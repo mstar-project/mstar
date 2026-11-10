@@ -477,15 +477,17 @@ so attaching more files does not multiply them.
        reads BMP and TIFF); other formats get a 400. A GIF or an animated
        WebP is read as its first frame. Images are turned upright by their
        EXIF orientation; a malformed EXIF block leaves one as stored.
-   * - ``MSTAR_MAX_VIDEO_PIXELS``
-     - ``1073741824``
-     - Pixels a request's videos may decode to (see
-       :func:`mstar.model.media_limits.max_video_pixels`), summed over the
+   * - ``MSTAR_MAX_VIDEO_BYTES``
+     - ``3221225472``
+     - Host bytes a request's videos may decode to (see
+       :func:`mstar.model.media_limits.max_video_bytes`), summed over the
        frames the model's loader decodes, each frame counting as at least
-       64x64; over it, the request gets a 400. At 1080p30 the default refuses
-       clips over about 17 s on Cosmos3, which decodes every frame, and over
-       about 259 s on Qwen3-Omni and Qwen3.5, which decode 2 frames a second
-       (Qwen3-Omni decodes every frame, as Cosmos3, when the clip's header
+       64x64: 3 bytes a pixel for uint8 frames, 15 for a loader that also
+       holds their float32 copy. Over it, the request gets a 400. At 1080p30
+       the default refuses clips over about 3.5 s on Cosmos3, which decodes
+       every frame and converts it to float, and over about 259 s on
+       Qwen3-Omni and Qwen3.5, which decode 2 uint8 frames a second
+       (Qwen3-Omni decodes every frame, about 17 s, when the clip's header
        gives no frame count).
    * - ``MSTAR_MAX_MEDIA_FILES``
      - ``16``

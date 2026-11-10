@@ -662,7 +662,7 @@ default, which lowers the token count of short clips. Notes:
   and 1,585 tok/s with none failing on 8192 pages. Raise
   ``resources: kv_cache: max_num_pages`` to fit the concurrency you serve.
 - Decoding happens in the API server process, before the request is queued,
-  and counts against ``MSTAR_MAX_VIDEO_PIXELS``: at the default, a 1080p
+  and counts against ``MSTAR_MAX_VIDEO_BYTES``: at the default, a 1080p
   video over about 259 s gets a 400.
 
 Most layers are gated DeltaNet, so a request holds a recurrent-state slot as

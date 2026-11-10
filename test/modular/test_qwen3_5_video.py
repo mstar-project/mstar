@@ -719,7 +719,7 @@ def _header_only_loader(monkeypatch, height, width, total=600, fps=30.0) -> list
 
 
 def test_the_video_pixel_cap_holds_before_decoding(model, tmp_path, monkeypatch):
-    """`MSTAR_MAX_VIDEO_PIXELS` counts the frames the processor samples, from
+    """`MSTAR_MAX_VIDEO_BYTES` counts the uint8 bytes of the frames the processor samples, from
     the header, so a video over it is refused before any frame is decoded."""
     from transformers.video_utils import VideoMetadata
 
@@ -733,12 +733,12 @@ def test_the_video_pixel_cap_holds_before_decoding(model, tmp_path, monkeypatch)
         VideoMetadata(total_num_frames=600, fps=30.0), num_frames=processor.num_frames, fps=processor.fps,
     ))
 
-    monkeypatch.setenv("MSTAR_MAX_VIDEO_PIXELS", str(n * 1080 * 1920))
+    monkeypatch.setenv("MSTAR_MAX_VIDEO_BYTES", str(n * 1080 * 1920 * 3))
     sample_video(str(path), processor)
     assert decoded == [n]
 
-    monkeypatch.setenv("MSTAR_MAX_VIDEO_PIXELS", str(n * 1080 * 1920 - 1))
-    with pytest.raises(ValueError, match="MSTAR_MAX_VIDEO_PIXELS"):
+    monkeypatch.setenv("MSTAR_MAX_VIDEO_BYTES", str(n * 1080 * 1920 * 3 - 1))
+    with pytest.raises(ValueError, match="MSTAR_MAX_VIDEO_BYTES"):
         sample_video(str(path), processor)
     assert decoded == [n]
 

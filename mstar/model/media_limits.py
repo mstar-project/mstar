@@ -6,7 +6,7 @@ check what a file will decode to, not how big it is. A refusal is a
 ``ValueError``, which the data worker answers with a 400, as is a file its
 decoder can't read (:func:`decoding_upload`).
 
-The pixel and audio caps hold for a whole request: while the data worker loads
+The image, video and audio caps hold for a whole request: while the data worker loads
 a request's files inside :class:`RequestMediaBudget`, every check also counts
 against what the request's earlier files used.
 """
@@ -34,9 +34,15 @@ def video_decode_threads() -> int:
 
 # PIL's DecompressionBombWarning threshold (about 9459 x 9459 RGB)
 DEFAULT_MAX_IMAGE_PIXELS = 89_478_485
-# about 39 s of 720p30, or 2.6 min of 640x360 at 30 fps, decoded at once: a
-# full decode of every short (up to 2 min) Video-MME clip fits
-DEFAULT_MAX_VIDEO_PIXELS = 1 << 30
+# 1 Gi pixels of decoded RGB: about 39 s of 720p30, or 2.6 min of 640x360 at
+# 30 fps, as uint8 frames, so a full decode of every short (up to 2 min)
+# Video-MME clip fits. A loader that also holds their float32 copy is charged
+# for it, so it fits a fifth as many pixels.
+DEFAULT_MAX_VIDEO_BYTES = 3 << 30
+# host bytes a decoded RGB pixel takes: uint8 as the decoder returns it, and
+# with the float32 copy a loader converts it to beside it
+RGB_BYTES = 3
+RGB_AND_FLOAT_BYTES = RGB_BYTES + 3 * 4
 # the least a decoded frame counts against the video cap
 MIN_FRAME_PIXELS = 64 * 64
 DEFAULT_MAX_MEDIA_FILES = 16
@@ -70,10 +76,10 @@ def max_image_pixels() -> int:
     return _positive_int_env("MSTAR_MAX_IMAGE_PIXELS", DEFAULT_MAX_IMAGE_PIXELS)
 
 
-def max_video_pixels() -> int:
-    """``MSTAR_MAX_VIDEO_PIXELS``: pixels a request's videos may decode to,
+def max_video_bytes() -> int:
+    """``MSTAR_MAX_VIDEO_BYTES``: host bytes a request's videos may decode to,
     summed over the frames the loader decodes from each."""
-    return _positive_int_env("MSTAR_MAX_VIDEO_PIXELS", DEFAULT_MAX_VIDEO_PIXELS)
+    return _positive_int_env("MSTAR_MAX_VIDEO_BYTES", DEFAULT_MAX_VIDEO_BYTES)
 
 
 def max_media_files() -> int:
@@ -98,7 +104,7 @@ def check_media_limits() -> None:
     from PIL import Image
 
     limit = max_image_pixels()
-    max_video_pixels()
+    max_video_bytes()
     max_media_files()
     max_audio_seconds()
     if Image.MAX_IMAGE_PIXELS is not None and limit > Image.MAX_IMAGE_PIXELS:
@@ -119,7 +125,7 @@ class RequestMediaBudget:
     # kind: what the refusal calls its files, their unit, the env var
     _LIMITS = {
         "image": ("images", "pixels", "MSTAR_MAX_IMAGE_PIXELS"),
-        "video": ("videos", "pixels", "MSTAR_MAX_VIDEO_PIXELS"),
+        "video": ("videos", "bytes", "MSTAR_MAX_VIDEO_BYTES"),
         "audio": ("audio clips", "seconds", "MSTAR_MAX_AUDIO_SECONDS"),
     }
 
@@ -129,7 +135,7 @@ class RequestMediaBudget:
             raise ValueError(
                 f"the request attaches {num_files} media files; the limit is {limit} (MSTAR_MAX_MEDIA_FILES)"
             )
-        self.limits = {"image": max_image_pixels(), "video": max_video_pixels(), "audio": max_audio_seconds()}
+        self.limits = {"image": max_image_pixels(), "video": max_video_bytes(), "audio": max_audio_seconds()}
         self.used = dict.fromkeys(self.limits, 0)
         self._file = dict.fromkeys(self.limits, 0)
 
@@ -537,22 +543,25 @@ def probe_video(filepath: str) -> tuple[int, float, int, int] | None:
 
 
 class VideoBudget:
-    """Counts decoded frames against ``max_video_pixels()``, so a loader stops
-    before it holds more than the cap whatever the container claims.
+    """Counts the host bytes decoded frames take against ``max_video_bytes()``,
+    so a loader stops before it holds more than the cap whatever the container
+    claims. ``bytes_per_pixel`` is what the loader holds per decoded pixel:
+    ``RGB_BYTES`` for uint8 frames, ``RGB_AND_FLOAT_BYTES`` when it also makes
+    their float32 copy.
 
     A frame counts as at least ``MIN_FRAME_PIXELS``: each decoded frame costs
     about 2 KB of tensor and frame objects whatever its size, so a clip of
     millions of 2x2 frames would otherwise pass the cap at hundreds of GB."""
 
     def __init__(self) -> None:
-        self.limit = max_video_pixels()
-        self.pixels = 0
+        self.limit = max_video_bytes()
+        self.bytes = 0
 
-    def add(self, height: int, width: int, frames: int = 1) -> None:
-        self.pixels += max(int(height) * int(width), MIN_FRAME_PIXELS) * int(frames)
-        if self.pixels > self.limit:
+    def add(self, height: int, width: int, frames: int = 1, bytes_per_pixel: int = RGB_BYTES) -> None:
+        self.bytes += max(int(height) * int(width), MIN_FRAME_PIXELS) * int(frames) * bytes_per_pixel
+        if self.bytes > self.limit:
             raise ValueError(
-                f"video decodes to more than {self.limit} pixels; send a shorter "
-                "or smaller clip (the limit is MSTAR_MAX_VIDEO_PIXELS)"
+                f"video decodes to more than {self.limit} bytes; send a shorter "
+                "or smaller clip (the limit is MSTAR_MAX_VIDEO_BYTES)"
             )
-        _charge_request("video", self.pixels)
+        _charge_request("video", self.bytes)
