@@ -30,10 +30,6 @@ import torch
 from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import (
-    CurrentForwardConductorMetadata,
-    StreamingConnectionState,
-)
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
@@ -53,13 +49,14 @@ from mstar.graph.base import (
 )
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import (
-    ForwardPassArgs,
     KVLabel,
     LabelLayout,
     Model,
     ProcessPromptOutput,
+    RobotIO,
     Span,
     TensorAndMetadata,
+    WalkStep,
 )
 from mstar.model.loader import LLAMA_STACKED_PARAMS, load_hf_weights
 from mstar.model.media_limits import read_image
@@ -162,6 +159,15 @@ def _reset_non_persistent_buffers(module: nn.Module, device) -> None:
                         num_positions, device=pos.device, dtype=pos.dtype
                     ).expand(shape)
                 )
+
+
+def _flat(value):
+    """Leaves of a nested list/tuple."""
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _flat(item)
+    else:
+        yield value
 
 
 class Pi05Model(Model):
@@ -538,6 +544,7 @@ class Pi05Model(Model):
         configured, ``robot_state`` is the raw state and is normalized first,
         as openpi's policy does; without, it is binned as given.
         """
+        robot_state = self._robot_state(kwargs.get("robot_state"))
         if self.tokenizer is None:
             # Tokenizer-less fallback for dummy mode (skip_weight_loading), used by structural unit tests.
             if prompt is not None:
@@ -549,9 +556,8 @@ class Pi05Model(Model):
             return {}
 
         state_bins = None
-        robot_state = kwargs.get("robot_state")
         if robot_state is not None:
-            state = torch.as_tensor(robot_state, dtype=torch.float64).detach().cpu().reshape(-1)
+            state = robot_state
             if self.norm_stats is not None:
                 state = self.norm_stats.normalize_state(state)
             state_bins = discretize_state(state, num_bins=self.config.state_token_bins).tolist()
@@ -575,10 +581,45 @@ class Pi05Model(Model):
         """The decoded RGB camera image, left uint8 ``(C, H, W)``: the ViT step
         normalizes uint8 on the GPU, so the API server skips a float pass per
         camera and stages a quarter of the bytes for the worker."""
-        return TensorAndMetadata(read_image(filepath, rgb=True).to(device))
+        return self.load_decoded_image(read_image(filepath, rgb=True), device)
+
+    def load_decoded_image(self, image: torch.Tensor, device: str) -> TensorAndMetadata:
+        return TensorAndMetadata(image.to(device))
+
+    def robot_io(self) -> RobotIO:
+        return RobotIO("robot_state", self.config.action_horizon, self.config.action_dim)
 
     def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
         return {LLM_KV: {"main": KVLabel()}}
+
+    def _robot_state(self, raw) -> torch.Tensor | None:
+        """The client's ``robot_state`` as a float64 vector of at most ``state_dim``
+        finite values; anything else is a ``ValueError``. A value outside [-1, 1]
+        (after ``norm_stats``, when configured) bins as openpi's (``discretize_state``)."""
+        if raw is None:
+            return None
+        limit = self.config.state_dim
+        if isinstance(raw, torch.Tensor):
+            state = raw.to(torch.float64)
+        else:
+            if isinstance(raw, (str, bytes)) or any(isinstance(v, (bool, str, bytes)) for v in _flat(raw)):
+                raise ValueError(f"robot_state must be a list of at most {limit} numbers; got {raw!r}")
+            try:
+                state = torch.tensor(raw, dtype=torch.float64)
+            except (TypeError, ValueError, RuntimeError):
+                raise ValueError(f"robot_state must be a list of at most {limit} numbers; got {raw!r}") from None
+        if state.dim() != 1 or not 1 <= state.numel() <= limit:
+            raise ValueError(
+                f"robot_state must be a list of 1 to {limit} numbers; got shape {tuple(state.shape)}"
+            )
+        if not torch.isfinite(state).all():
+            # NaN and +inf would bin as 255 and -inf as -1: an ordinary-looking state token
+            raise ValueError("robot_state must be finite; it holds NaN or inf")
+        return state
+
+    def request_kwargs(self) -> frozenset[str]:
+        # flow steps and the rest come from the deployment YAML, not the request
+        return frozenset({"robot_state"})
 
     def max_input_files(self) -> dict[str, int]:
         # one image per camera slot the SigLIP capture holds
@@ -596,71 +637,22 @@ class Pi05Model(Model):
     # Model ABC: forward pass orchestration
     # ------------------------------------------------------------------
 
-    def get_initial_forward_pass_args(
+    def walk_plan(
         self,
         partition_name: str,
         input_modalities: list[str],
         output_modalities: list[str],
         input_signals: dict[str, list[TensorPointerInfo]],
-        model_kwargs: dict | None = None,
-    ) -> ForwardPassArgs:
-        full_metadata = CurrentForwardConductorMetadata(
-            input_modalities=input_modalities,
-            output_modalities=output_modalities,
-            graph_walk=self.PREFILL_WALK,
-            is_prefill=True,
-            kwargs={},
-        )
-
-        inputs = []
-        if "image_inputs" in input_signals:
-            edge = GraphEdge(next_node="vit_encoder", name="image_inputs")
-            edge.tensor_info = input_signals["image_inputs"]
-            inputs.append(edge)
-        if "text_inputs" in input_signals:
-            edge = GraphEdge(next_node="LLM", name="text_inputs")
-            edge.tensor_info = input_signals["text_inputs"]
-            inputs.append(edge)
-
-        unpersist_tensors = sum([inp.tensor_info for inp in inputs], start=[])
-        return ForwardPassArgs(
-            full_metadata=full_metadata,
-            inputs=inputs,
-            unpersist_tensors=unpersist_tensors,
-            step_metadata={"is_prefill": True},
-        )
-
-    def get_partition_forward_pass_args(
-        self,
-        partition_name: str,
-        partition_metadata: CurrentForwardConductorMetadata,
-        persist_signals: dict[str, list[TensorPointerInfo]],
-        incoming_connections: list[StreamingConnectionState] | None = None,
-    ) -> ForwardPassArgs:
-        metadata = partition_metadata
-        request_done = False
-        inputs: list[GraphEdge] = []
-
-        if metadata.graph_walk == self.PREFILL_WALK:
-            metadata.is_prefill = False
-            metadata.graph_walk = self.ACTION_GEN_WALK
-            # Inputs for the first action_gen iteration are sampled inside the
-            # LLM submodule's preprocess (Gaussian noise + timestep_index=0).
-            inputs = [
-                GraphEdge(next_node="LLM", name="noisy_actions"),
-                GraphEdge(next_node="LLM", name="timestep_index"),
-            ]
-        elif metadata.graph_walk == self.ACTION_GEN_WALK:
-            request_done = True
-
-        unpersist_tensors = sum([inp.tensor_info for inp in inputs], start=[])
-        return ForwardPassArgs(
-            full_metadata=metadata,
-            inputs=inputs,
-            unpersist_tensors=unpersist_tensors,
-            step_metadata={"is_prefill": metadata.is_prefill},
-            request_done=request_done,
-        )
+        model_kwargs: dict,
+    ) -> list[WalkStep]:
+        """The prefill over the camera images and the prompt, then the action
+        flow, whose first iteration the LLM submodule seeds (Gaussian noise and
+        timestep 0)."""
+        # The prefill's LLM waits on the images' embeddings, so a request without
+        # them could never finish. process_prompt always emits the prompt's tokens.
+        if not input_signals.get("image_inputs"):
+            raise ValueError("Pi0.5 requires camera images (image_inputs)")
+        return [WalkStep(self.PREFILL_WALK), WalkStep(self.ACTION_GEN_WALK)]
 
     # ------------------------------------------------------------------
     # Model ABC: submodule loading

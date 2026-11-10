@@ -162,7 +162,7 @@ class _Serve:
         specs = model.get_node_resources()
         apply_yaml_overrides(specs, kv_yaml)
         by_key = resolve_spec_dependencies(specs)
-        groups = JointGroups(tp_group=CommGroup.trivial(), sp_group=CommGroup.trivial())
+        groups = JointGroups(tp_group=CommGroup.trivial(), sp_group=CommGroup.trivial(), instance=CommGroup.trivial())
         transfer = TransferEngineInfo(
             my_entity_id="glm52_serve_e2e", my_session_id="glm52_serve_e2e",
             transfer_engine=LocalTransferEngine("localhost"),
@@ -185,7 +185,7 @@ class _Serve:
         # vocab, so greedy decode on random weights can hit one and stop
         # early — which would break the exact-length assertions below.
         self.overrides = model.get_request_resource_configs(
-            {}, model_kwargs={"temperature": 0.0, "ignore_eos": True, **model_kwargs},
+            [], [], model_kwargs={"temperature": 0.0, "ignore_eos": True, **model_kwargs},
         )
         self.runner.ingest_request(rid, self.overrides)
 
@@ -230,13 +230,12 @@ class _Serve:
             resource.cleanup()
 
 
-def _run_generation(model, submodule, cfg, prompt_ids, max_tokens):
-    """The real serve loop: prefill -> decode -> check_stop, all through
-    ``forward_batched`` and the sampler resource (greedy)."""
+def _run_generation(model, submodule, prompt_ids, max_tokens):
+    """The real serve loop: prefill -> decode to the request's loop cap or a
+    stop, all through ``forward_batched`` and the sampler resource (greedy)."""
     serve = _Serve(model, submodule)
     info = serve.info(max_tokens)
     generated: list[int] = []
-    stopped = False
     try:
         out = serve.step("prefill", info, prompt_ids)
         new_token = out["new_token"][0]
@@ -245,24 +244,20 @@ def _run_generation(model, submodule, cfg, prompt_ids, max_tokens):
         generated.append(int(new_token.item()))
         next_token = out["text_inputs"][0]
         # as the runtime: a prefill stop ends the request (END_PARTITION); otherwise decode
-        stopped = END_PARTITION in submodule.check_stop(serve.rid, info, out)
-        if not stopped:
+        if END_PARTITION not in submodule.check_stop(serve.rid, info, out):
             info.graph_walk = "decode"
-            for step in range(max_tokens + 4):  # +slack; check_stop must break first
+            for _ in range(model.get_loop_caps(max_output_tokens=max_tokens)["decode_loop"]):
                 out = serve.step("decode", info, next_token)
                 new_token = out["new_token"][0]
                 submodule.postprocess(serve.rid, info, out)
                 assert out["text_inputs"] is out["new_token"]
-                info.dynamic_loop_iter_counts["decode_loop"] = step
-                stop = submodule.check_stop(serve.rid, info, out)
                 generated.append(int(new_token.item()))
                 next_token = out["text_inputs"][0]
-                if stop:
-                    stopped = True
+                if submodule.check_stop(serve.rid, info, out):
                     break
     finally:
         serve.close()
-    return generated, stopped
+    return generated
 
 
 def _prefill_logits(model, submodule, prompt_ids):
@@ -310,9 +305,8 @@ def test_serve_path_prefill_decode_loop_fp8(tmp_path):
     assert torch.isfinite(logits).all()
 
     MAX_TOKENS = 6
-    generated, stopped = _run_generation(model, submodule, cfg, prompt_ids, MAX_TOKENS)
+    generated = _run_generation(model, submodule, prompt_ids, MAX_TOKENS)
 
-    assert stopped, "decode loop did not terminate via check_stop"
     assert len(generated) == MAX_TOKENS, generated  # max_tokens counts the prefill-emitted token (vLLM semantics)
     assert all(0 <= t < cfg.vocab_size for t in generated), generated
 
@@ -329,7 +323,7 @@ def test_serve_path_is_deterministic_fp8(tmp_path):
     prompt_ids = model.process_prompt("serve", ["text"], ["text"]).new_input_tensors["text_inputs"][0].to(DEVICE)
 
     runs = [
-        _run_generation(model, submodule, model.config, prompt_ids, max_tokens=5)[0]
+        _run_generation(model, submodule, prompt_ids, max_tokens=5)
         for _ in range(2)
     ]
     assert runs[0] == runs[1], runs

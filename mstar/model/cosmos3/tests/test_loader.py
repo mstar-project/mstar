@@ -24,6 +24,8 @@ from mstar.model.cosmos3.loader import (
     cosmos3_name_remapper,
     read_transformer_weight_keys,
     read_transformer_weight_shapes,
+    stacked_param_name,
+    stacked_param_shapes,
 )
 
 NANO_DIR = Path(os.environ.get("COSMOS3_NANO_DIR", "/nonexistent-cosmos3-nano"))
@@ -99,17 +101,16 @@ def test_loader_key_coverage() -> None:
     dropped = {k for k in index_keys if cosmos3_name_remapper(k) is None}
     assert dropped == set(DROP_KEYS), dropped
 
-    mapped = {cosmos3_name_remapper(k) for k in index_keys}
-    mapped.discard(None)
+    mapped = {stacked_param_name(name) for k in index_keys if (name := cosmos3_name_remapper(k)) is not None}
 
     missing = model_keys - mapped  # backbone params with no checkpoint key
     unexpected = mapped - model_keys  # checkpoint keys with no backbone param
     assert not missing, f"backbone params not covered by checkpoint: {sorted(missing)[:20]}"
     assert not unexpected, f"checkpoint keys with no backbone param: {sorted(unexpected)[:20]}"
 
-    # Sanity on the exact counts: 36 layers * 22 + 22 non-layer == 814; drop lm_head -> 813.
+    # Sanity on the exact count: 36 layers * 22 + 22 non-layer == 814. The
+    # backbone drops lm_head and fuses each layer's q / k / v (covered above).
     assert len(index_keys) == 814, len(index_keys)
-    assert len(model_keys) == 813, len(model_keys)
 
 
 @needs_nano
@@ -125,13 +126,13 @@ def test_loader_shape_coverage() -> None:
         model = Cosmos3OmniTransformer(cfg)
 
     try:
-        ckpt_shapes = read_transformer_weight_shapes(NANO_DIR)
+        ckpt_shapes = stacked_param_shapes(read_transformer_weight_shapes(NANO_DIR))
     except Exception as exc:  # noqa: BLE001 — LFS pointer / missing shards
         print(f"  (shape check skipped: transformer shards unreadable: {exc})")
         return
 
     model_shapes = {k: tuple(v.shape) for k, v in model.state_dict().items()}
-    # The remapper is identity for backbone keys, so model key == checkpoint key.
+    # The remapper is identity for backbone keys; q / k / v rows stack into to_qkv.
     mismatched = {
         k: {"model": s, "ckpt": ckpt_shapes.get(k)}
         for k, s in model_shapes.items()

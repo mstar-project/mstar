@@ -2,10 +2,15 @@ name: CI
 on:
   pull_request:
     branches: [main]
-  # Every merge is tested on main too: PRs that are each green alone can still
-  # break main when they land together.
+  # Every commit on main is tested too, including merges that skip the queue
+  # (an admin can bypass it).
   push:
     branches: [main]
+  # The merge queue tests each PR merged with main and with every PR queued
+  # ahead of it, before it lands, so that break shows up here instead of on
+  # main. A check the queue requires must run on this event, or the queue
+  # waits for it forever. Each queued commit is its own concurrency group.
+  merge_group:
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -62,6 +67,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
+          # A queue run's branch is deleted at once, so a cache saved there is never read.
+          save-if: ${{ github.event_name != 'merge_group' }}
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -87,6 +94,9 @@ jobs:
           # Model.load_audio decodes with libsndfile before torchcodec; the
           # tests of that path skip without it.
           python -m pip install soundfile
+          # The eval runner (benchmark/asr_eval.py, imported by the WER and DROID
+          # dataset tests) needs aiohttp, which datasets 5.2 stopped pulling in.
+          python -m pip install aiohttp
           # The Wan VAE decode tests build tiny random AutoencoderKLWan models
           # (no weights); 0.39 is the release the decoder was verified on.
           python -m pip install diffusers==0.39.0
@@ -158,14 +168,16 @@ jobs:
         run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
         with:
+          save-if: ${{ github.event_name != 'merge_group' }}
           workspaces: |
             rust
             rust/server
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Install libzmq
-        run: sudo apt-get update && sudo apt-get install -y libzmq3-dev
+      - name: Install libzmq and ffmpeg
+        # ffmpeg: the video parity tests mux a generated sound track, which skip without it
+        run: sudo apt-get update && sudo apt-get install -y libzmq3-dev ffmpeg
       - name: Cargo tests (transport + arena semantics)
         working-directory: rust
         # The bindings without extension-module (see rust/Cargo.toml): the test
@@ -190,9 +202,11 @@ jobs:
           # pyyaml: the runtime tests reach mstar.model.base, which imports it;
           # prometheus-client: the frontend's /metrics test renders a real registry;
           # fastapi, uvicorn, python-multipart and httpx: the Rust/Python chat
-          # parity cases run the Python app through fastapi's TestClient
+          # parity cases run the Python app through fastapi's TestClient;
+          # soundfile (its wheel bundles libsndfile): the voice-clip checks and
+          # the compressed-speech byte parity, which skip without it
           pip install pytest==9.2.0 msgpack numpy pyyaml prometheus-client \
-            fastapi uvicorn python-multipart httpx
+            fastapi uvicorn python-multipart httpx soundfile
           # cpu torch + triton: the arena test imports the tensor-transport
           # stack, which reaches mstar.utils.sampling (triton at module level)
           pip install torch --index-url https://download.pytorch.org/whl/cpu

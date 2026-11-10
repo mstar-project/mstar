@@ -12,23 +12,17 @@ import torch
 
 from mstar.api_server.data_worker import PreprocessWorkerThread, RequestOutputState
 from mstar.graph.loop_indices import NestedLoopIndices
-from mstar.streaming.topology import PartitionTopology
+from mstar.testing_utils.model import StubModel
 from mstar.utils import cpus
 
 
-class _Model:
+class _Model(StubModel):
     """postprocess blocks on the gate named by the output's value, so a test
     decides when each encode finishes."""
 
     def __init__(self):
         self.gates: dict[int, threading.Event] = {}
         self.threads: dict[int, str] = {}
-
-    def text_output(self):
-        return None
-
-    def get_partition_topology(self):
-        return PartitionTopology(partitions=["default"])
 
     def gate(self, value: int) -> threading.Event:
         return self.gates.setdefault(value, threading.Event())
@@ -210,7 +204,8 @@ def test_a_failed_encode_answers_in_its_slot(worker):
     worker.model.gate(-1).set()
     chunks = _pass_until(worker, 2)
     assert [c.modality for c in chunks] == ["error", "text"]
-    assert chunks[0].metadata == {"status": 400}
+    # past intake a ValueError is a server bug
+    assert chunks[0].metadata == {"status": 500}
 
 
 def test_an_encode_finishing_after_teardown_delivers_nothing(worker):

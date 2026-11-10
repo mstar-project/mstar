@@ -28,6 +28,8 @@ from benchmark.eval.e2e import manifest as mf  # noqa: E402
 from benchmark.eval.e2e.manifest import Case, Model  # noqa: E402
 from benchmark.eval.e2e.report import Perf, Stat  # noqa: E402
 
+pytestmark = pytest.mark.usefixtures("no_host_gpus")
+
 RUN = {"id": "r", "base": {"label": "main", "sha": "a" * 40}, "head": {"label": "PR #1", "sha": "b" * 40},
        "gpu": "h200", "perf_pct": 5, "noise_sigma": 2, "gpu_hours": 1.0}
 
@@ -905,13 +907,13 @@ def test_signals_wait_until_server_teardown_is_done():
     import os as _os
     import signal as _signal
 
-    from benchmark.eval.e2e import arm
+    from benchmark.eval.server import _exit_on_signal, signals_deferred
 
-    old = _signal.signal(_signal.SIGTERM, arm._on_term)
+    old = _signal.signal(_signal.SIGTERM, _exit_on_signal)
     try:
         finished = []
-        with pytest.raises(SystemExit) as e:
-            with arm.signals_deferred():
+        with pytest.raises(SystemExit) as e:           # delivered to its own handler once the block is done
+            with signals_deferred():
                 _os.kill(_os.getpid(), _signal.SIGTERM)
                 finished.append(True)                  # the teardown keeps going after the signal
         assert finished == [True] and e.value.code == 128 + _signal.SIGTERM
@@ -1025,7 +1027,7 @@ sys.path[:0] = [{root!r}, {tests!r}]
 from argparse import Namespace
 from pathlib import Path
 import test_eval_compare as T
-from benchmark.eval import cli
+from benchmark.eval import cli, server
 from benchmark.eval.e2e import compare, hosts, manifest as mf, trees
 
 compare.POLL_S = 0.2
@@ -1045,9 +1047,8 @@ slot = hosts.Slot(T.FakeRemote(tmp / "home"), None)
 runner = compare.Runner(args, man, man.select("all"), base, base, tmp / "run", [slot])
 runner.cache = tmp / "cache"
 T.fake_tree(runner.cache / "src" / base.sha, delay=0.05)
-for sig in (signal.SIGTERM, signal.SIGHUP):
-    signal.signal(sig, cli._exit_on_signal)
-hosts.run_slots([slot], hosts.WorkQueue(["fake"], {{}}), runner.run_one, stop=runner.stop)
+with server.exit_on_signals():
+    hosts.run_slots([slot], hosts.WorkQueue(["fake"], {{}}), runner.run_one, stop=runner.stop)
 """
 
 
@@ -1082,7 +1083,7 @@ def test_sigterm_to_compare_stops_the_remote_job_before_compare_exits(tmp_path):
     assert not procs_under(tmp_path / "home")
 
 
-CTRL_C_RUN = SIGTERM_RUN.split("for sig in", maxsplit=1)[0] + r"""
+CTRL_C_RUN = SIGTERM_RUN.split("with server.exit_on_signals", maxsplit=1)[0] + r"""
 def fake_compare(args):
     hosts.run_slots([slot], hosts.WorkQueue(["fake"], {{}}), runner.run_one, stop=runner.stop)
     return 0
