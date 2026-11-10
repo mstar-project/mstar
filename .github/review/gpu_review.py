@@ -245,6 +245,8 @@ cluster mode: the box is already provisioned, and it ends when you exit.
   noise, and a control arm only when a claim needs one. Test the PR's head against its base: this
   overrides every part of the skill that asks for a merged-tree or stacked-neighbour rerun (its "Test
   on the merged tree too", the test matrix's "Anything a sibling PR also touches" row), so run none.
+  Never run what CI already runs (its CPU tests, lint, type checks): run only what needs a GPU or
+  what CI can't run.
 - GPUs are expensive: the smallest model and layout that reach the changed code, no reruns of
   checks whose code is unchanged, and stop when the plan is done. Plan for as little testing as the
   change needs; about two hours once compile caches are warm (compiling doesn't count) is the most a
