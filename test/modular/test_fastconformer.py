@@ -962,11 +962,16 @@ def test_encoder_steps_do_not_reproject_the_relative_positions():
 
 def test_encoder_layers_stream_at_one_chunk():
     """The layers keep one stream's chunk, with its band of distances and its
-    retained frames: binding them at another is refused, not served with the
-    first chunk's band."""
+    retained frames, and that stream's KV and conv pool: binding them at
+    another chunk, or to another node's resources, is refused, not served
+    with the first one's."""
     enc = _Encoder(lookahead=3)
     with pytest.raises(ValueError, match="chunk of 4 frames"):
         enc.node.encoder.bind_stream(1, enc.resources)
+    with pytest.raises(ValueError, match="one node's KV"):
+        enc.node.encoder.bind_stream(4, {**enc.resources, KV: object()})
+    with pytest.raises(ValueError, match="one node's state pool"):
+        enc.node.encoder.layers[0].conv.bind_stream(object())
     enc.node.encoder.bind_stream(4, enc.resources)
 
 

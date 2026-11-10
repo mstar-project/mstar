@@ -277,6 +277,8 @@ class RelPositionAttention(nn.Module):
         if self.chunk is not None and self.chunk != chunk:
             raise ValueError(f"the encoder's layers stream at a chunk of {self.chunk} frames; "
                              f"a second stream node asks for {chunk}")
+        if self.kv is not None and self.kv is not kv:
+            raise ValueError("the encoder's layers stream on one node's KV; a second stream node binds its own")
         self.kv, self.chunk = kv, chunk
         self.retained = stream_retained_frames(self.left_context, chunk)
         w = self.relative_k_proj.weight
@@ -363,7 +365,10 @@ class ConvModule(nn.Module):
         self.pointwise_conv2 = nn.Linear(c, c, bias=config.convolution_bias)
 
     def bind_stream(self, state) -> None:
-        """The stream node's recurrent-state pool of conv inputs."""
+        """The stream node's recurrent-state pool of conv inputs: one node's."""
+        if self.state is not None and self.state is not state:
+            raise ValueError("the encoder's conv modules stream on one node's state pool; "
+                             "a second stream node binds its own")
         self.state = state
 
     def forward(self, x: torch.Tensor, valid: torch.Tensor | None) -> torch.Tensor:
@@ -593,7 +598,8 @@ class FastConformerEncoder(nn.Module):
         """Bind the stream node's state, its KV and conv pool from its
         ``resources``, and its chunk, ``chunk`` frames a step, to each layer
         (``RelPositionAttention.bind_stream``); the offline ``blocks`` keep the
-        config's lookahead and need neither."""
+        config's lookahead and need neither. One stream node binds them: a
+        rebind at another chunk or to other resources is refused."""
         kv, state = resources[self.kv_key], resources[self.conv_key]
         for layer in self.layers:
             layer.self_attn.bind_stream(chunk, kv)
