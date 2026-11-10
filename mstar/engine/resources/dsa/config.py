@@ -41,6 +41,10 @@ class DSAConfig:
     # MiB each FlashInfer workspace of its sparse plans starts at (one per walk and capture
     # slot, one for eager steps); a plan that needs more grows it until captures are sealed
     workspace_mb: int = 128
+    # the cache's rope slot holds no key (the model attends without decoupled RoPE) and its
+    # queries fill that slot with ones, so a large negative value written there masks an entry;
+    # a step whose rows may move (``DSAStep.rows_may_move``) pads its captured plan that way
+    rope_slot_masks: bool = False
 
 
 @dataclass

@@ -1473,7 +1473,7 @@ def test_the_conductor_process_hands_the_status_interval_to_the_conductor(monkey
 def test_enable_metrics_without_the_package_stops_before_anything_starts(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(entrypoint, "MISSING_DEPENDENCY", ModuleNotFoundError("prometheus_client"))
     assert not _main_until_api_server(monkeypatch, tmp_path, "--enable-metrics")
-    assert "mstar[metrics]" in capsys.readouterr().err
+    assert "mstar-ai[metrics]" in capsys.readouterr().err
     assert _main_until_api_server(monkeypatch, tmp_path)
 
 
@@ -1504,7 +1504,7 @@ def test_a_missing_package_is_reported_and_a_broken_one_raises(monkeypatch):
             m.setitem(sys.modules, "prometheus_client", None)
             importlib.reload(metrics_module)
             assert metrics_module.MISSING_DEPENDENCY is not None
-            with pytest.raises(RuntimeError, match=r"mstar\[metrics\]"):
+            with pytest.raises(RuntimeError, match=r"mstar-ai\[metrics\]"):
                 metrics_module.ServingMetrics("dummy", in_flight=int, data_worker_queue_depth=int)
         with monkeypatch.context() as m:
             m.setitem(sys.modules, "prometheus_client.core", None)

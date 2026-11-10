@@ -262,6 +262,9 @@ class Glm5NextModel(ByteLevelTextOutput, Model):
                     kpool=self.config.index_kpool,
                     sm_scale=self.config.softmax_scale,
                     index_head_dim=self.config.index_head_dim,
+                    # no decoupled RoPE; with MTP its queries fill the rope slot with ones
+                    # (Glm5NextMLAAttention.kpe_query_fill), so a verify step's padding masks
+                    rope_slot_masks=self.config.mtp_num_draft_tokens > 0,
                 ),
             ))
         return specs
