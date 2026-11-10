@@ -421,30 +421,28 @@ def for_approval(review, pages):
     """`review` as the approval reads it: a re-review's `fixed` or `moot` counts as `disputed`, so a person decides,
     where nothing in the code backs it: on a bot thread GitHub doesn't show as outdated (none of its lines changed
     since the bot posted it), and on an earlier finding outside the diff, which has no thread, whose file no commit
-    since the last review is known to have touched (`untouched`, bot.untouched). And a P0 or P1 judged fixed in a PR
-    stacked above (a prior finding's `fixed_above`, an outside-diff item's `fixed_in`) stays open, as `disputed` or
-    with that reason added to its claim: a PR must fix its own P0/P1s. The summary's status line and the GPU gate
-    keep the review's own judgement."""
+    since the last review is known to have touched (`untouched`, bot.untouched). The summary's status line and the
+    GPU gate keep the review's own judgement."""
     unchanged = {**{str(first.get("databaseId", "")): "none of this thread's lines changed: a person decides, or "
                                                        "change one of those lines"
                     for first, _, _, outdated in render_summary.bot_threads(pages) if not outdated},
                  **{location: "no commit since the last review is known to have touched its file: a person decides, "
                               "or change that file" for location in review.get("untouched") or ()}}
+    return {**review, "prior_findings": [
+        {**f, "status": "disputed", "why": f"a re-review judged it {f['status']}, but {unchanged[f['ref']]}"}
+        if f["status"] in render_summary.CLEARS and f["ref"] in unchanged else f
+        for f in review.get("prior_findings") or []]}
 
-    def above(f):
-        """Why a P0/P1 judged fixed above stays open, or None for a P2/P3, which merges with the PR above."""
-        return f"fixed only in #{f.get('fixed_in', '?')} above: a P0/P1 must be fixed in this PR" \
-            if f["priority"] in ("P0", "P1") else None
 
-    def prior(f):
-        if f["status"] in render_summary.CLEARS and f["ref"] in unchanged:
-            return {**f, "status": "disputed", "why": f"a re-review judged it {f['status']}, but {unchanged[f['ref']]}"}
-        return {**f, "status": "disputed", "why": above(f)} if f["status"] == "fixed_above" and above(f) else f
-
-    return {**review,
-            "outside_diff": [{**{k: v for k, v in f.items() if k != "fixed_in"}, "claim": f"{f['claim']} ({above(f)})"}
-                             if f.get("fixed_in") and above(f) else f for f in review.get("outside_diff") or []],
-            "prior_findings": [prior(f) for f in review.get("prior_findings") or []]}
+def fixed_only_above(review, pages, stacked):
+    """The P0/P1 findings judged fixed in a PR stacked above, as a reason not to approve (none when there are
+    none): a PR must fix its own P0/P1s. Their priority is the one judged gives them, at least the bot's own tag;
+    the checklist's "fixed above" lines already say the bot won't approve them."""
+    review = render_summary.judged(review, pages, stacked)
+    found = [*[(f["ref"], f["priority"]) for f in render_summary.prior_above(review)],
+             *[(f["location"], f["priority"]) for f in review["outside_diff"] if f.get("fixed_in")]]
+    must = [f"{where} ({p})" for where, p in found if p in render_summary.MUST_FIX_HERE]
+    return [f"P0/P1 findings fixed only in a PR above: {', '.join(must)}"] if must else []
 
 
 def to_fix_first(review, pr, above):
@@ -488,6 +486,7 @@ class ApprovalFacts:
     risk_level: str
     questions: int
     to_fix_first: tuple  # what the review left open (to_fix_first)
+    fixed_only_above: tuple  # its P0/P1 findings a PR above fixes (fixed_only_above)
 
 
 def approval_facts(pr, sha, verdict, review):
@@ -497,6 +496,7 @@ def approval_facts(pr, sha, verdict, review):
     changes = changed_files(pull["base"]["repo"]["default_branch"], sha)
     blocked = file_gate(file_names(changes), ROOT)[0] if changes is not None else ()
     gitlinks = [f["filename"] for f in changes or [] if GITLINK.search(f.get("patch") or "")]
+    pages = review_threads(pr)
     return ApprovalFacts(
         head_moved=pull["head"]["sha"] != sha,
         author_access=bot.permission(REPO, pull["user"]["login"]),
@@ -508,7 +508,8 @@ def approval_facts(pr, sha, verdict, review):
         blocked=(*blocked, *gitlinks),
         risk_level=(review.get("risk") or {}).get("level", "unrated"),
         questions=len(review.get("questions") or ()),
-        to_fix_first=tuple(to_fix_first(for_approval(review, review_threads(pr)), pr, "stacked-above.json")),
+        to_fix_first=tuple(to_fix_first(for_approval(review, pages), pr, "stacked-above.json")),
+        fixed_only_above=tuple(fixed_only_above(review, pages, render_summary.stacked_above("stacked-above.json"))),
     )
 
 
@@ -556,7 +557,7 @@ def decide(f):
                       "summary's \"What's left for you\" lists")
     if f.questions:
         review.append(f"{f.questions} open question(s)")
-    return Decision(rule=tuple(rule), review=(*review, *f.to_fix_first))
+    return Decision(rule=tuple(rule), review=(*review, *f.to_fix_first, *f.fixed_only_above))
 
 
 def refresh_above():

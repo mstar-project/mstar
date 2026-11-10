@@ -86,7 +86,8 @@ turn re-reads everything read so far.
   on this one (`gh pr list --base <headRefName>`, recursively) and read their code. A finding that a
   PR above fixes for real is still reported, at its priority, as fixed above (status `fixed_above`
   with `fixed_in` set to that PR): "fixed in #N above; merge #N together with this PR, not this one
-  alone". It doesn't block, since the fix lands with it. For real means the later code meets the
+  alone". It doesn't count as open, since the fix lands with it, except that the bot never approves
+  this PR past a P0 or P1 fixed only above: a PR must fix its own. For real means the later code meets the
   same rule: a design or abstraction-fit finding counts only when the computation now lives where
   the finding asks, and a move, rename or deleted file isn't a fix (#392, above #387, deleted
   `dsa.py` but still planned DSA in `preprocess`). A partial fix is a plain open finding. Before
@@ -608,8 +609,8 @@ the last review.
   changes too, the live test still runs for what it can reach. It doesn't gate the GPU run. It stops
   the bot's approval: such a PR gets the normal review and checklist, and a person approves it.
 
-The live test starts only when the review left no open P0–P2 finding (counted as the approval rule
-counts them) and no skipped file. Otherwise no box starts, and the comment lists what to fix first
+The live test starts only when the review left no open P0–P2 finding (counted by the review's own
+judgement, as the summary's status line counts them) and no skipped file. Otherwise no box starts, and the comment lists what to fix first
 and asks for `/review` again; an open question and the design risk don't hold it back, though both
 still stop approval.
 

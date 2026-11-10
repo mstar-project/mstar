@@ -552,8 +552,8 @@ jobs:
           HOURS: ${{ vars.REVIEW_GPU_HOURS }}
         run: python3 .github/review/gpu_review.py inputs
 
-      # Nothing runs while the review left an open P0–P2 finding (counted as the approval rule counts
-      # them) or a skipped file (`gated`): the comment says what to fix first. Otherwise the review's
+      # Nothing runs while the review left an open P0–P2 finding (by the review's own judgement, as
+      # the status line counts them) or a skipped file (`gated`): the comment says what to fix first. Otherwise the review's
       # call stands unless the PR's last live test didn't pass on an ancestor of this head, or a
       # re-review's `targeted`, or its `none` on runtime code, has no live test before it: then the live
       # test runs in full, every kind of check, so a failure is never hidden (gpu_review.py, carry); a
