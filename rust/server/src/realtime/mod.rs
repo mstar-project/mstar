@@ -676,18 +676,129 @@ struct StepError {
     type_name: &'static str,
 }
 
-struct Realtime {
+/// How a transcription session turns an item's audio into text: re-decoded
+/// from the start each chunk ([`Redecode`], `RealtimeTranscription`), or heard
+/// as it comes on one call ([`live::Live`], `RealtimeLiveTranscription`). The
+/// rest of the session (events, formats, caps, turn detection) is
+/// [`Realtime`]'s.
+trait ItemDecoder: Sized + Send + 'static {
+    /// The pending audio to step on now, if any.
+    fn take_chunk(&self, s: &mut Session) -> Option<Vec<f32>>;
+
+    /// Hear `chunk` (the item's last when `final_`), sending what it adds to the text.
+    async fn step(rt: &mut Realtime<Self>, chunk: Vec<f32>, final_: bool);
+
+    /// End the item: the rest of its text, `committed`, and how it ended.
+    async fn commit(rt: &mut Realtime<Self>);
+
+    /// What a session update refuses before the rest of it applies.
+    fn refuse_update(_rt: &Realtime<Self>, _session: &Map<String, Value>) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// `transcription_session.*`'s view of the session, adjusted.
+    fn view(&self, _view: &mut Value) {}
+
+    /// A clear drops what the decoder holds for the item.
+    fn clear(&mut self) {}
+
+    /// The item's output arriving on its own, to [`ItemDecoder::relay`].
+    fn output(&mut self) -> Option<&mut OutStream> {
+        None
+    }
+
+    /// One item of [`ItemDecoder::output`]; `None`: it ended.
+    async fn relay(_rt: &mut Realtime<Self>, _item: Option<Out>) {}
+}
+
+/// Re-decoding: every `chunk_seconds`, the audio heard so far is transcribed
+/// again, continuing from the stable prefix of the last hypothesis.
+struct Redecode;
+
+impl ItemDecoder for Redecode {
+    fn take_chunk(&self, s: &mut Session) -> Option<Vec<f32>> {
+        s.take_chunk()
+    }
+
+    /// Hear `chunk`, decode everything so far again from the stable prefix, and
+    /// send the newly firm text and the whole hypothesis.
+    async fn step(rt: &mut Realtime<Self>, chunk: Vec<f32>, final_: bool) {
+        let chunk_len = chunk.len();
+        rt.s.heard.extend(chunk);
+        let tok = tokenizer();
+        let prefix = if rt.s.chunk_id < rt.s.unfixed_chunks {
+            String::new()
+        } else {
+            stable_prefix(&rt.s.raw_hypothesis, tok, rt.s.unfixed_tokens)
+        };
+        let (st, adapter, request, heard, id) = (rt.st.clone(), rt.adapter, rt.s.request.clone(), rt.s.heard.clone(), rt.s.id.clone());
+        match run_step(st, adapter, request, heard, id, prefix).await {
+            Ok(raw) => rt.s.raw_hypothesis = raw,
+            Err(e) => {
+                rt.step_failed(e).await;
+                return;
+            }
+        }
+        // a coalesced step counts every chunk it heard
+        let chunks = (chunk_len as f64 / rt.s.chunk_samples() as f64).round_ties_even() as i64;
+        rt.s.chunk_id += chunks.max(1);
+        let text = rt.current_text();
+        let hold = if final_ || tok.is_none() {
+            0
+        } else {
+            let stable = stable_prefix(&rt.s.raw_hypothesis, tok, rt.s.unfixed_tokens);
+            let stable_text = rt.adapter.parse_transcript(&stable, &rt.s.request).text;
+            text.chars().count().saturating_sub(stable_text.chars().count())
+        };
+        rt.emit(&text, hold).await;
+        let partial = event(
+            "mstar.transcription.partial",
+            json!({
+                "item_id": rt.s.item_id, "text": text, "chunk_id": rt.s.chunk_id,
+                "audio_seconds": rt.s.heard.len() as f64 / SAMPLE_RATE as f64, "created": crate::serving::now(),
+            }),
+        );
+        rt.send(partial).await;
+    }
+
+    async fn commit(rt: &mut Realtime<Self>) {
+        match rt.s.flush() {
+            Some(tail) => Self::step(rt, tail, true).await,
+            None => {
+                // nothing left to hear: what was held back is final now
+                let text = rt.current_text();
+                rt.emit(&text, 0).await;
+            }
+        }
+        let committed = event("input_audio_buffer.committed", json!({"item_id": rt.s.item_id}));
+        rt.send(committed).await;
+        let completed = event(
+            "conversation.item.input_audio_transcription.completed",
+            json!({"item_id": rt.s.item_id, "transcript": rt.current_text()}),
+        );
+        rt.send(completed).await;
+        rt.s.clear();
+    }
+}
+
+struct Realtime<D> {
     st: AppState,
     adapter: &'static dyn OpenAIAdapter,
     socket: WebSocket,
     s: Session,
-    /// a live transcription's item call (`RealtimeLiveTranscription`); `None` re-decodes
-    live: Option<live::LiveCall>,
+    d: D,
 }
 
-impl Realtime {
+impl<D: ItemDecoder> Realtime<D> {
     async fn send(&mut self, event: Value) -> bool {
         self.socket.send(Message::Text(event.to_string())).await.is_ok()
+    }
+
+    /// The session as `transcription_session.*` shows it.
+    fn view(&self) -> Value {
+        let mut view = self.s.view();
+        self.d.view(&mut view);
+        view
     }
 
     async fn run(mut self) {
@@ -698,11 +809,9 @@ impl Realtime {
         loop {
             let received = tokio::select! {
                 received = self.socket.recv() => received,
-                // a live item's call: its text as it comes
-                item = async { self.live.as_mut().and_then(|l| l.output.as_mut()).unwrap().next().await },
-                    if self.live.as_ref().is_some_and(|l| l.output.is_some()) =>
-                {
-                    self.relay(item).await;
+                // the item's output, as it comes
+                item = async { self.d.output().unwrap().next().await }, if self.d.output().is_some() => {
+                    D::relay(&mut self, item).await;
                     continue;
                 }
             };
@@ -808,10 +917,10 @@ impl Realtime {
                         return;
                     }
                 }
-                self.commit().await;
+                D::commit(self).await;
             }
             Some("input_audio_buffer.clear") => {
-                self.drop_call();
+                self.d.clear();
                 self.s.clear();
                 self.s.odd_byte = None;
                 self.s.reset_stream();
@@ -839,14 +948,12 @@ impl Realtime {
                 Op::Audio(audio) => {
                     self.s.add(&audio);
                     if i == n - 1 {
-                        // a live model takes all the audio in: the data worker cuts it on its frame
-                        let chunk = if self.live.is_some() { self.s.flush() } else { self.s.take_chunk() };
-                        if let Some(chunk) = chunk {
-                            self.step(chunk, false).await;
+                        if let Some(chunk) = self.d.take_chunk(&mut self.s) {
+                            D::step(self, chunk, false).await;
                         }
                     }
                 }
-                Op::Commit => self.commit().await,
+                Op::Commit => D::commit(self).await,
                 Op::SpeechStarted(ms) => {
                     let e = event("input_audio_buffer.speech_started", json!({"audio_start_ms": ms, "item_id": self.s.item_id}));
                     self.send(e).await;
@@ -874,33 +981,9 @@ impl Realtime {
         self.send(error_event(&message, "server_error", Some("end_of_turn_failed"))).await;
     }
 
-    async fn commit(&mut self) {
-        if self.live.is_some() {
-            return self.live_commit().await;
-        }
-        match self.s.flush() {
-            Some(tail) => self.step(tail, true).await,
-            None => {
-                // nothing left to hear: what was held back is final now
-                let text = self.current_text();
-                self.emit(&text, 0).await;
-            }
-        }
-        let committed = event("input_audio_buffer.committed", json!({"item_id": self.s.item_id}));
-        self.send(committed).await;
-        let completed = event(
-            "conversation.item.input_audio_transcription.completed",
-            json!({"item_id": self.s.item_id, "transcript": self.current_text()}),
-        );
-        self.send(completed).await;
-        self.s.clear();
-    }
-
     /// Apply a session update, all or nothing.
     fn update(&mut self, session: Map<String, Value>) -> Result<(), String> {
-        if self.live.is_some() {
-            self.refuse_live(&session)?;
-        }
+        D::refuse_update(self, &session)?;
         let s = &self.s;
         let fmt = input_format(session.get("input_audio_format"), s.input_format)?;
         if fmt != s.input_format && s.item_samples(0) > 0 {
@@ -1000,51 +1083,6 @@ impl Realtime {
 
     fn current_text(&self) -> String {
         self.adapter.parse_transcript(&self.s.raw_hypothesis, &self.s.request).text
-    }
-
-    /// Hear `chunk`, decode everything so far again from the stable prefix, and
-    /// send the newly firm text and the whole hypothesis.
-    async fn step(&mut self, chunk: Vec<f32>, final_: bool) {
-        if self.live.is_some() {
-            return self.live_step(chunk).await;
-        }
-        let chunk_len = chunk.len();
-        self.s.heard.extend(chunk);
-        let tok = tokenizer();
-        let prefix = if self.s.chunk_id < self.s.unfixed_chunks {
-            String::new()
-        } else {
-            stable_prefix(&self.s.raw_hypothesis, tok, self.s.unfixed_tokens)
-        };
-        let (st, adapter, request, heard, id) =
-            (self.st.clone(), self.adapter, self.s.request.clone(), self.s.heard.clone(), self.s.id.clone());
-        match run_step(st, adapter, request, heard, id, prefix).await {
-            Ok(raw) => self.s.raw_hypothesis = raw,
-            Err(e) => {
-                self.step_failed(e).await;
-                return;
-            }
-        }
-        // a coalesced step counts every chunk it heard
-        let chunks = (chunk_len as f64 / self.s.chunk_samples() as f64).round_ties_even() as i64;
-        self.s.chunk_id += chunks.max(1);
-        let text = self.current_text();
-        let hold = if final_ || tok.is_none() {
-            0
-        } else {
-            let stable = stable_prefix(&self.s.raw_hypothesis, tok, self.s.unfixed_tokens);
-            let stable_text = self.adapter.parse_transcript(&stable, &self.s.request).text;
-            text.chars().count().saturating_sub(stable_text.chars().count())
-        };
-        self.emit(&text, hold).await;
-        let partial = event(
-            "mstar.transcription.partial",
-            json!({
-                "item_id": self.s.item_id, "text": text, "chunk_id": self.s.chunk_id,
-                "audio_seconds": self.s.heard.len() as f64 / SAMPLE_RATE as f64, "created": crate::serving::now(),
-            }),
-        );
-        self.send(partial).await;
     }
 
     /// `_step_failed`: a request error keeps its message (cut, without server
@@ -1157,7 +1195,7 @@ pub async fn realtime(
     if let (Some(facts), None | Some("transcription")) = (audio.filter(|f| f.live_transcription()), intent) {
         if let Some(adapter) = crate::adapters::from_python(&st.python_adapter) {
             let s = Session::new(&st, adapter);
-            return ws.on_upgrade(move |socket| live::LiveCall::session(st, adapter, socket, s, facts).run());
+            return ws.on_upgrade(move |socket| live::Live::session(st, adapter, socket, s, facts).run());
         }
     }
     if converses && intent.is_none() {
@@ -1190,7 +1228,7 @@ pub async fn realtime(
     }
     let adapter = crate::resolve_message(&st, crate::Surface::RealtimeTranscription).expect("resolved above");
     let s = Session::new(&st, adapter);
-    ws.on_upgrade(move |socket| Realtime { st, adapter, socket, s, live: None }.run())
+    ws.on_upgrade(move |socket| Realtime { st, adapter, socket, s, d: Redecode }.run())
 }
 
 /// Whether the model hears transcription as it comes (`Model.live_transcription_stream`).

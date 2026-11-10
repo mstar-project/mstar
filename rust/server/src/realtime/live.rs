@@ -15,7 +15,7 @@ use serde_json::{json, Map, Value};
 
 use super::conversation::{truthy, Facts};
 use super::vad::SAMPLE_RATE;
-use super::{call_error, error_event, event, object, open_call, stream_audio, Realtime, Session};
+use super::{call_error, error_event, event, object, open_call, stream_audio, ItemDecoder, Realtime, Session};
 use crate::adapters::{OpenAIAdapter, SubmitArgs};
 use crate::serving::{AppState, Out, OutStream};
 use crate::utf8::Utf8Stream;
@@ -26,52 +26,112 @@ const REDECODE_KNOBS: [&str; 3] = ["chunk_seconds", "unfixed_chunks", "unfixed_t
 const ENDED_EARLY: &str = "this item's transcription ended before its commit";
 
 /// The open item's call.
-pub(super) struct LiveCall {
+pub(super) struct Live {
     facts: &'static Facts,
     /// the call's submission while it takes the item's audio
     sub: Option<u64>,
     /// the call's output, until it ends
-    pub(super) output: Option<OutStream>,
+    output: Option<OutStream>,
     text: Utf8Stream,
     /// the `error` event of this item's failed call (`None`: not failed)
     failure: Option<Value>,
 }
 
-impl LiveCall {
+impl Live {
     /// A transcription session on `facts`' stream.
-    pub(super) fn session(st: AppState, adapter: &'static dyn OpenAIAdapter, socket: WebSocket, mut s: Session, facts: &'static Facts) -> Realtime {
+    pub(super) fn session(st: AppState, adapter: &'static dyn OpenAIAdapter, socket: WebSocket, mut s: Session, facts: &'static Facts) -> Realtime<Live> {
         // the stream's own bound on one item's length, not the re-decoding path's
         if let Some(max_items) = facts.max_items {
             s.max_item_seconds = max_items as f64 / facts.rate as f64;
         }
-        let call = LiveCall { facts, sub: None, output: None, text: Utf8Stream::default(), failure: None };
-        Realtime { st, adapter, socket, s, live: Some(call) }
+        let d = Live { facts, sub: None, output: None, text: Utf8Stream::default(), failure: None };
+        Realtime { st, adapter, socket, s, d }
     }
 }
 
-impl Realtime {
-    fn call(&mut self) -> &mut LiveCall {
-        self.live.as_mut().expect("a live transcription")
+impl ItemDecoder for Live {
+    /// All the audio in: the data worker cuts it on the model's frame.
+    fn take_chunk(&self, s: &mut Session) -> Option<Vec<f32>> {
+        s.flush()
     }
 
-    /// The session as `transcription_session.*` shows it; a live one has no
-    /// re-decoding knobs.
-    pub(super) fn view(&self) -> Value {
-        let mut view = self.s.view();
-        if self.live.is_some() {
-            if let Some(Value::Object(knobs)) = view.get_mut("mstar") {
-                for name in REDECODE_KNOBS {
-                    knobs.remove(name);
-                }
+    /// Put `chunk` on the item's call, opening it with the item's first audio.
+    async fn step(rt: &mut Realtime<Self>, chunk: Vec<f32>, _final: bool) {
+        if rt.d.failure.is_some() || (rt.d.sub.is_none() && !rt.open().await) {
+            return; // the item has failed: its error is sent, and its commit reports it
+        }
+        let (sub, facts) = (rt.d.sub.expect("open"), rt.d.facts);
+        match stream_audio(&rt.st, sub, &facts.stream, &chunk, &rt.s.id).await {
+            Ok(true) => {}
+            Ok(false) => return, // the call has ended: its output says why
+            Err(error) => {
+                rt.send(error).await;
+                return;
             }
         }
-        view
+        rt.s.streamed_samples += chunk.len();
+        rt.s.chunk_id += 1;
     }
 
-    /// What a live session's update refuses before the rest applies: the
-    /// re-decoding knobs and a prompt do nothing here, and an open item's call
-    /// keeps the language it opened with.
-    pub(super) fn refuse_live(&self, session: &Map<String, Value>) -> Result<(), String> {
+    /// End the item: its stream ends, and the rest of its text arrives.
+    async fn commit(rt: &mut Realtime<Self>) {
+        if let Some(tail) = rt.s.flush() {
+            Self::step(rt, tail, true).await;
+        }
+        let (sub, mut output) = (rt.d.sub.take(), rt.d.output.take());
+        let ended = match (sub, rt.st.bridge.clone()) {
+            (None, _) => true,
+            (Some(sub), bridge) => {
+                let mut op = Map::new();
+                op.insert("end_input".into(), Value::Bool(true));
+                let reply = match bridge {
+                    Some(bridge) => bridge.live(sub, "append", op, crate::BRIDGE_PROBE_TIMEOUT * 5).await,
+                    None => None,
+                };
+                let meta = reply.as_ref().and_then(Value::as_object);
+                match meta.filter(|m| m.get("error").is_none()).and_then(|m| m.get("accepted")).and_then(Value::as_bool) {
+                    Some(accepted) => accepted,
+                    None => {
+                        // whether the call's input ended is unknown, so its output
+                        // may never end: dropping it aborts the call
+                        output = None;
+                        rt.fail(super::failed_in_server("commit", meta, &rt.s.id)).await;
+                        true
+                    }
+                }
+            }
+        };
+        if let Some(mut output) = output {
+            while let Some(item) = output.next().await {
+                Self::relay(rt, Some(item)).await;
+            }
+        }
+        if !ended {
+            rt.fail(error_event(ENDED_EARLY, "server_error", None)).await;
+        }
+        let item_id = rt.s.item_id.clone();
+        rt.send(event("input_audio_buffer.committed", json!({"item_id": item_id}))).await;
+        match rt.d.failure.take() {
+            Some(failure) => {
+                let failed = event(
+                    "conversation.item.input_audio_transcription.failed",
+                    json!({"item_id": item_id, "content_index": 0, "error": failure["error"]}),
+                );
+                rt.send(failed).await;
+            }
+            None => {
+                let text = rt.current_text();
+                rt.emit(&text, 0).await;
+                let completed = event("conversation.item.input_audio_transcription.completed", json!({"item_id": item_id, "transcript": text}));
+                rt.send(completed).await;
+            }
+        }
+        rt.s.clear();
+    }
+
+    /// The re-decoding knobs and a prompt do nothing here, and an open item's
+    /// call keeps the language it opened with.
+    fn refuse_update(rt: &Realtime<Self>, session: &Map<String, Value>) -> Result<(), String> {
         let knobs = object(session.get("mstar"), "mstar")?;
         if let Some(name) = REDECODE_KNOBS.iter().find(|n| knobs.is_some_and(|k| k.contains_key(**n))) {
             return Err(format!("mstar.{name} does not apply here: this model hears audio as it comes and re-decodes nothing"));
@@ -81,11 +141,10 @@ impl Realtime {
         if truthy(transcription.get("prompt")) {
             return Err("input_audio_transcription.prompt is not supported by this model".into());
         }
-        let open = self.live.as_ref().is_some_and(|c| c.sub.is_some());
-        if let (true, Some(language)) = (open, transcription.get("language")) {
+        if let (Some(_), Some(language)) = (rt.d.sub, transcription.get("language")) {
             // compared as `(language or None) != (current or None)`
             let sent = truthy(Some(language)).then(|| language.clone());
-            let current = self.s.request.language.clone().filter(|l| !l.is_empty()).map(Value::String);
+            let current = rt.s.request.language.clone().filter(|l| !l.is_empty()).map(Value::String);
             if sent != current {
                 return Err("commit or clear the input audio buffer before changing the language".into());
             }
@@ -93,13 +152,71 @@ impl Realtime {
         Ok(())
     }
 
+    /// A live session has no re-decoding knobs.
+    fn view(&self, view: &mut Value) {
+        if let Some(Value::Object(knobs)) = view.get_mut("mstar") {
+            for name in REDECODE_KNOBS {
+                knobs.remove(name);
+            }
+        }
+    }
+
+    /// A clear drops the item's call too: what it heard can't be unheard.
+    /// Dropping its output aborts a call still running.
+    fn clear(&mut self) {
+        self.sub = None;
+        self.output = None;
+        self.failure = None;
+    }
+
+    fn output(&mut self) -> Option<&mut OutStream> {
+        self.output.as_mut()
+    }
+
+    /// The call's text as deltas of the item, until the call ends (`None`).
+    async fn relay(rt: &mut Realtime<Self>, item: Option<Out>) {
+        match item {
+            Some(Out::Chunk(chunk)) if chunk.modality == "text" => {
+                let piece = rt.d.text.feed(&chunk.data);
+                rt.s.raw_hypothesis.push_str(&piece);
+                let text = rt.current_text();
+                rt.emit(&text, 0).await;
+                // the step this text came from covers its chunk of audio
+                let step = chunk.metadata.get("step").and_then(Value::as_i64).unwrap_or(rt.s.chunk_id);
+                let frame = rt.d.facts.frame_samples as f64 / rt.d.facts.rate as f64;
+                let heard = rt.s.streamed_samples as f64 / SAMPLE_RATE as f64;
+                let partial = event(
+                    "mstar.transcription.partial",
+                    json!({
+                        "item_id": rt.s.item_id, "text": text, "chunk_id": step,
+                        "audio_seconds": ((step + 1) as f64 * frame).min(heard), "created": crate::serving::now(),
+                    }),
+                );
+                rt.send(partial).await;
+            }
+            Some(Out::Chunk(_)) => {}
+            Some(Out::Error { status, message, .. }) => {
+                let error = call_error(&rt.st, status, &message);
+                rt.fail(error).await;
+            }
+            None => {
+                rt.d.output = None;
+                if rt.d.sub.is_some() {
+                    // not ended by the commit
+                    rt.fail(error_event(ENDED_EARLY, "server_error", None)).await;
+                }
+            }
+        }
+    }
+}
+
+impl Realtime<Live> {
     /// The item's call failed, or ended before its commit: it has ended, so it
     /// takes no more of the item's audio.
     async fn fail(&mut self, error: Value) {
-        let call = self.call();
-        call.sub = None;
-        if call.failure.is_none() {
-            call.failure = Some(error.clone());
+        self.d.sub = None;
+        if self.d.failure.is_none() {
+            self.d.failure = Some(error.clone());
             self.send(error).await;
         }
     }
@@ -123,139 +240,15 @@ impl Realtime {
         };
         match open_call(&self.st, &args, &self.s.id).await {
             Ok((sub, output)) => {
-                let call = self.call();
-                call.sub = Some(sub);
-                call.output = Some(output);
-                call.text = Utf8Stream::default();
+                self.d.sub = Some(sub);
+                self.d.output = Some(output);
+                self.d.text = Utf8Stream::default();
                 true
             }
             Err(error) => {
                 self.fail(error).await;
                 false
             }
-        }
-    }
-
-    /// One item of the call's output: its text as deltas of the item, until
-    /// the call ends (`None`).
-    pub(super) async fn relay(&mut self, item: Option<Out>) {
-        match item {
-            Some(Out::Chunk(chunk)) if chunk.modality == "text" => {
-                let piece = self.call().text.feed(&chunk.data);
-                self.s.raw_hypothesis.push_str(&piece);
-                let text = self.current_text();
-                self.emit(&text, 0).await;
-                // the step this text came from covers its chunk of audio
-                let step = chunk.metadata.get("step").and_then(Value::as_i64).unwrap_or(self.s.chunk_id);
-                let frame = self.call().facts.frame_samples as f64 / self.call().facts.rate as f64;
-                let heard = self.s.streamed_samples as f64 / SAMPLE_RATE as f64;
-                let partial = event(
-                    "mstar.transcription.partial",
-                    json!({
-                        "item_id": self.s.item_id, "text": text, "chunk_id": step,
-                        "audio_seconds": ((step + 1) as f64 * frame).min(heard), "created": crate::serving::now(),
-                    }),
-                );
-                self.send(partial).await;
-            }
-            Some(Out::Chunk(_)) => {}
-            Some(Out::Error { status, message, .. }) => {
-                let error = call_error(&self.st, status, &message);
-                self.fail(error).await;
-            }
-            None => {
-                let call = self.call();
-                call.output = None;
-                if call.sub.is_some() {
-                    // not ended by the commit
-                    self.fail(error_event(ENDED_EARLY, "server_error", None)).await;
-                }
-            }
-        }
-    }
-
-    /// Put `chunk` on the item's call, opening it with the item's first audio.
-    pub(super) async fn live_step(&mut self, chunk: Vec<f32>) {
-        if self.call().failure.is_some() || (self.call().sub.is_none() && !self.open().await) {
-            return; // the item has failed: its error is sent, and its commit reports it
-        }
-        let (sub, facts) = (self.call().sub.expect("open"), self.call().facts);
-        match stream_audio(&self.st, sub, &facts.stream, &chunk, &self.s.id).await {
-            Ok(true) => {}
-            Ok(false) => return, // the call has ended: its output says why
-            Err(error) => {
-                self.send(error).await;
-                return;
-            }
-        }
-        self.s.streamed_samples += chunk.len();
-        self.s.chunk_id += 1;
-    }
-
-    /// End the item: its stream ends, and the rest of its text arrives.
-    pub(super) async fn live_commit(&mut self) {
-        if let Some(tail) = self.s.flush() {
-            self.live_step(tail).await;
-        }
-        let call = self.call();
-        let (sub, mut output) = (call.sub.take(), call.output.take());
-        let ended = match (sub, self.st.bridge.clone()) {
-            (None, _) => true,
-            (Some(sub), bridge) => {
-                let mut op = Map::new();
-                op.insert("end_input".into(), Value::Bool(true));
-                let reply = match bridge {
-                    Some(bridge) => bridge.live(sub, "append", op, crate::BRIDGE_PROBE_TIMEOUT * 5).await,
-                    None => None,
-                };
-                let meta = reply.as_ref().and_then(Value::as_object);
-                match meta.filter(|m| m.get("error").is_none()).and_then(|m| m.get("accepted")).and_then(Value::as_bool) {
-                    Some(accepted) => accepted,
-                    None => {
-                        // whether the call's input ended is unknown, so its output
-                        // may never end: dropping it aborts the call
-                        output = None;
-                        self.fail(super::failed_in_server("commit", meta, &self.s.id)).await;
-                        true
-                    }
-                }
-            }
-        };
-        if let Some(mut output) = output {
-            while let Some(item) = output.next().await {
-                self.relay(Some(item)).await;
-            }
-        }
-        if !ended {
-            self.fail(error_event(ENDED_EARLY, "server_error", None)).await;
-        }
-        let item_id = self.s.item_id.clone();
-        self.send(event("input_audio_buffer.committed", json!({"item_id": item_id}))).await;
-        match self.call().failure.take() {
-            Some(failure) => {
-                let failed = event(
-                    "conversation.item.input_audio_transcription.failed",
-                    json!({"item_id": item_id, "content_index": 0, "error": failure["error"]}),
-                );
-                self.send(failed).await;
-            }
-            None => {
-                let text = self.current_text();
-                self.emit(&text, 0).await;
-                let completed = event("conversation.item.input_audio_transcription.completed", json!({"item_id": item_id, "transcript": text}));
-                self.send(completed).await;
-            }
-        }
-        self.s.clear();
-    }
-
-    /// A clear drops the item's call too: what it heard can't be unheard.
-    /// Dropping its output aborts a call still running.
-    pub(super) fn drop_call(&mut self) {
-        if let Some(call) = &mut self.live {
-            call.sub = None;
-            call.output = None;
-            call.failure = None;
         }
     }
 }
