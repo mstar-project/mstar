@@ -4481,6 +4481,9 @@ class KVManager(AttentionResource):
         and ``stream`` keeps its room for the page that replaces this one. A page no holder has room for stays on
         ``stream``, and `_release` shrinks its allotment by it, so `_unused` never grows by a page nothing frees.
         Returns the requests that took room, for the caller to recount. Under the lock."""
+        if not self._decides:
+            # nothing is lent where nothing is allotted
+            return []
         index = self._index
         shared = sorted(
             page for page, owners in zip(pages, self._arena.owners_of(pages), strict=True)
