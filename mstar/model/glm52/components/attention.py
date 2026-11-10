@@ -187,7 +187,7 @@ class Glm52MLAAttention(MLAAttention):
         selected slots (prefill rows too: each sees its causal top-k)."""
         layer_idx = self.cache_layer_idx
         self._kv.write_kv(latent, None, layer_idx=layer_idx)
-        return self._dsa.attend(layer_idx, q_nope, q_pe, slots, self.softmax_scale)
+        return self._dsa.attend(layer_idx, q_nope, q_pe, slots)
 
     @torch.compiler.disable
     def _attend_written(
@@ -198,4 +198,4 @@ class Glm52MLAAttention(MLAAttention):
         dsa_selection: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """``_attend_selected`` once the fused prep has written the step's latents."""
-        return self._dsa.attend(self.cache_layer_idx, q_nope, q_pe, slots, self.softmax_scale)
+        return self._dsa.attend(self.cache_layer_idx, q_nope, q_pe, slots)

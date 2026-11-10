@@ -275,7 +275,7 @@ class Glm5NextModel(Model):
                     kv_cache=KV_CACHE,
                     topk=self.config.index_topk,
                     kpool=self.config.index_kpool,
-                    sm_scale=self.config.qk_head_dim ** -0.5,
+                    sm_scale=self.config.softmax_scale,
                     index_head_dim=self.config.index_head_dim,
                 ),
             ))
