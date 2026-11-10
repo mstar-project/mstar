@@ -724,6 +724,13 @@ class _ImageStubAPIServer(_StubAPIServer):
 @contextlib.contextmanager
 def _model_stack(model, stub, env=None):
     """Launch the real mstar-server for `model` wired to `stub`."""
+    with _bridged_stack(model, stub, env) as (port, upload_dir, _bridge):
+        yield port, upload_dir
+
+
+@contextlib.contextmanager
+def _bridged_stack(model, stub, env=None):
+    """``_model_stack``, also yielding the ``RustFrontendBridge``."""
     import os
     import subprocess
 
@@ -738,7 +745,7 @@ def _model_stack(model, stub, env=None):
     thread.start()
     try:
         assert _wait_healthy(port)
-        yield port, upload_dir
+        yield port, upload_dir, bridge
     finally:
         bridge.stop()
         proc.terminate()
