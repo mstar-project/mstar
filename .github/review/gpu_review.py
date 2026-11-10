@@ -409,8 +409,8 @@ def show_progress(key, seen, final=False):
     job's log; the new count. Whole lines, at most 50 a poll, and on the `final` read the last line too; a line
     longer than the read's cap counts as one, cut, once wc counts it. Each is redacted with the exact secrets the
     redact step uses, then cut and quoted, since the session wrote them. A file that got shorter is read once
-    more, from its start. The box caps the read (a FIFO or a huge line can't hold it), and so does this; a read
-    that fails, times out or gives no line count changes nothing."""
+    more, from its start. The box caps the read (a FIFO or a huge line can't hold it), and what is printed is
+    capped again here; a read that fails, times out or gives no line count changes nothing."""
     log = f"{ERAS_OUT}/progress.log"
 
     def read(start):  # (the file's line count, what follows line `start`), or None
@@ -428,7 +428,8 @@ def show_progress(key, seen, final=False):
     if got is None:
         return seen
     total, raw = got[0], got[1].encode("utf-8", "surrogateescape")
-    # The box's caps again here, should it not have kept them.
+    # The box's caps again, so a box that didn't keep them can't flood the job's log. They don't bound what the
+    # ssh call captured, which isn't streamed: the PR's author is trusted.
     lines = raw[:PROGRESS_CAP].decode("utf-8", "surrogateescape").split("\n")
     # The last piece is a line still being written, or nothing. It is shown on the final read, and when it is one
     # line past the cap that wc already counts (so a line still being written isn't shown at every poll).
