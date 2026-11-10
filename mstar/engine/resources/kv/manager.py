@@ -1071,7 +1071,9 @@ class KVManager(AttentionResource):
         starts = [page for page in lease.starts if page not in kept] if end else []
         stream.lease = Lease(end, groups, starts=starts) if end else None
         kept.update(starts)
-        others = self._hand_over(stream, [page for group in lease.groups[1:] for page in group if page not in kept])
+        others = self._hand_over(
+            rid, stream, [page for group in lease.groups[1:] for page in group if page not in kept],
+        )
         self._release(rid, stream, [page for page in lease.pages() if page not in kept])
         self._recount(rid, *others)
         return end
@@ -3388,7 +3390,7 @@ class KVManager(AttentionResource):
         # A window's pages only cycle: the pages it takes next replace these in its allotment, which only
         # `_settle_window_allotment` trims, so one another request still holds lent passes its room on
         # (`_hand_over`).
-        others = self._hand_over(stream, freed) if group else ()
+        others = self._hand_over(rid, stream, freed) if group else ()
         self._release(rid, stream, freed)
         self._recount(rid, *others)
         return k * page_size
@@ -4485,13 +4487,14 @@ class KVManager(AttentionResource):
         if stream.lent:
             stream.lent.difference_update(pages)
 
-    def _hand_over(self, stream: CacheStream, pages: list[int]) -> list[str]:
-        """Before ``stream`` releases its window pages ``pages``, move the room for each one it pays for (holds
-        outside `lent`) that another stream still holds lent onto that stream, while that stream's request has
-        room left in its allotment, one page each: that allotment counts its window pages as its own (`_hit`),
+    def _hand_over(self, rid: str, stream: CacheStream, pages: list[int]) -> list[str]:
+        """Before ``rid``'s ``stream`` releases its window pages ``pages``, move the room for each one it pays for
+        (holds outside `lent`) that another stream still holds lent onto that stream, while that stream's request
+        has room left in its allotment, one page each: that allotment counts its window pages as its own (`_hit`),
         and ``stream`` keeps its room for the page that replaces this one. A page no holder has room for stays on
         ``stream``, and `_release` shrinks its allotment by it, so `_unused` never grows by a page nothing frees.
-        Returns the requests that took room, for the caller to recount. Under the lock."""
+        One of ``rid``'s own streams always takes it over, since that moves no room. Returns the other requests
+        that took room, for the caller to recount. Under the lock."""
         if not self._decides:
             # nothing is lent where nothing is allotted
             return []
@@ -4501,19 +4504,19 @@ class KVManager(AttentionResource):
             if page not in stream.lent and owners > 1 + (index is not None and index.holds(page))
         )
         took = []
-        for rid, streams in self._streams.items():
+        for holder, streams in self._streams.items():
             if not shared:
                 break
-            allotment = self._allotments.get(rid)
-            room = 0 if allotment is None else allotment.remaining
+            allotment = self._allotments.get(holder)
+            room = len(shared) if holder == rid else 0 if allotment is None else allotment.remaining
             for other in streams.values():
                 moved = [page for page in shared if page in other.lent][:room]
                 other.lent.difference_update(moved)
                 stream.lent.update(moved)
                 shared = [page for page in shared if page not in moved]
                 room -= len(moved)
-            if allotment is not None and room < allotment.remaining:
-                took.append(rid)
+            if holder != rid and allotment is not None and room < allotment.remaining:
+                took.append(holder)
         return took
 
     def _recount(self, *rids: str) -> None:
