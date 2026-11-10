@@ -716,11 +716,17 @@ def sequence_parallel_refusals(
         if placed:
             return []
         if shard is not None:
+            # a model may default its shard to none (Qwen3-Omni's Thinker), leaving Ulysses over its
+            # pools stored by head the deployment's opt-in
+            opt_in = (
+                f", split its steps by Ulysses (resources: {shard.resource_key}: exchange: ulysses)"
+                if shard.exchange == "none" and any(spec.places_positions is False for spec in specs) else ""
+            )
             return [
                 f"node {node!r} runs on {sp} SP ranks, and its steps never split (its sequence shard's exchange "
                 "none, or no attention there takes split steps: a ragged one without sp_exchange 'ulysses'), so "
-                "its SP ranks would only share heads: store its KV by position (context_parallel) or run it on "
-                "TP ranks"
+                f"its SP ranks would only share heads: store its KV by position (context_parallel){opt_in} or run "
+                "it on TP ranks"
             ]
         return [
             f"node {node!r} runs on {sp} SP ranks but neither splits tokens (a SeqShardSpec) nor stores "

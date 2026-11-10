@@ -31,7 +31,7 @@ from mstar.engine.resources.attn.ragged.config import (
 )
 from mstar.engine.resources.attn.ragged.kernels import RAGGED_ATTENTION, cudnn_rows, kernel_rows
 from mstar.engine.resources.attn.ragged.wrappers import _RaggedPrefillBase
-from mstar.engine.resources.base import AttentionResource, CGSlotKey, EngineResourceInfo
+from mstar.engine.resources.base import AttentionResource, CGSlotKey, EngineResourceInfo, head_shards
 from mstar.engine.resources.sequence_shard import (
     SeqShardPlan,
     SequenceShard,
@@ -75,15 +75,16 @@ def _build_ragged(
     hand it cuDNN's one row, refused here if cuDNN can't run the geometry."""
     config = spec.config
     joint = info.joint_comm_group
-    # Ulysses hands each rank 1/P of the heads; any other ragged attention, or one whose node never
-    # splits (`SeqShardSpec.splits`, so it runs copied), splits them over TP
+    # Ulysses hands each rank 1/(TP x SP) of the heads, whatever the node's KV pools store by (its own
+    # exchange, not theirs); any other ragged attention, or one whose node never splits
+    # (`SeqShardSpec.splits`, so it runs copied), splits them over TP
     ulysses = (
         spec.sp_exchange == "ulysses" and spec.shard_key is not None and info.dependency(spec.shard_key).splits
     )
     if joint is None:
         config.shard(1)
     else:
-        config.shard(info.head_shards if ulysses else joint.tp_group.world_size)
+        config.shard(head_shards(joint) if ulysses else joint.tp_group.world_size)
     dtype = config.dtype if config.dtype is not None else info.kv_dtype
     if dtype is None:
         raise ValueError(
