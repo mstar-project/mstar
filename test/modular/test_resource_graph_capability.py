@@ -133,7 +133,7 @@ def test_a_node_whose_split_steps_run_eagerly_captures_only_the_buckets_that_can
     ]
     submodule = SimpleNamespace(
         get_accelerator_graph_configs=lambda *args: configs,
-        declare_step=Mock(return_value=SimpleNamespace(steps={})),
+        declare_step=Mock(return_value=SimpleNamespace(steps={})), compiled_entries_per_shape=1,
     )
     runner = AcceleratorGraphRunner(
         submodule_name="llm", submodule=submodule, resources={"attention": manager},

@@ -360,8 +360,8 @@ def apply_resource_block(spec: NodeResourceSpec, block: Mapping[str, Any]) -> No
     """One ``resources:`` block on its spec: ``sp_exchange``, which every spec takes from its
     ``sp_exchanges``, and the rest through the spec's own ``apply_yaml_overrides``. A key the spec
     doesn't take is a TypeError, a value it can't take a ValueError."""
-    block = dict(block)
     if "sp_exchange" in block:
+        block = dict(block)
         choice = block.pop("sp_exchange")
         if not spec.sp_exchanges:
             raise ValueError(f"resource {spec.resource_key!r} takes no sp_exchange; got {choice!r}")
