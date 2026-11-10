@@ -700,6 +700,8 @@ class KVManager(AttentionResource):
         # `_asks` holds the pages each waiting request asks for: what `ask` counted for one with no allotment yet,
         #   which its allotment is sized from, or the shortage one that holds its allotment waits on (`_wait`).
         # `local_loops` holds the loops that grow KV on `_nodes` in a walk this worker runs, set by the worker.
+        # `moves` is whether the worker moves requests off the device when one runs short on any of `_nodes`, set by
+        #   the worker. Only a move takes back what a guaranteed request lent, so without it none lends.
         # `_unused` counts the pages admitted requests were allotted and haven't used yet.
         # `_guaranteed` holds the requests that reserve what they grow into and are never preempted once they start,
         #   decided at their first `ask`, or later when the host has no room to set aside for their move.
@@ -717,6 +719,7 @@ class KVManager(AttentionResource):
         #   ask again. Each returns as it passed, so it takes none of `_kept`.
         self._nodes = nodes
         self.local_loops: Collection[str] = frozenset()
+        self.moves = True
         self._asks: dict[str, int] = {}
         self._allotments: dict[str, Allotment] = {}
         self._unused = 0
@@ -4258,7 +4261,7 @@ class KVManager(AttentionResource):
                 assert allotment.taken_back <= allotment.remaining, (
                     f"{rid} took back {allotment.taken_back} pages but has {allotment.remaining} left to write"
                 )
-                if rid in self._guaranteed:
+                if rid in self._guaranteed and self.moves:
                     borrowable += allotment.remaining - allotment.taken_back
             assert unused == self._unused, (
                 f"the streams leave {unused} allotted pages unused, but the pool counts {self._unused}"
@@ -4690,12 +4693,13 @@ class KVManager(AttentionResource):
 
     def _class_room(self, guaranteed: bool, passing: bool) -> int:
         """`_room_for` a request that holds no guaranteed allotment. A preemptible request also borrows what
-        guaranteed requests lend, unless one of them waits to take pages back. A guaranteed request that asks to be
-        admitted counts what moving every preemptible request would free, since it can take that back."""
+        guaranteed requests lend, unless one of them waits to take pages back. Where moves happen, a guaranteed
+        request that asks to be admitted counts what moving every preemptible request would free, since it can take
+        that back."""
         room = self._room()
         if not guaranteed:
             room += 0 if self._taking_back() else self._borrowable
-        else:
+        elif self.moves:
             room += self._reclaimable()
         return room - (self._kept if passing else 0)
 
@@ -5265,7 +5269,7 @@ class KVManager(AttentionResource):
     def _count(self, rid: str, allotment: Allotment, remaining: int, taken_back: int) -> None:
         """Set ``allotment``'s ``remaining`` and ``taken_back``, and what it lends, `_unused` and `_borrowable` with
         them."""
-        lends = remaining - taken_back if rid in self._guaranteed else 0
+        lends = remaining - taken_back if rid in self._guaranteed and self.moves else 0
         self._unused += remaining - allotment.remaining
         self._borrowable += lends - allotment.lends
         allotment.remaining, allotment.taken_back, allotment.lends = remaining, taken_back, lends

@@ -50,6 +50,8 @@ class Preemption:
             self._caches[kv.key] = kv
             for node_name in kv.nodes:
                 self._keys[node_name].append(kv.key)
+        for kv in self._caches.values():
+            kv.cache.moves = all(self._moves(kv, node_name) for node_name in kv.nodes)
         self._preempted: dict[int, Preempted] = {}
         self.counts: dict[str, PreemptionCounts] = defaultdict(PreemptionCounts)
         self._waits_logged: dict[tuple[str, str], tuple[float, int]] = {}
