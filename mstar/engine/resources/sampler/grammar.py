@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from mstar.utils.cpus import usable_cpus
+from mstar.utils.cpus import plan as cpu_plan
 from mstar.utils.threads import ThreadPool
 
 if TYPE_CHECKING:
@@ -236,8 +236,9 @@ class GrammarRows:
         bits[stop] = 1
         words = (bits.view(-1, 32) << torch.arange(32)).sum(-1)
         self._stops = torch.where(words >= 1 << 31, words - (1 << 32), words).to(torch.int32) if stop else None
-        # sized by the CPUs this worker may use, which xgrammar's own "auto" doesn't read
-        cpus = usable_cpus()
+        # sized by the CPUs the process's plan leaves unpinned (not the step threads'),
+        # which xgrammar's own "auto" doesn't read
+        cpus = cpu_plan().left
         self._compiler = xgr.GrammarCompiler(self.info, max_threads=min(8, cpus), cache_limit_bytes=cache_bytes)
         # compiles run off the worker's threads (xgrammar releases the GIL)
         self._compile_pool = ThreadPool(max_workers=min(2, cpus), thread_name_prefix="grammar-compile")
