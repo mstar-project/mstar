@@ -232,14 +232,10 @@ class Qwen3ASRModel(MultimodalDecoderModel):
             prompt += f"{LANGUAGE_PREFIX}{language}{ASR_TEXT_TAG}"
         return prompt + assistant_prefix
 
-    def max_input_files(self) -> dict[str, int]:
-        # none refused before decoding: intake refuses a second clip and ignores other files
-        return {}
-
     def intake(self, prompt, input_modalities, tensors=None, prompt_parts=None, **kwargs):
         """The one clip, checked first, then the prompt around it. The text is
-        the system-turn context; the request's layout and any other
-        attachment are ignored, as they always were."""
+        the system-turn context; the request's layout is ignored, as it
+        always was."""
         clips = (tensors or {}).get("audio_inputs", [])
         if len(clips) != 1:
             raise ValueError(f"{self.NAME} expects one audio input per request, got {len(clips)}.")

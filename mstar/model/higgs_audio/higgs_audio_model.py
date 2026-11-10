@@ -162,16 +162,8 @@ class HiggsAudioModel(MultimodalDecoderModel):
     # -------------------------------------------------------------------
 
     def max_input_files(self) -> dict[str, int]:
-        return {"audio": 1}
-
-    def intake(self, prompt, input_modalities, tensors=None, prompt_parts=None, **kwargs):
-        # the reference prompt has a place for the one clip only: other
-        # attachments are ignored, as they always were
-        keep = {TEXT, "audio"}
-        return super().intake(
-            prompt, [m for m in input_modalities if m in keep], tensors,
-            None if prompt_parts is None else [p for p in prompt_parts if p.modality in keep], **kwargs,
-        )
+        # the reference prompt has a place for one clip only; the data worker refuses anything else before decoding
+        return {"audio": 1, "image": 0, "video": 0}
 
     # the sampling keys, max_output_tokens and enable_thinking, and their
     # configs, are MultimodalDecoderModel's: the checkpoint's defaults over

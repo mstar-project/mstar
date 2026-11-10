@@ -364,6 +364,10 @@ class OmniVoiceModel(Model):
             est = est / speed
         return max(1, int(est))
 
+    def max_input_files(self) -> dict[str, int]:
+        # one reference clip; the data worker refuses anything else before decoding
+        return {"audio": 1, "image": 0, "video": 0}
+
     def process_prompt(
         self,
         prompt: str | None,

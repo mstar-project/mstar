@@ -190,7 +190,7 @@ def test_pi05_refuses_more_images_than_cameras_before_decoding():
     from mstar.model.media_limits import check_file_counts
 
     model = _make_model()
-    assert model.max_input_files() == {"image": model.config.num_cameras} == {"image": 3}
+    assert model.max_input_files()["image"] == model.config.num_cameras == 3
     check_file_counts({"image": 3}, model.max_input_files())
     with pytest.raises(ValueError, match="attaches 4 image files; this model takes at most 3"):
         check_file_counts({"image": 4}, model.max_input_files())

@@ -688,6 +688,10 @@ class VJepa2Model(Model):
             f.readinto(encoded)
         return TensorAndMetadata(data=torch.frombuffer(encoded, dtype=torch.uint8), metadata=metadata)
 
+    def max_input_files(self) -> dict[str, int]:
+        # one clip; the data worker refuses anything else before decoding
+        return {"video": 1, "image": 0, "audio": 0}
+
     def process_prompt(
         self,
         prompt: str | None,

@@ -24,6 +24,7 @@ from mstar.model.components.audio_features import LogMelSpectrogram  # noqa: E40
 from mstar.model.components.aut_encoder import AuTEncoder, AuTEncoderConfig  # noqa: E402
 from mstar.model.components.aut_submodule import AUT_ENCODE  # noqa: E402
 from mstar.model.components.qwen3_lm import Qwen3LMConfig  # noqa: E402
+from mstar.model.media_limits import check_file_counts  # noqa: E402
 from mstar.model.multimodal import MEDIA_LAYOUT  # noqa: E402
 from mstar.model.multimodal_decoder import MediaIntake  # noqa: E402
 from mstar.model.qwen3_asr.config import (  # noqa: E402
@@ -231,13 +232,11 @@ def test_process_prompt_builds_features_and_prompt():
         assert set(out.metadata) == {MEDIA_LAYOUT, "kv_layout"}
     assert torch.equal(out.new_input_tensors["audio"][0], wave)  # samples as they are; the encoder makes the mel
 
-    # the request's layout and any other attachment are ignored, as they always were
-    other = model.process_prompt(
-        None, ["image", "audio", "audio"], ["text"], {"audio_inputs": [wave], "image_inputs": [torch.zeros(3, 4, 4)]},
-        language="en",
-    )
+    # the request's layout is ignored, as it always was; an image is refused before decoding
+    other = model.process_prompt(None, ["audio", "audio"], ["text"], {"audio_inputs": [wave]}, language="en")
     assert ids_of(other) == model.tokenizer.encode(model.prompt_text(n_tokens, "", "English"))
-    assert model.max_input_files() == {}
+    with pytest.raises(ValueError, match="takes no image files"):
+        check_file_counts({"image": 1, "audio": 1}, model.max_input_files())
 
     short = model.process_prompt(None, ["audio"], ["text"], {"audio_inputs": [torch.randn(1600)]})
     assert short.new_input_tensors["audio"][0].numel() == 8000  # padded to 0.5 s

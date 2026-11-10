@@ -939,8 +939,12 @@ class Cosmos3Model(Model):
     # ------------------------------------------------------------------
 
     def max_input_files(self) -> dict[str, int]:
-        # images and videos: the data worker refuses audio before decoding it
-        return {"audio": 0}
+        # the data worker refuses audio before decoding it. The reasoner takes
+        # any number of images and videos; generation conditions on one image
+        # or one video, which only a deployment without the reasoner can say here
+        if self._reasoner_enabled():
+            return {"audio": 0}
+        return {"image": 1, "audio": 0, "video": 0}
 
     def process_prompt(
         self,

@@ -151,26 +151,61 @@ IMAGE_MODELS = [
 ]
 
 
-@pytest.mark.parametrize("module, cls, modality", [
-    *[(module, cls, "audio") for module, cls in IMAGE_MODELS],
+# models that read some of their media and dropped the rest: one modality or count each now refuses
+PARTIAL_MEDIA_MODELS = [
+    ("mstar.model.whisper.whisper_model", "WhisperModel", "image", 1),
+    ("mstar.model.parakeet.parakeet_model", "ParakeetModel", "image", 1),
+    ("mstar.model.canary.canary_model", "CanaryModel", "video", 1),
+    ("mstar.model.canary_qwen.canary_qwen_model", "CanaryQwenModel", "image", 1),
+    ("mstar.model.higgs_audio.higgs_audio_model", "HiggsAudioModel", "image", 1),
+    ("mstar.model.qwen3_tts.qwen3_tts_model", "Qwen3TTSModel", "image", 1),
+    ("mstar.model.chatterbox.chatterbox_model", "ChatterboxModel", "video", 1),
+    ("mstar.model.cosyvoice3.cosyvoice3_model", "CosyVoice3Model", "audio", 2),
+    ("mstar.model.fish_s2_pro.fish_s2_pro_model", "FishS2ProModel", "image", 1),
+    ("mstar.model.voxcpm2.voxcpm2_model", "VoxCPM2Model", "video", 1),
+    ("mstar.model.omnivoice.omnivoice_model", "OmniVoiceModel", "audio", 2),
+    ("mstar.model.omnilingual_asr.omnilingual_asr_model", "OmnilingualASRModel", "image", 1),
+    ("mstar.model.nemotron_duplex.nemotron_duplex_model", "NemotronDuplexModel", "image", 1),
+    ("mstar.model.orpheus.orpheus_model", "OrpheusModel", "image", 1),
+    ("mstar.model.kokoro.kokoro_model", "KokoroModel", "audio", 1),
+    ("mstar.model.glm52.glm52_model", "Glm52Model", "image", 1),
+    ("mstar.model.glm5_next.glm5_next_model", "Glm5NextModel", "image", 1),
+    ("mstar.model.command_a_plus.command_a_plus_model", "CommandAPlusModel", "audio", 1),
+    ("mstar.model.vjepa2.vjepa2_model", "VJepa2Model", "audio", 1),
+    ("mstar.model.vjepa2.vjepa2_model", "VJepa2Model", "video", 2),
+    ("mstar.model.pi05.pi05_model", "Pi05Model", "audio", 1),
+    # without the reasoner, Cosmos3 conditions on one image or one video
+    ("mstar.model.cosmos3.cosmos3_model", "Cosmos3Model", "image", 2),
+]
+
+
+@pytest.mark.parametrize("module, cls, modality, count", [
+    *[(module, cls, "audio", 1) for module, cls in IMAGE_MODELS],
     # Cosmos3 takes video
-    *[(module, cls, "video") for module, cls in IMAGE_MODELS if cls != "Cosmos3Model"],
+    *[(module, cls, "video", 1) for module, cls in IMAGE_MODELS if cls != "Cosmos3Model"],
+    *PARTIAL_MEDIA_MODELS,
 ])
-def test_an_image_model_refuses_audio_and_video_before_decoding(tmp_path, module, cls, modality):
+def test_a_model_refuses_files_it_does_not_take_before_decoding(tmp_path, module, cls, modality, count):
     from mstar.api_server.request_types import PreprocessInput
     from mstar.model.flux2_klein.config import Flux2KleinConfig
 
     model = object.__new__(getattr(importlib.import_module(module), cls))
     model._config = Flux2KleinConfig()  # FLUX.2 counts reference images by its config
+    if not isinstance(getattr(type(model), "config", None), property):
+        # pi0.5 counts camera images by its config, Cosmos3 its media by whether the reasoner serves
+        model.config = types.SimpleNamespace(num_cameras=1, serves_reasoner=False, enable_reasoner=False)
     loaded = []
     setattr(model, f"load_{modality}", lambda path, device: loaded.append(path))
-    (tmp_path / "upload").write_bytes(b"")
+    paths = []
+    for i in range(count):
+        (tmp_path / f"upload{i}").write_bytes(b"")
+        paths.append(str(tmp_path / f"upload{i}"))
     request = PreprocessInput(
-        request_id="r1", text="a cat", file_paths={modality: [str(tmp_path / "upload")]},
-        input_modalities=[modality, "text"], output_modalities=["image"], model_kwargs={},
+        request_id="r1", text="a cat", file_paths={modality: paths},
+        input_modalities=[modality] * count + ["text"], output_modalities=["image"], model_kwargs={},
     )
     wt = _preprocess_thread(model)
-    with pytest.raises(ValueError, match=f"this model takes no {modality} files") as info:
+    with pytest.raises(ValueError, match=f"this model takes (no {modality} files|at most)") as info:
         wt._process_input(request)
     assert loaded == []
     assert _status(wt, info.value) == 400

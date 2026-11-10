@@ -167,6 +167,10 @@ class OmnilingualASRModel(Model):
         # argmax CTC: the transcription adapter's language, prompt and temperature are not read
         return frozenset()
 
+    def max_input_files(self) -> dict[str, int]:
+        # one clip; the data worker refuses anything else before decoding
+        return {"audio": 1, "image": 0, "video": 0}
+
     def process_prompt(
         self,
         prompt: str | None,

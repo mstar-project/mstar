@@ -322,7 +322,8 @@ class CanaryQwenModel(Model):
         return {KV_CACHE: {"main": KVLabel(growth=((DECODE_WALK, DECODE_LOOP),))}}
 
     def max_input_files(self) -> dict[str, int]:
-        return {"audio": 1}
+        # one clip; the data worker refuses anything else before decoding
+        return {"audio": 1, "image": 0, "video": 0}
 
     def text_output(self) -> TextOutput:
         return TextOutput(self._detokenizer)

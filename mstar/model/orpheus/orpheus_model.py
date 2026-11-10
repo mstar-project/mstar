@@ -280,6 +280,10 @@ class OrpheusModel(Model):
     # Model ABC: prompt processing
     # -------------------------------------------------------------------
 
+    def max_input_files(self) -> dict[str, int]:
+        # text only; the data worker refuses any file before decoding it
+        return {"image": 0, "audio": 0, "video": 0}
+
     def process_prompt(
         self,
         prompt: str | None,

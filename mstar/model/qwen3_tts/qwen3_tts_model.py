@@ -767,7 +767,8 @@ class Qwen3TTSModel(Model):
     REF_ENCODER_INPUTS = ("audio_inputs",)
 
     def max_input_files(self) -> dict[str, int]:
-        return {"audio": 1}
+        # one clip; the data worker refuses anything else before decoding
+        return {"audio": 1, "image": 0, "video": 0}
 
     def load_audio(self, filepath: str, device: str) -> TensorAndMetadata:
         """Decode a reference clip to 24 kHz mono float32 (speaker encoder + codec rate)."""

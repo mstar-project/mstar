@@ -143,6 +143,10 @@ class KokoroModel(Model):
         ids = [self.config.vocab[c] for c in phonemes if c in self.config.vocab]
         return [BOUNDARY_TOKEN_ID, *ids, BOUNDARY_TOKEN_ID]
 
+    def max_input_files(self) -> dict[str, int]:
+        # text only; the data worker refuses any file before decoding it
+        return {"image": 0, "audio": 0, "video": 0}
+
     def process_prompt(
         self,
         prompt: str | None,

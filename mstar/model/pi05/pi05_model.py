@@ -623,7 +623,7 @@ class Pi05Model(Model):
 
     def max_input_files(self) -> dict[str, int]:
         # one image per camera slot the SigLIP capture holds
-        return {"image": self.config.num_cameras}
+        return {"image": self.config.num_cameras, "audio": 0, "video": 0}
 
     def postprocess(self, output: torch.Tensor, modality: str, request_kwargs: dict | None = None) -> bytes:
         if modality == "action":

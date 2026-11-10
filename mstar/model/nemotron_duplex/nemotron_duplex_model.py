@@ -577,6 +577,10 @@ class NemotronDuplexModel(Model):
         # max_output_tokens is not read: the audio fixes the length
         return frozenset({*SAMPLING_KEYS, "min_p"})
 
+    def max_input_files(self) -> dict[str, int]:
+        # audio only, as many uploads as the call has; the data worker refuses anything else before decoding
+        return {"image": 0, "video": 0}
+
     def process_prompt(
         self,
         prompt: str | None,
