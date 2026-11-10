@@ -1035,7 +1035,7 @@ class KVManager(AttentionResource):
                         # Check this page against the whole allowance rather than ``remaining``.
                         own = self._grant(rid, label, 1, 0) if self._allowance(rid) > 0 else None
                         if own is None:
-                            self._release(rid, stream, cached)
+                            self._release(rid, stream, cached, windows=())
                         else:
                             image_page, copy_page, held = cached[0], own[0], end
                 if not stream.prefix_counted:
@@ -2006,7 +2006,7 @@ class KVManager(AttentionResource):
             part.stored_len = len(held) * group.page_size
             if part is not stream:
                 part.released = end - part.stored_len
-        self._release(rid, stream, empty)
+        self._release(rid, stream, empty, windows=())
         allotment = self._allotments.get(rid)
         if rid in self._guaranteed and allotment is not None:
             allotment.pages -= len(stream.lent.intersection(groups[0]))
@@ -2025,7 +2025,7 @@ class KVManager(AttentionResource):
     def _release_hold(self, rid: str, stream: CacheStream) -> None:
         hold, stream.hold = stream.hold, None
         if hold is not None:
-            self._release(rid, stream, hold)
+            self._release(rid, stream, hold, windows=())
 
     def fingerprint(self) -> bytes:
         return fingerprint(
@@ -3260,7 +3260,7 @@ class KVManager(AttentionResource):
             for rid, label in reversed(self._preplan_new_labels):
                 stream = self._streams.get(rid, {}).pop(label, None)
                 if stream is not None:
-                    self._release(rid, stream, stream.pages())
+                    self._release(rid, stream, stream.pages(), windows=held_pages(stream.later))
                     stream.free_lists()
                     self._recount(rid)
             self._preplan_new_labels = []
@@ -3317,7 +3317,7 @@ class KVManager(AttentionResource):
             self.kv_cache.copy_pages(tail[:1], keep)
         del stream.page_indices[first:]
         stream.page_indices.extend(keep)
-        self._release(rid, stream, tail)
+        self._release(rid, stream, tail, windows=())
         # its keys and cursor name pages this stream no longer holds
         stream.chain = None
         self._recount(rid)
@@ -3925,9 +3925,7 @@ class KVManager(AttentionResource):
             for claim in moved:
                 stream = streams[claim.label]
                 # the offload takes its pages off the allotment too, so every page it frees is room
-                self._release(
-                    rid, stream, held_pages(claim.groups), refund=False, windows=held_pages(claim.groups[1:]),
-                )
+                self._release(rid, stream, held_pages(claim.groups), refund=False, windows=held_pages(claim.groups[1:]))
                 # Offload changes residency, not logical stream contents.
                 stream.reset(freed=True, content_reset=False)
                 if claim.keys:
@@ -4395,8 +4393,7 @@ class KVManager(AttentionResource):
                 for stream in self._streams[rid].values():
                     self._release_lease(rid, stream)
                     self._release_hold(rid, stream)
-                    self._unshare(held_pages(stream.later))
-                    self._arena.release(stream.pages())
+                    self._release(rid, stream, stream.pages(), windows=held_pages(stream.later))
                     stream.free_lists()
             if self._cpu_pool is not None:
                 self._cpu_pool.remove_request(rid)
@@ -5418,7 +5415,7 @@ class KVManager(AttentionResource):
         return pages
 
     def _release(
-        self, rid: str, stream: CacheStream, pages: list[int], refund: bool = True, windows: Collection[int] = (),
+        self, rid: str, stream: CacheStream, pages: list[int], refund: bool = True, *, windows: Collection[int],
     ) -> None:
         """Release ``pages`` of ``stream``, which the caller takes off the stream before it recounts.
 
@@ -5431,6 +5428,7 @@ class KVManager(AttentionResource):
         only cycle: the page is still held, or only the index holds it, as a leaf that can be evicted, and a page
         replaces it. Without ``refund`` (an offload) they leave the allotment like any other page.
         """
+        windows = set(windows)
         self._unshare(windows)
         self._arena.release(pages)
         allotment = self._allotments.get(rid)
