@@ -72,7 +72,8 @@ class _HostPoolStub(CPUPagePool):
     def __init__(self):
         self.arena = new_page_arena(64)
         self.index = PrefixIndex(self.arena)
-        self.offloaded = {}
+        self.offloaded, self.reserved = {}, {}
+        self._unmoved = 0
         self._refused_logged_at = None
         self._refused_unlogged = 0
         self.dropped = self.written = self.cancelled = 0

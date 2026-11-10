@@ -22,7 +22,7 @@ from test_conductor_status import _conductor, _request, _to_api_server  # noqa: 
 from test_ingest_unpersist import _run  # noqa: E402
 from test_kv_prefix_lease import ROOT, _grow, _keys, _layout, _seed, _StubTransfer  # noqa: E402
 from test_micro_scheduler import _Engine, _Manager, _next_batch, _scheduler  # noqa: E402
-from test_rebuild_policy import POLICY, _graphs, _ran  # noqa: E402
+from test_rebuild_policy import R, _ran, _rebuilds  # noqa: E402
 from test_serving_metrics import _labels, _serve, _wait  # noqa: E402
 
 import mstar.communication.wire_types  # noqa: E402,F401  (registers the wire tags)
@@ -51,7 +51,6 @@ from mstar.utils.ipc_format import (  # noqa: E402
     WorkerStatus,
 )
 from mstar.worker import worker_metrics  # noqa: E402
-from mstar.worker.host_pool import HostPool  # noqa: E402
 from mstar.worker.rebuild import Rebuilds  # noqa: E402
 from mstar.worker.worker_metrics import WorkerMetrics  # noqa: E402
 
@@ -205,10 +204,10 @@ def test_a_cache_only_follower_nodes_use_is_not_reported():
 # ── kept-id pool ─────────────────────────────────────────────────────────────
 
 def test_the_kept_id_pool_reports_its_fill_under_its_node():
-    rebuilds = Rebuilds({NODE: POLICY}, _graphs(), HostPool(64, torch.device("cpu")))
+    rebuilds = _rebuilds(64)
     m = _metrics(rebuilds=rebuilds)
 
-    rebuilds.keep_prompts(_ran(PREFILL, {"r": {"text_inputs": [torch.arange(3)]}}))
+    rebuilds.keep_prompts(_ran(PREFILL, {R: {"text_inputs": [torch.arange(3)]}}))
 
     snaps = m.snapshot()
     assert (_values(snaps, "mstar_rebuild_host_bytes_used"), _values(snaps, "mstar_rebuild_host_bytes_total")) == (

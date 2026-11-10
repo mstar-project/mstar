@@ -422,7 +422,8 @@ class Admission:
         # a request admitted but not yet run holds no pages: offloading it
         # frees nothing and the retry would re-pick it
         candidates = [
-            rid for rid in active if engine.reclaimable(node_name, rid, affected_resources)
+            rid for rid in active
+            if engine.reclaimable(node_name, rid, affected_resources) and engine.can_offload(node_name, rid)
         ]
 
         if not candidates:

@@ -149,6 +149,8 @@ def make_worker(
         worker.tensor_manager = SimpleNamespace(get_tensor=None)
     # no node declares a rebuild policy unless the test passes one
     worker._rebuilds = rebuilds if rebuilds is not None else Rebuilds({}, {})
+    # no node writes a paged KV cache here, so no request keeps its ids
+    worker._kv_writes = {}
     services = WorkerServices(
         worker_id=worker_id, device=device, graph_runtime=graph_runtime, rebuilds=worker._rebuilds,
         **{name: getattr(worker, name) for name in _COLLABORATORS},
@@ -176,7 +178,7 @@ def make_worker(
     ))
     component("ingest", lambda: InputIngest(
         services=services, layout=layout, lifecycle=worker.lifecycle, lockstep=worker.lockstep,
-        wakeup_event=wakeup_event, metrics=metrics, enable_nvtx=enable_nvtx,
+        wakeup_event=wakeup_event, metrics=metrics, enable_nvtx=enable_nvtx, set_rebuildable=worker._set_rebuildable,
     ))
     component("executor", lambda: StepExecutor(
         services=services, layout=layout, timer=worker.timer, lockstep=worker.lockstep,

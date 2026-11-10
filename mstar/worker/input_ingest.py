@@ -6,6 +6,8 @@ teardown point, and TP-follow messages go to ``Lockstep``."""
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
+from typing import TYPE_CHECKING
 
 from mstar.communication.edge_items import frame_dtypes, row_infos, row_input_signals
 from mstar.communication.edge_items import rows as stream_rows
@@ -36,6 +38,9 @@ from mstar.worker.request_lifecycle import RequestLifecycle
 from mstar.worker.services import WorkerLayout, WorkerServices
 from mstar.worker.worker_metrics import WorkerMetrics
 
+if TYPE_CHECKING:
+    from mstar.engine.resources import ResourceReqConfig
+
 logger = logging.getLogger(__name__)
 
 # worker_phases span per message type
@@ -64,6 +69,7 @@ class InputIngest:
         self, services: WorkerServices, layout: WorkerLayout,
         lifecycle: RequestLifecycle, lockstep: Lockstep, wakeup_event: EventWakeup,
         *, metrics: WorkerMetrics | None = None, enable_nvtx: bool = False,
+        set_rebuildable: Callable[[int, dict[str, ResourceReqConfig]], None] | None = None,
     ):
         self._worker_id = services.worker_id
         self._runtime = services.graph_runtime
@@ -77,6 +83,8 @@ class InputIngest:
         self._lockstep = lockstep
         self._wakeup_event = wakeup_event
         self._enable_nvtx = enable_nvtx
+        # marks each paged KV cache of a request's first NewRequest rebuildable or not, before the engine adds it
+        self._set_rebuildable = set_rebuildable
         self.lora_loads = LoraLoads(services)
         self._handlers = {
             WorkerMessageType.NEW_REQUEST: self._add_new_request,
@@ -195,6 +203,8 @@ class InputIngest:
         if first:
             self._tensors.register_request(rid, runtime.get_sharding_config(rid))
         laps.lap("worker_state")
+        if first and self._set_rebuildable is not None:
+            self._set_rebuildable(rid, body.request_info.resource_configs)
         try:
             if first:
                 self._engines.add_request(

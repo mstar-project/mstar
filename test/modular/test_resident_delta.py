@@ -693,6 +693,7 @@ def _rank(*, leader: bool, parallel: bool = True) -> Worker:
     engine.evictable = lambda node, resources=None: True
     engine.residency = lambda node, rid: Residency.RESIDENT
     engine.reclaimable = lambda node, rid, resources: True
+    engine.can_offload = lambda node, rid: True
     engine.offload_request = lambda node, rid, affected_resources=None: engine.offload_attempts.append(node) or 1
     rank = make_worker(
         graph_runtime=_Queue(),

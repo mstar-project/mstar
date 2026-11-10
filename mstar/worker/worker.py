@@ -18,6 +18,8 @@ from mstar.communication.tensors import (
 )
 from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import WorkerParallelGroups
+from mstar.engine.resources import ResourceReqConfig
+from mstar.engine.resources.kv.config import KVReqConfig
 from mstar.engine.resources.kv.transfer import (
     TransferEngineInfo,
     make_deployment_kv_shm_dir,
@@ -49,7 +51,7 @@ from mstar.worker.micro_scheduler import (
 from mstar.worker.node_manager_utils import RequestStateManager
 from mstar.worker.phase_timer import PhaseTimer
 from mstar.worker.preemption import Preemption
-from mstar.worker.rebuild import DEFAULT_REBUILD_HOST_MB, Rebuilds, policies_run_here
+from mstar.worker.rebuild import DEFAULT_REBUILD_HOST_MB, Rebuilds, node_writes, policies_run_here
 from mstar.worker.request_lifecycle import RequestLifecycle
 from mstar.worker.services import WorkerLayout, WorkerServices
 from mstar.worker.speculation import (
@@ -358,6 +360,7 @@ class Worker:
             self.engine_manager, self._rebuilds, self.scheduler, self.request_state, self.admission.log_throttled,
             self._rid_str,
         )
+        self._set_kv_writes(model, layout.my_walks)
         if layout.side_keys:
             logger.info(
                 "Worker %s: %s run beside the chain on a side stream",
@@ -373,6 +376,7 @@ class Worker:
         self.ingest = InputIngest(
             services=services, layout=layout, lifecycle=self.lifecycle, lockstep=self.lockstep,
             wakeup_event=self.wakeup_event, metrics=self._metrics, enable_nvtx=self.enable_nvtx,
+            set_rebuildable=self._set_rebuildable,
         )
         self.executor = StepExecutor(
             services=services, layout=layout, timer=self.timer, lockstep=self.lockstep,
@@ -434,6 +438,24 @@ class Worker:
                 keys.append(key)
         if keys:
             engine.never_publish(keys)
+
+    def _set_kv_writes(self, model: Model | None, my_walks: frozenset[tuple[str, str]]) -> None:
+        """Record what each node of each paged KV cache writes here, and give each cache the loops that grow it
+        in a walk this worker runs on one of its nodes."""
+        labels = model.kv_labels() if model is not None else {}
+        # key -> node -> its `NodeWrites`
+        self._kv_writes = {}
+        for kv in self.engine_manager.engine.paged_kv_caches():
+            self._kv_writes[kv.key] = node_writes(labels.get(kv.key, {}), kv.nodes, my_walks)
+            kv.cache.local_loops = {loop for writes in self._kv_writes[kv.key].values() for loop in writes.loops}
+
+    def _set_rebuildable(self, request_id: int, configs: dict[str, ResourceReqConfig]) -> None:
+        kv_configs = {key: config for key, config in configs.items() if isinstance(config, KVReqConfig)}
+        layouts = {key: (config.kv_layout or {}).values() for key, config in kv_configs.items()}
+        unpausable = any(config.unpausable for config in kv_configs.values())
+        for key, rebuildable in self._rebuilds.ingest_request(request_id, self._kv_writes, layouts, unpausable).items():
+            if key in configs:
+                configs[key].rebuildable = rebuildable
 
     def _plan_step_cpus(
         self, worker_ids: list[str], local_worker_devices: list[str] | None,

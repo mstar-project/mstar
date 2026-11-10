@@ -84,6 +84,10 @@ class CPUPagePool:
 
         # {request_id: {label: OffloadedStream}}
         self.offloaded: dict[str, dict[str, OffloadedStream]] = {}
+        # request -> the pages set aside for its move here, for a request that no drop can free
+        # `_unmoved` sums the pages set aside that no request has moved into yet.
+        self.reserved: dict[str, int] = {}
+        self._unmoved = 0
 
         # copies run here so they don't serialize with compute
         self._stream: torch.cuda.Stream | None = None
@@ -97,6 +101,8 @@ class CPUPagePool:
         self.written = 0
         self.cancelled = 0
         self._dropped_logged_at: float | None = None
+        self.guaranteed = 0
+        self._guaranteed_logged_at: float | None = None
 
     def _get_stream(self) -> torch.cuda.Stream:
         if self._stream is None:
@@ -111,11 +117,57 @@ class CPUPagePool:
         self.arena.retain(pages)
         return pages
 
-    def take(self, n: int) -> list[int]:
-        """Up to ``n`` free pages, evicting cached pages when too few are free."""
-        if n > self.arena.num_free:
-            self.index.evict(n - self.arena.num_free)
-        return self.arena.acquire(min(n, self.arena.num_free))
+    def reserve(self, rid: str, pages: int) -> bool:
+        """Set ``pages`` aside for ``rid``'s move here, in place of what was set aside for it, or return False when
+        the room isn't there."""
+        if pages > self.arena.num_free + len(self.index.evictable()) - self._set_aside(rid):
+            return False
+        unmoved = self._unmoved_by(rid)
+        self.reserved[rid] = pages
+        self._unmoved += self._unmoved_by(rid) - unmoved
+        self._keep_free(0)
+        return True
+
+    def unreserve(self, rid: str) -> None:
+        self._unmoved -= self._unmoved_by(rid)
+        self.reserved.pop(rid, None)
+
+    def count_guaranteed(self, rid: str) -> None:
+        """Log that the pool had no room to set aside for ``rid``'s move, so ``rid`` reserves its whole footprint on
+        the device."""
+        self.guaranteed += 1
+        now = time.monotonic()
+        if self._guaranteed_logged_at is None or now - self._guaranteed_logged_at >= _EXHAUSTED_LOG_INTERVAL:
+            logger.warning(
+                "CPU page pool full: no room to set aside for %s's move here, so it reserves its whole KV footprint "
+                "on the device (%d requests so far)", rid, self.guaranteed,
+            )
+            self._guaranteed_logged_at = now
+
+    def _set_aside(self, rid: str | None) -> int:
+        """The reserved pages no request has moved into yet, other than ``rid``'s."""
+        return self._unmoved - (0 if rid is None else self._unmoved_by(rid))
+
+    def _unmoved_by(self, rid: str) -> int:
+        pages = self.reserved.get(rid)
+        if pages is None:
+            return 0
+        return max(0, pages - sum(len(state.host_pages) for state in self.offloaded.get(rid, {}).values()))
+
+    def _keep_free(self, n: int, rid: str | None = None) -> int:
+        """Evict cached pages until ``n`` pages are free past the pages set aside for requests other than ``rid``, and
+        return those. What is set aside stays free, not cached, since a host fetch could hold a cached page by the
+        time its request moves here."""
+        kept = self._set_aside(rid)
+        if n + kept > self.arena.num_free:
+            self.index.evict(n + kept - self.arena.num_free)
+        return kept
+
+    def take(self, n: int, rid: str | None = None) -> list[int]:
+        """Up to ``n`` free pages, evicting cached pages when too few are free. The pages set aside for requests
+        other than ``rid`` stay free."""
+        kept = self._keep_free(n, rid)
+        return self.arena.acquire(max(0, min(n, self.arena.num_free - kept)))
 
     def place(
         self,
@@ -132,17 +184,19 @@ class CPUPagePool:
         found = self.retain_run(keys)
         gpu_pages = held_pages(groups)
         n_pages = len(gpu_pages) - len(found)
-        cpu_pages = self.take(n_pages)
+        cpu_pages = self.take(n_pages, rid)
         if len(cpu_pages) < n_pages:
             self.arena.release(cpu_pages + found)
             self._log_refusal(rid, label, n_pages)
             return None
+        unmoved = self._unmoved_by(rid)
         self.offloaded.setdefault(rid, {})[label] = OffloadedStream(
             groups=on_pages(groups, found + cpu_pages),
             position=position,
             protected_prefix=protected_prefix,
             keys=list(keys),
         )
+        self._unmoved += self._unmoved_by(rid) - unmoved
         return PageCopies(gpu=gpu_pages[len(found):], cpu=cpu_pages)
 
     def insert_keys(self, rid: str, label: str) -> None:
@@ -247,20 +301,20 @@ class CPUPagePool:
         return event
 
     def pop(self, rid: str, label: str) -> OffloadedStream | None:
+        unmoved = self._unmoved_by(rid)
         state = self.offloaded.get(rid, {}).pop(label, None)
         if state is not None and not self.offloaded[rid]:
             del self.offloaded[rid]
+        self._unmoved += self._unmoved_by(rid) - unmoved
         return state
 
     def discard(self, rid: str, label: str) -> None:
-        """Drop a stream that was copied here but never committed to.
-
-        The offload aborted after the copy, so the device pages stay live and
-        these host pages go back to the pool.
-        """
+        """Release the host pages of a stream that was reloaded, or copied here by an offload that aborted."""
         state = self.pop(rid, label)
         if state is not None:
             self.arena.release(state.host_pages)
+            # the room set aside for rid grows back by every page, and a keyed page goes to the index, not the free list
+            self._keep_free(0)
 
     def sync(self) -> None:
         """Order the current stream behind the pending copies.
@@ -273,6 +327,7 @@ class CPUPagePool:
             torch.cuda.current_stream().wait_stream(self._stream)
 
     def remove_request(self, rid: str) -> None:
+        self.unreserve(rid)
         for state in self.offloaded.pop(rid, {}).values():
             self.arena.release(state.host_pages)
 
@@ -281,8 +336,8 @@ class CPUPagePool:
         return self.arena.num_free
 
     def room(self) -> int:
-        """Free pages plus the cached pages `place` can evict."""
-        return self.arena.num_free + len(self.index.evictable())
+        """Free pages plus the cached pages `place` can evict, less the pages set aside for requests."""
+        return self.arena.num_free + len(self.index.evictable()) - self._set_aside(None)
 
     def takes(self, pages: int, keys: list[bytes]) -> int:
         """How many pages `place` takes out of `room` for a stream ``pages`` long, filed under ``keys``. A page
