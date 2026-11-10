@@ -21,6 +21,7 @@ from __future__ import annotations
 import bisect
 import dataclasses
 from dataclasses import dataclass, field
+from typing import NamedTuple
 
 import torch
 
@@ -31,14 +32,23 @@ from mstar.engine.resources.dsa.config import INDEX_PLANES
 PREFILL_SCORE_BYTES = 256 << 20
 
 
+class DSASpan(NamedTuple):
+    """One request's rows of a step: ``rows`` of them from row ``start``, for request
+    ``request`` of the step's."""
+
+    start: int
+    rows: int
+    request: int
+
+
 @dataclass
 class DSAContext:
     """A step's DSA rows, as ``DSAManager.plan`` builds them from the KV plan.
 
     Device, per step row: ``pos`` its position (keys it sees are ``[0, pos]``), ``row_req`` its
     request. Per request: ``page_start`` its first entry in ``pages``, the flat page list of
-    the step's requests. Host, when the step runs eager: ``host_pos``, ``spans`` ((first row,
-    rows, request) per request, in row order) and ``host_page_start``. ``max_pools`` is the
+    the step's requests. Host, when the step runs eager: ``host_pos``, ``spans`` (each
+    request's ``DSASpan``, in row order) and ``host_page_start``. ``max_pools`` is the
     score width (the step's most pools, or a CUDA graph's fixed width); ``sparse_plan`` the
     graph slot's plan, or the eager one the first layer builds through ``eager``.
 
@@ -52,7 +62,7 @@ class DSAContext:
     pages: torch.Tensor
     page_start: torch.Tensor
     host_pos: list[int] | None
-    spans: list[tuple[int, int, int]] | None
+    spans: list[DSASpan] | None
     host_page_start: list[int] | None
     max_pools: int
     page_size: int
@@ -98,7 +108,7 @@ class DSAContext:
         for r0, n, req in self.spans:
             a, b = max(r0, c0), min(r0 + n, c1)
             if a < b:
-                spans.append((a - c0, b - a, req))
+                spans.append(DSASpan(a - c0, b - a, req))
         return self._subset(slice(c0, c1), self.host_pos[c0:c1], spans)
 
     def pick(self, rows: list[int]) -> DSAContext:
@@ -108,9 +118,9 @@ class DSAContext:
         req = [self.spans[bisect.bisect_right(starts, r) - 1][2] for r in rows]
         idx = torch.tensor(rows, device=self.pos.device)
         return self._subset(idx, [self.host_pos[r] for r in rows],
-                            [(i, 1, q) for i, q in enumerate(req)])
+                            [DSASpan(i, 1, q) for i, q in enumerate(req)])
 
-    def _subset(self, idx, host_pos: list[int], spans: list[tuple[int, int, int]]) -> DSAContext:
+    def _subset(self, idx, host_pos: list[int], spans: list[DSASpan]) -> DSAContext:
         return dataclasses.replace(
             self, pos=self.pos[idx], row_req=self.row_req[idx], host_pos=host_pos, spans=spans,
             max_pools=max(1, (max(host_pos) + 1) // self.kpool), needs_selection=True,
