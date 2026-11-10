@@ -5417,7 +5417,7 @@ class KVManager(AttentionResource):
     def _release(
         self, rid: str, stream: CacheStream, pages: list[int], refund: bool = True, *, windows: Collection[int],
     ) -> None:
-        """Release ``pages`` of ``stream``, which the caller takes off the stream before it recounts.
+        """Release ``pages`` of ``stream``; the caller takes them off the stream (or drops it) and recounts.
 
         A page not in ``stream.lent`` shrinks the allotment by one when its release leaves
         the page neither free nor evictable, and always when ``refund`` is False. Otherwise
