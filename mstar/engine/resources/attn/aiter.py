@@ -3,7 +3,7 @@
 One launch per layer covers a mixed batch (prefill, extend, decode) and reads
 the paged cache in place. The kernel wants a dense block table instead of
 FlashInfer's CSR, so ``plan`` converts the KV plan's indptrs and stages them
-from pinned host memory in one copy per label.
+through one ``PinnedStager`` copy per label.
 
 The kernel is causal only. A single query sees its whole row under the causal
 mask, so non-causal steps with one query per row run here too, and so does
@@ -34,6 +34,7 @@ from mstar.engine.resources.base import CGSlotKey
 from mstar.engine.resources.kv.config import PagedKVConfig
 from mstar.engine.resources.kv.plan import SINK_PAGE, KVPlanOutputs, PagedIndptrs
 from mstar.engine.resources.step import SlotLease, StepContext
+from mstar.utils.h2d import PinnedStager
 
 logger = logging.getLogger(__name__)
 
@@ -122,26 +123,6 @@ def _aiter_unified_attention(
     )
 
 
-# One op with a fake, so a traced caller sees one node. Defined with `Library`
-# instead of `torch.library.custom_op`, whose Python wrapper cost about 45 us
-# per eager call on an MI300X host (this one costs about 14).
-_LIB = torch.library.Library("mstar", "FRAGMENT")
-_LIB.define(
-    "aiter_unified_attention(Tensor q, Tensor k_cache, Tensor v_cache, Tensor(a!) out, "
-    "Tensor cu_seqlens_q, Tensor seqused_k, Tensor block_table, int max_seqlen_q, "
-    "int max_seqlen_k, float softmax_scale) -> ()"
-)
-_LIB.impl("aiter_unified_attention", _aiter_unified_attention, "CUDA")
-
-
-@torch.library.register_fake("mstar::aiter_unified_attention", lib=_LIB)
-def _aiter_unified_attention_fake(
-    q, k_cache, v_cache, out, cu_seqlens_q, seqused_k, block_table,
-    max_seqlen_q, max_seqlen_k, softmax_scale,
-) -> None:
-    return None
-
-
 def check_aiter_paged(kv_config: PagedKVConfig, dtype: torch.dtype) -> None:
     """Refuse at build time a cache the kernel wasn't checked for."""
     reason = aiter_paged_unavailable_reason()
@@ -181,39 +162,6 @@ class _Staged(NamedTuple):
     max_seqlen_q: int
     max_seqlen_k: int
     num_tokens: int  # query tokens the kernel reads (q can be longer, padded to a bucket)
-
-
-class _PlanImage:
-    """Pinned host buffer for one plan's int32 inputs, ``[cu_seqlens_q |
-    seqused_k | block_table]``, and the device buffer it is sent to in one copy.
-
-    Every plan for the same key rewrites it in place. Table entries past a row's
-    pages and tail tile keep stale values from earlier plans, which is fine
-    because the kernel never reads them.
-    """
-
-    def __init__(self, numel: int, device: torch.device):
-        pinned = device.type == "cuda" and torch.cuda.is_available()
-        self.numel = numel
-        self._host = torch.zeros(numel, dtype=torch.int32, pin_memory=pinned)
-        self.np = self._host.numpy()
-        self.dev = torch.zeros(numel, dtype=torch.int32, device=device)
-        self._copied = torch.cuda.Event() if pinned else None
-        self._pending = False
-
-    def wait(self) -> None:
-        """Block until the last copy out of the host buffer has finished."""
-        if self._pending:
-            self._copied.synchronize()
-            self._pending = False
-
-    def send(self, n: int) -> None:
-        if self._copied is None:
-            self.dev[:n].copy_(self._host[:n])
-            return
-        self.dev[:n].copy_(self._host[:n], non_blocking=True)
-        self._copied.record(torch.cuda.current_stream(self.dev.device))
-        self._pending = True
 
 
 def _image_numel(rows: int, width: int) -> int:
@@ -279,10 +227,11 @@ def per_query_rows(rows: _Rows, num_rows: int | None = None) -> _Rows:
 
 
 def stage_plan(
-    image: _PlanImage, rows: _Rows, width: int, pad_cols: int,
+    dev: torch.Tensor, stager: PinnedStager, rows: _Rows, width: int, pad_cols: int,
     max_seqlen_q: int, max_seqlen_k: int,
 ) -> _Staged:
-    """Write one plan into ``image``, send it, and return its device views.
+    """Write one plan into the int32 device buffer ``dev`` through ``stager``, and
+    return its device views.
 
     Each block table row holds the row's pages, then ``pad_cols`` entries of
     ``SINK_PAGE`` so its tail tile reads a valid page.
@@ -297,18 +246,17 @@ def stage_plan(
         )
     k_off = _round(num_rows + 1)
     bt_off = k_off + _round(num_rows)
-    image.wait()
-    host = image.np
+    starts = bt_off + np.arange(num_rows, dtype=np.int64) * width
+    tails = starts + counts
+    end = int(tails[-1]) + pad_cols if num_rows else bt_off
+    host = np.zeros(end, dtype=np.int32)
     host[:num_rows + 1] = rows.qo_indptr
     host[k_off:k_off + num_rows] = rows.kv_lens
-    starts = bt_off + np.arange(num_rows, dtype=np.int64) * width
     nnz = int(kv_indptr[-1])
     if nnz:
         host[np.repeat(starts - kv_indptr[:-1], counts) + np.arange(nnz)] = rows.kv_indices
-    tails = starts + counts
     host[(tails[:, None] + np.arange(pad_cols)).ravel()] = SINK_PAGE
-    image.send(int(tails[-1]) + pad_cols if num_rows else bt_off)
-    dev = image.dev
+    stager.copy_(dev, host)
     return _Staged(
         cu_seqlens_q=dev[:num_rows + 1],
         seqused_k=dev[k_off:k_off + num_rows],
@@ -334,23 +282,23 @@ class _UnifiedPlans:
     _scale: float
     _cg_images: dict
     _eager_images: dict
+    _stager: PinnedStager
 
-    def _eager_image(self, label: str, slot: int, numel: int) -> _PlanImage:
+    def _eager_image(self, label: str, slot: int, numel: int) -> torch.Tensor:
         key = EagerSlotKey(label=label, slot=slot)
         image = self._eager_images.get(key)
-        if image is None or image.numel < numel:
-            if image is not None:
-                # its pinned memory goes with it, so no copy may still read it
-                image.wait()
-            image = self._eager_images[key] = _PlanImage(max(numel, 4096), self._device)
+        if image is None or image.numel() < numel:
+            image = self._eager_images[key] = torch.zeros(
+                max(numel, 4096), dtype=torch.int32, device=self._device,
+            )
         return image
 
-    def _cg_image(self, lease: SlotLease, label: str, numel: int) -> _PlanImage:
+    def _cg_image(self, lease: SlotLease, label: str, numel: int) -> torch.Tensor:
         key = CGSlotKey(bucket=lease.bucket, slot=lease.slot, label=label)
         image = self._cg_images.get(key)
         if image is None:
-            image = self._cg_images[key] = _PlanImage(numel, self._device)
-        elif image.numel != numel:
+            image = self._cg_images[key] = torch.zeros(numel, dtype=torch.int32, device=self._device)
+        elif image.numel() != numel:
             raise RuntimeError(
                 f"AITER attention: bucket {lease.bucket} label {label!r} now "
                 "plans a different number of kernel rows than it was captured with"
@@ -368,7 +316,7 @@ class _UnifiedPlans:
         )
         qk = q if q.dtype == self._dtype else q.to(self._dtype)
         out = torch.empty(qk.shape, dtype=self._dtype, device=qk.device)
-        torch.ops.mstar.aiter_unified_attention(
+        _aiter_unified_attention(
             qk, kv_cache_layer[:, 0], kv_cache_layer[:, 1], out,
             plan.cu_seqlens_q, plan.seqused_k, plan.block_table,
             plan.max_seqlen_q, plan.max_seqlen_k, self._scale,
@@ -407,8 +355,9 @@ class AiterPagedAttentionManager(_UnifiedPlans, AttentionManager):
         self._pad_cols = -(-_TILE_TOKENS // kv_config.tokens_per_page)
         self._cg_width = kv_config.max_num_pages + self._pad_cols
 
-        self._cg_images: dict[CGSlotKey, _PlanImage] = {}
-        self._eager_images: dict[EagerSlotKey, _PlanImage] = {}
+        self._cg_images: dict[CGSlotKey, torch.Tensor] = {}
+        self._eager_images: dict[EagerSlotKey, torch.Tensor] = {}
+        self._stager = PinnedStager(torch.int32)
         # the (kernel rows, max_seqlen_q) or fallback each captured key was
         # first planned with, since a replay must run what its capture recorded
         self._cg_kinds: dict[CGSlotKey, object] = {}
@@ -536,7 +485,7 @@ class AiterPagedAttentionManager(_UnifiedPlans, AttentionManager):
         self._check_kind(lease, label, (num_rows, max_q))
         image = self._cg_image(lease, label, _image_numel(num_rows, self._cg_width))
         return stage_plan(
-            image, rows, self._cg_width, self._pad_cols,
+            image, self._stager, rows, self._cg_width, self._pad_cols,
             max_q, self._kv_config.max_seq_len,
         )
 
@@ -546,7 +495,7 @@ class AiterPagedAttentionManager(_UnifiedPlans, AttentionManager):
         width = (int(counts.max()) if num_rows else 0) + self._pad_cols
         image = self._eager_image(label, slot, _image_numel(num_rows, width))
         return stage_plan(
-            image, rows, width, self._pad_cols,
+            image, self._stager, rows, width, self._pad_cols,
             int(np.diff(rows.qo_indptr).max()) if num_rows else 1,
             int(rows.kv_lens.max()) if num_rows else 1,
         )
@@ -628,8 +577,9 @@ class AiterCrossManager(_UnifiedPlans, CrossAttentionManager):
         self._pad_cols = -(-_TILE_TOKENS // kv_config.tokens_per_page)
         self._cg_width = kv_config.max_num_pages + self._pad_cols
 
-        self._cg_images: dict[CGSlotKey, _PlanImage] = {}
-        self._eager_images: dict[EagerSlotKey, _PlanImage] = {}
+        self._cg_images: dict[CGSlotKey, torch.Tensor] = {}
+        self._eager_images: dict[EagerSlotKey, torch.Tensor] = {}
+        self._stager = PinnedStager(torch.int32)
         self._current_plans: dict[str, _Staged] = {}
         self._preplan_plans: dict[str, _Staged] = {}
         self._preplanned = False
@@ -672,7 +622,7 @@ class AiterCrossManager(_UnifiedPlans, CrossAttentionManager):
                     lease, plan_label, _image_numel(num_rows, self._cg_width),
                 )
                 plans[plan_label] = stage_plan(
-                    image, per_query_rows(request_rows, num_rows),
+                    image, self._stager, per_query_rows(request_rows, num_rows),
                     self._cg_width, self._pad_cols, 1, self._kv_config.max_seq_len,
                 )
                 continue
@@ -681,7 +631,7 @@ class AiterCrossManager(_UnifiedPlans, CrossAttentionManager):
             width = (int(np.diff(rows.kv_indptr).max()) if num_rows else 0) + self._pad_cols
             image = self._eager_image(plan_label, ctx.slot, _image_numel(num_rows, width))
             plans[plan_label] = stage_plan(
-                image, rows, width, self._pad_cols,
+                image, self._stager, rows, width, self._pad_cols,
                 1, int(rows.kv_lens.max()) if num_rows else 1,
             )
         if ctx.is_preplan:

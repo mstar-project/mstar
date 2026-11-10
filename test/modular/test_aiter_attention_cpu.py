@@ -18,13 +18,6 @@ from mstar.engine.resources.attn.aiter import (
     per_query_rows,
 )
 from mstar.engine.resources.attn.config import AttentionStep
-from mstar.engine.resources.attn.ragged import aiter as rocm_ragged
-from mstar.engine.resources.attn.ragged.aiter import AiterRaggedCrossManager, AiterRaggedManager
-from mstar.engine.resources.attn.ragged.config import (
-    RaggedAttentionConfig,
-    RaggedCrossAttentionStep,
-    cross_label,
-)
 from mstar.engine.resources.kv.config import PagedKVConfig
 from mstar.engine.resources.kv.plan import (
     SINK_PAGE,
@@ -33,7 +26,7 @@ from mstar.engine.resources.kv.plan import (
     SequenceView,
     build_paged_indptrs,
 )
-from mstar.engine.resources.step import BucketKey, Segment, SlotLease, StepContext
+from mstar.engine.resources.step import BucketKey, SlotLease, StepContext
 
 CPU = torch.device("cpu")
 PAGE = 16
@@ -43,7 +36,6 @@ POOL = 32
 @pytest.fixture(autouse=True)
 def kernels_importable(monkeypatch):
     monkeypatch.setattr(rocm_attn, "aiter_paged_unavailable_reason", lambda: None)
-    monkeypatch.setattr(rocm_ragged, "aiter_varlen_unavailable_reason", lambda: None)
 
 
 def kv_config(**kw) -> PagedKVConfig:
@@ -243,83 +235,3 @@ def test_cross_attention_runs_one_kernel_row_per_query():
     assert plan.seqused_k.tolist() == [20, 20, 5]
     assert plan.max_seqlen_q == 1
     assert [row[:n] for row, n in zip(plan.block_table.tolist(), (2, 2, 1), strict=True)] == [[10, 11], [10, 11], [12]]
-
-
-def ragged_config() -> RaggedAttentionConfig:
-    return RaggedAttentionConfig(num_qo_heads=4, num_kv_heads=4, head_dim=72, max_segments_per_request=2)
-
-
-def test_a_captured_ragged_step_pads_to_the_buckets_segments():
-    m = AiterRaggedManager(device=CPU, dtype=torch.bfloat16, config=ragged_config())
-    step = AttentionStep(segments=(Segment("a", "img", 30), Segment("b", "img", 10)), causal=False)
-    ctx = StepContext(request_ids=["a", "b"], graph_walk="w", slot=0, capture=False, slot_lease=lease(2, 64))
-    m.plan(step, ctx)
-    plan = m._current_plans["img"]
-    # bs 2 x 2 segments per request, the last two empty
-    assert plan.cu_seqlens_q.tolist() == [0, 30, 40, 40, 40]
-    assert plan.cu_seqlens_k.tolist() == plan.cu_seqlens_q.tolist()
-    assert (plan.max_seqlen_q, plan.num_segments, plan.num_tokens) == (64, 2, 40)
-    assert plan.out.shape == (64, 4, 72)
-    assert m.num_segments("img") == 2
-
-
-def test_an_eager_ragged_step_is_exact():
-    m = AiterRaggedManager(device=CPU, dtype=torch.bfloat16, config=ragged_config())
-    step = AttentionStep(segments=(Segment("a", "img", 30), Segment("b", "img", 10)), causal=False)
-    m.plan(step, StepContext(request_ids=["a", "b"], graph_walk="w", slot=0, capture=False))
-    plan = m._current_plans["img"]
-    assert plan.cu_seqlens_q.tolist() == [0, 30, 40]
-    assert (plan.max_seqlen_q, plan.out) == (30, None)
-
-
-def test_one_request_brings_several_segments_to_a_captured_step():
-    """A segment per image or frame group, one request a step, like Qwen3.5's
-    captured vision block loop. A leased plan holds the ``max_segments_per_request``
-    the model's lease check reads, so one request with more never gets a lease
-    and plans eagerly instead."""
-    config = RaggedAttentionConfig(num_qo_heads=4, num_kv_heads=4, head_dim=72, max_segments_per_request=4)
-    m = AiterRaggedManager(device=CPU, dtype=torch.bfloat16, config=config)
-    assert m.max_segments_per_request == 4
-
-    def plan(spans, leased=True):
-        step = AttentionStep(segments=tuple(Segment("a", "main", n) for n in spans), causal=False)
-        m.plan(step, StepContext(
-            request_ids=["a"], graph_walk="w", slot=0, capture=False,
-            slot_lease=lease(1, 1024) if leased else None,
-        ))
-        return m._current_plans["main"]
-
-    three = plan([256, 64, 16])
-    assert three.cu_seqlens_q.tolist() == [0, 256, 320, 336, 336]
-    assert (three.num_segments, three.num_tokens, three.max_seqlen_q) == (3, 336, 1024)
-    four = plan([256] * 4)
-    assert four.cu_seqlens_q.tolist() == [0, 256, 512, 768, 1024]
-    assert four.cu_seqlens_q.data_ptr() == three.cu_seqlens_q.data_ptr(), "a replay reads the captured address"
-    with pytest.raises(ValueError, match="5 segments"):
-        plan([16] * 5)
-    assert plan([16] * 5, leased=False).cu_seqlens_q.tolist() == [0, 16, 32, 48, 64, 80]
-
-
-def test_ragged_output_stays_in_the_resources_dtype(monkeypatch):
-    """Like FlashInfer's: whatever dtype q comes in, the output is the resource's."""
-    monkeypatch.setattr(rocm_ragged, "_varlen", lambda: lambda q, *args, out, **kwargs: out.copy_(q))
-    m = AiterRaggedManager(device=CPU, dtype=torch.bfloat16, config=ragged_config())
-    m.plan(AttentionStep(segments=(Segment("a", "img", 3),), causal=False),
-           StepContext(request_ids=["a"], graph_walk="w", slot=0, capture=False))
-    q = torch.randn(3, 4, 72)
-    out = m.run(q, q, q, "img")
-    assert out.dtype == torch.bfloat16
-    assert torch.equal(out, q.to(torch.bfloat16))
-
-
-def test_ragged_cross_pairs_plan_their_own_key_layout():
-    m = AiterRaggedCrossManager(device=CPU, dtype=torch.bfloat16, config=ragged_config())
-    step = RaggedCrossAttentionStep(
-        segments=(Segment("a", "vid", 8), Segment("a", "txt", 3), Segment("b", "vid", 4), Segment("b", "txt", 5)),
-        pairs=(("vid", "txt"),),
-    )
-    m.plan(step, StepContext(request_ids=["a", "b"], graph_walk="w", slot=0, capture=False))
-    plan = m._current_plans[cross_label("vid", "txt")]
-    assert plan.cu_seqlens_q.tolist() == [0, 8, 12]
-    assert plan.cu_seqlens_k.tolist() == [0, 3, 8]
-    assert (plan.max_seqlen_q, plan.max_seqlen_k, plan.causal) == (8, 5, False)
