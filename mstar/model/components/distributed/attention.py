@@ -186,8 +186,9 @@ class ParallelAttention(nn.Module):
         q, k, v = self._project_qkv(hidden_states)
         q, k = self._apply_qk_norm(q, k)
         if self.state is not None:
-            # Here, not through `_attend_state`, whose break in `add` would compile the rotation in a frame of its own.
-            # q and k are views of one projection there, and Inductor refuses aliased inputs to an in-place kernel.
+            # Rotate here rather than in `_attend_state`: the break in the handle's `add` compiles that method as a
+            # frame of its own, whose inputs q and k are views of one projection, and rotating those aliased inputs in
+            # place fails Inductor's `assert_size_stride` at boot.
             q, k = self._rotate_state(q, k)
             self.state.add(self.layer, k=k, v=v)
             attn_output = self.state.read(self.layer, q)
