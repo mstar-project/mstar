@@ -29,6 +29,10 @@ class RaggedAttnBackend(Enum):
     FLASHINFER = "flashinfer"
     # FA3 (AITER on ROCm) varlen; YAML name matches AttnBackend.DENSE
     DENSE = "dense"
+    # torch's cuDNN SDPA over equal-length segments, FlashInfer for any other
+    # layout; self-attention only, and refused at build where cuDNN can't run
+    # the geometry (GQA, a dtype other than bf16 / fp16, a padded head dim)
+    CUDNN = "cudnn"
 
 
 @dataclass(frozen=True)
@@ -77,7 +81,10 @@ class RaggedAttentionConfig:
     max_tokens_per_request: int | None = None
 
     backend: RaggedAttnBackend = RaggedAttnBackend.AUTO
-    flashinfer_backend: str = "auto"
+    # None: under AUTO a self-attention runs the `ragged_attention` kernel
+    # table's pick, and FlashInfer's own "auto" where no table applies. A name,
+    # "auto" included, runs that FlashInfer backend and reads no table.
+    flashinfer_backend: str | None = None
 
     # Whether a compiled caller keeps the attention in its graph, as the
     # ``mstar::ragged_attention`` op, rather than breaking there per layer. For
@@ -99,8 +106,9 @@ class RaggedAttentionConfig:
 
     # Where each label's FlashInfer workspace starts, per slot; None takes
     # MSTAR_WORKSPACE_BUFFER_MB, which a declared size wins over. A floor: a plan that
-    # asks for more grows it. A ragged prefill only spends it on split-KV partials, so a
-    # resource with many labels can declare less.
+    # asks for more grows it. FA3 plans don't use it; FA2 spends it on split-KV
+    # partials, which a captured plan sizes from its bucket's tokens and segment
+    # ceiling, so a resource with many labels can declare less.
     workspace_mb: int | None = None
 
     def __post_init__(self):

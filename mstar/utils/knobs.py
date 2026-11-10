@@ -15,10 +15,10 @@ KNOBS: dict[str, str] = {
     "sampler_slots": "MSTAR_SAMPLER_SLOTS",
     "ingraph_decode_rope": "MSTAR_INGRAPH_DECODE_ROPE",
     "kv_chain_lazy_steps": "MSTAR_KV_CHAIN_LAZY_STEPS",
-    "kv_plan_cache": "MSTAR_KV_PLAN_CACHE",
     "kv_pinned_indptrs": "MSTAR_KV_PINNED_INDPTRS",
     "gc_gen0_threshold": "MSTAR_GC_GEN0_THRESHOLD",
     "pre_plan": "MSTAR_PRE_PLAN_SPEC",
+    "step_threads": "MSTAR_STEP_THREADS",
     "step_thread_core": "MSTAR_STEP_THREAD_CORE",
     "compile_deterministic": "MSTAR_COMPILE_DETERMINISTIC",
     "idle_hold": "MSTAR_IDLE_HOLD",
@@ -51,6 +51,8 @@ def check(settings: Mapping[str, object] | None) -> dict[str, str]:
             out[key] = _idle_hold_value(value)
         elif key == "resident_planning":
             out[key] = _resident_planning_value(value)
+        elif key == "step_threads":
+            out[key] = _step_threads_value(value)
         elif isinstance(value, bool):
             out[key] = "1" if value else "0"
         elif isinstance(value, int):
@@ -60,6 +62,13 @@ def check(settings: Mapping[str, object] | None) -> dict[str, str]:
                 f"`knobs: {key}` must be a bool or an integer, got {value!r}"
             )
     return out
+
+
+def _step_threads_value(value: object) -> str:
+    text = str(value).strip().lower()
+    if text in ("threaded", "serial"):
+        return text
+    raise ValueError(f"`knobs: step_threads` must be threaded or serial, got {value!r}")
 
 
 def _resident_planning_value(value: object) -> str:
@@ -165,18 +174,6 @@ def kv_chain_lazy_steps() -> int:
     return max(1, int(_setting("kv_chain_lazy_steps", "1")))
 
 
-def kv_plan_cache() -> int:
-    """``kv_plan_cache`` / ``MSTAR_KV_PLAN_CACHE`` (default 0): the KV manager
-    plans a leased decode step from the previous step's plan when the batch
-    is the same rows in the same order and nothing but that step's commit
-    touched the streams: lengths advance by one, pages change only where a
-    row crossed a page boundary, and the five index arrays come from numpy
-    instead of a per-row Python pass. ``0`` plans every step from the
-    streams; ``2`` does both and logs any difference (a correctness check for
-    runs)."""
-    return int(_setting("kv_plan_cache", "0"))
-
-
 def kv_pinned_indptrs() -> bool:
     """``kv_pinned_indptrs`` / ``MSTAR_KV_PINNED_INDPTRS`` (default off): the
     KV plan writes FlashInfer's index arrays (qo_indptr, kv_indptr,
@@ -211,6 +208,15 @@ def pre_plan_enabled() -> bool:
     4 layers), where the step is too short to hide the planning in and the
     extra thread is just GIL contention."""
     return _setting("pre_plan", "1") == "1"
+
+
+def step_threads() -> str:
+    """``step_threads`` / ``MSTAR_STEP_THREADS`` (default ``threaded``): where a
+    worker runs a step's host work. ``threaded`` uses its GPU and plan threads;
+    ``serial`` runs that work on the main thread, keeping CPU-GPU overlap and
+    giving up CPU-CPU overlap, which the GIL mostly denies a Python-heavy step
+    anyway."""
+    return _step_threads_value(_setting("step_threads", "threaded"))
 
 
 def step_thread_core() -> str | int:

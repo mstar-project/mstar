@@ -104,8 +104,8 @@ class ConvMetadata:
     token_chunk_offset_ptr: torch.Tensor
 
 
-# Compiled: eager it is a launch per op; pointwise, so dynamic=True costs
-# nothing (unlike a reduction over a symbolic head dim).
+# Compiled: eager it is a launch per op. The caller marks only the token dim
+# dynamic (``compiled``'s ``dynamic_args``), so the head dim stays static.
 def _masked_rows(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     """``x`` with its rows where ``mask`` is 0 zeroed, by select (they can hold inf)."""
     return torch.where(mask[: x.shape[0], None].bool(), x, torch.zeros((), dtype=x.dtype, device=x.device))
@@ -389,7 +389,7 @@ class GDNPrefillWrapper(GDNWrapper):
         # the same mask never sees the tail.
         if self._kernel.masks_padded_tail:
             return out
-        return compiled(_masked_rows, dynamic=True)(out, self._plan_state.token_mask)
+        return compiled(_masked_rows, dynamic_args=(0, 1))(out, self._plan_state.token_mask)
 
     def _save_conv_snapshots(self, x: torch.Tensor, conv_layer: torch.Tensor):
         """A snapshot's conv state is the inputs before its boundary, the

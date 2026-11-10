@@ -349,6 +349,25 @@ def test_a_failed_construction_anywhere_is_a_failure_everywhere(fake_aiter, monk
     assert ca.closed
 
 
+@pytest.mark.parametrize("vote", [0, 1, 2])
+def test_a_vote_that_meets_a_peers_aiter_collective_falls_back(fake_aiter, monkeypatch, vote):
+    """A peer failed partway through AITER's own collectives, so this rank's
+    vote meets one of them and gloo raises. Like FlashInfer's, this stays
+    unfused instead of failing the load."""
+    peers = _Peers()
+
+    def agree(group, values):
+        if len(peers.seen) == vote:
+            raise RuntimeError("gloo: ranks lost sync")
+        return peers(group, values)
+
+    monkeypatch.setattr(ar_fusion, "_agree", agree)
+    monkeypatch.setattr(AiterARFusion, "_check_kernel", staticmethod(lambda *a: None))
+    group = types.SimpleNamespace(rank=0, world_size=2, cpu_group="gloo-group")
+    assert AiterARFusion.create(group, 2048, 4096, BF16) is None
+    assert all(ca.closed for ca in _FakeCA.built) and len(_FakeCA.built) == min(vote, 1)
+
+
 def test_a_disabled_custom_all_reduce_builds_nothing(fake_aiter, monkeypatch):
     real_init = _FakeCA.__init__
 
@@ -467,13 +486,20 @@ def test_the_kernel_check_catches_a_kernel_that_ignores_gemma():
 
 
 def test_the_kernel_check_reports_a_raising_kernel():
+    """A raise on this rank alone (say an OOM) still leaves its peers waiting in
+    the later cases' collectives, so it keeps making those calls."""
     ca = _FakeCA(None, "cpu")
+    real = ca.fused_ar_rms
 
-    def boom(*a, **kw):
-        raise RuntimeError("no kernel for this size")
+    def boom_once(inp, res, **kw):
+        if not ca.calls:
+            ca.calls.append(kw)
+            raise RuntimeError("no kernel for this size")
+        return real(inp, res, **kw)
 
-    ca.fused_ar_rms = boom
+    ca.fused_ar_rms = boom_once
     assert "no kernel" in AiterARFusion._check_kernel(ca, 0, 1, 64, BF16, 8, torch.device("cpu"))
+    assert len(ca.calls) == 4, "1 and 8 rows, gemma on and off"
 
 
 # --- running and capturing ----------------------------------------------------
@@ -593,7 +619,7 @@ def _group_with(monkeypatch, fusion) -> CommGroup:
         fusion.ws_id = len(ar_fusion._FUSIONS)
         ar_fusion._FUSIONS.append(fusion)
     if fusion is not None:
-        group._ar_fusion[(torch.float32, 16)] = ArFusionWorkspace(fusion, 64)
+        group._ar_fusion[(torch.float32, 16)] = ArFusionWorkspace(fusion, 64, torch.zeros(64, 16))
     # stands in for the peer's zero contribution
     monkeypatch.setattr(group, "all_reduce", lambda t: t)
     return group
@@ -621,6 +647,10 @@ def test_the_rest_keep_the_collective_and_a_separate_norm(monkeypatch, weight_bi
     want = want_r * torch.rsqrt(want_r.pow(2).mean(-1, keepdim=True) + 1e-6) * (w + weight_bias)
     torch.testing.assert_close(r, want_r)
     torch.testing.assert_close(normed, want)
+    # the norm without a residual too, though the rows fit the workspace's zeros
+    want = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + 1e-6) * (w + weight_bias)
+    torch.testing.assert_close(group.allreduce_rmsnorm(x, w, 1e-6, weight_bias), want)
+    assert fusion.runs == 0
 
 
 def test_without_a_fusion_capture_scopes_are_plain(monkeypatch):

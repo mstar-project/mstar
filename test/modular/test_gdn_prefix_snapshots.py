@@ -51,6 +51,9 @@ class _StubChains:
     def chain_keys(self, rid, label, pages):
         return [self.chain_key(rid, label, n) for n in range(1, pages + 1)]
 
+    def bind_snapshots(self, pool):
+        del pool
+
 
 def _build(device):
     spec = RecurrentStateSpec(POOL, {"llm"}, RecurrentStateConfig(

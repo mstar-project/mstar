@@ -87,8 +87,8 @@ def gdn_gates(
 
 # The chunked path's elementwise work around its kernels, compiled into one
 # kernel each: run eagerly, it was a dozen launches per layer and about a
-# third of a long prefill's GPU time on Qwen3.5-0.8B. Pointwise only, so
-# dynamic=True costs nothing here (unlike a reduction over a symbolic head dim).
+# third of a long prefill's GPU time on Qwen3.5-0.8B. The callers mark only the
+# token dim dynamic (``compiled``'s ``dynamic_args``), so the head dim stays static.
 def _chunked_gates(
     a: torch.Tensor, b: torch.Tensor,
     a_log: torch.Tensor, dt_bias: torch.Tensor, mask: torch.Tensor,
@@ -362,7 +362,9 @@ class FlashInferPrefill(GDNPrefillKernel):
             # and v by `run_conv`, whose output they are, the gates here. The
             # chunked kernel takes the decay and the learning rate already formed,
             # where the decode kernel takes `a`/`b` raw and forms them itself.
-            alpha, beta = compiled(_chunked_gates, dynamic=True)(a, b, a_log, dt_bias, plan.token_mask)
+            alpha, beta = compiled(_chunked_gates, dynamic_args=(0, 1, 4))(
+                a, b, a_log, dt_bias, plan.token_mask,
+            )
 
         snapshot_args = {}
         if plan.every:

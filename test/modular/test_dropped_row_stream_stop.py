@@ -1,8 +1,9 @@
 """A row that leaves a step (its prepare_inputs, postprocess or check_stop
-raised, or prepare_inputs declined it) must not end its streams on that step.
+raised) must not end its streams on that step, and a row prepare_inputs
+declined on its stream's final chunk must.
 
 ``final_stream_rids`` drives the stream-terminated loop stop in
-``Worker._postprocess_batch``: every rid in it gets its innermost loop stopped,
+``StepExecutor.postprocess``: every rid in it gets its innermost loop stopped,
 and ``Engine.finalize_stopped_requests`` then reads that rid's forward-pass
 info. A dropped row is no longer in the batch, so stopping it raised
 ``KeyError`` there and the main loop failed every request in the batch.
@@ -11,8 +12,8 @@ Also: an ``END_PARTITION`` stop (a prefill that sampled a stop token) reports
 the partition done on the step and never reaches the runtime as a loop name;
 from a row inside a loop it fails the request.
 
-Drives the real ``Engine.prepare_inputs``, ``Worker._drop_failed_rids`` and
-``Worker._postprocess_batch``; the graph runtime and tensor store are stubs
+Drives the real ``Engine.prepare_inputs`` and ``StepPipeline``'s handling of a
+finished step; the graph runtime and tensor store are stubs
 that stop at output routing.
 """
 
@@ -26,15 +27,16 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from mstar.communication.tensors import StoredOutputs  # noqa: E402
-from mstar.engine.chunking import ChunkingManagement  # noqa: E402
-from mstar.engine.engine import Engine, ExecutingBatch  # noqa: E402
+from mstar.engine.engine import ExecutingBatch  # noqa: E402
 from mstar.engine.resources.runner import StepRunner  # noqa: E402
 from mstar.engine.resources.step import StepContext  # noqa: E402
 from mstar.graph.runtime.base import PhasedPostprocess, RouteOutput  # noqa: E402
 from mstar.model.submodule_base import END_PARTITION, BatchedModelOutput, chunk_loop_name  # noqa: E402
+from mstar.testing_utils.engine import make_engine, make_mgmt  # noqa: E402
+from mstar.testing_utils.worker import make_worker  # noqa: E402
 from mstar.worker.chunk_loops import ChunkLoops  # noqa: E402
 from mstar.worker.micro_scheduler import ScheduledBatch  # noqa: E402
-from mstar.worker.worker import PendingBatch, Worker  # noqa: E402
+from mstar.worker.step_executor import PendingBatch  # noqa: E402
 
 NODE, WALK, LOOP = "vocoder", "w", "stream_loop"
 
@@ -92,6 +94,9 @@ class _Runtime(PhasedPostprocess):
     def clear_pending_loop_stops(self):
         pass
 
+    def get_rid_string(self, rid):
+        return rid
+
     def mark_partition_done(self, rid, partition):
         self.partition_done.append(rid)
 
@@ -115,12 +120,7 @@ class _Runtime(PhasedPostprocess):
 
 
 def _engine(sub):
-    eng = Engine.__new__(Engine)
-    eng._submodules = {NODE: SimpleNamespace(submodule=sub, resources={})}
-    eng._enable_nvtx = False
-    eng._loopback_steps = {}
-    eng._chunking = ChunkingManagement(eng._submodules)
-    eng._runner = StepRunner({})
+    eng = make_engine(_submodules={NODE: make_mgmt(sub)}, _runner=StepRunner({}))
     return eng
 
 
@@ -139,38 +139,37 @@ def _batch(rids, streams=True):
     )
 
 
-def _worker(eng, runtime, in_loop=True, through_send=False, loop=LOOP):
+def _worker(eng, runtime, rids, in_loop=True, through_send=False, loop=LOOP, chunk_loop=False):
     def _store(rids, outputs, signals, **k):
         if not through_send:
             raise _ReachedRoutingError
         return StoredOutputs([], [], [], [0] * (len(rids) * len(signals)))
 
-    w = Worker.__new__(Worker)
-    w._phase_period = 0
-    w._stop_token_signal = {}  # no declared stop policies: check_stop decides
-    w._walk_drivers = {}  # no producer-driven walk transitions here
-    w._walk_driven_edges = {}
-    w.enable_nvtx = False
-    w.enable_prof = False
-    w.device = torch.device("cpu")
-    w._graph_runtime = runtime
-    w.scheduler = SimpleNamespace(failed_rids=set())
-    w.tensor_manager = SimpleNamespace(
-        cleanup_collectable=lambda *a: None,
-        store_and_return_tensor_info_batch=_store,
-        drop_host_copies=lambda: None,
-        dereference_batch_uniform=lambda uuids: None,
+    reported: dict[int, str] = {}
+    w = make_worker(
+        device=torch.device("cpu"),
+        graph_runtime=runtime,
+        communicator=SimpleNamespace(send=lambda entity, msg: reported.update(msg.body.errors)),
+        tensor_manager=SimpleNamespace(
+            get_tensor=None,
+            cleanup_collectable=lambda *a: None,
+            store_and_return_tensor_info_batch=_store,
+            drop_host_copies=lambda: None,
+            dereference_batch_uniform=lambda uuids: None,
+        ),
+        streams=SimpleNamespace(assign_consumer_walks=lambda batch: None),
+        engine_manager=SimpleNamespace(get_engine=lambda n: eng),
+        request_state=SimpleNamespace(
+            buffer_publish_info=lambda *a: None, flush_publish_info=lambda *a: None,
+            get_fwd_info=lambda rid, partition: None,
+            get_pending_publish_info=lambda rid, partition: {},
+        ),
+        innermost_loop_by_node={(WALK, NODE): loop} if in_loop else {},
+        chunk_loops=ChunkLoops({(NODE, WALK)}) if chunk_loop else ChunkLoops(),
     )
-    w.streams = SimpleNamespace(consumption_batch=lambda rids: [])
-    w.engine_manager = SimpleNamespace(get_engine=lambda n: eng)
-    w._innermost_loop_by_node = {(WALK, NODE): loop} if in_loop else {}
-    w.reported: dict[int, str] = {}
-    w._fail_requests = w.reported.update
-    w.request_state = SimpleNamespace(
-        buffer_publish_info=lambda *a: None, flush_publish_info=lambda *a: None,
-        get_fwd_info=lambda rid, partition: None,
-        get_pending_publish_info=lambda rid, partition: {},
-    )
+    w.reported = reported
+    for rid in rids:
+        w.lifecycle.add(rid, rid)
     return w
 
 
@@ -178,21 +177,19 @@ def _postprocess(
     sub, rids=(1, 2), pending_stops=(), cached=(), chunk_loop=False,
     streams=True, in_loop=True, through_send=False, loop=LOOP,
 ):
-    """What ``Worker.run`` does with a finished step: drop and report the rows
-    a per-rid stage failed, then postprocess the rest. ``pending_stops`` makes
+    """What the pipeline does with a finished step: drop and report the rows a
+    per-rid stage failed, then postprocess the rest. ``pending_stops`` makes
     the step a speculative new loop iteration whose rows in it already
     stopped a step earlier."""
     eng, runtime = _engine(sub), _Runtime(pending_stops)
     batch = _batch(rids, streams)
-    eng.prepare_inputs(batch)
-    # rows the prefix cache served whole: declined by prepare, kept by postprocess
+    # rows the prefix cache served whole: noted, then declined, by prepare; kept by postprocess
     batch.cached_rids = set(cached)
+    eng.prepare_inputs(batch)
     outputs = BatchedModelOutput(per_rid_outputs={
         r: {"audio": [torch.zeros(1)]} for r in batch.request_ids
     })
-    w = _worker(eng, runtime, in_loop, through_send, loop)
-    if chunk_loop:
-        w.chunk_loops = ChunkLoops({(NODE, WALK)})
+    w = _worker(eng, runtime, rids, in_loop, through_send, loop, chunk_loop)
     pending = PendingBatch(
         batch=ScheduledBatch(
             node_name=NODE, graph_walk=WALK,
@@ -203,14 +200,14 @@ def _postprocess(
         loop_name=LOOP,
     )
     if batch.failed_requests:
-        failed = dict(batch.failed_requests)
-        w._drop_failed_rids(pending, outputs, failed)
-        w._fail_requests(failed)
+        w.pipeline._fail_step_rows(pending, outputs)
     if through_send:
-        w._postprocess_batch(pending, outputs)
+        w.pipeline._finish_step(pending, outputs)
     else:
         with pytest.raises(_ReachedRoutingError):
-            w._postprocess_batch(pending, outputs)
+            w.pipeline._finish_step(pending, outputs)
+        # the stub cut the step off before its own report of what the stop check failed
+        w.pipeline._report_failures()
     return batch, runtime, w
 
 
@@ -228,10 +225,14 @@ def test_a_failed_prepare_inputs_row_does_not_fail_the_batch():
     assert set(w.reported) == {2}
 
 
-def test_a_declined_row_is_not_stopped():
-    batch, runtime, _ = _postprocess(_Sub(skip={2}))
-    assert runtime.stopped == [1]
-    assert 2 not in batch.final_stream_rids
+def test_a_row_that_declines_its_final_chunk_still_ends_its_streams():
+    # no dummy forward is needed to end the loop on an empty final chunk
+    batch, runtime, w = _postprocess(_Sub(skip={2}))
+    assert sorted(runtime.stopped) == [1, 2]
+    assert not w.reported
+    assert batch.request_ids == [1]
+    assert batch.final_stream_rids == {1, 2}
+    assert batch.partition_done_rids == {1, 2}
 
 
 def test_a_failed_check_stop_row_does_not_fail_the_batch():
@@ -260,7 +261,7 @@ def test_a_cache_served_row_ends_its_chunk_loop_without_publishing():
     batch, runtime, w = _postprocess(_Sub(skip={2}), cached={2}, chunk_loop=True)
     served = ScheduledBatch(
         node_name=NODE, graph_walk=WALK, request_to_worker_graph={2: 0},
-        chunk_loop_walks=w.chunk_loops.walks_by_node[NODE],
+        chunk_loop_walks=w.layout.chunk_loops.walks_by_node[NODE],
     )
     assert served.loop_strides([2]) == [CHUNK_LOOP_END], "the served row's loop still ends"
     assert runtime.stopped == [1], "by its stride, not a stop"

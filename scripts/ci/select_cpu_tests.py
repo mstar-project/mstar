@@ -23,6 +23,8 @@ CPU_TEST_PATHS = (
     "benchmark/worker_phases",
 )
 NOT_CPU_CORE = {
+    "mstar_sim/tests": "opt-in emulator tests, not CI: python -m pytest mstar_sim/tests",
+    "mstar_sim/audits": "opt-in emulator compatibility audit: python -m pytest mstar_sim/audits",
     "test/ci": "the build job runs it with unittest, without PyTorch",
     "test/rust": "the rust-transport job runs it against the built mstar_rust extension",
     "test/integration": "needs a GPU and real weights; skips without the checkpoint",

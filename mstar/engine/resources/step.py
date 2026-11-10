@@ -2,6 +2,7 @@
 from collections.abc import Callable, Collection, KeysView, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
+from itertools import combinations
 from typing import Any, ClassVar, NamedTuple
 
 # The graph walk on a piecewise region's step context: the region declares, plans and
@@ -37,10 +38,23 @@ class BucketKey:
     num_tokens: int
     # Matches additional_key_info in CudaGraphConfig
     cg_key_info: Any | None = None
+    # the keys of the resources this capture leaves running lean
+    # (`Resource.lean_capture`); empty for the plain bucket every step can replay
+    lean: frozenset[str] = frozenset()
 
     def __str__(self) -> str:
         key = "" if self.cg_key_info is None else f",key={self.cg_key_info}"
-        return f"{self.graph_walk}[bs={self.bs},tokens={self.num_tokens}{key}]"
+        lean = f",lean={'+'.join(sorted(self.lean))}" if self.lean else ""
+        return f"{self.graph_walk}[bs={self.bs},tokens={self.num_tokens}{key}{lean}]"
+
+
+def lean_subsets(keys: Sequence[str]) -> tuple[frozenset[str], ...]:
+    """The non-empty subsets of ``keys``, largest first, those of one size in the
+    order of ``keys``: the lean twins a step that leaves all of ``keys`` lean may
+    replay, in the order it tries them."""
+    return tuple(
+        frozenset(subset) for size in range(len(keys), 0, -1) for subset in combinations(keys, size)
+    )
 
 
 @dataclass(frozen=True)
@@ -132,6 +146,13 @@ class StepContext:
     # reserve them now (``ChunkingPolicy.reserve_whole_prefill``). Check it
     # before reserving by ``chunk_tokens_after``.
     reserve_whole_prefill: PerReqSetting = ALL_SET
+    # rows that recompute KV their request already had: the step throws their
+    # samples away, and they change no per-request state but the KV
+    rebuild_rids: frozenset[int] = frozenset()
+    # the keys of the resources that run lean this step: its lease's
+    # (`BucketKey.lean`), or for an eager step those whose `lean_for` holds for
+    # every row. Set by the engine; a piecewise region's step takes its bucket's.
+    lean: frozenset[str] = frozenset()
 
     def walk_of(self, rid: int) -> str:
         return self.request_walks.get(rid, self.graph_walk)
@@ -288,6 +309,8 @@ class FullAdmitOutcome(NamedTuple):
     failed_resource: str | None = None
     # waits for capacity on its node, until `StepRunner.admit_waiting` admits it
     queued: bool = False
+    # dropped on its node: not ready until a rebuild from its token ids lands
+    rebuild: bool = False
 
     @property
     def ok(self) -> bool:
@@ -306,3 +329,4 @@ FULL_ADMIT_OK = FullAdmitOutcome(ADMIT_OK)
 # admitted, but something it needs has not landed yet: retry, don't fail
 FULL_ADMIT_NOT_READY = FullAdmitOutcome(AdmitOutcome(ok=True, ready=False))
 FULL_ADMIT_QUEUED = FullAdmitOutcome(AdmitOutcome(ok=True, ready=False), queued=True)
+FULL_ADMIT_REBUILD = FullAdmitOutcome(AdmitOutcome(ok=True, ready=False), rebuild=True)

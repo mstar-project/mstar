@@ -72,11 +72,11 @@ def test_configs_carry_the_field():
 
 @pytest.fixture
 def fresh_deterministic_check():
-    from mstar.engine import accelerator_graph_runner
+    from mstar.platforms import compile as platform_compile
 
-    accelerator_graph_runner._has_deterministic_mode.cache_clear()
+    platform_compile._has_deterministic_mode.cache_clear()
     yield
-    accelerator_graph_runner._has_deterministic_mode.cache_clear()
+    platform_compile._has_deterministic_mode.cache_clear()
 
 
 @pytest.mark.parametrize("build", [_batched, _piecewise])
@@ -96,11 +96,11 @@ def test_a_torch_without_the_deterministic_mode_says_so(monkeypatch, caplog, fre
 
     import torch._inductor.config as inductor_config
 
-    from mstar.engine.accelerator_graph_runner import deterministic_inductor_options
+    from mstar.platforms.compile import deterministic_inductor_options
 
     if hasattr(inductor_config, "deterministic"):
         monkeypatch.delattr(inductor_config, "deterministic")
-    with caplog.at_level(logging.WARNING, logger="mstar.engine.accelerator_graph_runner"):
+    with caplog.at_level(logging.WARNING, logger="mstar.platforms.compile"):
         assert deterministic_inductor_options() == {}
         assert compile_kwargs("deterministic") == {"fullgraph": False, "dynamic": False}
     assert caplog.text.count("has no Inductor deterministic mode") == 1
@@ -133,3 +133,53 @@ def test_select_last_hidden_compiles_no_frame_per_prefill_bucket(manager_cls, pl
                     assert torch.equal(compiled(hidden), head(hidden[qo[1:].long() - 1]))
     finally:
         torch._dynamo.reset()
+
+
+def test_inductor_options_are_checked_at_build():
+    with pytest.raises(ValueError, match="no Inductor config entry"):
+        BatchedAcceleratorGraphConfig(
+            capture_graph_walk="decode", single_request_inputs=NodeInputs(input_seq_len=1),
+            inductor_options={"no_such_option": True},
+        )
+    with pytest.raises(ValueError, match="CUDA graphs"):
+        BatchedAcceleratorGraphConfig(
+            capture_graph_walk="decode", single_request_inputs=NodeInputs(input_seq_len=1),
+            inductor_options={"triton.cudagraphs": True},
+        )
+    config = BatchedAcceleratorGraphConfig(
+        capture_graph_walk="decode", single_request_inputs=NodeInputs(input_seq_len=1),
+        inductor_options={"max_autotune_gemm_backends": "ATEN"},
+    )
+    assert config.inductor_options == {"max_autotune_gemm_backends": "ATEN"}
+
+
+def test_inductor_options_go_over_the_modes_own():
+    # torch.compile takes a mode or options, not both: the mode becomes its option set
+    from torch._inductor import list_mode_options
+
+    pinned = {"max_autotune_gemm_backends": "ATEN"}
+    kwargs = compile_kwargs("max-autotune-no-cudagraphs", pinned)
+    assert "mode" not in kwargs
+    assert kwargs["options"] == {**list_mode_options("max-autotune-no-cudagraphs"), **pinned}
+    # without options the mode passes through untouched
+    assert compile_kwargs("max-autotune-no-cudagraphs", None) == compile_kwargs("max-autotune-no-cudagraphs")
+    assert compile_kwargs("default", pinned)["options"] == pinned
+
+
+@pytest.mark.parametrize("level", ["0", "1", "2"])
+def test_inductor_options_go_over_the_compile_level(monkeypatch, level):
+    from torch._inductor import list_mode_options
+
+    from mstar.engine import accelerator_graph_runner as runner
+
+    monkeypatch.setenv("MSTAR_COMPILE_LEVEL", level)
+    runner.compile_level.cache_clear()
+    try:
+        plain = compile_kwargs(None)
+        kwargs = compile_kwargs(None, {"max_autotune_gemm_backends": "ATEN"})
+    finally:
+        runner.compile_level.cache_clear()
+    want = dict(list_mode_options(plain["mode"])) if "mode" in plain else {}
+    want.update(plain.get("options", {}))
+    want["max_autotune_gemm_backends"] = "ATEN"
+    assert "mode" not in kwargs and kwargs["options"] == want
