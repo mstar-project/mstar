@@ -36,7 +36,7 @@ from typing import TYPE_CHECKING
 from mstar.api_server import media_io
 from mstar.api_server.openai import glm_chat
 from mstar.api_server.openai.speech_chunking import _cut_evenly, split_sentences
-from mstar.model.multimodal import PromptPart
+from mstar.model.multimodal import GLM_TEMPLATE_KWARGS, PromptPart
 from mstar.model.qwen3_asr.constants import ASR_TEXT_TAG
 from mstar.model.registry import qwen_3_5_dense_sizes as QWEN_3_5_DENSE_SIZES
 from mstar.model.whisper.config import WORDS_MARKER
@@ -1775,8 +1775,8 @@ class GlmChatAdapter(TextChatAdapter):
         template_kwargs = mk.pop("chat_template_kwargs", None) or {}
         if not isinstance(template_kwargs, dict):
             raise ValueError("chat_template_kwargs must be an object")
-        template_kwargs = {k: v for k, v in template_kwargs.items() if k in glm_chat.TEMPLATE_KWARGS}
-        for key in glm_chat.TEMPLATE_KWARGS:
+        template_kwargs = {k: v for k, v in template_kwargs.items() if k in GLM_TEMPLATE_KWARGS}
+        for key in GLM_TEMPLATE_KWARGS:
             if key in mk:
                 template_kwargs.setdefault(key, mk.pop(key))
         return tools, template_kwargs

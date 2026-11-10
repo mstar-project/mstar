@@ -8,7 +8,6 @@ from types import MappingProxyType
 
 import torch
 
-from mstar.api_server.openai.glm_chat import TEMPLATE_KWARGS
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import FINAL_PREFILL
 from mstar.engine.resources import (
@@ -47,7 +46,7 @@ from mstar.model.glm52.config import (
     SAMPLER_RESOURCE,
     Glm52ModelConfig,
 )
-from mstar.model.multimodal import PromptPart, render_chat_template
+from mstar.model.multimodal import GLM_TEMPLATE_KWARGS, PromptPart, render_chat_template
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.utils import (
     ByteLevelTextOutput,
@@ -386,7 +385,7 @@ class Glm52Model(ByteLevelTextOutput, Model):
             byte_ids = [min(b, vocab - 1) for b in prompt.encode("utf-8")] or [0]
             input_ids = torch.tensor(byte_ids, dtype=torch.long)
         elif getattr(self.tokenizer, "chat_template", None):
-            input_ids = render_chat_template(self.tokenizer, prompt, prompt_parts, kwargs, TEMPLATE_KWARGS)
+            input_ids = render_chat_template(self.tokenizer, prompt, prompt_parts, kwargs, GLM_TEMPLATE_KWARGS)
         else:
             input_ids = self.tokenizer(prompt, return_tensors="pt").input_ids[0]
 
