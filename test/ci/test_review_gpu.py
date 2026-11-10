@@ -883,7 +883,7 @@ class TestEras(unittest.TestCase):
 
         def rest(log, seen):
             path = Path(tempfile.mkdtemp(), "progress.log")
-            path.write_text(log)
+            path.write_bytes(log if isinstance(log, bytes) else log.encode())
             printed = io.StringIO()
             with contextlib.redirect_stdout(printed):
                 gpu_review.show_rest(path, seen)
@@ -892,6 +892,10 @@ class TestEras(unittest.TestCase):
                          "once the box ends, what the polls didn't print would be lost, the last line too")
         self.assertEqual(rest("09:00 a\n09:01 b\n09:02 c", 2), ['"09:02 c"'], "a line would be printed twice")
         self.assertEqual(len(rest(many * 2, 0)), gpu_review.PROGRESS_REST)
+        self.assertEqual(rest(b"09:00 a 50%\r100%\n09:01 b\n09:02 c", 2), ['"09:02 c"'],
+                         "a progress bar's \\r would split a line, and lines already printed would be printed again")
+        self.assertEqual(rest("09:00 a\n", 5), ['"09:00 a"'], "a log rewritten shorter would print nothing")
+        self.assertEqual(len(rest("x" * 100000 + "\n09:01 b\n", 0)), 2, "one long line would swallow the next")
 
     def test_a_box_that_left_no_results_reports_the_platforms_reason(self):
         run = {"status": "failed", "failure": {"code": "launch_refused",
