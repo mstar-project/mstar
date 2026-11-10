@@ -122,3 +122,28 @@ def test_a_transition_into_the_loop_starts_at_its_first_iteration():
 
     assert spec.node_batch.per_request_info_wrapped[1].dynamic_loop_iter_counts == {LOOP: 0}
     assert spec.is_new_iter is False
+
+
+def test_a_step_left_with_only_another_walks_rows_routes_that_walks_signals():
+    """The chain's own decode rows all ended at N and only prompt rows joined
+    (one mid-prefill, new ones): the step is a ``prefill_text`` step, and it
+    routes that walk's outputs. Routing decode's loop-back token instead sent
+    each prompt's first token to neither the client (an empty 200 for
+    ``max_tokens: 1``) nor its first decode step (an IndexError)."""
+    shared = {1: _info(1, 0), 2: _info(2, 0)}
+    ctx = _context(shared)
+    signals = {"decode": ("text_inputs",), "prefill_text": ("new_token",)}
+    ctx.graph_runtime.get_output_signals = lambda node, walk: signals[walk]
+    decode = SpeculationOutput(
+        node_name="LLM", graph_walk="decode", is_new_loop_iter=True, loop_name="decode_loop",
+        output_signals=signals["decode"],
+    )
+
+    spec = SpeculationBuilder(ctx).assemble(
+        SimpleNamespace(node_name="LLM", graph_walk="mixed", partition=PARTITION),
+        decode, {1: 0, 2: 0}, {1: {}, 2: {}}, {}, [], {},
+        is_same_node=True, request_walks={1: "prefill_text", 2: "prefill_text"},
+    )
+
+    assert spec.scheduled_batch.graph_walk == "prefill_text"
+    assert tuple(spec.scheduled_batch.output_signals) == ("new_token",)
