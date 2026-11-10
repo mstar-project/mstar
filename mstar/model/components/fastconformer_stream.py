@@ -27,6 +27,8 @@ bounded KV (``encoder_kv_config``).
 """
 from __future__ import annotations
 
+import dataclasses
+
 import torch
 import torch.nn.functional as F
 
@@ -169,9 +171,10 @@ class FastConformerStreamSubmodule(NodeSubmodule):
 
     Used by Nemotron VoiceChat's duplex model and by Nemotron ASR's live walks.
     ``config`` is the stream's encoder config, the one its resources are built
-    from: the encoder's own, or the encoder's at a narrower lookahead, which
-    sets the stream's chunk while the offline node keeps the encoder's
-    (Nemotron ASR streams at 3 and hears clips at 13).
+    from: the encoder's own (the default), or the encoder's at another
+    lookahead, which sets the stream's chunk while the offline node keeps the
+    encoder's (Nemotron ASR streams at 3 and hears clips at 13); any other
+    difference is refused.
     Construction refuses ``normalize=True``: a per-clip normalization can't be
     streamed. A stream's audio comes one chunk per step: its client stream cuts
     it on ``chunk_samples``, and only the first and last chunks can differ.
@@ -191,10 +194,10 @@ class FastConformerStreamSubmodule(NodeSubmodule):
     def __init__(
         self,
         encoder: FastConformerEncoder,
-        config: FastConformerConfig,
         log_mel: NemoLogMel,
         projection: torch.nn.Module | None,
         *,
+        config: FastConformerConfig | None = None,
         input_edge: str,
         output_edge: str,
         front_key: str,
@@ -202,7 +205,10 @@ class FastConformerStreamSubmodule(NodeSubmodule):
         item_per_step: bool = False,
     ):
         super().__init__()
-        c = config
+        c = encoder.config if config is None else config
+        if dataclasses.replace(c, lookahead=encoder.config.lookahead) != encoder.config:
+            raise ValueError(f"a stream's encoder config may differ from its encoder's only in lookahead; "
+                             f"got {c} for an encoder of {encoder.config}")
         frame_samples = log_mel.hop_length * c.subsampling_factor
         unsupported = {
             name: value for name, value, ok in (

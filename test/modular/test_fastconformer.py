@@ -360,10 +360,12 @@ def test_replay_plan_covers_every_row_and_merges_short_clips():
 KV, CONV, FRONT = "encoder_kv", "encoder_state", "encoder_front"
 
 
-def _stream_node(n_fft=512, win_length=400, lookahead=0, normalize=False, reflect_edges=True, stream_lookahead=None):
+def _stream_node(n_fft=512, win_length=400, lookahead=0, normalize=False, reflect_edges=True, stream_lookahead=None,
+                 **stream_config):
     """The stream node over a shrunk causal [6, lookahead] encoder with random
     weights (the same at any lookahead) and a featurizer with random filters,
-    NeMo's pre-2.5 convention; ``stream_lookahead`` streams narrower."""
+    NeMo's pre-2.5 convention; ``stream_lookahead`` streams narrower, and
+    ``stream_config`` overrides more of the stream's config."""
     torch.manual_seed(0)
     config = FastConformerConfig(
         hidden_size=64, num_heads=4, num_layers=3, intermediate_size=256, num_mel_bins=32, subsampling_channels=8,
@@ -379,9 +381,10 @@ def _stream_node(n_fft=512, win_length=400, lookahead=0, normalize=False, reflec
         mel_filters=torch.rand(32, n_fft // 2 + 1),
     )
     if stream_lookahead is not None:
-        config = dataclasses.replace(config, lookahead=stream_lookahead)
+        stream_config["lookahead"] = stream_lookahead
+    config = dataclasses.replace(config, **stream_config)
     return FastConformerStreamSubmodule(
-        enc.eval(), config, log_mel, proj.eval(), input_edge="audio_in", output_edge="audio_frame",
+        enc.eval(), log_mel, proj.eval(), config=config, input_edge="audio_in", output_edge="audio_frame",
         front_key=FRONT, batch_sizes=[1, 2, 4, 8, 16, 32],
     )
 
@@ -819,10 +822,11 @@ def test_encoder_takes_no_batch_wider_than_its_graphs():
     assert engine.get_max_batch_size("conformer_encoder", "encode") == max(node.capture_batch_sizes)
 
 
-@pytest.mark.parametrize("unsupported", [dict(normalize=True), dict(n_fft=2048)])
+@pytest.mark.parametrize("unsupported", [dict(normalize=True), dict(n_fft=2048), dict(left_context=2)])
 def test_encoder_refuses_what_it_cannot_stream(unsupported):
-    """A per-clip normalization or a window longer than the samples the front
-    end keeps are refused when the node is built, not met as wrong frames
+    """A per-clip normalization, a window longer than the samples the front
+    end keeps, or a stream config that is not its encoder's but for the
+    lookahead are refused when the node is built, not met as wrong frames
     mid-stream."""
     with pytest.raises(ValueError, match=next(iter(unsupported))):
         _stream_node(**unsupported)
