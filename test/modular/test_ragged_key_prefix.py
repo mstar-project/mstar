@@ -87,6 +87,11 @@ def test_layout_packs_each_segments_key_prefix():
     assert index.tolist() == [0, 1, 4, 5, 6]
 
 
+def test_layout_pads_the_index_with_row_zero():
+    _, index = key_prefix_layout([4, 3], [2, 3], rows=8)
+    assert index.tolist() == [0, 1, 4, 5, 6, 0, 0, 0]
+
+
 @pytest.mark.parametrize(("spans", "key_lens"), [([4], [5]), ([4], [0]), ([4, 2], [1])])
 def test_layout_refuses_keys_outside_their_segment(spans, key_lens):
     with pytest.raises(ValueError):
@@ -145,9 +150,21 @@ def capture(w, spans, key_lens):
     return graph, static, out
 
 
+def dense_wrapper(**overrides):
+    from mstar.engine.resources.attn.ragged.dense_wrappers import DenseKeyPrefixPrefillWrapper
+
+    kwargs = dict(num_qo_heads=HEADS, num_kv_heads=HEADS, head_dim=HEAD_DIM, device=DEVICE, q_data_type=DTYPE)
+    kwargs.update(overrides)
+    try:
+        return DenseKeyPrefixPrefillWrapper(**kwargs)
+    except (ImportError, RuntimeError) as e:
+        pytest.skip(f"no FA3 varlen kernel here: {e}")
+
+
 @cuda
-def test_graph_replay_matches_reference_across_changing_layouts():
-    w = wrapper(max_num_segments=MAX_SEGMENTS, max_total_tokens=MAX_TOKENS, accelerator_graph=True)
+@pytest.mark.parametrize("make", [wrapper, dense_wrapper], ids=["flashinfer", "fa3"])
+def test_graph_replay_matches_reference_across_changing_layouts(make):
+    w = make(max_num_segments=MAX_SEGMENTS, max_total_tokens=MAX_TOKENS, accelerator_graph=True)
     graph, static, out = capture(w, [MAX_TOKENS], [MAX_TOKENS])
     for i, (spans, key_lens) in enumerate(list(LAYOUTS.values()) * 2):
         total = sum(spans)
@@ -191,6 +208,11 @@ def step(spans, key_lens, label="main"):
 def test_plan_then_run_matches_reference(backend):
     spans, key_lens = LAYOUTS["two_masked_and_none"]
     m = manager(backend)
+    if backend is RaggedAttnBackend.DENSE:
+        from mstar.engine.resources.attn.ragged.dense import DenseRaggedKeyPrefixManager
+
+        if not isinstance(m, DenseRaggedKeyPrefixManager):
+            pytest.skip("no FA3 varlen kernel here; the factory built FlashInfer")
     m.plan(step(spans, key_lens), ctx(len(spans)))
     q, k, v = qkv(sum(spans))
     close(m.run(q, k, v), ref(q, k, v, spans, key_lens))
