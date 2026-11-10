@@ -341,6 +341,20 @@ def test_none_in_a_field_with_a_non_none_default_survives():
     assert out.top_p == 1
 
 
+def test_a_sampler_config_s_grammar_survives():
+    from mstar.engine.resources.sampler.config import SamplingReqConfig
+    from mstar.engine.resources.sampler.grammar import GrammarRequest
+
+    grammar = GrammarRequest("json", '{"type": "object"}', after="</think>")
+    fi = _fwd_info()
+    fi.resource_configs = {"sampler": SamplingReqConfig(grammar=grammar)}
+    msg = WorkerMessage(
+        message_type=WorkerMessageType.INPUT_SIGNALS,
+        body=InputSignals(request_id="r", partition_name="p", request_info=fi, inputs=[]),
+    )
+    assert roundtrip(msg).body.request_info.resource_configs["sampler"].grammar == grammar
+
+
 def test_non_mstar_types_are_refused_rather_than_imported_from_the_wire():
     from dataclasses import dataclass
 

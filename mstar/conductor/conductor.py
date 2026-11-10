@@ -712,6 +712,15 @@ class Conductor:
             )
         return built
 
+    def _split_by_walk(self, resource_key: str) -> bool:
+        """Whether a node of this resource runs its walks on more than one group
+        (``graph_walks`` in ``node_groups``: a prefill/decode split)."""
+        spec = next((s for s in self._node_resources() if s.resource_key == resource_key), None)
+        if spec is None:
+            return False
+        groups = (getattr(self, "model_config", None) or {}).get("node_groups") or []
+        return sum(bool(set(g.get("node_names") or ()) & spec.nodes and g.get("graph_walks")) for g in groups) > 1
+
     def _streamed_partitions(self) -> frozenset[str]:
         streamed = getattr(self, "_streamed_partitions_cache", None)
         if streamed is None:
@@ -781,6 +790,10 @@ class Conductor:
                     "`resources: {<text sampler>: {enable_grammar: true}}`" if not constrained else
                     "structured_outputs is on for more than one sampler; enable_grammar belongs on the text sampler only"
                 )
+            key = next(k for k, cfg in configs.items() if getattr(cfg, "grammar", None) is not None)
+            if self._split_by_walk(key):
+                # the prefill worker's first draw would never reach the decode worker's matcher
+                raise ValueError("structured_outputs is not served on a deployment that splits prefill and decode")
         lora_ops = getattr(self, "_lora_ops_cache", None)
         if lora_ops is not None:
             lora_ops.refuse_request(configs.values())

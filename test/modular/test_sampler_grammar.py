@@ -11,7 +11,8 @@ import torch
 
 pytest.importorskip("xgrammar")
 
-from mstar.api_server.openai.adapters import _refuse_unserved_chat  # noqa: E402
+from mstar.api_server.openai.adapters import _constrain_after_thinking, _refuse_unserved_chat  # noqa: E402
+from mstar.conductor.conductor import Conductor  # noqa: E402
 from mstar.engine.resources.sampler import utils  # noqa: E402
 from mstar.engine.resources.sampler.config import SamplerSpec, SamplerStep, SamplingReqConfig  # noqa: E402
 from mstar.engine.resources.sampler.grammar import grammar_request  # noqa: E402
@@ -116,16 +117,6 @@ def test_a_bad_grammar_is_refused(value, error):
         grammar_request(value)
 
 
-def test_the_text_sampler_takes_the_grammar_into_the_model_s_config():
-    spec = SamplerSpec(resource_key="sampler", nodes={"lm"}, vocab_size=V)
-    kwargs = {"structured_outputs": {"regex": "a+"}}
-    assert spec.request_config(kwargs, SamplingReqConfig()) is None, "served without enable_grammar"
-    spec.apply_yaml_overrides(enable_grammar=True)
-    merged = spec.request_config(kwargs, SamplingReqConfig(temperature=0.2))
-    assert merged.temperature == 0.2 and merged.grammar.kind == "regex"
-    assert spec.request_config({}, SamplingReqConfig()) is None
-
-
 @pytest.mark.parametrize("response_format, want", [
     ({"type": "json_object"}, {"json_object": True}),
     ({"type": "json_schema", "json_schema": {"name": "n", "schema": SCHEMA}}, {"json": SCHEMA}),
@@ -135,3 +126,37 @@ def test_a_chat_response_format_becomes_structured_outputs(response_format, want
     mk = {"response_format": response_format}
     _refuse_unserved_chat(SimpleNamespace(n=None, stop=None), mk)
     assert mk.get("structured_outputs") == want and "response_format" not in mk
+
+
+@pytest.mark.parametrize("mk, after", [
+    ({"structured_outputs": {"json_object": True}}, "</think>"),
+    ({"structured_outputs": {"json_object": True}, "enable_thinking": False}, None),
+    ({"structured_outputs": {"json_object": True, "after": "<answer>"}}, "<answer>"),
+])
+def test_a_qwen_thinking_turn_starts_its_grammar_after_the_think_block(mk, after):
+    _constrain_after_thinking(mk)
+    assert mk["structured_outputs"].get("after") == after
+
+
+def _conductor(enable_grammar: bool, node_groups=()):
+    """The conductor's intake: there a ValueError is the client's 400."""
+    spec = SamplerSpec(resource_key="sampler", nodes={"LLM"}, vocab_size=V, enable_grammar=enable_grammar)
+    conductor = Conductor.__new__(Conductor)
+    conductor.model = SimpleNamespace(
+        get_request_resource_configs=lambda i, o, kw: {"sampler": SamplingReqConfig(temperature=0.3)})
+    conductor.model_config = {"node_groups": list(node_groups)}
+    conductor._kv_labels = {}
+    conductor._node_resources_cache = [spec]
+    return conductor
+
+
+def test_the_conductor_serves_structured_outputs_only_where_a_whole_sampler_enables_it():
+    kwargs = {"structured_outputs": {"regex": "a+"}}
+    with pytest.raises(ValueError, match="enable_grammar: true"):
+        _conductor(False)._get_resource_configs(["text"], ["text"], kwargs)
+    config = _conductor(True)._get_resource_configs(["text"], ["text"], kwargs)["sampler"]
+    assert config.temperature == 0.3 and config.grammar.kind == "regex", "the model's own config was dropped"
+    pd = [{"node_names": ["LLM"], "ranks": [0], "graph_walks": ["prefill"]},
+          {"node_names": ["LLM"], "ranks": [1], "graph_walks": ["decode"]}]
+    with pytest.raises(ValueError, match="splits prefill and decode"):
+        _conductor(True, pd)._get_resource_configs(["text"], ["text"], kwargs)

@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -50,6 +51,9 @@ class GrammarRequest:
     value: str
     after: str | None = None
 
+    def _regex(self) -> str:
+        return "|".join(_regex_escape(c) for c in json.loads(self.value))
+
     def grammar(self):
         """The xgrammar ``Grammar``; tokenizer-free, so it checks the request
         anywhere. ``ValueError`` names what is unsupported."""
@@ -59,14 +63,21 @@ class GrammarRequest:
                 return xgr.Grammar.from_json_schema(self.value)
             if self.kind == "json_object":
                 return xgr.Grammar.builtin_json_grammar()
-            if self.kind == "regex":
-                return xgr.Grammar.from_regex(self.value)
-            if self.kind == "choice":
-                choices = json.loads(self.value)
-                return xgr.Grammar.from_regex("|".join(_regex_escape(c) for c in choices))
+            if self.kind in ("regex", "choice"):
+                return xgr.Grammar.from_regex(self.value if self.kind == "regex" else self._regex())
             return xgr.Grammar.from_ebnf(self.value)
         except (RuntimeError, ValueError) as e:
             raise ValueError(f"structured_outputs {self.kind}: {e}") from e
+
+    def compile(self, compiler):
+        """Compiled against ``compiler``'s vocabulary, through the calls its cache keys by text."""
+        if self.kind == "json":
+            return compiler.compile_json_schema(self.value)
+        if self.kind == "json_object":
+            return compiler.compile_builtin_json_grammar()
+        if self.kind in ("regex", "choice"):
+            return compiler.compile_regex(self.value if self.kind == "regex" else self._regex())
+        return compiler.compile_grammar(self.value)
 
 
 def _regex_escape(text: str) -> str:
@@ -129,18 +140,43 @@ def response_format_request(response_format: Any) -> dict | None:
 
 
 class _Row:
-    __slots__ = ("matcher", "after_id", "active")
+    """One request's matcher, compiled in the background: the first step that
+    needs it waits for the compile (usually done by then: the prefill runs first)."""
+    __slots__ = ("_compiled", "_matcher", "after_id", "active")
 
-    def __init__(self, matcher, after_id: int | None):
-        self.matcher = matcher
+    def __init__(self, compiled: Future, after_id: int | None):
+        self._compiled = compiled
+        self._matcher = None
         self.after_id = after_id
         self.active = after_id is None
+
+    @property
+    def matcher(self):
+        if self._matcher is None:
+            try:
+                self._matcher = _xgr().GrammarMatcher(self._compiled.result())
+            except Exception:
+                # checked tokenizer-free at the conductor already; a compile that
+                # still fails leaves the row free rather than failing its batch
+                logger.exception("structured_outputs grammar failed to compile; the row draws freely")
+                self.active, self.after_id = False, -1
+                raise
+        return self._matcher
+
+    @property
+    def constrained(self) -> bool:
+        if not self.active:
+            return False
+        try:
+            return not self.matcher.is_terminated()
+        except Exception:
+            return False
 
     def accept(self, token: int) -> None:
         if not self.active:
             self.active = token == self.after_id
             return
-        if self.matcher.is_terminated():
+        if not self.constrained:
             return
         if not self.matcher.accept_token(token):
             # the mask allowed it, so this is a row the mask did not cover (a
@@ -172,6 +208,9 @@ class GrammarRows:
         self.vocab_size = size
         self.words = math.ceil(size / 32)
         self._compiler = xgr.GrammarCompiler(self.info, max_threads=8)
+        # compiles run off the worker's threads (xgrammar releases the GIL)
+        self._compile_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="grammar-compile")
+        self._batch = xgr.BatchGrammarMatcher()
         self._device = device
         self._rows: dict[Any, _Row] = {}
         # (rids, host tokens, event) per committed step not yet accepted, oldest first
@@ -186,12 +225,18 @@ class GrammarRows:
         return bool(self._rows) and any(r in self._rows for r in rids)
 
     def add(self, rid, request: GrammarRequest) -> None:
-        compiled = self._compiler.compile_grammar(request.grammar())
         after_id = None if request.after is None else self._single_token(request.after)
-        self._rows[rid] = _Row(self._xgr.GrammarMatcher(compiled), after_id)
+        self._rows[rid] = _Row(self._compile_pool.submit(request.compile, self._compiler), after_id)
 
     def remove(self, rid) -> None:
         self._rows.pop(rid, None)
+
+    def release(self, rids, why: str) -> None:
+        """Stop constraining ``rids``: their draws can no longer be tracked."""
+        for rid in rids:
+            row = self._rows.pop(rid, None)
+            if row is not None:
+                logger.error("structured_outputs dropped for request %r: %s", rid, why)
 
     def _single_token(self, text: str) -> int:
         if self._token_ids is None:
@@ -237,18 +282,30 @@ class GrammarRows:
         if len(set(rids)) != len(rids):
             raise ValueError("a constrained request has two rows in one step (speculative decoding is not served)")
         mask = torch.full((len(rids), self.words), -1, dtype=torch.int32)
+        matchers, index = [], []
         for i, rid in enumerate(rids):
             row = self._rows.get(rid)
-            if row is not None and row.active and not row.matcher.is_terminated():
-                row.matcher.fill_next_token_bitmask(mask, i)
+            if row is not None and row.constrained:
+                matchers.append(row.matcher)
+                index.append(i)
+        if len(matchers) == 1:
+            matchers[0].fill_next_token_bitmask(mask, index[0])
+        elif matchers:
+            self._batch.batch_fill_next_token_bitmask(matchers, mask, index)
         return mask
 
     def apply(self, logits: torch.Tensor, mask: torch.Tensor) -> None:
         """Set every disallowed logit to -inf, in place; capturable (no host
         reads). Columns past the vocabulary the mask covers are disallowed."""
         rows, width = logits.shape[0], logits.shape[-1]
-        allowed = ((mask[:rows].unsqueeze(-1) >> self._shifts) & 1).reshape(rows, -1)
-        covered = min(width, allowed.shape[-1])
-        logits[:, :covered].masked_fill_(allowed[:, :covered] == 0, float("-inf"))
+        covered = min(width, mask.shape[-1] * 32)
+        if logits.is_cuda:
+            from xgrammar.kernels.apply_token_bitmask_inplace_triton import apply_token_bitmask_inplace_triton
+
+            # one pass, no host reads: capturable
+            apply_token_bitmask_inplace_triton(logits, mask[:rows], vocab_size=covered)
+        else:
+            allowed = ((mask[:rows].unsqueeze(-1) >> self._shifts) & 1).reshape(rows, -1)
+            logits[:, :covered].masked_fill_(allowed[:, :covered] == 0, float("-inf"))
         if width > covered:
             logits[:, covered:] = float("-inf")

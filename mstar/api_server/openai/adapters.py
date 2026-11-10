@@ -241,6 +241,16 @@ def _flatten_template_kwargs(mk: dict) -> None:
         mk.setdefault(key, value)
 
 
+def _constrain_after_thinking(mk: dict) -> None:
+    """A thinking turn (Qwen's template opens ``<think>`` unless ``enable_thinking``
+    is false) starts its ``structured_outputs`` grammar at ``</think>``, so the
+    model reasons freely and then answers in the grammar. A client's own
+    ``after`` wins."""
+    structured = mk.get(STRUCTURED_OUTPUTS_KWARG)
+    if isinstance(structured, dict) and "after" not in structured and mk.get("enable_thinking", True) is not False:
+        mk[STRUCTURED_OUTPUTS_KWARG] = {**structured, "after": "</think>"}
+
+
 def _apply_sampling(
     req,
     mk: dict,
@@ -543,6 +553,8 @@ class Qwen3_5Adapter(OpenAIAdapter):
     * ``enable_thinking`` (default true) — Qwen's template opens a ``<think>``
       block; for Muse Glimmer false means reasoning strength low.
     * ``reasoning_effort`` — Muse Glimmer's reasoning strength.
+    * ``response_format`` / ``structured_outputs`` — on a thinking turn the
+      grammar starts at ``</think>``.
 
     ``chat_template_kwargs`` keys are read as flat ones, and a flat key wins.
     """
@@ -555,6 +567,7 @@ class Qwen3_5Adapter(OpenAIAdapter):
         _apply_sampling(req, mk)
         # before the attachments are saved, since a malformed value refuses the request
         _flatten_template_kwargs(mk)
+        _constrain_after_thinking(mk)
         text, file_paths, in_mods, parts = flatten_messages(req.messages, upload_dir)
         return SubmitArgs(
             text=text,

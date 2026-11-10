@@ -295,10 +295,24 @@ fn a_json_response_format_becomes_structured_outputs() {
     ] {
         for (name, adapter) in ADAPTERS.iter().filter(|(_, a)| a.supports_chat()) {
             let mk = adapter.chat_to_request(&chat_with(fields), Path::new("/unused"), false).unwrap().model_kwargs;
-            assert_eq!(mk.get("structured_outputs"), Some(&want), "{fields} on {name}");
+            // a thinking chat (Qwen3.5) also starts it at </think>
+            let mut got = mk.get("structured_outputs").cloned().unwrap();
+            got.as_object_mut().unwrap().remove("after");
+            assert_eq!(got, want, "{fields} on {name}");
             assert!(!mk.contains_key("response_format"), "{fields} on {name}");
         }
     }
+}
+
+#[test]
+fn a_qwen3_5_thinking_turn_starts_its_grammar_after_the_think_block() {
+    let after = |fields: &str| {
+        let mk = Qwen3_5.chat_to_request(&chat_with(fields), Path::new("/unused"), false).unwrap().model_kwargs;
+        mk["structured_outputs"].get("after").cloned()
+    };
+    let json = r#""response_format":{"type":"json_object"}"#;
+    assert_eq!(after(json), Some(Value::String("</think>".to_string())));
+    assert_eq!(after(&format!(r#"{json},"chat_template_kwargs":{{"enable_thinking":false}}"#)), None);
 }
 
 #[test]

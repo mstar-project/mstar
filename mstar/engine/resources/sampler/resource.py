@@ -740,6 +740,10 @@ class SamplerResource(Resource):
             tokens = self._drawn.pop(None, None) if key is None else self._drawn.get(key)
             if tokens is not None:
                 self._grammar.note_draws(ctx.request_ids, tokens, self._kept_rids_of(step, ctx))
+            else:
+                # the forward drew without `sample` (a draft verify's argmax): the mask
+                # never applied, so the rows go free rather than track tokens they never saw
+                self._grammar.release(ctx.request_ids, "this step drew its tokens outside the sampler")
         # None on an eager step, which never gathered one
         if self._cg_buffers is None or self._cg_sampler is None:
             return
