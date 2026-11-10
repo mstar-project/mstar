@@ -489,13 +489,15 @@ def test_repeats_of_one_cached_prompt_on_a_window_pool_fit_the_capture_bound():
 
     # room for the window pages they share too, which each repeat rolls out into pages of its own (`_shared`)
     kv = _window_manager(max_num_pages=20)
-    shared = list(range(6 * PAGE_SIZE))
+    shared = list(range(8 * PAGE_SIZE))
     rids = [f"r{i}" for i in range(10)]
     for i, rid in enumerate(rids):
         _write(kv, rid, shared + [10_000 + i])
     named = sum(len(kv._streams[rid]["main"].page_indices) for rid in rids)
-    assert named > kv.config.num_units
-    assert named <= captured_page_capacity(len(rids), len(rids), kv.config, kv.config.groups[0])
+    # more than the pool, a step's pages and a page a row, which bounded them before repeats shared the cached prefix
+    first = kv.config.groups[0]
+    assert named > kv.config.num_units + -(-len(rids) // first.page_size) + len(rids)
+    assert named <= captured_page_capacity(len(rids), len(rids), kv.config, first)
 
 
 def test_a_repeat_on_a_window_pool_takes_the_window_pages_the_first_request_left_in_the_cache():
