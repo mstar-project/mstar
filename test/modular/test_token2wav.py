@@ -424,8 +424,10 @@ def test_batched_windows_on_pool(random_token2wav, device):
     from mstar.model.chatterbox.components.s3gen_hift import HiFTNoise
 
     model = copy.deepcopy(random_token2wav).to(device)
-    # the CUDA path's attention kernel multiplies in TF32, as served
-    tol = dict(rtol=1e-4, atol=1e-4) if device == "cpu" else dict(rtol=1e-3, atol=1e-3)
+    # The CUDA path's attention kernel multiplies in TF32, as served: the DiT's conv caches
+    # drift from the reference state by up to ~1.1e-3 (values ~4) over the utterance, either
+    # way round the conformer's relative-position band is read.
+    tol = dict(rtol=1e-4, atol=1e-4) if device == "cpu" else dict(rtol=1e-3, atol=2e-3)
     p = 50
     torch.manual_seed(1)
     voice = model.prepare_voice(VoicePrompt(
