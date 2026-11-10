@@ -24,15 +24,17 @@ from mstar.engine.node_dtype import resolve_model_dtype
 from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec
 from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
 from mstar.engine.resources.linear_attn.config import LinearAttnConfig, LinearAttnSpec, LinearAttnVariant
+from mstar.engine.resources.lora.config import LORA_RESOURCE_KEY
 from mstar.engine.resources.position.config import PositionConfig, PositionSpec
 from mstar.engine.resources.recurrent.config import DeltaNetGeometry, RecurrentStateConfig, RecurrentStateSpec
 from mstar.engine.resources.sampler.config import SamplerSpec
 from mstar.engine.resources.spec import CombinedSplit, apply_yaml_overrides
 from mstar.engine.state.adapters import node_resources
 from mstar.engine.state.analysis import state_declaration_problems
-from mstar.model.base import parse_autocast_dtype, serving_resources
+from mstar.model.base import enabled_resources, parse_autocast_dtype, serving_resources
 from mstar.model.command_a_plus import config as command_a_plus_config
 from mstar.model.command_a_plus.command_a_plus_model import CommandAPlusModel
+from mstar.model.components.request_kwargs import sampler_capabilities
 from mstar.model.keys import MIXED
 from mstar.model.qwen3_5.config import (
     ATTN,
@@ -95,6 +97,8 @@ def _qwen3_5_state_dtype(config) -> torch.dtype:
     return torch.bfloat16 if dtype is torch.bfloat16 and head_dims_ok else torch.float32
 
 
+# Less the opt-in LoRA spec, which `enabled_resources` builds only when a deployment names it. It holds callables, so
+# a second build wouldn't equal it.
 def _qwen3_5_reference(config) -> list:
     return [
         KVSpec(
@@ -133,7 +137,7 @@ def _qwen3_5_reference(config) -> list:
             ),
         ),
         SamplerSpec(
-            resource_key=SAMPLER, nodes={"LLM"}, vocab_size=config.vocab_size, enable_repetion_penalty=True,
+            resource_key=SAMPLER, nodes={"LLM"}, vocab_size=config.vocab_size, enable_repetition_penalty=True,
         ),
     ]
 
@@ -170,7 +174,7 @@ def test_the_published_configs_are_found():
 @pytest.mark.parametrize("size", QWEN3_5)
 def test_qwen3_5_specs_equal_the_hand_written_ones(size):
     model = _qwen3_5(**QWEN3_5[size])
-    _assert_equal_per_key(node_resources(model), _qwen3_5_reference(model.config))
+    _assert_equal_per_key(enabled_resources(model, {}), _qwen3_5_reference(model.config))
 
 
 # The `resources:` blocks of configs/qwen3_5_9b.yaml, with its commented-out state_dtype on.
@@ -210,7 +214,7 @@ def test_qwen3_5_stored_dtype_equals_the_hand_written_rule(ssm_dtype, head_k_dim
         **QWEN3_5["9B"], "mamba_ssm_dtype": ssm_dtype, "linear_key_head_dim": head_k_dim,
         "linear_value_head_dim": head_v_dim,
     })
-    _assert_equal_per_key(node_resources(model), _qwen3_5_reference(model.config))
+    _assert_equal_per_key(enabled_resources(model, {}), _qwen3_5_reference(model.config))
 
 
 def test_qwen3_5_conv_follows_the_engine_dtype_and_its_state_does_not():
@@ -230,7 +234,7 @@ _ALL_FULL_SHAPES = pytest.mark.parametrize(
 @_ALL_FULL_SHAPES
 def test_qwen3_5_all_full_specs_equal_the_hand_written_ones(overrides):
     model = _qwen3_5(**{**_ALL_FULL, **overrides})
-    specs = node_resources(model)
+    specs = enabled_resources(model, {})
     _assert_equal_per_key(specs, _qwen3_5_reference(model.config))
     assert {spec.resource_key: spec for spec in specs}[GDN_STATE].config.num_layers == 0, "not the all-full shape"
 
@@ -254,9 +258,9 @@ def test_qwen3_5_refuses_a_shape_that_cant_run(overrides, where):
         _qwen3_5(**{**QWEN3_5["9B"], **overrides}).declare_state()
 
 
-def test_qwen3_5_writes_only_positions_and_the_sampler_by_hand():
+def test_qwen3_5_writes_only_positions_the_sampler_and_lora_by_hand():
     model = _qwen3_5(**QWEN3_5["9B"])
-    assert {spec.resource_key for spec in model.get_node_resources()} == {ROPE, SAMPLER}
+    assert {spec.resource_key for spec in model.get_node_resources()} == {ROPE, SAMPLER, LORA_RESOURCE_KEY}
 
 
 def test_qwen3_5_keeps_its_vision_attention_by_hand(monkeypatch):
@@ -314,7 +318,7 @@ def _command_a_plus_reference(model: CommandAPlusModel) -> list:
             rope_theta=config.rope_theta,
         )),
         SamplerSpec(resource_key=SAMPLER, nodes={"LLM"}, vocab_size=config.vocab_size,
-                    enable_repetion_penalty=True),
+                    **sampler_capabilities(model.sampling_defaults)),
     ]
 
 
