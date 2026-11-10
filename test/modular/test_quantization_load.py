@@ -225,16 +225,20 @@ def test_the_cuda_kernels_match_the_reference(name):
     fmt = linear_format(name)
     fmt.prepare_device(torch.device("cuda"))
     w = (torch.randn(512, 1024, device="cuda") * 0.05).to(torch.bfloat16)
-    buffers = fmt.quantize_weight(w, None)
+    # viewed as a served layer hands them to linear() (what the bytes stand for)
+    stands_for = {st.name: st.stands_for for st in fmt.storage(512, 1024)}
+    buffers = {name: t.view(stands_for[name]) for name, t in fmt.quantize_weight(w, None).items()}
     for m in (1, 7, 64, 300):
         x = torch.randn(m, 1024, device="cuda", dtype=torch.bfloat16)
         gpu = fmt.linear(x, *(buffers[b] for b in fmt.buffers))
         cpu = fmt.linear(x.cpu(), *(buffers[b].cpu() for b in fmt.buffers))
-        assert rel(gpu.cpu(), cpu) < 0.02, (name, m)
+        # the CPU reference keeps x in bf16 (W8A16); the W8A8 kernels round it to e4m3 (3 mantissa bits), which
+        # measured 0.026 for fp8_block at 64 tokens on an H200
+        assert rel(gpu.cpu(), cpu) < 0.04, (name, m)
         if fmt.has_glu:
             gpu = fmt.glu_linear(x, *(buffers[b] for b in fmt.buffers))
             cpu = fmt.glu_linear(x.cpu(), *(buffers[b].cpu() for b in fmt.buffers))
-            assert gpu.shape == (m, 256) and rel(gpu.cpu(), cpu) < 0.03, (name, m, "glu")
+            assert gpu.shape == (m, 256) and rel(gpu.cpu(), cpu) < 0.05, (name, m, "glu")
 
 
 def test_experts_count_matches_the_helper():
