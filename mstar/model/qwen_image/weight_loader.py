@@ -16,6 +16,7 @@ from mstar.model.components.diffusion.weight_loading import (
     materialize,
 )
 from mstar.model.components.qwen_vision import QWEN25_VISION_PREFIXES, Qwen25VisionModel, qwen25_vision_key
+from mstar.model.loader.base import load_weights_into
 from mstar.model.qwen_image.components.transformer import QwenImageTransformer
 from mstar.model.qwen_image.config import QwenImageConfig
 
@@ -45,7 +46,8 @@ def build_text_encoder(config: QwenImageConfig, snapshot: Path, device, dtype=to
 
 
 def build_vision_tower(config: QwenImageConfig, snapshot: Path, device, dtype=torch.bfloat16) -> Qwen25VisionModel:
-    """The text encoder checkpoint's vision tower."""
+    """The text encoder checkpoint's vision tower. Its rotary ``inv_freq`` is derived (``materialize`` recomputes it,
+    fp32), so every parameter, not every buffer, must come from the checkpoint."""
     with torch.device("meta"):
         tower = Qwen25VisionModel(config.vision)
     materialize(tower, dtype, device)
@@ -53,10 +55,11 @@ def build_vision_tower(config: QwenImageConfig, snapshot: Path, device, dtype=to
     def skip(name: str) -> bool:
         return not name.startswith(QWEN25_VISION_PREFIXES)
 
-    return load_native(
-        tower, iter_transformers_component(Path(snapshot) / "text_encoder", device, skip=skip), qwen25_vision_key,
-        "Qwen2.5-VL vision tower", skip=skip,
+    load_weights_into(
+        tower, iter_transformers_component(Path(snapshot) / "text_encoder", device, skip=skip),
+        name_remapper=qwen25_vision_key, skip_predicate=skip, strict=True,
     )
+    return tower
 
 
 def build_vae(snapshot: Path, device, dtype=torch.bfloat16) -> torch.nn.Module:

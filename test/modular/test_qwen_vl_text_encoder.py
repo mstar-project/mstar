@@ -41,13 +41,13 @@ from mstar.model.components.qwen_vision import (  # noqa: E402
     VISION_ATTN,
     FrameSDPA,
     Qwen25VisionConfig,
-    Qwen25VisionModel,
     QwenVisionConfig,
     QwenVisionModel,
     qwen25_tower_inputs,
-    qwen25_vision_key,
 )
 from mstar.model.keys import VISION_FULL  # noqa: E402
+from mstar.model.qwen_image.config import QwenImageConfig  # noqa: E402
+from mstar.model.qwen_image.weight_loader import build_vision_tower  # noqa: E402
 
 IMAGE, VISION_START, VISION_END = 250, 251, 252
 TEXT = {"vocab_size": 256, "hidden_size": 64, "intermediate_size": 128, "num_hidden_layers": 4,
@@ -107,8 +107,11 @@ def _qwen3_tower(reference, path, grids):
 
 def _qwen25_tower(reference, path, grids):
     config = Qwen25VisionConfig.from_dict(json.loads((path / "config.json").read_text())["vision_config"])
-    vision = Qwen25VisionModel(config).eval()
-    vision.load_state_dict({qwen25_vision_key(k): v for k, v in reference.model.visual.state_dict().items()})
+    # through Qwen-Image's loader, from the saved checkpoint, which holds no rotary inv_freq: it is derived
+    snapshot = path / "snapshot"
+    snapshot.mkdir()
+    (snapshot / "text_encoder").symlink_to(path)
+    vision = build_vision_tower(QwenImageConfig(vision=config), snapshot, "cpu", dtype=torch.float32).eval()
     inputs = qwen25_tower_inputs(grids, config)
     windows, frames = FrameSDPA(inputs.window_lengths), FrameSDPA(inputs.frame_lengths)
     for block in vision.blocks:

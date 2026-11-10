@@ -303,7 +303,8 @@ class Qwen25VisionModel(nn.Module):
         super().__init__()
         self.config = config
         self.patch_embed = ConvPatchEmbed(config, bias=False)
-        self.rotary_pos_emb = VisionRotaryEmbedding(config)
+        # derived, not in the checkpoint: fp32 through every move and cast, as the reference keeps it
+        self.rotary_pos_emb = VisionRotaryEmbedding(config, keep_fp32=True)
         norm = functools.partial(QwenRMSNorm, eps=1e-6)
         full = set(config.fullatt_block_indexes)
         self.blocks = nn.ModuleList(
