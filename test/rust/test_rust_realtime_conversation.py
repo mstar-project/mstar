@@ -553,6 +553,10 @@ LIVE = {
     "end-fails": ([_text(0, b" hello")], [
         _append(_tone(16000, 0.2).tobytes()), _append(np.array([-16384], "<i2").tobytes()), 0.3, COMMIT,
         _append(_tone(16000, 0.1).tobytes()), COMMIT, END]),
+    # a clear aborts the item's call; the next append opens another
+    "cleared": ([_text(0, b" hello")], [
+        _append(_tone(16000, 0.2).tobytes()), 0.3, {"type": "input_audio_buffer.clear"},
+        _append(_tone(16000, 0.1).tobytes()), COMMIT, END]),
 }
 
 
@@ -581,6 +585,10 @@ def test_live_transcription_reads_as_pythons(stacks, monkeypatch, name):
     elif name == "end-fails":
         assert [e["error"]["message"] for e in py[0] if e["type"] == "error"][0] == "the commit failed (error id X)"
         assert kinds.count("conversation.item.input_audio_transcription.failed") == 1
+        assert [e["transcript"] for e in py[0] if e["type"].endswith(".completed")] == ["hello"]
+        assert len(py[2]["submits"]) == 2 and py[2]["aborted"] == 1 and py[2]["ended"] == 1
+    elif name == "cleared":
+        assert "input_audio_buffer.cleared" in kinds and "error" not in kinds[:-1]
         assert [e["transcript"] for e in py[0] if e["type"].endswith(".completed")] == ["hello"]
         assert len(py[2]["submits"]) == 2 and py[2]["aborted"] == 1 and py[2]["ended"] == 1
     else:
