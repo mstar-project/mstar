@@ -752,9 +752,10 @@ behind it start. The captured sampler then applies a bitmask on every step but a
 without a constrained row (the lean twin), and a step holding a constrained row waits for its
 rows' last draws to reach the host before it launches. A grammar that fails to compile fails
 its request with an error. A drawn token the grammar refuses (only a mask that failed to cover
-the draw lets one through) fails its request a step later, and past it the reply may only draw a
-stop token; when that stop finishes the reply first (always without async scheduling), the reply
-ends normally with the refused token in it. Not served
+the draw lets one through) fails its request at the step after the next, and meanwhile the reply
+may only draw one of the model's stop tokens (any token, for a model that declares none); when the
+reply finishes first (a stop or its length limit; always without async scheduling), it ends
+normally with the refused token in it. Not served
 with it yet: speculative decoding (no model that declares ``text_output()`` drafts outside its
 sampler), resident planning, and a text sampler whose walks run on different ranks (a
 prefill/decode split); the deployment is refused at startup for the last, and for
