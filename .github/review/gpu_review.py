@@ -434,11 +434,11 @@ def for_approval(review, pages):
         for f in review.get("prior_findings") or []]}
 
 
-def fixed_only_above(review, pages, stacked):
+def fixed_only_above(review, stacked):
     """The P0/P1 findings judged fixed in a PR stacked above, as a reason not to approve (none when there are
-    none): a PR must fix its own P0/P1s. Their priority is the one judged gives them, at least the bot's own tag;
-    the checklist's "fixed above" lines already say each must be fixed in this PR."""
-    review = render_summary.judged(review, pages, stacked)
+    none): a PR must fix its own P0/P1s. Their priority is the one `carried` gave them, never below the bot's
+    record; the checklist's "fixed above" lines already say each must be fixed in this PR."""
+    review = render_summary.judged(review, stacked)
     found = [*[(f["ref"], f["priority"]) for f in render_summary.prior_above(review)],
              *[(f["location"], f["priority"]) for f in review["outside_diff"] if f.get("fixed_in")]]
     must = [f"{where} ({p})" for where, p in found if p in render_summary.MUST_FIX_HERE]
@@ -509,7 +509,7 @@ def approval_facts(pr, sha, verdict, review):
         risk_level=(review.get("risk") or {}).get("level", "unrated"),
         questions=len(review.get("questions") or ()),
         to_fix_first=tuple(to_fix_first(for_approval(review, pages), pr, "stacked-above.json")),
-        fixed_only_above=tuple(fixed_only_above(review, pages, render_summary.stacked_above("stacked-above.json"))),
+        fixed_only_above=tuple(fixed_only_above(review, render_summary.stacked_above("stacked-above.json"))),
     )
 
 

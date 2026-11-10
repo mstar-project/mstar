@@ -501,7 +501,8 @@ class TestComment(unittest.TestCase):
 
 class TestApprove(unittest.TestCase):
     def approve(self, variable, verdict="pass", head="0123456789", perm="write", risk="low", files=None,
-                outside=(), above=None, extra=None, untestable="", head_repo=OWN_HEAD, inline=None, prior=()):
+                outside=(), above=None, extra=None, untestable="", head_repo=OWN_HEAD, inline=None, prior=(),
+                untouched=()):
         """approve on a PR that meets the rule (a docs change) with REVIEW_APPROVALS as `variable`, unless
         `verdict` or the other arguments fail it; its decision text, the outputs and the writes."""
         pr = {"head": {"sha": head, "repo": head_repo}, "base": {"sha": "abcdef", "repo": BASE_REPO},
@@ -515,7 +516,8 @@ class TestApprove(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp, workspace() as ws:
             (ws / "review.json").write_text(json.dumps({
                 "outside_diff": list(outside), "prior_findings": list(prior), "questions": [], "skipped": [],
-                "inline": inline or {}, "risk": {"level": risk, "reason": "docs only", "look_at": []},
+                "inline": inline or {}, "untouched": list(untouched),
+                "risk": {"level": risk, "reason": "docs only", "look_at": []},
                 "live_test": {"run": "full", "reason": "r", "checks": ["correctness"], "gpus": 1,
                               "untestable": untestable}}))
             if above is not None:
@@ -585,35 +587,46 @@ class TestApprove(unittest.TestCase):
                                               extra={f"GET repos/{R}/pulls/9": reply})
                 self.assertEqual(writes == [f"POST repos/{R}/pulls/7/reviews"], approved, f"a PR above that is {name}")
 
-    def test_a_p1_fixed_only_in_a_pr_above_stops_the_approval(self):
+    def test_a_re_review_cant_lower_a_priority_and_a_p1_fixed_only_above_stops_the_approval(self):
         above = [{"number": 9, "head_sha": "a" * 40}]
         still = {f"GET repos/{R}/pulls/9": {"state": "open", "head": {"sha": "a" * 40}}}
+        must = "A P0/P1 has to be fixed in this PR itself, not only above"
 
-        def on_thread(tag, said):
-            """An earlier inline finding, tagged `tag`, a re-review judged fixed above at priority `said`."""
-            return {"prior": [{"ref": "4", "priority": said, "status": "fixed_above", "fixed_in": 9, "why": "w"}],
-                    "extra": {**still, "POST graphql": threads_page(thread(4, f"**[{tag}]** x"))}}
+        def item(p, fixed_in=9, claim="c"):
+            return {"priority": p, "location": "a.py:1", "claim": claim, "detail": "d",
+                    **({"fixed_in": fixed_in} if fixed_in else {})}
 
-        def outside(priority, earlier=None):
-            """An item outside the diff fixed above, as `carried` makes it when the earlier review's state had it
-            at priority `earlier`."""
-            item = {"priority": priority, "location": "a.py:1", "claim": "c", "detail": "d", "fixed_in": 9}
-            state = {"outside_diff": [{**item, "priority": earlier}]} if earlier else None
-            review = render_summary.carried({"outside_diff": [item], "prior_findings": [], "questions": []}, state,
-                                            False)
-            return {"extra": still, "outside": review["outside_diff"]}
+        def verdict(ref, p, status):
+            return {"ref": ref, "priority": p, "status": status, "why": "w",
+                    **({"fixed_in": 9} if status == "fixed_above" else {})}
 
-        for name, blocks, kwargs in (("outside the diff", True, outside("P1")),
-                                     ("a bot thread", True, on_thread("P1", "P1")),
-                                     ("a P1 thread the re-review calls P2", True, on_thread("P1", "P2")),
-                                     ("an earlier P1 item restated as P2", True, outside("P2", "P1")),
-                                     ("a P2's bot thread", False, on_thread("P2", "P2"))):
+        # name, the earlier state's items, this run's items, its verdicts, the tag of bot thread 4, untouched files,
+        # what the checklist says (None: approved)
+        for name, earlier, new, verdicts, tag, untouched, says in (
+                ("a P1 thread the re-review calls P2, fixed above", [], [], [verdict("4", "P2", "fixed_above")], "P1",
+                 (), must),
+                ("a P2 thread fixed above", [], [], [verdict("4", "P2", "fixed_above")], "P2", (), None),
+                ("an earlier P1 restated as P2, fixed above", [item("P1", None)], [item("P2")], [], None, (), must),
+                ("the most severe of two earlier items at one place", [item("P1", None, "x"), item("P2", None, "y")],
+                 [item("P2")], [], None, (), must),
+                ("an earlier P2 judged P1 and fixed above", [item("P2", None)], [],
+                 [verdict("a.py:1", "P1", "fixed_above")], None, (), must),
+                ("an earlier P1 judged fixed at P3, its file untouched", [item("P1", None)], [],
+                 [verdict("a.py:1", "P3", "fixed")], None, ("a.py:1",), "disputed"),
+                ("a new P3 where an earlier P1 was fixed", [item("P1", None)], [item("P3", None, "new")],
+                 [verdict("a.py:1", "P1", "fixed")], None, (), None)):
             with self.subTest(name):
-                text, _, writes = self.approve({"value": "on"}, above=above, **kwargs)
-                self.assertEqual(writes == [f"POST repos/{R}/pulls/7/reviews"], not blocks,
-                                 f"{name}: a P0/P1 a PR above fixes would approve, or a P2 one wouldn't")
-                self.assertEqual("**[P1]**" in text and "A P0/P1 has to be fixed in this PR itself, not only above"
-                                 in text, blocks, f"{name}: the checklist wouldn't say why")
+                pages = [threads_page(*([thread(4, f"**[{tag}]** x")] if tag else []))]
+                review = render_summary.carried({"outside_diff": new, "prior_findings": verdicts, "questions": []},
+                                                {"outside_diff": earlier}, False, pages)
+                text, _, writes = self.approve({"value": "on"}, above=above, outside=review["outside_diff"],
+                                               prior=review["prior_findings"], untouched=untouched,
+                                               extra={**still, "POST graphql": pages[0]})
+                self.assertEqual(writes == [f"POST repos/{R}/pulls/7/reviews"], says is None,
+                                 f"{name}: a re-review would lower a P1 and approve, or a P2/P3 would block")
+                if says:
+                    self.assertIn("**[P1]**", text, name)
+                    self.assertIn(says, text, f"{name}: the checklist wouldn't say why")
 
     def test_approvals_happen_only_when_the_variable_reads_on(self):
         posted = []
