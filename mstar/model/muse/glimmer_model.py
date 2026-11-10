@@ -13,6 +13,7 @@ from typing import Any
 import torch
 from jinja2 import TemplateError
 
+from mstar.engine.precision import NodePrecision
 from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec
 from mstar.engine.resources.attn.ragged.config import (
     RaggedAttentionConfig,
@@ -127,6 +128,12 @@ class MuseGlimmerModel(MultimodalDecoderModel):
     def rebuild_policies(self) -> dict[str, RebuildPolicy]:
         # not yet dropped: no drop and rebuild has run through its sliding-window KV pool
         return {}
+
+    def get_node_precision(self, node_name: str) -> NodePrecision:
+        """bf16 under bf16 autocast, as the model has served; the vision
+        tower's rotary frequencies stay fp32 (``keep_fp32``)."""
+        fp32 = ("model.rotary_emb",) if node_name == "vision_encoder" else ()
+        return NodePrecision(torch.bfloat16, fp32_modules=fp32, autocast=True)
 
     def get_node_resources(self) -> list[NodeResourceSpec]:
         cfg = self.config

@@ -238,15 +238,6 @@ def test_postprocess_encodes_png():
         _make_model().postprocess(torch.zeros(1), "text")
 
 
-def test_autocast_is_off_so_numerics_follow_the_checkpoint():
-    assert _make_model().get_autocast_dtype() is None
-
-
-# ----------------------------------------------------------------------
-# OpenAI adapter
-# ----------------------------------------------------------------------
-
-
 def test_diffusion_image_adapter_maps_size_seed_and_edits(tmp_path):
     pytest.importorskip("pydantic")
     from mstar.api_server.openai import adapters

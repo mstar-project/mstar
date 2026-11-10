@@ -493,17 +493,6 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             time.perf_counter() - t0, width, height, frames,
         )
 
-    def to(self, *args, **kwargs):
-        # The engine casts this submodule to bf16; the timestep embedder must stay
-        # fp32 (diffusers keeps it in _keep_in_fp32_modules, and the multi-step
-        # video denoise scrambles when it runs in bf16), so re-assert fp32 after
-        # any cast — paired with the autocast-disabled forward below.
-        super().to(*args, **kwargs)
-        te = getattr(self.transformer, "time_embedder", None)
-        if te is not None:
-            te.float()
-        return self
-
     def cg_key_info(
         self, graph_walk: str, per_request_info: dict, per_request_input_metadata=None, **kwargs,
     ) -> object | None:
@@ -2075,9 +2064,10 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         output comes at the end of its loop."""
         return StepOrder.TURNS if graph_walk == VIDEO_GEN_AR_WALK else StepOrder.ARRIVAL
 
-    # Native bf16, not the engine autocast, as forward() runs: the same dtypes as
-    # the per-request path, so batching (and the compiled layer stack) changes
-    # only kernel-level rounding.
+    # Native bf16, not autocast, as forward() runs: the same dtypes as the
+    # per-request path, so batching (and the compiled layer stack) changes only
+    # kernel-level rounding. The node's policy runs it without autocast; this
+    # also covers a direct call.
     @torch.autocast(device_type="cuda", enabled=False)
     def forward_batched(
         self, graph_walk, engine_inputs: ModelInputsFromEngine,
@@ -2683,9 +2673,9 @@ class Cosmos3VAEEncoderSubmodule(NodeSubmodule):
     ):
         vae = self.vae
         # In the VAE's own dtype, like the reference pipeline's encode and latent
-        # normalization: bf16 as built and as the engine casts this node. An
-        # fp32 encode moves the anchor latent enough to move the whole i2v
-        # trajectory.
+        # normalization: bf16 as built and as the node's precision policy keeps
+        # it. An fp32 encode moves the anchor latent enough to move the whole
+        # i2v trajectory.
         dtype = next(vae.parameters()).dtype
         device = vision.device
         mean, inv_std = latent_affine(vae, dtype, device)
@@ -2814,9 +2804,11 @@ class Cosmos3VAEDecoderSubmodule(NodeSubmodule):
         # ``fast`` (config.vae_decode_fast, whole-clip node only): clips decode
         # through the shared Wan VAE decoder, always channels-last.
         fast = vae is not None and fast
-        if fast:
+        if vae is not None:
             # Cast before the layout switch and the compile trace, so both see
-            # the weights the decode runs with.
+            # the weights the decode runs with; the node's precision policy
+            # keeps this dtype (an instance shared with another decoder takes
+            # the same one).
             self.vae = vae = vae.to(self._decode_dtype())
         # Channels-last weights and activations (cuDNN's native conv3d layout),
         # converted in place before any compile traces the decode; only the
@@ -2867,10 +2859,8 @@ class Cosmos3VAEDecoderSubmodule(NodeSubmodule):
         if next(vae.parameters()).dtype != vae_dtype:
             vae = vae.to(vae_dtype)
         mean, inv_std = latent_affine(vae, vae_dtype, latents.device)
-        # Force z to the VAE dtype: the engine's outer autocast promotes the
-        # `1.0 / std` division to fp32, and a fp32 z into the autocast-off bf16
-        # conv3d fails ("Input type (float) and bias type (BFloat16)"). No-op
-        # on the fp32-decode path.
+        # z in the VAE dtype: the latents arrive fp32, and a fp32 z into a bf16
+        # conv3d fails ("Input type (float) and bias type (BFloat16)").
         z = (latents.to(vae_dtype) / inv_std + mean).to(vae_dtype)
         if self._channels_last:
             # Also the layout the compiled decode's warm-up traces with.
@@ -3144,11 +3134,10 @@ class Cosmos3VisionEncoderSubmodule(PackedBlockLoopEncoder):
     MAX_BATCH_SIZE = 8
     # Per-request shapes vary; the block loop's capture is the accelerator.
     disable_torch_compile = True
-    # The tower is bf16 already. Under autocast each LayerNorm upcasts its input
-    # and its fp32 output is cast back once per projection reading it, ~18% of
-    # the block loop's GPU time for the same rounding (the norm accumulates in
-    # fp32 either way).
-    disable_autocast = True
+    # The tower is bf16 already and its policy runs it without autocast. Under
+    # autocast each LayerNorm upcasts its input and its fp32 output is cast back
+    # once per projection reading it, ~18% of the block loop's GPU time for the
+    # same rounding (the norm accumulates in fp32 either way).
     BLOCK_LOOP_DTYPE = torch.bfloat16
     # Resized position tables kept on the device, least recently used dropped
     # first, within a byte budget: one is h*w x hidden, ~151 MB at the processor's

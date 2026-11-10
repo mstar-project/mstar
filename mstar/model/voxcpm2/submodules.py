@@ -158,7 +158,6 @@ class RefEncoderSubmodule(NodeSubmodule):
     """
 
     disable_torch_compile = True
-    disable_autocast = True
     CACHE_SIZE = 64
 
     def __init__(self, vae: AudioVAE, config: VoxCPM2Config):
@@ -227,7 +226,6 @@ class TalkerSubmodule(ARNodeSubmodule):
     """
 
     disable_torch_compile = True
-    disable_autocast = True
     MAX_BATCH_SIZE = 32
     DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32]
     # The prefill's captured ladder (``ARNodeSubmodule``'s, which a deployment may
@@ -634,7 +632,6 @@ class VAEDecoderSubmodule(ARNodeSubmodule):
     """
 
     disable_torch_compile = True
-    disable_autocast = True
     # Nothing in the Talker reads the audio, and the decoder holds no resources, so a
     # deployment can run its windows beside the Talker's steps (``side_stream: true``)
     side_stream_walks = frozenset({"vae_chunk"})

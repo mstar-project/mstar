@@ -2546,6 +2546,45 @@ def test_qwen3_tts_ref_encoder_memoises_conditioning_by_clip_content():
     assert encoder.calls == 4
 
 
+def test_qwen3_tts_node_precision_keeps_ref_encoder_islands_fp32():
+    """The engine casts each node by its policy at load. RefEncoder's speaker
+    encoder runs in bf16, its mel front end and codec encoder stay fp32 (and
+    the globs name real modules: one that matched nothing would fail the
+    load)."""
+    from mstar.engine.precision import apply_precision
+    from mstar.model.qwen3_tts.components.speaker_encoder import (
+        Qwen3TTSSpeakerEncoder,
+        speaker_mel,
+    )
+    from mstar.model.qwen3_tts.config import Qwen3TTSSpeakerEncoderConfig
+    from mstar.model.qwen3_tts.submodules import RefEncoderSubmodule
+
+    model = Qwen3TTSModel.__new__(Qwen3TTSModel)
+    config = _tiny_model_config()
+    speaker_config = Qwen3TTSSpeakerEncoderConfig(
+        enc_dim=config.talker.hidden_size, enc_channels=(16, 16, 16, 16, 48),
+        enc_se_channels=8, enc_attention_channels=8,
+    )
+    submodule = apply_precision(RefEncoderSubmodule(
+        Qwen3TTSSpeakerEncoder(speaker_config), speaker_mel(speaker_config),
+        _FakeCodecEncoder(config.codec.num_quantizers), config,
+    ), model.get_node_precision("RefEncoder"))
+    assert {t.dtype for t in submodule.speaker_encoder.state_dict().values()} == {torch.bfloat16}
+    for island in (submodule.mel_front_end, submodule.codec_encoder):
+        tensors = [*island.parameters(), *island.buffers()]
+        assert tensors and {t.dtype for t in tensors} == {torch.float32}
+
+    clip = torch.randn(4000) * 0.1
+    engine_inputs = ModelInputsFromEngine(request_ids=["clone"], per_request_info={})
+    prepared = submodule.prepare_inputs(
+        "talker_prefill_clone", _ref_info("clone", clip, [0, 2, 1, 5, 7]), {"audio_inputs": [clip]},
+    )
+    out = submodule.forward("talker_prefill_clone", engine_inputs, **submodule.preprocess(
+        "talker_prefill_clone", engine_inputs, [prepared]))
+    assert out["speaker_embed"][0].dtype == torch.bfloat16
+    assert out["ref_codes"][0].shape == (7, config.codec.num_quantizers)
+
+
 def test_qwen3_tts_codec_dtype_option():
     from mstar.model.qwen3_tts.qwen3_tts_model import codec_dtype
 

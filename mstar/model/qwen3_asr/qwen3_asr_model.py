@@ -34,6 +34,7 @@ from collections.abc import Mapping
 
 import torch
 
+from mstar.engine.precision import NodePrecision
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
@@ -298,6 +299,11 @@ class Qwen3ASRModel(MultimodalDecoderModel):
     # -------------------------------------------------------------------
     # Submodules
     # -------------------------------------------------------------------
+
+    def get_node_precision(self, node_name: str) -> NodePrecision:
+        """bf16 params under bf16 autocast, for the AuT encoder and the LLM."""
+        del node_name
+        return NodePrecision(torch.bfloat16, autocast=True)
 
     def _create_submodule(
         self, node_name: str, device: str, dtype: torch.dtype, tp_group,

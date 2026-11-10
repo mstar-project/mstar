@@ -9,6 +9,7 @@ import torch
 
 from mstar.conductor.request_info import FINAL_PREFILL
 from mstar.distributed.base import ShardingConfig
+from mstar.engine.precision import NodePrecision
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
@@ -157,6 +158,11 @@ class CommandAPlusModel(Model):
 
     def get_default_sharding_config(self):
         return ShardingConfig(groups=[], tp_enabled_nodes={"LLM"}, shard_dim={})
+
+    def get_node_precision(self, node_name):
+        """bf16 params under bf16 autocast, for the LLM and the vision encoder."""
+        del node_name
+        return NodePrecision(torch.bfloat16, autocast=True)
 
     def get_submodule(
         self, node_name, device="cpu", tp_group=None, autocast_dtype=None, sp_group=None,

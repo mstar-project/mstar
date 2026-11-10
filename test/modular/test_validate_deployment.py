@@ -150,9 +150,12 @@ def test_missing_node_groups_is_refused(tmp_path):
     _refused(_Model(), str(cfg), r"must define `node_groups`")
 
 
-def test_unknown_autocast_dtype_is_refused(tmp_path):
-    """Each worker refused it after spawn."""
-    _refused(_Model(), _cfg(tmp_path, autocast_dtype="bf16"), r"autocast_dtype 'bf16' is not a torch dtype")
+def test_the_model_wide_autocast_dtype_is_refused(tmp_path):
+    """Node precision replaced it; the conductor refuses it before any worker spawns."""
+    _refused(
+        _Model(), _cfg(tmp_path, autocast_dtype="bfloat16"),
+        r"`autocast_dtype:` in the serving config is no longer read",
+    )
 
 
 @pytest.mark.parametrize("node_groups,pattern", [

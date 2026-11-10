@@ -37,7 +37,10 @@ import torch
 from transformers import AutoTokenizer
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import PartitionDefinition
+from mstar.conductor.request_info import (
+    PartitionDefinition,
+)
+from mstar.engine.precision import NodePrecision
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
@@ -487,6 +490,13 @@ class FishS2ProModel(Model):
     # -----------------------------------------------------------------------
     # Lazy worker-side submodule and weight loading
     # -----------------------------------------------------------------------
+
+    def get_node_precision(self, node_name: str) -> NodePrecision:
+        """The AR runs in bf16 under autocast; the codec's decoder and encoder
+        keep the fp32 they are built in and run without autocast."""
+        if node_name == "AR":
+            return NodePrecision(torch.bfloat16, autocast=True)
+        return NodePrecision(None)
 
     def get_submodule(
         self,

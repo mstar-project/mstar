@@ -21,6 +21,7 @@ import torch
 import torchaudio
 import yaml
 
+from mstar.engine.precision import NodePrecision
 from mstar.model.omnilingual_asr import audio
 from mstar.model.omnilingual_asr.components.wav2vec2 import Wav2Vec2CTC, attention_mask
 from mstar.model.omnilingual_asr.config import (
@@ -624,7 +625,7 @@ def test_graph_is_one_stateless_node(tiny_model):
     node = walks[TRANSCRIBE_WALK]
     assert node.name == ENCODER_NODE and node.input_names == {WAVEFORM}
     assert [(e.name, e.output_modality) for e in node.outputs] == [(TOKEN_IDS, "text")]
-    assert tiny_model.get_autocast_dtype() == torch.float32
+    assert tiny_model.get_node_precision(ENCODER_NODE) == NodePrecision(torch.float32, autocast=False)
 
 
 def test_process_prompt_normalizes_and_validates(tiny_model):
@@ -675,7 +676,7 @@ def _run_node(sub, waveforms: list[torch.Tensor]) -> dict[str, torch.Tensor]:
 def test_node_batches_and_matches_single_requests(tiny_model):
     sub = tiny_model.get_submodule(ENCODER_NODE, "cpu")
     assert sub is tiny_model.get_submodule(ENCODER_NODE, "cpu")
-    assert sub.disable_autocast and sub.disable_torch_compile
+    assert sub.disable_torch_compile
     torch.manual_seed(3)
     waves = [audio.preprocess(torch.randn(n)) for n in (16000, 9000, 4000)]
     batched = _run_node(sub, waves)

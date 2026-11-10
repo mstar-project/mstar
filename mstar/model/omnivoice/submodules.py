@@ -28,6 +28,7 @@ from mstar.engine.accelerator_graph_config import (
     PiecewiseCaptureShape,
     PiecewisePackedConfig,
 )
+from mstar.engine.input_spec import TensorSpec
 from mstar.engine.resources import AttentionStep, Segment, SlotLease, SubmoduleStep
 from mstar.model.omnivoice.components.backbone import (
     CanvasItem,
@@ -93,7 +94,6 @@ class OmniVoiceRefEncoderSubmodule(NodeSubmodule):
     """
 
     disable_torch_compile = True
-    disable_autocast = True
 
     def __init__(self, codec: nn.Module, config: OmniVoiceConfig):
         super().__init__()
@@ -152,12 +152,12 @@ class OmniVoiceBackboneSubmodule(NodeSubmodule):
     disable_torch_compile = True
     # The fused flashinfer kernels this path runs on (RMSNorm, silu_and_mul,
     # ragged attention) require every tensor in a call to share one dtype --
-    # unlike ATen, which would quietly promote. Under the engine's autocast the
-    # activations arrive at a different dtype from the weights and the fused
-    # RMSNorm rejects the call outright:
+    # unlike ATen, which would quietly promote. Under autocast the activations
+    # arrive at a different dtype from the weights and the fused RMSNorm
+    # rejects the call outright:
     #   Mismatched Tensor on argument #1 ... expected dtype=float32
-    # So numerics here are governed by the load dtype, not by the engine.
-    disable_autocast = True
+    # So the model's precision policy runs this node in the load dtype, with
+    # autocast off.
     # Packed tokens per step (both CFG documents of every request); a step
     # above the largest bucket runs eagerly. Eager steps stay launch-bound well
     # past 4096 tokens: at 16 requests (~5-9k tokens) the eager layer loop took
@@ -168,6 +168,9 @@ class OmniVoiceBackboneSubmodule(NodeSubmodule):
         256, 512, 768, 1024, 1536, 2048, 2560, 3072, 3584, 4096,
         4608, 5120, 5632, 6144, 6656, 7168, 7680, 8192,
     ]
+
+    # the codec's reference tokens extend the prompt's ids, so both are long
+    input_specs = {"prefix_ids": TensorSpec(torch.long), "ref_audio_tokens": TensorSpec(torch.long)}
 
     def __init__(self, backbone: OmniVoiceBackbone, config: OmniVoiceConfig):
         super().__init__()
@@ -195,7 +198,7 @@ class OmniVoiceBackboneSubmodule(NodeSubmodule):
         # the prefix back and forth.
         ref_tokens = inputs.get("ref_audio_tokens")
         if ref_tokens:
-            ref = ref_tokens[0].to(device=device, dtype=prefix_ids.dtype)
+            ref = ref_tokens[0].to(device)
             prefix_ids = torch.cat([prefix_ids, ref], dim=-1)
             prefix_audio_mask = torch.cat(
                 [
@@ -496,7 +499,6 @@ class OmniVoiceCode2WavSubmodule(NodeSubmodule):
     """
 
     disable_torch_compile = True
-    disable_autocast = True
 
     def __init__(self, codec: nn.Module, config: OmniVoiceConfig):
         super().__init__()

@@ -55,6 +55,7 @@ from mstar.engine.accelerator_graph_config import (
     decode_rows_then_prompt,
 )
 from mstar.engine.engine import ExecutingBatch
+from mstar.engine.input_spec import TensorSpec
 from mstar.engine.resources import AttentionStep, KVStep, PositionStep, SamplerStep, Segment, SlotLease, SubmoduleStep
 from mstar.engine.resources.recurrent import RecurrentStatePool, RecurrentStep
 from mstar.engine.resources.sampler.resource import SamplerResource
@@ -156,6 +157,8 @@ class TalkerSubmodule(ARNodeSubmodule):
     16 codec embeddings becomes the recurrent input for the next Talker step;
     the complete code vector is streamed independently to ``CodecSubmodule``.
     """
+
+    input_specs = {"talker_input_embeds": TensorSpec("param")}
 
     # Compiling the entire engine-facing forward traces request sampling,
     # residual-code control flow, and recurrent routing in addition to the
@@ -964,7 +967,7 @@ class TalkerSubmodule(ARNodeSubmodule):
         """
         del tp_world_size
         hidden_size = self.talker_config.hidden_size
-        capture_dtype = autocast_dtype or self.model.model.codec_embedding.weight.dtype
+        capture_dtype = autocast_dtype
 
         def make_static_inputs(
             shape: PiecewiseCaptureShape,
@@ -1033,7 +1036,6 @@ class CodecSubmodule(ARNodeSubmodule):
     # stateless decode is compiled (``__init__``): the capture's gather and
     # scatter stay outside it
     disable_torch_compile = True
-    disable_autocast = True
     # Nothing in the Talker reads the audio, so its decode steps need not queue
     # behind a window. The side lane refuses a node that holds resources, though,
     # and the windows read and write ``codec_state``, so no config turns it on.
@@ -1379,10 +1381,9 @@ class RefEncoderSubmodule(NodeSubmodule):
     Runs once per request, before the clone prefill, and owns no resources.
     The x-vector comes from the ECAPA-TDNN encoder over a log-mel spectrogram
     of the 24 kHz clip; for in-context cloning the codec encoder also turns
-    the clip into ``ref_frames`` 16-group frames. The node keeps the dtypes it
-    was built with (``disable_autocast``): the mel front end and the codec
-    encoder stay in float32, the speaker encoder runs in the Talker's dtype
-    as the reference does.
+    the clip into ``ref_frames`` 16-group frames. The mel front end and the
+    codec encoder stay in float32, the speaker encoder runs in the Talker's
+    dtype as the reference does (the model's precision policy for the node).
 
     The same clip recurs: a voice is reused across a session, and every
     sentence chunk of a long clone request carries it. The conditioning is
@@ -1391,8 +1392,9 @@ class RefEncoderSubmodule(NodeSubmodule):
     """
 
     disable_torch_compile = True
-    disable_autocast = True
     CONDITIONING_CACHE_SIZE = 64
+    # the mel front end is fp32, whatever the speaker encoder runs in
+    input_specs = {"audio_inputs": TensorSpec(torch.float32)}
 
     def __init__(
         self,
@@ -1417,7 +1419,7 @@ class RefEncoderSubmodule(NodeSubmodule):
         **kwargs: Any,
     ) -> NodeInputs:
         del graph_walk, kwargs
-        waveform = inputs["audio_inputs"][0].to(device=self.get_device(), dtype=torch.float32)
+        waveform = inputs["audio_inputs"][0].to(self.get_device())
         if waveform.ndim > 1:
             waveform = waveform.mean(dim=0) if waveform.shape[0] < waveform.shape[-1] else waveform.mean(dim=-1)
         # ``process_prompt`` settled the layout and hashed the clip on the host.
@@ -1442,18 +1444,15 @@ class RefEncoderSubmodule(NodeSubmodule):
             self._conditioning.move_to_end(clip_key)
             speaker_embed, codes = self._conditioning[clip_key]
             return {"speaker_embed": [speaker_embed], "ref_codes": [codes]}
-        device_type = waveform.device.type
-        with torch.autocast(device_type=device_type, enabled=False):
-            mels = self.mel_front_end(waveform.unsqueeze(0)).transpose(1, 2)  # [1, frames, mel]
+        mels = self.mel_front_end(waveform.unsqueeze(0)).transpose(1, 2)  # [1, frames, mel]
         encoder_dtype = next(self.speaker_encoder.parameters()).dtype
         speaker_embed = self.speaker_encoder(mels.to(encoder_dtype))[0]
 
         num_quantizers = self.config.codec.num_quantizers
         if ref_frames > 0:
-            with torch.autocast(device_type=device_type, enabled=False):
-                encoded = self.codec_encoder.encode(
-                    input_values=waveform.view(1, 1, -1).float(), return_dict=True
-                )
+            encoded = self.codec_encoder.encode(
+                input_values=waveform.view(1, 1, -1).float(), return_dict=True
+            )
             codes = encoded.audio_codes[0, :num_quantizers, :ref_frames].t().contiguous().long()
             if codes.shape[0] < ref_frames:
                 raise ValueError(

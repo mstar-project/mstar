@@ -80,7 +80,7 @@ def _stubs(monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
 
 
-def _build_engine(seed: int = 0, autocast_dtype: torch.dtype | None = None):
+def _build_engine(seed: int = 0):
     torch.manual_seed(seed)
     cfg = Glm5NextModelConfig.reduced()
     model = Glm5NextModel("x", config_variant="reduced", kda_conv_dtype=torch.float32, kda_max_requests=4)
@@ -92,7 +92,7 @@ def _build_engine(seed: int = 0, autocast_dtype: torch.dtype | None = None):
     lm.eval()
     sub = Glm5NextLLMSubmodule(lm, cfg)
 
-    engine = Engine(None, autocast_dtype=autocast_dtype)  # no offload, so no runtime
+    engine = Engine(None)  # no offload, so no runtime
     engine.load_model(
         {"LLM": sub}, model.get_node_resources(),
         parallel_groups=WorkerParallelGroups(num_workers=1, global_rank=0),
@@ -262,13 +262,14 @@ class TestEngineCpu:
         assert emitted == max_tokens == 6 and _context(sub, "r") == limit
         engine.remove_request("r")
 
-    def test_forward_runs_outside_the_engine_autocast(self):
-        engine, sub, cfg = _build_engine(autocast_dtype=torch.bfloat16)
+    def test_forward_runs_outside_an_enclosing_autocast(self):
+        engine, sub, cfg = _build_engine()
         seen = []
         sub.language_model.model.layers[0].register_forward_pre_hook(
             lambda module, args: seen.append(torch.is_autocast_enabled("cpu")))
         _add(engine, "r")
-        _run(engine, "prefill", {"r": torch.tensor([1, 2, 3], dtype=torch.long)})
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            _run(engine, "prefill", {"r": torch.tensor([1, 2, 3], dtype=torch.long)})
         assert seen == [False]
         engine.remove_request("r")
 

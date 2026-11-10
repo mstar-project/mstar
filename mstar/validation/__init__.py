@@ -11,8 +11,9 @@ from collections.abc import Mapping
 from typing import Any, NamedTuple
 
 from mstar.distributed.base import ShardingConfig
+from mstar.engine.precision import deployment_precisions
 from mstar.engine.resources.lora.serving import refuse_unresolved_lora_adapters
-from mstar.model.base import Model, WorkerGraph, built_resources, enabled_resources, parse_autocast_dtype
+from mstar.model.base import Model, WorkerGraph, built_resources, enabled_resources
 from mstar.model.multimodal import SUPPORTED_MODALITIES
 from mstar.validation.client_streams import check_client_streams
 from mstar.validation.knobs import check_knobs
@@ -78,10 +79,6 @@ def validate_deployment(
     problems = list(check_knobs())
     if "max_seq_len" not in config:
         problems.append("the config must define `max_seq_len`")
-    try:
-        parse_autocast_dtype(config.get("autocast_dtype"))
-    except ValueError as e:
-        problems.append(str(e))
     if not isinstance(mps := config.get("mps", False), bool):
         problems.append(f"mps must be true or false, got {mps!r}")
     unpausable = config.get("unpausable_outputs", [])
@@ -118,6 +115,13 @@ def validate_deployment(
     problems += routing_weights_problems(config)
     malformed = node_groups_problems(config)
     problems += malformed
+    if not malformed:
+        try:
+            # every placed node's precision, the deployment's blocks over the model's;
+            # read only once node_groups can be
+            deployment_precisions(model, config)
+        except (ValueError, TypeError) as e:
+            problems.append(str(e))
     deployment = None
     if not malformed:
         # refuses the placement (check_placement) once the model has read it

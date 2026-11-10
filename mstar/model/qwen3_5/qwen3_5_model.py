@@ -1,10 +1,12 @@
 import logging
+from dataclasses import replace
 from typing import Any
 
 import torch
 from jinja2 import TemplateError
 from transformers import AutoTokenizer
 
+from mstar.engine.precision import NodePrecision
 from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec
 from mstar.engine.resources.attn.ragged.config import (
     RaggedAttentionConfig,
@@ -41,6 +43,7 @@ from mstar.model.qwen3_5.config import (
     ATTN,
     GDN_STATE,
     KV_CACHE,
+    LINEAR_ATTENTION,
     LINEAR_ATTN,
     ROPE,
     VISION_ATTN,
@@ -423,6 +426,15 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
     # Model ABC: submodule loading
     # ------------------------------------------------------------------
 
+    def get_node_precision(self, node_name: str) -> NodePrecision:
+        """bf16 params, no autocast: the norms compute in fp32 themselves and
+        every kernel takes its dtype explicitly. FlashInfer's GDN kernels assert
+        on the three gated-delta-net params, so they stay fp32."""
+        fp32 = ()
+        if node_name == "LLM" and LINEAR_ATTENTION in self.config.layer_types:
+            fp32 = ("*.self_attn.A_log", "*.self_attn.dt_bias", "*.self_attn.norm.weight")
+        return NodePrecision(torch.bfloat16, fp32_modules=fp32, autocast=False)
+
     def _create_submodule(
         self, node_name: str, device: str, dtype: torch.dtype, tp_group,
     ) -> NodeSubmodule | None:
@@ -434,6 +446,8 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
         if node_name not in ("LLM", "vision_encoder"):
             return None
 
+        # the policy as resolved, YAML param dtype included
+        precision = replace(self.get_node_precision(node_name), param_dtype=dtype)
         weights_dir = self._resolve_weights()
 
         if node_name == "vision_encoder":
@@ -450,6 +464,7 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
                 )
             tower = self._build(
                 lambda: Qwen3_5VisionModel(self.vision_config), dtype, device,
+                precision,
             )
             load_qwen3_5_vision_weights(tower, weights_dir, device=device)
             tower.requires_grad_(False).eval()
@@ -462,6 +477,7 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
 
         model = self._build(
             lambda: Qwen3_5ForCausalLM(self.config, tp_group), dtype, device,
+            precision,
         )
         load_qwen3_5_weights(model, weights_dir, device=device)
         model.requires_grad_(False).eval()

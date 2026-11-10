@@ -27,9 +27,10 @@ from pathlib import Path
 
 import torch
 
+from mstar.engine.precision import NodePrecision, apply_precision
 from mstar.model.loader.base import load_weights_into
 from mstar.model.loader.iterators import iter_safetensors_file
-from mstar.model.wan22.components.dit import Wan22DiT
+from mstar.model.wan22.components.dit import FP32_ISLANDS, Wan22DiT
 from mstar.model.wan22.config import Wan22Config
 
 # Attention-projection renames applied after the attn1/attn2 module renames.
@@ -100,14 +101,17 @@ def build_wan22_dit(
     device: torch.device | str = "cpu",
     cache_dir: str | None = None,
     sp_group=None,
+    dtype: torch.dtype = torch.bfloat16,
 ) -> Wan22DiT:
     """Meta-build, materialize on ``device``, and load the checkpoint into a
-    ready-to-serve (eval-mode) native DiT (``sp_group``: see ``Wan22DiT``)."""
+    ready-to-serve (eval-mode) native DiT (``sp_group``: see ``Wan22DiT``):
+    ``dtype`` with the fp32 islands, cast on meta so storage is allocated once,
+    in its final dtype."""
     transformer_dir = resolve_transformer_dir(model_path_hf, cache_dir)
 
     with torch.device("meta"):
         dit = Wan22DiT(config, sp_group=sp_group)
-    dit.cast_serving_dtypes()
+    apply_precision(dit, NodePrecision(dtype, fp32_modules=FP32_ISLANDS, autocast=False))
     dit.to_empty(device=device)
 
     params = dict(dit.named_parameters())

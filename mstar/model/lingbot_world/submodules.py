@@ -22,9 +22,9 @@ encoder's and decoder's causal-conv caches likewise. The dit's one engine
 resource is the attention over them: a ragged cross-attention (``DIT_ATTN``)
 whose step pairs the chunk's queries with its K/V window and with the text.
 
-Numerics are the model's, not the engine's: ``LingBotWorldModel.get_autocast_dtype``
-returns None, the DiT enters the reference's bf16 autocast itself, and the VAE
-encode runs fp32 as the reference does; the decode runs bf16 (cuDNN >= 9.16)
+Numerics are the model's, not the engine's: ``LingBotWorldModel.get_node_precision``
+runs no node under autocast, the DiT enters the reference's bf16 autocast itself,
+and the VAE encode runs fp32 as the reference does; the decode runs bf16 (cuDNN >= 9.16)
 unless ``reference_numerics``.
 """
 
@@ -207,6 +207,7 @@ class LingBotDitSubmodule(NodeSubmodule):
         if encoder_vae is not None and fast:
             wan_vae.encoder_to_channels_last(encoder_vae)
         if vae is not None and fast:
+            # as LingBotWorldModel.vae_decode_dtype, whose fp32_modules keep the choice
             self._decode_dtype = wan_vae_decode_dtype()
             if self._decode_dtype == torch.bfloat16:
                 vae.to(torch.bfloat16)

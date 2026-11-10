@@ -25,6 +25,7 @@ from collections.abc import Hashable
 import torch
 
 from mstar.communication.tensors import NameToTensorList
+from mstar.engine.precision import NodePrecision
 from mstar.engine.resources import NodeResourceSpec, RaggedAttentionConfig, RaggedAttentionSpec
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
@@ -32,6 +33,7 @@ from mstar.model.base import Model, WalkStep
 from mstar.model.components.diffusion.image_io import OUTPUT_FORMAT_KWARGS, encode_image, image_output_format
 from mstar.model.components.diffusion.qwen3.submodule import TEXT_INPUTS
 from mstar.model.components.quant_linear import (
+    BF16,
     check_linear_dtype,
     check_linear_dtype_steps,
     check_linear_keep,
@@ -57,6 +59,9 @@ logger = logging.getLogger(__name__)
 ENCODE_TEXT_WALK = "encode_text"
 IMAGE_GEN_WALK = "image_gen"
 ATTENTION_BACKENDS = ("flashinfer", "sdpa")
+
+
+_PRECISION = NodePrecision(torch.bfloat16, autocast=False)
 
 
 class ZImageModel(Model):
@@ -259,8 +264,13 @@ class ZImageModel(Model):
         return encode_image(output, request_kwargs)
 
     # ------------------------------------------------------------- loading
-    def get_autocast_dtype(self):
-        return None
+    def get_node_precision(self, node_name: str) -> NodePrecision:
+        # bf16 throughout with no autocast: numerics follow the load-time dtypes
+        if node_name == "dit" and self.linear_dtype != BF16:
+            # the transformer is built bf16, and its QuantLinears hold fp32
+            # tensor scales a bf16 cast would break
+            return NodePrecision(None)
+        return _PRECISION
 
     def capture_buckets(self) -> list[tuple[str, Hashable]]:
         if not self.accelerator_graph:
@@ -285,17 +295,19 @@ class ZImageModel(Model):
 
         if node_name == "text_encoder":
             return ZImageTextEncoderSubmodule(
-                build_text_encoder(self.config, self.snapshot, device), self.config,
+                build_text_encoder(self.config, self.snapshot, device, dtype=_PRECISION.param_dtype), self.config,
                 max_batch_size=self.max_batch_size,
                 capture_walk=ENCODE_TEXT_WALK if self.accelerator_graph else None,
             )
         if node_name == "vae_decoder":
             return ZImageVaeDecoderSubmodule(
-                build_vae(self.config, self.snapshot, device), self.config, max_batch_size=self.max_batch_size,
+                build_vae(self.config, self.snapshot, device, dtype=_PRECISION.param_dtype), self.config,
+                max_batch_size=self.max_batch_size,
                 compile_decode=self.vae_compile,
                 warmup_grids=[self.config.latent_grid(h, w) for h, w in self.capture_sizes],
             )
         if node_name == "dit":
+            # bf16 whatever the dit's policy: a quantized dit keeps its build dtypes
             transformer = build_transformer(self.config, self.snapshot, device)
             selection = select_linears(
                 transformer, self.linear_dtype, QUANTIZABLE_LINEARS, self.linear_keep_bf16, "Z-Image transformer",

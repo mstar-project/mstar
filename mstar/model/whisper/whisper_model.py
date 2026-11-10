@@ -45,6 +45,7 @@ from pathlib import Path
 import torch
 
 from mstar.communication.tensors import NameToTensorList
+from mstar.engine.precision import NodePrecision
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
@@ -623,6 +624,16 @@ class WhisperModel(Model):
     # -------------------------------------------------------------------
     # Model ABC: submodule loading
     # -------------------------------------------------------------------
+
+    def get_node_precision(self, node_name: str) -> NodePrecision:
+        """bf16 params, no autocast. The LayerNorms emit bf16 where autocast
+        emitted fp32, which every consumer rounded to bf16 at its next matmul.
+        The encoder's log-mel front end stays fp32 (filter bank, window and its
+        matmul, which autocast ran in bf16), as HF's feature extractor computes
+        it; the features are rounded to bf16 only for the first conv."""
+        if node_name == ENCODER_NODE:
+            return NodePrecision(torch.bfloat16, fp32_modules=("log_mel",), autocast=False)
+        return NodePrecision(torch.bfloat16, autocast=False)
 
     def get_submodule(
         self, node_name: str, device: str = "cpu", tp_group=None,

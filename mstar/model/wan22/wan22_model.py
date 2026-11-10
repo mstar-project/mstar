@@ -34,6 +34,7 @@ import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.distributed.base import ShardingConfig
+from mstar.engine.precision import NodePrecision
 from mstar.engine.resources import NodeResourceSpec
 from mstar.engine.resources.attn.ragged.config import RaggedAttentionConfig, RaggedAttentionSpec
 from mstar.graph.base import (
@@ -48,6 +49,7 @@ from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import Model, WalkStep
 from mstar.model.components.video_encode import encode_mp4
 from mstar.model.submodule_base import NodeSubmodule
+from mstar.model.wan22.components.dit import FP32_ISLANDS
 from mstar.model.wan22.config import WAN22_VARIANT_TI2V_5B, Wan22Config
 from mstar.model.wan22.submodules import (
     DENOISE_LOOP_NAME,
@@ -72,6 +74,18 @@ REQUEST_KWARGS = frozenset({
 
 def _is_number(value) -> bool:
     return not isinstance(value, bool) and isinstance(value, (int, float)) and math.isfinite(value)
+
+
+_NODE_PRECISION = {
+    # UMT5 and the encode VAE load bf16 throughout (transformers keeps UMT5's
+    # ``wo`` in fp32 only for an fp16 load)
+    "text_encoder": NodePrecision(torch.bfloat16, autocast=False),
+    "vae_encoder": NodePrecision(torch.bfloat16, autocast=False),
+    "dit": NodePrecision(
+        torch.bfloat16, fp32_modules=tuple(f"transformer.{g}" for g in FP32_ISLANDS), autocast=False,
+    ),
+    "vae_decoder": NodePrecision(None, autocast=False),
+}
 
 
 class Wan22Model(Model):
@@ -612,11 +626,11 @@ class Wan22Model(Model):
     # Model ABC: submodule loading
     # ------------------------------------------------------------------
 
-    # None disables both autocast and the engine's blanket cast, so numerics are
-    # governed by the load-time dtypes (bf16 with fp32 islands) rather than by the
-    # engine — which is what keeps them equal to the reference pipeline.
-    def get_autocast_dtype(self):
-        return None
+    def get_node_precision(self, node_name: str) -> NodePrecision:
+        """No node runs under autocast: numerics are governed by the load-time
+        dtypes, which is what keeps them equal to the reference pipeline. The
+        VAE decoder keeps the dtype it picks from the cuDNN version."""
+        return _NODE_PRECISION[node_name]
 
     def get_submodule(
         self, node_name: str, device: str = "cpu", tp_group=None,
@@ -671,6 +685,7 @@ class Wan22Model(Model):
             transformer = build_wan22_dit(
                 self.config, self.model_path_hf, device=device, cache_dir=self.cache_dir,
                 sp_group=sp_group,
+                dtype=_NODE_PRECISION["dit"].param_dtype,
             )
             return Wan22DitSubmodule(transformer, self.config, cfg_group=cfg_group)
         logger.warning("Wan2.2 has no submodule for node %r; running it dummy.", node_name)

@@ -5,10 +5,10 @@
     dit          -> KleinDenoiseSubmodule      DenoiseLoopSubmodule + the klein transformer + Euler step
     vae_decoder  -> KleinVaeDecoderSubmodule   packed tokens -> uint8 image; batches equal shapes
 
-Numerics are governed by the checkpoint dtypes (bf16 everywhere), not by the
-engine: ``Flux2KleinModel.get_autocast_dtype`` returns None, so nothing is
-autocast or blanket-cast, and each forward mirrors the reference pipeline's op
-order (see ``notes`` in the PR description and the equivalence tests).
+Numerics are governed by the load-time dtypes (bf16 everywhere), not by
+autocast: ``Flux2KleinModel.get_node_precision`` runs every node without it, and
+each forward mirrors the reference pipeline's op order (see ``notes`` in the PR
+description and the equivalence tests).
 """
 
 from __future__ import annotations
@@ -23,6 +23,7 @@ from torch import nn
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.accelerator_graph_config import geometric_batch_sizes
+from mstar.engine.input_spec import TensorSpec
 from mstar.model.components.batched_rows import BatchedRows
 from mstar.model.components.diffusion.compile_utils import (
     ExactOps,
@@ -254,6 +255,9 @@ class KleinVaeDecoderSubmodule(BatchedRows, NodeSubmodule):
     pixel. Requests at the same grid batch.
     """
 
+    # the denoiser's fp32 tokens, taken in the VAE's dtype
+    input_specs = {LATENTS: TensorSpec("param")}
+
     disable_torch_compile = True
     output_keys = (IMAGE_OUTPUT,)
     keep_batch_dim = True
@@ -294,7 +298,7 @@ class KleinVaeDecoderSubmodule(BatchedRows, NodeSubmodule):
         }
 
     def run_batch(self, latents: torch.Tensor, grid: tuple[int, int], **kwargs):
-        latents = latents.to(device=self.get_device(), dtype=self.vae.dtype)
+        latents = latents.to(self.get_device())
         patched = self.vae.denormalize_latents(unpack_latents(latents, *grid))
         image = self._vae_decode(unpatchify_latents(patched))
         return {IMAGE_OUTPUT: pixels_to_uint8(image)}

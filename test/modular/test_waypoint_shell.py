@@ -29,6 +29,7 @@ sys.path.insert(0, ".")
 
 from mstar.conductor.conductor import _walk_io
 from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.engine.input_spec import ingest
 from mstar.engine.resources import (
     AttentionSpec,
     AttnBackend,
@@ -400,7 +401,7 @@ def test_no_prepared_tensor_carries_tokens_per_frame_in_its_shape(
         )
 
 
-def test_prepared_shapes_and_dtypes_are_the_capture_template_exactly(submodule, config):
+def test_prepared_shapes_and_dtypes_are_the_capture_template_exactly(submodule, config, model):
     """``_capture_one`` bakes the config's template; replay re-stages only
     what ``preprocess`` returns into it. A mismatched key, shape, or dtype is
     either a stale-address read or a silent eager fallback -- asserted
@@ -412,7 +413,9 @@ def test_prepared_shapes_and_dtypes_are_the_capture_template_exactly(submodule, 
     inputs = {**_action(config), "latent": [torch.zeros((1, 1, *config.latent_shape))]}
 
     for walk, template in templates.items():
-        prepared = submodule.prepare_inputs(walk, _fwd_info(graph_walk=walk), inputs)
+        # as the engine ingests them: the fp32 latent in the dit's param dtype
+        ingested = ingest(submodule, inputs, model.get_node_precision(DIT_NODE))
+        prepared = submodule.prepare_inputs(walk, _fwd_info(graph_walk=walk), ingested)
         assert set(prepared.tensor_inputs) == set(template.tensor_inputs), walk
         assert prepared.input_seq_len == template.input_seq_len, walk
         for name, tensor in prepared.tensor_inputs.items():
@@ -1324,7 +1327,6 @@ def test_ae_graphs_are_compiled_for_capture_but_remain_optional(encoder, decoder
     assert encoder_configs
     assert all(cfg.compile for cfg in encoder_configs)
     assert encoder.disable_torch_compile is True
-    assert encoder.disable_autocast is True
 
     # The fused dit+decode node compiles its own two reference-shaped regions
     # (WaypointDiT.compile_regions, gated by config.compile_dit); letting the
@@ -1333,7 +1335,6 @@ def test_ae_graphs_are_compiled_for_capture_but_remain_optional(encoder, decoder
     assert fused_configs
     assert all(cfg.compile is False for cfg in fused_configs)
     assert decoder.disable_torch_compile is True
-    assert decoder.disable_autocast is True
 
 
 def test_ae_nodes_declare_no_capture_when_accelerator_graph_is_disabled(

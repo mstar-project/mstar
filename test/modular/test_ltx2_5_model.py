@@ -197,15 +197,6 @@ def test_dummy_mode_returns_no_submodules():
     assert all(model.get_submodule(node) is None for node in model.nodes)
 
 
-def test_autocast_is_off_so_numerics_follow_the_checkpoint():
-    assert _make_model().get_autocast_dtype() is None
-
-
-# ----------------------------------------------------------------------
-# requests
-# ----------------------------------------------------------------------
-
-
 def test_process_prompt_tokenizes_the_stripped_prompt():
     out = _make_model().process_prompt("  a dog ", ["text"], ["video", "audio"])
     assert out["text_inputs"][0].tolist() == list(b"a dog")

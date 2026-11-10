@@ -39,7 +39,10 @@ import torch
 
 from mstar.api_server.media_io import check_resample_rate
 from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import PartitionDefinition
+from mstar.conductor.request_info import (
+    PartitionDefinition,
+)
+from mstar.engine.precision import NodePrecision
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
@@ -767,8 +770,18 @@ class ChatterboxModel(Model):
     # Output
     # -----------------------------------------------------------------------
 
-    def get_autocast_dtype(self):
-        return self._t3_dtype
+    def get_node_precision(self, node_name: str) -> NodePrecision:
+        if node_name == T3_NODE:
+            # the KV cache and the paged attention inherit this dtype
+            return NodePrecision(self._t3_dtype, autocast=False)
+        if node_name == VOICE_ENCODER_NODE:
+            return NodePrecision(torch.float32, autocast=False)
+        if node_name == S3GEN_NODE:
+            # fp32 as built, but the CFM estimator runs in s3gen_estimator_dtype
+            # (set_estimator_dtype at load), so no blanket dtype; its S3
+            # tokenizer is shared with the voice encoder and stays fp32
+            return NodePrecision(None, autocast=False)
+        raise ValueError(f"Unknown Chatterbox node {node_name!r}")
 
     def get_output_sample_rate(self, modality: str = "audio") -> int:
         return self.config.sample_rate

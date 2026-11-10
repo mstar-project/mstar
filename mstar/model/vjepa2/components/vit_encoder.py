@@ -18,7 +18,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from mstar.model.vjepa2.components.layers import VJEPA2Layer
+from mstar.model.vjepa2.components.layers import FP32LayerNorm, VJEPA2Layer
 from mstar.model.vjepa2.config import VJepa2Config
 
 
@@ -91,7 +91,7 @@ class VJEPA2Encoder(nn.Module):
                 for _ in range(config.num_hidden_layers)
             ]
         )
-        self.layernorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.layernorm = FP32LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
 
     def forward(self, pixel_values_videos: torch.Tensor) -> torch.Tensor:
         hidden_states = self.embeddings(pixel_values_videos)

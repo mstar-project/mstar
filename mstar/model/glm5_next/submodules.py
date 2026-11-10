@@ -104,9 +104,6 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
     # torch.compile of the eager forwards is untested: they host the KDA resource
     # (compiler-disabled) and the reference MoE loop
     disable_torch_compile: bool = True
-    # Weights load in bf16; the KDA conv and delta rule, the router and mHC run
-    # in fp32 on purpose, which the engine's bf16 autocast would undo.
-    disable_autocast: bool = True
 
     def __init__(self, language_model: nn.Module, config: Glm5NextModelConfig) -> None:
         super().__init__()

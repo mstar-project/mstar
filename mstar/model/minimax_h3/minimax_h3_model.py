@@ -26,6 +26,7 @@ import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.distributed.base import ShardingConfig
+from mstar.engine.precision import NodePrecision
 from mstar.engine.resources import NodeResourceSpec, RaggedAttentionConfig, RaggedAttentionSpec
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Parallel, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
@@ -589,9 +590,11 @@ class H3Model(Model):
         return float(FPS)
 
     # ------------------------------------------------------------- loading
-    def get_autocast_dtype(self):
-        # the checkpoint's dtypes: bf16, with the reference's fp32 modules and step math
-        return None
+    def get_node_precision(self, node_name: str) -> NodePrecision:
+        """The checkpoint's dtypes, no autocast: bf16, with the reference's fp32
+        modules and step math."""
+        del node_name
+        return NodePrecision(None, autocast=False)
 
     def get_default_sharding_config(self) -> ShardingConfig:
         # The dit shards its rows by rank (Ulysses), the video decoder its clips. No tensor

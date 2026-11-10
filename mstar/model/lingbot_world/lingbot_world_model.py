@@ -31,10 +31,12 @@ import numpy as np
 import torch
 
 from mstar.communication.tensors import NameToTensorList
+from mstar.engine.precision import NodePrecision
 from mstar.engine.resources import NodeResourceSpec, RaggedAttentionConfig, RaggedCrossAttentionSpec
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import Model, TensorAndMetadata, WalkStep
+from mstar.model.components import wan_vae
 from mstar.model.lingbot_world.components.camera import latent_camera_poses, scale_intrinsics
 from mstar.model.lingbot_world.config import (
     LINGBOT_CONFIGS,
@@ -58,6 +60,9 @@ REFERENCE_MODEL_KWARGS = {"reference_numerics": True}
 
 ENCODE_TEXT_WALK = "encode_text"
 _DIT_INPUTS = ("text_embeds_pos", "image_inputs", "camera_poses", "intrinsics", "clock")
+
+
+_DIT_DTYPE = torch.bfloat16
 
 
 class LingBotWorldModel(Model):
@@ -334,8 +339,21 @@ class LingBotWorldModel(Model):
     # Submodule loading
     # ------------------------------------------------------------------
 
-    def get_autocast_dtype(self):
-        return None
+    def get_node_precision(self, node_name: str) -> NodePrecision:
+        """No node runs under engine autocast: the DiT enters the reference's
+        bf16 autocast itself. The dit node's encode VAE stays fp32, and so does
+        its decode VAE unless the decode runs bf16 (``vae_decode_dtype``)."""
+        if node_name == "dit":
+            fp32 = ("encoder_vae",) if self.vae_decode_dtype() == torch.bfloat16 else ("encoder_vae", "vae")
+            return NodePrecision(_DIT_DTYPE, fp32_modules=fp32)
+        # the text encoder: wan22's UMT5, loaded bf16 throughout
+        return NodePrecision(torch.bfloat16)
+
+    def vae_decode_dtype(self) -> torch.dtype:
+        """The dtype the dit node decodes in: fp32 under ``reference_numerics``,
+        else what the live cuDNN runs fastest (``LingBotDitSubmodule`` casts its
+        decode VAE to it)."""
+        return torch.float32 if self.config.reference_numerics else wan_vae.decode_dtype()
 
     def get_submodule(
         self, node_name: str, device: str = "cpu", tp_group=None,
@@ -366,7 +384,9 @@ class LingBotWorldModel(Model):
 
             if self.config.reference_numerics:
                 require_flash_attn()
-            dit = build_lingbot_dit(self.config, self.model_path_hf, device=device, cache_dir=self.cache_dir)
+            dit = build_lingbot_dit(
+                self.config, self.model_path_hf, device=device, cache_dir=self.cache_dir, dtype=_DIT_DTYPE,
+            )
             cfg = self.config
             return LingBotDitSubmodule(
                 dit, self._load_vae().to(device), cfg, encoder_vae=self._load_vae().to(device),

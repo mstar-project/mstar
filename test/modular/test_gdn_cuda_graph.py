@@ -24,6 +24,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+from mstar.engine.precision import NodePrecision, apply_precision
 from mstar.engine.resources.base import EngineResourceInfo
 from mstar.engine.resources.linear_attn import (
     LinearAttnConfig,
@@ -131,7 +132,10 @@ class Stack(torch.nn.Module):
                 if module.bias is not None:
                     module.bias.data.zero_()
 
-        self.to(device=device, dtype=torch.bfloat16)
+        # Qwen3.5's policy: bf16, but FlashInfer's GDN kernels take these fp32
+        apply_precision(self.to(device=device), NodePrecision(
+            torch.bfloat16, fp32_modules=("layers.*.A_log", "layers.*.dt_bias", "layers.*.norm.weight"),
+        ))
         self.requires_grad_(False).eval()
         for layer in self.layers:
             layer.bind_resources({GDN_STATE: pool, LINEAR_ATTN: manager})
