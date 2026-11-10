@@ -1818,3 +1818,15 @@ def test_a_live_item_whose_call_fails_is_reported_failed(monkeypatch):
         ws.send_text(json.dumps({"type": "input_audio_buffer.commit"}))
         done = _recv_until(ws, "conversation.item.input_audio_transcription.completed")[-1]
         assert done["transcript"] == "again" and len(api.submits) == 2
+
+
+def test_a_live_model_transcribes_with_intent_omitted(monkeypatch):
+    """Transcription is the intent a live transcription model serves, so an
+    omitted intent opens it; an intent it can't serve is refused with a
+    close reason within RFC 6455's 123 bytes, however long the intent."""
+    with _live_socket(monkeypatch, _LiveTranscriptionAPI(), "/v1/realtime") as ws:
+        assert ws.receive_json()["type"] == "transcription_session.created"
+    with pytest.raises(WebSocketDisconnect) as refused:
+        with _live_socket(monkeypatch, _LiveTranscriptionAPI(), "/v1/realtime?intent=" + "x" * 200) as ws:
+            ws.receive_text()
+    assert refused.value.code == 1008 and len(refused.value.reason.encode()) <= 123
