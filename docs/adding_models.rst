@@ -3573,7 +3573,7 @@ together). The scaffold reads both sets off the model's graph as one value
 LLM node whatever the model builds (``get_submodule`` calls its ``bind_walks``), so a model
 declares nothing for them. A node with hidden walks returns both outputs from every
 step, so every capture holds them; a row whose walk has no edge for them leaves them
-unrouted, and the step's rows whose walk has one take them as one copy (in
+unrouted, and a row whose walk has one takes its own copy of them (in
 ``batch_postprocess``), which a loop may accumulate.
 It reports a text prompt's length and a decode row's one token
 (``get_input_sequence_len``, ``speculative_input_seq_len``), so a model chunks its text

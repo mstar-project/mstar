@@ -736,23 +736,19 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
         piecewise_runners: Mapping[str, Any] | None = None,
     ) -> None:
         """A row whose own walk (in a mixed step too) routes `ROW_IDS` and
-        `ROW_HIDDEN` keeps them, all such rows of the step gathered into one
-        copy: its loop may accumulate them for the reply's life, and a view of
-        the step's batch clone would keep every row of it alive. Any other row
-        drops them. A rows-only step routes nothing off the device."""
+        `ROW_HIDDEN` keeps them, each in its own copy: its loop may accumulate
+        them for the reply's life, and a view of the step's batch clone, or of
+        any copy shared with its step-mates, would keep all their rows alive
+        that long. Any other row drops them. A rows-only step routes nothing
+        off the device."""
         if not self._hidden_walks or not outputs.per_rid_outputs:
             return
-        kept = []
         for rid, info in request_infos.items():
             out = outputs.get(rid)
             if out is None or ROW_HIDDEN not in out:
                 continue
             if info.graph_walk in self._hidden_walks:
-                kept.append(out)
+                for name in (ROW_IDS, ROW_HIDDEN):
+                    out[name] = [row.clone() for row in out[name]]
             else:
                 del out[ROW_IDS], out[ROW_HIDDEN]
-        if kept:
-            for name in (ROW_IDS, ROW_HIDDEN):
-                rows = torch.cat([out[name][0] for out in kept]).split(1)
-                for out, row in zip(kept, rows, strict=True):
-                    out[name] = [row]

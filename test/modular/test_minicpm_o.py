@@ -256,8 +256,8 @@ def test_the_spoken_decode_hands_the_tts_each_rows_id_and_hidden(tmp_path):
     """Only ``decode_spoken``'s graph routes each row's input id and hidden, which
     the TTS prefill reads. The LLM, built with its graph's decode and hidden walks,
     returns them from the one decode capture both decode walks replay; a text
-    reply's row drops them, and the step's spoken rows keep theirs, taken as one
-    copy for their loops to accumulate."""
+    reply's row drops them, and each of the step's spoken rows keeps its own copy
+    for its loop to accumulate, which holds no other row alive."""
     from mstar.model.components.sampled_token_decoder import ROW_HIDDEN, ROW_IDS
     from mstar.model.submodule_base import BatchedModelOutput
 
@@ -288,9 +288,9 @@ def test_the_spoken_decode_hands_the_tts_each_rows_id_and_hidden(tmp_path):
     spoken = [outputs.get(rid)[ROW_HIDDEN][0] for rid in ("spoken", "spoken2")]
     assert [h.tolist() for h in spoken] == [[[6.0, 7.0]], [[7.0, 8.0]]]
     assert [outputs.get(rid)[ROW_IDS][0].tolist() for rid in ("spoken", "spoken2")] == [[6], [7]]
-    # one copy for the step's spoken rows, apart from the batch clone
-    assert spoken[0].untyped_storage().data_ptr() == spoken[1].untyped_storage().data_ptr()
-    assert spoken[0].untyped_storage().data_ptr() != rows[ROW_HIDDEN].untyped_storage().data_ptr()
+    # each row its own copy, apart from the batch clone and from its step-mates
+    ptrs = {h.untyped_storage().data_ptr() for h in (*spoken, rows[ROW_HIDDEN])}
+    assert len(ptrs) == 3 and spoken[0].untyped_storage().nbytes() == spoken[0].nbytes
 
 
 def test_tts_code_budget_is_its_loop_cap():
