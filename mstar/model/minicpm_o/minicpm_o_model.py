@@ -52,28 +52,21 @@ from mstar.engine.resources import (
     SamplerSpec,
     SamplingReqConfig,
 )
-from mstar.engine.resources.kv.bounded import BoundedKVConfig, BoundedKVSpec
 from mstar.engine.resources.kv.config import DEFAULT_PAGE_SIZE
-from mstar.engine.resources.recurrent.config import (
-    RecurrentBlockConfig,
-    RecurrentStateConfig,
-    RecurrentStateSpec,
-)
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Parallel, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import KVLabel, LabelLayout, Model, ProcessPromptOutput, Span, WalkStep
 from mstar.model.components.audio_features import HOP_LENGTH, LogMelSpectrogram
-from mstar.model.minicpm_o import processor, weight_loader
-from mstar.model.minicpm_o.components.audio import MiniCPMOAudio
-from mstar.model.minicpm_o.components.token2wav import (
-    CACHE_FAMILIES,
+from mstar.model.components.token2wav.model import (
     DIT_COMPUTE_DTYPE,
     HOP,
     LEAD_SILENCE,
-    CacheCapacity,
     load_token2wav,
-    slot_layout,
 )
+from mstar.model.components.token2wav.resources import check_token2wav_slots, token2wav_resources
+from mstar.model.components.token2wav.submodule import Token2WavKeys, Token2WavSubmodule
+from mstar.model.minicpm_o import processor, weight_loader
+from mstar.model.minicpm_o.components.audio import MiniCPMOAudio
 from mstar.model.minicpm_o.components.tts import MiniCPMTTS, TTSConfig
 from mstar.model.minicpm_o.components.vision import MiniCPMOVision
 from mstar.model.minicpm_o.config import (
@@ -106,7 +99,6 @@ from mstar.model.minicpm_o.config import (
 from mstar.model.minicpm_o.submodules import (
     AudioEncoderSubmodule,
     LLMSubmodule,
-    Token2WavSubmodule,
     TTSSubmodule,
     VisionEncoderSubmodule,
 )
@@ -138,6 +130,7 @@ TTS_SAMPLING = TTSSampling()
 VOICES = {"default": "HT_ref_audio.wav"}
 DEFAULT_VOICE = "default"
 T2W_DEFAULT_SLOTS = 9
+T2W_KEYS = Token2WavKeys(codes="tts_code", state=T2W_STATE, kv=T2W_KV)
 
 # Upstream's `get_sys_prompt(mode="audio_assistant", language="en")`, around
 # the voice's reference audio.
@@ -229,16 +222,7 @@ class MiniCPMOModel(Model):
         finish."""
         resources = config.get("resources") or {}
 
-        def slots(key: str, default: int) -> int:
-            return int((resources.get(key) or {}).get("max_slots", default))
-
-        state = slots(T2W_STATE, T2W_DEFAULT_SLOTS)
-        kv = {key: slots(key, T2W_DEFAULT_SLOTS - 1) for key in T2W_KV.values()}
-        if any(n != state - 1 for n in kv.values()):
-            raise ValueError(
-                f"{config_path}: resources.{T2W_STATE}.max_slots ({state}) must be one more than "
-                f"each of {', '.join(f'{k}.max_slots ({n})' for k, n in kv.items())}"
-            )
+        check_token2wav_slots(T2W_KEYS, resources, T2W_DEFAULT_SLOTS, config_path)
 
         tts = resources.get(TTS_KV) or {}
         reply = -(-self.tts_config.max_position_embeddings // int(tts.get("page_size") or DEFAULT_PAGE_SIZE))
@@ -315,20 +299,9 @@ class MiniCPMOModel(Model):
                 ),
             ),
             *self._tts_resources(),
-            RecurrentStateSpec(
-                resource_key=T2W_STATE, nodes={TOKEN2WAV},
-                config=RecurrentStateConfig(
-                    num_layers=1,
-                    blocks={
-                        name: RecurrentBlockConfig(shape=block.shape, dtype=block.dtype)
-                        for name, block in self._t2w_slot_layout().items()
-                    },
-                    # ~0.4 GB a slot (one speaking request) for the bundled
-                    # voices; `t2w_state.max_slots` in the yaml sizes it
-                    max_slots=T2W_DEFAULT_SLOTS,
-                ),
-            ),
-            *self._t2w_kv(),
+            # ~0.4 GB a slot (one speaking request) for the bundled voices;
+            # `t2w_state.max_slots` in the yaml sizes it
+            *token2wav_resources(T2W_KEYS, TOKEN2WAV, self._voice_seconds(), T2W_DEFAULT_SLOTS),
         ]
 
     def _voice_seconds(self) -> tuple[float, float]:
@@ -337,38 +310,6 @@ class MiniCPMOModel(Model):
 
         seconds = [sf.info(str(Path(self.local_dir) / "assets" / f)).duration for f in VOICES.values()]
         return min(seconds), max(seconds)
-
-    def _t2w_capacity(self):
-        """Token2wav's caches sized for the longest voice."""
-        # the s3 tokenizer runs at 25 Hz; one token of slack for rounding
-        return CacheCapacity(int(self._voice_seconds()[1] * 25) + 1)
-
-    def _t2w_slot_layout(self) -> dict:
-        return slot_layout(self._t2w_capacity(), dit_dtype=DIT_COMPUTE_DTYPE)
-
-    def _t2w_kv(self) -> list[BoundedKVSpec]:
-        """Token2wav's attention caches, sized for every voice length allowed."""
-        voice_tokens = self._t2w_capacity().prompt_tokens
-        # one token of slack for rounding
-        min_tokens = max(0, int(self._voice_seconds()[0] * 25) - 1)
-        return [
-            BoundedKVSpec(
-                resource_key=T2W_KV[name], nodes={TOKEN2WAV},
-                config=BoundedKVConfig(
-                    num_layers=family.num_layers,
-                    num_heads=family.num_heads,
-                    head_dim=family.head_dim,
-                    rows_per_request=family.rows,
-                    max_source_len=family.rate * voice_tokens,
-                    min_source_len=family.rate * min_tokens,
-                    retention=family.retention,
-                    max_slots=T2W_DEFAULT_SLOTS - 1,
-                    reverse_step_order=family.reverse_step_order,
-                    dtype=DIT_COMPUTE_DTYPE if name == "dit" else torch.float32,
-                ),
-            )
-            for name, family in CACHE_FAMILIES.items()
-        ]
 
     def _tts_resources(self) -> list[NodeResourceSpec]:
         tts = self.tts_config
@@ -836,7 +777,7 @@ class MiniCPMOModel(Model):
         }
         logger.info("Loaded MiniCPM-o token2wav with voices %s onto %s", sorted(voices), device)
         return Token2WavSubmodule(
-            t2w.requires_grad_(False), voices, self.tts_config.eos_code, dit_dtype=DIT_COMPUTE_DTYPE)
+            t2w.requires_grad_(False), T2W_KEYS, voices, self.tts_config.eos_code, dit_dtype=DIT_COMPUTE_DTYPE)
 
     @staticmethod
     def _build(make, dtype: torch.dtype, device: str) -> torch.nn.Module:
