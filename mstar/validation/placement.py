@@ -263,7 +263,10 @@ def _node_placement(walk_graphs: Mapping[str, GraphSection], node_groups: list[d
     for i, group in enumerate(node_groups):
         unknown_nodes = sorted(set(group["node_names"]) - nodes)
         if unknown_nodes:
-            yield f"node_groups[{i}] lists nodes {unknown_nodes}, which this model does not define"
+            yield (
+                f"node_groups[{i}] lists nodes {unknown_nodes}, which no graph walk of this "
+                f"model uses with this config (nodes: {sorted(nodes)})."
+            )
         unknown = sorted(set(group.get("graph_walks", [])) - walk_graphs.keys())
         if unknown:
             yield (

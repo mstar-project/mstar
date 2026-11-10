@@ -157,10 +157,10 @@ class RequestLifecycle:
 
     def removes_ready(self, in_flight: Collection[int], last_consumed_seq: int) -> list[int]:
         """The requests to tear down now, in order; each stays pending until
-        ``removed``, so a teardown that raises doesn't lose the ones after it. A
-        step holding a rid defers its remove; on a follower it also defers the
-        followed ones after it, which rank 0 tore down later. The free list
-        hands pages back out in the order they were freed."""
+        ``removed`` (a teardown that raises stops the worker). A step holding
+        a rid defers its remove; on a follower it also defers the followed ones
+        after it, which rank 0 tore down later. The free list hands pages back
+        out in the order they were freed."""
         self._land_removes(last_consumed_seq)
         if not self.pending_removes:
             return []

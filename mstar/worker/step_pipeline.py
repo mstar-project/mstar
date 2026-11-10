@@ -896,9 +896,19 @@ class StepPipeline:
             self._tear_down_request(rid)
 
     def _tear_down_request(self, rid: int) -> None:
+        wire_rid = self._graph_runtime.get_rid_string(rid)
+        try:
+            self._tear_down(rid, wire_rid)
+        except Exception as exc:
+            # A teardown that raised may have leaked or corrupted pages that every
+            # later request shares, so failing the step in flight would not
+            # contain it. Stop, and the conductor's dead-worker check fails the rest.
+            logger.exception("Worker %s: teardown of request %s raised; stopping", self.worker_id, wire_rid)
+            raise SystemExit(f"Worker {self.worker_id}: teardown of request {wire_rid} raised ({exc!r})") from exc
+
+    def _tear_down(self, rid: int, wire_rid: str) -> None:
         # Rank 0 fans its removes out so that a follower tears down in the same
         # gap between steps, and can't tear down state rank 0 is still reading.
-        wire_rid = self._graph_runtime.get_rid_string(rid)
         self.lockstep.forward_teardown(rid, WorkerMessage(
             message_type=WorkerMessageType.REMOVE_REQUEST,
             body=RemoveRequest(
@@ -914,15 +924,7 @@ class StepPipeline:
         laps = PhaseLaps("worker.msg.remove_request.")
         for message in self.lifecycle.removed(rid, wire_rid):
             self.ingest.drop_for_removed(message)
-        try:
-            self._release_request(rid, wire_rid, laps)
-        except Exception as exc:
-            # The release may have leaked or corrupted pages that every later
-            # request shares, so failing the step in flight would not contain
-            # it. Stop, and the conductor's dead-worker check fails the rest.
-            raise SystemExit(
-                f"Worker {self.worker_id}: teardown of request {wire_rid} raised ({exc!r})"
-            ) from exc
+        self._release_request(rid, wire_rid, laps)
 
     def _release_request(self, rid: int, wire_rid: str, laps: PhaseLaps) -> None:
         freed = self.engine_manager.remove_request(rid)
