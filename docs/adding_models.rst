@@ -2142,6 +2142,19 @@ the prefill) still brings it routed, and that read puts it over the slot's.
 and a node on it that reads the routed token sets ``device_loopback = None``; Whisper and
 Qwen3-Omni's Thinker declare their own.
 
+A token that also streams to another node can go down the stream by value, when the
+stream's ``Connection`` sets ``by_value=True``: its consumer then takes a window of the
+stream as one CPU int64 tensor of its items' values. A step whose node names the signal
+in ``inline_signals(walk)`` sends each row's value in the step's ``EDGE_ITEMS`` frame
+instead of a tensor, with nothing to stage, read or acknowledge. A step carries one
+inline signal, the first of those it outputs, so a client token and a different stream
+token cannot both ride inline. The step keeps its rows on the device only if every
+output is one of ``device_loopback_signals``, so the streamed signal must also be the
+loop-back signal: MiniCPM-o's TTS decode loops its code back on the device and streams
+the same code to the vocoder by value. A lockstep node's streams keep their tensors,
+and a ``by_value`` connection cannot join its items, drive its consumer's walk or come
+from the client.
+
 On such a node a captured step writes each row's token and RNG offset back to the request's
 row inside the graph (``knobs: sampler_ingraph_scatter``, on by default). Those rows are
 allocated once, ``knobs: sampler_slots`` of them, so a request takes its row when the runner
@@ -2370,7 +2383,8 @@ Both types share the base ``CudaGraphConfig`` fields:
 - ``capture_graph_walk`` is the walk to capture.
 - ``replay_graph_walks`` lists the walks that may replay this capture. One capture can
   therefore serve several walks, for example ``prefill_audio`` reusing ``prefill_text``.
-- ``capture_batch_sizes`` lists the batch sizes to record.
+- ``capture_batch_sizes`` lists the batch sizes to record. ``None`` uses the runner
+  default; ``[]`` records none.
 - ``additional_key_info`` is an extra hashable component of the capture bucket key. Use it
   when one walk must be captured more than once because the batch shape alone does not
   identify the capture. Its value must equal both the value returned by the submodule's
@@ -2545,7 +2559,12 @@ Both types share the base ``PiecewiseCudaGraphConfig`` fields:
   none, since its replay would address every request's tokens to the first request's
   adapter.
 - ``capture_batch_sizes`` lists the batch sizes to record. ``None`` uses the runner
-  default.
+  default; ``[]`` records none, for an eager-only region (below).
+- ``eager_fallback`` runs a shape with no graph eagerly through ``run`` instead of
+  raising: the runner declares, plans and commits the region's step over the real rows
+  (as a replay declares it, without padding), so the caller has one path for captured
+  and uncaptured shapes. Off, the caller checks ``can_run`` first. MiniCPM-o's vocoder
+  uses it, with eager-only regions for the shapes it never captures.
 - ``compile`` runs ``torch.compile`` on ``capture_fn`` before capture. The default is
   ``False``.
 - ``compile_mode`` is that ``torch.compile``'s mode, as on ``AcceleratorGraphConfig``.
@@ -3756,8 +3775,8 @@ streams (audio and video, say): each has its own buffer and its own end.
   and a final chunk, and a loop fed by the stream ends as any stream-terminated loop does.
   Over ``/generate/ws`` a client that opens with ``end_input: false`` appends and ends
   input explicitly (see :doc:`clients`), and a ``/v1/realtime`` conversation keeps it open
-  for the call's life; every other request ends the input as soon as it is submitted. ``/generate/ws``
-  and ``/v1/realtime`` are on the Python frontend only, not ``--rust-frontend``.
+  for the call's life; every other request ends the input as soon as it is submitted. Both
+  frontends serve ``/generate/ws`` and ``/v1/realtime``.
 - The API server's data worker is the stream's producer. The conductor tells it the
   consuming node and its ranks once per call, when it dispatches the request, and the data
   worker sends each append's items to every one of those ranks itself, and then the
