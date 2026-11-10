@@ -8,8 +8,9 @@ from the ONNX files MiniCPM-o ships (``speech_tokenizer_v2_25hz.onnx``, ``camppl
   the tanh output before rounding (Chatterbox's ``FSQuantizer`` scales it by 0.999 instead),
   and its attention LayerNorm eps of 1e-6 (the ONNX graph and Chatterbox use 1e-5);
 - x-vector: ``CAMPPlus`` on the mean-normalised Kaldi fbank;
-- mel: the Matcha log-mel (``MatchaLogMel``) of the clip resampled 16 -> 24 kHz,
-  replicate-padded (or cut) to two frames per prompt token, which is what the flow's prompt condition must be.
+- mel: the Matcha log-mel (``MatchaLogMel``) of the clip at 24 kHz (resampled from 16 kHz, or
+  handed over from the clip's own rate), replicate-padded (or cut) to two frames per prompt
+  token, which is what the flow's prompt condition must be.
 
 Both ONNX files load through CosyVoice3's readers (``cosyvoice3.components.onnx_weights``),
 which need no ``onnx`` package.
@@ -79,8 +80,11 @@ class VoicePromptEncoder(nn.Module):
         self.resample = torchaudio.transforms.Resample(PROMPT_SR, MEL_SR)
 
     @torch.inference_mode()
-    def forward(self, wav16: torch.Tensor) -> VoicePrompt:
-        """``wav16 [T]`` float32 at 16 kHz. Each part runs on its module's device."""
+    def forward(self, wav16: torch.Tensor, wav24: torch.Tensor | None = None) -> VoicePrompt:
+        """``wav16 [T]`` float32 at 16 kHz. ``wav24``: the clip at 24 kHz for the mel, resampled
+        from its own rate, which is where Step-Audio2's reference takes it from
+        (``token2wav.py:73-80``); without it, the 16 kHz copy is resampled (MiniCPM-o). Each
+        part runs on its module's device."""
         tok_dev = self.tokenizer.window.device
         log_mel = self.tokenizer.log_mel(wav16.to(tok_dev))
         tokens, _ = self.tokenizer.encode_mel(log_mel, torch.tensor([log_mel.shape[-1]], device=tok_dev))
@@ -90,6 +94,7 @@ class VoicePromptEncoder(nn.Module):
         spk_emb = self.speaker(kaldi_fbank_80(wav16.to(spk_dev))[None])
 
         mel_dev = self.mel.window.device
-        mel = self.mel(self.resample(wav16.to(mel_dev)[None])).transpose(1, 2)
+        wav24 = self.resample(wav16.to(mel_dev)) if wav24 is None else wav24.to(mel_dev)
+        mel = self.mel(wav24[None]).transpose(1, 2)
         mel = F.pad(mel, (0, 0, 0, tokens.shape[1] * FRAMES_PER_TOKEN - mel.shape[1]), mode="replicate")
         return VoicePrompt(tokens=tokens, spk_emb=spk_emb, mel=mel)
