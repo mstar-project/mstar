@@ -148,7 +148,7 @@ def _executor(engine: Engine) -> tuple[StepExecutor, dict]:
     stored: dict = {}
 
     def store(rids, outputs, signals, **kwargs):
-        stored.update({rid: outputs.get(rid) for rid in rids}, signals=signals)
+        stored.update({rid: outputs.get(rid) for rid in rids}, signals=signals, host=kwargs.get("cpu_tensors"))
         raise _ReachedStoreError
 
     worker = make_worker(
@@ -220,6 +220,27 @@ def test_rows_reach_the_stop_check_and_the_store_cut_to_their_spans(batched):
         assert stored[rid]["level"][0].shape == (1,)
     # a span covering the whole row leaves the tensor as it was
     assert stored[2]["audio"][0] is uncut[2]
+
+
+def test_a_spanned_outputs_stop_buffer_is_cut_like_the_output():
+    """A step that also stages a spanned output's rows for the stop check: the check reads
+    each row cut to its span off that host copy, and the store gets the same cut copy for a
+    host transport, so the rows cross to the host once."""
+
+    class _Rows(_SpanningVocoder):
+        def _output(self, rids, padded):
+            spans = super()._output(rids, padded).output_spans
+            return BatchedModelOutput(
+                row_outputs={"audio": padded}, check_stop_buffers={"audio": padded}, output_spans=spans,
+            )
+
+    sub = _Rows()
+    stored, _, _ = _run_step(sub, SAMPLES)
+    for rid, expected in EXPECTED.items():
+        assert sub.stop_check_lengths[rid] == len(expected)
+        sent, host = stored[rid]["audio"][0], stored["host"][rid]["audio"][0]
+        assert host.shape == sent.shape
+        assert host.reshape(-1).tolist() == sent.reshape(-1).tolist() == pytest.approx(expected)
 
 
 def test_a_row_whose_span_is_empty_is_left_out_of_the_store():
