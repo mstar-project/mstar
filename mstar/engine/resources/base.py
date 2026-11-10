@@ -96,17 +96,18 @@ class EngineResourceInfo:
     # the prefix caches this engine opens (`opening_prefix_caches`), decided
     # before any resource is built, for one that sizes itself by its own
     prefix_caches: frozenset[str] = frozenset()
-    # how many ways the node's ranks split its attention heads, which each builder sizes head counts
-    # by; None for every TP and SP rank (`head_shards`), which the engine narrows for a node that
-    # places positions over its SP ranks. A ragged resource declaring
-    # ``RaggedAttentionConfig.shard_over_sp=False`` splits over TP only.
-    head_shards: int | None = None
+    # whether the resource's nodes run replicated over their SP ranks, because their pools place
+    # positions over them (`context_parallel.positions_over_sp`), rather than running their own SP
+    replicated_over_sp: bool = False
     # what each step may still copy to the host once its outputs are sent, or on a pass that runs no step
     host_allowance: StepAllowance | None = None
 
-    def __post_init__(self):
-        if self.head_shards is None:
-            object.__setattr__(self, "head_shards", head_shards(self.joint_comm_group))
+    @property
+    def head_shards(self) -> int:
+        """How many ways the node's ranks split its attention heads, which each builder sizes head
+        counts by (`head_shards`). A ragged resource declaring
+        ``RaggedAttentionConfig.shard_over_sp=False`` splits over TP only."""
+        return head_shards(self.joint_comm_group, self.replicated_over_sp)
 
     def dependency(self, key: str) -> NodeResourceSpec:
         spec = self.dependencies.get(key)

@@ -538,7 +538,8 @@ def _cp_attention(
     ))
     info = EngineResourceInfo(
         device=device, joint_comm_group=joint, kv_dtype=dtype, dependencies={"kv": kv},
-        head_shards=joint.tp_group.world_size,
+        # SP placement replicates the node over the SP ranks, heads split over TP alone
+        replicated_over_sp=joint.sp_group.world_size > 1,
     )
     spec = AttentionSpec(resource_key="attn", nodes={NODE}, config=AttentionConfig(kv_cache="kv", **attention))
     attn = AttentionManager.build(spec, info)

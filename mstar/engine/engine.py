@@ -753,15 +753,16 @@ class Engine:
         prefix_caches = opening_prefix_caches(specs, instance, checkpoint_named=checkpoint is not None)
 
         self._classify_tp_roles(node_names, parallel_groups)
-        # node -> how many ways its heads split: TP alone where its pools place positions over its SP ranks
-        shards = {}
+        # node -> whether it runs replicated over its SP ranks, its pools placing positions over them,
+        # and how many ways its heads split then: TP alone where it does
+        over_sp, shards = {}, {}
         for node in node_names:
             group = parallel_groups.get_joint_group_for_node(node)
             sp = group.sp_group.world_size
-            over_sp = sp > 1 and positions_over_sp(
+            over_sp[node] = sp > 1 and positions_over_sp(
                 specs, node, sp, () if model is None else model.get_default_sharding_config().sp_enabled_nodes,
             )
-            shards[node] = head_shards(group, over_sp)
+            shards[node] = head_shards(group, over_sp[node])
 
         for spec in specs:
             relevant_nodes = spec.nodes & node_names
@@ -773,9 +774,10 @@ class Engine:
             # This Engine constructs only the local instance, whose consumers
             # validate_deployment checked share one parallel group.
             first_node = min(relevant_nodes)
-            # one resource is sized by one head-shard count (validate_deployment checks this
-            # first); conservative for a resource that never reads it
-            if len({shards[node] for node in relevant_nodes}) > 1:
+            # one resource is sized by one head-shard count over one parallel group, so its nodes
+            # all run replicated over SP or none do (validate_deployment checks this first);
+            # conservative for a resource that never reads it
+            if len({over_sp[node] for node in relevant_nodes}) > 1:
                 raise ValueError(
                     f"resource {spec.resource_key!r} serves nodes that split heads different ways "
                     f"({ {node: shards[node] for node in sorted(relevant_nodes)} }): one places its KV "
@@ -804,7 +806,7 @@ class Engine:
                     ),
                     host_allowance=self.host_allowance,
                     prefix_caches=prefix_caches,
-                    head_shards=shards[first_node],
+                    replicated_over_sp=over_sp[first_node],
                 ),
             )
             for node in relevant_nodes:

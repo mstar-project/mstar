@@ -552,17 +552,17 @@ def test_a_node_running_sequence_or_cfg_parallelism_refuses_lora(adapters, axis)
     _, paths = adapters
     sp2 = CommGroup(my_global_rank=0, my_group_rank=0, group_members=[0, 1])
 
-    def build(group, head_shards=None):
+    def build(group, replicated_over_sp=False):
         groups = JointGroups(tp_group=CommGroup.trivial(), sp_group=CommGroup.trivial(), instance=group)
         setattr(groups, f"{axis}_group", group)
-        info = EngineResourceInfo(device=CPU, joint_comm_group=groups, head_shards=head_shards)
+        info = EngineResourceInfo(device=CPU, joint_comm_group=groups, replicated_over_sp=replicated_over_sp)
         return LoraAdapterPool.build(make_spec(paths), info)
 
     with pytest.raises(ValueError, match=rf"at {axis}_size 2, which LoRA does not support"):
         build(sp2)
     assert build(CommGroup.trivial()).targets
     if axis == "sp":
-        assert build(sp2, head_shards=1).targets
+        assert build(sp2, replicated_over_sp=True).targets
 
 
 def test_a_replicated_slice_that_does_not_split_evenly_is_refused():
