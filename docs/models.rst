@@ -109,6 +109,10 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
    * - ``qwen3_8_27b``
      - ``Qwen/Qwen3.8-27B``
      - Qwen3.8-27B on the Qwen3.5 code above (same architecture); ships a TP4 config.
+   * - ``minicpm_o`` *(Beta)*
+     - ``openbmb/MiniCPM-o-4_5``
+     - Omni-modal chat (text/image/audio in, text out): Qwen3-8B over a navit SigLIP +
+       resampler and a Whisper-medium encoder. Half-duplex only.
    * - ``omnivoice``
      - ``k2-fsa/OmniVoice``
      - Massively multilingual zero-shot TTS: masked-diffusion canvas over a Qwen3-0.6B
@@ -261,7 +265,9 @@ Notes
   model's config. BAGEL and Orpheus are the exception: their files are the
   backbone's chat presets (Qwen2.5-7B-Instruct, Llama-3.2-3B), so only
   ``do_sample: false`` is read and the recipes stay (BAGEL temperature 0.6,
-  top_k 0, top_p 1.0; Orpheus temperature 0.6, top_p 0.8).
+  top_k 0, top_p 1.0; Orpheus temperature 0.6, top_p 0.8). MiniCPM-o keeps
+  upstream ``chat``'s recipe over its file (temperature 0.7, top_p 0.8, top_k
+  100, repetition_penalty 1.02).
 - Qwen3-Omni's Talker cap comes from ``talker_max_new_tokens``, 4096 on the
   released checkpoint (it was 2048). Plain sampling keys target the Thinker, except
   on ``/v1/audio/speech``, where ``temperature`` and ``top_p`` set the Talker;
@@ -387,7 +393,7 @@ Higgs Audio notes
 - The model drops or repeats text on long audio, so ``/v1/audio/transcriptions``
   cuts an upload longer than 30 s into windows of at most 30 s run in parallel.
 - One prefill step per request: the ChatML text around the audio and the audio
-  embeddings go into the KV cache as one span.
+  embeddings go into the KV cache as three spans.
 - Decode keeps each request's last token in the sampler's slot master and
   sends the client's copy inline (``MSTAR_DEVICE_LOOPBACK``, on by default),
   as Qwen3.5 does: a decode step stores and routes no tensors.

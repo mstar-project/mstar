@@ -21,6 +21,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from mstar.engine.resources import Residency  # noqa: E402
 from mstar.engine.resources.step import FULL_ADMIT_OK  # noqa: E402
 from mstar.graph.base import GraphNode  # noqa: E402
 from mstar.graph.runtime.base import (
@@ -57,6 +58,9 @@ class _FakeEngine:
 
     def splits_by_capture_key(self, node_name, graph_walk):
         return False
+
+    def residency(self, node_name, rid):
+        return Residency.RESIDENT
 
 
 class _FakeEngineManager:

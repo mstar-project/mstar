@@ -61,7 +61,7 @@ from mstar.engine.resources.lora.config import LORA_RESOURCE_KEY, LoraSpec, lora
 from mstar.engine.resources.lora.serving import lora_spec, resolve_lora_adapters
 from mstar.model.base import declared_resources
 from mstar.model.media_limits import RAW_INPUT_CHARGES
-from mstar.model.multimodal import PromptPart
+from mstar.model.multimodal import SUPPORTED_MODALITIES, PromptPart
 from mstar.model.registry import model_init_kwargs
 from mstar.observability.catalog import STATUS_INTERVAL_S
 from mstar.observability.metrics import (
@@ -89,9 +89,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-SUPPORTED_MODALITIES = frozenset({
-    "text", "image", "audio", "video", "video_frame", "action", "scalar", "tensor",
-})
 STREAMING_ONLY_MODALITIES = frozenset({"video_frame"})
 
 NDJSON_STREAM_MEDIA_TYPE = "application/x-ndjson"
@@ -927,6 +924,7 @@ class APIServer:
             prompt_parts=prompt_parts,
             prefix_root=prefix_root,
             ends=ending,
+            streaming=streaming,
             raw_inputs=raw_inputs,
         ))
 

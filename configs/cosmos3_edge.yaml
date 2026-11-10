@@ -2,6 +2,12 @@ model: "cosmos3_edge"
 # Sequence-length hint for the scheduler. The conductor only asserts its
 # presence; the real per-request capacity is the KV pool below.
 max_seq_len: 8192
+knobs:
+  # Threaded, the reasoner's decode replay was launched only after the GPU had
+  # gone idle (nsys): the GPU thread's per-step host work, with its waits on the
+  # plan thread, was about as long as the decode graph. On the main thread the
+  # GPU no longer waits on the launch. The generator walks measured level.
+  step_threads: serial
 # KV pool sizing. Edge is 28 layers x 8 KV heads x 128 (half of Nano's per-page
 # footprint); one pool serves both the DiT's frozen text prefixes (a few pages
 # per guidance branch) and the reasoner's chat context (up to 131k tokens per

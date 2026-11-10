@@ -1,5 +1,6 @@
 import atexit
 import hashlib
+import itertools
 import logging
 import math
 import multiprocessing as mp
@@ -36,7 +37,7 @@ from mstar.conductor.workers import accelerator_type, deployment_workers
 from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import GlobalParallelConfig, WorkerParallelGroups
 from mstar.engine.resources import KVReqConfig, ResourceReqConfig
-from mstar.engine.resources.kv.config import refuse_undeclared_labels, without_layouts
+from mstar.engine.resources.kv.config import mark_unpausable, refuse_undeclared_labels, without_layouts
 from mstar.engine.resources.lora.config import LoraSpec
 from mstar.graph.base import GraphEdge, NodeAndGraphWalk, TensorPointerInfo
 from mstar.model.base import Model, WorkerGraph, serving_resources, streamed_inputs
@@ -479,6 +480,7 @@ class Conductor:
         ``model_config_file``, which the model's placement methods read in any case. A
         LoRA adapter without its digest is refused either way."""
         self.requests: dict[str, RequestData] = {}
+        self._arrivals = itertools.count()
         # Requests in teardown: kept in self.requests (so they still count toward
         # concurrency until their GPU state is freed) with barrier state here.
         self.draining: dict[str, DrainingRequest] = {}
@@ -536,6 +538,7 @@ class Conductor:
         self.max_concurrent_requests: int = self.model_config.get(
             "max_concurrent_requests", None
         )
+        self._unpausable_outputs = frozenset(self.model_config.get("unpausable_outputs", model.UNPAUSABLE_OUTPUTS))
         # Optional ``mps: true``: workers run as clients of a CUDA MPS daemon the
         # conductor owns, so workers sharing a GPU overlap their kernels instead
         # of time-slicing. validate_deployment checked the value.
@@ -1409,6 +1412,7 @@ class Conductor:
         if not all(partition_states[name].is_done for name in self._streamed_partitions()):
             prefix_cache = False
         kv_layout = kwargs.get("kv_layout") or {}
+        arrival = next(self._arrivals)
         # process_prompt's {stream edge: context-only lead items}; each worker
         # primes the streams its own partition consumes
         stream_lead_items = kwargs.get("stream_lead_items") or {}
@@ -1432,6 +1436,10 @@ class Conductor:
             )
             for key, cfg in resource_configs.items():
                 cfg.apply_conductor_config(seed=seed, resource_key=key, loop_caps=loop_caps)
+        mark_unpausable(
+            resource_configs,
+            body.streaming and not self._unpausable_outputs.isdisjoint(body.initial_output_modalities),
+        )
         for specs in self._resource_specs():
             for key, cfg in resource_configs.items():
                 cfg.validate(specs.get(key))
@@ -1526,7 +1534,8 @@ class Conductor:
                         random_seed=pstate.random_seed,
                         partition_name=partition_name,
                         max_tokens=request_data.max_output_tokens,
-                        resource_configs=request_data.resource_configs
+                        resource_configs=request_data.resource_configs,
+                        arrival=arrival,
                     ),
                 )
                 self.communicator.send(

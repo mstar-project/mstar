@@ -184,20 +184,20 @@ def test_leader_remove_then_conductor_remove_goes_through_remove_request():
     assert w.lockstep.pending_follow_count("tp#1") == 0
 
 
-def test_conductor_remove_for_a_request_never_admitted_drops_what_was_parked():
-    """A NEW_REQUEST refused because the request was already draining: nothing
-    replays its parked messages or clears its drain state, and the conductor's
-    REMOVE follows it on the same socket, so no later NEW_REQUEST will."""
+def test_a_request_drained_before_its_new_request_acks_what_was_parked():
+    """A request drained before its NEW_REQUEST, which sent READS_DONE at once, is still taken in, without reads, so
+    a TP follower can apply rank 0's moves for it. Its parked inputs are never read, so they are ACKed unread, and the
+    conductor's REMOVE tears it down and clears its drain state."""
     w = _worker()
     deliver(w, _drain("D#1"))
     deliver(w, _signals("D#1", 3), _new("D#1"))
-    assert w._graph_runtime.get_rid_handle("D#1") is None and _parked(w) == 1
+    assert w._graph_runtime.get_rid_handle("D#1") is not None and _parked(w) == 0
+    assert w.tensor_manager.acked == [3] and w.tensor_manager.reads == []
     w.lockstep.enqueue_follow(_follow("D#1"))
     assert w.lockstep.pending_follow_count("D#1") == 1
 
     deliver(w, _remove("D#1"))
-    assert not w.lifecycle._parked
-    assert w.tensor_manager.acked == [3]
+    assert not w.lifecycle._parked and w._graph_runtime.get_rid_handle("D#1") is None
     assert "D#1" not in w.lifecycle.draining and "D#1" not in w.lifecycle._reads_done_sent
     assert w.lockstep.pending_follow_count("D#1") == 0
 
