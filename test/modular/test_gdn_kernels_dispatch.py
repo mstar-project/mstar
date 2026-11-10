@@ -34,6 +34,7 @@ from mstar.engine.resources.linear_attn.gdn_kernels import (
     FlashInferDecode,
     FlashInferGDNKernels,
     FlashInferPrefill,
+    snapshot_refusal,
 )
 from mstar.engine.resources.linear_attn.gdn_kernels_aiter import (
     DEFAULT_MAX_CAPTURED_PREFILL_TOKENS,
@@ -150,6 +151,17 @@ def test_the_default_backend_is_auto():
 def test_auto_resolves_to_the_platforms_kernels(on_platform, platform, expected):
     on_platform(platform)
     assert resolve_linear_attn_backend(LinearAttnBackend.AUTO, torch.device("cuda")) is expected
+
+
+@pytest.mark.parametrize("hip", [None, "6.4"])
+def test_a_spec_resolves_auto_from_the_torch_build_not_the_gpus_it_sees(on_platform, monkeypatch, hip):
+    """The conductor and data worker answer `restore_refusal` too, on a node that may see no GPU,
+    and must agree with the engines."""
+    on_platform(CpuPlatform())
+    monkeypatch.setattr(torch.version, "hip", hip)
+    expected = LinearAttnBackend.FLASHINFER if hip is None else LinearAttnBackend.AITER
+    assert resolve_linear_attn_backend(LinearAttnBackend.AUTO) is expected
+    assert (snapshot_refusal(LinearAttnBackend.AUTO) is None) is (hip is None)
 
 
 @pytest.mark.parametrize(
