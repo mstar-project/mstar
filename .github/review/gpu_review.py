@@ -217,9 +217,11 @@ def vendor_list(text):
 # nothing on its own.
 FILLER = re.compile(r"\b(?:a|an|the|and|or|no|of|on|for|in|its|kernels?|code|paths?|backends?|gpus?|hardware"
                     r"|support|cloud)\b|\W|_", re.IGNORECASE)
-# A hardware word with what goes with it: a suffix (`ROCm-specific`) and, after ROCm or HIP, a version (`ROCm 7`).
+# A hardware word with what goes with it: a suffix (`ROCm-specific`) and, after ROCm or HIP, a version (`ROCm 7`),
+# but not a count (`ROCm 8 GPUs`).
 HARDWARE_PHRASE = re.compile(rf"({UNTESTABLE_HARDWARE.pattern})(-(?:specific|only|based))?"
-                             r"(\s+v?\d+(?:\.\d+)*(?![\w.]))?", re.IGNORECASE)
+                             r"(\s+v?\d+(?:\.\d+)*(?![\w.])(?!\s*-?\s*(?:gpus?|nodes?|ranks?|devices?|x\b)))?",
+                             re.IGNORECASE)
 
 
 def covered_by_amd(word):
@@ -246,9 +248,8 @@ def beyond_vendors(text, vendors):
 
     kept = []
     for clause in re.split(r"[;,]", text):
-        rest = HARDWARE_PHRASE.sub(drop, clause)
-        rest = " ".join(rest.split())
-        if FILLER.sub("", rest):
+        rest = " ".join(HARDWARE_PHRASE.sub(drop, clause).split())
+        if rest == " ".join(clause.split()) or FILLER.sub("", rest):  # filler goes only where an AMD word went
             kept.append(rest)
     return "; ".join(kept)
 
