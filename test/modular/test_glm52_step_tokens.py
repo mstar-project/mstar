@@ -31,7 +31,7 @@ def test_longctx_config_window_fits_its_pages(name):
     assert model.config.dsa_shard_prefill
     # every captured prefill bucket runs in one pass, never in row chunks (MTP over DSA captures none)
     ladders = cfg.get("prefill_token_buckets", {}).get("LLM", {}).get("prefill", {})
-    assert max((n for ladder in ladders.values() for n in ladder), default=0) <= model.config.prefill_chunk_tokens
+    assert max((n for ladder in ladders.values() for n in ladder), default=0) <= model.config.prefill_window_tokens
     assert model.config.max_seq_len == cfg["max_seq_len"]
     assert set(cfg["resources"]) == {"kv"}
     res = cfg["resources"]["kv"]
@@ -39,32 +39,36 @@ def test_longctx_config_window_fits_its_pages(name):
     assert (res["max_num_pages"] - 1) * res["page_size"] >= model.config.max_seq_len
 
 
-def _kv(pages, page_size):
+def test_long_context_bind_refuses_an_empty_prefill_window():
+    cfg = Glm52ModelConfig(dsa_long_context=True, max_seq_len=262144, prefill_window_tokens=0)
+    with pytest.raises(ValueError, match="must be >= 1"):
+        _submodule(cfg).bind_node_resources({})
+
+
+@pytest.mark.parametrize("serving_ladder, captured", [
+    ({}, [32, 64]),  # the model's own ladder
+    ({"prefill": [32, 128]}, [32]),  # the serving config's
+])
+def test_no_ladder_captures_a_prefill_bucket_past_the_window(serving_ladder, captured):
+    """A prefill step past prefill_window_tokens plans no dense attention and runs eager in
+    windows, so the engine must capture no bucket that large, wherever its ladder came from."""
     import types
 
-    return types.SimpleNamespace(config=types.SimpleNamespace(
-        max_num_pages=pages, page_size=page_size, tokens_per_page=page_size))
-
-
-@pytest.mark.parametrize("change, resources, match", [
-    ({"prefill_chunk_tokens": 0}, {}, "must be >= 1"),
-    ({}, {"kv": _kv(4096, 96)}, "kv page_size=96 must be a power of two"),
-])
-def test_long_context_bind_refuses_what_it_cannot_serve(change, resources, match):
-    cfg = Glm52ModelConfig(dsa_long_context=True, max_seq_len=262144, **change)
-    with pytest.raises(ValueError, match=match):
-        _submodule(cfg).bind_node_resources(resources)
-
-
-def test_long_context_captures_no_prefill_bucket_past_the_chunk():
     import torch
 
-    chunk = max(Glm52LLMSubmodule.PREFILL_TOKEN_BUCKETS) // 2
-    cfg = Glm52ModelConfig(dsa_long_context=True, max_seq_len=262144, prefill_chunk_tokens=chunk)
-    sub = _submodule(cfg)
+    from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner
+
+    language_model = torch.nn.Module()
+    language_model.lm_head = torch.nn.Identity()
+    sub = Glm52LLMSubmodule(language_model, Glm52ModelConfig(
+        dsa_long_context=True, mla_absorb=True, max_seq_len=262144, prefill_window_tokens=64))
     sub._moe_capture_blocked = lambda tp_world_size: False
-    configs = sub.get_accelerator_graph_configs(torch.device("cpu"))
-    prefill = [n for c in configs if c.capture_graph_walk == "prefill"
-               for ladder in c.capture_token_lengths.values() for n in ladder]
-    assert prefill and max(prefill) <= chunk
+    runner = AcceleratorGraphRunner(
+        submodule_name="LLM", submodule=sub, resources={}, step_runner=None,
+        device=torch.device("cpu"), autocast_dtype=None,
+        joint_comm_group=types.SimpleNamespace(world_size=1), num_slots=1,
+        token_ladders=serving_ladder, step_tokens=lambda walk, rows: None)
+    got = sorted({spec.bucket.num_tokens for spec in runner._get_slot_specs()
+                  if spec.bucket.graph_walk == "prefill" and spec.bucket.bs == 1})
+    assert got == captured
 

@@ -796,7 +796,8 @@ Worker scheduling
        the streams holding the pages, the reservations against the free and evictable
        pages, and each commit against its request's layout. A recurrent snapshot's key is
        checked against the KV chain's key at its boundary. Logs a label left under its
-       footprint at removal. Tests and debugging only.
+       footprint at removal. Above one rank, each follower stops if the reservations it
+       admits a step from differ from rank 0's. Tests and debugging only.
 
 Compilation
 -----------

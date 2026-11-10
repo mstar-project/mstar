@@ -613,7 +613,7 @@ def test_mtp_stream_matches_baseline_past_topk_on_paged_dsa(chunk, wrong_every):
     index keys are trimmed with its latents."""
     cfg = _cfg(2, True)
     cfg.dsa_long_context, cfg.index_topk = True, 4
-    cfg.prefill_chunk_tokens = chunk
+    cfg.prefill_window_tokens = chunk
     model = _model(cfg)
     prompt = torch.tensor([5, 9, 2, 7, 1, 8, 3])
     streams = []

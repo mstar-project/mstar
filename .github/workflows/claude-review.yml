@@ -1,7 +1,8 @@
 name: Claude Review
 
-# Advisory LLM review of PRs. Not a merge gate. Rules live in AGENTS.md;
-# the reviewer's operating instructions are in .github/review/review-prompt.md.
+# LLM review of PRs: advisory in light and nogpu mode; a bare `/review` (full mode)
+# can approve by the rule in gpu_review.py. Rules live in AGENTS.md; the reviewer's operating
+# instructions are in .github/review/review-prompt.md.
 #
 # Why issue_comment: a plain `pull_request` trigger withholds secrets from fork
 # PRs, so the reviewer could never review a fork's code. issue_comment runs with
@@ -22,17 +23,37 @@ name: Claude Review
 #      model to ignore any AGENTS.md or prompt found under pr-head/, so a PR
 #      cannot rewrite the rules it is judged by.
 #   4. The job's token can write only to pull requests, and the review app's
-#      token (below) only to pull requests and issues of this repository. The
-#      model has no shell and no mutation tools: it returns its inline findings
-#      and the summary as fields, which a workflow step redacts and posts. The worst
-#      case for a prompt injection is a bad comment.
+#      token (below) only to pull requests and issues of this repository, and
+#      in full mode to the media repository's contents
+#      (REVIEW_MEDIA_REPO). The one exception is the approval's own token,
+#      minted for the approve step alone, which has contents write on this
+#      repository (GitHub counts an app's approval only when it can push); that
+#      step runs no model and no PR code. The job token has no issues: write
+#      (the app token it mints does, to post and react) and can't read
+#      repository variables.
+#      The model has no shell and no mutation tools: it returns its inline
+#      findings and the summary as fields, which a workflow step redacts, makes
+#      inert and posts. In light
+#      and nogpu mode the worst case for a prompt injection is a bad
+#      comment. In full mode the live test runs the PR's code with a shell on
+#      the GPU box; see the README's threat model for what that box can reach.
 #   5. Third-party actions are pinned to a commit SHA, since they run with the
 #      API key. Bump them deliberately.
-#   6. Every step that isn't an action runs main's .github/review/bot.py, never
-#      bash. Untrusted text reaches it through env vars and files, never a
-#      shell; a command line gets only values checked against a fixed pattern
-#      (a branch name, a label from the fixed list), and what it posts goes to
-#      gh on stdin.
+#   6. Every step that isn't an action runs main's .github/review/bot.py (or,
+#      in the live-test job, gpu_review.py), never bash. Untrusted text reaches
+#      it through env vars and files, never a shell; a command line gets only
+#      values checked against a fixed pattern (a branch name, a label from the
+#      fixed list), and what it posts goes to gh on stdin.
+#
+# `/review` (full mode) adds a second job, live-test, that runs no model and no PR code
+# here either: it rents GPUs (an open Eras listing),
+# starts the live-test session on that box (gpu_review_box.sh), waits for it,
+# collects its report and media, posts them, and approves the PR when the rule
+# in gpu_review.py holds. The box gets the PR's public code, a fixed brief, the
+# review's notes and the PR's title and description (pr-body.md) as data, and its
+# own Anthropic key (an Eras secret), never a GitHub token or a cloud key; the
+# GPUs go when the box's session ends (or at the Eras Pod's deadline), whether
+# or not this job is still running.
 
 # When it runs, and who can cause it. Only on request; opening or pushing to
 # a PR never starts a review.
@@ -41,12 +62,19 @@ name: Claude Review
 #     has the `skip-ai-review` label. "Contributor" is the commenter's
 #     author_association: OWNER, MEMBER, COLLABORATOR or CONTRIBUTOR, i.e. the
 #     team plus anyone who has had a PR merged here, from a fork or not;
-#   - nogpu, when someone with write access comments `/review` or `/review nogpu`
-#     on a PR whose author also has write access. A request that lacks either
-#     gets a one-line reply pointing to `/review light` when the commenter could
-#     run that (write access, or their own PR), and nothing runs;
+#   - nogpu, when someone with write access comments `/review nogpu` on a PR
+#     whose author also has write access;
+#   - full, when someone with write access comments `/review` on a PR whose
+#     author also has write access and whose head is on this repository or a
+#     fork owned by someone with write access: nogpu, then the live test, then
+#     approval if the rule holds.
+#     A `/review` or `/review nogpu` that lacks the write access it takes gets a
+#     one-line reply pointing to `/review light` when the commenter could run
+#     that (write access, or their own PR), and nothing runs; a `/review` whose
+#     head repository fails the check is pointed to `/review nogpu`.
 #   - /review continue follows the mode it continues: as light allows, or for
-#     nogpu both write checks again (bot.py, restore).
+#     nogpu both write checks again (bot.py, restore); a stopped full review
+#     can't be continued.
 # A run someone with write access starts has a turn cap high enough only to stop
 # a loop (CLAUDE_REVIEW_MAX_TURNS_TEAM, 2000); a contributor's own light review
 # keeps CLAUDE_REVIEW_MAX_TURNS (40).
@@ -84,7 +112,7 @@ name: Claude Review
 # `pull_request` workflow can upload an artifact with any name.
 #
 # Every run that reaches Claude records its API calls, tokens, turns and cost
-# in the job summary and a review-usage-* artifact, never on the PR.
+# in the job summary, never on the PR.
 
 on:
   issue_comment:
@@ -104,6 +132,9 @@ jobs:
   # group, so a refused or unrelated request never cancels a review in progress.
   preflight:
     name: Preflight
+    # The key check below reads ANTHROPIC_API_KEY, which is in the environment. (The job's `if` runs first,
+    # so an unrelated comment makes no deployment.)
+    environment: review-bot
     # No repository pin: a fork with no ANTHROPIC_API_KEY exits green at the
     # preflight below, which is the same protection and visible in the log
     # rather than a silently skipped job. It also means a fork that *does* set
@@ -150,15 +181,16 @@ jobs:
       # instead. Lets this land before ANTHROPIC_API_KEY exists without
       # failing a check on every PR. Then the actor needs write access, or must
       # be the PR's author, a contributor, on `/review light` or `/review
-      # continue`; `/review` and `/review nogpu` also take an author with write
-      # access (see the header). Those two get a one-line reply when refused on
-      # a PR the commenter could run `/review light` on; anyone else exits green
-      # with a notice (bot.py, preflight).
+      # continue`; `/review` and `/review nogpu` also need an author with write
+      # access, and a full review a head repository with it (see the header). A
+      # request that fails only those checks gets a one-line reply; anyone else
+      # exits green with a notice (bot.py, preflight).
       - name: Preflight
         id: pre
         env:
           KEY_SET: ${{ secrets.ANTHROPIC_API_KEY != '' }}
-          ACTOR: ${{ github.actor }}
+          # Who pressed the button on a re-run; `github.actor` stays the original commenter.
+          ACTOR: ${{ github.triggering_actor }}
           AUTHOR: ${{ github.event.issue.user.login }}
           # The commenter's association; a self-serve run also requires commenter == author.
           ASSOC: ${{ github.event.comment.author_association }}
@@ -168,21 +200,39 @@ jobs:
           # The command, as one of these fixed words; the comment's text itself never reaches the script.
           COMMAND: >-
             ${{ (github.event.comment.body == '/review light' && 'light') ||
-                ((github.event.comment.body == '/review' || github.event.comment.body == '/review nogpu') && 'nogpu') ||
+                (github.event.comment.body == '/review nogpu' && 'nogpu') ||
+                (github.event.comment.body == '/review' && 'full') ||
                 (github.event.comment.body == '/review continue' && 'continue') || '' }}
         run: python3 .github/review/bot.py preflight
 
   review:
     name: Review
     needs: preflight
+    # issue_comment runs on the default branch, so the environment's branch rule passes; a branch's own
+    # workflow can't read these secrets.
+    environment: review-bot
     if: needs.preflight.outputs.run == 'true'
     # Job-level, and only for a request the preflight accepted, so no other
     # comment can cancel a review in progress.
+    # A `/review` (full) has a group of its own, so a later `/review light` or
+    # `/review nogpu` can't cancel a paid live test, and the reverse.
     concurrency:
-      group: claude-review-${{ github.event.issue.number }}
+      group: claude-review-${{ github.event.issue.number }}${{ github.event.comment.body == '/review' && '-full' || '' }}
       cancel-in-progress: true
     runs-on: ubuntu-latest
     timeout-minutes: 330
+    outputs:
+      mode: ${{ steps.pr.outputs.mode }}
+      head_sha: ${{ steps.pr.outputs.head_sha }}
+      main_sha: ${{ steps.base.outputs.commit }}
+      # The summary's fields as `post` rendered them, with what it carried over and this run's inline findings.
+      result: ${{ steps.post.outputs.result }}
+      # Built on an earlier review: the live test's `targeted`, or its `none` on runtime code, needs a live test before it.
+      rereview: ${{ steps.diff.outputs.rereview }}
+      # stacked-above.json, for the approval rule's count of findings fixed above.
+      above: ${{ steps.diff.outputs.above }}
+      # Finished and returned its summary itself: a salvaged or stopped review never approves.
+      complete: ${{ steps.review.outcome == 'success' && steps.post.outcome == 'success' }}
     permissions:
       # actions: read lists and downloads the saved handoff for /review continue.
       actions: read
@@ -274,7 +324,7 @@ jobs:
       - name: Review
         if: steps.diff.outcome == 'success'
         id: review
-        # Advisory: an API or action failure (bad key, outage, out of turns,
+        # Never red: an API or action failure (bad key, outage, out of turns,
         # timeout) never turns the PR's check red; the last step reports it.
         continue-on-error: true
         timeout-minutes: ${{ fromJSON(steps.pr.outputs.timeout || '25') }}
@@ -352,11 +402,9 @@ jobs:
         run: python3 .github/review/bot.py salvage
 
       # What the run used, from the execution file or, after a timeout, the
-      # session transcript: a table in the job summary, and a small artifact to
-      # compare runs by. Never posted on the PR.
+      # session transcript: a table in the job summary. Never posted on the PR.
       - name: Record usage
         if: always() && steps.diff.outcome == 'success'
-        id: usage
         continue-on-error: true
         env:
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
@@ -365,20 +413,10 @@ jobs:
           OUTCOME: ${{ steps.review.outcome }}
         run: python3 .github/review/bot.py usage
 
-      - name: Upload the usage record
-        if: always() && steps.usage.outcome == 'success'
-        continue-on-error: true
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: review-usage-${{ env.PR }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/usage
-          retention-days: 30
-          if-no-files-found: ignore
-
-      # The inline comments and the summary are model output from untrusted input. The script reads them
-      # from the action's execution file (an env var would fail the step past about 128 KB); it renders the
-      # summary with main's render_summary.py, and redacts credential-shaped strings before it posts either
-      # (bot.py, post).
+      # The inline comments and the summary are model output from untrusted input. The script reads them from
+      # the action's execution file (an env var would fail the step past about 128 KB); it renders the summary with
+      # main's render_summary.py, redacts credential-shaped strings and makes the text inert before it posts
+      # either (bot.py, post).
       - name: Post the summary
         if: steps.review.outcome == 'success' || steps.salvage.outputs.structured_output != ''
         id: post
@@ -391,6 +429,7 @@ jobs:
           MODE: ${{ steps.pr.outputs.mode }}
           SALVAGED: ${{ steps.review.outcome != 'success' }}
           DETAIL: ${{ steps.salvage.outputs.detail }}
+          MAX_GPUS: ${{ vars.REVIEW_GPU_MAX_GPUS }}
         run: python3 .github/review/bot.py post
 
       # Hide the earlier summaries as outdated, so the PR shows only the latest
@@ -460,3 +499,225 @@ jobs:
           REFUSED: ${{ steps.pr.outputs.refused == 'true' }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: python3 .github/review/bot.py incomplete
+
+  # `/review` (full mode), after the review: the live test on GPUs, then the approval
+  # rule. Fixed steps only; see the header. Its own group, so a later
+  # `/review` on the PR replaces it and nothing else does.
+  live-test:
+    name: Live test
+    needs: review
+    environment: review-bot
+    if: needs.review.outputs.mode == 'full' && needs.review.outputs.complete == 'true'
+    concurrency:
+      group: claude-live-test-${{ github.event.issue.number }}
+      cancel-in-progress: true
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    permissions:
+      contents: read
+      pull-requests: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      REPO: ${{ github.repository }}
+      PR: ${{ github.event.issue.number }}
+      HEAD_SHA: ${{ needs.review.outputs.head_sha }}
+      TAG: ${{ github.run_id }}-${{ github.run_attempt }}
+      ERAS_API_KEY: ${{ secrets.ERAS_API_KEY }}
+    steps:
+      - name: Check out main
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ needs.review.outputs.main_sha }}
+          persist-credentials: false
+
+      # gpu.py's settings, from repository variables, and from a secret the ssh key every box is
+      # reached with. The key stays on the runner: it never reaches the box.
+      - name: Configure the GPUs
+        env:
+          SSH_KEY: ${{ secrets.REVIEW_SSH_KEY }}
+          HOURS: ${{ vars.REVIEW_GPU_HOURS }}
+          MAX_USD: ${{ vars.REVIEW_GPU_MAX_USD_PER_HOUR }}
+          MAX_RUNS: ${{ vars.REVIEW_GPU_MAX_RUNS }}
+          ERAS_SECRET: ${{ vars.ERAS_RUN_SECRET_ID }}
+          ERAS_CACHE_VOLUMES: ${{ vars.ERAS_CACHE_VOLUMES }}
+        run: python3 .github/review/gpu_review.py configure
+
+      # The review's fields as files for the steps below, whether the PR's author has write access
+      # (the live test runs the PR's code: only then), and the box's size.
+      - name: Read the review
+        id: cfg
+        env:
+          RESULT: ${{ needs.review.outputs.result }}
+          ABOVE: ${{ needs.review.outputs.above }}
+          MAX_GPUS: ${{ vars.REVIEW_GPU_MAX_GPUS }}
+          HOURS: ${{ vars.REVIEW_GPU_HOURS }}
+        run: python3 .github/review/gpu_review.py inputs
+
+      # Nothing runs while the review left an open P0–P2 finding (by the review's own judgement, as
+      # the status line counts them) or a skipped file (`gated`): the comment says what to fix first. Otherwise the review's
+      # call stands unless the PR's last live test didn't pass on an ancestor of this head, or a
+      # re-review's `targeted`, or its `none` on runtime code, has no live test before it: then the live
+      # test runs in full, every kind of check, so a failure is never hidden (gpu_review.py, carry); a
+      # re-review with `untestable` set is exempt, since that PR can't be approved. A
+      # `none` that stands runs nothing (verdict `skipped`), which the approval never counts as a pass.
+      # It posts no live-test marker: it isn't a live test, so the next run still checks against the
+      # last real one. A failed read of the PR's comments fails this step.
+      - name: Check the last live test
+        if: steps.cfg.outputs.trusted == 'true'
+        id: carry
+        env:
+          REREVIEW: ${{ needs.review.outputs.rereview }}
+        run: python3 .github/review/gpu_review.py carry
+
+      - name: Get GPUs and start the live test
+        if: steps.carry.outputs.run == 'full' || steps.carry.outputs.run == 'targeted'
+        id: start
+        continue-on-error: true
+        env:
+          BASE: ${{ steps.cfg.outputs.base }}
+          GPUS: ${{ steps.cfg.outputs.gpus }}
+          HOURS: ${{ steps.cfg.outputs.hours }}
+          RUN: ${{ steps.carry.outputs.run }}
+          CHECKS: ${{ steps.carry.outputs.checks }}
+          SINCE: ${{ steps.carry.outputs.since }}
+          FORCED: ${{ steps.carry.outputs.forced }}
+          ASKED: ${{ steps.carry.outputs.asked }}
+          ASKED_CHECKS: ${{ steps.carry.outputs.asked_checks }}
+          TURNS: ${{ vars.CLAUDE_REVIEW_MAX_TURNS_TEAM }}
+        run: python3 .github/review/gpu_review.py start
+
+      - name: Wait for the live test
+        if: steps.start.outcome == 'success'
+        id: wait
+        continue-on-error: true
+        timeout-minutes: 340
+        run: python3 .github/review/gpu_review.py wait
+
+      # What the box and the providers wrote, redacted in place before anything reads it, so the
+      # comment, the kept report and the artifact all get the redacted copy: bot.py's patterns and
+      # the exact values of the secrets this job holds.
+      - name: Redact the live test's output
+        if: always() && steps.cfg.outcome == 'success'
+        id: redact
+        continue-on-error: true
+        env:
+          S2: ${{ secrets.ANTHROPIC_API_KEY }}
+          S3: ${{ secrets.ERAS_API_KEY }}
+        run: python3 .github/review/gpu_review.py redact
+
+      # The media go to the gallery repository (GitHub Pages), never into this
+      # repository, whose every clone would carry them. Only audio, images and
+      # video, up to 100 MB a run (gpu_review.py, published_media).
+      - name: Render the report and the media gallery
+        if: steps.wait.outcome == 'success' && steps.redact.outcome == 'success'
+        id: render
+        continue-on-error: true
+        run: python3 .github/review/gpu_review.py comment
+
+      - name: Mint a token for the media repository
+        if: steps.render.outputs.media == 'true' && vars.REVIEW_MEDIA_REPO != ''
+        id: media-app
+        continue-on-error: true
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.REVIEW_APP_CLIENT_ID }}
+          private-key: ${{ secrets.REVIEW_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ vars.REVIEW_MEDIA_REPO }}
+          permission-contents: write
+
+      # The newest runs that fit in 900 MB, as one commit; a push that loses a race fails rather
+      # than overwrite it, and the comment links the gallery only once the push went through.
+      - name: Publish the media
+        if: steps.media-app.outcome == 'success'
+        continue-on-error: true
+        env:
+          MEDIA_REPO: ${{ vars.REVIEW_MEDIA_REPO }}
+          MEDIA_TOKEN: ${{ steps.media-app.outputs.token }}
+          OWNER: ${{ github.repository_owner }}
+        run: python3 .github/review/gpu_review.py publish
+
+      # Minted here, after the live test, since the app's token lasts an hour:
+      # everything below that posts uses it.
+      - name: Mint the review app's token
+        if: always() && vars.REVIEW_APP_CLIENT_ID != ''
+        id: app
+        continue-on-error: true
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.REVIEW_APP_CLIENT_ID }}
+          private-key: ${{ secrets.REVIEW_APP_PRIVATE_KEY }}
+          permission-contents: read
+          permission-issues: write
+          permission-pull-requests: write
+
+      # The approval's own token, the only one on this repository with contents write: GitHub
+      # counts an app's approval only when the app can push (README, One-time setup). The step
+      # it feeds runs no model and no PR code. Reading REVIEW_APPROVALS takes an app token too
+      # (the job's own can't read variables), right before approving.
+      - name: Mint the approval's token
+        if: always() && vars.REVIEW_APP_CLIENT_ID != '' && (steps.render.outcome == 'success' || steps.carry.outputs.verdict != '')
+        id: approver
+        continue-on-error: true
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.REVIEW_APP_CLIENT_ID }}
+          private-key: ${{ secrets.REVIEW_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+          permission-actions-variables: read
+
+      - name: Decide approval
+        if: always() && (steps.render.outcome == 'success' || steps.carry.outputs.verdict != '')
+        id: approve
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ steps.approver.outputs.token || secrets.GITHUB_TOKEN }}
+          VERDICT: ${{ steps.render.outputs.verdict || steps.carry.outputs.verdict }}
+        run: python3 .github/review/gpu_review.py approve
+
+      # Model output from untrusted input, posted only from the redacted copies.
+      - name: Post the live test
+        if: >-
+          always() && steps.cfg.outcome == 'success' && steps.redact.outcome == 'success' &&
+          (steps.render.outcome == 'success' || steps.carry.outputs.verdict != '' || steps.carry.outputs.gated == 'true' ||
+           steps.cfg.outputs.trusted != 'true' ||
+           steps.start.outputs.unavailable == 'true' || steps.wait.outputs.unavailable == 'true')
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token || secrets.GITHUB_TOKEN }}
+          APPROVE_OUTCOME: ${{ steps.approve.outcome }}
+          TRUSTED: ${{ steps.cfg.outputs.trusted }}
+          GATED: ${{ steps.carry.outputs.gated }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: python3 .github/review/gpu_review.py post
+
+      - name: Keep the report
+        if: always() && steps.wait.outcome == 'success' && steps.redact.outcome == 'success'
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: live-test-${{ env.PR }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/lt/results/report.md
+            ${{ runner.temp }}/lt/results/result.json
+          retention-days: 30
+          if-no-files-found: ignore
+
+      # Whatever this run launched goes, even after a cancel or a failure above.
+      - name: Release the GPUs
+        if: always() && steps.cfg.outcome == 'success'
+        continue-on-error: true
+        run: python3 .github/review/gpu_review.py cleanup
+
+      - name: Report a live test that didn't complete
+        if: >-
+          failure() || (always() &&
+            (steps.redact.outcome == 'failure' || steps.render.outcome == 'failure' ||
+             (steps.start.outcome == 'failure' && steps.start.outputs.unavailable != 'true') ||
+             (steps.wait.outcome == 'failure' && steps.wait.outputs.unavailable != 'true')))
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token || secrets.GITHUB_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: python3 .github/review/gpu_review.py incomplete

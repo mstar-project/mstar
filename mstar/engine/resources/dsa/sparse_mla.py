@@ -12,25 +12,12 @@ from typing import NamedTuple
 
 import torch
 
+from mstar.engine.resources.attn.workspace import Workspace, WorkspacePool
+from mstar.utils.h2d import PinnedStager
+
 # FlashInfer's kernel over one-token pages faults past ~16k rows, so an eager plan attends in
 # chunks of this many rows.
 MAX_ROWS = 8192
-WORKSPACE_BYTES = 128 << 20
-# A prefill's selection shards across TP ranks from this many rows per rank.
-SHARD_MIN_ROWS = 64
-
-
-def check_flashinfer() -> None:
-    """Refuse an installed FlashInfer older than 0.6.18, whose ``top_k_page_table_transform``
-    takes no ``page_size``."""
-    try:
-        import flashinfer
-        from packaging.version import Version
-    except ImportError:
-        return
-    installed = getattr(flashinfer, "__version__", None)  # None: a stub, as CPU tests install
-    if installed is not None and Version(installed) < Version("0.6.18"):
-        raise ValueError(f"DSA long context needs FlashInfer >= 0.6.18, found {installed}")
 
 
 def uses_kernel(q_nope: torch.Tensor, latent: torch.Tensor) -> bool:
@@ -42,7 +29,7 @@ def uses_kernel(q_nope: torch.Tensor, latent: torch.Tensor) -> bool:
             and flashinfer_mla_supports(rank, latent.shape[-1] - rank))
 
 
-def _plan(wrapper, indices: torch.Tensor, lens: list[int], heads: int,
+def _plan(workspace: Workspace, wrapper, indices: torch.Tensor, lens: list[int], heads: int,
           kv_lora_rank: int, kpe: int, sm_scale: float) -> None:
     # packed: row r's slots at indices[sum(lens[:r]):], which FlashInfer >= 0.7 checks each
     # row's page count against; _pack lays them out to match, lens already held to the width
@@ -55,8 +42,9 @@ def _plan(wrapper, indices: torch.Tensor, lens: list[int], heads: int,
     threads = torch.get_num_threads()
     torch.set_num_threads(1)
     try:
-        wrapper.plan(qo, kv, indices, torch.tensor(lens, dtype=torch.int32), heads,
-                     kv_lora_rank, kpe, 1, False, sm_scale, torch.bfloat16, torch.bfloat16)
+        workspace.plan(wrapper.plan, qo, kv, indices, torch.tensor(lens, dtype=torch.int32),
+                       heads, kv_lora_rank, kpe, 1, False, sm_scale, torch.bfloat16,
+                       torch.bfloat16)
     finally:
         torch.set_num_threads(threads)
 
@@ -89,11 +77,12 @@ class SparseGraphPlan:
     buffers and a view of the capture slot's index buffer (``rows * width + 1`` entries, the
     last a spare for ``_pack``), planned outside the graph every step and read by the replay."""
 
-    def __init__(self, rows: int, width: int, workspace: torch.Tensor,
+    def __init__(self, rows: int, width: int, workspace: Workspace,
                  indices: torch.Tensor | None = None):
         import flashinfer
 
-        device = workspace.device
+        device = workspace.tensor.device
+        self._workspace = workspace
         self.rows, self.width = rows, width
         size = rows * width + 1
         assert indices is None or indices.numel() >= size, (indices.numel(), size)
@@ -103,7 +92,7 @@ class SparseGraphPlan:
         self._kv = torch.zeros(rows + 1, dtype=torch.int32, device=device)
         self._lens = torch.zeros(rows, dtype=torch.int32, device=device)
         self.wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(
-            workspace, use_cuda_graph=True, qo_indptr=self._qo, kv_indptr=self._kv,
+            workspace.tensor, use_cuda_graph=True, qo_indptr=self._qo, kv_indptr=self._kv,
             kv_indices=self.indices, kv_len_arr=self._lens, backend="auto")
         self._planned: torch.cuda.Event | None = None
 
@@ -113,8 +102,8 @@ class SparseGraphPlan:
         if self._planned is not None:
             # the last plan's copy out of the wrapper's pinned buffer may still be queued
             self._planned.synchronize()
-        _plan(self.wrapper, self.indices, _lens(lens, self.width), heads, kv_lora_rank, kpe,
-              sm_scale)
+        _plan(self._workspace, self.wrapper, self.indices, _lens(lens, self.width), heads,
+              kv_lora_rank, kpe, sm_scale)
         self._planned = torch.cuda.Event()
         self._planned.record()
 
@@ -130,43 +119,32 @@ class SparseGraphPlan:
         return self.wrapper.run(*_split(q_nope, q_pe, latent))
 
 
+class SparseChunk(NamedTuple):
+    """Rows ``[r0, r1)`` of an eager plan: their wrapper, its index buffer, and the plan's
+    offsets and lengths on the device, which ``_pack`` lays the slots out by."""
+
+    r0: int
+    r1: int
+    wrapper: object
+    indices: torch.Tensor
+    indptr: torch.Tensor
+    lens: torch.Tensor
+
+
 class EagerSparsePlan:
-    """An eager forward's plan: a wrapper per ``MAX_ROWS`` rows, sharing one workspace since
-    the chunks run in turn. Every layer attends with the same lengths, so it is built once."""
+    """An eager forward's plan (``EagerSparsePlans.plan``): a wrapper per ``MAX_ROWS`` rows,
+    which run in turn. Every layer attends with the same lengths, so it is planned once."""
 
-    def __init__(self, lens: list[int], width: int, heads: int, kv_lora_rank: int, kpe: int,
-                 sm_scale: float, device: torch.device):
-        import flashinfer
-
-        # plan() copies a pinned host buffer to the device with its own async memcpy, which
-        # torch does not track: a buffer freed with an earlier plan can come back here and be
-        # rewritten before that copy has run
-        torch.cuda.current_stream(device).synchronize()
-        workspace = torch.empty(WORKSPACE_BYTES, dtype=torch.uint8, device=device)
-        lens = _lens(lens, width)
-        self.chunks = []
-        for r0 in range(0, len(lens), MAX_ROWS):
-            r1 = min(r0 + MAX_ROWS, len(lens))
-            wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(workspace, backend="auto")
-            indices = torch.empty((r1 - r0) * width + 1, dtype=torch.int32, device=device)
-            chunk = torch.tensor(lens[r0:r1], dtype=torch.int32)
-            indptr = torch.cat([chunk.new_zeros(1), chunk.cumsum(0, dtype=torch.int32)])
-            _plan(wrapper, indices, lens[r0:r1], heads, kv_lora_rank, kpe, sm_scale)
-            self.chunks.append((r0, r1, wrapper, indices,
-                                indptr.to(device, non_blocking=True), chunk.to(device, non_blocking=True)))
-
-    @classmethod
-    def of_chunks(cls, chunks: list) -> EagerSparsePlan:
-        plan = cls.__new__(cls)
-        plan.chunks = chunks
-        return plan
+    def __init__(self, chunks: list[SparseChunk]):
+        self.chunks = chunks
 
     def attend(self, q_nope, q_pe, latent, slots) -> torch.Tensor:
         q_nope, q_pe, ckv, kpe = _split(q_nope, q_pe, latent)
         out = q_nope.new_empty(q_nope.shape)
-        for r0, r1, wrapper, indices, indptr, lens in self.chunks:
-            _pack(indices, slots[r0:r1], indptr, lens)
-            out[r0:r1] = wrapper.run(q_nope[r0:r1], q_pe[r0:r1], ckv, kpe)
+        for chunk in self.chunks:
+            rows = slice(chunk.r0, chunk.r1)
+            _pack(chunk.indices, slots[rows], chunk.indptr, chunk.lens)
+            out[rows] = chunk.wrapper.run(q_nope[rows], q_pe[rows], ckv, kpe)
         return out
 
 
@@ -177,13 +155,13 @@ class EagerSparsePlans:
     last copy (an event recorded after it), not for the stream; after the first plans nothing
     is allocated or freed under a copy in flight."""
 
-    def __init__(self, device: torch.device):
-        self._device = device
-        self._workspace: torch.Tensor | None = None
+    def __init__(self, workspaces: WorkspacePool):
+        self._workspaces = workspaces
         # per set: (wrapper, index buffer) per chunk of MAX_ROWS rows
         self._sets: tuple[list, list] = ([], [])
         self._planned: list[torch.cuda.Event | None] = [None, None]
         self._turn = 0
+        self._stager = PinnedStager(torch.int32)
 
     def plan(self, lens: list[int], width: int, heads: int, kv_lora_rank: int, kpe: int,
              sm_scale: float) -> EagerSparsePlan:
@@ -192,8 +170,8 @@ class EagerSparsePlans:
         turn, self._turn = self._turn, 1 - self._turn
         if self._planned[turn] is not None:
             self._planned[turn].synchronize()
-        if self._workspace is None:
-            self._workspace = torch.empty(WORKSPACE_BYTES, dtype=torch.uint8, device=self._device)
+        workspace = self._workspaces.get("eager")  # allocated at the first eager plan
+        device = workspace.tensor.device
         wrappers = self._sets[turn]
         lens = _lens(lens, width)
         chunks = []
@@ -202,21 +180,24 @@ class EagerSparsePlans:
             need = (r1 - r0) * width + 1  # + the spare entry _pack writes the unused slots to
             if i == len(wrappers):
                 wrappers.append((
-                    flashinfer.mla.BatchMLAPagedAttentionWrapper(self._workspace, backend="auto"),
-                    torch.empty(MAX_ROWS * width + 1, dtype=torch.int32, device=self._device)))
+                    flashinfer.mla.BatchMLAPagedAttentionWrapper(workspace.tensor, backend="auto"),
+                    torch.empty(MAX_ROWS * width + 1, dtype=torch.int32, device=device)))
             wrapper, indices = wrappers[i]
             if indices.numel() < need:  # a wider plan than the buffer's first
-                indices = torch.empty(MAX_ROWS * width + 1, dtype=torch.int32, device=self._device)
+                indices = torch.empty(MAX_ROWS * width + 1, dtype=torch.int32, device=device)
                 wrappers[i] = (wrapper, indices)
             chunk = torch.tensor(lens[r0:r1], dtype=torch.int32)
             indptr = torch.cat([chunk.new_zeros(1), chunk.cumsum(0, dtype=torch.int32)])
-            _plan(wrapper, indices[:need], lens[r0:r1], heads, kv_lora_rank, kpe, sm_scale)
-            chunks.append((r0, r1, wrapper, indices[:need],
-                           indptr.to(self._device, non_blocking=True),
-                           chunk.to(self._device, non_blocking=True)))
+            _plan(workspace, wrapper, indices[:need], lens[r0:r1], heads, kv_lora_rank, kpe,
+                  sm_scale)
+            # the plan's offsets, then its lengths: one pinned copy
+            staged = torch.empty(indptr.numel() + chunk.numel(), dtype=torch.int32, device=device)
+            self._stager.copy_(staged, torch.cat([indptr, chunk]).numpy())
+            chunks.append(SparseChunk(r0, r1, wrapper, indices[:need],
+                                      staged[:indptr.numel()], staged[indptr.numel():]))
         self._planned[turn] = torch.cuda.Event()
         self._planned[turn].record()
-        return EagerSparsePlan.of_chunks(chunks)
+        return EagerSparsePlan(chunks)
 
 
 def reference(q_nope: torch.Tensor, q_pe: torch.Tensor, latent: torch.Tensor,
@@ -263,13 +244,14 @@ class RequestPages(NamedTuple):
 
 def select_rows(select: Callable[[int, int], torch.Tensor], r0: int, r1: int, width: int,
                 device: torch.device, group=None,
-                request: RequestPages | None = None) -> torch.Tensor:
+                request: RequestPages | None = None, *, min_rows: int) -> torch.Tensor:
     """``select(a, b)`` (``[b - a, width]`` int32 cache slots) over rows ``[r0, r1)`` of one
-    request's prefill. With a TP ``group`` each rank selects a contiguous block and the blocks
-    are all-gathered as token positions in ``request`` (``RequestPages``)."""
+    request's prefill. With a TP ``group`` and at least ``min_rows`` rows per rank, each rank
+    selects a contiguous block and the blocks are all-gathered as token positions in
+    ``request`` (``RequestPages``)."""
     n = r1 - r0
     world = group.world_size if group is not None else 1
-    if world == 1 or n < world * SHARD_MIN_ROWS:
+    if world == 1 or n < world * min_rows:
         return select(r0, r1)
     if request is None:
         raise ValueError("a selection sharded across ranks needs the request's pages")
