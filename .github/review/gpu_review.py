@@ -313,8 +313,9 @@ cluster mode: the box is already provisioned, and it ends when you exit.
   claim, measure the cells the PR claims and those its change could put at risk (a likely regression:
   another concurrency, model or path the diff reaches), adding boots or rounds only when a delta sits
   within the noise (a claim that holds in direction but measures smaller is still a pass, with "the
-  description says X, measured Y" in the report), and a main-arm perf baseline only when the claim is
-  relative to main (the skill's same-code control for an output-diff conclusion stays). Test the PR's
+  description says X, measured Y" in the report), with a base-arm baseline at every at-risk cell and
+  at the claimed cells only when the claim is relative to the base (the skill's same-code control for
+  an output-diff conclusion stays). Test the PR's
   head against its base: this overrides every part of the skill that asks for a merged-tree or
   stacked-neighbour rerun (its "Test on the merged tree too", the test matrix's "Anything a sibling
   PR also touches" row), so run none. Never run what CI already runs (its CPU tests, lint, type
