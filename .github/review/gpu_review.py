@@ -619,11 +619,11 @@ def fixed_only_above(review, stacked):
 
 def to_fix_first(review, pr, above):
     """What the review left open that stops the live test from starting, and approval too: open P0–P2
-    findings (counted as the summary counts them, fixed above judged) and skipped files. Open questions
-    and the design risk stop only approval."""
+    findings (counted as the summary counts them, fixed above judged) and skipped files, which under a full
+    review's team turn cap mean the review didn't finish. Open questions and the design risk stop only approval."""
     why = []
     if review.get("skipped"):
-        why.append("the review skipped files")
+        why.append(render_summary.UNFINISHED)
     open_ = blocking(review, review_threads(pr), render_summary.stacked_above(above))
     if open_:
         why.append("open P0–P2 findings: " + ", ".join(open_))
@@ -964,6 +964,9 @@ def post(out, pr, head_sha, runner_temp, run_url, trusted="", gated="", approve_
         reasons = render_summary.inert(Path(runner_temp, "gate.txt").read_text()).rstrip("\n")
         body = (f"No live test yet ({reasons}): a finding's thread was edited after the bot posted it, so another "
                 "`/review` can't clear it and a person has to decide.\n" if render_summary.EDITED in reasons else
+                f"No live test yet ({reasons}): the files the review left are the bot's to finish, not yours. "
+                "Comment `/review` again, after fixing any open finding named here.\n"
+                if render_summary.UNFINISHED in reasons else
                 f"No live test yet: fix what the review left open first ({reasons}), then comment `/review` again.\n")
     elif text(lt / "comment.md"):
         body = text(lt / "comment.md")
