@@ -67,6 +67,7 @@ from mstar.model.media_limits import (
     check_file_counts,
     check_media_limits,
 )
+from mstar.model.utils import TextOutput
 from mstar.observability.catalog import STATUS_INTERVAL_S
 from mstar.observability.recorders import EdgeTransfers
 from mstar.profile.format import InputInfo, RxInfo, TxInfo
@@ -110,6 +111,18 @@ def pooled_output(modality: str, loop_indices: NestedLoopIndices | None) -> bool
     and audio, whose chunks are cheap and carry inline metadata."""
     streamed = loop_indices is not None and bool(loop_indices.loop_name_order)
     return modality in ARTIFACT_MODALITIES and not streamed
+
+
+def text_tokens(modality: str, tensor: torch.Tensor) -> int:
+    """The token ids an output tensor carries to the client, as ``token_ids``
+    lists them. A float text tensor (Whisper's word alignment) carries none."""
+    return tensor.numel() if modality == "text" and not tensor.is_floating_point() else 0
+
+
+def ends_reply(token: int, text: TextOutput | None, request_kwargs: dict | None) -> bool:
+    """Whether a sampled text token ended its reply: one of the model's declared
+    stop ids, unless the request set ``ignore_eos``."""
+    return text is not None and token in text.stop_token_ids and not (request_kwargs or {}).get("ignore_eos")
 
 
 def _sha256(path: str) -> bytes:
@@ -647,6 +660,8 @@ class PreparedInput(NamedTuple):
     tensors: NameToTensorList
     input_metadata: dict[str, list[dict]]
     model_kwargs: dict
+    # for the response's usage (``Model.prompt_tokens``)
+    prompt_tokens: int
 
 
 class PreparingInput(NamedTuple):
@@ -940,6 +955,7 @@ class PreprocessWorkerThread:
         ):
             model_kwargs.pop(name, None)
         open_streams = self._client_edges - input.ends
+        num_prompt_tokens = 0
         if self.model is not None:
             prompt_tensors = self.model.process_prompt(
                 input.text,
@@ -957,6 +973,7 @@ class PreprocessWorkerThread:
             if prompt_tensors:
                 tensors.update(prompt_tensors)
             layouts = model_kwargs.pop("kv_layout", {})
+            num_prompt_tokens = self.model.prompt_tokens(tensors, layouts)
             rows = {
                 key: {label: layout.row() for label, layout in by_label.items()}
                 for key, by_label in layouts.items()
@@ -979,13 +996,13 @@ class PreprocessWorkerThread:
             tensors["text_inputs"] = [torch.tensor(
                 list(byte_data), dtype=torch.uint8, device=self.device
             )]
-        return PreparedInput(tensors, input_metadata, model_kwargs)
+        return PreparedInput(tensors, input_metadata, model_kwargs, num_prompt_tokens)
 
     def _finish_input(
         self, input: PreprocessInput, prepared: PreparedInput, profile: DataWorkerProfile | None,
     ) -> None:
         """Store a prepared request's tensors and hand it to the conductor."""
-        tensors, input_metadata, model_kwargs = prepared
+        tensors, input_metadata, model_kwargs, num_prompt_tokens = prepared
 
         # A client stream's first chunk, not a prompt signal: a one-shot upload
         # is a stream of one chunk. Stored before the request reaches the
@@ -1018,6 +1035,7 @@ class PreprocessWorkerThread:
                 client_request_id=input.client_request_id,
                 input_open=bool(self._client_edges - input.ends),
                 streaming=input.streaming,
+                prompt_tokens=num_prompt_tokens,
             ),
         )
         self.communicator.send("conductor", msg)
@@ -1649,6 +1667,8 @@ class PreprocessWorkerThread:
             datas = None
         share = (time.perf_counter() - start) / len(rids) if start is not None and rids else 0.0
         postprocess_s = share
+        num_tokens = 1 if item.modality == "text" else 0
+        text = self.model.text_output() if num_tokens else None
         states = self.request_output_state
         for i, request_id in enumerate(rids):
             state = states.get(request_id)
@@ -1678,7 +1698,8 @@ class PreprocessWorkerThread:
                     sequence,
                     ResultChunk(
                         request_id=request_id, modality=item.modality, data=data, metadata=metadata,
-                        postprocess_s=postprocess_s,
+                        postprocess_s=postprocess_s, num_tokens=num_tokens,
+                        stopped=ends_reply(values[i], text, kwargs.get(request_id)),
                     ),
                 )
             except Exception as exc:  # noqa: BLE001 — must reach the client
@@ -1801,6 +1822,10 @@ class PreprocessWorkerThread:
                     f"expected {expected_bytes} bytes, got {len(postprocessed)}"
                 )
 
+        num_tokens = text_tokens(modality, tensor)
+        stopped = num_tokens > 0 and ends_reply(
+            int(tensor.reshape(-1)[-1]), self.model.text_output(), self.request_model_kwargs.get(request_id),
+        )
         if self.enable_nvtx:
             profiler.range_push("dataworker.queue_output")
         self._queue_completed_output(
@@ -1813,6 +1838,8 @@ class PreprocessWorkerThread:
                 metadata=chunk_metadata,
                 read_time=read_time,
                 postprocess_s=postprocess_s,
+                num_tokens=num_tokens,
+                stopped=stopped,
             ),
         )
         if self.enable_nvtx:

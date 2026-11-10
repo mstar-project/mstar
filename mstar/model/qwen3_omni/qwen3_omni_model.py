@@ -1095,7 +1095,7 @@ class Qwen3OmniModel(Model):
         # So writing the parts out in request order and tokenizing once lets
         # the placement be read back off the ids, with no boundary
         # re-tokenized. The walks re-emit the sentinels themselves
-        # (``ThinkerSubmodule._wrap_audio_input``) and the encoder embeddings
+        # (``ThinkerSubmodule._audio_row``, ``_wrap_vision_input``) and the encoder embeddings
         # replace the pad tokens, so the Thinker's spans are what lies between
         # the placeholders.
         #
@@ -1198,6 +1198,10 @@ class Qwen3OmniModel(Model):
         for k, step in enumerate(_thinker_steps(plan)):
             out[span_name("text_inputs", k)] = [texts[part.index] for part in step.parts if part.modality == TEXT]
         return split_spans(out, self.MEDIA_SPANS, kv_layout)
+
+    def prompt_tokens(self, tensors: NameToTensorList, kv_layout: dict[str, dict[str, LabelLayout]]) -> int:
+        # text_inputs leaves out each attachment, whose span in the Thinker's layout counts its sentinels and rows
+        return sum(span.length for span in kv_layout[THINKER_KV]["main"].spans)
 
     def _kv_layout(self, plan: list[PromptPart], tensors: NameToTensorList, audio_output: bool) -> dict:
         """What each Thinker prefill step writes and, with audio out, what the Talker writes of it.
