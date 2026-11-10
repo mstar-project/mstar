@@ -794,6 +794,7 @@ class TestApprove(unittest.TestCase):
                           ("torch.xpu", True), ("Intel Gaudi", True), ("TPU", True), ("Apple Silicon", True),
                           ("tpu = PS // 2", False), ("amd64 builds", False), ("AuthenticAMD", False),
                           ("hipster", False), ("test_bare_metal", False), ("bare-metal hosts", False),
+                          ("by Amdahl's law", False),
                           ("MPS on and off", False)):
             with self.subTest(text):
                 self.assertEqual(bool(bot.UNTESTABLE_HARDWARE.search(text)), hit)

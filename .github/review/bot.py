@@ -57,7 +57,7 @@ LIVE_TEST = re.compile(r"<!-- claude-live-test sha=([0-9a-f]{40}) verdict=([a-z]
 # PR's live test run on an AMD box too (vendors_of), and those it covers (gpu_review.covered_by_amd) stop
 # counting once it passed there.
 AMD_MODEL = r"mi\d{3}[ax]?"
-AMD = rf"(?:is)?amd(?!64)[a-z0-9]*|rocm|hip(?:cc)?|{AMD_MODEL}"
+AMD = rf"(?:is)?amd(?!64|ahl)[a-z0-9]*|rocm|hip(?:cc)?|{AMD_MODEL}"  # not Amdahl's law
 UNTESTABLE_HARDWARE = re.compile(rf"(?<![a-z0-9])(?:{AMD}|xpu|gaudi|hpu|(?-i:TPU)|(?<!bare[- _])metal"
                                  r"|apple[ _-]?silicon)(?![a-z0-9])", re.IGNORECASE)
 AMD_HARDWARE = re.compile(AMD, re.IGNORECASE)
