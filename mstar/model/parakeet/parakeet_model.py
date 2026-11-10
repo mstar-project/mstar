@@ -373,13 +373,16 @@ class ParakeetModel(Model):
                 batch_sizes=[1, 2, 4, 8, 16, 32], item_per_step=True,
                 lookahead=self.config.live_encoder.lookahead,
             )
-        if node_name in ("transducer", "transducer_stream"):
+        if node_name == "transducer":
             from mstar.model.parakeet.submodules import TransducerSubmodule
 
             return TransducerSubmodule(
                 self._head(device), compile_step=self.compile_step, encoder_dtype=autocast_dtype or torch.float32,
-                live_frames=self.chunk_frames if node_name == "transducer_stream" else None,
             )
+        if node_name == "transducer_stream":
+            from mstar.model.parakeet.submodules import LiveTransducerSubmodule
+
+            return LiveTransducerSubmodule(self._head(device), self.chunk_frames, compile_step=self.compile_step)
         return None
 
     def _encoder(self, device: str, autocast_dtype: torch.dtype | None):

@@ -197,9 +197,8 @@ class RealtimeSession:
     resampler: media_io.StreamResampler | None = None
     # samples the last chunk was short of its boundary (see take_chunk)
     short: int = 0
-    # a model that hears audio as it comes (RealtimeLiveTranscription), not re-decodes
-    stream_as_it_comes: bool = False
-    # samples already on that model's stream: an item's length without holding its audio
+    # samples already on a live model's stream (RealtimeLiveTranscription): an
+    # item's length without holding its audio
     streamed_samples: int = 0
     # server turn detection (None: the client commits); the segmenter, like
     # the resampler, spans turns, so a commit does not reset either
@@ -272,8 +271,6 @@ class RealtimeSession:
         return self.pending_samples + held + self.streamed_samples + sum(int(a.size) for a in self.heard)
 
     def take_chunk(self) -> np.ndarray | None:
-        if self.stream_as_it_comes:  # the data worker cuts it on the model's chunk
-            return self.flush()
         """Every full chunk of pending audio as one array, or None until
         enough arrived. Output the resampler still holds for its lookahead
         counts toward the chunk, so a chunk of 24 kHz input is decoded on the
@@ -783,7 +780,7 @@ class RealtimeTranscription:
         for i, op in enumerate(ops):
             if op[0] == "audio":
                 s.add(op[1])
-                if i == len(ops) - 1 and (chunk := s.take_chunk()) is not None:
+                if i == len(ops) - 1 and (chunk := self.take_chunk()) is not None:
                     await self.step(chunk)
             elif op[0] == "commit":
                 await self.commit()
@@ -887,6 +884,10 @@ class RealtimeTranscription:
     def current_text(self) -> str:
         return self.adapter.parse_transcript(self.session.raw_hypothesis, self.session.request).text
 
+    def take_chunk(self) -> np.ndarray | None:
+        """The audio the next step hears, or None until a chunk is in."""
+        return self.session.take_chunk()
+
     def _tokenizer(self):
         return getattr(getattr(self.api, "model", None), "tokenizer", None)
 
@@ -980,7 +981,6 @@ class RealtimeLiveTranscription(RealtimeTranscription):
 
     def __init__(self, api, model_name: str, adapter, websocket: WebSocket, stream: Connection):
         super().__init__(api, model_name, adapter, websocket)
-        self.session.stream_as_it_comes = True
         self.stream = stream.edge_name
         self.chunk_seconds = stream.audio.frame_samples / stream.audio.sample_rate
         # the stream's own bound on one item's length, not the re-decoding path's
@@ -1050,6 +1050,10 @@ class RealtimeLiveTranscription(RealtimeTranscription):
             return
         if self.key is not None:   # not ended by the commit
             await self._fail(error_event("this item's transcription ended before its commit", kind="server_error"))
+
+    def take_chunk(self) -> np.ndarray | None:
+        """All the audio in: the data worker cuts it on the model's chunk."""
+        return self.session.flush()
 
     async def step(self, chunk: np.ndarray, final: bool = False) -> None:
         s = self.session

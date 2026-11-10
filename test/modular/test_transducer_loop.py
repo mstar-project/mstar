@@ -36,7 +36,7 @@ from mstar.model.parakeet.config import (
     ParakeetModelConfig,
 )
 from mstar.model.parakeet.parakeet_model import ParakeetModel
-from mstar.model.parakeet.submodules import TransducerSubmodule, _batch_sizes
+from mstar.model.parakeet.submodules import LiveTransducerSubmodule, TransducerSubmodule, _batch_sizes
 from mstar.model.submodule_base import BatchedModelOutput, HostRows, ModelInputsFromEngine
 
 BUCKETS = (8, 32)
@@ -301,8 +301,9 @@ def test_a_live_stream_decodes_the_whole_clip_tokens(scenario, chunk):
     one iteration, even when each emits the most tokens a frame can."""
     head, clips = SCENARIOS[scenario]([])
     harness = Harness(head)
-    node = harness.node
-    node.live_frames, node.live_steps = chunk, chunk * head.config.max_symbols_per_step
+    harness.node = node = LiveTransducerSubmodule(head, chunk, compile_step=False)
+    node.requires_grad_(False)
+    node.bind_node_resources(harness.resources)
     with torch.no_grad():
         for rid, clip in enumerate(clips[:4]):
             harness.runner.ingest_request(rid)
