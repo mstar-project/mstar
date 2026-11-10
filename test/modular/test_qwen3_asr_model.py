@@ -694,8 +694,8 @@ def test_decode_loop_emits_its_one_signal_inline_and_loops_it_back_on_the_device
     sub.node_resources = {SAMPLER: type("S", (), {"has_slot_masters": True})()}
     assert sub.device_loopback_signals(DECODE_WALK) == frozenset({"text_inputs"})
     assert sub.device_loopback_signals(PREFILL_WALK) == frozenset()
-    assert sub.inline_client_signals(DECODE_WALK) == {"text_inputs": "new_token"}
-    assert sub.inline_client_signals(PREFILL_WALK) == {}
+    assert sub.inline_signals(DECODE_WALK) == {"text_inputs": "new_token"}
+    assert sub.inline_signals(PREFILL_WALK) == {}
     # a loop-back row brings no ids; preprocess reads them off the sampler
     row = sub.prepare_inputs(DECODE_WALK, None, {}, has_loopback=True)
     assert row.input_ids is None and row.input_seq_len == 1

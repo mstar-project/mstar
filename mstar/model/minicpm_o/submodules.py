@@ -137,11 +137,11 @@ class LLMSubmodule(ARNodeSubmodule):
             walk=DECODE, signal="text_inputs", sampler=LLM_SAMPLER, buffer="new_token",
         )
 
-    def inline_client_signals(self, graph_walk: str) -> dict[str, str]:
+    def inline_signals(self, graph_walk: str) -> dict[str, str]:
         # a spoken reply's client token rides inline too; its other outputs go through the host
         if graph_walk == DECODE_SPOKEN:
             return {self.device_loopback.signal: self.device_loopback.buffer}
-        return super().inline_client_signals(graph_walk)
+        return super().inline_signals(graph_walk)
 
     def get_accelerator_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,
@@ -608,11 +608,9 @@ class TTSSubmodule(ARNodeSubmodule):
             walk=TTS_DECODE, signal="tts_code", sampler=TTS_SAMPLER, buffer="tts_code",
         )
 
-    def inline_client_signals(self, graph_walk: str) -> dict[str, str]:
-        return {}  # the codes go to the vocoder, not the client
-
-    def inline_stream_signals(self, graph_walk: str) -> dict[str, str]:
-        # one code a row, which the stop check copies to the host
+    def inline_signals(self, graph_walk: str) -> dict[str, str]:
+        # The prefill's code too, not only the loop-back's: then every item of a
+        # reply's stream goes by value, and no window mixes in a stored one.
         return {"tts_code": "tts_code"}
 
     def get_accelerator_graph_configs(

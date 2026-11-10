@@ -2065,15 +2065,18 @@ the prefill) still brings it routed, and that read puts it over the slot's.
 and a node on it that reads the routed token sets ``device_loopback = None``; Whisper and
 Qwen3-Omni's Thinker declare their own.
 
-A token that also streams to another node can still stay on the device: return its
-stop buffer from ``inline_stream_signals(walk)`` (signal name -> buffer, as
-``inline_client_signals``), and the worker sends each row's value in the step's
-``EDGE_ITEMS`` frame instead of a tensor, with nothing to stage, read or acknowledge.
-The consumer's stream buffer takes a window of such items as one CPU int64 tensor of
-their values. A walk whose outputs are then all kept on the device or sent inline runs
-rows-only, as MiniCPM-o's TTS decode does: its code loops back on the device and streams
-to the vocoder inline. Startup refuses it for a stream that joins its items or drives
-its consumer's walk.
+A token that also streams to another node can go down the stream by value, when the
+stream's ``Connection`` sets ``by_value=True``: its consumer then takes a window of the
+stream as one CPU int64 tensor of its items' values. A step whose node names the signal
+in ``inline_signals(walk)`` sends each row's value in the step's ``EDGE_ITEMS`` frame
+instead of a tensor, with nothing to stage, read or acknowledge. A step carries one
+inline signal, the first of those it outputs, so a client token and a different stream
+token cannot both ride inline. The step keeps its rows on the device only if every
+output is one of ``device_loopback_signals``, so the streamed signal must also be the
+loop-back signal: MiniCPM-o's TTS decode loops its code back on the device and streams
+the same code to the vocoder by value. A lockstep node's streams keep their tensors,
+and a ``by_value`` connection cannot join its items, drive its consumer's walk or come
+from the client.
 
 On such a node a captured step writes each row's token and RNG offset back to the request's
 row inside the graph (``knobs: sampler_ingraph_scatter``, on by default). Those rows are

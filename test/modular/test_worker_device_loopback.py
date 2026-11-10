@@ -35,19 +35,16 @@ def test_all_on_device_is_per_step_signals_and_cached_per_node_and_walk():
 
 
 def test_a_signal_that_also_streams_as_a_tensor_is_not_kept_on_the_device():
-    """A stream that keeps its tensors (one the node does not send inline, or a
-    lockstep node's) needs the step to store them, so the engine does not count
-    its signal as kept on the device, and the step does not run rows-only."""
-    from mstar.testing_utils.engine import make_engine, make_mgmt
-
-    sub = SimpleNamespace(device_loopback_signals=lambda walk: frozenset({"tts_code"}))
-    streamed = make_engine(
-        _submodules={"TTS": make_mgmt(sub)}, _tensor_streams={("TTS", "tts_decode"): frozenset({"tts_code"})},
-    )
-    assert streamed.device_loopback_signals("TTS", "tts_decode") == frozenset()
-    assert not _body().all_on_device(streamed, "TTS", "tts_decode", ["tts_code"])
-    inline = make_engine(_submodules={"TTS": make_mgmt(sub)})
-    assert _body().all_on_device(inline, "TTS", "tts_decode", ["tts_code"])
+    """A stream that keeps its tensors (not by value, or a lockstep node's)
+    needs the step to store them, so its signal does not make the step
+    rows-only, whatever the node keeps on the device."""
+    engine = _Engine({("TTS", "tts_decode"): frozenset({"tts_code"})})
+    streamed = make_worker(
+        graph_runtime=SimpleNamespace(supports_inline_emit=True),
+        tensor_streams={("TTS", "tts_decode"): frozenset({"tts_code"})},
+    ).executor._body
+    assert not streamed.all_on_device(engine, "TTS", "tts_decode", ["tts_code"])
+    assert _body().all_on_device(engine, "TTS", "tts_decode", ["tts_code"])
 
 
 def test_no_rows_only_step_on_a_runtime_without_inline_emit():

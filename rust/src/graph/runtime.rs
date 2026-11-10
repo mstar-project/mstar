@@ -185,8 +185,8 @@ pub struct GraphRuntime {
     /// info carries that walk; EDGE_ITEMS has no room for it.
     walk_driven_signals: FxHashSet<String>,
     /// (node, signal) pairs whose streamed items go as values when the route
-    /// carries the signal inline (`NodeSubmodule.inline_stream_signals`); any
-    /// other stream keeps its tensors, whatever rides inline to the client.
+    /// carries the signal inline (a `by_value` `Connection`'s); any other
+    /// stream keeps its tensors, whatever rides inline to the client.
     inline_streams: FxHashSet<(String, String)>,
 
     /// A share of the SAME bookkeeper Python handed TensorStore, taken at

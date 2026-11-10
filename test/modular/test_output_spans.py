@@ -359,38 +359,49 @@ def test_startup_refuses_a_withheld_output_the_worker_cannot_leave_unrouted():
     _refuse_unroutable_withholds(other, graph(StreamingGraphEdge(next_node="Codec", name="token")))
 
 
-@pytest.mark.parametrize("conn, refused", [
-    ({}, False),
-    ({"join_dim": 0}, True),
-    ({"consumer_walk": lambda ctx: WALK}, True),
-], ids=["plain", "joined", "walk_driven"])
-def test_startup_refuses_an_inline_stream_whose_items_cannot_go_as_values(conn, refused):
-    """A signal sent down its stream inline may have no tensor to fall back on,
-    so its stream must take items as values: not joined, not walk-driven."""
+def test_a_by_value_stream_goes_by_value_only_where_its_signal_rides_inline():
+    """A ``by_value`` connection's stream is registered for the route; on a walk
+    it goes by value only when its signal is the step's inline signal, and a
+    lockstep node's, an undeclared stream's or a plain connection's keeps its
+    tensors (so the step stores them)."""
     from mstar.streaming.chunk_policy import FixedChunkPolicy
     from mstar.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
 
-    class _Streams(_Graph):
-        def get_partition_topology(self):
-            return PartitionTopology(partitions=["a", "b"], connections=[
-                Connection("a", "b", "token", lambda: FixedChunkPolicy(chunk_size=1), **conn),
-            ])
+    def model(by_value):
+        class _Streams(_Graph):
+            def get_partition_topology(self):
+                return PartitionTopology(partitions=["a", "b"], connections=[
+                    Connection("a", "b", "token", lambda: FixedChunkPolicy(chunk_size=1), by_value=by_value),
+                ])
 
-    node = GraphNode(name=NODE, input_names=["x"], outputs=[StreamingGraphEdge(next_node="Codec", name="token")])
-    model = _Streams(Loop(name="loop", section=node, max_iters=4, outputs=[]))
-    talker = {NODE: SimpleNamespace(inline_stream_signals=lambda walk: {"token": "token"})}
-    if refused:
-        with pytest.raises(ValueError, match="sends 'token' inline"):
-            _inline_streams(talker, model)
-        return
-    streams = _inline_streams(talker, model)
+        node = GraphNode(name=NODE, input_names=["x"], outputs=[StreamingGraphEdge(next_node="Codec", name="token")])
+        return _Streams(Loop(name="loop", section=node, max_iters=4, outputs=[]))
+
+    talker = {NODE: SimpleNamespace(inline_signals=lambda walk: {"token": "token"})}
+    streams = _inline_streams(talker, model(True))
     assert streams.keys == {(NODE, "token")} and streams.tensor_streams == {}
-    # a lockstep node's streams keep their tensors, and so its token is not
-    # one a step keeps on the device; nor is a stream the node does not declare
     lockstep = SimpleNamespace(get_instance_world_size_for_node=lambda node: 2)
-    for submodules, groups in ((talker, lockstep), ({NODE: SimpleNamespace(inline_stream_signals=lambda w: {})}, None)):
-        streams = _inline_streams(submodules, model, groups)
-        assert streams.keys == frozenset() and streams.tensor_streams == {(NODE, WALK): {"token"}}
+    quiet = {NODE: SimpleNamespace(inline_signals=lambda walk: {})}
+    for submodules, by_value, groups, keys in (
+        (talker, True, lockstep, frozenset()),
+        (quiet, True, None, {(NODE, "token")}),
+        (talker, False, None, frozenset()),
+    ):
+        streams = _inline_streams(submodules, model(by_value), groups)
+        assert streams.keys == keys and streams.tensor_streams == {(NODE, WALK): {"token"}}
+
+
+@pytest.mark.parametrize("conn", [
+    {"join_dim": 0}, {"consumer_walk": lambda ctx: WALK}, {"from_partition": "client"},
+], ids=["joined", "walk_driven", "client"])
+def test_a_connection_whose_items_cannot_go_as_values_refuses_by_value(conn):
+    from mstar.streaming.chunk_policy import FixedChunkPolicy
+    from mstar.streaming.topology import Connection
+
+    args = {"from_partition": "a", "to_partition": "b", "edge_name": "token",
+            "chunk_policy_factory": lambda: FixedChunkPolicy(chunk_size=1), "by_value": True, **conn}
+    with pytest.raises(ValueError, match="goes by value"):
+        Connection(**args)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="stages a CUDA span to pinned host memory")

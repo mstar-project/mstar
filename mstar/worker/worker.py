@@ -317,7 +317,10 @@ class Worker:
             graph_runtime=self._graph_runtime, topology=topology,
         )
 
-        layout = replace(layout, side_keys=frozenset(self.engine_manager.side_keys))
+        layout = replace(
+            layout, side_keys=frozenset(self.engine_manager.side_keys),
+            tensor_streams=self.engine_manager.inline_streams.tensor_streams,
+        )
         self.layout = layout
         self._rebuilds = _make_rebuilds(model, model_config, node_names, layout.parallel_nodes, self.device)
         services = WorkerServices(

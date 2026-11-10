@@ -101,7 +101,7 @@ class DeviceLoopback(NamedTuple):
 
     Declared as ``ARNodeSubmodule.device_loopback``; the loop-back hooks
     (``uniform_row_inputs``, ``device_loopback_signals``,
-    ``inline_client_signals``) and the read in ``preprocess``
+    ``inline_signals``) and the read in ``preprocess``
     (``loopback_inputs``) follow from it. The sampler keeps the masters only
     for a node that declares this: their eager step write is a small
     synchronous host-to-device copy per step, which a node that reads its
@@ -1213,25 +1213,17 @@ class NodeSubmodule(torch.nn.Module, ABC):
         del graph_walk
         return frozenset()
 
-    def inline_client_signals(self, graph_walk: str) -> dict[str, str]:
-        """Output signals whose client-facing value is one scalar per row that
-        the stop check already copies to the host, as signal name -> the name
-        of the row-addressed stop buffer holding it. The worker then sends
-        those values inline, one frame per step, instead of one tensor per
-        request. Only for a walk whose emit edge is not persisted."""
-        del graph_walk
-        return {}
-
-    def inline_stream_signals(self, graph_walk: str) -> dict[str, str]:
-        """``inline_client_signals`` for a streaming edge to another node: the
-        signal's value is one scalar per row that the stop check already
-        copies to the host (signal name -> its row-addressed stop buffer), and
-        its consumer takes a window of the stream as a tensor of those values.
-        The worker then sends each item as its value, in the step's one frame
-        per consumer worker (``EdgeItems.values``), with nothing to stage, read
-        or acknowledge; a walk whose other outputs all stay on the device then
-        runs rows-only (``device_loopback_signals``). Not for a stream whose
-        items are joined or drive the consumer's walk. Empty by default."""
+    def inline_signals(self, graph_walk: str) -> dict[str, str]:
+        """Output signals whose value is one scalar per row that the stop check
+        already copies to the host, as signal name -> the name of the
+        row-addressed stop buffer holding it. The worker then sends those values
+        inline, one frame per step, instead of one tensor per request: to the
+        client on an emit edge that is not persisted, and down a stream whose
+        ``Connection`` goes ``by_value``. A step carries one inline signal, the
+        first of these it outputs. Its rows stay on the device only if every
+        output is a ``device_loopback_signals`` one, so a stream's signal sent
+        inline lets the step run rows-only when it is also the loop-back
+        signal."""
         del graph_walk
         return {}
 
@@ -1592,11 +1584,11 @@ class ARNodeSubmodule(NodeSubmodule):
             return frozenset({self.device_loopback.signal})
         return super().device_loopback_signals(graph_walk)
 
-    def inline_client_signals(self, graph_walk: str) -> dict[str, str]:
-        # the client's copy of the token the stop check already has on the host
+    def inline_signals(self, graph_walk: str) -> dict[str, str]:
+        # the loop-back token, which the stop check already has on the host
         if self._loops_back(graph_walk):
             return {self.device_loopback.signal: self.device_loopback.buffer}
-        return super().inline_client_signals(graph_walk)
+        return super().inline_signals(graph_walk)
 
     def loopback_inputs(
         self, engine_inputs: ModelInputsFromEngine, inputs: list[ARNodeInputs],

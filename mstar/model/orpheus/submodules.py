@@ -30,10 +30,9 @@ class OrpheusLLMSubmodule(SampledTokenDecoder):
 
     PREFILL_WALK = "prefill"
     ATTN_KEY = ATTN
-    # The decode step also streams its token to SNAC, as a stored tensor: it
-    # sends nothing inline (``inline_stream_signals``), so its outputs never all
-    # stay on the device, which the loop-back needs, and the sampler keeps no
-    # slot masters for it.
+    # The decode step also streams its token to SNAC, as a stored tensor (its
+    # connection is not ``by_value``), so its outputs never all stay on the
+    # device, which the loop-back needs: the sampler keeps no slot masters for it.
     device_loopback = None
     # A prompt is a voice and its text, so the ladder stops at 1024: a longer
     # step runs eagerly rather than every capture being sized for 8192.

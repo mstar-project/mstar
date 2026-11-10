@@ -187,7 +187,7 @@ class InlineStreams(NamedTuple):
     """Which streamed signals go as values (``_inline_streams``)."""
     # (node, signal) pairs whose streamed items the route sends as values
     keys: frozenset[tuple[str, str]]
-    # (node, walk) -> its streamed signals that go as tensors: a step keeps
+    # (node, walk) -> its streamed signals that go as tensors there: a step keeps
     # such a signal's rows on the device only if nothing streams it
     tensor_streams: dict[tuple[str, str], frozenset[str]]
 
@@ -195,39 +195,31 @@ class InlineStreams(NamedTuple):
 def _inline_streams(
     submodules: dict, model: Model, parallel_groups: WorkerParallelGroups | None = None,
 ) -> InlineStreams:
-    """The streams whose items the route sends as values
-    (``NodeSubmodule.inline_stream_signals``), for the graph runtime; any other
-    signal's stream keeps its tensors, even one that rides inline to the client.
-
-    A lockstep node's streams keep their tensors: a replicated stream's
-    consumer counts its items from every rank, which a value cannot say. And
-    an inline signal may have no tensor to fall back on, since a step that
-    keeps its rows on the device stores none, so each of its streams must be
-    one whose items can ride a frame as values: not joined from a chunked
-    producer's pieces, and not driving its consumer's walk, which only a
-    tensor's descriptor carries. Startup refuses any other."""
+    """The streams whose items the route sends as values: a ``by_value``
+    connection's, for the graph runtime. On a walk, such a stream goes by value
+    only when its signal is the step's one inline signal, the first of the
+    node's ``inline_signals`` it outputs; every other stream, and a lockstep
+    node's (whose replicated stream's consumer counts items from every rank,
+    which a value cannot say), keeps its tensors."""
     topology = model.get_partition_topology()
-    conns = {c.edge_name: c for c in (topology.connections if topology else [])}
+    by_value = {c.edge_name for c in (topology.connections if topology else []) if c.by_value}
     keys = set()
     tensor_streams: dict[tuple[str, str], set[str]] = {}
     for walk, section in model.get_graph_walk_graphs().items():
         for name, node in section.get_nodes().items():
             submodule = submodules.get(name)
-            inline = submodule.inline_stream_signals(walk) if submodule is not None else {}
             lockstep = parallel_groups is not None and parallel_groups.get_instance_world_size_for_node(name) > 1
+            outputs = {edge.name for edge in node.outputs}
+            inline = submodule.inline_signals(walk) if submodule is not None else {}
+            sent_inline = next((signal for signal in inline if signal in outputs), None)
             for edge in node.outputs:
                 if not edge.is_streaming:
                     continue
-                if edge.name not in inline or lockstep:
-                    tensor_streams.setdefault((name, walk), set()).add(edge.name)
-                    continue
-                conn = conns.get(edge.name)
-                if conn is not None and (conn.join_dim is not None or conn.consumer_walk is not None):
-                    raise ValueError(
-                        f"{type(model).__name__}: {name!r} sends {edge.name!r} inline in walk {walk!r}, "
-                        "but its stream joins its items or drives its consumer's walk"
-                    )
-                keys.add((name, edge.name))
+                if edge.name in by_value and not lockstep:
+                    keys.add((name, edge.name))
+                    if edge.name == sent_inline:
+                        continue
+                tensor_streams.setdefault((name, walk), set()).add(edge.name)
     return InlineStreams(frozenset(keys), {k: frozenset(v) for k, v in tensor_streams.items()})
 
 
@@ -448,7 +440,6 @@ class EngineManager:
             gpu_memory_fraction=model_config.get("gpu_memory_fraction"),
             device_capability=device_capability,
             side_stream_nodes={name for name, _ in side_keys},
-            tensor_streams=inline_streams.tensor_streams,
         )
         engine.load_model(
             submodules,

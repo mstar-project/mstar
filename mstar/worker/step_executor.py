@@ -9,7 +9,7 @@ import math
 import threading
 import time
 import time as _time
-from collections.abc import Collection
+from collections.abc import Collection, Mapping
 from concurrent.futures import Future
 from dataclasses import dataclass
 from typing import Any, NamedTuple
@@ -85,6 +85,7 @@ class GpuStepBody:
         self, services: WorkerServices, timer: PhaseTimer, lockstep: Lockstep,
         lifecycle: RequestLifecycle, host_copies: HostCopies,
         device_capability: DeviceCapability, enable_nvtx: bool,
+        tensor_streams: Mapping[tuple[str, str], frozenset[str]] | None = None,
     ):
         self.worker_id = services.worker_id
         self.device = services.device
@@ -98,6 +99,8 @@ class GpuStepBody:
         self.enable_nvtx = enable_nvtx
         # (node, walk) -> the loop-back signals the node keeps on the device
         self._device_loopback: dict[tuple[str, str], frozenset[str]] = {}
+        # (node, walk) -> its streamed signals that go as tensors (``WorkerLayout``)
+        self._tensor_streams = tensor_streams or {}
 
     def __call__(
         self,
@@ -241,7 +244,8 @@ class GpuStepBody:
     def all_on_device(self, engine, node_name: str, graph_walk: str, signals) -> bool:
         """Whether every output signal of this step is one the node keeps on
         the device (cached per node and walk: it depends on the node's
-        resources, not on the step)."""
+        resources, not on the step). Not one that streams as a tensor: its
+        stream needs the tensor stored."""
         # without inline emit, a rows-only step has no path for the client's tokens
         if not signals or not self._graph_runtime.supports_inline_emit:
             return False
@@ -250,7 +254,7 @@ class GpuStepBody:
         if on_device is None:
             on_device = self._device_loopback[key] = frozenset(
                 engine.device_loopback_signals(node_name, graph_walk)
-            )
+            ) - self._tensor_streams.get(key, frozenset())
         return all(s in on_device for s in signals)
 
     def walk_signals(self, batch: ScheduledBatch, walk: str):
@@ -310,6 +314,7 @@ class StepExecutor:
         self._body = GpuStepBody(
             services=services, timer=timer, lockstep=lockstep, lifecycle=lifecycle,
             host_copies=self._host_copies, device_capability=self.device_capability, enable_nvtx=enable_nvtx,
+            tensor_streams=layout.tensor_streams,
         )
         self._gpu_pool: ThreadPool | InlineExecutor | None = None
         self._plan_pool: ThreadPool | InlineExecutor | None = None
