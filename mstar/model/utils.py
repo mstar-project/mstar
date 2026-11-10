@@ -457,6 +457,19 @@ class TextChunkDetokenizer:
         return data
 
 
+class ByteIdDetokenizer:
+    """Token ids that are bytes, as a reduced model's byte tokenizer
+    (``tokenizer_mode: byte``) makes them: an id is its low byte."""
+
+    @staticmethod
+    def to_bytes(token_ids: list[int]) -> bytes:
+        return bytes(t & 0xFF for t in token_ids)
+
+    @staticmethod
+    def token_bytes(token_id: int) -> bytes:
+        return bytes((token_id & 0xFF,))
+
+
 class SentencePieceDetokenizer:
     """Per-token detokenization for SentencePiece-style vocabularies (``▁``
     marks a word start, ``<0xNN>`` pieces are byte fallback), read from an HF
@@ -491,7 +504,7 @@ class TextOutput(NamedTuple):
     declares it, and ``Model.postprocess`` and ``Model.postprocess_inline``
     derive their text paths from it."""
 
-    detokenizer: ByteLevelDetokenizer | TextChunkDetokenizer | SentencePieceDetokenizer
+    detokenizer: ByteLevelDetokenizer | TextChunkDetokenizer | SentencePieceDetokenizer | ByteIdDetokenizer
     # ids that end a reply, dropped unless the request sets ``ignore_eos``
     stop_token_ids: Container[int] = frozenset()
 

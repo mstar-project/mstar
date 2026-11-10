@@ -11,6 +11,7 @@ and ``test/rust/test_rust_frontend.py``.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import inspect
 import json
 import queue
@@ -319,10 +320,11 @@ class _OnePass:
         return False
 
 
-def _served(token_counts, cap, report_usage=True, error=False, stopped=False):
+def _served(token_counts, cap, report_usage=True, error=False, stopped=False, chunks=None):
     """A request run through ``submit_request`` and one pass of the message
     thread: text chunks carrying ``token_counts`` tokens, the last one ended by
-    a stop token when ``stopped``, then its completion."""
+    a stop token when ``stopped``, or the data worker's own ``chunks``; then
+    its completion."""
     worker = _DataWorker()
     server = make_test_api_server(preprocess_worker=worker)
     server.submit_request(
@@ -330,14 +332,14 @@ def _served(token_counts, cap, report_usage=True, error=False, stopped=False):
         request_id="r", report_usage=report_usage,
     )
     key = worker.inputs[0].request_id
-    worker.chunks = [
-        ResultChunk(request_id=key, modality="text", data=b"x", num_tokens=n) for n in token_counts
-    ]
-    worker.chunks[-1].stopped = stopped
+    if chunks is None:
+        chunks = [ResultChunk(request_id=key, modality="text", data=b"x", num_tokens=n) for n in token_counts]
+        chunks[-1].stopped = stopped
+    worker.chunks = [dataclasses.replace(c, request_id=key) for c in chunks]
     if error:
         worker.chunks.append(ResultChunk(request_id=key, modality="error", data=b"boom", metadata={"status": 500}))
     server.communicator = _OnePass([APIServerMessage(message_type="request_complete", body=RequestComplete(
-        request_id=key, output_chunk_counts={"new_token": len(token_counts)},
+        request_id=key, output_chunk_counts={"new_token": len(chunks)},
         conductor_ingest_time=0.0, conductor_finish_time=0.0,
         prompt_tokens=len(_tokenize(PROMPT)), max_output_tokens=cap,
     ))])
@@ -373,6 +375,24 @@ def test_a_reported_request_ends_with_its_usage(read, token_counts, cap, stopped
     assert chunks[-1].metadata == {
         "prompt_tokens": len(_tokenize(PROMPT)), "completion_tokens": completion, "finish_reason": finish,
     }
+
+
+@pytest.mark.parametrize("name", ["glm52", "glm5_next"])
+def test_a_glm_reply_that_ends_on_eos_in_its_last_slot_is_stop(name):
+    """Both GLMs declare their stop ids (``text_output``), so the data worker
+    sees the EOS that fills ``max_tokens``."""
+    model = get_model_class(name)(model_path_hf="", tokenizer_mode="byte")
+    worker = _data_worker(model)
+    for token in (ord("H"), model.config.eos_token_ids[0]):
+        worker._emit_inline_tokens(InlineTokens(["r"], [token], "text"))
+    chunks = [worker.out_queue.get_nowait() for _ in range(2)]
+
+    usage = _collected(_served(None, cap=2, chunks=chunks))[-1]
+    assert usage.metadata == {
+        "prompt_tokens": len(_tokenize(PROMPT)), "completion_tokens": 2, "finish_reason": "stop",
+    }
+    # and the EOS is not text
+    assert [c.data for c in chunks] == [b"H", b""]
 
 
 def test_a_request_that_did_not_ask_gets_no_usage_chunk():
