@@ -54,6 +54,10 @@ class Guidance(NamedTuple):
 
     # Per branch: {model_output argument: the request input it takes}. Inputs no branch names are shared
     # by every branch. An empty mapping is a branch that differs by what its row reads, not by an input.
+    # ``request_inputs`` returns, under its input name, every input a branch of ``key.branches`` takes (it
+    # may skip the others), each the same shape across the branches: the base stacks them as rows. A model
+    # that shapes a branch's input per step (Qwen-Image left-pads each prompt to the step's longest) finds
+    # the input's name here, ``branches[b][argument]``.
     branches: tuple[Mapping[str, str], ...]
     combine: GuidanceCombine
 

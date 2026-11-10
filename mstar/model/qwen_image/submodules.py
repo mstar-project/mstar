@@ -244,7 +244,7 @@ class QwenImageDenoiseSubmodule(DenoiseLoopSubmodule):
     def request_inputs(self, fwd_info, inputs: NameToTensorList, key: StepKey) -> dict[str, torch.Tensor]:
         rows = text_rows(key)
         tensors = {REF_LATENTS: inputs[REF_LATENTS][0]}
-        for b in key.branches:
+        for b in key.branches:  # each run branch's prompt, left-padded to the step's rows (Guidance.branches)
             edge = self.GUIDANCE.branches[b]["text_embeds"]
             embeds = inputs[edge][0]
             tensors[edge] = torch.nn.functional.pad(embeds, (0, 0, rows - embeds.shape[0], 0))

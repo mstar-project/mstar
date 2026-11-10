@@ -319,7 +319,8 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         self, fwd_info: CurrentForwardPassInfo, inputs: NameToTensorList, key: StepKey,
     ) -> dict[str, torch.Tensor]:
         """The request's conditioning tensors for this step, without a batch dim. A guided model returns every
-        branch input its ``key.branches`` read; the base maps them onto each branch's row."""
+        branch input its ``key.branches`` read (the contract is on ``Guidance.branches``); the base maps them onto
+        each branch's row."""
         raise NotImplementedError
 
     def num_tokens(self, key: StepKey) -> int:
