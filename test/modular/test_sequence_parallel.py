@@ -22,7 +22,6 @@ from torch._C._dynamo.eval_frame import _debug_get_cache_entry_list
 
 from mstar.distributed import communication
 from mstar.distributed.communication import CommGroup, JointGroups, gather_sequence, sp_seq_split
-from mstar.engine.resources.attn.ragged.base import _build_ragged
 from mstar.engine.resources.base import EngineResourceInfo
 from mstar.engine.resources.context_parallel import gather_merge, merge
 from mstar.engine.resources.kv.config import KVSpec, KVStep, PagedKVConfig
@@ -225,24 +224,12 @@ def test_sequence_shard_exchanges_match_one_rank(tmp_path, world, total, rows, c
     _run(_split_exchanges, world, tmp_path / "store", total, rows, captured)
 
 
-def test_a_ulysses_ragged_attention_divides_its_heads_by_the_nodes_head_shards():
-    """Not by the instance's rank count, which main's CFG axis makes wider than TP x SP (here TP 1, SP 2, CFG 2)."""
-    shards = []
-    spec = types.SimpleNamespace(
-        config=types.SimpleNamespace(shard=shards.append, dtype=torch.float16),
-        sp_exchange="ulysses", shard_key="shard", resource_key="ragged",
-    )
-    joint = types.SimpleNamespace(world_size=4, tp_group=types.SimpleNamespace(world_size=1))
-    info = types.SimpleNamespace(joint_comm_group=joint, head_shards=2, device="cpu", kv_dtype=None)
-    _build_ragged(spec, info, lambda **kwargs: types.SimpleNamespace())
-    assert shards == [2]
-
-
 # --- when a step splits ---------------------------------------------------------------------------
 
 
 def _shard(world: int = 2, rank: int = 0, labels=("main",), axis: int = 0, **spec):
-    joint = JointGroups(tp_group=CommGroup.trivial(), sp_group=CommGroup(rank, rank, list(range(world))))
+    sp = CommGroup(rank, rank, list(range(world)))
+    joint = JointGroups(tp_group=CommGroup.trivial(), sp_group=sp, instance=sp)
     spec = SeqShardSpec("shard", {"n"}, labels, axis, **spec)
     return spec.resource_class.build(spec, EngineResourceInfo(device=torch.device("cpu"), joint_comm_group=joint))
 

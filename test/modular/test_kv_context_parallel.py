@@ -938,7 +938,7 @@ def _cosmos3_over_ranks(rank, world, store):
         statics, latents, timesteps = inputs(32, 64)
         with torch.no_grad():
             want, _ = _cosmos3_steps(sub, _SdpaResources().as_dict(), statics, latents, timesteps)
-            res = _cosmos3_resources(model, JointGroups(tp_group=CommGroup.trivial(), sp_group=group))
+            res = _cosmos3_resources(model, JointGroups(tp_group=CommGroup.trivial(), sp_group=group, instance=group))
             got, runner = _cosmos3_steps(sub, res, statics, latents, timesteps)
             row = tower.denoise_step_row(statics[0], latents, timesteps, statics[0]["rotary"], statics[0]["rotary"])
             warm = tower.denoise_step_batched([row, row], CFG_BATCHED_LABEL, _WarmupAttention())
@@ -996,7 +996,8 @@ def test_cosmos3s_reasoner_shares_the_dits_sequence_shard_and_declares_it(monkey
     with pytest.raises(ValueError, match=r"spans nodes \['reasoner'\] without the sequence shard"):
         resolve_spec_dependencies([replaced(spec, nodes={DIT_NODE}) if spec is shard else spec for spec in specs])
 
-    res = _cosmos3_resources(model, JointGroups(tp_group=CommGroup.trivial(), sp_group=CommGroup.trivial()))
+    trivial = CommGroup.trivial()
+    res = _cosmos3_resources(model, JointGroups(tp_group=trivial, sp_group=trivial, instance=trivial))
     runner = StepRunner(res)
     runner.ingest_request("t", {"kv": KVReqConfig(needed_labels=[REASONER_LABEL]), SAMPLER: SamplingReqConfig()})
     reasoner = Cosmos3ReasonerSubmodule(sub.transformer, model.config)

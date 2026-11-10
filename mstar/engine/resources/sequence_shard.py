@@ -437,11 +437,12 @@ def ulysses(run: Callable, q, k, v, r: SeqRange):
     tokens) to ``[N, H / P, D]``, ``run``, and the output back.
 
     A captured step compiles the all-to-all at its own shapes, once in the warm-up, so the graph
-    replays fused layout copies; ``dynamic=False`` because another bucket's token count would make
+    replays fused layout copies; static (``compiled`` marks no dim dynamic, and a call inside a captured
+    forward inherits the runner's ``dynamic=False``), because another bucket's token count would make
     that dim dynamic, a slower kernel than eager. Any other step stays eager: its token counts vary,
     so compiling would stall on each new one and gain nothing per step."""
     _check_entry(r, q, k, v)
-    all_to_all = compiled(CommGroup.all_to_all, dynamic=False) if r.captured else CommGroup.all_to_all
+    all_to_all = compiled(CommGroup.all_to_all) if r.captured else CommGroup.all_to_all
     seq, head = (0, 1) if r.rows is None else (1, 2)
     parts = [x for x in (q, k, v) if x is not None]
     exchanged = all_to_all(
