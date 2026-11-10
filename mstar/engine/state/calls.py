@@ -25,6 +25,9 @@ class ArrayHandle(StepHandle):
     resources hold the step's plan.
     """
 
+    # whether a step that lists the array has anything to do for it
+    needs_step = True
+
     def __init__(
         self, array: Array, resources: Mapping[str, Any], positions_key: str | None,
         host_fields: HostFields | None = None,

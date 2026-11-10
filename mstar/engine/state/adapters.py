@@ -236,97 +236,42 @@ def build_handle(declared: Array | Sampler, resources: Mapping[str, Any]) -> Arr
 
 
 def state_steps(step: SubmoduleStep | None, handles: Mapping[str, ArrayHandle | SamplerHandle]) -> SubmoduleStep | None:
-    """``step`` as a new step, with what its ``state`` declares expanded into today's step objects, built afresh for
-    each step because `SubmoduleStep` writes the segments onto them. None when every read it lists runs SDPA with no
-    exchange, which leaves the step nothing to do."""
+    """``step`` as a new step, with what its ``state`` declares expanded into today's step objects by each storage's
+    builder, built afresh for each step because `SubmoduleStep` writes the segments onto them. None when no array or
+    sampler it lists needs it, so the step skips its resources' admit, plan and commit."""
     if step is None or not step.state:
         return step
-    if all(getattr(handles.get(name), "plans_nothing", False) for name in step.state):
+    if not any(getattr(handles.get(name), "needs_step", True) for name in step.state):
         return None
     steps = dict(step.steps)
-    plans: dict[str, _WithinStepPlan] = {}
+    builders: dict[Storage, StepBuilder] = {}
     for name, declared in step.state.items():
         handle = handles.get(name)
-        if isinstance(handle, SamplerHandle) and isinstance(declared, SampleStep):
+        # the step's type first: a check against a handle's class goes through `ABCMeta` and costs more
+        if isinstance(declared, ArrayStep) and isinstance(handle, ArrayHandle):
+            if declared.segments is None and step.segments is None:
+                raise ValueError(f"Array {name!r}: a step lists it with no segments, its own or the step's")
+            storage = storage_of(handle.array)
+            builder = builders.get(storage)
+            if builder is None:
+                builder = builders[storage] = storage.step_builder()
+            builder.add(handle, declared, step)
+        elif isinstance(declared, SampleStep) and isinstance(handle, SamplerHandle):
             steps[name] = SamplerStep(
                 apply_penalty=declared.apply_penalty, apply_filters=declared.apply_filters,
                 prefill_tracked_tokens=declared.prompt_tokens, kept_rids=declared.kept_rows,
             )
-        elif isinstance(handle, ArrayHandle) and isinstance(declared, ArrayStep):
-            if declared.segments is None and step.segments is None:
-                raise ValueError(f"Array {name!r}: a step lists it with no segments, its own or the step's")
-            if isinstance(handle, WithinStepHandle):
-                if not handle.runs_sdpa:
-                    _plan_within_step(handle, declared, step, plans.setdefault(handle.resource_key, _WithinStepPlan()))
-            else:
-                _array_steps(handle, declared, step, steps)
         else:
             raise ValueError(
                 f"a step's state[{name!r}] is a {type(declared).__name__}, and on this node {name!r} is "
                 f"{'not declared' if handle is None else type(handle).__name__}, which take an ArrayStep for an array "
                 "and a SampleStep for a sampler"
             )
-    steps.update((key, plan.step()) for key, plan in plans.items())
+    for builder in builders.values():
+        steps.update(builder.steps())
     expanded = replace(step, steps=steps)
     expanded.set_state_handles(tuple(handles[name] for name in step.state))
     return expanded
-
-
-class _WithinStepPlan:
-    """What the arrays sharing one ragged resource plan in one step: each label's segments, and the cross reads' pairs.
-
-    A label is one layout on the resource, so two arrays with one label have to mean the same tokens.
-    """
-
-    __slots__ = ("by_label", "pairs")
-
-    def __init__(self):
-        self.by_label: dict[str, Sequence[Segment]] = {}
-        self.pairs: list[tuple[str, str]] = []
-
-    def add(self, name: str, segments: Sequence[Segment]) -> str:
-        label = segments[0].label
-        if tuple(self.by_label.setdefault(label, segments)) != tuple(segments):
-            raise ValueError(f"Array {name!r}: label {label!r} on its resource already holds other segments")
-        return label
-
-    def step(self) -> AttentionStep | RaggedCrossAttentionStep:
-        if self.pairs:
-            return RaggedCrossAttentionStep(
-                segments=tuple(s for segments in self.by_label.values() for s in segments), pairs=tuple(self.pairs),
-            )
-        if len(self.by_label) == 1:
-            return AttentionStep(segments=next(iter(self.by_label.values())), causal=False)
-        return AttentionStep(segments=tuple(s for segments in self.by_label.values() for s in segments), causal=False)
-
-
-def _plan_within_step(
-    handle: "WithinStepHandle", declared: ArrayStep, step: SubmoduleStep, plan: _WithinStepPlan,
-) -> None:
-    """Add ``handle``'s read to ``plan``, over the segments its kernel sees. A Ulysses read runs over whole segments
-    after the exchange, and any other over this rank's share of a sharded side."""
-    name = handle.name
-    segments = declared.segments or step.segments
-    if handle.queried is None:
-        plan.add(name, segments)
-        return
-    queries = step.state.get(handle.queried.name)
-    if queries is None:
-        raise ValueError(f"Array {name!r}: a step lists it without {handle.queried.name!r}, whose segments lay out its "
-                         "queries")
-    q_label = plan.add(name, handle.query_share(queries.segments or step.segments))
-    plan.pairs.append((q_label, plan.add(name, handle.key_share(segments))))
-
-
-def _array_steps(handle: ArrayHandle, declared: ArrayStep, step: SubmoduleStep, steps: dict[str, Any]) -> None:
-    array, segments = handle.array, declared.segments
-    storage_of(array).steps(handle, declared, steps)
-    for bound in handle._bindings:
-        bound.binding.steps(bound.key, segments, steps)
-    if array.positions is not None:
-        # a step that keeps nothing doesn't advance the counter
-        advance = declared.advance if declared.keep else (0,) * len(segments or step.segments)
-        steps[handle.positions_key] = PositionStep(segments=segments, advance=advance, pos_ids=declared.position_ids)
 
 
 def _forks(array: Array, declared: ArrayStep) -> tuple[tuple, tuple, frozenset | None]:
@@ -340,6 +285,84 @@ def _forks(array: Array, declared: ArrayStep) -> tuple[tuple, tuple, frozenset |
         tuple((fork.src, fork.dst) for fork in declared.forks if fork.at == "end"),
         rows.pop(),
     )
+
+
+class StepBuilder(ABC):
+    """Today's steps of one storage's arrays in one step."""
+
+    @abstractmethod
+    def add(self, handle: ArrayHandle, declared: ArrayStep, step: SubmoduleStep) -> None:
+        """``declared`` is what ``step`` lists for ``handle``'s array."""
+
+    @abstractmethod
+    def steps(self) -> dict[str, Any]:
+        """The steps of the arrays added, by resource key."""
+
+
+class ArraySteps(StepBuilder):
+    """Each array's steps on its own: its storage's, its ops' and its positions'."""
+
+    def __init__(self, storage: "Storage"):
+        self._storage = storage
+        self._steps: dict[str, Any] = {}
+
+    def add(self, handle: ArrayHandle, declared: ArrayStep, step: SubmoduleStep) -> None:
+        segments = declared.segments
+        self._storage.steps(handle, declared, self._steps)
+        for bound in handle._bindings:
+            bound.binding.steps(bound.key, segments, self._steps)
+        if handle.array.positions is not None:
+            # a step that keeps nothing doesn't advance the counter
+            advance = declared.advance if declared.keep else (0,) * len(segments or step.segments)
+            self._steps[handle.positions_key] = PositionStep(
+                segments=segments, advance=advance, pos_ids=declared.position_ids,
+            )
+
+    def steps(self) -> dict[str, Any]:
+        return self._steps
+
+
+class WithinStepSteps(StepBuilder):
+    """The step of each ragged resource, from the reads that share it: each label's segments, and the cross reads'
+    pairs. A label is one layout on the resource, so two arrays with one label have to mean the same tokens."""
+
+    def __init__(self):
+        self._labels: dict[str, dict[str, Sequence[Segment]]] = {}
+        self._pairs: dict[str, list[tuple[str, str]]] = {}
+
+    def add(self, handle: "WithinStepHandle", declared: ArrayStep, step: SubmoduleStep) -> None:
+        """Plan ``handle``'s read over the segments its kernel sees. A Ulysses read runs over whole segments after the
+        exchange, and any other over this rank's share of a sharded side."""
+        if handle.runs_sdpa:
+            return
+        key, name, segments = handle.resource_key, handle.name, declared.segments or step.segments
+        if handle.queried is None:
+            self._label(key, name, segments)
+            return
+        queries = step.state.get(handle.queried.name)
+        if queries is None:
+            raise ValueError(f"Array {name!r}: a step lists it without {handle.queried.name!r}, whose segments lay out "
+                             "its queries")
+        q_label = self._label(key, name, handle.query_share(queries.segments or step.segments))
+        self._pairs.setdefault(key, []).append((q_label, self._label(key, name, handle.key_share(segments))))
+
+    def _label(self, key: str, name: str, segments: Sequence[Segment]) -> str:
+        label = segments[0].label
+        if tuple(self._labels.setdefault(key, {}).setdefault(label, segments)) != tuple(segments):
+            raise ValueError(f"Array {name!r}: label {label!r} on its resource already holds other segments")
+        return label
+
+    def steps(self) -> dict[str, Any]:
+        steps: dict[str, Any] = {}
+        for key, by_label in self._labels.items():
+            segments = tuple(s for each in by_label.values() for s in each) if len(by_label) > 1 else (
+                next(iter(by_label.values()))
+            )
+            if key in self._pairs:
+                steps[key] = RaggedCrossAttentionStep(segments=tuple(segments), pairs=tuple(self._pairs[key]))
+            else:
+                steps[key] = AttentionStep(segments=segments, causal=False)
+        return steps
 
 
 def kv_layouts(
@@ -689,8 +712,8 @@ class WithinStepHandle(ArrayHandle):
         sharded = sp_group is not None and sp_group.world_size > 1
         self._keys_sharded = sharded and array.seq_sharded
         self._queries_sharded = sharded and (array if queried is None else queried).seq_sharded
-        # Nothing for a step to do here: no plan, and no rank sizes to learn from its segments for a Ulysses exchange.
-        self.plans_nothing = self.runs_sdpa and not (self._keys_sharded and self._queries_sharded)
+        # A read on SDPA plans nothing, so a step needs to run for it only to learn a Ulysses exchange's rank sizes.
+        self.needs_step = not self.runs_sdpa or (self._keys_sharded and self._queries_sharded)
         self._seq_sizes: list[int] | None = None
         # Both sides fix the plan's label, so it is one string for the life of the handle. See `cross_label`.
         self._plan_label = min(array.labels) if queried is None else cross_label(min(queried.labels), min(array.labels))
@@ -797,6 +820,10 @@ class Storage(ABC):
     def steps(self, handle: ArrayHandle, declared: ArrayStep, steps: dict[str, Any]) -> None:
         """Add the step of the array's own resource, under its name."""
         return
+
+    def step_builder(self) -> StepBuilder:
+        """What gathers the steps of this storage's arrays in one step."""
+        return ArraySteps(self)
 
     def layouts(
         self, by_label: Mapping[str, Layout], keyed_spans: Mapping[str, int],
@@ -905,6 +932,9 @@ class WithinStepStorage(Storage):
     """An array with ``max_len`` 0, whose adds last only the step, so it has no pool."""
 
     handle_class = WithinStepHandle
+
+    def step_builder(self) -> StepBuilder:
+        return WithinStepSteps()
 
     def resolve(self, arrays: Sequence[Array], declared: Sequence[Array]) -> Resolved:
         """A ragged spec per read, a `RaggedCrossAttentionSpec` for a read with ``queries``. Reads of one kind, on one
