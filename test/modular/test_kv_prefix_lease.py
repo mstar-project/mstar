@@ -482,6 +482,21 @@ def _write(kv: KVManager, rid: str, tokens: list[int]) -> None:
     _grow(kv, rid, len(tokens) - (prefix.tokens if prefix is not None else 0))
 
 
+def test_repeats_of_one_cached_prompt_on_a_window_pool_fit_the_capture_bound():
+    """Repeats of one cached prompt each name its full-group pages, so together they name more pages than the
+    pool holds; a captured wrapper's index buffer holds them all (it was once sized by the pool)."""
+    from mstar.engine.resources.attn.base import captured_page_capacity
+
+    kv = _window_manager(max_num_pages=16)
+    shared = list(range(6 * PAGE_SIZE))
+    rids = [f"r{i}" for i in range(10)]
+    for i, rid in enumerate(rids):
+        _write(kv, rid, shared + [10_000 + i])
+    named = sum(len(kv._streams[rid]["main"].page_indices) for rid in rids)
+    assert named > kv.config.num_units
+    assert named <= captured_page_capacity(len(rids), len(rids), kv.config, kv.config.groups[0])
+
+
 def test_a_repeat_on_a_window_pool_takes_the_window_pages_the_first_request_left_in_the_cache():
     kv = _window_manager()
     tokens = list(range(100))

@@ -293,13 +293,15 @@ def captured_page_capacity(
     ``num_tokens`` tokens, in pages of ``group`` (the pool's first by default).
 
     Per row, since rows that matched one cached prefix all name its pages, and at least the
-    bucket's own sink pages. A pool that keeps a window caches no prefix and forks nothing, so
-    its rows name at most the pool, or in the window's group a window each, plus the step."""
+    bucket's own sink pages. In a pool that keeps a window, the window's group names a window
+    a row plus the step; any other group's rows share cached prefixes too, so each names at
+    most a whole sequence."""
     group = group or kv_config.groups[0]
     step_pages = -(-num_tokens // group.page_size)
     if group.retention is not None:
         # a page more per row, which a row's share of the step can cross into
         return num_rows * (group.retention.max_pages(group.page_size) + 1) + step_pages
     if len(kv_config.groups) > 1:
-        return kv_config.num_units + step_pages + num_rows
+        per_row = min(kv_config.num_units, -(-kv_config.max_seq_len // group.page_size))
+        return max(num_rows * per_row, step_pages + num_rows)
     return max(num_rows * kv_config.max_num_pages, step_pages + num_rows)
