@@ -1,0 +1,615 @@
+Model scaffolds and examples
+============================
+
+Choose an implementation by its computation and state, not only by its output modality.
+For a new text or vision-language decoder, start with the `decoder
+scaffold <#worked-example-a-vision-language-model-on-the-vlm-scaffold>`__. For image
+diffusion, start with the `denoise
+scaffold <#worked-example-an-image-dit-on-the-diffusion-scaffold>`__. Orpheus, BAGEL,
+and Whisper below explain existing graphs and their resource ownership.
+
+Worked example: Orpheus
+-----------------------
+
+Orpheus (``mstar/model/orpheus/``) is a small and complete reference. It is a TTS model.
+A Llama 3.2 3B LLM emits audio tokens, and a SNAC decoder converts them into 24 kHz PCM.
+
+The two nodes have different needs. The LLM declares the four standard resources, shown
+under `Declare resources per node <model_resources.html#step-2a-declare-your-resources>`__. No spec names
+``snac_decoder``, so that node receives no resources. The SNAC decoder instead declares
+how it must be run, using two class attributes on the submodule:
+
+.. code:: python
+
+   class SNACDecoderSubmodule(NodeSubmodule):
+       disable_torch_compile = True   # runs in fp32, without compilation
+       disable_autocast = True
+
+There are three graph walks: ``prefill`` and a ``decode`` ``Loop`` on the LLM, plus a
+``snac_chunk`` node that emits audio to the client:
+
+.. code:: python
+
+   snac_chunk = GraphNode(
+       name="snac_decoder",
+       input_names=["new_token"],
+       outputs=[GraphEdge(next_node=EMIT_TO_CLIENT, name="audio_chunk",
+                          output_modality="audio")],
+   )
+
+``process_prompt`` formats the string ``"{voice}: {text}"``, tokenizes it, wraps the ids
+in the model’s start and end tokens, and returns ``{"text_inputs": [ids]}``.
+``get_submodule`` builds either the Llama LLM submodule, a ``SampledTokenDecoder`` that
+declares little beyond its walk names, resource steps and capture buckets, or the SNAC
+decoder submodule, and caches the result. The SNAC submodule emits int16 PCM, which the
+default ``postprocess`` passes through as raw bytes.
+
+Orpheus also demonstrates the `async partition API <model_streaming.html#advanced-async-partitions-and-streaming>`__. The
+LLM and the SNAC decoder run as two partitions connected by a streaming edge. Audio is
+therefore decoded in a sliding window while the LLM is still generating.
+
+Worked example: BAGEL
+---------------------
+
+Orpheus is a single pipeline. BAGEL (``mstar/model/bagel/``) is much more complex, and
+it shows why the graph abstraction is useful. BAGEL is a unified model. It performs
+image understanding, which maps an image to text, and image generation, which maps text
+to an image. Both use the same Qwen2 LLM. That LLM is also the denoiser for
+rectified-flow image generation. The sections that follow trace its registration, resources, graph walks, and deployment.
+
+Registration
+~~~~~~~~~~~~
+
+The lazy entry in ``registry.py`` maps ``"bagel"`` to ``("mstar.model.bagel.bagel_model", "BagelModel")``. Its ``HF_MODELS`` entry points to
+``ByteDance-Seed/BAGEL-7B-MoT``.
+
+Nodes and resources
+~~~~~~~~~~~~~~~~~~~
+
+The model has four core nodes: a ViT encoder
+(SigLIP2, used for understanding), a VAE encoder (FLUX, used for editing and
+generation), the LLM (Qwen2, which contains the embedding, the transformer, the lm_head
+and the CFG logic), and a VAE decoder. It has four more nodes for the CFG-parallel
+image-generation path described below: ``init_latents``, the two branch nodes
+``LLM_cfg_text`` and ``LLM_cfg_img``, and ``combine_cfg``.
+
+The three LLM nodes share one set of resources: the same KV pool, attention, positions
+and sampler. Each of those specs names all three nodes in its ``nodes`` field. The ViT
+encoder declares one resource of its own, a ``RaggedAttentionSpec`` with no cache behind
+it, so that its block loop can be CUDA-graph captured:
+
+.. code:: python
+
+   def get_node_resources(self) -> list[NodeResourceSpec]:
+       nodes = set(self._LLM_NODES)   # {"LLM", "LLM_cfg_text", "LLM_cfg_img"}
+       return [
+           RaggedAttentionSpec(resource_key=VIT_ATTN, nodes={"vit_encoder"},
+                               config=RaggedAttentionConfig(...)),
+           KVSpec(resource_key="kv", nodes=nodes, config=self._kv_config(), leader="LLM"),
+           AttentionSpec(resource_key="attn", nodes=nodes,
+                         config=AttentionConfig(kv_cache="kv")),
+           PositionSpec(resource_key="rope", nodes=nodes,
+                        config=PositionConfig(kv_cache="kv",
+                                              rope_theta=self.config.rope_theta)),
+           SamplerSpec(resource_key="sampler", nodes=nodes,
+                       vocab_size=self.config.vocab_size),
+       ]
+
+No spec names the VAE encoder, ``init_latents``, ``combine_cfg`` or the VAE decoder, so
+those nodes receive no resources. The CFG nodes are always declared, but they are used
+only when the config enables CFG-parallel mode, described in `BAGEL placement <#bagel-placement>`__. A single-GPU
+config never routes requests to them.
+
+**Per-request resources.** Whether a request uses classifier-free guidance determines
+which cache labels it reads. This is a property of the request, not of the deployment.
+BAGEL’s ``get_request_resource_configs`` therefore returns a ``KVReqConfig`` that names
+the active labels per node and walk, together with a ``SamplingReqConfig``. It settles
+guidance from the request’s modalities and kwargs as its ``walk_plan`` does (an edit,
+image in and image out, defaults to image guidance). A request with guidance disabled
+names only ``"main"``, so a PD-disaggregated transfer copies only that stream.
+
+The ``LLM`` node is deliberately coarse. It contains the text embedding, the lm_head and
+the flow projection. These always run on the same GPU, so splitting them into separate
+graph nodes would only add IPC overhead. This is a general modeling rule: make a node as
+coarse as the colocation boundary allows.
+
+Graph walks
+~~~~~~~~~~~
+
+Understanding and generation are different pipelines, so BAGEL
+returns five walks from ``get_graph_walk_graphs`` instead of two:
+
++-------------------------------------------+-------------------------------------------+
+| Graph walk                                | What it does                              |
++===========================================+===========================================+
+| ``prefill_text``                          | Embed text tokens and prefill the LLM.    |
+|                                           | Attention is causal.                      |
++-------------------------------------------+-------------------------------------------+
+| ``prefill_vit``                           | ``vit_encoder``, then the LLM. Encodes an |
+|                                           | input image for understanding. Attention  |
+|                                           | is bidirectional.                         |
++-------------------------------------------+-------------------------------------------+
+| ``prefill_vae``                           | ``vae_encoder``, then the LLM. Encodes an |
+|                                           | image for editing or generation.          |
++-------------------------------------------+-------------------------------------------+
+| ``decode``                                | Autoregressive text generation. This is a |
+|                                           | ``Loop``, the same as in Orpheus.         |
++-------------------------------------------+-------------------------------------------+
+| ``image_gen``                             | The flow-matching denoising ``Loop``. The |
+|                                           | LLM applies CFG and one Euler step per    |
+|                                           | iteration. ``vae_decoder`` then converts  |
+|                                           | the final latents into pixels.            |
++-------------------------------------------+-------------------------------------------+
+
+The two encoder walks are ``Sequential`` chains of two nodes. ``image_gen`` is a
+``Loop`` followed by the decoder. In the loop body, ``latents`` and ``time_index`` are
+routed back to the same node, and the loop’s ``outputs`` pass the final latents to
+``vae_decoder``:
+
+.. code:: python
+
+   prefill_vit = Sequential([
+       GraphNode(name="vit_encoder", input_names=["image_inputs"],
+                 outputs=[GraphEdge(next_node="LLM", name="img_emb")]),
+       GraphNode(name="LLM", input_names=["img_emb"],
+                 outputs=[GraphEdge(next_node=EMIT_TO_CLIENT, name="new_token",
+                                    output_modality="text", persist=True)]),
+   ])
+
+   image_gen = Sequential([
+       Loop(
+           section=GraphNode(
+               name="LLM",
+               input_names=["latents", "time_index"],
+               outputs=[GraphEdge(next_node="LLM", name="latents"),
+                        GraphEdge(next_node="LLM", name="time_index")],
+           ),
+           max_iters=self.config.num_timesteps - 1,   # one Euler step per interval
+           outputs=[GraphEdge(next_node="vae_decoder", name="latents")],
+       ),
+       GraphNode(
+           name="vae_decoder",
+           input_names=["latents"],
+           outputs=[GraphEdge(next_node=EMIT_TO_CLIENT, name="image_output",
+                              output_modality="image")],
+       ),
+   ])
+
+**Declared outputs are conditional.** A node’s ``outputs`` list is the set of edges that
+the node can emit. What it emits on a given step depends on what its submodule produces.
+``new_token`` above is the clearest example. The LLM samples a token only when the
+request requires text output, which is the case on the understanding path and on every
+``decode`` step. On the image-generation and editing paths, the same node still runs and
+writes the KV cache, but samples no token, so it does not produce ``new_token``. The
+edge is present in the graph because understanding requests need it. Treat declared
+edges as the possible outputs, and let the submodule decide which of them are produced
+on each step.
+
+**Choosing the walks per request.** BAGEL’s plan follows a schedule, unlike Orpheus’s
+two fixed steps. The output modality is known in advance from the request’s
+``output_modalities``, so ``walk_plan`` builds the prefill schedule by iterating over
+the interleaved text and image inputs, one walk per text span or image, and then adds
+``decode`` for text output or ``image_gen`` for image output. In ``think_mode`` the
+model first decodes a reasoning trace, so the plan runs ``decode`` and then
+``image_gen``.
+
+Each prefill walk reads one span, so ``process_prompt`` hands every span over as a
+signal of its own with
+`mstar.model.multimodal.split_spans <https://github.com/mstar-project/mstar/blob/main/mstar/model/multimodal.py>`__
+(``text_inputs.0``, ``image_inputs.0``, …), and each step binds its walk’s input to one:
+``WalkStep("prefill_text", bind={"text_inputs": "text_inputs.1"})``. An ids span keys
+the entry its ``source`` names, so ``split_spans`` renames the KV layout’s ids-span
+sources to match. This is the same method Orpheus implements; BAGEL’s plan is only
+longer.
+
+Submodules
+~~~~~~~~~~
+
+Each node maps to a ``NodeSubmodule`` in
+``bagel/submodules.py``: ``ViTEncoderSubmodule``, ``VAEEncoderSubmodule``,
+``LLMSubmodule`` and ``VAEDecoderSubmodule``. ``get_submodule`` builds them on demand,
+so a worker that runs only ``vit_encoder`` never allocates the 7B LLM.
+``process_prompt`` tokenizes the prompt, and also a system prompt in ``think_mode``.
+``postprocess`` selects an encoding by modality: ``utf-8`` text for ``decode``, and PNG
+bytes for ``image``.
+
+Step declarations
+~~~~~~~~~~~~~~~~~
+
+BAGEL’s ``LLMSubmodule.declare_step`` is the most
+complex declaration in the tree. Read it to see every advanced ``KVStep`` field in
+context:
+
+- ``pre_forks`` and ``post_forks``: guidance requires a ``cfg_text`` stream forked from
+  ``main``, and the fork time differs by walk. In ``prefill_text``, the branch must keep
+  the context from before the text, so it forks before any planning or writing. In
+  ``prefill_vit`` and ``prefill_vae``, the branch must include the image, so it forks at
+  commit time, after this step’s writes are applied.
+- ``combined_labels``: in the batched-guidance denoise step, the conditional and
+  unconditional labels are packed into one plan under a single combined label.
+  ``PositionStep.pos_ids`` is keyed by that combined label, with the ids concatenated in
+  the same label-major order.
+- ``commit=False``: the step plans and reads, but its writes do not become resident yet.
+- ``cg_key_info``: the step records whether guidance is enabled. This value matches the
+  ``additional_key_info`` of the two ``decode`` capture configs, so each replay uses its
+  own bucket. The submodule’s ``cg_key_info()`` method reports the same value from the
+  batch, because the engine leases a slot before the step is declared.
+
+.. _bagel-placement:
+
+BAGEL placement
+~~~~~~~~~~~~~~~
+
+This is the main benefit of the graph
+abstraction. The same model code runs on one GPU:
+
+.. code:: yaml
+
+   model: "bagel"
+   max_seq_len: 32768
+   node_groups:
+     - {node_names: [vit_encoder], ranks: [0]}
+     - {node_names: [vae_encoder, vae_decoder], ranks: [0]}
+     - {node_names: [LLM], ranks: [0]}
+
+The same code also runs disaggregated across GPUs. Assign the same ``LLM`` node to
+different ranks per graph walk: prefill on GPU 0, decode on GPU 1, and image generation
+on GPU 2:
+
+.. code:: yaml
+
+   node_groups:
+     - {node_names: [LLM], ranks: [0], graph_walks: [prefill_text, prefill_vit, prefill_vae]}
+     - {node_names: [LLM], ranks: [1], graph_walks: [decode]}
+     - {node_names: [LLM], ranks: [2], graph_walks: [image_gen, image_gen_head, image_gen_guided2, image_gen_guided3]}
+
+A guided request’s denoising runs as a sequence of walks. Its guided steps form one
+window, known when the request arrives, which runs as ``image_gen_guided2`` (text
+guidance) or ``image_gen_guided3`` (text and image guidance), every branch in one
+combined forward on ``LLM``. The steps before the window run as ``image_gen_head``, and
+the steps after it run as ``image_gen``, which also decodes; a window that reaches the
+last step is followed by the decode alone (``image_decode``). Each walk’s loop is capped
+per request at its share of the steps (``get_loop_caps``), the conductor moves the
+request from one walk to the next, and the latents cross between walks as persisted
+edges. Each walk’s branch count is fixed when the request arrives, so no node reads a
+loop counter to decide it. A request without guidance runs ``image_gen`` alone. A config
+that places ``LLM`` per walk, as above, lists all four of its denoise walks.
+
+BAGEL also supports a CFG-parallel mode. When the config names the extra
+``LLM_cfg_text`` and ``LLM_cfg_img`` nodes, as in ``configs/bagel_cfg_parallel.yaml``,
+the window runs as ``image_gen_cfg2`` or ``image_gen_cfg3`` instead. The loop body of
+that walk is a ``Parallel`` of the guidance branches, each on its own GPU, feeding a
+``combine_cfg`` node, and a request without guidance never reaches the branch GPUs. The
+model code detects this mode only from the node names present in the config, so the
+extra parallelism is enabled in YAML and requires no code change. One model can
+therefore run in many physical layouts.
+
+Worked example: Whisper
+-----------------------
+
+Whisper (``mstar/model/whisper/``) is the reference for encoder-decoder models. It is
+the smallest complete example of cross-attention over a fixed context.
+
+It has two nodes. ``audio_encoder`` declares no resources. ``decoder`` declares six: its
+own KV cache and attention, a second KV cache for the encoder context, a
+``CrossAttentionSpec`` over that second cache, a ``PositionSpec``, and a
+``SamplerSpec``. The ``PositionSpec`` exists only for the position counter. Whisper uses
+learned position embeddings, so the planned ids index an ``embed_positions`` table
+instead of driving RoPE. The ``SamplerSpec`` sets ``enable_repetition_penalty=False``,
+because ASR transcription decodes greedily.
+
+The page counts show how to size a cache for a specific model instead of using the
+default. Both caches use 128-token pages and hold
+``WhisperModel.MAX_CONCURRENT_REQUESTS`` (64) requests at full length, plus the sink
+page that every ``KVManager`` keeps out of circulation. A sequence is at most
+``max_target_positions`` (448) tokens, which is 4 pages per request, so the
+self-attention cache has 64 \* 4 + 1 = 257 pages, about 5 GiB for large-v3 in bf16. The
+2048-page default would use about 40 GiB. The fixed 30-second context window is
+``max_source_positions`` (1500) tokens, which is 12 pages per request held from prefill
+to the last token, so the context cache has 64 \* 12 + 1 = 769 pages, about 15 GiB.
+Sizing the caches is only half of it: ``configs/whisper_large.yaml`` also sets
+``max_concurrent_requests: 64``, so the conductor queues further requests instead of the
+worker offloading decoding requests to admit them. ``WhisperModel.validate_config_yaml``
+refuses at startup a cap that either cache cannot hold after the YAML’s ``resources:``
+overrides, through ``mstar.model.utils.check_kv_pools_fit``, which any model with KV
+caches can call the same way.
+
+The decoder node’s ``declare_step`` shows how a write-once context is expressed with
+spans. Canary’s comes from ``EncoderDecoderNode``
+(``mstar/model/components/encoder_decoder.py``), a ``SampledTokenDecoder`` that adds
+only the cross-attention part: the context segments, and the encoder output on the
+prefill row, which its decoder writes into the context before its layers read it.
+Whisper’s declares its own, since it writes the context eagerly and captures prefill.
+The context segments have a non-zero span in the prefill step that writes them, and a
+span of 0 in every later step. The ``commit`` in the prefill step converts the
+reservation into resident pages that the later steps read.
+
+Worked example: an image DiT on the diffusion scaffold
+------------------------------------------------------
+
+Flow-matching image and video transformers (FLUX-family DiTs, Z-Image, Wan-style video)
+share one graph shape, so M\* ships it as a scaffold in
+``mstar/model/components/diffusion/``; a model adds only its exact component ports, its
+checkpoint remap and a few hooks.
+
+Graph and Walks:
+
+.. code:: text
+
+   text_encoder ──text_embeds──▶ Loop("denoise_loop", dit) ──latents──▶ vae_decoder ──▶ EMIT image
+   vae_encoder  ──ref_latents──▶ (image_edit only)
+
+   encode_text  : text_inputs  -> text_embeds  (persist)
+   encode_image : image_inputs -> ref_latents  (persist)
+   image_gen    : Sequential[Loop(dit) -> vae_decoder]
+   image_edit   : image_gen with ref_latents as an extra Loop input
+
+``latents`` is the loop-back edge; every other input is re-injected each iteration. The
+step index is the engine’s loop counter (``fwd_info.dynamic_loop_iter_counts``), so
+there is no host sync per step.
+
+The ``dit`` node subclasses ``DenoiseLoopSubmodule`` (``denoise_loop.py``), which owns
+the engine contract — seeded initial noise, per-request schedules, equal-key request
+batching (``can_batch``), stacked ``forward_batched``, the ragged-attention
+``declare_step`` and one CUDA-graph bucket per ``bucket_key`` with the Euler update
+inside the graph — and asks the model for the hooks below. The loop ends on its
+iteration count: a model whose request picks its step count returns it from
+``get_loop_caps`` (``{"denoise_loop": steps}``), resolved exactly as ``schedule_for``
+resolves it, and a stage that always runs its graph ``max_iters`` declares nothing. The
+scaffold refuses an iteration past the schedule. The hooks:
+
+.. code:: python
+
+   class MyDenoise(DenoiseLoopSubmodule):
+       def bucket_key_for(self, fwd_info): ...       # hashable: latent grid, text length, ...
+       def schedule_for(self, fwd_info, key): ...    # FlowMatchSchedule (flow_match.py)
+       def seed_latents(self, fwd_info, key, gen): ...  # [L, C] initial noise, seeded
+       def request_inputs(self, fwd_info, inputs, key): ...  # per-row conditioning tensors
+       def num_tokens(self, key): ...                # image tokens for the attention step
+       def capture_request_inputs(self, key, device): ...   # dummy rows for graph capture
+       def denoise(self, engine_inputs, key, latents, timestep, sigma, sigma_next, **cond): ...
+       # optional: extra attention spans (a refiner over the image tokens alone, ...)
+       def attention_segments(self, key): return (("main", self.num_tokens(key)),)
+
+``bucket_key`` is whatever has to match for two rows to share a forward, and it is also
+the CUDA-graph bucket key — shape, but equally a knob like whether CFG is on.
+
+A multi-step scheduler that carries solver state between iterations names it in
+``SOLVER_STATE``; those become loop-back edges alongside ``latents``, seeded by
+``seed_loop_back`` and returned from ``denoise`` as a ``{name: tensor}`` mapping. UniPC
+comes with the scaffold: a subclass of ``UniPCDenoiseLoopSubmodule`` implements
+``model_output`` in place of ``denoise``, and the base carries ``unipc_model_outputs``
+and ``unipc_last_sample`` and steps each row by the loop counter from its own tables,
+with no host read, so rows at different steps share a forward (wan22 is the example). A
+scheduler needing another per-step scalar adds a ``STEP_SCALARS`` entry naming the
+attribute of its ``FlowMatchSchedule`` to slice it from — the base stages that tensor on
+the device and slices it per step, so nothing in the batching path has to change.
+
+A model whose ``seed_loop_back`` depends on nothing but the bucket key and the request’s
+seed sets ``PREFETCH_SEEDS = True`` (klein and Z-Image do): the base then draws the
+noise when the request reaches the worker, on a thread of its own, and iteration 0 only
+copies it to the device. Otherwise the CPU draw runs on the GPU thread at iteration 0,
+once per joining row.
+
+Every span a layer attends over must be declared with its own label (default: one
+``"main"`` segment per request); ``ragged_for(label)`` hands that span’s kernel to the
+layers, which fall back to SDPA when no ragged resource is bound.
+
+Shared pieces to build the components from: ``flow_match.py`` (shift schedules and the
+exact Euler step), ``rope.py`` (multi-axis rotary embeddings), ``attention.py`` (joint
+attention over packed tokens: SDPA eagerly, the ragged FlashInfer resource under
+graphs), ``text_encoder.py`` (native Qwen3 hidden-state taps), ``autoencoder_kl.py``
+(the KL VAE family), ``image_io.py`` (latent packing, PNG) and ``lora.py`` (static LoRA
+merge at load, also into fused ``q``/``k``/``v`` shards via
+``FusedColumnLinear.shard_slice``; the checkpoint parsing it uses is shared, in
+``mstar/engine/resources/lora/checkpoint.py``).
+
+Two pieces swap a one-pass kernel in for what Inductor would emit, inside a compiled
+transformer only; eager calls run the plain PyTorch formulation, which is what a port’s
+bit-exact tests hold. ``modulation.ada_layer_norm`` is a block’s gated residual add,
+LayerNorm and shift/scale modulation, with the modulation given per group of tokens
+(``[B, G, D]``: one group per sample, or per latent frame as in Wan2.2); Inductor reads
+a LayerNorm row wider than 1024 twice. ``qk_norm_rope.rms_norm_rope`` is the q/k RMSNorm
+across heads followed by the interleaved-pair RoPE, q and k in one launch. Both agree
+with eager to bf16 rounding rather than bitwise. Wan2.2 is the first user;
+``test/modular/test_diffusion_dit_kernels.py`` holds them to the eager form.
+
+On the API side, add the corresponding Rust adapter and parity tests as described in
+`registration <adding_models.html#step-1-register-the-model>`__.
+``DiffusionImageAdapter`` (``mstar/api_server/openai/adapters.py``) serves
+``/v1/images/generations`` and ``/v1/images/edits`` for any such model (``size`` becomes
+``width``/``height``, ``seed`` and other knobs pass through); register it under the
+model’s registry key. The SDK exposes ``generate_image`` and ``edit_image``.
+
+Worked example: a vision-language model on the VLM scaffold
+-----------------------------------------------------------
+
+A decoder LLM with a ViT in front of it (Qwen3.5, Muse Glimmer) shares one graph and two
+node shapes, so M\* ships them as a scaffold; a model adds its components, its resource
+declarations and a few overrides. The older span-split path, a walk per text span and
+attachment (``prefill_plan``, ``find_media_spans``, ``split_around_spans``,
+``prompt_spans``; BAGEL and Qwen3-Omni), is legacy: a new model builds on this scaffold.
+BAGEL stays on it because a whole-prompt row would lose what its spans carry: an image
+to generate from is written twice, as VAE latents and as ViT patches, by walks of their
+own, its classifier-free-guidance branches open KV labels over different subsets of the
+prompt’s spans, and its leading text span is keyed for prefix reuse. Moving Qwen3-Omni
+and BAGEL onto the scaffold is tracked as a follow-up.
+
+Graph and walks (``mstar/model/multimodal.py``), from the model’s ``MediaEncoder`` list:
+
+.. code:: text
+
+   prefill_text   : LLM(text_inputs)                        a text-only prompt
+   prefill_vision : vision_encoder(pixel_values)            each run's grid off MEDIA_LAYOUT
+                    -> LLM(text_inputs, vision_embeds)      the whole prompt, one row
+   prefill_<a>_<b>: Parallel(encoder a, encoder b) -> LLM   one walk per subset of encoders
+   decode         : Loop("decode_loop", LLM)
+   mixed          : prefill_text and decode rows in one step (a combined walk)
+
+Implement the model interface
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The ``Model`` subclasses ``MultimodalDecoderModel``
+(``mstar/model/multimodal_decoder.py``), which declares the walks
+(``media_walks(max_iters, encoders)`` and ``text_combined_walks()``), plans the one
+prefill walk ``media_prefill_step`` picks and then decode (``walk_plan``), decodes text
+output, and owns media intake (``process_prompt``), the decode loop’s cap
+(``get_loop_caps``, the request’s output budget less the prefill’s token), the KV label
+and its one-span layout (``kv_labels``, ``kv_layout``), the sampler’s per-request config
+(``get_request_resource_configs``: the request’s ``SAMPLING_KEYS`` over
+``sampling_defaults``, which ``__init__`` reads from the checkpoint’s
+``generation_config.json``), the LLM’s ``SamplerSpec`` (``_sampler_spec``, whose min-p
+filter is on only where the checkpoint defaults ``min_p``, so a request’s ``min_p > 0``
+is otherwise refused at admission), sharding, the submodule cache and where the files
+come from.
+
+Model-specific overrides
+^^^^^^^^^^^^^^^^^^^^^^^^
+
+A model sets ``NAME`` and ``METADATA_FILES`` and writes ``__init__`` (setting
+``config``, ``tokenizer`` and ``media``), its resources (the sampler from
+``_sampler_spec``; ``MIXED_SPLIT`` is the attention resources’ split of a mixed step),
+``_prompt_ids`` and ``_create_submodule``.
+
+Rebuild policies
+^^^^^^^^^^^^^^^^
+
+The scaffold’s ``rebuild_policies`` lets the KV cache drop a text request and reprefill
+its ids on ``prefill_text``. A model whose LLM node holds a resource that can’t drop
+returns ``{}``, or the engine refuses to start; Muse Glimmer and Ripple-65B return
+``{}`` until a drop has run through a sliding-window pool. A model without text prompts
+(``TEXT_PROMPTS = False``) has no ``prefill_text`` walk, so the scaffold returns ``{}``
+for it.
+
+Media intake
+^^^^^^^^^^^^
+
+``media`` holds a ``MediaIntake`` per attachment modality: its ``MediaEncoder``
+(modalities may share one), its placeholder ``pad`` id, the sentinels a template leaves
+to its processor, how many placeholders an attachment fills (``runs``, one by default; a
+Qwen3.5 video fills one per temporal group), and ``prepare``, which turns an attachment
+into the encoder’s input tensors and each placeholder’s tokens (a ``PreparedMedia``).
+
+Prompt layout and placeholders
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+``_prompt_ids`` renders and tokenizes the whole prompt once. ``intake`` then refuses a
+prompt whose placeholders don’t match its attachments, prepares each attachment in
+prompt order, expands each placeholder to one pad per token with ``expand_media_pads``,
+and ``process_prompt`` returns the pads’ layout as ``MEDIA_LAYOUT`` metadata and
+``"kv_layout": self.kv_layout(layout, length)``. The layout’s runs say which encoders
+the prompt runs (``media_encoders``), for the prefill schedule’s walk and the KV
+layout’s alike.
+
+Position extent
+^^^^^^^^^^^^^^^
+
+``kv_layout``\ ‘s ``advance``, how far the prompt moves the position counter, defaults
+to the prompt’s length; under Qwen-style MRoPE it is the positions’ extent instead, an
+image spanning ``max(h', w')`` positions rather than its tokens, which Qwen3.5 computes
+from the runs’ grids in its ``kv_layout`` override. ``process_prompt`` also empties each
+sent attachment’s raw ``<modality>_inputs``, spent once prepared. The encoders’ inputs
+are lists in prompt order, as their outputs fill the pads.
+
+Keep layout metadata on the host
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Each run’s patch grid (the ``grids`` of its ``PreparedMedia``) rides ``MEDIA_LAYOUT``
+rather than a tensor, so a tower’s grid maths in ``prepare_inputs`` reads host values
+(``PackedBlockLoopEncoder.grids``) and never syncs on the device.
+
+Implement the decoder
+~~~~~~~~~~~~~~~~~~~~~
+
+The ``LLM`` node subclasses ``SampledTokenDecoder``
+(``mstar/model/components/sampled_token_decoder.py``), which owns the capture configs
+(decode, packed text prefill, mixed, and one packed capture every media walk replays,
+which also caps their batches), device loop-back of the sampled token, the splice of the
+encoders’ outputs into the prompt’s embeddings inside the forward
+(``where(pad, media[cumsum(pad) - 1], embed(ids))``), the step declaration around the
+sampler and the position resource, the forward through the sampler, and the stop: a
+``TokenStop`` over the prefill walks and decode. A stop id on a decode row ends the
+loop; a stop id on the prefill row (the step the walk plan marks ``FINAL_PREFILL``), or
+a one-token budget, ends the partition before decode runs. The loop’s cap,
+``max(1, max_output_tokens - 1)``, is the only budget. A media row’s tensor holds
+exactly the pads in its ids, checked against the layout in ``prepare_inputs``. A
+prompt’s ids, pads and sentinels included, feed the repetition penalty, as in
+transformers and vLLM. A model writes:
+
+.. code:: python
+
+   class LLMSubmodule(SampledTokenDecoder):
+       ATTN_KEY = ATTN_FULL  # the attention resource that picks each prefill row's last token
+
+       def layer_steps(self):  # this step's work on the layers' resources
+           return {KV_CACHE: KVStep(), ATTN_FULL: AttentionStep(causal=True)}
+
+       # optional, for positions the resource cannot place (MRoPE):
+       def prompt_positions(self, start, layout, num_tokens): ...  # -> (custom_pos_ids, advance)
+       def decoder_kwargs(self, graph_walk, engine_inputs, num_tokens, **tensors): ...
+
+Its decoder module provides ``embed(ids)``, ``forward(input_embeds, *, label, **kw)``
+(the stack through its final norm), ``logits(hidden)`` and ``embed_dtype``, as
+``Qwen3_5ForCausalLM`` and ``Qwen3DenseLM`` do. The sampler is declared under
+``mstar.model.keys``\ ’ ``SAMPLER``, and the positions under the node’s ``POS_KEY``
+(``ROPE`` unless the model’s layers name another ``pos_key``). ``MSTAR_DECODE_BUCKETS``
+sets the default decode ladder, ``MIXED_MAX_PREFILL_ROWS`` caps a mixed step’s prompt
+rows, ``capture_compile_mode(walk)`` names a capture’s ``compile_mode`` (``None``, the
+default, takes the deployment’s compile level), and ``CAPTURE_PREFILL = False`` captures
+decode only. A lone encoder’s ``MediaEncoder.walk`` names its media walk when the
+model’s graph calls it something other than ``prefill_<name>`` (Qwen3-ASR’s and
+Canary-Qwen’s ``prefill``). A graph that names its other walks otherwise sets
+``PREFILL_WALK``, ``DECODE_WALK`` and ``DECODE_LOOP``. It reports a text prompt’s length
+and a decode row’s one token (``get_input_sequence_len``,
+``speculative_input_seq_len``), so a model chunks its text prefill by declaring
+``get_chunking_policies`` alone, as Qwen3.5 does.
+
+Implement the vision encoder
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The ``vision_encoder`` node subclasses ``PackedBlockLoopEncoder``
+(``mstar/model/components/block_loop_encoder.py``): up to ``MAX_BATCH_SIZE`` requests
+per step, every image packed into one call, and the tower’s block loop replayed as a
+piecewise region per patch bucket (``BLOCK_LOOP_PATCH_BUCKETS``), the step as one row.
+Its ``prepare_inputs`` returns the tower’s tensors in ``tensor_inputs`` and, in
+``resource_step_info``, each of ``SEGMENT_LABELS``\ ’ attending spans (frames, windows)
+over the same patches. The tower provides ``embed(**tensors) -> (hidden, cos, sin)``,
+``encode(hidden, cos, sin)`` and ``project(encoded, **tensors)``. The replay’s input
+buffers are in the node’s autocast dtype unless ``BLOCK_LOOP_DTYPE`` names what
+``embed`` returns (Muse Glimmer’s ends on a LayerNorm, which autocast returns in fp32).
+The runner refuses an ``embed`` output its buffers may round, and widens a narrower one,
+so a declaration wider than ``embed``\ ’s output replays the loop in more precision than
+the eager loop runs. A step whose spans under some label exceed the ragged resource’s
+``max_segments_per_step`` takes no lease and runs eagerly.
+
+LoRA around a captured encoder
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+On a node serving LoRA adapters a leased step still declares its spans, with no
+attention step, so the engine adds the pool’s step of them for the bound modules around
+the loop (``engine_step``). Qwen3-Omni’s ViT node is one too, off the scaffold: its
+region also returns the deepstack taps (its ``_capture_block_loop``), which its own
+``forward_batched`` reads off the replay.
+
+Reusable vision components
+^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+A tower builds on the pieces in ``mstar/model/components/qwen3_vit.py``:
+``bilinear_table_taps`` (the learned position table resampled onto a patch grid),
+``VisionRotaryEmbedding`` (axial 2D rope; ``keep_fp32`` keeps its frequencies fp32
+through the node’s dtype cast) and ``VisionBlock``, whose attention runs over the packed
+patches through the ragged resource under the block’s ``label`` (Qwen3.5’s frames; Muse
+Glimmer’s windows and frames), q, k and v as one projection a split checkpoint loads by
+stacked-param rules.
+
+Other media encoders
+^^^^^^^^^^^^^^^^^^^^
+
+An encoder of another medium need only send its ``MediaEncoder.output``, a row per pad
+in prompt order: Higgs-Audio’s audio tower and Qwen3-ASR’s packed AuT encoder are plain
+``NodeSubmodule``\ s on the audio walk. That walk is ``prefill_audio`` unless the lone
+encoder’s ``MediaEncoder.walk`` names it: Qwen3-ASR’s keeps ``prefill``, the name its
+configs and metrics read. A model whose graph is not ``MultimodalDecoderModel``\ ’s
+(Canary-Qwen’s LLM node is ``llm``) writes its own walks and hands its LLM node its
+``MediaEncoder``\ s and ``text_prompts`` itself, with ``MEDIA_LAYOUT`` on the prefill
+step.

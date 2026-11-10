@@ -1,0 +1,435 @@
+Place and tune model nodes
+==========================
+
+Use deployment YAML to place a model’s existing graph on hardware. Keep rank placement,
+resource capacity, and scheduling choices out of model-specific forwards. Begin with one
+supported rank layout, verify a request, then add the parallel or disaggregated layout
+you need.
+
+.. _config-yaml:
+
+Map nodes to ranks
+------------------
+
+A config maps nodes to GPU ranks. The value under ``model:`` is your registry key. Each
+``node_groups`` entry assigns one or more ``node_names`` to ``ranks``. An entry can also
+name specific ``graph_walks``, which is how prefill-decode disaggregation is expressed.
+Every node of a walk must be placed by exactly one entry that applies to that walk; the
+conductor refuses a config that places it twice or not at all.
+
+.. code:: yaml
+
+   model: "your_model"
+   max_seq_len: 2048
+   node_groups:
+     - node_names: ["LLM"]
+       ranks: [0]
+
+Run it with:
+
+.. code:: bash
+
+   mstar serve your_model --config configs/your_model.yaml --port 8000
+
+Tuning resources per deployment
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The model declares the shapes that the model requires. A deployment then tunes the
+values that suit the machine it runs on. Use a ``resources:`` block for this, with one
+sub-block per ``resource_key``. A model with two caches of the same kind, such as
+Whisper’s decoder cache and its encoder context, can therefore tune each one separately:
+
+.. code:: yaml
+
+   model: "whisper_large"
+   max_seq_len: 448
+   resources:
+     kv_cache:
+       cpu_offload_pages: 128
+     cross_kv_cache:
+       cpu_offload_pages: 128
+
+Each spec declares which keys it accepts. An unknown key raises an error at load time,
+so that a misspelled setting is never silently ignored:
+
++-------------------------------------------+-------------------------------------------+
+| Spec                                      | Accepts                                   |
++===========================================+===========================================+
+| ``KVSpec`` with ``PagedKVConfig``         | ``max_num_pages``, ``page_size``,         |
+|                                           | ``max_seq_len``, ``cpu_offload_pages``,   |
+|                                           | ``prefix_cache``, ``prefix_cache_salt``   |
++-------------------------------------------+-------------------------------------------+
+| ``KVSpec`` with ``RingKVConfig``          | ``num_sessions``                          |
++-------------------------------------------+-------------------------------------------+
+| ``BoundedKVSpec``                         | ``max_slots``                             |
++-------------------------------------------+-------------------------------------------+
+| ``SamplerSpec``                           | ``enable_logprobs``,                      |
+|                                           | ``enable_processed_logprobs`` (see        |
+|                                           | ``SamplingReqConfig``),                   |
+|                                           | ``greedy_capture`` (``true`` / ``false``; |
+|                                           | by default a sampler past the one-kernel  |
+|                                           | draw takes each row’s argmax in a step    |
+|                                           | whose rows all sample greedily, in a twin |
+|                                           | of each batched capture)                  |
++-------------------------------------------+-------------------------------------------+
+| ``RecurrentStateSpec``                    | ``max_slots``, ``state_dtype``,           |
+|                                           | ``prefix_slots`` (see **Cross-request     |
+|                                           | prefix reuse**). ``max_slots`` counts the |
+|                                           | sink unless ``disable_sink_slot``; a      |
+|                                           | value that leaves no slot for a request   |
+|                                           | is refused at startup.                    |
++-------------------------------------------+-------------------------------------------+
+| ``AttentionSpec``                         | ``backend`` (``auto`` / ``flashinfer`` /  |
+|                                           | ``dense`` / ``flex`` / ``xpu_paged``),    |
+|                                           | ``flashinfer_backend`` (``auto`` /        |
+|                                           | ``fa2`` / ``fa3``),                       |
+|                                           | ``decode_tensor_cores`` (``true`` /       |
+|                                           | ``false``), ``decode_fmha`` (``true`` /   |
+|                                           | ``false``)                                |
++-------------------------------------------+-------------------------------------------+
+| ``CrossAttentionSpec``                    | ``backend`` (``auto`` / ``flashinfer``),  |
+|                                           | ``flashinfer_backend`` (``auto`` /        |
+|                                           | ``fa2`` / ``fa3``),                       |
+|                                           | ``decode_tensor_cores`` (``true`` /       |
+|                                           | ``false``)                                |
++-------------------------------------------+-------------------------------------------+
+| ``RaggedAttentionSpec``                   | ``backend`` (``auto`` / ``flashinfer`` /  |
+|                                           | ``dense`` / ``cudnn``),                   |
+|                                           | ``flashinfer_backend`` (unset by default: |
+|                                           | a self-attention reads the                |
+|                                           | ``ragged_attention`` kernel table; any    |
+|                                           | name, ``auto`` / ``fa2`` / ``fa3`` /      |
+|                                           | ``cudnn`` / ``cutlass``, runs that        |
+|                                           | FlashInfer backend and no table),         |
+|                                           | ``max_segments_per_request``,             |
+|                                           | ``max_segments_per_step``,                |
+|                                           | ``max_tokens_per_request``. The ceilings  |
+|                                           | size CUDA-graph buckets, which is a       |
+|                                           | memory-against-coverage trade the         |
+|                                           | deployment makes, not the model. A        |
+|                                           | resource sized per step refuses           |
+|                                           | ``max_segments_per_request``, which it    |
+|                                           | would ignore.                             |
++-------------------------------------------+-------------------------------------------+
+| ``LoraSpec``                              | ``max_slots`` (adapters resident on the   |
+|                                           | device at once, beside the zero adapter), |
+|                                           | ``max_rank`` (the largest rank served;    |
+|                                           | slots are sized to it), ``cpu_capacity``  |
+|                                           | (adapters held in pinned host memory),    |
+|                                           | ``adapters`` (adapter name to safetensors |
+|                                           | path: the names requests can ask for),    |
+|                                           | ``targets`` (the subset of the model’s    |
+|                                           | targets to allocate; by default, with     |
+|                                           | ``runtime_updates`` off, the targets the  |
+|                                           | configured adapters touch, and every      |
+|                                           | target with it on; a node left with none  |
+|                                           | gets no pool, while a YAML list keeping   |
+|                                           | none at all is an error),                 |
+|                                           | ``runtime_updates`` (default false: serve |
+|                                           | ``/v1/load_lora_adapter`` and             |
+|                                           | ``/v1/unload_lora_adapter``),             |
+|                                           | ``runtime_update_timeout_s`` (default     |
+|                                           | 120: how long the conductor waits for     |
+|                                           | every worker to answer one before giving  |
+|                                           | up on it). The one ``lora:`` block sizes  |
+|                                           | the pool of every node the model’s spec   |
+|                                           | reaches                                   |
++-------------------------------------------+-------------------------------------------+
+
+Tune the cache shape on the KV resource, not on the attention resource that reads it.
+For example, ``configs/qwen3tts.yaml`` selects FA2 under ``talker_attn``,
+``configs/cosmos3_nano.yaml`` sets the page count under its paged KV key, and
+``configs/waypoint.yaml`` sets the resident world count under its ring KV key.
+
+.. note::
+
+   A top-level ``kv_cache:`` block is no longer read. It raises an error at load time, with
+   a message describing the migration. Move the block under ``resources:``, keyed by the
+   resource name.
+
+Routing across data-parallel replicas
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+When a node group has several replicas, the conductor sends each new request to the
+replica where it is cheapest (see “Data-parallel routing” in
+`Serving <serving.html>`__). A resource whose state makes a request cheaper on one
+replica than another takes part through its spec, so models declare nothing for it.
+
+**The hook.** ``NodeResourceSpec.routing_mirror(ctx)`` returns a ``RoutingMirror`` or
+``None``, the default. The router asks once per set of node groups with replicas that
+holds one of the spec’s nodes, and ``ctx`` (a ``RoutingContext``) gives the replica
+count, the walks of the worker graphs there that hold the spec’s nodes, the resource’s
+keyed labels with the walks that key each (empty for a resource that is not a KV cache),
+and whether every replica’s engine opens its prefix cache, which the router derives with
+``prefix_caches_by_rank``. A mirror is conductor-side bookkeeping that follows the
+resource’s own rules as far as the conductor’s inputs allow. The module that defines one
+must stay free of kernels, since the conductor builds it.
+
+**The mirror’s methods.** Each is given the request’s ``ResourceReqConfig`` for the
+resource, which the conductor builds and validates before the pick.
+
+- ``facts(config)`` reports the request’s ``RoutingFacts`` on each replica: named
+  counts, such as ``work`` (prompt positions) and ``kv_hit`` (of those, the ones
+  predicted cached). The router adds every mirror’s row on a replica field by field,
+  then prices the sum once with ``routing_cost`` in ``mstar/conductor/routing.py``, one
+  term per ``routing_weights`` key, each 0 when its facts are absent.
+- ``add_request(config, replica)`` records the placement once the request is dispatched,
+  and returns a handle.
+- ``remove_request(handle, ran)`` releases it when the request leaves. ``ran`` says
+  whether a pass came back for one of the request’s partitions with a walk on the
+  resource’s node groups.
+
+**Adding a resource.** A new resource adds its fields to ``RoutingFacts``, its mirror,
+and its term to ``routing_cost`` and ``RoutingWeights``. ``ReplicaRouter`` changes only
+if its fields are not counts that add, or if its mirror reads a model declaration other
+than the KV ones, which then becomes a ``RoutingContext`` field that ``ReplicaRouter``
+fills. ``KVSpec`` with a ``PagedKVConfig`` is the one implementation. Its mirror runs
+the worker’s own ``PrefixIndex`` and ``PageArena`` per replica, with no storage, takes
+each request’s lease, pages and index entries at dispatch, an item’s end inside a page
+among them, and exists only where a walk keying the cache runs and
+``opening_prefix_caches`` says the workers open it.
+
+Preprocessing threads
+~~~~~~~~~~~~~~~~~~~~~
+
+The API server runs ``load_image`` / ``process_prompt`` and output encoding with torch’s
+intra-op pool. Torch sizes it at one thread per host core, which in a container can be
+several times the CPUs the cgroup quota lets run, and an op waits on any of its threads
+the scheduler has parked. The API server therefore defaults to a quarter of the CPUs it
+may use (its affinity, capped by the cgroup ``cpu.max`` quota), at most 4. A model sets
+its own size with ``PREPROCESS_TORCH_THREADS`` on the class (Qwen3.5 uses 4). A
+deployment overrides either at the top level of its config; ``null`` keeps torch’s
+default:
+
+.. code:: yaml
+
+   model: "qwen3_5_4b"
+   preprocess_torch_threads: 4
+
+The setting applies only to the API server process. The conductor and workers keep
+torch’s default. It does not size video decoding: each torchcodec decode that asks
+``media_limits.video_decode_threads`` (``Model.load_video`` does) runs FFmpeg with up to
+8 threads, no more than the CPUs the process’s CPU plan leaves unpinned
+(``CpuPlan.left``).
+
+The data worker prepares one request at a time on its own thread, so a request’s media
+decode holds up every request behind it and the output chunks of the ones running. A
+model whose ``load_image`` / ``load_audio`` / ``load_video`` and ``process_prompt`` keep
+no shared state sets ``PREPROCESS_PARALLEL = True``, and requests then prepare on a pool
+sized to the CPUs left (``CpuPlan.prepare_workers``: at most 8, and the pool times the
+process’s intra-op thread count stays within the CPUs left, so a higher
+``preprocess_torch_threads`` means fewer workers). Tensors are still stored and requests
+still reach the conductor from the data worker’s thread, in arrival order. A deployment
+sets the pool at the top level of its config; 1 turns it off:
+
+.. code:: yaml
+
+   model: "qwen3_omni"
+   preprocess_workers: 2
+
+The pool only helps work that releases the GIL, so measure each stage first. Qwen3-Omni,
+V-JEPA2 and Cosmos3 declare it (``configs/vjepa2.yaml`` and ``configs/vjepa2_ac.yaml``
+set 8 and 4, the sizes measured for their video decode; Cosmos3’s DROID policy configs
+set 1, since a robot sends one request at a time). A model with client streams always
+prepares inline, since an append has to follow its request.
+
+A pool that small is slow for a large copy, and a 121-frame 832x480 video is 145 MB. A
+video decoder should therefore emit its clip in the layout the encoder takes, transposed
+on the GPU inside its forward, so ``postprocess`` hands the tensor it reads straight to
+the encoder: ``[T, C, H, W]`` for torchcodec’s ``VideoEncoder`` (Cosmos3) and
+``[T, H, W, 3]`` rgb24 frames for PyAV (Wan2.2, LTX-2.5) or a raw ``video_frame`` stream
+(LingBot-World). A permute in ``postprocess`` costs a host copy of the whole clip, or a
+slower copy of each frame inside PyAV. A PyAV mp4 should be written with
+``mstar.model.components.video_encode.encode_mp4``, which takes the model’s x264
+options, rate and padding, and converts the frames to the encoder’s pixel format on a
+thread a few frames ahead of the encoder, so x264 gets the frames the plain
+``stream.encode`` loop would hand it without waiting on the conversion between them. The
+SHM arena’s CPU read of an output slices a large copy over threads of its own
+(``mstar.utils.host_copy.HostCopier``), one encode’s share of the CPUs.
+
+.. _tensor-parallelism:
+
+Tensor parallelism (sharding)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+To shard a node across several GPUs, add ``tp_size`` to its ``node_groups`` entry and
+list ``tp_size`` ranks. The runtime splits the group’s ranks into TP groups of that size
+and builds one ``comm_group`` per shard.
+
+A node is sharded only if its components are built from the tensor-parallel modules in
+``mstar/model/components/distributed``: ``ParallelAttention``,
+``ParallelCrossAttention``, ``ParallelGatedMLP``, ``ColumnParallelLinear``,
+``RowParallelLinear``, ``VocabParallelEmbedding`` and others. The ``weight_loader`` of
+each such parameter slices it automatically. See `Loading
+weights <model_submodules.html#loading-weights>`__. A node whose components do not use
+these modules is replicated on every rank instead. For example, a tensor-parallel
+Qwen3-Omni Talker keeps its code predictor replicated.
+
+Once a component is built from these modules, moving from one GPU to tensor parallelism
+requires only the YAML change and a small sharding declaration. No model code changes.
+The example below runs the Orpheus LLM with tensor parallelism across two GPUs. See
+``configs/orpheus_tp2.yaml``:
+
+.. code:: yaml
+
+   model: "orpheus"
+   node_groups:
+     - node_names: [LLM]
+       ranks: [0, 1]
+       tp_size: 2
+       graph_walks: [prefill, decode]
+     - node_names: [snac_decoder]
+       ranks: [0]
+       graph_walks: [snac_chunk]
+
+For a node to be eligible for ``tp_size > 1`` it must be declared TP-enabled by the
+model. Override ``get_default_sharding_config`` to return a ``ShardingConfig`` that
+names the shardable nodes, and any non-default shard dimensions:
+
+.. code:: python
+
+   def get_default_sharding_config(self):
+       from mstar.distributed.base import ShardingConfig
+       return ShardingConfig(groups=[], tp_enabled_nodes={"LLM"}, shard_dim={})
+
+Two separate mechanisms split work across the TP group. Keep them distinct:
+
+- **Weights** are sharded inside the components, by each parameter’s ``weight_loader``.
+  Column-parallel and row-parallel linear layers built with the ``comm_group`` do this
+  automatically, once the module is constructed for tensor parallelism. The config needs
+  nothing more.
+- **Activations** that cross a node boundary are handled by ``shard_dim`` in the
+  ``ShardingConfig``. It maps an inter-node edge or signal name to the dimension along
+  which that tensor is split across the group. If a name is absent, or maps to ``None``,
+  the tensor is replicated to every rank. You need an entry only for edges where the
+  producer and the consumer both keep the data sharded. The common case is replicated
+  activations, which needs no entry. You can also set ``shard_dim`` per run, under a
+  ``sharding_config`` block in the YAML. A sharded signal is split over the node’s whole
+  lockstep instance, so placement refuses one on a node group with ``sp_size`` or
+  ``cfg_size`` above 1.
+
+If a node group has ``tp_size > 1`` and names a node that is not in
+``tp_enabled_nodes``, loading fails. See ``configs/qwen3omni_thinker_tp2.yaml`` for an
+example with several node types.
+
+A row-parallel projection followed by an RMSNorm can leave its all-reduce to the norm,
+which runs both in one fused kernel. Set the projection’s ``reduce_results = False``, so
+it returns its partial sum, and hand the norm the comm group:
+``RMSNorm.forward_residual(x, residual, comm_group)`` reduces, adds and norms, and
+``RMSNorm.forward(x, comm_group)`` reduces and norms (a post-norm before the residual
+add). The two go together, since a norm called without the group norms an unreduced
+partial sum, which is wrong only under TP. Keep both in the module whose ``forward``
+calls the norms, as ``Qwen3_5LanguageModel``, ``MuseGlimmerTextModel`` and
+``RippleTextModel`` do. ``MultimodalDecoderModel`` builds the kernel’s workspace for its
+TP node.
+
+.. _Guidance (CFG) parallelism:
+
+Guidance (CFG) parallelism
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A diffusion node that runs its classifier-free-guidance branches as one batch can split
+them over a node group’s ``cfg_size`` ranks, a mesh axis of its own beside ``tp_size``
+and ``sp_size`` (see `Serving <serving.html>`__). Declare the node and the most branches
+it runs in ``cfg_enabled_nodes``; placement refuses a ``cfg_size`` that doesn’t divide
+that count:
+
+.. code:: python
+
+   def get_default_sharding_config(self):
+       return ShardingConfig(
+           groups=[], tp_enabled_nodes=set(), shard_dim={},
+           cfg_enabled_nodes={"dit": 2},
+       )
+
+The submodule receives ``cfg_group`` from ``get_submodule``, takes its rows of the
+branch batch with ``my_rows(cfg_group, branches)``
+(``mstar/model/components/distributed/sequence_parallel.py``), and after the forward
+reassembles them with ``cfg_group.all_gather(out, dim=0)``. Every rank then runs the
+same guidance combine and solver step on replicated latents. CFG ranks keep every
+attention head; only TP and SP ranks split them. The ranks run in lockstep on the same
+requests, so any per-request resource the node declares must stay the same shape on
+every rank, and a node with ``cfg_size > 1`` can’t hold a paged KV cache (placement
+refuses one before any worker starts): branches that hold different KV are separate
+nodes in a graph ``Parallel`` instead, on a node group with ``cfg_size: 1``, as BAGEL’s
+``LLM_cfg_text`` and ``LLM_cfg_img`` are. ``Wan22DitSubmodule`` is the reference.
+
+.. _Expert parallelism (MoE):
+
+Expert parallelism (MoE)
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+A sharded MoE node can split its routed experts in two ways. Under TP, the default,
+every rank holds a slice of every expert. Under EP, each rank holds whole experts. A
+deployment picks one per node group with an ``ep_config`` block; see
+`Serving <serving.html>`__ for the keys. The shared pieces are in
+``mstar/model/components/moe_parallel.py``. The Qwen3-Omni Thinker
+(``mstar/model/qwen3_omni/components/thinker.py``) is the reference user.
+
+To support it in a model:
+
+1. **Declare the node EP-enabled.** Add it to ``ep_enabled_nodes`` in
+   ``get_default_sharding_config``. An ``ep_config`` on any other node fails at
+   start-up.
+
+   .. code:: python
+
+      return ShardingConfig(
+          groups=[], tp_enabled_nodes={"LLM"}, shard_dim={}, ep_enabled_nodes={"LLM"},
+      )
+
+2. **Build the MoE layers with** ``instantiate_moe_block``. Accept ``moe_parallel`` in
+   ``get_submodule`` and pass it, with the node’s ``tp_group``, down to each MoE layer.
+   The helper returns a ``ParallelSparseMoeBlock``, with ``expert_parallel=True`` under
+   EP. It keeps its experts in a ``FusedExperts`` (``block.experts``), which owns the
+   ``gate_up_proj`` / ``down_proj`` parameters, the weight loaders that keep only the
+   rank’s slice or its own experts, and the dispatch. ``moe_parallel=None`` gives TP.
+
+   .. code:: python
+
+      self.mlp = instantiate_moe_block(
+          hidden_size=cfg.hidden_size,
+          moe_intermediate_size=cfg.moe_intermediate_size,
+          num_experts=cfg.num_experts,
+          num_experts_per_tok=cfg.num_experts_per_tok,
+          norm_topk_prob=cfg.norm_topk_prob,
+          comm_group=tp_group,
+          moe_parallel=moe_parallel,
+      )
+
+3. **Optionally, mix in** ``MoeParallelMixin`` on the model’s top-level module, and call
+   ``self.init_moe_parallel(moe_parallel)`` at the end of its ``__init__``. It provides:
+
+   - ``maybe_log_expert_load(synthetic)``, which implements ``log_expert_load_every``.
+     Call it from eager code before each forward, usually from ``preprocess``, with
+     ``synthetic=engine_inputs.synthetic`` so capture and warmup routing are discarded.
+   - ``moe_token_valid(hidden_states, num_valid_tokens)``, which implements
+     ``mask_padding``. It returns the ``token_valid`` mask for the MoE blocks, or
+     ``None`` when masking is off. Pass the mask only to MoE layers, not dense MLPs.
+     ``num_valid_tokens`` must be a ``(1,)`` device tensor that ``preprocess`` returns
+     as a static input, so a replay can update it; fill it from
+     ``engine_inputs.real_seq_len``. ``ThinkerSubmodule.preprocess`` shows the wiring.
+
+``instantiate_moe_block`` builds no shared-expert block. A node with one
+(``ParallelSparseMoeBlock(shared_expert=...)``, the Qwen3-Omni Talker’s) builds it
+directly and stays TP-only.
+
+Tuned kernel configs
+~~~~~~~~~~~~~~~~~~~~
+
+Launch configs that depend on the GPU and the shapes, such as the fused MoE’s tiles, are
+data, not code. Each kernel op (``mstar/kernels``) names the dimensions its configs are
+keyed by, and its tuned configs live in one JSON table per GPU under
+``mstar/kernels/tables/<op>/``. A model on a shared component gets them without code of
+its own: the component looks its shape up once per process and keeps the default config
+where no table has it, and the server logs the sweep command for that shape
+(``kernel table: no moe_gemm bfloat16 E=128,N=1536,K=2048,top_k=8 ...``). A cacheless
+self-attention (``ragged_attention``) takes its kernel per head geometry and longest
+query segment the same way: torch’s cuDNN SDPA or one of FlashInfer’s ragged backends. A
+table can also be named for an architecture (``sm_103.json``) rather than one GPU model,
+for rows that hold on every GPU of it; the sweep’s ``--arch`` writes that file.
+
+``python -m benchmark.kernels.sweep`` times the candidates at those shapes on one GPU,
+checks each against a reference output, and writes the winners with where they were
+measured. ``--out DIR`` with ``MSTAR_KERNEL_TABLES=DIR`` serves a sweep before it is
+committed; ``benchmark/kernels/README.md`` has the workflow and how to add an op.

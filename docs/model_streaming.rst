@@ -1,0 +1,224 @@
+Streaming model graphs
+======================
+
+Use separate partitions when producer and consumer walks must progress independently,
+such as a token decoder feeding an audio codec. Connect them with streaming edges and an
+explicit chunk policy. This is separate from the worker’s asynchronous execution of
+consecutive steps; a streaming model must satisfy both contracts.
+
+.. _advanced-async-partitions-and-streaming:
+
+Connect producer and consumer partitions
+----------------------------------------
+
+Models with a single partition can skip this section. The defaults in ``Model`` provide
+one partition, named ``"default"``, that contains all walks.
+
+Use several partitions when one stage must run asynchronously while another continues to
+produce data, for example an LLM feeding a vocoder, or a thinker feeding a talker.
+Override these methods:
+
+- ``get_partition_topology()`` declares the partitions and the streaming ``Connection``
+  objects between them, including a ``chunk_policy_factory`` such as
+  ``SlidingWindowChunkPolicy(window=..., stride=...)``.
+- ``get_partitions()`` declares each ``PartitionDefinition``: its name and its walks.
+  Every walk belongs to exactly one partition.
+- Route cross-partition tensors with
+  ``StreamingGraphEdge(next_node=..., name=..., target_partition=...)`` instead of a
+  plain ``GraphEdge``.
+
+A consuming partition’s plan needs nothing about the stream. A step whose walk a stream
+feeds, and that runs no Loop but chunk loops, runs once per chunk the stream brings, and
+the partition ends when the worker reports the pass that consumed the stream’s final
+chunk. For a stream from another partition, the conductor tells the consumer
+``producer_done`` once the producer partition is done; the data worker ends a stream
+from the client (below) itself.
+
+The consumer receives each chunk as its items stacked along a new leading dimension, or
+as the item itself when the chunk holds one. Don’t write into a streamed input in place:
+a one-item chunk is the stored tensor, which the producer may also have routed to other
+destinations, and a sliding window’s overlap items reappear in the next chunk.
+
+Keep a walk that consumes a stream to one node or one ``Loop`` on one node group, and
+move later work into a downstream partition fed by its own ``StreamingGraphEdge``. A
+consumer whose every input is streamed runs again as soon as the next chunk arrives, and
+the runtime and conductor count passes per worker graph, so the conductor refuses at
+startup such a consumer sharing its worker graph with another top-level node or
+``Loop``, and a stream-consuming walk split over worker graphs, unless every consumer
+also waits on a non-streamed input and all the walk’s worker graphs run on the same
+workers. That input must arrive once per pass (from the conductor, say); startup cannot
+check this.
+
+Let the producer select the consumer walk
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A consumer whose walk should follow the producer’s progress, rather than a count fixed
+at ingest, is *producer-triggered*: the producer decides the consumer’s walk. Set the
+same ``consumer_walk`` function on every connection into the consumer, all from one
+producer partition. The producer worker calls it for each row of a pass that emits on
+those edges, with a ``ProducerWalkCtx``: the walk that row ran (its own, even in a step
+that mixed walks), the node that just completed, the iteration each enclosing dynamic
+loop is on, and the producer’s full ``CurrentForwardPassInfo`` (``step_metadata`` and
+all; the hook runs on the producer). The row’s streamed items run under the walk it
+returns. The context is reused across calls, so a hook must not keep it.
+
+- Each streamed item carries its assigned walk, and a chunk never spans two walks, so
+  these connections need a ``FixedChunkPolicy``. A client stream cannot set
+  ``consumer_walk``.
+- The consumer’s worker switches walk before popping a chunk, and only once the
+  partition has no pass under way. The conductor learns each pass’s walk from the
+  worker’s ``WORKER_GRAPHS_DONE``.
+- A walk the consumer enters on its own, with conductor inputs, takes effect when they
+  arrive, so send them only once the stream has moved the consumer through the walk
+  before it.
+
+Qwen3-Omni’s Talker (``_talker_walk``) is the reference: Thinker prefill passes run
+``talker_prefill``, the first decode iteration runs ``talker_last_prefill``, and later
+ones run ``talker_decode``. Its plan lists the three walks. The conductor follows the
+walk each pass reports and enters the next step only to send it something, so it feeds
+``talker_decode`` its first input once ``talker_last_prefill`` has run.
+
+Streams from the client
+~~~~~~~~~~~~~~~~~~~~~~~
+
+A model that listens while it runs (a full-duplex speech model, say) takes its live
+input as a stream the client feeds. Declare it like any other connection, with the
+reserved producer ``CLIENT``:
+
+.. code:: python
+
+   from mstar.streaming.topology import CLIENT, Connection
+   from mstar.streaming.chunk_policy import FixedChunkPolicy
+
+   Connection(from_partition=CLIENT, to_partition="Encoder", edge_name="audio_in",
+              chunk_policy_factory=lambda: FixedChunkPolicy(chunk_size=1))
+
+``CLIENT`` is not a partition: it has no walks and no worker, and it must not appear in
+``partitions``. The node that lists ``audio_in`` in its ``input_names`` (with
+``consumes_stream=True``) consumes it through a ``StreamBuffer`` and the connection’s
+chunk policy, exactly as it would a stream from another partition. Its partition
+self-triggers from the stream, and the conductor sends its walk none of the streamed
+input. That node must be the only one, in any walk, that takes the edge; the conductor
+checks this at startup, and that the model implements ``process_stream_chunk`` unless
+each client stream declares ``ClientAudio`` (below). A partition may take several client
+streams (audio and video, say): each has its own buffer and its own end.
+
+Convert an append into stream items
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``process_stream_chunk(chunk)`` turns each append the client sends into stream items,
+keyed by client edge name. ``chunk`` is a ``ClientChunk`` (``mstar.model.base``):
+``text``; ``tensors`` and ``input_metadata``, the append’s files loaded as for a request
+(``audio_inputs`` and so on); ``streams``, per ``tensors`` list the client stream each
+file names (``None`` where the client named none, so the model decides);
+``model_kwargs``, the append’s own; and ``request_kwargs``, the opening message’s. Raise
+``ValueError`` for an append the model doesn’t take (the client gets a 400). An append
+of text alone, or of ``model_kwargs`` alone that ends no stream, that yields no item is
+refused rather than dropped, but the data worker can’t tell which items text sent with
+files yielded: refuse such text yourself if the model takes none. Keep it stateless; the
+consuming node keeps its own state, in its resources or ``request_state``.
+
+Accept the opening chunk
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+Tensors ``process_prompt`` returns under a client edge’s name are the stream’s first
+chunk, so a one-shot request (one uploaded file, then nothing) is a stream of one chunk.
+``process_prompt`` gets ``open_streams``, the client streams the opening leaves open; a
+model whose request settings can’t take appends on one (Qwen3-TTS text in a layout that
+streams none) raises ``ValueError`` there, so the live opening gets a 400.
+
+Bound the client stream
+~~~~~~~~~~~~~~~~~~~~~~~
+
+A client stream may declare limits, ``Connection(..., limits=ClientStreamLimits(...))``
+(``mstar.streaming.topology``), which the client-stream layer enforces before any of the
+model’s code runs: ``max_items``, what the stream may carry over a call’s life, each
+item counting ``item_size(item)`` (1 by default; a stream of variable-length chunks
+counts their frames or samples, named by ``unit``). A call past ``max_items`` ends with
+a 400 that names the limit, so the consumer need not check a session cap of its own.
+Declare the most the consumer can take: a deployment may lower a declared bound under
+``client_streams:`` (see `Serving <serving.html>`__), but not raise it.
+
+Declare audio frames
+~~~~~~~~~~~~~~~~~~~~
+
+An audio client stream may declare what its audio is,
+``Connection(..., audio=ClientAudio(sample_rate, frame_samples))``: mono audio at
+``sample_rate``, whose consumer computes on frames of ``frame_samples``.
+``/v1/realtime`` then serves the model as a conversation (`Using a
+Server <clients.html>`__), when only one of its client streams declares it and its audio
+output is mono: the route decodes the caller’s codec, resamples to ``sample_rate`` and
+turns the model’s output back into the caller’s format from ``get_output_sample_rate``.
+On every route the data worker, the stream’s producer, sends it in whole frames: each
+whole frame of an append goes as an item (an opening clip’s frames as one) and the rest
+waits for the next append, or goes with the stream’s end.
+
+A model whose client streams all declare ``ClientAudio`` needs no
+``process_stream_chunk``: the data worker takes appended audio files at ``sample_rate``
+(one at another rate is refused: resampling an append alone leaves a seam), refuses
+non-finite samples and clamps to [-1, 1]. Nemotron VoiceChat declares
+``ClientAudio(16000, 1280)``: its encoder’s 80 ms frame, taken from the encoder’s own
+hop and subsampling.
+
+Mark realtime conversation turns
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A model that declares ``ClientAudio`` decides when to speak (full duplex). To serve
+``/v1/realtime`` conversations it also declares ``turn_tokens = (start_id, end_id)`` on
+the model (a property when the ids come from its config): the text tokens that open and
+close each reply, and, if its replies may get no end mark, ``turn_idle_steps``: a reply
+then also ends after that many steps with no text and no audio above
+``turn_silence_rms`` (the RMS of samples in [-1, 1], 0.005 unless the model sets it),
+and text outside a reply opens one.
+
+Without them ``/generate/ws`` still serves it, and a conversation is refused (an omitted
+``intent`` then means transcription, if the model’s adapter serves it).
+
+The data worker marks the text chunks they arrive in with ``metadata["turn"]``, their
+marks (``"start"`` / ``"end"``) in token order, on every route, before ``postprocess``
+(which may decode them to nothing), and stamps each text and audio chunk with
+``metadata["step"]``, the iteration of the loop that emitted it. ``/v1/realtime`` frames
+one response per reply from the marks and puts step ``k``\ ’s audio in the reply whose
+text steps hold ``k``, so the text and the audio node must each emit from a loop that
+steps once per input item.
+
+Startup refuses one that emits outside a loop, or from a partition not stepped one item
+at a time on every connection from the ``ClientAudio`` stream;
+``FixedChunkPolicy(chunk_size=1)`` is the only policy the check takes as one.
+
+Turns as a pair of token ids fit a model that brackets each reply (Nemotron’s BOS /
+EOS); one that marks speech another way, such as Moshi-style PAD / EPAD runs, can’t
+declare them yet, and serves ``/generate/ws`` only.
+
+End input and finish the consumer
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A stream ends when the client ends it: ``end_input: true`` ends all of the call’s
+streams, a list of names only those. The consumer gets ``producer_done`` for that edge
+and a final chunk, and a loop fed by the stream ends as any stream-terminated loop does.
+Over ``/generate/ws`` a client that opens with ``end_input: false`` appends and ends
+input explicitly (see `Using a Server <clients.html>`__), and a ``/v1/realtime``
+conversation keeps it open for the call’s life; every other request ends the input as
+soon as it is submitted.
+
+``/generate/ws`` and ``/v1/realtime`` are on the Python frontend only, not
+``--rust-frontend``.
+
+Route appends to consumer ranks
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The API server’s data worker is the stream’s producer. The conductor tells it the
+consuming node and its ranks once per call, when it dispatches the request, and the data
+worker sends each append’s items to every one of those ranks itself, and then the
+stream’s end with how many items it carried. Every rank gets each item whole, so a
+client stream can’t take a ``sharding_config.shard_dim`` entry (startup refuses one).
+Once the consuming partition ends, later appends for its streams are answered as late.
+
+Handle the final empty chunk
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A consumer with nothing to do on the step that ends its last stream
+(``is_final_stream_chunk``; empty when the last item was taken before the end arrived)
+returns None from ``prepare_inputs``. The row still completes its node, so its loop ends
+and its partition reports done. None on any other chunk drops the row from the step.
+Every rank sees the same chunk, so all decline alike.
