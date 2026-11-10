@@ -464,15 +464,13 @@ class MiniCPMOModel(MultimodalDecoderModel):
                 GraphEdge(next_node=EMPTY_DESTINATION, name="tts_code", persist=True),
             ],
         )
-        # A decode step's code streams to the vocoder as ``tts_code`` and loops back
-        # as ``tts_next``, which the TTS keeps on the device (``device_loopback``).
         walks[TTS_DECODE] = Loop(
             name=TTS_DECODE_LOOP,
             section=GraphNode(
                 name=TTS,
-                input_names=["tts_next"],
+                input_names=["tts_code"],
                 outputs=tts_outputs + [
-                    GraphEdge(next_node=TTS, name="tts_next"),
+                    GraphEdge(next_node=TTS, name="tts_code"),
                 ],
             ),
             max_iters=TTS_SAMPLING.max_new_tokens,
@@ -771,7 +769,7 @@ class MiniCPMOModel(MultimodalDecoderModel):
             prefill,
             replace(decode, walk=DECODE_SPOKEN),
             WalkStep(TTS_PREFILL),
-            WalkStep(TTS_DECODE, bind={"tts_next": "tts_code"}),
+            WalkStep(TTS_DECODE),
         ]
 
     # ------------------------------------------------------------------
@@ -780,7 +778,6 @@ class MiniCPMOModel(MultimodalDecoderModel):
 
     def _create_token2wav(self, weights: str, device: str) -> NodeSubmodule:
         t2w = load_token2wav(str(Path(weights) / "assets" / "token2wav"), device=device)
-        t2w.flow.decoder.estimator.compute_dtype = DIT_COMPUTE_DTYPE
         # the reference prepares voice prompts on the CPU; it is once per voice
         t2w.voice_encoder.cpu()
         voices = {
@@ -789,7 +786,7 @@ class MiniCPMOModel(MultimodalDecoderModel):
         }
         logger.info("Loaded MiniCPM-o token2wav with voices %s onto %s", sorted(voices), device)
         return Token2WavSubmodule(
-            t2w.requires_grad_(False), voices, self.tts_config.eos_code)
+            t2w.requires_grad_(False), voices, self.tts_config.eos_code, dit_dtype=DIT_COMPUTE_DTYPE)
 
     @staticmethod
     def _build(make, dtype: torch.dtype, device: str) -> torch.nn.Module:

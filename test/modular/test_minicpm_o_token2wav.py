@@ -315,6 +315,19 @@ def test_truncation_matches_reference_bookkeeping(p):
         assert s.enc_len1 <= cap.enc_25hz and s.enc_len2 <= cap.frames_50hz and s.dit_len <= cap.frames_50hz
 
 
+def test_the_dit_refuses_voice_sources_in_another_dtype_than_its_caches():
+    """The fused DiT computes in its caches' dtype; a voice bank built in another one
+    is refused rather than attended in mixed precision."""
+    from types import SimpleNamespace
+
+    pytest.importorskip("triton")
+    from mstar.model.minicpm_o.components.token2wav_kernels import dit_forward
+
+    cnn_cache = torch.zeros(1, 1, 4, 2, dtype=torch.float16)
+    kv = [SimpleNamespace(source=torch.zeros(1, 1, dtype=torch.float32))]
+    with pytest.raises(ValueError, match="build the VoiceBank in the caches' dtype"):
+        dit_forward(None, torch.zeros(1, 80, 4), None, None, None, None, None, cnn_cache, kv)
+
 def test_sine_source_draw_order():
     """The excitation's draws come in the reference's order (phase, noise laid out
     harmonic-major, then a discarded field), so a seeded generator reproduces them and ends
@@ -607,7 +620,7 @@ def test_hift_noise_is_the_requests_own(random_token2wav):
         tokens=torch.randint(0, 6561, (1, 6), dtype=torch.int32), spk_emb=torch.randn(1, 192),
         mel=torch.randn(1, 12, 80),
     ))
-    node = Token2WavSubmodule(model, {"v": voice}, eos_code=6561)
+    node = Token2WavSubmodule(model, {"v": voice}, eos_code=6561, dit_dtype=torch.float32)
     frames = window_frames(28, False)
     region = node.get_piecewise_accelerator_graph_configs(torch.device("cpu"), torch.float32)[
         node.hift_region(True, frames, False)]

@@ -15,6 +15,7 @@ from mstar.engine.accelerator_graph_runner import (
     fail_if_graphs_required,
 )
 from mstar.model.submodule_base import NodeInputs
+from mstar.testing_utils.resource import make_resource
 
 
 @pytest.mark.parametrize("device_type", ["cpu", "cuda", "xpu"])
@@ -44,7 +45,7 @@ def test_resource_owns_kernel_capture_support(device_type):
 def test_resource_capability_filters_recipes_and_preserves_strict_mode(
     monkeypatch, caplog, piecewise, can_capture,
 ):
-    resource = SimpleNamespace(can_capture=lambda: can_capture, force_double_buffer=False, lean_capture=False)
+    resource = make_resource(can_capture=lambda: can_capture)
     step = SimpleNamespace(steps={"attention": object()})
     declare = Mock(return_value=step)
     step_runner = Mock()
@@ -115,7 +116,8 @@ def test_empty_capture_batch_sizes_capture_nothing(piecewise):
         runner = AcceleratorGraphRunner(
             submodule_name="llm",
             submodule=SimpleNamespace(
-                get_accelerator_graph_configs=lambda *args: [config], declare_step=declare, compiled_entries_per_shape=1,
+                get_accelerator_graph_configs=lambda *args: [config], declare_step=declare,
+                compiled_entries_per_shape=1,
             ),
             resources={"attention": resource}, step_runner=Mock(), device=torch.device("cpu"),
             autocast_dtype=None, joint_comm_group=SimpleNamespace(world_size=1), num_slots=2,

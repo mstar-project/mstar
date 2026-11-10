@@ -171,7 +171,7 @@ def test_a_text_replys_decode_steps_loop_back(tmp_path, speech):
 
 def test_a_spoken_reply_plans_the_tts_after_its_text_and_streams_to_the_vocoder(tmp_path):
     """A spoken reply decodes on ``decode_spoken``, then the TTS prefills over it and
-    decodes looping its code back as ``tts_next``; Token2Wav runs only for it."""
+    decodes on the prefill's code; Token2Wav runs only for it."""
     from mstar.conductor.request_info import FINAL_PREFILL
     from mstar.model.minicpm_o.config import TTS_DECODE, TTS_PREFILL
     from mstar.model.minicpm_o.minicpm_o_model import DEFAULT_VOICE, MAIN, T2W_CHUNK, TOKEN2WAV
@@ -182,7 +182,7 @@ def test_a_spoken_reply_plans_the_tts_after_its_text_and_streams_to_the_vocoder(
         ("prefill_text", {}),
         (DECODE_SPOKEN, {"text_inputs": "new_token"}),
         (TTS_PREFILL, {}),
-        (TTS_DECODE, {"tts_next": "tts_code"}),
+        (TTS_DECODE, {}),
     ]
     assert plan[0].step_metadata[FINAL_PREFILL]
     assert model.walk_plan(TOKEN2WAV, ["text"], ["text"], {}, {}) == []

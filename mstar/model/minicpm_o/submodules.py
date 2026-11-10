@@ -87,7 +87,6 @@ from mstar.model.submodule_base import (
     ARNodeInputs,
     ARNodeSubmodule,
     BatchedModelOutput,
-    DeviceLoopback,
     InputMetadata,
     ModelInputsFromEngine,
     NodeInputs,
@@ -405,10 +404,6 @@ class TTSSubmodule(ARNodeSubmodule):
             loop=TTS_DECODE_LOOP, buffer="tts_code", stop_ids=frozenset({model.config.eos_code}),
             sampler=TTS_SAMPLER, walk=TTS_DECODE, runtime_check=True,
         )
-        # a decode step reads its last code off the sampler's slot masters
-        self.device_loopback = DeviceLoopback(
-            walk=TTS_DECODE, signal="tts_next", sampler=TTS_SAMPLER, buffer="tts_code",
-        )
 
     def inline_client_signals(self, graph_walk: str) -> dict[str, str]:
         return {}  # the codes go to the vocoder, not the client
@@ -452,22 +447,15 @@ class TTSSubmodule(ARNodeSubmodule):
         graph_walk: str,
         fwd_info: CurrentForwardPassInfo,
         inputs: NameToTensorList,
-        has_loopback: bool = False,
         **kwargs: Any,
     ) -> ARNodeInputs:
-        if (row := self.uniform_row_inputs(graph_walk, has_loopback)) is not None:
-            # one code, read off the sampler's slot master in `preprocess`; the
-            # routed signal is empty here
-            return row
         device = self.get_device()
         if graph_walk == TTS_PREFILL:
             ids = torch.cat([t.reshape(-1) for t in inputs[ROW_IDS]]).to(device)
             hidden = torch.cat([t.reshape(-1, t.shape[-1]) for t in inputs[ROW_HIDDEN]]).to(device)
             embeds = self.model.condition(ids, hidden)
             return ARNodeInputs(input_seq_len=embeds.shape[0], input_embeds=embeds)
-        # a row whose last step did not keep its code on the device (its first
-        # decode step, after the prefill) brings it routed
-        return ARNodeInputs(input_seq_len=1, input_ids=inputs["tts_next"][0].reshape(1).to(device))
+        return ARNodeInputs(input_seq_len=1, input_ids=inputs["tts_code"][0].reshape(1).to(device))
 
     def preprocess(
         self,
@@ -475,10 +463,6 @@ class TTSSubmodule(ARNodeSubmodule):
         engine_inputs: ModelInputsFromEngine,
         inputs: list[ARNodeInputs],
     ) -> dict[str, Any]:
-        if graph_walk == TTS_DECODE and any(inp.input_ids is None for inp in inputs):
-            # a row that looped back brings no code: it is read by slot, beside the
-            # rows that bring theirs
-            return {"input_embeds": self.model.emb_code(self.loopback_inputs(engine_inputs, inputs)["input_ids"])}
         if inputs[0].input_ids is not None:
             return {"input_embeds": self.model.emb_code(torch.cat([inp.input_ids for inp in inputs]))}
         return {"input_embeds": torch.cat([inp.input_embeds for inp in inputs])}
@@ -517,9 +501,7 @@ class TTSSubmodule(ARNodeSubmodule):
         hidden = self.model.model(input_embeds, label="main")
         if graph_walk != TTS_DECODE:
             hidden = attn.select_last_hidden(hidden)
-        codes = sampler.sample(engine_inputs.request_ids, logits=self.model.logits(hidden))
-        # a decode step's code streams to the vocoder and loops back (``tts_next``)
-        return {"tts_code": codes, "tts_next": codes} if graph_walk == TTS_DECODE else {"tts_code": codes}
+        return {"tts_code": sampler.sample(engine_inputs.request_ids, logits=self.model.logits(hidden))}
 
     def forward(self, graph_walk: str, engine_inputs: ModelInputsFromEngine, **kwargs) -> NameToTensorList:
         return {k: [v] for k, v in self._forward(graph_walk, engine_inputs, **kwargs).items()}
@@ -562,12 +544,13 @@ class Token2WavSubmodule(NodeSubmodule):
     disable_torch_compile = True
     disable_autocast = True
 
-    def __init__(self, model, voices: dict, eos_code: int):
-        """``voices``: the model's bundled ones, by name."""
+    def __init__(self, model, voices: dict, eos_code: int, dit_dtype: torch.dtype):
+        """``voices``: the model's bundled ones, by name. ``dit_dtype``: the dtype of the
+        DiT's caches, as the model declares them, which the DiT computes in."""
         super().__init__()
         self.model = model
         self.eos_code = eos_code
-        self.bank = VoiceBank.build(voices, dit_dtype=model.flow.decoder.estimator.compute_dtype)
+        self.bank = VoiceBank.build(voices, dit_dtype=dit_dtype)
         self._lead_silence = torch.full((LEAD_SILENCE,), SILENCE_CODE, dtype=torch.int32)
 
     def compile_regions(self) -> dict[str, list[tuple]]:

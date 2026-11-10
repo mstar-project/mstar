@@ -3276,6 +3276,14 @@ class Cosmos3ReasonerSubmodule(SampledTokenDecoder):
     PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4, 8]
     MIXED_CAPTURE_BATCH_SIZES = [4, 16, 64]
     PREFILL_MEDIA_TOKEN_BUCKETS = [256, 512, 1024, 2048]
+    # Image and video prompts join decode steps too, so a burst of them does
+    # not stop every decode stream for a step each
+    MIXED_MEDIA = True
+    # A long prompt (a video, many images) runs in chunks of at most this many
+    # tokens, a step's decode rows included, rather than as one step that
+    # stops every decode stream for its length: the top of the prefill ladders.
+    CHUNKS_MEDIA = True
+    MAX_BATCH_TOKENS = 2048
 
     def __init__(self, transformer, config, encoders: Sequence[MediaEncoder] = ()):
         super().__init__(Cosmos3TextTower(transformer), config, encoders)
@@ -3312,19 +3320,24 @@ class Cosmos3ReasonerSubmodule(SampledTokenDecoder):
     # ------------------------------------------------------------------
 
     def prompt_positions(self, start: int, layout: dict, num_tokens: int) -> tuple[torch.Tensor, int]:
-        return layout_position_ids(
-            layout, self.config.reasoner.vision.spatial_merge_size, num_tokens, start, self.get_device(),
-        )
+        # built on the host: the scaffold moves them, and a chunk's cut rebuilds them
+        return layout_position_ids(layout, self.config.reasoner.vision.spatial_merge_size, num_tokens, start)
 
-    @staticmethod
-    def _rope_in_graph(engine_inputs: ModelInputsFromEngine, graph_walk: str) -> bool:
+    def resident_walks(self) -> frozenset[str]:
+        # a captured decode step builds its rope inside the graph (`_rope_in_graph`),
+        # so its `preprocess` reads nothing the tables fill
+        return frozenset({self.DECODE_WALK})
+
+    def _rope_in_graph(self, engine_inputs: ModelInputsFromEngine, graph_walk: str) -> bool:
         """A captured step of a text walk, whose rotary tables come from the
         planned positions inside the graph (as Qwen3.5's): always for decode,
-        with ``ingraph_decode_rope`` for text prefill and mixed steps. Only a
-        media walk's rows bring their own 3D positions."""
+        with ``ingraph_decode_rope`` for text prefill. Media rows bring their own
+        3D positions, so a mixed step does too while media rows can join it
+        (``MIXED_MEDIA``)."""
         if not engine_inputs.captured:
             return False
-        return graph_walk == "decode" or (graph_walk in ("prefill_text", MIXED) and ingraph_decode_rope())
+        text_walks = ("prefill_text",) if self._mixes_media else ("prefill_text", MIXED)
+        return graph_walk == "decode" or (graph_walk in text_walks and ingraph_decode_rope())
 
     def preprocess(self, graph_walk: str, engine_inputs: ModelInputsFromEngine, inputs: list[ARNodeInputs]) -> dict:
         out = super().preprocess(graph_walk, engine_inputs, inputs)

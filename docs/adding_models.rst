@@ -2063,10 +2063,7 @@ row whose last step did not keep its value on the device (its first decode step,
 the prefill) still brings it routed, and that read puts it over the slot's.
 ``SampledTokenDecoder`` declares it for Qwen3.5, Muse Glimmer, Higgs Audio, Qwen3-ASR and the Cosmos3 reasoner,
 and a node on it that reads the routed token sets ``device_loopback = None``; Whisper and
-Qwen3-Omni's Thinker declare their own. A decode step whose token also streams to
-another node keeps only the loop-back on the device: give the loop-back its own signal
-(MiniCPM-o's TTS loops back ``tts_next`` and streams ``tts_code`` to the vocoder), and the
-worker routes that signal without a tensor while the step's other outputs go as tensors.
+Qwen3-Omni's Thinker declare their own.
 
 On such a node a captured step writes each row's token and RNG offset back to the request's
 row inside the graph (``knobs: sampler_ingraph_scatter``, on by default). Those rows are
@@ -3501,6 +3498,11 @@ loop may accumulate.
 It reports a text prompt's length and a decode row's one token
 (``get_input_sequence_len``, ``speculative_input_seq_len``), so a model chunks its text
 prefill by declaring ``get_chunking_policies`` alone, as Qwen3.5 does.
+``MIXED_MEDIA = True`` lets media prompt rows join mixed steps too (the model lists its
+media walks in its combined walk), and ``CHUNKS_MEDIA = True`` reports a media row's length
+so a token budget can cut it: a chunk takes its slice of the mask with its ids, and the
+media rows the mask marks there. A decode row's sampled id never takes a media row, since
+only the layout's tokens are masked. Cosmos3-Edge's reasoner sets both.
 
 The ``vision_encoder`` node subclasses ``PackedBlockLoopEncoder``
 (``mstar/model/components/block_loop_encoder.py``): up to ``MAX_BATCH_SIZE`` requests per
