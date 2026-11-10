@@ -8,7 +8,7 @@ and from runtime loads (``/v1/load_lora_adapter``), so the set changes while ser
 from __future__ import annotations
 
 import threading
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from typing import Any, NamedTuple
 
 from mstar.engine.resources.lora.config import LORA_ADAPTER_KWARG, LORA_DIGEST_KWARG, lora_enabled
@@ -39,6 +39,7 @@ class ServedModels:
         self._digests: Mapping[str, bytes] = dict(digests or {})
         self.lora = lora or bool(self._digests)
         self._lock = threading.Lock()
+        self._listeners: list[Callable[[tuple[str, ...]], None]] = []
 
     @classmethod
     def of(
@@ -56,10 +57,18 @@ class ServedModels:
     def adapters(self) -> tuple[str, ...]:
         return tuple(self._digests)
 
+    def subscribe(self, listener: Callable[[tuple[str, ...]], None]) -> None:
+        """Call ``listener`` with the served adapters after every change, under the
+        lock so it sees the changes in order; it must not block. The Rust frontend's
+        bridge pushes each set to ``mstar-server`` this way."""
+        with self._lock:
+            self._listeners.append(listener)
+
     def add(self, name: str, digest: bytes) -> None:
         """Make ``name`` selectable, serving the weights ``digest`` names."""
         with self._lock:
             self._digests = {**self._digests, name: digest}
+            self._changed()
 
     def remove(self, name: str) -> bytes | None:
         """Take ``name`` out of selection; its digest, or None if it was not selectable."""
@@ -67,7 +76,13 @@ class ServedModels:
             digest = self._digests.get(name)
             if digest is not None:
                 self._digests = {n: d for n, d in self._digests.items() if n != name}
+                self._changed()
             return digest
+
+    def _changed(self) -> None:
+        adapters = tuple(self._digests)
+        for listener in self._listeners:
+            listener(adapters)
 
     def adapter_for(self, requested: str | None) -> str | None:
         """The adapter a request's ``model`` names; None runs the base model.
