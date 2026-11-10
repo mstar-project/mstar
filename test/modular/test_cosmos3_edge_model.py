@@ -541,8 +541,12 @@ def test_a_media_prompt_cuts_into_chunks_that_add_up_to_it(tmp_path) -> None:
     assert torch.equal(torch.cat(spliced), want)
     # positions 10-14, then up to 19 inside the second image, then 20
     assert advance == 11 and [c.resource_step_info for c in chunks] == [5, 5, 1]
-    # an image-free chunk carries no vision rows
-    assert sub.split_inputs(walk, info, full, 0, 3).tensor_inputs == {}
+    # an image-free chunk carries no vision rows, and still stages an all-False
+    # mask: alone on a captured step, its replay would splice in the last step's rows
+    text = sub.split_inputs(walk, info, full, 0, 3)
+    assert text.tensor_inputs == {}
+    out = SampledTokenDecoder.preprocess(sub, walk, eager, [text])
+    assert MEDIA_EMBEDS not in out and out[MEDIA_MASK].tolist() == [False] * 3
 
 
 def test_the_reasoner_prompts_chunk_under_one_budget(tmp_path) -> None:

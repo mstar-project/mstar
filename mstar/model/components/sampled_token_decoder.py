@@ -512,11 +512,10 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
         """A media step's ``MEDIA_EMBEDS``, its rows' in row order as the
         forward's cumulative mask count reads them, and its ``MEDIA_MASK``: one
         host mask and one copy, a row without media (a decode or text row)
-        masking nothing. Every mixed step brings the mask, zeros when no row has
-        media, so a replay never splices in the rows a previous step left in
-        the static buffer."""
-        mixed = graph_walk == MIXED and self._mixes_media
-        if graph_walk not in self._media_walks and not mixed:
+        masking nothing. Every step of a walk a media capture replays brings
+        the mask, zeros when no row has media, so a replay never splices in
+        the rows a previous step left in the static buffer."""
+        if graph_walk not in self._media_walks and not (graph_walk == MIXED and self._mixes_media):
             return
         rows: list[torch.Tensor] = []
         masks: list[torch.Tensor] = []
@@ -531,8 +530,6 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
                 plain = 0
             masks.append(mask)
             rows.append(inp.tensor_inputs[MEDIA_EMBEDS])
-        if not rows and not mixed:
-            return
         if plain or not masks:
             masks.append(torch.zeros(plain, dtype=torch.bool))
         if rows:
