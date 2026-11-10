@@ -160,16 +160,18 @@ def test_only_the_spoken_decode_streams_to_the_vocoder_in_the_reference_clients_
     (connection,) = model.get_partition_topology().connections
     policy = connection.chunk_policy_factory()
     assert connection.edge_name == SPEECH_IDS and isinstance(policy, SlidingWindowChunkPolicy)
+    assert connection.by_value
     assert (policy.window_size(), policy.next_chunk_size(28)) == (28, 25)
     assert model.get_combined_graph_walks() == {"LLM": {DECODE_MIXED: {DECODE, DECODE_SPOKEN}}}
 
 
-def test_a_text_decode_loops_back_on_the_device_and_a_spoken_ones_ids_go_through_the_host():
+def test_a_text_decode_loops_back_on_the_device_and_a_spoken_ones_ids_go_by_value():
     llm = an_llm()
     assert llm.device_loopback_signals(DECODE) == {"text_inputs"}
     assert llm.device_loopback_signals(DECODE_SPOKEN) == frozenset()
-    for walk in (DECODE, DECODE_SPOKEN):
-        assert llm.inline_signals(walk) == {"text_inputs": "new_token"}
+    assert llm.inline_signals(DECODE) == {"text_inputs": "new_token"}
+    # the speech id first: a step carries the first inline signal it outputs
+    assert list(llm.inline_signals(DECODE_SPOKEN).items()) == [(SPEECH_IDS, "new_token"), ("text_inputs", "new_token")]
 
 
 # --- stop and withhold -----------------------------------------------------------------------
