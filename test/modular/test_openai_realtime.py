@@ -1830,3 +1830,23 @@ def test_a_live_model_transcribes_with_intent_omitted(monkeypatch):
         with _live_socket(monkeypatch, _LiveTranscriptionAPI(), "/v1/realtime?intent=" + "x" * 200) as ws:
             ws.receive_text()
     assert refused.value.code == 1008 and len(refused.value.reason.encode()) <= 123
+
+
+def test_a_live_session_refuses_what_it_cannot_apply(monkeypatch):
+    """The re-decoding knobs and a prompt do nothing on a live model, so an
+    update naming them is refused, as is a language change while an item's
+    call is open; the session shows no re-decoding knobs."""
+    api = _LiveTranscriptionAPI()
+    with _live_socket(monkeypatch, api) as ws:
+        assert "chunk_seconds" not in ws.receive_json()["session"]["mstar"]
+        for session in ({"mstar": {"chunk_seconds": 1.0}}, {"input_audio_transcription": {"prompt": "names"}}):
+            _send(ws, "transcription_session.update", session=session)
+            assert ws.receive_json()["type"] == "error"
+        _send(ws, "input_audio_buffer.append", audio=_pcm(0.2))
+        _send(ws, "transcription_session.update", session={"input_audio_transcription": {"language": "de"}})
+        assert "language" in ws.receive_json()["error"]["message"]
+        _send(ws, "input_audio_buffer.commit")
+        _recv_until(ws, "conversation.item.input_audio_transcription.completed")
+        update = {"input_audio_transcription": {"language": "de", "prompt": ""}}
+        _send(ws, "transcription_session.update", session=update)
+        assert ws.receive_json()["session"]["input_audio_transcription"]["language"] == "de"

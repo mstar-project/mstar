@@ -584,8 +584,10 @@ Per-model notes:
   stream and no ``turn_tokens``, such as ``nemotron_asr``) — each item is one engine request,
   opened by its first append and ended by its commit, so its text streams as
   ``conversation.item.input_audio_transcription.delta`` events while the audio is still
-  arriving, and ``mstar.transcription.partial`` events report the audio covered so far. No
-  ``chunk_seconds`` applies, and an item holds up to the model's bound on a live call. If an
+  arriving, and ``mstar.transcription.partial`` events report the audio covered so far. Nothing
+  is re-decoded, so an update naming ``chunk_seconds``, ``unfixed_chunks``, ``unfixed_tokens``
+  or a ``prompt`` is refused, as is a ``language`` change while an item is open. An item holds
+  up to the model's bound on a live call. If an
   item's request fails (or can't open), the server sends an ``error``, drops the rest of the
   item's audio, and answers its commit with
   ``conversation.item.input_audio_transcription.failed``; the next item opens a request of its

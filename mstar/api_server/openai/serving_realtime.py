@@ -971,6 +971,10 @@ class RealtimeTranscription:
             ))
 
 
+# a re-decoding session's knobs, which a live transcription has no use for
+_REDECODE_KNOBS = ("chunk_seconds", "unfixed_chunks", "unfixed_tokens")
+
+
 class RealtimeLiveTranscription(RealtimeTranscription):
     """A transcription session on a model that hears audio as it comes (one
     ``ClientAudio`` client stream and no turn tokens): each item is one engine
@@ -1050,6 +1054,28 @@ class RealtimeLiveTranscription(RealtimeTranscription):
             return
         if self.key is not None:   # not ended by the commit
             await self._fail(error_event("this item's transcription ended before its commit", kind="server_error"))
+
+    def _session_view(self) -> dict:
+        view = super()._session_view()
+        for name in _REDECODE_KNOBS:
+            del view["mstar"][name]
+        return view
+
+    def update(self, session: dict) -> None:
+        """As a re-decoding session's, but its knobs and a prompt do nothing
+        here, so they are refused, and an open item's call keeps the language
+        it opened with."""
+        knobs = [name for name in _REDECODE_KNOBS if name in _object(session.get("mstar"), "mstar")]
+        if knobs:
+            raise ValueError(f"mstar.{knobs[0]} does not apply here: this model hears audio as it comes and "
+                             "re-decodes nothing")
+        transcription = _object(session.get("input_audio_transcription"), "input_audio_transcription")
+        if transcription.get("prompt"):
+            raise ValueError("input_audio_transcription.prompt is not supported by this model")
+        if self.key is not None and "language" in transcription \
+                and (transcription["language"] or None) != (self.session.request.language or None):
+            raise ValueError("commit or clear the input audio buffer before changing the language")
+        super().update(session)
 
     def take_chunk(self) -> np.ndarray | None:
         """All the audio in: the data worker cuts it on the model's chunk."""
