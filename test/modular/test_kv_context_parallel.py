@@ -733,7 +733,7 @@ def test_a_ring_plans_each_partners_first_query_apart_where_it_sees_no_key_here(
     world = 4
     case = _Case.build(((0, 6), (0, 1)), CPU, torch.float32)
     for rank in range(world):
-        joint = JointGroups(tp_group=CommGroup.trivial(), sp_group=_group(rank, world))
+        joint = JointGroups(tp_group=CommGroup.trivial(), sp_group=_group(rank, world), instance=_group(rank, world))
         shard = SequenceShard(("main",), 0, None, 0, joint.sp_group, stripe_pool="kv")
         attn, _ = _cp_attention(
             joint, CPU, torch.float32, shard=shard, exchange="ring", kv_resource=lambda p: _PlacedKV(p, case),
@@ -955,7 +955,7 @@ def test_a_split_label_reached_outside_an_exchange_is_refused():
     # real tokens to its 16-token bucket, which the step splits 8 and 8
     lease = SlotLease(0, BucketKey("w", bs=1, num_tokens=16))
     for rank in range(P):
-        joint = JointGroups(tp_group=CommGroup.trivial(), sp_group=_group(rank, P))
+        joint = JointGroups(tp_group=CommGroup.trivial(), sp_group=_group(rank, P), instance=_group(rank, P))
         shard = SequenceShard(("main",), 0, None, 0, joint.sp_group)
         attn, _ = _cp_attention(joint, CPU, torch.float32, shard=shard)
         ctx = StepContext(request_ids=("r0",), graph_walk="w", slot=0, capture=False, slot_lease=lease,
@@ -1494,7 +1494,7 @@ def _thinker_over_ranks(rank, world, store, placed, exchange):
         # the engine's order: derive, then the SP refusals
         by_key = resolve_spec_dependencies(specs)
         assert sequence_parallel_refusals(specs, "Thinker", 1, world) == []
-        joint = JointGroups(tp_group=CommGroup.trivial(), sp_group=group)
+        joint = JointGroups(tp_group=CommGroup.trivial(), sp_group=group, instance=group)
 
         # (rid, tokens) per step: two first prefills, then their next tokens beside a fresh prompt,
         # one row a decode; 13 tokens, the last 2 the MoE's padding

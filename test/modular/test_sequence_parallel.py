@@ -407,7 +407,8 @@ def test_a_shard_that_never_splits_plans_every_step_copied():
         apply_yaml_overrides(specs, {"resources": {} if choice is None else {"shard": {"exchange": choice}}})
         by_key = resolve_spec_dependencies(specs)
         spec = by_key["shard"]
-        joint = JointGroups(tp_group=CommGroup.trivial(), sp_group=CommGroup(0, 0, [0, 1]))
+        pair = CommGroup(0, 0, [0, 1])
+        joint = JointGroups(tp_group=CommGroup.trivial(), sp_group=pair, instance=pair)
         shard = spec.resource_class.build(spec, EngineResourceInfo(device=torch.device("cpu"), joint_comm_group=joint))
         assert (spec.splits, shard.can_split, _split(shard, [("r0", "main", 10)]) is not None) == (splits,) * 3
         ragged = RaggedAttnManager.build(by_key["ragged"], EngineResourceInfo(
