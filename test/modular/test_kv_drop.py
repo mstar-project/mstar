@@ -38,6 +38,7 @@ from mstar.engine.resources.step import FULL_ADMIT_NOT_READY, FULL_ADMIT_REBUILD
 from mstar.model.base import LabelLayout, Span
 from mstar.testing_utils.engine import make_engine, make_mgmt
 from mstar.testing_utils.model import StubModel, make_model
+from mstar.testing_utils.resource import StubResource, make_resource
 
 PAGE_SIZE = 16
 WALK = "prefill"
@@ -156,12 +157,8 @@ def test_a_drop_is_refused_when_one_row_couldnt_write_the_request_again(layout):
     assert "r" not in kv._dropped, "a request its rebuild couldn't bring back would be dropped"
 
 
-class _Recording:
+class _Recording(StubResource):
     """A resource that records the rebuild hooks it is called with."""
-
-    supports_preplan = False
-    force_double_buffer = False
-    lean_capture = False
 
     def __init__(self):
         self.calls = []
@@ -191,7 +188,7 @@ def test_a_drop_keeps_the_sampler_and_starts_positions_and_recurrent_state_over(
     pool = RecurrentStatePool.build(RecurrentStateSpec("gdn_state", {NODE}, RecurrentStateConfig(
         num_layers=1, blocks={"state": RecurrentBlockConfig(shape=(2, 4), dtype=torch.float32)}, max_slots=4,
     )), EngineResourceInfo(device=CPU))
-    sampler = SamplerResource(vocab_size=64, enable_repetion_penalty=True, device=CPU)
+    sampler = SamplerResource(vocab_size=64, enable_repetition_penalty=True, device=CPU)
     engine = _engine({"kv": kv, "rope": rope, "gdn_state": pool, "sampler": sampler})
     engine._runner.ingest_request("r", {"sampler": SamplingReqConfig(temperature=1.0, repetition_penalty=1.3)})
     _prefill(kv, "r", PAGE_SIZE)
@@ -324,8 +321,7 @@ def test_a_rebuild_policy_on_a_node_with_a_resource_that_cant_drop_is_refused_at
     _boot_engine({"kv": _manager()})._check_rebuild_policies(_model())
 
     with pytest.raises(ValueError, match=r"\['bounded'\] can't drop"):
-        bounded = SimpleNamespace(supports_drop=False, supports_preplan=False, force_double_buffer=False,
-                                  lean_capture=False)
+        bounded = make_resource(supports_drop=False)
         engine = _boot_engine({"kv": _manager(), "bounded": bounded})
         engine._check_rebuild_policies(_model())
 

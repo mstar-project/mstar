@@ -5,6 +5,7 @@ import argparse
 import contextlib
 import http.client
 import io
+import itertools
 import os
 import runpy
 import subprocess
@@ -47,7 +48,7 @@ class TestGpu(unittest.TestCase):
     def setUp(self):
         self.g = GPU["http"].__globals__
         saved = {k: self.g[k] for k in ("STATE", "LEDGER", "runpod", "runpod_list", "runpod_volumes", "find_offer",
-                                        "runpod_offers", "lambda_offers")}
+                                        "eras")}
         self.addCleanup(self.g.update, saved)
         state = Path(tempfile.mkdtemp())
         self.g.update(STATE=state, LEDGER=state / "instances.json")
@@ -90,16 +91,18 @@ class TestGpu(unittest.TestCase):
                 else:
                     self.assertEqual(GPU["http"]("POST", "https://x/pods", "RUNPOD_API_KEY", {}, retry=False), want)
 
-    def launch(self, answer, shows_up=True):
-        """cmd_launch against a RunPod that makes the pod and then answers the create with ``answer``;
-        the pod shows in its listing at once, or (``shows_up`` False) only after the launch gave up.
-        Returns the pods, the ledger and whether the launch exited."""
+    def launch(self, answer=None, shows_up=True, cfg=CFG):
+        """cmd_launch against a RunPod that makes the pod and then answers the create with ``answer``
+        (None: its id); the pod shows in its listing at once, or (``shows_up`` False) only after the
+        launch gave up. Returns the pods, the ledger and whether the launch exited."""
         made, listed, deleted = [], [], []
 
         def runpod(method, path, body=None, params=None, retry=True):
             if method == "POST":
                 made.append({"id": "p1", "name": body["name"]})
                 (listed if shows_up else []).extend(made)
+                if answer is None:
+                    return {"id": "p1"}
                 raise answer
             if method == "DELETE":
                 deleted.append(path)
@@ -107,13 +110,14 @@ class TestGpu(unittest.TestCase):
         self.g.update(runpod=runpod, runpod_list=lambda path, field, params=None: listed,
                       find_offer=lambda cfg, oid: OFFER,
                       runpod_volumes=lambda cfg: {"US-1": {"id": "v", "kind": "network"}})
-        args = argparse.Namespace(offer=OFFER["id"], pr=7, hours=1, allow_over_budget=False, dry_run=False)
+        args = argparse.Namespace(offer=OFFER["id"], pr=7, hours=1, tag=None, run=None, input=[],
+                                  allow_over_budget=False, dry_run=False)
         exited = False
         with unittest.mock.patch("subprocess.Popen") as popen, contextlib.redirect_stdout(io.StringIO()), \
                 contextlib.redirect_stderr(io.StringIO()):
             try:
-                GPU["cmd_launch"](args, CFG)
-            except SystemExit:
+                GPU["cmd_launch"](args, cfg)
+            except (SystemExit, GPU["ApiError"]):  # main() exits on an ApiError
                 exited = True
         self.watchdogs = [c.args[0][-1] for c in popen.call_args_list]
         return made, listed, deleted, exited
@@ -121,17 +125,26 @@ class TestGpu(unittest.TestCase):
     def test_a_launch_whose_answer_was_lost_adopts_the_pod_it_made(self):
         # a 502, and a 503 whose page says "not available" (a proxy's, not RunPod's capacity answer)
         # and a 200 with no id in it
-        for answer in (GPU["ApiError"](502, "bad gateway"), GPU["ApiError"](503, "Service not available"),
-                       KeyError("id")):
-            GPU["save_ledger"]({})
-            self.launch(answer)
-            self.assertEqual(list(GPU["ledger"]()), ["runpod:p1"],
-                             f"the pod the lost create made never reached the ledger ({answer})")
+        names = set()
+        # all in one second, with suffixes that differ as random ones almost always do
+        hexes = (f"{i:04x}" for i in itertools.count())
+        with unittest.mock.patch.object(self.g["time"], "strftime", return_value="1109-000000"), \
+                unittest.mock.patch.object(self.g["secrets"], "token_hex", side_effect=lambda n: next(hexes)):
+            for answer in (GPU["ApiError"](502, "bad gateway"), GPU["ApiError"](503, "Service not available"),
+                           KeyError("id")):
+                GPU["save_ledger"]({})
+                names.add(self.launch(answer)[0][0]["name"])
+                self.assertEqual(list(GPU["ledger"]()), ["runpod:p1"],
+                                 f"the pod the lost create made never reached the ledger ({answer})")
+        self.assertEqual(len(names), 3, "launches in the same second would share a name, so a lost create could "
+                                        "adopt another launch's pod")
 
     def test_a_lost_create_whose_pod_shows_up_late_is_still_ended_by_name(self):
         made, _, _, exited = self.launch(GPU["ApiError"](502, "bad gateway"), shows_up=False)
         (key,) = GPU["ledger"]()
         self.assertTrue(exited and key.startswith("pending:"), "the lost create's cost stopped counting")
+        self.assertIn("answer lost", GPU["status"](GPU["ledger"]()[key], CFG)[0],
+                      "it would ask the provider about an instance with no id")
         self.assertEqual(self.watchdogs, [key], "nothing ends the lost create's pod if nobody acts")
         self.assertTrue(self.launch(GPU["ApiError"](502, "bad gateway"))[3], "a second launch got past the cap")
         entry = GPU["ledger"]()[key]
@@ -175,7 +188,8 @@ class TestGpu(unittest.TestCase):
                 return [{"id": "p1", "name": state["name"]}]
             self.g.update(runpod=runpod, runpod_list=runpod_list, find_offer=lambda cfg, oid: OFFER,
                           runpod_volumes=lambda cfg: {"US-1": {"id": "v", "kind": "network"}})
-            args = argparse.Namespace(offer=OFFER["id"], pr=7, hours=1, allow_over_budget=False, dry_run=False)
+            args = argparse.Namespace(offer=OFFER["id"], pr=7, hours=1, tag=None, run=None, input=[],
+                                  allow_over_budget=False, dry_run=False)
             with unittest.mock.patch("subprocess.Popen") as popen, contextlib.redirect_stdout(io.StringIO()), \
                     contextlib.redirect_stderr(io.StringIO()):
                 GPU["cmd_launch"](args, CFG)
@@ -185,14 +199,54 @@ class TestGpu(unittest.TestCase):
             self.assertAlmostEqual((entry["deadline"] - time.time()) / 60, want, delta=1,
                                    msg=f"the {change} made while launch looked was lost")
 
-    def test_a_create_refused_with_a_429_makes_nothing_to_look_for(self):
-        made, listed, deleted, exited = self.launch(GPU["ApiError"](429, "slow down"))
-        self.assertTrue(exited)
-        self.assertEqual(GPU["ledger"](), {}, "a rate-limited create left a pending entry blocking the next launch")
+    def test_a_create_refused_with_a_429_or_a_4xx_makes_nothing_to_look_for(self):
+        for answer in (GPU["ApiError"](429, "slow down"), GPU["ApiError"](400, "bad image")):
+            exited = self.launch(answer)[3]
+            self.assertTrue(exited)
+            self.assertEqual(GPU["ledger"](), {}, f"a refused create ({answer}) left a pending entry blocking the "
+                                                  "next launch")
+            self.assertEqual(self.watchdogs, [])
+
+    def test_an_eras_outage_refuses_only_an_eras_launch(self):
+        def eras_down(*a, **k):
+            raise GPU["ApiError"](-1, "GET /instances: gave up after retries")
+        self.g["eras"] = eras_down
+        cfg = {**CFG, "budget": {**CFG["budget"], "max_running": 1}}
+        with unittest.mock.patch.dict(os.environ, {"ERAS_API_KEY": "k"}):
+            self.assertFalse(self.launch(cfg=cfg)[3], "an Eras outage would stop launches on RunPod and Lambda")
+            self.assertEqual(list(GPU["ledger"]()), ["runpod:p1"])
+            GPU["save_ledger"]({})
+            self.g["find_offer"] = lambda cfg, oid: {**OFFER, "id": "eras:l1", "provider": "eras"}
+            with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()) as err:
+                GPU["cmd_launch"](argparse.Namespace(offer="eras:l1", pr=7, hours=1, tag=None, allow_over_budget=False,
+                                                     dry_run=False), cfg)
+        self.assertIn("budget.max_running", err.getvalue(), "an Eras launch would go past max_running unchecked")
+
+    def test_an_entry_of_a_provider_gpu_py_does_not_have_holds_nothing_up(self):
+        key = "slurm:node1:42"
+        GPU["save_ledger"]({key: {"provider": "slurm", "instance_id": "42", "name": "live-pr-7-x", "pr": 7,
+                                  "usd_per_hour": 100.0, "gpu": "H200", "count": 1, "region": "node1",
+                                  "launched_at": time.time() - 3600, "deadline": time.time() + 3600}})
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            GPU["cmd_list"](argparse.Namespace(all=False), CFG)
+        self.assertIn(key, out.getvalue(), "list would stop at an entry it can't ask about")
+        for cmd, extra in (("cmd_wait", {"timeout": 1}), ("cmd_ssh", {"command": []}),
+                           ("cmd_extend", {"hours": 0, "allow_over_budget": False})):
+            with self.subTest(cmd), self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+                GPU[cmd](argparse.Namespace(instance=key, **extra), CFG)
+        with unittest.mock.patch.object(self.g["time"], "sleep", side_effect=InterruptedError), \
+                contextlib.redirect_stdout(io.StringIO()):
+            GPU["cmd_watchdog"](argparse.Namespace(instance=key), CFG)  # returns rather than waiting on it
+        self.launch()
+        self.assertEqual(sorted(GPU["ledger"]()), ["runpod:p1", key],
+                         "an entry nothing can release would block every launch under max_concurrent_instances")
+        with contextlib.redirect_stdout(io.StringIO()):
+            GPU["cmd_terminate"](argparse.Namespace(instance=key), CFG)
+        self.assertEqual(list(GPU["ledger"]()), ["runpod:p1"])
 
     def test_extend_keeps_to_the_launch_caps(self):
         now = time.time()
-        one = {"usd_per_hour": 3.0, "launched_at": now, "deadline": now + 3600}
+        one = {"provider": "runpod", "usd_per_hour": 3.0, "launched_at": now, "deadline": now + 3600}
         dear = {**one, "usd_per_hour": 30.0, "deadline": now + 3 * 3600}  # $90 to its deadline
         for ledger, hours in (({"runpod:p1": one}, 50),  # past budget.max_hours
                               ({"runpod:p1": one, "runpod:p2": dear}, 3.9)):  # past max_total_usd
@@ -215,8 +269,9 @@ class TestGpu(unittest.TestCase):
         def erroring(*a, **k):
             raise GPU["ApiError"](503, "unavailable")
         args = argparse.Namespace(gpus=1, min_vram=80, all_regions=False, allow_arm=False, json=False)
-        self.g["runpod_offers"] = erroring
-        self.g["lambda_offers"] = lambda *a, **k: []
+        unittest.mock.patch.object(GPU["RunPod"], "offers", erroring).start()
+        unittest.mock.patch.object(GPU["Lambda"], "offers", lambda *a, **k: []).start()
+        self.addCleanup(unittest.mock.patch.stopall)
         # no key anywhere; RunPod erroring with no Lambda key; RunPod erroring and Lambda answering with nothing
         for env in ({}, {"RUNPOD_API_KEY": "k"}, {"RUNPOD_API_KEY": "k", "LAMBDA_API_KEY": "k"}):
             out = io.StringIO()

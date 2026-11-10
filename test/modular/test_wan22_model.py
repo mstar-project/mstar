@@ -255,21 +255,70 @@ def test_wan22_rejects_promptless_request():
         _plan(model, ["image"], ["video"], {"image_inputs": [_tensor_info("image")]})
 
 
-@pytest.mark.parametrize("requested,expected", [
-    (1, 1),
-    (50, 50),
-    (100, 100),   # exactly the ceiling
-    (10_000, 100),  # clamped to max_denoise_steps
-    (0, 1),       # floored at one step
-])
-def test_wan22_num_inference_steps_clamped(requested, expected):
+@pytest.mark.parametrize("requested", [1, 50, 100])  # 100 is exactly the ceiling
+def test_wan22_num_inference_steps_in_range_are_honored(requested):
     model = _make_model()
     assert model.config.max_denoise_steps == 100
     plan = _plan(model, ["text"], ["video"], {"text_inputs": [_tensor_info("text")]},
                  {"num_inference_steps": requested})
-    assert plan[0].step_metadata["num_inference_steps"] == expected
+    assert plan[0].step_metadata["num_inference_steps"] == requested
     # the same count ends the denoise loop (and its speculation)
-    assert model.get_loop_caps(num_inference_steps=requested) == {DENOISE_LOOP_NAME: expected}
+    assert model.get_loop_caps(num_inference_steps=requested) == {DENOISE_LOOP_NAME: requested}
+
+
+@pytest.mark.parametrize("requested", [0, -1, 50.0, "50", True])
+def test_wan22_num_inference_steps_out_of_range_is_a_400(requested):
+    model = _make_model()
+    with pytest.raises(ValueError, match="num_inference_steps must be an integer >= 1"):
+        _plan(model, ["text"], ["video"], {"text_inputs": [_tensor_info("text")]}, {"num_inference_steps": requested})
+    with pytest.raises(ValueError, match="num_inference_steps"):
+        model.process_prompt(
+            prompt="a cat surfing", input_modalities=["text"], output_modalities=["video"],
+            num_inference_steps=requested,
+        )
+
+
+@pytest.mark.parametrize("requested", [101, 10_000])
+def test_wan22_steps_past_the_denoise_loop_are_refused_by_the_conductor(requested):
+    from mstar.conductor.conductor import Conductor
+
+    conductor = Conductor.__new__(Conductor)
+    conductor.model = model = _make_model()
+    conductor._loop_max_iters = {
+        name: loop.max_iters
+        for walk in model.get_graph_walk_graphs().values()
+        for name, loop in walk.get_loops().items()
+    }
+    assert conductor._loop_caps({"num_inference_steps": 100})[model.DENOISE_LOOP_NAME] == 100
+    with pytest.raises(ValueError, match="iterations"):
+        conductor._loop_caps({"num_inference_steps": requested})
+
+
+@pytest.mark.parametrize("kwargs,fragment", [
+    ({"guidance_scale": "5"}, "guidance_scale must be a finite number"),
+    ({"guidance_scale": float("inf")}, "guidance_scale must be a finite number"),
+    ({"guidance_scale": False}, "guidance_scale must be a finite number"),
+    ({"negative_prompt": 3}, "negative_prompt must be a string"),
+])
+def test_wan22_bad_denoise_knobs_are_400s(kwargs, fragment):
+    model = _make_model()
+    with pytest.raises(ValueError, match=fragment):
+        model.process_prompt(
+            prompt="a cat surfing", input_modalities=["text"], output_modalities=["video"], **kwargs,
+        )
+
+
+def test_wan22_null_knobs_mean_default_and_request_kwargs_are_declared():
+    model = _make_model()
+    plan = _plan(model, ["text"], ["video"], {"text_inputs": [_tensor_info("text")]},
+                 {"guidance_scale": None, "num_inference_steps": None, "width": None})
+    meta = plan[0].step_metadata
+    assert meta["guidance_scale"] == model.config.guidance_scale
+    assert meta["num_inference_steps"] == model.config.default_num_inference_steps
+    assert meta["width"] == model.config.default_width
+    # the video adapter maps size -> height/width and forwards num_frames/fps
+    assert {"height", "width", "num_frames", "fps"} <= model.request_kwargs()
+    assert {"guidance_scale", "num_inference_steps", "negative_prompt"} <= model.request_kwargs()
 
 
 # ----------------------------------------------------------------------
@@ -463,7 +512,8 @@ def test_wan22_process_prompt_rejects_unaligned_sizes(height, width, bad_axis, n
     ({"height": 0}, "must be positive"),
     ({"width": -32}, "must be positive"),
     ({"height": "tall"}, "must be an integer"),
-    ({"width": None}, "must be an integer"),
+    ({"height": "480"}, "must be an integer"),
+    ({"width": 832.0}, "must be an integer"),
 ])
 def test_wan22_process_prompt_rejects_malformed_sizes(kwargs, fragment):
     model = _make_model()
@@ -519,6 +569,7 @@ def test_wan22_process_prompt_rejects_unaligned_num_frames(frames, nearest):
     (0, "must be positive"),
     (-4, "must be positive"),      # would have crashed the worker on a negative dim
     ("many", "must be an integer"),
+    (33.0, "must be an integer"),
 ])
 def test_wan22_process_prompt_rejects_malformed_num_frames(frames, fragment):
     model = _make_model()
@@ -551,6 +602,7 @@ def test_wan22_process_prompt_accepts_valid_fps(fps):
     (float("nan"), "must be positive"),
     (float("inf"), "must be positive"),
     ("fast", "must be a number"),
+    ("24", "must be a number"),
 ])
 def test_wan22_process_prompt_rejects_bad_fps(fps, fragment):
     model = _make_model()
@@ -648,11 +700,11 @@ def test_wan22_config_echo_logs_resolved_settings(caplog):
 
 def test_wan22_config_echo_marks_absent_negative_and_auto_seed(caplog):
     # No seed and an empty negative prompt: seed reads "auto", negative "absent",
-    # and steps reflect the clamped/defaulted value.
+    # and steps echo the requested value.
     model = _make_model()
     with caplog.at_level(logging.INFO, logger="mstar.model.wan22.wan22_model"):
-        # clamps to max_denoise_steps
-        _plan(model, ["text"], ["video"], {"text_inputs": [_tensor_info("text")]}, {"num_inference_steps": 10_000})
+        # exactly the max_denoise_steps ceiling
+        _plan(model, ["text"], ["video"], {"text_inputs": [_tensor_info("text")]}, {"num_inference_steps": 100})
     line = next(r.getMessage() for r in caplog.records if r.getMessage().startswith("Wan2.2 request:"))
     assert "seed=auto" in line
     assert "negative_prompt=absent" in line

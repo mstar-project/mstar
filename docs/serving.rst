@@ -325,6 +325,17 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        closes its socket with ``1009`` before any handler sees it, so the client gets no
        error frame. Raise it for clients that send big uncompressed frames, such as several
        raw camera images in one openpi observation.
+   * - ``scheduling``
+     - *(optional)* Which (node, walk) a worker's next step goes to (see "Walk priorities" in
+       :doc:`adding_models`). ``policy``: ``priority`` (the default) or ``round_robin``, which
+       turns the model's priorities off. ``max_wait``: the most of a worker's chain steps (side-lane steps not counted) a ready key
+       may go without running before it goes first, for every key its entry leaves unbounded.
+       ``walk_priorities``: a list of entries ``{node, walk, priority, max_wait}``, each naming
+       a node, a walk or both, which replaces the model's list; the most specific entry for a
+       pair decides. An entry naming nothing the model runs, a negative priority, a
+       ``max_wait`` under 1, two entries for the same target or an unknown field fail
+       loading. For example ``scheduling: {walk_priorities: [{walk: talker_prefill, priority:
+       1}, {node: Talker, walk: talker_decode, max_wait: 4}]}``.
    * - ``speculation_mixes_walks``
      - *(optional)* Per node, ``true``/``false`` for every walk of the node's combined
        walks, or a mapping of walk -> ``true``/``false``. On for a walk, a speculation
@@ -842,10 +853,13 @@ DROID robot's normalization stats:
 With ``norm_stats`` set, Pi0.5 takes the raw robot state in ``robot_state`` and returns
 actions in robot units, as openpi's policy server does. ``norm_stats`` can also be the path
 of an openpi ``norm_stats.json``. Without it, ``robot_state`` must already be normalized to
-[-1, 1].
+[-1, 1]. Either way it is a list of 1 to ``state_dim`` finite numbers (the checkpoint's
+``max_state_dim``, 32 when it sets none); anything else is a 400.
 
 Per-request knobs (``temperature``, ``voice``, ``max_output_tokens``, …) are sent by the
-client instead — see :doc:`clients`. Give each request its own ``seed`` for independent
+client instead — see :doc:`clients`, and :ref:`generation-parameters` for what each
+sampling knob means.
+Give each request its own ``seed`` for independent
 samples. A seed fixes a request's tokens whatever it is batched with only where M\* draws
 with one kernel that reads each row's own seed: on CUDA, a sampler whose vocabulary is at
 most 4,096 tokens (the talker and code-predictor samplers of Qwen3-TTS and Qwen3-Omni),
