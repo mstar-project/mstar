@@ -22,7 +22,7 @@ from jinja2 import TemplateError
 from mstar.conductor.request_info import FINAL_PREFILL
 from mstar.graph.base import GraphNode, Loop, Sequential
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.components.sampled_token_decoder import PROMPT_TOKENS
+from mstar.model.components.sampled_token_decoder import MEDIA_EMBEDS, MEDIA_MASK
 from mstar.model.cosmos3.cosmos3_model import (
     DIT_NODE,
     REASONER_NODE,
@@ -439,9 +439,11 @@ def test_reasoner_rotary_tables_come_from_the_layout_and_the_counter(tmp_path) -
 
 def test_a_mixed_step_carries_media_prompt_rows(tmp_path) -> None:
     """A media prompt row joins a decode step: it advances the position
-    counter by its MRoPE advance beside the decode rows' one, its encoder
-    output is packed beside the decode rows' loop-back tokens, and a mixed
-    step holds at most the scaffold's cap of prompt rows."""
+    counter by its MRoPE advance beside the decode rows' one, its media and
+    mask are packed beside the decode rows' loop-back tokens (the mask False
+    on them), every mixed step stages a mask, media or not, under the keys
+    the mixed capture holds, and a mixed step holds at most the scaffold's cap
+    of prompt rows."""
     import types
 
     from mstar.model.components.sampled_token_decoder import SampledTokenDecoder
@@ -453,9 +455,10 @@ def test_a_mixed_step_carries_media_prompt_rows(tmp_path) -> None:
     image_pad = model.config.reasoner.image_token_id
     decode = ARNodeInputs(input_seq_len=1)
     decode.graph_walk = Cosmos3Model.REASONER_DECODE_WALK
+    mask = torch.tensor([False] * 5 + [True] * 4 + [False])
     media = ARNodeInputs(
         input_seq_len=10, input_ids=torch.tensor([5, 6, 7, 8, 9] + [image_pad] * 4 + [10]),
-        resource_step_info=8, tensor_inputs={"vision_embeds": torch.ones(4, 8)},
+        resource_step_info=8, tensor_inputs={MEDIA_EMBEDS: torch.ones(4, 8), MEDIA_MASK: mask},
     )
     media.graph_walk = Cosmos3Model.REASONER_PREFILL_VISION_WALK
     step = sub.declare_step("mixed", ["d", "m"], [decode, media])
@@ -466,44 +469,16 @@ def test_a_mixed_step_carries_media_prompt_rows(tmp_path) -> None:
     engine_inputs = types.SimpleNamespace(resources={SAMPLER: sampler}, request_ids=["d", "m"])
     out = SampledTokenDecoder.preprocess(sub, "mixed", engine_inputs, [decode, media])
     assert out["input_ids"].tolist() == [42, 5, 6, 7, 8, 9] + [image_pad] * 4 + [10]
-    assert torch.equal(out["vision_embeds"], torch.ones(4, 8))
-    assert out[PROMPT_TOKENS].tolist() == [False] + [True] * 10
+    assert torch.equal(out[MEDIA_EMBEDS], torch.ones(4, 8))
+    assert out[MEDIA_MASK].tolist() == [False] + mask.tolist()
 
-
-def test_a_sampled_pad_in_a_mixed_step_takes_no_media_row(tmp_path) -> None:
-    """A decode row whose sampled token is the image pad sits before the media
-    row in a mixed step. The splice reads the prompt rows' pads alone, so each
-    of the media row's pads still gets its own embedding and the decode row
-    keeps its token's."""
-    import types
-
-    from mstar.model.components.sampled_token_decoder import SampledTokenDecoder
-    from mstar.model.cosmos3.submodules import Cosmos3ReasonerSubmodule
-    from mstar.model.multimodal import splice_media
-    from mstar.model.submodule_base import ARNodeInputs
-
-    model = _model(tmp_path)
-    sub = Cosmos3ReasonerSubmodule(transformer=None, config=model.config, encoders=(model._vision_encoder(),))
-    image_pad = model.config.reasoner.image_token_id
-    decode = ARNodeInputs(input_seq_len=1)
-    decode.graph_walk = Cosmos3Model.REASONER_DECODE_WALK
-    rows = torch.arange(3.0).unsqueeze(1).expand(3, 4)
-    media = ARNodeInputs(
-        input_seq_len=5, input_ids=torch.tensor([5] + [image_pad] * 3 + [6]),
-        resource_step_info=4, tensor_inputs={"vision_embeds": rows},
-    )
-    media.graph_walk = Cosmos3Model.REASONER_PREFILL_VISION_WALK
-    sampler = types.SimpleNamespace(loopback_tokens=lambda rids: torch.tensor([image_pad, 0]))
-    engine_inputs = types.SimpleNamespace(resources={SAMPLER: sampler}, request_ids=["d", "m"])
-    out = SampledTokenDecoder.preprocess(sub, "mixed", engine_inputs, [decode, media])
-    ids, mask = out["input_ids"], out[PROMPT_TOKENS]
-    encoder = model._vision_encoder()
-    embeds = torch.full((ids.shape[0], 4), -1.0)
-    spliced = splice_media(embeds, encoder.pads(ids) & mask, out["vision_embeds"])
-    assert spliced[0].tolist() == [-1.0] * 4  # the decode row keeps its token's embedding
-    assert torch.equal(spliced[2:5], rows)  # each pad its own row, in order
-    # without the mask the sampled pad would take row 0 and shift the rest
-    assert not torch.equal(splice_media(embeds, encoder.pads(ids), out["vision_embeds"])[2:5], rows)
+    (mixed,) = [c for c in sub.get_accelerator_graph_configs(torch.device("cpu")) if c.capture_graph_walk == "mixed"]
+    assert set(out) - {"input_ids"} == set(mixed.input_seq_dims)
+    # decode and text rows alone: the replay would otherwise splice the rows a previous step left
+    text = ARNodeInputs(input_seq_len=3, input_ids=torch.tensor([5, 6, 7]))
+    text.graph_walk = Cosmos3Model.REASONER_PREFILL_WALK
+    out = SampledTokenDecoder.preprocess(sub, "mixed", engine_inputs, [decode, text])
+    assert MEDIA_EMBEDS not in out and out[MEDIA_MASK].tolist() == [False] * 4
 
 
 def test_a_mixed_step_that_can_carry_media_keeps_host_positions(tmp_path, monkeypatch) -> None:
@@ -525,18 +500,21 @@ def test_a_mixed_step_that_can_carry_media_keeps_host_positions(tmp_path, monkey
 
 def test_a_media_prompt_cuts_into_chunks_that_add_up_to_it(tmp_path) -> None:
     """Chunked prefill of an image prompt: each chunk takes its ids and
-    positions, the vision rows its pads read (cuts landing inside an image),
-    and its part of the MRoPE advance, so the chunks rebuild the row and
-    advance the position counter by the whole prompt's."""
+    positions, its part of the mask and the vision rows that part marks (cuts
+    landing inside an image), and its part of the MRoPE advance, so the
+    chunks splice in the whole row's media and advance the position counter
+    by the whole prompt's."""
     import types
 
     from mstar.model.components.mrope import layout_position_ids
+    from mstar.model.components.sampled_token_decoder import SampledTokenDecoder
     from mstar.model.cosmos3.submodules import Cosmos3ReasonerSubmodule
-    from mstar.model.multimodal import MEDIA_LAYOUT, media_rows_between
-    from mstar.model.submodule_base import ARNodeInputs
+    from mstar.model.multimodal import MEDIA_LAYOUT, splice_media
 
     model = _model(tmp_path)
     sub = Cosmos3ReasonerSubmodule(transformer=None, config=model.config, encoders=(model._vision_encoder(),))
+    sub.get_device = lambda: torch.device("cpu")
+    sub.node_resources = {ROPE: types.SimpleNamespace(position=lambda rid, label: 10)}
     pad = model.config.reasoner.image_token_id
     # text 3, a 2x3 merged image, text 2, a 2x2 merged image, text 1
     layout = {"offset": [3, 11], "tokens": [6, 4], "output": ["vision_embeds"] * 2,
@@ -544,23 +522,31 @@ def test_a_media_prompt_cuts_into_chunks_that_add_up_to_it(tmp_path) -> None:
     ids = torch.tensor([1, 2, 3] + [pad] * 6 + [4, 5] + [pad] * 4 + [6])
     pos, advance = layout_position_ids(layout, 2, 16, 10)
     rows = torch.arange(10.0).unsqueeze(1).expand(10, 8)
-    full = ARNodeInputs(input_seq_len=16, input_ids=ids, custom_pos_ids=pos,
-                        tensor_inputs={"vision_embeds": rows}, resource_step_info=advance)
-    info = types.SimpleNamespace(step_metadata={MEDIA_LAYOUT: layout})
+    info = types.SimpleNamespace(rid_handle="r", step_metadata={MEDIA_LAYOUT: layout})
     walk = Cosmos3Model.REASONER_PREFILL_VISION_WALK
+    full = sub.prepare_inputs(walk, info, {"text_inputs": [ids], "vision_embeds": [rows]})
     assert sub.get_input_sequence_len(walk, info, {"text_inputs": [ids]}).seq_len == 16
-    assert media_rows_between(layout, 5, 13) == {"vision_embeds": (2, 8)}
 
     chunks = [sub.split_inputs(walk, info, full, a, b) for a, b in ((0, 5), (5, 13), (13, 16))]
     assert torch.equal(torch.cat([c.input_ids for c in chunks]), ids)
     assert torch.equal(torch.cat([c.custom_pos_ids for c in chunks], dim=-1), pos)
-    media = [c.tensor_inputs.get("vision_embeds", rows[:0]) for c in chunks]
-    assert [m.shape[0] for m in media] == [int((c.input_ids == pad).sum()) for c in chunks] == [2, 6, 2]
-    assert torch.equal(torch.cat(media), rows)
+    assert [c.tensor_inputs[MEDIA_EMBEDS].shape[0] for c in chunks] == [2, 6, 2]
+    # each chunk splices in its own rows: together, the whole prompt's
+    eager = types.SimpleNamespace(resources={}, request_ids=["r"])
+    spliced = [
+        splice_media(out["input_ids"].float()[:, None].expand(-1, 8), out[MEDIA_MASK], out[MEDIA_EMBEDS])
+        for out in (SampledTokenDecoder.preprocess(sub, walk, eager, [c]) for c in chunks)
+    ]
+    want = splice_media(ids.float()[:, None].expand(-1, 8), full.tensor_inputs[MEDIA_MASK], rows)
+    assert torch.equal(torch.cat(spliced), want)
     # positions 10-14, then up to 19 inside the second image, then 20
     assert advance == 11 and [c.resource_step_info for c in chunks] == [5, 5, 1]
-    # an image-free chunk carries no vision rows
-    assert sub.split_inputs(walk, info, full, 0, 3).tensor_inputs == {}
+    # an image-free chunk carries no vision rows, and still stages an all-False
+    # mask: alone on a captured step, its replay would splice in the last step's rows
+    text = sub.split_inputs(walk, info, full, 0, 3)
+    assert text.tensor_inputs == {}
+    out = SampledTokenDecoder.preprocess(sub, walk, eager, [text])
+    assert MEDIA_EMBEDS not in out and out[MEDIA_MASK].tolist() == [False] * 3
 
 
 def test_the_reasoner_prompts_chunk_under_one_budget(tmp_path) -> None:

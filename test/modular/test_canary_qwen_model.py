@@ -194,7 +194,7 @@ def _model_with_word_tokenizer() -> CanaryQwenModel:
     model.config = SimpleNamespace(audio_locator_tag="<|audio|>")
     model.tokenizer = SimpleNamespace(encode=encode)
     model.audio_token_id = encode("<|audio|>")[0]
-    model.audio_encoder = audio_encoder(model.audio_token_id)
+    model.audio_encoder = audio_encoder()
     return model
 
 
@@ -304,7 +304,7 @@ def test_llm_node_caps_captures_and_names():
                                         num_key_value_heads=1, head_dim=8, intermediate_size=32, vocab_size=20))
     llm = Qwen3DenseLM(config, attn_key="attn", kv_key="kv", pos_key="rope")
     stops = SimpleNamespace(stop_token_ids=frozenset({11, 12}))
-    node = CanaryQwenLLMSubmodule(llm, stops, (audio_encoder(19),), text_prompts=False)
+    node = CanaryQwenLLMSubmodule(llm, stops, (audio_encoder(),), text_prompts=False)
     assert node.max_batch_size(PREFILL_WALK) == 16 and node.max_batch_size("decode") is None
     (capture,) = node.get_accelerator_graph_configs(torch.device("cpu"))
     assert capture.capture_graph_walk == "decode" and capture.capture_batch_sizes == [1, 2, 4, 8, 16, 32, 64]

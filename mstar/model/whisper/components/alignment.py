@@ -96,7 +96,7 @@ def _compiled_dtw_trace():
         from numba import njit
     except ImportError:
         logger.warning("numba is not installed: word timestamps run the DTW in plain Python, far slower. "
-                       "Install mstar[asr].")
+                       "Install mstar-ai[asr].")
         return _dtw_trace
     try:
         fast = njit(cache=True, nogil=True)(_dtw_trace)
