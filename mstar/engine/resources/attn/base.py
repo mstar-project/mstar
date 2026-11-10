@@ -34,17 +34,20 @@ _BACKEND_KV_CONFIG: dict[AttnBackend, type[KVConfig]] = {
 
 def resolve_attn_backend(
     backend: AttnBackend, device: torch.device, page_size: int | None = None,
+    windowed: bool = False,
 ) -> AttnBackend:
     """The concrete backend for ``backend`` on ``device``.
 
     ``AUTO`` becomes the platform's default. A backend named in the spec or
-    YAML is returned as is. ``page_size``, the paged cache's if there is one,
-    decides between AITER and FlashInfer on ROCm (see ``_rocm_paged_backend``).
+    YAML is returned as is. On ROCm, ``page_size`` (the paged cache's, if there
+    is one) decides between AITER and FlashInfer (see ``_rocm_paged_backend``),
+    and ``windowed`` (the attention declares a sliding window, or its pool keeps
+    one) picks FlashInfer, the only backend that reads a windowed pool.
     """
     if backend is not AttnBackend.AUTO:
         return backend
     if current_platform.is_rocm():
-        return _rocm_paged_backend(page_size)
+        return AttnBackend.FLASHINFER if windowed else _rocm_paged_backend(page_size)
     return AttnBackend.FLASHINFER
 
 
@@ -131,21 +134,22 @@ class AttentionManager(AttentionResource):
 
     @classmethod
     def build(cls, spec: AttentionSpec, info: EngineResourceInfo):
-        backend = resolve_attn_backend(spec.config.backend, info.device)
-        if spec.config.sliding_window is not None and backend != AttnBackend.FLASHINFER:
+        window = spec.config.sliding_window
+        # AUTO is FlashInfer wherever a window is declared (see `resolve_attn_backend`)
+        if window is not None and spec.config.backend not in (AttnBackend.AUTO, AttnBackend.FLASHINFER):
             raise ValueError(
-                f"sliding_window is unsupported for attention backend {backend!r}; "
+                f"sliding_window is unsupported for attention backend {spec.config.backend!r}; "
                 "use the flashinfer backend"
             )
         # the KV resource's own config, not a copy; per-rank head counts, and
         # `shard` is idempotent so both builders can call it
         kv_config = info.dependency(spec.config.kv_cache).config
-        # AUTO on ROCm picks by the cache's page size (see `_rocm_paged_backend`)
+        windowed = isinstance(kv_config, PagedKVConfig) and len(kv_config.groups) > 1
+        # AUTO on ROCm picks by the cache's page size and by the window
         backend = resolve_attn_backend(
             spec.config.backend, info.device, getattr(kv_config, "tokens_per_page", None),
+            windowed=windowed or window is not None,
         )
-        windowed = isinstance(kv_config, PagedKVConfig) and len(kv_config.groups) > 1
-        window = spec.config.sliding_window
         keeps_window = isinstance(kv_config, PagedKVConfig) and window is not None and window < kv_config.max_seq_len
         if keeps_window and not windowed:
             # the pool derives its window from its attentions, which resolving the specs does

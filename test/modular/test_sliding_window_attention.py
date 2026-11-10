@@ -351,7 +351,7 @@ class SlidingWindowTests(unittest.TestCase):
 
     def test_default_auto_plans_fa2_from_sm100(self):
         """From SM100 FlashInfer's auto can send short rows to cuDNN, and its fa3 is SM90's only."""
-        blackwell = SimpleNamespace(cuda_capability=lambda device=None: (10, 0))
+        blackwell = SimpleNamespace(cuda_capability=lambda device=None: (10, 0), is_rocm=lambda: False)
         with patch("mstar.engine.resources.attn.base.current_platform", blackwell):
             ctx = context([7, 5], [7, 5])
             plans = KVPlanOutputs(ctx.plan_results["kv"], later_groups=(ctx.plan_results["kv"],))
