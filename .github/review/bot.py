@@ -704,11 +704,13 @@ def since_live_test(repo, pull, head_sha, conversation):
     """Full mode: since-live-test.diff and since-live-test-commits.txt, the diff and commits since the PR's
     last live test, when it passed on an ancestor of the head (last_live_test, passed_on_ancestor) on every GPU
     vendor this PR's live test needs (vendors_for, as the live-test job decides), for the review's
-    live-test call (review-prompt.md, Re-review step 4). Without both files (GitHub refused either) the review
-    judges the whole PR."""
+    live-test call (review-prompt.md, Re-review step 4). Without both files (GitHub refused either, or the vendors
+    couldn't be read) the review judges the whole PR."""
     live = last_live_test(conversation)
-    if not passed_on_ancestor(repo, live, head_sha) \
-            or not set(vendors_for(repo, pull, head_sha)) <= set(live["vendors"]):
+    if not passed_on_ancestor(repo, live, head_sha):
+        return
+    vendors = read(vendors_for, repo, pull, head_sha)
+    if vendors is None or not set(vendors) <= set(live["vendors"]):  # unknown, or a vendor that pass didn't run on
         return
     tested = f"repos/{repo}/compare/{live['sha']}...{head_sha}"
     try:

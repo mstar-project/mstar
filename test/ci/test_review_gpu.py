@@ -224,9 +224,11 @@ class TestCarry(unittest.TestCase):
 
     def test_the_review_gets_no_since_diff_from_a_pass_that_missed_a_vendor(self):
         pull = {"title": "T", "base": {"repo": BASE_REPO}}
-        for vendors, written in (("nvidia", False), ("nvidia,amd", True)):
-            with self.subTest(vendors), workspace() as ws:
-                routes = {f"GET repos/{R}/compare/main...*": {"files": [{"filename": "mstar/ops/rocm_attention.py"}]},
+        rocm = {"files": [{"filename": "mstar/ops/rocm_attention.py"}]}
+        for vendors, files, written in (("nvidia", rocm, False), ("nvidia,amd", rocm, True),
+                                        ("nvidia,amd", Fail("HTTP 502"), False)):
+            with self.subTest(vendors=vendors, files=files), workspace() as ws:
+                routes = {f"GET repos/{R}/compare/main...*": files,
                           f"GET repos/{R}/compare/{'a' * 40}...*": {"status": "ahead", "commits": []}}
                 earlier = live_test("pass", vendors=vendors)
                 conversation = [{"user": earlier["user"]["login"], "body": earlier["body"]}]
