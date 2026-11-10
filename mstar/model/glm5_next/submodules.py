@@ -727,6 +727,8 @@ class Glm5NextLLMSubmodule(EagerPastCachedPrefix, ARNodeSubmodule):
             next_input, target, sent = self._mtp_decode(engine_inputs, input_ids, base)
             return BatchedModelOutput(
                 row_outputs={"text_inputs": next_input, "new_token": target},
+                # the stop check and a host transport read the cut tokens off this one copy
+                check_stop_buffers={"new_token": target},
                 output_spans={"new_token": F.pad(sent[:, None], (1, 0))},  # [0, sent) per row
             )
         new_tokens = self._forward(
