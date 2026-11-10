@@ -291,6 +291,9 @@ class AudioEncoderSubmodule(NodeSubmodule):
 
     # 50 post-conv frames a second, at most 1249 per 25 s clip: 5 s up to two full clips
     BLOCK_LOOP_FRAME_BUCKETS = [256, 512, 1024, 1280, 2560]
+    # The eager convolutions run at widths padded to a multiple of this (``_padded`` in
+    # ``components/audio.py``): about 20 widths a 25 s clip, rather than one per length.
+    CONV_WIDTH_QUANTUM = 128
 
     # Every clip has its own length, which a compiled forward would recompile for; the
     # captured block loop is what makes it fast.
@@ -406,11 +409,11 @@ class AudioEncoderSubmodule(NodeSubmodule):
         layout: list, tokens_per_request: list[int], **kwargs,
     ) -> dict[str, NameToTensorList]:
         encoder = self.model.encoder
-        hidden = encoder.frontend(mels, layout)
+        hidden = encoder.frontend(mels, layout, self.CONV_WIDTH_QUANTUM)
         encoded = self._replay_block_loop(engine_inputs, hidden, layout)
         if encoded is None:
             encoded = encoder.encode(hidden)
-        embeds = self.model.adapter(encoder.pool(encoded, layout), layout)
+        embeds = self.model.adapter(encoder.pool(encoded, layout), layout, self.CONV_WIDTH_QUANTUM)
         return {
             rid: {AUDIO_EMBEDS: [rows]}
             for rid, rows in zip(engine_inputs.request_ids, embeds.split(tokens_per_request), strict=True)

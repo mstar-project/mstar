@@ -76,6 +76,17 @@ def request_layout(mel_frames: list[int]) -> list[ClipLayout]:
     return [clip_layout(n, padded) for n in mel_frames]
 
 
+def _padded(n: int, quantum: int) -> int:
+    """``n`` rounded up to a multiple of ``quantum``.
+
+    A convolution's input zero-padded on its right gives the same outputs as the unpadded
+    one where those read only the input and its own zero padding, so a clip's convolutions
+    can run at one of a few widths. cuDNN builds a plan per input width, which costs 5-20 ms
+    the first time a width is seen (H200), so with clips of every length it would land on
+    almost every request."""
+    return -(-n // quantum) * quantum
+
+
 class WhisperEncoder(nn.Module):
     """``AudioEncoder``; parameter paths mirror the checkpoint's ``encoder.*`` but for each
     block's internals, which are ``AuTEncoderLayer``'s."""
@@ -99,13 +110,21 @@ class WhisperEncoder(nn.Module):
         )
         self.after_norm = nn.LayerNorm(d)
 
-    def frontend(self, mels: list[torch.Tensor], layout: list[ClipLayout]) -> torch.Tensor:
-        """Per clip ``[n_mels, M]`` -> packed ``[sum frames, d]``, positions from 0 per clip."""
+    def frontend(self, mels: list[torch.Tensor], layout: list[ClipLayout], quantum: int = 1) -> torch.Tensor:
+        """Per clip ``[n_mels, M]`` -> packed ``[sum frames, d]``, positions from 0 per clip.
+
+        ``quantum``: run the convolutions over the clip zero-padded on to a multiple of this
+        many mel frames, which gives the same frames (``_padded``) on one of a few widths."""
         dtype = self.conv1.weight.dtype
         out = []
         for mel, clip in zip(mels, layout, strict=True):
-            x = F.pad(mel.to(dtype), (0, clip.conv_frames - mel.shape[-1]))[None]
-            x = F.gelu(self.conv2(F.gelu(self.conv1(x))))[0, :, : clip.frames].transpose(0, 1)
+            width = _padded(clip.conv_frames, quantum)
+            x = F.pad(mel.to(dtype), (0, width - mel.shape[-1]))[None]
+            h = F.gelu(self.conv1(x))
+            if width > clip.conv_frames:
+                # conv2 reads past the clip's conv frames as its own zero padding
+                h[..., clip.conv_frames:] = 0
+            x = F.gelu(self.conv2(h))[0, :, : clip.frames].transpose(0, 1)
             out.append(x + self.positional_embedding.weight[: clip.frames])
         return torch.cat(out)
 
@@ -142,17 +161,21 @@ class Adapter(nn.Module):
         self.linear1 = nn.Linear(d, config.adapter_hidden)
         self.linear2 = nn.Linear(config.adapter_hidden, config.llm_dim)
 
-    def forward(self, pooled: torch.Tensor, layout: list[ClipLayout]) -> torch.Tensor:
+    def forward(self, pooled: torch.Tensor, layout: list[ClipLayout], quantum: int = 1) -> torch.Tensor:
         """Packed pooled frames -> each clip's kept tokens, end to end ``[sum tokens, llm_dim]``.
         The conv pads each clip on its own, so it runs per clip. The linears run on all its
         outputs (at most one past the kept tokens) and, for one clip, on the conv's
         channel-major view with a batch axis, as the reference's do: the same GEMM shape and
         operand route (a 2D input of that layout takes another) keeps a one-clip request
-        bit-identical to it."""
-        convolved = [
-            F.gelu(self.conv(clip_frames.transpose(0, 1)[None]))[0].transpose(0, 1)
-            for clip_frames in pooled.split([c.frames // 2 for c in layout])
-        ]
+        bit-identical to it. ``quantum`` pads each clip's conv input as ``frontend``'s does;
+        at a padded width the conv's outputs are the same values, though cuDNN may then take
+        another algorithm, so the served path is equivalent rather than bit-identical."""
+        convolved = []
+        for clip_frames in pooled.split([c.frames // 2 for c in layout]):
+            n = clip_frames.shape[0]
+            x = F.pad(clip_frames.transpose(0, 1)[None], (0, _padded(n, quantum) - n))
+            # the outputs of the unpadded input (stride 2, padding 1)
+            convolved.append(F.gelu(self.conv(x))[0, :, : (n - 1) // 2 + 1].transpose(0, 1))
         rows = convolved[0] if len(convolved) == 1 else torch.cat(convolved)
         out = self.linear2(F.relu(self.linear1(rows[None])))[0]
         if all(c.tokens == x.shape[0] for c, x in zip(layout, convolved, strict=True)):
@@ -177,8 +200,8 @@ class StepAudio2Audio(nn.Module):
         for block in self.encoder.blocks:
             block.self_attn.qkv_proj.bias.data.zero_()
 
-    def forward(self, mels: list[torch.Tensor], layout: list[ClipLayout]) -> torch.Tensor:
+    def forward(self, mels: list[torch.Tensor], layout: list[ClipLayout], quantum: int = 1) -> torch.Tensor:
         """A step's clips (each ``[n_mels, M]``, any number of requests, with ``layout`` from
         ``request_layout`` per request) -> ``[sum tokens, llm_dim]``, clips end to end."""
-        hidden = self.encoder.encode(self.encoder.frontend(mels, layout))
-        return self.adapter(self.encoder.pool(hidden, layout), layout)
+        hidden = self.encoder.encode(self.encoder.frontend(mels, layout, quantum))
+        return self.adapter(self.encoder.pool(hidden, layout), layout, quantum)
