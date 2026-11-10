@@ -3,7 +3,7 @@ import json
 import logging
 import os
 import re
-from collections.abc import Container
+from collections.abc import Container, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -671,6 +671,26 @@ def check_loaded(module: torch.nn.Module, loaded: set[str], what: str) -> None:
     missing = sorted({name for name, _ in module.named_parameters()} - loaded)
     if missing:
         raise KeyError(f"{what}: checkpoint is missing {len(missing)} parameters, e.g. {missing[:4]}")
+
+
+def long_context_kwargs(kwargs: Mapping[str, Any]) -> bool:
+    """Whether ``model_kwargs`` turn ``dsa_long_context`` on, after refusing the long-context
+    knobs a model would misread: one that only applies with it, a switch that is not a bool
+    (``bool("false")`` is True) and a count that is not an int (``int()`` takes True as 1 and
+    2.5 as 2)."""
+    on = kwargs.get("dsa_long_context", False)
+    long_only = sorted(k for k in ("max_seq_len", "prefill_window_tokens", "dsa_shard_prefill")
+                       if k in kwargs)
+    if long_only and not on:
+        # they size and split the long-context path only; without it they would be dropped
+        raise ValueError(f"{long_only} apply only with dsa_long_context")
+    for key in ("dsa_long_context", "dsa_shard_prefill"):
+        if key in kwargs and not isinstance(kwargs[key], bool):
+            raise ValueError(f"{key} must be true or false, got {kwargs[key]!r}")
+    for key in ("max_seq_len", "prefill_window_tokens"):
+        if key in kwargs and (isinstance(kwargs[key], bool) or not isinstance(kwargs[key], int)):
+            raise ValueError(f"{key} must be an integer, got {kwargs[key]!r}")
+    return on
 
 
 def kv_pages(tokens: int, page_size: int, requests: int) -> int:
