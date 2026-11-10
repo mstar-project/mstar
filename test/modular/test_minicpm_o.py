@@ -643,8 +643,9 @@ def test_an_unk_the_user_types_stays_a_token(chat_model, media):
 
 @needs_ckpt
 def test_kv_layout_covers_the_prompt_and_each_decode_step(model):
-    """The LLM's layout: one span over every prompt row (placeholders included),
-    written by the prefill walk the request takes, then a row per decode step."""
+    """The LLM's layout: every prompt row (placeholders included), written by
+    the prefill walk the request takes, the text as ``ids`` spans and each
+    run of pads as a ``rows`` span, then a row per decode step."""
     from mstar.model.base import LabelLayout
     from mstar.model.minicpm_o.config import TTS_KV
     from mstar.model.multimodal import PromptPart
@@ -654,9 +655,12 @@ def test_kv_layout_covers_the_prompt_and_each_decode_step(model):
         tensors={"image_inputs": [an_image()]},
         prompt_parts=[PromptPart("image"), PromptPart("text", "Describe it.")],
     )
-    (span,) = out.metadata["kv_layout"][KV_CACHE]["main"].spans
+    spans = out.metadata["kv_layout"][KV_CACHE]["main"].spans
     rows = out.new_input_tensors["text_inputs"][0].numel()
-    assert (span.walk, span.length, span.advance) == ("prefill_image", rows, rows)
+    assert {s.walk for s in spans} == {"prefill_image"}
+    assert sum(s.length for s in spans) == sum(s.advance for s in spans) == rows
+    layout = out.metadata["media_layout"]
+    assert [s.length for s in spans if s.kind == "rows"] == layout["tokens"]
     assert out.metadata["kv_layout"][KV_CACHE]["main"].growth == ((DECODE_LOOP, 1),)
     assert set(model.kv_labels()) == {KV_CACHE, TTS_KV}
     # a text reply opens the TTS's pool with nothing in it; a spoken one prefills its
