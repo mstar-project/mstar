@@ -2048,12 +2048,20 @@ methods are:
    a device read. ``check_stop_batched`` returns a ``BatchedStopCheck`` for the same.
    The Qwen3-Omni Talker and Fish S2 Pro's AR keep their EOS frame out of the codec
    stream this way; a ``TokenStop`` names such outputs in ``withhold``, left unrouted on a
-   row whose token is a stop id (the Qwen3-TTS Talker).
-   Only an output that leaves by a streaming edge, as a tensor or by value, can be withheld
-   (any other consumer would wait for an item that never comes), and not one that a node
-   this worker speculates into reads, nor the loop-back signal. Startup refuses a
-   ``TokenStop.withhold`` that breaks this; a ``StopCheck`` from ``check_stop`` is not
-   checked.
+   row whose token is a stop id (the Qwen3-TTS Talker). Its ``withhold_unless``, a
+   predicate on the sampled id, also withholds them on a row whose token fails it, for a
+   stream that carries only some of the ids (Step-Audio2's spoken decode streams its
+   speech ids, ``withhold_unless=is_speech_id``, and not the text between them); its
+   ``withhold_walk`` limits withholding, the stop-id one too, to the walks that have the
+   stream (None, the default, is every walk).
+   Only an output that leaves by a streaming edge, as a tensor or by value, can be
+   withheld (any other consumer would wait for an item that never comes), and not one
+   that a node this worker speculates into reads, nor the loop-back signal. The graph runtime's own stop check
+   never withholds, so a walk that withholds keeps ``check_stop``: its
+   ``get_stop_policies`` must return None, which ``TokenStop`` does for its withholding
+   walks even with ``runtime_check``. Startup refuses, per walk that withholds, a
+   ``TokenStop.withhold`` that breaks either rule; a ``StopCheck`` from ``check_stop`` is
+   not checked.
 
 ``on_request_added(self, request_id, request_info)`` (optional)
    Called on the worker's main thread when the request reaches the worker, before any of

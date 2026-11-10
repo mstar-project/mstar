@@ -77,18 +77,43 @@ class TokenStop:
     # or not (``StopCheck.withheld``): a frame streamed beside the stop token
     # is loop control, and only the stop check's host copy tells it from data
     withhold: tuple[str, ...] = ()
+    # also withhold on a row whose token fails this, for a stream that carries
+    # only some of the ids sampled (Step-Audio2's speech ids, beside its text)
+    withhold_unless: Callable[[int], bool] | None = None
+    # the only walk, or walks, whose rows withhold; None for every walk
+    withhold_walk: str | frozenset[str] | None = None
     # the graph runtime checks ``walk``'s stop ids itself, without calling
     # check_stop (``ARNodeSubmodule.get_stop_policies``); the prompt walks keep
-    # check_stop, which can end the partition. The runtime's check never
-    # withholds, so a walk with a withheld output must keep check_stop (its
-    # ``get_stop_policies`` None), which startup checks per walk
-    # (``engine_manager._refuse_unroutable_withholds``)
+    # check_stop, which can end the partition, and so does a walk that
+    # withholds, since the runtime's check never withholds (startup refuses a
+    # submodule that overrides that: ``engine_manager._refuse_unroutable_withholds``)
     runtime_check: bool = False
+
+    def __post_init__(self):
+        if (self.withhold_unless is not None or self.withhold_walk is not None) and not self.withhold:
+            raise ValueError("a TokenStop's withhold_unless and withhold_walk need outputs to withhold")
 
     def stops_on(self, graph_walk: str) -> bool:
         """Whether a row of ``graph_walk`` can stop the loop."""
-        walk = self.walk
-        return walk is None or graph_walk == walk or (isinstance(walk, frozenset) and graph_walk in walk)
+        return _names_walk(self.walk, graph_walk)
+
+    def withholds_on(self, graph_walk: str) -> bool:
+        """Whether a row of ``graph_walk`` can withhold ``withhold``."""
+        return bool(self.withhold) and _names_walk(self.withhold_walk, graph_walk)
+
+    def withholds_row(self, token: int, info) -> bool:
+        """Whether the row of ``info`` that sampled ``token`` withholds ``withhold``
+        (which the caller has checked is set). The token tests first: they need no
+        read through the info wrapper."""
+        unless = self.withhold_unless
+        if token not in self.stop_ids and (unless is None or unless(token)):
+            return False
+        return self.withhold_walk is None or _names_walk(self.withhold_walk, info.graph_walk)
+
+
+def _names_walk(walks: str | frozenset[str] | None, graph_walk: str) -> bool:
+    """``walks`` (one, several, or None for every walk) includes ``graph_walk``."""
+    return walks is None or graph_walk == walks or (isinstance(walks, frozenset) and graph_walk in walks)
 
 
 class DeviceLoopback(NamedTuple):
@@ -1700,15 +1725,15 @@ class ARNodeSubmodule(NodeSubmodule):
     def get_stop_policies(self, graph_walk: str) -> dict[str, StopPolicy] | None:
         stop = self.token_stop
         # A walk asked to repeat that can (it runs resident and loops its token
-        # back) reads its stop in the runtime, unless the stop withholds a frame,
-        # which only check_stop does. Any other walk keeps the node's own stop.
+        # back) reads its stop in the runtime, unless the stop withholds a frame
+        # on it, which only check_stop does. Any other walk keeps the node's own stop.
         runtime = stop is not None and (
             stop.runtime_check or (
                 graph_walk in self._repeat_walks and graph_walk in self.resident_walks()
-                and self._loops_back(graph_walk) and not stop.withhold
+                and self._loops_back(graph_walk)
             )
         )
-        if not runtime or graph_walk in stop.prefill_walks:
+        if not runtime or graph_walk in stop.prefill_walks or stop.withholds_on(graph_walk):
             return super().get_stop_policies(graph_walk)
         if not stop.stops_on(graph_walk):
             return {}  # as `_token_stops`: only a row of ``walk`` ends the loop
@@ -1730,7 +1755,7 @@ class ARNodeSubmodule(NodeSubmodule):
         # a row's first element, as ``HostRows.first_values`` reads it
         token = outputs[stop.buffer][0].reshape(-1)[0].item()
         stops = self._stop_names(request_info) if self._token_stops(request_id, token, request_info) else set()
-        if stop.withhold and token in stop.stop_ids:
+        if stop.withhold and stop.withholds_row(token, request_info):
             return StopCheck(stops, withheld=stop.withhold)
         return stops
 
@@ -1753,10 +1778,11 @@ class ARNodeSubmodule(NodeSubmodule):
             }
         stops: dict[str, set[str]] = {}
         withheld: dict[str, tuple[str, ...]] = {}
+        withholds = stop.withholds_row
         for rid, token in pairs:
             if verdict(rid, token, info := request_infos[rid]):
                 stops[rid] = names(info)
-            if token in stop.stop_ids:
+            if withholds(token, info):
                 withheld[rid] = stop.withhold
         return BatchedStopCheck(stops, withheld) if withheld else stops
 

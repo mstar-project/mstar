@@ -170,13 +170,14 @@ def _refuse_unroutable_withholds(submodules: dict, model: Model) -> None:
     (``ARNodeSubmodule.device_loopback``) is kept on the device, so
     withholding it does nothing. And the graph runtime's own stop check
     (``get_stop_policies``) never withholds, so the walk must leave its stops
-    to ``check_stop``."""
+    to ``check_stop`` (``ARNodeSubmodule`` does, unless overridden). Only the
+    walks whose rows withhold (``TokenStop.withholds_on``) count."""
     for walk, section in model.get_graph_walk_graphs().items():
         nodes = section.get_nodes()
         for name, node in nodes.items():
             submodule = submodules.get(name)
             stop = getattr(submodule, "token_stop", None)
-            if stop is None:
+            if stop is None or not stop.withholds_on(walk):
                 continue
             loopback = getattr(submodule, "device_loopback", None)
             loopback_signal = loopback.signal if loopback is not None and loopback.covers(walk) else None
