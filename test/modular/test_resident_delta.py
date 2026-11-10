@@ -1382,13 +1382,14 @@ def _pool_rank(monkeypatch, rank: int, cfg: PagedKVConfig | None = None) -> tupl
     return kv, engine
 
 
-def _ingest(kvs, rid: str, pages: int, arrival: int, rebuildable: bool = True) -> None:
+def _ingest(kvs, rid: str, pages: int, arrival: int, rebuildable: bool = True, guaranteed: bool = False) -> None:
     """``rid``'s prompt fills ``pages`` pages, and it decodes one token per iteration."""
     tokens = pages * PAGE_SIZE
     layout = StreamLayout(spans=(PrefixSpan(tokens, tokens, "prefill"),), growth=(("decode", 1),))
     for kv in kvs:
         _ENGINES[id(kv)]._runner.ingest_request(rid, {"kv": KVReqConfig(
             kv_layout={"main": layout}, loop_caps={"decode": 4 * PAGE_SIZE}, rebuildable=rebuildable,
+            unpausable=guaranteed,
         )}, arrival)
 
 
@@ -1396,7 +1397,10 @@ def _counts(kv) -> tuple:
     """What the next admit reads, and the order the next grant takes free pages in."""
     return (
         kv._unused,
-        {rid: (a.pages, a.remaining, a.asks_again, a.grown, a.grown_from) for rid, a in kv._allotments.items()},
+        {
+            rid: (a.pages, a.remaining, a.asks_again, a.grown, a.grown_from, a.taken_back)
+            for rid, a in kv._allotments.items()
+        },
         # a request the moves set aside waits holding only on rank 0, which alone moves it
         sorted(kv._stalled & kv._asks.keys()),
         {rid: (e.pages, sorted(e.victims), e.granted) for rid, e in kv._earmarks.items()},
@@ -1867,6 +1871,29 @@ def test_a_follower_allots_the_room_rank_0_counted_for_a_short_grant(monkeypatch
     assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
 
     assert _counts(follower) == _counts(leader), "r's allotment here lacks the room rank 0 counted for its grant"
+
+
+def test_a_follower_holds_back_what_rank_0_took_back_from_an_older_borrower(monkeypatch):
+    """o borrowed what g hasn't written, and rank 0 drops o, older, for g's grant. A follower that grew g's allotment
+    by the pages o freed, instead of holding them back from borrowers, would let o's return borrow them there."""
+    (leader, lead), (follower, follow) = _pool_rank(monkeypatch, 0), _pool_rank(monkeypatch, 1)
+    _ingest((leader, follower), "o", 3, arrival=1)
+    _ingest((leader, follower), "g", 1, arrival=2, guaranteed=True)
+    assert _admits(leader, "o") and _admits(leader, "g")
+    assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
+    for rid, tokens in (("o", 3 * PAGE_SIZE), ("g", PAGE_SIZE), ("o", 3 * PAGE_SIZE)):
+        assert _step(leader, rid, tokens).ok and _step(follower, rid, tokens).ok
+    outcome = _step(leader, "g", 4 * PAGE_SIZE)
+    assert not outcome.ok and not _step(follower, "g", 4 * PAGE_SIZE).ok
+    runner = _ENGINES[id(leader)]._runner
+    victims = leader.preempt("g", outcome.reason.pages_short, runner.newer_than("g"), runner.older_than("g"), bool)
+    assert victims.to_drop == ["o"]
+    lead.drop_request(NODE, "o", 6 * PAGE_SIZE)
+
+    assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
+
+    assert _counts(follower) == _counts(leader), "g holds back other pages here than on rank 0"
+    assert _step(leader, "g", 4 * PAGE_SIZE).ok and _step(follower, "g", 4 * PAGE_SIZE).ok
 
 
 def test_a_short_grant_with_no_room_to_claim_leaves_the_allotment_alike_on_every_rank(monkeypatch):

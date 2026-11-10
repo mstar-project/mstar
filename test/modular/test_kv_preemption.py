@@ -1205,6 +1205,103 @@ def test_a_request_grows_into_pages_a_guaranteed_request_was_allotted_and_hasnt_
     assert kv.residency("v") is Residency.RESIDENT and kv._allotments["g"].remaining == 4
 
 
+def test_a_guaranteed_request_takes_back_what_it_lent_by_moving_the_newest_preemptible_request(monkeypatch):
+    """o borrowed what g hasn't written. g's grant then moves v, the newest, and keeps every page v frees, so o can't
+    borrow them again before g writes them."""
+    monkeypatch.setattr(manager_mod, "_DEBUG_ASSERTS", True)
+    kv = _pool()
+    _running(kv, "o", 3, arrival=0)
+    _running(kv, "g", 1, arrival=1, guaranteed=True)
+    _running(kv, "v", 1, arrival=2)
+    assert _step(kv, "o", 2 * PAGE_SIZE).ok, "o ran short with the pages it needs free in g's allotment"
+    pages = kv._allotments["g"].pages
+
+    short = _step(kv, "g", 4 * PAGE_SIZE).reason.pages_short
+    assert _preempt(kv, "g", short, droppable=lambda rid: True).to_drop == ["v"]
+    _drop(kv, "v")
+
+    assert kv._spare() == 0, "o can borrow the pages g took back"
+    assert _step(kv, "g", 4 * PAGE_SIZE).ok and kv._allotments["g"].pages == pages, "g grew instead of taking back"
+
+
+@pytest.mark.parametrize("moves", ["is dropped", "moves to the host"])
+def test_a_guaranteed_request_takes_back_what_it_lent_from_an_older_borrower(moves):
+    """o arrived before g and borrowed what g hasn't written. A request that runs short moves only newer ones, so g
+    would have waited for o to finish, a gap in its stream."""
+    kv = _pool()
+    if moves == "moves to the host":
+        kv._cpu_pool = host._HostPool(64)
+    _running(kv, "o", 3, arrival=0)
+    _running(kv, "g", 1, arrival=1, guaranteed=True)
+    assert _step(kv, "o", 3 * PAGE_SIZE).ok, "o ran short with the pages it needs free in g's allotment"
+
+    victims = _preempt(kv, "g", _step(kv, "g", 4 * PAGE_SIZE).reason.pages_short, droppable=lambda rid: True)
+
+    assert (victims.to_drop, victims.to_host) == ((["o"], []) if moves == "is dropped" else ([], ["o"]))
+    (_drop if moves == "is dropped" else _offload)(kv, "o")
+    assert _step(kv, "g", 4 * PAGE_SIZE).ok, "g couldn't take back what o borrowed"
+
+
+def test_a_guaranteed_request_whose_borrower_cant_move_yet_lends_nothing_more_until_it_takes_back():
+    """o borrowed what g hasn't written, and has a step in flight when g needs the pages, so g waits holding its
+    allotment. Had lending gone on, o and newer prompts would have taken the room as it came free, and g would have
+    waited for o to finish. o instead runs short at its next page and waits too, and g moves it."""
+    kv = _pool()
+    _running(kv, "o", 3, arrival=0)
+    _running(kv, "g", 1, arrival=1, guaranteed=True)
+    assert _step(kv, "o", 3 * PAGE_SIZE).ok, "o ran short with the pages it needs free in g's allotment"
+    short = _step(kv, "g", 4 * PAGE_SIZE).reason.pages_short
+    kv._streams["o"]["main"].step_in_flight = True
+    assert _preempt(kv, "g", short, droppable=lambda rid: True).waits
+    kv._streams["o"]["main"].step_in_flight = False
+    _runner(kv).readmit("g", NODE)
+    _request(kv, "p", 1, arrival=2)
+
+    assert not _ready(kv, "p"), "p borrowed what g waits to take back"
+    assert _preempt(kv, "o", _short(kv, "o"), droppable=lambda rid: True).waits
+    _runner(kv).readmit("o", NODE)
+    assert _make_room(kv, droppable=lambda rid: True).to_drop == ["o"], "g waited for o to finish"
+    _drop(kv, "o")
+    assert _admitted(kv, "g") and _step(kv, "g", 4 * PAGE_SIZE).ok
+
+
+def test_a_guaranteed_request_is_admitted_against_what_moving_preemptible_requests_frees():
+    """g1's footprint doesn't fit in the free pages, but it can take back every page x holds. g2's footprint fits only
+    in what g1 was allotted, which nothing can take back."""
+    kv = _pool()
+    _running(kv, "x", 5, arrival=0)
+    _request(kv, "g1", 2, arrival=1, guaranteed=True)
+    _request(kv, "g2", 2, arrival=2, guaranteed=True)
+
+    assert _ready(kv, "g1"), "g1 waited for x, whose pages it can take back"
+    assert not _ready(kv, "g2"), "g2 was admitted into pages g1 was allotted"
+
+
+def test_a_passer_borrows_what_a_guaranteed_request_lends_but_none_of_the_pages_kept_for_the_head():
+    kv = _pool()
+    _running(kv, "g", 2, arrival=0, guaranteed=True)
+    _request(kv, "h", 9, arrival=1)
+    assert not _admitted(kv, "h")
+    _request(kv, "p", 5, arrival=2, decodes=1)
+    assert _ready(kv, "p"), "p passed h only into room no allotment counts"
+    _remove(kv, "p")
+    _request(kv, "q", 3, arrival=3, decodes=1)
+
+    assert kv._kept == 6 and not _ready(kv, "q"), "q borrowed the pages p left kept for h"
+
+
+def test_a_request_no_move_can_free_borrows_nothing():
+    """u can be neither dropped nor moved to a host, so it is guaranteed, and whatever it borrowed could never be
+    taken back. Past its footprint it takes only the room."""
+    kv = _pool()
+    _running(kv, "g", 1, arrival=0, guaranteed=True)
+    _running(kv, "u", 1, arrival=1, rebuildable=False, decodes=PAGE_SIZE)
+    _running(kv, "x", 3, arrival=2)
+    assert _step(kv, "u", PAGE_SIZE).ok
+
+    assert not _step(kv, "u", 1).ok, "u borrowed what g lends"
+
+
 def test_a_page_an_earlier_row_gives_back_is_no_release():
     """Run row by row, a step admits each row as a step of its own and rolls back the rows ahead of one that fails,
     after that row has rolled back. r's grant counted the page a then gave back as room it had seen, took it, and a's
