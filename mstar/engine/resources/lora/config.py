@@ -13,13 +13,13 @@ import dataclasses
 import os
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Literal, NamedTuple
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, NamedTuple
 
 import torch
 
 from mstar.distributed.utils import kv_head_replicas
-from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig, check_sizes
-from mstar.engine.resources.step import ResourceStep
+from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig, check_sizes, instance_key
+from mstar.utils.client_errors import scrub_paths
 
 if TYPE_CHECKING:
     from mstar.engine.resources.base import Resource
@@ -30,29 +30,29 @@ if TYPE_CHECKING:
 LORA_RESOURCE_KEY = "lora"
 # The request kwarg that names a request's adapter; the OpenAI ``model`` field maps onto it.
 LORA_ADAPTER_KWARG = "lora_adapter"
+# The digest of the adapter's weights when the API server selected it (``ServedModels``),
+# set there, never by a client.
+LORA_DIGEST_KWARG = "lora_digest"
 
 
 def lora_enabled(model_config: Mapping[str, Any]) -> bool:
-    """Whether a deployment's YAML turns LoRA on (a ``resources: lora:`` block). A
-    ``resources:`` value that is not a mapping turns nothing on: the conductor's
-    ``validate_deployment`` reports it with the deployment's other problems."""
+    """Whether a deployment's YAML turns LoRA on (a ``resources: lora:`` block), with or
+    without adapters named in it: adapters may also be loaded at runtime. A ``resources:``
+    value that is not a mapping turns nothing on: the conductor's ``validate_deployment``
+    reports it with the deployment's other problems."""
     resources = model_config.get("resources")
     return isinstance(resources, Mapping) and LORA_RESOURCE_KEY in resources
 
 
-def served_lora_adapters(model_config: Mapping[str, Any]) -> tuple[str, ...]:
-    """The adapter names a deployment's YAML serves; empty when it does not turn LoRA on."""
-    block = model_config["resources"][LORA_RESOURCE_KEY] if lora_enabled(model_config) else None
-    return tuple(block.get("adapters") or ()) if isinstance(block, Mapping) else ()
-
-
 def describe_load_error(exc: BaseException) -> str:
     """What a failed adapter read tells a client: a refusal (a ``ValueError``: rank,
-    targets, shapes, weights changed on disk, a name already loaded) as itself, anything
+    targets, shapes, weights changed on disk, a name already loaded) as itself, with
+    server paths cut to base names as every route's errors are (``scrub_paths``), anything
     else (an I/O error naming the server's files, say) only that it could not be read.
-    The caller logs ``exc`` in full."""
+    Deterministic, so every rank of an instance says the same. The caller logs ``exc``
+    in full."""
     if isinstance(exc, ValueError):
-        return str(exc)
+        return scrub_paths(str(exc))
     return "the adapter could not be read (the server log has the details)"
 
 
@@ -94,7 +94,8 @@ class LoraTarget:
     ``slice_packs`` names checkpoint modules that pack several slices into one tensor: a
     gated delta-net's ``in_proj_qkv`` is ``[q | k | v]``, three outputs the base shards
     across ranks on their own. Such a module has one A, which each of its slices takes,
-    and a B whose rows are those slices' in order.
+    and a B whose rows are those slices' in order. A pack named None is the module itself
+    as a checkpoint stores it fused, with no stacked-shard id.
 
     ``slice_align`` rounds each slice's rank-local width up to a multiple, for a base
     linear that pads its fused output per rank so the next slice starts aligned. The
@@ -102,6 +103,10 @@ class LoraTarget:
 
     ``layers`` names the stack layer indices this target exists on (a hybrid stack has
     attention on some layers only); None means all of the spec's ``num_layers``.
+
+    ``node`` is the graph node the target's linears run on, which a spec over several
+    nodes names for every target (each node's pool holds its own, ``LoraSpec.for_node``);
+    None for a spec over one node.
 
     ``kind="embedding"`` is a token embedding: ``in_features`` is the vocabulary, a row's
     input is its token id, and the shrink gathers A's column for it (``x @ A^T`` of the
@@ -111,6 +116,14 @@ class LoraTarget:
     (the default), one per segment (``per_segment``, e.g. an LM head over each row's last
     token), or one per ``token_fold`` consecutive tokens of a segment (a patch merger that
     folds 2x2 patches into one row).
+
+    ``experts`` counts the groups of the weight: 1 for a linear, ``E`` for one stacked
+    parameter of an MoE layer's routed experts (``[E, out, in]``), where each row runs
+    its token's slot's adapter on the expert the router picked for it. Each expert has
+    its own A and B per slice, named in a checkpoint by the stacked-shard id
+    ``"<slice>:<expert>"`` (``"gate:3"``). ``expert_split`` is ``(first, count)`` of the
+    experts one rank's module holds when expert parallelism splits them; None when it
+    holds every expert.
     """
 
     in_features: int
@@ -118,12 +131,15 @@ class LoraTarget:
     parallel: Literal["column", "row", "none"] = "column"
     slice_names: tuple[str | int, ...] = ()
     slice_units: tuple[int, ...] | None = None
-    slice_packs: tuple[tuple[str | int, tuple[str | int, ...]], ...] | None = None
+    slice_packs: tuple[tuple[str | int | None, tuple[str | int, ...]], ...] | None = None
     slice_align: tuple[int, ...] | None = None
     layers: tuple[int, ...] | None = None
+    node: str | None = None
     kind: Literal["linear", "embedding"] = "linear"
     per_segment: bool = False
     token_fold: int = 1
+    experts: int = 1
+    expert_split: tuple[int, int] | None = None
 
     def __post_init__(self):
         object.__setattr__(self, "out_slices", tuple(self.out_slices))
@@ -169,6 +185,18 @@ class LoraTarget:
             raise ValueError(
                 f"token_fold must be >= 1, and 1 with per_segment; got {self.token_fold}"
             )
+        if self.experts < 1:
+            raise ValueError(f"experts must be >= 1; got {self.experts}")
+        if self.experts > 1 and (
+            self.kind != "linear" or self.row_grouping != 1 or self.slice_packs is not None
+            or not self.slice_names
+        ):
+            raise ValueError(
+                "an experts target is a linear over the step's tokens, with each slice named "
+                "and no packs"
+            )
+        if self.expert_split is not None and self.experts == 1:
+            raise ValueError("expert_split needs an experts target")
 
     @property
     def num_slices(self) -> int:
@@ -184,8 +212,21 @@ class LoraTarget:
         0 per segment."""
         return 0 if self.per_segment else self.token_fold
 
+    def expert_of(self, shard_id: str | int | None) -> int:
+        """The expert a checkpoint module of an experts target holds, from its
+        ``"<slice>:<expert>"`` shard id; 0 for any other target."""
+        if self.experts == 1:
+            return 0
+        expert = _expert_part(shard_id)
+        if expert is None or not 0 <= expert < self.experts:
+            raise KeyError(f"shard id {shard_id!r} names no expert of {self.experts}")
+        return expert
+
     def slice_index(self, shard_id: str | int | None) -> int:
         """Which slice a checkpoint module lands on, from its stacked-shard id."""
+        if self.experts > 1:
+            self.expert_of(shard_id)
+            shard_id = shard_id.rsplit(":", 1)[0]
         if shard_id is None:
             if self.num_slices != 1:
                 raise KeyError(
@@ -255,6 +296,13 @@ class LoraTarget:
         return a, b.narrow(0, *self.slice_rows(slice_idx, rank, world_size))
 
 
+def _expert_part(shard_id: str | int | None) -> int | None:
+    if not isinstance(shard_id, str) or ":" not in shard_id:
+        return None
+    expert = shard_id.rsplit(":", 1)[1]
+    return int(expert) if expert.isdigit() else None
+
+
 def _divide(numerator: int, denominator: int) -> int:
     if numerator % denominator:
         raise ValueError(f"{numerator} is not divisible by {denominator}")
@@ -263,11 +311,14 @@ def _divide(numerator: int, denominator: int) -> int:
 
 class LoraModuleRef(NamedTuple):
     """Where one checkpoint module's adapter lands: a target, a stack layer, and the
-    stacked-shard id of its slice (None for a single-slice target)."""
+    stacked-shard id of its slice (None for a single-slice target). ``param`` names the
+    parameter of the bound module the target adapts, for a module with a target per
+    parameter (MoE experts); None for a module that is one target."""
 
     target: str
     layer: int
     shard_id: str | int | None = None
+    param: str | None = None
 
 
 # checkpoint module path -> where it lands, or None for a module the model does not know
@@ -275,9 +326,9 @@ LoraModuleResolver = Callable[[str], "LoraModuleRef | None"]
 
 
 class AdapterInfo(NamedTuple):
-    """What validation needs to know about an adapter checkpoint, read without its weights.
+    """What validation needs to know about an adapter checkpoint, from its modules' shapes.
 
-    ``rank`` covers every LoRA module in the file, those left to another spec included.
+    ``rank`` covers every LoRA module in the file, those left to another node's pool included.
     ``misfits`` names modules whose shapes do not fit their target (an adapter trained on
     another size of the model)."""
 
@@ -294,21 +345,40 @@ class LoraSpec(NodeResourceSpec):
     base-model rows use, and up to ``cpu_capacity`` are kept pinned on the host.
     ``adapters`` maps the names requests ask for to safetensors paths. ``module_map``
     places each checkpoint module on a target; a node's spec comes from
-    ``module_lora_spec`` (``mstar.model.components.lora.modules``), whose
-    ``ModuleLoraMap`` is what binds the node's modules (a spec with any other resolver
-    is refused as the deployment's specs are declared, ``declared_lora_specs``).
-    ``convert_keys`` rewrites a model-native checkpoint layout first.
+    ``module_lora_spec`` (``mstar.model.components.lora.modules``), whose ``LoraMap`` is
+    what binds the node's modules, and a pool built with any other resolver is refused at
+    bind. ``convert_keys`` rewrites a model-native checkpoint layout first. ``declare``
+    gives ``num_layers``, ``targets``, ``module_map`` and ``ignored_modules`` in place of
+    passing them, on their first read: ``module_lora_spec`` walks a node's modules there,
+    which a deployment that never builds the spec skips.
+
+    Opt-in (``NodeResourceSpec.opt_in``): built only for a deployment whose serving config
+    has a ``resources: lora:`` block. One spec covers every node an adapter reaches (an
+    LLM and its vision tower), and each node gets a pool of its own (``per_node``): the
+    nodes may sit in different lockstep instances, whose ranks must make the same slot
+    decisions.
     """
 
-    num_layers: int
-    targets: dict[str, LoraTarget]
-    module_map: LoraModuleResolver
+    opt_in: ClassVar[bool] = True
+    per_node: ClassVar[bool] = True
+
+    # what ``declare`` may give defaults by factory, which sets no class attribute that
+    # would answer a read before ``__getattr__`` does
+    num_layers: int = field(default_factory=int)
+    targets: dict[str, LoraTarget] = field(default_factory=dict)
+    module_map: LoraModuleResolver | None = field(default_factory=lambda: None)
     max_slots: int = 4
     max_rank: int = 16
     cpu_capacity: int = 16
     adapters: dict[str, str] = field(default_factory=dict)
+    # serve /v1/load_lora_adapter and /v1/unload_lora_adapter, which make the server read
+    # client-named paths; off, they answer 404 as vLLM's do without its opt-in
+    runtime_updates: bool = False
+    # how long the conductor waits for every worker to answer a runtime load or unload
+    # before it gives up on it (a load is then undone everywhere)
+    runtime_update_timeout_s: float = 120.0
     # adapter name -> the digest (``identity.adapter_digest``) its weights were checked
-    # and prefix-keyed under; every read must match it. The conductor fills these in for
+    # and prefix-keyed under; every read must match it. The API server fills these in for
     # the serving config's adapters, and a runtime load carries its own.
     adapter_digests: dict[str, bytes] = field(default_factory=dict)
     # the slot weights' dtype; None takes the nodes' compute dtype (the serving config's
@@ -319,21 +389,45 @@ class LoraSpec(NodeResourceSpec):
     # something else in the process registered Triton's (registration is process-wide)
     backend: Literal["auto", "torch", "triton"] = "auto"
     convert_keys: Callable | None = None
-    # checkpoint modules this spec neither loads nor refuses: another node's LoRA spec of
-    # the same model loads them (a vision tower's), or the deployment never runs them
-    ignored_modules: Callable[[str], bool] | None = None
-    # targets the YAML's ``targets`` list dropped: a layer binding one gets no delta,
-    # while binding a name the spec never declared stays an error
-    dropped_targets: frozenset[str] = field(default_factory=frozenset)
-    _info: dict[str, AdapterInfo] = field(
-        default_factory=dict, init=False, repr=False, compare=False,
-    )
+    # checkpoint modules this spec neither loads nor refuses: the deployment never runs
+    # them, or (in a node's pool) another node's pool loads them
+    ignored_modules: Callable[[str], bool] | None = field(default_factory=lambda: None)
+    # declared targets not served: the experts targets unless the YAML's ``targets``
+    # names them (``module_lora_spec`` leaves them out), and any that list leaves out. A
+    # module bound to one gets no delta, and a later ``targets`` list may name it again
+    dropped_targets: dict[str, LoraTarget] = field(default_factory=dict)
+    declare: Callable[[], dict[str, Any]] | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self):
         super().__post_init__()
-        if not self.targets:
-            raise ValueError(f"LoRA resource {self.resource_key!r} declares no targets")
         check_sizes({name: getattr(self, name) for name in _SIZES})
+        if self.declare is not None:
+            for name in _DECLARED:
+                del self.__dict__[name]  # read through `__getattr__`
+            return
+        self._check_declaration()
+
+    def __getattr__(self, name: str) -> Any:
+        # reached only for an attribute not set: a field ``declare`` gives, read first
+        declare = self.__dict__.get("declare")
+        if declare is None or name not in _DECLARED:
+            raise AttributeError(f"{type(self).__name__!r} object has no attribute {name!r}")
+        self.__dict__.update(declare())
+        self.declare = None
+        self._check_declaration()
+        return self.__dict__[name]
+
+    def _check_declaration(self) -> None:
+        declared = {**self.targets, **self.dropped_targets}
+        if not declared:
+            raise ValueError(f"LoRA resource {self.resource_key!r} declares no targets")
+        if len(self.nodes) > 1:
+            astray = sorted(name for name, t in declared.items() if t.node not in self.nodes)
+            if astray:
+                raise ValueError(
+                    f"LoRA resource {self.resource_key!r} spans nodes {sorted(self.nodes)}, so "
+                    f"each target names one of them; {astray} do not"
+                )
 
     @property
     def num_slots(self) -> int:
@@ -356,6 +450,32 @@ class LoraSpec(NodeResourceSpec):
             "SP rank holds a shard of the tokens. Serve this node without SP, or drop the 'lora:' block"
         ]
 
+    def for_node(self, node: str) -> "LoraSpec | None":
+        """``node``'s pool: the targets on it, keyed ``lora@<node>``; None when the
+        YAML's ``targets`` left it none. Placement stays the whole spec's, so a pool reads
+        an adapter file as the API server checked it, leaving the modules another node's
+        targets place to that node's pool."""
+        own = {name: t for name, t in self.targets.items() if t.node in (None, node)}
+        if not own:
+            return None
+        elsewhere = frozenset(self.targets.keys() - own.keys())
+        ignored = self.ignored_modules
+        if elsewhere:
+            ignored = _ignoring(ignored, self.module_map, elsewhere)
+        dropped = {name: t for name, t in self.dropped_targets.items() if t.node in (None, node)}
+        return dataclasses.replace(
+            self, resource_key=instance_key(self.resource_key, node), nodes={node},
+            targets=own, dropped_targets=dropped, ignored_modules=ignored,
+        )
+
+    def request_config(self, model_kwargs: dict | None) -> "LoraReqConfig | None":
+        """The adapter the ``lora_adapter`` kwarg names, and the digest it was selected
+        under; None for a base-model request, which lets the pool run lean
+        (``Resource.lean_capture``)."""
+        kwargs = model_kwargs or {}
+        adapter = kwargs.get(LORA_ADAPTER_KWARG)
+        return None if adapter is None else LoraReqConfig(adapter=adapter, digest=kwargs.get(LORA_DIGEST_KWARG))
+
     def apply_yaml_overrides(
         self,
         max_slots: int | None = None,
@@ -363,14 +483,17 @@ class LoraSpec(NodeResourceSpec):
         cpu_capacity: int | None = None,
         adapters: dict[str, str] | None = None,
         adapter_digests: dict[str, str] | None = None,
+        runtime_updates: bool | None = None,
+        runtime_update_timeout_s: float | None = None,
         targets: list[str] | None = None,
     ):
         """How many adapters stay resident, the largest rank served, and which adapters
-        this deployment serves. ``targets`` keeps only those of the model's targets (one
-        list for every LoRA spec of the model, so a name another spec declares is not an
-        error here; ``serving_resources`` checks the list as a whole): dropping the LM
-        head and embedding saves their vocabulary-sized slots, and an adapter that
-        touches a dropped target is refused.
+        this deployment serves. ``targets`` serves just those of the model's declared
+        targets, the experts targets included (served only when named,
+        ``dropped_targets``): dropping the LM head and embedding saves their
+        vocabulary-sized slots, a node left with none gets no pool, and an adapter that
+        touches a dropped target is refused. Without ``targets`` the served set stays as
+        it is.
 
         Every value is checked before any is set, so a refused override leaves the spec
         as declared."""
@@ -380,6 +503,16 @@ class LoraSpec(NodeResourceSpec):
             if value is not None
         }
         check_sizes(sizes)
+        if runtime_updates is not None and not isinstance(runtime_updates, bool):
+            raise ValueError(f"runtime_updates must be true or false; got {runtime_updates!r}")
+        if runtime_update_timeout_s is not None and (
+            isinstance(runtime_update_timeout_s, bool)
+            or not isinstance(runtime_update_timeout_s, int | float)
+            or runtime_update_timeout_s <= 0
+        ):
+            raise ValueError(
+                f"runtime_update_timeout_s must be a positive number; got {runtime_update_timeout_s!r}"
+            )
         if adapters is not None:
             if not isinstance(adapters, dict) or not all(
                 isinstance(k, str) and isinstance(v, str) for k, v in adapters.items()
@@ -389,46 +522,44 @@ class LoraSpec(NodeResourceSpec):
             adapters = {name: resolve_adapter_path(path) for name, path in adapters.items()}
         if adapter_digests is not None:
             served = self.adapters if adapters is None else adapters
-            # hex, as the conductor writes them into the config it spawns workers with
+            # hex, as the API server writes them into the config the conductor gets
             adapter_digests = {
                 name: bytes.fromhex(digest) for name, digest in adapter_digests.items()
                 if name in served
             }
-        if targets is not None and (
-            not isinstance(targets, list) or not all(isinstance(t, str) for t in targets)
-        ):
-            raise ValueError(f"targets must be a list of target names; got {targets!r}")
+        if targets is not None:
+            if not isinstance(targets, list) or not all(isinstance(t, str) for t in targets):
+                raise ValueError(f"targets must be a list of target names; got {targets!r}")
+            declared = {**self.targets, **self.dropped_targets}
+            unknown = sorted(set(targets) - set(declared))
+            if unknown:
+                raise ValueError(
+                    f"`resources: {self.resource_key}: targets:` names {unknown}, which this "
+                    f"model does not declare; it declares {sorted(declared)}"
+                )
+            kept = {name: t for name, t in declared.items() if name in targets}
+            if not kept:
+                raise ValueError(
+                    f"`resources: {self.resource_key}: targets:` keeps none of {sorted(declared)}"
+                )
+        check_expert_ids(
+            self.resource_key, sizes.get("max_slots", self.max_slots), self.targets if targets is None else kept,
+        )
 
         for name, value in sizes.items():
             setattr(self, name, value)
+        if runtime_updates is not None:
+            self.runtime_updates = runtime_updates
+        if runtime_update_timeout_s is not None:
+            self.runtime_update_timeout_s = float(runtime_update_timeout_s)
         if adapters is not None:
             self.adapters = adapters
             self.adapter_digests = {}
-            self._info.clear()
         if adapter_digests is not None:
             self.adapter_digests = adapter_digests
         if targets is not None:
-            self.dropped_targets = self.dropped_targets | (set(self.targets) - set(targets))
-            self.targets = {name: t for name, t in self.targets.items() if name in targets}
-            self._info.clear()
-
-    def stop_ignoring(self, modules: Callable[[str], bool]) -> None:
-        """Refuse, rather than ignore, the checkpoint modules ``modules`` matches: those
-        of another node's spec the deployment does not build, which no spec loads now."""
-        if self.ignored_modules is None:
-            return
-        ignored = self.ignored_modules
-        self.ignored_modules = lambda m: ignored(m) and not modules(m)
-        self._info.clear()
-
-    def adapter_info(self, name: str) -> AdapterInfo:
-        """Rank and unmapped modules of a configured adapter, read once and cached."""
-        info = self._info.get(name)
-        if info is None:
-            from mstar.engine.resources.lora.store import inspect_adapter
-
-            info = self._info[name] = inspect_adapter(self, self.adapters[name])
-        return info
+            self.dropped_targets = {name: t for name, t in declared.items() if name not in kept}
+            self.targets = kept
 
     def check_adapter(self, name: str, info: AdapterInfo) -> None:
         """Refuse an adapter this deployment cannot serve: no LoRA layers, a rank above
@@ -444,6 +575,13 @@ class LoraSpec(NodeResourceSpec):
             # a module map built from the model's modules says why one is not a target
             explain = getattr(self.module_map, "explain", None)
             why = [r for r in map(explain, info.unmapped) if r] if explain else []
+            refs = (self.module_map(m) for m in info.unmapped) if self.dropped_targets else ()
+            off = sorted({ref.target for ref in refs if ref is not None and ref.target in self.dropped_targets})
+            if off:
+                note = f"targets {off} are left out of this deployment's `resources: {self.resource_key}: targets:`"
+                if any(self.dropped_targets[t].experts > 1 for t in off):
+                    note += ", and an experts target is served only when that list names it"
+                why.insert(0, note)
             raise ValueError(
                 f"LoRA adapter {name!r} touches modules this deployment does not "
                 f"serve LoRA on: {_some(info.unmapped)}. "
@@ -457,19 +595,46 @@ class LoraSpec(NodeResourceSpec):
                 "differently from the target it names"
             )
 
-    def add_adapter(self, name: str, path: str, digest: bytes | None = None) -> None:
-        """Serve ``name`` from ``path``, whose weights digest to ``digest``, from now on
-        (a runtime load)."""
-        self.adapters[name] = path
-        if digest is not None:
-            self.adapter_digests[name] = digest
-        self._info.pop(name, None)
 
-    def remove_adapter(self, name: str) -> None:
-        """Stop serving ``name`` (a runtime unload)."""
-        self.adapters.pop(name, None)
-        self.adapter_digests.pop(name, None)
-        self._info.pop(name, None)
+# what ``LoraSpec.declare`` gives
+_DECLARED = ("num_layers", "targets", "dropped_targets", "module_map", "ignored_modules")
+
+# the fused-MoE align op (``moe_align_block_size.cu``) groups, in one thread block, fewer
+# than this many ids once padded to its WARP_SIZE
+_ALIGN_MAX_IDS = 1024
+_ALIGN_WARP = 32
+
+
+def check_expert_ids(resource_key: str, max_slots: int, targets: Mapping[str, LoraTarget]) -> None:
+    """Refuse an experts target with more (slot, expert) ids, ``max_slots`` slots of its
+    experts each, than the align op groups."""
+    for name, target in targets.items():
+        ids = max_slots * target.experts
+        if target.experts == 1 or -(-ids // _ALIGN_WARP) * _ALIGN_WARP < _ALIGN_MAX_IDS:
+            continue
+        raise ValueError(
+            f"LoRA resource {resource_key!r}: target {name!r} holds {target.experts} experts "
+            f"per slot, so max_slots {max_slots} gives {ids} (slot, expert) ids, more than the "
+            f"fused-MoE align op groups (fewer than {_ALIGN_MAX_IDS}, padded to {_ALIGN_WARP}); "
+            f"serve at most {(_ALIGN_MAX_IDS - _ALIGN_WARP) // target.experts} slots "
+            f"(`resources: {LORA_RESOURCE_KEY}: max_slots:`), or leave the experts targets "
+            "out of its `targets:`"
+        )
+
+
+def _ignoring(
+    never_run: Callable[[str], bool] | None, place: LoraModuleResolver, elsewhere: frozenset[str],
+) -> Callable[[str], bool]:
+    """``LoraSpec.ignored_modules`` of one node's pool: what the spec ignores, and the
+    modules ``place`` puts on ``elsewhere``, the other nodes' targets."""
+
+    def ignored(module: str) -> bool:
+        if never_run is not None and never_run(module):
+            return True
+        ref = place(module)
+        return ref is not None and ref.target in elsewhere
+
+    return ignored
 
 
 _SIZES = ("max_slots", "max_rank", "cpu_capacity")
@@ -482,44 +647,16 @@ def _some(items: tuple[str, ...], n: int = 5) -> str:
 
 @dataclass
 class LoraReqConfig(ResourceReqConfig):
-    """The adapter a request runs under; None runs the base model."""
+    """The adapter a request runs under. A base-model request carries none.
 
-    adapter: str | None = None
+    Which adapters are served is the API server's to check (``ServedModels``), where a
+    request names one; a pool refuses at ingest a name it does not serve, or serves under
+    other weights than ``digest``, which the request's prompt was keyed under: the name
+    was unloaded and loaded again since."""
+
+    adapter: str
+    digest: bytes | None = None
 
     def validate(self, spec: "LoraSpec | None" = None) -> None:
-        if self.adapter is None:
-            return
         if not isinstance(self.adapter, str) or not self.adapter:
             raise ValueError(f"adapter must be a non-empty string; got {self.adapter!r}")
-        if spec is None:
-            return
-        if self.adapter not in spec.adapters:
-            raise ValueError(
-                f"unknown LoRA adapter {self.adapter!r}; this deployment serves "
-                f"{sorted(spec.adapters)}"
-            )
-        spec.check_adapter(self.adapter, spec.adapter_info(self.adapter))
-
-
-@dataclass(frozen=True)
-class LoraStep(ResourceStep):
-    """One step's rows: a segment per request, its ``span`` the tokens that request puts
-    through the LoRA'd linears this step, in the order they are packed."""
-
-
-@dataclass(frozen=True)
-class LoraBaseOnly:
-    """The capture key of a step none of whose rows names an adapter: the node's own
-    ``cg_key_info`` (``key``), wrapped. A node serving adapters captures each bucket under
-    both keys, and the base-only graph records no LoRA kernel: at decode width the
-    launches of a delta that adds zero cost about what the work does."""
-
-    key: Any = None
-
-    def __str__(self) -> str:
-        return "lora-base-only" if self.key is None else f"lora-base-only:{self.key}"
-
-
-def node_capture_key(key: Any) -> Any:
-    """The node's own ``cg_key_info`` in a capture key, without its ``LoraBaseOnly``."""
-    return key.key if isinstance(key, LoraBaseOnly) else key

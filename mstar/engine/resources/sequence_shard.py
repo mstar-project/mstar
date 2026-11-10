@@ -84,13 +84,17 @@ class SeqShardSpec(NodeResourceSpec):
     A ragged attention's own ``sp_exchange`` is the model's, which ``exchange`` doesn't change;
     a shard that never splits stops it splitting too.
 
+    ``exchanges=False`` declares that no op on the node mixes a listed label's units (a video
+    decoder's independent clips): nothing exchanges them, so the node needs no attention, and a
+    rank may get an empty range (fewer units than ranks still splits; ``gather`` takes it).
+
     The attention and position resources on the node take this as a dependency in their own
     ``derive``, so every ``declare_step`` branch of the node declares a ``SeqShardStep``; at one
     SP rank it plans copied at no cost.
 
     Two fields are derived from ``exchange`` and the resources on its nodes (``derive``):
     ``splits``, whether the node's steps may split (not where ``exchange`` resolves to ``none``,
-    or where no attention there takes split steps), and ``stripe_pool``, the pool a ring
+    or where no attention there takes split steps and ``exchanges`` is True), and ``stripe_pool``, the pool a ring
     attention reads, by whose stored positions each step is striped."""
 
     labels: tuple[str, ...]
@@ -100,6 +104,7 @@ class SeqShardSpec(NodeResourceSpec):
     exchange: SpExchange | Literal["auto"] = field(default="auto", kw_only=True)
     splits: bool = field(default=True, init=False, repr=False)
     stripe_pool: str | None = field(default=None, init=False, repr=False)
+    exchanges: bool = field(default=True, kw_only=True)
 
     def __post_init__(self):
         super().__post_init__()
@@ -141,7 +146,10 @@ class SeqShardSpec(NodeResourceSpec):
         ours = [spec for spec in specs.values() if spec.nodes & self.nodes]
         by_position = any(spec.places_positions for spec in ours)
         exchanges = [(spec, spec.resolve_exchange(specs)) for spec in ours]
-        self.splits = self.exchange_over(by_position) != "none" and any(e != "none" for _, e in exchanges)
+        # a split nothing exchanges (`exchanges`) needs no attention to take it
+        self.splits = self.exchange_over(by_position) != "none" and (
+            not self.exchanges or any(e != "none" for _, e in exchanges)
+        )
         pools = sorted({spec.config.kv_cache for spec, exchange in exchanges if exchange == "ring"})
         self.stripe_pool = pools[0] if len(pools) == 1 else None
         nodes = sorted(self.nodes)
@@ -264,17 +272,21 @@ class SequenceShard(Resource):
     striped step's ``order`` is copied to the device with it. Off its defaults:
     ``prefix_skip_safe`` (it plans from the step a prefix hit already trimmed), ``supports_preplan``
     (its dependents pre-plan), ``supports_context_parallel`` (a striped shard reads a placed pool's
-    plan); it keeps ``can_capture`` True and ``force_double_buffer`` False (a leased step, the
-    only kind a pre-plan stages, never stripes)."""
+    plan), ``resident_refusal`` (None: a one-token-a-row step, what resident planning replays, is
+    never split); it keeps ``can_capture`` True and ``force_double_buffer`` False (a leased step,
+    the only kind a pre-plan stages, never stripes)."""
 
     prefix_skip_safe = True
     supports_split_steps = True
     supports_context_parallel = True
 
+    def resident_refusal(self) -> str | None:
+        return None
+
     def __init__(
         self, labels: tuple[str, ...], axis: int, walks: frozenset[str] | None, min_tokens: int,
         group: CommGroup, splits: bool = True, stripe_pool: str | None = None,
-        device: torch.device = torch.device("cpu"),
+        device: torch.device = torch.device("cpu"), exchanges: bool = True,
     ):
         self.labels = labels
         self.axis = axis
@@ -285,6 +297,9 @@ class SequenceShard(Resource):
         # `SeqShardSpec.stripe_pool`
         self.stripe_pool = stripe_pool
         self._device = device
+        # whether a resource exchanges the split labels' units, so each rank needs some
+        # (`SeqShardSpec.exchanges`)
+        self.exchanges = exchanges
         # fixed at bind, so a compiled frame at one SP rank (or on a node whose attentions take no
         # split steps) traces the bracket straight through
         self.can_split = group.world_size > 1 and splits
@@ -303,6 +318,7 @@ class SequenceShard(Resource):
         walks = None if spec.walks is None else frozenset(spec.walks)
         return cls(
             spec.labels, spec.axis, walks, spec.min_tokens, group, spec.splits, spec.stripe_pool, info.device,
+            exchanges=spec.exchanges,
         )
 
     def depends_on(self) -> set[str]:
@@ -410,7 +426,9 @@ class SequenceShard(Resource):
                     "a packed capture needs one listed label and axis 0"
                 )
             spans.setdefault(self.labels[0], []).append(pad)
-        if sum(map(sum, spans.values())) < max(sp, self.min_tokens):
+        # an exchange needs every rank to hold tokens; a split nothing exchanges takes empty ranges
+        least = sp if self.exchanges else 1
+        if sum(map(sum, spans.values())) < max(least, self.min_tokens):
             return COPIED
         for label, label_spans in spans.items():
             if self.axis == 1 and len(set(label_spans)) > 1:
@@ -418,7 +436,7 @@ class SequenceShard(Resource):
                     f"sequence shard on axis 1 splits each row of {label!r} alike, so its rows must be "
                     f"one length; this step's are {label_spans}"
                 )
-            if (min(label_spans) if self.axis == 1 else sum(label_spans)) < sp:
+            if (min(label_spans) if self.axis == 1 else sum(label_spans)) < least:
                 return COPIED
         if self.stripe_pool is not None:
             return self._striped(spans, step, ctx)
@@ -473,7 +491,7 @@ class SequenceShard(Resource):
             if not counts.all():
                 return COPIED
             order = to_device_nonblocking(np.argsort(owners, kind="stable"), self._device, torch.int64)
-            ranges[label] = SeqRange(self.group, tuple(counts.tolist()), None, order)
+            ranges[label] = SeqRange(self.group, tuple(counts.tolist()), None, order=order)
         return SeqShardPlan(True, ranges)
 
     def _range(self, spans: list[int]) -> SeqRange:
@@ -596,19 +614,23 @@ def _packed(x: torch.Tensor, r: SeqRange) -> torch.Tensor:
 
 def ulysses(run: Callable, q, k, v, r: SeqRange):
     """Split tokens to split heads: one all-to-all of q, k and v (each ``[n, H, D]``, this rank's
-    tokens) to ``[N, H / P, D]``, ``run``, and the output back."""
+    tokens) to ``[N, H / P, D]``, ``run``, and the output back.
+
+    Eager, as main's exchange is (`CommGroup.all_to_all`): a traced variant measured no faster.
+    """
     _check_entry(r, q, k, v)
+    all_to_all = CommGroup.all_to_all
     seq, head = (0, 1) if r.rows is None else (1, 2)
     parts = [x for x in (q, k, v) if x is not None]
-    exchanged = r.group.all_to_all(
-        [_seq_view(x, r) for x in parts], scatter_dim=head, gather_dim=seq, gather_sizes=list(r.counts),
+    exchanged = all_to_all(
+        r.group, [_seq_view(x, r) for x in parts], scatter_dim=head, gather_dim=seq, gather_sizes=list(r.counts),
     )
     exchanged = [_packed(x, r) for x in exchanged]
     if q is None:
         run(None, *exchanged)
         return None
     out = run(*exchanged)
-    out = r.group.all_to_all(_seq_view(out, r), scatter_dim=seq, gather_dim=head, scatter_sizes=list(r.counts))
+    out = all_to_all(r.group, _seq_view(out, r), scatter_dim=seq, gather_dim=head, scatter_sizes=list(r.counts))
     return _packed(out, r)
 
 
@@ -674,7 +696,8 @@ def sequence_parallel_refusals(
     checks on built objects (``supports_split_steps``, ``check_captures``) are the engine's."""
     if sp == 1:
         return []
-    specs = [spec for spec in specs if node in spec.nodes]
+    all_specs = list(specs)
+    specs = [spec for spec in all_specs if node in spec.nodes]
     shard = next((spec for spec in specs if isinstance(spec, SeqShardSpec)), None)
     try:
         placed = any(position_pools(specs, node).values())
@@ -697,6 +720,13 @@ def sequence_parallel_refusals(
             "KV by position (context_parallel on its paged KV pools)",
         ]
     refusals = []
+    if not shard.exchanges:
+        by_key = {spec.resource_key: spec for spec in all_specs}
+        if any(spec.resolve_exchange(by_key) != "none" for spec in specs):
+            refusals.append(
+                f"node {node!r} declares SeqShardSpec {shard.resource_key!r} with exchanges=False, which can hand "
+                "a rank no tokens, beside an attention that exchanges split tokens"
+            )
     for spec in specs:
         refusals += spec.split_step_refusals(node, shard, tp, sp)
     if moe_parallel is not None and moe_parallel.parallel == "ep":

@@ -79,7 +79,7 @@ pub(super) struct Stored {
     pub tensors: Vec<u64>,
     pub num_tensors: Vec<usize>,
     pub inline_signal: Option<String>,
-    pub inline_values: Vec<i64>,
+    pub inline_values: Vec<Option<i64>>,
     pub logprobs: Vec<Option<f64>>,
 }
 
@@ -460,7 +460,7 @@ impl GraphRuntime {
         let sent = py.detach(|| -> PyResult<Result<Vec<u32>, RouteOut>> {
             let route = self.complete_and_route_batch(pp.route_arg(Stored {
                 tensors: Vec::new(), num_tensors: vec![0; n], inline_signal: signal,
-                inline_values: values, logprobs: Vec::new(),
+                inline_values: values.into_iter().map(Some).collect(), logprobs: Vec::new(),
             }))?;
             pp.completion_id = route.completion_id;
             if pp.send_needs_python(&route) {
@@ -468,8 +468,8 @@ impl GraphRuntime {
             }
             // Nothing in the frames comes from Python: no rid carries
             // per_request_info, so none completes a worker graph, and the
-            // count, consumption, profiling and publication payloads are all
-            // read only for those.
+            // count, profiling and publication payloads are all read only for
+            // those.
             let (completed, frames) = self.pp_send_frames(&pp, SendArgs::default())?;
             self.dispatch_frames_nogil(frames)?;
             Ok(Ok(completed))
@@ -507,8 +507,8 @@ impl GraphRuntime {
         }
         self.build_send_frames(
             pp.completion_id, args.info_rids, args.request_infos, args.ntc_rids,
-            args.new_token_counts, args.consumed_rids, args.stream_tokens_consumed,
-            args.prof_rids, args.profiling, args.publish_rids, args.publications, args.skip_rids,
+            args.new_token_counts, args.prof_rids, args.profiling, args.publish_rids,
+            args.publications, args.skip_rids,
         )
     }
 
@@ -550,8 +550,6 @@ pub(super) struct SendArgs {
     pub request_infos: Vec<Option<Vec<u8>>>,
     pub ntc_rids: Vec<u32>,
     pub new_token_counts: Vec<FxHashMap<String, i64>>,
-    pub consumed_rids: Vec<u32>,
-    pub stream_tokens_consumed: Vec<FxHashMap<String, i64>>,
     pub prof_rids: Vec<u32>,
     pub profiling: Vec<Option<Vec<u8>>>,
     pub publish_rids: Vec<u32>,

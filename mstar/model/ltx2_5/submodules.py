@@ -27,7 +27,6 @@ from torch import nn
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.resources import (
-    AttentionStep,
     RaggedCrossAttentionStep,
     Segment,
     SeqShardStep,
@@ -387,8 +386,8 @@ class LTXDenoiseSubmodule(DenoiseLoopSubmodule):
         return SubmoduleStep(
             steps={
                 VIDEO_SHARD: SeqShardStep(segments=tuple(video)),
-                VIDEO_ATTN: AttentionStep(segments=tuple(video), causal=False),
-                AUDIO_ATTN: AttentionStep(segments=tuple(audio), causal=False),
+                VIDEO_ATTN: self.attention_step(video),
+                AUDIO_ATTN: self.attention_step(audio),
                 VIDEO_XATTN: RaggedCrossAttentionStep(
                     segments=tuple(video + text), pairs=VIDEO_XATTN_PAIRS,
                 ),
@@ -528,7 +527,7 @@ class LTXVideoDecoderSubmodule(_ShapeBatchedBase, BatchedRows, NodeSubmodule):
         # shapes cover 1088x1920 (dynamo would unroll the tile loop of ``vae.decode`` into one
         # enormous graph).
         if compile_decode:
-            # before the warm-up: dynamo guards on requires_grad (see KleinVaeDecoderSubmodule)
+            # before the warm-up: dynamo guards on requires_grad (see decode_utils.WarmedDecode)
             vae.requires_grad_(False)
             vae.decoder = _WarmedDecoder(vae.decoder)
             self.warmup(warmup_shapes)

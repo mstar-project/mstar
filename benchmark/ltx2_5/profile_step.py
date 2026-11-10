@@ -77,7 +77,7 @@ def main():
         p.error("--parallel sp splits the step through the engine's resources: --attention flashinfer")
     from mstar.distributed.communication import CommGroup, JointGroups
 
-    joint = JointGroups(tp_group=CommGroup.trivial(), sp_group=CommGroup.trivial())
+    joint = JointGroups(tp_group=CommGroup.trivial(), sp_group=CommGroup.trivial(), instance=CommGroup.trivial())
     world_size, rank = 1, 0
     if args.parallel:
         dist.init_process_group("nccl")
@@ -86,8 +86,8 @@ def main():
         group = CommGroup(rank, rank, list(range(world_size)))
         group.device_group, group.initialized = dist.group.WORLD, True
         trivial = CommGroup.trivial()
-        joint = (JointGroups(tp_group=group, sp_group=trivial) if args.parallel == "tp"
-                 else JointGroups(tp_group=trivial, sp_group=group))
+        joint = (JointGroups(tp_group=group, sp_group=trivial, instance=group) if args.parallel == "tp"
+                 else JointGroups(tp_group=trivial, sp_group=group, instance=group))
     device = torch.device("cuda", int(os.environ.get("LOCAL_RANK", "0")))
     snapshot = resolve_snapshot_dir(LTX25_REPO, allow_patterns=SNAPSHOT_PATTERNS)
     config = LTX25Config.from_snapshot(snapshot)

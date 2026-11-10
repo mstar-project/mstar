@@ -18,9 +18,7 @@ from typing import NamedTuple
 
 import torch
 
-from mstar.model.multimodal import TEXT, PromptPart
-
-VIDEO = "video"
+from mstar.model.media_limits import VideoBudget, decoding_upload, ffmpeg_unavailable
 
 
 class SampledVideo(NamedTuple):
@@ -43,21 +41,6 @@ class ProcessedVideo(NamedTuple):
     timestamps: list[float]
 
 
-def ffmpeg_unavailable() -> str | None:
-    """Why torchcodec can't decode video in this process, or None if it can."""
-    try:
-        import torchcodec
-        import torchcodec.decoders  # noqa: F401
-    except (ImportError, RuntimeError, OSError) as exc:
-        # torchcodec 0.9 and earlier raise here when FFmpeg is missing
-        return f"it failed to load: {exc}"
-    # 0.16 imports without FFmpeg and fails only at decode (0.8 has no
-    # ffmpeg_major_version, and has already raised above)
-    if getattr(torchcodec, "ffmpeg_major_version", 0) is None:
-        return "it found no FFmpeg shared libraries"
-    return None
-
-
 def sample_video(path: str, video_processor) -> SampledVideo:
     """Decode the frames the checkpoint's video processor would sample.
 
@@ -75,15 +58,14 @@ def sample_video(path: str, video_processor) -> SampledVideo:
     try:
         from transformers.video_utils import load_video
     except ImportError as exc:
-        raise ValueError(f"Qwen3.5 video input needs transformers: {exc}") from exc
+        raise RuntimeError(f"Qwen3.5 video input needs transformers: {exc}") from exc
     if reason := ffmpeg_unavailable():
-        raise ValueError(
+        raise RuntimeError(
             "Qwen3.5 video input needs torchcodec with FFmpeg, the decoder "
             f"transformers uses; {reason}"
         )
 
     from mstar.model.base import video_metadata_dict
-    from mstar.model.media_limits import VideoBudget
 
     budget = VideoBudget()
 
@@ -98,11 +80,8 @@ def sample_video(path: str, video_processor) -> SampledVideo:
         budget.add(metadata.height, metadata.width, len(indices))
         return indices
 
-    try:
+    with decoding_upload(path, "the video"):
         frames, metadata = load_video(path, backend="torchcodec", sample_indices_fn=sampler)
-    except RuntimeError as exc:
-        # torchcodec's error for a corrupt or unsupported file: the client's input, a 400
-        raise ValueError(f"Qwen3.5 could not decode video {path!r}: {exc}") from exc
     return SampledVideo(frames, video_metadata_dict(metadata))
 
 
@@ -132,8 +111,8 @@ def expand_video_pads(
 ) -> str:
     """Replace the nth ``pad`` in ``text`` with the nth video's groups.
 
-    One pad per group: `find_media_spans` reads each group back as a span and
-    the vision walk inserts its embeddings, as for an image.
+    One pad per group, expanded to the group's tokens afterwards
+    (`expand_media_pads`), as an image's pad is.
     """
     pieces = text.split(pad)
     if len(pieces) != len(timestamps) + 1:
@@ -146,34 +125,3 @@ def expand_video_pads(
         out += [f"<{t:.1f} seconds>{start}{pad}{end}" for t in times]
         out.append(after)
     return "".join(out)
-
-
-def expand_video_parts(
-    parts: list[PromptPart], groups: Sequence[int],
-) -> list[PromptPart]:
-    """``parts`` with each video as text, group, text, ..., group, text.
-
-    The prefill plan's view of `expand_video_pads`: the text around each group
-    is the outer sentinel and the timestamps, so a video always has text on
-    both sides, and `prefill_plan` merges it with the user's text next to it.
-    Video parts are renumbered per group, as `find_media_spans` numbers spans.
-    A video with no entry in ``groups`` expands to nothing.
-    """
-    out: list[PromptPart] = []
-    group = 0
-    for part in parts:
-        if part.modality != VIDEO:
-            out.append(part)
-            continue
-        n = groups[part.index] if part.index < len(groups) else 0
-        for g in range(n):
-            out.append(PromptPart(modality=TEXT))
-            out.append(PromptPart(modality=VIDEO, index=group + g))
-        out.append(PromptPart(modality=TEXT))
-        group += n
-    return out
-
-
-def group_owners(groups: Sequence[int]) -> list[int]:
-    """The video each group (numbered across all videos) belongs to."""
-    return [v for v, n in enumerate(groups) for _ in range(n)]

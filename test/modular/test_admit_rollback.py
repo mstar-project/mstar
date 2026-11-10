@@ -40,6 +40,7 @@ from mstar.engine.resources.step import (
     SubmoduleStep,
 )
 from mstar.model.submodule_base import NodeSubmodule
+from mstar.testing_utils.engine import make_engine
 
 PAGE = 16
 
@@ -71,7 +72,8 @@ class _HostPoolStub(CPUPagePool):
     def __init__(self):
         self.arena = new_page_arena(64)
         self.index = PrefixIndex(self.arena)
-        self.offloaded = {}
+        self.offloaded, self.reserved = {}, {}
+        self._unmoved = 0
         self._refused_logged_at = None
         self._refused_unlogged = 0
         self.dropped = self.written = self.cancelled = 0
@@ -227,6 +229,39 @@ def test_a_commit_keeps_another_rows_unwind_record():
     assert kv._arena.num_free == free - 2, "only row 1's committed pages stay held"
 
 
+def test_a_refused_admit_leaves_the_free_list_as_it_found_it():
+    """The next admit then takes the pages it would have taken had the refused one never run, as on a TP rank that
+    never ran it."""
+    kv = _kv("kv", pages=6)  # 5 usable: two rows fit, the third does not
+    runner = StepRunner({"kv": kv})
+    for rid in (1, 2, 3):
+        kv.ingest_request(rid, None)
+    free = kv._arena.free_pages()
+    step = SubmoduleStep(steps={"kv": KVStep(segments=tuple(Segment(rid, "main", 2 * PAGE) for rid in (1, 2, 3)))})
+
+    assert not _drive(runner, step, _ctx(1, 2, 3)).ok
+
+    assert kv._arena.free_pages() == free, "the refused admit put its pages back in another order"
+
+
+def test_an_undone_admit_gives_its_pages_back_in_the_order_it_took_them():
+    """Each fork target takes a page for the copy, then each row's span takes one more on the same label, so each
+    label's pages come from both passes. Giving them back label by label put the free list back out of order."""
+    kv = _kv("kv", pages=8)
+    for rid in (1, 2):
+        kv.ingest_request(rid, None)
+        prefill = _kv_step(rid, PAGE)
+        assert kv.admit(prefill, _ctx(rid)).ok
+        kv.commit(prefill, _ctx(rid))
+    free = kv._arena.free_pages()
+    step = KVStep(segments=tuple(Segment(rid, "fork", 2 * PAGE) for rid in (1, 2)), pre_forks=(("main", "fork"),))
+    assert kv.admit(step, _ctx(1, 2)).ok
+
+    kv.rollback_admit(step, _ctx(1, 2))
+
+    assert kv._arena.free_pages() == free, "the undone admit put its pages back in another order"
+
+
 # --- the unbatched fallback admits all or nothing -----------------------------
 
 
@@ -249,17 +284,13 @@ class _Sub:
 
 
 def _engine(resources: dict) -> Engine:
-    eng = Engine.__new__(Engine)
-    eng._runner = StepRunner(resources)
-    eng._enable_nvtx = False
-    eng._enable_profile = False
-    eng._device = torch.device("cpu")
-    eng._tp_follower_nodes = set()
-    eng._pre_plan_done = {}
-    eng._submodules = {"n": SubmoduleManagement(
-        submodule=_Sub(list(resources)), forward=None, forward_batched=None,
-        joint_comm_group=None, resources=resources, head_shards=1,
-    )}
+    eng = make_engine(
+        _runner=StepRunner(resources),
+        _submodules={"n": SubmoduleManagement(
+            submodule=_Sub(list(resources)), forward=None, forward_batched=None,
+            joint_comm_group=None, resources=resources, head_shards=1,
+        )},
+    )
     return eng
 
 

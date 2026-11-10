@@ -23,14 +23,13 @@ from test_ingest_unpersist import _conductor, _ToyModel
 from mstar.api_server.data_worker import PreprocessWorkerThread, _kv_page_sizes
 from mstar.api_server.request_types import PreprocessInput
 from mstar.conductor.conductor import Conductor
-from mstar.conductor.request_info import CurrentForwardConductorMetadata, PartitionDefinition
+from mstar.conductor.request_info import WalkStep
 from mstar.engine.resources import SamplingReqConfig
 from mstar.engine.resources.kv.config import KVReqConfig, KVSpec, PagedKVConfig
 from mstar.engine.resources.kv.keys import chain
 from mstar.graph.base import GraphEdge, GraphNode, Sequential
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import (
-    ForwardPassArgs,
     KVLabel,
     LabelLayout,
     PrefixKeys,
@@ -41,7 +40,8 @@ from mstar.model.base import (
 )
 from mstar.model.orpheus.config import OrpheusModelConfig
 from mstar.model.orpheus.orpheus_model import OrpheusModel
-from mstar.streaming.topology import PartitionTopology, StreamingGraphEdge
+from mstar.streaming.topology import StreamingGraphEdge
+from mstar.testing_utils.model import StubModel
 from mstar.utils.ipc_format import NewRequestConductor
 
 PAGE_SIZE = 16
@@ -74,8 +74,7 @@ class _StubTensorManager:
         pass
 
 
-class _Model:
-
+class _Model(StubModel):
     def __init__(
         self, declares: bool = True, metadata: dict | None = None,
         decode_walk: str | None = None, lays_out: bool = True,
@@ -85,9 +84,6 @@ class _Model:
         self._decode_walk = decode_walk
         self._lays_out = lays_out
 
-    def get_partition_topology(self):
-        return PartitionTopology(partitions=["default"])
-
     def kv_labels(self):
         if not self._declares:
             return {}
@@ -95,9 +91,6 @@ class _Model:
         return {"kv": {"main": KVLabel(growth=growth, keys=PrefixKeys(
             "text_inputs", ("prefill",), growth=self._decode_walk is not None,
         ))}}
-
-    def max_input_files(self):
-        return {}
 
     def checkpoint_path(self):
         # a model that names no checkpoint and sets no salt keys nothing
@@ -340,7 +333,7 @@ def test_each_resource_config_is_handed_only_its_own_chain():
 
 
 def test_a_cache_every_engine_holding_it_keeps_shut_is_not_keyed():
-    class _Thinker:
+    class _Thinker(StubModel):
         """A cache on a two-rank node without prefix_cache_tp, so its engines keep it shut."""
 
         def get_node_resources(self):
@@ -405,10 +398,7 @@ class _Talking(_ToyModel):
         ])
         super().__init__(
             {"prefill": llm(), "prefill_image": Sequential([vit, llm()]), "talk": talker}, None,
-            partitions=[
-                PartitionDefinition("LLM", {"prefill", "prefill_image"}, "prefill"),
-                PartitionDefinition("Talker", {"talk"}, "talk", ["LLM"]),
-            ],
+            groups={"LLM": ["prefill", "prefill_image"], "Talker": ["talk"]},
         )
 
     def get_node_resources(self):
@@ -419,18 +409,10 @@ class _Talking(_ToyModel):
     def kv_labels(self):
         return {"kv": {"main": KVLabel(keys=PrefixKeys("text_inputs", ("prefill", "prefill_image")))}}
 
-    def get_initial_forward_pass_args(
-        self, partition_name, input_modalities, output_modalities, input_signals, model_kwargs=None,
-    ):
-        walk = "prefill" if partition_name == "LLM" else "talk"
-        return ForwardPassArgs(
-            full_metadata=CurrentForwardConductorMetadata(
-                input_modalities=input_modalities, output_modalities=output_modalities,
-                graph_walk=walk, is_prefill=True,
-            ),
-            inputs=[], unpersist_tensors=[],
-            request_done=partition_name == "Talker" and "audio" not in output_modalities,
-        )
+    def walk_plan(self, partition_name, input_modalities, output_modalities, input_signals, model_kwargs):
+        if partition_name == "LLM":
+            return [WalkStep("prefill")]
+        return [WalkStep("talk")] if "audio" in output_modalities else []
 
 
 def test_a_request_whose_talker_runs_is_not_cached(tmp_path, monkeypatch):
@@ -458,8 +440,8 @@ def test_a_request_whose_talker_runs_is_not_cached(tmp_path, monkeypatch):
 class _SamplerOnlyModel(_Model):
     """Declares a stream and asks for no config of its own, as Orpheus did."""
 
-    def get_request_resource_configs(self, partition_fwd_args, model_kwargs=None):
-        del partition_fwd_args, model_kwargs
+    def get_request_resource_configs(self, input_modalities, output_modalities, model_kwargs):
+        del input_modalities, output_modalities, model_kwargs
         return {"sampler": SamplingReqConfig()}
 
 
@@ -469,7 +451,7 @@ def _conductor_configs(model, model_kwargs: dict | None = None) -> dict:
     each handed its own chain."""
     declared = {key: tuple(labels) for key, labels in model.kv_labels().items()}
     configs = Conductor._get_resource_configs(
-        SimpleNamespace(model=model, _kv_labels=declared, _node_resources=list), model_kwargs or {}, {},
+        SimpleNamespace(model=model, _kv_labels=declared, _node_resources=list), ["text"], ["text"], model_kwargs or {},
     )
     for key, cfg in configs.items():
         _apply_chain(cfg, key, model_kwargs)

@@ -33,13 +33,14 @@ bidirectional video DiT with 3D RoPE would have to override all of it. The
 two-linear MLPs ARE the shared ``components.mlp.MLP``.
 """
 
+import functools
 import math
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
-from mstar.model.components.diffusion.attention import RaggedAttentionFn, joint_attention
+from mstar.model.components.diffusion.attention import Attend, RaggedAttentionFn, joint_attention
 from mstar.model.components.diffusion.ffn import gelu_tanh_ffn
 from mstar.model.components.diffusion.modulation import ada_layer_norm
 from mstar.model.components.diffusion.qk_norm_rope import rms_norm_rope
@@ -163,7 +164,7 @@ class Wan22DiTAttention(nn.Module):
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor | None = None,
         rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
-        attn_fn: RaggedAttentionFn | None = None,
+        attend: Attend = joint_attention,
     ) -> torch.Tensor:
         kv_source = hidden_states if encoder_hidden_states is None else encoder_hidden_states
         query = self.q_proj(hidden_states)
@@ -178,8 +179,9 @@ class Wan22DiTAttention(nn.Module):
             key = self.k_norm(key).unflatten(2, (self.num_heads, -1))
 
         # Bidirectional, no mask: SDPA (the reference's dispatch_attention_fn
-        # native path) without a ragged callable, one segment per row with one.
-        out = joint_attention(query, key, value, ragged=attn_fn)
+        # native path) by default; the DiT passes self-attention its ragged and
+        # Ulysses ``attend``.
+        out = attend(query, key, value)
         return self.o_proj(out.flatten(2, 3))
 
 
@@ -203,7 +205,8 @@ class Wan22TimeTextEmbedding(nn.Module):
     def forward(
         self, timestep: torch.Tensor, encoder_hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """``timestep`` ``[B, frames]``, one per latent frame; returns
+        """``timestep`` ``[B, frames]``, one per latent frame (under SP, one per
+        run of a frame's tokens on this rank: ``Wan22DiT.forward``); returns
         ``temb [B, frames, dim]``, ``timestep_proj [B, frames, 6, dim]``,
         projected text ``[B, 512, dim]`` — all in the text embeds' dtype."""
         batch, frames = timestep.shape
@@ -240,16 +243,17 @@ class Wan22DiTBlock(nn.Module):
         encoder_hidden_states: torch.Tensor,
         timestep_proj: torch.Tensor,
         rotary_emb: tuple[torch.Tensor, torch.Tensor],
-        self_attn_fn: RaggedAttentionFn | None = None,
+        self_attend: Attend = joint_attention,
     ) -> torch.Tensor:
-        # [1, 1, 6, dim] + [B, frames, 6, dim] -> six [B, frames, dim] fp32
-        # tensors, each applied to all of a frame's tokens.
+        # [1, 1, 6, dim] + [B, G, 6, dim] -> six [B, G, dim] fp32 tensors, each
+        # applied to one of G equal groups of tokens: a frame, or under SP a run
+        # of a frame's tokens.
         shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
             self.scale_shift_table.unsqueeze(0) + timestep_proj.float()
         ).unbind(2)
 
         _, norm_hidden = ada_layer_norm(hidden_states, shift_msa, scale_msa, eps=self.norm1.eps)
-        attn_output = self.self_attn(norm_hidden, rotary_emb=rotary_emb, attn_fn=self_attn_fn)
+        attn_output = self.self_attn(norm_hidden, rotary_emb=rotary_emb, attend=self_attend)
         hidden_states, norm_hidden = ada_layer_norm(
             hidden_states, None, None, eps=self.norm2.eps, weight=self.norm2.weight, bias=self.norm2.bias,
             residual=attn_output, gate=gate_msa,
@@ -260,18 +264,42 @@ class Wan22DiTBlock(nn.Module):
             hidden_states, c_shift_msa, c_scale_msa, eps=self.norm3.eps, residual=attn_output,
         )
         ff_output = gelu_tanh_ffn(norm_hidden, self.ffn)
-        frames = timestep_proj.shape[1]
+        groups = timestep_proj.shape[1]
         return (
-            hidden_states.unflatten(1, (frames, -1)).float()
-            + ff_output.unflatten(1, (frames, -1)).float() * c_gate_msa.unsqueeze(2)
+            hidden_states.unflatten(1, (groups, -1)).float()
+            + ff_output.unflatten(1, (groups, -1)).float() * c_gate_msa.unsqueeze(2)
         ).type_as(hidden_states).flatten(1, 2)
+
+
+# the label a denoise step declares a row's tokens under (``DenoiseLoopSubmodule.MAIN_SPAN``),
+# which the node's sequence shard splits
+TOKENS = "main"
+
+
+@torch.compiler.disable
+def _token_runs(shard, timestep: torch.Tensor, per_frame: int) -> torch.Tensor:
+    """``timestep`` ``[B, frames]`` as this rank's share of its tokens takes it: whole frames
+    unless the shard splits the step's tokens. A rank's share need not be whole frames, so it
+    then modulates per run of tokens, the longest run that tiles a frame and every rank's share:
+    ``[B, count / run]``. Eager, so a compiled forward doesn't guard on the step's plan."""
+    r = shard.split_range(TOKENS)
+    if r is None:
+        return timestep
+    run = math.gcd(per_frame, *r.counts)
+    return timestep.repeat_interleave(per_frame // run, dim=1).narrow(1, r.start // run, r.count // run)
 
 
 class Wan22DiT(nn.Module):
     """The dense 5B TI2V video DiT: Conv3d patchify -> 30 blocks -> adaLN
     output head + unpatchify. Built on the meta device and materialized by
     ``weight_loader.build_wan22_dit`` (meta -> ``cast_serving_dtypes`` ->
-    ``to_empty(device)`` -> checkpoint load)."""
+    ``to_empty(device)`` -> checkpoint load).
+
+    Under sequence parallelism the node's sequence shard (``forward``'s
+    ``shard``) splits each row's post-patchify tokens: this rank's blocks run
+    on its contiguous share, the self-attention resource trades them for heads
+    around the kernel (Ulysses), and the shares are gathered before
+    unpatchify."""
 
     def __init__(self, config: Wan22Config):
         super().__init__()
@@ -324,13 +352,18 @@ class Wan22DiT(nn.Module):
         timestep: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
         self_attn_fn: RaggedAttentionFn | None = None,
+        shard=None,
     ) -> torch.Tensor:
         """``hidden_states`` ``[B, C, F, H, W]`` (bf16 latents), ``timestep``
         ``[B, F // p_t]`` per post-patch frame (``expand_timesteps``: each
         token takes its frame's value), text embeds ``[B, 512, text_dim]``
         bf16. Returns ``[B, C_out, F, H, W]`` bf16.
         ``self_attn_fn`` runs the self-attention on the engine's ragged
-        resource; without it, and always for the cross-attention, SDPA."""
+        resource; without it, and always for the cross-attention, SDPA.
+        ``shard``: the node's sequence shard (``SequenceShard``), which on a
+        step it splits cuts each row's tokens (label ``TOKENS``) to this
+        rank's share; ``self_attn_fn`` then exchanges them inside its
+        resource."""
         batch_size, _, num_frames, height, width = hidden_states.shape
         p_t, p_h, p_w = self.config.patch_size
         grid = (num_frames // p_t, height // p_h, width // p_w)
@@ -343,18 +376,28 @@ class Wan22DiT(nn.Module):
         hidden_states = self.patch_embedding(hidden_states)
         hidden_states = hidden_states.flatten(2).transpose(1, 2)
 
+        # every per-token tensor is cut to this rank's tokens on a step the shard splits
+        # `can_split` is fixed at bind: at one SP rank a compiled forward traces straight through
+        if shard is not None and shard.can_split:
+            timestep = _token_runs(shard, timestep, hidden_states.shape[1] // grid[0])
+            hidden_states = shard.scatter(TOKENS, hidden_states)
+            rotary_emb = shard.scatter(TOKENS, *rotary_emb, dim=0)  # [S, D] tables
+        self_attend = functools.partial(joint_attention, ragged=self_attn_fn)
+
         temb, timestep_proj, encoder_hidden_states = self.condition_embedder(
             timestep, encoder_hidden_states
         )
 
         for block in self.blocks:
-            hidden_states = block(hidden_states, encoder_hidden_states, timestep_proj, rotary_emb, self_attn_fn)
+            hidden_states = block(hidden_states, encoder_hidden_states, timestep_proj, rotary_emb, self_attend)
 
         # Output head: 2-chunk adaLN in fp32 ([1, 1, 2, dim] island table +
-        # bf16 temb promotes, per frame), then project and unpatchify.
+        # bf16 temb promotes, per group of tokens), then project and unpatchify.
         shift, scale = (self.scale_shift_table.unsqueeze(0) + temb.unsqueeze(2)).unbind(2)
         _, hidden_states = ada_layer_norm(hidden_states, shift, scale, eps=self.norm_out.eps)
         hidden_states = self.proj_out(hidden_states)
+        if shard is not None:
+            hidden_states = shard.gather(TOKENS, hidden_states)
 
         hidden_states = hidden_states.reshape(batch_size, *grid, p_t, p_h, p_w, -1)
         hidden_states = hidden_states.permute(0, 7, 1, 4, 2, 5, 3, 6)

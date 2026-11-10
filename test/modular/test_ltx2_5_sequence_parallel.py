@@ -94,7 +94,8 @@ def _denoise(rank, frames, height, width):
     # one rank: no resources, so every attention runs SDPA
     whole = LTXDenoiseSubmodule(dit, cfg, loop_name=DENOISE_LOOP, use_ragged_attention=True)
     split = LTXDenoiseSubmodule(dit, cfg, loop_name=DENOISE_LOOP, use_ragged_attention=True)
-    split.bind_node_resources(_resources(cfg, JointGroups(tp_group=CommGroup.trivial(), sp_group=_group(rank))))
+    sp = _group(rank)
+    split.bind_node_resources(_resources(cfg, JointGroups(tp_group=CommGroup.trivial(), sp_group=sp, instance=sp)))
     rids = ["r0", "r1"]
     step = split.declare_step("generate_av", rids, [NodeInputs(resource_step_info=shape)] * len(rids))
     step.set_ctx(StepContext(request_ids=rids, graph_walk="generate_av", slot=0, capture=False))

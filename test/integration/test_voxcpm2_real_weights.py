@@ -162,7 +162,6 @@ def test_teacher_forced_fp32_steps_match_the_reference(model, prompts, design, m
         t_span = cfm_t_span(model.inference_timesteps, device, torch.float32)
         cfg = torch.tensor([2.0], device=device)
         tokens = torch.tensor(case["tokens"], device=device)
-        empty = torch.zeros(0, 4, 64, device=device)
         preds, stops = [], []
         with torch.inference_mode():
             reset()
@@ -170,8 +169,7 @@ def test_teacher_forced_fp32_steps_match_the_reference(model, prompts, design, m
             patch, stop = generator.prefill(
                 tokens,
                 torch.ones_like(tokens, dtype=torch.bool),
-                empty,
-                tokens.new_zeros(0),
+                torch.zeros(tokens.numel(), 4, 64, device=device),
                 torch.tensor([tokens.numel() - 1], device=device),
                 torch.zeros(1, 4, 64, device=device),
                 torch.randn((1, 64, 4), generator=noise, device=device),

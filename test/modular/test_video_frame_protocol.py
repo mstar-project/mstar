@@ -37,6 +37,7 @@ from mstar.graph.base import GraphEdge  # noqa: E402
 from mstar.graph.loop_indices import NestedLoopIndices  # noqa: E402
 from mstar.model.waypoint.submodules import PRIME_WALK, ROLLOUT_WALK  # noqa: E402
 from mstar.model.waypoint.waypoint_model import WaypointModel  # noqa: E402
+from mstar.testing_utils.model import StubModel, make_model  # noqa: E402
 
 
 def _metadata(**overrides):
@@ -119,7 +120,7 @@ def _form_request(**fields):
     async def form():
         return fields
 
-    return SimpleNamespace(form=form)
+    return SimpleNamespace(form=form, headers={})
 
 
 def test_native_endpoint_reports_nonstreaming_raw_frames_as_bad_request(monkeypatch):
@@ -187,7 +188,7 @@ def test_server_metadata_is_canonical_and_counts_raw_frames():
     }
 
 
-class _FrameModel:
+class _FrameModel(StubModel):
     def postprocess(self, tensor, modality, request_kwargs=None):
         assert modality == "video_frame"
         return tensor.cpu().contiguous().numpy().tobytes()
@@ -398,13 +399,12 @@ def test_data_worker_cleanup_drops_all_frame_protocol_state():
     assert "reused" not in worker.request_output_state
     assert worker.request_output_state["other"].frame_index == 8
 
-    worker.model = SimpleNamespace(process_prompt=lambda *args, **kwargs: {})
+    worker.model = make_model(process_prompt=lambda *args, **kwargs: {})
     worker.device = "cpu"
     worker.enable_prof = False
     worker.timing_requested = threading.Event()
     worker._keyed_labels = {}
     worker._live_requests = {}
-    worker._client_edges = frozenset()
     worker.communicator = SimpleNamespace(send=lambda *args: None)
     worker._process_input(
         PreprocessInput(
@@ -585,7 +585,6 @@ def test_rollout_harness_submits_and_consumes_typed_sdk_stream(tmp_path):
         "input_modalities": ("image",),
         "output_modalities": ("video_frame",),
         "request_id": "rid",
-        "num_steps": 1,
         "actions": [{"mouse": [-12.0, 0.0], "buttons": [0], "scroll": 0.0}],
         "seed": 17,
     }
@@ -668,10 +667,6 @@ def test_rollout_harness_requires_worker_schedule_interleaving_and_cleanup_marke
         [
             "DEBUG Executing: dit graph_walk=rollout ('rid-a', 'rid-b', 'rid-c')",
             "DEBUG Executing: dit graph_walk=rollout ('rid-a', 'rid-b', 'rid-c')",
-            "DEBUG Executing: dit graph_walk=rollout ('rid-a', 'rid-b', 'rid-c')",
-            "INFO Waypoint dit: skipping async-overshoot rollout step 2 (request rid-a runs 2 steps)",
-            "INFO Waypoint dit: skipping async-overshoot rollout step 2 (request rid-b runs 2 steps)",
-            "INFO Waypoint dit: skipping async-overshoot rollout step 2 (request rid-c runs 2 steps)",
         ]
     )
     assert interleaving_failure(three_way, ("rid-a", "rid-b", "rid-c")) is None
