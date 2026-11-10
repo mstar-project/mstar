@@ -409,11 +409,12 @@ PROGRESS_CAP = 65536  # bytes of progress.log a poll reads
 
 def show_progress(key, seen, final=False):
     """Print the lines the box's session added to progress.log since the `seen` lines already printed, to the
-    job's log; the new count. Whole lines, at most 50 a poll, and on the `final` read the last line too; a line
-    longer than the read's cap counts as one, cut, once wc counts it. Each is redacted with the exact secrets the
-    redact step uses, then cut and quoted, since the session wrote them. A file that got shorter is read once
-    more, from its start. The box caps the read (a FIFO or a huge line can't hold it), and what is printed is
-    capped again here; a read that fails, times out or gives no line count changes nothing."""
+    job's log; the new count. Whole lines, at most 50 a read; the `final` read reads on until nothing new comes
+    (20 reads at most), the last line too. A line longer than the read's cap counts as one, cut, once wc counts
+    it. Each is redacted with the exact secret the redact step holds and the credential patterns, then cut and
+    quoted, since the session wrote them. A file that got shorter is read once more, from its start. The box caps
+    the read (a FIFO or a huge line can't hold it), and what is printed is capped again here; a read that fails,
+    times out or gives no line count changes nothing."""
     log = f"{ERAS_OUT}/progress.log"
 
     def read(start):  # (the file's line count, what follows line `start`), or None
@@ -425,25 +426,29 @@ def show_progress(key, seen, final=False):
             return None
         return None if r.returncode or total < 0 else (total, r.stdout.partition("\n")[2])
 
-    got = read(seen)
-    if got and got[0] < seen:  # rewritten shorter
-        seen, got = 0, read(0)
-    if got is None:
-        return seen
-    total, raw = got[0], got[1].encode("utf-8", "surrogateescape")
-    # The box's caps again, so a box that didn't keep them can't flood the job's log. They don't bound what the
-    # ssh call captured, which isn't streamed: the PR's author is trusted.
-    lines = raw[:PROGRESS_CAP].decode("utf-8", "surrogateescape").split("\n")
-    # The last piece is a line still being written, or nothing. It is shown on the final read, and when it is one
-    # line past the cap that wc already counts (so a line still being written isn't shown at every poll).
-    whole = len(lines) == 1 and len(raw) >= PROGRESS_CAP and total > seen
-    if not lines[-1] or not (final or whole):
-        lines = lines[:-1]
-    lines = lines[:50]
-    exact = [os.environ.get(k, "") for k in ("ANTHROPIC_API_KEY", "ERAS_API_KEY")]
-    for line in lines:
-        print(bot.log_value(bot.redact(line, exact=exact)[:300]), flush=True)
-    return seen + len(lines)
+    for _ in range(20 if final else 1):
+        got = read(seen)
+        if got and got[0] < seen:  # rewritten shorter
+            seen, got = 0, read(0)
+        if got is None:
+            return seen
+        total, raw = got[0], got[1].encode("utf-8", "surrogateescape")
+        # The box's caps again, so a box that didn't keep them can't flood the job's log. They don't bound what the
+        # ssh call captured, which isn't streamed: the PR's author is trusted.
+        lines = raw[:PROGRESS_CAP].decode("utf-8", "surrogateescape").split("\n")
+        # The last piece is a line still being written, or nothing. It is shown on the final read (it ends the
+        # file, so nothing follows it), and when it is one line past the cap that wc already counts (so a line
+        # still being written isn't shown at every poll).
+        tail = lines.pop()
+        whole = not lines and len(raw) >= PROGRESS_CAP and total > seen
+        unended = bool(tail) and final and not whole and len(lines) < 50
+        lines = [*lines, *([tail] if tail and (whole or unended) else [])][:50]
+        for line in lines:
+            print(bot.log_value(bot.redact(line, exact=[os.environ.get("ERAS_API_KEY", "")])[:300]), flush=True)
+        seen += len(lines)
+        if not lines or unended:
+            break
+    return seen
 
 
 def wait(out, runner_temp):
@@ -843,8 +848,8 @@ def redact(out, runner_temp, s2="", s3=""):
     lt = Path(runner_temp, "lt")
     exact = (s2, s3)
     for f in (lt / "results/report.md", lt / "results/progress.log", lt / "unavailable.md"):
-        if f.is_file():
-            f.write_text(bot.redact(f.read_text(), exact=exact))
+        if f.is_file():  # bytes that aren't UTF-8 become U+FFFD, so nothing that reads it later can fail on them
+            f.write_text(bot.redact(f.read_text(errors="replace"), exact=exact))
     verdict = lt / "results/result.json"
     if verdict.is_file():  # the box wrote this: unreadable counts as no verdict
         try:

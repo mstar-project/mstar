@@ -376,6 +376,15 @@ class TestComment(unittest.TestCase):
             gpu_review.render_comment("0123456789", out, media_url=media_url)
         return out, (out / "comment.md").read_text()
 
+    def test_a_box_file_that_isnt_utf8_is_still_redacted(self):
+        with tempfile.TemporaryDirectory() as temp:
+            results = Path(temp, "lt/results")
+            results.mkdir(parents=True)
+            (results / "progress.log").write_bytes(b"09:00 caf\xe9\n09:01 key plaintoken123\n")
+            gpu_review.redact({}, temp, s3="plaintoken123")
+            self.assertEqual((results / "progress.log").read_text(), "09:00 caf\ufffd\n09:01 key [REDACTED]\n",
+                             "one stray byte from the box would fail the step and lose the finished run")
+
     def test_redacting_the_verdict_keeps_it_json(self):
         for text, verdict in (('{"verdict": "pass", "summary": "\\u00eeyJabcdefghijk.lmnopqrstuv.w"}', "pass"),
                               ("not json", None), ("[1]", None)):
@@ -869,6 +878,8 @@ class TestEras(unittest.TestCase):
         self.assertEqual(len(show(long, 0, final=True)[0]), 1, "the last line would be lost when the box ends")
         many = "".join(f"09:00 line {i}\n" for i in range(5000))
         self.assertEqual(show(many, 0, caps=False)[1], 50, "a box that ignores head could flood the job's log")
+        self.assertEqual(show(many[:3000] + "09:59 end", 0, final=True)[1], many[:3000].count("\n") + 1,
+                         "the final read would stop at 50 lines and lose the rest of the log")
 
     def test_a_box_that_left_no_results_reports_the_platforms_reason(self):
         run = {"status": "failed", "failure": {"code": "launch_refused",
