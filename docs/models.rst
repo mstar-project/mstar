@@ -227,6 +227,11 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
      - ``black-forest-labs/FLUX.2-klein-9B``
      - FLUX.2 [klein] 9B (Qwen3-8B encoder, 4096-wide DiT), same class. Released under
        the FLUX Non-Commercial License; check it before deploying.
+   * - ``qwen_image_edit`` *(Beta)*
+     - ``Qwen/Qwen-Image-Edit-2511``
+     - Qwen-Image-Edit-2511: edits 1-3 reference images from a prompt with a 20B dual-stream
+       MMDiT, a Qwen2.5-VL-7B prompt encoder that also sees the images, and true CFG (40 steps).
+       Edit-2509 loads through the same class. Apache-2.0.
    * - ``ltx2_5`` *(Beta)*
      - ``Lightricks/LTX-2.5-Diffusers``
      - LTX-2.5 (22B) text-to-audio+video: the distilled 8-step recipe, no guidance; native
@@ -2317,6 +2322,32 @@ SGLang ran ``--performance-mode speed`` at Ulysses 4 / 8, without compile or ste
 vllm-omni USP 4 / 8 with the text encoder and VAE split as wide. The DiT's 49 steps are
 ~74 s of the SP4 clip. Not done: CUDA-graph capture, more than one request per step, tensor
 parallelism, ``Ref2VA``.
+
+Qwen-Image-Edit (``qwen_image_edit``)
+-------------------------------------
+
+Qwen-Image-Edit-2511 edits one to three reference images from a prompt
+(``mstar/model/qwen_image/``). Four nodes: ``text_encoder`` (Qwen2.5-VL-7B: its windowed vision
+tower over each image at ~384^2, then the language model over the templated prompt with the
+images' tokens spliced in, once for the positive prompt and once for the negative when
+guided), ``vae_encoder`` (each reference at ~1024^2, through the Wan2.1-architecture VAE),
+``dit`` (the 60-block dual-stream MMDiT on the DiT scaffold, the references' tokens modulated
+as at timestep 0) and ``vae_decoder``. Guidance is the scaffold's: both prompts run as rows of
+one forward (``cfg_size: 2`` puts one on each GPU) and combine with Qwen-Image's
+norm-rescaled CFG. Edit-2509 is the same pipeline without the timestep-0 references and loads
+with ``model_path_hf: Qwen/Qwen-Image-Edit-2509``.
+
+Request knobs: ``height`` / ``width`` (default: the last image's aspect at ~1024^2; floored to
+16 as the pipeline does), ``num_inference_steps`` (40), ``guidance_scale`` (true CFG, 4.0; 1
+turns guidance off and skips the negative prompt), ``negative_prompt`` (``" "``) and ``seed``.
+``true_cfg_scale``, the pipeline's name for the scale, is refused with a 400 that names
+``guidance_scale``. ``POST /v1/images/edits`` takes up to three ``image[]`` uploads, in order.
+
+Deployment knobs (``configs/qwen_image_edit.yaml``): ``attention_backend`` (``flashinfer`` or
+``sdpa``, the reference kernel) and ``compile`` (each transformer block, static but for the text
+length). ``qwen_image_edit_tp2.yaml`` splits the DiT over two GPUs, and
+``qwen_image_edit_cfg2.yaml`` the guidance branches. Not done: CUDA-graph capture (a step is
+GPU-bound), sequence parallelism, the text-to-image and layered Qwen-Image pipelines.
 
 FLUX.2 [klein] (``flux2_klein`` / ``flux2_klein_9b``)
 -----------------------------------------------------

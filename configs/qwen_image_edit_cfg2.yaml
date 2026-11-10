@@ -1,0 +1,20 @@
+model: "qwen_image_edit"
+
+max_seq_len: 8192
+
+# See qwen_image_edit.yaml. CFG-parallel on two GPUs: each rank runs one guidance branch (the
+# positive or the negative prompt) of every row and the predictions are all-gathered each step,
+# so a guided step costs one branch's forward. The text encoder and the VAE run on rank 0.
+model_kwargs:
+  attention_backend: flashinfer
+  compile: false
+
+node_groups:
+  - node_names: [text_encoder]
+    ranks: [0]
+  - node_names: [vae_encoder, vae_decoder]
+    ranks: [0]
+  - node_names: [dit]
+    ranks: [0, 1]
+    # one classifier-free-guidance branch per rank
+    cfg_size: 2
