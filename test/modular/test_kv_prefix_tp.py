@@ -13,7 +13,7 @@ import torch
 import yaml
 from test_kv_prefix_correctness import NODE, PAGE_SIZE, ROOT, WALK
 from test_kv_prefix_layout_lease import ASK, IMAGE, IMAGE_WALK, OTHER_ASK, TEXT, _config, _walks
-from test_kv_prefix_lease import _StubTransfer
+from test_kv_prefix_lease import _Holding, _StubTransfer
 from test_tp_async_teardown_order import _rank, _Stop
 
 import mstar.communication.wire_types  # noqa: F401  (registers the tags)
@@ -189,6 +189,29 @@ def test_a_follower_takes_rank_0s_hit_and_never_probes_itself(window):
         # The window page of tokens 72-80: a, at 83 tokens, holds window pages 7-10, and b, at 100, 9-12.
         a, b = (leader._streams[rid]["main"].later[0] for rid in "ab")
         assert a.page_indices[2] == b.page_indices[0], "b's sliding layers missed the window a cached"
+
+
+def test_ranks_cut_a_window_lease_alike_when_one_index_has_dropped_a_page():
+    """A cut below a window lease's end needs window pages the lease doesn't hold, and a follower's index can be
+    ahead of rank 0's, so the ranks cut from the lease's own pages rather than looking them up."""
+    ranks = leader, follower = _manager(0, window=24), _manager(1, window=24)
+    shared = _tokens(6 * PAGE_SIZE + 4, seed=0)
+    _cache(ranks, "a", shared)
+    for kv in ranks:
+        _ingest(kv, "b", shared)
+    assert _follow(follower, _send(leader, "b"))
+    # the follower's index has dropped the window page of tokens 64-72, which a cut to 80 needs
+    rooted = follower._streams["b"]["main"].chain.rooted
+    follower._index._remove(follower._index.page_for(follower._window_key(rooted[follower._ends_on(1, 8)], 1, 8)))
+
+    answers = [
+        StepRunner({"kv": kv, "other": _Holding(80)}, node_resources={NODE: ["kv", "other"]})
+        .resolve_cached_prefix("b", NODE, WALK, ARNodeInputs(input_seq_len=len(shared)))
+        for kv in ranks
+    ]
+
+    assert answers[0] == answers[1], "the ranks cut the lease to different lengths"
+    assert leader._streams["b"]["main"].lease == follower._streams["b"]["main"].lease
 
 
 def test_ranks_evict_alike_however_their_probes_and_commits_interleave():

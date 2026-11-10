@@ -532,25 +532,44 @@ def test_eviction_takes_window_pages_before_the_full_page_they_end_on():
     )
 
 
-@pytest.mark.parametrize("other", [0, 80])
-def test_a_window_lease_cut_below_its_end_keeps_nothing_or_raises(other):
-    """Past the window, a shorter prefix needs window pages the lease doesn't hold: a declined
-    hit gives the lease back, and any other cut is refused rather than served wrong."""
+class _Capping(StubResource):
+    """A resource that answers no prefix and caps the agreed one, as the recurrent pool does."""
+
+    def __init__(self, cap: int):
+        self._cap = cap
+
+    def cap_cached_prefix(self, rid, node_name, graph_walk, prefix):
+        tokens = min(prefix.tokens, self._cap)
+        return prefix._replace(tokens=tokens, position=prefix.position - prefix.tokens + tokens)
+
+
+@pytest.mark.parametrize(("other", "gone", "served"), [
+    (_Holding(0), None, 0),
+    # the lease ends at 96 and holds the window of tokens 72-96, but the index still holds 56-80's
+    (_Holding(80), None, 80),
+    # the window page of tokens 64-72 is gone, so the cache serves 64, and the cap is asked again at 64
+    (_Capping(80), 8, 64),
+], ids=["declined", "shorter", "capped"])
+def test_a_window_lease_cut_below_its_end_serves_what_the_index_holds_there(other, gone, served):
     kv = _window_manager()
     tokens = list(range(100))
     _write(kv, "a", tokens)
     kv.remove_request("a")
+    if gone is not None:
+        rooted = [fingerprint(ROOT, key) for key in _keys(tokens)]
+        kv._index._remove(kv._index.page_for(kv._window_key(rooted[kv._ends_on(1, gone)], 1, gone)))
     kv.ingest_request("b", KVReqConfig(prefix_keys={"main": _keys(tokens)}, kv_layout=_layout(100)))
-    runner = StepRunner({"kv": kv, "other": _Holding(other)}, node_resources={NODE: ["kv", "other"]})
-    matched = runner.resolve_cached_prefix("b", NODE, WALK, ARNodeInputs(input_seq_len=100))
+    runner = StepRunner({"kv": kv, "other": other}, node_resources={NODE: ["kv", "other"]})
+    inputs = ARNodeInputs(input_seq_len=100)
 
-    if other:
-        with pytest.raises(RuntimeError, match="window"):
-            runner.apply_cached_prefix("b", NODE, WALK, None, matched)
-    else:
-        runner.apply_cached_prefix("b", NODE, WALK, None, matched)
-        assert kv._streams["b"]["main"].lease is None
-        kv.assert_pages_conserved()
+    matched = runner.resolve_cached_prefix("b", NODE, WALK, inputs)
+    runner.apply_cached_prefix("b", NODE, WALK, inputs, matched)
+    _grow(kv, "b", 100 - matched.tokens)
+
+    assert matched.tokens == served
+    b = kv._streams["b"]["main"].later[0]
+    assert b.stored_len + b.released == 100, "the repeat's window doesn't stand where its prompt ends"
+    kv.assert_pages_conserved()
 
 
 # ── what is done with the lock down ─────────────────────────────────────

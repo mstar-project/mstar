@@ -963,10 +963,13 @@ class KVManager(AttentionResource):
         released = group.retention.released_pages(end, group.page_size)
         return [*range(released.start), *range(released.stop, end // group.page_size)]
 
-    def _match(self, rooted: list[bytes], limit: int) -> tuple[int, list[list[int]]]:
+    def _match(
+        self, rooted: list[bytes], limit: int, among: Collection[int] | None = None,
+    ) -> tuple[int, list[list[int]]]:
         """The longest boundary within the first ``limit`` of ``rooted``'s pages at which the index holds every
         page each group keeps (`_kept`), with those pages, group by group. Walks back from the first group's
-        run: a window page missing at ``i`` puts the boundary at or below that page's start. Doesn't stamp."""
+        run: a window page missing at ``i`` puts the boundary at or below that page's start. With ``among``,
+        a window page outside it counts as missing. Doesn't stamp."""
         index, page_size, unit = self._index, self.config.tokens_per_page, self._hit_unit
         run = index.pages_for(rooted[:limit])
         end = len(run) * page_size // unit * unit
@@ -975,6 +978,8 @@ class KVManager(AttentionResource):
             for g, group in self._windows:
                 kept = self._kept(g, end)
                 held = [index.page_for(self._window_key(rooted[self._ends_on(g, i)], g, i)) for i in kept]
+                if among is not None:
+                    held = [page if page in among else None for page in held]
                 missing = [i for i, page in zip(kept, held, strict=True) if page is None]
                 if missing:
                     lower = min(lower, missing[-1] * group.page_size // unit * unit)
@@ -1009,25 +1014,50 @@ class KVManager(AttentionResource):
         self._arena.retain([page for group in groups for page in group])
         return end, groups
 
-    def _cut_lease(self, rid: str, stream: CacheStream, held: int) -> None:
-        """Cut the stream's lease to its first ``held`` tokens, floored to a page. With windows only where each
-        window keeps a subset of what it keeps at the lease's end: none of it, or a lease that ends within the
-        window. Any other cut would need window pages the lease doesn't hold, so it raises."""
-        page_size, lease = self.config.tokens_per_page, stream.lease
-        keep = [lease.groups[0][:held // page_size]]
-        for g, _ in self._windows:
-            at = dict(zip(self._kept(g, lease.end), lease.groups[g], strict=True))
-            kept = self._kept(g, held)
-            if held % self._hit_unit or any(i not in at for i in kept):
-                raise RuntimeError(
-                    f"KV {self.name}: {rid}'s lease ends at {lease.end} tokens, and its window pages there don't "
-                    f"cover a cut to {held}"
-                )
-            keep.append([at[i] for i in kept])
-        kept_pages = {page for group in keep for page in group}
-        cut = [page for page in lease.pages() if page not in kept_pages]
-        stream.lease = Lease(len(keep[0]) * page_size, keep) if keep[0] else None
-        self._release(rid, stream, cut)
+    def _recut(self, rid: str, stream: CacheStream, held: int, least: int) -> int:
+        """Cut the stream's lease to the longest boundary at or under ``held`` the cache serves, matched again
+        there, and return it. A window keeps other pages at a shorter boundary than at the lease's end, which
+        the index may still hold. Above one rank only the lease's own pages count: every rank holds the same
+        lease, but this rank's index may be ahead of rank 0's. Raises if that boundary is under ``least``."""
+        lease = stream.lease
+        among = None if self._world_size == 1 else set(lease.pages())
+        end, groups = self._match(stream.chain.rooted, held // self.config.tokens_per_page, among)
+        if end < least:
+            raise RuntimeError(
+                f"KV {self.name}: {rid}'s lease ends at {lease.end} tokens, and the cache doesn't hold what "
+                f"a stream holds at {least}"
+            )
+        kept, leased = {page for group in groups for page in group}, set(lease.pages())
+        taken = [page for page in kept if page not in leased]
+        self._arena.retain(taken)
+        if self._world_size == 1:
+            self._index.touch(taken)
+        stream.lease = Lease(end, groups) if end else None
+        self._release(rid, stream, [page for page in lease.pages() if page not in kept])
+        return end
+
+    def cap_cached_prefix(
+        self, rid: str, node_name: str, graph_walk: str, prefix: CachedPrefix,
+    ) -> CachedPrefix:
+        """Cut ``prefix`` to the longest the cache serves at or under it, and the lease with it (`_recut`): a
+        window pool's lease holds a window's pages only at its own end. A walk the lease serves whole is left
+        alone, since the walks after it use the rest."""
+        if not self._windows:
+            # every page boundary under the lease is served, so `apply_cached_prefix` cuts it
+            return prefix
+        with self._lock:
+            label = self._keyed_label(rid, node_name, graph_walk)
+            stream = self._streams.get(rid, {}).get(label)
+            if stream is None or stream.lease is None or stream.stored_len:
+                return prefix
+            cursor = stream.span_cursor
+            step = cursor.next_step(graph_walk)
+            held = cursor.consumed + prefix.tokens
+            if held >= stream.lease.end or prefix.tokens == sum(span.length for span in step):
+                return prefix
+            end = self._recut(rid, stream, held, cursor.consumed)
+            self._recount(rid)
+            return self._answer(prefix.label, cursor, step, end)
 
     def lease_cached_prefix(self, rid: str, node_name: str, graph_walk: str) -> list[list[int]] | None:
         """Returns the same lease's pages, group by group, with every step until `admit` converts it."""
@@ -1149,7 +1179,7 @@ class KVManager(AttentionResource):
                     f"KV {self.name}: {rid}/{label}: the walks the cache served end "
                     f"inside a page ({cursor.consumed} slots), so their KV cannot be kept"
                 )
-            self._cut_lease(rid, stream, cursor.consumed)
+            self._recut(rid, stream, cursor.consumed, cursor.consumed)
             lease, stream.lease = stream.lease, None
             if lease is None:
                 lease = Lease(0, [[] for _ in self._groups])
@@ -1192,7 +1222,7 @@ class KVManager(AttentionResource):
                 return
             held = cursor.consumed + prefix.tokens
             if held < stream.lease.end:
-                self._cut_lease(rid, stream, held)
+                self._recut(rid, stream, held, held // self.config.tokens_per_page * self.config.tokens_per_page)
                 self._recount(rid)
 
     def complete_cached_walk(self, rid: str, node_name: str, graph_walk: str) -> None:
