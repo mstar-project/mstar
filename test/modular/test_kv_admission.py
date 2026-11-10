@@ -50,7 +50,7 @@ from mstar.engine.resources.kv.config import (
     StreamLayout,
 )
 from mstar.engine.resources.kv.keys import chain, fingerprint
-from mstar.engine.resources.kv.manager import KVManager, KVSequenceInfo, PublishedKVInfo
+from mstar.engine.resources.kv.manager import KVManager, KVSequenceInfo, PassMark, PublishedKVInfo
 from mstar.engine.resources.kv.prefix_index import PrefixIndex
 from mstar.engine.resources.recurrent.config import (
     RecurrentBlockConfig,
@@ -247,6 +247,21 @@ def test_a_filed_page_tries_no_guaranteed_request_whose_footprint_cant_fit_besid
     _runner(kv).admit_waiting(lambda rid, node: None)
 
     assert not tried, f"one filed page tried {len(tried)} guaranteed requests, whose hit takes nothing off"
+
+
+def test_a_pass_that_changed_nothing_asks_once_about_the_passers_refused_against_one_room(monkeypatch):
+    """Each passer's mark named the passer, so the runner asked the pool about every refused passer on every pass."""
+    kv = _passing(free=3, head=5)
+    for n in range(16):
+        _short_chat(kv, f"w{n}", [7000 + n] * 8, cap=512)
+        assert not _ready(kv, f"w{n}")
+    asked, grew = [], KVManager.grew_since
+    monkeypatch.setattr(KVManager, "grew_since", lambda kv, mark: asked.append(mark) or grew(kv, mark))
+
+    _runner(kv).admit_waiting(lambda rid, node: None)
+
+    passers = [mark for mark in asked if isinstance(mark, PassMark)]
+    assert len(passers) == 1, f"one pass asked the pool {len(passers)} times about passers refused against one room"
 
 
 def test_a_request_that_asks_while_the_heads_mark_is_out_of_date_passes_once_the_head_is_refused_again():
