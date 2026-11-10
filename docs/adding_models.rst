@@ -2530,6 +2530,52 @@ example, ``configs/qwen3tts.yaml`` selects FA2 under ``talker_attn``,
    with a message describing the migration. Move the block under ``resources:``, keyed by
    the resource name.
 
+Quantization per deployment
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A ``quantization:`` block picks a weight format per layer, for every model that declares its weights roots
+(``Model.get_quantization_roots``: the root class its loader fills, which linears may go low precision and
+which stay bf16 as a ``QuantizableLinears``, and its ``CheckpointRules``). Without the block a declared model
+serves its checkpoint as stored, so a block-fp8 checkpoint (``quant_method: fp8``) loads into fp8 layers.
+
+.. code-block:: yaml
+
+   quantization:
+     format: fp8_block            # auto (default) | bf16 | fp8_tensor | fp8_channel | fp8_block | mxfp8 | nvfp4
+                                  # | mxfp4 | w4a16
+     layers:                      # ordered, first match wins
+       - {match: "model.layers.0-3.**", format: bf16}
+       - {match: "model.layers.*.mlp.*", format: fp8_channel}
+     keep_bf16: [lm_head]
+     nodes:                       # per node; its rules go before the top level's
+       vision_encoder: {format: bf16}
+
+Patterns are module paths under the root (each dotted segment an ``fnmatch`` pattern or an index range, ``**``
+for any number of segments, or ``re:<regex>``). The checkpoint's format per linear is read from its safetensors
+headers, so the compressed-tensors, modelopt, AWQ, GPTQ and DeepSeek-style layouts are all recognised; one with
+no loader yet, a rule that matches nothing, a rule on a layer the model keeps bf16, or a stored format served as
+another quantized one is refused at startup with every problem listed. A default format that doesn't fit one
+layer's width keeps that layer bf16 and logs why. Tensor-parallel linears and MoE experts take a format in place,
+each rank quantizing or loading its own shard. ``python -m mstar.quantization.convert`` writes a bf16
+checkpoint's chosen linears as block fp8; ``benchmark/quantization/qa_gate.py`` and ``bench_linears.py`` are the
+quality gate and the GEMM sweep for a format.
+
+4-bit checkpoints load as stored, in compressed-tensors' layout: ``pack-quantized`` int4 (symmetric or with zero
+points, any group), AutoAWQ and GPTQ (repacked to it as they stream in; a GPTQ act-order checkpoint is refused),
+``mxfp4-pack-quantized`` (Kimi K3's routed experts) and modelopt NVFP4 (``nvidia/*-NVFP4``; its GEMM needs
+compute capability 10.0, so ``auto`` refuses it elsewhere and ``format: bf16`` dequantizes it instead). ``w4a16``
+and ``mxfp4`` run a Triton GEMM that dequantizes each weight tile to bf16 in registers (Ampere and later; both can
+also quantize a bf16 checkpoint at load); MoE routed experts take every 4-bit format, through a Triton grouped GEMM
+on H100/H200 and FlashInfer's TRT-LLM FP4 MoE (MXFP4, NVFP4) on B200/B300. ``bench_experts.py`` times the experts'
+formats against the bf16 fused MoE.
+
+A mixed checkpoint is read the same way, tensor by tensor: nvidia/GLM-5.3-NVFP4 (modelopt ``MIXED_PRECISION``)
+serves its routed experts as NVFP4, the dense layers' FFN as fp8 per tensor (gate and up requantized to one scale,
+as modelopt calibrates them apart) and its bf16 attention as bf16, with no ``quantization:`` block; a rule can
+still move any of its bf16 linears to a format at load. An experts layer that takes NVFP4 needs one tensor scale for
+gate and up per expert and one activation scale per layer (modelopt's own convention); the NVFP4 activations are
+quantized against the checkpoint's calibrated ``input_scale``.
+
 Routing across data-parallel replicas
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 

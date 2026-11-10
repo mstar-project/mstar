@@ -88,7 +88,6 @@ class Qwen3_5VisionConfig:
 class Qwen3_5Config:
     num_hidden_layers: int
     hidden_size: int
-    intermediate_size: int
     # per layer, LINEAR_ATTENTION or FULL_ATTENTION
     layer_types: list[str]
 
@@ -108,6 +107,14 @@ class Qwen3_5Config:
     rms_norm_eps: float
     max_position_embeddings: int
 
+    # the dense MLP's width (0 on a MoE checkpoint, which has none)
+    intermediate_size: int = 0
+    # qwen3_5_moe: every layer's MLP is `num_experts` routed experts (top `num_experts_per_tok`, softmax then
+    # renormalized) beside one shared expert scaled by a sigmoid gate; 0 experts is the dense model
+    num_experts: int = 0
+    num_experts_per_tok: int = 0
+    moe_intermediate_size: int = 0
+    shared_expert_intermediate_size: int = 0
     attn_output_gate: bool = False
     tie_word_embeddings: bool = False
     eos_token_id: int | list[int] | None = None
@@ -138,6 +145,10 @@ class Qwen3_5Config:
         return cls(**{k: v for k, v in merged.items() if k in known})
 
     # Derived
+
+    @property
+    def is_moe(self) -> bool:
+        return self.num_experts > 0
 
     @property
     def eos_token_ids(self) -> frozenset[int]:

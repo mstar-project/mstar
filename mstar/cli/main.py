@@ -87,6 +87,8 @@ DEFAULT_CONFIGS.update({
 })
 # 27B has no single-GPU form
 DEFAULT_CONFIGS["qwen3_5_27b"] = "qwen3_5_27b_tp4.yaml"
+# Qwen3.5-397B-A17B (NVFP4 / FP8), text only
+DEFAULT_CONFIGS["qwen3_5_moe"] = "qwen3_5_397b_a17b_tp8.yaml"
 # Qwen3.8-27B runs on the Qwen3.5 code; TP4 like the 3.5 27B
 DEFAULT_CONFIGS["qwen3_8_27b"] = "qwen3_8_27b_tp4.yaml"
 

@@ -44,6 +44,7 @@ from mstar.engine.resources import (  # noqa: E402
     SamplingReqConfig,
 )
 from mstar.graph.base import Loop  # noqa: E402
+from mstar.model.glm52._testing import planned_load  # noqa: E402
 from mstar.model.glm52.components.causal_lm import Glm52ForCausalLM  # noqa: E402
 from mstar.model.glm52.config import (  # noqa: E402
     ATTN_RESOURCE,
@@ -377,12 +378,23 @@ def test_glm52_no_cuda_graphs_under_reference_dispatch():
     # The reference MoE dispatch (.nonzero()/host loop) cannot be stream-
     # captured; registering graph configs would fail every capture and then
     # break eager prefill. Reference modes must register none.
-    fp8 = _make_submodule(Glm52ModelConfig.reduced_fp8())
+    # decided from the experts as loaded (the quantization plan's), not from the config
+    from mstar.model.glm52.components.moe import Glm52SparseMoeBlock
+
+    def with_moe(config, fp8):
+        sub = _make_submodule(config)
+        block = Glm52SparseMoeBlock(config)
+        if fp8:
+            block.experts_prepare("fp8_block", config.quantization_config.weight_block_size)
+        sub.language_model.moe = block
+        return sub
+
+    fp8 = with_moe(Glm52ModelConfig.reduced_fp8(), fp8=True)  # not resolved to the fused kernel
     assert fp8.get_accelerator_graph_configs(torch.device("cpu")) == []
-    bf16_tp = _make_submodule(Glm52ModelConfig.reduced())
+    bf16_tp = with_moe(Glm52ModelConfig.reduced(), fp8=False)
     assert bf16_tp.get_accelerator_graph_configs(torch.device("cpu"), tp_world_size=8) == []
     # bf16 TP=1 uses the capture-safe fused kernel on GPU: graphs stay.
-    bf16 = _make_submodule(Glm52ModelConfig.reduced())
+    bf16 = with_moe(Glm52ModelConfig.reduced(), fp8=False)
     assert len(bf16.get_accelerator_graph_configs(torch.device("cpu"))) == 2
 
 
@@ -583,7 +595,7 @@ def test_load_weights_skips_indexer_keys_flag_off_and_demands_them_flag_on():
     # flag-off: the keys are dropped before the dequant stream, the load is
     # complete both ways without them
     off = Glm52ForCausalLM(cfg)
-    loaded = off.load_weights(iter(state))
+    loaded = planned_load(off, state)
     assert loaded == set(dict(off.named_parameters()))
     assert not any(".indexer." in n for n in loaded)
 
@@ -591,13 +603,13 @@ def test_load_weights_skips_indexer_keys_flag_off_and_demands_them_flag_on():
     # keys is refused rather than served from uninitialized memory
     cfg.dsa_long_context = True
     on = Glm52ForCausalLM(cfg)
-    loaded = on.load_weights(iter(state))
+    loaded = planned_load(on, state)
     assert loaded == set(dict(on.named_parameters()))
     assert _indexer_params(on) <= loaded and _indexer_params(on)
 
     stripped = [(n, t) for n, t in state if ".self_attn.indexer." not in n]
     with pytest.raises(RuntimeError, match="indexer parameters received no checkpoint"):
-        Glm52ForCausalLM(cfg).load_weights(iter(stripped))
+        planned_load(Glm52ForCausalLM(cfg), stripped)
 
 
 def _hf_config(cfg: Glm52ModelConfig) -> dict:
@@ -696,15 +708,22 @@ def test_load_refuses_a_checkpoint_missing_a_layer(tmp_path):
         [(n, t) for n, t in state if not n.startswith("model.layers.1.")],
     )
 
+    from mstar.quantization.scope import node_scope
+
     def load(name):
         model = Glm52Model(
             model_path_hf="", checkpoint_path=str(tmp_path / name),
             tokenizer_mode="byte",
         )
-        return model.get_submodule("LLM", device="cpu")
+        with node_scope(model, "LLM", {}) as scope:  # as the engine manager loads a node
+            sub = model.get_submodule("LLM", device="cpu")
+            scope.finish(sub)
+        return sub
 
     lm = load("complete").language_model
-    layer1 = [n for n, _ in lm.named_parameters() if n.startswith("model.layers.1.")]
+    # (stored fp8 layers also hold *_scale_inv; the missing layer loads bf16-shaped)
+    layer1 = [n for n, _ in lm.named_parameters()
+              if n.startswith("model.layers.1.") and not n.endswith("_scale_inv")]
     assert layer1
     with pytest.raises(RuntimeError) as exc:
         load("missing")

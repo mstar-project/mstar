@@ -17,6 +17,12 @@ smaller ``s`` moved the NVFP4 GEMM's error by under 5% on any linear). So a mode
 measured above 2688 (``QuantizableLinears.input_amax``) and those linears take the smallest power of two
 that holds it (``Nvfp4Format.input_scale``); the rest keep ``s = 1``. A power of two quantizes every block
 inside both ranges the same way.
+
+A modelopt NVFP4 checkpoint (``nvidia/*-NVFP4``) loads as it is stored: ``weight`` uint8 ``[N, K/2]``, ``weight_scale``
+e4m3 ``[N, K/16]`` in plain row-major order (swizzled by ``after_load``, once this rank's rows and columns are cut,
+since a swizzled tile can't be sharded), ``weight_scale_2`` (the fp32 tensor scale) and ``input_scale`` (the
+activation's calibrated tensor scale, the role a declared ``input_amax`` plays at load). The two meet in the same
+buffers, so a stored layer and one quantized at load run the same op.
 """
 
 from __future__ import annotations
@@ -25,7 +31,7 @@ import math
 
 import torch
 
-from mstar.model.components.quant_linear import LinearFormat, register_format
+from mstar.model.components.quant_linear import LinearFormat, Storage, register_format
 from mstar.platforms import current_platform
 from mstar.utils.fp8_block import (
     BLOCKS_PER_TILE,
@@ -128,10 +134,21 @@ class Nvfp4Format(BlockScaledFormat):
     scale (see the module docstring for an activation's)."""
 
     name = "nvfp4"
-    buffers = ("weight", "weight_scale", "weight_tensor_scale", "input_scale")
+    buffers = ("weight", "weight_scale", "weight_scale_2", "input_scale")
     data_dtype, scale_dtype, block, packing, data_max = FP4_DTYPE, FP8_DTYPE, 16, 2, 6.0
     # a 16-block's largest magnitude a unit tensor scale holds: e4m3's top code times e2m1's top
     UNIT_RANGE = 6.0 * 448.0
+
+    def __init__(self, nearest: bool = False):
+        # how an activation block's e4m3 scale rounds: up (nothing clips; the input scales this module places) or
+        # to nearest, as modelopt calibrates a checkpoint's input_scale and FlashInfer's FP4 MoE quantizes
+        self.nearest = nearest
+
+    def for_stored(self, stored) -> Nvfp4Format:
+        """A checkpoint's NVFP4 linears quantize their activations as its calibration assumed: to nearest."""
+        if stored is None or stored.format != self.name:
+            return self
+        return NVFP4_STORED
 
     @classmethod
     def input_scale(cls, input_amax: float | None) -> float:
@@ -151,9 +168,10 @@ class Nvfp4Format(BlockScaledFormat):
         )
         return code.to(torch.uint8)
 
-    def quantize(self, x, tensor_scale=None) -> BlockQuant:
-        """A block's scale is the e4m3 at or above ``amax / 6`` in units of ``tensor_scale`` (default: the tensor's
-        own ``amax / (6 * 448)``, which gives the largest block the top of e4m3's range)."""
+    def quantize(self, x, tensor_scale=None, nearest: bool = False) -> BlockQuant:
+        """A block's scale is the e4m3 at or above ``amax / 6`` (``nearest``: nearest to it) in units of
+        ``tensor_scale`` (default: the tensor's own ``amax / (6 * 448)``, which gives the largest block the top of
+        e4m3's range)."""
         rows, k = x.shape
         blocks, amax = self._blocks(x)
         if tensor_scale is None:
@@ -161,14 +179,16 @@ class Nvfp4Format(BlockScaledFormat):
         tensor_scale = torch.as_tensor(tensor_scale, dtype=torch.float32, device=x.device).reshape(1)
         want = amax / tensor_scale / self.data_max
         code = want.to(FP8_DTYPE).view(torch.uint8).int()
-        code = (code + (code.to(torch.uint8).view(FP8_DTYPE).float() < want).int()).clamp(1, _E4M3_MAX_FINITE)
+        if not nearest:
+            code = code + (code.to(torch.uint8).view(FP8_DTYPE).float() < want).int()
+        code = code.clamp(1, _E4M3_MAX_FINITE)
         code = code.to(torch.uint8)
         scale = code.view(FP8_DTYPE).float() * tensor_scale
         nibbles = self._codes((blocks / scale[..., None]).view(rows, k)).view(rows, k // 2, 2)
         data = (nibbles[..., 0] | (nibbles[..., 1] << 4)).view(self.data_dtype)
         return BlockQuant(data, swizzle_block_scales(code).view(self.scale_dtype), tensor_scale)
 
-    def dequantize(self, q: BlockQuant) -> torch.Tensor:
+    def _dequantize(self, q: BlockQuant) -> torch.Tensor:
         rows, stored = q.data.shape
         raw = q.data.view(torch.uint8)
         codes = torch.stack([raw & 15, raw >> 4], dim=-1)
@@ -181,14 +201,68 @@ class Nvfp4Format(BlockScaledFormat):
     def quantize_weight(self, weight, input_amax):
         q = self.quantize(weight)
         scale = torch.full((1,), self.input_scale(input_amax), dtype=torch.float32, device=weight.device)
-        return {"weight": q.data, "weight_scale": q.scale, "weight_tensor_scale": q.tensor_scale, "input_scale": scale}
+        return {"weight": q.data, "weight_scale": q.scale, "weight_scale_2": q.tensor_scale, "input_scale": scale}
 
-    def linear(self, x, weight, weight_scale, weight_tensor_scale, input_scale):
-        return torch.ops.mstar.nvfp4_linear(x, weight, weight_scale, weight_tensor_scale, input_scale)
+    def linear(self, x, weight, weight_scale, weight_scale_2, input_scale):
+        return torch.ops.mstar.nvfp4_linear(x, weight, weight_scale, weight_scale_2, input_scale, self.nearest)
+
+    # -- a modelopt checkpoint, as stored ----------------------------------------------------------------
+    def storage(self, n, k):
+        return (Storage("weight", (n, k // 2), torch.uint8, FP4_DTYPE, (1, 2)),
+                Storage("weight_scale", (n, k // self.block), torch.uint8, FP8_DTYPE, (1, self.block)),
+                Storage("weight_scale_2", (1,), torch.int32, torch.float32, (None, None)),
+                Storage("input_scale", (1,), torch.int32, torch.float32, (None, None)))
+
+    def from_checkpoint(self, name, tensor):
+        if name in ("weight_scale_2", "input_scale"):
+            return tensor.to(torch.float32).reshape(-1).view(torch.int32)
+        return tensor.view(torch.uint8) if tensor.element_size() == 1 and tensor.dtype != torch.uint8 else tensor
+
+    def after_load(self, tensors):
+        """The block scales swizzled for the GEMM, one tensor scale and one input scale for the layer: a fused
+        layer's shards (q/k/v, gate/up) must agree on both (modelopt calibrates them together, e.g. nvidia/GLM-5.3-
+        Flash-NVFP4's gate/up), since one GEMM epilogue applies one of each; a checkpoint where they differ is
+        refused rather than served with the other shards' values."""
+        out = dict(tensors)
+        for name in ("weight_scale_2", "input_scale"):
+            values = tensors[name].reshape(-1)
+            if values.numel() > 1 and not bool((values == values[0]).all()):
+                raise ValueError(f"nvfp4: this layer's checkpoint shards have different {name} "
+                                 f"({values.tolist()}); one GEMM takes one. Serve the layer bf16 instead")
+            out[name] = values[:1].clone()
+        scale = tensors["weight_scale"]
+        if scale.dim() == 2:
+            out["weight_scale"] = swizzle_block_scales(scale.view(torch.uint8)).view(FP8_DTYPE)
+        return out
+
+    def dequantize(self, q):
+        """The fp32 weight of a ``BlockQuant``, or of a layer's buffers by suffix (as stored or as swizzled)."""
+        return self._dequantize(q if isinstance(q, BlockQuant) else self._as_blockquant(q))
+
+    def reference_stored(self, x: torch.Tensor, buffers) -> torch.Tensor:
+        """What the GEMM computes on a layer's buffers: ``x`` quantized in units of its ``input_scale``, times the
+        dequantized weight (tests, the experts' reference)."""
+        return self.reference_linear(self.quantize(x, _f32(buffers["input_scale"])[:1], self.nearest),
+                                     self._as_blockquant(buffers))
+
+    @staticmethod
+    def _as_blockquant(buffers) -> BlockQuant:
+        weight = buffers["weight"].view(torch.uint8)
+        scale = buffers["weight_scale"].view(torch.uint8)
+        if scale.dim() == 2:
+            scale = swizzle_block_scales(scale)
+        return BlockQuant(weight.view(FP4_DTYPE), scale.view(FP8_DTYPE), _f32(buffers["weight_scale_2"])[:1])
+
+
+def _f32(t: torch.Tensor) -> torch.Tensor:
+    """An fp32 scale held in an int32 container, or any float, as a flat fp32 tensor."""
+    return (t.view(torch.float32) if t.dtype == torch.int32 else t.float()).reshape(-1)
 
 
 MXFP8 = register_format(Mxfp8Format())
 NVFP4 = register_format(Nvfp4Format())
+# a checkpoint's NVFP4, as stored (``Nvfp4Format.for_stored``): its activations round to nearest
+NVFP4_STORED = Nvfp4Format(nearest=True)
 
 
 def _out(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
@@ -218,29 +292,30 @@ def _(x, weight, weight_scale):
 
 @torch.library.custom_op("mstar::nvfp4_linear", mutates_args=())
 def nvfp4_linear(
-    x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor, weight_tensor_scale: torch.Tensor,
-    input_scale: torch.Tensor,
+    x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor, weight_scale_2: torch.Tensor,
+    input_scale: torch.Tensor, nearest: bool = False,
 ) -> torch.Tensor:
-    """``x [M, K]`` bf16 times an NVFP4 weight ``[N, K // 2]``, ``x`` quantized in units of ``input_scale``."""
+    """``x [M, K]`` bf16 times an NVFP4 weight ``[N, K // 2]``, ``x`` quantized in units of ``input_scale`` (its
+    block scales rounded up, or to ``nearest``)."""
     return NVFP4.reference_linear(
-        NVFP4.quantize(x, input_scale), BlockQuant(weight, weight_scale, weight_tensor_scale),
+        NVFP4.quantize(x, input_scale, nearest), BlockQuant(weight, weight_scale, weight_scale_2),
     )
 
 
 @nvfp4_linear.register_fake
-def _(x, weight, weight_scale, weight_tensor_scale, input_scale):
+def _(x, weight, weight_scale, weight_scale_2, input_scale, nearest=False):
     return _out(x, weight)
 
 
 @nvfp4_linear.register_kernel("cuda")
-def _(x, weight, weight_scale, weight_tensor_scale, input_scale):
+def _(x, weight, weight_scale, weight_scale_2, input_scale, nearest=False):
     from mstar.utils.quant_fp8 import quant_nvfp4
 
-    q = quant_nvfp4(x, input_scale)
+    q = quant_nvfp4(x, input_scale, nearest)
     ops = torch.nn.functional
     recipe = [ops.ScalingType.BlockWise1x16.value, ops.ScalingType.TensorWise.value]
     swizzle = [ops.SwizzleType.SWIZZLE_32_4_4.value, ops.SwizzleType.NO_SWIZZLE.value]
     return torch._scaled_mm_v2(
         q.data, weight.t(), [q.scale, q.tensor_scale], recipe, swizzle,
-        [weight_scale, weight_tensor_scale], recipe, swizzle, None, torch.bfloat16,
+        [weight_scale, weight_scale_2], recipe, swizzle, None, torch.bfloat16,
     )

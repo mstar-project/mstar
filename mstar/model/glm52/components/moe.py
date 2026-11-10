@@ -1,4 +1,9 @@
-"""GLM-5.2 fine-grained MoE: the noaux_tc router (components/moe.py) + FP8-resident experts."""
+"""GLM-5.2 fine-grained MoE: the noaux_tc router (components/moe.py) + quantized routed experts.
+
+The routed experts are one quantizable layer (``QuantExperts``): built bf16-shaped, they take the checkpoint's
+storage from the node's quantization plan. Block fp8 (zai-org's checkpoints) runs this block's fused prefill /
+decode kernels; NVFP4 (nvidia/GLM-5.3-NVFP4) runs the format's own experts kernel (FlashInfer's TRT-LLM FP4 MoE
+on B200/B300) on this block's routing."""
 from __future__ import annotations
 
 import logging
@@ -10,9 +15,9 @@ from torch import nn
 from mstar.distributed.communication import CommGroup
 from mstar.distributed.utils import divide
 from mstar.model.components.distributed import ParallelGatedMLP
-from mstar.model.components.fp8_linear import Fp8ParallelGatedMLP, dense_fp8_block, fp8_reference
 from mstar.model.components.moe import (
     NoAuxTcRouter,
+    QuantExperts,
     _dispatch,
     _down_proj_fp8_weight_loader,
     _down_proj_weight_loader,
@@ -46,12 +51,16 @@ def fused_fp8_available(device: torch.device, block_size: tuple[int, int]) -> bo
 _DECODE_MAX_TOKENS = 64
 
 
-def _ceil_div(a: int, b: int) -> int:
-    return -(-a // b)
-
-
-class Glm52SparseMoeBlock(nn.Module):
+class Glm52SparseMoeBlock(QuantExperts, nn.Module):
     """Routed experts + ungated shared expert (DeepSeek-V3 block shape)."""
+
+    @property
+    def fp8_experts(self) -> bool:
+        return self.experts_fp8_block is not None
+
+    @property
+    def block_size(self) -> tuple[int, int] | None:
+        return self.experts_fp8_block
 
     def __init__(
         self, config: Glm52ModelConfig, comm_group: CommGroup | None = None,
@@ -71,9 +80,6 @@ class Glm52SparseMoeBlock(nn.Module):
         self.moe_intermediate_size = config.moe_intermediate_size
         shard_inter = divide(config.moe_intermediate_size, self.tp_size)
 
-        self.fp8_experts = (
-            config.quantization_config is not None and config.moe_fp8_resident
-        )
         self.kernels = config.kernels
         if self.kernels not in KERNELS:
             # an unknown value would otherwise resolve to the uncapturable
@@ -99,49 +105,12 @@ class Glm52SparseMoeBlock(nn.Module):
         )
 
         self.experts = nn.Module()
-        if self.fp8_experts:
-            bo, bi = config.quantization_config.weight_block_size
-            self.block_size = (bo, bi)
-            hidden, E = config.hidden_size, config.n_routed_experts
-            assert shard_inter % bo == 0 and shard_inter % bi == 0, (
-                f"per-rank intermediate {shard_inter} must be a multiple of the "
-                f"fp8 scale block {self.block_size} for clean TP slicing (full "
-                f"model: 2048/8=256 per rank, 2 blocks of 128)"
-            )
-            # fp8 bytes in uint8 containers; e4m3 view happens at dispatch.
-            self.experts.gate_up_proj_fp8 = nn.Parameter(
-                torch.empty(E, 2 * shard_inter, hidden, dtype=torch.uint8),
-                requires_grad=False,
-            )
-            self.experts.gate_up_proj_scale_inv = nn.Parameter(
-                torch.empty(
-                    E, 2 * (shard_inter // bo), _ceil_div(hidden, bi),
-                    dtype=torch.float32,
-                ),
-                requires_grad=False,
-            )
-            self.experts.down_proj_fp8 = nn.Parameter(
-                torch.empty(E, hidden, shard_inter, dtype=torch.uint8),
-                requires_grad=False,
-            )
-            self.experts.down_proj_scale_inv = nn.Parameter(
-                torch.empty(
-                    E, _ceil_div(hidden, bo), shard_inter // bi,
-                    dtype=torch.float32,
-                ),
-                requires_grad=False,
-            )
-        else:
-            self.experts.gate_up_proj = nn.Parameter(
-                torch.empty(
-                    config.n_routed_experts, 2 * shard_inter, config.hidden_size,
-                )
-            )
-            self.experts.down_proj = nn.Parameter(
-                torch.empty(
-                    config.n_routed_experts, config.hidden_size, shard_inter,
-                )
-            )
+        self.experts.gate_up_proj = nn.Parameter(
+            torch.empty(config.n_routed_experts, 2 * shard_inter, config.hidden_size)
+        )
+        self.experts.down_proj = nn.Parameter(
+            torch.empty(config.n_routed_experts, config.hidden_size, shard_inter)
+        )
         self._attach_expert_weight_loaders()
 
         # kernels: auto sums the shared and routed partials and reduces once; sum-then-reduce
@@ -150,39 +119,26 @@ class Glm52SparseMoeBlock(nn.Module):
         # the two partials are summed before any reduce: one here, or none
         self._sum_partials = self.tp_size > 1 and (self._fused_allreduce or not reduce_results)
         shared_inter = config.moe_intermediate_size * config.n_shared_experts
-        dense_block = dense_fp8_block(config)
-        if dense_block is not None and config.fp8_shared_expert:
-            self.shared_expert = Fp8ParallelGatedMLP(
-                config.hidden_size, shared_inter, dense_block, comm_group=comm_group,
-                reduce_results=not self._sum_partials, reference=fp8_reference(config))
-        else:
-            self.shared_expert = ParallelGatedMLP(
-                hidden_size=config.hidden_size,
-                intermediate_size=shared_inter,
-                comm_group=comm_group,
-                activation=config.hidden_act,
-                bias=False,
-                reduce_results=not self._sum_partials,
-            )
+        # bf16 or fp8 as the plan says (Glm52Model.get_quantization_roots keeps it bf16 under kernels: auto,
+        # whose decode chain reads its bf16 weights)
+        self.shared_expert = ParallelGatedMLP(
+            hidden_size=config.hidden_size,
+            intermediate_size=shared_inter,
+            comm_group=comm_group,
+            activation=config.hidden_act,
+            bias=False,
+            reduce_results=not self._sum_partials,
+        )
 
     def _attach_expert_weight_loaders(self) -> None:
         """Reattach per-shard loaders after ``_apply`` rebuilds parameters."""
         from functools import partial
 
         full_inter = self.moe_intermediate_size
-        if self.fp8_experts:
-            bo, bi = self.block_size
-            self.experts.gate_up_proj_fp8.weight_loader = partial(
-                _gate_up_fp8_weight_loader, self.tp_rank, self.tp_size, full_inter, 1,
-            )
-            self.experts.gate_up_proj_scale_inv.weight_loader = partial(
-                _gate_up_fp8_weight_loader, self.tp_rank, self.tp_size, full_inter, bo,
-            )
-            self.experts.down_proj_fp8.weight_loader = partial(
-                _down_proj_fp8_weight_loader, self.tp_rank, self.tp_size, full_inter, 1,
-            )
-            self.experts.down_proj_scale_inv.weight_loader = partial(
-                _down_proj_fp8_weight_loader, self.tp_rank, self.tp_size, full_inter, bi,
+        if self.experts_quantized:
+            self._attach_quant_loaders(
+                lambda unit: partial(_gate_up_fp8_weight_loader, self.tp_rank, self.tp_size, full_inter, unit),
+                lambda unit: partial(_down_proj_fp8_weight_loader, self.tp_rank, self.tp_size, full_inter, unit),
             )
         else:
             self.experts.gate_up_proj.weight_loader = partial(
@@ -192,10 +148,19 @@ class Glm52SparseMoeBlock(nn.Module):
                 _down_proj_weight_loader, self.tp_rank, self.tp_size, full_inter,
             )
 
+    def _reattach_loaders(self) -> None:
+        self._attach_expert_weight_loaders()
+
     def _apply(self, fn, recurse=True):
         result = super()._apply(fn, recurse=recurse)
         self._attach_expert_weight_loaders()
         return result
+
+    def _fp8_tensors(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """``(gate_up, gate_up scales, down, down scales)``: e4m3 bytes and fp32 scales as the kernels take them."""
+        exp = self.experts
+        return (exp.gate_up_proj, exp.gate_up_proj_scale_inv.view(torch.float32),
+                exp.down_proj, exp.down_proj_scale_inv.view(torch.float32))
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         input_shape = hidden_states.shape
@@ -210,7 +175,11 @@ class Glm52SparseMoeBlock(nn.Module):
 
         # topk_weights stay fp32 into the combine, as in HF's experts.
         topk_weights, topk_ids, _ = self.gate(flat)
-        if self.fp8_experts:
+        if self.experts_packed is not None:
+            routed = self._experts_4bit(flat, topk_weights, topk_ids, skip_invalid=False)
+            if self.tp_size > 1 and not self._sum_partials:
+                routed = self.comm_group.all_reduce(routed)
+        elif self.fp8_experts:
             if self._use_fused and self._prefill_kernel and flat.shape[0] > _DECODE_MAX_TOKENS:
                 routed = self._dispatch_prefill(flat, topk_weights, topk_ids)
                 if self.tp_size > 1 and not self._sum_partials:
@@ -218,14 +187,9 @@ class Glm52SparseMoeBlock(nn.Module):
             elif self._use_fused:
                 from mstar.utils.fused_moe import fused_experts_fp8
 
+                w1, s1, w2, s2 = self._fp8_tensors()
                 routed = fused_experts_fp8(
-                    flat,
-                    self.experts.gate_up_proj_fp8,
-                    self.experts.down_proj_fp8,
-                    self.experts.gate_up_proj_scale_inv,
-                    self.experts.down_proj_scale_inv,
-                    topk_weights, topk_ids,
-                    block_size=self.block_size,
+                    flat, w1, w2, s1, s2, topk_weights, topk_ids, block_size=self.block_size,
                 )
                 if self.tp_size > 1 and not self._sum_partials:
                     routed = self.comm_group.all_reduce(routed)
@@ -269,7 +233,7 @@ class Glm52SparseMoeBlock(nn.Module):
         return (
             flat.is_cuda
             and shared.dtype == flat.dtype == torch.bfloat16
-            and shared.shape[1] == self.experts.down_proj_fp8.shape[2]
+            and shared.shape[1] == self.experts.down_proj.shape[2]
         )
 
     def _dispatch_decode(
@@ -281,10 +245,10 @@ class Glm52SparseMoeBlock(nn.Module):
         """Routed + shared experts in the fused_moe decode kernels, launched unchained."""
         from mstar.utils.fused_moe import decode as moe_decode
 
-        exp, shared = self.experts, self.shared_expert
+        shared = self.shared_expert
+        w1, s1, w2, s2 = self._fp8_tensors()
         return moe_decode.experts(
-            flat, exp.gate_up_proj_fp8, exp.gate_up_proj_scale_inv,
-            exp.down_proj_fp8, exp.down_proj_scale_inv,
+            flat, w1, s1, w2, s2,
             shared.gate_up_proj.weight, shared.down_proj.weight, topk_weights, topk_ids,
             block_size=self.block_size)
 
@@ -295,11 +259,11 @@ class Glm52SparseMoeBlock(nn.Module):
         this rank's partial (routed + shared), unreduced."""
         from mstar.utils.fused_moe import decode as moe_decode
 
-        gate, exp, shared = self.gate, self.experts, self.shared_expert
+        gate, shared = self.gate, self.shared_expert
+        w1, s1, w2, s2 = self._fp8_tensors()
         return moe_decode.forward(
             flat, gate.weight, gate.e_score_correction_bias,
-            exp.gate_up_proj_fp8, exp.gate_up_proj_scale_inv,
-            exp.down_proj_fp8, exp.down_proj_scale_inv,
+            w1, s1, w2, s2,
             shared.gate_up_proj.weight, shared.down_proj.weight,
             top_k=gate.top_k, scale=gate.routed_scaling_factor, normalize=gate.norm_topk_prob,
             block_size=self.block_size)
@@ -315,10 +279,9 @@ class Glm52SparseMoeBlock(nn.Module):
         """fused_experts_fp8's output from the fused_moe prefill kernels (same bits)."""
         from mstar.utils.fused_moe import prefill as moe_prefill
 
-        exp = self.experts
+        w1, s1, w2, s2 = self._fp8_tensors()
         return moe_prefill.experts(
-            flat, exp.gate_up_proj_fp8, exp.down_proj_fp8, exp.gate_up_proj_scale_inv,
-            exp.down_proj_scale_inv, topk_weights, topk_ids, block_size=self.block_size,
+            flat, w1, w2, s1, s2, topk_weights, topk_ids, block_size=self.block_size,
             swiglu_limit=None)
 
     def _dispatch_fp8_reference(
@@ -341,16 +304,9 @@ class Glm52SparseMoeBlock(nn.Module):
             top_k_pos, token_idx = torch.where(expert_mask[e])
             tokens = flat[token_idx]
 
-            gate_up_w = dequantize_fp8_block_weight(
-                self.experts.gate_up_proj_fp8[e],
-                self.experts.gate_up_proj_scale_inv[e],
-                block_size=self.block_size, out_dtype=flat.dtype,
-            )
-            down_w = dequantize_fp8_block_weight(
-                self.experts.down_proj_fp8[e],
-                self.experts.down_proj_scale_inv[e],
-                block_size=self.block_size, out_dtype=flat.dtype,
-            )
+            w1, s1, w2, s2 = self._fp8_tensors()
+            gate_up_w = dequantize_fp8_block_weight(w1[e], s1[e], block_size=self.block_size, out_dtype=flat.dtype)
+            down_w = dequantize_fp8_block_weight(w2[e], s2[e], block_size=self.block_size, out_dtype=flat.dtype)
             gate, up = torch.mm(tokens, gate_up_w.T).chunk(2, dim=-1)
             out = torch.mm(F.silu(gate) * up, down_w.T)
             out = out * topk_weights[token_idx, top_k_pos, None]
@@ -366,7 +322,14 @@ class Glm52SparseMoeBlock(nn.Module):
         dev = torch.device(device) if device is not None else torch.device("cpu")
         self._use_fused = (self.fp8_experts and self.kernels == "auto"
                            and fused_fp8_available(dev, self.block_size))
-        self.gate.finalize_weights(topk_kernel=self._use_fused and self._router_kernel)
+        # the router kernels serve any quantized experts on CUDA under kernels: auto, not only the fused fp8 ones
+        fused_router = self._use_fused or (self.experts_packed is not None and dev.type == "cuda"
+                                           and self.kernels == "auto")
+        self.gate.finalize_weights(topk_kernel=fused_router and self._router_kernel)
+        if self.experts_packed is not None:
+            logger.info("Glm52SparseMoeBlock routed experts: %s, %s", self.experts_packed.name,
+                        "FlashInfer TRT-LLM FP4 MoE" if self._experts_kernel is not None else "the reference")
+            return
         if not self.fp8_experts:
             return
         global _BACKEND_LOGGED

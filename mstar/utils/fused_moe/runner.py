@@ -236,6 +236,7 @@ def fused_experts_fp8(
     activation: str = "silu",
     reduce_results: bool = True,
     swiglu_limit: float | None = None,
+    skip_invalid: bool = False,
 ) -> torch.Tensor:
     """Grouped-GEMM MoE dispatch for block-scaled FP8 experts (W8A8).
 
@@ -265,8 +266,9 @@ def fused_experts_fp8(
         ``(block_n, block_k)`` weight scale blocks.  ``block_k`` doubles as
         the activation quant group and the kernel's ``BLOCK_SIZE_K``, so
         both GEMM contraction dims must be multiples of it.
-    activation, reduce_results
-        As in :func:`fused_experts`.
+    activation, reduce_results, skip_invalid
+        As in :func:`fused_experts`: with ``skip_invalid``, slots routed to the sentinel id ``num_experts``
+        (padding rows, another rank's experts) run no GEMM and add nothing.
 
     Returns
     -------
@@ -276,8 +278,72 @@ def fused_experts_fp8(
     """
     return torch.ops.mstar.fused_experts_fp8(
         hidden_states, w1_fp8, w2_fp8, w1_scale_inv, w2_scale_inv, topk_weights, topk_ids,
-        list(block_size), activation, reduce_results, swiglu_limit,
+        list(block_size), activation, reduce_results, swiglu_limit, skip_invalid,
     )
+
+
+def per_pair_fp8(num_tokens: int, device: torch.device, w1_shape, top_k: int, block_size, skip_invalid: bool) -> bool:
+    """Whether :func:`experts_fp8` runs this call as per-pair GEMVs (``decode.routed_experts_fp8``): up to
+    ``decode.routed_fp8_max_tokens`` tokens on an NVIDIA GPU, every slot a real expert, and whole scale blocks
+    (``decode.routed_fp8_fits``). ROCm keeps the grouped runner, as ``runs_per_pair`` does for bf16."""
+    if skip_invalid or device.type != "cuda" or not current_platform.is_cuda():
+        return False
+    # imported here: it needs triton's CUDA extras, which CPU hosts may lack
+    from mstar.utils.fused_moe import decode
+
+    experts, two_inter, hidden = w1_shape
+    if not decode.routed_fp8_fits(hidden, two_inter // 2, tuple(block_size)):
+        return False
+    return num_tokens <= decode.routed_fp8_max_tokens(device, (hidden, experts, two_inter // 2, top_k))
+
+
+def experts_fp8(
+    hidden_states: torch.Tensor,
+    w1_fp8: torch.Tensor,
+    w2_fp8: torch.Tensor,
+    w1_scale_inv: torch.Tensor,
+    w2_scale_inv: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    block_size: tuple[int, int] = (128, 128),
+    skip_invalid: bool = False,
+) -> torch.Tensor:
+    """Block-fp8 routed experts (no shared expert), summed per token, by token count: per-pair GEMVs where
+    :func:`per_pair_fp8` says (a few tokens: the grouped runner's alignment, quantize, SwiGLU and sum
+    launches outweigh reading the experts; the GEMVs scale each fp8 block against bf16 activations, w8a16),
+    else :func:`fused_experts_fp8`. Arguments as there."""
+    return torch.ops.mstar.experts_fp8(
+        hidden_states, w1_fp8, w2_fp8, w1_scale_inv, w2_scale_inv, topk_weights, topk_ids, list(block_size),
+        skip_invalid)
+
+
+# One op to dynamo, so the token-count dispatch is a runtime branch, not a guard.
+@torch.library.custom_op("mstar::experts_fp8", mutates_args=())
+def _experts_fp8_op(
+    hidden_states: torch.Tensor,
+    w1_fp8: torch.Tensor,
+    w2_fp8: torch.Tensor,
+    w1_scale_inv: torch.Tensor,
+    w2_scale_inv: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    block_size: list[int],
+    skip_invalid: bool,
+) -> torch.Tensor:
+    if per_pair_fp8(hidden_states.shape[0], hidden_states.device, w1_fp8.shape, topk_ids.shape[1], block_size,
+                    skip_invalid):
+        from mstar.utils.fused_moe import decode
+
+        return decode.routed_experts_fp8(hidden_states, w1_fp8, w1_scale_inv, w2_fp8, w2_scale_inv, topk_weights,
+                                         topk_ids, block_size=tuple(block_size))
+    return _fused_experts_fp8_impl(hidden_states, w1_fp8, w2_fp8, w1_scale_inv, w2_scale_inv, topk_weights,
+                                   topk_ids, tuple(block_size), "silu", True, None, skip_invalid)
+
+
+@_experts_fp8_op.register_fake
+def _(hidden_states, w1_fp8, w2_fp8, w1_scale_inv, w2_scale_inv, topk_weights, topk_ids, block_size,
+      skip_invalid):
+    return torch.empty_like(hidden_states)
 
 
 # One opaque op to dynamo: traced inline, the launch path's host logic breaks
@@ -295,16 +361,17 @@ def _fused_experts_fp8_op(
     activation: str,
     reduce_results: bool,
     swiglu_limit: float | None,
+    skip_invalid: bool = False,
 ) -> torch.Tensor:
     return _fused_experts_fp8_impl(
         hidden_states, w1_fp8, w2_fp8, w1_scale_inv, w2_scale_inv, topk_weights, topk_ids,
-        tuple(block_size), activation, reduce_results, swiglu_limit,
+        tuple(block_size), activation, reduce_results, swiglu_limit, skip_invalid,
     )
 
 
 @_fused_experts_fp8_op.register_fake
 def _(hidden_states, w1_fp8, w2_fp8, w1_scale_inv, w2_scale_inv, topk_weights, topk_ids,
-      block_size, activation, reduce_results, swiglu_limit):
+      block_size, activation, reduce_results, swiglu_limit, skip_invalid=False):
     if reduce_results:
         return torch.empty_like(hidden_states)
     tokens, hidden = hidden_states.shape
@@ -323,6 +390,7 @@ def _fused_experts_fp8_impl(
     activation: str,
     reduce_results: bool,
     swiglu_limit: float | None,
+    skip_invalid: bool = False,
 ) -> torch.Tensor:
     assert hidden_states.is_contiguous(), "hidden_states must be contiguous"
     assert hidden_states.dim() == 2
@@ -387,7 +455,8 @@ def _fused_experts_fp8_impl(
         device=hidden_states.device,
         dtype=hidden_states.dtype,
     )
-    cache3 = torch.empty(
+    # Skipped slots are never written by the down GEMM, so they must start at zero.
+    cache3 = (torch.zeros if skip_invalid else torch.empty)(
         (num_tokens, top_k, hidden),
         device=hidden_states.device,
         dtype=hidden_states.dtype,

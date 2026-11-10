@@ -88,6 +88,35 @@ def routed_fits(H, I):
             and all(H % t["bn"] == 0 and I % t["bc"] == 0 for _, t in _UNSCALED.down))
 
 
+# ``routed_experts_fp8``: block-fp8 experts, no shared expert, up to this many tokens (``runner.experts_fp8``)
+# where no ``moe_decode`` entry has the shape; above it the grouped W8A8 runner. The crossover at Qwen3-Omni's
+# Thinker shape on an H200 (benchmark/quantization/bench_experts.py: a tie at 8 tokens, grouped ahead from 12).
+ROUTED_FP8_MAX_TOKENS = 7
+
+
+def routed_fp8_fits(H, I, block_size) -> bool:
+    """Whether ``routed_experts_fp8`` runs experts of hidden ``H`` and per-rank intermediate ``I`` in
+    ``block_size`` scale blocks: power-of-two blocks, whole ones per gate / up half and along H."""
+    bo, bi = block_size
+    return I % bo == 0 and H % bi == 0 and bo & (bo - 1) == 0 and bi & (bi - 1) == 0
+
+
+def routed_fp8_max_tokens(device, shape) -> int:
+    """Up to how many tokens ``routed_experts_fp8`` runs experts of ``shape`` (H, E, I, K) on this GPU: the
+    last per-pair row of a ``moe_decode`` entry for the shape (rows swept against the grouped runner, which
+    its ``"*"`` row names), else ``ROUTED_FP8_MAX_TOKENS``."""
+    entry = MOE_DECODE.lookup(torch.float8_e4m3fn, dict(zip("HEIK", shape, strict=True)), device)
+    return ROUTED_FP8_MAX_TOKENS if entry is None else _tuning(device, tuple(shape)).pair_max_tokens
+
+
+def _fit(tile, dim):
+    """The largest power of two up to ``tile`` that divides ``dim``."""
+    t = 1 << (min(tile, dim).bit_length() - 1)
+    while dim % t:
+        t //= 2
+    return t
+
+
 @functools.cache
 def _tuning(device: torch.device, shape: tuple[int, int, int, int] | None = None) -> _Tuning:
     """The registry's ``moe_decode`` entry for ``shape`` (H, E, I, K) on this GPU if a table
@@ -603,8 +632,10 @@ def _launch_gate_up(x, ids, w13, s13, sw13, act, block_size, limit, pdl, bj, bk,
     ns = 0 if sw13 is None else I // bjs
     assert bo % bj == 0 and I % bo == 0 and H % bk == 0
     assert ns == 0 or (I % bjs == 0 and H % bks == 0)
+    # without a shared expert its branch never runs but still compiles, so its weight stands in as x
+    # (the dot needs both operands in x's dtype; fp8 experts' bytes are uint8)
     _gate_up_kernel[(ns + T * K * (I // bj),)](
-        x, ids, w13, w13 if s13 is None else s13, w13 if sw13 is None else sw13, act,
+        x, ids, w13, w13 if s13 is None else s13, x if sw13 is None else sw13, act,
         0.0 if limit is None else float(limit), T, w13.stride(0),
         0 if s13 is None else s13.stride(0), K=K, I=I, H=H, BO=bo, BI=bi, BJ=bj, BK=bk, NS=ns,
         TB=max(16, triton.next_power_of_2(T)), BJS=bjs, BKS=bks, CLAMP=limit is not None,
@@ -753,6 +784,31 @@ def routed_experts(x, w13, w2, topk_w, topk_ids, *, reduce=True):
         gu, dn = _tiles(T, _UNSCALED)
         _launch_gate_up(x, ids, w13, None, None, act, None, None, False, **gu)
         _launch_down(act, ids, tw, w2, None, None, out, None, False, **dn, reduce=reduce)
+    return out
+
+
+def routed_experts_fp8(x, w13, s13, w2, s2, topk_w, topk_ids, *, block_size, tuning=None, reduce=True):
+    """``fused_experts_fp8`` for a few tokens: per-pair GEMVs over block-fp8 experts, no shared
+    expert, each fp8 weight block scaled against bf16 activations in fp32 (as the decode chain's
+    per-pair kernels), SwiGLU and the routing weights in fp32. ``(T, H)``, or each slot's term
+    ``(T, K, H)`` without ``reduce``. ``topk_ids``: real experts only, distinct per token. Tiles from
+    ``tuning`` (default: the ``moe_decode`` entry for the shape, else the GPU's built-in table)."""
+    T, H = x.shape
+    K = topk_ids.shape[1]
+    E, I = w13.shape[0], w13.shape[1] // 2
+    assert x.is_contiguous() and w13.is_contiguous() and w2.is_contiguous()
+    assert s13.is_contiguous() and s2.is_contiguous(), "block scales must be contiguous"
+    tuning = tuning or _tuning(x.device, (H, E, I, K))
+    out = torch.empty((T, H) if reduce else (T, K, H), dtype=x.dtype, device=x.device)
+    if T:
+        act = torch.empty(T * K, I, dtype=torch.float32, device=x.device)
+        ids, tw = topk_ids.contiguous(), topk_w.float().contiguous()
+        (bo, _), (gu, dn) = block_size, _tiles(T, tuning)
+        # the table's tiles, narrowed to divide this shape (a TP shard's I = 384 takes 128-column down tiles)
+        gu = {**gu, "bj": _fit(gu["bj"], bo), "bk": _fit(gu["bk"], H)}
+        dn = {**dn, "bn": _fit(dn["bn"], bo), "bc": _fit(dn["bc"], I)}
+        _launch_gate_up(x, ids, w13, s13, None, act, block_size, None, False, **gu)
+        _launch_down(act, ids, tw, w2, s2, None, out, block_size, False, **dn, reduce=reduce)
     return out
 
 

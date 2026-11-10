@@ -201,7 +201,7 @@ HF_MODELS: dict[str, dict] = {
     "z_image_turbo": {"model_path_hf": "Tongyi-MAI/Z-Image-Turbo"},
 }
 
-# qwen 3.5 family: dense (MoE TODO)
+# qwen 3.5 family: dense
 qwen_3_5_dense_sizes = ("0.8", "2", "4", "9", "27")
 MODEL_REGISTRY.update({
     f"qwen3_5_{size}b": ("mstar.model.qwen3_5.qwen3_5_model", "Qwen3_5DenseModel") \
@@ -214,6 +214,9 @@ HF_MODELS.update({
 # Qwen3.8-27B is the Qwen3.5 architecture (same config.json geometry)
 MODEL_REGISTRY["qwen3_8_27b"] = ("mstar.model.qwen3_5.qwen3_5_model", "Qwen3_5DenseModel")
 HF_MODELS["qwen3_8_27b"] = {"model_path_hf": "Qwen/Qwen3.8-27B"}
+# Qwen3.5-MoE, text-only; `model_kwargs.checkpoint_path` serves another of the family's checkpoints (Qwen's FP8)
+MODEL_REGISTRY["qwen3_5_moe"] = ("mstar.model.qwen3_5.qwen3_5_moe_model", "Qwen3_5MoeModel")
+HF_MODELS["qwen3_5_moe"] = {"model_path_hf": "nvidia/Qwen3.5-397B-A17B-NVFP4-V2"}
 
 
 def model_init_kwargs(name: str) -> dict:

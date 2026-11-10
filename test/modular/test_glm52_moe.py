@@ -36,7 +36,7 @@ def _cpu_flashinfer_without_the_real_one(monkeypatch):
 
 
 from mstar.model.components.moe import NoAuxTcRouter  # noqa: E402
-from mstar.model.glm52._testing import fake_quantize_fp8_block  # noqa: E402
+from mstar.model.glm52._testing import fake_quantize_fp8_block, planned_load  # noqa: E402
 from mstar.model.glm52.components.causal_lm import Glm52ForCausalLM  # noqa: E402
 from mstar.model.glm52.components.indexer import is_full_indexer_layer  # noqa: E402
 from mstar.model.glm52.components.moe import Glm52SparseMoeBlock  # noqa: E402
@@ -95,6 +95,18 @@ def test_gate_is_noaux_tc_groupless():
     assert torch.equal(w_before, w_after) and torch.equal(ids_before, ids_after)
 
 
+def _fp8_moe(cfg, comm_group=None, **kwargs):
+    """A block whose experts hold a block-fp8 checkpoint's storage, as the quantization plan's
+    stored load leaves them (``experts_prepare``)."""
+    block = Glm52SparseMoeBlock(cfg, comm_group=comm_group, **kwargs)
+    block.experts_prepare("fp8_block", cfg.quantization_config.weight_block_size)
+    return block
+
+
+def _f32(t):
+    return t.view(torch.float32)
+
+
 def _fill_expert_weights(block_fp8, block_bf16, cfg):
     """Give both blocks the same experts: fp8 bytes vs their fp32 dequant."""
     shard = cfg.moe_intermediate_size
@@ -109,12 +121,12 @@ def _fill_expert_weights(block_fp8, block_bf16, cfg):
         srow = shard // BLOCK[0]
 
         exp8 = block_fp8.experts
-        exp8.gate_up_proj_fp8.data[e, :shard] = g8.view(torch.uint8)
-        exp8.gate_up_proj_fp8.data[e, shard:] = u8.view(torch.uint8)
-        exp8.gate_up_proj_scale_inv.data[e, :srow] = gs
-        exp8.gate_up_proj_scale_inv.data[e, srow:] = us
-        exp8.down_proj_fp8.data[e] = d8.view(torch.uint8)
-        exp8.down_proj_scale_inv.data[e] = ds
+        exp8.gate_up_proj.data[e, :shard] = g8.view(torch.uint8)
+        exp8.gate_up_proj.data[e, shard:] = u8.view(torch.uint8)
+        _f32(exp8.gate_up_proj_scale_inv.data)[e, :srow] = gs
+        _f32(exp8.gate_up_proj_scale_inv.data)[e, srow:] = us
+        exp8.down_proj.data[e] = d8.view(torch.uint8)
+        _f32(exp8.down_proj_scale_inv.data)[e] = ds
 
         # fp32 dequant (not bf16) so both paths multiply identical values.
         g32 = dequantize_fp8_block_weight(g8, gs, BLOCK, out_dtype=torch.float32)
@@ -132,7 +144,7 @@ def test_fp8_resident_dispatch_matches_bf16_dispatch():
     torch.manual_seed(1)
     cfg8 = Glm52ModelConfig.reduced_fp8(block=BLOCK)
     cfg = Glm52ModelConfig.reduced()
-    block8 = Glm52SparseMoeBlock(cfg8)
+    block8 = _fp8_moe(cfg8)
     block = Glm52SparseMoeBlock(cfg)
     assert block8.fp8_experts and not block.fp8_experts
 
@@ -170,8 +182,8 @@ def _hf_routed(flat, topk_weights, topk_ids, expert_weights):
     return final
 
 
-def _bf16_block(cfg):
-    block = Glm52SparseMoeBlock(cfg)
+def _bf16_block(cfg, fp8=False):
+    block = _fp8_moe(cfg) if fp8 else Glm52SparseMoeBlock(cfg)
     for prm in block.parameters():
         if prm.dtype.is_floating_point:
             prm.data.normal_(0, 0.05)
@@ -187,7 +199,7 @@ def test_bf16_combine_keeps_fp32_routing_weights():
     torch.manual_seed(5)
     cfg = Glm52ModelConfig.reduced()
     cfg8 = Glm52ModelConfig.reduced_fp8(block=BLOCK)
-    block, block8 = _bf16_block(cfg), _bf16_block(cfg8)
+    block, block8 = _bf16_block(cfg), _bf16_block(cfg8, fp8=True)
     _fill_expert_weights(block8, block, cfg)
 
     x = (torch.randn(32, cfg.hidden_size) * 0.5).bfloat16()
@@ -196,8 +208,8 @@ def test_bf16_combine_keeps_fp32_routing_weights():
             deq = [
                 tuple(
                     dequantize_fp8_block_weight(
-                        getattr(blk.experts, f"{n}_fp8")[e],
-                        getattr(blk.experts, f"{n}_scale_inv")[e],
+                        getattr(blk.experts, n)[e],
+                        _f32(getattr(blk.experts, f"{n}_scale_inv"))[e],
                         block_size=BLOCK, out_dtype=torch.bfloat16,
                     )
                     for n in ("gate_up_proj", "down_proj")
@@ -226,7 +238,7 @@ def test_fused_dispatch_receives_fp32_routing_weights(monkeypatch):
     monkeypatch.setitem(sys.modules, "mstar.utils.fused_moe", fake)
 
     torch.manual_seed(6)
-    block8 = _bf16_block(Glm52ModelConfig.reduced_fp8(block=BLOCK))
+    block8 = _bf16_block(Glm52ModelConfig.reduced_fp8(block=BLOCK), fp8=True)
     block8._use_fused = True
     block8(torch.randn(4, block8.hidden_size).bfloat16())
     assert seen["dtype"] == torch.float32
@@ -241,7 +253,8 @@ def test_submodule_refuses_post_load_dtype_cast():
     cfg = Glm52ModelConfig.reduced_fp8(block=BLOCK)
     lm = Glm52ForCausalLM(cfg)
     moe = lm.model.layers[1].mlp
-    moe.experts.gate_up_proj_scale_inv.data.normal_(0, 0.1)
+    moe.experts_prepare("fp8_block", BLOCK)
+    _f32(moe.experts.gate_up_proj_scale_inv.data).normal_(0, 0.1)
     moe.gate.e_score_correction_bias.data.normal_(0, 0.5)
     scales_before = moe.experts.gate_up_proj_scale_inv.data.clone()
     bias_before = moe.gate.e_score_correction_bias.data.clone()
@@ -249,11 +262,11 @@ def test_submodule_refuses_post_load_dtype_cast():
     sub = Glm52LLMSubmodule(language_model=lm, config=cfg)
     sub.to(device="cpu", dtype=torch.bfloat16)  # the engine manager's call
 
-    assert moe.experts.gate_up_proj_scale_inv.dtype == torch.float32
+    assert moe.experts.gate_up_proj_scale_inv.dtype == torch.int32
     assert moe.gate.e_score_correction_bias.dtype == torch.float32
     assert torch.equal(moe.experts.gate_up_proj_scale_inv.data, scales_before)
     assert torch.equal(moe.gate.e_score_correction_bias.data, bias_before)
-    assert moe.experts.gate_up_proj_fp8.dtype == torch.uint8
+    assert moe.experts.gate_up_proj.dtype == torch.uint8
 
 
 def test_default_dispatch_is_fused_where_the_kernel_runs(monkeypatch):
@@ -267,12 +280,16 @@ def test_default_dispatch_is_fused_where_the_kernel_runs(monkeypatch):
     assert Glm52SparseMoeBlock(cfg)._use_fused is False
     for available in (True, False):
         monkeypatch.setattr(moe_mod, "fused_fp8_available", lambda dev, block, a=available: a)
-        block = Glm52SparseMoeBlock(cfg)
+        block = _fp8_moe(cfg)
         block.process_weights_after_loading("cpu")
         assert block._use_fused is available
+    # bf16 experts (the plan kept them bf16) never take the fp8 kernels
+    block = Glm52SparseMoeBlock(cfg)
+    block.process_weights_after_loading("cpu")
+    assert block._use_fused is False
     ref_cfg = Glm52ModelConfig.reduced_fp8(block=BLOCK)
     ref_cfg.kernels = "reference"
-    block = Glm52SparseMoeBlock(ref_cfg)
+    block = _fp8_moe(ref_cfg)
     block.process_weights_after_loading("cpu")
     assert block._use_fused is False
 
@@ -316,7 +333,7 @@ def test_cuda_graphs_return_with_fused_dispatch():
     sub.config = cfg
 
     lm = _torch.nn.Module()
-    lm.blk = Glm52SparseMoeBlock(cfg)
+    lm.blk = _fp8_moe(cfg)
     # object.__new__ skipped nn.Module.__init__, so bypass its __setattr__.
     object.__setattr__(sub, "language_model", lm)
 
@@ -328,19 +345,22 @@ def test_cuda_graphs_return_with_fused_dispatch():
 
 def test_autocast_then_restore_keeps_fp8_layout():
     cfg8 = Glm52ModelConfig.reduced_fp8(block=BLOCK)
-    block8 = Glm52SparseMoeBlock(cfg8)
-    bytes_before = block8.experts.gate_up_proj_fp8.data.clone()
+    block8 = _fp8_moe(cfg8)
+    _f32(block8.experts.gate_up_proj_scale_inv.data).normal_(0, 0.1)
+    bytes_before = block8.experts.gate_up_proj.data.clone()
+    scales_before = block8.experts.gate_up_proj_scale_inv.data.clone()
 
     block8.to(torch.bfloat16)  # the submodule-load autocast
-    assert block8.experts.gate_up_proj_fp8.dtype == torch.uint8  # ints immune
-    assert block8.experts.gate_up_proj_scale_inv.dtype == torch.bfloat16
+    # integer containers: the cast moves neither the e4m3 bytes nor the fp32 scales
+    assert block8.experts.gate_up_proj.dtype == torch.uint8
+    assert torch.equal(block8.experts.gate_up_proj_scale_inv.data, scales_before)
     assert block8.gate.e_score_correction_bias.dtype == torch.bfloat16
 
     restore_fp32_params(block8)
-    assert block8.experts.gate_up_proj_scale_inv.dtype == torch.float32
-    assert block8.experts.down_proj_scale_inv.dtype == torch.float32
+    assert torch.equal(block8.experts.gate_up_proj_scale_inv.data, scales_before)
+    assert block8.experts.down_proj_scale_inv.dtype == torch.int32
     assert block8.gate.e_score_correction_bias.dtype == torch.float32
-    assert torch.equal(block8.experts.gate_up_proj_fp8.data, bytes_before)
+    assert torch.equal(block8.experts.gate_up_proj.data, bytes_before)
 
 
 def _fp8_entry(state, refs, base, shape):
@@ -450,12 +470,9 @@ def test_load_end_to_end_reduced_fp8():
     model = Glm52ForCausalLM(cfg)
     state, refs = _fabricate_checkpoint(cfg)
 
-    loaded = load_glm52_hf_weights(
-        model, iter(state), cfg.n_routed_experts,
-        quant_config=cfg.quantization_config, fp8_experts=True,
-        dense_fp8=cfg.dense_fp8, fp8_shared_expert=cfg.fp8_shared_expert,
-        num_hidden_layers=cfg.num_hidden_layers,
-    )
+    loaded = planned_load(model, state, load=lambda stream: load_glm52_hf_weights(
+        model, stream, cfg.n_routed_experts, num_hidden_layers=cfg.num_hidden_layers,
+    ))
 
     # Completeness both ways: every model param got a tensor, nothing extra.
     assert loaded == set(dict(model.named_parameters()))
@@ -465,7 +482,7 @@ def test_load_end_to_end_reduced_fp8():
     attn = model.model.layers[0].self_attn
     w8, s, _ = refs["model.layers.0.self_attn.q_a_proj"]
     assert torch.equal(attn.q_a_proj.weight.data, w8.view(torch.uint8))
-    assert torch.equal(attn.q_a_proj.weight_scale_inv.data, s)
+    assert torch.equal(_f32(attn.q_a_proj.weight_scale_inv.data), s)
     _, _, kv_b = refs["model.layers.0.self_attn.kv_b_proj"]
     assert torch.equal(attn.kv_b_proj.weight.data, kv_b.to(attn.kv_b_proj.weight.dtype))
 
@@ -485,14 +502,14 @@ def test_load_end_to_end_reduced_fp8():
         g8, gs, _ = refs[f"model.layers.1.mlp.experts.{e}.gate_proj"]
         u8, us, _ = refs[f"model.layers.1.mlp.experts.{e}.up_proj"]
         d8, ds, _ = refs[f"model.layers.1.mlp.experts.{e}.down_proj"]
-        got = moe.experts.gate_up_proj_fp8.data[e]
+        got = moe.experts.gate_up_proj.data[e]
         assert torch.equal(got[:shard], g8.view(torch.uint8))
         assert torch.equal(got[shard:], u8.view(torch.uint8))
-        assert torch.equal(moe.experts.gate_up_proj_scale_inv.data[e, :srow], gs)
-        assert torch.equal(moe.experts.gate_up_proj_scale_inv.data[e, srow:], us)
-        assert torch.equal(moe.experts.down_proj_fp8.data[e], d8.view(torch.uint8))
-        assert torch.equal(moe.experts.down_proj_scale_inv.data[e], ds)
-    assert moe.experts.gate_up_proj_scale_inv.dtype == torch.float32
+        assert torch.equal(_f32(moe.experts.gate_up_proj_scale_inv.data)[e, :srow], gs)
+        assert torch.equal(_f32(moe.experts.gate_up_proj_scale_inv.data)[e, srow:], us)
+        assert torch.equal(moe.experts.down_proj.data[e], d8.view(torch.uint8))
+        assert torch.equal(_f32(moe.experts.down_proj_scale_inv.data)[e], ds)
+    assert moe.experts.gate_up_proj_scale_inv.dtype == torch.int32
 
     # Shared expert dequantized into the fused ParallelGatedMLP param.
     _, _, sg_deq = refs["model.layers.1.mlp.shared_experts.gate_proj"]
@@ -551,31 +568,24 @@ class _OutOfPlaceGroup(_RecordingGroup):
 
 
 def _random_weights(block):
-    """Finite random weights; fp8 experts and linears as block-quantized ones."""
-    from mstar.model.components.fp8_linear import Fp8Linear
-
+    """Finite random weights; fp8 experts as block-quantized ones."""
     for prm in block.parameters():
         if prm.dtype.is_floating_point:
             prm.data.normal_(0, 0.05)
-    for lin in block.modules():
-        if isinstance(lin, Fp8Linear):
-            q, s, _ = fake_quantize_fp8_block(torch.randn(lin.weight.shape) * 0.1, lin.block_size)
-            lin.weight.data.copy_(q.view(torch.uint8))
-            lin.weight_scale_inv.data.copy_(s)
     if block.fp8_experts:
         for name in ("gate_up_proj", "down_proj"):
-            weight, scale = getattr(block.experts, f"{name}_fp8"), getattr(block.experts, f"{name}_scale_inv")
+            weight, scale = getattr(block.experts, name), getattr(block.experts, f"{name}_scale_inv")
             for e in range(weight.shape[0]):
                 q, s, _ = fake_quantize_fp8_block(torch.randn(weight.shape[1:]) * 0.1, BLOCK)
                 weight.data[e] = q.view(torch.uint8)
-                scale.data[e] = s
+                _f32(scale.data)[e] = s
 
 
 def _twins(cfg, setup=lambda block: None):
     """The same block over an in-place and an out-of-place 2-rank collective."""
     blocks = []
     for group in (_RecordingGroup(), _OutOfPlaceGroup()):
-        block = Glm52SparseMoeBlock(cfg, comm_group=group)
+        block = (_fp8_moe if cfg.quantization_config is not None else Glm52SparseMoeBlock)(cfg, comm_group=group)
         setup(block)
         blocks.append(block)
     _random_weights(blocks[0])

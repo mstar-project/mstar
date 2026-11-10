@@ -24,6 +24,7 @@ from mstar.model.glm52.components.moe import Glm52SparseMoeBlock
 from mstar.model.glm52.config import ATTN_RESOURCE, DSA_RESOURCE, KV_RESOURCE, Glm52ModelConfig
 from mstar.model.glm52.submodules import Glm52LLMSubmodule
 from mstar.model.submodule_base import END_PARTITION, ModelInputsFromEngine
+from mstar.quantization.scope import load_submodule
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(),
@@ -283,7 +284,7 @@ def test_dsa_longctx_decode_past_topk(tmp_path):
     cfg.dsa_long_context = True
     cfg.index_topk = TOPK
 
-    submodule = model.get_submodule(NODE, device="cuda", autocast_dtype=DTYPE)
+    submodule = load_submodule(model, NODE, device="cuda", autocast_dtype=DTYPE)
     assert isinstance(submodule, Glm52LLMSubmodule)
     # Long-context serving is eager-only (the DSA resource selects per request
     # on the host, which a captured graph would not replay): neither

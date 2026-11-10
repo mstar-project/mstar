@@ -756,6 +756,15 @@ def _qwen3_5(name, model_kwargs, tmp_path, monkeypatch):
     return _bare(Qwen3_5DenseModel, config=config, vision_config=None)
 
 
+def _qwen3_5_moe(name, model_kwargs, tmp_path, monkeypatch):
+    """The dense shapes above with every MLP a small MoE block; text only."""
+    from mstar.model.qwen3_5.qwen3_5_moe_model import Qwen3_5MoeModel
+    config = _qwen3_5(name, model_kwargs, tmp_path, monkeypatch).config
+    config.intermediate_size, config.num_experts, config.num_experts_per_tok = 0, 8, 2
+    config.moe_intermediate_size, config.shared_expert_intermediate_size = 128, 128
+    return _bare(Qwen3_5MoeModel, config=config, vision_config=None)
+
+
 def _qwen3_omni(name, model_kwargs, tmp_path, monkeypatch):
     # The talker imports flashinfer at module level; none of it runs here.
     if importlib.util.find_spec("flashinfer") is None:
@@ -858,6 +867,7 @@ _FACTORIES = {
     "OrpheusModel": _orpheus,
     "ParakeetModel": _parakeet,
     "Qwen3_5DenseModel": _qwen3_5,
+    "Qwen3_5MoeModel": _qwen3_5_moe,
     "Qwen3OmniModel": _qwen3_omni,
     "Qwen3TTSModel": _qwen3_tts,
     "Qwen3ASRModel": _qwen3_asr,

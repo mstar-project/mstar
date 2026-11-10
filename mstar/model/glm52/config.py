@@ -131,8 +131,9 @@ class Glm52ModelConfig:
 
     # --- quantization / serving knobs ---
     # The official checkpoint is FP8 e4m3 with [128, 128] block scales
-    # (`weight_scale_inv`). Populated from config.json by Glm52Model. The routed experts
-    # and the non-expert linears it stores in fp8 stay fp8 (``dense_fp8``).
+    # (`weight_scale_inv`). Populated from config.json by Glm52Model; the read plan slices
+    # its experts per rank. Which linears stay fp8 is the node's quantization plan
+    # (glm52/quantization.py).
     quantization_config: Fp8BlockQuantConfig | None = None
     # Keep routed experts FP8-resident (uint8 container + block scales). Disabling this
     # dequantizes them to bf16 on load — fine for reduced tests, but bf16 routed experts
@@ -166,18 +167,6 @@ class Glm52ModelConfig:
     def tuned_kernels(self) -> bool:
         """``kernels: auto``, the tuned kernels rather than the reference."""
         return self.kernels == "auto"
-
-    @property
-    def dense_fp8(self) -> bool:
-        """Whether the non-expert linears the checkpoint stores in fp8 stay fp8 with their block
-        scales: exactly when it is block fp8. kv_b_proj still dequantizes, since the absorbed
-        MLA folds it into w_kc / w_vc."""
-        return self.quantization_config is not None
-
-    @property
-    def fp8_shared_expert(self) -> bool:
-        # the decode chain runs the shared expert faster from bf16 weights
-        return self.dense_fp8 and not self.tuned_kernels
 
     @property
     def qk_head_dim(self) -> int:

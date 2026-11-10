@@ -484,6 +484,7 @@ exclude = ["tests*", "benchmark*", "examples*"]
 # `mstar serve <model>` works from a pip install.
 [tool.setuptools.package-data]
 "mstar.utils.fused_moe" = ["csrc/*.cu", "csrc/*.cuh", "csrc/*.h", "csrc/*.cpp"]
+"mstar.utils.marlin" = ["csrc/*.cu", "csrc/*.cuh", "csrc/*.h", "csrc/core/*.hpp", "csrc/NOTICE"]
 "mstar.kernels" = ["tables/*/*.json"]
 "mstar.default_configs" = ["*.yaml"]
 

@@ -98,7 +98,7 @@ def test_every_shipped_prefill_ladder_is_a_model_argument(config):
     from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
     from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
     cls, buckets = _configs_with_prefill_ladders()[config]
-    assert cls in (Qwen3_5DenseModel, Qwen3OmniModel, Glm52Model), (
+    assert issubclass(cls, (Qwen3_5DenseModel, Qwen3OmniModel, Glm52Model)), (
         f"a {cls.__name__} config sets prefill_token_buckets, which no test checks")
     assert "prefill_token_buckets" in inspect.signature(cls.__init__).parameters, (
         f"prefill_token_buckets isn't a named argument of {cls.__name__}.__init__")

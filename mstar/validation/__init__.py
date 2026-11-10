@@ -16,6 +16,7 @@ from mstar.engine.precision import deployment_precisions
 from mstar.engine.resources.lora.config import LORA_RESOURCE_KEY, lora_enabled
 from mstar.engine.resources.lora.serving import declared_lora_specs, size_lora_specs
 from mstar.model.base import Model, WorkerGraph, built_resources
+from mstar.quantization.validate import quantization_problems
 from mstar.validation.client_streams import check_client_streams
 from mstar.validation.knobs import check_knobs
 from mstar.validation.placement import check_worker_graphs, node_groups_problems, routing_weights_problems
@@ -92,6 +93,7 @@ def validate_deployment(
         except _UNREADABLE as e:
             problems.append(_unreadable("validate_config_yaml", e))
 
+    problems += _checked("checking the quantization block", quantization_problems, model, config)
     problems += routing_weights_problems(config)
     malformed = node_groups_problems(config)
     problems += malformed

@@ -41,6 +41,12 @@ _FI_MAX_TOKENS = 512
 _W8A8_API = hasattr(F, "scaled_mm") and hasattr(F, "ScalingType")
 _W8A8_OK: dict[torch.device, bool] = {}
 _FI_OK: dict[torch.device, bool] = {}
+# Blackwell (sm_100 / sm_103), set per device by reserve(): neither block-fp8 GEMM above runs there, and w8a16
+# is ~10x slower than bf16 from 512 tokens (B300: Qwen3.5-27B's 5120 x 4352 down, 187 vs 17 us). So above
+# _DEQUANT_MIN_TOKENS the weight is dequantized to bf16 per call and cuBLAS runs it: exact up to the fp8 weights,
+# a transient bf16 copy of one weight, no resident one.
+_BLACKWELL: dict[torch.device, bool] = {}
+_DEQUANT_MIN_TOKENS = 64
 # Split-K arrival counters, one per output tile; every launch leaves them at zero.
 _COUNTERS: dict[torch.device, torch.Tensor] = {}
 _MAX_TILES = 4096
@@ -68,6 +74,8 @@ FP8_LINEAR = register(KernelOp(
                  "none for the built-in tile of the token count"),
         Impl("flashinfer", _fi_unavailable, doc="flashinfer's SM90 block-scale GEMM, x quantized per 128 columns"),
         Impl("cublas", _cublas_unavailable, doc="cuBLAS's block-scaled GEMM, x quantized per 128 columns"),
+        Impl("dequant", _w8a16_unavailable,
+             doc="the weight dequantized to bf16 per call, then cuBLAS's bf16 GEMM (exact up to the fp8 weights)"),
     ),
     doc="a block-fp8 (128 x 128 scales) dense linear: N outputs (per half with glu), K inputs, glu 1 for "
         "a [gate; up] weight's SwiGLU; rows by token count",
@@ -262,6 +270,8 @@ def reserve(device: torch.device | str) -> None:
         _COUNTERS[device] = torch.zeros(_MAX_TILES, dtype=torch.int32, device=device)
         _FI_OK[device] = _probe_fi(device)
         _W8A8_OK[device] = _probe_w8a8(device)
+        capability = current_platform.cuda_capability(device)
+        _BLACKWELL[device] = capability is not None and capability[0] == 10
 
 
 def _probe_w8a8(device: torch.device) -> bool:
@@ -361,6 +371,8 @@ def _w8a16_tiles(M: int, N: int, K: int, glu: bool, block_size=(128, 128)) -> di
 
 
 def _w8a16(x, w, s, block_size, glu, cfg=None):
+    # the kernel loads the weight's bytes and bitcasts them (an e4m3 pointer can't take its masked loads' zero)
+    w = w.view(torch.uint8)
     M, K = x.shape
     N = w.shape[0] // 2 if glu else w.shape[0]
     bo, bi = block_size
@@ -428,6 +440,42 @@ def _fi(x, w, s, glu):
     return out
 
 
+@triton.jit
+def _dequant_kernel(w, s, out, N, K: tl.constexpr, KB: tl.constexpr, BO: tl.constexpr, BI: tl.constexpr,
+                    BN: tl.constexpr, BK: tl.constexpr):
+    """``out[n, k] = e4m3(w[n, k]) * s[n // BO, k // BI]`` over one (BN, BK) tile."""
+    n = tl.program_id(0) * BN + tl.arange(0, BN)
+    k = tl.program_id(1) * BK + tl.arange(0, BK)
+    live = (n[:, None] < N) & (k[None, :] < K)
+    q = tl.load(w + n[:, None] * K + k[None, :], mask=live, other=0).to(tl.float8e4nv, bitcast=True)
+    sc = tl.load(s + (n[:, None] // BO) * KB + k[None, :] // BI, mask=live, other=0.0)
+    tl.store(out + n[:, None] * K + k[None, :], (q.to(tl.float32) * sc).to(out.dtype.element_ty), mask=live)
+
+
+def dequantize(w, s, block_size, dtype=torch.bfloat16):
+    """A block-fp8 weight ``(N, K)`` (uint8 or e4m3) with its fp32 scales as ``dtype``."""
+    w = w.view(torch.uint8)
+    rows, k = w.shape
+    bo, bi = block_size
+    out = torch.empty(rows, k, dtype=dtype, device=w.device)
+    bn, bk = 64, 128
+    _dequant_kernel[(triton.cdiv(rows, bn), triton.cdiv(k, bk))](
+        w, s, out, rows, K=k, KB=triton.cdiv(k, bi), BO=bo, BI=bi, BN=bn, BK=bk, num_warps=4)
+    return out
+
+
+def _dequant_linear(x, w, s, block_size, glu):
+    """The weight dequantized to x's dtype, then cuBLAS; SwiGLU after it with glu, as on the other paths."""
+    h = F.linear(x, dequantize(w, s, block_size, x.dtype))
+    if not glu:
+        return h
+    from mstar.utils.fused_moe.kernels import act_and_mul_triton
+
+    out = torch.empty(x.shape[0], h.shape[1] // 2, dtype=x.dtype, device=x.device)
+    act_and_mul_triton(h, out, activation="silu")
+    return out
+
+
 def _table_rows(device: torch.device, n: int, k: int, glu: bool):
     """The fp8_linear table's rows for this shape on ``device``, looked up once, or None."""
     key = (device, n, k, glu)
@@ -439,7 +487,10 @@ def _table_rows(device: torch.device, n: int, k: int, glu: bool):
 
 def _builtin(device: torch.device, n: int, k: int, glu: bool, m: int) -> str:
     """GLM-5.2's dispatch on any GPU: w8a16 up to its token limit, flashinfer to _FI_MAX_TOKENS
-    where it runs, then cuBLAS where it runs, else w8a16."""
+    where it runs, then cuBLAS where it runs, else w8a16. On Blackwell, dequant above
+    _DEQUANT_MIN_TOKENS."""
+    if _BLACKWELL.get(device) and m > _DEQUANT_MIN_TOKENS:
+        return "dequant"
     if m <= _W8A16_MAX_TOKENS_BY_SHAPE.get((n, k, glu), _W8A16_MAX_TOKENS):
         return "w8a16"
     if m <= _FI_MAX_TOKENS and _FI_OK.get(device):
@@ -452,12 +503,12 @@ def _choose(device: torch.device, n: int, k: int, glu: bool, m: int, block_size=
     on ``device`` (a w8a16 row without a config takes the built-in tile), else the built-in rule.
     The table is keyed by 128 x 128 scale blocks; any other block runs w8a16."""
     if tuple(block_size) != (128, 128):
-        return "w8a16", None
+        return ("dequant" if _BLACKWELL.get(device) and m > _DEQUANT_MIN_TOKENS else "w8a16"), None
     rows = _table_rows(device, n, k, glu) if device.type == "cuda" else None
     if rows is not None:
         bounds, choices = rows
         choice = choices[bisect.bisect_left(bounds, m)]
-        if (choice.impl == "w8a16" or (choice.impl == "flashinfer" and _FI_OK.get(device))
+        if (choice.impl in ("w8a16", "dequant") or (choice.impl == "flashinfer" and _FI_OK.get(device))
                 or (choice.impl == "cublas" and _W8A8_OK.get(device))):
             return choice.impl, choice.config
     return _builtin(device, n, k, glu, m), None
@@ -472,6 +523,8 @@ def _linear(x, w, s, block_size, glu):
     if M == 0:
         return x.new_empty(0, N)
     impl, config = _choose(x.device, N, K, glu, M, block_size)
+    if impl == "dequant":
+        return _dequant_linear(x, w, s, block_size, glu)
     if impl == "flashinfer":
         return _fi(x, w, s, glu)
     if impl == "cublas":

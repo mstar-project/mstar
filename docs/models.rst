@@ -99,6 +99,12 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
    * - ``qwen3_8_27b``
      - ``Qwen/Qwen3.8-27B``
      - Qwen3.8-27B on the Qwen3.5 code above (same architecture); ships a TP4 config.
+   * - ``qwen3_5_moe`` *(Beta)*
+     - ``nvidia/Qwen3.5-397B-A17B-NVFP4-V2``
+     - Qwen3.5-MoE (e.g. 397B-A17B), text only: the Qwen3.5 stack with 512 routed experts
+       and a gated shared expert per layer. Serves the NVFP4 checkpoint (experts NVFP4, B200 /
+       B300) or ``Qwen/Qwen3.5-397B-A17B-FP8`` (``model_kwargs.checkpoint_path``) as stored;
+       ``configs/qwen3_5_397b_a17b_tp{8,4}.yaml``.
    * - ``omnivoice``
      - ``k2-fsa/OmniVoice``
      - Massively multilingual zero-shot TTS: masked-diffusion canvas over a Qwen3-0.6B

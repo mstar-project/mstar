@@ -8,7 +8,6 @@ from mstar.model.components.distributed import (
     ParallelGatedMLP,
     VocabParallelEmbedding,
 )
-from mstar.model.components.fp8_linear import Fp8ParallelGatedMLP, dense_fp8_block, fp8_reference
 from mstar.model.glm52.components.moe import Glm52SparseMoeBlock
 from mstar.model.glm52.config import Glm52ModelConfig
 
@@ -43,12 +42,9 @@ def build_rmsnorm(config: Glm52ModelConfig) -> RMSNorm:
 def build_dense_mlp(
     config: Glm52ModelConfig, comm_group: CommGroup | None = None,
     reduce_results: bool = True,
-) -> ParallelGatedMLP | Fp8ParallelGatedMLP:
-    block = dense_fp8_block(config)
-    if block is not None:
-        return Fp8ParallelGatedMLP(
-            config.hidden_size, config.intermediate_size, block, comm_group=comm_group,
-            reduce_results=reduce_results, reference=fp8_reference(config))
+) -> ParallelGatedMLP:
+    """The dense FFN; the quantization plan gives its gate/up and down the checkpoint's fp8 (whose
+    SwiGLU then runs in the block-fp8 GEMM's epilogue)."""
     return ParallelGatedMLP(
         hidden_size=config.hidden_size,
         intermediate_size=config.intermediate_size,

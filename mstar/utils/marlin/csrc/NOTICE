@@ -1,0 +1,17 @@
+Marlin W4A16 GEMM, vendored for M* (mstar/utils/marlin).
+
+Source: vllm-project/vllm @ 4ba787ec9959e566d3b587a796dff07673324da5 (vLLM 0.33.0), Apache License 2.0,
+Copyright contributors to the vLLM project; Marlin by Elias Frantar (IST-DASLab/marlin, Apache License 2.0),
+modified by Neural Magic.
+
+  marlin_template.h, dequant.h, marlin_mma.h, marlin.cuh, marlin_dtypes.cuh, kernel.h
+      <- csrc/quantization/marlin/ (verbatim, one provenance line added at the top)
+  core/scalar_type.hpp
+      <- csrc/core/scalar_type.hpp (verbatim, one provenance line added at the top)
+  mstar_marlin.cu
+      <- csrc/quantization/marlin/marlin.cu: the thread-config, kernel-selection and launch code verbatim; the
+         torch stable-ABI wrapper rewritten on the ATen API and registered under an M* op namespace.
+
+The kernel instantiations and kernel_selector.h are generated at build time (mstar/utils/marlin/__init__.py,
+after csrc/quantization/marlin/generate_kernels.py), as is the weight / scale / zero-point layout (after
+vllm/model_executor/layers/quantization/utils/marlin_utils.py and marlin_utils_test.py).

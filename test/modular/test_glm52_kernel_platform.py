@@ -45,7 +45,8 @@ def test_each_gpu_picks_what_dense_fp8_picked_before_the_table(monkeypatch):
     """Every dense fp8 linear shape GLM-5.2 builds at TP8 and TP4 (and GLM-5.3's MLA and MLP
     shapes, should it turn dense_fp8 on), at every token boundary, on an H200 with and without
     flashinfer's and cuBLAS's GEMMs, an H200 NVL and an H100 (no table rows): the kernel and
-    tile are the ones the dispatch before the fp8_linear table picked."""
+    tile are the ones the dispatch before the fp8_linear table picked, except where the H200's rows
+    for another model's identical GEMM now decide (the golden file's made_by says which)."""
     from mstar.kernels import DeviceKey, registry
     from mstar.utils import dense_fp8
 

@@ -75,7 +75,8 @@ from torch import nn
 
 from mstar.distributed.communication import CommGroup
 from mstar.distributed.utils import divide
-from mstar.utils.fp8_block import FP8_DTYPE
+from mstar.model.components.quant_linear import QuantCapability, QuantGeometry
+from mstar.utils.fp8_block import FP8_DTYPE, dequantize_fp8_block_weight, quantize_fp8_block_weight
 
 logger = logging.getLogger(__name__)
 
@@ -568,7 +569,8 @@ def _gate_up_weight_loader(
     expert_idx = int(expert_str)
     shard_inter = divide(full_inter, tp_size)
     start = tp_rank * shard_inter
-    tp_slice = loaded_weight[start:start + shard_inter, :]
+    # the full tensor, or this rank's slice from a sliced read
+    tp_slice = loaded_weight if loaded_weight.shape[0] == shard_inter else loaded_weight[start:start + shard_inter, :]
     if kind == "gate":
         param.data[expert_idx, :shard_inter, :] = tp_slice
     else:
@@ -589,7 +591,9 @@ def _down_proj_weight_loader(
     expert_idx = int(loaded_shard_id.split(":")[1])
     shard_inter = divide(full_inter, tp_size)
     start = tp_rank * shard_inter
-    param.data[expert_idx, :, :] = loaded_weight[:, start:start + shard_inter]
+    if loaded_weight.shape[1] != shard_inter:
+        loaded_weight = loaded_weight[:, start:start + shard_inter]
+    param.data[expert_idx, :, :] = loaded_weight
 
 
 def _gate_up_fp8_weight_loader(
@@ -644,7 +648,355 @@ def _down_proj_fp8_weight_loader(
     param.data[expert_idx, :, :] = loaded_weight
 
 
-class ParallelSparseMoeBlock(nn.Module):
+def _f32_container(loader):
+    """``loader`` for an fp32 tensor kept in an int32 container: the checkpoint's scales viewed, not cast."""
+    def load(param, loaded_weight, loaded_shard_id=None):
+        loader(param, loaded_weight.to(torch.float32).view(torch.int32), loaded_shard_id)
+    return load
+
+
+class Fp8Experts:
+    """A MoE block's routed experts (``experts.gate_up_proj (E, 2I, H)``, ``experts.down_proj (E, H, I)``, this
+    rank's share) as one quantizable layer, ``<block>.experts`` (``mstar.quantization``), held as block fp8: e4m3
+    in uint8 containers and their fp32 ``*_scale_inv`` blocks in int32 ones (the engine's node cast would round
+    them). Loaded as a block-fp8 checkpoint stores them (``experts_prepare``) or quantized from the loaded bf16
+    an expert at a time (``experts_quantize``); dispatched through ``experts_fp8``: per-pair GEMVs at a few tokens,
+    else ``fused_experts_fp8`` (W8A8, activations per token per 128), whose sentinel expert id skips a slot as the
+    bf16 dispatch's does.
+
+    The block supplies ``_reattach_loaders()`` (its ``_attach_weight_loaders`` with its own arguments), which
+    calls ``_attach_fp8_loaders`` while ``experts_fp8_block`` is set."""
+
+    # (block_n, block_k) once the experts hold block-scaled e4m3
+    experts_fp8_block: tuple[int, int] | None = None
+
+    def _reattach_loaders(self) -> None:
+        raise NotImplementedError
+
+    def experts_quant_capability(self) -> QuantCapability:
+        if self.experts_fp8_block is not None:
+            return QuantCapability(False, "already fp8_block")
+        return QuantCapability(True)
+
+    def experts_geometry(self) -> QuantGeometry:
+        """gate_up's ``[2I, H]`` per rank, its gate and up halves as row spans (down's K is ``I``)."""
+        _, two_inter, hidden = self.experts.gate_up_proj.shape
+        return QuantGeometry(two_inter, hidden, (two_inter // 2, two_inter // 2), (hidden,))
+
+    def _attach_fp8_loaders(self, gate_up, down) -> None:
+        """``gate_up(row_unit)`` / ``down(col_unit)``: the block's loaders for a stored tensor whose one index
+        covers that many weight rows / columns (1 for the e4m3 data, the scale block for its scales)."""
+        bn, bk = self.experts_fp8_block
+        experts = self.experts
+        experts.gate_up_proj.weight_loader = gate_up(1)
+        experts.down_proj.weight_loader = down(1)
+        experts.gate_up_proj_scale_inv.weight_loader = _f32_container(gate_up(bn))
+        experts.down_proj_scale_inv.weight_loader = _f32_container(down(bk))
+
+    def _fp8_storage(self, block: tuple[int, int], data: dict[str, torch.Tensor] | None = None) -> None:
+        """Replace the bf16 experts with block-fp8 storage, empty or ``data``."""
+        bn, bk = block
+        experts = self.experts
+        e, two_inter, hidden = experts.gate_up_proj.shape
+        inter = two_inter // 2
+        device = experts.gate_up_proj.device
+        shapes = {
+            "gate_up_proj": ((e, two_inter, hidden), torch.uint8),
+            "gate_up_proj_scale_inv": ((e, -(-two_inter // bn), -(-hidden // bk)), torch.int32),
+            "down_proj": ((e, hidden, inter), torch.uint8),
+            "down_proj_scale_inv": ((e, -(-hidden // bn), -(-inter // bk)), torch.int32),
+        }
+        for name, (shape, dtype) in shapes.items():
+            tensor = torch.empty(shape, dtype=dtype, device=device) if data is None else data[name]
+            assert tuple(tensor.shape) == shape and tensor.dtype == dtype, (name, tensor.shape, tensor.dtype)
+            if hasattr(experts, name):
+                delattr(experts, name)
+            setattr(experts, name, nn.Parameter(tensor, requires_grad=False))
+        self.experts_fp8_block = tuple(block)
+        self._reattach_loaders()
+
+    def experts_prepare(self, fmt: str, block: tuple[int, int] = (128, 128), source=None) -> None:
+        """Hold the experts as a block-fp8 checkpoint stores them, before it loads (``source``: how the
+        checkpoint stores them, ``checkpoint.StoredBase``; one layout here)."""
+        assert fmt == "fp8_block", fmt
+        self._fp8_storage(block)
+
+    def experts_scales(self) -> dict[str, torch.dtype]:
+        """The experts' scale params and the float each stands for (the loader checks they all arrived)."""
+        return {"gate_up_proj_scale_inv": torch.float32, "down_proj_scale_inv": torch.float32}
+
+    def experts_after_load(self) -> None:
+        """Put the loaded experts in their kernel's layout; block fp8 runs the checkpoint's as is."""
+
+    @torch.no_grad()
+    def experts_quantize(self, fmt: str, block: tuple[int, int] = (128, 128)) -> None:
+        """Quantize this rank's loaded bf16 experts to block fp8, one expert at a time (a whole stack's fp32
+        working copy would be several GB)."""
+        assert fmt == "fp8_block", fmt
+        data = {}
+        for name in ("gate_up_proj", "down_proj"):
+            weight = getattr(self.experts, name).data
+            parts = [quantize_fp8_block_weight(weight[i], block) for i in range(weight.shape[0])]
+            data[name] = torch.stack([q for q, _ in parts]).view(torch.uint8)
+            data[f"{name}_scale_inv"] = torch.stack([s for _, s in parts]).contiguous().view(torch.int32)
+        self._fp8_storage(block, data)
+
+    def _experts_fp8(
+        self, flat: torch.Tensor, routing_weights: torch.Tensor, selected_experts: torch.Tensor,
+        skip_invalid: bool = False,
+    ) -> torch.Tensor:
+        """The routed experts' weighted sum over this rank's experts, ``(tokens, hidden)``; ids equal to the
+        local expert count are skipped with ``skip_invalid``. Off CUDA, the weights dequantized as a bf16
+        checkpoint would hold them (tests)."""
+        experts = self.experts
+        w1, w2 = experts.gate_up_proj, experts.down_proj
+        s1 = experts.gate_up_proj_scale_inv.view(torch.float32)
+        s2 = experts.down_proj_scale_inv.view(torch.float32)
+        if not flat.is_cuda:
+            bf16 = [
+                torch.stack([dequantize_fp8_block_weight(w[i], s[i], self.experts_fp8_block, flat.dtype)
+                             for i in range(w.shape[0])])
+                for w, s in ((w1, s1), (w2, s2))
+            ]
+            return dispatch_experts_fused(flat, *bf16, w1.shape[0], selected_experts, routing_weights,
+                                          skip_invalid=skip_invalid)
+        from mstar.utils.fused_moe.runner import experts_fp8
+
+        return experts_fp8(
+            flat, w1, w2, s1, s2, routing_weights, selected_experts,
+            block_size=self.experts_fp8_block, skip_invalid=skip_invalid,
+        )
+
+
+# a stored 4-bit tensor's checkpoint suffix -> the stacked experts param's, after ``gate_up_proj`` / ``down_proj``
+# (the stacked rules replace ``.experts.<proj>.__expertN__.weight`` and keep what follows)
+_EXPERT_SUFFIX = {"weight": "", "weight_packed": "_packed", "weight_scale": "_scale",
+                  "weight_zero_point": "_zero_point", "weight_scale_2": "_scale_2", "input_scale": "_input_scale"}
+_INT_OF_SIZE = {1: torch.uint8, 2: torch.int16, 4: torch.int32}
+
+
+def _expert_tensor_loader(fmt, suffix: str, loader):
+    """``loader`` for one checkpoint tensor of a 4-bit expert: the format's ``from_checkpoint``, then floating
+    data viewed as the param's integer container (the engine's node cast would round it)."""
+    def load(param, loaded_weight, loaded_shard_id=None):
+        loaded_weight = fmt.from_checkpoint(suffix, loaded_weight)
+        if loaded_weight.dtype.is_floating_point or loaded_weight.dtype != param.dtype:
+            loaded_weight = loaded_weight.contiguous().view(_INT_OF_SIZE[loaded_weight.element_size()])
+        loader(param, loaded_weight, loaded_shard_id)
+    return load
+
+
+def _expert_scalar_loader(expert_start: int, num_local: int, param, loaded_weight, loaded_shard_id=None):
+    """One expert's fp32 per-tensor scale (NVFP4's ``weight_scale_2`` / ``input_scale``) into its slot: ``(E, 2)``
+    for gate / up, ``(E, 1)`` for down, in an int32 container; another rank's expert is skipped."""
+    kind, expert = str(loaded_shard_id).split(":")
+    local = int(expert) - expert_start
+    if not 0 <= local < num_local:
+        return
+    param.data[local, 1 if kind == "up" else 0] = loaded_weight.to(torch.float32).reshape(1).view(torch.int32)[0]
+
+
+class QuantExperts(Fp8Experts):
+    """``Fp8Experts`` plus the 4-bit formats, ``w4a16`` (int4 groups), ``mxfp4`` and ``nvfp4``, held as the
+    compressed-tensors / modelopt checkpoint stores them, per expert stacked: ``gate_up_proj_packed (E, 2I, H/8)``
+    int32 or ``(E, 2I, H/2)`` uint8, ``gate_up_proj_scale``, ``gate_up_proj_zero_point`` (asymmetric int4), NVFP4's
+    ``gate_up_proj`` / ``gate_up_proj_scale`` / ``gate_up_proj_scale_2`` / ``gate_up_proj_input_scale``, and down's
+    the same. The stacked rules that route ``experts.N.gate_proj.weight`` route every suffix after ``weight``
+    the same way, so a model's loader needs no change beyond passing those suffixes through its remap.
+
+    Dispatch: H100/H200 and later run ``w4a16`` / ``mxfp4`` through ``fused_experts_w4a16`` (Triton, the weight
+    dequantized in registers); B200/B300 run ``mxfp4`` / ``nvfp4`` through FlashInfer's TRT-LLM FP4 MoE
+    (``experts_after_load`` shuffles the weights into its layout on the device). Off CUDA, the reference: every
+    expert dequantized, NVFP4's activations quantized as its kernel would."""
+
+    # the format (as the checkpoint stores it) once the experts hold 4-bit storage
+    experts_packed = None
+
+    @property
+    def experts_quantized(self) -> bool:
+        return self.experts_fp8_block is not None or self.experts_packed is not None
+
+    def experts_quant_capability(self) -> QuantCapability:
+        if self.experts_packed is not None:
+            return QuantCapability(False, f"already {self.experts_packed.name}")
+        return super().experts_quant_capability()
+
+    def experts_geometry(self) -> QuantGeometry:
+        e, two_inter, hidden = self._experts_dims()
+        return QuantGeometry(two_inter, hidden, (two_inter // 2, two_inter // 2), (hidden,))
+
+    def _experts_dims(self) -> tuple[int, int, int]:
+        dims = getattr(self, "_experts_bf16_dims", None)
+        return dims if dims is not None else tuple(self.experts.gate_up_proj.shape)
+
+    def experts_scales(self) -> dict[str, torch.dtype]:
+        if self.experts_packed is None:
+            return super().experts_scales()
+        return {name: view[0] for name, view in self._experts_views.items() if view[0].is_floating_point}
+
+    def _attach_quant_loaders(self, gate_up, down) -> None:
+        if self.experts_packed is None:
+            self._attach_fp8_loaders(gate_up, down)
+            return
+        from functools import partial
+
+        start = getattr(self, "expert_start", 0)
+        local = self._experts_dims()[0]
+        for name, (_, units, proj, suffix) in self._experts_views.items():
+            param = getattr(self.experts, name)
+            if units == (None, None):
+                param.weight_loader = partial(_expert_scalar_loader, start, local)
+            elif proj == "gate_up_proj":
+                param.weight_loader = _expert_tensor_loader(self.experts_packed, suffix, gate_up(units[0]))
+            else:
+                param.weight_loader = _expert_tensor_loader(self.experts_packed, suffix, down(units[1]))
+
+    def _packed_storage(self, fmt, data: dict[str, torch.Tensor] | None = None) -> None:
+        """Replace the bf16 experts with ``fmt``'s storage, stacked per expert, empty or ``data``."""
+        e, two_inter, hidden = self._experts_bf16_dims = self._experts_dims()
+        experts = self.experts
+        device = next(iter(experts.parameters())).device
+        self._experts_views = {}
+        for proj, (n, k) in (("gate_up_proj", (two_inter, hidden)), ("down_proj", (hidden, two_inter // 2))):
+            if hasattr(experts, proj):
+                delattr(experts, proj)
+            for st in fmt.storage(n, k):
+                name = proj + _EXPERT_SUFFIX[st.name]
+                # a per-tensor scale: one per expert per checkpoint linear (gate and up are two)
+                shape = (e, 2 if proj == "gate_up_proj" else 1) if st.units == (None, None) else (e, *st.shape)
+                tensor = torch.empty(shape, dtype=st.dtype, device=device) if data is None else data[name]
+                assert tuple(tensor.shape) == shape and tensor.dtype == st.dtype, (name, tensor.shape, tensor.dtype)
+                if hasattr(experts, name):
+                    delattr(experts, name)
+                setattr(experts, name, nn.Parameter(tensor, requires_grad=False))
+                self._experts_views[name] = (st.stands_for, st.units, proj, st.name)
+        self.experts_packed = fmt
+        self._experts_kernel = None
+        self._reattach_loaders()
+
+    def experts_prepare(self, fmt: str, block: tuple[int, int] = (128, 128), source=None) -> None:
+        """Hold the experts as the checkpoint stores them (``source``: its layout and params), before it loads."""
+        if fmt == "fp8_block":
+            super().experts_prepare(fmt, block)
+            return
+        from mstar.model.components.quant_linear import linear_format
+
+        self._packed_storage(linear_format(fmt).for_stored(source))
+
+    @torch.no_grad()
+    def experts_quantize(self, fmt: str, block: tuple[int, int] = (128, 128)) -> None:
+        """Quantize this rank's loaded bf16 experts, one expert at a time."""
+        if fmt == "fp8_block":
+            super().experts_quantize(fmt, block)
+            return
+        from mstar.model.components.quant_linear import as_container, linear_format
+
+        fmt_ = linear_format(fmt)
+        data = {}
+        for proj in ("gate_up_proj", "down_proj"):
+            weight = getattr(self.experts, proj).data
+            quantize = getattr(fmt_, "quantize_storage", None) or (lambda w: fmt_.quantize_weight(w, None))
+            parts = [quantize(weight[i]) for i in range(weight.shape[0])]
+            # the storage a checkpoint would fill (not a linear kernel's extra copies, e.g. tinygemm's)
+            for key in (st.name for st in fmt_.storage(*weight.shape[1:])):
+                data[proj + _EXPERT_SUFFIX[key]] = torch.stack([as_container(p[key]) for p in parts])
+        self._packed_storage(fmt_, data)
+
+    def _expert_buffers(self, proj: str, index) -> dict[str, torch.Tensor]:
+        """One expert's (or, ``index`` a slice, several experts') storage under the format's names, viewed as
+        what it stands for."""
+        out = {}
+        for name, (stands_for, _, p, suffix) in self._experts_views.items():
+            if p == proj:
+                t = getattr(self.experts, name)[index]
+                out[suffix] = t if not stands_for.is_floating_point else t.view(stands_for)
+        return out
+
+    def experts_after_load(self) -> None:
+        """Put the loaded experts in their kernel's layout, on the device they serve from (B200/B300's FlashInfer
+        FP4 MoE; the Triton kernel reads the checkpoint layout as is)."""
+        if self.experts_packed is None or self.experts_packed.name not in ("mxfp4", "nvfp4"):
+            return
+        if self.experts_packed.name == "nvfp4":
+            # one GEMM per expert takes one tensor scale and one activation scale for gate and up together
+            for name in ("gate_up_proj_scale_2", "gate_up_proj_input_scale"):
+                pair = getattr(self.experts, name).view(torch.float32)
+                if not bool((pair[:, 0] == pair[:, 1]).all()):
+                    raise ValueError(f"nvfp4 experts: the checkpoint's gate and up {name.rpartition('_proj_')[2]} "
+                                     "differ; serve these experts bf16 instead")
+        from mstar.utils.fused_moe import fp4_flashinfer
+
+        device = next(iter(self.experts.parameters())).device
+        if fp4_flashinfer.unavailable_reason(device) is None:
+            self._experts_kernel = fp4_flashinfer.TrtllmFp4Experts.convert(self, device)
+
+    def _experts_quant(
+        self, flat: torch.Tensor, routing_weights: torch.Tensor, selected_experts: torch.Tensor,
+        skip_invalid: bool = False,
+    ) -> torch.Tensor:
+        if self.experts_packed is None:
+            return self._experts_fp8(flat, routing_weights, selected_experts, skip_invalid=skip_invalid)
+        return self._experts_4bit(flat, routing_weights, selected_experts, skip_invalid)
+
+    def _experts_4bit(self, flat, routing_weights, selected_experts, skip_invalid):
+        fmt = self.experts_packed
+        if self._experts_kernel is not None:
+            return self._experts_kernel(flat, routing_weights, selected_experts, skip_invalid)
+        if flat.is_cuda and fmt.name in ("w4a16", "mxfp4"):
+            from mstar.model.components.int4_formats import KIND_E2M1, KIND_INT4_SYM, KIND_INT4_ZP
+            from mstar.utils.fused_moe.w4a16 import fused_experts_w4a16
+
+            w1, s1, z1 = (self._expert_buffers("gate_up_proj", slice(None)).get(k)
+                          for k in ("weight_packed", "weight_scale", "weight_zero_point"))
+            w2, s2, z2 = (self._expert_buffers("down_proj", slice(None)).get(k)
+                          for k in ("weight_packed", "weight_scale", "weight_zero_point"))
+            kind = KIND_E2M1 if fmt.name == "mxfp4" else KIND_INT4_SYM if z1 is None else KIND_INT4_ZP
+            if kind == KIND_E2M1:
+                s1, s2 = s1.view(torch.uint8), s2.view(torch.uint8)
+            return fused_experts_w4a16(
+                flat, w1.view(torch.uint8), w2.view(torch.uint8), s1, s2, z1, z2, routing_weights, selected_experts,
+                kind, fmt.group, "silu", skip_invalid,
+            )
+        if flat.is_cuda:
+            raise RuntimeError(f"{fmt.name} experts need FlashInfer's FP4 MoE (compute capability 10.0)")
+        return self._experts_reference(flat, routing_weights, selected_experts, skip_invalid)
+
+    def _experts_reference(self, flat, routing_weights, selected_experts, skip_invalid):
+        """What the 4-bit experts compute, in fp32 per expert (tests): the dequantized weights, and for NVFP4 the
+        activations quantized with each expert's input scale as the kernel quantizes them."""
+        fmt = self.experts_packed
+        e = self._experts_dims()[0]
+        out = torch.zeros(flat.shape, dtype=torch.float32, device=flat.device)
+        for i in range(e):
+            hit = selected_experts == i
+            tokens, slot = torch.where(hit)
+            if not tokens.numel():
+                continue
+            x = flat[tokens].float()
+            gate_up = self._expert_matmul(fmt, "gate_up_proj", i, x)
+            gate, up = gate_up.chunk(2, dim=-1)
+            h = (F.silu(gate) * up).to(flat.dtype).float()
+            y = self._expert_matmul(fmt, "down_proj", i, h)
+            out.index_add_(0, tokens, y * routing_weights[tokens, slot, None].float())
+        return out.to(flat.dtype)
+
+    def _expert_matmul(self, fmt, proj, i, x):
+        buffers = self._expert_buffers(proj, i)
+        if fmt.name != "nvfp4":
+            return x @ fmt.dequantize(buffers).to(torch.bfloat16).float().t()
+        # NVFP4: each checkpoint linear (gate, up) keeps its own tensor scale and activation scale
+        halves = []
+        rows = buffers["weight"].shape[0] // buffers["weight_scale_2"].numel()
+        for j in range(buffers["weight_scale_2"].numel()):
+            part = {"weight": buffers["weight"][j * rows:(j + 1) * rows],
+                    "weight_scale": buffers["weight_scale"][j * rows:(j + 1) * rows],
+                    "weight_scale_2": buffers["weight_scale_2"][j:j + 1],
+                    "input_scale": buffers["input_scale"][j:j + 1]}
+            halves.append(fmt.reference_stored(x.to(torch.bfloat16), part).float())
+        return torch.cat(halves, dim=-1)
+
+
+class ParallelSparseMoeBlock(QuantExperts, nn.Module):
     """TP-aware Top-K sparse MoE.
 
     When ``tp_size == 1``, the forward is identical to
@@ -693,9 +1045,18 @@ class ParallelSparseMoeBlock(nn.Module):
         )
         self._attach_weight_loaders(tp_rank, tp_size, moe_intermediate_size)
 
+    def _reattach_loaders(self) -> None:
+        self._attach_weight_loaders(self.comm_group.rank, self.comm_group.world_size, self.moe_intermediate_size)
+
     def _attach_weight_loaders(self, tp_rank: int, tp_size: int, full_inter: int):
         from functools import partial
 
+        if self.experts_quantized:
+            self._attach_quant_loaders(
+                lambda unit: partial(_gate_up_fp8_weight_loader, tp_rank, tp_size, full_inter, unit),
+                lambda unit: partial(_down_proj_fp8_weight_loader, tp_rank, tp_size, full_inter, unit),
+            )
+            return
         self.experts.gate_up_proj.weight_loader = partial(
             _gate_up_weight_loader, tp_rank, tp_size, full_inter,
         )
@@ -723,6 +1084,17 @@ class ParallelSparseMoeBlock(nn.Module):
         hidden_dim = hidden_states.shape[-1]
         flat = hidden_states.view(-1, hidden_dim).contiguous()
         skip = token_valid is not None
+        if self.experts_quantized:
+            routing_weights, selected_experts, router_states_next, _ = _route(self.gate, flat, None, router_states)
+            if skip:
+                selected_experts, routing_weights = _mask_padding(
+                    selected_experts, routing_weights, token_valid, self.num_experts,
+                )
+            out = self._experts_quant(flat, routing_weights, selected_experts, skip_invalid=skip)
+            if self.comm_group.world_size > 1:
+                self.comm_group.all_reduce(out)
+            out = out.view(input_shape)
+            return (out, router_states_next) if return_router_states else out
         # the mask below moves experts after routing, and TP's dispatch aligns for itself
         can_align = not skip and self.comm_group.world_size == 1
         routing_weights, selected_experts, router_states_next, alignment = _route(
@@ -763,7 +1135,7 @@ class ParallelSparseMoeBlock(nn.Module):
         return output
 
 
-class ParallelSparseMoeBlockWithSharedExpert(nn.Module):
+class ParallelSparseMoeBlockWithSharedExpert(QuantExperts, nn.Module):
     """TP-aware Top-K sparse MoE with a shared expert + sigmoid gating.
 
     The shared expert should be a ``ParallelGatedMLP`` constructed with
@@ -812,9 +1184,18 @@ class ParallelSparseMoeBlockWithSharedExpert(nn.Module):
         self.shared_expert_gate = nn.Linear(hidden_size, 1, bias=False)
         self._attach_weight_loaders(tp_rank, tp_size, moe_intermediate_size)
 
+    def _reattach_loaders(self) -> None:
+        self._attach_weight_loaders(self.comm_group.rank, self.comm_group.world_size, self.moe_intermediate_size)
+
     def _attach_weight_loaders(self, tp_rank: int, tp_size: int, full_inter: int):
         from functools import partial
 
+        if self.experts_quantized:
+            self._attach_quant_loaders(
+                lambda unit: partial(_gate_up_fp8_weight_loader, tp_rank, tp_size, full_inter, unit),
+                lambda unit: partial(_down_proj_fp8_weight_loader, tp_rank, tp_size, full_inter, unit),
+            )
+            return
         self.experts.gate_up_proj.weight_loader = partial(
             _gate_up_weight_loader, tp_rank, tp_size, full_inter,
         )
@@ -843,6 +1224,13 @@ class ParallelSparseMoeBlockWithSharedExpert(nn.Module):
 
         shared = self.shared_expert(flat)
 
+        if self.experts_quantized:
+            routing_weights, selected_experts, router_states_next, _ = _route(self.gate, flat, None, router_states)
+            routed = self._experts_quant(flat, routing_weights, selected_experts)
+            if self.comm_group.world_size > 1:
+                self.comm_group.all_reduce(routed)
+            out = (routed + torch.sigmoid(self.shared_expert_gate(flat)) * shared).view(input_shape)
+            return (out, router_states_next) if return_router_states else out
         routing_weights, selected_experts, router_states_next, alignment = _route(
             self.gate, flat, self.experts.gate_up_proj if self.comm_group.world_size == 1 else None, router_states,
         )
@@ -927,7 +1315,42 @@ def _ep_down_proj_weight_loader(
     param.data[local_idx] = loaded_weight
 
 
-class ExpertParallelSparseMoeBlock(nn.Module):
+def _ep_gate_up_fp8_weight_loader(
+    expert_start: int, num_local_experts: int, full_inter: int, row_unit: int,
+    param: nn.Parameter, loaded_weight: torch.Tensor,
+    loaded_shard_id: int | str | None = None,
+):
+    """:func:`_ep_gate_up_weight_loader` for block-fp8 storage: one expert's gate or up weight (``row_unit``
+    1) or its ``weight_scale_inv`` (``row_unit`` the scale block's rows), whole, if this rank owns it."""
+    assert loaded_shard_id is not None
+    kind, expert_str = str(loaded_shard_id).split(":")
+    local_idx = int(expert_str) - expert_start
+    if not 0 <= local_idx < num_local_experts:
+        return
+    rows = -(-full_inter // row_unit)
+    if loaded_weight.dtype == FP8_DTYPE:
+        loaded_weight = loaded_weight.view(torch.uint8)
+    assert loaded_weight.shape == (rows, param.shape[2]), (
+        f"expert {loaded_shard_id} tensor {tuple(loaded_weight.shape)} != {(rows, param.shape[2])}"
+    )
+    if kind == "gate":
+        param.data[local_idx, :rows, :] = loaded_weight
+    else:
+        param.data[local_idx, rows:2 * rows, :] = loaded_weight
+
+
+def _ep_down_proj_fp8_weight_loader(
+    expert_start: int, num_local_experts: int,
+    param: nn.Parameter, loaded_weight: torch.Tensor,
+    loaded_shard_id: int | str | None = None,
+):
+    """:func:`_ep_down_proj_weight_loader` for block-fp8 storage (data or scales, whole)."""
+    if loaded_weight.dtype == FP8_DTYPE:
+        loaded_weight = loaded_weight.view(torch.uint8)
+    _ep_down_proj_weight_loader(expert_start, num_local_experts, param, loaded_weight, loaded_shard_id)
+
+
+class ExpertParallelSparseMoeBlock(QuantExperts, nn.Module):
     """Expert-parallel Top-K sparse MoE.
 
     Rank ``r`` of ``P`` owns global experts ``[r*E_local, (r+1)*E_local)``
@@ -990,9 +1413,19 @@ class ExpertParallelSparseMoeBlock(nn.Module):
         )
         self._attach_weight_loaders()
 
+    def _reattach_loaders(self) -> None:
+        self._attach_weight_loaders()
+
     def _attach_weight_loaders(self):
         from functools import partial
 
+        if self.experts_quantized:
+            self._attach_quant_loaders(
+                lambda unit: partial(_ep_gate_up_fp8_weight_loader, self.expert_start, self.num_local_experts,
+                                     self.moe_intermediate_size, unit),
+                lambda unit: partial(_ep_down_proj_fp8_weight_loader, self.expert_start, self.num_local_experts),
+            )
+            return
         self.experts.gate_up_proj.weight_loader = partial(
             _ep_gate_up_weight_loader,
             self.expert_start, self.num_local_experts, self.moe_intermediate_size,
@@ -1047,6 +1480,10 @@ class ExpertParallelSparseMoeBlock(nn.Module):
                 selected_experts, routing_weights = _mask_padding(
                     selected_experts, routing_weights, token_valid, self.num_experts,
                 )
+            if self.experts_quantized:
+                out = self._experts_quant(flat, routing_weights, selected_experts, skip_invalid=skip)
+                out = out.view(input_shape)
+                return (out, router_states_next) if return_router_states else out
             out = _dispatch(
                 flat, self.experts.gate_up_proj, self.experts.down_proj,
                 self.num_experts, selected_experts, routing_weights, skip_invalid=skip,
@@ -1073,9 +1510,12 @@ class ExpertParallelSparseMoeBlock(nn.Module):
         local = torch.where(owned, local, self.num_local_experts)
         # Skipped slots never reach a GEMM; zeroing their weight is belt-and-braces.
         routing_weights = torch.where(owned, routing_weights, 0)
-        out = _dispatch(
-            flat, self.experts.gate_up_proj, self.experts.down_proj,
-            self.num_local_experts, local, routing_weights, skip_invalid=True,
-        )
+        if self.experts_quantized:
+            out = self._experts_quant(flat, routing_weights, local, skip_invalid=True)
+        else:
+            out = _dispatch(
+                flat, self.experts.gate_up_proj, self.experts.down_proj,
+                self.num_local_experts, local, routing_weights, skip_invalid=True,
+            )
         self.comm_group.all_reduce(out)
         return out
