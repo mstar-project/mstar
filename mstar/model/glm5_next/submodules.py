@@ -367,7 +367,8 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
             # every MLA layer attends sparse over the DSA resource's plan, not a dense one; a
             # verify step's rows move on the device (_trim_on_device)
             del steps[ATTN]
-            steps[DSA] = DSAStep(mtp_trims=self.config.mtp_trims and graph_walk == "decode")
+            steps[DSA] = DSAStep(
+                rows_may_move=self.config.mtp_trims and graph_walk == "decode")
         return SubmoduleStep(
             segments=[
                 Segment(request_id=rid, label=LABEL, span=inp.input_seq_len)

@@ -828,7 +828,7 @@ The spec types are:
        (an eager prefill's scores per launch) and ``shard_min_rows`` (the rows per rank
        from which a prefill's selection splits across TP ranks).
        An MTP verify block that the device places after its last accepted row rather than
-       where the host planned it declares ``DSAStep(mtp_trims=True)`` and moves its rows
+       where the host planned it declares ``DSAStep(rows_may_move=True)`` and moves its rows
        with ``move_rows`` (GLM-5.3): a captured step's spare entries attend the cache's
        ``spare_row``, masked in its rope slot.
    * - ``CrossAttentionSpec(config=CrossAttentionConfig(...))``

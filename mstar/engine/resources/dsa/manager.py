@@ -152,7 +152,7 @@ class DSAManager(Resource):
         if self._preplanned is not None and not ctx.is_preplan:
             self._current, self._preplanned = dict(self._preplanned), None
             return self._current
-        plans = {label: self._plan_label(ctx, kv_out, step.mtp_trims)
+        plans = {label: self._plan_label(ctx, kv_out, step.rows_may_move)
                  for label, kv_out in ctx.plan_results[self.config.kv_cache].items()}
         if ctx.is_preplan:
             self._preplanned = plans
@@ -160,11 +160,12 @@ class DSAManager(Resource):
             self._current = dict(plans)
         return plans
 
-    def _plan_label(self, step_ctx: StepContext, kv_out, mtp_trims: bool = False) -> DSAContext:
+    def _plan_label(self, step_ctx: StepContext, kv_out,
+                    rows_may_move: bool = False) -> DSAContext:
         """One label's rows: per row its position and request, per request its first entry in
         the flat page list. Under a lease every row scores on its own, the score width spans
         the serving window (a prefill bucket's own rows) and the slot's sparse plan is
-        re-planned here; ``mtp_trims`` (``DSAStep``) plans it for each row's longest."""
+        re-planned here; ``rows_may_move`` (``DSAStep``) plans it for each row's longest."""
         lease = step_ctx.slot_lease
         graph = lease is not None and lease.bucket is not None
         walk = step_ctx.graph_walk
@@ -211,7 +212,7 @@ class DSAManager(Resource):
                 max_pools, needs_selection = self.kv_rows // kpool, True
             if (needs_selection or not self.config.dense_below_topk) and self._device.type == "cuda":
                 lens = attn_lens(pos, topk, kpool)  # a padding row's is 1
-                if mtp_trims:
+                if rows_may_move:
                     # a row sits at or past its true position: plan it for the longest it can
                     # be, its spare entries masked (SparseGraphPlan.attend's valid)
                     lens = [min(p + 1, topk + kpool - 1) for p in pos]
@@ -284,7 +285,7 @@ class DSAManager(Resource):
         """Move this step's rows to the device positions ``pos``, each at or before the one the
         host planned (an MTP verify block placed after the last step's accepted rows, not its
         whole block): the cache slots its latents and index keys go to, and the positions it
-        selects and attends from. A captured plan stays as made (``DSAStep(mtp_trims=True)``):
+        selects and attends from. A captured plan stays as made (``DSAStep(rows_may_move=True)``):
         each row's entries past its own length attend the cache's spare row, whose rope slot
         gets ``pad_kpe`` for the caller's queries to mask. An eager plan takes exact rows, from
         one host read of ``pos``."""

@@ -302,7 +302,7 @@ def test_move_rows_writes_and_attends_a_block_at_its_true_rows(captured):
     # two 4-row blocks planned at positions 8-11 and 5-8; the first request holds 6 rows
     lease = SlotLease(slot=0, bucket=BucketKey("decode", bs=2, num_tokens=8)) if captured else None
     ctx = _stage(dsa, "decode", pages=[[1, 2, 3], [4, 5, 6]], lengths=[12, 9], to_compute=[4, 4],
-                 lease=lease, step=DSAStep(mtp_trims=True))
+                 lease=lease, step=DSAStep(rows_may_move=True))
     assert ctx.captured == captured
     pos = torch.tensor([6, 7, 8, 9, 5, 6, 7, 8])
     dsa.move_rows(pos, kpe)

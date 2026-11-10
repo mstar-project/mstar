@@ -76,4 +76,4 @@ class DSAStep(ResourceStep):
     # a decode step whose rows may sit before the positions the host planned (an MTP verify
     # block the device places after its last accepted rows, ``DSAManager.move_rows``): a
     # captured plan is made for the longest each row can be
-    mtp_trims: bool = False
+    rows_may_move: bool = False
