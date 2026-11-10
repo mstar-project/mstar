@@ -13,6 +13,8 @@ the numbers:
 * The ``t = 0`` modulation is a constant of the weights, computed once (``set_prefix_modulation``).
 * A prefix pass's output is only the K/V it writes, so its last block stops after attention and
   the output head never runs.
+* On CUDA the q/k norms with the rotation, and the target's gated residuals, run as the shared Qwen-Image
+  kernels (``dit_kernels``), which round where the eager ops do.
 * Heads shard over ``comm_group`` (q/k/v and the SwiGLU column-wise, their outputs row-wise); the
   modulation, the input projections and the output head are replicated.
 """
@@ -27,6 +29,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
+from mstar.model.components.diffusion.qwen import dit_kernels as kernels
 from mstar.model.components.diffusion.rope import qwen_rope_params
 from mstar.model.components.distributed.linear import (
     MergedColumnParallelLinear,
@@ -100,6 +103,22 @@ def apply_rope(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
     return torch.view_as_real(rotated * freqs.unsqueeze(1)).flatten(-2).type_as(x)
 
 
+def norm_rope(x: torch.Tensor, norm: QwenRMSNorm, freqs: torch.Tensor) -> torch.Tensor:
+    """``apply_rope(norm(x), freqs)`` on ``[N, H, D]``: one fused pass on CUDA, the same bits."""
+    if kernels.fits(x) and x.shape[-1] == 128:
+        return kernels.qk_norm_rope(x, norm.weight, freqs, norm.eps)
+    return apply_rope(norm(x).to(x.dtype), freqs)
+
+
+def gated_add(x: torch.Tensor, gate: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """``x + gate * y``: for the target's ``x``, ``y [R, L, D]`` and ``gate [R, 1, D]`` one fused pass on CUDA, the
+    same bits. Under ``torch.compile`` the eager ops, which inductor fuses with the next block's norm."""
+    if (not torch.compiler.is_compiling() and x.dim() == 3 and gate.shape == (x.shape[0], 1, x.shape[2])
+            and kernels.fits(x, gate, y) and x.is_contiguous() and y.is_contiguous()):
+        return kernels.gated_add(x, gate.reshape(x.shape[0], -1).contiguous(), y, x.shape[1])
+    return x + gate * y
+
+
 class ZeroCenterRMSNorm(nn.Module):
     """``QwenImage21ZeroCenterRMSNorm``: the checkpoint stores ``scale - 1``; fp32 throughout."""
 
@@ -168,8 +187,8 @@ class Attention(nn.Module):
         q, k, v = self.to_qkv(x).split([local, local, local], dim=-1)
         shape = (-1, self.local_heads, self.head_dim)
         v = v.reshape(shape)
-        q = apply_rope(self.norm_q(q.reshape(shape)).to(v.dtype), rope)
-        k = apply_rope(self.norm_k(k.reshape(shape)).to(v.dtype), rope)
+        q = norm_rope(q.reshape(shape), self.norm_q, rope)
+        k = norm_rope(k.reshape(shape), self.norm_k, rope)
         return attend(q, k, v).flatten(1).type_as(q)
 
 
@@ -211,8 +230,8 @@ class Block(nn.Module):
         out = self.attn.attend(h, rope, attend)
         if last_prefix:
             return None
-        x = x + gate1.tanh() * self.attn.to_out(out).reshape(*lead, -1)
-        x = x + gate2.tanh() * self.img_mlp(self._norm(x) * (1 + scale2))
+        x = gated_add(x, gate1.tanh(), self.attn.to_out(out).reshape(*lead, -1))
+        x = gated_add(x, gate2.tanh(), self.img_mlp(self._norm(x) * (1 + scale2)))
         if x.dtype == torch.float16:
             x = x.clip(-65504, 65504)
         return x

@@ -8,6 +8,8 @@ bidirectional, then the target alone. Their prefix K/V and target velocities mus
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import numpy as np
 import pytest
 import torch
@@ -106,16 +108,16 @@ def _ours(model, vl, refs, target, timesteps):
     for part in LAYOUT:
         if isinstance(part, int):
             hidden = model.txt_in(vl[0, vl_row:vl_row + part])
-            positions = text_positions(position, part)
+            positions = text_positions(position, part).to(vl.device)
             vl_row, position, causal = vl_row + part, position + part, True
         else:
             h, w = part
             hidden = model.img_in(refs[image])
-            positions = image_positions(position, h, w)
+            positions = image_positions(position, h, w).to(vl.device)
             vl_row, position, image, causal = vl_row + h * w // TOKENS_PER_SLOT, position + max(h, w), image + 1, False
         model.prefix(hidden, positions, attend.step([Row(stream, hidden.shape[0])], causal=causal, commit=True))
     prefix_kv = {layer: kv for layer, kv in attend.cache[stream].items()}
-    positions = image_positions(position, *TARGET)[None]
+    positions = image_positions(position, *TARGET)[None].to(vl.device)
     out = []
     for t in timesteps:
         attend.step([Row(stream, positions.shape[1])], causal=False, commit=False)
@@ -153,6 +155,31 @@ def test_span_prefix_and_target_match_the_block_causal_reference(dtype, processo
     for ours_t, cached_t, dense_t in zip(got, expected, dense, strict=True):
         _close(ours_t, cached_t, bound)
         _close(ours_t, dense_t, bound)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the fused kernels run on CUDA")
+@torch.no_grad()
+def test_the_fused_kernels_round_as_the_eager_ops(monkeypatch):
+    """On CUDA the q/k norms with the rotation and the target's gated residuals run as the shared Qwen-Image
+    kernels. They round where the eager ops do, so the prefix K/V and the velocities are the eager pass's bits."""
+    from mstar.model.components.diffusion.qwen import dit_kernels as kernels
+
+    torch.manual_seed(0)
+    model = QwenImage21Transformer(replace(CFG, attention_head_dim=128, axes_dims_rope=(16, 56, 56))).eval()
+    for p in model.parameters():
+        p.normal_(std=0.2)
+    model = model.to("cuda", torch.bfloat16)
+    model.set_prefix_modulation()
+    vl, refs, target = _inputs(torch.bfloat16)
+    vl, target, refs = vl.cuda(), target.cuda(), [r.cuda() for r in refs]
+    timesteps = torch.tensor([1000.0, 613.5, 87.25], device="cuda")
+    fused, fused_kv = _ours(model, vl, refs, target, timesteps)
+    monkeypatch.setattr(kernels, "fits", lambda *tensors: False)
+    eager, eager_kv = _ours(model, vl, refs, target, timesteps)
+    for layer in range(CFG.num_layers):
+        assert all(torch.equal(a, b) for a, b in zip(fused_kv[layer], eager_kv[layer], strict=True))
+    for a, b in zip(fused, eager, strict=True):
+        assert torch.equal(a, b)
 
 
 # ----------------------------------------------------------------------
