@@ -29,7 +29,6 @@ from mstar.engine.resources import (
     SlotLease,
     SubmoduleStep,
 )
-from mstar.engine.resources.dsa import sparse_mla
 from mstar.engine.resources.dsa.manager import DSAManager
 from mstar.engine.resources.dsa.paged import DSAContext
 from mstar.model.glm52.config import (
@@ -59,16 +58,21 @@ _VERDICT_DEADLINE_S = 300.0
 
 
 class _PackedPrefillConfig(PackedAcceleratorGraphConfig):
-    """Packed prefill capture without the buckets whose capture rows would pass the context
-    limit: ``distribute_tokens`` gives row 0 the remainder, and such a capture fails."""
+    """Packed prefill capture without the buckets it cannot replay, whichever ladder they came
+    from (the model's or the serving config's): one whose capture rows would pass the context
+    limit (``distribute_tokens`` gives row 0 the remainder, and such a capture fails), and one
+    of more than ``max_step_tokens``, whose step runs eager."""
 
-    def __init__(self, *, max_row_tokens: int, **kwargs):
+    def __init__(self, *, max_row_tokens: int, max_step_tokens: int | None = None, **kwargs):
         super().__init__(**kwargs)
         self.max_row_tokens = max_row_tokens
+        self.max_step_tokens = max_step_tokens
 
     def get_total_tokens(self, bs: int) -> list[int]:
-        return [n for n in super().get_total_tokens(bs)
-                if distribute_tokens(n // self.total_tokens_multiplier, bs)[0] <= self.max_row_tokens]
+        tokens = [(n, n // self.total_tokens_multiplier) for n in super().get_total_tokens(bs)]
+        return [n for n, step in tokens
+                if distribute_tokens(step, bs)[0] <= self.max_row_tokens
+                and (self.max_step_tokens is None or step <= self.max_step_tokens)]
 
 
 class Glm52LLMSubmodule(ARNodeSubmodule):
@@ -324,18 +328,9 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             self.config.prefill_capture_batch_sizes or self.PREFILL_CAPTURE_BATCH_SIZES
         )
         flags = self._compile_flags()
-        prefill_buckets = list(self.PREFILL_TOKEN_BUCKETS)
-        if self.config.dsa_long_context:
-            # a captured prefill plans dense attention, which a step past
-            # prefill_window_tokens leaves unplanned (declare_step), and its sparse attention in
-            # one plan, which FlashInfer takes up to sparse_mla.MAX_ROWS rows
-            cap = min(self.config.prefill_window_tokens, sparse_mla.MAX_ROWS)
-            past = [n for n in prefill_buckets if n > cap]
-            if past:
-                logger.warning("Glm52LLMSubmodule: prefill buckets %s pass %d tokens "
-                               "(prefill_window_tokens or sparse_mla.MAX_ROWS) and run eager",
-                               past, cap)
-                prefill_buckets = [n for n in prefill_buckets if n <= cap]
+        # a captured prefill plans dense attention, which a step past prefill_window_tokens
+        # leaves unplanned (declare_step): the capture config holds no such bucket
+        window = self.config.prefill_window_tokens if self.config.dsa_long_context else None
         configs = [
             BatchedAcceleratorGraphConfig(
                 capture_graph_walk="decode",
@@ -347,17 +342,17 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
                 capture_batch_sizes=self.MTP_CAPTURE_BATCH_SIZES if self.mtp_k else None,
                 **flags,
             ),
-            *([_PackedPrefillConfig(
+            _PackedPrefillConfig(
                 max_row_tokens=self._context_limit(),
+                max_step_tokens=window,
                 capture_graph_walk="prefill",
-                capture_token_lengths=prefill_buckets,
+                capture_token_lengths=list(self.PREFILL_TOKEN_BUCKETS),
                 make_node_input=lambda n: ARNodeInputs(
                     input_ids=torch.zeros(n, dtype=torch.long, device=device),
                     input_seq_len=n,
                 ),
                 capture_batch_sizes=list(prefill_batch_sizes),
                 **flags,
-            )] if prefill_buckets else []
             ),
         ]
         if self.config.dsa_long_context and self.mtp_k:
