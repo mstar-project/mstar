@@ -168,7 +168,7 @@ def test_vae_pixels_are_the_image_processors_to_the_bit_and_layout():
     image_processor = pytest.importorskip("diffusers.image_processor")
     from PIL import Image
 
-    from mstar.model.qwen_image21.submodules import vae_pixels
+    from mstar.model.components.diffusion.image_io import vae_pixels
 
     rgba = _image(96, 64)
     pil = Image.fromarray(rgba.permute(1, 2, 0).numpy(), mode="RGBA")

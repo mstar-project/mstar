@@ -23,7 +23,7 @@ from mstar.model.components.diffusion.decode_utils import latent_affine, latent_
 from mstar.model.components.diffusion.denoise_loop import LATENTS, DenoiseLoopSubmodule, StepKey
 from mstar.model.components.diffusion.flow_match import FlowMatchSchedule
 from mstar.model.components.diffusion.guidance import Guidance, cfg
-from mstar.model.components.diffusion.image_io import pixels_to_uint8
+from mstar.model.components.diffusion.image_io import pixels_to_uint8, vae_pixels
 from mstar.model.components.diffusion.qwen.vl_prompt import qwen3_vl_tokens
 from mstar.model.components.qwen_vision import VISION_ATTN, FrameSDPA, QwenVisionModel
 from mstar.model.qwen_image21.components.transformer import (
@@ -113,15 +113,6 @@ class QwenImage21TextEncoderSubmodule(NodeSubmodule):
 # ---------------------------------------------------------------------------
 # vae_encoder / vae_decoder
 # ---------------------------------------------------------------------------
-
-def vae_pixels(image: torch.Tensor) -> torch.Tensor:
-    """uint8 ``[C, H, W]`` -> ``[1, C, 1, H, W]`` in ``[-1, 1]`` fp32, as ``VaeImageProcessor.preprocess``
-    hands it to the VAE: the division on the CPU (CUDA divides by a scalar through its reciprocal,
-    which rounds differently) and the memory NHWC-strided (cuDNN picks its kernels by layout). Both
-    change the latents' bits."""
-    pixels = image.permute(1, 2, 0).contiguous().float() / 255.0
-    return (2.0 * pixels - 1.0)[None].permute(0, 3, 1, 2).unsqueeze(2)
-
 
 class QwenImage21VaeEncoderSubmodule(NodeSubmodule):
     """RGBA uint8 ``[4, H, W]`` references -> their normalized latents (the posterior's mode) as
