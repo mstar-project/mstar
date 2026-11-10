@@ -398,9 +398,9 @@ def start(out, pr, head_sha, runner_temp, tag, base, gpus, hours, run, checks, v
     """Get GPUs and start the live-test session on them, a box per vendor (lt/<vendor>): the brief (fixed text, the
     commits, carry's call and the box's vendor), the review's notes (findings.json) and the PR's title and
     description (pr-body.md) as data, and the box's own Anthropic key. Every vendor's box or none: when one has no
-    GPUs free, none starts, and the first launch asks budget.max_running for room for them all. A box that then
-    fails to start (its offer taken meanwhile) gets an unavailable.md; exits 3, with `unavailable` set, when no box
-    started."""
+    GPUs free, none starts, and the first launch asks budget.max_running for room for them all; when a box then
+    fails to start (its offer taken meanwhile), those already started go. Each box that doesn't run gets an
+    unavailable.md, and the step exits 3 with `unavailable` set."""
     pr, gpus, hours, turns = int(pr), int(gpus), float(hours), int(turns)
     base, checks, vendors = branch(base), check_kinds(checks), vendor_list(vendors)
     since = commit(since) if since else ""
@@ -444,12 +444,16 @@ def start(out, pr, head_sha, runner_temp, tag, base, gpus, hours, run, checks, v
         lines += [f"- {e}" for e in everything["errors"]]
         unavailable(lt / vendor, "\n".join(lines))
 
-    def stop(why):
-        """No box starts: the PR is approvable only when every vendor's box passes, so one alone would be paid
-        for nothing."""
-        for vendor in vendors:
-            if not (lt / vendor / "unavailable.md").exists():
-                unavailable(lt / vendor, why)
+    def stop():
+        """No box runs: the PR is approvable only when every vendor's box passes, so one alone would be paid for
+        nothing. Those this run started go."""
+        for box in boxes(lt):
+            if (box / "instance").exists():
+                gpu("terminate", (box / "instance").read_text().strip(), check=False)
+                (box / "instance").unlink()
+            if not (box / "unavailable.md").exists():
+                unavailable(box, "No box: another vendor's couldn't start, and the PR passes only when every box "
+                                 "does.")
         out["unavailable"] = "true"
         sys.exit(3)
 
@@ -457,7 +461,7 @@ def start(out, pr, head_sha, runner_temp, tag, base, gpus, hours, run, checks, v
         if not found[vendor][0]:
             none_free(vendor)
     if any((lt / v / "unavailable.md").exists() for v in vendors):
-        stop("Not started: another vendor's box can't start, and the PR passes only when every box does.")
+        stop()
     secret = os.environ.get(cfg.get("digitalocean", {}).get("run_secret_env") or "", "")
     for i, vendor in enumerate(vendors):
         box = lt / vendor
@@ -475,18 +479,17 @@ def start(out, pr, head_sha, runner_temp, tag, base, gpus, hours, run, checks, v
             return r
 
         o, r = launch_first(free, launch)
-        if r and r.returncode == 4:  # budget.max_running
-            unavailable(box, f"The bot's GPU boxes would go past {cfg['budget']['max_running']} with this run's "
-                             f"{len(vendors)} (REVIEW_GPU_MAX_RUNS); comment `/review` again when one finishes.")
-        elif o:
+        if o:
             (box / "instance").write_text(r.stdout.strip().splitlines()[-1])
             (box / "offer.json").write_text(json.dumps(o))
             print(f"launched {vendor} on {o['id']} ({o['count']}x {o['gpu']}, ${o['usd_per_hour']}/hr)")
+            continue
+        if r and r.returncode == 4:  # budget.max_running
+            unavailable(box, f"The bot's GPU boxes would go past {cfg['budget']['max_running']} with this run's "
+                             f"{len(vendors)} (REVIEW_GPU_MAX_RUNS); comment `/review` again when one finishes.")
         else:
-            none_free(vendor)  # taken since the listing
-    if not any((box / "instance").exists() for box in boxes(lt)):
-        out["unavailable"] = "true"
-        sys.exit(3)
+            none_free(vendor)  # its offers were taken since the listing
+        stop()
 
 
 CUT = "\n\n(cut to fit)\n"

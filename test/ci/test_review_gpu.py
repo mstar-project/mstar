@@ -287,6 +287,7 @@ class TestStart(unittest.TestCase):
             return offers_answer or {"offers": offers.get(vendor, []), "errors": [], "max_usd_per_hour": 30}
 
         routes = {"gpu.py launch": launch, "gpu.py offers": listing,
+                  "gpu.py terminate": lambda argv, stdin: launched.append(argv[2:]) or "",
                   "git rev-parse": "abcdef\n",
                   f"GET repos/{R}/pulls/7": {"title": "Faster decode", "body": getattr(self, "body", self.INJECTED)},
                   f"GET repos/{R}/issues[?]*": []}
@@ -366,9 +367,13 @@ class TestStart(unittest.TestCase):
                          ["eras:l1:1", "digitalocean:gpu-mi300xx1:1"])
         out, launched = self.start({"eras": {}}, offers=offers, vendors="nvidia,amd",
                                    launch_code={"digitalocean:gpu-mi300xx1": 1})
-        self.assertEqual([x[1] for x in launched], ["digitalocean:gpu-h100x1", "digitalocean:gpu-mi300xx1"],
+        self.assertEqual([x[1] for x in launched if x[0] == "launch"],
+                         ["digitalocean:gpu-h100x1", "digitalocean:gpu-mi300xx1"],
                          "an Eras offer the bot has no key for would block DigitalOcean's")
-        self.assertTrue((out / "nvidia/instance").exists(), "an AMD box that can't start would stop the NVIDIA one")
+        self.assertIn(["terminate", "digitalocean:gpu-h100x1:1"], launched,
+                      "the NVIDIA box would run for hours on a PR its AMD box can't let pass")
+        self.assertFalse((out / "nvidia/instance").exists(), "wait would wait on a box that is gone")
+        self.assertIn("another vendor's couldn't start", (out / "nvidia/unavailable.md").read_text())
         self.assertIn("No AMD GPUs", (out / "amd/unavailable.md").read_text())
         with self.assertRaises(ValueError, msg="a vendor set the workflow never makes would reach the box"):
             self.start({}, vendors="amd")
