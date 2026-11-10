@@ -597,19 +597,23 @@ class InlineColumn(NamedTuple):
     column: "torch.Tensor"
 
 
-def inline_column(
-    candidates: Mapping[str, str], outputs: Collection[str],
-) -> tuple[tuple[str, ...], str | None]:
-    """The signals a step carries inline, and the stop buffer they read: of
-    ``candidates`` (signal -> buffer, ``NodeSubmodule.inline_signals``), the
-    first the step outputs and every other output read off the same buffer.
-    ``((), None)`` when it outputs none. One column a step: signals reading
-    another buffer keep their tensors."""
+class StepColumn(NamedTuple):
+    """The signals a step carries inline (``inline_column``), and the stop
+    buffer they read; ``((), None)`` for none."""
+    signals: tuple[str, ...]
+    buffer: str | None
+
+
+def inline_column(candidates: Mapping[str, str], outputs: Collection[str]) -> StepColumn:
+    """Of ``candidates`` (signal -> buffer, ``NodeSubmodule.inline_signals``),
+    the first the step outputs and every other output read off the same
+    buffer. One column a step: signals reading another buffer keep their
+    tensors."""
     first = next((signal for signal in candidates if signal in outputs), None)
     if first is None:
-        return (), None
+        return StepColumn((), None)
     buffer = candidates[first]
-    return tuple(s for s, b in candidates.items() if b == buffer and s in outputs), buffer
+    return StepColumn(tuple(s for s, b in candidates.items() if b == buffer and s in outputs), buffer)
 
 
 class PostprocessRequest(NamedTuple):

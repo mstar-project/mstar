@@ -2492,10 +2492,12 @@ off another buffer keeps its tensors. A row whose stop check withheld one of the
 (``StopCheck.withheld``) sends nothing for it, and its stream counts no item. The step
 keeps its rows on the device when every output is one of ``device_loopback_signals`` or
 rides the column on every edge (a client emit or a ``by_value`` stream, neither persisted,
-and not collected by an enclosing loop): MiniCPM-o's TTS decode loops its code back on the
-device and streams the same code to the vocoder by value. A lockstep node's streams keep
-their tensors, and a ``by_value`` connection cannot join its items, drive its consumer's
-walk or come from the client.
+and not counted toward the conductor's output tokens nor collected by an enclosing loop):
+MiniCPM-o's TTS decode loops its code back on the device and streams the same code to the
+vocoder by value. A rows-only step builds no per-request outputs and skips
+``postprocess``, so whatever a submodule's ``postprocess`` does must be about the outputs
+a stored step routes. A lockstep node's streams keep their tensors, and a ``by_value``
+connection cannot join its items, drive its consumer's walk or come from the client.
 
 On such a node a captured step writes each row's token and RNG offset back to the request's
 row inside the graph (``knobs: sampler_ingraph_scatter``, on by default). Those rows are

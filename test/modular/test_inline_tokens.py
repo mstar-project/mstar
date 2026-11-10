@@ -378,6 +378,17 @@ def test_a_mixed_step_inlines_its_decode_rows():
     assert sigs == ("text_inputs",) and vals == [70, 80, 90]
 
 
+def test_a_mixed_step_carries_every_signal_on_its_column():
+    """A stored mixed step's column is the walks' signals off one buffer: the
+    spoken walk's stream rides beside the token both walks emit."""
+    rows = HostRows((7, 8), {"new_token": torch.tensor([70, 80])})
+    batch = _Batch({7: "decode", 8: "decode_spoken"}, label="mixed")
+    engine = _Engine({"text_inputs": "new_token", "speech_ids": "new_token"}, walks=("decode", "decode_spoken"))
+    assert _executor()._inline_emit_values(engine, batch, rows, [7, 8], ["speech_ids", "text_inputs"]) == (
+        ("text_inputs", "speech_ids"), [70, 80],
+    )
+
+
 def test_a_mixed_step_row_with_no_value_takes_the_tensor_path():
     rows = HostRows((7,), {"new_token": torch.tensor([[70]])})
     for walks in ({7: "prefill_text", 9: "decode"}, {7: "decode", 9: "prefill_text"}):

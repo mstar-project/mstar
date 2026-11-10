@@ -97,8 +97,8 @@ def test_a_signal_the_inline_column_carries_needs_no_tensor():
 def test_a_mixed_step_loops_back_a_walk_whose_stream_rides_its_column():
     """A combined step of both walks keeps each walk's rows on the device when
     every walk's inline signals read one buffer, so its one column carries the
-    spoken walk's stream; a spoken walk whose stream reads another buffer
-    than the decode walk's token stores its rows instead."""
+    spoken walk's stream; when the spoken walk's stream reads another buffer
+    than the decode walk's token, the rows of both store."""
     batch = SimpleNamespace(
         node_name="LLM", request_walks={1: "decode", 2: "decode_spoken", 3: "decode_spoken"},
         walk_output_signals={"decode": ["text_inputs"], "decode_spoken": ["text_inputs", "speech_ids"]},
@@ -109,4 +109,25 @@ def test_a_mixed_step_loops_back_a_walk_whose_stream_rides_its_column():
         "decode": {"text_inputs": "new_token"},
         "decode_spoken": {"speech_ids": "speech_token", "text_inputs": "new_token"},
     })
-    assert _spoken_body()._loopback_rids(two, batch) == {1}
+    assert _spoken_body()._loopback_rids(two, batch) == frozenset()
+
+
+def test_a_mixed_step_of_loop_back_walks_on_two_buffers_stores_them():
+    """A loop-back-only walk's client emit rides the column too: when the
+    step's walks read two buffers, the one column cannot carry both, so their
+    rows store. The answer is cached per (node, walks)."""
+    batch = SimpleNamespace(
+        node_name="LLM", request_walks={1: "decode", 2: "decode_spoken"},
+        walk_output_signals={"decode": ["text_inputs"], "decode_spoken": ["text_inputs"]},
+    )
+    engine = _SpokenEngine({"decode": {"text_inputs": "new_token"}, "decode_spoken": {"text_inputs": "alt"}})
+    calls = []
+    inline_signals = engine.inline_signals
+    engine.inline_signals = lambda node, walk: calls.append(walk) or inline_signals(node, walk)
+    body = _spoken_body(carried=False)
+    assert body._loopback_rids(engine, batch) == frozenset()
+    n = len(calls)
+    assert body._loopback_rids(engine, batch) == frozenset()
+    assert len(calls) == n, "cached per (node, walks)"
+    one = _SpokenEngine({"decode": {"text_inputs": "new_token"}, "decode_spoken": {"text_inputs": "new_token"}})
+    assert _spoken_body(carried=False)._loopback_rids(one, batch) == {1, 2}

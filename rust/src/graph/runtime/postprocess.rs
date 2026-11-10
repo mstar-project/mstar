@@ -121,6 +121,14 @@ pub(super) struct Stops {
     pub missing: Vec<u32>,
 }
 
+/// What a step's stop check withheld (`RouteArg::withheld_signals`):
+/// `rids[i]` withheld `signals[i]`.
+#[derive(Default)]
+pub(super) struct Withheld {
+    pub signals: Vec<String>,
+    pub rids: Vec<Vec<u32>>,
+}
+
 /// A step's postprocess (`PostprocessRequest`), and how far it got.
 pub(super) struct Postprocess {
     pub partition: String,
@@ -145,9 +153,7 @@ pub(super) struct Postprocess {
     /// rid -> the iterations of a repeated step that count, for a row that
     /// stopped inside it: what the device ran past that is dropped
     kept: FxHashMap<u32, u32>,
-    /// what the stop check withheld (`RouteArg::withheld_signals`), as
-    /// (signals, rids per signal)
-    pub withheld: (Vec<String>, Vec<Vec<u32>>),
+    pub withheld: Withheld,
     phase: Phase,
     stops: Option<Vec<(u32, Vec<String>)>>,
     stopped: Vec<u32>,
@@ -167,7 +173,7 @@ impl Postprocess {
         Postprocess {
             partition, node_name, graph_walk, output_signals, rids, walks, rid_walk_idx,
             known_stops, runtime_stops, tokens, row_rids, inline, partition_done, python_send,
-            loop_strides, kept: FxHashMap::default(), withheld: (Vec::new(), Vec::new()),
+            loop_strides, kept: FxHashMap::default(), withheld: Withheld::default(),
             phase: Phase::Stops, stops: None, stopped: Vec::new(), stored: None, completion_id: 0,
         }
     }
@@ -228,8 +234,8 @@ impl Postprocess {
             inline_signals: s.inline_signals,
             inline_values: s.inline_values,
             inline_tails: s.inline_tails,
-            withheld_signals: self.withheld.0.clone(),
-            withheld_rids: self.withheld.1.clone(),
+            withheld_signals: self.withheld.signals.clone(),
+            withheld_rids: self.withheld.rids.clone(),
             logprobs: s.logprobs,
             walks: if self.rid_walk_idx.is_some() { self.walks.clone() } else { None },
             rid_walk_idx: self.rid_walk_idx.clone(),
@@ -602,12 +608,12 @@ impl GraphRuntime {
 
     pub(super) fn pp_resume_stops(
         &mut self, py: Python<'_>, rids: Vec<u32>, loops: Vec<Vec<String>>, dropped: Vec<u32>,
-        withheld: (Vec<String>, Vec<Vec<u32>>),
+        withheld: Withheld,
     ) -> PyResult<PostprocessOut> {
         let mut pp = self.pp_take()?;
         let given: Vec<(u32, Vec<String>)> = rids.into_iter().zip(loops).collect();
         pp.stops = Some(merged_stops([&pp.known_stops, &given]));
-        if !withheld.0.is_empty() {
+        if !withheld.signals.is_empty() {
             pp.withheld = withheld;
         }
         pp.keep_rows(&dropped.into_iter().collect());

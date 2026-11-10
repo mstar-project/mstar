@@ -446,6 +446,57 @@ def test_signals_sharing_the_columns_buffer_ride_it_and_need_no_tensor():
         assert streams.carried == {(NODE, WALK): {"text"}}
 
 
+def test_a_signal_the_conductor_counts_off_its_tensors_is_not_carried():
+    """The conductor counts a reply's output tokens off the tensors of a
+    ``conductor_new_token`` edge, so a signal with one needs its tensor, to the
+    client or to an empty destination; a streamed one is not counted there."""
+    from mstar.streaming.topology import StreamingGraphEdge
+
+    def edges(counted):
+        return [
+            GraphEdge(next_node=NODE, name="token"),
+            StreamingGraphEdge(next_node="Vocoder", name="speech", conductor_new_token=True),
+            GraphEdge(next_node=EMPTY_DESTINATION, name="speech", conductor_new_token=counted),
+            GraphEdge(next_node=EMIT_TO_CLIENT, name="text", conductor_new_token=counted),
+        ]
+
+    one = {"token": "new_token", "speech": "new_token", "text": "new_token"}
+    talker = {NODE: SimpleNamespace(inline_signals=lambda walk: one)}
+    assert _inline_streams(talker, _spoken(edges(False))).carried == {(NODE, WALK): {"speech", "text"}}
+    assert _inline_streams(talker, _spoken(edges(True))).carried == {}
+
+
+def test_startup_refuses_a_loop_back_on_a_combined_walk():
+    """A combined walk named by ``DeviceLoopback`` would take a mixed step
+    rows-only past the per-walk check; its real walks are fine."""
+    from mstar.model.submodule_base import DeviceLoopback
+    from mstar.worker.engine_manager import _refuse_combined_loopbacks
+
+    class _Combined(StubModel):
+        def get_combined_graph_walks(self):
+            return {NODE: {"mixed": {WALK, "spoken"}}}
+
+    def talker(walk):
+        return {NODE: SimpleNamespace(device_loopback=DeviceLoopback(walk=walk, signal="t", sampler="s", buffer="t"))}
+
+    _refuse_combined_loopbacks(talker(frozenset({WALK, "spoken"})), _Combined())
+    _refuse_combined_loopbacks({NODE: SimpleNamespace(device_loopback=None)}, _Combined())
+    for walk in ("mixed", frozenset({WALK, "mixed"})):
+        with pytest.raises(ValueError, match="combined walk"):
+            _refuse_combined_loopbacks(talker(walk), _Combined())
+
+
+def test_a_side_walk_hands_over_rows_on_each_loop_back_walk():
+    """``_stops_on_a_token`` asks the loop-back which walks it covers."""
+    from mstar.model.submodule_base import DeviceLoopback
+    from mstar.worker.engine_manager import _stops_on_a_token
+
+    loopback = DeviceLoopback(walk=frozenset({WALK, "spoken"}), signal="t", sampler="s", buffer="t")
+    sub = SimpleNamespace(token_stop=None, device_loopback=loopback)
+    assert _stops_on_a_token(sub, WALK) and _stops_on_a_token(sub, "spoken")
+    assert not _stops_on_a_token(sub, "prefill")
+
+
 def test_a_loop_back_over_several_walks_loops_back_on_each():
     """``DeviceLoopback.walk`` may name several walks: each keeps its token on
     the device, names it inline, and refuses to withhold it."""

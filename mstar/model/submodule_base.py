@@ -1275,7 +1275,9 @@ class NodeSubmodule(torch.nn.Module, ABC):
         buffer. A row whose stop check withheld one of them sends nothing for
         it. The step keeps its rows on the device (rows-only) when every
         output is a ``device_loopback_signals`` one or rides the column on
-        every edge: a client emit, or a ``by_value`` stream."""
+        every edge: a client emit, or a ``by_value`` stream. A rows-only step
+        builds no per-request outputs and skips ``postprocess``, so anything
+        ``postprocess`` does must be about outputs the step stores."""
         del graph_walk
         return {}
 

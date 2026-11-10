@@ -190,6 +190,20 @@ def _refuse_unroutable_withholds(submodules: dict, model: Model) -> None:
                     )
 
 
+def _refuse_combined_loopbacks(submodules: dict, model: Model) -> None:
+    """A ``DeviceLoopback`` names real walks: a combined step's rows loop back
+    per their own walk (``GpuStepBody._loopback_rids``), and a combined walk
+    named here would take the whole step rows-only past that check."""
+    for node, combined in model.get_combined_graph_walks().items():
+        loopback = getattr(submodules.get(node), "device_loopback", None)
+        named = sorted(walk for walk in combined if loopback is not None and loopback.covers(walk))
+        if named:
+            raise ValueError(
+                f"{type(model).__name__}: {node!r}'s DeviceLoopback names combined walk(s) {named}; "
+                "name their real walks instead"
+            )
+
+
 class InlineStreams(NamedTuple):
     """Which streamed signals go as values (``_inline_streams``)."""
     # (node, signal) pairs whose streamed items the route sends as values
@@ -214,7 +228,13 @@ def _inline_streams(
 
     A signal of the column is carried when every edge of it rides too: a
     client emit or a by-value stream, neither persisted, or an empty
-    destination; and no enclosing loop collects it as an output."""
+    destination; none of them counted toward the conductor's output tokens,
+    which it counts off tensors; and no enclosing loop collects it as an
+    output.
+
+    These are ``node.outputs``, and the step's ``output_signals`` are the
+    same edges' names: the worker graphs keep the model's ``GraphNode``
+    objects, and the runtime lists a node's outputs from them."""
     topology = model.get_partition_topology()
     by_value = {c.edge_name for c in (topology.connections if topology else []) if c.by_value}
     keys = set()
@@ -227,7 +247,7 @@ def _inline_streams(
             lockstep = parallel_groups is not None and parallel_groups.get_instance_world_size_for_node(name) > 1
             outputs = {edge.name for edge in node.outputs}
             inline = submodule.inline_signals(walk) if submodule is not None else {}
-            riding, _ = inline_column(inline, outputs)
+            riding = inline_column(inline, outputs).signals
             for edge in node.outputs:
                 if not edge.is_streaming:
                     continue
@@ -243,7 +263,8 @@ def _inline_streams(
                 }
 
                 def rides(edge, lockstep=lockstep):
-                    if edge.persist:
+                    # the route counts a step's new tokens off its tensors
+                    if edge.persist or (edge.conductor_new_token and not edge.is_streaming):
                         return False
                     if edge.is_streaming:
                         return edge.name in by_value and not lockstep
@@ -457,6 +478,7 @@ class EngineManager:
         _refuse_split_combined_walks(submodules, model)
         _refuse_speculated_spans(submodules, model)
         _refuse_unroutable_withholds(submodules, model)
+        _refuse_combined_loopbacks(submodules, model)
         inline_streams = _inline_streams(submodules, model, parallel_groups)
         side_keys = _side_lane_keys(
             submodules, specs, model, node_names, side_stream_nodes(model_config["node_groups"]),

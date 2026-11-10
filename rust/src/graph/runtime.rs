@@ -3564,7 +3564,7 @@ impl GraphRuntime {
             stop_rids.into_iter().zip(stop_loops).collect(), runtime_stops,
             tokens, row_rids, inline, partition_done, python_send, loop_strides,
         );
-        pp.withheld = (withheld_signals, withheld_rids);
+        pp.withheld = postprocess::Withheld { signals: withheld_signals, rids: withheld_rids };
         self.postprocess = None;
         self.pp_run(py, pp)
     }
@@ -3577,7 +3577,8 @@ impl GraphRuntime {
         &mut self, py: Python<'_>, rids: Vec<u32>, loops: Vec<Vec<String>>, dropped: Vec<u32>,
         withheld_signals: Vec<String>, withheld_rids: Vec<Vec<u32>>,
     ) -> PyResult<postprocess::PostprocessOut> {
-        self.pp_resume_stops(py, rids, loops, dropped, (withheld_signals, withheld_rids))
+        let withheld = postprocess::Withheld { signals: withheld_signals, rids: withheld_rids };
+        self.pp_resume_stops(py, rids, loops, dropped, withheld)
     }
 
     /// Resume a step parked for its stored outputs (STORE): `RouteTensors`.
