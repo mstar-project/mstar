@@ -443,7 +443,8 @@ class StepAudio2Model(Model):
         return DEFAULT_VOICE if DEFAULT_VOICE in self.voices else next(iter(self.voices))
 
     def check_voice(self, voice: str | None) -> str:
-        name = voice or self.get_default_voice()
+        # None is the default voice; a sent but empty one is a mistake, not a request for it
+        name = self.get_default_voice() if voice is None else voice
         if name not in self.voices:
             raise ValueError(f"unknown Step-Audio2 voice {name!r}; choose one of {sorted(self.voices)}")
         return name

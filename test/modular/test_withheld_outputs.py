@@ -250,3 +250,90 @@ def test_the_stops_resume_names_what_the_check_withheld(tmp_path):
     assert runtime.stops == [{DROP: [LOOP]}]
     (route,) = runtime.routes
     assert route.withheld == {"frame": [DROP]}
+
+
+def test_a_mixed_step_streams_only_the_spoken_rows_speech_ids(tmp_path):
+    """Step-Audio2's ``decode_mixed``: a spoken row whose token is text routes its token
+    to the next step but no item to the vocoder's stream, a spoken row's speech id routes
+    both, and a text row, which has no stream, routes its token. Through Step-Audio2's own
+    stop check and postprocess, the real engine stop check and the real
+    ``StepExecutor.postprocess``."""
+    from mstar.model.step_audio2.config import (
+        DECODE,
+        DECODE_MIXED,
+        DECODE_SPOKEN,
+        EOT,
+        LLM_SAMPLER,
+        SPEECH_BASE,
+        SPEECH_IDS,
+        TTS_END,
+    )
+    from mstar.model.step_audio2.submodules import LLMSubmodule
+
+    config = SimpleNamespace(stop_token_ids=(EOT, TTS_END))
+    llm = LLMSubmodule(torch.nn.Identity(), config)
+    llm.node_resources = {LLM_SAMPLER: SimpleNamespace(has_slot_masters=True)}
+    spoken_text, spoken_speech, text = 11, 12, 13
+    rows = {spoken_text: (DECODE_SPOKEN, 785), spoken_speech: (DECODE_SPOKEN, SPEECH_BASE + 7), text: (DECODE, 785)}
+    infos = {
+        rid: SimpleNamespace(
+            graph_walk=walk, max_tokens=64, step_metadata={}, dynamic_loop_iter_counts={},
+            resource_configs={LLM_SAMPLER: SimpleNamespace(ignore_eos=False)},
+        )
+        for rid, (walk, _) in rows.items()
+    }
+    outputs = {}
+    for rid, (_, token) in rows.items():
+        outputs[rid] = {"new_token": [torch.tensor([token])]}
+        llm.postprocess(rid, infos[rid], outputs[rid])
+    assert set(outputs[text]) == {"new_token", "text_inputs"}
+
+    engine = make_engine(_submodules={"LLM": make_mgmt(submodule=llm)})
+    node_batch = ExecutingBatch(
+        node_name="LLM", per_request_info=infos,
+        step_context=StepContext(request_ids=tuple(rows), graph_walk=DECODE_MIXED, slot=0, capture=False),
+    )
+    runtime = _RecordingRuntime()
+    tensor_manager = SharedMemoryCommunicationManager(
+        my_entity_id="worker_0", hostname="localhost", device="cpu",
+        communicator=_Communicator(), shm_dir=str(tmp_path),
+    )
+    request_state = SimpleNamespace(
+        per_request_info={}, buffer_publish_info=lambda *args: None,
+        get_fwd_info=lambda rid, partition: None, get_pending_publish_info=lambda rid, partition: {},
+    )
+    w = make_worker(
+        graph_runtime=runtime, tensor_manager=tensor_manager,
+        engine_manager=SimpleNamespace(get_engine=lambda node: SimpleNamespace(
+            check_stop_for_batch=engine.check_stop_for_batch,
+            extend_prefix_chains=lambda batch, outputs, **kwargs: None,
+            materialize_publish=lambda batch, rids: None,
+            after_output_copy=lambda batch: None,
+            step_finished=lambda batch, outputs, **kwargs: None,
+        )),
+        request_state=request_state, streams=StreamBufferManager(request_state, tensor_manager, []),
+    )
+    signals = ["text_inputs", SPEECH_IDS]
+    pending = SimpleNamespace(
+        batch=ScheduledBatch(
+            node_name="LLM", graph_walk=DECODE_MIXED, request_to_worker_graph=dict.fromkeys(rows, 0),
+            output_signals=signals, request_walks={rid: walk for rid, (walk, _) in rows.items()},
+            walk_output_signals={DECODE: ["text_inputs"], DECODE_SPOKEN: signals},
+        ),
+        node_batch=node_batch, node_name="LLM", partition="main", graph_walk=DECODE_MIXED, loop_name=None,
+        speculative_new_iter=False,
+    )
+
+    w.executor.postprocess(pending, BatchedModelOutput(per_rid_outputs=outputs))
+
+    assert node_batch.withheld_outputs == {spoken_text: (SPEECH_IDS,)}
+    assert runtime.stops in ([], [{}])
+    (route,) = runtime.routes
+    routed = dict(zip(
+        [(rid, s) for rid in route.wg_ids.keys for s in signals], route.num_tensors, strict=True,
+    ))
+    assert routed == {
+        (spoken_text, "text_inputs"): 1, (spoken_text, SPEECH_IDS): 0,
+        (spoken_speech, "text_inputs"): 1, (spoken_speech, SPEECH_IDS): 1,
+        (text, "text_inputs"): 1, (text, SPEECH_IDS): 0,
+    }

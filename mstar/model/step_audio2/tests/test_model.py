@@ -18,13 +18,13 @@ from mstar.conductor.request_info import FINAL_PREFILL
 from mstar.model.components.qwen3_lm import Qwen3LMConfig
 from mstar.model.step_audio2.config import (
     AUDIO_ATTN,
+    AUDIO_EMBEDS,
     AUDIO_END,
+    AUDIO_MEL_FRAMES,
+    AUDIO_MELS,
     AUDIO_PATCH,
     AUDIO_START,
     BOT,
-    AUDIO_EMBEDS,
-    AUDIO_MEL_FRAMES,
-    AUDIO_MELS,
     DECODE,
     DECODE_LOOP,
     DECODE_MIXED,
@@ -307,7 +307,9 @@ def reference_windows(codes: list[int]) -> list[tuple[list[int], bool]]:
     return out
 
 
-@pytest.mark.parametrize("n", [1, 3, 25, 27, 28, 29, 53, 54, 100, 160])
+# 0: an empty spoken reply; 2047: the most a reply at its cap streams (its first token is
+# the prefill's, which does not stream)
+@pytest.mark.parametrize("n", [0, 1, 3, 25, 27, 28, 29, 53, 54, 100, 160, 2047])
 def test_the_vocoder_voices_the_streams_windows_as_the_reference_client_does(tmp_path, n):
     """The spoken walk's speech ids through the stream's policy and ``prepare_inputs`` are the
     reference client's windows, every code voiced once, each window's caches holding what the
@@ -351,6 +353,60 @@ def test_the_vocoder_voices_the_streams_windows_as_the_reference_client_does(tmp
     assert served == reference_windows(codes)
     rows = node.preprocess(T2W_CHUNK, None, prepared)["rows"]
     assert [r[0][0].tolist() for r in rows] == [w for w, _ in served]
+    # within what the conformer's caches hold (``Token2WavStreaming.conformer_reply_tokens``)
+    from mstar.model.step_audio2.step_audio2_model import SPEECH_MAX_OUTPUT_TOKENS
+    from mstar.model.step_audio2.token2wav import CONFORMER_REPLY_TOKENS
+
+    assert sum(window_tokens(len(w), last) for w, last in served) <= CONFORMER_REPLY_TOKENS
+    assert n <= SPEECH_MAX_OUTPUT_TOKENS - 1
+
+
+def test_a_stream_without_an_offset_hands_its_codes_over_as_they_are():
+    """MiniCPM-o's stream is its codes, so no subtraction runs for it."""
+    from mstar.model.components.token2wav.submodule import Token2WavSubmodule
+    from mstar.model.submodule_base import NodeInputs
+
+    node = Token2WavSubmodule.__new__(Token2WavSubmodule)
+    torch.nn.Module.__init__(node)
+    node.model = torch.nn.Linear(1, 1)
+    codes = torch.tensor([[5, 6, 7]], dtype=torch.int32)
+    inputs = [NodeInputs(input_seq_len=3, tensor_inputs={"codes": codes}, kwargs={"last": True})]
+    for offset, same in ((0, True), (SPEECH_BASE, False)):
+        node.code_offset = offset
+        (row,) = node.preprocess(T2W_CHUNK, None, inputs)["rows"]
+        assert (row[0] is codes) == same
+
+
+def test_the_batched_stop_check_reads_the_tokens_once():
+    class Counting(HostRows):
+        reads = 0
+
+        def first_values(self, name, request_ids):
+            Counting.reads += 1
+            return super().first_values(name, request_ids)
+
+    llm = an_llm()
+    rids = ["s", "t"]
+    infos = {"s": row_info(DECODE_SPOKEN), "t": row_info(DECODE)}
+    got = llm.check_stop_batched(rids, infos, Counting(tuple(rids), {"new_token": torch.tensor([[785], [EOT]])}))
+    assert Counting.reads == 1
+    assert (got.stops, got.withheld) == ({"t": {DECODE_LOOP}}, {"s": (SPEECH_IDS,)})
+
+
+def test_startup_checks_the_spoken_streams_withhold(tmp_path):
+    """The stream is declared withheld, so startup checks the edge can go without an item,
+    and that the walk leaves its stops to check_stop, which is what withholds."""
+    from mstar.model.submodule_base import ARNodeSubmodule
+    from mstar.worker.engine_manager import _refuse_unroutable_withholds
+
+    llm = an_llm()
+    assert SPEECH_IDS in llm.token_stop.withhold
+    model = a_model(tmp_path)
+    _refuse_unroutable_withholds({"LLM": llm}, model)
+    # were the runtime to check the spoken walk's stops itself, nothing would withhold
+    llm.get_stop_policies = lambda walk: ARNodeSubmodule.get_stop_policies(llm, walk)
+    with pytest.raises(ValueError, match="get_stop_policies"):
+        _refuse_unroutable_withholds({"LLM": llm}, model)
 
 
 # --- prompt intake ---------------------------------------------------------------------------
@@ -366,8 +422,10 @@ def test_a_clip_to_clone_and_inputs_it_cannot_take_are_refused(tmp_path):
         model.process_prompt("hi", ["text", "image"], ["text"], tensors={"image_inputs": [torch.zeros(3, 4, 4)]})
     with pytest.raises(ValueError, match="outputs text and audio"):
         model.process_prompt("hi", ["text"], ["image"])
-    with pytest.raises(ValueError, match="unknown Step-Audio2 voice"):
-        model.process_prompt("hi", ["text"], ["text", "audio"], voice="nobody")
+    for voice in ("nobody", ""):
+        with pytest.raises(ValueError, match="unknown Step-Audio2 voice"):
+            model.process_prompt("hi", ["text"], ["text", "audio"], voice=voice)
+    assert model.check_voice(None) == "default_female" and model.check_voice("default_male") == "default_male"
 
 
 @pytest.mark.parametrize("seconds", [25.005, 50.005])

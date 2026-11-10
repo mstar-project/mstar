@@ -23,10 +23,12 @@ resources:
   # 128-token pages; the LLM's 56 KiB/token: 1024 pages (131k tokens) are 7 GiB.
   llm_kv:
     max_num_pages: 1024
-  # The vocoder holds a slot in each of these per spoken reply, ~0.55 GiB in all with the
-  # bundled voices (its conformer caches hold the whole reply), so they cap the replies
-  # being voiced at once; a reply waits for slots before its first audio. t2w_state has one
-  # more, its sink; startup refuses counts that disagree.
+  # The vocoder holds a slot in each of these per spoken reply, so they cap the replies
+  # being voiced at once; a reply waits for slots before its first audio. A slot is 284 MiB
+  # of t2w_dit_kv (with the bundled voices; it grows with the longest), 64 MiB of
+  # t2w_enc2_kv and 48 MiB of t2w_enc1_kv (the conformer's caches hold the whole reply) and
+  # 1.3 MiB of t2w_state, about 0.39 GiB. t2w_state has one more, its sink; startup refuses
+  # counts that disagree.
   t2w_state:
     max_slots: 17
   t2w_enc1_kv:
