@@ -351,7 +351,7 @@ class KVPageCounts(NamedTuple):
     total: int
     # pages the prefix index names; some may also be in ``used`` by a request
     cached: int
-    # pages guaranteed requests were allotted and haven't written that preemptible requests hold
+    # pages guaranteed requests lent that aren't free
     lent: int
 
 
@@ -946,7 +946,7 @@ class KVManager(AttentionResource):
         return KVPageCounts(
             used=self.config.pages_of(total - self._arena.num_free), total=self.config.pages_of(total),
             cached=0 if index is None else index.num_pages(),
-            # borrowers grow only into what guaranteed requests lend once the room runs out
+            # the room falls below zero only once pages guaranteed requests lent are taken
             lent=self.config.pages_of(min(self._borrowable, max(0, -self._room()))),
         )
 

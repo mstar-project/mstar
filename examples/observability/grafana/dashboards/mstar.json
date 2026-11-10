@@ -2114,7 +2114,7 @@
     {
       "type": "timeseries",
       "title": "KV cache pages and rebuild host pool used",
-      "description": "Share of each paged KV cache's pages off the free list, per graph node and cache; dashed: share the prefix cache names (it frees the ones no request holds on demand); dotted: share of the rebuild host pool holding kept prompt ids (a prompt that doesn't fit is never dropped); lent: share guaranteed requests were allotted and haven't written that preemptible requests borrowed.",
+      "description": "Share of each paged KV cache's pages off the free list, per graph node and cache; dashed: share the prefix cache names (it frees the ones no request holds on demand); dotted: share of the rebuild host pool holding kept prompt ids (a prompt that doesn't fit is never dropped); lent: share guaranteed requests lent that isn't free.",
       "datasource": {
         "type": "prometheus",
         "uid": "prom"
@@ -2600,7 +2600,7 @@
     {
       "type": "timeseries",
       "title": "KV preemptions per second",
-      "description": "Requests chosen to drop when a grant ran short of KV pages, those dropped, requests preempted a second time, returned requests preempted again before they kept another token, requests moved so a guaranteed request takes back pages it lent, and guaranteed requests that waited to take them back.",
+      "description": "Requests chosen to drop when a grant ran short of KV pages, those dropped, requests preempted a second time, returned requests preempted again before they kept another token, requests moved so a guaranteed request takes back pages it lent, and waits by guaranteed requests to take them back.",
       "datasource": {
         "type": "prometheus",
         "uid": "prom"

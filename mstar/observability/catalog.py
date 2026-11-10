@@ -81,8 +81,7 @@ KV_PAGES_CACHED = Family(
 )
 KV_PAGES_LENT = Family(
     "mstar_kv_pages_lent", GAUGE,
-    "Pages of a paged KV cache that guaranteed requests were allotted and haven't written, held by preemptible "
-    "requests that borrowed them.",
+    "Pages of a paged KV cache that guaranteed requests lent that aren't free.",
     ("component", "resource"),
 )
 STEP_SECONDS = Family(
@@ -150,7 +149,7 @@ KV_TAKE_BACKS = Family(
 )
 KV_TAKE_BACK_WAITS = Family(
     "mstar_kv_take_back_waits_total", COUNTER,
-    "Guaranteed requests that waited to take back pages they lent, since no request holding them could move.",
+    "Waits by guaranteed requests to take back pages they lent, since no request holding them could move.",
     ("component",),
 )
 COMPONENT_PENDING_STEPS = Family(

@@ -267,9 +267,10 @@ TP, SP or CFG instance count once: the instance's first rank reports.
    the cache frees the others when a request needs the room.
 
 ``mstar_kv_pages_lent{model_name, component, resource}``
-   Gauge. Pages guaranteed requests were allotted and haven't written that preemptible
-   requests borrowed. A guaranteed request takes them back by moving a borrower when it
-   needs them and no page is free.
+   Gauge. Pages guaranteed requests lent that aren't free: what preemptible requests
+   borrowed, and a guaranteed request's own cache hits until its walk takes them over.
+   A guaranteed request takes a borrowed page back by moving a borrower when it needs
+   the page and none is free.
 
 ``mstar_rebuild_host_bytes_used{model_name, component}``
    Gauge. Bytes of the worker's rebuild host pool that hold kept prompt ids and host
@@ -331,7 +332,7 @@ TP, SP or CFG instance count once: the instance's first rank reports.
    it lent. They count in ``mstar_kv_preemptions_total`` too.
 
 ``mstar_kv_take_back_waits_total{model_name, component}``
-   Counter. Guaranteed requests that waited to take back pages they lent, since no request
+   Counter. Waits by guaranteed requests to take back pages they lent, since no request
    holding them could move yet. Each wait holds up a stream that can't pause.
 
 ``mstar_component_pending_steps{model_name, component}``

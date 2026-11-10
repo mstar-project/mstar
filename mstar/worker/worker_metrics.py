@@ -50,7 +50,8 @@ class PreemptionCounts:
     # `rebuild_tokens`: tokens the rebuild rows prefilled.
     # `returns_preempted`: requests preempted again before they sampled a token since they were last preempted.
     # `take_backs`: victims moved so a guaranteed request takes back pages it lent.
-    # `take_back_waits`: guaranteed requests that waited because no request holding what they lent could move.
+    # `take_back_waits`: waits by guaranteed requests to take back pages they lent, since no request holding them
+    #   could move.
     victims: int = 0
     drops: int = 0
     rebuild_tokens: int = 0
