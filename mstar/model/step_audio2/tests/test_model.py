@@ -294,6 +294,47 @@ def test_the_tower_steps_each_clip_as_a_key_prefix_segment_laid_out_against_its_
     assert want[1][1] != request_layout([225])[0] and want[2][1] == request_layout([380])[0]
 
 
+def test_every_decode_walk_replays_the_decode_capture_and_both_prefills_the_prefill_capture():
+    from mstar.engine.accelerator_graph_config import BatchedAcceleratorGraphConfig, PackedAcceleratorGraphConfig
+
+    decode, prefill = an_llm().get_accelerator_graph_configs(torch.device("cpu"))
+    assert isinstance(decode, BatchedAcceleratorGraphConfig) and isinstance(prefill, PackedAcceleratorGraphConfig)
+    assert {decode.capture_graph_walk, *decode.replay_graph_walks} == {DECODE, DECODE_SPOKEN, DECODE_MIXED}
+    assert {prefill.capture_graph_walk, *prefill.replay_graph_walks} == {PREFILL_TEXT, PREFILL_AUDIO}
+
+
+def test_a_prefill_batch_is_embedded_with_each_rows_tower_rows_at_its_placeholders():
+    """The prefill capture takes embeddings: ``preprocess`` splices each audio row's tower
+    output in at its placeholders, rows in order, beside a text row; a decode takes ids."""
+    from mstar.model.step_audio2.submodules import LLMSubmodule
+    from mstar.model.submodule_base import ARNodeInputs
+
+    class Embed(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed_tokens = torch.nn.Embedding(AUDIO_PATCH + 1, 4)
+
+        def embed(self, ids):
+            return self.embed_tokens(ids)
+
+    llm = LLMSubmodule(Embed(), a_config())
+    a = torch.tensor([1, AUDIO_PATCH, AUDIO_PATCH, 2])
+    b = torch.tensor([3, 4])
+    c = torch.tensor([AUDIO_PATCH, 5])
+    rows_a, rows_c = torch.randn(2, 4), torch.randn(1, 4)
+    inputs = [
+        ARNodeInputs(input_seq_len=4, input_ids=a, tensor_inputs={AUDIO_EMBEDS: rows_a}),
+        ARNodeInputs(input_seq_len=2, input_ids=b),
+        ARNodeInputs(input_seq_len=2, input_ids=c, tensor_inputs={AUDIO_EMBEDS: rows_c}),
+    ]
+    with torch.no_grad():
+        got = llm.preprocess(PREFILL_AUDIO, None, inputs)["input_embeds"]
+        want = llm.model.embed(torch.cat([a, b, c]))
+    want[1:3], want[6:7] = rows_a, rows_c
+    assert torch.equal(got, want)
+    assert set(llm.preprocess(DECODE_SPOKEN, None, [ARNodeInputs(input_seq_len=1, input_ids=b[:1])])) == {"input_ids"}
+
+
 # --- the vocoder's stream --------------------------------------------------------------------
 
 def reference_windows(codes: list[int]) -> list[tuple[list[int], bool]]:

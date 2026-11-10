@@ -1,7 +1,7 @@
 """Step-Audio2's node submodules: the audio tower and the Qwen2 LLM.
 
 The LLM's prompt is the whole rendered chat, ``<audio_patch>`` placeholders included; an
-audio prefill's forward splices the tower's rows in at those placeholders, in prompt
+audio prefill's preprocess splices the tower's rows in at those placeholders, in prompt
 order. RoPE is plain 1D over the sequence, so the position resource advances by the token
 count.
 
@@ -18,6 +18,11 @@ import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import FINAL_PREFILL, CurrentForwardPassInfo
+from mstar.engine.accelerator_graph_config import (
+    AcceleratorGraphConfig,
+    BatchedAcceleratorGraphConfig,
+    PackedAcceleratorGraphConfig,
+)
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import (
     AttentionStep,
@@ -41,6 +46,7 @@ from mstar.model.step_audio2.config import (
     AUDIO_PATCH,
     DECODE,
     DECODE_LOOP,
+    DECODE_MIXED,
     DECODE_SPOKEN,
     DECODE_WALKS,
     LLM_ATTN,
@@ -48,6 +54,7 @@ from mstar.model.step_audio2.config import (
     LLM_POS,
     LLM_SAMPLER,
     PREFILL_AUDIO,
+    PREFILL_TEXT,
     PREFILL_WALKS,
     SPEECH_IDS,
     StepAudio2Config,
@@ -70,12 +77,18 @@ from mstar.model.submodule_base import (
 class LLMSubmodule(ARNodeSubmodule):
     """The Qwen2 decoder: a prefill walk per prompt kind, then a text or a spoken decode.
 
-    Eager for now (no capture configs); the forward is tensor-in, tensor-out, with the
-    audio splice inside it, so decode and prefill captures can be declared as MiniCPM-o's
-    are.
+    Captured as MiniCPM-o's LLM is: one batched decode graph per batch size, which every
+    decode walk replays, and one packed prefill graph per (batch size, token bucket), which
+    both prefill walks replay. A prefill's audio rows are spliced into its embeddings in
+    ``preprocess``, so the prefill forward takes embeddings whatever the walk; a decode
+    forward takes ids and embeds them in the graph.
     """
 
-    # Eager: every step's shape is new to a compiled forward without capture buckets.
+    PREFILL_TOKEN_BUCKETS = [32, 64, 128, 256, 512, 1024, 2048]
+    PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4, 8]
+    # the serving config's max_concurrent_requests; a wider step runs eagerly
+    DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32]
+    # Off for the eager path only (a shape no capture holds); the captures compile.
     disable_torch_compile = True
 
     def __init__(self, model: Qwen3DenseLM, config: StepAudio2Config):
@@ -103,6 +116,28 @@ class LLMSubmodule(ARNodeSubmodule):
         if graph_walk == DECODE_SPOKEN:
             return {self.device_loopback.signal: self.device_loopback.buffer}
         return super().inline_signals(graph_walk)
+
+    def get_accelerator_graph_configs(
+        self, device: torch.device, tp_world_size: int = 1,
+    ) -> list[AcceleratorGraphConfig]:
+        def dummy(n: int) -> ARNodeInputs:
+            return ARNodeInputs(input_ids=torch.zeros(n, dtype=torch.long, device=device), input_seq_len=n)
+
+        return [
+            BatchedAcceleratorGraphConfig(
+                capture_graph_walk=DECODE,
+                replay_graph_walks=[DECODE, DECODE_SPOKEN, DECODE_MIXED],
+                single_request_inputs=dummy(1),
+                capture_batch_sizes=self.DECODE_CAPTURE_BATCH_SIZES,
+            ),
+            PackedAcceleratorGraphConfig(
+                capture_graph_walk=PREFILL_TEXT,
+                replay_graph_walks=[PREFILL_AUDIO],
+                capture_token_lengths=self.PREFILL_TOKEN_BUCKETS,
+                make_node_input=dummy,
+                capture_batch_sizes=self.PREFILL_CAPTURE_BATCH_SIZES,
+            ),
+        ]
 
     # ------------------------------------------------------------------
     # Inputs
@@ -155,12 +190,15 @@ class LLMSubmodule(ARNodeSubmodule):
             ids = self.loopback_inputs(engine_inputs, inputs)["input_ids"]
         else:
             ids = torch.cat([inp.input_ids for inp in inputs]).to(device)
-        out: dict[str, Any] = {"input_ids": ids}
-        # in row order, as the splice's cumulative placeholder count reads them
+        if graph_walk in DECODE_WALKS:
+            return {"input_ids": ids}
+        # Both prefill walks replay one capture, which takes embeddings: the audio rows
+        # are spliced in here, in row order, as the cumulative placeholder count reads them.
+        embeds = self.model.embed(ids)
         rows = [inp.tensor_inputs[AUDIO_EMBEDS] for inp in inputs if AUDIO_EMBEDS in inp.tensor_inputs]
         if rows:
-            out[AUDIO_EMBEDS] = torch.cat(rows).to(device)
-        return out
+            embeds = splice_media(embeds, ids == AUDIO_PATCH, torch.cat(rows).to(device))
+        return {"input_embeds": embeds}
 
     def declare_step(
         self, graph_walk: str, request_ids: list[str], inputs: list[ARNodeInputs], **kwargs,
@@ -188,33 +226,32 @@ class LLMSubmodule(ARNodeSubmodule):
     # ------------------------------------------------------------------
 
     def _forward(
-        self, graph_walk: str, engine_inputs: ModelInputsFromEngine, input_ids: torch.Tensor,
-        audio_embeds: torch.Tensor | None = None,
+        self, graph_walk: str, engine_inputs: ModelInputsFromEngine, input_ids: torch.Tensor | None = None,
+        input_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """A decode step's ``input_ids``, or a prefill's ``input_embeds`` (``preprocess``)."""
         attn: AttentionManager = engine_inputs.resources[LLM_ATTN]
         sampler: SamplerResource = engine_inputs.resources[LLM_SAMPLER]
-        embeds = self.model.embed(input_ids)
-        if audio_embeds is not None:
-            embeds = splice_media(embeds, input_ids == AUDIO_PATCH, audio_embeds)
+        embeds = self.model.embed(input_ids) if input_embeds is None else input_embeds
         hidden = self.model(embeds, label="main")
         if graph_walk not in DECODE_WALKS:
             hidden = attn.select_last_hidden(hidden)
         return sampler.sample(engine_inputs.request_ids, logits=self.model.logits(hidden))
 
     def forward(
-        self, graph_walk: str, engine_inputs: ModelInputsFromEngine, input_ids: torch.Tensor,
-        audio_embeds: torch.Tensor | None = None, **kwargs,
+        self, graph_walk: str, engine_inputs: ModelInputsFromEngine, input_ids: torch.Tensor | None = None,
+        input_embeds: torch.Tensor | None = None, **kwargs,
     ) -> NameToTensorList:
-        return {"new_token": [self._forward(graph_walk, engine_inputs, input_ids, audio_embeds)]}
+        return {"new_token": [self._forward(graph_walk, engine_inputs, input_ids, input_embeds)]}
 
     def can_batch(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
         return True
 
     def forward_batched(
-        self, graph_walk: str, engine_inputs: ModelInputsFromEngine, input_ids: torch.Tensor,
-        audio_embeds: torch.Tensor | None = None, **kwargs,
+        self, graph_walk: str, engine_inputs: ModelInputsFromEngine, input_ids: torch.Tensor | None = None,
+        input_embeds: torch.Tensor | None = None, **kwargs,
     ) -> BatchedModelOutput:
-        new_token = self._forward(graph_walk, engine_inputs, input_ids, audio_embeds)
+        new_token = self._forward(graph_walk, engine_inputs, input_ids, input_embeds)
         return BatchedModelOutput(row_outputs={"new_token": new_token}, check_stop_buffers={"new_token": new_token})
 
     # ------------------------------------------------------------------
