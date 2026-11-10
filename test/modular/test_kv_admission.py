@@ -437,13 +437,19 @@ def test_a_cut_lease_refunds_only_the_pages_that_go_back_to_the_evictable_set():
 
 def test_a_window_page_another_request_holds_is_no_room_once_the_first_rolls_it_out():
     """Two repeats lease the same cached window pages. When the first's window rolls them out before its prompt
-    ends, the second still holds them, so they don't come back as room for the first's allotment to count on."""
+    ends, the second still holds them, so they don't come back as room for the first's allotment to count on, and
+    the first still takes pages in their place."""
     kv = _window_manager()
     shared = list(range(100))
     _write(kv, "seed", shared)
     _remove(kv, "seed")
+    # one step writes the prompt's 40-token spans, so the allotment holds a window of 40-token steps
+    spans = tuple(PrefixSpan(40, 40, WALK, opens_step=not i) for i in range(5))
     for rid, base in (("a", 1000), ("b", 2000)):
-        _laid_out(kv, rid, shared + list(range(base, base + 100)), keyed=True)
+        kv.ingest_request(rid, KVReqConfig(
+            prefix_keys={"main": _keys(shared + list(range(base, base + 100)))},
+            kv_layout={"main": StreamLayout(spans=spans, keyed_spans=len(spans))},
+        ))
         assert _ready(kv, rid) and _probe(kv, rid, 200).tokens == 96
     # a third request is allotted what room is left
     for slots in range(kv._room(), 0, -1):
@@ -453,7 +459,11 @@ def test_a_window_page_another_request_holds_is_no_room_once_the_first_rolls_it_
         _remove(kv, "c")
 
     _grow(kv, "a", 40)
+    kv.assert_pages_conserved()
 
+    # and "a"'s allotment still covers the pages its window takes in their place through the rest of its prompt
+    _grow(kv, "a", 24)
+    _grow(kv, "a", 40)
     kv.assert_pages_conserved()
 
 
