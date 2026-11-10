@@ -222,6 +222,7 @@ def test_after_starts_the_grammar_once_the_reply_holds_its_text():
     ({"grammar": "root ::= nothing_defined"}, "structured_outputs grammar"),
     ({"json_object": True, "after": ""}, "after must be"),
     ({"regex": "a" * (MAX_GRAMMAR_CHARS + 1)}, "at most"),
+    ({"regex": "a", "after": "x" * MAX_GRAMMAR_CHARS}, "at most"),
 ])
 def test_a_bad_grammar_is_refused(value, error):
     with pytest.raises(ValueError, match=error):

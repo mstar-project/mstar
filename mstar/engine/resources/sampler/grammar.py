@@ -126,11 +126,12 @@ def grammar_request(value: Any) -> GrammarRequest | None:
         raw = json.dumps(raw)
     elif not isinstance(raw, str):
         raise ValueError(f"structured_outputs {kind} must be a string")
-    if len(raw) > MAX_GRAMMAR_CHARS:
-        raise ValueError(f"structured_outputs {kind} is {len(raw)} characters; at most {MAX_GRAMMAR_CHARS} are served")
     after = value.get("after")
     if after is not None and (not isinstance(after, str) or not after):
         raise ValueError("structured_outputs after must be a non-empty string")
+    size = len(raw) + len(after or "")
+    if size > MAX_GRAMMAR_CHARS:
+        raise ValueError(f"structured_outputs is {size} characters; at most {MAX_GRAMMAR_CHARS} are served")
     request = GrammarRequest(kind, raw, after)
     request.grammar()
     return request
