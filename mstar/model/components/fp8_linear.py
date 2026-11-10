@@ -4,6 +4,8 @@ Each holds this rank's shard of an e4m3 weight, in a uint8 container so ``module
 leaves it alone, and its fp32 ``weight_scale_inv`` blocks. The scales shard with the weight,
 so every per-rank size must be a whole number of blocks. ``reference`` dequantizes the
 weight per call (``kernels: reference``); otherwise ``mstar.utils.dense_fp8`` runs them.
+``keep_bf16`` adds a bf16 copy of the weight that cuBLAS runs from a token count up, for GPUs
+whose block-fp8 kernels lose to a bf16 GEMM past a few tokens.
 """
 from __future__ import annotations
 
@@ -37,6 +39,16 @@ def fp8_reference(config) -> bool:
 
 def _ceil_div(a: int, b: int) -> int:
     return -(-a // b)
+
+
+def bf16_linear(x: torch.Tensor, weight: torch.Tensor, glu: bool = False) -> torch.Tensor:
+    """``x @ weight.T`` from a bf16 copy of an fp8 linear's weight, its SwiGLU with ``glu``,
+    as ``reference`` computes it."""
+    y = torch.nn.functional.linear(x, weight)
+    if glu:
+        g, u = y.chunk(2, dim=-1)
+        y = torch.nn.functional.silu(g) * u
+    return y
 
 
 def reference(x, weight, scale, block_size, glu=False):
@@ -105,6 +117,9 @@ class Fp8Linear(nn.Module):
             torch.empty(_ceil_div(self.out_features, bo), _ceil_div(self.in_features, bi),
                         dtype=torch.float32),
             requires_grad=False)
+        # ``keep_bf16``: the weight dequantized, which runs from bf16_min_tokens tokens up
+        self.weight_bf16: torch.Tensor | None = None
+        self.bf16_min_tokens = 0
         self._attach_weight_loaders()
 
     def _attach_weight_loaders(self) -> None:
@@ -143,8 +158,11 @@ class Fp8Linear(nn.Module):
         dst.copy_(loaded)
 
     def forward(self, x: torch.Tensor, glu: bool = False) -> torch.Tensor:
-        y = fp8_block_linear(x, self.weight, self.weight_scale_inv, self.block_size, glu,
-                             use_reference=self.reference)
+        if self.weight_bf16 is not None and x.shape[0] >= self.bf16_min_tokens:
+            y = bf16_linear(x, self.weight_bf16, glu)
+        else:
+            y = fp8_block_linear(x, self.weight, self.weight_scale_inv, self.block_size, glu,
+                                 use_reference=self.reference)
         if self.reduce_results and self.tp_size > 1:
             y = self.comm_group.all_reduce(y)
         return y
@@ -155,10 +173,21 @@ class Fp8Linear(nn.Module):
 
             dense_fp8.reserve(device)
 
+    def keep_bf16(self, min_tokens: int, dtype: torch.dtype = torch.bfloat16) -> None:
+        """Also hold the weight dequantized, and run it from ``min_tokens`` tokens up. The fp8
+        weight stays for fewer tokens. Not under ``reference``, which is the numerics anchor,
+        nor for a released weight."""
+        if self.reference or self.weight.numel() == 0:
+            return
+        self.weight_bf16 = dequantize_fp8_block_weight(
+            self.weight.data, self.weight_scale_inv.data, block_size=self.block_size, out_dtype=dtype)
+        self.bf16_min_tokens = min_tokens
+
     def release(self) -> None:
         """Drop the storage (the absorbed MLA fuses its sources); keep the Parameters."""
         for p in (self.weight, self.weight_scale_inv):
             p.data = p.data.new_empty(0)
+        self.weight_bf16 = None
 
 
 class Fp8ParallelGatedMLP(nn.Module):

@@ -1,0 +1,53 @@
+model: "glm52"
+# GLM-5.3 (zai-org/GLM-5.3: GLM-5.2's glm_moe_dsa geometry, fp8 e4m3 128x128 blocks, 756 GB) on
+# 4x B300 (275 GB). The routed experts stay fp8-resident: ~189 GB/rank of weights, plus the bf16
+# copy of the dense linears below (~8 GB/rank; 64 GB free after capture). Resolve the checkpoint through the HF cache
+# (HF_HOME) or point model_kwargs.checkpoint_path at a local snapshot.
+#
+# As glm52_tp8.yaml, the context is capped at index_topk (2048), where dense MLA equals GLM's
+# DSA exactly; glm52_tp8_longctx.yaml goes past it.
+max_seq_len: 2048
+# A 750 GB load outruns PyTorch's default process-group timeout.
+dist_timeout_s: 7200
+# FlashInfer's one-kernel all-reduce for what the fused all-reduce + add + RMSNorm doesn't
+# take: ~9.5 us vs NCCL's 31-49 per decode all-reduce on 8x B300, and symm_multimem fails
+# under dynamo at TP4 here
+tp_allreduce: "flashinfer"
+# a 4096-token batched prefill moves 48 MiB per all-reduce
+tp_allreduce_max_kb: 65536
+tp_async_sched: true
+# The decode graphs go to 64 rows (the engine's capture sizes); a full window each below.
+max_concurrent_requests: 64
+model_kwargs:
+  model_path_hf: "zai-org/GLM-5.3"
+  # Every dense linear runs cuBLAS bf16 from a bf16 copy: w8a16 runs ~0.5x bf16 at 4-64
+  # tokens, and at 1-2 the fp8 path takes flashinfer's groupwise GEMM (10.2 us a call in the c=1
+  # profile). Measured on 4x B300, c=1 TPOT: 9.33 ms with the copy at every count, 10.08 from 3 up.
+  dense_bf16_min_tokens: 1
+  # the trtllm fp8 MoE routes from the router's logits itself (its load probe decides): c=1 TPOT
+  # 8.97 ms vs 9.33 with the router outside, GSM8K unchanged (0.988)
+  routed_experts_routing: "kernel"
+  prefill_capture_batch_sizes: [1, 4, 16]
+# the capture ladder glm52_tp8.yaml uses (it booted at TP4 on B300: 59 graphs, 1.2 GB)
+prefill_token_buckets:
+  LLM:
+    prefill:
+      1: [64, 128, 192, 256, 320, 384, 448, 512, 576, 640, 704, 768,
+          832, 896, 960, 1024, 1088, 1152, 1216, 1280, 1344, 1408, 1472, 1536,
+          1600, 1664, 1728, 1792, 1856, 1920, 1984, 2048]
+      2: [256, 512, 1024, 1536, 2048, 2304, 2560, 3072, 3584, 4096]
+resources:
+  attn:
+    # captured one-token decode on trtllm-gen's MLA kernel, kept only where its load probe
+    # matches the paged kernel (FlashInfer's fa2 MLA, which "auto" runs on Blackwell)
+    decode_fmha: true
+  kv:
+    # MLA latent pages, replicated: 576 dims x bf16 x 78 layers = ~90 KB/token/rank. A full
+    # window (16 pages) per request plus the sink page: 1025 x 128 tokens, ~11.8 GB/rank.
+    max_num_pages: 1025
+    page_size: 128
+node_groups:
+  - node_names: [LLM]
+    ranks: [0, 1, 2, 3]
+    tp_size: 4
+    graph_walks: [prefill, decode]

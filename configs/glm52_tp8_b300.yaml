@@ -1,0 +1,40 @@
+model: "glm52"
+# GLM-5.2 (zai-org/GLM-5.2-FP8, ~750 GB) on 8x B300 (275 GB): ~95 GB/rank of weights with the
+# routed experts fp8-resident, plus the bf16 copy of the dense linears below (~4 GB/rank).
+# Serves GLM-5.3 too with model_kwargs.model_path_hf: zai-org/GLM-5.3 (same geometry). The
+# B300 choices are glm53_tp4_b300.yaml's; see there.
+#
+# As glm52_tp8.yaml, the context is capped at index_topk (2048), where dense MLA equals GLM's
+# DSA exactly; glm52_tp8_longctx.yaml goes past it.
+max_seq_len: 2048
+dist_timeout_s: 7200
+tp_allreduce: "flashinfer"
+tp_allreduce_max_kb: 65536
+tp_async_sched: true
+max_concurrent_requests: 64
+model_kwargs:
+  dense_bf16_min_tokens: 1
+  routed_experts_routing: "kernel"
+  prefill_capture_batch_sizes: [1, 4, 16]
+# the capture ladder glm52_tp8.yaml uses
+prefill_token_buckets:
+  LLM:
+    prefill:
+      1: [64, 128, 192, 256, 320, 384, 448, 512, 576, 640, 704, 768,
+          832, 896, 960, 1024, 1088, 1152, 1216, 1280, 1344, 1408, 1472, 1536,
+          1600, 1664, 1728, 1792, 1856, 1920, 1984, 2048]
+      2: [256, 512, 1024, 1536, 2048, 2304, 2560, 3072, 3584, 4096]
+resources:
+  attn:
+    # captured one-token decode on trtllm-gen's MLA kernel, kept only where its load probe
+    # matches the paged kernel (FlashInfer's fa2 MLA, which "auto" runs on Blackwell)
+    decode_fmha: true
+  kv:
+    # a full window (16 pages) per request plus the sink page: ~11.8 GB/rank
+    max_num_pages: 1025
+    page_size: 128
+node_groups:
+  - node_names: [LLM]
+    ranks: [0, 1, 2, 3, 4, 5, 6, 7]
+    tp_size: 8
+    graph_walks: [prefill, decode]

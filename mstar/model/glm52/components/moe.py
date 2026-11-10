@@ -83,6 +83,13 @@ class Glm52SparseMoeBlock(nn.Module):
         # Resolved on the real device by process_weights_after_loading;
         # blocks used without the load hook (CPU tests) stay on reference.
         self._use_fused = False
+        # Set by process_weights_after_loading where flashinfer's Blackwell kernel passed its probe:
+        # the routed experts then hold its layout (fused_moe.trtllm_fp8) and it serves every count.
+        self._trtllm = False
+        # Set there too where the kernel also routes from the router's logits (routed_experts_routing:
+        # kernel) and that call form passed its probe
+        self._kernel_routing = False
+        self._routing_wanted = getattr(config, "routed_experts_routing", "torch") == "kernel"
         # the decode chain (w8a16, fp32 routing weights) and the router kernel (ids can differ
         # at exact ties, weights by an ulp) change numerics, so only kernels: auto takes them;
         # the prefill kernels keep the runner's bits, so every fused block does
@@ -208,10 +215,20 @@ class Glm52SparseMoeBlock(nn.Module):
                 out = self.comm_group.all_reduce(out)
             return out.view(input_shape)
 
+        if self._kernel_routing:
+            routed = self._dispatch_trtllm_logits(flat)
+            if self.tp_size > 1 and not self._sum_partials:
+                routed = self.comm_group.all_reduce(routed)
+            return self._with_shared(flat, routed, input_shape)
+
         # topk_weights stay fp32 into the combine, as in HF's experts.
         topk_weights, topk_ids, _ = self.gate(flat)
         if self.fp8_experts:
-            if self._use_fused and self._prefill_kernel and flat.shape[0] > _DECODE_MAX_TOKENS:
+            if self._trtllm:
+                routed = self._dispatch_trtllm(flat, topk_weights, topk_ids)
+                if self.tp_size > 1 and not self._sum_partials:
+                    routed = self.comm_group.all_reduce(routed)
+            elif self._use_fused and self._prefill_kernel and flat.shape[0] > _DECODE_MAX_TOKENS:
                 routed = self._dispatch_prefill(flat, topk_weights, topk_ids)
                 if self.tp_size > 1 and not self._sum_partials:
                     routed = self.comm_group.all_reduce(routed)
@@ -253,6 +270,9 @@ class Glm52SparseMoeBlock(nn.Module):
             )
             if not self._sum_partials:
                 routed = self.comm_group.all_reduce(routed)
+        return self._with_shared(flat, routed, input_shape)
+
+    def _with_shared(self, flat: torch.Tensor, routed: torch.Tensor, input_shape) -> torch.Tensor:
         shared = self.shared_expert(flat)
         out = routed + shared
         if self._sum_partials and self.reduce_results:
@@ -262,7 +282,7 @@ class Glm52SparseMoeBlock(nn.Module):
     def _use_decode(self, flat: torch.Tensor) -> bool:
         """Small batches take the decode kernels on the fused path under kernels: auto; they
         need bf16 activations and the shared expert in the routed experts' shape and dtype."""
-        if not (self._decode_kernel and self._use_fused
+        if not (self._decode_kernel and self._use_fused and not self._trtllm
                 and flat.shape[0] <= _DECODE_MAX_TOKENS):
             return False
         shared = self.shared_expert.down_proj.weight
@@ -303,6 +323,63 @@ class Glm52SparseMoeBlock(nn.Module):
             shared.gate_up_proj.weight, shared.down_proj.weight,
             top_k=gate.top_k, scale=gate.routed_scaling_factor, normalize=gate.norm_topk_prob,
             block_size=self.block_size)
+
+    def _dispatch_trtllm(
+        self,
+        flat: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """The routed experts in flashinfer's Blackwell kernel (one opaque op to dynamo)."""
+        from mstar.utils.fused_moe import trtllm_fp8
+
+        exp = self.experts
+        return trtllm_fp8.experts(
+            flat, trtllm_fp8.ExpertWeights(exp.gate_up_proj_fp8, exp.gate_up_proj_scale_inv,
+                                           exp.down_proj_fp8, exp.down_proj_scale_inv),
+            topk_weights, topk_ids)
+
+    def _dispatch_trtllm_logits(self, flat: torch.Tensor) -> torch.Tensor:
+        """The routed experts in flashinfer's Blackwell kernel, routed inside it from the gate's logits."""
+        from mstar.utils.fused_moe import trtllm_fp8
+
+        exp, gate = self.experts, self.gate
+        return trtllm_fp8.experts_from_logits(
+            flat, trtllm_fp8.ExpertWeights(exp.gate_up_proj_fp8, exp.gate_up_proj_scale_inv,
+                                           exp.down_proj_fp8, exp.down_proj_scale_inv),
+            gate.logits(flat), gate.e_score_correction_bias, gate.top_k, gate.routed_scaling_factor)
+
+    def _take_kernel_routing(self) -> bool:
+        """Whether the trtllm kernel can route this block itself: GLM's router is noaux_tc over one
+        group, which is its DeepSeekV3 routing when the top-k renormalizes (fused_moe.trtllm_fp8.take_routing)."""
+        from mstar.utils.fused_moe import trtllm_fp8
+
+        gate, exp = self.gate, self.experts
+        if not gate.norm_topk_prob:
+            return False
+        return trtllm_fp8.take_routing(
+            trtllm_fp8.ExpertWeights(exp.gate_up_proj_fp8.data, exp.gate_up_proj_scale_inv.data,
+                                     exp.down_proj_fp8.data, exp.down_proj_scale_inv.data),
+            self.hidden_size, gate.e_score_correction_bias.data.float().contiguous(), gate.top_k,
+            float(gate.routed_scaling_factor))
+
+    def _take_trtllm(self) -> bool:
+        """Repack the routed experts in place for flashinfer's Blackwell kernel where it runs and
+        passed its probe (fused_moe.trtllm_fp8.take); True if it did."""
+        from mstar.utils.fused_moe import trtllm_fp8
+
+        exp = self.experts
+        packed = trtllm_fp8.take(
+            trtllm_fp8.ExpertWeights(exp.gate_up_proj_fp8.data, exp.gate_up_proj_scale_inv.data,
+                                     exp.down_proj_fp8.data, exp.down_proj_scale_inv.data),
+            self.gate.top_k, self.block_size)
+        if packed is None:
+            return False
+        exp.gate_up_proj_fp8.data = packed.w13
+        exp.gate_up_proj_scale_inv.data = packed.s13
+        exp.down_proj_fp8.data = packed.w2
+        exp.down_proj_scale_inv.data = packed.s2
+        return True
 
     # Triton launches stay outside dynamo, as the runner's fp8 quant does.
     @torch.compiler.disable
@@ -369,14 +446,18 @@ class Glm52SparseMoeBlock(nn.Module):
         self.gate.finalize_weights(topk_kernel=self._use_fused and self._router_kernel)
         if not self.fp8_experts:
             return
+        # kernels: auto only (the reference stays the numerics anchor); repacked experts stay so
+        self._trtllm = self._trtllm or (self._use_fused and self._decode_kernel and self._take_trtllm())
+        self._kernel_routing = self._trtllm and self._routing_wanted and self._take_kernel_routing()
         global _BACKEND_LOGGED
         if not _BACKEND_LOGGED:
             logger.info(
                 "Glm52SparseMoeBlock routed-expert backend: %s "
                 "(kernels=%s, decode kernels=%s, block_size=%s, tp_size=%d).",
-                "fused_experts_fp8 W8A8" if self._use_fused
+                "flashinfer trtllm fp8 (Blackwell)" if self._trtllm
+                else "fused_experts_fp8 W8A8" if self._use_fused
                 else "fp8-resident reference dispatch",
-                self.kernels, self._decode_kernel and self._use_fused, self.block_size,
-                self.tp_size,
+                self.kernels, self._decode_kernel and self._use_fused and not self._trtllm,
+                self.block_size, self.tp_size,
             )
             _BACKEND_LOGGED = True

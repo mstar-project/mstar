@@ -392,7 +392,7 @@ def _specs_by_key(model: Glm5NextModel) -> dict:
     return {s.resource_key: s for s in specs}
 
 
-@pytest.mark.parametrize("name", ["glm5_next_tp8.yaml", "glm5_next_tp8_mtp.yaml"])
+@pytest.mark.parametrize("name", ["glm5_next_tp8.yaml", "glm5_next_tp8_mtp.yaml", "glm53_flash_tp2_b300.yaml"])
 def test_serve_yaml_pages_cover_the_slot_pool(name):
     """Every slot can hold a full-length request without the KV pool refusing it (under MTP
     a request's rejected drafts take cache rows too)."""

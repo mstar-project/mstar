@@ -33,6 +33,7 @@ OP_SWEEPS = {
     "moe_gemm": "benchmark.kernels.moe_gemm:MoeGemmSweep",
     "moe_decode": "benchmark.kernels.moe_decode:MoeDecodeSweep",
     "ragged_attention": "benchmark.kernels.ragged_attention:RaggedAttentionSweep",
+    "fp8_linear": "benchmark.kernels.fp8_linear:Fp8LinearSweep",
 }
 
 

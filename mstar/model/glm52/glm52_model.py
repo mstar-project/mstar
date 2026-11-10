@@ -71,6 +71,18 @@ QUANT_METHODS = ("fp8",)
 DEFAULT_SAMPLING = MappingProxyType({"temperature": 1.0, "top_p": 0.95})
 
 
+def keep_dense_bf16(
+    language_model: torch.nn.Module, min_tokens: int, dtype: torch.dtype = torch.bfloat16,
+) -> None:
+    """Give every fp8 non-expert linear (and MLA's fused q_a | kv_a) a ``dtype`` copy of its
+    weight, run from ``min_tokens`` tokens up (``dense_bf16_min_tokens``). After
+    ``process_weights_after_loading``, which builds the fused weight and releases its sources."""
+    for module in language_model.modules():
+        keep = getattr(module, "keep_bf16", None)
+        if keep is not None:
+            keep(min_tokens, dtype)
+
+
 class Glm52Model(Model):
     """GLM-5.2: 753B MoE causal LM (MLA + DSA), text in / text out."""
 
@@ -123,6 +135,16 @@ class Glm52Model(Model):
             if kwargs["kernels"] not in KERNELS:
                 raise ValueError(f"kernels must be one of {KERNELS}, got {kwargs['kernels']!r}")
             self.config.kernels = kwargs["kernels"]
+        if "dense_bf16_min_tokens" in kwargs:
+            n = kwargs["dense_bf16_min_tokens"]
+            if n is not None and (isinstance(n, bool) or not isinstance(n, int) or n < 1):
+                raise ValueError(f"dense_bf16_min_tokens must be a token count, 1 or more, or null; got {n!r}")
+            self.config.dense_bf16_min_tokens = n
+        if "routed_experts_routing" in kwargs:
+            if kwargs["routed_experts_routing"] not in ("torch", "kernel"):
+                raise ValueError("routed_experts_routing must be torch or kernel, got "
+                                 f"{kwargs['routed_experts_routing']!r}")
+            self.config.routed_experts_routing = kwargs["routed_experts_routing"]
         if "graph_compile" in kwargs:
             # bool("false") is True
             if not isinstance(kwargs["graph_compile"], bool):
@@ -519,6 +541,9 @@ class Glm52Model(Model):
         language_model.to_empty(device=device)
         self._load_checkpoint(language_model, source, device, tp_group)
         process_weights_after_loading(language_model, torch.device(device))
+        if self.config.dense_bf16_min_tokens is not None:
+            keep_dense_bf16(language_model, self.config.dense_bf16_min_tokens,
+                            language_model.model.norm.weight.dtype)
         language_model.eval()
         if self.config.tuned_kernels and tp_group is not None and tp_group.world_size > 1:
             # collective over the TP group; every rank builds the LLM here

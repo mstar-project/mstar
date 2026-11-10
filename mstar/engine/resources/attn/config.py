@@ -51,10 +51,11 @@ class AttentionConfig:
     # narrow GQA, where the tensor-core kernel pads few query heads per KV
     # head out to a tile.
     decode_tensor_cores: bool = True
-    # FlashInfer only: run captured one-token decode rows on trtllm-gen's fmha
-    # kernel where one exists for this GPU and geometry (`FmhaDecodeWrapper`),
-    # which also drops the paged kernel's per-step plan. Eager steps and prompt
-    # rows stay on the paged kernels.
+    # FlashInfer and FlashInfer MLA: run captured one-token decode rows on
+    # trtllm-gen's fmha kernel where one exists for this GPU and geometry
+    # (`FmhaDecodeWrapper`; MLA's `FlashInferMLAFmhaDecodeWrapper` after a
+    # numerics probe against the paged kernel), which also drops the paged
+    # kernel's per-step plan. Eager steps and prompt rows stay on the paged kernels.
     decode_fmha: bool = False
     # Each query attends to the last ``sliding_window`` positions, its own included, and the
     # pool keeps about that window of K/V per request for this attention's layers and frees
