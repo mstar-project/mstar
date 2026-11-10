@@ -1142,11 +1142,16 @@ class KVManager(AttentionResource):
             held = set(self._start_pages(chain, end, matched))
             if (found < end or not held.issuperset(starts)) and not caught_up:
                 return False
-            if matched != lease.groups or not held.issuperset(starts):
+            for g, (here, there) in enumerate(zip(matched, lease.groups, strict=True)):
+                if here != there:
+                    raise RuntimeError(
+                        f"KV {self.name}: prefix index diverged from rank 0 for {rid}/{label}: group {g}'s "
+                        f"pages {here[:4]}... here ({len(here)}), {there[:4]}... there ({len(there)})"
+                    )
+            if not held.issuperset(starts):
                 raise RuntimeError(
-                    f"KV {self.name}: prefix index diverged from rank 0 for {rid}/{label}: "
-                    f"pages {matched[0][:4]}... here ({len(matched[0])}), "
-                    f"{lease.groups[0][:4]}... there ({len(lease.groups[0])})"
+                    f"KV {self.name}: prefix index diverged from rank 0 for {rid}/{label}: it lacks the window "
+                    f"pages {sorted(set(starts) - held)[:4]}... rank 0 keeps at a walk start"
                 )
             stream.lease = Lease(end, matched, starts=starts)
             self._arena.retain(stream.lease.pages())
