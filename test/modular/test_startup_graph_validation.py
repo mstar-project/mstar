@@ -715,14 +715,26 @@ def _kokoro(name, model_kwargs, tmp_path, monkeypatch):
 def _minicpm_o(name, model_kwargs, tmp_path, monkeypatch):
     from mstar.model.components.qwen3_lm import Qwen3LMConfig
     from mstar.model.minicpm_o.components.tts import TTSConfig
-    from mstar.model.minicpm_o.config import AudioConfig, MiniCPMOConfig, ResamplerConfig, VisionConfig
+    from mstar.model.minicpm_o.config import (
+        AUDIO_ENCODER,
+        IMAGE_ENCODER,
+        AudioConfig,
+        MiniCPMOConfig,
+        ResamplerConfig,
+        VisionConfig,
+    )
     from mstar.model.minicpm_o.minicpm_o_model import MiniCPMOModel
+    from mstar.model.multimodal_decoder import MediaIntake
     config = MiniCPMOConfig(
         llm=Qwen3LMConfig(), vision=VisionConfig(), resampler=ResamplerConfig(), audio=AudioConfig(),
     )
     # the bundled voice's length, read from the checkpoint's clip in a real boot
     voice = (6.016, 6.016)
-    return _bare(MiniCPMOModel, max_seq_len=64, config=config, tts_config=TTSConfig(), _voice_seconds=lambda: voice)
+    # both media fill one placeholder, the tokenizer's <unk>
+    media = (MediaIntake("image", IMAGE_ENCODER, 0, None), MediaIntake("audio", AUDIO_ENCODER, 0, None))
+    return _bare(
+        MiniCPMOModel, max_seq_len=64, config=config, tts_config=TTSConfig(), _voice_seconds=lambda: voice, media=media,
+    )
 
 
 def _orpheus(name, model_kwargs, tmp_path, monkeypatch):

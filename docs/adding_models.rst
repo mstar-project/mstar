@@ -3428,7 +3428,9 @@ nth attachment of that pad in the order of the prompt's parts, which is where ``
 renders each), the sentinels a template leaves to its processor, how many
 placeholders an attachment fills (``runs(attachment, metadata)``, one by default; a Qwen3.5 video fills one
 per temporal group), and ``prepare``, which turns an attachment into the encoder's input
-tensors and each placeholder's tokens (a ``PreparedMedia``). ``_prompt_ids`` renders and
+tensors and each placeholder's tokens (a ``PreparedMedia``). Both see the attachment and its loader
+metadata only; a request knob they read (MiniCPM-o's ``max_slice_nums``) is put in each
+attachment's metadata by the model's ``process_prompt``. ``_prompt_ids`` renders and
 tokenizes the whole prompt once. ``intake`` then refuses a prompt whose placeholders don't
 match its attachments, prepares each attachment in prompt order, expands each placeholder
 to its run (a ``MediaRun``) with ``expand_media_pads`` (one pad per token, read from the run's encoder output,
@@ -3487,6 +3489,15 @@ only. A lone encoder's ``MediaEncoder.walk`` names its media walk when the model
 calls it something other than ``prefill_<name>`` (Qwen3-ASR's and Canary-Qwen's
 ``prefill``). A graph that names its other walks otherwise sets
 ``PREFILL_WALK``, ``DECODE_WALK`` and ``DECODE_LOOP``.
+A decode loop that runs under more than one walk names them all in ``DECODE_WALKS``
+(``DECODE_WALK`` alone by default): their rows share the decode capture, the client token
+inline, the stop and the mixed step, and only ``DECODE_WALK`` keeps its token on the device.
+MiniCPM-o's spoken reply decodes on ``decode_spoken``, whose graph also sends each row's input
+id and post-norm hidden state to its TTS (``ROW_IDS``, ``ROW_HIDDEN``). Built with the walks
+whose graph routes them (``hidden_walks``, read off the model's graph by ``row_hidden_walks``),
+the node returns both from every step, so every capture holds them; a row whose walk has no
+edge for them leaves them unrouted, and a row whose walk has one gets its own copy, which a
+loop may accumulate.
 It reports a text prompt's length and a decode row's one token
 (``get_input_sequence_len``, ``speculative_input_seq_len``), so a model chunks its text
 prefill by declaring ``get_chunking_policies`` alone, as Qwen3.5 does.

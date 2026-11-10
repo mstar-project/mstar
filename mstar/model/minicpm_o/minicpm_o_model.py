@@ -1,24 +1,27 @@
-"""MiniCPM-o 4.5: a Qwen3-8B LLM over SigLIP image slices and Whisper audio.
+"""MiniCPM-o 4.5: a Qwen3-8B LLM over SigLIP image slices and Whisper audio,
+on the shared VLM scaffold (`MultimodalDecoderModel`), with a spoken reply's
+TTS and vocoder beside it.
 
 Graph:
-    prefill_text   LLM
-    prefill_image  vision_encoder -> LLM
-    prefill_audio  audio_encoder -> LLM
-    prefill_omni   (vision_encoder || audio_encoder) -> LLM
-    decode         LLM, looped (a text reply)
-    decode_spoken  LLM, looped, accumulating the TTS's input (a spoken reply)
-    tts_prefill    TTS -> Token2Wav, streamed
-    tts_decode     TTS, looped -> Token2Wav, streamed
-    t2w_chunk      Token2Wav (its own partition) -> client audio
+    prefill_text         LLM
+    prefill_image        vision_encoder -> LLM
+    prefill_audio        audio_encoder -> LLM
+    prefill_image_audio  (vision_encoder || audio_encoder) -> LLM
+    decode               LLM, looped (a text reply)
+    decode_spoken        LLM, looped, accumulating the TTS's input (a spoken reply)
+    tts_prefill          TTS -> Token2Wav, streamed
+    tts_decode           TTS, looped -> Token2Wav, streamed
+    t2w_chunk            Token2Wav (its own partition) -> client audio
 
-A request runs one prefill walk over its whole rendered prompt, picked by
-which attachments it carries, then decodes; a spoken reply's TTS then turns
-the decode's tokens and hiddens into codes, which Token2Wav vocodes window by
-window. Text and spoken replies decode in one step as ``decode_mixed``.
+A request runs one prefill walk over its whole rendered prompt, picked by the
+media it holds, then decodes; a spoken reply's TTS then turns the decode's
+tokens and hiddens into codes, which Token2Wav vocodes window by window. Text
+prefill and both decode walks share a step as ``mixed``.
 
-The prompt keeps upstream's placeholder tokens; the LLM overwrites their
-embeddings with the encoders' outputs at positions ``process_prompt`` reads
-off the prompt (see ``submodules``).
+Images and audio share upstream's ``<unk>`` placeholder: each image slice and
+each audio clip is one run of it, and the media layout, not the token, places
+the encoders' rows. A spoken reply's voice clip is a system-turn audio
+attachment like any other.
 
 Half-duplex chat only: the duplex/streaming-session machinery upstream is not
 ported.
@@ -27,15 +30,16 @@ from __future__ import annotations
 
 import logging
 import math
+from dataclasses import replace
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 import torch
 from transformers import Qwen2Tokenizer
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import FINAL_PREFILL, PartitionDefinition
-from mstar.distributed.base import ShardingConfig
+from mstar.conductor.request_info import PartitionDefinition
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
@@ -59,10 +63,12 @@ from mstar.engine.resources.recurrent.config import (
     RecurrentStateConfig,
     RecurrentStateSpec,
 )
-from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Parallel, Sequential, TensorPointerInfo
+from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.base import KVLabel, LabelLayout, Model, ProcessPromptOutput, Span, WalkStep
+from mstar.model.base import KVLabel, LabelLayout, ProcessPromptOutput, Span, WalkStep
 from mstar.model.components.audio_features import HOP_LENGTH, LogMelSpectrogram
+from mstar.model.components.sampled_token_decoder import ROW_HIDDEN, ROW_IDS, row_hidden_walks
+from mstar.model.keys import KV_CACHE, MIXED, PREFILL_TEXT, ROPE, VISION_ATTN
 from mstar.model.minicpm_o import processor, weight_loader
 from mstar.model.minicpm_o.components.audio import MiniCPMOAudio
 from mstar.model.minicpm_o.components.token2wav import (
@@ -77,17 +83,12 @@ from mstar.model.minicpm_o.components.token2wav import (
 from mstar.model.minicpm_o.components.tts import MiniCPMTTS, TTSConfig
 from mstar.model.minicpm_o.components.vision import MiniCPMOVision
 from mstar.model.minicpm_o.config import (
+    ATTN,
     AUDIO_ATTN,
-    AUDIO_FEATURE_LENS,
-    DECODE,
-    DECODE_LOOP,
-    DECODE_MIXED,
+    AUDIO_ENCODER,
     DECODE_SPOKEN,
-    IMAGE_TGT_SIZES,
-    LLM_ATTN,
-    LLM_KV,
-    LLM_POS,
-    LLM_SAMPLER,
+    IMAGE_ENCODER,
+    MAX_SLICE_NUMS_KEY,
     RESAMPLER_ATTN,
     SPEECH_TEXT_TOKENS,
     T2W_KV,
@@ -99,28 +100,34 @@ from mstar.model.minicpm_o.config import (
     TTS_POS,
     TTS_PREFILL,
     TTS_SAMPLER,
-    VISION_ATTN,
     MiniCPMOConfig,
     TTSSampling,
 )
 from mstar.model.minicpm_o.submodules import (
     AudioEncoderSubmodule,
-    LLMSubmodule,
+    MiniCPMOLLM,
     Token2WavSubmodule,
     TTSSubmodule,
     VisionEncoderSubmodule,
 )
-from mstar.model.multimodal import TEXT, PromptPart, check_attachments, messages_from_parts, parts_from_modalities
+from mstar.model.multimodal import (
+    MEDIA_LAYOUT,
+    TEXT,
+    PromptPart,
+    media_walks,
+    messages_from_parts,
+    parts_from_modalities,
+)
+from mstar.model.multimodal_decoder import MIXED_SPLIT, MediaIntake, MultimodalDecoderModel, PreparedMedia
 from mstar.model.submodule_base import NodeSubmodule
-from mstar.model.utils import TextOutput
 from mstar.streaming.chunk_policy import LeftContextChunkPolicy
 from mstar.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
 
 logger = logging.getLogger(__name__)
 
 LLM = "LLM"
-VISION = "vision_encoder"
-AUDIO = "audio_encoder"
+VISION = IMAGE_ENCODER.node
+AUDIO = AUDIO_ENCODER.node
 TTS = "TTS"
 TOKEN2WAV = "Token2Wav"
 
@@ -148,21 +155,12 @@ VOICE_PROMPT_SUFFIX = (
     "You are a helpful assistant developed by ModelBest: MiniCPM-Omni."
 )
 
-# Upstream's `chat` defaults when sampling.
-DEFAULT_SAMPLING = dict(temperature=0.7, top_p=0.8, top_k=100, repetition_penalty=1.02)
-
-
-
-def _resolve_metadata(repo_id: str, cache_dir: str | None) -> str:
-    """Config and tokenizer files only; workers fetch weights."""
-    if Path(repo_id).is_dir():
-        return repo_id
-    from huggingface_hub import snapshot_download
-
-    return snapshot_download(
-        repo_id=repo_id, cache_dir=cache_dir,
-        allow_patterns=["*.json", "*.txt", "assets/*.wav"],
-    )
+# Upstream's `chat` defaults when sampling, in place of the checkpoint's
+# generation_config.json. It generates from embeddings, so its repetition
+# penalty sees only the reply.
+SAMPLING_DEFAULTS = MappingProxyType(dict(
+    temperature=0.7, top_p=0.8, top_k=100, repetition_penalty=1.02, penalize_prompt=False,
+))
 
 
 def _as_pil(image: torch.Tensor):
@@ -178,26 +176,32 @@ def _as_pil(image: torch.Tensor):
     return Image.fromarray(image.permute(1, 2, 0).cpu().contiguous().numpy(), mode="RGB")
 
 
-class MiniCPMOModel(Model):
-    # Preprocessing is a few small ops per request, which a thread per core
-    # only slows (Qwen3.5 measured its image preprocessing at 4 threads).
-    PREPROCESS_TORCH_THREADS = 4
-    # the encoders' segment sizes and a spoken reply's text cap, which process_prompt settles
-    INTERNAL_KWARGS = (IMAGE_TGT_SIZES, AUDIO_FEATURE_LENS, SPEECH_TEXT_TOKENS)
+def _image_size(image: torch.Tensor) -> tuple[int, int]:
+    """A ``(C, H, W)`` image's ``(width, height)``, as PIL gives it."""
+    return int(image.shape[-1]), int(image.shape[-2])
+
+
+class MiniCPMOModel(MultimodalDecoderModel):
+    NAME = "MiniCPM-o"
+    # config and tokenizer, and the voices' clips; workers fetch weights (`_resolve_weights`)
+    METADATA_FILES = ("*.json", "*.txt", "assets/*.wav")
+    # the media layout, and a spoken reply's text cap, which process_prompt settles
+    INTERNAL_KWARGS = (MEDIA_LAYOUT, SPEECH_TEXT_TOKENS)
+    sampling_defaults = SAMPLING_DEFAULTS
 
     def __init__(
         self, model_path_hf: str, cache_dir: str | None = None, max_seq_len: int | None = None, **kwargs: Any,
     ):
-        self.model_path_hf = model_path_hf
-        self.cache_dir = cache_dir
-        self.local_dir = _resolve_metadata(model_path_hf, cache_dir)
+        super().__init__(model_path_hf, cache_dir)
+        # not the checkpoint's generation_config.json: upstream's `chat` sets its own
+        self.sampling_defaults = SAMPLING_DEFAULTS
         self.config = MiniCPMOConfig.from_hf(self.local_dir)
         limit = self.config.llm.max_position_embeddings
         self.max_seq_len = limit if max_seq_len is None else max_seq_len
         if type(self.max_seq_len) is not int or not 0 < self.max_seq_len <= limit:
             raise ValueError(f"max_seq_len must be in 1..{limit} (max_position_embeddings), got {max_seq_len!r}")
-        # upstream's tokenizer class is Qwen2's with token-name attributes added
         self.tts_config = TTSConfig.from_hf(self.config.tts_config)
+        # upstream's tokenizer class is Qwen2's with token-name attributes added
         tokenizer = Qwen2Tokenizer.from_pretrained(self.local_dir)
         self.tokenizer = tokenizer
         # upstream's mel: Whisper's, as its own audio processor configures it
@@ -209,7 +213,13 @@ class MiniCPMOModel(Model):
         self.config.stop_token_ids = tuple(
             tokenizer.convert_tokens_to_ids(t) for t in ("<|im_end|>", "<|endoftext|>", "<|tts_eos|>")
         )
-        self._submodule_cache: dict[str, NodeSubmodule | None] = {}
+        # Each image slice and each audio clip is one run of `<unk>`, wrapped in
+        # its sentinels by the rendered prompt (`_prompt_ids`).
+        unk = tokenizer.convert_tokens_to_ids("<unk>")
+        self.media = (
+            MediaIntake("image", IMAGE_ENCODER, unk, self._image_intake, runs=self._image_runs),
+            MediaIntake("audio", AUDIO_ENCODER, unk, self._audio_intake, runs=self._audio_runs),
+        )
         self._voices: dict[str, torch.Tensor] = {}
 
     def validate_config_yaml(self, config: dict, config_path: str) -> None:
@@ -247,8 +257,16 @@ class MiniCPMOModel(Model):
                 "nothing else caps the replies the TTS holds at once, and a burst past the pool stalls"
             )
 
-    def checkpoint_path(self) -> str | None:
-        return self.local_dir
+    def _resolve_weights(self) -> str:
+        """The weights and the vocoder's assets, nothing else of the snapshot."""
+        if Path(self.model_path_hf).is_dir():
+            return self.model_path_hf
+        from huggingface_hub import snapshot_download
+
+        return snapshot_download(
+            repo_id=self.model_path_hf, cache_dir=self.cache_dir,
+            allow_patterns=["*.safetensors", "*.json", "assets/token2wav/*.pt", "assets/token2wav/*.onnx"],
+        )
 
     # ------------------------------------------------------------------
     # Resources
@@ -260,7 +278,7 @@ class MiniCPMOModel(Model):
         )
         return [
             KVSpec(
-                resource_key=LLM_KV, nodes={LLM},
+                resource_key=KV_CACHE, nodes={LLM},
                 config=PagedKVConfig(
                     num_layers=llm.num_hidden_layers,
                     num_kv_heads=llm.num_key_value_heads,
@@ -269,17 +287,15 @@ class MiniCPMOModel(Model):
                     num_qo_heads=llm.num_attention_heads,
                 ),
             ),
-            AttentionSpec(resource_key=LLM_ATTN, nodes={LLM}, config=AttentionConfig(kv_cache=LLM_KV)),
+            AttentionSpec(
+                resource_key=ATTN, nodes={LLM}, config=AttentionConfig(kv_cache=KV_CACHE, splits=(MIXED_SPLIT,)),
+            ),
             PositionSpec(
-                resource_key=LLM_POS, nodes={LLM},
-                config=PositionConfig(kv_cache=LLM_KV, rope_theta=llm.rope_theta),
+                resource_key=ROPE, nodes={LLM},
+                config=PositionConfig(kv_cache=KV_CACHE, rope_theta=llm.rope_theta),
             ),
-            SamplerSpec(
-                resource_key=LLM_SAMPLER, nodes={LLM},
-                vocab_size=llm.vocab_size, enable_repetion_penalty=True,
-                # upstream's `chat` hands min_p to HF `generate`, which honours it
-                enable_min_p=True,
-            ),
+            # upstream's `chat` hands min_p to HF `generate`, which honours it
+            replace(self._sampler_spec(llm.vocab_size), enable_min_p=True),
             RaggedAttentionSpec(
                 resource_key=VISION_ATTN, nodes={VISION},
                 config=RaggedAttentionConfig(
@@ -388,7 +404,7 @@ class MiniCPMOModel(Model):
             # upstream's TTS sampling (see TTSSubmodule)
             SamplerSpec(
                 resource_key=TTS_SAMPLER, nodes={TTS},
-                vocab_size=tts.num_audio_tokens, enable_repetion_penalty=False,
+                vocab_size=tts.num_audio_tokens, enable_repetition_penalty=False,
                 max_repetition_window=TTS_SAMPLING.penalty_window,
                 min_tokens_stop_ids=(tts.eos_code,),
                 enable_top_p_first=True,
@@ -398,15 +414,9 @@ class MiniCPMOModel(Model):
     def get_request_resource_configs(
         self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
     ) -> dict[str, ResourceReqConfig]:
-        keys = (
-            "temperature", "top_p", "top_k", "min_p", "repetition_penalty", "ignore_eos",
-            "return_logprobs", "logprobs_mode",
-        )
-        knobs = {**DEFAULT_SAMPLING, **{k: model_kwargs[k] for k in keys if k in model_kwargs}}
         tts = TTS_SAMPLING
         return {
-            # upstream generates from embeddings, so its penalty sees only generated tokens
-            LLM_SAMPLER: SamplingReqConfig(**knobs, penalize_prompt=False),
+            **super().get_request_resource_configs(input_modalities, output_modalities, model_kwargs),
             TTS_SAMPLER: SamplingReqConfig(
                 temperature=tts.temperature, top_p=tts.top_p, top_k=tts.top_k,
                 repetition_penalty=tts.repetition_penalty, repetition_window=tts.penalty_window,
@@ -414,63 +424,49 @@ class MiniCPMOModel(Model):
             ),
         }
 
+    def request_kwargs(self) -> frozenset[str]:
+        return super().request_kwargs() | {MAX_SLICE_NUMS_KEY, "system_prompt", "voice", "voice_prompt"}
+
     # ------------------------------------------------------------------
     # Graph
     # ------------------------------------------------------------------
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
-        def llm(inputs: list[str]) -> GraphNode:
-            return GraphNode(
+        # the scaffold's, its decode loop bounded by max_seq_len (a safety bound;
+        # the per-request budget is `get_loop_caps`')
+        walks = media_walks(self.max_seq_len, self.encoders)
+        # A spoken reply's decode also hands the TTS each step's input token and
+        # its hidden state, accumulated until the reply ends; nothing reads them
+        # per step.
+        hidden = (ROW_IDS, ROW_HIDDEN)
+        walks[DECODE_SPOKEN] = Loop(
+            name=self.DECODE_LOOP,
+            section=GraphNode(
                 name=LLM,
-                input_names=inputs,
+                input_names=["text_inputs"],
                 outputs=[
-                    GraphEdge(next_node=EMIT_TO_CLIENT, name="new_token", persist=True, output_modality="text"),
+                    GraphEdge(next_node=LLM, name="text_inputs"),
+                    GraphEdge(next_node=EMIT_TO_CLIENT, name="text_inputs", output_modality="text"),
+                    *(GraphEdge(next_node=EMPTY_DESTINATION, name=name) for name in hidden),
                 ],
-            )
-
-        vision = GraphNode(
-            name=VISION, input_names=["pixel_values"],
-            outputs=[GraphEdge(next_node=LLM, name="vision_embeds")],
+            ),
+            max_iters=self.max_seq_len,
+            outputs=[],
+            # the reply's TTS condition, handed over whole when it ends
+            accumulated_outputs=[GraphEdge(next_node=EMPTY_DESTINATION, name=name, persist=True) for name in hidden],
         )
-        audio = GraphNode(
-            name=AUDIO, input_names=["audio_features"],
-            outputs=[GraphEdge(next_node=LLM, name="audio_embeds")],
-        )
-        def decode(spoken: bool) -> Loop:
-            # A text reply's only output is its token, which the LLM keeps on the
-            # device: its steps loop back. A spoken reply's also hands the TTS its
-            # per-step (input token, its hidden), for the accumulation below;
-            # nothing reads them per step.
-            tts = ("tts_ids", "tts_hidden") if spoken else ()
-            return Loop(
-                name=DECODE_LOOP,
-                section=GraphNode(
-                    name=LLM,
-                    input_names=["text_inputs"],
-                    outputs=[
-                        GraphEdge(next_node=LLM, name="text_inputs"),
-                        GraphEdge(next_node=EMIT_TO_CLIENT, name="text_inputs", output_modality="text"),
-                        *(GraphEdge(next_node=EMPTY_DESTINATION, name=name) for name in tts),
-                    ],
-                ),
-                # a safety bound; the per-request budget is `get_loop_caps`'
-                max_iters=self.max_seq_len,
-                outputs=[],
-                # the reply's TTS condition, handed over whole when it ends
-                accumulated_outputs=[GraphEdge(next_node=EMPTY_DESTINATION, name=name, persist=True) for name in tts],
-            )
         tts_outputs = [
             StreamingGraphEdge(next_node=TOKEN2WAV, name="tts_code", target_partition=TOKEN2WAV),
         ]
-        tts_prefill = GraphNode(
-            name=TTS, input_names=["tts_ids", "tts_hidden"],
+        walks[TTS_PREFILL] = GraphNode(
+            name=TTS, input_names=list(hidden),
             outputs=tts_outputs + [
                 GraphEdge(next_node=EMPTY_DESTINATION, name="tts_code", persist=True),
             ],
         )
         # A decode step's code streams to the vocoder as ``tts_code`` and loops back
         # as ``tts_next``, which the TTS keeps on the device (``device_loopback``).
-        tts_decode = Loop(
+        walks[TTS_DECODE] = Loop(
             name=TTS_DECODE_LOOP,
             section=GraphNode(
                 name=TTS,
@@ -482,31 +478,20 @@ class MiniCPMOModel(Model):
             max_iters=TTS_SAMPLING.max_new_tokens,
             outputs=[],
         )
-        return {
-            "prefill_text": llm(["text_inputs"]),
-            "prefill_image": Sequential([vision, llm(["text_inputs", "vision_embeds", "image_positions"])]),
-            "prefill_audio": Sequential([audio, llm(["text_inputs", "audio_embeds", "audio_positions"])]),
-            "prefill_omni": Sequential([
-                Parallel([vision, audio]),
-                llm(["text_inputs", "vision_embeds", "image_positions", "audio_embeds", "audio_positions"]),
-            ]),
-            DECODE: decode(spoken=False),
-            DECODE_SPOKEN: decode(spoken=True),
-            TTS_PREFILL: tts_prefill,
-            TTS_DECODE: tts_decode,
-            T2W_CHUNK: GraphNode(
-                name=TOKEN2WAV, input_names=["tts_code"],
-                outputs=[GraphEdge(next_node=EMIT_TO_CLIENT, name="audio_chunk", output_modality="audio")],
-                # Not speculated: a window's step syncs on the host (the inverse STFT), so
-                # overlap hides little, and a batch picked after the step's postprocess
-                # can carry that step's rows again.
-                enable_async_scheduling=False,
-            ),
-        }
+        walks[T2W_CHUNK] = GraphNode(
+            name=TOKEN2WAV, input_names=["tts_code"],
+            outputs=[GraphEdge(next_node=EMIT_TO_CLIENT, name="audio_chunk", output_modality="audio")],
+            # Not speculated: a window's step syncs on the host (the inverse STFT), so
+            # overlap hides little, and a batch picked after the step's postprocess
+            # can carry that step's rows again.
+            enable_async_scheduling=False,
+        )
+        return walks
 
     def get_combined_graph_walks(self) -> dict[str, dict[str, set[str]]]:
-        # text and spoken replies decode in one step; a text row still loops back
-        return {LLM: {DECODE_MIXED: {DECODE, DECODE_SPOKEN}}}
+        # a walk joins one combined walk a node: both replies' decode rows share
+        # the text prompts' mixed step
+        return {LLM: {MIXED: {PREFILL_TEXT, "decode", DECODE_SPOKEN}}}
 
     def get_partitions(self) -> list[PartitionDefinition]:
         main = set(self.get_graph_walk_graphs()) - {T2W_CHUNK}
@@ -526,45 +511,17 @@ class MiniCPMOModel(Model):
             )],
         )
 
+    def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
+        (main,) = super().kv_labels()[KV_CACHE].values()
+        return {
+            # a spoken reply's decode writes the LLM's label as a text reply's does
+            KV_CACHE: {"main": main._replace(growth=(*main.growth, (DECODE_SPOKEN, self.DECODE_LOOP)))},
+            TTS_KV: {"main": KVLabel(growth=((TTS_DECODE, TTS_DECODE_LOOP),))},
+        }
+
     # ------------------------------------------------------------------
     # Prompt
     # ------------------------------------------------------------------
-
-    def _render(
-        self,
-        parts: list[PromptPart],
-        has_audio: bool,
-        enable_thinking: bool,
-        system_prompt: str | None,
-        voice_audio: torch.Tensor | None,
-        speech: bool,
-    ) -> str:
-        """The chat string as upstream's `chat` renders it: a message per turn,
-        its items joined by newlines, with a tag per attachment.
-
-        A spoken reply's system message is upstream's voice prompt around the
-        voice's reference clip (``voice_audio``, the first audio the prompt
-        holds; ``process_prompt`` refuses a system message of the request's
-        beside it); without it, the request's ``system_prompt``."""
-        tags = {"image": processor.IMAGE_TAG, "audio": processor.AUDIO_TAG}
-        system = system_prompt or None
-        if voice_audio is not None:
-            system = "\n".join([VOICE_PROMPT_PREFIX, processor.AUDIO_TAG, VOICE_PROMPT_SUFFIX])
-        msgs = [
-            {"role": m["role"], "content": m["content"] if isinstance(m["content"], str) else "\n".join(
-                item["text"] if item["type"] == TEXT else tags[item["type"]] for item in m["content"]
-            )}
-            for m in messages_from_parts(parts, default_system=system)
-        ]
-        return self.tokenizer.apply_chat_template(
-            msgs,
-            tokenize=False,
-            add_generation_prompt=True,
-            # upstream turns the speech template on whenever audio is anywhere
-            # in the request, and a spoken reply needs it
-            use_tts_template=has_audio or speech,
-            enable_thinking=enable_thinking,
-        )
 
     def process_prompt(
         self,
@@ -575,43 +532,47 @@ class MiniCPMOModel(Model):
         prompt_parts: list[PromptPart] | None = None,
         **kwargs,
     ) -> ProcessPromptOutput:
+        """The scaffold's intake, after MiniCPM-o's own request knobs: a
+        spoken reply's voice clip joins the prompt as a system-turn audio
+        attachment, and ``max_slice_nums`` rides each image's metadata to its
+        intake. Then the TTS's KV layout and a spoken reply's text cap."""
         unsupported = set(output_modalities) - {TEXT, "audio"}
         if unsupported:
             raise ValueError(f"MiniCPM-o outputs text and audio; got {sorted(unsupported)}")
         speech = "audio" in output_modalities
-        enable_thinking = kwargs.get("enable_thinking", False)
-        if not isinstance(enable_thinking, bool):
-            raise ValueError(f"enable_thinking must be true or false, got {enable_thinking!r}")
-        max_slice_nums = kwargs.get("max_slice_nums")
+        if not isinstance(kwargs.get("enable_thinking", False), bool):
+            raise ValueError(f"enable_thinking must be true or false, got {kwargs['enable_thinking']!r}")
+        max_slice_nums = kwargs.get(MAX_SLICE_NUMS_KEY)
         max_slice_nums = processor.MAX_SLICE_NUMS if max_slice_nums is None else max_slice_nums
         # the checkpoint's own setting is the most: each slice is up to 1024 patches
         if type(max_slice_nums) is not int or not 1 <= max_slice_nums <= processor.MAX_SLICE_NUMS:
             raise ValueError(
                 f"max_slice_nums must be an integer in 1..{processor.MAX_SLICE_NUMS}, got {max_slice_nums!r}"
             )
-        tensors = tensors or {}
+        if speech:
+            # The TTS reads the whole reply and then speaks it, all within its
+            # positions; a longer reply would run past them, so speech caps the text.
+            requested = kwargs.get("max_output_tokens")
+            if requested is not None and int(requested) > self.speech_max_text_tokens:
+                raise ValueError(
+                    f"a spoken reply holds at most {self.speech_max_text_tokens} text tokens; "
+                    f"got max_output_tokens={requested}"
+                )
+        tensors = dict(tensors or {})
         parts = parts_from_modalities(
             input_modalities,
             [p.text or "" for p in prompt_parts if p.modality == TEXT] if prompt_parts is not None else prompt,
-            roles=[p.role for p in prompt_parts] if prompt_parts is not None else None,
+            [p.role for p in prompt_parts] if prompt_parts is not None else None,
         )
-        bad = {p.modality for p in parts} - {TEXT, "image", "audio"}
-        if bad:
-            raise ValueError(f"MiniCPM-o takes text, image and audio inputs; got {sorted(bad)}")
-        raw_images = tensors.get("image_inputs", [])
-        raw_audios = tensors.get("audio_inputs", [])
-        check_attachments(parts, {"image": len(raw_images), "audio": len(raw_audios)})
-        if not any(p.text for p in parts if p.modality == TEXT) and not raw_images and not raw_audios:
+        if not any(p.text for p in parts if p.modality == TEXT) and not any(p.modality != TEXT for p in parts):
             raise ValueError("MiniCPM-o got a request with no text and no attachments")
+        metadata = dict(kwargs.get("input_metadata") or {})
 
-        audios = [a.reshape(-1).float().cpu() for a in raw_audios]
         # `voice_prompt=False` leaves the voice clip out of the system message
         # (the reply is still spoken in the voice): what vllm-omni's examples
         # send, so the two can be compared on the same conditioning
-        voice_audio = self.voice_audio(kwargs.get("voice")) if speech else None  # validates the voice
-        if not kwargs.get("voice_prompt", True):
-            voice_audio = None
-        if voice_audio is not None:
+        voice = self.voice_audio(kwargs.get("voice")) if speech else None  # validates the voice
+        if voice is not None and kwargs.get("voice_prompt", True):
             if kwargs.get("system_prompt") or any(p.role == "system" for p in parts):
                 # upstream's voice prompt is the reply's system message, and a second
                 # one would change what the voice clone was conditioned on
@@ -619,102 +580,128 @@ class MiniCPMOModel(Model):
                     "a spoken MiniCPM-o reply's system message is its voice prompt; "
                     "send voice_prompt=false to use your own system prompt"
                 )
-            audios = [voice_audio] + audios
-        text = self._render(
-            parts, bool(audios),
-            enable_thinking=enable_thinking,
-            system_prompt=kwargs.get("system_prompt"),
-            voice_audio=voice_audio,
-            speech=speech,
-        )
-        p, queries = self.config.vision.patch_size, self.config.resampler.num_queries
-        sliced = [processor.slice_image(_as_pil(img), max_slice_nums, p) for img in raw_images]
-        text = processor.expand_tags(
-            text,
-            [processor.image_placeholder(i, grid, queries) for i, (_, grid) in enumerate(sliced)],
-            [processor.audio_placeholder(len(a), self.config.audio) for a in audios],
-        )
-        input_ids, image_positions, audio_positions = processor.prompt_ids(self.tokenizer, text)
-        result: NameToTensorList = {"text_inputs": [input_ids]}
-        metadata: dict[str, Any] = {}
-
-        if sliced:
-            patches, tgt_sizes = zip(
-                *(processor.slice_patches(s, p) for slices, _ in sliced for s in slices), strict=True,
-            )
-            if image_positions.numel() != len(tgt_sizes) * queries:
-                raise ValueError(
-                    f"image placeholders ({image_positions.numel()}) do not match "
-                    f"{len(tgt_sizes)} slices x {queries} queries"
-                )
-            # bf16 is what the tower casts them to before its patch conv, so the cast is exact
-            result["pixel_values"] = [torch.cat(patches).to(torch.bfloat16)]
-            metadata[IMAGE_TGT_SIZES] = list(tgt_sizes)
-            result["image_positions"] = [image_positions]
-
-        if audios:
-            all_pieces = [piece for a in audios for piece in processor.audio_pieces(a)]
-            # each piece padded to Whisper's 30 s window, then cut to its own frames
-            mel = self.log_mel(torch.stack([self.log_mel.pad_or_trim(piece) for piece in all_pieces]))
-            # a piece shorter than one pooling step (a clip under ~0.1 s, or what
-            # is left of a long one past its last 30 s cut) pools to no tokens
-            lens = [
-                (i, n) for i, n in enumerate(math.ceil(len(piece) / HOP_LENGTH) for piece in all_pieces)
-                if self.config.audio.pooled_tokens(n) > 0
+            parts = [
+                PromptPart(TEXT, VOICE_PROMPT_PREFIX, role="system"),
+                PromptPart("audio", role="system"),
+                PromptPart(TEXT, VOICE_PROMPT_SUFFIX, role="system"),
+                *parts,
             ]
-            pieces = [mel[i, :, :n] for i, n in lens]
-            tokens = sum(self.config.audio.pooled_tokens(n) for _, n in lens)
-            if audio_positions.numel() != tokens:
-                # upstream sizes the placeholder off the whole clip but encodes
-                # 30 s pieces, which disagree for some long clips
-                raise ValueError(
-                    f"audio placeholders ({audio_positions.numel()}) do not match the "
-                    f"{tokens} tokens its {len(pieces)} piece(s) encode to"
-                )
-            if pieces:  # else the clips are all too short to encode, and the prompt is text only
-                result["audio_features"] = [torch.cat(pieces, dim=-1).to(torch.bfloat16)]
-                metadata[AUDIO_FEATURE_LENS] = [n for _, n in lens]
-                result["audio_positions"] = [audio_positions]
-        if speech:
-            # The TTS reads the whole reply and then speaks it, all within its
-            # positions; a longer reply would run past them, so speech caps the text.
-            limit = self.speech_max_text_tokens
-            requested = kwargs.get("max_output_tokens")
-            if requested is not None and int(requested) > limit:
-                raise ValueError(f"a spoken reply holds at most {limit} text tokens; got max_output_tokens={requested}")
-            metadata[SPEECH_TEXT_TOKENS] = limit
-        # the LLM's prefill writes every prompt row, placeholders included, then a row per decode step
-        rows = int(input_ids.numel())
-        llm = LabelLayout(
-            spans=(Span("rows", self._prefill_walk(result), rows, rows, "text_inputs"),),
-            growth=((DECODE_LOOP, 1),),
+            tensors["audio_inputs"] = [voice, *tensors.get("audio_inputs", [])]
+            if metadata.get("audio_inputs"):
+                metadata["audio_inputs"] = [{}, *metadata["audio_inputs"]]
+        images = tensors.get("image_inputs", [])
+        given = list(metadata.get("image_inputs") or ())
+        metadata["image_inputs"] = [
+            {**(given[i] if i < len(given) else {}), MAX_SLICE_NUMS_KEY: max_slice_nums} for i in range(len(images))
+        ]
+        # the parts carry the text; an empty request is refused above
+        out = super().process_prompt(
+            "" if prompt is None else prompt, [p.modality for p in parts], output_modalities, tensors, parts,
+            **{
+                **kwargs, "input_metadata": metadata, MAX_SLICE_NUMS_KEY: max_slice_nums,
+                # upstream turns the speech template on whenever audio is anywhere in
+                # the request, and a spoken reply needs it
+                "use_tts_template": speech or bool(tensors.get("audio_inputs")),
+            },
         )
         # A spoken reply's TTS prefills its condition in one step: the reply, at most a token
         # per LLM decode step, then two more. That is a bound, laid out as two rows plus a row
         # per LLM step; then a row per code.
-        tts = LabelLayout(
-            spans=(Span("rows", TTS_PREFILL, 2, 2, "tts_hidden"),),
-            growth=((DECODE_LOOP, 1), (TTS_DECODE_LOOP, 1)),
-        ) if speech else LabelLayout()
-        metadata["kv_layout"] = {LLM_KV: {"main": llm}, TTS_KV: {"main": tts}}
-        return ProcessPromptOutput(result, metadata)
+        out.metadata["kv_layout"][TTS_KV] = {"main": LabelLayout(
+            spans=(Span("rows", TTS_PREFILL, 2, 2, ROW_HIDDEN),),
+            growth=((self.DECODE_LOOP, 1), (TTS_DECODE_LOOP, 1)),
+        ) if speech else LabelLayout()}
+        if speech:
+            out.metadata[SPEECH_TEXT_TOKENS] = self.speech_max_text_tokens
+        return out
+
+    def _prompt_ids(self, parts: list[PromptPart], raw: dict[str, list[torch.Tensor]], **kwargs) -> torch.Tensor:
+        """The chat as upstream's `chat` renders it: a message per turn, its
+        items joined by newlines, a tag per attachment; each tag then becomes
+        upstream's placeholder text with one ``<unk>`` a run, in its sentinels,
+        and the ids drop ``<|listen|>``, as upstream's do."""
+        tags = {"image": processor.IMAGE_TAG, "audio": processor.AUDIO_TAG}
+        messages = [
+            {"role": m["role"], "content": m["content"] if isinstance(m["content"], str) else "\n".join(
+                item["text"] if item["type"] == TEXT else tags[item["type"]] for item in m["content"]
+            )}
+            for m in messages_from_parts(parts, default_system=kwargs.get("system_prompt") or None)
+        ]
+        text = self.tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            use_tts_template=kwargs.get("use_tts_template", bool(raw.get("audio"))),
+            enable_thinking=kwargs.get("enable_thinking", False),
+        )
+        max_slice_nums = kwargs.get(MAX_SLICE_NUMS_KEY) or processor.MAX_SLICE_NUMS
+        text = processor.expand_tags(
+            text,
+            [
+                processor.image_placeholder(i, processor.slice_grid(_image_size(image), max_slice_nums))
+                for i, image in enumerate(raw.get("image", []))
+            ],
+            [processor.audio_placeholder(self._audio_runs(clip, {})) for clip in raw.get("audio", [])],
+        )
+        listen = self.tokenizer.convert_tokens_to_ids("<|listen|>")
+        return torch.tensor([t for t in self.tokenizer.encode(text) if t != listen], dtype=torch.long)
+
+    def _image_runs(self, image: torch.Tensor, metadata: dict) -> int:
+        """The source image's run, and one per slice."""
+        grid = processor.slice_grid(_image_size(image), metadata.get(MAX_SLICE_NUMS_KEY, processor.MAX_SLICE_NUMS))
+        return processor.image_runs(grid)
+
+    def _image_intake(self, image: torch.Tensor, metadata: dict) -> PreparedMedia:
+        """Each slice's patches, its ``num_queries`` tokens and its ``(h, w)``
+        in patches, which the tower lays its segments out by."""
+        p = self.config.vision.patch_size
+        slices, _ = processor.slice_image(
+            _as_pil(image), metadata.get(MAX_SLICE_NUMS_KEY, processor.MAX_SLICE_NUMS), p,
+        )
+        patches, grids = zip(*(processor.slice_patches(s, p) for s in slices), strict=True)
+        queries = self.config.resampler.num_queries
+        # bf16 is what the tower casts them to before its patch conv, so the cast is exact
+        return PreparedMedia({"pixel_values": torch.cat(patches).to(torch.bfloat16)}, [queries] * len(grids), grids)
+
+    def _audio_runs(self, clip: torch.Tensor, metadata: dict) -> int:
+        """One run a clip, none for a clip too short to pool to a token."""
+        return 1 if processor.audio_tokens(clip.numel(), self.config.audio) > 0 else 0
+
+    def _audio_intake(self, clip: torch.Tensor, metadata: dict) -> PreparedMedia:
+        """A clip's log-mel pieces (30 s each at most), cut to their frames
+        and joined; its run's tokens, and its pieces' mel lengths, which the
+        encoder lays its segments out by."""
+        audio = self.config.audio
+        clip = clip.reshape(-1).float().cpu()
+        pieces = processor.audio_pieces(clip)
+        # each piece padded to Whisper's 30 s window, then cut to its own frames
+        mel = self.log_mel(torch.stack([self.log_mel.pad_or_trim(piece) for piece in pieces]))
+        # a piece shorter than one pooling step (what is left of a long clip past its
+        # last 30 s cut) pools to no tokens
+        lens = [
+            (i, n) for i, n in enumerate(math.ceil(len(piece) / HOP_LENGTH) for piece in pieces)
+            if audio.pooled_tokens(n) > 0
+        ]
+        tokens = sum(audio.pooled_tokens(n) for _, n in lens)
+        if tokens != processor.audio_tokens(clip.numel(), audio):
+            # upstream sizes the placeholder off the whole clip but encodes 30 s
+            # pieces, which disagree for some long clips
+            raise ValueError(
+                f"an audio clip's placeholder ({processor.audio_tokens(clip.numel(), audio)} tokens) does not "
+                f"match the {tokens} tokens its {len(lens)} piece(s) encode to"
+            )
+        if not tokens:  # too short to encode: no run (`_audio_runs`)
+            return PreparedMedia({}, [])
+        features = torch.cat([mel[i, :, :n] for i, n in lens], dim=-1).to(torch.bfloat16)
+        return PreparedMedia({"audio_features": features}, [tokens], [[n for _, n in lens]])
 
     def get_max_output_tokens(self, **model_kwargs) -> int:
         cap = super().get_max_output_tokens(**model_kwargs)
         return min(cap, model_kwargs.get(SPEECH_TEXT_TOKENS, cap))
 
     def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
-        # each prefill samples the first token or code, so its loop runs one fewer
-        return {
-            DECODE_LOOP: max(1, self.get_max_output_tokens(**model_kwargs) - 1),
-            TTS_DECODE_LOOP: TTS_SAMPLING.max_new_tokens - 1,
-        }
-
-    def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
-        return {
-            LLM_KV: {"main": KVLabel(growth=((DECODE, DECODE_LOOP), (DECODE_SPOKEN, DECODE_LOOP)))},
-            TTS_KV: {"main": KVLabel(growth=((TTS_DECODE, TTS_DECODE_LOOP),))},
-        }
+        # the TTS prefill samples the first code, so its loop runs one fewer
+        return {**super().get_loop_caps(**model_kwargs), TTS_DECODE_LOOP: TTS_SAMPLING.max_new_tokens - 1}
 
     @property
     def speech_max_text_tokens(self) -> int:
@@ -744,9 +731,6 @@ class MiniCPMOModel(Model):
             cached = self._voices[name] = torch.from_numpy(audio)
         return cached
 
-    def text_output(self) -> TextOutput:
-        return TextOutput(self._chunk_detokenizer(), self.config.stop_token_ids)
-
     def postprocess(self, output: torch.Tensor, modality: str, request_kwargs: dict | None = None) -> bytes:
         if modality == TEXT:
             return super().postprocess(output, modality, request_kwargs)
@@ -759,18 +743,6 @@ class MiniCPMOModel(Model):
     # Walks
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _prefill_walk(signals: dict[str, list[TensorPointerInfo]]) -> str:
-        has_image = bool(signals.get("pixel_values"))
-        has_audio = bool(signals.get("audio_features"))
-        if has_image and has_audio:
-            return "prefill_omni"
-        if has_image:
-            return "prefill_image"
-        if has_audio:
-            return "prefill_audio"
-        return "prefill_text"
-
     def walk_plan(
         self,
         partition_name: str,
@@ -779,12 +751,10 @@ class MiniCPMOModel(Model):
         input_signals: dict[str, list[TensorPointerInfo]],
         model_kwargs: dict,
     ) -> list[WalkStep]:
-        """Main: one prefill walk over the whole prompt, picked by the
-        attachments it carries, then decode fed the prefill's token. A spoken
-        reply decodes on ``decode_spoken`` instead and then runs the TTS:
-        ``tts_prefill`` over the reply's hidden states, then ``tts_decode``,
-        whose codes stream to the vocoder. The prefill carries the encoders'
-        segment sizes that ``process_prompt`` settled.
+        """Main: the scaffold's prefill and decode. A spoken reply decodes on
+        ``decode_spoken`` instead and then runs the TTS: ``tts_prefill`` over
+        the reply's ids and hiddens, then ``tts_decode``, whose codes stream
+        to the vocoder.
 
         Token2Wav runs a chunk per streamed window, and only for a spoken reply."""
         speech = "audio" in output_modalities
@@ -792,13 +762,14 @@ class MiniCPMOModel(Model):
             if not speech:
                 return []
             return [WalkStep(T2W_CHUNK, step_metadata={"voice": model_kwargs.get("voice") or DEFAULT_VOICE})]
-        settled = {k: model_kwargs[k] for k in self.INTERNAL_KWARGS if k in model_kwargs}
-        prefill = WalkStep(self._prefill_walk(input_signals), step_metadata={FINAL_PREFILL: True, **settled})
+        prefill, decode = super().walk_plan(
+            partition_name, input_modalities, output_modalities, input_signals, model_kwargs,
+        )
         if not speech:
-            return [prefill, WalkStep(DECODE, bind={"text_inputs": "new_token"})]
+            return [prefill, decode]
         return [
             prefill,
-            WalkStep(DECODE_SPOKEN, bind={"text_inputs": "new_token"}),
+            replace(decode, walk=DECODE_SPOKEN),
             WalkStep(TTS_PREFILL),
             WalkStep(TTS_DECODE, bind={"tts_next": "tts_code"}),
         ]
@@ -806,29 +777,6 @@ class MiniCPMOModel(Model):
     # ------------------------------------------------------------------
     # Submodules
     # ------------------------------------------------------------------
-
-    def get_default_sharding_config(self) -> ShardingConfig:
-        return ShardingConfig(groups=[], tp_enabled_nodes={LLM}, shard_dim={})
-
-    def get_submodule(
-        self, node_name: str, device: str = "cpu", tp_group=None,
-        autocast_dtype: torch.dtype | None = None, sp_group=None,
-    ) -> NodeSubmodule | None:
-        if node_name not in self._submodule_cache:
-            self._submodule_cache[node_name] = self._create_submodule(
-                node_name, device, tp_group, autocast_dtype or torch.bfloat16,
-            )
-        return self._submodule_cache[node_name]
-
-    def _weights_dir(self) -> str:
-        if Path(self.model_path_hf).is_dir():
-            return self.model_path_hf
-        from huggingface_hub import snapshot_download
-
-        return snapshot_download(
-            repo_id=self.model_path_hf, cache_dir=self.cache_dir,
-            allow_patterns=["*.safetensors", "*.json", "assets/token2wav/*.pt", "assets/token2wav/*.onnx"],
-        )
 
     def _create_token2wav(self, weights: str, device: str) -> NodeSubmodule:
         t2w = load_token2wav(str(Path(weights) / "assets" / "token2wav"), device=device)
@@ -852,22 +800,20 @@ class MiniCPMOModel(Model):
             module = make()
         return module.to(dtype).to_empty(device=device)
 
-    def _create_submodule(self, node_name: str, device: str, tp_group, dtype: torch.dtype) -> NodeSubmodule | None:
-
+    def _create_submodule(
+        self, node_name: str, device: str, dtype: torch.dtype, tp_group,
+    ) -> NodeSubmodule | None:
         if node_name not in (LLM, VISION, AUDIO, TTS, TOKEN2WAV):
             return None
-        weights = self._weights_dir()
+        weights = self._resolve_weights()
         if node_name == VISION:
-
             tower = self._build(lambda: MiniCPMOVision(self.config.vision, self.config.resampler), dtype, device)
             weight_loader.load_vision_weights(tower, weights, device)
             return VisionEncoderSubmodule(tower.requires_grad_(False).eval(), self.config)
         if node_name == AUDIO:
-
             tower = self._build(lambda: MiniCPMOAudio(self.config.audio), dtype, device)
             weight_loader.load_audio_weights(tower, weights, device)
             return AudioEncoderSubmodule(tower.requires_grad_(False).eval(), self.config)
-
         if node_name == TOKEN2WAV:
             return self._create_token2wav(weights, device)
         if node_name == TTS:
@@ -886,11 +832,12 @@ class MiniCPMOModel(Model):
         from mstar.model.components.qwen3_lm import Qwen3DenseLM
 
         lm = self._build(
-            lambda: Qwen3DenseLM(
-                self.config.llm, attn_key=LLM_ATTN, kv_key=LLM_KV, pos_key=LLM_POS, comm_group=tp_group,
-            ),
+            lambda: Qwen3DenseLM(self.config.llm, attn_key=ATTN, kv_key=KV_CACHE, pos_key=ROPE, comm_group=tp_group),
             dtype, device,
         )
         weight_loader.load_llm_weights(lm, weights, device)
         logger.info("Loaded MiniCPM-o LLM onto %s", device)
-        return LLMSubmodule(lm.requires_grad_(False).eval(), self.config)
+        return MiniCPMOLLM(
+            lm.requires_grad_(False).eval(), self.config, self.encoders,
+            hidden_walks=row_hidden_walks(self.get_graph_walk_graphs(), LLM),
+        )

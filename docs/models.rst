@@ -902,6 +902,15 @@ request with a system prompt of its own is refused (400) unless it sets ``voice_
 false``, which uses the request's ``system_prompt`` instead, as vllm-omni does.
 ``streaming_generate``, video input and full duplex are not supported.
 
+The LLM and its encoders run on the VLM scaffold (``MultimodalDecoderModel``): a prompt prefills as one row on
+``prefill_text``, ``prefill_image``, ``prefill_audio`` or ``prefill_image_audio``, by the media it holds. Image slices
+and audio clips share upstream's ``<unk>`` placeholder; each is one run of the prompt's media layout, which places the
+encoders' rows. ``max_slice_nums`` (1 to 9, default 9) caps the slices an image is cut into. A spoken reply decodes on
+``decode_spoken``, which shares the decode capture and stop with a text reply's ``decode`` and hands the TTS each row's
+input id and hidden state; text prompts and both decode walks share a ``mixed`` step, and a text prompt is keyed for
+the prefix cache. Sampling defaults to upstream's ``chat()``: temperature 0.7, top-p 0.8, top-k 100 and repetition
+penalty 1.02 over the reply only (``penalize_prompt: false``), with ``min_p`` accepted.
+
 ``configs/minicpm_o.yaml`` runs three workers on one GPU (LLM and encoders, TTS, vocoder);
 it sets ``mps: true``, so their kernels overlap (see *Several workers on one GPU* in :doc:`serving`). Each spoken
 reply holds a slot of each ``t2w_*`` resource (~0.4 GiB in all) while it speaks, so their
@@ -910,7 +919,7 @@ three ``t2w_*_kv`` (its sink); startup refuses counts that disagree. The slots d
 back the TTS, which keeps a spoken reply's ``tts_kv`` pages (up to 32) until its last code,
 so ``max_concurrent_requests`` caps the requests in flight and startup refuses a ``tts_kv``
 that can't hold that many full replies: overfilled, the TTS would stall. A reply's LLM
-pages have no such bound, so ``llm_kv`` has host pages (``cpu_offload_pages``): a full
+pages have no such bound, so ``kv_cache`` has host pages (``cpu_offload_pages``): a full
 pool moves a request to the host until those fill. At the cap of 32, with 2048 tokens
 out on an H200 (one run per size), a burst of prompts around 3.7k tokens or longer still
 waits, 2.5k does not (follow-up: reserve a request's whole layout).

@@ -15,9 +15,9 @@ mps: true
 # the TTS holds at once (the vocoder's slots gate only the vocoder), so tts_kv
 # is sized for this many; startup refuses a tts_kv that can't hold them.
 max_concurrent_requests: 32
-# Text and spoken replies decode in one step (`decode_mixed`) rather than taking
-# turns. Mixing is on by default only where the LLM has a token budget, and it
-# has none.
+# Text and spoken replies decode in one step (`mixed`, which text prompts join
+# too) rather than taking turns. Mixing is on by default only where the LLM has
+# a token budget, and it has none.
 speculation_mixes_walks: {LLM: true}
 node_groups:
   - node_names: [LLM, vision_encoder, audio_encoder]
@@ -34,7 +34,7 @@ resources:
   # timed out. At the cap of 32, with 2048 tokens out on an H200 (one run per
   # size), a burst of prompts around 3.7k tokens or longer still waits, 2.5k does
   # not; a wait warns to raise cpu_offload_pages.
-  llm_kv:
+  kv_cache:
     max_num_pages: 384
     cpu_offload_pages: 512
   # The TTS's ~60 KiB/token. A spoken reply's condition and codes fill at most
