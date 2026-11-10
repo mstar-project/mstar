@@ -82,8 +82,9 @@ FIX_SUBJECT = re.compile(r"\b(?:fix(?:e[sd]|ing)?|bugs?|bugfix(?:es)?|revert(?:s
 # author_association values: the team, and the team plus anyone with a merged PR (see the workflow's header).
 TEAM = ("OWNER", "MEMBER", "COLLABORATOR")
 CONTRIBUTORS = (*TEAM, "CONTRIBUTOR")
-# The improvement run, every other day: the days of evidence it reads (its cadence, so issues don't repeat it), how
-# much a reader needs (PRs read, and comments kept per PR; characters of a comment), and what the model returns.
+# The improvement run, every other day: the days of evidence it reads (its cadence, so issues don't repeat it: only
+# comments and reviews dated inside it, and the bot's resolved findings on a PR active inside it), how much a reader
+# needs (PRs read, and comments kept per PR; characters of a comment), and what the model returns.
 IMPROVE_DAYS = 2
 IMPROVE_ITEMS = 30
 IMPROVE_TEXT = 800
@@ -1188,8 +1189,9 @@ def scrub(text):
 
 def pr_evidence(repo, pr, since):
     """What happened on PR `pr` since `since`, for the improvement run: the findings a later review judged moot,
-    its reviews, inline comments and conversation. Logins become a role.
-    A finding someone resolved stays however old it is: GitHub doesn't say when a thread was resolved."""
+    its reviews, inline comments and conversation. Logins become a role. GitHub doesn't say when a thread was
+    resolved, so a finding of the bot's someone resolved is kept, however old, only when the PR is active since
+    `since`: a review or comment from a person or this bot dated inside the window. A quiet PR gives nothing."""
     author = (api(f"repos/{repo}/pulls/{pr}").get("user") or {}).get("login")
     inline, conversation = discussion(repo, pr)
     reviews = [{"user": (r.get("user") or {}).get("login"), "user_type": (r.get("user") or {}).get("type"),
@@ -1197,13 +1199,18 @@ def pr_evidence(repo, pr, since):
                for r in api_list(f"repos/{repo}/pulls/{pr}/reviews?per_page=100")
                if (r.get("user") or {}).get("login") not in BOT_USERS]
 
+    def read(c):  # what a reader sees: not empty, and not another bot's
+        return c.get("body") and not (c.get("user_type") == "Bot" and c["user"] not in POSTING_BOT_USERS)
+
+    active = any(read(c) and (c.get("created_at") or "") >= since for c in [*reviews, *inline, *conversation])
+
     def kept(comments):
         rows = []
         for c in comments:
             mine = c["user"] in POSTING_BOT_USERS
-            if not c.get("body") or (c.get("user_type") == "Bot" and not mine):
+            if not read(c):
                 continue
-            if (c.get("created_at") or "") >= since or (mine and c.get("resolved")):
+            if (c.get("created_at") or "") >= since or (active and mine and c.get("resolved")):
                 rows.append({**{k: c[k] for k in ("id", "path", "line", "in_reply_to_id", "resolved", "outdated",
                                                   "url") if k in c},
                              "role": "bot" if mine else "author" if c["user"] == author else "other",
