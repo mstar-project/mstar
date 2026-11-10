@@ -149,7 +149,7 @@ def test_a_request_no_rebuild_can_write_again_isnt_rebuildable_in_its_pools(monk
     monkeypatch.setattr(manager_mod, "KVTransferManager", _StubTransfer)
     # the streams don't bear on the class, and no resource publishes
     w, _ = _worker(
-        streams=SimpleNamespace(add_request=lambda rid, info: None),
+        streams=SimpleNamespace(add_request=lambda rid, info: None, consumer_node={}),
         wakeup_event=SimpleNamespace(register_futures=lambda futures: None),
     )
     if talker_walk is not None:
@@ -386,7 +386,7 @@ def test_intake_journals_each_log_rank_0s_pool_couldnt_hold_once_the_engine_hold
     rolled a back, and the follower stopped."""
     w, eng = _worker(
         rebuilds=Rebuilds({NODE: POLICY}, _graphs(), HostPool(16, torch.device("cpu"))),
-        streams=SimpleNamespace(add_request=lambda rid, info: None),
+        streams=SimpleNamespace(add_request=lambda rid, info: None, consumer_node={}),
         wakeup_event=SimpleNamespace(register_futures=lambda futures: None),
     )
     journaled, held = [], []
