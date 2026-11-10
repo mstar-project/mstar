@@ -100,7 +100,6 @@ Then set up the box:
 
 ```bash
 python3 $S/gpu.py push <instance> $S/bootstrap.sh '~/'
-python3 $S/gpu.py push <instance> $S/ci_tests.py '~/'
 python3 $S/gpu.py push <instance> .claude/skills/benchmarking/scripts/server.sh '~/'
 python3 $S/gpu.py ssh <instance> 'bash ~/bootstrap.sh <n> --hf-home <hf_home from wait> > ~/bootstrap.log 2>&1; tail -20 ~/bootstrap.log'
 ```
@@ -112,20 +111,6 @@ In cluster mode, run the same script on the cluster with `--workdir` and `--hf-h
 Installing packages and making new venvs is fine, and expected when a check needs them: a PR that changes dependencies, an extra the shared environment lacks (a G2P package, an older `setuptools`), a pinned torch build, or a library version the code requires (e.g. FlashInfer). Build them in the work directory, never in the shared environment, and name them in `harness-notes.md`. A `--no-deps` overlay put first on `PYTHONPATH` is often enough for one package.
 
 A venv with a different torch (or FlashInfer/Triton) version gets its own JIT caches: point `FLASHINFER_WORKSPACE_BASE`, `TORCHINDUCTOR_CACHE_DIR` and `TRITON_CACHE_DIR` at a directory of its own whenever that arm runs. FlashInfer keys its cache by its own version, not torch's, so two torch versions share one directory, rebuild each other's kernels, and hold the build lock while they do. One torch-2.10 arm's first boot (a `gdn_prefill` rebuild) blocked every other Qwen3.5 server on the node until it was stopped. Expect that arm's first boot to recompile everything (20–30 minutes); size its readiness timeout for it.
-
-**Then CI's tests that reach the change, on the GPUs, before any server starts** (they would compete with it for GPU memory). GitHub's CPU Core job skips every test that needs CUDA; here they run, in the PR arm bootstrap built, but only those that reach the change: the whole suite took about 20 minutes of an H200 on #1386, mostly on code the PR never touched. `ci_tests.py` (push it beside `bootstrap.sh`; on the review bot's box it is `main/.claude/skills/live-pr-test/scripts/ci_tests.py`) prints them: of CI's test files (the paths in `scripts/ci/select_cpu_tests.py`, plus the CUDA cases in `test/rust/test_arena_transport.py`), those the PR adds or changes, those under a `conftest.py` it changes, and those that import a module it changes, directly or through the checkout's other modules (a change under `rust/` counts as one to `mstar_rust`). It reads imports statically, so an `importlib` import isn't seen: run a test you know the change reaches by hand. When it prints nothing, skip this step and say in the report's Tests block that no CI test reaches the change. ruff, the dynamo smoke and cargo stay with GitHub's CI: a GPU changes nothing for them.
-
-```bash
-source ~/live-pr/env.sh && arm pr && mkdir -p $LIVE_RESULTS/ci
-python ~/ci_tests.py <base branch> > $LIVE_RESULTS/ci/tests.txt; wc -l < $LIVE_RESULTS/ci/tests.txt
-[ ! -s $LIVE_RESULTS/ci/tests.txt ] || { uv pip install -q pytest-xdist pytest-timeout && HF_HUB_OFFLINE=1 timeout 60m \
-  python -m pytest -p xdist -n 4 --timeout=900 -ra --junitxml=$LIVE_RESULTS/ci/pytest.xml $(cat $LIVE_RESULTS/ci/tests.txt) \
-  > $LIVE_RESULTS/ci/pytest.log 2>&1; }
-```
-
-- Keep `-n` small: every worker lands on `cuda:0`. A test past `--timeout` (15 minutes) fails by name. Exit 124 means one hung somewhere `--timeout` couldn't interrupt, until the outer `timeout`: rerun what the log shows last, as for a failure.
-- Rerun each failure once, serially (`python -m pytest <node id>`, no xdist), in `arm pr`, so contention flakes drop out. Rerun what still fails in `arm main` (run bootstrap again without `--no-main` if the plan skipped that arm). A test that fails on main too is "also fails on main" and doesn't count against the PR. One that only the PR fails makes the verdict Fail.
-- Tests that need more GPUs than the box has, or a checkpoint the box hasn't cached (`HF_HUB_OFFLINE=1`), skip themselves. The report's Tests block says which, from `-ra`.
 
 ## 3. Run
 
