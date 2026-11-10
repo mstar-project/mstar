@@ -873,7 +873,7 @@ class TestEras(unittest.TestCase):
             def ssh(argv, stdin):
                 start = int(argv[-1].split("tail -n +")[1].split()[0])
                 rest = log.splitlines(True)[start - 1:]
-                body = "".join(rest[:50])[:gpu_review.PROGRESS_CAP] if caps else "".join(rest)
+                body = "".join(rest[:50])[:int(argv[-1].split("head -c ")[1])] if caps else "".join(rest)
                 return f"{log.count(chr(10)) if count is None else count} progress.log\n" + body
             printed = io.StringIO()
             with contextlib.redirect_stdout(printed):
@@ -912,6 +912,13 @@ class TestEras(unittest.TestCase):
             with self.subTest(cap=cap):  # a line cut at a cap, a token straddling the cut
                 cut = show_cut("sk-ant-" + "A" * (cap - 26) + " " + hf_token + "\n09:02 c\n")
                 self.assertNotIn("hf_", "".join(cut), "the start of a token the cut split would reach the log")
+                if cap == gpu_review.LINE_CAP:
+                    self.assertEqual(cut[-1], '"09:02 c"', "one long line would swallow the next")
+                exact = show_cut("x" * cap + "\n09:02 c\n")[0]
+                self.assertNotIn("\\u2026", exact, "a line exactly the cap long would be marked cut")
+                with unittest.mock.patch.dict(os.environ, {"ERAS_API_KEY": "eras/k3y+secret=="}):
+                    cut = show_cut("sk-ant-" + "A" * (cap - 17) + " eras/k3y+secret==\n09:02 c\n")
+                self.assertNotIn("eras/", "".join(cut), "the start of an exact key the cut split would reach the log")
 
     def test_a_box_that_left_no_results_reports_the_platforms_reason(self):
         run = {"status": "failed", "failure": {"code": "launch_refused",

@@ -412,10 +412,15 @@ def box_cost(path):
 PROGRESS_CAP = 65536  # bytes of progress.log a poll reads
 
 
+def exact_secrets():
+    """The exact values a box's progress lines are redacted of: the Eras key, the only one this box could hold."""
+    return [os.environ.get("ERAS_API_KEY", "")]
+
+
 def print_progress(lines):
-    """Print the box session's progress lines to the job's log, each redacted (the Eras key, the only exact secret
-    this box could hold, and the credential patterns), then cut and quoted, since the session wrote them."""
-    exact = [os.environ.get("ERAS_API_KEY", "")]
+    """Print the box session's progress lines to the job's log, each redacted (exact_secrets and the credential
+    patterns), then cut and quoted, since the session wrote them."""
+    exact = exact_secrets()
     for line in lines:
         print(bot.log_value(bot.redact(line, exact=exact)[:300]), flush=True)
 
@@ -431,7 +436,7 @@ def show_progress(key, seen):
     def read(start):  # (the file's line count, what follows line `start`), or None
         try:
             r = gpu("ssh", key, f"timeout 60 wc -l {log} && timeout 60 tail -n +{start + 1} {log} | head -n 50 "
-                                f"| head -c {PROGRESS_CAP}", check=False, timeout=120)
+                                f"| head -c {PROGRESS_CAP + 1}", check=False, timeout=120)
             total = int(r.stdout.split(maxsplit=1)[0])
         except (subprocess.TimeoutExpired, ValueError, IndexError):
             return None
@@ -450,20 +455,25 @@ def show_progress(key, seen):
     # wc already counts (so a line still being written isn't shown at every poll).
     tail = lines.pop()
     whole = not lines and len(raw) >= PROGRESS_CAP and total > seen
-    lines = [*lines, *([cut_short(tail)] if tail and whole else [])][:50]
+    ended = raw[PROGRESS_CAP:PROGRESS_CAP + 1] == b"\n"  # exactly the cap long: whole, not cut
+    lines = [*lines, *([tail if ended else cut_short(tail)] if tail and whole else [])][:50]
     print_progress(lines)
     return seen + len(lines)
 
 
 PROGRESS_REST = 1000  # the most lines of what is left of progress.log the end of a run prints
+LINE_CAP = 4096  # the bytes of one such line read; print_progress cuts it shorter after redacting it
+# What a credential pattern's token is made of. The exact secrets needn't be: cut_short strips their starts itself.
 TOKEN_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-"
 
 
 def cut_short(line):
-    """A progress line that was cut short at a cap, before it is redacted: without the run of token characters it
-    ends in, which may be the start of a secret the cut split (too short for the redaction to know), and marked."""
+    """A progress line that was cut short at a cap, before it is redacted, and marked: without what it ends in that
+    may be the start of a secret the cut split (too short for the redaction to know), the longest start of an exact
+    secret (exact_secrets), then a run of token characters."""
+    for value in filter(None, exact_secrets()):
+        line = line[:len(line) - next((k for k in range(len(value) - 1, 0, -1) if line.endswith(value[:k])), 0)]
     return line.rstrip(TOKEN_CHARS) + "…"
-LINE_CAP = 4096  # the bytes of one such line read; print_progress cuts it shorter after redacting it
 
 
 def log_lines(f):
@@ -472,9 +482,9 @@ def log_lines(f):
     doesn't."""
     while line := f.readline(LINE_CAP):
         cut = False
-        if not line.endswith(b"\n"):  # longer than the cap, or the last line, unended
+        if not line.endswith(b"\n"):  # longer than the cap, exactly the cap, or the last line, unended
             while more := f.readline(LINE_CAP):
-                cut = True
+                cut = cut or more != b"\n"
                 if more.endswith(b"\n"):
                     break
         text = line.removesuffix(b"\n").decode("utf-8", "replace")
