@@ -461,6 +461,20 @@ class TestComment(unittest.TestCase):
                 gpu_review.redact({}, temp)
                 self.assertEqual(json.loads((results / "result.json").read_text()).get("verdict"), verdict)
 
+    def test_a_box_with_no_verdict_keeps_the_redacted_tail_of_its_sessions_stderr(self):
+        for verdict, kept in (("unavailable", True), ("pass", False)):
+            with self.subTest(verdict), tempfile.TemporaryDirectory() as temp:
+                results = Path(temp, "lt/amd/results")
+                results.mkdir(parents=True)
+                (results / "result.json").write_text(json.dumps({"verdict": verdict, "summary": "exit 1"}))
+                (results / "claude.err").write_text("x" * 9000 + "\nAPI Error: 401 for key plaintoken123\n")
+                gpu_review.redact({}, temp, s4="plaintoken123")
+                tail = results / "claude.err.tail"
+                self.assertEqual(tail.exists(), kept, "a session that died at once would leave no reason")
+                if kept:
+                    self.assertTrue(tail.read_text().endswith("API Error: 401 for key [REDACTED]\n"))
+                    self.assertLessEqual(len(tail.read_text()), gpu_review.ERR_TAIL)
+
     def test_the_box_key_is_redacted_though_the_job_doesnt_hold_it(self):
         box_key = "sk-ant-api03-" + "Ab1_-" * 8
         with tempfile.TemporaryDirectory() as temp:

@@ -1007,22 +1007,34 @@ def publish(out, pr, head_sha, tag, runner_temp, media_repo, media_token, owner,
                    media_url=f"https://{owner.lower()}.github.io/{media_repo}/pr-{pr}/{tag}")
 
 
+ERR_TAIL = 4096  # how much of a box session's stderr the run's artifact keeps
+
+
 def redact(out, runner_temp, s2="", s3="", s4=""):
     """What the boxes and the providers wrote, redacted in place before anything reads it, so the comment,
     the kept reports and the artifact all get the redacted copy: the exact values of the secrets this job
-    holds (S2-S4), then bot.redact's credential patterns, which also strip a box's own Anthropic key."""
+    holds (S2-S4), then bot.redact's credential patterns, which also strip a box's own Anthropic key. For a box
+    with no pass, partial or fail, the redacted tail of its session's stderr (claude.err.tail, for the artifact),
+    so a session that died at once leaves its reason."""
     exact = (s2, s3, s4)
     for box in boxes(Path(runner_temp, "lt")):
         for f in (box / "results/report.md", box / "unavailable.md"):
             if f.is_file():
                 f.write_text(bot.redact(f.read_text(), exact=exact))
-        verdict = box / "results/result.json"
-        if verdict.is_file():  # the box wrote this: unreadable counts as no verdict
+        result, fields = box / "results/result.json", {}
+        if result.is_file():  # the box wrote this: unreadable counts as no verdict
             try:
-                fields = json.loads(verdict.read_text())
-                verdict.write_text(json.dumps(bot.redact_fields(fields if isinstance(fields, dict) else {}, exact)))
+                fields = json.loads(result.read_text())
+                fields = bot.redact_fields(fields if isinstance(fields, dict) else {}, exact)
             except (ValueError, RecursionError):
-                verdict.write_text("{}")
+                fields = {}
+            result.write_text(json.dumps(fields))
+        err = box / "results/claude.err"
+        if err.is_file() and fields.get("verdict") not in ("pass", "partial", "fail"):
+            tail = bot.redact(err.read_text(errors="replace"), exact=exact)  # whole, so no secret is cut in two
+            if len(tail) > ERR_TAIL:
+                tail = tail[-ERR_TAIL:].partition("\n")[2]
+            (box / "results/claude.err.tail").write_text(tail)
 
 
 def post(out, pr, head_sha, runner_temp, run_url, trusted="", gated="", approve_outcome=""):

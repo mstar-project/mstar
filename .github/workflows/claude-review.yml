@@ -714,6 +714,7 @@ jobs:
           path: |
             ${{ runner.temp }}/lt/*/results/report.md
             ${{ runner.temp }}/lt/*/results/result.json
+            ${{ runner.temp }}/lt/*/results/claude.err.tail
           retention-days: 30
           if-no-files-found: ignore
 
