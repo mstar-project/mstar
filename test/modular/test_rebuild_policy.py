@@ -35,7 +35,7 @@ from mstar.model.rebuild import RebuildPolicy
 from mstar.model.submodule_base import HostRows, chunk_loop_name
 from mstar.worker.host_copies import _LazyHostOutputs
 from mstar.worker.host_pool import HostCopy, HostPool, HostSlice, aligned
-from mstar.worker.rebuild import HostCopies, KeptIds, LogRoom, NodeWrites, Prefilling, Rebuilds, policies_run_here
+from mstar.worker.rebuild import KeptIds, LogRoom, MediaCopies, NodeWrites, Prefilling, Rebuilds, policies_run_here
 
 NODE, PREFILL, VISION, DECODE, MIXED = "LLM", "prefill", "vision", "decode", "mixed"
 R, A, B = 7, 8, 9
@@ -296,8 +296,8 @@ def test_a_request_no_drop_can_free_keeps_no_ids(why):
     assert R not in rebuilds._kept[NODE], f"a request kept its ids though {why}"
 
 
-def _media(prompt=(1,), *sampled: int, copies: HostCopies | None = None) -> KeptIds:
-    return replace(_kept(prompt, *sampled), walk=VISION, copies=HostCopies() if copies is None else copies)
+def _media(prompt=(1,), *sampled: int, copies: MediaCopies | None = None) -> KeptIds:
+    return replace(_kept(prompt, *sampled), walk=VISION, copies=MediaCopies() if copies is None else copies)
 
 
 def _copying(*rids: int) -> Rebuilds:
@@ -320,7 +320,7 @@ def test_a_prompt_with_images_keeps_its_ids_as_its_walk_read_them_and_waits_for_
     assert kept.prompt.view.tolist() == [1, 2, 3, 4, 5] and kept.lengths == (3, 2), (
         "the rebuild row would read other text"
     )
-    assert kept.walk == VISION and kept.copies == HostCopies(6), "a rebuild row would leave out the image"
+    assert kept.walk == VISION and kept.copies == MediaCopies(6), "a rebuild row would leave out the image"
     kept.sampled.append(6)
     assert "haven't landed" in rebuilds.refusal(R, NODE, DECODE, {}, None), (
         "a drop would leave nothing to rebuild the image"
@@ -588,7 +588,7 @@ def test_the_copy_back_waits_for_the_step_that_reads_it():
     waited. The copy back runs when the row's step is built, and only that step waits for it."""
     pool = _CountingPool()
     rebuilds = Rebuilds({NODE: MEDIA}, _graphs(), pool, StepAllowance())
-    copies = HostCopies(inputs={"embeds": [torch.ones(6, 2)]})
+    copies = MediaCopies(inputs={"embeds": [torch.ones(6, 2)]})
     rebuilds._kept[NODE][R] = replace(_media([1, 2, 3, 4, 5], 6, copies=copies), lengths=(3, 2))
 
     rebuilds.start(R, NODE, None)
@@ -630,7 +630,7 @@ def test_a_request_removed_with_copies_queued_leaves_the_next_owner_of_its_slice
 def test_a_rebuild_of_a_prompt_with_images_reads_its_copies_under_its_prefills_metadata():
     rebuilds = Rebuilds({NODE: MEDIA}, _graphs(), HostPool(1 << 10, torch.device("cpu")), StepAllowance(), DTYPES)
     embeds, metadata = torch.ones(6, 2), {"prefill_order": ("text", "image", "text")}
-    copies = HostCopies(inputs={"embeds": [embeds]})
+    copies = MediaCopies(inputs={"embeds": [embeds]})
     rebuilds._kept[NODE][R] = replace(
         _media([1, 2, 3, 4, 5], 6, 7, copies=copies), lengths=(3, 2), step_metadata=metadata,
     )

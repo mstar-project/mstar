@@ -36,7 +36,7 @@ from mstar.worker import worker as worker_mod
 from mstar.worker.executing_batch import build_executing_batch
 from mstar.worker.host_pool import HostCopy, HostPool
 from mstar.worker.micro_scheduler import CHAIN_LANE, SIDE_LANE, ScheduledBatch
-from mstar.worker.rebuild import HostCopies, KeptIds, LogRoom, NodeWrites, Prefilling, RebuildCursor, Rebuilds
+from mstar.worker.rebuild import KeptIds, LogRoom, MediaCopies, NodeWrites, Prefilling, RebuildCursor, Rebuilds
 from mstar.worker.speculation import Speculation
 from mstar.worker.step_executor import PendingBatch
 from mstar.worker.stream_buffers import StreamBufferManager
@@ -196,7 +196,7 @@ def test_a_request_with_images_that_samples_a_pad_id_never_leaves_an_older_one_w
     w.engine_manager.engine = SimpleNamespace(paged_kv_caches=lambda: [PagedKVCache("kv", frozenset({node}), kv)])
     preempting(w)
     w._rebuilds._policies = {node: replace(POLICY, pad_ids=frozenset({90}))}
-    w._rebuilds._kept, w._rebuilds._keeps_ids = {node: {A: replace(_kept(), copies=HostCopies())}}, {node: {}}
+    w._rebuilds._kept, w._rebuilds._keeps_ids = {node: {A: replace(_kept(), copies=MediaCopies())}}, {node: {}}
     batch = _step((R, A), walk, node, rebuild=None)
     eng.prepare_inputs(batch)
     pending = PendingBatch(ScheduledBatch(node, walk, {R: 0, A: 0}), batch, node, "p", walk, Future())
@@ -222,7 +222,7 @@ def test_postprocess_keeps_a_host_copy_of_what_a_prefill_row_read_besides_its_id
     w, node, walk = _worker(eng, _Runtime(), (R, 1, 2)), "vocoder", "w"
     w._rebuilds._policies = {node: replace(POLICY, walks=frozenset({walk}))}
     w._rebuilds._copied = {node: {walk: frozenset({"embeds"})}}
-    w._rebuilds._kept = {node: {1: replace(_kept(), walk=walk, copies=HostCopies())}}
+    w._rebuilds._kept = {node: {1: replace(_kept(), walk=walk, copies=MediaCopies())}}
     w._rebuilds._pool, w._rebuilds._allowance = (pool := HostPool(1 << 10, torch.device("cpu"))), StepAllowance()
     w._rebuilds._keeps_ids = {node: {1: LogRoom(pool.take(64), 0, 0)}}
     embeds = {rid: torch.full((2,), rid) for rid in (R, 1, 2)}

@@ -39,7 +39,7 @@ DEFAULT_REBUILD_MEDIA_HOST_MB = 1024
 
 
 @dataclass(slots=True)
-class HostCopies:
+class MediaCopies:
     """Host copies of what a request's prefill walk read besides its ids, for the request's rebuild row, which fill
     ``slots`` of its KV besides those its ids fill, none when the walk read a pad id at each. Empty until the row's
     step has run. ``queued`` counts the tensors whose copy hasn't started, and ``landed`` is recorded after the last
@@ -64,7 +64,7 @@ class KeptIds:
     sampled: array
     step_metadata: dict
     lengths: tuple[int, ...] | None = None
-    copies: HostCopies | None = None
+    copies: MediaCopies | None = None
 
 
 class LogRoom(NamedTuple):
@@ -80,7 +80,7 @@ class QueuedCopy(NamedTuple):
     src: torch.Tensor
     into: HostSlice
     after: torch.Event | None
-    copies: HostCopies
+    copies: MediaCopies
 
 
 class Prefilling(NamedTuple):
@@ -106,7 +106,7 @@ class RebuildCursor:
     ids: array | None = None
     dtype: torch.dtype | None = None
     lengths: tuple[int, ...] | None = None
-    copies: HostCopies | None = None
+    copies: MediaCopies | None = None
     step_metadata: dict | None = None
     done: int = 0
     ran: int = 0
@@ -336,7 +336,7 @@ class Rebuilds:
                 HostCopy(prompt, copy.landed), row_walk, array("i"),
                 dict(node_batch.per_request_info[rid].step_metadata),
                 tuple(map(len, tensors)) if len(tensors) > 1 else None,
-                HostCopies(0 if length == room.slots else room.slots - room.ids) if copies else None,
+                MediaCopies(0 if length == room.slots else room.slots - room.ids) if copies else None,
             )
             if not copies:
                 self._trim(node, rid, aligned(prompt.nbytes))
