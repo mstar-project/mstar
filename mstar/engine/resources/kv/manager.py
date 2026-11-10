@@ -215,15 +215,16 @@ class SpanCursor:
 class Lease:
     """The pages the index matched for a stream and holds for it, from the probe until `admit` converts
     them: in each group of its pool, the first group's first, the pages a stream holds once it has written
-    ``end`` tokens (`KVManager._kept`). In a pool of one group, a hit past a cached image end ends at that
-    image, and the first group's pages then also hold the cached partial page and the page it is copied
-    onto. That copy stays leased past `admit`, until `plan` copies it."""
+    ``end`` tokens (`KVManager._kept`), whole pages only. In a pool of one group, a hit past a cached image end
+    ends at that image, inside a page, and ``image_end`` holds the cached partial page and the page it is
+    copied onto. After `admit` a lease holds only the cached partial page, until `plan` copies it."""
     end: int
     groups: list[list[int]]
+    image_end: list[int] = field(default_factory=list)
 
     def pages(self) -> list[int]:
-        """Every page it holds, group by group."""
-        return [page for group in self.groups for page in group]
+        """Every page it holds, group by group, then its image end."""
+        return [*(page for group in self.groups for page in group), *self.image_end]
 
 
 @dataclass(slots=True)
@@ -892,6 +893,7 @@ class KVManager(AttentionResource):
                 # If an image ends inside the next page, look up its cached partial page. Not with windows: the
                 # hit would end inside a page of each window group too.
                 image_end = None if self._windows else self._image_end(ends, held, total)
+                copied = []
                 if image_end is not None:
                     end, key = image_end
                     cached = self._retain_cached(rid, stream, self._index.lookup([key]))
@@ -902,14 +904,14 @@ class KVManager(AttentionResource):
                         if own is None:
                             self._release(rid, stream, cached)
                         else:
-                            matched, held = [matched[0] + cached + own], end
+                            copied, held = cached + own, end
                 if not stream.prefix_counted:
                     stream.prefix_counted = True
                     # one assignment, so a reader on another thread never sees half of it
                     queried, hit = self.prefix_tokens.get(node_name, (0, 0))
                     self.prefix_tokens[node_name] = (queried + total, hit + held)
                 if held:
-                    stream.lease = Lease(held, matched)
+                    stream.lease = Lease(held, matched, copied)
                     self._recount(rid)
             return True
 
@@ -2142,17 +2144,18 @@ class KVManager(AttentionResource):
                         "the pages the lease holds for it"
                     )
                     lease = stream.lease
-                    whole = lease.end // self.config.tokens_per_page
-                    first = lease.groups[0]
                     # the first group's whole pages, then past a cached image end the page it is copied onto
                     self._adopt(
-                        segment.request_id, stream, [first[:whole] + first[whole + 1:], *lease.groups[1:]], lease.end,
+                        segment.request_id, stream, [lease.groups[0] + lease.image_end[1:], *lease.groups[1:]],
+                        lease.end,
                     )
                     stream.stored_len = lease.end
                     # they came out of the index, so they are already in it
-                    stream.chain.cursor = whole
+                    stream.chain.cursor = len(lease.groups[0])
                     # A cached image end stays leased until `plan` copies it on the step's stream.
-                    stream.lease = Lease(lease.end, [first[whole:whole + 1]]) if len(first) > whole else None
+                    stream.lease = (
+                        Lease(lease.end, [[] for _ in lease.groups], lease.image_end[:1]) if lease.image_end else None
+                    )
                     if stream.lease is not None:
                         self._image_ends.append((segment.request_id, stream))
                     stream.converted = True
@@ -2836,7 +2839,7 @@ class KVManager(AttentionResource):
                     continue
                 if stream.lease is not None and stream.stored_len:
                     whole, end = divmod(stream.stored_len, self.config.tokens_per_page)
-                    self.kv_cache.copy_slots(stream.lease.groups[0][0], stream.page_indices[whole], end)
+                    self.kv_cache.copy_slots(stream.lease.image_end[0], stream.page_indices[whole], end)
                 # no walk writes the cached image end, so releasing it also shrinks the allotment
                 self._release_lease(rid, stream, refund=False)
                 self._recount(rid)
