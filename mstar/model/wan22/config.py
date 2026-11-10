@@ -64,7 +64,7 @@ class Wan22Config:
     default_negative_prompt: str = ""
     video_fps: int = 24
 
-    # Ceiling on the denoise loop; the per-request step count is clamped to it.
+    # The denoise loop's max_iters; the conductor refuses a num_inference_steps past it.
     max_denoise_steps: int = 100
 
     # Ceiling on a request's height x width x num_frames (about 3.6x the default

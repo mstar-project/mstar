@@ -92,7 +92,7 @@ def test_what_samples_greedily(kw, greedy):
     (FUSED_SAMPLE_MAX_VOCAB, True, True),
 ])
 def test_a_sampler_runs_lean_by_its_vocabulary_unless_its_spec_says_otherwise(vocab_size, greedy_capture, lean):
-    sampler = _sampler(vocab_size, greedy_capture=greedy_capture, enable_repetion_penalty=vocab_size is not None)
+    sampler = _sampler(vocab_size, greedy_capture=greedy_capture, enable_repetition_penalty=vocab_size is not None)
     assert sampler.lean_capture is lean and sampler.resource_key == "sampler"
 
 

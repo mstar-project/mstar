@@ -29,7 +29,7 @@ from mstar.engine.resources import NodeResourceSpec, RaggedAttentionConfig, Ragg
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import Model, WalkStep
-from mstar.model.components.diffusion.image_io import encode_image, image_output_format
+from mstar.model.components.diffusion.image_io import OUTPUT_FORMAT_KWARGS, encode_image, image_output_format
 from mstar.model.components.diffusion.qwen3.submodule import TEXT_INPUTS
 from mstar.model.components.quant_linear import (
     check_linear_dtype,
@@ -189,8 +189,8 @@ class ZImageModel(Model):
         return enc["input_ids"][0].to(torch.long)
 
     def _resolve_size(self, model_kwargs: dict) -> tuple[int, int]:
-        height = int(model_kwargs.get("height", self.config.default_height))
-        width = int(model_kwargs.get("width", self.config.default_width))
+        height = model_kwargs.get("height", self.config.default_height)
+        width = model_kwargs.get("width", self.config.default_width)
         align = self.config.spatial_alignment
         # the rotary table has one row per token along each image axis (axes 1 and 2)
         axes = self.config.transformer.axes_lens
@@ -207,13 +207,15 @@ class ZImageModel(Model):
         return height, width
 
     def _resolve_steps(self, model_kwargs: dict) -> int:
-        steps = int(model_kwargs.get("num_inference_steps", self.config.default_num_inference_steps))
-        if steps < 1:
-            raise ValueError(f"num_inference_steps must be >= 1, got {steps}")
-        return min(steps, self.config.max_denoise_steps)
+        return model_kwargs.get("num_inference_steps", self.config.default_num_inference_steps)
+
+    def request_kwargs(self) -> frozenset[str]:
+        # guidance_scale is read only to log that the distilled checkpoint ignores it
+        return frozenset({"height", "width", "num_inference_steps", "guidance_scale", *OUTPUT_FORMAT_KWARGS})
 
     def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
-        # the loop ends on the request's own step count, and is never speculated past it
+        # the loop ends on the request's own step count, and is never speculated past it;
+        # past the loop's max_iters the conductor refuses the request
         return {DENOISE_LOOP: self._resolve_steps(model_kwargs)}
 
     def process_prompt(
@@ -229,7 +231,7 @@ class ZImageModel(Model):
         self._resolve_size(kwargs)
         self._resolve_steps(kwargs)
         image_output_format(kwargs)  # fail a bad output knob now, not after the denoise
-        if float(kwargs.get("guidance_scale", 0.0)) > 0.0:
+        if kwargs.get("guidance_scale", 0.0) > 0.0:
             logger.info("guidance_scale is ignored: Z-Image-Turbo is distilled and runs without CFG")
         return {TEXT_INPUTS: [self.tokenize(prompt)]}
 

@@ -1541,3 +1541,8 @@ def test_postprocess_emits_the_step_s_frames_as_raw_rgb_bytes(model, config):
         model.postprocess(frames.float(), "video_frame")
     with pytest.raises(ValueError, match="modality"):
         model.postprocess(frames, "image")
+
+
+def test_request_kwargs_are_the_keys_process_prompt_reads(model):
+    # num_steps is read only to refuse it (test above); actions drives the frames
+    assert model.request_kwargs() == {"num_steps", "actions"}

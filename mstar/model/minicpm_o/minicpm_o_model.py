@@ -150,6 +150,11 @@ VOICE_PROMPT_SUFFIX = (
 
 # Upstream's `chat` defaults when sampling.
 DEFAULT_SAMPLING = dict(temperature=0.7, top_p=0.8, top_k=100, repetition_penalty=1.02)
+# the sampler knobs a request may set
+SAMPLING_KEYS = (
+    "temperature", "top_p", "top_k", "min_p", "repetition_penalty", "ignore_eos",
+    "return_logprobs", "logprobs_mode",
+)
 
 
 
@@ -276,7 +281,7 @@ class MiniCPMOModel(Model):
             ),
             SamplerSpec(
                 resource_key=LLM_SAMPLER, nodes={LLM},
-                vocab_size=llm.vocab_size, enable_repetion_penalty=True,
+                vocab_size=llm.vocab_size, enable_repetition_penalty=True,
                 # upstream's `chat` hands min_p to HF `generate`, which honours it
                 enable_min_p=True,
             ),
@@ -388,7 +393,7 @@ class MiniCPMOModel(Model):
             # upstream's TTS sampling (see TTSSubmodule)
             SamplerSpec(
                 resource_key=TTS_SAMPLER, nodes={TTS},
-                vocab_size=tts.num_audio_tokens, enable_repetion_penalty=False,
+                vocab_size=tts.num_audio_tokens, enable_repetition_penalty=False,
                 max_repetition_window=TTS_SAMPLING.penalty_window,
                 min_tokens_stop_ids=(tts.eos_code,),
                 enable_top_p_first=True,
@@ -398,11 +403,7 @@ class MiniCPMOModel(Model):
     def get_request_resource_configs(
         self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
     ) -> dict[str, ResourceReqConfig]:
-        keys = (
-            "temperature", "top_p", "top_k", "min_p", "repetition_penalty", "ignore_eos",
-            "return_logprobs", "logprobs_mode",
-        )
-        knobs = {**DEFAULT_SAMPLING, **{k: model_kwargs[k] for k in keys if k in model_kwargs}}
+        knobs = {**DEFAULT_SAMPLING, **{k: model_kwargs[k] for k in SAMPLING_KEYS if k in model_kwargs}}
         tts = TTS_SAMPLING
         return {
             # upstream generates from embeddings, so its penalty sees only generated tokens
@@ -413,6 +414,11 @@ class MiniCPMOModel(Model):
                 min_tokens=tts.min_new_tokens, top_p_first=True, top_p_min_keep=tts.top_p_min_keep,
             ),
         }
+
+    def request_kwargs(self) -> frozenset[str]:
+        return frozenset(
+            {*SAMPLING_KEYS, "enable_thinking", "max_slice_nums", "system_prompt", "voice", "voice_prompt"}
+        )
 
     # ------------------------------------------------------------------
     # Graph

@@ -30,6 +30,7 @@ Prompt (the reference SDK's chat template, system turn included):
 """
 
 import logging
+from collections.abc import Mapping
 
 import torch
 
@@ -45,10 +46,16 @@ from mstar.engine.resources import (
     RaggedAttentionSpec,
     ResourceReqConfig,
     SamplerSpec,
-    SamplingReqConfig,
 )
 from mstar.model.components.audio_features import LogMelSpectrogram
-from mstar.model.components.request_kwargs import checked_request_kwargs
+from mstar.model.components.request_kwargs import (
+    GREEDY_SAMPLING,
+    SAMPLING_KEYS,
+    checked_request_kwargs,
+    sampler_capabilities,
+    sampling_config,
+    sampling_defaults,
+)
 from mstar.model.multimodal import TEXT, MediaEncoder, PromptPart
 from mstar.model.multimodal_decoder import MediaIntake, MultimodalDecoderModel, PreparedMedia
 from mstar.model.qwen3_asr.config import (
@@ -90,6 +97,9 @@ class Qwen3ASRModel(MultimodalDecoderModel):
     # ``resources:`` in their YAML.
     KV_PAGES = 1024
 
+    # greedy, as the reference decodes, under the checkpoint's generation_config.json; set by __init__
+    sampling_defaults: Mapping[str, object] = GREEDY_SAMPLING
+
     def __init__(
         self,
         model_path_hf: str,
@@ -98,6 +108,7 @@ class Qwen3ASRModel(MultimodalDecoderModel):
     ):
         super().__init__(model_path_hf, cache_dir)
         self.config = Qwen3ASRModelConfig.from_pretrained(self.local_dir)
+        self.sampling_defaults = sampling_defaults(self.local_dir)
         self.AUDIO_INPUT_RATE = self.config.sampling_rate
         self.MAX_AUDIO_SECONDS = self.config.max_audio_seconds
 
@@ -164,27 +175,18 @@ class Qwen3ASRModel(MultimodalDecoderModel):
             SamplerSpec(
                 resource_key=SAMPLER, nodes={LLM_NODE},
                 vocab_size=text.vocab_size,
-                # the reference decodes greedily and exposes no penalty knob
-                enable_repetion_penalty=False,
+                **sampler_capabilities(self.sampling_defaults),
             ),
         ]
 
     def request_kwargs(self) -> frozenset[str]:
-        # the scaffold's sampler knobs are not this model's: it reads these alone
-        return frozenset({"temperature", "top_p", "ignore_eos", "language", "initial_prompt", "assistant_prefix"})
+        return frozenset({"language", "initial_prompt", "assistant_prefix", "max_output_tokens", *SAMPLING_KEYS})
 
     def get_request_resource_configs(
         self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
     ) -> dict[str, ResourceReqConfig]:
         del input_modalities, output_modalities
-        kw = checked_request_kwargs(model_kwargs)
-        return {
-            SAMPLER: SamplingReqConfig(
-                temperature=kw.get("temperature", 0.0),
-                top_p=kw.get("top_p", 1.0),
-                ignore_eos=kw.get("ignore_eos", False),
-            )
-        }
+        return {SAMPLER: sampling_config(self.sampling_defaults, model_kwargs)}
 
     # -------------------------------------------------------------------
     # Serving config and budget
@@ -271,7 +273,7 @@ class Qwen3ASRModel(MultimodalDecoderModel):
         # One placeholder in the text, expanded in ids by intake: tokenizing
         # thousands of repeated special tokens is slow and adds nothing.
         ids = self.tokenizer.encode(
-            self.prompt_text(1, context, language, kwargs.get("assistant_prefix") or ""),
+            self.prompt_text(1, context, language, kw.get("assistant_prefix") or ""),
             add_special_tokens=False,
         )
         if ids.count(self.config.audio_token_id) != 1:

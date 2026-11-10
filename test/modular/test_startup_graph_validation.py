@@ -868,7 +868,7 @@ def _voxcpm2(name, model_kwargs, tmp_path, monkeypatch):
 
 def _whisper(name, model_kwargs, tmp_path, monkeypatch):
     from mstar.model.whisper.whisper_model import WhisperModel, WhisperModelConfig
-    return _bare(WhisperModel, config=WhisperModelConfig())
+    return _bare(WhisperModel, config=WhisperModelConfig(), sampling_defaults={})
 
 
 def _canary(name, model_kwargs, tmp_path, monkeypatch):

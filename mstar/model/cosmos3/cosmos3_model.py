@@ -30,10 +30,10 @@ Edge checkpoints add the reasoner (the understanding tower served as a VLM):
     reasoner       (kv_cache, sampler, rope) - the same transformer instance
                                  as the DiT (one copy of the text weights, the
                                  same KV pool), run as a causal text model.
-    reasoner_prefill / reasoner_prefill_vision - embed the chat-templated
-                 prompt (vision tokens scattered over the media placeholders),
-                 write its K/V, sample the first token.
-    reasoner_decode - one token per loop iteration until EOS / max tokens.
+    prefill_text / prefill_vision - embed the chat-templated prompt (vision
+                 tokens spliced in at the media placeholders), write its K/V,
+                 sample the first token.
+    decode - one token per iteration of decode_loop until EOS / max tokens.
 
 Streaming rollout (opt-in, ``enable_windowed_video``; ported from #198):
     video_gen_ar - the denoise loop run window by window over a long clip.
@@ -60,7 +60,7 @@ from pathlib import Path
 import torch
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import FINAL_PREFILL, PartitionDefinition
+from mstar.conductor.request_info import PartitionDefinition
 from mstar.distributed.base import ShardingConfig
 from mstar.engine.resources import (
     AttentionConfig,
@@ -76,6 +76,8 @@ from mstar.engine.resources import (
     SamplerSpec,
     SamplingReqConfig,
 )
+from mstar.engine.resources.attn.ragged.config import RaggedAttentionConfig, RaggedAttentionSpec, RaggedAttnBackend
+from mstar.engine.resources.spec import CombinedSplit
 from mstar.engine.windowing import WindowSchedule
 from mstar.graph.base import (
     GraphEdge,
@@ -127,7 +129,7 @@ from mstar.model.cosmos3.submodules import (
     latent_frames,
     sound_frames,
 )
-from mstar.model.keys import ROPE
+from mstar.model.keys import MIXED, ROPE, VISION_ATTN
 from mstar.model.media_limits import UndecodableMediaError, VideoBudget
 from mstar.model.multimodal import (
     MEDIA_LAYOUT,
@@ -135,8 +137,12 @@ from mstar.model.multimodal import (
     MediaEncoder,
     PromptPart,
     check_attachments,
+    media_prefill_step,
+    media_walks,
     parts_from_modalities,
 )
+from mstar.model.submodule_base import ChunkingPolicy
+from mstar.model.utils import load_generation_defaults
 from mstar.streaming.chunk_policy import FixedChunkPolicy
 from mstar.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
 
@@ -148,8 +154,91 @@ VAE_DECODER_NODE = "vae_decoder"
 AUDIO_DECODER_NODE = "audio_decoder"
 VAE_DECODER_AR_NODE = "vae_decoder_ar"
 VISION_ENCODER_NODE = "vision_encoder"
+# A mixed step's prompt rows, text or media, take the prefill kernels
+REASONER_MIXED_SPLIT = CombinedSplit(
+    MIXED, prefill_walks=(constants.REASONER_PREFILL_WALK, constants.REASONER_PREFILL_VISION_WALK),
+)
 REASONER_NODE = "reasoner"
 
+# every request key the model reads; the Cosmos3 adapters map onto these names
+_REQUEST_KWARGS = frozenset({
+    # reasoner (text output)
+    "temperature", "top_k", "top_p", "min_p", "repetition_penalty", "penalize_prompt",
+    "ignore_eos", "max_output_tokens", "seed", "enable_thinking", "system_prompt",
+    "video_num_frames", "video_fps",
+    # generation (image / video / action)
+    "size", "width", "height", "num_frames", "fps", "num_inference_steps", "guidance_scale",
+    "guidance_interval", "flow_shift", "use_karras_sigmas", "max_sequence_length",
+    "negative_prompt", "use_system_prompt", "use_resolution_template", "use_duration_template",
+    "condition_frame_indexes_vision", "condition_video_keep",
+    "action_mode", "action_chunk_size", "action_fps", "action", "domain_id", "domain_name",
+    "raw_action_dim", "robot_state", "generate_sound", "sound_gen", "sound_duration",
+    "window_mode", "window_frames", "overlap_frames", "context_frames", "stream_video",
+    "session_id", "resume_session", "end_session", "session_timeout_s",
+})
+
+# the loops built with max_iters = max_inference_steps, one iteration per step; not the windowed one
+DENOISE_LOOPS = (IMAGE_GEN_LOOP, VIDEO_GEN_LOOP, VIDEO_SOUND_GEN_LOOP, ACTION_GEN_LOOP, ACTION_VIDEO_GEN_LOOP)
+
+
+def _int_kwarg(mk: dict, key: str, default, lo: int | None = None, hi: int | None = None):
+    """A request integer (a whole float such as ``16.0`` counts), strictly typed;
+    ``ValueError`` outside ``[lo, hi]``."""
+    value = mk.get(key)
+    if value is None:
+        return default
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"Cosmos3 {key} must be an integer; got {value!r}.")
+    if (lo is not None and value < lo) or (hi is not None and value > hi):
+        bounds = f"in [{lo}, {hi}]" if hi is not None else f">= {lo}"
+        raise ValueError(f"Cosmos3 {key} must be {bounds}; got {value}.")
+    return value
+
+
+def _num_kwarg(mk: dict, key: str, default, positive: bool = False):
+    """A request number (int or float), strictly typed; finite, optionally > 0."""
+    value = mk.get(key)
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"Cosmos3 {key} must be a finite number; got {value!r}.")
+    if positive and not (math.isfinite(value) and value > 0):
+        raise ValueError(f"Cosmos3 {key} must be positive and finite; got {value!r}.")
+    if not math.isfinite(value):
+        raise ValueError(f"Cosmos3 {key} must be a finite number; got {value!r}.")
+    return float(value)
+
+
+def _bool_kwarg(mk: dict, key: str, default=False):
+    """A request boolean; strings like ``"false"`` are refused, not truthy."""
+    value = mk.get(key)
+    if value is None:
+        return default
+    if not isinstance(value, bool):
+        raise ValueError(f"Cosmos3 {key} must be true or false; got {value!r}.")
+    return value
+
+
+def _str_kwarg(mk: dict, key: str, default=None):
+    """A request string, strictly typed."""
+    value = mk.get(key)
+    if value is None:
+        return default
+    if not isinstance(value, str):
+        raise ValueError(f"Cosmos3 {key} must be a string; got {value!r}.")
+    return value
+
+
+def _parse_size(size) -> tuple[int, int]:
+    """``"WxH"`` with positive integer sides, else ``ValueError``."""
+    parts = size.lower().split("x") if isinstance(size, str) else []
+    if len(parts) == 2 and all(p.strip().isdigit() for p in parts):
+        width, height = int(parts[0]), int(parts[1])
+        if width > 0 and height > 0:
+            return width, height
+    raise ValueError(f"Cosmos3 size must be 'WIDTHxHEIGHT' with positive integers; got {size!r}.")
 
 
 class Cosmos3Model(Model):
@@ -165,8 +254,9 @@ class Cosmos3Model(Model):
     # the output modality that picks the loop and its step count
     DENOISE_CAP = "denoise_cap"
     # and the width of a policy request's robot_state, which process_prompt
-    # hands the conductor (the values themselves ride the action_inputs edge)
-    INTERNAL_KWARGS = (DENOISE_CAP, "robot_state_dim", "action_shape")
+    # hands the conductor (the values themselves ride the action_inputs edge),
+    # and a reasoner prompt's media layout
+    INTERNAL_KWARGS = (DENOISE_CAP, "robot_state_dim", "action_shape", MEDIA_LAYOUT)
 
     PREFILL_WALK = constants.PREFILL_WALK
     PREFILL_COND_WALK = constants.PREFILL_COND_WALK
@@ -206,6 +296,11 @@ class Cosmos3Model(Model):
                 "block-causally, and a kv rollout can leave the conditioning image within a "
                 "few windows. Prefer window_mode='chained', the default for stream_video."
             )
+        # reasoner sampling defaults the checkpoint ships; the config is the fallback
+        local = self._repo_dir or Path(model_path_hf)
+        self._generation_defaults = (
+            load_generation_defaults(local) if self._reasoner_enabled() and local.is_dir() else {}
+        )
 
         self._submodule_cache: dict[str, torch.nn.Module | None] = {}
         # The Wan VAE is shared between the DiT submodule (conditioning encode)
@@ -292,6 +387,16 @@ class Cosmos3Model(Model):
     # Model ABC: structure
     # ------------------------------------------------------------------
 
+    def _reasoner_sampler_spec(self) -> SamplerSpec:
+        """The reasoner's sampler; its min-p filter is on when the checkpoint
+        defaults min_p, so that default is not refused."""
+        return SamplerSpec(
+            resource_key=SAMPLER, nodes={REASONER_NODE},
+            vocab_size=self.config.vocab_size,
+            enable_repetition_penalty=True,
+            enable_min_p=bool(getattr(self, "_generation_defaults", {}).get("min_p")),
+        )
+
     def get_node_resources(self) -> list[NodeResourceSpec]:
         """The DiT's KV cache and the attention backends over it.
 
@@ -334,19 +439,19 @@ class Cosmos3Model(Model):
                 nodes=kv_nodes,
                 config=AttentionConfig(
                     kv_cache=KV_CACHE, backend=AttnBackend.AUTO,
+                    # only the reasoner runs mixed (prompt + decode) steps
+                    splits=(REASONER_MIXED_SPLIT,) if self._reasoner_enabled() else (),
                 ),
             ),
         ]
         if self._reasoner_enabled():
-            specs.append(SamplerSpec(
-                resource_key=SAMPLER, nodes={REASONER_NODE},
-                vocab_size=self.config.vocab_size,
-                enable_repetion_penalty=True,
-            ))
-            # only the counter: the tower builds its mRoPE tables from the ids
+            specs.append(self._reasoner_sampler_spec())
+            # The reasoner's position counter. Its layers apply the 3D mRoPE
+            # themselves, from these positions or a media prompt's own.
             specs.append(PositionSpec(
                 resource_key=ROPE, nodes={REASONER_NODE}, config=PositionConfig(kv_cache=KV_CACHE),
             ))
+            specs.append(self._vision_attention_spec())
         if self.config.attention_backend == "dense_gen":
             specs.append(AttentionSpec(
                 resource_key=ATTN_GEN,
@@ -370,6 +475,52 @@ class Cosmos3Model(Model):
         main = KVLabel(growth=((self.REASONER_DECODE_WALK, REASONER_DECODE_LOOP),))
         return {KV_CACHE: {COND_LABEL: main, UNCOND_LABEL: uncond}}
 
+    def _vision_attention_spec(self) -> RaggedAttentionSpec:
+        """The vision tower's attention, a segment per image or video frame."""
+        from mstar.model.cosmos3.submodules import Cosmos3VisionEncoderSubmodule
+
+        reasoner = self.config.reasoner
+        vision = reasoner.vision
+        # the smallest frame the processors make bounds a replay's segments
+        min_patches = min(
+            reasoner.image_processor.min_pixels, reasoner.video_processor.min_pixels,
+        ) // vision.patch_size ** 2
+        return RaggedAttentionSpec(
+            resource_key=VISION_ATTN, nodes={VISION_ENCODER_NODE},
+            config=RaggedAttentionConfig(
+                num_qo_heads=vision.num_attention_heads,
+                num_kv_heads=vision.num_attention_heads,
+                head_dim=vision.hidden_size // vision.num_attention_heads,
+                max_segments_per_step=Cosmos3VisionEncoderSubmodule.BLOCK_LOOP_PATCH_BUCKETS[-1] // max(min_patches, 1),
+                # FA3 varlen takes head_dim 72 as it is; FlashInfer pads it to 128
+                # (three pads, a zero fill and a slice a layer). Falls back to
+                # FlashInfer where FA3 can't load.
+                backend=RaggedAttnBackend.DENSE,
+            ),
+        )
+
+    def get_combined_graph_walks(self) -> dict[str, dict[str, set[str]]]:
+        # the reasoner's text and media prompt rows share steps with its decode rows
+        if not self._reasoner_enabled():
+            return {}
+        return {REASONER_NODE: {MIXED: set(REASONER_MIXED_SPLIT.prefill_walks) | {self.REASONER_DECODE_WALK}}}
+
+    def get_chunking_policies(self) -> dict[str, tuple[ChunkingPolicy, ...]]:
+        # the reasoner's text and media prompts split by its token budget; the
+        # mixed walk carries it for the steps a chunk shares with decode rows
+        if not self._reasoner_enabled():
+            return {}
+        from mstar.model.cosmos3.submodules import Cosmos3ReasonerSubmodule
+
+        budget = Cosmos3ReasonerSubmodule.MAX_BATCH_TOKENS
+        return {REASONER_NODE: (
+            ChunkingPolicy(
+                walks=(self.REASONER_PREFILL_WALK, self.REASONER_PREFILL_VISION_WALK),
+                chunkable=True, max_batch_tokens=budget,
+            ),
+            ChunkingPolicy(walks=(MIXED,), max_batch_tokens=budget),
+        )}
+
     def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
         return {**super().get_loop_caps(**model_kwargs), **(model_kwargs.get(self.DENOISE_CAP) or {})}
 
@@ -391,8 +542,9 @@ class Cosmos3Model(Model):
                 KV_CACHE: KVReqConfig(needed_labels=[REASONER_LABEL]),
                 SAMPLER: SamplingReqConfig(
                     temperature=sampling.temperature, top_k=sampling.top_k,
-                    top_p=sampling.top_p, repetition_penalty=sampling.repetition_penalty,
-                    ignore_eos=sampling.ignore_eos,
+                    top_p=sampling.top_p, min_p=sampling.min_p,
+                    repetition_penalty=sampling.repetition_penalty,
+                    penalize_prompt=sampling.penalize_prompt, ignore_eos=sampling.ignore_eos,
                 ),
             }
         return {
@@ -401,28 +553,48 @@ class Cosmos3Model(Model):
 
     def get_sampling_config(self, node_name: str, model_kwargs: dict | None = None):
         """The reasoner's sampling knobs: OpenAI-standard ``temperature`` /
-        ``top_p`` plus ``top_k`` / ``repetition_penalty`` / ``ignore_eos``
-        from ``extra_body``. Greedy at temperature 0."""
+        ``top_p`` plus ``top_k`` / ``min_p`` / ``repetition_penalty`` /
+        ``penalize_prompt`` / ``ignore_eos`` from ``extra_body``. A knob the
+        request leaves unset takes the checkpoint's ``generation_config.json``
+        value, then the config's. Values pass through unconverted; the
+        sampler's ``validate`` refuses a wrong type or range."""
         from mstar.engine.resources.sampler.utils import SamplingConfig
 
         mk = model_kwargs or {}
+        defaults = {
+            "temperature": self.config.reasoner_temperature, "top_k": 0, "top_p": 1.0,
+            "min_p": 0.0, "repetition_penalty": 1.0,
+            **getattr(self, "_generation_defaults", {}),
+            "penalize_prompt": True, "ignore_eos": False,
+        }
+
+        def pick(key):
+            value = mk.get(key)
+            return defaults[key] if value is None else value
+
         return SamplingConfig(
             vocab_size=self.config.vocab_size,
-            temperature=float(mk.get("temperature", self.config.reasoner_temperature)),
-            top_k=int(mk.get("top_k", 0)),
-            top_p=float(mk.get("top_p", 1.0)),
-            repetition_penalty=float(mk.get("repetition_penalty", 1.0)),
-            ignore_eos=bool(mk.get("ignore_eos", False)),
+            temperature=pick("temperature"),
+            top_k=pick("top_k"),
+            top_p=pick("top_p"),
+            min_p=pick("min_p"),
+            repetition_penalty=pick("repetition_penalty"),
+            penalize_prompt=pick("penalize_prompt"),
+            ignore_eos=pick("ignore_eos"),
         )
+
+    def request_kwargs(self) -> frozenset[str]:
+        """Every request key this model reads, adapter-mapped ones included."""
+        return _REQUEST_KWARGS
 
     def _vision_encoder(self) -> MediaEncoder:
         """The reasoner's one medium: the vision encoder's tokens fill the
-        prompt's image and video pads, in prompt order, on the reasoner's
-        vision prefill walk (beside the DiT's own ``prefill*`` walks)."""
+        prompt's image and video pads, in prompt order, on the scaffold's
+        ``prefill_vision`` walk (beside the DiT's own ``prefill*`` walks)."""
         r = self.config.reasoner
         return MediaEncoder(
-            "vision", VISION_ENCODER_NODE, ("pixel_values", "vision_grid_thw"), "vision_embeds",
-            (r.image_token_id, r.video_token_id), walk=self.REASONER_PREFILL_VISION_WALK,
+            "vision", VISION_ENCODER_NODE, ("pixel_values",), "vision_embeds",
+            (r.image_token_id, r.video_token_id),
         )
 
     def _reasoner_enabled(self) -> bool:
@@ -777,57 +949,12 @@ class Cosmos3Model(Model):
         )
 
     def _reasoner_walks(self) -> dict[str, GraphSection]:
-        """The VLM walks. ``reasoner_prefill`` embeds a text-only prompt;
-        ``reasoner_prefill_vision`` first runs the vision encoder over the
-        request's packed patches and hands the projected tokens to the
-        reasoner, which scatters them over the media placeholders. Both
-        sample the first token, which persists into the decode loop; each
-        decode iteration emits its token and feeds it back."""
-        first_token = GraphEdge(
-            next_node=EMIT_TO_CLIENT, name="new_token", output_modality="text", persist=True,
+        """The VLM scaffold's walks over the reasoner: ``prefill_text``, the
+        ``prefill_vision`` media walk (the vision encoder, then the whole prompt
+        as one row with its vision tokens spliced in), and the ``decode`` loop."""
+        return media_walks(
+            self.config.reasoner.max_position_embeddings, (self._vision_encoder(),), node=REASONER_NODE,
         )
-        prefill = GraphNode(
-            name=REASONER_NODE,
-            input_names=["text_inputs"],
-            outputs=[first_token],
-        )
-        prefill_vision = Sequential(
-            [
-                GraphNode(
-                    name=VISION_ENCODER_NODE,
-                    input_names=["pixel_values", "vision_grid_thw"],
-                    outputs=[GraphEdge(next_node=REASONER_NODE, name="vision_embeds")],
-                ),
-                GraphNode(
-                    name=REASONER_NODE,
-                    input_names=["text_inputs", "vision_embeds"],
-                    outputs=[
-                        GraphEdge(
-                            next_node=EMIT_TO_CLIENT, name="new_token",
-                            output_modality="text", persist=True,
-                        ),
-                    ],
-                ),
-            ]
-        )
-        decode = Loop(
-            name=REASONER_DECODE_LOOP,
-            section=GraphNode(
-                name=REASONER_NODE,
-                input_names=["text_inputs"],
-                outputs=[
-                    GraphEdge(next_node=EMIT_TO_CLIENT, name="new_token", output_modality="text"),
-                    GraphEdge(next_node=REASONER_NODE, name="text_inputs"),
-                ],
-            ),
-            max_iters=self.config.reasoner.max_position_embeddings,
-            outputs=[],
-        )
-        return {
-            self.REASONER_PREFILL_WALK: prefill,
-            self.REASONER_PREFILL_VISION_WALK: prefill_vision,
-            self.REASONER_DECODE_WALK: decode,
-        }
 
     # ------------------------------------------------------------------
     # Model ABC: I/O
@@ -867,7 +994,7 @@ class Cosmos3Model(Model):
         # sentences; action prompts are tokenized raw.
         from mstar.model.cosmos3.components.packing import tokenize_prompt
 
-        negative_prompt = kwargs.get("negative_prompt")
+        negative_prompt = _str_kwarg(kwargs, "negative_prompt")
         video = (tensors or {}).get("video_inputs")
         if p.get("action_mode") == ACTION_MODE_INVERSE_DYNAMICS and video and video[0].shape[0] < p["num_frames"]:
             # the encoder takes the clip's first num_frames frames; a shorter one encodes too few latent frames
@@ -887,9 +1014,9 @@ class Cosmos3Model(Model):
         cond_ids, uncond_ids = tokenize_prompt(
             self.tokenizer, prompt, negative_prompt,
             num_frames=p["num_frames"], height=p["height"], width=p["width"], fps=p["fps"],
-            use_system_prompt=allow_templates and bool(kwargs.get("use_system_prompt", False)),
-            add_resolution_template=allow_templates and bool(kwargs.get("use_resolution_template", False)),
-            add_duration_template=allow_templates and bool(kwargs.get("use_duration_template", False)),
+            use_system_prompt=allow_templates and _bool_kwarg(kwargs, "use_system_prompt"),
+            add_resolution_template=allow_templates and _bool_kwarg(kwargs, "use_resolution_template"),
+            add_duration_template=allow_templates and _bool_kwarg(kwargs, "use_duration_template"),
             max_sequence_length=p["max_sequence_length"],
         )
         layout = self._gen_layout(p, cond_ids, uncond_ids, input_modalities, tensors or {})
@@ -1022,9 +1149,10 @@ class Cosmos3Model(Model):
         encoder pass.
 
         Returns ``text_inputs`` (the token ids) and, with attachments, the
-        packed ``pixel_values`` + ``vision_grid_thw`` the vision_encoder node
-        consumes, plus the ``MEDIA_LAYOUT`` the reasoner splices the encoder's
-        tokens and places its mRoPE positions by."""
+        packed ``pixel_values`` the vision_encoder node consumes, plus the
+        ``MEDIA_LAYOUT`` the vision encoder plans its frames by and the
+        reasoner splices the encoder's tokens and places its mRoPE positions
+        by."""
         from mstar.model.cosmos3.components.reasoner import (
             IMAGE,
             VIDEO,
@@ -1065,30 +1193,28 @@ class Cosmos3Model(Model):
             source_fps = meta.get("average_fps") or meta.get("fps")
             pv, grid = preprocess_video(
                 video.cpu(), reasoner.video_processor, source_fps,
-                num_frames=model_kwargs.get("video_num_frames"), fps=model_kwargs.get("video_fps"),
+                num_frames=_int_kwarg(model_kwargs, "video_num_frames", None, lo=1),
+                fps=_num_kwarg(model_kwargs, "video_fps", None, positive=True),
             )
             patches.append(pv)
             video_grids.append(grid)
-        # Media patches are packed in prompt order (images, then videos, as
-        # the parts list them); the vision encoder returns tokens in that
-        # order and the placeholders are expanded in the same order.
+        # Media patches are packed in prompt order (images and videos as the
+        # parts list them), the order the placeholders are expanded in: the
+        # layout's runs, which the vision encoder plans its frames by, follow it.
         ordered_patches: list[torch.Tensor] = []
-        ordered_grids: list[tuple[int, int, int]] = []
         img_i = vid_i = 0
         for part in parts:
             if part.modality == IMAGE:
                 ordered_patches.append(patches[img_i])
-                ordered_grids.append(image_grids[img_i].thw)
                 img_i += 1
             elif part.modality == VIDEO:
                 ordered_patches.append(patches[len(image_grids) + vid_i])
-                ordered_grids.append(video_grids[vid_i].thw)
                 vid_i += 1
 
         text = render_chat(
             self.tokenizer, parts, reasoner,
-            enable_thinking=model_kwargs.get("enable_thinking"),
-            system_prompt=model_kwargs.get("system_prompt"),
+            enable_thinking=_bool_kwarg(model_kwargs, "enable_thinking", None),
+            system_prompt=_str_kwarg(model_kwargs, "system_prompt"),
         )
         text = expand_placeholders(text, self.tokenizer, reasoner, image_grids, video_grids)
         ids = torch.tensor(self.tokenizer(text, add_special_tokens=False)["input_ids"], dtype=torch.long)
@@ -1102,7 +1228,6 @@ class Cosmos3Model(Model):
         out: NameToTensorList = {"text_inputs": [ids]}
         if ordered_patches:
             out["pixel_values"] = [torch.cat(ordered_patches, dim=0)]
-            out["vision_grid_thw"] = [torch.tensor(ordered_grids, dtype=torch.long)]
         walk = self.REASONER_PREFILL_VISION_WALK if ordered_patches else self.REASONER_PREFILL_WALK
         # a vision run spans its merged grid's longer side in positions, not its tokens
         advance = layout_extent(layout, reasoner.vision.spatial_merge_size, ids.numel())
@@ -1286,23 +1411,18 @@ class Cosmos3Model(Model):
         if is_video_request and self.config.video_size_default is not None:
             default_size = self.config.video_size_default
         width, height = int(default_size[0]), int(default_size[1])
-        size = mk.get("size")
-        if isinstance(size, str) and "x" in size.lower():
-            sw, sh = size.lower().split("x", 1)
-            try:
-                width, height = int(sw), int(sh)
-            except ValueError:
-                pass
+        if mk.get("size") is not None:
+            width, height = _parse_size(mk["size"])
 
         # Action requests resolve their mode up front: it switches the frame,
         # step, guidance and flow-shift defaulting below to the action recipe.
         # A request that sends the robot's state without a mode is a policy request.
         state_dim = self._robot_state_dim(mk)
-        action_mode = mk.get("action_mode")
+        action_mode = _str_kwarg(mk, "action_mode")
         if action_mode is None and state_dim and "action" in (output_modalities or []):
             action_mode = ACTION_MODE_POLICY
         if action_mode is not None:
-            action_mode = str(action_mode).strip().lower()
+            action_mode = action_mode.strip().lower()
             if action_mode not in ACTION_MODES:
                 raise ValueError(
                     f"Unsupported Cosmos3 action_mode={mk.get('action_mode')!r}; "
@@ -1319,12 +1439,12 @@ class Cosmos3Model(Model):
             # (the reference action default). The chunk is the rows the reply
             # carries: a policy request's robot_state is one more token, clean
             # in front of them at frame 0, so then num_frames = chunk + 1.
-            raw_chunk = mk.get("action_chunk_size")
-            raw_frames = mk.get("num_frames")
+            raw_chunk = _int_kwarg(mk, "action_chunk_size", None)
+            raw_frames = _int_kwarg(mk, "num_frames", None)
             if raw_chunk is not None:
-                action_chunk = int(raw_chunk)
+                action_chunk = raw_chunk
             elif raw_frames is not None:
-                action_chunk = int(raw_frames) - 1
+                action_chunk = raw_frames - 1
             elif action_mode == ACTION_MODE_POLICY and self.config.policy_action_chunk_size:
                 action_chunk = int(self.config.policy_action_chunk_size)
             else:
@@ -1333,7 +1453,7 @@ class Cosmos3Model(Model):
                 raise ValueError(
                     f"Cosmos3 action_chunk_size must be positive, got {action_chunk}."
                 )
-            num_frames = int(raw_frames) if raw_frames is not None else action_chunk + 1
+            num_frames = raw_frames if raw_frames is not None else action_chunk + 1
             if state_dim and num_frames != action_chunk + 1:
                 raise ValueError(
                     "A Cosmos3 policy request with a robot_state requires num_frames to be "
@@ -1358,19 +1478,21 @@ class Cosmos3Model(Model):
             default_frames = (
                 self.config.num_frames_video if "video" in (output_modalities or []) else 1
             )
-            num_frames = int(mk.get("num_frames", default_frames))
+            num_frames = _int_kwarg(mk, "num_frames", default_frames, lo=1)
         # The cookbook step counts differ per mode (image 50, video 35, action
         # 30 — configs override the action count per checkpoint); default by
         # mode and let the request override. The denoise loop's cap is this
-        # many steps (``_denoise_cap``), bounded above by its static max_iters.
+        # many steps (``_denoise_cap``); the conductor refuses one past the
+        # loop's static max_iters.
         if action_mode is not None:
             default_steps = self.config.num_inference_steps_action
         elif num_frames > 1:
             default_steps = self.config.num_inference_steps_video
         else:
             default_steps = self.config.num_inference_steps
-        steps = int(mk.get("num_inference_steps", default_steps))
-        steps = max(1, min(steps, self.config.max_inference_steps))
+        steps = _int_kwarg(
+            mk, "num_inference_steps", default_steps, lo=1,
+        )
         default_guidance = (
             self.config.guidance_scale_action if action_mode is not None else self.config.guidance_scale
         )
@@ -1382,18 +1504,18 @@ class Cosmos3Model(Model):
         if action_mode == ACTION_MODE_POLICY and self.config.policy_conditioning_fps:
             default_fps = self.config.policy_conditioning_fps
         params = {
-            "width": int(mk.get("width", width)),
-            "height": int(mk.get("height", height)),
+            "width": _int_kwarg(mk, "width", width, lo=1),
+            "height": _int_kwarg(mk, "height", height, lo=1),
             "num_frames": num_frames,
-            "fps": float(mk.get("fps", default_fps)),
-            "guidance_scale": float(mk.get("guidance_scale", default_guidance)),
+            "fps": _num_kwarg(mk, "fps", float(default_fps), positive=True),
+            # sign is not checked; guidance semantics are the recipe's
+            "guidance_scale": _num_kwarg(mk, "guidance_scale", float(default_guidance)),
             "num_inference_steps": steps,
             "has_image_condition": "image" in (input_modalities or []),
-            "use_karras_sigma": mk.get("use_karras_sigmas"),
-            # Prompt-token truncation cap (reference serving default 4096),
-            # request-overridable; floor 1 so a bad value can't empty the prompt.
-            "max_sequence_length": max(
-                1, int(mk.get("max_sequence_length", constants.DEFAULT_MAX_SEQUENCE_LENGTH))
+            "use_karras_sigma": _bool_kwarg(mk, "use_karras_sigmas", None),
+            # Prompt-token truncation cap (reference serving default 4096), request-overridable
+            "max_sequence_length": _int_kwarg(
+                mk, "max_sequence_length", constants.DEFAULT_MAX_SEQUENCE_LENGTH, lo=1,
             ),
         }
         # the packing divides by it, and postprocess muxes at it
@@ -1431,7 +1553,7 @@ class Cosmos3Model(Model):
                     f"Cosmos3 condition_frame_indexes_vision {indexes} is outside the latent "
                     f"video ({latent_frames} latent frames for num_frames={num_frames})."
                 )
-            keep = str(mk.get("condition_video_keep") or constants.DEFAULT_CONDITION_VIDEO_KEEP).strip().lower()
+            keep = _str_kwarg(mk, "condition_video_keep", constants.DEFAULT_CONDITION_VIDEO_KEEP).strip().lower()
             if keep not in ("first", "last"):
                 raise ValueError("Cosmos3 condition_video_keep must be 'first' or 'last'.")
             params["has_video_condition"] = True
@@ -1445,7 +1567,7 @@ class Cosmos3Model(Model):
         # reference V2V flow shift; other image-conditioned / video paths keep
         # their own defaults (full CFG, scheduler-config flow_shift).
         is_t2i = num_frames == 1 and not params["has_image_condition"] and action_mode is None
-        fs = mk.get("flow_shift")
+        fs = _num_kwarg(mk, "flow_shift", None, positive=True)
         if fs is None and action_mode is not None:
             fs = self.config.flow_shift_action
         if fs is None and is_t2i:
@@ -1459,6 +1581,11 @@ class Cosmos3Model(Model):
         if fs is not None:
             params["flow_shift"] = float(fs)
         gi = mk.get("guidance_interval")
+        if gi is not None and (
+            not isinstance(gi, (list, tuple)) or len(gi) != 2
+            or any(isinstance(v, bool) or not isinstance(v, (int, float)) for v in gi)
+        ):
+            raise ValueError(f"Cosmos3 guidance_interval must be two numbers [low, high]; got {gi!r}.")
         if gi is None and is_t2i:
             gi = (400.0, 1000.0)
         if gi is None and action_mode is not None:
@@ -1482,7 +1609,7 @@ class Cosmos3Model(Model):
             params["domain_id"] = resolve_action_domain_id(
                 mk.get("domain_id"), domain_name, self.config.num_embodiment_domains
             )
-            raw_dim = mk.get("raw_action_dim")
+            raw_dim = _int_kwarg(mk, "raw_action_dim", None)
             if raw_dim is None and state_dim:
                 raw_dim = state_dim
             is_fd = action_mode == ACTION_MODE_FORWARD_DYNAMICS
@@ -1501,7 +1628,6 @@ class Cosmos3Model(Model):
                     "Cosmos3 action requests require 'raw_action_dim' (it may be left out when "
                     "a robot_state or a forward-dynamics 'action' array is sent, which carries the width)."
                 )
-            raw_dim = int(raw_dim)
             if not 1 <= raw_dim <= self.config.max_action_dim:
                 raise ValueError(
                     f"Cosmos3 raw_action_dim must be in [1, {self.config.max_action_dim}], "
@@ -1522,11 +1648,11 @@ class Cosmos3Model(Model):
                         f"A Cosmos3 robot_state must have raw_action_dim={raw_dim} values, got {state_dim}."
                     )
                 params["action_state_rows"] = 1
-            if "action_fps" in mk:
-                params["action_fps"] = mk["action_fps"]
+            if mk.get("action_fps") is not None:
+                params["action_fps"] = _num_kwarg(mk, "action_fps", None, positive=True)
         # Opt-in sound generation: video-only (image and action requests carry
         # no sound band), and only when the served checkpoint/config enable it.
-        if mk.get("generate_sound") or mk.get("sound_gen"):
+        if _bool_kwarg(mk, "generate_sound") or _bool_kwarg(mk, "sound_gen"):
             if num_frames <= 1 or action_mode is not None:
                 raise ValueError(
                     "Cosmos3 sound generation is supported only for video requests "
@@ -1539,7 +1665,7 @@ class Cosmos3Model(Model):
                 )
             params["generate_sound"] = True
             if mk.get("sound_duration") is not None:
-                params["sound_duration"] = float(mk["sound_duration"])
+                params["sound_duration"] = _num_kwarg(mk, "sound_duration", None, positive=True)
         self._resolve_window_params(mk, params, num_frames, action_mode, has_video_condition)
         return params
 
@@ -1550,12 +1676,12 @@ class Cosmos3Model(Model):
         video-to-video or windowed modes. Mirrors the reference's
         ``Cosmos3DistilledSetTimestepsStep`` checks."""
         fixed = len(self.config.distilled_sigmas)
-        if mk.get("num_inference_steps") is not None and int(mk["num_inference_steps"]) != fixed:
+        if mk.get("num_inference_steps") is not None and mk["num_inference_steps"] != fixed:
             raise ValueError(
                 f"This Cosmos3 checkpoint is distilled: num_inference_steps is fixed at {fixed} "
                 f"(got {mk['num_inference_steps']}); leave it unset."
             )
-        if mk.get("guidance_scale") is not None and float(mk["guidance_scale"]) != 1.0:
+        if mk.get("guidance_scale") is not None and mk["guidance_scale"] != 1.0:
             raise ValueError(
                 "This Cosmos3 checkpoint is distilled: classifier-free guidance is baked into the "
                 f"weights, guidance_scale must be 1.0 (got {mk['guidance_scale']}); leave it unset."
@@ -1579,14 +1705,14 @@ class Cosmos3Model(Model):
         quantized to latent frames here so the whole pipeline agrees on the
         schedule; validation up front so malformed requests fail at
         submission."""
-        window_mode = mk.get("window_mode")
+        window_mode = _str_kwarg(mk, "window_mode")
         if window_mode is None:
-            if not mk.get("stream_video"):
+            if not _bool_kwarg(mk, "stream_video"):
                 return
             # The non-windowed walks emit one video at the very end, so a
             # streamed request runs windowed, in the mode that holds the scene.
             window_mode = "chained"
-        window_mode = str(window_mode).strip().lower()
+        window_mode = window_mode.strip().lower()
         if window_mode not in ("chained", "kv"):
             raise ValueError(
                 f"Cosmos3 window_mode must be 'chained' or 'kv', got {mk.get('window_mode')!r}."
@@ -1606,7 +1732,7 @@ class Cosmos3Model(Model):
             raise ValueError("Cosmos3 context_frames applies to window_mode='kv' only.")
         tf = self.config.vae.scale_factor_temporal
         default_window = self.config.kv_window_frames_default if is_kv else self.config.window_frames_default
-        window_frames = int(mk.get("window_frames", default_window))
+        window_frames = _int_kwarg(mk, "window_frames", default_window)
         if window_frames < 1 + tf:
             raise ValueError(f"Cosmos3 window_frames must be at least {1 + tf}, got {window_frames}.")
         window_units = 1 + (window_frames - 1) // tf
@@ -1614,7 +1740,7 @@ class Cosmos3Model(Model):
         # conditioning flows through the committed K/V, and a zero overlap
         # keeps each commit exactly covering the span its denoise steps wrote.
         default_overlap = 0 if is_kv else self.config.overlap_frames_default
-        overlap_frames = int(mk.get("overlap_frames", default_overlap))
+        overlap_frames = _int_kwarg(mk, "overlap_frames", default_overlap, lo=0)
         if is_kv and overlap_frames:
             raise ValueError(
                 "Cosmos3 window_mode='kv' does not support overlap_frames; "
@@ -1635,7 +1761,7 @@ class Cosmos3Model(Model):
             )
         context_units = 0
         if is_kv:
-            context_frames = int(mk.get("context_frames", self.config.context_frames_default))
+            context_frames = _int_kwarg(mk, "context_frames", self.config.context_frames_default)
             if context_frames < 0:
                 raise ValueError(f"Cosmos3 context_frames must be >= 0, got {context_frames}.")
             # 0 retains all committed frames (no release).
@@ -1649,9 +1775,9 @@ class Cosmos3Model(Model):
         # of window 0 as clean conditioning (the chained overlap, at least the
         # two-frame V2V floor), and the schedule grows by those units so
         # ``num_frames`` stays the count of new frames the client receives.
-        session_id = mk.get("session_id")
-        resume = bool(mk.get("resume_session"))
-        end_session = bool(mk.get("end_session"))
+        session_id = _str_kwarg(mk, "session_id")
+        resume = _bool_kwarg(mk, "resume_session")
+        end_session = _bool_kwarg(mk, "end_session")
         if resume and not session_id:
             raise ValueError("Cosmos3 resume_session requires a session_id.")
         if end_session and not session_id:
@@ -1662,15 +1788,15 @@ class Cosmos3Model(Model):
                 "drop the conditioning image."
             )
         if session_id is not None:
-            params["session_id"] = str(session_id)
+            params["session_id"] = session_id
             # Drop the session once this request is done instead of keeping it.
             params["end_session"] = end_session
-            timeout = mk.get("session_timeout_s")
+            timeout = _num_kwarg(mk, "session_timeout_s", None, positive=True)
             if timeout is not None:
-                timeout = float(timeout)
-                if not timeout > 0:
-                    raise ValueError("Cosmos3 session_timeout_s must be > 0.")
-                params["session_timeout_s"] = min(timeout, float(self.config.session_timeout_max_s))
+                limit = float(self.config.session_timeout_max_s)
+                if timeout > limit:
+                    raise ValueError(f"Cosmos3 session_timeout_s must be in (0, {limit:g}]; got {timeout:g}.")
+                params["session_timeout_s"] = timeout
         resume_units = max(overlap_units, 2) if resume else 0
         if resume_units and resume_units >= window_units:
             raise ValueError(
@@ -1701,7 +1827,7 @@ class Cosmos3Model(Model):
         params["context_latent_units"] = context_units
         params["total_latent_units"] = total_units
         params["num_windows"] = schedule.num_windows
-        params["stream_video"] = bool(mk.get("stream_video"))
+        params["stream_video"] = _bool_kwarg(mk, "stream_video")
         # Every window after the first is conditioned generation, which the
         # reference recipe runs at the V2V flow shift; one shift for all
         # windows keeps the per-window schedules consistent. A deployment's
@@ -1733,18 +1859,18 @@ class Cosmos3Model(Model):
         if is_text:
             if not self._reasoner_enabled():
                 raise ValueError("This Cosmos3 deployment does not serve the reasoner (text output).")
-            has_vision = "pixel_values" in input_signals and "vision_grid_thw" in input_signals
             knobs = {
                 "max_output_tokens": self.get_max_output_tokens(**model_kwargs),
                 "enable_thinking": model_kwargs.get("enable_thinking"),
             }
-            if has_vision:
-                # where the encoder's tokens and the prompt's positions go
-                prefill = WalkStep(self.REASONER_PREFILL_VISION_WALK, step_metadata={
-                    **knobs, MEDIA_LAYOUT: model_kwargs.get(MEDIA_LAYOUT) or {}, FINAL_PREFILL: True,
-                })
-            else:
-                prefill = WalkStep(self.REASONER_PREFILL_WALK, step_metadata={**knobs, FINAL_PREFILL: True})
+            # the vision prefill when the prompt's layout places media (the
+            # layout says where the encoder's tokens and the positions go), the
+            # text-only prefill otherwise
+            prefill = media_prefill_step(
+                input_signals, (self._vision_encoder(),), model_kwargs.get(MEDIA_LAYOUT),
+                model_name="Cosmos3 reasoner",
+            )
+            prefill = WalkStep(prefill.walk, step_metadata={**knobs, **prefill.step_metadata})
             decode = WalkStep(self.REASONER_DECODE_WALK, bind={"text_inputs": "new_token"}, step_metadata=knobs)
             return [prefill, decode]
         params = self._resolve_gen_params(model_kwargs, input_modalities, output_modalities)

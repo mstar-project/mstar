@@ -39,7 +39,7 @@ def _sampler(device: str):
 
 
 def test_an_eager_step_has_no_fused_draw():
-    resource = SamplerResource(vocab_size=2048, enable_repetion_penalty=False, device=torch.device("cpu"))
+    resource = SamplerResource(vocab_size=2048, enable_repetition_penalty=False, device=torch.device("cpu"))
     assert resource.fused_draw_args() is None, "an eager step draws through the eager sampler, not fused_sample"
 
 
@@ -52,7 +52,7 @@ class _StubGraphSampler:
 
 def _leased(**flags):
     """A resource on a leased step whose graph sampler can draw, with ``flags`` set on it."""
-    resource = SamplerResource(vocab_size=2048, enable_repetion_penalty=False, device=torch.device("cpu"))
+    resource = SamplerResource(vocab_size=2048, enable_repetition_penalty=False, device=torch.device("cpu"))
     resource._cg_sampler, resource._apply_filters_this_step = _StubGraphSampler(), True
     resource._apply_penalty_this_step = resource._keep_last_token = False
     for name, value in flags.items():
