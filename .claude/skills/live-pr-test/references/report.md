@@ -37,9 +37,9 @@ Keep it short enough to read in a minute: aim for under ~3,500 characters, about
 
 ### Tests
 
-| CI's test paths on <N> GPU(s) | Result |
+| CI's tests that reach the change, on <N> GPU(s) | Result |
 | --- | --- |
-| <passed> passed, <skipped> skipped | ✅ / ❌ <failing tests only the PR fails, after the serial rerun> |
+| <files> files: <passed> passed, <skipped> skipped (or: none reach the change, not run) | ✅ / ❌ <failing tests only the PR fails, after the serial rerun> |
 | Also fail on main | <test ids; they don't count> |
 | Skipped: need more GPUs than the box | <test modules> |
 

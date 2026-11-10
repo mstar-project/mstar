@@ -3,6 +3,7 @@ offers, bootstrap.sh's arguments, and gpu_health.py's choice of GPUs."""
 
 import argparse
 import contextlib
+import functools
 import http.client
 import io
 import itertools
@@ -24,6 +25,7 @@ import gpu as gpu_module  # noqa: E402
 
 GPU = vars(gpu_module)  # patched in place, with each test's cleanup restoring it
 HEALTH = runpy.run_path(str(SCRIPTS / "gpu_health.py"))
+CI_TESTS = runpy.run_path(str(SCRIPTS / "ci_tests.py"))
 CFG = {"budget": {"max_usd_per_hour": 30, "max_hours": 4, "max_total_usd": 100}, "ssh_public_key": "/dev/null",
        "runpod": {"image": "img", "hf_home": "/workspace/hf"}}
 OFFER = {"id": "runpod:H100:US-1:1", "provider": "runpod", "gpu": "H100", "count": 1, "vram_gb": 80,
@@ -271,6 +273,28 @@ class TestGpu(unittest.TestCase):
                 GPU["cmd_offers"](args, {**CFG, "lambda": {}})
             self.assertNotEqual(exited.exception.code, 0)
             self.assertNotIn("no availability", out.getvalue())
+
+
+class TestCiTests(unittest.TestCase):
+    def test_only_the_ci_tests_that_reach_the_change_run(self):
+        root = Path(tempfile.mkdtemp())
+        files = {"mstar/__init__.py": "", "mstar/engine/__init__.py": "", "mstar/engine/sampler.py": "",
+                 "mstar/engine/runner.py": "from mstar.engine import sampler\n",
+                 "mstar/model/a.py": "import mstar.engine.runner\n", "mstar/model/b.py": "",
+                 "test/modular/helpers.py": "from mstar.model.a import x\n",
+                 "test/modular/test_a.py": "from helpers import y\n",  # through a sibling helper
+                 "test/modular/test_b.py": "from mstar.model import b\n",
+                 "test/modular/test_c.py": "from .test_b import z\n"}
+        for path, text in files.items():
+            (root / path).parent.mkdir(parents=True, exist_ok=True)
+            (root / path).write_text(text)
+        select = functools.partial(CI_TESTS["select"], root, candidates=sorted(p for p in files if "/test_" in p))
+        self.assertEqual(select(["mstar/engine/sampler.py"]), ["test/modular/test_a.py"],
+                         "a test that reaches the change through other modules would be left out, or one that "
+                         "doesn't would run")
+        self.assertEqual(select(["test/modular/test_b.py"]), ["test/modular/test_b.py", "test/modular/test_c.py"])
+        self.assertEqual(select(["test/modular/conftest.py"]), sorted(p for p in files if "/test_" in p))
+        self.assertEqual(select(["docs/models.rst", ""]), [], "a docs change would hold the GPUs for CI's suite")
 
 
 class TestBootstrap(unittest.TestCase):

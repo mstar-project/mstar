@@ -593,8 +593,8 @@ the last review.
     or code no served request runs); never a change to what a model or the server does, however
     small. The bot never approves a `none`: approval needs a live test that passed on the commit.
     The reason says why in one sentence. A change to tests that skip without CUDA gets at
-    least `targeted`: the live test runs CI's tests on the box's GPUs, and GitHub's CPU job never
-    does.
+    least `targeted`: the live test runs CI's tests that reach the change on the box's GPUs, and
+    GitHub's CPU job never does.
 - `checks`, the kinds of check: `correctness` (served output, parity, regressions) and/or
   `performance` (throughput and latency A/Bs). Leave `performance` out when the change can't
   plausibly move speed; leave `correctness` out only for a pure performance change whose outputs you
