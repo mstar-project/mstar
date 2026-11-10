@@ -18,7 +18,7 @@ part reads the host.
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import NamedTuple
@@ -227,7 +227,8 @@ class Phi4MMAudioEncoder(nn.Module):
         ``(N, H, W, W)`` with keys at or past ``key_lengths (N,)`` masked."""
         pos = torch.arange(width, device=self.rel_bias.weight.device)
         distance = (pos[None, :] - pos[:, None]).clamp(-self.config.max_distance, self.config.max_distance - 1)
-        bias = self.rel_bias(distance + self.config.max_distance).permute(2, 0, 1)[None]
+        # contiguous: SDPA's memory-efficient kernel refuses a permuted bias and falls to math
+        bias = self.rel_bias(distance + self.config.max_distance).permute(2, 0, 1).contiguous()[None]
         if key_lengths is None:
             return bias
         keys = length_mask(key_lengths, width)[:, None, None, :]
@@ -260,15 +261,20 @@ class AudioWindows(NamedTuple):
     rows: list[int]
 
 
-def plan_windows(tokens: Sequence[int], window: int) -> AudioWindows:
-    """The windows of clips of ``tokens`` encoder frames each.
+def plan_windows(tokens: Sequence[int], window: int, width: int | None = None) -> AudioWindows:
+    """The windows of clips of ``tokens`` encoder frames each, ``width``
+    frames wide (a capture bucket), or as wide as they need.
 
     Clips that fit one window run at the longest clip's width, each masked
     past its own frames. Past one window every row is ``window`` wide and a
     long clip's windows attend in full, the last one's zero tail included:
     the reference unfolds a clip alone that way, with no mask."""
     longest = max(tokens)
-    width, per_clip = (longest, 1) if longest <= window else (window, -(-longest // window))
+    needed, per_clip = (longest, 1) if longest <= window else (window, -(-longest // window))
+    if width is None:
+        width = needed
+    elif not needed <= width <= window:
+        raise ValueError(f"windows of {needed} frames don't run {width} wide")
     source: list[int] = []
     keys: list[int] = []
     rows: list[int] = []
@@ -289,22 +295,30 @@ class AudioBatch(NamedTuple):
     width: int
     per_clip: int
     source: torch.Tensor  # (windows,)
-    key_lengths: torch.Tensor | None  # (windows,), None when no window is masked
+    key_lengths: torch.Tensor | None  # (windows,), None when no window is masked and no width bucketed
     rows: torch.Tensor  # (output rows,)
 
 
 def audio_batch(
     clips: Sequence[torch.Tensor], config: Phi4MMAudioConfig, device: torch.device, dtype: torch.dtype,
+    mel_frames: int | None = None, width: int | None = None,
 ) -> AudioBatch:
-    """``clips``, each ``(mel frames, mel bins)``, as one `AudioBatch`. Host
-    values throughout; the copies are queued without a stall."""
+    """``clips``, each ``(mel frames, mel bins)``, as one `AudioBatch`, its
+    mel padded to ``mel_frames`` and its windows ``width`` wide when given (a
+    capture's buckets). The copies are queued without a stall, and the
+    padding is done on the device: a host copy of that size runs on torch's
+    intra-op pool, which stalls on a busy host (~75 ms for 8 clips at a load
+    of 40)."""
     frames = [int(c.shape[0]) for c in clips]
-    plan = plan_windows([config.tokens(f) for f in frames], config.window)
-    mel = torch.nn.utils.rnn.pad_sequence(list(clips), batch_first=True)
-    masked = any(k != plan.width for k in plan.keys)
+    plan = plan_windows([config.tokens(f) for f in frames], config.window, width)
+    mel = torch.nn.utils.rnn.pad_sequence([to_device_nonblocking(c, device) for c in clips], batch_first=True)
+    if mel_frames is not None:
+        mel = F.pad(mel, (0, 0, 0, mel_frames - mel.shape[1]))
+    # a capture's key lengths are a static buffer, so a bucketed batch always carries them
+    masked = width is not None or any(k != plan.width for k in plan.keys)
     return AudioBatch(
         # the reference rounds the mel to the weights' dtype before CMVN
-        mel=to_device_nonblocking(mel, device).to(dtype),
+        mel=mel.to(dtype),
         mel_lengths=to_device_nonblocking(frames, device, dtype=torch.long),
         width=plan.width,
         per_clip=plan.per_clip,
@@ -331,13 +345,20 @@ class Phi4MMAudioTower(nn.Module):
         self.encoder = Phi4MMAudioEncoder(config)
         self.projection = nn.ModuleDict({SPEECH: _mlp(config), VISION: _mlp(config)})
 
-    def encode(self, batch: AudioBatch) -> torch.Tensor:
-        """The conformer's output rows, ``(rows, hidden)``, clip by clip."""
-        x = self.encoder.subsample(batch.mel, batch.mel_lengths)
+    def encode(
+        self, batch: AudioBatch,
+        subsample: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] | None = None,
+        blocks: Callable[[torch.Tensor, torch.Tensor | None], torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+        """The conformer's output rows, ``(rows, hidden)``, clip by clip.
+        ``subsample`` and ``blocks`` stand in for the encoder's own (a
+        captured replay of each)."""
+        x = (subsample or self.encoder.subsample)(batch.mel, batch.mel_lengths)
         clips, frames, hidden = x.shape
+        # a bucketed mel can subsample past the windows' frames, all zero there
         x = F.pad(x, (0, 0, 0, batch.per_clip * batch.width - frames))
         windows = x.reshape(clips * batch.per_clip, batch.width, hidden).index_select(0, batch.source)
-        out = self.encoder.blocks(windows, batch.key_lengths)
+        out = (blocks or self.encoder.blocks)(windows, batch.key_lengths)
         return out.reshape(-1, hidden).index_select(0, batch.rows)
 
     def project(self, rows: torch.Tensor, mode: str) -> torch.Tensor:

@@ -10,15 +10,23 @@ the node lays out its batch from host values.
 
 from __future__ import annotations
 
-from collections.abc import Collection
-from functools import cache
-from typing import TYPE_CHECKING, Any
+from collections.abc import Collection, Iterable
+from contextlib import nullcontext
+from functools import cache, partial
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import numpy as np
 import torch
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.engine.accelerator_graph_config import (
+    PiecewiseAcceleratorGraphConfig,
+    PiecewiseBatchedConfig,
+    PiecewiseCallInputs,
+    PiecewiseCaptureShape,
+)
 from mstar.model.multimodal import MEDIA_LAYOUT, MediaEncoder, media_grids
 from mstar.model.multimodal_decoder import PreparedMedia
 from mstar.model.phi4mm.components.audio import (
@@ -129,6 +137,42 @@ def audio_intake(
     return PreparedMedia({AUDIO_FEATURES: torch.from_numpy(mel)}, [config.tokens(frames)], [[frames]])
 
 
+# Captured shapes. The subsampling runs per clip, by the step's longest mel
+# (10, 20, 41 s); the blocks per window, by its width in encoder frames (10, 20,
+# 40 s; a clip past one window runs at 500).
+MEL_BUCKETS = (1024, 2048, 4096)
+WIDTH_BUCKETS = (128, 256, 500)
+CLIP_BATCH_SIZES = (1, 2, 4, 8, 16)
+WINDOW_BATCH_SIZES = (1, 2, 4, 8, 16, 32)
+# SDPA sends the dense T5 bias to cuDNN, which builds a graph per new shape: ~0.5 s of
+# host time a step when every eager step's clips differ. Captured blocks keep cuDNN,
+# whose builds happen once at capture and which runs 1.2-3.7x faster in the graph.
+_EAGER_ATTENTION_BACKENDS = [SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]
+# mel frames per subsampling replay, which bounds its activations (the first
+# conv's output is 1024 channels x half the frames x 40)
+MAX_CAPTURE_MEL_FRAMES = 32 * 1024
+
+
+def _subsample_region(bucket: int) -> str:
+    return f"subsample_T{bucket}"
+
+
+def _blocks_region(width: int) -> str:
+    return f"blocks_W{width}"
+
+
+def _clip_batch_sizes(bucket: int) -> list[int]:
+    return [bs for bs in CLIP_BATCH_SIZES if bs * bucket <= MAX_CAPTURE_MEL_FRAMES]
+
+
+class StepRegions(NamedTuple):
+    """The captured regions a step replays, chosen with its buckets in
+    ``preprocess``; None runs that part eagerly at the step's own shape."""
+
+    subsample: str | None
+    blocks: str | None
+
+
 class Phi4MMAudioEncoderSubmodule(NodeSubmodule):
     """The conformer and a projection over a step's clips, stateless.
 
@@ -138,20 +182,33 @@ class Phi4MMAudioEncoderSubmodule(NodeSubmodule):
     clip by clip, so each request's ``audio_embeds`` fill its audio pads in
     prompt order. A prompt that also holds an image (`vision_walks`) takes
     the ``vision`` projection, any other the ``speech`` one.
+
+    The subsampling replays a graph per (clips, mel bucket) and the blocks
+    per (windows, width bucket); padding is exact in both (zeroed before
+    each conv, masked in attention). A step past every bucket runs that part
+    eagerly at its own shape. The projection and the row gather stay eager.
     """
 
-    # eager for now; compiled, every new clip length would recompile
+    # the captured regions carry the speed; compiled, every new clip length would recompile
     disable_torch_compile = True
+    # the tower runs in its own bf16, as the reference does: autocast would run
+    # every LayerNorm in fp32 behind a cast copy each way
+    disable_autocast = True
     MAX_BATCH_SIZE = 16
     # attention windows a step batches across requests; one request's clip may hold
     # more (a 30-minute clip is 45), and runs alone
-    MAX_WINDOWS = 32
+    MAX_WINDOWS = max(WINDOW_BATCH_SIZES)
 
-    def __init__(self, tower: Phi4MMAudioTower, vision_walks: Collection[str] = (VISION_AUDIO_WALK,)):
+    def __init__(
+        self, tower: Phi4MMAudioTower, vision_walks: Collection[str] = (VISION_AUDIO_WALK,),
+    ):
         super().__init__()
         self.tower = tower
         self.config = tower.config
         self.vision_walks = frozenset(vision_walks)
+
+    def _dtype(self) -> torch.dtype:
+        return self.tower.encoder.rel_bias.weight.dtype
 
     def prepare_inputs(
         self,
@@ -178,6 +235,68 @@ class Phi4MMAudioEncoderSubmodule(NodeSubmodule):
     def max_batch_size(self, graph_walk: str) -> int:
         return self.MAX_BATCH_SIZE
 
+    # -- capture ---------------------------------------------------------------
+
+    def _capture_subsample(self, inp: PiecewiseCallInputs) -> dict[str, torch.Tensor]:
+        s = inp.static_inputs
+        # padding rows replay zeroed: one frame keeps them a well-formed clip
+        return {"x": self.tower.encoder.subsample(s["mel"], s["mel_lengths"].clamp(min=1))}
+
+    def _capture_blocks(self, inp: PiecewiseCallInputs) -> dict[str, torch.Tensor]:
+        s = inp.static_inputs
+        # padding windows replay zeroed: one key keeps their softmax over a real key
+        return {"x": self.tower.encoder.blocks(s["windows"], s["key_lengths"].clamp(min=1))}
+
+    def get_piecewise_accelerator_graph_configs(
+        self, device: torch.device, autocast_dtype: torch.dtype, tp_world_size: int = 1, **kwargs: Any,
+    ) -> dict[str, PiecewiseAcceleratorGraphConfig]:
+        """The subsampling by mel bucket and the blocks by width bucket; the
+        T5 bias and the masks are built in the graph from the length buffers."""
+        del autocast_dtype, tp_world_size, kwargs
+        dtype, c = self._dtype(), self.config
+
+        def mel(shape: PiecewiseCaptureShape, bucket: int) -> dict[str, torch.Tensor]:
+            return {
+                "mel": torch.zeros(shape.bs, bucket, c.num_mel_bins, dtype=dtype, device=device),
+                "mel_lengths": torch.zeros(shape.bs, dtype=torch.long, device=device),
+            }
+
+        def windows(shape: PiecewiseCaptureShape, width: int) -> dict[str, torch.Tensor]:
+            return {
+                "windows": torch.zeros(shape.bs, width, c.hidden_size, dtype=dtype, device=device),
+                "key_lengths": torch.zeros(shape.bs, dtype=torch.long, device=device),
+            }
+
+        configs: dict[str, PiecewiseAcceleratorGraphConfig] = {
+            _subsample_region(bucket): PiecewiseBatchedConfig(
+                capture_fn=self._capture_subsample,
+                make_static_inputs=partial(mel, bucket=bucket),
+                seq_len=bucket,
+                capture_batch_sizes=_clip_batch_sizes(bucket),
+            )
+            for bucket in MEL_BUCKETS
+        }
+        configs.update({
+            _blocks_region(width): PiecewiseBatchedConfig(
+                capture_fn=self._capture_blocks,
+                make_static_inputs=partial(windows, width=width),
+                seq_len=width,
+                capture_batch_sizes=list(WINDOW_BATCH_SIZES),
+            )
+            for width in WIDTH_BUCKETS
+        })
+        return configs
+
+    @staticmethod
+    def _region(runners: dict, labels: Iterable[tuple[int, str]], needed: int, rows: int) -> tuple[int, str] | None:
+        """The smallest ``(bucket, label)`` holding ``needed`` whose runner
+        replays ``rows`` rows."""
+        return next(
+            ((bucket, label) for bucket, label in labels
+             if bucket >= needed and label in runners and runners[label].can_run(rows)),
+            None,
+        )
+
     def preprocess(
         self,
         graph_walk: str,
@@ -188,9 +307,24 @@ class Phi4MMAudioEncoderSubmodule(NodeSubmodule):
             clip for inp in inputs
             for clip in inp.tensor_inputs[AUDIO_FEATURES].split(inp.kwargs["frames"])
         ]
-        dtype = self.tower.encoder.rel_bias.weight.dtype
+        runners = engine_inputs.piecewise_runners
+        longest = max(int(clip.shape[0]) for clip in clips)
+        tokens = self.config.tokens(longest)
+        windows = sum(self.config.windows(self.config.tokens(int(clip.shape[0]))) for clip in clips)
+        subsample = self._region(runners, ((b, _subsample_region(b)) for b in MEL_BUCKETS), longest, len(clips))
+        blocks = self._region(
+            runners, ((w, _blocks_region(w)) for w in WIDTH_BUCKETS), min(tokens, self.config.window), windows,
+        )
+        batch = audio_batch(
+            clips, self.config, self.get_device(), self._dtype(),
+            mel_frames=None if subsample is None else subsample[0],
+            width=None if blocks is None else blocks[0],
+        )
         return {
-            "batch": audio_batch(clips, self.config, self.get_device(), dtype),
+            "batch": batch,
+            "regions": StepRegions(
+                None if subsample is None else subsample[1], None if blocks is None else blocks[1],
+            ),
             "rows_per_request": [inp.input_seq_len for inp in inputs],
         }
 
@@ -203,9 +337,33 @@ class Phi4MMAudioEncoderSubmodule(NodeSubmodule):
         engine_inputs: ModelInputsFromEngine,
         batch: AudioBatch,
         rows_per_request: list[int],
+        regions: StepRegions = StepRegions(None, None),
         **kwargs,
     ) -> dict[str, NameToTensorList]:
-        embeds = self.tower.project(self.tower.encode(batch), self.projection_mode(graph_walk))
+        runners = engine_inputs.piecewise_runners
+
+        def subsample(mel: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+            replay = runners[regions.subsample].run(
+                static_inputs={"mel": mel, "mel_lengths": lengths}, real_bs=mel.shape[0],
+            )
+            return replay.get_view("x")
+
+        def blocks(windows: torch.Tensor, key_lengths: torch.Tensor | None) -> torch.Tensor:
+            # a bucketed batch always carries its key lengths (`audio_batch`); without
+            # them the replay would read the last step's
+            assert key_lengths is not None
+            replay = runners[regions.blocks].run(
+                static_inputs={"windows": windows, "key_lengths": key_lengths}, real_bs=windows.shape[0],
+            )
+            return replay.get_view("x")
+
+        with sdpa_kernel(_EAGER_ATTENTION_BACKENDS) if regions.blocks is None else nullcontext():
+            encoded = self.tower.encode(
+                batch,
+                subsample=subsample if regions.subsample is not None else None,
+                blocks=blocks if regions.blocks is not None else None,
+            )
+        embeds = self.tower.project(encoded, self.projection_mode(graph_walk))
         return {
             rid: {AUDIO_EMBEDS: [rows]}
             for rid, rows in zip(engine_inputs.request_ids, embeds.split(rows_per_request), strict=True)
