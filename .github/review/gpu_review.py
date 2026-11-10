@@ -210,16 +210,24 @@ def vendor_list(text):
     return [v for v in VENDORS if v in vendors]
 
 
+# What is left of a clause of the review's `untestable` text once its AMD hardware words are gone, that says
+# nothing on its own.
+FILLER = re.compile(r"\b(?:a|an|the|and|or|of|on|for|in|its|kernels?|code|paths?|gpus?|hardware|support)\b|\W|_",
+                    re.IGNORECASE)
+
+
 def beyond_vendors(text, vendors):
     """The review's `untestable` text (model text) without what a run on `vendors` covers: with AMD among them, its
-    parts (between `;` and `,`) that name AMD hardware and no other."""
+    AMD hardware words, and a clause (between `;` and `,`) they leave saying nothing (FILLER)."""
     if "amd" not in vendors or not text:
         return text or ""
-
-    def amd_only(part):
-        words = UNTESTABLE_HARDWARE.findall(part)
-        return words and all(AMD_HARDWARE.fullmatch(w) for w in words)
-    return "; ".join(x.strip() for x in re.split(r"[;,]", text) if x.strip() and not amd_only(x))
+    kept = []
+    for clause in re.split(r"[;,]", text):
+        rest = UNTESTABLE_HARDWARE.sub(lambda m: "" if AMD_HARDWARE.fullmatch(m[0]) else m[0], clause)
+        rest = " ".join(rest.split())
+        if FILLER.sub("", rest):
+            kept.append(rest)
+    return "; ".join(kept)
 
 
 def carry(out, pr, head_sha, runner_temp, rereview=""):

@@ -693,6 +693,16 @@ class TestApprove(unittest.TestCase):
                 self.assertEqual(writes == [f"POST repos/{R}/pulls/7/reviews"], approved,
                                  f"{name}: an AMD change would approve untested, or never approve once tested")
 
+    def test_an_amd_run_clears_only_the_amd_hardware_in_the_reviews_untestable_text(self):
+        for text, kept in (("AMD MI300X kernels on two nodes (16 GPUs)", "two nodes (16 GPUs)"),
+                           ("the ROCm path needs the aiter weights from a gated repo",
+                            "aiter weights from a gated repo"),
+                           ("MI250 (gfx90a) kernels", "(gfx90a) kernels"), ("AMD MI300X kernels; ROCm code", "")):
+            with self.subTest(text):
+                left = gpu_review.beyond_vendors(text, ["nvidia", "amd"])
+                self.assertIn(kept, left, "what the AMD box can't run either would stop counting")
+                self.assertEqual(left == "", kept == "", "AMD hardware alone would still stop an AMD PR's approval")
+
     def test_the_fixed_check_finds_hardware_words_and_leaves_ordinary_ones(self):
         for text, hit in (("amdsmi.gpu", True), ("if isAMD():", True), ("MI300A nodes", True), ("hipcc -c x", True),
                           ("torch.xpu", True), ("Intel Gaudi", True), ("TPU", True), ("Apple Silicon", True),
