@@ -47,6 +47,7 @@
    loader
    ltx2_5
    media_limits
+   minicpm_o
    minimax_h3
    multimodal
    multimodal_decoder
