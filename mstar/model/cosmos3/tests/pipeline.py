@@ -529,12 +529,11 @@ class Cosmos3Pipeline:
         kvs: list[list[tuple[torch.Tensor, torch.Tensor]]] = [[] for _ in branch_ids]
         for layer in tf.layers:
             attn = layer.self_attn
-            h, hkv, d = attn.num_attention_heads, attn.num_key_value_heads, attn.head_dim
+            h, d = attn.num_attention_heads, attn.head_dim
             und_norm = layer.input_layernorm(und_seq)
-            q = attn.norm_q(attn.to_q(und_norm).view(-1, h, d))
-            k_raw = attn.to_k(und_norm).view(-1, hkv, d)
+            q, k_raw, v = attn._und_qkv(und_norm)
+            q = attn.norm_q(q)
             k = attn.norm_k(k_raw)
-            v = attn.to_v(und_norm).view(-1, hkv, d)
             q = attn._apply_rope(q, cos, sin)
             k = attn._apply_rope(k, cos, sin)
             if attn.k_norm_und_for_gen is not None:

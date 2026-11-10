@@ -45,7 +45,7 @@ if [[ ! -d .venv ]]; then
   echo "== Creating venv"
   uv venv
 fi
-echo "== Installing mstar[asr] + ninja"
+echo "== Installing mstar-ai[asr] + ninja"
 uv pip install -q -e ".[asr]" ninja
 
 export PATH="$REPO_ROOT/.venv/bin:$PATH"

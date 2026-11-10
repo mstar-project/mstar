@@ -14,8 +14,6 @@ torch = pytest.importorskip("torch")
 
 from test_ingest_unpersist import (  # noqa: E402  (sibling helper, by module name)
     PREPROCESS,
-    _edge,
-    _fwd,
     _info,
     _msg,
     _new_request,
@@ -34,6 +32,7 @@ from mstar.api_server.request_types import (  # noqa: E402
 )
 from mstar.communication import wire  # noqa: E402
 from mstar.conductor.conductor import Conductor  # noqa: E402
+from mstar.conductor.request_info import WalkStep  # noqa: E402
 from mstar.graph.base import GraphEdge, GraphNode, Sequential  # noqa: E402
 from mstar.graph.special_destinations import EMIT_TO_CLIENT  # noqa: E402
 from mstar.observability import catalog  # noqa: E402
@@ -59,9 +58,6 @@ def _walks():
 
 
 def _conductor(tmp_path, monkeypatch, status_interval_s, max_concurrent_requests=1):
-    def initial(partition, signals):
-        return _fwd("prefill", [_edge("enc", "x", signals["x"])])
-
     path = tmp_path / "cfg.yaml"
     path.write_text(yaml.safe_dump({
         "max_seq_len": 64, "node_groups": NODE_GROUPS,
@@ -70,7 +66,7 @@ def _conductor(tmp_path, monkeypatch, status_interval_s, max_concurrent_requests
     comm = _StubComm()
     monkeypatch.setattr(Conductor, "_launch_workers", lambda self: None)
     monkeypatch.setattr(conductor_mod, "make_communicator", lambda **kw: comm)
-    c = Conductor(_ToyModel(_walks(), initial, lambda metadata, persist: _fwd("prefill", done=True)),
+    c = Conductor(_ToyModel(_walks(), {"default": [WalkStep("prefill")]}),
                   str(path), socket_path_prefix=str(tmp_path / "s"), status_interval_s=status_interval_s)
     c.comm = comm
     return c

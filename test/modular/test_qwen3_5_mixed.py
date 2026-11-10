@@ -7,15 +7,16 @@ import pytest
 import torch
 
 from mstar.engine.resources.linear_attn.gdn import GDNManager
-from mstar.model.qwen3_5.config import LLM_MIXED, SAMPLER
+from mstar.model.keys import MIXED
+from mstar.model.qwen3_5.config import SAMPLER
 from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
 from mstar.model.qwen3_5.submodules import LLMSubmodule
 from mstar.model.submodule_base import ARNodeInputs
 
 
 def test_text_prefill_and_decode_share_the_mixed_walk():
-    assert Qwen3_5DenseModel.get_combined_graph_walks(None) == {
-        "LLM": {LLM_MIXED: {"prefill_text", "decode"}},
+    assert Qwen3_5DenseModel.get_combined_graph_walks(object.__new__(Qwen3_5DenseModel)) == {
+        "LLM": {MIXED: {"prefill_text", "decode"}},
     }
 
 
@@ -27,7 +28,7 @@ def test_a_mixed_step_tracks_only_its_prefill_rows_prompt_tokens():
         ARNodeInputs(input_seq_len=3, input_ids=prompt, graph_walk="prefill_text"),
     ]
 
-    step = llm.declare_step(LLM_MIXED, [0, 1], rows)
+    step = llm.declare_step(MIXED, [0, 1], rows)
 
     tracked = step.steps[SAMPLER].prefill_tracked_tokens
     assert list(tracked) == [1] and tracked[1] is prompt
@@ -68,14 +69,12 @@ def test_the_kernel_follows_a_packed_capture_not_the_spans(force_prefill, spans,
     ("prefill_vision", {"text_inputs": [torch.zeros(7, dtype=torch.long)]}, None),
 ])
 def test_text_and_decode_rows_report_their_length(walk, inputs, length):
-    info = LLMSubmodule.get_input_sequence_len(None, walk, None, inputs)
+    info = object.__new__(LLMSubmodule).get_input_sequence_len(walk, None, inputs)
 
     assert (info.seq_len if info is not None else None) == length
 
 
 def test_text_prefill_chunks_under_a_budget_that_fits_the_captures():
-    from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
-
     model = Qwen3_5DenseModel.__new__(Qwen3_5DenseModel)
     model.config = SimpleNamespace(max_position_embeddings=4096)
     model.vision_config = None
@@ -83,7 +82,7 @@ def test_text_prefill_chunks_under_a_budget_that_fits_the_captures():
 
     assert policies[("LLM", "prefill_text")].chunkable
     assert ("LLM", "prefill_vision") not in policies
-    mixed = policies[("LLM", LLM_MIXED)]
+    mixed = policies[("LLM", MIXED)]
     assert not mixed.chunkable and mixed.max_batch_tokens == LLMSubmodule.MAX_BATCH_TOKENS
     # decode rows count inside the budget, and a step over a bucket pads to the next one up
     assert LLMSubmodule.MAX_BATCH_TOKENS in LLMSubmodule.PREFILL_TOKEN_BUCKETS

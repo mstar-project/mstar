@@ -11,13 +11,12 @@ import numpy as np
 import pytest
 import torch
 
-from mstar.api_server.media_io import AudioTooLongError
+from mstar.api_server.media_io import MAX_AUDIO_SECONDS
 from mstar.model.components.audio_features import (
     LogMelSpectrogram,
     NemoLogMel,
     clip_samples,
     librosa_mel_filters,
-    load_audio_file,
     load_speech_file,
     sinusoid_positions,
     slaney_mel_filter_bank,
@@ -86,20 +85,16 @@ def test_sinusoid_positions_match_hf():
         sinusoid_positions(10, 63)
 
 
-def test_load_audio_file_decodes_and_resamples(tmp_path):
+def test_load_speech_file_decodes_and_resamples(tmp_path):
     sf = pytest.importorskip("soundfile")
     t = np.arange(8000) / 8000.0
     stereo = np.stack([np.sin(2 * np.pi * 440 * t)] * 2, axis=1).astype(np.float32)
     sf.write(tmp_path / "a.flac", stereo, 8000)
-    wave = load_audio_file(str(tmp_path / "a.flac"), 16_000)
+    wave = load_speech_file(str(tmp_path / "a.flac"), 16_000, MAX_AUDIO_SECONDS)
     assert wave.dtype == torch.float32 and wave.dim() == 1
     assert abs(wave.numel() - 16_000) <= 16
     sf.write(tmp_path / "b.wav", stereo[:, :1], 16_000)
-    assert load_audio_file(str(tmp_path / "b.wav")).numel() == 8000
-    # a bounded decode refuses a longer file, and a shorter one comes back whole
-    with pytest.raises(AudioTooLongError):
-        load_audio_file(str(tmp_path / "b.wav"), 16_000, max_seconds=0.25)
-    assert load_audio_file(str(tmp_path / "b.wav"), 16_000, max_seconds=5.0).numel() == 8000
+    assert load_speech_file(str(tmp_path / "b.wav"), 16_000, MAX_AUDIO_SECONDS).numel() == 8000
 
 
 def test_load_speech_file_refuses_a_file_past_the_limit_as_it_decodes(tmp_path):
@@ -111,10 +106,18 @@ def test_load_speech_file_refuses_a_file_past_the_limit_as_it_decodes(tmp_path):
         clip_samples({"audio_inputs": [torch.zeros(16_000 * 11)]}, 10.0, "this model")
 
 
-def test_librosa_mel_filters_are_bit_identical():
+@pytest.mark.parametrize("sr, n_fft, n_mels, fmin, fmax", [
+    (16_000, 512, 128, 0.0, None),      # NeMo
+    (16_000, 400, 40, 0.0, 8000.0),     # Chatterbox voice encoder
+    (16_000, 400, 128, 0.0, None),      # S3 tokenizer (Chatterbox, CosyVoice3)
+    (24_000, 1920, 80, 0.0, None),      # CosyVoice3's Matcha mel
+    (24_000, 1920, 80, 0.0, 8000.0),    # S3Gen's Matcha mel
+    (24_000, 1024, 128, 0.0, 12000.0),  # Qwen3-TTS speaker mel
+])
+def test_librosa_mel_filters_are_bit_identical(sr, n_fft, n_mels, fmin, fmax):
     librosa = pytest.importorskip("librosa")
-    expected = librosa.filters.mel(sr=16_000, n_fft=512, n_mels=128, fmin=0.0, fmax=8000, norm="slaney")
-    assert np.array_equal(librosa_mel_filters(16_000, 512, 128), expected)
+    expected = librosa.filters.mel(sr=sr, n_fft=n_fft, n_mels=n_mels, fmin=fmin, fmax=fmax, norm="slaney")
+    assert np.array_equal(librosa_mel_filters(sr, n_fft, n_mels, fmin, fmax), expected)
 
 
 @pytest.mark.parametrize("seconds", [0.5, 3.37])
@@ -239,12 +242,11 @@ def test_irfft_as_a_matmul_is_torch_irfft(n):
 
 @pytest.mark.parametrize("ffmpeg, error", [
     ("import fails", RuntimeError),  # older torchcodec without FFmpeg
-    ("ops flag down", RuntimeError),  # newer torchcodec without FFmpeg
-    ("ops flag up", ValueError),
-    ("no flag", ValueError),  # older torchcodec that imports
+    ("no libraries", RuntimeError),  # newer torchcodec without FFmpeg
+    ("loaded", ValueError),
+    ("no version", ValueError),  # older torchcodec that imports
 ])
-def test_a_decode_failure_blames_the_upload_only_where_ffmpeg_loads(monkeypatch, ffmpeg, error):
-    import functools
+def test_a_decode_failure_blames_the_upload_only_where_ffmpeg_loads(monkeypatch, tmp_path, ffmpeg, error):
     import sys
     import types
 
@@ -254,21 +256,20 @@ def test_a_decode_failure_blames_the_upload_only_where_ffmpeg_loads(monkeypatch,
         raise RuntimeError("Invalid data found")
 
     decoders = types.SimpleNamespace(AudioDecoder=object)
-    monkeypatch.setitem(sys.modules, "torchcodec", types.SimpleNamespace(decoders=decoders))
+    torchcodec = types.SimpleNamespace(decoders=decoders)
+    if ffmpeg in ("no libraries", "loaded"):
+        torchcodec.ffmpeg_major_version = None if ffmpeg == "no libraries" else 7
+    monkeypatch.setitem(sys.modules, "torchcodec", torchcodec)
     monkeypatch.setitem(sys.modules, "torchcodec.decoders", None if ffmpeg == "import fails" else decoders)
-    monkeypatch.delitem(sys.modules, "torchcodec._core.ops", raising=False)
-    if ffmpeg.startswith("ops flag"):
-        ops = types.SimpleNamespace(_FFMPEG_AVAILABLE=ffmpeg == "ops flag up")
-        monkeypatch.setitem(sys.modules, "torchcodec._core.ops", ops)
-    # a fresh cache, so this host's torchcodec and the fake don't answer for each other
-    check = audio_features._ffmpeg_decoder_loads
-    monkeypatch.setattr(audio_features, "_ffmpeg_decoder_loads", functools.cache(check.__wrapped__))
     monkeypatch.setattr(audio_features, "_decode", refuse)
+    upload = tmp_path / "x.m4a"
+    upload.write_bytes(b"")
     with pytest.raises(error):
-        load_speech_file("x.m4a", 16_000, 10.0)
+        load_speech_file(str(upload), 16_000, 10.0)
 
 
-def test_load_speech_file_blames_the_upload_only_for_decoding(monkeypatch):
+def test_load_speech_file_blames_the_upload_only_for_decoding(monkeypatch, tmp_path):
+    from mstar.model import media_limits
     from mstar.model.components import audio_features
 
     def raises(exc):
@@ -276,22 +277,25 @@ def test_load_speech_file_blames_the_upload_only_for_decoding(monkeypatch):
             raise exc
         return load
 
+    upload = tmp_path / "x.wav"
+    upload.write_bytes(b"")
+    path = str(upload)
     # the decoders ran and refused the file: the client's error
-    monkeypatch.setattr(audio_features, "_ffmpeg_decoder_loads", lambda: True)
+    monkeypatch.setattr(media_limits, "ffmpeg_unavailable", lambda: None)
     monkeypatch.setattr(audio_features, "_decode", raises(RuntimeError("Invalid data found")))
     with pytest.raises(ValueError):
-        load_speech_file("x.wav", 16_000, 10.0)
+        load_speech_file(path, 16_000, 10.0)
     # no decoder to run, or no memory: the server's
     for exc in (ImportError("torchcodec"), MemoryError()):
         monkeypatch.setattr(audio_features, "_decode", raises(exc))
         with pytest.raises(type(exc)):
-            load_speech_file("x.wav", 16_000, 10.0)
+            load_speech_file(path, 16_000, 10.0)
     # it decoded, and resampling failed: the server's too
     monkeypatch.setattr(audio_features, "_decode", lambda *args: (torch.zeros(4800), 48_000))
     monkeypatch.setattr(audio_features, "_resample", raises(RuntimeError("can't allocate memory")))
     with pytest.raises(RuntimeError):
-        load_speech_file("x.wav", 16_000, 10.0)
-    monkeypatch.setattr(audio_features, "_ffmpeg_decoder_loads", lambda: False)
+        load_speech_file(path, 16_000, 10.0)
+    monkeypatch.setattr(media_limits, "ffmpeg_unavailable", lambda: "it failed to load")
     monkeypatch.setattr(audio_features, "_decode", raises(RuntimeError("Could not load libtorchcodec")))
     with pytest.raises(RuntimeError):
-        load_speech_file("x.wav", 16_000, 10.0)
+        load_speech_file(path, 16_000, 10.0)

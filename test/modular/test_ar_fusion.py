@@ -619,7 +619,7 @@ def _group_with(monkeypatch, fusion) -> CommGroup:
         fusion.ws_id = len(ar_fusion._FUSIONS)
         ar_fusion._FUSIONS.append(fusion)
     if fusion is not None:
-        group._ar_fusion[(torch.float32, 16)] = ArFusionWorkspace(fusion, 64)
+        group._ar_fusion[(torch.float32, 16)] = ArFusionWorkspace(fusion, 64, torch.zeros(64, 16))
     # stands in for the peer's zero contribution
     monkeypatch.setattr(group, "all_reduce", lambda t: t)
     return group
