@@ -917,7 +917,7 @@ class TestEras(unittest.TestCase):
                 if cap == gpu_review.LINE_CAP:
                     self.assertEqual(cut[-1], '"09:02 c"', "one long line would swallow the next")
                 exact = show_cut("x" * cap + "\n09:02 c\n")[0]
-                self.assertNotIn("\\u2026", exact, "a line exactly the cap long would be marked cut")
+                self.assertEqual(exact, '"' + "x" * 300 + '"', "a line exactly the cap long would be cut or lost")
                 with unittest.mock.patch.dict(os.environ, {"ERAS_API_KEY": "eras/k3y+secret=="}):
                     cut = show_cut("sk-ant-" + "A" * (cap - 17) + " eras/k3y+secret==\n09:02 c\n")
                 self.assertNotIn("eras/", "".join(cut), "the start of an exact key the cut split would reach the log")
