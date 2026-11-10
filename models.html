@@ -1033,7 +1033,10 @@ input, or for at most <code class="docutils literal notranslate"><span class="pr
 chunk by chunk (Wan2.1-layout causal DiT, rolling KV cache, 4 distilled steps).
 A request carries the whole camera trajectory as JSON in <code class="docutils literal notranslate"><span class="pre">model_kwargs</span></code>, which the API
 server caps at 1 MiB: about 3,900 frames of <code class="docutils literal notranslate"><span class="pre">[4,</span> <span class="pre">4]</span></code> float32 poses; send <code class="docutils literal notranslate"><span class="pre">[F,</span> <span class="pre">3,</span> <span class="pre">4]</span></code>
-rows for up to the 4,077-frame maximum. One rollout per GPU. The DiT’s attention runs
+rows for up to the 4,077-frame maximum. One rollout at a time: the model refuses any
+other <code class="docutils literal notranslate"><span class="pre">max_concurrent_requests</span></code> until each rollout’s text K/V and VAE caches, which
+are outside the rolling K/V pool (<code class="docutils literal notranslate"><span class="pre">resources:</span> <span class="pre">dit_kv:</span> <span class="pre">pool_tokens</span></code>), are engine
+resources. The DiT’s attention runs
 through the engine’s ragged attention resource, its blocks are compiled (Inductor’s
 deterministic mode), the condition encode runs channels-last, and the VAE decode is
 channels-last, compiled and bf16 where cuDNN &gt;= 9.16 (frames 51 dB from the fp32 decode).

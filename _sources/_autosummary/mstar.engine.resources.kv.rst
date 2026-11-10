@@ -40,6 +40,7 @@ mstar.engine.resources.kv
    prefix_index
    resident
    ring
+   rolling
    routing
    transfer
 
