@@ -861,10 +861,10 @@ def test_a_verify_step_times_its_cut_take_back_and_commit_under_fixed_names(monk
 
 
 def test_the_engine_turns_rebuild_off_for_a_verifying_node(caplog, monkeypatch):
-    """`Engine.rebuild_policies` leaves the verifying node out, logged once, so
-    neither the engine's check nor the worker's rebuilds ask its resources to
-    drop; another node keeps its policy, and the worker refuses a verifying
-    node's policy handed to it directly."""
+    """`rebuild_policies_of` leaves the verifying node out (the engine logs it
+    once), so neither the engine's check nor the worker's rebuilds ask its
+    resources to drop; another node keeps its policy, and the worker refuses a
+    policy left for a node the engine verifies on."""
     import logging
 
     from spec_toy import ToyModel
@@ -896,11 +896,11 @@ def test_the_engine_turns_rebuild_off_for_a_verifying_node(caplog, monkeypatch):
     cpu = torch.device("cpu")
     # every walk runs here, the decode loop's included
     walks = {(node, walk) for node in (NODE, "other") for walk in model.get_graph_walk_graphs()}
-    # an engine that left the verifying node's policy in is refused
-    unfiltered = SimpleNamespace(rebuild_policies=lambda m: m.rebuild_policies(), host_allowance=None,
-                                 node_dtype=lambda node: None)
-    with pytest.raises(RuntimeError, match="verifying nodes"):
-        _make_rebuilds(model, {}, walks, set(), cpu, unfiltered, verifying_nodes={NODE})
+    # a policy left for a node the engine verifies on, from a model that doesn't declare it, is refused
+    with monkeypatch.context() as m:
+        m.setattr(model, "verify_nodes", lambda: [])
+        with pytest.raises(RuntimeError, match="verifying nodes"):
+            _make_rebuilds(model, {}, walks, set(), cpu, eng, verifying_nodes={NODE})
     with caplog.at_level(logging.WARNING, logger="mstar.worker.worker"):
         rebuilds = _make_rebuilds(model, {"rebuild_host_mb": 1}, walks, set(), cpu, eng, verifying_nodes={NODE})
     assert NODE not in rebuilds.nodes and rebuilds.pool is None
@@ -912,8 +912,8 @@ def test_the_engine_turns_rebuild_off_for_a_verifying_node(caplog, monkeypatch):
     built = []
     monkeypatch.setattr(worker_mod, "Rebuilds", lambda policies, graphs, pool, *rest: built.append((policies, pool)))
     model.rebuild_policies = lambda: {NODE: policy, "other": policy}
-    # the engine's own filter; "other" is a node this toy engine doesn't build, so it has no dtype to report
-    filtered = SimpleNamespace(rebuild_policies=eng.rebuild_policies, host_allowance=None, node_dtype=lambda node: None)
+    # "other" is a node this toy engine doesn't build, so it has no dtype to report
+    filtered = SimpleNamespace(host_allowance=None, node_dtype=lambda node: None)
     with caplog.at_level(logging.WARNING, logger="mstar.worker.worker"):
         _make_rebuilds(model, {"rebuild_host_mb": 1}, walks, set(), cpu, filtered, verifying_nodes={NODE})
     assert built[0][0] == {"other": policy} and built[0][1] is not None

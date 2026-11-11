@@ -19,7 +19,7 @@ from mstar.communication.tensors import (
 )
 from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import WorkerParallelGroups
-from mstar.engine.engine import Engine
+from mstar.engine.engine import Engine, rebuild_policies_of
 from mstar.engine.resources import ResourceReqConfig
 from mstar.engine.resources.kv.config import KVReqConfig
 from mstar.engine.resources.kv.transfer import (
@@ -121,13 +121,14 @@ def _make_rebuilds(
     verifying_nodes: Collection[str] = (),
 ) -> Rebuilds:
     """What a dropped request is rebuilt from, on each node whose model declares how and whose rebuild this worker
-    runs: a disaggregated decode node can't run the prefill walk a rebuild needs. The policies are the engine's
-    (`Engine.rebuild_policies`), which leave out every verifying node.
+    runs: a disaggregated decode node can't run the prefill walk a rebuild needs. The policies leave out every
+    verifying node the model declares (`rebuild_policies_of`), and a policy left for a node the engine verifies on is
+    refused.
 
     A worker that follows one of those nodes sets aside twice ``rebuild_host_mb``. Beside the ids of every request
     rank 0 keeps ids for, it holds those of requests rank 0 has torn down until it tears them down too."""
     graphs = model.get_graph_walk_graphs() if model is not None else {}
-    declared = {} if model is None else engine.rebuild_policies(model)
+    declared = {} if model is None else rebuild_policies_of(model)
     verifying = sorted(declared.keys() & set(verifying_nodes))
     if verifying:
         raise RuntimeError(f"rebuild policies for verifying nodes {verifying}, which never drop a request")
