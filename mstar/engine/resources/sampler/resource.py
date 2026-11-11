@@ -932,7 +932,8 @@ class GrammarSamplerResource(SamplerResource):
 
     def admit(self, step: SamplerStep, ctx: StepContext) -> AdmitOutcome:
         """Fail the rows whose grammar can no longer be served (it failed to
-        compile, or refused a drawn token), and a constrained request with two
+        compile, start or accept, or refused a drawn token; or, on one rank, failed
+        to fill), and a constrained request with two
         rows in the step: an error to the client rather than a reply its
         constraint stopped holding. The same on every rank, which compile and
         accept the same tokens, each as its next draw begins (`_fill_grammar`).
@@ -994,21 +995,22 @@ class GrammarSamplerResource(SamplerResource):
         between the two graphs of a split capture's replay, so the forward is
         already running.
 
-        Never raises, as a rank that skipped the draw's graph would skip its
-        collectives. A fill that raises leaves the constrained rows only a stop,
-        and fails no row, since it may fail on one rank alone; a refused draw
-        still fails its request at admit, through the accept."""
+        A row whose accept fails, as a draw its grammar refuses does, fails its
+        request at admit, on every rank alike. A fill that raises (on rank 0
+        alone, which fills) leaves the step's constrained rows only a stop, and
+        fails them only when this rank serves alone: an error set on one rank of
+        several would split the ranks' admits."""
         grammar, rids, slot = self._grammar, self._grammar_rids, self._grammar_slot
+        grammar.accept_pending()
+        if not self._fills_masks:
+            return
         try:
-            grammar.accept_pending()
-            if not self._fills_masks:
-                return
             masks = grammar.fill(rids) if grammar.any_of(rids) else None
-        except Exception:
+        except Exception as exc:  # noqa: BLE001 - the rows' failure, not the step's
             logger.exception("structured_outputs: filling a step's grammar masks failed; its rows may only stop")
-            if not self._fills_masks:
-                return
             masks = grammar.stop_masks(rids)
+            if self._decides:
+                grammar.fail(rids, f"structured_outputs grammar failed to fill its mask: {exc}")
         if masks is not None:
             self._grammar_stager.copy_(self._grammar_mask, masks.numpy().reshape(-1), pad_value=-1)
             if slot is not None:

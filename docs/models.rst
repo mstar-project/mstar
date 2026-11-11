@@ -751,8 +751,10 @@ The grammar compiles in the background, on every rank, while its request waits a
 behind it start. The captured sampler then applies a bitmask on every step but a greedy one
 without a constrained row (the lean twin). A step holding a constrained row launches its
 forward, then waits for its rows' last draws to reach the host and fills their masks while the
-forward runs, before it launches the draw (its capture is split there). A grammar that fails to compile fails
-its request with an error. A drawn token the grammar refuses (only a mask that failed to cover
+forward runs, before it launches the draw (its capture is split there). A grammar that fails to compile, or
+whose matcher fails to start or to accept a draw, fails its request with an error. A mask fill that fails leaves
+the step's constrained rows only a stop token, and is the request's error too on a single-GPU deployment (under
+tensor parallelism only the first rank fills, so the reply ends at that stop). A drawn token the grammar refuses (only a mask that failed to cover
 the draw lets one through) fails its request at the step after the next, and meanwhile the reply
 may only draw one of the model's stop tokens (any token, for a model that declares none); when the
 reply finishes first (a stop or its length limit; always without async scheduling), it ends

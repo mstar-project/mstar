@@ -219,12 +219,13 @@ def test_a_grammar_that_can_no_longer_hold_fails_its_request(failure):
     assert not outcome.ok and outcome.reason.terminal and outcome.reason.request_ids == {0}
 
 
-def test_a_fill_that_raises_still_draws_and_fails_no_row(monkeypatch):
-    """A replay fills the masks between its forward and its draw, and a raise
-    there would skip the draw's graph and its collectives on one rank alone: the
-    draw goes on, the row may only stop, and no row fails, as other ranks may
-    not have raised."""
-    res = _resource(graph=True)
+@pytest.mark.parametrize("ranks", [1, 2])
+def test_a_fill_or_accept_that_raises_fails_what_every_rank_agrees_on(monkeypatch, ranks):
+    """A replay fills the masks between its forward and its draw: a fill that raises
+    still draws, and the row may only stop; it fails its request only on a lone rank,
+    since a fill runs on rank 0 alone. An accept runs on every rank, so one that raises
+    fails its row's request on each, and the other rows' draws are still accepted."""
+    res = _resource(graph=True, comm_group=SimpleNamespace(world_size=ranks, rank=0))
     res.ingest_request(0, SamplingReqConfig(grammar=grammar_request({"choice": ["ab"]})))
     lease = SlotLease(slot=0, bucket=SimpleNamespace(bs=4))
     step = SamplerStep(apply_penalty=False)
@@ -241,7 +242,31 @@ def test_a_fill_that_raises_still_draws_and_fails_no_row(monkeypatch):
     logits[:, VOCAB.index(b"a")] = 1.0
     res._grammar.apply(logits, res._grammar_mask)
     assert logits[0].argmax().item() == EOS, "a row whose fill raised drew past its grammar"
-    assert res.admit(step, ctx).ok
+    assert res.admit(step, ctx).ok == (ranks > 1)
+
+    outcomes, accept = [], grammar._Row.accept
+    for rank in range(ranks):
+        res = _resource(graph=True, comm_group=SimpleNamespace(world_size=ranks, rank=rank))
+        for rid in (1, 2):
+            res.ingest_request(rid, SamplingReqConfig(grammar=grammar_request({"choice": ["ab"]})))
+        ctx = StepContext(request_ids=(1, 2), graph_walk="w", slot=0, capture=False, slot_lease=lease)
+        res.plan(step, ctx)
+        res._fill_grammar()
+        res._cg_sampler.last_token_buf.fill_(VOCAB.index(b"a"))
+        res.commit(step, ctx)
+        res.plan(step, ctx)
+        with monkeypatch.context() as patch:
+            patch.setattr(grammar._Row, "accept", lambda row, token, broken=res._grammar._rows[1], accept=accept:
+                          1 / 0 if row is broken else accept(row, token))
+            res._fill_grammar()
+        assert not res._grammar.failures([2])
+        if rank == 0:
+            res._grammar.apply(logits := torch.zeros(4, V), res._grammar_mask)
+            assert logits[1, VOCAB.index(b"b")] == 0 and logits[1, VOCAB.index(b"a")] == float("-inf"), \
+                "a row after the one whose accept raised lost its draw"
+        outcome = res.admit(step, ctx)
+        outcomes.append((outcome.ok, outcome.reason and outcome.reason.request_ids))
+    assert outcomes == [(False, {1})] * ranks
 
 
 def test_only_rank_0_fills_masks_and_every_rank_fails_a_refused_draw_alike():

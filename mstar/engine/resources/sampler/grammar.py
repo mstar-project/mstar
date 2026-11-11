@@ -15,6 +15,7 @@ path, so a captured step bakes the apply over the slot's static mask buffer.
 from __future__ import annotations
 
 import json
+import logging
 import math
 from concurrent.futures import Future
 from dataclasses import dataclass
@@ -24,6 +25,8 @@ import torch
 
 from mstar.utils.cpus import plan as cpu_plan
 from mstar.utils.threads import ThreadPool
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from mstar.model.utils import TextOutput
@@ -192,7 +195,10 @@ class _Row:
             else:
                 import xgrammar as xgr
 
-                self._matcher = xgr.GrammarMatcher(self.compiled.result())
+                try:
+                    self._matcher = xgr.GrammarMatcher(self.compiled.result())
+                except Exception as exc:  # noqa: BLE001 - the request's error, not the step's
+                    self.error = f"structured_outputs grammar failed to start: {exc}"
         return None if self.error is not None else self._matcher
 
     @property
@@ -294,15 +300,31 @@ class GrammarRows:
         self._pending.append((rows, index, host, event))
 
     def accept_pending(self) -> None:
-        """Advance each row by the draws `note_draws` queued, once they reach the host."""
-        # taken first, so a step whose accept raises never accepts a draw twice
-        pending, self._pending = self._pending, []
-        for rows, index, host, event in pending:
+        """Advance each row by the draws `note_draws` queued, once they reach the
+        host. A row whose accept raises fails (`failures`), and the rest go on: the
+        same on every rank, which accept the same draws."""
+        pending = self._pending
+        while pending:
+            rows, index, host, event = pending[0]
             if event is not None:
                 event.synchronize()
             drawn = host.tolist()
+            # taken before its accepts, so no draw is accepted twice, and none is lost
+            # to a raise above, which leaves this step's draws and every later one queued
+            pending.pop(0)
             for row, i in zip(rows, index, strict=True):
-                row.accept(drawn[i])
+                try:
+                    row.accept(drawn[i])
+                except Exception as exc:  # noqa: BLE001 - that request's error, not the step's
+                    logger.exception("structured_outputs: accepting a drawn token failed")
+                    row.error = f"structured_outputs grammar failed to accept drawn token {drawn[i]}: {exc}"
+
+    def fail(self, rids, why: str) -> None:
+        """Fail the grammar rows of ``rids`` (`failures`) with ``why``."""
+        for rid in rids:
+            row = self._rows.get(rid)
+            if row is not None and row.error is None:
+                row.error = why
 
     def stop_masks(self, rids) -> torch.Tensor:
         """The host bitmask for a step's rows whose fill failed: all ones for a
