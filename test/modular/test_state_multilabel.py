@@ -489,7 +489,8 @@ def test_a_pool_on_one_node_has_no_leader():
 
 def test_a_kept_arrays_handle_is_the_same_whichever_of_its_nodes_builds_it():
     array = _array(nodes={"LLM", "LLM_cfg_img"}, labels=set(LABELS), reads=_per_walk().reads)
-    model = SimpleNamespace(declare_state=lambda: [array], get_combined_graph_walks=lambda: {"LLM": COMBINED})
+    model = SimpleNamespace(declare_state=lambda: [array], get_combined_graph_walks=lambda: {"LLM": COMBINED},
+                            get_graph_walk_graphs=dict)
     resources = {"kv": _StubKV(), **{key: _StubAttn() for key in _resolve([array], StateSetup()).resource_of.values()}}
     llm, cfg = (node_handles(model, node, resources)["kv"] for node in ("LLM", "LLM_cfg_img"))
     assert set(COMBINED) <= set(cfg.walk_reads.reads)
@@ -565,7 +566,7 @@ def test_at_last_token_over_every_row_of_a_combined_plan_refuses_a_segment_with_
 
 def test_a_node_takes_the_handle_another_node_of_its_process_built():
     array = _array(nodes={"LLM", "LLM_cfg_img"})
-    model = SimpleNamespace(declare_state=lambda: [array])
+    model = SimpleNamespace(declare_state=lambda: [array], get_graph_walk_graphs=dict)
     resources, built = {"kv": _StubKV(), "attn": _StubAttn()}, {}
     llm, cfg = (node_handles(model, node, resources, built=built)["kv"] for node in ("LLM", "LLM_cfg_img"))
     assert cfg is llm, "a layer both nodes run would stay on the handle of the node bound last"

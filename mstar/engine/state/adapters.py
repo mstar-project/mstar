@@ -82,15 +82,23 @@ if TYPE_CHECKING:
 
 
 def node_resources(model: "Model", *, setup: "StateSetup | None" = None) -> list[NodeResourceSpec]:
-    """The specs ``model`` declares through `declare_state`, then the ones it writes by hand. The walk graphs are built
-    only for an array on several nodes, since building them can read checkpoints."""
+    """The specs ``model`` declares through `declare_state`, then the ones it writes by hand."""
     declarations = model.declare_state()
-    setup = setup or StateSetup()
-    if any(isinstance(declared, Array) and len(declared.nodes) > 1 for declared in declarations):
-        nodes = {walk: frozenset(graph.get_nodes()) for walk, graph in model.get_graph_walk_graphs().items()}
-        setup = replace(setup, walks=Walks(nodes=nodes))
+    setup = _with_walks(model, declarations, setup or StateSetup())
     specs = build_specs(declarations, kernel_settings=model.kernel_settings(), setup=setup)
     return specs + list(model.get_node_resources() or [])
+
+
+def _with_walks(model: "Model", declarations: Sequence[Array | Sampler], setup: "StateSetup") -> "StateSetup":
+    """``setup`` with ``model``'s `Walks`, each built only where an array needs it, since building the walk graphs can
+    read checkpoints: the nodes each walk runs for an array on several nodes, and the combined walks for an array whose
+    reads differ by walk."""
+    arrays = [declared for declared in declarations if isinstance(declared, Array)]
+    nodes = EMPTY
+    if any(len(array.nodes) > 1 for array in arrays):
+        nodes = {walk: frozenset(graph.get_nodes()) for walk, graph in model.get_graph_walk_graphs().items()}
+    combined = model.get_combined_graph_walks() if any(reads_differ_by_walk(array) for array in arrays) else EMPTY
+    return replace(setup, walks=Walks(nodes, combined))
 
 
 def build_specs(
@@ -304,10 +312,8 @@ def node_handles(
     setup = setup or StateSetup()
     built = {} if built is None else built
     declarations = model.declare_state()
-    arrays = [declared for declared in declarations if isinstance(declared, Array)]
-    if any(reads_differ_by_walk(array) for array in arrays):
-        setup = replace(setup, walks=Walks(combined=model.get_combined_graph_walks()))
-    resolved = _resolve(arrays, setup)
+    setup = _with_walks(model, declarations, setup)
+    resolved = _resolve([declared for declared in declarations if isinstance(declared, Array)], setup)
     for declared in declarations:
         if node in declared.nodes and declared.name not in built:
             built[declared.name] = build_handle(declared, resources, setup, resolved, sp_group)
