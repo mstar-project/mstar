@@ -471,17 +471,42 @@ class PagedArrayHandle(ArrayHandle):
         # adds that run before the reads, outside the captured graph, which the reads find in the pages
         self._eager = step.state[self.name].eager_add
 
+    def check_step(self, step) -> None:
+        # in the step's forward, before its commit: the last add, if its layer went unread
+        self._write_unread()
+        super().check_step(step)
+
     @torch.compiler.disable
     def add(self, layer: int | torch.Tensor, *, keep: bool | None = None, **fields: torch.Tensor) -> None:
         layer = self._layer_id(layer)
         self._record_add(layer, keep)
+        self._write_unread()
+        k, v = fields["k"], fields["v"]
         attn = self._attn.get(layer)
-        if attn is not None and not self._eager:
-            # held for the read, which passes them on as a layer calls attention (`requires_kv_write`): a kernel may
-            # attend the step's own k and v rather than the pages (`reads_step_kv`), and an exchange writes them
-            self._held, self._held_layer = (fields["k"], fields["v"]), layer
-        if attn is None or attn.requires_kv_write and not _exchanges(attn):
-            self._kv.write_kv(fields["k"], fields["v"], layer_idx=self._pool_layer[layer], label=self.label)
+        if attn is None or self._eager:
+            self._write(layer, k, v)
+            return
+        # held for the read, which passes them on as a layer calls attention (`requires_kv_write`): a kernel may
+        # attend the step's own k and v rather than the pages (`reads_step_kv`), and an exchange writes them
+        self._held, self._held_layer = (k, v), layer
+        if not _exchanges(attn):
+            self._write(layer, k, v)
+
+    def _write(self, layer: int, k: torch.Tensor, v: torch.Tensor) -> None:
+        """``layer``'s write alone, where its kernel reads the pages: through the exchange where the attention
+        exchanges, as `AttentionCallable.write` makes it."""
+        attn = self._attn.get(layer)
+        if attn is not None and _exchanges(attn):
+            attn.exchange(partial(self._attend, layer), None, k, v, label=self.label)
+        elif attn is None or attn.requires_kv_write:
+            self._kv.write_kv(k, v, layer_idx=self._pool_layer[layer], label=self.label)
+
+    def _write_unread(self) -> None:
+        """Write the held add of a layer the step didn't read where its write waits for the read's exchange, so
+        each add is written once: when the next add or the step's check finds it still held."""
+        layer = self._held_layer
+        if layer is not None and _exchanges(self._attn[layer]):
+            self._write(layer, *self._take_hold(layer))
 
     @torch.compiler.disable
     def read(self, layer: int | torch.Tensor, q: torch.Tensor | None = None, **mask_args: Any) -> torch.Tensor:
