@@ -5,19 +5,14 @@ on a replay, and its checks live in it.
 """
 
 from abc import abstractmethod
-from collections.abc import Collection, Iterable, Mapping, Sequence
+from collections.abc import Collection, Iterable, Mapping
 from typing import Any
 
 import torch
 
 from mstar.engine.resources.sampler.utils import FUSED_DRAW_MAX_VOCAB, FusedDrawArgs
-from mstar.engine.resources.step import Segment, StepHandle
+from mstar.engine.resources.step import StepHandle
 from mstar.engine.state.contract import Array, ArrayStep, CausalConv, GatedDeltaNet, Op, Sampler
-
-
-def step_labels(segments: Sequence[Segment]) -> tuple[str, ...]:
-    """The labels ``segments`` name, in the order they first appear."""
-    return tuple(dict.fromkeys(segment.label for segment in segments))
 
 
 class ArrayHandle(StepHandle):

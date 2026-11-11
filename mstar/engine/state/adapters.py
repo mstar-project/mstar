@@ -45,7 +45,7 @@ from mstar.engine.resources.sampler.config import SamplerSpec, SamplerStep, Samp
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
 from mstar.engine.resources.step import Segment, SubmoduleStep
 from mstar.engine.state.analysis import position_key, reads_differ_by_walk, written_by_step
-from mstar.engine.state.calls import ArrayHandle, SamplerHandle, step_labels
+from mstar.engine.state.calls import ArrayHandle, SamplerHandle
 from mstar.engine.state.contract import (
     EMPTY,
     Array,
@@ -371,6 +371,11 @@ def check_capture(handles: Mapping[str, ArrayHandle | SamplerHandle], walks: Col
     for handle in handles.values():
         if isinstance(handle, ArrayHandle):
             handle._check_capture(walks)
+
+
+def step_labels(segments: Sequence[Segment]) -> tuple[str, ...]:
+    """The labels ``segments`` name, in the order they first appear."""
+    return tuple(dict.fromkeys(segment.label for segment in segments))
 
 
 def _forks(array: Array, declared: ArrayStep) -> tuple[tuple, tuple, frozenset | None]:
