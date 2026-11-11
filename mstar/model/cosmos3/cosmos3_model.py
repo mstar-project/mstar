@@ -1294,10 +1294,9 @@ class Cosmos3Model(Model):
                 for i in ids
             )
         if modality == "image":
-            import io
             import os
 
-            from PIL import Image
+            from mstar.model.components.diffusion.image_io import uint8_to_png
 
             # The decoder emits 8-bit frames [B, C, T, H, W]; take the first one.
             x = output
@@ -1305,17 +1304,12 @@ class Cosmos3Model(Model):
                 x = x[0, :, 0]
             elif x.ndim == 4:
                 x = x[0]
-            arr = x.permute(1, 2, 0).cpu().numpy()  # H, W, C uint8
-            buf = io.BytesIO()
             # PNG is lossless at every compression level, so the level only trades
-            # encode time for file size. PIL defaults to 6, which spends ~0.75 s on a
-            # 720p frame and dominates the serving latency. Level 0 (no deflate) is
-            # the fastest and matches what the OpenAI image endpoint emits at full
-            # quality; the decoded pixels are identical regardless. Override with
-            # COSMOS3_PNG_COMPRESS for A/B.
+            # encode time for file size; level 0 (stored) is the fastest. The shared
+            # writer also skips PIL's adaptive scanline filters, which cost ~110 ms
+            # at 1024^2 even at level 0. Override with COSMOS3_PNG_COMPRESS for A/B.
             compress_level = int(os.environ.get("COSMOS3_PNG_COMPRESS", "0"))
-            Image.fromarray(arr).save(buf, format="PNG", compress_level=compress_level)
-            return buf.getvalue()
+            return uint8_to_png(x, compress_level=compress_level)
         if modality == "video":
             import os
 
