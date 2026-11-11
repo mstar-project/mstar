@@ -34,6 +34,10 @@ NODE = "LLM"
 _CTX = ResourceCapabilitiesCtx(NODE, {})
 
 
+# a drafter that loads no checkpoint, served by its own table, as a test's scripted drafter is
+_SCRIPTED = {**DRAFT_METHODS, "scripted": DraftMethod("scripted", needs_model=False)}
+
+
 # ---- the schema ----
 
 def test_the_block_parses_with_defaults():
@@ -41,23 +45,23 @@ def test_the_block_parses_with_defaults():
     assert (cfg.method, cfg.model, cfg.num_draft_tokens) == ("dspark", "org/drafter", 7)
     assert cfg.mode == DraftMode.AUTO
     assert cfg.block == 8 and cfg.kv_slack == 16
-    mtp = DraftConfig.parse({"method": "mtp", "num_draft_tokens": 3, "mode": "synchronous"})
-    assert mtp.mode == DraftMode.SYNCHRONOUS
+    own = DraftConfig.parse({"method": "scripted", "num_draft_tokens": 3, "mode": "synchronous"}, _SCRIPTED)
+    assert own.mode == DraftMode.SYNCHRONOUS
 
 
 @pytest.mark.parametrize("block,pattern", [
     ({"method": "dspark", "model": "m", "num_draft_tokens": 7, "draft_tokens": 7}, "unknown key 'draft_tokens'"),
     ({"method": "eagle", "num_draft_tokens": 2}, "method must be one of"),
     ({"method": "dspark", "num_draft_tokens": 2}, "set model"),
-    ({"method": "mtp", "model": "m", "num_draft_tokens": 2}, "drop model"),
-    ({"method": "mtp", "num_draft_tokens": 0}, "positive integer"),
-    ({"method": "mtp", "num_draft_tokens": True}, "positive integer"),
-    ({"method": "mtp", "num_draft_tokens": 2, "mode": "fast"}, "mode must be one of"),
+    ({"method": "scripted", "model": "m", "num_draft_tokens": 2}, "drop model"),
+    ({"method": "scripted", "num_draft_tokens": 0}, "positive integer"),
+    ({"method": "scripted", "num_draft_tokens": True}, "positive integer"),
+    ({"method": "scripted", "num_draft_tokens": 2, "mode": "fast"}, "mode must be one of"),
     (["dspark"], "must be a mapping"),
 ])
 def test_a_bad_block_is_refused_naming_the_problem(block, pattern):
     with pytest.raises(ValueError, match=pattern):
-        DraftConfig.parse(block)
+        DraftConfig.parse(block, _SCRIPTED)
 
 
 def test_several_problems_come_back_together():
@@ -73,8 +77,9 @@ def test_no_block_leaves_speculative_decoding_off():
 
 
 def test_a_model_may_serve_a_method_of_its_own():
-    methods = {**DRAFT_METHODS, "scripted": DraftMethod("scripted", needs_model=False)}
-    assert DraftConfig.parse({"method": "scripted", "num_draft_tokens": 2}, methods).method == "scripted"
+    assert DraftConfig.parse({"method": "scripted", "num_draft_tokens": 2}, _SCRIPTED).method == "scripted"
+    with pytest.raises(ValueError, match="method must be one of"):
+        DraftConfig.parse({"method": "scripted", "num_draft_tokens": 2})
 
 
 # ---- the node ----
@@ -414,7 +419,7 @@ def test_a_draft_block_on_a_model_that_serves_none_is_refused():
     from mstar.validation.draft import check_draft
 
     model = SimpleNamespace(verify_nodes=lambda: [])
-    block = {"method": "mtp", "num_draft_tokens": 3}
+    block = {"method": "dspark", "model": "m", "num_draft_tokens": 3}
     problems = check_draft(model, {"model_kwargs": {"draft": block}}, None)
     assert len(problems) == 1 and "drop model_kwargs.draft" in problems[0]
     with pytest.raises(ValueError, match="unknown key"):
