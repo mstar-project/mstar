@@ -32,9 +32,9 @@ class DrafterShare(NamedTuple):
     sampler_key: str
     num_draft_tokens: int
     prompt_walks: frozenset[str]
-    # the sampler loop-back state the drafter's carry is stored through (`carry_writes`)
-    prompt_writes: frozenset[str]
-    verify_writes: frozenset[str]
+    # the sampler loop-back state the drafter's carry is stored through, on its prompt and verify steps
+    # (`carry_writes`)
+    loopback_writes: frozenset[str]
     # the drafter's own resources' steps (`VerifyNode.prefill_steps`, `VerifyNode.verify_steps`)
     prompt_steps: Mapping[str, ResourceStep]
     verify_steps: Mapping[str, ResourceStep]
@@ -54,9 +54,9 @@ def drafter_step(step, graph_walk: str, share: DrafterShare | None):
     if share is None or step is None:
         return step
     if graph_walk == share.verify_walk:
-        writes, own = share.verify_writes, share.verify_steps
+        writes, own = share.loopback_writes, share.verify_steps
     elif graph_walk in share.prompt_walks:
-        writes, own = share.prompt_writes, share.prompt_steps
+        writes, own = share.loopback_writes, share.prompt_steps
     else:
         return step
     steps = dict(step.steps)
