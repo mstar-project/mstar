@@ -47,7 +47,7 @@ class ChunkBoundary(Enum):
 
 
 class CarrySpec(NamedTuple):
-    """Per-request drafter state across steps (MTP's hidden vector): the
+    """Per-request drafter state across steps (a drafter's hidden vector): the
     node's sampler keeps it as loop-back state `DRAFT_CARRY`, by request, from
     admission to removal."""
     width: int

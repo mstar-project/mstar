@@ -1850,7 +1850,7 @@ What the model writes, and nothing more:
   RoPE base isn't the node's positions' (``rope_theta``).
 
 - A drafter whose state crosses steps declares ``DrafterNeeds.carry`` (``CarrySpec(width,
-  dtype)``, MTP's hidden vector). The engine keeps it as the node sampler's loop-back state
+  dtype)``, a drafter's hidden vector). The engine keeps it as the node sampler's loop-back state
   ``DRAFT_CARRY``, one row per request from admission to removal: ``drafter_resources`` adds it
   to the node's ``SamplerSpec.loopback_state`` at that width and dtype (startup checks), and
   the engine adds it to the ``SamplerStep.loopback_writes`` of the node's prompt and verify
