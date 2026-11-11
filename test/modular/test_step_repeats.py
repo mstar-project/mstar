@@ -133,6 +133,10 @@ def test_a_capture_another_walk_replays_is_refused_at_load_for_a_device_run():
     assert runner._capture_run(spec, None) is None
     assert "alias" in runner.device_run_refusal(WALK)
 
+    # an ask of its own for the other walk, with other stop ids, is no cover
+    runner._run_asks, runner._run_failures = {WALK: object(), "alias": object()}, {}
+    assert runner._capture_run(spec, None) is None and "alias" in runner.device_run_refusal(WALK)
+
 
 def test_a_slot_with_a_device_run_never_replays_unstaged():
     """A walk that shares the capture of an asked walk gets its WHILE graph but

@@ -1276,9 +1276,9 @@ class AcceleratorGraphRunner:
         ask = self._run_asks.get(walk)
         if ask is None or walk in self._run_failures:
             return None
-        if unasked := [w for w in spec.config.replay_graph_walks if w != walk and w not in self._run_asks]:
-            # a step of such a walk would lease this WHILE slot with no stop to run it
-            self._run_failures[walk] = f"its capture is also replayed by {unasked}, which no step_repeats ask covers"
+        if unfit := [w for w in spec.config.replay_graph_walks if w != walk and self._run_asks.get(w) != ask]:
+            # a step of such a walk would lease this WHILE slot with no stop to run it, or the other's
+            self._run_failures[walk] = f"its capture is also replayed by {unfit}, which ask for another run"
             return None
         backend = self._graph_backend
         if refusal := backend.while_refusal():
