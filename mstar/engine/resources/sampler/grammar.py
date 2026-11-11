@@ -152,8 +152,8 @@ def after_reasoning(structured: Any, text_output: TextOutput | None, prompt_ids:
     leaves the reasoning open, so a thinking turn reasons freely and then answers
     in its grammar; as it came on a turn whose prompt ends past the reasoning.
     The check reads the last 8 ids and the whitespace before the end does not
-    count. If they do not end in ``reasoning_end``, it drops one trailing special
-    token and reads again, so a template may add special tokens after the end
+    count. While they do not end in ``reasoning_end``, it drops trailing special
+    tokens one at a time, reading again after each, so a template may add special tokens after the end
     (MiniCPM-o's ``<|tts_bos|>``) and an end made of special tokens still matches."""
     end = None if text_output is None else text_output.reasoning_end
     if end is None or not isinstance(structured, dict) or "after" in structured:
