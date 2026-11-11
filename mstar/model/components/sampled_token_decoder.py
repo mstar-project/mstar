@@ -72,7 +72,7 @@ from mstar.engine.accelerator_graph_config import (
     decode_rows_then_prompt,
 )
 from mstar.engine.resources.attn.config import AttentionStep
-from mstar.engine.resources.draft.drafter import PrefillInputs
+from mstar.engine.resources.draft.drafter import Drafter, PrefillInputs
 from mstar.engine.resources.position.config import PositionStep
 from mstar.engine.resources.sampler.config import SamplerStep
 from mstar.engine.resources.step import ResourceStep, Segment, SubmoduleStep
@@ -165,7 +165,7 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
         config: Any,
         encoders: Sequence[MediaEncoder] = (),
         text_prompts: bool = True,
-        drafter: Any = None,
+        drafter: Drafter | None = None,
         accelerator_graph: bool = True,
     ):
         """``encoders`` are the model's media encoders, as its walks declare
