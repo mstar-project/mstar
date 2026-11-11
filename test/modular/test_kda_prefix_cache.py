@@ -270,6 +270,31 @@ def test_windows_that_cut_a_row_inside_a_chunk_compute_what_the_whole_step_does(
                 torch.testing.assert_close(x, y, rtol=1e-5, atol=1e-5)
 
 
+def test_a_window_cut_with_no_snapshot_in_it_runs_its_row_as_one_piece():
+    """With no snapshot to place, a row a window boundary cuts runs in one launch, chunked from
+    the cut, and still computes what the whole step does."""
+    rows = {"a": _tokens(100, seed=3), "b": _tokens(90, seed=4)}
+    whole, cut = _Node(prefix_slots=0), _Node(prefix_slots=0)
+    for node in (whole, cut):
+        for rid, tokens in rows.items():
+            node.ingest(rid, tokens)
+    heads = []
+    run = cut.kda.run
+
+    def recording(*args, **kwargs):
+        heads.append(cut.kda.current_plan("main").head)
+        return run(*args, **kwargs)
+
+    cut.kda.run = recording
+    ref = whole.step(rows)
+    out = cut.step(rows, windows=[120])
+    assert heads == [None, None], "a window split a row that keeps no snapshot"
+    torch.testing.assert_close(out, ref, rtol=1e-5, atol=1e-5)
+    for rid in rows:
+        for x, y in zip(whole.state(whole.slot(rid)), cut.state(cut.slot(rid)), strict=True):
+            torch.testing.assert_close(x, y, rtol=1e-5, atol=1e-5)
+
+
 def test_a_page_off_the_kda_chunk_is_refused_at_load():
     """A snapshot sits on a chunk end, so a page of half a chunk would leave one inside a chunk."""
     with pytest.raises(ValueError, match="page_size to a multiple of 64"):
