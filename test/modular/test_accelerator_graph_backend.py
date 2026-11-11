@@ -161,6 +161,12 @@ def test_a_split_capture_replays_its_host_call_between_its_graphs(monkeypatch):
     log.clear()
     graph.replay()
     assert log == ["A", "fill", "B"]
+    # a host call that raises: the second graph (and any collective in it) still replays
+    log.clear()
+    graph.fn = lambda: 1 / 0
+    with pytest.raises(ZeroDivisionError):
+        graph.replay()
+    assert log == ["A", "B"]
 
 
 @pytest.mark.parametrize("device_type", ["cuda", "xpu"])

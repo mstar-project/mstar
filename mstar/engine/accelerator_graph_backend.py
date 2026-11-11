@@ -20,7 +20,8 @@ class CapturedGraph(Protocol):
 
 
 class SplitGraph:
-    """A capture `split_capture` split: a replay runs the first graph, ``fn`` on the host, then the second."""
+    """A capture `split_capture` split: a replay runs the first graph, ``fn`` on the host, then the
+    second, even when ``fn`` raises, so a rank whose ``fn`` raised still runs the second's collectives."""
 
     def __init__(self, graphs: list[CapturedGraph], fn: Callable[[], None]):
         self.graphs = graphs
@@ -29,8 +30,10 @@ class SplitGraph:
     def replay(self) -> None:
         first, second = self.graphs
         first.replay()
-        self.fn()
-        second.replay()
+        try:
+            self.fn()
+        finally:
+            second.replay()
 
     def reset(self) -> None:
         for graph in self.graphs:
@@ -60,8 +63,8 @@ def split_capture(fn: Callable[[], None]) -> None:
     """End the graph this thread is capturing and capture on into a new one in the same pool, so
     every replay runs ``fn`` on the host between the two (`SplitGraph`): host work that needs what
     the step before wrote, done while the first graph runs. ``fn`` runs on the stream the replay
-    is on, and must not raise: a rank that skipped the second graph would skip its collectives.
-    Once per capture; a second split is a ``ValueError``."""
+    is on; the second graph replays whether or not it raises. Once per capture; a second split is
+    a ``ValueError``."""
     capture: GraphCapture | None = getattr(_capturing, "capture", None)
     if capture is None or not capture.backend.is_current_stream_capturing():
         raise ValueError("split_capture runs only inside a graph capture (AcceleratorGraphBackend.capture)")
