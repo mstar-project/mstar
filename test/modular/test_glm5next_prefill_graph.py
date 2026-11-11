@@ -193,8 +193,10 @@ class _Engine:
             dynamic_loop_iter_counts={"decode_loop": 0},
         )
 
-    def step(self, walk, prompts, captured):
-        """One step over ``prompts`` (rid -> ids); returns (tokens, lease)."""
+    def step(self, walk, prompts, captured, cached=0):
+        """One step over ``prompts`` (rid -> ids); returns (tokens, lease). The cache holds each
+        prompt's first ``cached`` tokens, so the step is cut past them as the engine cuts a
+        prompt past a prefix hit."""
         rids = list(prompts)
         for rid in rids:
             if walk == "prefill" and rid not in self.resources[KDA_STATE]._slots:
@@ -202,6 +204,9 @@ class _Engine:
         infos = {rid: self.info(rid, walk) for rid in rids}
         inputs = [self.sub.prepare_inputs(walk, infos[rid], {"text_inputs": [ids]})
                   for rid, ids in prompts.items()]
+        if cached:
+            inputs = [self.sub.split_inputs(walk, infos[rid], inp, cached, inp.input_seq_len)
+                      for rid, inp in zip(rids, inputs, strict=True)]
         lease = None
         if captured:
             lease = self.cg.lease_slot(walk, bs=len(rids), slot=0,
@@ -307,3 +312,27 @@ def test_captured_prefill_matches_eager(engine, lengths):
         assert torch.equal(nxt_e[re], nxt_g[rg])
     for rid in [*eager, *graph]:
         engine.runner.remove_request(rid)
+
+
+def test_a_captured_prefill_past_cached_rows_matches_eager(engine):
+    """Without DSA a prefill past a cached prefix stays on its captures: the replay attends
+    the rows the cache holds and continues the KDA state at their end, as the eager step does."""
+    cached = 128
+    eager = _prompts("e", [300], 11)
+    graph = {"g0": eager["e0"]}
+    for prompts in (eager, graph):  # the rows a prefix hit hands the request
+        engine.step("prefill", {rid: ids[:cached] for rid, ids in prompts.items()}, captured=False)
+    tok_e, _ = engine.step("prefill", eager, captured=False, cached=cached)
+    tok_g, lease = engine.step("prefill", graph, captured=True, cached=cached)
+    assert lease.bucket.num_tokens >= 300 - cached
+    assert torch.equal(tok_e["e0"], tok_g["g0"]), (tok_e, tok_g)
+    (rec_e, conv_e), (rec_g, conv_g) = engine.state("e0"), engine.state("g0")
+    # a padded bucket: the dense GEMMs see more rows, so cuBLAS may block them differently
+    torch.testing.assert_close(rec_g, rec_e, rtol=2e-2, atol=2e-3)
+    torch.testing.assert_close(conv_g.float(), conv_e.float(), rtol=2e-2, atol=2e-2)
+    nxt_e, _ = engine.step("decode", {"e0": tok_e["e0"].view(1)}, captured=False)
+    nxt_g, _ = engine.step("decode", {"g0": tok_g["g0"].view(1)}, captured=False)
+    assert torch.equal(nxt_e["e0"], nxt_g["g0"])
+    for rid in ("e0", "g0"):
+        engine.runner.remove_request(rid)
+        engine.sub.request_states.pop(rid, None)  # the engine drops it on removal

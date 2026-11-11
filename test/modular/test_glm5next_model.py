@@ -512,12 +512,13 @@ def test_mtp_off_and_on_both_construct():
 
 @torch.no_grad()
 def test_mtp_block_row_query_matches_the_causal_block():
-    """A draft pass queries one row of the step's block (the other rows attend with zero
-    queries and rewrite their latents): its output is that row of the MTP layer run over the
-    whole block."""
+    """Without index_share_for_mtp_iteration a draft pass queries one row of the step's block
+    (the other rows attend with zero queries and rewrite their latents): its output is that row
+    of the MTP layer run over the whole block."""
     h = _Harness(seed=18, mtp_num_draft_tokens=3)
     layer = h.lm.mtp.transformer_layer
     attn = layer.self_attn
+    attn.share_mtp_indices = False
     hidden = h.cfg.hidden_size
     h.ingest("r0")
     step, _ = h.open_step("prefill", ["r0"], [torch.arange(2, 7)])
@@ -534,6 +535,32 @@ def test_mtp_block_row_query_matches_the_causal_block():
     h.close_step(step)
     h.remove("r0")
 
+
+
+@torch.no_grad()
+def test_mtp_draft_rows_attend_only_the_context_before_the_block():
+    """index_share_for_mtp_iteration (the checkpoint's): every draft pass attends what the
+    step's first pass attended, the cache before the block, so a row's output depends neither on
+    its row nor on what earlier drafts wrote into the block."""
+    h = _Harness(seed=19, mtp_num_draft_tokens=3)
+    layer = h.lm.mtp.transformer_layer
+    attn = layer.self_attn
+    assert attn.share_mtp_indices
+    hidden = h.cfg.hidden_size
+    h.ingest("r0")
+    step, _ = h.open_step("prefill", ["r0"], [torch.arange(2, 7)])
+    layer(torch.randn(5, hidden))  # the MTP plane's context
+    h.close_step(step)
+    block = 4
+    x = torch.randn(1, hidden)
+    step, _ = h.open_step("prefill", ["r0"], [torch.zeros(block, dtype=torch.long)])
+    latents = x.new_zeros(1, block, attn.kv_lora_rank + attn.mla_cache_kpe)
+    first = layer(x, row=0, latents=latents)
+    for row in range(1, block):
+        layer(torch.randn(1, hidden), row=row - 1, latents=latents)  # an earlier draft's row
+        torch.testing.assert_close(layer(x, row=row, latents=latents), first, rtol=1e-4, atol=1e-5)
+    h.close_step(step)
+    h.remove("r0")
 
 # --- the loader against the model ------------------------------------------
 

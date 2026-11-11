@@ -53,7 +53,8 @@ class DSAContext:
     ``needs_selection``: some row sees more than ``topk`` keys (below, dense MLA is the same
     computation). ``decode_rows``: every row scores on its own, the capturable launch (decode,
     an MTP verify block, any captured step). ``last_selection``: the last indexer layer's pick,
-    which a layer without an indexer reuses."""
+    which a layer without an indexer reuses. ``last_pools``: ``select(keep_pools=True)``'s
+    top pools. ``reused``: the slots of rows that attend an earlier pass's (``reuse``)."""
 
     pos: torch.Tensor
     row_req: torch.Tensor
@@ -74,6 +75,8 @@ class DSAContext:
     valid: torch.Tensor | None = None
     pad_slot: int | None = None
     last_selection: torch.Tensor | None = None
+    last_pools: torch.Tensor | None = None
+    reused: torch.Tensor | None = None
     # the resource's reused eager plans, which an eager step plans through
     eager: sparse_mla.EagerSparsePlans | None = None
     # planned under a capture lease (its rows are the slot's buffers)
@@ -138,7 +141,26 @@ class DSAContext:
         return dataclasses.replace(
             self, pos=self.pos[idx], row_req=self.row_req[idx], host_pos=host_pos, spans=spans,
             max_pools=max(1, (max(host_pos) + 1) // self.kpool), needs_selection=True,
-            decode_rows=False, sparse_plan=None, last_selection=None)
+            decode_rows=False, sparse_plan=None, last_selection=None, last_pools=None,
+            reused=None)
+
+    def reuse(self, pos: torch.Tensor, pools: torch.Tensor,
+              host_pos: list[int] | None) -> DSAContext:
+        """These rows attending, instead of their own selection, the one an earlier pass made
+        at ``pos`` (``host_pos`` on the host when eager): its ``pools`` (``last_pools``) and the
+        tail of ``pos``. Pools are request-relative, so they outlive the pages moving."""
+        graph = isinstance(self.sparse_plan, sparse_mla.SparseGraphPlan)
+        if graph and self.pad_slot is None:
+            raise ValueError("a reused selection under a graph plan needs a pad slot")
+        ctx = dataclasses.replace(
+            self, pos=pos, host_pos=host_pos, sparse_plan=self.sparse_plan if graph else None,
+            valid=attn_lens_device(pos, self.topk, self.kpool).to(torch.int32) if graph else None,
+            last_selection=None, last_pools=None)
+        first = _token_slots(ctx, ctx.row_req[:, None].long(),
+                             pools.long().clamp_min(0) * ctx.kpool, ctx.page_size)
+        first = torch.where(pools >= 0, first, -1).to(torch.int32)
+        ctx.reused = first if ctx.kpool == 1 else expand_slots(first, ctx)
+        return ctx
 
 
 def attn_lens(positions: list[int], topk: int, kpool: int) -> list[int]:
@@ -202,7 +224,7 @@ def _pool_keys_torch(view: torch.Tensor, ctx: DSAContext, ape: torch.Tensor,
 # -- selection ---------------------------------------------------------------------------------
 
 def select(q: torch.Tensor, w: torch.Tensor, view: torch.Tensor,
-           ctx: DSAContext, group=None, *,
+           ctx: DSAContext, group=None, keep_pools: bool = False, *,
            score_bytes: int = DSAConfig.prefill_score_bytes,
            shard_min_rows: int = DSAConfig.shard_min_rows) -> torch.Tensor:
     """``[rows, width]`` int32 MLA-cache slots each row attends: the tokens of its top ``topk /
@@ -210,11 +232,18 @@ def select(q: torch.Tensor, w: torch.Tensor, view: torch.Tensor,
     ``w (rows, NH)`` fp32 with the scales folded in, ``view`` the layer's index plane
     (``kv.aux_view(INDEX_PLANES, plane)``). Single-row spans (decode) score in one launch,
     longer spans (prefill) in chunks of one request's rows; a TP ``group`` splits a prefill's
-    rows across ranks (``sparse_mla.select_rows``). ``score_bytes`` and ``shard_min_rows`` are
-    the resource's ``DSAConfig`` sizing."""
+    rows across ranks (``sparse_mla.select_rows``). ``keep_pools``: one-launch rows leave
+    their top pools in ``ctx.last_pools`` (None on the other paths). ``score_bytes`` and
+    ``shard_min_rows`` are the resource's ``DSAConfig`` sizing."""
     if ctx.decode_rows or ctx.spans is None or all(n == 1 for _, n, _ in ctx.spans):
         scores = _decode_scores(q, w, view, ctx, ctx.pos, ctx.row_req, max(ctx.max_pools, 1))
-        return _slots(scores, ctx)
+        if not keep_pools:
+            return _slots(scores, ctx)
+        ctx.last_pools = torch.empty(q.shape[0], ctx.topk // ctx.kpool, dtype=torch.int32,
+                                     device=q.device)
+        return _slots(scores, ctx, indices=ctx.last_pools)
+    if keep_pools:
+        ctx.last_pools = None
     out = torch.empty(q.shape[0], ctx.width, dtype=torch.int32, device=q.device)
     single = [r0 for r0, n, _ in ctx.spans if n == 1]
     if single:  # a mixed step's decode rows, in one launch
@@ -251,9 +280,10 @@ def _select_rows(q, w, view, ctx, req, r0, r1, score_bytes):
     return out
 
 
-def _slots(scores: torch.Tensor, ctx: DSAContext, rows=slice(None)) -> torch.Tensor:
+def _slots(scores: torch.Tensor, ctx: DSAContext, rows=slice(None),
+           indices: torch.Tensor | None = None) -> torch.Tensor:
     """Rows ``rows`` of the step: their top pools' slots, expanded to their tokens."""
-    first = top_pools(scores, ctx, rows)
+    first = top_pools(scores, ctx, rows, indices)
     return first if ctx.kpool == 1 else expand_slots(first, ctx, rows)
 
 
@@ -297,27 +327,32 @@ def _scores_torch(q, w, view, ctx, req, pos, pools):
     return scores.masked_fill(~visible, float("-inf"))
 
 
-def top_pools(scores: torch.Tensor, ctx: DSAContext, rows=slice(None)) -> torch.Tensor:
+def top_pools(scores: torch.Tensor, ctx: DSAContext, rows=slice(None),
+              indices: torch.Tensor | None = None) -> torch.Tensor:
     """``[rows, topk / kpool]`` int32: the slot of the first token of each row's top pools
     (ties to the earlier pool), -1 past ``min(pools, topk / kpool)``. With ``kpool == 1``,
-    each row's top ``topk`` token slots."""
+    each row's top ``topk`` token slots. ``indices``, the same shape, receives each pick's
+    index in its request (pool j holds tokens ``[j * kpool, (j + 1) * kpool)``)."""
     n, starts, batch = (t[rows] for t in ctx.row_meta())
     k = ctx.topk // ctx.kpool
     if scores.is_cuda:
         import flashinfer
 
-        pool_slots = flashinfer.top_k_page_table_transform(
+        picked = flashinfer.top_k_page_table_transform(
             scores, ctx.pages[None, :], n, k, row_to_batch=batch, deterministic=True,
             tie_break=flashinfer.TopKTieBreak.SMALL, dsa_graph_safe=True,
-            page_table_row_starts=starts, page_size=ctx.page_size // ctx.kpool)
+            page_table_row_starts=starts, page_size=ctx.page_size // ctx.kpool,
+            out_raw_indices=indices)
         if ctx.kpool == 1:
-            return pool_slots
-        return torch.where(pool_slots >= 0, pool_slots * ctx.kpool, -1)
+            return picked
+        return torch.where(picked >= 0, picked * ctx.kpool, -1)
     # stable sort: equal scores keep pool order, so ties go to the earlier pool
     order = torch.sort(scores, dim=-1, descending=True, stable=True).indices[:, :k]
     if order.shape[1] < k:
         order = torch.cat([order, order.new_zeros(order.shape[0], k - order.shape[1])], 1)
     live = torch.arange(k, device=scores.device)[None, :] < n[:, None]
+    if indices is not None:
+        indices.copy_(torch.where(live, order, -1))
     first = _token_slots(ctx, ctx.row_req[rows][:, None].long(),
                          torch.where(live, order * ctx.kpool, 0), ctx.page_size)
     return torch.where(live, first, -1).to(torch.int32)

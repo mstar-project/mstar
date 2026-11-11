@@ -286,6 +286,12 @@ class DSAManager(Resource):
         """The step's given rows alone (``DSAContext.pick``), under ``KVManager.token_rows``."""
         return self._narrowed(self.current(label).pick(rows), label)
 
+    def reuse(self, pos: torch.Tensor, pools: torch.Tensor, host_pos: list[int] | None,
+              label: str | None = None):
+        """Rows at ``pos`` attending an earlier pass's selection, its ``pools``, instead of
+        their own (``DSAContext.reuse``)."""
+        return self._narrowed(self.current(label).reuse(pos, pools, host_pos), label)
+
     def dense(self, label: str | None = None):
         """No plan: the layers attend densely (a pass DSA doesn't cover)."""
         return self._narrowed(None, label)
@@ -329,10 +335,11 @@ class DSAManager(Resource):
                           ape=ape)
 
     def select(self, plane: int, q: torch.Tensor, w: torch.Tensor, group=None,
-               label: str | None = None) -> torch.Tensor:
-        """``[rows, width]`` cache slots each row attends, scored over ``plane``'s keys."""
+               label: str | None = None, keep_pools: bool = False) -> torch.Tensor:
+        """``[rows, width]`` cache slots each row attends, scored over ``plane``'s keys;
+        ``keep_pools`` leaves the top pools in the plan's ``last_pools`` (``paged.select``)."""
         return paged.select(q, w, self._need_kv().aux_view(INDEX_PLANES, plane),
-                            self.current(label), group,
+                            self.current(label), group, keep_pools=keep_pools,
                             score_bytes=self.config.prefill_score_bytes,
                             shard_min_rows=self.config.shard_min_rows)
 

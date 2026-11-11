@@ -113,12 +113,12 @@ class _Model(StubModel):
         return tensors if self._layout is None else ProcessPromptOutput(tensors, {"kv_layout": self._layout})
 
 
-def _preprocess(model: _Model, model_kwargs: dict, **config) -> dict:
+def _preprocess(model: _Model, model_kwargs: dict, kv_key: str = "kv", **config) -> dict:
     worker = PreprocessWorkerThread(
         *(queue.Queue() for _ in range(8)), stop_event=threading.Event(), communicator=_Comm(),
         tensor_manager=_StubTensorManager(), model=model,
         model_config={
-            "model": "stub", "resources": {"kv": {"page_size": PS}},
+            "model": "stub", "resources": {kv_key: {"page_size": PS}},
             "node_groups": [{"node_names": ["llm", "talker"], "ranks": [0]}], **config,
         },
     )

@@ -34,9 +34,14 @@ resources:
     # 11 latent planes (the MLA layers) of 512 bf16 = 11.3 KB/token, ~1.5 GB/rank.
     max_num_pages: 1025
     page_size: 128
+    # the prefix cache above one rank: rank 0 decides each hit and the other ranks adopt it
+    prefix_cache_tp: true
   kda_state:
     # max_concurrent_requests + the sink, ~18.5 MB/slot/rank (head-sharded): ~1.2 GB/rank
     max_slots: 65
+    # KDA states kept for prefix reuse, at page boundaries: a session's next turn restores its
+    # last prompt's. One request slot's memory each.
+    prefix_slots: 64
 node_groups:
   - node_names: [LLM]
     ranks: [0, 1, 2, 3, 4, 5, 6, 7]

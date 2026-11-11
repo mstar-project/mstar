@@ -316,7 +316,7 @@ class MLAAttention(nn.Module):
             q_pe_all = q.new_zeros(n, block, h, self.qk_rope_head_dim)
             q_pe_all[:, row] = q_pe
         latents = rows.setdefault("latent", latent.new_zeros(n, block, latent.shape[-1]))
-        latents[:, row] = latent
+        latents[:, row] = self._draft_row_entry(latent)
         q_nope_all = q_nope.new_zeros(n, block, h, self.kv_lora_rank)
         q_nope_all[:, row] = torch.einsum("thd,hdl->thl", q_nope, self.w_kc)
         q_nope_all, q_pe_all = q_nope_all.view(n * block, h, -1), q_pe_all.view(n * block, h, -1)
@@ -328,6 +328,11 @@ class MLAAttention(nn.Module):
             attn = self._attend_selected(selection, q_nope_all, q_pe_all, latents.view(n * block, -1))
         out = self._out(attn.view(n, block, h, -1)[:, row])
         return self.o_proj(out)
+
+    def _draft_row_entry(self, latent: torch.Tensor) -> torch.Tensor:
+        """The cache row ``forward_block_row`` writes for its query's own row: by default the
+        latent itself, which later rows of the block then attend."""
+        return latent
 
     def _block_row_naive(self, hidden_states, position_ids, row, block, rows):
         """``forward_block_row`` on the naive path: padded per-head K/V rows instead of latents."""

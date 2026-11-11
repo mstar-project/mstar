@@ -164,16 +164,21 @@ class _Engine:
         ctx.is_preplan = False
         return lease
 
-    def step(self, walk, prompts, captured, slot=0, preplan=False):
-        """One step; returns ({rid: emitted tokens}, {rid: next input}, lease)."""
+    def step(self, walk, prompts, captured, slot=0, preplan=False, cached=0):
+        """One step; returns ({rid: emitted tokens}, {rid: next input}, lease). The cache holds
+        each prompt's first ``cached`` tokens, so the step is cut past them as the engine cuts a
+        prompt past a prefix hit."""
         rids = list(prompts)
-        if walk == "prefill":
+        if walk == "prefill" and not cached:
             for rid in rids:
                 self.runner.ingest_request(rid, {SAMPLER: SamplingReqConfig(temperature=0.0)})
         lease = self.preplan(walk, rids, slot) if preplan else None
         infos = {rid: self.info(rid, walk) for rid in rids}
         inputs = [self.sub.prepare_inputs(walk, infos[rid], {"text_inputs": [ids]})
                   for rid, ids in prompts.items()]
+        if cached:
+            inputs = [self.sub.split_inputs(walk, infos[rid], inp, cached, inp.input_seq_len)
+                      for rid, inp in zip(rids, inputs, strict=True)]
         if captured and lease is None:
             lease = self.cg.lease_slot(walk, bs=len(rids), slot=slot,
                                        num_tokens=sum(i.input_seq_len for i in inputs))
@@ -215,8 +220,10 @@ class _Engine:
             self.cg.release(lease, len(rids))
         return emitted, nxt, lease
 
-    def generate(self, prompts, captured_decode, captured_prefill=False, preplan=False):
-        emitted, nxt, _ = self.step("prefill", prompts, captured=captured_prefill)
+    def generate(self, prompts, captured_decode, captured_prefill=False, preplan=False, cached=0):
+        if cached:  # the rows a prefix hit hands the request
+            self.step("prefill", {rid: ids[:cached] for rid, ids in prompts.items()}, captured=False)
+        emitted, nxt, _ = self.step("prefill", prompts, captured=captured_prefill, cached=cached)
         seqs = dict(emitted)
         step = 0
         while min(len(s) for s in seqs.values()) < MAX_TOKENS:
@@ -300,6 +307,17 @@ def test_captured_verify_matches_eager_and_greedy(greedy, k, batch):
 
 # past index_topk (64), several windows; "three" replays bucket 4 with a padding request
 LONG_LENGTHS = {"one": [150], "two": [100, 70], "three": [100, 70, 90]}
+
+
+def test_a_captured_mtp_prefill_past_cached_rows_matches_eager():
+    """Without DSA a prefill past a cached prefix stays on its captures, its MTP pass too."""
+    eng = _Engine(k=3)
+    prompts = _prompts([200], seed=5)
+    eager, _ = eng.generate(prompts, captured_decode=True, cached=128)
+    graph, _ = eng.generate(prompts, captured_decode=True, captured_prefill=True, cached=128)
+    # a padded bucket moves the prefill GEMMs' rounding: the rule of the captured prefill above
+    split = _split(graph["r0"], eager["r0"])
+    assert split is None or split >= 4, (split, graph, eager)
 
 
 @pytest.fixture(scope="module")
