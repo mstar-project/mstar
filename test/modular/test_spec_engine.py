@@ -11,7 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from spec_toy import NODE, STOP, Driver, always_wrong, engine, every, oracle, reference
+from spec_toy import NODE, STOP, Driver, always_wrong, engine, every, oracle, reference, stub_offload
 
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.manager import KVManager
@@ -282,21 +282,9 @@ def test_a_verify_step_run_row_by_row_is_refused(caplog):
     assert "runs batched" in caplog.text
 
 
-def _stub_offload(monkeypatch, snapshots):
-    """KV's host copy needs CUDA: record the length an offload would snapshot instead."""
-    def offload(self, rid):
-        snapshots[rid] = self._streams[rid]["main"].stored_len
-        return 1
-
-    monkeypatch.setattr(KVManager, "supports_eviction", property(lambda self: True))
-    monkeypatch.setattr(KVManager, "offload", offload)
-    monkeypatch.setattr(KVManager, "reload", lambda self, rid: True)
-    monkeypatch.setattr(KVManager, "is_offloaded", lambda self, rid: False)
-
-
 def test_an_offload_marks_its_victim_and_its_results_come_due_at_its_first_admit_back(monkeypatch):
     snapshots: dict[int, int] = {}
-    _stub_offload(monkeypatch, snapshots)
+    stub_offload(monkeypatch, snapshots)
     eng = engine(3, every(2))
     driver = Driver(eng)
     driver.add(1, PROMPTS[1], 30)

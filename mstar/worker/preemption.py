@@ -179,11 +179,15 @@ class Preemption:
 
     def _check_verify_victims(self, kv: PagedKVCache, victims: Victims) -> None:
         """On a verifying node, a victim moved or dropped holds no unrecorded verify step, and one asked again
-        holds no verify result at all: it has written no rows."""
+        holds no verify result unless it is back from the host: it holds no page, so a resident row has written
+        none, while a returning row keeps its results until its first admit back (`VerifyLedger.take_due`)."""
         for node_name in kv.nodes:
             engine = self._engine_manager.get_engine(node_name)
             moved = [rid for rid in (*victims.to_host, *victims.to_drop) if engine.verify_unrecorded(node_name, rid)]
-            asked = [rid for rid in victims.to_ask if engine.verify_pending(node_name, rid)]
+            asked = [
+                rid for rid in victims.to_ask
+                if engine.verify_pending(node_name, rid) and not engine.verify_returning(node_name, rid)
+            ]
             if moved or asked:
                 raise RuntimeError(
                     f"preemption on {node_name}: victims with unrecorded verify results {moved}, "

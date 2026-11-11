@@ -4280,6 +4280,12 @@ class Engine:
         draft = self._drafts.get(node_name)
         return draft is not None and draft.ledger.pending(rid)
 
+    def verify_returning(self, node_name: str, rid: int) -> bool:
+        """``rid`` moved to the host on ``node_name`` since its last admit, and holds
+        its verify results until the next (`VerifyLedger.returning`)."""
+        draft = self._drafts.get(node_name)
+        return draft is not None and draft.ledger.returning(rid)
+
     def unrecorded_verify_rows(self, node_name: str) -> list[int]:
         """The rows of ``node_name`` with a committed verify step not recorded yet; none off a verifying node."""
         draft = self._drafts.get(node_name)
