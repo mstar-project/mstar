@@ -737,7 +737,7 @@ class ValueHandle(ArrayHandle):
             for field in array.entry.tensors
         }
         self._runners = {type(bound.declared): bound.binding.bind(array, bound.key, resources) for bound in bindings}
-        self._layouts = _field_layouts(bindings)
+        self._layouts = _field_layouts(array, bindings)
 
     def _check_storage(self, declared: ArrayStep, segments, ctx) -> None:
         if not declared.keep:
@@ -760,9 +760,7 @@ class ValueHandle(ArrayHandle):
         self._check_open("write")
         for field, value in fields.items():
             self.block(field, layer)
-            layout = self._layouts.get(field)
-            stored = value if layout is None else layout.stored(value)
-            self._pool.scatter_(field, stored, self._pool_layer[layer], label=self.label)
+            self._pool.scatter_(field, self._layouts[field].stored(value), self._pool_layer[layer], label=self.label)
 
     def _update(self, kind: type[Op], field: str, layer: int) -> tuple[Any, torch.Tensor]:
         runner = self._runners.get(kind)
@@ -1128,15 +1126,12 @@ class ValueStorage(Storage):
         if len(holders) != 1 or not array.nodes <= holders[0].nodes:
             raise _no_layout(array, f"its nodes must hold one append-only array, the one RecurrentStateConfig.kv_cache "
                                     f"links to, and they hold {[other.name for other in holders]}")
-        layouts = _field_layouts(bound)
+        layouts = _field_layouts(array, bound)
         pool = RecurrentStateSpec(
             resource_key=array.name, nodes=array.nodes,
             config=RecurrentStateConfig(
                 num_layers=len(array.layers),
-                blocks={
-                    field: layouts[field].block(tensor) if field in layouts else _block(tensor)
-                    for field, tensor in array.entry.tensors.items()
-                },
+                blocks={field: layouts[field].block(tensor) for field, tensor in array.entry.tensors.items()},
                 kv_cache=holders[0].name,
             ),
         )
@@ -1282,6 +1277,8 @@ def _op_specs(array: Array, bound: Sequence[BoundOp]) -> list[NodeResourceSpec]:
     return [spec for each in bound for spec in each.binding.specs(array, each.key, each.declared)]
 
 
-def _field_layouts(bound: Sequence[BoundOp]) -> dict[str, OpBinding]:
-    """Each field an update writes, with that update's binding, which lays the field out in the pool."""
-    return {field: each.binding for each in bound for field in each.declared.writes}
+def _field_layouts(array: Array, bound: Sequence[BoundOp]) -> dict[str, OpBinding]:
+    """Each of ``array``'s fields with the binding that lays it out in the pool: the update's that writes it, or the
+    base binding's layout as declared."""
+    written = {field: each.binding for each in bound for field in each.declared.writes}
+    return {field: written.get(field, OpBinding()) for field in array.entry.tensors}
