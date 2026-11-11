@@ -49,6 +49,11 @@ def position_key(array: Array) -> str:
     return f"{array.name.removesuffix('_kv')}_pos" if array.name.endswith("_kv") else "rope"
 
 
+def host_field_holders(arrays: Iterable[Array]) -> list[Array]:
+    """The arrays of ``arrays`` that hold host fields."""
+    return [array for array in arrays if array.entry.host]
+
+
 def query_array(array: Array, read: Read, arrays: Mapping[str, Array]) -> Array:
     """The array whose segments lay out the queries of ``array``'s ``read``: the one of ``arrays`` its ``queries``
     names, or else ``array``."""
@@ -145,7 +150,7 @@ def _cross_read_problems(arrays: Sequence[Array]) -> list[str]:
 
 def _host_problems(arrays: Sequence[Array], kv_labels: Mapping[str, Mapping[str, object]]) -> list[str]:
     """A prefix hit restores a Value's snapshot, and a snapshot doesn't carry host fields yet."""
-    holders = [array for array in arrays if array.entry.host]
+    holders = host_field_holders(arrays)
     if not holders:
         return []
     keyed = {

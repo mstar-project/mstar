@@ -64,6 +64,7 @@ from mstar.engine.resources.step import (
     lean_subsets,
 )
 from mstar.engine.state.adapters import StateSetup, node_handles
+from mstar.engine.state.analysis import host_field_holders
 from mstar.engine.state.contract import Array
 from mstar.engine.state.state_op import bind_state_ops
 from mstar.graph.runtime.base import GraphRuntime
@@ -873,10 +874,9 @@ class Engine:
     def _check_host_fields(self, model: "Model") -> None:
         """Raise for a node here that holds host fields and reports `step_is_input_free` for one of its walks."""
         held: dict[str, list[str]] = {}
-        for declared in model.declare_state():
-            if isinstance(declared, Array) and declared.entry.host:
-                for node in declared.nodes & self._submodules.keys():
-                    held.setdefault(node, []).append(declared.name)
+        for array in host_field_holders(declared for declared in model.declare_state() if isinstance(declared, Array)):
+            for node in array.nodes & self._submodules.keys():
+                held.setdefault(node, []).append(array.name)
         if not held:
             return
         walks = {walk: graph.get_nodes() for walk, graph in model.get_graph_walk_graphs().items()}
