@@ -132,9 +132,9 @@ def _regrouping_problems(model: "Model", arrays: Sequence[Array]) -> list[str]:
           for array in arrays for label, kv_label in model.kv_labels().get(array.name, {}).items()
           if kv_label.keys is not None for node in array.nodes
           for walk in (*kv_label.keys.walks, *(grown for grown, _ in kv_label.growth if kv_label.keys.growth))),
-        *((node, policy.walk, f"{node}'s rebuild policy runs again in one step with the ids sampled after it",
+        *((node, walk, f"{node}'s rebuild policy runs it again with the ids sampled after the prompt",
            "drop the rebuild policy")
-          for node, policy in model.rebuild_policies().items()),
+          for node, policy in model.rebuild_policies().items() for walk in policy.walks),
     ]
     return [
         f"Array {array.name!r}.reads[{key!r}]: {type(read.mask).__name__} on walk {walk!r}, which {cause}. A Block or "
