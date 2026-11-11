@@ -281,7 +281,7 @@ class _Engine:
         self._signals = signals
         self._walks = walks
 
-    def inline_client_signals(self, node_name, graph_walk):
+    def inline_signals(self, node_name, graph_walk):
         # as the submodule: a walk it does not inline, and a combined label, get none
         return self._signals if graph_walk in self._walks else {}
 
@@ -396,7 +396,7 @@ def _inline_step(withheld=None):
     w = _executor()
     engine = SimpleNamespace(
         device_loopback_signals=lambda node, walk: ("text_inputs",),
-        inline_client_signals=lambda node, walk: {"text_inputs": "new_token"},
+        inline_signals=lambda node, walk: {"text_inputs": "new_token"},
     )
     batch = _Batch()
     batch.partition = "p"

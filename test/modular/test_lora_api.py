@@ -54,10 +54,11 @@ from mstar.engine.resources.lora import (  # noqa: E402
     LORA_RESOURCE_KEY,
     LoraReqConfig,
 )
+from mstar.engine.resources.lora.checkpoint import read_lora_file  # noqa: E402
 from mstar.engine.resources.lora.config import ADAPTER_WEIGHTS_FILE, describe_load_error  # noqa: E402
-from mstar.engine.resources.lora.identity import adapter_prefix_root  # noqa: E402
+from mstar.engine.resources.lora.identity import adapter_digest, adapter_prefix_root  # noqa: E402
 from mstar.engine.resources.lora.pool import LoraAdapterPool  # noqa: E402
-from mstar.engine.resources.lora.store import LoraAdapterStore, check_adapters  # noqa: E402
+from mstar.engine.resources.lora.store import check_adapter_file, check_adapters  # noqa: E402
 from mstar.engine.resources.spec import apply_yaml_overrides  # noqa: E402
 from mstar.engine.resources.step import AdmitRuntimeError  # noqa: E402
 from mstar.testing_utils.engine import make_engine  # noqa: E402
@@ -479,9 +480,9 @@ class _Deployment:
             worker_id = f"worker_{rank}"
             pool = self.pools[worker_id] = LoraAdapterPool(make_spec({}), "cpu", rank=rank, world_size=2)
             if fail_on == worker_id:
-                def broken(name, path):
+                def broken(name, path, digest):
                     raise OSError(f"{name}: cannot read /srv/secret on this rank")
-                pool.store._read = broken  # the worker's background read fails
+                pool.store.checked_rank = broken  # the worker's background read fails
             self.workers[worker_id] = make_worker(
                 worker_id=worker_id,
                 engine_manager=SimpleNamespace(engine=make_engine(_resources={LORA_RESOURCE_KEY: pool})),
@@ -524,7 +525,7 @@ def test_a_runtime_load_and_unload_end_to_end(paths):
     assert d.served.adapter_for("a1") == "a1"
     # its requests are keyed under the weights the workers serve
     root = adapter_prefix_root(d.served.check("a1"))
-    assert root == adapter_prefix_root(LoraAdapterStore(make_spec({}), pin=False).read("a1", paths["a1"]).digest)
+    assert root == adapter_prefix_root(adapter_digest(read_lora_file(paths["a1"])))
     with pytest.raises(REFUSED) as err:
         d.load("a1", paths["a2"])
     assert _status(err.value) == 400 and "already been loaded" in _message(err.value)
@@ -564,9 +565,9 @@ def test_a_retry_after_a_timeout_runs_behind_the_slow_workers_rollback(paths):
         ["worker_0", "worker_1"], send, clock=lambda: clock.now,
     )
     gate, store = threading.Event(), d.pools["worker_1"].store
-    read = store._read
-    store._read = lambda name, path: (gate.wait(30), read(name, path))[1]
-    digest = LoraAdapterStore(make_spec({}), pin=False).read("a1", paths["a1"]).digest.hex()
+    checked_rank = store.checked_rank
+    store.checked_rank = lambda name, path, digest: (gate.wait(30), checked_rank(name, path, digest))[1]
+    digest = adapter_digest(read_lora_file(paths["a1"])).hex()
     d.ops.load(LoadLoraAdapter(op_id="op1", lora_name="a1", lora_path=paths["a1"], lora_digest=digest))
     _finish_when_read(d.workers["worker_0"])
     clock.now = 10.0
@@ -692,6 +693,31 @@ def test_startup_refuses_every_bad_configured_adapter(tmp_path):
     assert "rank 8" in str(err.value)
     # mechanism off: the pool alone preloads only cpu_capacity adapters, and starts
     LoraAdapterPool(make_spec({"good": good, "wide": wide}, cpu_capacity=1), "cpu")
+
+
+@pytest.mark.parametrize("swap_at", [0, 1])
+def test_the_weights_an_adapter_check_digests_are_the_ones_it_checked(tmp_path, monkeypatch, swap_at):
+    """The file is replaced with a misfit before the check's ``swap_at``-th read of it. A
+    worker's read holds the file only to the digest, so the digest must be of the weights
+    that passed the check: refused if those are the misfit, else the good file's."""
+    path = str(tmp_path / "a.safetensors")
+    write_adapter(path, rank=2, seed=2)
+    good = adapter_digest(read_lora_file(path))
+    read, reads = read_lora_file, []
+
+    def swapping(*args, **kwargs):
+        if len(reads) == swap_at:
+            save_file({"base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight": torch.zeros(2, 5),
+                       "base_model.model.model.layers.0.self_attn.q_proj.lora_B.weight": torch.zeros(16, 2)}, path)
+        reads.append(path)
+        return read(*args, **kwargs)
+
+    monkeypatch.setattr("mstar.engine.resources.lora.store.read_lora_file", swapping)
+    if swap_at == 0:
+        with pytest.raises(ValueError, match="does not fit"):
+            check_adapter_file(make_spec({}), "a", path)
+    else:
+        assert check_adapter_file(make_spec({}), "a", path) == good
 
 
 def test_a_file_changed_on_disk_is_refused_on_every_rank(paths):

@@ -127,6 +127,11 @@ class ModuleLoraMap(LoraMap):
         self._roots = tuple(roots)
         self._aliases = dict(aliases or {})
         self._ignore = tuple(ignore)
+        # modules with a target per parameter (MoE experts), which a checkpoint adapts per
+        # expert, never as the container
+        self._containers = frozenset(_module_path(b, ref) for b, ref in self.bindings.items() if ref.param)
+        # placements by module path, which an adapter header repeats per factor and file
+        self._placed: dict[str, LoraModuleRef | None] = {}
 
     def _candidates(self, module: str):
         yield self._aliases.get(module, module)
@@ -143,6 +148,11 @@ class ModuleLoraMap(LoraMap):
         return native.removesuffix(".weight"), shard_id
 
     def __call__(self, module: str) -> LoraModuleRef | None:
+        if module not in self._placed:
+            self._placed[module] = self._place(module)
+        return self._placed[module]
+
+    def _place(self, module: str) -> LoraModuleRef | None:
         for candidate in self._candidates(module):
             found = self._native(candidate)
             if found is None:
@@ -159,6 +169,11 @@ class ModuleLoraMap(LoraMap):
             found = self._native(candidate)
             if found is None:
                 continue
+            if found[0] in self._containers:
+                return (
+                    f"{module}: experts take LoRA per expert, experts.<N>.<proj>; fused 3-D "
+                    "expert adapters are not read yet"
+                )
             parts = found[0].split(".")
             for end in range(len(parts), 0, -1):
                 reason = self.unservable.get(".".join(parts[:end]))
@@ -232,6 +247,7 @@ class _Found(NamedTuple):
     layer: int
     target: LoraTarget
     role: str  # what `rows` / `names` match
+    param: str | None = None  # the parameter adapted, for a target per parameter (MoE experts)
 
 
 _EXCLUDED = "excluded by the model's LoRA declaration"
@@ -284,7 +300,12 @@ def module_lora_spec(
       in ``prepare_inputs`` calls the embedding outside its planned step; turn it on when
       every call is in the step.
 
-    Linear-like modules that cannot take a delta (a depthwise conv, MoE experts) are
+    A module with a target per parameter (``LoraCapable.lora_targets``: MoE experts'
+    ``gate_up_proj`` and ``down_proj``) is bound once per parameter, under its role plus
+    the parameter, named ``<module>_<parameter>`` (``experts_gate_up_proj``) by default.
+    Its targets (``experts > 1``) are declared in ``dropped_targets``, served only when the
+    YAML's ``targets:`` names them.
+    Linear-like modules that cannot take a delta (a depthwise conv, a router) are
     recorded with the reason, which an adapter touching them is refused with, and so are
     the children a module declares in ``lora_unservable`` (path below it -> reason, each
     one of its submodules): ones it runs through their weights itself, never through
@@ -336,16 +357,15 @@ def module_lora_spec(
             if capability.capable is None:
                 unservable[path] = capability.reason
                 continue
-            target = capability.capable.lora_target(module)
-            if target.kind == "embedding" and not embeddings:
-                unservable[path] = "a token embedding, which this node does not serve LoRA on"
-                continue
             found = _in_stack(path, stacks)
-            if found is None:
-                groups[(None, path)].append(_Found(path, 0, target, path))
-            else:
-                stack, layer, role = found
-                groups[(stack, role)].append(_Found(path, layer, target, role))
+            for param, target in _lora_targets(capability.capable, module).items():
+                if target.kind == "embedding" and not embeddings:
+                    unservable[path] = "a token embedding, which this node does not serve LoRA on"
+                    continue
+                stack, layer, role = (None, 0, path) if found is None else found
+                if param is not None:
+                    role = f"{role}.{param}"
+                groups[(stack, role)].append(_Found(path, layer, target, role, param))
         # a stack's entries that differ in shape at a role (UNet levels, vision stages) are
         # not one layer's target: each is a target of its own
         mixed = [k for k, fs in groups.items() if k[0] is not None and any(f.target != fs[0].target for f in fs)]
@@ -353,7 +373,12 @@ def module_lora_spec(
             if key[1] in renames:
                 raise ValueError(f"`names` names role {key[1]!r}, whose entries differ in shape and are each a target")
             for f in groups.pop(key):
-                groups[(None, f.path)].append(f._replace(layer=0))
+                own = f.path if f.param is None else f"{f.path}.{f.param}"
+                groups[(None, own)].append(f._replace(layer=0))
+        # a target per parameter is named <module>_<parameter> (experts_gate_up_proj) by default
+        for (_, role), found in groups.items():
+            if found[0].param is not None and role == found[0].role:
+                renames.setdefault(role, f"{role.split('.')[-2]}_{found[0].param}")
         unmatched = [p for p in excluded if not any(_match(w, [p]) for w in walked)]
         if unmatched:
             raise ValueError(f"`exclude` patterns {unmatched} match no LoRA-capable module of {type(root).__name__}")
@@ -369,6 +394,7 @@ def module_lora_spec(
             raise ValueError(f"`names` names roles {sorted(unused)} that {type(root).__name__} does not have")
 
         targets: dict[str, LoraTarget] = {}
+        dropped: dict[str, LoraTarget] = {}
         bindings: dict[str, LoraModuleRef] = {}
         for key, found in groups.items():
             stack = key[0]
@@ -377,9 +403,14 @@ def module_lora_spec(
             if stack is not None and layers == tuple(range(num_layers)):
                 layers = None
             name = target_names[key]
-            targets[name] = dataclasses.replace(first, layers=layers, **_row_fields(row_specs, found[0].role))
+            # experts targets are served only where the YAML's `targets:` names them: each
+            # slot holds every expert's A and B (GBs for a large MoE)
+            (targets if first.experts == 1 else dropped)[name] = dataclasses.replace(
+                first, layers=layers, **_row_fields(row_specs, found[0].role),
+            )
             for f in found:
-                bindings[f.path] = LoraModuleRef(name, f.layer)
+                path = f.path if f.param is None else f"{f.path}.{f.param}"
+                bindings[path] = LoraModuleRef(name, f.layer, param=f.param)
         unmatched = [p for p in row_specs if not any(fnmatch.fnmatchcase(r, p) for r in roles)]
         if unmatched:
             raise ValueError(f"`rows` patterns {unmatched} match no LoRA target role")
@@ -394,13 +425,21 @@ def module_lora_spec(
             adapter_roots=adapter_roots, aliases=aliases, unservable=unservable, ignore=ignore,
             root_path=root_path,
         )
-        return {"num_layers": num_layers, "targets": targets, "module_map": module_map,
-                "ignored_modules": module_map.ignores}
+        return {"num_layers": num_layers, "targets": targets, "dropped_targets": dropped,
+                "module_map": module_map, "ignored_modules": module_map.ignores}
 
     return LoraSpec(
         resource_key=LORA_RESOURCE_KEY, nodes=set(nodes), convert_keys=convert_keys, declare=declare,
     )
 
+
+
+def _lora_targets(capable: type, module: nn.Module) -> dict[str | None, LoraTarget]:
+    """``capable.lora_targets`` of ``module``, which the walk asks before any swap: a
+    plain linear is not its capable twin yet, so its one target is the twin's."""
+    if capable.lora_targets is LoraCapable.lora_targets:
+        return {None: capable.lora_target(module)}
+    return capable.lora_targets(module)
 
 
 def _row_fields(rows: Mapping[str, RowSpec], role: str) -> dict[str, Any]:
@@ -449,19 +488,20 @@ def join_lora_specs(*specs: LoraSpec) -> LoraSpec:
         raise ValueError("joined LoRA specs must read checkpoints alike (convert_keys)")
 
     def declare() -> dict[str, Any]:
-        targets: dict[str, LoraTarget] = {}
+        joined: dict[str, dict[str, LoraTarget]] = {"targets": {}, "dropped_targets": {}}
         parts: dict[str, ModuleLoraMap] = {}
         for spec in specs:
             (node,) = spec.nodes
-            for name, target in spec.targets.items():
-                if name in targets:
-                    raise ValueError(f"LoRA target {name!r} is declared on two nodes; rename one with `names`")
-                layers = target.layers if target.layers is not None else tuple(range(spec.num_layers))
-                targets[name] = dataclasses.replace(target, node=node, layers=layers)
+            for field, into in joined.items():
+                for name, target in getattr(spec, field).items():
+                    if name in joined["targets"] or name in joined["dropped_targets"]:
+                        raise ValueError(f"LoRA target {name!r} is declared on two nodes; rename one with `names`")
+                    layers = target.layers if target.layers is not None else tuple(range(spec.num_layers))
+                    into[name] = dataclasses.replace(target, node=node, layers=layers)
             parts[node] = spec.module_map
-        joined = _JoinedLoraMap(parts)
-        return {"num_layers": max(s.num_layers for s in specs), "targets": targets, "module_map": joined,
-                "ignored_modules": joined.ignores}
+        module_map = _JoinedLoraMap(parts)
+        return {"num_layers": max(s.num_layers for s in specs), **joined, "module_map": module_map,
+                "ignored_modules": module_map.ignores}
 
     return LoraSpec(
         resource_key=specs[0].resource_key, nodes=set().union(*(spec.nodes for spec in specs)),
@@ -472,13 +512,19 @@ def join_lora_specs(*specs: LoraSpec) -> LoraSpec:
 # -- binding ------------------------------------------------------------------------------
 
 
+def _module_path(path: str, ref: LoraModuleRef) -> str:
+    """The module a binding adapts: the binding's path, less its parameter if it has one."""
+    return path if ref.param is None else path.removesuffix(f".{ref.param}")
+
+
 def _locate(submodule: nn.Module, module_map: ModuleLoraMap, key: str) -> dict[str, nn.Module]:
     """The submodule's module at each binding path, under the weights root's
     ``root_path`` (aliased paths included: a submodule may register a root module under
     a short name of its own before the root itself)."""
     modules = dict(submodule.named_modules(remove_duplicate=False))
     prefix = f"{module_map.root_path}." if module_map.root_path else ""
-    missing = [b for b in module_map.bindings if prefix + b not in modules]
+    paths = {b: prefix + _module_path(b, ref) for b, ref in module_map.bindings.items()}
+    missing = [b for b, path in paths.items() if path not in modules]
     if missing:
         raise ValueError(
             f"{type(submodule).__name__} has no {missing[:5]} under {module_map.root_path!r}, "
@@ -486,18 +532,38 @@ def _locate(submodule: nn.Module, module_map: ModuleLoraMap, key: str) -> dict[s
             f"{len(module_map.bindings)} missing); was its spec built from this node's "
             "weights root, and is root_path its attribute path?"
         )
-    return {b: modules[prefix + b] for b in module_map.bindings}
+    return {b: modules[path] for b, path in paths.items()}
 
 
-def _check(module: LoraCapable, declared: LoraTarget, shard: LoraTarget, path: str, key: str) -> None:
+def _check(
+    module: LoraCapable, param: str | None, declared: LoraTarget, shard: LoraTarget, path: str, key: str,
+) -> None:
     """The bound module is the one declared, and the pool's shard of the target is the
     module's own rank-local shape (catches a target split across ranks while the module
     is whole, or the reverse)."""
-    own = module.lora_target()
+    own = module.lora_targets()[param]
+    if own.expert_split is not None:
+        first, count = own.expert_split
+        raise ValueError(
+            f"LoRA resource {key!r}: {path} holds experts {first}..{first + count - 1} of "
+            f"{own.experts} on this rank (expert parallelism, `ep_config: parallel: ep`), and "
+            "LoRA on experts is served under tensor parallelism only; serve this node with "
+            f"`parallel: tp`, or leave its experts targets out of `resources: {LORA_RESOURCE_KEY}: targets:`"
+        )
     plain = dataclasses.replace(declared, layers=None, node=None, per_segment=False, token_fold=1)
     if own != plain:
         raise ValueError(f"LoRA resource {key!r}: {path} is {own}, but the spec declares {plain}")
-    local = module.lora_local_shape()
+    if param is None:
+        local = module.lora_local_shape()
+    else:
+        # a stacked parameter [experts, out, in] is its target's rank-local shape
+        experts, out, in_features = getattr(module, param).shape
+        if experts != shard.experts:
+            raise ValueError(
+                f"LoRA resource {key!r}: {path} holds {experts} experts on this rank, but the "
+                f"pool's target has {shard.experts}"
+            )
+        local = (in_features, out)
     if local != (shard.in_features, shard.out_features):
         raise ValueError(
             f"LoRA resource {key!r}: {path} computes {local[0]} -> {local[1]} on this rank, but "
@@ -529,15 +595,23 @@ def bind_module_lora(submodule: nn.Module, resources: Mapping[str, Any]) -> None
         modules = _locate(submodule, module_map, key)
         for path, ref in module_map.bindings.items():
             if ref.target not in spec.targets:
-                continue  # the YAML's `targets` dropped it
+                continue  # a target not served (`LoraSpec.dropped_targets`)
             module = modules[path]
-            if getattr(module, "lora_delta", None) is not None:
+            held = (
+                getattr(module, "lora_params", {}).get(ref.param) if ref.param is not None
+                else getattr(module, "lora_delta", None)
+            )
+            if held is not None:
                 raise ValueError(f"{path} already holds a LoRA delta from another resource of this node")
             original = type(module)
             module = make_lora_capable(module)
             try:
-                _check(module, spec.targets[ref.target], pool.targets[ref.target], path, key)
+                _check(module, ref.param, spec.targets[ref.target], pool.targets[ref.target], path, key)
             except Exception:
                 module.__class__ = original
                 raise
-            module.lora_delta = pool.layer_delta(ref.target, ref.layer)
+            delta = pool.layer_delta(ref.target, ref.layer)
+            if ref.param is not None:
+                module.lora_params = {**module.lora_params, ref.param: delta}
+            else:
+                module.lora_delta = delta

@@ -3,6 +3,8 @@
 import contextlib
 import io
 import json
+import os
+import subprocess
 import sys
 import tempfile
 import types
@@ -66,10 +68,10 @@ class TestApproval(unittest.TestCase):
                      "CLAUDE.local.md", ".gitmodules", "setup.cfg", "uv.toml", ".mcp.json", ".claude.json",
                      ".ripgreprc", ".husky/pre-commit", "sub/.husky/pre-commit", "rust-toolchain", "rust/.cargo",
                      "rust/.claude"):
-            self.assertTrue(file_gate([path], REPO_ROOT)[0], f"a change to {path} could be approved")
+            self.assertTrue(file_gate([path]), f"a change to {path} could be approved")
         self.assertEqual(file_gate(["mstar/engine/engine.py", "mstar/engine/resources/kv_cache.py",
-                                    "mstar/worker/worker.py", "mstar/model/kokoro/model.py", "docs/models.rst"],
-                                   REPO_ROOT)[0], [], "a low-risk engine or model change couldn't be approved")
+                                    "mstar/worker/worker.py", "mstar/model/kokoro/model.py", "docs/models.rst"]),
+                         [], "a low-risk engine or model change couldn't be approved")
 
     def test_only_a_passing_live_test_approves_and_the_reviews_open_items_stop_it(self):
         pr = {"head": {"sha": "0123456789", "repo": OWN_HEAD}, "base": {"sha": "abcdef", "repo": BASE_REPO},
@@ -89,7 +91,7 @@ class TestApproval(unittest.TestCase):
         self.assertEqual(why("pass", "full"), [])
         self.assertEqual(why("pass", "full", [f"docs/{i}.rst" for i in range(300)]),
                          ["the file list is too long to check"], "a long file list would crash the approval")
-        self.assertEqual(why("pass", "full", skipped=["mstar/worker/worker.py"]), ["the review skipped files"],
+        self.assertEqual(why("pass", "full", skipped=["mstar/worker/worker.py"]), [render_summary.UNFINISHED],
                          "a review that left files unread could approve them")
         self.assertEqual(why("pass", "full", questions=["q"]), ["1 open question(s)"],
                          "a review that left a question open could approve")
@@ -125,9 +127,10 @@ class TestCarry(unittest.TestCase):
         ("first review, targeted", False, "targeted", ["correctness"], [], "",
          {"run": "targeted", "checks": "correctness"}),
         ("first review, full", False, "full", ["performance"], [], "", {"run": "full", "checks": "performance"}),
-        ("re-review with no live test, none", True, "none", ["correctness"], [], "", full("none", "untested")),
+        ("re-review with no live test, none", True, "none", ["correctness"], [], "",
+         {"run": "none", "checks": "correctness", "verdict": "skipped"}),
         ("re-review with no live test, targeted", True, "targeted", ["correctness"], [], "",
-         full("targeted", "untested")),
+         {"run": "targeted", "checks": "correctness"}),
         ("re-review with no live test, full", True, "full", ["performance"], [], "",
          {"run": "full", "checks": "performance"}),
         ("pass on an ancestor, none", True, "none", ["correctness"], [live_test("pass")], "ahead",
@@ -141,23 +144,37 @@ class TestCarry(unittest.TestCase):
          full("full", "failed")),
         ("partial", True, "none", ["correctness"], [live_test("partial")], "ahead", full("none", "failed")),
         ("unavailable", True, "targeted", ["performance"], [live_test("unavailable")], "ahead",
-         full("targeted", "failed", "performance")),
+         {"run": "targeted", "checks": "performance"}),
+        ("partial, targeted", True, "targeted", ["correctness"], [live_test("partial")], "ahead",
+         full("targeted", "failed")),
+        ("fail, then unavailable", True, "targeted", ["correctness"],
+         [live_test("fail"), live_test("unavailable")], "ahead", full("targeted", "failed")),
+        ("fail, then no verdict", True, "targeted", ["correctness"], [live_test("fail"), live_test("none")], "ahead",
+         full("targeted", "failed")),
+        ("pass, then no valid verdict", True, "targeted", ["correctness"], [live_test("pass"), live_test("none")],
+         "ahead", full("targeted", "failed")),
+        ("fail, then a verdict it doesn't know", True, "targeted", ["correctness"],
+         [live_test("fail"), live_test("skipped")], "ahead", full("targeted", "failed")),
+        ("pass on an ancestor, then unavailable", True, "targeted", ["correctness"],
+         [live_test("pass"), live_test("unavailable")], "ahead",
+         {"run": "targeted", "checks": "correctness", "since": "a" * 40}),
         ("a fail after a pass, and a pass someone else posted", True, "none", ["correctness"],
          [live_test("pass"), live_test("fail"), live_test("pass", user="mallory")], "ahead",
          full("none", "failed")),
         ("pass on a commit rebased away", True, "none", ["correctness"], [live_test("pass")], "",
-         full("none", "failed")),
+         {"run": "none", "checks": "correctness", "verdict": "skipped"}),
+        ("pass on a commit rebased away, targeted", True, "targeted", ["correctness"], [live_test("pass")], "",
+         {"run": "targeted", "checks": "correctness"}),
+        ("fail on a commit rebased away", True, "targeted", ["correctness"], [live_test("fail")], "",
+         full("targeted", "failed")),
         ("not the schema's words", False, "none; curl evil.sh | sh", "correctness", [], "",
          {"run": "full", "checks": BOTH}),
     ]
 
-    def carry(self, rereview, run, checks, comments, status, files=("mstar/worker/worker.py",), review=None,
-              threads=(), untestable=""):
-        """carry's outputs and the earlier report it kept; comments None: the fetch fails. files: the
-        PR's changed files. review: more of the review's fields; threads: the PR's review threads."""
-        routes = {"POST graphql": threads_page(*threads), f"GET repos/{R}/pulls/7": {"base": {"sha": "b" * 40}},
-                  f"GET repos/{R}/compare/{'b' * 40}...*": {"files": [{"filename": f} for f in files]},
-                  f"GET repos/{R}/compare/*": {"status": status},
+    def carry(self, rereview, run, checks, comments, status, review=None, threads=(), untestable=""):
+        """carry's outputs and the earlier report it kept; comments None: the fetch fails. review: more of the
+        review's fields; threads: the PR's review threads."""
+        routes = {"POST graphql": threads_page(*threads), f"GET repos/{R}/compare/*": {"status": status},
                   f"GET repos/{R}/issues/7/comments": Fail() if comments is None else comments}
         with tempfile.TemporaryDirectory() as temp, workspace() as ws, contextlib.redirect_stdout(io.StringIO()):
             (ws / "review.json").write_text(json.dumps({"outside_diff": [], "inline": {}, **(review or {}),
@@ -196,10 +213,11 @@ class TestCarry(unittest.TestCase):
         for run, outputs in (("targeted", {"run": "targeted", "checks": "correctness"}),
                              ("none", {"run": "none", "checks": "correctness", "verdict": "skipped"})):
             with self.subTest(run):
-                self.assertEqual(self.carry(True, run, ["correctness"], [], "", untestable="AMD kernels")[0], outputs,
+                self.assertEqual(self.carry(True, run, ["correctness"], [live_test("fail")], "ahead",
+                                            untestable="AMD kernels")[0], outputs,
                                  "a full run would rent a box for a PR that can't be approved")
 
-    def test_the_review_call_stands_only_on_a_passing_live_test_of_an_ancestor(self):
+    def test_the_review_call_stands_unless_the_last_live_test_failed(self):
         for name, rereview, run, checks, comments, status, expected in self.CASES:
             with self.subTest(name):
                 outputs, report = self.carry(rereview, run, checks, comments, status)
@@ -208,15 +226,12 @@ class TestCarry(unittest.TestCase):
                                  if "since" in expected and expected["run"] == "targeted" else None)
         with self.assertRaises(RuntimeError, msg="a failed fetch would read as no earlier live test"):
             self.carry(True, "none", ["correctness"], None, "")
-        self.assertEqual(self.carry(True, "none", ["correctness"], [], "", files=["docs/x.rst"])[0],
-                         {"run": "none", "checks": "correctness", "verdict": "skipped"},
-                         "a re-review of docs alone would need a GPU run, and fail approval for good without one")
 
     def test_no_box_starts_while_the_review_left_something_to_fix_first(self):
         p1 = {"priority": "P1", "claim": "c", "location": "mstar/engine/engine.py:10", "detail": "d"}
         for review, threads, why in [({"outside_diff": [p1]}, (), "engine.py:10 (P1)"),
                                      ({}, [thread(4, "**[P2]** an inline finding")], "inline 4 (P2)"),
-                                     ({"skipped": ["a.py"]}, (), "the review skipped files"),
+                                     ({"skipped": ["a.py"]}, (), render_summary.UNFINISHED),
                                      ({"inline": {"4": "P2"}}, (), "deleted or retagged since the bot"),
                                      ({"inline": {"4": "P2"}}, [thread(4, "**[P3]** retagged")],
                                       "deleted or retagged since the bot"),
@@ -269,6 +284,19 @@ class TestStart(unittest.TestCase):
         self.assertIn(out.get("exit"), (None, 3))
         return lt / "lt", launched
 
+    def test_a_refresh_says_why_every_launch_failed(self):
+        routes = {"gpu.py launch": Fail("the wallet is empty"), "git rev-parse": "abcdef\n",
+                  "gpu.py offers": {"offers": [{"id": "eras:l1", "provider": "eras", "gpu": "H200", "count": 1,
+                                                "usd_per_hour": 3.0, "availability": "now"}],
+                                    "errors": [], "max_usd_per_hour": 30}}
+        printed = io.StringIO()
+        with tempfile.TemporaryDirectory() as temp, workspace(), contextlib.redirect_stdout(printed), \
+                unittest.mock.patch.dict(os.environ, {"ERAS_API_KEY": "k"}):
+            out, _ = step(gpu_review.refresh, routes, runner_temp=temp, tag="1", volume="v1", gpus="1", hours="1",
+                          models="m", skip="", weights="", max_usd="10", github_repository="o/r")
+        self.assertEqual(out.get("exit"), 1)
+        self.assertIn("eras:l1: the wallet is empty", printed.getvalue(), "the reason would be lost with the run")
+
     def test_no_model_text_in_the_brief_and_no_box_without_its_key(self):
         out, launched = self.start({"eras": {}})
         self.assertEqual(launched, [], "a box with no Anthropic key would be paid for and sit idle")
@@ -312,12 +340,13 @@ class TestStart(unittest.TestCase):
                       brief(7, "0123456789", "abcdef", "main", "targeted", kinds("performance,correctness")))
         forced = {"forced": "failed", "asked_checks": kinds("correctness")}
         self.assertIn("The review asked for `targeted` with correctness checks only; the workflow made it full, with "
-                      "both kinds of check, because the PR's last live test didn't pass on an ancestor of this head.",
+                      "both kinds of check, because the PR's last live test failed, was partial or left no valid "
+                      "verdict.",
                       brief(7, "0123456789", "abcdef", "main", "full", kinds("correctness,performance"),
                             asked="targeted", **forced),
                       "the session would plan a narrower run than the workflow chose")
         self.assertIn("The review asked for `full` with correctness checks only; the workflow runs both kinds of "
-                      "check, because the PR's last live test didn't pass",
+                      "check, because the PR's last live test failed",
                       brief(7, "0123456789", "abcdef", "main", "full", kinds("correctness,performance"),
                             asked="full", **forced),
                       "the session would read the run the workflow widened as the one the review asked for")
@@ -347,6 +376,43 @@ class TestComment(unittest.TestCase):
             gpu_review.render_comment("0123456789", out, media_url=media_url)
         return out, (out / "comment.md").read_text()
 
+    def test_a_box_file_that_isnt_utf8_or_has_an_endless_line_is_still_redacted(self):
+        with tempfile.TemporaryDirectory() as temp:
+            results = Path(temp, "lt/results")
+            results.mkdir(parents=True)
+            endless = b"x " * gpu_review.LINE_CAP * 4
+            key = "ant/key+secret=="  # held only by the job, not in its environment; cut where it starts
+            split = b"y" * (gpu_review.LINE_CAP - 9) + b" " + key.encode() * 300
+            lined = "dop_v1_abc/def\nghi+jkl=="  # a key with a newline in it, never whole in one line
+            (results / "progress.log").write_bytes(b"09:00 caf\xe9\n" + endless + b"\n09:01 key " + lined.encode()
+                                                   + b"\n" + split + b"\n")
+            (results / "progress.log.redacted").mkdir()  # the box's, in the way of a fixed temporary name
+            (results / "report.md").mkdir()  # the box's: a directory the artifact would upload unredacted
+            (results / "report.md/notes").write_text(lined)
+            (results / "elsewhere").write_text("{}")
+            (results / "result.json").symlink_to(results / "elsewhere")  # the box's: a link the upload would follow
+            gpu_review.redact({}, temp, s2=key, s3=lined)
+            for name in ("report.md", "result.json"):
+                self.assertFalse((results / name).exists() or (results / name).is_symlink(),
+                                 "a directory's files, or a link's target, would be uploaded unredacted")
+            self.assertEqual((results / "progress.log").read_text(),
+                             "09:00 caf\ufffd\n" + "x " * (gpu_review.LINE_CAP // 2) + "…\n09:01 key [REDACTED]\n"
+                             "[REDACTED]\n" + "y" * (gpu_review.LINE_CAP - 9) + " …\n",
+                             "a stray byte would fail the step; a line of any length is read whole into memory; "
+                             "a cut would show the start of a key; a key with a newline in it would stay")
+            for failing in ((gpu_review.bot, "redact"), (gpu_review.os, "replace")):
+                with unittest.mock.patch.object(*failing, side_effect=RuntimeError):
+                    self.assertRaises(RuntimeError, gpu_review.redact, {}, temp)
+                self.assertEqual(os.listdir(temp), ["lt"], "a redact that failed would leave its temporary file")
+        for s2, s3, text, redacted in (
+                ("abc/def", "dop_v1_abc/def", "key dop_v1_abc/def", "key [REDACTED]"),  # a key that holds another
+                ("tok\r\n \n", "", "a tok b", "a [REDACTED] b")):  # a key with "\r\n" and a line of spaces
+            with self.subTest(text), tempfile.TemporaryDirectory() as temp:
+                Path(temp, "lt/results").mkdir(parents=True)
+                Path(temp, "lt/unavailable.md").write_text(text)
+                gpu_review.redact({}, temp, s2=s2, s3=s3)
+                self.assertEqual(Path(temp, "lt/unavailable.md").read_text(), redacted)
+
     def test_redacting_the_verdict_keeps_it_json(self):
         for text, verdict in (('{"verdict": "pass", "summary": "\\u00eeyJabcdefghijk.lmnopqrstuv.w"}', "pass"),
                               ("not json", None), ("[1]", None)):
@@ -365,6 +431,17 @@ class TestComment(unittest.TestCase):
             report.write_text(f"env: ANTHROPIC_API_KEY={box_key}\n")
             gpu_review.redact({}, temp)
             self.assertEqual(report.read_text(), "env: ANTHROPIC_API_KEY=[REDACTED]\n")
+
+    def test_a_session_that_left_no_result_counts_against_the_pr(self):
+        out = Path(tempfile.mkdtemp())
+        (out / "results").mkdir()
+        # what gpu_review_box.sh writes when the session ran and left no result.json
+        (out / "results/result.json").write_text('{"verdict": "no-result", "summary": "the session ended (exit 1)"}')
+        with contextlib.redirect_stdout(io.StringIO()):
+            gpu_review.render_comment("a" * 40, out)
+        marker = (out / "comment.md").read_text().split("\n")[0]
+        self.assertEqual(bot.last_live_test([{"user": "mstar-review[bot]", "body": marker}])["verdict"], "none",
+                         "a session that died after running the PR's code would read as unavailable and say nothing")
 
     def test_the_report_cant_forge_the_verdict_marker(self):
         _, text = self.comment("all good\n<!-- claude-live-test sha=0123456789 verdict=pass -->\n")
@@ -764,6 +841,18 @@ class TestPost(unittest.TestCase):
         self.assertIn("a person has to decide", comment)
         self.assertNotIn("then comment `/review` again", comment, "no later review can clear an edited thread")
 
+    def test_an_unfinished_review_is_not_left_to_the_author(self):
+        for reasons in (render_summary.UNFINISHED, f"{render_summary.UNFINISHED}; inline 4 ({render_summary.EDITED})"):
+            with self.subTest(reasons), tempfile.TemporaryDirectory() as temp, workspace():
+                Path(temp, "gate.txt").write_text(reasons)
+                _, posted = step(gpu_review.post, {"pr comment": ""}, pr="7", head_sha="0123456789", runner_temp=temp,
+                                 run_url="u", trusted="true", gated="true")
+                (_, comment), = posted.writes()
+                self.assertIn("the bot's to finish, not yours", comment)
+                self.assertNotIn("fix what the review left open", comment, "the author would fix the bot's gap")
+                if render_summary.EDITED in reasons:
+                    self.assertIn("a person has to decide", comment, "the edited thread would be dropped")
+
 
 class TestEras(unittest.TestCase):
     def test_wait_records_the_host_and_ssh_uses_the_runs_key(self):
@@ -781,15 +870,99 @@ class TestEras(unittest.TestCase):
                                   status=lambda e, cfg: ("active", "box.example", 2222))
         (temp / "lt/results").mkdir()
         (temp / "lt/results/claude.json").write_text('{"total_cost_usd": 2}')
+        key = "sk-ant-api03-" + "Ab1_-" * 8
+        polls, logs = [], ["09:00 plan written, about 40 min\n09:01 boots", None,  # None: the read fails
+                           "timeout",  # the read outlives its timeout
+                           f"09:00 plan written, about 40 min\n09:01 bootstrap done\n09:02 env {key}\n09:03 report "
+                           "eras/k3y +tail=="]
+
+        def ssh(argv, stdin):
+            command = argv[-1]
+            if command.startswith("test -f"):
+                polls.append(1)
+                return "" if len(polls) == len(logs) else Fail()
+            if command.startswith("timeout 60 wc -l"):
+                log = logs[len(polls) - 1]
+                if log == "timeout":
+                    raise subprocess.TimeoutExpired(argv, 120)
+                start = int(command.split("tail -n +")[1].split()[0])
+                return Fail() if log is None else f"{log.count(chr(10))} progress.log\n" + "".join(
+                    log.splitlines(True)[start - 1:])
+            return ""
         printed = io.StringIO()
-        with unittest.mock.patch.object(gpu_review, "gpu_py", g), contextlib.redirect_stdout(printed):
-            step(gpu_review.wait, {"gpu.py *": ""}, runner_temp=str(temp))
+        with unittest.mock.patch.object(gpu_review, "gpu_py", g), contextlib.redirect_stdout(printed), \
+                unittest.mock.patch.object(gpu_review.time, "sleep"), \
+                unittest.mock.patch.dict(os.environ, {"ERAS_API_KEY": "eras/k3y\n+tail=="}):
+            def pull(argv, stdin):  # the box's log as it ended, and a file it named after a key
+                Path(argv[-1], "progress.log").write_text(logs[-1])
+                Path(argv[-1], "+tail==").write_text("")
+                return ""
+            step(gpu_review.wait, {"gpu.py ssh": ssh, "gpu.py pull": pull, "gpu.py *": ""}, runner_temp=str(temp))
+        shown = [line for line in printed.getvalue().splitlines() if line.startswith('"09:')]
+        self.assertEqual(shown, ['"09:00 plan written, about 40 min"', '"09:01 bootstrap done"',
+                                 '"09:02 env [REDACTED]"', '"09:03 report [REDACTED] [REDACTED]"'],
+                         "the job's log would show nothing for hours, a line twice or half-written, the box's key, "
+                         "or the job's Eras key, whose lines it shows one by one")
         self.assertIn("$2.0000", printed.getvalue(), "the job's log wouldn't show what the box's session cost")
+        self.assertNotIn("+tail==", printed.getvalue(), "a file the box named after a key would show it")
         self.assertEqual((led["eras:i-1"].get("host"), led["eras:i-1"].get("port")), ("box.example", 2222),
                          "gpu.py ssh and pull would die with 'run gpu.py wait first'")
         ssh = gpu_review.gpu_py.ssh_base({**e, "host": "box.example", "port": 2222},
                                          {"identity_file": "~/.ssh/live_pr"})
         self.assertIn(str(Path("~/.ssh/live_pr").expanduser()), ssh, "ssh would not offer the run's key")
+
+    def test_a_progress_read_survives_a_shrunk_log_a_bad_count_and_an_endless_line(self):
+        def show(log, seen, count=None, caps=True, exact=()):
+            """show_progress on a box whose progress.log is `log` (its line count `count`, default wc's), with
+            `head`'s caps kept or not; what it printed and the count it returned."""
+            def ssh(argv, stdin):
+                start = int(argv[-1].split("tail -n +")[1].split()[0])
+                rest = log.splitlines(True)[start - 1:]
+                body = "".join(rest[:50])[:int(argv[-1].split("head -c ")[1])] if caps else "".join(rest)
+                return f"{log.count(chr(10)) if count is None else count} progress.log\n" + body
+            printed = io.StringIO()
+            with contextlib.redirect_stdout(printed):
+                out, _ = step(lambda o: o.update(n=gpu_review.show_progress("eras:i-1", seen, exact)),
+                              {"gpu.py ssh": ssh})
+            return printed.getvalue().splitlines(), out["n"]
+
+        self.assertEqual(show("09:00 a\n09:01 b\n", 5), (['"09:00 a"', '"09:01 b"'], 2),
+                         "a log rewritten shorter would print nothing for the rest of the run")
+        self.assertEqual(show("09:00 a\n", 1, count=-1), ([], 1), "a bad line count would recurse until wait dies")
+        long = "x" * (gpu_review.PROGRESS_CAP + 10)
+        lines, n = show(long + "\n09:02 c\n", 0)
+        self.assertEqual((len(lines), n), (1, 1), "one line past the cap would stall the progress for good")
+        self.assertEqual(show(long + "\n09:02 c\n", 1), (['"09:02 c"'], 2))
+        self.assertEqual(show(long, 0), ([], 0), "a long line still being written would be shown at every poll")
+        many = "".join(f"09:00 line {i}\n" for i in range(5000))
+        self.assertEqual(show(many, 0, caps=False)[1], 50, "a box that ignores head could flood the job's log")
+
+        def rest(log, seen, exact=()):
+            path = Path(tempfile.mkdtemp(), "progress.log")
+            path.write_bytes(log if isinstance(log, bytes) else log.encode())
+            printed = io.StringIO()
+            with contextlib.redirect_stdout(printed):
+                gpu_review.show_rest(path, seen, exact)
+            return printed.getvalue().splitlines()
+        self.assertEqual(len(rest(many[:10000] + long, 0)), many[:10000].count("\n") + 1,
+                         "once the box ends, what the polls didn't print would be lost, the last line too")
+        self.assertEqual(rest("09:00 a\n09:01 b\n09:02 c", 2), ['"09:02 c"'], "a line would be printed twice")
+        self.assertEqual(len(rest(many * 2, 0)), gpu_review.PROGRESS_REST)
+        self.assertEqual(rest(b"09:00 a 50%\r100%\n09:01 b\n09:02 c", 2), ['"09:02 c"'],
+                         "a progress bar's \\r would split a line, and lines already printed would be printed again")
+        self.assertEqual(rest("09:00 a\n", 5), ['"09:00 a"'], "a log rewritten shorter would print nothing")
+        hf_token = "hf_" + "Q1w2E3r4T5y6U7i8O9p0" * 3
+        for cap, show_cut in ((gpu_review.LINE_CAP, lambda text, exact=(): rest(text, 0, exact)),
+                              (gpu_review.PROGRESS_CAP, lambda text, exact=(): show(text, 0, exact=exact)[0])):
+            with self.subTest(cap=cap):  # a line cut at a cap, a token straddling the cut
+                cut = show_cut("sk-ant-" + "A" * (cap - 26) + " " + hf_token + "\n09:02 c\n")
+                self.assertNotIn("hf_", "".join(cut), "the start of a token the cut split would reach the log")
+                if cap == gpu_review.LINE_CAP:
+                    self.assertEqual(cut[-1], '"09:02 c"', "one long line would swallow the next")
+                exact = show_cut("x" * cap + "\n09:02 c\n")[0]
+                self.assertEqual(exact, '"' + "x" * 300 + '"', "a line exactly the cap long would be cut or lost")
+                cut = show_cut("sk-ant-" + "A" * (cap - 17) + " eras/k3y+secret==\n09:02 c\n", ["eras/k3y+secret=="])
+                self.assertNotIn("eras/", "".join(cut), "the start of an exact key the cut split would reach the log")
 
     def test_a_box_that_left_no_results_reports_the_platforms_reason(self):
         run = {"status": "failed", "failure": {"code": "launch_refused",

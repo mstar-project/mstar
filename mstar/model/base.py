@@ -5,7 +5,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from fractions import Fraction
-from typing import TYPE_CHECKING, NamedTuple, Type
+from typing import TYPE_CHECKING, Any, NamedTuple, Type
 
 import torch
 import yaml
@@ -142,6 +142,7 @@ if TYPE_CHECKING:
     from mstar.model.components.moe_parallel import MoeParallelConfig
 
 if TYPE_CHECKING:
+    from mstar.engine.state import Array
     from mstar.worker.scheduling_policy import WalkPriority
 
 DECODE = "decode"
@@ -219,8 +220,10 @@ class LabelLayout(NamedTuple):
 
     ``spans`` are the committed writes known at intake, in walk order. Each
     ``(loop, slots)`` in ``growth`` writes ``slots`` per iteration of the named
-    loop. ``scratch`` is the most one non-committing step writes past the
-    committed length, and ``retention`` the policy the label's committing steps declare.
+    loop, and ``max_growth``, when set, is the most slots ``growth`` writes in all,
+    for loops that end before their caps. ``scratch`` is the most one
+    non-committing step writes past the committed length, and ``retention`` the
+    policy the label's committing steps declare.
     """
     spans: tuple[Span, ...] = ()
     growth: tuple[tuple[str, int], ...] = ()
@@ -228,6 +231,7 @@ class LabelLayout(NamedTuple):
     retention: RetentionPolicy | None = None
     # how many leading spans the label's keys cover, by default every span before the first rows span
     keyed_spans: int | None = None
+    max_growth: int | None = None
 
     def keyed_count(self) -> int:
         if self.keyed_spans is not None:
@@ -235,7 +239,7 @@ class LabelLayout(NamedTuple):
         return next((i for i, span in enumerate(self.spans) if span.kind == SpanKind.ROWS), len(self.spans))
 
     def row(self) -> list:
-        """The layout as ``[spans, growth, scratch, retention, keyed spans]``, a span as
+        """The layout as ``[spans, growth, scratch, retention, keyed spans, max growth]``, a span as
         ``[length, advance, walk, scratch, digest, end key, opens step, kind]``: plain values, which
         keep a request's kwargs on the wire's msgpack path. Digest and end key are None until the
         preprocess worker keys the span."""
@@ -263,6 +267,7 @@ class LabelLayout(NamedTuple):
             self.scratch,
             None if retention is None else [retention.context_budget, retention.protected_prefix],
             self.keyed_count(),
+            self.max_growth,
         ]
 
 
@@ -556,10 +561,17 @@ def streamed_inputs(model: "Model", graph_walk: str, graph: GraphSection) -> set
 def enabled_resources(model: "Model", model_config: dict) -> list[NodeResourceSpec]:
     """The resource specs a deployment's YAML turns on, before its ``resources:``
     overrides: the model's declaration, less the opt-in specs (``NodeResourceSpec.opt_in``)
-    its ``resources:`` block does not name."""
+    its ``resources:`` block does not name. Raises the first problem with the declaration,
+    for callers that skip ``validate_deployment``, which reports them all."""
+    from mstar.engine.state.adapters import node_resources
+    from mstar.engine.state.analysis import state_declaration_problems
+
+    problems = state_declaration_problems(model)
+    if problems:
+        raise ValueError(problems[0])
     named = (model_config.get("resources") or {}).keys()
     return [
-        spec for spec in model.get_node_resources() or []
+        spec for spec in node_resources(model)
         if not spec.opt_in or spec.resource_key in named
     ]
 
@@ -638,6 +650,10 @@ class Model(ABC):
     ENGINE_KWARGS: tuple[str, ...] = (
         "seed", "prefix_cache", "return_token_ids", "return_logprobs", LORA_ADAPTER_KWARG, LORA_DIGEST_KWARG,
     )
+    # Output modalities a client plays as they stream, where a pause is a gap. A streamed request with one of
+    # them reserves its whole KV footprint and is never preempted. ``unpausable_outputs`` in the serving config
+    # overrides it.
+    UNPAUSABLE_OUTPUTS: frozenset[str] = frozenset({"audio"})
 
     # Intra-op threads for the API server's preprocessing of this model's
     # inputs (``load_image``, ``process_prompt``, ...). None takes a default
@@ -653,6 +669,10 @@ class Model(ABC):
     # conductor in arrival order. Declare it only once those calls are checked
     # for shared state, and for the GIL: work that holds it gains nothing here.
     PREPROCESS_PARALLEL: bool = False
+    # Also decode one request's images at once, for a ``load_image`` that is mostly
+    # a GIL-free decode: intra-op work in it would run on each of these threads.
+    # It needs PREPROCESS_PARALLEL, since the decode pool is sized like the prepare pool.
+    PREPROCESS_PARALLEL_IMAGES: bool = False
 
     # The rate the default ``load_audio`` decodes an upload to, and the longest
     # clip it decodes (default 30 min). The request's audio budget
@@ -771,13 +791,24 @@ class Model(ABC):
     def get_node_resources(self) -> list[NodeResourceSpec]:
         """Declare the resources the engine builds, and which nodes share each.
 
-        The whole declaration: a KV cache's shape, the attention backend over
-        it, positions, samplers. The engine builds one resource per spec and
-        hands each node the subset naming it. An opt-in spec (per-request LoRA
-        adapters) is declared here too, and built only for a deployment whose
-        ``resources:`` block names it.
+        The whole declaration, apart from what `declare_state` declares: a KV
+        cache's shape, the attention backend over it, positions, samplers. The
+        engine builds one resource per spec and hands each node the subset naming it.
+        An opt-in spec (per-request LoRA adapters) is declared here too, and built
+        only for a deployment whose ``resources:`` block names it.
         """
         pass
+
+    def declare_state(self) -> "list[Array]":
+        """The state the model keeps between steps, from which the engine builds the specs for it.
+
+        A pure function of the model's config and the deployment's settings, since each process calls it.
+        """
+        return []
+
+    def kernel_settings(self) -> dict[str, dict[str, Any]]:
+        """``splits`` and ``decode_fmha`` by read or update key, until the engine picks kernels itself."""
+        return {}
 
     def checkpoint_path(self) -> str | None:
         """Where this model's weights and config sit on disk.
@@ -1032,6 +1063,14 @@ class Model(ABC):
             into the existing ``tensors`` dict via ``dict.update``.
         """
         pass
+
+    def prompt_tokens(self, tensors: NameToTensorList, kv_layout: dict[str, dict[str, LabelLayout]]) -> int:
+        """A response's ``usage.prompt_tokens``: the positions the prompt fills,
+        attachments included, as OpenAI and vLLM count them. ``tensors`` and
+        ``kv_layout`` are what `process_prompt` returned. By default the ids in
+        ``text_inputs``, which hold each attachment's pads in place; a model
+        that splits ``text_inputs`` around its attachments adds theirs."""
+        return sum(ids.numel() for ids in tensors.get("text_inputs", ()))
 
     def max_input_files(self) -> dict[str, int]:
         """Most files of each input modality one request may attach, e.g.

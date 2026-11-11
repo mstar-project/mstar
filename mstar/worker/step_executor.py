@@ -9,7 +9,7 @@ import math
 import threading
 import time
 import time as _time
-from collections.abc import Collection
+from collections.abc import Collection, Mapping
 from concurrent.futures import Future
 from dataclasses import dataclass
 from functools import partial
@@ -41,6 +41,7 @@ from mstar.worker.host_copies import HostCopies, _host_column, _LazyHostOutputs,
 from mstar.worker.lockstep import Lockstep
 from mstar.worker.micro_scheduler import CHAIN_LANE, ScheduledBatch
 from mstar.worker.phase_timer import PhaseTimer, step_key
+from mstar.worker.preemption import Preemption
 from mstar.worker.request_lifecycle import RequestLifecycle
 from mstar.worker.services import WorkerLayout, WorkerServices
 from mstar.worker.speculation import Speculation
@@ -86,6 +87,7 @@ class GpuStepBody:
         self, services: WorkerServices, timer: PhaseTimer, lockstep: Lockstep,
         lifecycle: RequestLifecycle, host_copies: HostCopies,
         device_capability: DeviceCapability, enable_nvtx: bool,
+        tensor_streams: Mapping[tuple[str, str], frozenset[str]] | None = None,
     ):
         self.worker_id = services.worker_id
         self.device = services.device
@@ -99,6 +101,8 @@ class GpuStepBody:
         self.enable_nvtx = enable_nvtx
         # (node, walk) -> the loop-back signals the node keeps on the device
         self._device_loopback: dict[tuple[str, str], frozenset[str]] = {}
+        # (node, walk) -> its streamed signals that go as tensors (``WorkerLayout``)
+        self._tensor_streams = tensor_streams or {}
 
     def __call__(
         self,
@@ -242,7 +246,8 @@ class GpuStepBody:
     def all_on_device(self, engine, node_name: str, graph_walk: str, signals) -> bool:
         """Whether every output signal of this step is one the node keeps on
         the device (cached per node and walk: it depends on the node's
-        resources, not on the step)."""
+        resources, not on the step). Not one that streams as a tensor: its
+        stream needs the tensor stored."""
         # without inline emit, a rows-only step has no path for the client's tokens
         if not signals or not self._graph_runtime.supports_inline_emit:
             return False
@@ -251,7 +256,7 @@ class GpuStepBody:
         if on_device is None:
             on_device = self._device_loopback[key] = frozenset(
                 engine.device_loopback_signals(node_name, graph_walk)
-            )
+            ) - self._tensor_streams.get(key, frozenset())
         return all(s in on_device for s in signals)
 
     def walk_signals(self, batch: ScheduledBatch, walk: str):
@@ -280,7 +285,7 @@ class GpuStepBody:
 class StepExecutor:
     def __init__(
         self, services: WorkerServices, layout: WorkerLayout, timer: PhaseTimer,
-        lockstep: Lockstep, lifecycle: RequestLifecycle, *,
+        lockstep: Lockstep, lifecycle: RequestLifecycle, preemption: Preemption, *,
         wakeup_event=None, metrics: WorkerMetrics | None = None,
         profile_info: WorkerProfileInfo | None = None,
         device_capability: DeviceCapability | None = None,
@@ -299,6 +304,7 @@ class StepExecutor:
         self.timer = timer
         self.lockstep = lockstep
         self.lifecycle = lifecycle
+        self.preemption = preemption
         self.wakeup_event = wakeup_event
         self._metrics = metrics
         self.profile_info = profile_info if profile_info is not None else WorkerProfileInfo()
@@ -311,6 +317,7 @@ class StepExecutor:
         self._body = GpuStepBody(
             services=services, timer=timer, lockstep=lockstep, lifecycle=lifecycle,
             host_copies=self._host_copies, device_capability=self.device_capability, enable_nvtx=enable_nvtx,
+            tensor_streams=layout.tensor_streams,
         )
         self._gpu_pool: ThreadPool | InlineExecutor | None = None
         self._plan_pool: ThreadPool | InlineExecutor | None = None
@@ -648,8 +655,8 @@ class StepExecutor:
                 torch.accelerator.synchronize(self.device)
 
     def _finish_rebuild_rows(self, batch_N: PendingBatch, outputs: BatchedModelOutput) -> None:
-        """Take the step's rebuild rows off it and advance their rebuilds. A rebuild's last chunk lands it and
-        lets its request's decode row run."""
+        """Take the step's rebuild rows off it and advance their rebuilds. A row's last chunk moves its rebuild to
+        the next row, and the last row's lands the rebuild and lets its request's decode row run."""
         batch, node_batch = batch_N.batch, batch_N.node_batch
         rebuild = batch.rebuild_rids
         if not rebuild:
@@ -665,15 +672,24 @@ class StepExecutor:
             })
         # a row the prefix cache served whole ran no forward, and its rebuild is done all the same
         ran = set(node_batch.request_ids) | node_batch.cached_rids
-        landed = [
-            rid for rid in rebuild if rid in ran and self._rebuilds.land_chunk(rid, node, batch.chunk_ranges.get(rid))
-        ]
-        if landed:
+        ended = {
+            rid: run for rid in rebuild
+            if rid in ran and (run := self._rebuilds.land_chunk(rid, node, batch.chunk_ranges.get(rid)))
+        }
+        if ended:
             # the step's kernels read the prepared input released here
             self.wait_for_step(batch_N)
             engine = self.engine_manager.get_engine(node)
-            for rid in landed:
-                engine.release_chunk_inputs(rid, node)
+            for rid, run in ended.items():
+                self.preemption.rebuilt(rid, node, run.ran)
+                # A row from a record prepared its own input. A prompt's step in progress goes on from the
+                # input the engine keeps for the prompt, which waited aside while the rows before it ran.
+                if run.row.record is not None:
+                    engine.release_chunk_inputs(rid, node)
+                if self._rebuilds.rebuilding(rid, node):
+                    if self._rebuilds.cursor(rid, node).resumes_prefill:
+                        engine.restore_chunk_inputs(rid, node)
+                    continue
                 engine.land_rebuild(node, rid)
         for rid in rebuild:
             outputs.pop(rid, None)
@@ -821,16 +837,19 @@ class StepExecutor:
             outputs, batch_N.node_batch.completion_event,
             request_ids=batch_N.node_batch.request_ids,
         )
-        self._rebuilds.keep_prompts(batch_N.node_batch)
+        self._rebuilds.record(batch_N.node_batch, {
+            rid: self.request_state.get_fwd_info(rid, batch_N.partition) for rid in batch_N.node_batch.cached_rids
+        })
         # Until its last chunk a row's sampled token is not a real sample, so it
         # keys no prefix and decides no stop (`_check_stops`).
         engine.step_finished(
             batch_N.node_batch, cpu_outputs, host_rows=host_rows,
             skip_rids=batch_N.batch.incomplete_node_rids,
         )
-        self._rebuilds.keep_samples(
+        forgot = self._rebuilds.keep_samples(
             batch_N.node_batch, cpu_outputs, host_rows, skip_rids=batch_N.batch.incomplete_node_rids,
         )
+        self.preemption.refuse_drops(forgot, batch_N.node_name)
         _pp_stage("prematerialize")
         runtime_stops, tokens = self._runtime_stop_column(batch_N, host_rows)
         checked = None
@@ -915,6 +934,7 @@ class StepExecutor:
         # Those sends were the last readers of this step's host copies.
         self.tensor_manager.drop_host_copies()
         _pp_stage("tail")
+        self._rebuilds.flush()
         engine.after_output_copy(batch_N.node_batch)
         _pp_stage("after_output_copy")
 
@@ -1011,7 +1031,7 @@ class StepExecutor:
             and not batch_N.node_batch.withheld_outputs
             and self._body.all_on_device(engine, batch_N.node_name, batch_N.graph_walk, signals)
         ):
-            client = engine.inline_client_signals(batch_N.node_name, batch_N.graph_walk)
+            client = engine.inline_signals(batch_N.node_name, batch_N.graph_walk)
             signal = next((s for s in client if s in signals), None)
             column = None if signal is None else _host_column(host_rows, client[signal], repeats)
             if column is not None:
@@ -1269,6 +1289,10 @@ class StepExecutor:
                 )
                 for uuid in uuids:
                     stream_buf.put(uuid, uuid)
+        for signal, per_signal in route_output.local_stream_values_by_signal.items():
+            buffers = self.request_state.per_request_info
+            for rid, value in per_signal:
+                buffers[rid].stream_buffers[signal].put_values([value])
         laps.lap("local_streams")
 
         send_rids = [rid for rid in rids if rid not in failed_rids] if failed_rids else list(rids)
@@ -1347,7 +1371,7 @@ class StepExecutor:
         walks = list(batch_N.batch.rids_by_walk()) or [batch_N.graph_walk]
         candidates: dict[str, str] = {}
         for walk in walks:
-            for signal, buffer_name in engine.inline_client_signals(
+            for signal, buffer_name in engine.inline_signals(
                 batch_N.node_name, walk,
             ).items():
                 candidates.setdefault(signal, buffer_name)
@@ -1374,7 +1398,7 @@ class StepExecutor:
         """`_inline_emit_values` for a step of one walk: every row takes the
         value, so one comprehension, and a slice when the host rows are in
         the batch's order (the usual case)."""
-        candidates = engine.inline_client_signals(batch_N.node_name, batch_N.graph_walk)
+        candidates = engine.inline_signals(batch_N.node_name, batch_N.graph_walk)
         for signal, buffer_name in candidates.items():
             if signal not in signals:
                 continue

@@ -29,28 +29,31 @@ def _geometry(head_k_dim=128, head_v_dim=128):
     )
 
 
-@pytest.fixture
-def blackwell(monkeypatch):
+def _gpu(monkeypatch, capability):
     monkeypatch.setattr(
         gdn_stage, "current_platform",
-        SimpleNamespace(has_cuda_capability=lambda major, minor=0, device=None: major <= 10),
+        SimpleNamespace(has_cuda_capability=lambda major, minor=0, device=None: major <= capability),
     )
 
 
-def test_guard_takes_a_blackwell_gpu_with_one_head_dim(blackwell):
+@pytest.fixture
+def hopper(monkeypatch):
+    _gpu(monkeypatch, 9)
+
+
+@pytest.mark.parametrize("capability", [9, 10])
+def test_guard_takes_hopper_and_blackwell_with_one_head_dim(monkeypatch, capability):
+    _gpu(monkeypatch, capability)
     assert gdn_stage_applies(_CUDA, _geometry())
 
 
-def test_guard_refuses_cpu_and_older_gpus(monkeypatch, blackwell):
+def test_guard_refuses_cpu_and_older_gpus(monkeypatch, hopper):
     assert not gdn_stage_applies(torch.device("cpu"), _geometry())
-    monkeypatch.setattr(
-        gdn_stage, "current_platform",
-        SimpleNamespace(has_cuda_capability=lambda major, minor=0, device=None: major <= 9),
-    )
+    _gpu(monkeypatch, 8)
     assert not gdn_stage_applies(_CUDA, _geometry())
 
 
-def test_guard_refuses_head_dims_the_kernel_does_not_take(blackwell):
+def test_guard_refuses_head_dims_the_kernel_does_not_take(hopper):
     assert not gdn_stage_applies(_CUDA, _geometry(head_k_dim=64, head_v_dim=128))
     assert not gdn_stage_applies(_CUDA, _geometry(head_k_dim=1024, head_v_dim=1024))
 
