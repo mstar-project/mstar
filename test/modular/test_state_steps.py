@@ -633,8 +633,9 @@ def test_keyed_spans_on_a_value_fail_the_request():
 # Request settings
 
 
-def test_sample_settings_have_todays_request_fields_less_the_seed():
-    today = {f.name: f.default for f in fields(SamplingReqConfig) if f.name != "_seed"}
+def test_sample_settings_have_todays_request_fields_less_the_seed_and_grammar():
+    # the conductor sets both: the seed, and the grammar from the request (SamplerSpec.request_config)
+    today = {f.name: f.default for f in fields(SamplingReqConfig) if f.name not in ("_seed", "grammar")}
     settings = {f.name: f.default for f in fields(SampleSettings)}
     assert settings == today
 
