@@ -2018,7 +2018,9 @@ methods are:
    ``postprocess`` still sees the uncut output. A row whose span is empty is left out of the
    store after the stop check, as a withheld output is (``StopCheck``): a streaming edge
    gets no item for it. A spanned output must not feed a node that the same worker
-   speculates into.
+   speculates into. Rows of a spanned output that the step also hands over as a stop buffer
+   under the same name (``check_stop_buffers``) are cut the same way, so ``check_stop``
+   reads the cut rows off the step's one host copy and a host transport sends that copy.
 
 Two more methods control batching and CUDA graphs: ``can_batch`` with
 ``forward_batched``, and ``get_cuda_graph_configs``. They are described in Step 5.

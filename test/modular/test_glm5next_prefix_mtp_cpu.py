@@ -35,6 +35,7 @@ from mstar.model.glm5_next.components.causal_lm import Glm5NextForCausalLM
 from mstar.model.glm5_next.config import KDA_STATE, KV_CACHE, SAMPLER, Glm5NextModelConfig
 from mstar.model.glm5_next.glm5_next_model import Glm5NextModel, process_weights_after_loading
 from mstar.model.glm5_next.submodules import Glm5NextLLMSubmodule
+from mstar.worker.host_copies import crop_to_spans
 
 K = 3
 # decode steps a request may run: the plain reference runs K + 1 for each of an MTP run's
@@ -136,6 +137,8 @@ class _Session:
         self._decoding = False
         assert batch.admit_error is None, batch.admit_error
         self.engine.finalize_batch(batch)
+        if outputs.output_spans:  # as the worker cuts a verify step's tokens, before its stop check
+            crop_to_spans(outputs)
         self.engine.check_stop_for_batch(batch, outputs)
         return outputs.per_rid_outputs
 
