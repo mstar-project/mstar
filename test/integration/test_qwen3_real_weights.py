@@ -8,19 +8,27 @@ log-probs:
 
     e_srv(t) = |served(s_t) - f[t, s_t]|      e_bf(t) = |b[t, s_t] - f[t, s_t]|
 
-The gate is, per prompt set, R = trim(e_srv).mean() / trim(e_bf).mean(), each error's
-positions under its own 0.98 quantile: a bf16 port errs from fp32 as transformers' bf16
-does. Trimmed, because one served greedy flip in a reply of ~100 positions moves a plain
-mean by most of the margin (Alice: 1.8 with it, 1.1 without). The real model needs
-R <= R_MAX on every set; the control (``CONTROLS``, a checkpoint edited the way a port bug
-would read it) must fail the same gate on the long set. Measured on an H100 (Qwen3-8B, the
-committed prompts): the real model 0.911 short and 0.962 long, rope_theta x1.1 1.038 short
-and 2.374 long. Only the long set separates the control: the short replies are too short
-for a position error to build up. Per prompt the two overlap (the real model up to 1.65 on
-one short prompt, the control down to 1.42 on one long one), which is why R is pooled per
+The gate (`mstar.testing_utils.logprob_gate`) has two checks per prompt set, and a set
+passes only with both:
+
+- R = trim(e_srv).mean() / trim(e_bf).mean() <= R_MAX, each error's positions under its
+  own 0.98 quantile: a bf16 port errs from fp32 as transformers' bf16 does. It measures
+  drift spread over the replies. Trimmed, because one served greedy flip in a reply of
+  ~100 positions moves a plain mean by most of the margin (Alice: 1.8 with it, 1.1 without).
+- The served greedy flips are at most the bf16 flips + FLIP_SLACK (3). Errors confined to a
+  few positions sit past the quantile, so the trim drops them: +2 nats at 8 of 384
+  positions keeps R near 1.2. Where they flip the greedy token, this catches them.
+
+The real model passes both on every set; the control (``CONTROLS``, a checkpoint edited the
+way a port bug would read it) must fail the gate. Measured on an H100 (Qwen3-8B, the
+committed prompts): the real model R 0.911 short and 0.962 long, with served vs bf16 flips
+0 vs 2 and 5 vs 7; rope_theta x1.1 R 1.038 short and 2.374 long, flips 3 vs 3 and 8 vs 3.
+Only the long set separates the control, on both checks: the short replies are too short for
+a position error to build up. Per prompt the two overlap (the real model up to 1.65 on one
+short prompt, the control down to 1.42 on one long one), which is why the gate pools each
 set. rms_norm_eps 1e-5 isn't a control: its served log-probs match the real model's at
-every length. The plain-mean and p90 ratios, the greedy-flip counts
-and the deficit (fp32's margin given up at a flip) are printed only.
+every length. The plain-mean and p90 ratios and the deficit (fp32's margin given up at a
+flip) are printed only.
 
 Qwen3-0.6B ties its head to the embedding (its file also ships the head, equal to
 the embedding); it is not a registered size, so the loader's tie path is checked
@@ -44,6 +52,8 @@ import pytest
 import requests
 import torch
 import yaml
+
+from mstar.testing_utils.logprob_gate import FLIP_SLACK, R_MAX, PromptErrors, Verdict, ratios, verdict
 
 REPO = Path(__file__).resolve().parents[2]
 E2E = REPO / "test" / "e2e"
@@ -79,10 +89,6 @@ SETS = {"short": PROMPTS, "long": LONG_PROMPTS}
 # every prompt, in the order the server and the reference run them, with its set
 ALL_PROMPTS = [(name, prompt) for name, prompts in SETS.items() for prompt in prompts]
 TOKENS = 128
-# the real model at 0.962 and the control at 2.374 over the long set: about 1.6x each side
-R_MAX = 1.5
-# each error's positions past this quantile are left out of its mean
-TRIM = 0.98
 
 
 def _scale_rope_theta(config: dict) -> None:
@@ -194,16 +200,7 @@ class _Reference:
         return out
 
 
-class _Errors(NamedTuple):
-    """One prompt's per-position errors against fp32, at the served tokens."""
-    served: torch.Tensor  # e_srv
-    bf16: torch.Tensor  # e_bf
-    served_flips: int  # served token != fp32's argmax
-    bf16_flips: int  # bf16's argmax != fp32's
-    deficit: float  # fp32's margin given up at a served flip, the largest
-
-
-def _errors(ref: _Reference, served: list[_Served]) -> list[_Errors]:
+def _errors(ref: _Reference, served: list[_Served]) -> list[PromptErrors]:
     replies = [s.ids for s in served]
     fp32 = ref.log_probs(torch.float32, replies)
     bf16 = ref.log_probs(torch.bfloat16, replies)
@@ -211,7 +208,7 @@ def _errors(ref: _Reference, served: list[_Served]) -> list[_Errors]:
     for f, b, s in zip(fp32, bf16, served, strict=True):
         rows, tokens = torch.arange(len(s.ids)), torch.tensor(s.ids, dtype=torch.long)
         f_s, top = f[rows, tokens], f.argmax(-1)
-        out.append(_Errors(
+        out.append(PromptErrors(
             served=(torch.tensor(s.logprobs, dtype=torch.float32) - f_s).abs(),
             bf16=(b[rows, tokens] - f_s).abs(),
             served_flips=int((tokens != top).sum()),
@@ -221,29 +218,10 @@ def _errors(ref: _Reference, served: list[_Served]) -> list[_Errors]:
     return out
 
 
-def _trimmed_mean(x: torch.Tensor) -> float:
-    return float(x[x <= x.quantile(TRIM)].mean())
-
-
-class _Ratios(NamedTuple):
-    trimmed: float  # R, the gate's
-    mean: float
-    p90: float
-
-
-def _ratios(errors: list[_Errors]) -> _Ratios:
-    srv, bf = torch.cat([e.served for e in errors]), torch.cat([e.bf16 for e in errors])
-    assert bf.numel() and float(bf.mean()) > 0, "no positions to compare"
-    return _Ratios(
-        _trimmed_mean(srv) / _trimmed_mean(bf), float(srv.mean() / bf.mean()),
-        float(srv.quantile(0.9) / bf.quantile(0.9)),
-    )
-
-
-def _report(label: str, errors: list[_Errors]) -> dict[str, float]:
-    """Print what the calibration reads (the PR quotes it) and return each set's R."""
-    def line(group: list[_Errors]) -> str:
-        r = _ratios(group)
+def _report(label: str, errors: list[PromptErrors]) -> dict[str, Verdict]:
+    """Print what the calibration reads (the PR quotes it), both checks per set, and return each set's verdict."""
+    def line(group: list[PromptErrors]) -> str:
+        r = ratios(group)
         srv, bf = torch.cat([e.served for e in group]), torch.cat([e.bf16 for e in group])
         return (f"R {r.trimmed:.3f} (mean ratio {r.mean:.3f}, p90 ratio {r.p90:.3f}); e_srv mean "
                 f"{float(srv.mean()):.4f} e_bf mean {float(bf.mean()):.4f}; greedy flips served "
@@ -252,12 +230,14 @@ def _report(label: str, errors: list[_Errors]) -> dict[str, float]:
 
     for i, ((name, _), e) in enumerate(zip(ALL_PROMPTS, errors, strict=True)):
         print(f"{label}: {name} prompt {i} ({len(e.served)} tokens): {line([e])}")
-    ratios = {}
+    verdicts = {}
     for name in SETS:
         group = [e for (n, _), e in zip(ALL_PROMPTS, errors, strict=True) if n == name]
-        ratios[name] = _ratios(group).trimmed
+        v = verdicts[name] = verdict(group)
         print(f"{label}: {name} set: {line(group)}")
-    return ratios
+        print(f"{label}: {name} set gate: R {v.r:.3f} <= {R_MAX} {'pass' if v.r_ok else 'FAIL'}; flips served "
+              f"{v.served_flips} <= bf16 {v.bf16_flips} + {FLIP_SLACK} {'pass' if v.flips_ok else 'FAIL'}")
+    return verdicts
 
 
 CASES = [("qwen3_8b", "Qwen/Qwen3-8B")]
@@ -313,18 +293,18 @@ def reference():
 
 @pytest.mark.parametrize("name, repo", CASES, ids=[c[0] for c in CASES])
 def test_served_log_probs_err_from_fp32_as_transformers_bf16_does(tmp_path, name, repo, reference):
-    ratios = _report(name, _errors(reference, _served_ids(tmp_path, name)))
-    past = {k: round(r, 3) for k, r in ratios.items() if r > R_MAX}
-    assert not past, f"{name}: served log-probs err from fp32 past {R_MAX}x transformers' bf16 on {past}"
+    verdicts = _report(name, _errors(reference, _served_ids(tmp_path, name)))
+    failed = {k: v for k, v in verdicts.items() if not v.ok}
+    assert not failed, f"{name}: served log-probs fail the parity gate on {failed}"
 
 
 @pytest.mark.parametrize("control, edit", CONTROLS, ids=[c[0] for c in CONTROLS])
 def test_a_port_bug_fails_the_check(tmp_path, control, edit, reference):
-    """The negative control: the real model's gate fails it on the long set."""
+    """The negative control: the gate fails it."""
     name, repo = CASES[0]
     served = _served_ids(tmp_path, name, model_path=_edited(tmp_path, _snapshot_or_skip(repo), edit))
-    ratios = _report(f"{name} ({control})", _errors(reference, served))
-    assert ratios["long"] > R_MAX, f"{control} passes the gate: R {ratios['long']:.3f} on the long set"
+    verdicts = _report(f"{name} ({control})", _errors(reference, served))
+    assert not all(v.ok for v in verdicts.values()), f"{control} passes the gate: {verdicts}"
 
 
 def test_a_tied_head_checkpoint_loads_its_head_from_the_embedding():
