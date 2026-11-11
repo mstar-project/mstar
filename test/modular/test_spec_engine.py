@@ -1029,3 +1029,23 @@ def test_a_workers_own_refusal_is_fatal_or_drops_the_node_to_synchronous(monkeyp
         return
     got, reason = eng._agreed_mode(decl, mgmt, _toy_specs(), (True, ""))
     assert got.value == "synchronous" and "resource 'kv': cannot here" in reason
+
+
+def test_a_verifying_node_on_a_pool_with_no_host_pool_is_warned_about(caplog):
+    """With no host pool every request on a verifying node is guaranteed, so the leader says so once at load.
+    Negative control: a pool with host pages gets no warning."""
+    import logging
+
+    from mstar.engine import engine as engine_mod
+    from mstar.engine.resources.kv.manager import KVManager
+
+    with caplog.at_level(logging.WARNING, logger="mstar.engine.engine"):
+        engine(3, oracle)
+    warned = [r.getMessage() for r in caplog.records if "no host pool" in r.getMessage()]
+    assert len(warned) == 1 and "KV 'kv'" in warned[0], warned
+    caplog.clear()
+    hosted = KVManager.__new__(KVManager)
+    hosted.config = SimpleNamespace(cpu_offload_pages=4)
+    with caplog.at_level(logging.WARNING, logger="mstar.engine.engine"):
+        engine_mod._warn_hostless(NODE, {"kv": hosted})
+    assert not any("no host pool" in r.getMessage() for r in caplog.records)

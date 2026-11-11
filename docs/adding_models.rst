@@ -1900,7 +1900,9 @@ captured verify bucket was planned on the host (an attention without ``Attention
 on the verify walk), since that plan could attend over the reserved lengths.
 A verifying node never drops a request: ``Engine.rebuild_policies`` leaves it out of the model's
 rebuild policies, which the engine's checks and the worker's rebuilds both read, so a model needs
-no drafting case in ``rebuild_policies``.
+no drafting case in ``rebuild_policies``. With no host pool (``cpu_offload_pages`` 0) every request on the
+node is then guaranteed, and reserves its whole footprint at admission; startup warns about it, and a drafting
+config sets a host pool.
 
 Step 3 — Declare the computation graph
 --------------------------------------
