@@ -224,7 +224,8 @@ class CudaWhile:
         if devrt is None or path is None:
             raise RuntimeError(
                 "linking the device stop kernel needs libnvJitLink and libcudadevrt.a from one CUDA release, "
-                "and none was found; set CUDA_HOME to a toolkit that has them"
+                f"and none was found next to torch's NVRTC ({nvrtc_dir}), its sibling wheel directories, "
+                "CUDA_HOME or /usr/local/cuda"
             )
         lib, handle = ctypes.CDLL(path), ctypes.c_void_p()
 

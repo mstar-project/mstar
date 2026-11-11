@@ -1,6 +1,7 @@
 """Which decode steps may stand for several iterations (``step_repeats:``)."""
 from __future__ import annotations
 
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -225,6 +226,8 @@ def test_the_link_libraries_are_looked_for_next_to_nvrtc_before_the_toolkit(
     """Both have to come from one CUDA release, the NVRTC's own before a toolkit that may not be."""
     link_name, devrt_name = "libnvJitLink.so.13", "libcudadevrt.a"
     monkeypatch.setattr(torch.version, "cuda", "13.0")
+    real_exists = os.path.exists  # this host's /usr/local/cuda must not answer for the fake dirs
+    monkeypatch.setattr(os.path, "exists", lambda p: str(p).startswith(str(tmp_path)) and real_exists(p))
     nvrtc, toolkit = tmp_path / "cu13" / "lib", tmp_path / "cuda" / "lib64"
     for d in (nvrtc, toolkit):
         d.mkdir(parents=True)

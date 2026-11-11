@@ -216,13 +216,15 @@ class CUDAGraphBackend(_TorchGraphBackend):
         from mstar.engine.device_run import CudaWhile
 
         try:
-            nvjitlink, devrt = CudaWhile.link_libraries(CudaWhile.nvrtc()[1])
+            nvrtc_dir = CudaWhile.nvrtc()[1]
         except OSError as error:
             return f"no NVRTC to compile its stop kernel with: {error}"
+        nvjitlink, devrt = CudaWhile.link_libraries(nvrtc_dir)
         if nvjitlink is None or devrt is None:
             return (
-                "no one CUDA release has both libnvJitLink and libcudadevrt.a to link the stop kernel "
-                "(the NVRTC's own, else set CUDA_HOME)"
+                "no one CUDA release has both libnvJitLink and libcudadevrt.a to link the stop kernel: "
+                f"looked next to torch's NVRTC ({nvrtc_dir}), its sibling wheel directories, then CUDA_HOME "
+                "and /usr/local/cuda"
             )
         return None
 

@@ -436,7 +436,7 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        the device; another AR node must declare those itself (see :doc:`adding_models`), and a node
        not named keeps its own token path. A step isn't rewound for a row that stopped inside it.
        ``device_stop: true`` launches each step once, as a WHILE node that ends on the device when every
-       row has stopped (needs CUDA 12.4 or later, with ``libnvJitLink`` and ``libcudadevrt.a`` from torch's CUDA release (its pip wheels, or ``CUDA_HOME``)).
+       row has stopped (needs CUDA 12.4 or later, and ``libnvJitLink`` with ``libcudadevrt.a`` from one CUDA release: torch's pip wheels, else the toolkit at ``CUDA_HOME`` or ``/usr/local/cuda``).
    * - ``batch_builder``
      - *(optional, default* ``fifo`` *)* How the worker composes a step under a token
        budget (``max_batch_tokens``). ``fifo`` serves prompts in the order they started:
