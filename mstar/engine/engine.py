@@ -3987,7 +3987,11 @@ class Engine:
     def _mark_offloaded(self, node_name: str, request_id: int) -> None:
         """A verifying node's row gave up its slot to an offload: what it holds is due
         at its first admit back (`VerifyLedger.mark_offloaded`). Every rank marks it
-        from the same journaled OFFLOAD, so they apply its results at the same step."""
+        from the same journaled OFFLOAD, so they apply its results at the same step.
+        Only this node's ledger: `_release_resident_slot` can also release a slot on
+        another node's planner that shares a resource, but a verifying node that shares
+        one never runs asynchronous (`_agreed_mode`), and the synchronous rule makes all
+        its held results due anyway."""
         draft = self._drafts.get(node_name)
         if draft is not None:
             draft.ledger.mark_offloaded(request_id)
