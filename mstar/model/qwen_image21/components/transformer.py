@@ -186,9 +186,13 @@ class Attention(nn.Module):
         local = self.local_heads * self.head_dim
         q, k, v = self.to_qkv(x).split([local, local, local], dim=-1)
         shape = (-1, self.local_heads, self.head_dim)
-        v = v.reshape(shape)
-        q = norm_rope(q.reshape(shape), self.norm_q, rope)
-        k = norm_rope(k.reshape(shape), self.norm_k, rope)
+        q, k, v = q.reshape(shape), k.reshape(shape), v.reshape(shape)
+        if kernels.fits(q, k) and self.head_dim == 128 and q.stride() == k.stride():
+            # q and k in one launch, the token's rotation read once: the same bits as two norm_rope calls
+            q, k = kernels.qk_pair_norm_rope(q, k, self.norm_q.weight, self.norm_k.weight, rope, self.norm_q.eps)
+        else:
+            q = norm_rope(q, self.norm_q, rope)
+            k = norm_rope(k, self.norm_k, rope)
         return attend(q, k, v).flatten(1).type_as(q)
 
 
