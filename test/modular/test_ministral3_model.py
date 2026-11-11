@@ -220,6 +220,9 @@ def test_image_layout_graph_and_decoder_splice(model, monkeypatch):
     assert [segment.span for segment in step.segments] == [16, 12]  # whole images, not token rows
 
     decoder = Ministral3Decoder(model.config, encoders=model.encoders)
+    # Distributed embeddings allocate empty storage until checkpoint loading.
+    weight = decoder.model.embed_tokens.weight
+    weight.copy_(torch.arange(weight.numel(), dtype=weight.dtype).reshape_as(weight) / weight.numel())
     decoder.node_resources[ROPE] = SimpleNamespace(position=lambda **kwargs: 0)
     # Distinct synthetic features reveal dropped/reordered image embeddings.
     features = torch.arange(7 * model.config.hidden_size, dtype=torch.float32).reshape(7, -1)
