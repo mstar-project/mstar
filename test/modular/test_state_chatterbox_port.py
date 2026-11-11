@@ -10,7 +10,7 @@ its dict-backed path, copied here too.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from types import SimpleNamespace
 
 import pytest
@@ -24,6 +24,7 @@ from mstar.conductor.conductor import Conductor
 from mstar.engine.node_dtype import resolve_model_dtype
 from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec, AttentionStep
 from mstar.engine.resources.kv.config import KVReqConfig, KVSpec, KVStep, PagedKVConfig
+from mstar.engine.resources.lora.config import LORA_RESOURCE_KEY
 from mstar.engine.resources.position.config import PositionConfig, PositionSpec, PositionStep
 from mstar.engine.resources.recurrent.config import (
     RecurrentBlockConfig,
@@ -35,11 +36,10 @@ from mstar.engine.resources.sampler.config import SamplerSpec, SamplerStep, Samp
 from mstar.engine.resources.spec import apply_yaml_overrides
 from mstar.engine.resources.step import Segment, SubmoduleStep
 from mstar.engine.state import Span, host
-from mstar.engine.state.adapters import kv_layouts, node_resources
+from mstar.engine.state.adapters import StateSetup, kv_layouts
 from mstar.engine.state.analysis import declaration_digests, state_declaration_problems
-from mstar.model.base import LabelLayout, parse_autocast_dtype, serving_resources
+from mstar.model.base import LabelLayout, enabled_resources, parse_autocast_dtype, serving_resources
 from mstar.model.chatterbox.chatterbox_model import ChatterboxModel
-from mstar.model.chatterbox.components.audio import MelSpectrogram24k
 from mstar.model.chatterbox.components.audio_frontend import resample, trim_reference
 from mstar.model.chatterbox.components.s3_tokenizer import S3Tokenizer
 from mstar.model.chatterbox.components.s3gen import FlowRow, ReferenceConditioning, S3Gen
@@ -76,6 +76,7 @@ from mstar.model.chatterbox.submodules import (
     max_reference_tokens,
     reference_tokens,
 )
+from mstar.model.components.audio_features import MatchaLogMel
 from mstar.model.submodule_base import ARNodeInputs, engine_step
 from mstar.streaming.chunk_policy import RampChunkPolicy
 from mstar.streaming.stream_buffer import StreamBuffer
@@ -85,7 +86,8 @@ VARIANTS = ("chatterbox", "multilingual", "turbo")
 
 
 def _reference_specs(model: ChatterboxModel) -> list:
-    """`ChatterboxModel.get_node_resources` before the port, and the stream Value S3Gen declares now."""
+    """`ChatterboxModel.get_node_resources` before the port, and the stream Value S3Gen declares now. Less the opt-in
+    LoRA spec, which `enabled_resources` builds only when a deployment names it."""
     t3 = model.config.t3
     bb = t3.backbone
     kv = PagedKVConfig(
@@ -113,7 +115,7 @@ def _reference_specs(model: ChatterboxModel) -> list:
         PositionSpec(resource_key=T3_POS, nodes={T3_NODE}, config=position),
         SamplerSpec(
             resource_key=T3_SAMPLER, nodes={T3_NODE}, vocab_size=t3.speech_vocab_size,
-            enable_repetion_penalty=True, enable_min_p=not model.config.is_turbo,
+            enable_repetition_penalty=True, enable_min_p=not model.config.is_turbo,
         ),
         # Named: S3Gen kept each stream in a dict on its node. The stream is now a Value of the vocoder's 8-frame tail
         # and the reference, padded to the 250 tokens of a 10 s clip.
@@ -134,7 +136,7 @@ def _reference_specs(model: ChatterboxModel) -> list:
 @pytest.mark.parametrize("variant", VARIANTS)
 def test_specs_equal_the_hand_written_ones(variant):
     model = _make_model(variant)
-    _assert_equal_per_key(node_resources(model), _reference_specs(model))
+    _assert_equal_per_key(enabled_resources(model, {}, StateSetup()), _reference_specs(model))
 
 
 @pytest.mark.parametrize("variant", VARIANTS)
@@ -149,6 +151,12 @@ def test_specs_equal_the_hand_written_ones_under_a_resources_block(variant):
     _assert_equal_per_key(serving_resources(model, deployment), expected)
 
 
+@pytest.mark.parametrize("variant", VARIANTS)
+def test_the_port_writes_only_lora_by_hand(variant):
+    hand_written = {spec.resource_key for spec in _make_model(variant).get_node_resources()}
+    assert hand_written == (set() if variant == "turbo" else {LORA_RESOURCE_KEY})
+
+
 def test_every_published_config_is_covered():
     stems = {path.stem for path in _published("ChatterboxModel")}
     assert stems == {
@@ -161,7 +169,7 @@ def test_every_published_config_is_covered():
 def test_specs_equal_the_hand_written_ones_on_every_published_config(path, tmp_path, monkeypatch):
     deployment = yaml.safe_load(path.read_text())
     model = _FACTORIES["ChatterboxModel"](deployment["model"], deployment["model_kwargs"], tmp_path, monkeypatch)
-    _assert_equal_per_key(node_resources(model), _reference_specs(model))
+    _assert_equal_per_key(enabled_resources(model, {}, StateSetup()), _reference_specs(model))
     expected = _reference_specs(model)
     apply_yaml_overrides(expected, deployment)
     kv_dtype = parse_autocast_dtype(resolve_model_dtype(model, deployment))
@@ -270,6 +278,7 @@ def _reference_configs(model: ChatterboxModel, kwargs: dict) -> dict:
         T3_SAMPLER: SamplingReqConfig(
             temperature=knobs["temperature"], top_k=knobs["top_k"], top_p=knobs["top_p"],
             repetition_penalty=knobs["repetition_penalty"], min_p=knobs["min_p"], ignore_eos=knobs["ignore_eos"],
+            penalize_prompt=knobs["penalize_prompt"],
         ),
         T3_KV: KVReqConfig(needed_labels=labels),
     }
@@ -288,7 +297,9 @@ def test_request_configs_equal_the_hand_written_ones(variant, kwargs):
         model=model, _declarations=model.declare_state, _node_resources=list,
         _kv_labels={key: tuple(labels) for key, labels in model.kv_labels().items()},
     )
-    configs = Conductor._get_resource_configs(conductor, {**kwargs, "kv_layout": kv_layout}, {})
+    configs = Conductor._get_resource_configs(
+        conductor, ["text", "audio"], ["audio"], {**kwargs, "kv_layout": kv_layout},
+    )
     assert configs == _reference_configs(model, kwargs)
 
 
@@ -689,7 +700,7 @@ def test_the_stream_holds_every_reference_token_of_a_clip_at_least_dec_cond_seco
     wav24 = trim_reference(wav24, config.sample_rate, config.dec_cond_seconds)
     with torch.no_grad():
         _, lens = S3Tokenizer(config.s3_tokenizer).eval()([resample(wav24, config.sample_rate, S3_SR)])
-        frames = MelSpectrogram24k(config.s3gen.mel)(wav24[None]).shape[-1]
+        frames = MatchaLogMel(**asdict(config.s3gen.mel))(wav24[None]).shape[-1]
     # `S3Gen.embed_reference`'s cut
     kept = min(int(lens[0]), frames // config.s3gen.token_mel_ratio)
     assert kept == max_reference_tokens(config) == 250, "the stream's reference fields would cut or pad a full clip"

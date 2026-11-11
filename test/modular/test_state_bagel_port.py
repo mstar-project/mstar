@@ -28,12 +28,13 @@ sys.path.insert(0, ".")
 import pytest
 import torch
 import yaml
+from test_bagel_cfg_parallel import _image_kwargs
 from test_multimodal_ordering import _StubTokenizer
 from test_state_ports import _assert_equal_per_key, _assert_steps_equal, _published
 
 from mstar.api_server.data_worker import PreprocessWorkerThread
 from mstar.conductor.conductor import Conductor
-from mstar.conductor.request_info import DEFAULT_PARTITION
+from mstar.conductor.request_info import FINAL_PREFILL
 from mstar.engine.accelerator_graph_config import PiecewisePackedConfig
 from mstar.engine.accelerator_graph_runner import PiecewiseAcceleratorGraphRunner
 from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec, AttentionStep
@@ -55,14 +56,13 @@ from mstar.model.bagel.submodules import (
     _LOGITS,
     IMAGE_SENTINELS,
     VIT_BLOCK_LOOP,
-    ImageGenPhase,
     LLMSubmodule,
     ViTEncoderSubmodule,
     vae_latents,
     vit_patches,
 )
 from mstar.model.base import LabelLayout, keyed_labels, serving_resources
-from mstar.model.multimodal import PromptPart
+from mstar.model.multimodal import PromptPart, span_name
 from mstar.model.submodule_base import ARNodeInputs, engine_step
 
 CONFIGS = {path.stem: path for path in _published("BagelModel")}
@@ -186,7 +186,7 @@ def _segments(labels, spans: dict[int, int]) -> tuple[Segment, ...]:
 def _info(rows: dict[int, tuple[bool, bool]]) -> dict:
     """``rows``: rid -> whether its request is guided, and whether this step samples its prefill's token."""
     return {
-        rid: SimpleNamespace(step_metadata={"requires_cfg": guided, "sample_prefill_token": samples})
+        rid: SimpleNamespace(step_metadata={"requires_cfg": guided, FINAL_PREFILL: samples})
         for rid, (guided, samples) in rows.items()
     }
 
@@ -380,7 +380,7 @@ def test_the_vit_region_step_equals_the_hand_written_one(monkeypatch):
     vit.bind_node_state(_handles(model, "vit_encoder"))
     config = vit.get_piecewise_accelerator_graph_configs(torch.device("cpu"), torch.float32)[VIT_BLOCK_LOOP]
     runner = object.__new__(PiecewiseAcceleratorGraphRunner)
-    runner._config, runner._lora_keys, runner._state_handles = config, (), vit.state_handles
+    runner._config, runner._segment_keys, runner._state_handles = config, (), vit.state_handles
     reference = PiecewisePackedConfig(
         capture_fn=config.capture_fn, make_static_inputs=config.make_static_inputs, attn_key=VIT_ATTN,
         total_tokens=config.total_tokens, capture_batch_sizes=config.capture_batch_sizes,
@@ -418,8 +418,8 @@ def _laid_out(model: BagelModel, prompt, input_modalities, output_modalities, im
     return layouts["kv"], out.new_input_tensors
 
 
-def _ids(n: int) -> Span:
-    return Span("ids", "prefill_text", n, n, "text_inputs")
+def _ids(n: int, k: int = 0) -> Span:
+    return Span("ids", "prefill_text", n, n, span_name("text_inputs", k))
 
 
 def test_a_guided_generation_lays_out_what_bagel_did():
@@ -447,26 +447,26 @@ def test_an_unguided_generation_lays_out_what_bagel_did():
 def test_an_understood_image_lays_out_what_bagel_did():
     model = _bagel()
     layouts, tensors = _laid_out(model, "What is it?", ["image", "text"], ["text"], [torch.rand(3, 480, 640)])
-    before, after = (t.numel() for t in tensors["text_inputs"])
+    before, after = (tensors[span_name("text_inputs", k)][0].numel() for k in (0, 1))
     c = model.config
     patches = vit_patches(480, 640, "default", c.vit_config.patch_size, c.vit_max_num_patch_per_side)
     image = Span("digest", "prefill_vit", patches + IMAGE_SENTINELS, 1, ("image", 0), ("default",))
     assert layouts == {
-        "main": LabelLayout(spans=(_ids(before), image, _ids(after)), growth=(("decode_loop", 1),)),
+        "main": LabelLayout(spans=(_ids(before), image, _ids(after, 1)), growth=(("decode_loop", 1),)),
     }, "the request would reserve and key other pages than Bagel's"
 
 
 def test_an_edit_lays_out_what_bagel_did():
     model = _bagel()
     layouts, tensors = _laid_out(model, "Make it night", ["image", "text"], ["image"], [torch.rand(3, 480, 640)])
-    height, width = tensors["image_inputs"][0].shape[-2:]
+    height, width = tensors[span_name("image_inputs", 0)][0].shape[-2:]
     c = model.config
     patches = vit_patches(height, width, "default", c.vit_config.patch_size, c.vit_max_num_patch_per_side)
     latents = vae_latents(height, width, "default", c.latent_downsample, c.max_latent_size)
     item = (("image", 0), ("default",))
     vae = Span("digest", "prefill_vae", latents + IMAGE_SENTINELS, 1, *item)
     vit = Span("digest", "prefill_vit", patches + IMAGE_SENTINELS, 1, *item)
-    text = _ids(tensors["text_inputs"][0].numel())
+    text = _ids(tensors[span_name("text_inputs", 0)][0].numel())
     scratch = (height // 16) * (width // 16) + IMAGE_SENTINELS
     assert layouts == {
         # the input is resized before its walks see it, so its file's digest keys nothing
@@ -478,14 +478,12 @@ def test_an_edit_lays_out_what_bagel_did():
 
 def test_a_request_opens_with_bagels_per_node_labels_and_its_sampling_settings():
     model = _bagel(CFG_PARALLEL)
-    fwd = {DEFAULT_PARTITION: SimpleNamespace(full_metadata=SimpleNamespace(kwargs={
-        "requires_cfg": True, "target_output": "image", "image_gen_phases": (ImageGenPhase("image_gen_cfg2", 3),),
-    }))}
     conductor = SimpleNamespace(
         model=model, _declarations=model.declare_state, _node_resources=lambda: node_resources(model),
         _kv_labels={key: tuple(labels) for key, labels in model.kv_labels().items()},
     )
-    configs = Conductor._get_resource_configs(conductor, {"temperature": 0.2, "top_k": None}, fwd)
+    kwargs = _image_kwargs(model, {"temperature": 0.2, "top_k": None})
+    configs = Conductor._get_resource_configs(conductor, ["text"], ["image"], kwargs)
     c = model.config
     assert configs["sampler"] == SamplingReqConfig(
         temperature=0.2, top_k=c.top_k, top_p=c.top_p, ignore_eos=c.ignore_eos, repetition_penalty=c.repetition_penalty,

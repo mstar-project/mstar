@@ -195,7 +195,7 @@ def test_a_cross_read_refuses_queries_laid_out_over_two_labels():
 
 def _conductor(kv_labels: dict, returned: dict | None = None) -> Conductor:
     conductor = Conductor.__new__(Conductor)
-    conductor.model = SimpleNamespace(get_request_resource_configs=lambda **kwargs: dict(returned or {}))
+    conductor.model = SimpleNamespace(get_request_resource_configs=lambda *args: dict(returned or {}))
     conductor._kv_labels = kv_labels
     conductor._node_resources_cache = []
     return conductor
@@ -204,19 +204,19 @@ def _conductor(kv_labels: dict, returned: dict | None = None) -> Conductor:
 def test_a_request_opens_the_labels_its_layout_names():
     conductor = _conductor({"t3_kv": LABELS})
     layout = {"t3_kv": {"main": LabelLayout(spans=()).row()}}
-    configs = conductor._get_resource_configs({"kv_layout": layout}, {})
+    configs = conductor._get_resource_configs([], [], {"kv_layout": layout})
     assert configs["t3_kv"].needed_labels == ["main"], "an unguided request would open uncond, which it doesn't lay out"
 
 
 def test_a_request_opens_every_label_of_an_array_its_layout_doesnt_name():
-    configs = _conductor({"t3_kv": LABELS})._get_resource_configs({"kv_layout": {}}, {})
+    configs = _conductor({"t3_kv": LABELS})._get_resource_configs([], [], {"kv_layout": {}})
     assert configs["t3_kv"].needed_labels == list(LABELS)
 
 
 def test_a_config_the_model_returns_is_left_as_it_returned_it():
     """Bagel names its labels per node and walk, and an unguided request touches no branch label."""
     returned = KVReqConfig(needed_labels_per_node_walk={("LLM", "decode"): ["main"]})
-    configs = _conductor({"kv": ("main", "cfg_img")}, {"kv": returned})._get_resource_configs({"kv_layout": {}}, {})
+    configs = _conductor({"kv": ("main", "cfg_img")}, {"kv": returned})._get_resource_configs([], [], {"kv_layout": {}})
     assert configs["kv"].needed_labels is None, "the request would open branch labels its unguided steps never touch"
 
 

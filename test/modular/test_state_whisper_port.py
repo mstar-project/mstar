@@ -121,7 +121,7 @@ def _reference(model: WhisperModel) -> list:
         PositionSpec(resource_key=ROPE, nodes=nodes, config=PositionConfig(kv_cache=KV_CACHE)),
         # The model also declared `loopback_state={"ts_rules": ...}`, the decode loop's rule state kept by sampler
         # slot, which is a field of the decoder state now.
-        SamplerSpec(resource_key=SAMPLER, nodes=nodes, vocab_size=c.vocab_size, enable_repetion_penalty=False),
+        SamplerSpec(resource_key=SAMPLER, nodes=nodes, vocab_size=c.vocab_size, enable_repetition_penalty=False),
         # New: the rule state, and the transcript the stop check recorded in the node's request state.
         RecurrentStateSpec(resource_key=DECODER_STATE, nodes=nodes, config=RecurrentStateConfig(
             num_layers=1, labels=("main",), blocks={
@@ -286,13 +286,13 @@ def test_the_layout_converts_to_the_hand_written_one(kwargs):
 @pytest.mark.parametrize("kwargs, expected", [
     ({}, SamplingReqConfig(temperature=0.0, top_p=1.0, ignore_eos=False)),
     (
-        {"temperature": "0.4", "top_p": 0.9, "ignore_eos": True},
+        {"temperature": 0.4, "top_p": 0.9, "ignore_eos": True},
         SamplingReqConfig(temperature=0.4, top_p=0.9, ignore_eos=True),
     ),
 ])
 def test_sample_settings_convert_to_the_hand_written_ones(kwargs, expected):
     model = _model()
-    settings = sampling_configs(model.get_request_resource_configs({}, kwargs), model.declare_state())
+    settings = sampling_configs(model.get_request_resource_configs(["audio"], ["text"], kwargs), model.declare_state())
     assert settings == {SAMPLER: expected}, "the request would sample with other settings than it did"
 
 
@@ -304,9 +304,12 @@ MAXPOS = 24
 TIMESTAMP = 50365
 
 
-def _forced(language: int, first: int, decoded: list[int], ignore_eos: bool) -> list[int]:
-    """The ids the align walk forced before the port. The stop check recorded the prompt walk's token, then each decode
-    step's up to the one whose end-of-text stopped the loop, and the walk kept the tokens below end-of-text that fit."""
+def _forced(language: int, first: int, decoded: list[int], ignore_eos: bool) -> list[int] | None:
+    """The ids the align walk forced before the port, or None where the prompt walk's end-of-text ended the request. The
+    stop check recorded the prompt walk's token, then each decode step's up to the one whose end-of-text stopped the
+    loop, and the walk kept the tokens below end-of-text that fit."""
+    if first == EOT and not ignore_eos:
+        return None
     recorded = [first]
     for token in decoded:
         recorded.append(token)
@@ -317,7 +320,7 @@ def _forced(language: int, first: int, decoded: list[int], ignore_eos: bool) -> 
 
 
 class _WordRequest:
-    """Word-timestamp request ``rid`` on ``driver``, routed as the conductor routes it."""
+    """Word-timestamp request ``rid`` on ``driver``, stepped through its walk plan as the conductor steps it."""
 
     def __init__(self, driver: _Driver, rid: int, **kwargs):
         self.driver, self.rid = driver, rid
@@ -325,19 +328,21 @@ class _WordRequest:
         kwargs = {"timestamps": "word", **kwargs}
         prompt = model.process_prompt(None, ["audio"], ["text"], {"audio_inputs": [torch.zeros(8000)]}, **kwargs)
         self.tensors = prompt.new_input_tensors
-        self.sampling = sampling_configs(model.get_request_resource_configs({}, kwargs), model.declare_state())
-        signals = {name: [object()] for name in self.tensors}
-        self.route = model.get_initial_forward_pass_args(
-            "default", ["audio"], ["text"], signals, {**kwargs, **prompt.metadata},
+        self.sampling = sampling_configs(
+            model.get_request_resource_configs(["audio"], ["text"], kwargs), model.declare_state(),
         )
+        signals = {name: [object()] for name in self.tensors}
+        self.plan = model.walk_plan("default", ["audio"], ["text"], signals, {**kwargs, **prompt.metadata})
+        self.k = 0
         config = driver.node.config
         self.encoder = {"encoder_states": [torch.zeros(config.max_source_positions, config.d_model)]}
 
     def info(self) -> SimpleNamespace:
-        return SimpleNamespace(step_metadata=self.route.step_metadata, resource_configs=self.sampling)
+        step = self.plan[self.k]
+        return SimpleNamespace(graph_walk=step.walk, step_metadata=step.step_metadata, resource_configs=self.sampling)
 
     def next_walk(self) -> None:
-        self.route = self.model.get_partition_forward_pass_args("default", self.route.full_metadata, {})
+        self.k += 1
 
     def step(self, walk: str, inputs: dict):
         return self.driver.step(walk, {self.rid: (self.info(), inputs)})
@@ -346,10 +351,11 @@ class _WordRequest:
 def _serve(
     driver: _Driver, rid: int, first: int, decoded: list[int], *, language: str | None = "en",
     ignore_eos: bool = False, initial_prompt: str | None = None, after_step: Callable[[str], None] | None = None,
-) -> tuple[list[int], int]:
+) -> tuple[list[int] | None, int]:
     """Serve word-timestamp request ``rid`` through its walks, the prompt walk sampling ``first`` and each decode step
     the next of ``decoded``. Every step commits, a speculative one past a stop too, and then calls ``after_step`` with
-    its walk. Returns the align walk's teacher-forced ids, and the request's language token."""
+    its walk. Returns the align walk's teacher-forced ids, or None when the stop check ends the request at the prompt
+    walk, and the request's language token."""
     request = _WordRequest(driver, rid, language=language, initial_prompt=initial_prompt, ignore_eos=ignore_eos)
     tensors, encoder = request.tensors, request.encoder
     driver.sampler.tokens = [first, *decoded]
@@ -364,11 +370,13 @@ def _serve(
         out = step(DETECT_LANGUAGE_WALK, {"text_inputs": tensors["text_inputs"], **encoder})
         detected = out.row_outputs["new_token"]
         request.next_walk()
-        step(PREFILL_PROMPT_WALK, {"text_inputs": [detected], "prompt_tail": tensors["prompt_tail"]})
+        out = step(PREFILL_PROMPT_WALK, {"text_inputs": [detected], "prompt_tail": tensors["prompt_tail"]})
         language_token = int(detected)
     else:
-        step(PREFILL_WALK, {"text_inputs": tensors["text_inputs"], **encoder})
+        out = step(PREFILL_WALK, {"text_inputs": tensors["text_inputs"], **encoder})
         language_token = driver.node.config.language_token(language)
+    if driver.node.check_stop(rid, request.info(), {"new_token": [out.row_outputs["new_token"]]}):
+        return None, language_token
     request.next_walk()
     for token in [first, *decoded[:-1]]:
         step(DECODE_WALK, {"text_inputs": [torch.tensor([token])]})

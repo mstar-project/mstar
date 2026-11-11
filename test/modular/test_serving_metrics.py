@@ -1422,7 +1422,7 @@ def test_the_api_server_reads_the_placement_and_refuses_declarations_the_conduct
 
     class _Server:
         fatal_error = None
-        lora_adapter_digests: dict = {}
+        model_config: dict = {}
 
         def __init__(self, **kwargs):
             pass
