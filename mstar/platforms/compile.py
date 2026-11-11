@@ -43,6 +43,42 @@ def with_inductor_overrides(
 
 
 @functools.cache
+def keep_split_scans_in_their_workspace() -> None:
+    """Stop Inductor's coordinate descent from tuning a split scan's block size below the
+    one its workspace is sized for. Process-wide; the engine installs it before anything
+    compiles.
+
+    A split scan (a long 1-D ``cumsum``, e.g. ``splice_media``'s over a media walk's
+    pads) keeps one look-back slot per block in a workspace sized at codegen for blocks of
+    at least ``config.triton.min_split_scan_rblock`` elements, and its autotune configs
+    are clamped to that. Coordinate descent (``coordinate_descent_tuning``, on at
+    compile level 1 and 2) halves ``R0_BLOCK`` past it all the same, checking only for
+    zero. The scan then runs twice the blocks its workspace holds and reads and writes
+    past it: an illegal memory access when what follows is unmapped, and otherwise a
+    silent overwrite of a neighbouring allocation, which a captured graph repeats on every
+    replay. On Phi-4-multimodal it faulted at startup in 5 of about 40 boots, in the
+    12288- and 16384-token media buckets' scans at R0_BLOCK 128 (torch 2.11).
+    """
+    try:
+        from torch._inductor.runtime.coordinate_descent_tuner import CoordescTuner
+    except ImportError:
+        return
+    below_any = CoordescTuner.value_too_small
+
+    def value_too_small(self, name: str, val: int) -> bool:
+        meta = self.inductor_meta
+        if (
+            meta.get("grid_type") == "SplitScanGrid"
+            and name.startswith("R") and name.endswith("BLOCK")
+            and val < meta.get("min_split_scan_rblock", 256)
+        ):
+            return True
+        return below_any(self, name, val)
+
+    CoordescTuner.value_too_small = value_too_small
+
+
+@functools.cache
 def _has_deterministic_mode() -> bool:
     import torch._inductor.config as inductor_config
 
