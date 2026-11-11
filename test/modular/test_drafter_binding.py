@@ -60,6 +60,29 @@ def test_a_drafter_that_doesnt_propose_cant_be_built_even_on_the_meta_device():
         _NoResources()
 
 
+def test_a_hosted_drafter_decl_that_doesnt_build_cant_be_made():
+    """Without the abstract methods a missing one would inherit the protocol's ``...`` body and
+    hand the target None for its drafter or its steps."""
+    from mstar.model.components.hosted_drafter import HostedDrafterDecl
+
+    class _NoBuild(HostedDrafterDecl):
+        needs, num_draft_tokens = NEEDS, 1
+
+        def node_resources(self, nodes):
+            return []
+
+        def prefill_steps(self):
+            return {}
+
+        def verify_steps(self):
+            return {}
+
+    with pytest.raises(TypeError, match="build"):
+        _NoBuild()
+    with torch.device("meta"), pytest.raises(TypeError, match="build"):
+        _NoBuild()
+
+
 def test_a_drafter_observes_nothing_unless_it_says_otherwise():
     result = VerifyResult(torch.zeros(1, 2, dtype=torch.long), torch.zeros(1, dtype=torch.long))
     assert _Proposes().observe(ObserveInputs(torch.zeros(1, 2, dtype=torch.long), result)) is None

@@ -186,7 +186,7 @@ class Drafter(Protocol):
         step. Nothing by default."""
         return None
 
-    def prefill(self, inputs: PrefillInputs) -> torch.Tensor | None:
+    def prefill(self, inputs: PrefillInputs) -> None:
         """After a prompt step samples: the drafter's pass over the step's prompt
         rows. Nothing by default."""
         return None

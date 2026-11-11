@@ -16,7 +16,7 @@ if TYPE_CHECKING:
 
 class HostedDrafter(Drafter, Protocol):
     @abstractmethod
-    def prefill(self, inputs: PrefillInputs) -> torch.Tensor | None:
+    def prefill(self, inputs: PrefillInputs) -> None:
         """Its state over a prompt step's rows, after the target's forward wrote what it reads.
         A hosted drafter runs its own stack over the prompt, so it has to say what it keeps."""
         ...
@@ -25,14 +25,17 @@ class HostedDrafter(Drafter, Protocol):
 class HostedDrafterDecl(DrafterDecl, Protocol):
     num_draft_tokens: int
 
+    @abstractmethod
     def prefill_steps(self) -> dict[str, ResourceStep]:
         """Its resources' steps on a prompt step (`VerifyNode.prefill_steps`)."""
         ...
 
+    @abstractmethod
     def verify_steps(self) -> dict[str, ResourceStep]:
         """Its resources' steps on a verify step (`VerifyNode.verify_steps`)."""
         ...
 
+    @abstractmethod
     def build(
         self, *, device, comm_group=None, dtype: torch.dtype | None = None, target: nn.Module | None = None,
     ) -> HostedDrafter:
