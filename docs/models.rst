@@ -2345,8 +2345,9 @@ turns guidance off and skips the negative prompt), ``negative_prompt`` (``" "``)
 ``guidance_scale``. ``POST /v1/images/edits`` takes up to three ``image[]`` uploads, in order.
 
 Deployment knobs (``configs/qwen_image_edit.yaml``): ``attention_backend`` (``flashinfer`` or
-``sdpa``, the reference kernel) and ``compile`` (each transformer block, static but for the text
-length, and the VAE's encoder and decoder, dynamic). ``qwen_image_edit_tp2.yaml`` splits the DiT over two GPUs, and
+``sdpa``, the reference kernel) and ``compile`` (experimental: each transformer block, static but for the text
+length, and the VAE's encoder and decoder, dynamic; it failed the fp32 yardstick on one prompt, served slower than
+eager and recompiled the DiT on its first batched step, so it is off). ``qwen_image_edit_tp2.yaml`` splits the DiT over two GPUs, and
 ``qwen_image_edit_cfg2.yaml`` the guidance branches. Not done: CUDA-graph capture (a step is
 GPU-bound), sequence parallelism, the text-to-image and layered Qwen-Image pipelines.
 

@@ -660,7 +660,7 @@ Qwen-Image-Edit-2511 edits one to three reference images from a prompt (`mstar/m
 
 Request knobs: `height` / `width` (default: the last image's aspect at ~1024^2; floored to 16 as the pipeline does), `num_inference_steps` (40), `guidance_scale` (true CFG, 4.0; 1 turns guidance off and skips the negative prompt), `negative_prompt` (`" "`) and `seed`. `true_cfg_scale`, the pipeline's name for the scale, is refused with a 400 that names `guidance_scale`. `POST /v1/images/edits` takes up to three `image[]` uploads, in order.
 
-Deployment knobs (`configs/qwen_image_edit.yaml`): `attention_backend` (`flashinfer` or `sdpa`, the reference kernel) and `compile` (each transformer block, static but for the text length). `qwen_image_edit_tp2.yaml` splits the DiT over two GPUs, and `qwen_image_edit_cfg2.yaml` the guidance branches. Not done: CUDA-graph capture (a step is GPU-bound), sequence parallelism, the text-to-image and layered Qwen-Image pipelines.
+Deployment knobs (`configs/qwen_image_edit.yaml`): `attention_backend` (`flashinfer` or `sdpa`, the reference kernel) and `compile` (experimental: each transformer block, static but for the text length; it failed the fp32 yardstick on one prompt, served slower than eager and recompiled the DiT on its first batched step, so it is off). `qwen_image_edit_tp2.yaml` splits the DiT over two GPUs, and `qwen_image_edit_cfg2.yaml` the guidance branches. Not done: CUDA-graph capture (a step is GPU-bound), sequence parallelism, the text-to-image and layered Qwen-Image pipelines.
 
 ## FLUX.2 \[klein\] (`flux2_klein` / `flux2_klein_9b`) {#flux-2-klein-flux2-klein-flux2-klein-9b}
 
