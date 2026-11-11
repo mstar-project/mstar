@@ -353,12 +353,64 @@ def test_a_verifying_node_needs_a_float32_state():
     # the bf16 pool's own decode checks need FlashInfer's bf16 backend: only the verify check runs here
     manager = GDNManager.__new__(GDNManager)
     manager._pool, manager.state_dtype, manager._device, manager._verify_walks = pool, torch.bfloat16, CPU, {}
+    manager._world_size = 1
     caps = manager.capabilities()
     assert "float32" in caps.verify_refusal and caps.async_verify_refusal is None
     manager.state_dtype = torch.float32
     assert manager.capabilities().verify_refusal is None
     manager._pool = None
     assert "needs its recurrent state pool" in manager.capabilities().verify_refusal
+
+
+def test_a_verifying_node_off_cuda_or_without_the_kernel_is_refused(monkeypatch):
+    """The multi-token kernel is FlashInfer's, on CUDA: a ROCm or XPU worker (both
+    can report ``cuda`` devices or capabilities) or a FlashInfer without
+    ``gated_delta_rule_mtp`` refuses at load, not with an ImportError at warmup."""
+    import sys
+    import types
+
+    from mstar.engine.resources.linear_attn import gdn
+    from mstar.engine.resources.spec import ResourceCapabilities
+
+    _, manager = _build(verifying=False)
+    assert manager.capabilities() == ResourceCapabilities.granting_all()
+    with monkeypatch.context() as patch:
+        patch.setattr(gdn, "current_platform", SimpleNamespace(is_cuda=lambda: False, name="rocm"))
+        caps = manager.capabilities()
+        assert "runs on CUDA, not rocm" in caps.verify_refusal and caps.async_verify_refusal is None
+    monkeypatch.setitem(sys.modules, "flashinfer.gdn_decode", types.ModuleType("flashinfer.gdn_decode"))
+    assert "doesn't import" in manager.capabilities().verify_refusal
+
+
+def test_a_verifying_node_on_more_than_one_rank_is_refused():
+    """No test covers the rerun on a lockstep instance yet. The refusal reads the
+    instance's size, which every rank of it shares."""
+    geometry = DeltaNetGeometry(num_k_heads=2, num_v_heads=4, head_k_dim=8, head_v_dim=8, conv_kernel_size=4)
+    pool_spec = RecurrentStateSpec(POOL, {"LLM"}, RecurrentStateConfig(
+        num_layers=LAYERS, blocks=geometry.to_blocks(state_dtype=torch.float32, conv_dtype=torch.float32),
+        max_slots=8,
+    ))
+    pool = RecurrentStatePool.build(pool_spec, EngineResourceInfo(device=CPU))
+    spec = LinearAttnSpec(LIN, {"LLM"}, LinearAttnConfig(recurrent_state=POOL, variant=LinearAttnVariant.GDN))
+    two = SimpleNamespace(world_size=2, tp_group=SimpleNamespace(world_size=2), sp_group=SimpleNamespace(world_size=1))
+    manager = LinearAttnManager.build(
+        spec, EngineResourceInfo(device=CPU, dependencies={POOL: pool_spec}, joint_comm_group=two),
+    )
+    manager.bind_dependencies({POOL: pool})
+    assert "lockstep instance of 2" in manager.capabilities().verify_refusal
+
+
+def test_binding_a_verify_walk_off_cuda_warms_no_kernel(monkeypatch):
+    """A ROCm GPU is a ``cuda`` device too: binding asks the platform, so it never
+    imports the kernel where `capabilities` refused it."""
+    from mstar.engine.resources.linear_attn import gdn
+
+    _, manager = _build(verifying=False)
+    manager._device = torch.device("cuda")
+    monkeypatch.setattr(gdn, "current_platform", SimpleNamespace(is_cuda=lambda: False, name="rocm"))
+    monkeypatch.setattr(manager, "_warm_verify", lambda block: pytest.fail("warmed the verify kernel off CUDA"))
+    manager.bind_verify_walk(VERIFY, K + 1, 0)
+    assert manager._verify_walks == {VERIFY: K + 1}
 
 
 class _Chains:
