@@ -11,10 +11,12 @@ LayerNorm and a two-layer GELU projector map the tokens into the LLM's width.
 
 Windows are the attention's only structure, so the stack is packed varlen
 attention: every window is a segment, and any number of requests can be
-packed into one forward. On the engine it runs through an array with
-``max_len`` 0, whose plan the runner builds outside the graph — which is what
-lets the block loop replay as a CUDA graph. Without a bound handle (CPU tests,
-standalone use) it falls back to SDPA per window.
+packed into one forward. On the engine it runs through the node's array
+with ``max_len`` 0, or, on a model not yet on the state contract (MiniCPM-o),
+the cacheless ``RaggedAttentionSpec`` resource; either way the runner builds
+the plan outside the graph — which is what lets the block loop replay as a
+CUDA graph. Unbound (CPU tests, standalone use) it falls back to SDPA per
+window.
 
 Parameter paths mirror HF's ``audio_tower.*`` (``Qwen3OmniMoeAudioEncoder``,
 which Qwen3-ASR reuses unchanged), with ``q/k/v_proj`` fused into
@@ -110,20 +112,29 @@ def _activation(name: str):
 class AuTAttention(nn.Module):
     """Bidirectional attention within the packed windows of one forward.
 
-    ``array`` names the node's array with ``max_len`` 0; bound at load, it attends through the runner's plan. Unbound,
-    SDPA runs per window from ``cu_seqlens``.
+    ``array`` names the node's array with ``max_len`` 0, and ``attn_key`` the
+    ``RaggedAttentionSpec`` resource of a node still on resources; bound at
+    load, either attends through the runner's plan. Unbound, SDPA runs per
+    window from ``cu_seqlens``.
     """
 
-    def __init__(self, d_model: int, num_heads: int, array: str | None = None, layer: int | None = None):
+    def __init__(
+        self, d_model: int, num_heads: int, attn_key: str | None, array: str | None = None, layer: int | None = None,
+    ):
         super().__init__()
         if d_model % num_heads:
             raise ValueError(f"d_model {d_model} is not divisible by {num_heads} heads")
         self.num_heads = num_heads
         self.head_dim = d_model // num_heads
+        self._attn_key = attn_key
+        self.ragged = None
         self.array, self.layer = array, layer
         self.state = None
         self.qkv_proj = FusedColumnLinear(d_model, {"q": d_model, "k": d_model, "v": d_model}, bias=True)
         self.out_proj = nn.Linear(d_model, d_model, bias=True)
+
+    def bind_resources(self, resources: dict) -> None:
+        self.ragged = None if self._attn_key is None else resources.get(self._attn_key)
 
     def bind_state(self, handles: dict) -> None:
         self.state = handles.get(self.array)
@@ -151,16 +162,20 @@ class AuTAttention(nn.Module):
         if self.state is not None:
             self.state.add(self.layer, k=k, v=v)
             out = self.state.read(self.layer, q)
+        elif self.ragged is not None:
+            out = self.ragged.run(q, k, v)
         else:
             out = self._sdpa_per_window(q, k, v, cu_seqlens)
         return self.out_proj(out.reshape(n, d_model))
 
 
 class AuTEncoderLayer(nn.Module):
-    def __init__(self, config: AuTEncoderConfig, array: str | None = None, layer: int | None = None):
+    def __init__(
+        self, config: AuTEncoderConfig, attn_key: str | None, array: str | None = None, layer: int | None = None,
+    ):
         super().__init__()
         self.self_attn_layer_norm = nn.LayerNorm(config.d_model)
-        self.self_attn = AuTAttention(config.d_model, config.encoder_attention_heads, array, layer)
+        self.self_attn = AuTAttention(config.d_model, config.encoder_attention_heads, attn_key, array, layer)
         self.final_layer_norm = nn.LayerNorm(config.d_model)
         self.fc1 = nn.Linear(config.d_model, config.encoder_ffn_dim)
         self.fc2 = nn.Linear(config.encoder_ffn_dim, config.d_model)
@@ -199,7 +214,7 @@ class AuTLayout:
 class AuTEncoder(nn.Module):
     """Packed audio encoder; parameter paths mirror HF's ``audio_tower.*``."""
 
-    def __init__(self, config: AuTEncoderConfig, array: str | None = None):
+    def __init__(self, config: AuTEncoderConfig, attn_key: str | None = None, array: str | None = None):
         super().__init__()
         self.config = config
         hidden = config.downsample_hidden_size
@@ -213,7 +228,7 @@ class AuTEncoder(nn.Module):
             persistent=False,
         )
         self.layers = nn.ModuleList(
-            [AuTEncoderLayer(config, array, layer) for layer in range(config.encoder_layers)]
+            [AuTEncoderLayer(config, attn_key, array, layer) for layer in range(config.encoder_layers)]
         )
         self.ln_post = nn.LayerNorm(config.d_model)
         self.proj1 = nn.Linear(config.d_model, config.d_model)
@@ -309,7 +324,7 @@ class AuTEncoder(nn.Module):
         """The transformer stack and projector over a packed sequence:
         ``(total_tokens, d_model)`` -> ``(total_tokens, output_dim)``. This is
         the region a submodule captures. ``cu_seqlens`` (the layout's host
-        list) is read only without a bound handle."""
+        list) is read only when nothing is bound."""
         for layer in self.layers:
             hidden_states = layer(hidden_states, cu_seqlens)
         hidden_states = self.ln_post(hidden_states)

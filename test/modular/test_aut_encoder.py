@@ -135,6 +135,41 @@ def test_packed_requests_match_hf_one_by_one():
         offset += n_tok
 
 
+def test_encode_runs_through_a_bound_ragged_resource():
+    """With a resource bound, attention goes through ``run(q, k, v)`` and the
+    layout must have been planned by the caller; the unbound path is SDPA."""
+    hf, ours = _pair()
+    calls = []
+
+    class _Recorder:
+        def run(self, q, k, v):
+            calls.append(q.shape)
+            # dense attention over the whole packed batch stands in for the
+            # planned kernel, only the call is under test
+            o = torch.nn.functional.scaled_dot_product_attention(
+                q.transpose(0, 1), k.transpose(0, 1), v.transpose(0, 1),
+            )
+            return o.transpose(0, 1)
+
+    rec = _Recorder()
+    for module in ours.modules():
+        if hasattr(module, "bind_resources"):
+            module.bind_resources({"aut_attn": rec})
+    # attn_key is None on this instance, so nothing binds
+    assert all(layer.self_attn.ragged is None for layer in ours.layers)
+    keyed = AuTEncoder(AuTEncoderConfig.from_hf(TINY), attn_key="aut_attn")
+    keyed.load_weights(list(hf.state_dict().items()))
+    for module in keyed.modules():
+        if hasattr(module, "bind_resources"):
+            module.bind_resources({"aut_attn": rec})
+    assert all(layer.self_attn.ragged is rec for layer in keyed.layers)
+    feats = torch.randn(TINY["num_mel_bins"], 120)
+    with torch.no_grad():
+        out, layout = keyed([feats])
+    assert len(calls) == TINY["encoder_layers"] and calls[0] == (layout.total_tokens, 4, 16)
+    assert out.shape == (layout.total_tokens, TINY["output_dim"])
+
+
 def test_encode_attends_through_a_bound_handle():
     """With a handle bound, attention goes through its ``add`` and ``read``, and the layout must have been planned by
     the caller; the unbound path is SDPA."""
@@ -175,7 +210,7 @@ def test_a_float16_layer_keeps_its_residual_stream_finite():
     short of the dtype's max, so a long clip's embeddings never overflow to inf."""
     from mstar.model.components.aut_encoder import AuTEncoderLayer
 
-    layer = AuTEncoderLayer(AuTEncoderConfig(**TINY)).half()
+    layer = AuTEncoderLayer(AuTEncoderConfig(**TINY), attn_key=None).half()
     with torch.no_grad():
         for param in layer.parameters():
             param.normal_(std=0.02)
