@@ -263,6 +263,21 @@ def _layer_set_problem(submodule, resources: Mapping[str, Resource], joined) -> 
     return None
 
 
+def _warn_hostless(node: str, resources: Mapping[str, Resource]) -> None:
+    """A verifying node never drops a request, so on a KV pool with no host pool every request it serves is
+    guaranteed: it reserves its whole footprint at admission, and one with no max_tokens is fitted to nearly the
+    whole pool, so such requests run about one at a time."""
+    for key, resource in resources.items():
+        if isinstance(resource, kv_manager.KVManager) and not resource.config.cpu_offload_pages:
+            logger.warning(
+                "speculative decoding on %s: KV %r has no host pool (cpu_offload_pages 0), and a verifying node "
+                "never drops a request, so every request is guaranteed: it reserves its whole footprint at "
+                "admission, and requests without max_tokens run about one at a time. Set "
+                "resources.%s.cpu_offload_pages to let it preempt by moving requests to the host",
+                node, key, key,
+            )
+
+
 def _verify_nodes(model) -> list:
     """The model's verifying nodes; none for a model, or a test's stand-in, that declares none."""
     verify_nodes = getattr(model, "verify_nodes", None)
@@ -1068,6 +1083,7 @@ class Engine:
         if mgmt.joint_comm_group is None or mgmt.joint_comm_group.rank == 0:
             # the instance's leader logs the agreed mode once
             log_mode(decl, mode, reason)
+            _warn_hostless(decl.node, mgmt.resources)
         # every check above derives from config and built shapes, so a raise was every rank's; from here
         # every step the engine declares for the node, capture's and each replay's, carries its drafter's share
         submodule.bind_draft(DrafterShare(
