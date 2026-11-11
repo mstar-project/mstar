@@ -54,11 +54,12 @@ def drafter_step(step, graph_walk: str, share: DrafterShare | None):
     if share is None or step is None:
         return step
     if graph_walk == share.verify_walk:
-        writes, own = share.loopback_writes, share.verify_steps
+        own = share.verify_steps
     elif graph_walk in share.prompt_walks:
-        writes, own = share.loopback_writes, share.prompt_steps
+        own = share.prompt_steps
     else:
         return step
+    writes = share.loopback_writes
     steps = dict(step.steps)
     if clash := sorted(steps.keys() & own.keys()):
         raise RuntimeError(f"a {graph_walk!r} step declares {clash}, its drafter's steps, which the engine adds")
