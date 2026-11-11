@@ -268,3 +268,24 @@ def test_the_verify_wrapper_takes_the_managers_dtype(dtype):
     step = AttentionStep(causal=False, hide_last=1, verify=True)
     wrapper = FlashInferManager._verify_wrapper(_stub_manager(dtype), step, num_rows=2, num_tokens=8, lease=None)
     assert wrapper.dtype is dtype
+
+
+def test_a_verify_step_on_fa3_that_plans_two_labels_is_refused():
+    """FA3 keeps one verify wrapper per (bucket, slot), whatever the label, so a second label's
+    plan would overwrite the first's under the same key."""
+    from types import SimpleNamespace
+
+    from mstar.engine.resources.attn.flashinfer import FlashInferManager
+    from mstar.engine.resources.kv.plan import KVPlanOutputs
+
+    manager = FlashInferManager.__new__(FlashInferManager)
+    manager._window_left, manager._preplanned, manager._group_idx = -1, False, 0
+    manager._kv_cache_name, manager._verify_fa3 = "kv", True
+    manager._current_plan_states, manager._preplan_states = {}, {}
+    ctx = SimpleNamespace(
+        resident=None, slot_lease=None, is_preplan=False, plan_phase="plan",
+        plan_results={"kv": KVPlanOutputs({"main": object(), "uncond": object()})},
+    )
+
+    with pytest.raises(RuntimeError, match="plans one KV label"):
+        manager.plan(AttentionStep(verify=True), ctx)
