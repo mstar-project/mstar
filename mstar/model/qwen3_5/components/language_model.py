@@ -5,7 +5,7 @@ position among its own kind; see ``Qwen3_5Config.resource_layer_index``.
 
 TP shards by head (q-heads for attention, k/v-heads for the delta net), and the
 engine shards the KV cache and recurrent pool to match, so
-``get_node_resources`` stays unsharded. ``q/k/v``, ``gate/up`` and the delta
+``declare_state`` stays unsharded. ``q/k/v``, ``gate/up`` and the delta
 net's four projections are each fused into one GEMM, since at decode width they
 are latency-bound. ``num_key_value_heads`` is 4 or 2, so past
 that TP degree the K/V heads replicate (see ``QKVParallelLinear``).

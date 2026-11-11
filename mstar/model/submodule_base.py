@@ -915,9 +915,9 @@ class NodeSubmodule(torch.nn.Module, ABC):
         A layer body (attention, cross-attention) calls the resources
         directly — ``attn.run``, ``kv.write_kv``, ``pos.apply_qk`` — so it
         needs its own references. It resolves them here, once at load, by the
-        labels the model declared in ``get_node_resources``; a layer that
-        names a label this node doesn't have fails at bind rather than in the
-        middle of a forward.
+        labels the model declared in ``declare_state`` or
+        ``get_node_resources``; a layer that names a label this node doesn't
+        have fails at bind rather than in the middle of a forward.
         """
         self.segment_keys = tuple(
             key for key, resource in resources.items() if getattr(resource, "steps_from_segments", False)

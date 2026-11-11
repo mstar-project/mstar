@@ -5,7 +5,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from fractions import Fraction
-from typing import TYPE_CHECKING, NamedTuple, Type
+from typing import TYPE_CHECKING, Any, NamedTuple, Type
 
 import torch
 import yaml
@@ -142,6 +142,7 @@ if TYPE_CHECKING:
     from mstar.model.components.moe_parallel import MoeParallelConfig
 
 if TYPE_CHECKING:
+    from mstar.engine.state import Array
     from mstar.streaming.topology import Connection
     from mstar.worker.scheduling_policy import WalkPriority
 
@@ -561,10 +562,17 @@ def streamed_inputs(model: "Model", graph_walk: str, graph: GraphSection) -> set
 def enabled_resources(model: "Model", model_config: dict) -> list[NodeResourceSpec]:
     """The resource specs a deployment's YAML turns on, before its ``resources:``
     overrides: the model's declaration, less the opt-in specs (``NodeResourceSpec.opt_in``)
-    its ``resources:`` block does not name."""
+    its ``resources:`` block does not name. Raises the first problem with the declaration,
+    for callers that skip ``validate_deployment``, which reports them all."""
+    from mstar.engine.state.adapters import node_resources
+    from mstar.engine.state.analysis import state_declaration_problems
+
+    problems = state_declaration_problems(model)
+    if problems:
+        raise ValueError(problems[0])
     named = (model_config.get("resources") or {}).keys()
     return [
-        spec for spec in model.get_node_resources() or []
+        spec for spec in node_resources(model)
         if not spec.opt_in or spec.resource_key in named
     ]
 
@@ -784,13 +792,24 @@ class Model(ABC):
     def get_node_resources(self) -> list[NodeResourceSpec]:
         """Declare the resources the engine builds, and which nodes share each.
 
-        The whole declaration: a KV cache's shape, the attention backend over
-        it, positions, samplers. The engine builds one resource per spec and
-        hands each node the subset naming it. An opt-in spec (per-request LoRA
-        adapters) is declared here too, and built only for a deployment whose
-        ``resources:`` block names it.
+        The whole declaration, apart from what `declare_state` declares: a KV
+        cache's shape, the attention backend over it, positions, samplers. The
+        engine builds one resource per spec and hands each node the subset naming it.
+        An opt-in spec (per-request LoRA adapters) is declared here too, and built
+        only for a deployment whose ``resources:`` block names it.
         """
         pass
+
+    def declare_state(self) -> "list[Array]":
+        """The state the model keeps between steps, from which the engine builds the specs for it.
+
+        A pure function of the model's config and the deployment's settings, since each process calls it.
+        """
+        return []
+
+    def kernel_settings(self) -> dict[str, dict[str, Any]]:
+        """``splits`` and ``decode_fmha`` by read or update key, until the engine picks kernels itself."""
+        return {}
 
     def checkpoint_path(self) -> str | None:
         """Where this model's weights and config sit on disk.

@@ -43,6 +43,7 @@ from mstar.model.qwen3_5.lora import qwen3_5_lora_spec  # noqa: E402
 from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel  # noqa: E402
 from mstar.model.qwen3_5.submodules import VisionEncoderSubmodule  # noqa: E402
 from mstar.model.submodule_base import engine_step, with_segment_steps  # noqa: E402
+from mstar.testing_utils.model import make_model  # noqa: E402
 
 FIXTURES = Path(__file__).parent / "fixtures"
 # the vision node's pool, as the engine keys it (`LoraSpec.for_node`)
@@ -216,7 +217,7 @@ def test_the_api_server_keeps_the_experts_targets_the_yaml_names_and_refuses_the
     c = stack.config()
     path, _ = H.make_adapter(tmp_path / "a1.safetensors", stack.a1(c), 4, 8.0, 100, stack.embedding,
                              stack.a1_rename)
-    model = SimpleNamespace(get_node_resources=lambda: [stack.lora_spec(c)])
+    model = make_model(get_node_resources=lambda: [stack.lora_spec(c)])
     declared = stack.lora_spec(c)
     assert {"experts_gate_up_proj", "experts_down_proj"} == set(declared.dropped_targets)
     named = _declared(declared)
