@@ -75,7 +75,7 @@ def test_an_edit_under_cfg_lays_out_its_spans_keys_and_plan():
     images = [_image(1200, 800), _image(600, 900)]
     kwargs = {"guidance_scale": 4.0, "negative_prompt": "blurry", "output_resolution": 512}
     out = model.process_prompt("make it night", ["text", "image"], ["image"], {"image_inputs": images}, **kwargs)
-    tensors, meta = out
+    tensors, meta = out.new_input_tensors, out.metadata
     layout = RequestLayout.from_metadata(meta["layout"])
 
     grids = [calculate_dimensions(512 * 512, 1200 / 800), calculate_dimensions(512 * 512, 600 / 900)]
@@ -115,7 +115,7 @@ def test_text_to_image_is_one_span_and_keys_nothing():
     model = _model()
     # a scale without a negative prompt runs no CFG: the dit's guidance stays off
     kwargs = {"height": 640, "width": 1000, "guidance_scale": 4.0}
-    tensors, meta = model.process_prompt("a cat", ["text"], ["image"], {}, **kwargs)
+    tensors, meta, _ = model.process_prompt("a cat", ["text"], ["image"], {}, **kwargs)
     layout = RequestLayout.from_metadata(meta["layout"])
     assert len(layout.spans) == 1 and layout.target == (640 // 16, 992 // 16)
     assert meta["kv_layout"][KV][MAIN].keyed_count() == 0 and not tensors[PREFIX_IDS]
