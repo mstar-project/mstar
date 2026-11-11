@@ -245,6 +245,8 @@ def _apply_kernel_settings(
         for array in arrays for bound in resolved.bound[array.name] if bound.binding.kernel_settings
     }
     by_key = {spec.resource_key: spec for spec in specs}
+    # a resource that several reads share holds one value per field
+    set_by: dict[tuple[str, str], tuple[str, Any]] = {}
     for key, settings in kernel_settings.items():
         if key not in owners:
             raise ValueError(f"kernel_settings[{key!r}] names no read or update of the declarations that takes kernel "
@@ -254,7 +256,13 @@ def _apply_kernel_settings(
         if refused:
             raise ValueError(f"Array {array.name!r}: kernel_settings[{key!r}] sets {sorted(refused)}; "
                              f"it may set only {sorted(binding.kernel_settings)}")
-        binding.apply(by_key.get(resolved.resource_of[key]), settings)
+        resource = resolved.resource_of[key]
+        for field, value in settings.items():
+            other, was = set_by.setdefault((resource, field), (key, value))
+            if was != value:
+                raise ValueError(f"kernel_settings[{other!r}] and kernel_settings[{key!r}] set {field} to {was!r} and "
+                                 f"{value!r}, and both reads run on the resource {resource!r}, which holds one value")
+        binding.apply(by_key.get(resource), settings)
 
 
 def node_handles(
