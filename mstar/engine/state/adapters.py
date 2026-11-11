@@ -245,7 +245,7 @@ def _forks(array: Array, declared: ArrayStep) -> tuple[tuple, tuple, frozenset |
 
 
 def kv_layouts(
-    declarations: Sequence[Array | Sampler],
+    declarations: Sequence[Array | Sampler | SeqShard],
     state_layout: Mapping[str, Mapping[str, Layout]],
     keyed_spans: Mapping[str, Mapping[str, int]],
 ) -> "dict[str, dict[str, LabelLayout]]":
@@ -276,7 +276,7 @@ def kv_layouts(
 
 
 def sampling_configs(
-    configs: Mapping[str, ResourceReqConfig | SampleSettings], declarations: Sequence[Array | Sampler],
+    configs: Mapping[str, ResourceReqConfig | SampleSettings], declarations: Sequence[Array | Sampler | SeqShard],
 ) -> dict[str, ResourceReqConfig]:
     """``configs`` with each `SampleSettings` as today's `SamplingReqConfig`. A name no sampler declares fails the
     request, and so do log-probs on a sampler with ``draws`` above 1, which take one token per step."""

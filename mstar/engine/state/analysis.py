@@ -123,9 +123,11 @@ def _shard_problems(
     shard: SeqShard, arrays: Sequence[Array], walks: Mapping[str, set[str]], combined: set[str],
 ) -> list[str]:
     """``walks`` are rows' walks, as a read's are, and ``labels`` those an array on the shard's nodes opens: a label
-    nothing opens would never split, and nothing would say so."""
+    nothing opens would never split, and nothing would say so. The shard's handle brackets one label."""
     where = f"SeqShard {shard.name!r}"
     problems: list[str] = []
+    if len(shard.labels) > 1:
+        problems.append(f"{where}.labels: {sorted(shard.labels)} are several, and the handle brackets one")
     for walk in sorted(shard.walks or ()):
         if walk in combined:
             problems.append(f"{where}.walks: {walk!r} is a combined walk; list the walks it combines, and it splits "
@@ -174,7 +176,7 @@ def deployment_problems(model: "Model", resources: Mapping[str, Mapping[str, obj
     ]
 
 
-def declaration_digest(declarations: Sequence[Array | Sampler]) -> str:
+def declaration_digest(declarations: Sequence[Array | Sampler | SeqShard]) -> str:
     """A SHA-256 that matches across processes, which Python's `hash` doesn't, since it randomizes strings per process.
 
     Every field of every declaration goes in, with keys sorted and dtypes and classes by name.

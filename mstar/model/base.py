@@ -142,7 +142,7 @@ if TYPE_CHECKING:
     from mstar.model.components.moe_parallel import MoeParallelConfig
 
 if TYPE_CHECKING:
-    from mstar.engine.state import Array, Sampler, SampleSettings
+    from mstar.engine.state import Array, Sampler, SampleSettings, SeqShard
     from mstar.worker.scheduling_policy import WalkPriority
 
 DECODE = "decode"
@@ -772,7 +772,7 @@ class Model(ABC):
         """
         return []
 
-    def declare_state(self) -> "list[Array | Sampler]":
+    def declare_state(self) -> "list[Array | Sampler | SeqShard]":
         """The state the model keeps between steps, from which the engine builds the specs for it.
 
         A pure function of the model's config and the deployment's settings, since each process calls it.

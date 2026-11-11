@@ -1,7 +1,9 @@
-"""What layers and submodules hold for declared state: a handle per array or sampler, over today's resources.
+"""What layers and submodules hold for declared state: a handle per array, sampler or sequence shard, over today's
+resources.
 
-A call that touches state runs behind a graph break, so it is plain Python in eager steps and at capture, it never runs
-on a replay, and its checks live in it.
+A call that touches an array or a sampler runs behind a graph break, so it is plain Python in eager steps and at
+capture, it never runs on a replay, and its checks live in it. A shard's `scatter` and `gather` deliberately don't break
+the graph: a compiled frame of a walk the shard never splits traces them straight through.
 """
 
 from abc import abstractmethod
@@ -236,15 +238,9 @@ class ShardHandle(StepHandle):
         self.label: str | None = None
         self.walk: str | None = None
 
-    def _refusal(self, cause: str) -> ValueError:
-        return ValueError(f"SeqShard {self.name!r}: {cause}")
-
     def begin_step(self, step) -> None:
-        # No refusal of a second open: a region's step inside the node's reopens it on the same step.
-        labels = {segment.label for segment in step.segments or ()} & self.shard.labels
-        if len(labels) > 1 and not step.ctx.replays:
-            raise self._refusal(f"a step touches its labels {sorted(labels)}, and a bracket holds one")
-        self.label = next(iter(labels), None)
+        (label,) = self.shard.labels  # analysis refuses a shard of several
+        self.label = label if any(segment.label == label for segment in step.segments or ()) else None
         self.walk = step.ctx.graph_walk
 
     def check_step(self, step) -> None:

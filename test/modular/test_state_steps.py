@@ -48,6 +48,7 @@ from mstar.engine.state import (
     Sampler,
     SampleSettings,
     SampleStep,
+    SeqShard,
     Span,
     TensorType,
     Value,
@@ -123,7 +124,7 @@ def _handles(*declarations, node="LLM") -> dict:
         "kv": _StubKV(), "attn": SimpleNamespace(), "local": SimpleNamespace(), "global": SimpleNamespace(),
         "rope": SimpleNamespace(), "kv_pos": SimpleNamespace(), "other_pos": SimpleNamespace(),
         "other_kv": _StubKV(), "gdn": _StubPool(), "linear": SimpleNamespace(), "conv": None,
-        "sampler": SimpleNamespace(), "vision_attn": SimpleNamespace(),
+        "sampler": SimpleNamespace(), "vision_attn": SimpleNamespace(), "shard": SimpleNamespace(),
     }
     return node_handles(_StubModel(*declarations), node, resources)
 
@@ -245,6 +246,22 @@ def test_each_step_gets_fresh_step_objects():
     second = state_steps(SubmoduleStep(segments=[Segment(2, "main", 2)], state={"kv": ArrayStep()}), handles)
     assert first.steps["kv"].segments == [Segment(1, "main", 1)], "SubmoduleStep writes segments onto its step objects"
     assert second.steps["kv"].segments == [Segment(2, "main", 2)]
+
+
+def test_a_regions_step_leaves_the_nodes_shard_handle_open():
+    handles = _handles(SeqShard("shard", nodes={"LLM"}))
+    ctx = SimpleNamespace(replays=False, graph_walk="prefill")
+    node_step = state_steps(SubmoduleStep(segments=SEGMENTS), handles)
+    node_step.set_ctx(ctx)
+    node_step.begin_calls()
+    runner = object.__new__(agr.PiecewiseAcceleratorGraphRunner)
+    runner._config = SimpleNamespace(region_step=lambda *args: SubmoduleStep(segments=SEGMENTS))
+    runner._segment_keys, runner._state_handles = (), handles
+    region_step = runner._region_step([1], [4])
+    region_step.set_ctx(ctx)
+    region_step.begin_calls()
+    region_step.end_calls()
+    assert handles["shard"].label == "main", "the node's step is still running"
 
 
 def test_a_step_with_no_state_comes_back_as_it_was():

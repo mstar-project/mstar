@@ -619,12 +619,12 @@ Step 2a — Declare your state
 ----------------------------
 
 ``declare_state(self) -> list[Array | Sampler | SeqShard]`` says what each node keeps between
-steps, and whether its steps may split over SP ranks. The declaration says only what the model's math needs: the shape of each entry, its dtype,
-which earlier entries each layer reads, and what its kernels update. How the state is
-stored, such as a cache's page size and layout, depends on the deployment, so the engine
-decides it. ``mstar.engine.state`` is the whole surface a model imports, and its ``__all__``
-only grows. ``SubmoduleStep`` imports from there too, and stays out of ``__all__``, since it
-is the engine's own dataclass and its fields will change.
+steps, and whether its steps may split over SP ranks. The declaration says only what the model's
+math needs: the shape of each entry, its dtype, which earlier entries each layer reads, and what
+its kernels update. How the state is stored, such as a cache's page size and layout, depends on
+the deployment, so the engine decides it. ``mstar.engine.state`` is the whole surface a model
+imports, and its ``__all__`` only grows. ``SubmoduleStep`` imports from there too, and stays out
+of ``__all__``, since it is the engine's own dataclass and its fields will change.
 
 Every process calls ``declare_state``, so it must be a pure function of the model's config
 and the deployment's settings, with no device and no process state. Declarations are values:
@@ -649,8 +649,8 @@ RoPE position or a ring slot.
            Sampler(SAMPLER, nodes={"LLM"}, vocab_size=c.vocab_size, penalty=True),
        ]
 
-The names you pass (the array's, each read's and update's, the sampler's, the sequence
-shard's) share one namespace. Existing models define them as module-level constants in ``config.py``. A
+The names you pass (the array's, each read's and update's, the sampler's, the sequence shard's)
+share one namespace. Existing models define them as module-level constants in ``config.py``. A
 deployment YAML tunes them under ``resources:`` (see :ref:`Step 6 <config-yaml>`).
 
 - ``Array(name, nodes=, layers=, entry=, max_len=, reads=, updates=, rewritable=, labels=,
@@ -699,8 +699,11 @@ deployment YAML tunes them under ``resources:`` (see :ref:`Step 6 <config-yaml>`
   ``none``, ``ulysses``, ``all_gather`` or ``ring``), which a deployment's ``resources:`` block
   overrides under ``name``. The layer stack calls ``scatter`` before it and ``gather`` after it
   on the shard's handle (`Reaching your state`_); the reads and updates of the node's arrays
-  exchange what a split step needs by themselves. A walk or label the node's arrays don't have
-  is refused at load.
+  exchange what a split step needs by themselves. Loading checks ``walks`` against the model's
+  walks and the shard's nodes, and refuses a label no array on those nodes opens, and a shard
+  of more than one label, since its handle brackets one. A node with no arrays can't declare a
+  ``SeqShard``, since its label has none to match: it declares a ``SeqShardSpec`` directly, as
+  MiniMax-H3's video decoder does.
 
 Qwen3.5's declaration shows both kinds of state, its sequence shard and its ViT:
 
@@ -2211,8 +2214,9 @@ lifecycle directly.
 Reaching your state
 ~~~~~~~~~~~~~~~~~~~
 
-The engine binds one handle per declared array, sampler and sequence shard. ``bind_state(self, handles)``
-receives them by declared name, on the submodule and on every layer that defines it:
+The engine binds one handle per declared array, sampler and sequence shard.
+``bind_state(self, handles)`` receives them by declared name, on the submodule and on every layer
+that defines it:
 
 .. code-block:: python
 
@@ -3047,8 +3051,9 @@ the model writes no exchange but a ragged attention's ``sp_exchange``:
 Splitting is declared in four places:
 
 - ``SeqShardSpec(resource_key, nodes, labels, axis, walks=None)`` names the labels whose tokens
-  split (on the state contract, the ``SeqShard`` the model declares, on axis 0). ``axis=0`` cuts a label's packed tokens into contiguous ranges; ``axis=1`` cuts each row
-  of a ``[B, S, ...]`` layout alike (every row of the label one length). ``walks`` limits splitting
+  split (on the state contract, the ``SeqShard`` the model declares, on axis 0). ``axis=0`` cuts a
+  label's packed tokens into contiguous ranges; ``axis=1`` cuts each row of a ``[B, S, ...]``
+  layout alike (every row of the label one length). ``walks`` limits splitting
   to those walks; the others plan copied. A step splits only when it isn't one token a row, its
   listed tokens reach ``max(sp_size, min_tokens)``, and every listed label has at least
   ``sp_size`` tokens (a row, on axis 1). ``min_tokens`` (default 0) is a ``resources:`` override,
@@ -3074,9 +3079,9 @@ Splitting is declared in four places:
   them on the ``SubmoduleStep`` and gives the other resources' steps their own.
 - The forward **brackets** its layer stack (on the state contract, with ``scatter(shard, *xs)``
   and ``gather(shard, x)`` on the shard's handle, as Qwen3.5 does in
-  ``mstar/model/qwen3_5/components/language_model.py``): ``shard.scatter(label, *xs, dim=None)`` before it
-  (this rank's share of each tensor, ``dim`` the spec's axis by default; ``None`` passes through),
-  ``shard.gather(label, x)`` after it. Both are the identity on a copied step, at one SP rank, and
+  ``mstar/model/qwen3_5/components/language_model.py``): ``shard.scatter(label, *xs, dim=None)``
+  before it (this rank's share of each tensor, ``dim`` the spec's axis by default; ``None`` passes
+  through), ``shard.gather(label, x)`` after it. Both are the identity on a copied step, at one SP rank, and
   outside a step (a warmup compile); at one rank they trace straight through a compiled frame,
   and on SP ranks each breaks the graph once. Everything between them runs on this rank's tokens.
   LTX-2.5 brackets the DiT in its denoise step (``mstar/model/ltx2_5/submodules.py``), Wan2.2 and

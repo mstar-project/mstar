@@ -121,7 +121,7 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
     # Model ABC: resources
     # -----------------------------------------------------------------------
 
-    def declare_state(self) -> list[Array | Sampler]:
+    def declare_state(self) -> list[Array | Sampler | SeqShard]:
         c, v = self.config, self.vision_config
         conv_dim = (
             2 * c.linear_num_key_heads * c.linear_key_head_dim

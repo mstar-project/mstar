@@ -210,6 +210,12 @@ def test_a_sequence_shard_lists_rows_walks_and_labels_its_arrays_open(shard, pro
     assert _one_problem(_array(), declared, combined={"LLM": {"mixed": {"prefill", "decode"}}}).startswith(problem)
 
 
+def test_a_sequence_shard_lists_one_label_since_its_handle_brackets_one():
+    declared = SeqShard("shard", nodes={"LLM"}, labels={"main", "cfg"})
+    problem = _one_problem(_array(labels={"main", "cfg"}), declared)
+    assert problem.startswith("SeqShard 'shard'.labels: ['cfg', 'main'] are several")
+
+
 def test_a_block_read_needs_max_len_zero():
     problem = _one_problem(_array(reads={"r": _read(mask=Block())}))
     assert problem.startswith("Array 'kv'.reads['r'].mask") and "Block needs max_len 0" in problem

@@ -1075,8 +1075,15 @@ def _layer_over_ranks(rank, world, store, split=None):
         (spec,) = build_specs([declared_shard])
         if split is not None:
             spec.apply_yaml_overrides(exchange=split)
-        spec.splits = spec.exchange != "none"
-        spec.stripe_pool = "kv" if split == "ring" else None
+        specs = resolve_spec_dependencies([
+            KVSpec(resource_key="kv", nodes={NODE}, config=PagedKVConfig(
+                num_layers=1, num_kv_heads=1, head_dim=HEAD_DIM, max_seq_len=64, num_qo_heads=Q_HEADS,
+                max_num_pages=16, page_size=CP_PAGE, context_parallel=True,
+            )),
+            AttentionSpec(resource_key="attn", nodes={NODE}, config=AttentionConfig(kv_cache="kv")),
+            spec,
+        ])
+        assert (spec.splits, spec.stripe_pool) == (split is not None, "kv" if split == "ring" else None)
         shard = SequenceShard.build(spec, EngineResourceInfo(device=CPU, joint_comm_group=joint))
         built = []
         attn, placement = _cp_attention(
