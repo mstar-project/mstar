@@ -121,14 +121,14 @@ class RunState:
             self.limit.fill_(limit)
             self._immune_stager.copy_(self.immune, immune, pad_value=False)
         rows = tuple(rows)
+        assert previous is not self, "a slot's run is never the run it continues: leases rotate"
         same = previous is not None and previous.rows == rows
-        if not (same and previous is self):
-            if same and len(previous.marks) == len(self.marks):
-                self.marks.copy_(previous.marks)  # same rows, same bucket: padding is marked alike
-            else:
-                torch.ge(self._positions, real, out=self.marks)
-                if same:
-                    self.marks[:real].copy_(previous.marks[:real])
+        if same and len(previous.marks) == len(self.marks):
+            self.marks.copy_(previous.marks)  # same rows, same bucket: padding is marked alike
+        else:
+            torch.ge(self._positions, real, out=self.marks)
+            if same:
+                self.marks[:real].copy_(previous.marks[:real])
         self.rows = rows
 
     def keep_token(self, token: torch.Tensor) -> None:

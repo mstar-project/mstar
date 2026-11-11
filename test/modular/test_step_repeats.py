@@ -114,8 +114,6 @@ def test_a_device_run_after_a_run_of_its_rows_starts_with_that_runs_marks(rows, 
     run.stage(rows, [False] * len(rows), 3, before)
     want = seeded + [True] * (4 - len(rows))
     assert run.marks.tolist() == want, "a stopped row keeps its mark, padding rows theirs"
-    run.stage(rows, [False] * len(rows), 3, run)
-    assert run.marks.tolist() == want, "a slot after its own run keeps its marks"
     run.stage(rows, [False] * len(rows), 3, None)
     assert run.marks.tolist() == [False] * len(rows) + [True] * (4 - len(rows)), "no step before: unmarked"
 
