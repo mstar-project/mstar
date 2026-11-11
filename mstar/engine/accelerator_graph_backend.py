@@ -46,14 +46,14 @@ class SplitGraph:
         return self.graphs[0].pool()
 
 
-def replay_graph(graph: CapturedGraph | SplitGraph, before_last_launch: Callable[[], None] | None = None) -> None:
-    """Replay ``graph``, running ``before_last_launch`` just before its last launch: before
+def replay_graph(graph: CapturedGraph | SplitGraph, launching: Callable[[], None] | None = None) -> None:
+    """Replay ``graph``, running ``launching`` just before its last launch: before
     the only one of a plain graph, before the second of a split one."""
     if isinstance(graph, SplitGraph):
-        graph.replay(before_last_launch)
+        graph.replay(launching)
         return
-    if before_last_launch is not None:
-        before_last_launch()
+    if launching is not None:
+        launching()
     graph.replay()
 
 
