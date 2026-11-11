@@ -17,6 +17,7 @@ from mstar.api_server.data_worker import PreprocessWorkerThread
 from mstar.api_server.request_types import ResultTensors
 from mstar.communication.tensor_store import PythonTensorBookkeeping, TensorStore
 from mstar.communication.tensors import SharedMemoryCommunicationManager, TensorCommunicationManager
+from mstar.conductor.conductor import _walk_io
 from mstar.graph.base import GraphEdge, Loop, TensorPointerInfo
 from mstar.graph.graph_io import WorkerGraphIO
 from mstar.graph.runtime.base import ColumnarEdgeSpecs, RouteInput, SendInput
@@ -123,10 +124,8 @@ def test_partitions_stream_agent_frames_to_the_codec():
     model = _model()
     partitions = {p.name: p for p in model.get_partitions()}
     assert set(partitions) == {cfg.LM_PARTITION, cfg.CODEC_PARTITION}
-    lm, codec = partitions[cfg.LM_PARTITION], partitions[cfg.CODEC_PARTITION]
-    assert lm.graph_walks == {cfg.ENCODE_USER_AUDIO_WALK, *LM_WALKS} and lm.initial_walk == cfg.ENCODE_USER_AUDIO_WALK
-    assert lm.producer_partitions == []
-    assert codec.graph_walks == {cfg.CODEC_WALK} and codec.producer_partitions == [cfg.LM_PARTITION]
+    assert partitions[cfg.LM_PARTITION].graph_walks == {cfg.ENCODE_USER_AUDIO_WALK, *LM_WALKS}
+    assert partitions[cfg.CODEC_PARTITION].graph_walks == {cfg.CODEC_WALK}
     (connection,) = model.get_partition_topology().connections
     assert (connection.from_partition, connection.to_partition, connection.edge_name) == (
         cfg.LM_PARTITION, cfg.CODEC_PARTITION, "agent_frame")
@@ -136,61 +135,44 @@ def test_partitions_stream_agent_frames_to_the_codec():
         cfg.STREAM_CHUNK_SCHEDULE, cfg.STREAM_CHUNK_FRAMES, 0)
 
 
-def test_codec_partition_carries_the_sample_budget_and_never_finishes_itself():
-    """The codec ends by its stream's final chunk; it must not read the LM's schedule."""
+COUNTS = {"num_voice_embeddings": 4, "num_text_tokens": 9, "num_user_frames": 21,
+          "num_samples": 1920 * 20 + 7, "conditioning_frames": 4 + 12 + 9}
+
+
+def test_lm_plan_runs_encode_condition_generate_and_the_conductor_feeds_each_walk():
+    """The conductor sends each walk the persisted signal of each input's name, or an empty edge."""
     model = _model()
-    signals = {"audio_inputs": _signals()["audio_inputs"]}  # nothing the LM partition needs
-    args = model.get_initial_forward_pass_args(cfg.CODEC_PARTITION, ["audio"], ["audio", "text"], signals)
-    assert args.full_metadata.graph_walk == cfg.CODEC_WALK and not args.request_done
-    assert args.inputs == [] and args.unpersist_tensors == []
-    assert args.step_metadata == {"num_samples": 1920 * 20 + 7, "num_user_frames": 21}
-    again = model.get_partition_forward_pass_args(cfg.CODEC_PARTITION, args.full_metadata, {}, incoming_connections=[])
-    assert not again.request_done and again.inputs == [] and again.step_metadata == args.step_metadata
+    plan = model.walk_plan(cfg.LM_PARTITION, ["audio"], ["audio", "text"], _signals(), {})
+    assert [step.walk for step in plan] == [cfg.ENCODE_USER_AUDIO_WALK, cfg.CONDITIONING_WALK, cfg.GENERATE_WALK]
+    assert all(dict(step.step_metadata) == COUNTS and not step.bind for step in plan)
+    inputs, persists, repeating = _walk_io(model)
+    assert inputs[cfg.ENCODE_USER_AUDIO_WALK] == (("audio_inputs", "MimiEncoder"),)
+    assert persists[cfg.ENCODE_USER_AUDIO_WALK] == {"user_audio_codes"}
+    assert {name for name, _ in inputs[cfg.CONDITIONING_WALK]} == {
+        "voice_embeddings", "voice_cache", "persona_tokens", cfg.CONDITIONING_TICK}
+    for walk in (cfg.GENERATE_WALK, GENERATE_AUDIO_WALK):
+        assert {name for name, _ in inputs[walk]} == {"user_audio_codes", "agent_frame", "text_frame"}
+    assert all(node == "LM" for walk in LM_WALKS for _, node in inputs[walk])
+    # The codec walk is fed by the stream alone and runs once per chunk until the worker reports the last.
+    assert inputs[cfg.CODEC_WALK] == () and repeating == {cfg.CODEC_WALK}
+
+
+def test_codec_plan_carries_the_sample_budget():
+    """The codec partition needs only the upload's length, not the LM's conditioning inputs."""
+    model = _model()
+    signals = {"audio_inputs": _signals()["audio_inputs"]}
+    (step,) = model.walk_plan(cfg.CODEC_PARTITION, ["audio"], ["audio", "text"], signals, {})
+    assert step.walk == cfg.CODEC_WALK
+    assert dict(step.step_metadata) == {"num_samples": 1920 * 20 + 7, "num_user_frames": 21}
     with pytest.raises(ValueError, match="audio_inputs"):
-        model.get_initial_forward_pass_args(cfg.CODEC_PARTITION, ["audio"], ["audio"], {})
-
-
-def _step(model, metadata, persist):
-    return model.get_partition_forward_pass_args("default", metadata, persist, incoming_connections=[])
-
-
-def test_schedule_encode_condition_generate_done_with_persisted_state():
-    model = _model()
-    signals = _signals()
-    args = model.get_initial_forward_pass_args("default", ["audio"], ["audio", "text"], signals)
-    meta = args.full_metadata
-    assert meta.graph_walk == cfg.ENCODE_USER_AUDIO_WALK and meta.is_prefill
-    assert meta.kwargs["walk_schedule"] == [cfg.ENCODE_USER_AUDIO_WALK, cfg.CONDITIONING_WALK, cfg.GENERATE_WALK]
-    assert [(e.next_node, e.name) for e in args.inputs] == [("MimiEncoder", "audio_inputs")]
-    assert args.step_metadata == {"num_voice_embeddings": 4, "num_text_tokens": 9, "num_user_frames": 21,
-                                  "num_samples": 1920 * 20 + 7, "conditioning_frames": 4 + 12 + 9}
-    assert {i.uuid for i in args.unpersist_tensors} == {"uuid-audio"}
-
-    persist = {name: signals[name] for name in ("voice_embeddings", "voice_cache", "persona_tokens")}
-    persist["user_audio_codes"] = [_info("codes", [1, 8, 21])]
-    cond = _step(model, meta, persist)
-    assert cond.full_metadata.graph_walk == cfg.CONDITIONING_WALK and not cond.request_done
-    by_name = {e.name: e for e in cond.inputs}
-    assert set(by_name) == {"voice_embeddings", "voice_cache", "persona_tokens", cfg.CONDITIONING_TICK}
-    assert all(e.next_node == "LM" for e in cond.inputs) and by_name[cfg.CONDITIONING_TICK].tensor_info == []
-    assert {i.uuid for i in cond.unpersist_tensors} == {"uuid-voice_embeddings", "uuid-voice_cache",
-                                                       "uuid-persona_tokens"}
-
-    persist = {"user_audio_codes": persist["user_audio_codes"]}
-    gen = _step(model, cond.full_metadata, persist)
-    assert gen.full_metadata.graph_walk == cfg.GENERATE_WALK
-    by_name = {e.name: e for e in gen.inputs}
-    assert set(by_name) == {"user_audio_codes", "agent_frame", "text_frame"}
-    assert by_name["agent_frame"].tensor_info == [] and by_name["text_frame"].tensor_info == []
-    assert {i.uuid for i in gen.unpersist_tensors} == {"uuid-codes"}
-
-    done = _step(model, gen.full_metadata, {})
-    assert done.request_done and done.inputs == []
+        model.walk_plan(cfg.CODEC_PARTITION, ["audio"], ["audio"], {}, {})
+    with pytest.raises(ValueError, match="partition"):
+        model.walk_plan("default", ["audio"], ["audio"], _signals(), {})
 
 
 def test_audio_only_requests_use_the_walk_without_text_emission():
-    args = _model().get_initial_forward_pass_args("default", ["audio"], ["audio"], _signals())
-    assert args.full_metadata.kwargs["walk_schedule"][-1] == GENERATE_AUDIO_WALK
+    plan = _model().walk_plan(cfg.LM_PARTITION, ["audio"], ["audio"], _signals(), {})
+    assert plan[-1].walk == GENERATE_AUDIO_WALK
 
 
 @pytest.mark.parametrize("with_text,reverse_ready", [(False, False), (True, False), (True, True)],
@@ -266,15 +248,17 @@ def test_data_worker_emits_requested_modalities(with_text, reverse_ready):
 
 def test_conductor_backstops_budget_and_missing_inputs():
     model = _model()
+
+    def plan(signals):
+        return model.walk_plan(cfg.LM_PARTITION, ["audio"], ["audio"], signals, {})
+
     with pytest.raises(ValueError, match="context budget"):
-        model.get_initial_forward_pass_args("default", ["audio"], ["audio"],
-                                            _signals(n_emb=50, n_text=20, samples=1920 * 2918))
-    model.get_initial_forward_pass_args("default", ["audio"], ["audio"],
-                                        _signals(n_emb=50, n_text=20, samples=1920 * 2917))
+        plan(_signals(n_emb=50, n_text=20, samples=1920 * 2918))
+    plan(_signals(n_emb=50, n_text=20, samples=1920 * 2917))
     signals = _signals()
     del signals["voice_cache"]
     with pytest.raises(ValueError, match="voice_cache"):
-        model.get_initial_forward_pass_args("default", ["audio"], ["audio"], signals)
+        plan(signals)
 
 
 def test_worker_graphs_from_yaml_stream_agent_frames():
@@ -815,10 +799,10 @@ def test_max_batch_size_reaches_the_lm_submodule(monkeypatch):
 
 def test_sampling_configs_default_to_reference_and_greedy_is_temperature_zero():
     model = _model()
-    configs = model.get_request_resource_configs({}, {})
+    configs = model.get_request_resource_configs(["audio"], ["audio"], {})
     text, depth = configs[cfg.TEXT_SAMPLER], configs[cfg.DEPTH_SAMPLER]
     assert (text.temperature, text.top_k, depth.temperature, depth.top_k) == (0.7, 25, 0.8, 250)
-    greedy = model.get_request_resource_configs({}, {"greedy": True, "temp_text": 0.9})
+    greedy = model.get_request_resource_configs(["audio"], ["audio"], {"greedy": True, "temp_text": 0.9})
     assert greedy[cfg.TEXT_SAMPLER].temperature == 0.0 and greedy[cfg.DEPTH_SAMPLER].temperature == 0.0
 
 
@@ -826,7 +810,7 @@ def test_sampling_configs_default_to_reference_and_greedy_is_temperature_zero():
 def test_null_sampling_options_mean_unset(tmp_path, name):
     model = _model(tmp_path)
     _request(model, **{name: None})  # validation accepts null
-    configs = model.get_request_resource_configs({}, {name: None})
+    configs = model.get_request_resource_configs(["audio"], ["audio"], {name: None})
     text, depth = configs[cfg.TEXT_SAMPLER], configs[cfg.DEPTH_SAMPLER]
     assert (text.temperature, text.top_k, depth.temperature, depth.top_k) == (0.7, 25, 0.8, 250)
 

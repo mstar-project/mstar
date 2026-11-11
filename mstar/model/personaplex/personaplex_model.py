@@ -6,7 +6,7 @@ Nodes:
                   one 80 ms frame (one temporal forward) per iteration
     MimiDecoder - streamed agent codes -> 24 kHz PCM chunks, at most the input's length
 
-Walks, stepped through ``kwargs["walk_schedule"]`` (Wan2.2 pattern):
+Walks, in the LM partition's ``walk_plan`` order:
     encode_user_audio - MimiEncoder; persists ``user_audio_codes``
     conditioning      - Loop over LM: voice embeddings, 6 silence, persona text,
                         6 silence ([PP] models/lm.py:1110-1121); each frame
@@ -34,7 +34,7 @@ from pathlib import Path
 import torch
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import CurrentForwardConductorMetadata, PartitionDefinition, StreamingConnectionState
+from mstar.conductor.request_info import PartitionDefinition, WalkStep
 from mstar.engine.resources import NodeResourceSpec, ResourceReqConfig
 from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec
 from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
@@ -43,7 +43,7 @@ from mstar.engine.resources.recurrent import RecurrentBlockConfig, RecurrentStat
 from mstar.engine.resources.sampler.config import SamplerSpec, SamplingReqConfig
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, TensorAndMetadata
+from mstar.model.base import KVLabel, LabelLayout, Model, ProcessPromptOutput, TensorAndMetadata
 from mstar.streaming.chunk_policy import ScheduledLeftContextChunkPolicy
 from mstar.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
 
@@ -124,8 +124,8 @@ class PersonaPlexModel(Model):
                 config=PositionConfig(kv_cache=cfg.LM_KV, interleave=True, rope_theta=float(c.rope_theta)),
             ),
             SamplerSpec(resource_key=cfg.TEXT_SAMPLER, nodes=lm, vocab_size=c.text_card,
-                        enable_repetion_penalty=False),
-            SamplerSpec(resource_key=cfg.DEPTH_SAMPLER, nodes=lm, vocab_size=c.card, enable_repetion_penalty=False),
+                        enable_repetition_penalty=False),
+            SamplerSpec(resource_key=cfg.DEPTH_SAMPLER, nodes=lm, vocab_size=c.card, enable_repetition_penalty=False),
             RecurrentStateSpec(
                 resource_key=cfg.LM_CACHE, nodes=lm,
                 config=RecurrentStateConfig(num_layers=1, blocks={
@@ -229,12 +229,8 @@ class PersonaPlexModel(Model):
             PartitionDefinition(
                 name=cfg.LM_PARTITION,
                 graph_walks={cfg.ENCODE_USER_AUDIO_WALK, cfg.CONDITIONING_WALK, cfg.GENERATE_WALK, GENERATE_AUDIO_WALK},
-                initial_walk=cfg.ENCODE_USER_AUDIO_WALK, producer_partitions=[],
             ),
-            PartitionDefinition(
-                name=cfg.CODEC_PARTITION, graph_walks={cfg.CODEC_WALK}, initial_walk=cfg.CODEC_WALK,
-                producer_partitions=[cfg.LM_PARTITION],
-            ),
+            PartitionDefinition(name=cfg.CODEC_PARTITION, graph_walks={cfg.CODEC_WALK}),
         ]
 
     def get_partition_topology(self) -> PartitionTopology:
@@ -359,7 +355,7 @@ class PersonaPlexModel(Model):
 
         Request checks run on the data worker (here and in ``load_audio``), where
         a ValueError becomes a 400 before any GPU work; the conductor-side checks
-        in ``get_initial_forward_pass_args`` repeat the context budget as a backstop.
+        in ``walk_plan`` repeat the context budget as a backstop.
         """
         if "audio" not in output_modalities or not set(output_modalities) <= {"audio", "text"}:
             raise ValueError(f"PersonaPlex outputs audio (optionally with text); got {output_modalities}")
@@ -448,13 +444,13 @@ class PersonaPlexModel(Model):
         return torch.bfloat16
 
     def get_request_resource_configs(
-        self, partition_fwd_args: dict[str, ForwardPassArgs], model_kwargs: dict | None = None,
+        self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
     ) -> dict[str, ResourceReqConfig]:
         """Reference defaults ([PP] offline.py:363-374); ``greedy`` maps to temperature 0.
 
         An option sent as ``null`` is unset, as for the shared sampling parameters.
         """
-        del partition_fwd_args
+        del input_modalities, output_modalities
         kw = model_kwargs or {}
 
         def option(name, default):
@@ -473,118 +469,50 @@ class PersonaPlexModel(Model):
             ),
         }
 
-    @staticmethod
-    def _signals(persist: dict[str, list[TensorPointerInfo]], node: str, names) -> list[GraphEdge]:
-        return [GraphEdge(next_node=node, name=name, tensor_info=list(persist.get(name, []))) for name in names]
-
-    @staticmethod
-    def _step_metadata(metadata: CurrentForwardConductorMetadata) -> dict:
-        kw = metadata.kwargs
-        return {key: kw[key] for key in (
-            "num_voice_embeddings", "num_text_tokens", "num_user_frames", "num_samples", "conditioning_frames",
-        )}
-
-    def get_initial_forward_pass_args(
+    def walk_plan(
         self,
         partition_name: str,
         input_modalities: list[str],
         output_modalities: list[str],
         input_signals: dict[str, list[TensorPointerInfo]],
-        model_kwargs: dict | None = None,
-    ) -> ForwardPassArgs:
-        if partition_name == cfg.CODEC_PARTITION:
-            return self._codec_forward_pass_args(input_modalities, output_modalities, input_signals)
-        # Backstops only: process_prompt rejected these on the data worker.
-        for name in ("audio_inputs", "voice_embeddings", "voice_cache", "persona_tokens"):
-            if len(input_signals.get(name) or []) != 1:
-                raise ValueError(f"PersonaPlex request is missing {name}")
-        num_samples = int(input_signals["audio_inputs"][0].dims[-1])
-        counts = {
-            "num_voice_embeddings": int(input_signals["voice_embeddings"][0].dims[0]),
-            "num_text_tokens": int(input_signals["persona_tokens"][0].dims[0]),
-            "num_user_frames": math.ceil(num_samples / cfg.FRAME_SIZE),
-            "num_samples": num_samples,
-        }
-        cfg.validate_context_budget(
-            voice_embeddings=counts["num_voice_embeddings"], text_tokens=counts["num_text_tokens"],
-            user_frames=counts["num_user_frames"],
-        )
-        generate = cfg.GENERATE_WALK if "text" in output_modalities else GENERATE_AUDIO_WALK
-        kwargs = {
-            "walk_schedule": [cfg.ENCODE_USER_AUDIO_WALK, cfg.CONDITIONING_WALK, generate],
-            "walk_step": 0,
-            # One LM iteration per voice embedding, silence frame and persona token.
-            "conditioning_frames": counts["num_voice_embeddings"] + 2 * cfg.SILENCE_FRAMES
-            + counts["num_text_tokens"],
-            **counts,
-        }
-        metadata = CurrentForwardConductorMetadata(
-            input_modalities=input_modalities, output_modalities=output_modalities,
-            graph_walk=cfg.ENCODE_USER_AUDIO_WALK, is_prefill=True, kwargs=kwargs,
-        )
-        inputs = self._signals(input_signals, cfg.MIMI_ENCODER_NODE, ["audio_inputs"])
-        return ForwardPassArgs(
-            full_metadata=metadata, inputs=inputs,
-            unpersist_tensors=sum((e.tensor_info for e in inputs), start=[]),
-            step_metadata=self._step_metadata(metadata),
-        )
+        model_kwargs: dict,
+    ) -> list[WalkStep]:
+        """LM: encode_user_audio -> conditioning -> generate[_audio]. Codec: its
+        stream-fed walk, which ends when the decoder takes the stream's final chunk.
 
-    @staticmethod
-    def _codec_forward_pass_args(input_modalities, output_modalities, input_signals) -> ForwardPassArgs:
-        """The codec partition is driven by the agent-frame stream; it needs only the sample budget.
-
-        No input tensor: the budget is read off the upload's dims, so the
+        Every step carries the request's counts, read off the upload's dims, so the
         decoder never emits past the input's length, whichever chunk comes last.
         """
+        del input_modalities, model_kwargs
         audio = input_signals.get("audio_inputs") or []
         if len(audio) != 1:
             raise ValueError("PersonaPlex request is missing audio_inputs")
         num_samples = int(audio[0].dims[-1])
         budget = {"num_samples": num_samples, "num_user_frames": math.ceil(num_samples / cfg.FRAME_SIZE)}
-        metadata = CurrentForwardConductorMetadata(
-            input_modalities=input_modalities, output_modalities=output_modalities,
-            graph_walk=cfg.CODEC_WALK, is_prefill=False, kwargs=dict(budget),
-        )
-        return ForwardPassArgs(full_metadata=metadata, inputs=[], unpersist_tensors=[], step_metadata=budget)
-
-    def get_partition_forward_pass_args(
-        self,
-        partition_name: str,
-        partition_metadata: CurrentForwardConductorMetadata,
-        persist_signals: dict[str, list[TensorPointerInfo]],
-        incoming_connections: list[StreamingConnectionState] | None = None,
-    ) -> ForwardPassArgs:
-        """LM: encode_user_audio -> conditioning -> generate[_audio] -> done.
-
-        The codec partition never finishes here: it ends when its decoder
-        consumes the stream's final chunk, which the worker reports.
-        """
-        metadata = partition_metadata
         if partition_name == cfg.CODEC_PARTITION:
-            budget = {key: metadata.kwargs[key] for key in ("num_samples", "num_user_frames")}
-            return ForwardPassArgs(full_metadata=metadata, inputs=[], unpersist_tensors=[], step_metadata=budget)
-        schedule = metadata.kwargs["walk_schedule"]
-        step = metadata.kwargs["walk_step"] + 1
-        inputs: list[GraphEdge] = []
-        request_done = step >= len(schedule)
-        if not request_done:
-            walk = schedule[step]
-            metadata.kwargs["walk_step"] = step
-            metadata.graph_walk = walk
-            metadata.is_prefill = False
-            if walk == cfg.CONDITIONING_WALK:
-                inputs = self._signals(persist_signals, cfg.LM_NODE,
-                                       ["voice_embeddings", "voice_cache", "persona_tokens"])
-                inputs.append(GraphEdge(next_node=cfg.LM_NODE, name=cfg.CONDITIONING_TICK))
-            else:
-                inputs = self._signals(persist_signals, cfg.LM_NODE, ["user_audio_codes"])
-                inputs += [GraphEdge(next_node=cfg.LM_NODE, name=n) for n in ("agent_frame", "text_frame")]
-        # Each persisted tensor is used for the last time in the walk it feeds.
-        return ForwardPassArgs(
-            full_metadata=metadata, inputs=inputs,
-            unpersist_tensors=sum((e.tensor_info for e in inputs), start=[]),
-            step_metadata=self._step_metadata(metadata), request_done=request_done,
+            return [WalkStep(cfg.CODEC_WALK, step_metadata=budget)]
+        if partition_name != cfg.LM_PARTITION:
+            raise ValueError(f"Unknown PersonaPlex partition: {partition_name!r}")
+        # Backstops only: process_prompt rejected these on the data worker.
+        for name in ("voice_embeddings", "voice_cache", "persona_tokens"):
+            if len(input_signals.get(name) or []) != 1:
+                raise ValueError(f"PersonaPlex request is missing {name}")
+        counts = {
+            "num_voice_embeddings": int(input_signals["voice_embeddings"][0].dims[0]),
+            "num_text_tokens": int(input_signals["persona_tokens"][0].dims[0]),
+            **budget,
+        }
+        cfg.validate_context_budget(
+            voice_embeddings=counts["num_voice_embeddings"], text_tokens=counts["num_text_tokens"],
+            user_frames=counts["num_user_frames"],
         )
+        # One LM iteration per voice embedding, silence frame and persona token.
+        counts["conditioning_frames"] = (
+            counts["num_voice_embeddings"] + 2 * cfg.SILENCE_FRAMES + counts["num_text_tokens"]
+        )
+        generate = cfg.GENERATE_WALK if "text" in output_modalities else GENERATE_AUDIO_WALK
+        return [WalkStep(walk, step_metadata=counts)
+                for walk in (cfg.ENCODE_USER_AUDIO_WALK, cfg.CONDITIONING_WALK, generate)]
 
     # ------------------------------------------------------------------
     # Model ABC: submodules

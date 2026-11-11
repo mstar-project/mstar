@@ -61,7 +61,7 @@ class ResourceBackend:
         }
         self.runner = StepRunner(self.resources)
         self.request_ids, self.sub = [], sub
-        self.overrides = model.get_request_resource_configs({}, {"greedy": True})
+        self.overrides = model.get_request_resource_configs(["audio"], ["audio"], {"greedy": True})
         self.overrides[cfg.LM_KV] = KVReqConfig(needed_labels=["main"], prefix_cache=False)
         for rid in request_ids:
             self.add(rid)
