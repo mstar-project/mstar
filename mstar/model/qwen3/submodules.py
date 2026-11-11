@@ -13,6 +13,7 @@ class Qwen3LMSubmodule(DeclaredTokenDecoder):
     array. ``drafter`` (a hosted drafter module) makes decode verify its drafts,
     k a step as the engine binds."""
 
+    # kept for the narrower type: the node reads its hosted drafter's declaration (``needs.tap_key``)
     def __init__(self, model, config, drafter: HostedDrafter | None = None, accelerator_graph: bool = True):
         super().__init__(model, config, drafter=drafter, accelerator_graph=accelerator_graph)
 
