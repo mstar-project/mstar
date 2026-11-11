@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -713,6 +715,47 @@ def test_padding_rows_stay_finite_and_never_reach_the_request():
         step.end_calls()
     for a, b in zip(got, want, strict=True):
         assert torch.equal(a, b)
+
+
+def test_one_handle_runs_a_padded_step_and_then_an_unpadded_one():
+    """The split takes each step's spans, so one step's padding never reaches the next step's rows."""
+    dit, config, layout, inputs = _padding_case()
+
+    def run(row_bucket, handles):
+        node = H3DenoiseSubmodule(dit, config, loop_name=DENOISE_LOOP, row_bucket=row_bucket)
+        step = _opened(node, layout, handles)
+        with torch.no_grad():
+            out = dit(inputs, node.build_layout(layout, "cpu"))
+        step.end_calls()
+        return out
+
+    want = run(1, _on_sdpa(config))
+    handles = _on_sdpa(config)
+    padded, unpadded = run(64, handles), run(1, handles)
+    for a, b in zip(padded, want, strict=True):
+        torch.testing.assert_close(a, b, rtol=1e-5, atol=1e-6)
+    assert all(torch.equal(a, b) for a, b in zip(unpadded, want, strict=True)), "the padded step's spans outlived it"
+
+
+def test_two_shift_pairs_at_one_layout_get_a_schedule_each_and_share_its_layout():
+    """The shifts key the schedule beside the bucket: a request at other shifts would otherwise run the schedule of
+    the one before it, and shifts in the bucket key would build its rope table twice."""
+    model = _model()
+    node = H3DenoiseSubmodule(_StubDiT(), H3Config(), loop_name=DENOISE_LOOP)
+    schedules = []
+    for kwargs, shifts in (({}, (12.0, 3.0)), ({"flow_shift": 7.0, "audio_flow_shift": 2.0}, (7.0, 2.0))):
+        plan = model.walk_plan("default", ["text"], ["video", "audio"], {"text_inputs": [_tensor_info([37])]},
+                               {"height": 256, "width": 448, "num_inference_steps": 30, **kwargs})
+        info = SimpleNamespace(graph_walk=GENERATE_AV_WALK, step_metadata=plan[-1].step_metadata)
+        key = node.bucket_key_for(info)
+        got, want = node.schedule_of(info, key), h3_schedule(30, *shifts)
+        for field in ("sigmas", "timesteps", "audio_sigmas", "audio_timesteps", "cond_timesteps"):
+            assert torch.equal(getattr(got, field), getattr(want, field)), f"{shifts}: {field}"
+        node.layout(key, "cpu")
+        schedules.append(got)
+    assert not torch.equal(schedules[0].sigmas, schedules[1].sigmas)
+    assert node._schedules.cache_info().currsize == 2, "one schedule served both shift pairs"
+    assert len(node._uncaptured_layouts) == 1, "the shifts split the layout's rope table in two"
 
 
 def test_an_sp_size_the_heads_do_not_divide_is_refused_at_validation():

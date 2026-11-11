@@ -1,4 +1,4 @@
-"""The four DiTs plan the same attention on the contract that they planned by hand.
+"""The five DiTs plan the same attention on the contract that they planned by hand.
 
 These models compare their output bytes exactly, so a plan that attends other tokens, or one more resource, moves
 their output with no error. The hand-written specs and steps below are the reference, copied from the models as they
@@ -16,6 +16,7 @@ sys.path.insert(0, ".")
 import pytest
 import torch
 import yaml
+from torch import nn
 
 from mstar.distributed.base import node_group_axis_sizes
 from mstar.distributed.communication import CommGroup
@@ -51,6 +52,12 @@ from mstar.model.ltx2_5.config import (
 )
 from mstar.model.ltx2_5.ltx2_5_model import LTX25Model
 from mstar.model.ltx2_5.submodules import LTXDenoiseSubmodule, LTXShape
+from mstar.model.minimax_h3.components.layout import H3Layout
+from mstar.model.minimax_h3.components.transformer import H3Attention
+from mstar.model.minimax_h3.config import DIT_ATTN as H3_ATTN
+from mstar.model.minimax_h3.config import DIT_ROWS, REFINER_ATTN, H3Config, H3TransformerConfig
+from mstar.model.minimax_h3.minimax_h3_model import H3Model
+from mstar.model.minimax_h3.submodules import H3DenoiseSubmodule, H3TextEncoderSubmodule
 from mstar.model.submodule_base import NodeInputs, engine_step, with_segment_steps
 from mstar.model.wan22.components.dit import Wan22DiTAttention
 from mstar.model.wan22.config import DIT_TOKENS, SELF_ATTN, Wan22Config
@@ -88,6 +95,12 @@ def _z(**kwargs) -> ZImageModel:
 def _ltx(**kwargs) -> LTX25Model:
     model = LTX25Model(skip_weight_loading=True, **kwargs)
     model.set_config(LTX25Config())
+    return model
+
+
+def _h3(**kwargs) -> H3Model:
+    model = H3Model(model_path_hf="test/minimax_h3", skip_weight_loading=True, **kwargs)
+    model.set_config(H3Config())
     return model
 
 
@@ -172,10 +185,15 @@ def test_declarations_have_no_problems(name):
     assert state_declaration_problems(MODELS[name][0]()) == []
 
 
-@pytest.mark.parametrize("build", [_klein, _z])
+@pytest.mark.parametrize("build", [_klein, _z, _h3])
 def test_the_old_knob_is_refused(build):
     with pytest.raises(ValueError, match="attention_backend is a resource's setting"):
         build(attention_backend="sdpa")
+
+
+def test_h3_refuses_a_model_kwarg_it_doesnt_take():
+    with pytest.raises(TypeError, match="unexpected model_kwargs \\['row_buckets'\\]"):
+        _h3(row_buckets=256)
 
 
 def test_the_old_knob_is_refused_on_wan22():
@@ -385,8 +403,13 @@ def _klein_attention(layer):
     return Flux2JointAttention(8, 2, 4, 1e-6, layer), lambda x: (x, rope)
 
 
+def _h3_attention(layer):
+    config = replace(H3TransformerConfig(), hidden_size=8, num_attention_heads=2, attention_head_dim=4)
+    return H3Attention(config, CommGroup.trivial(), "tokens", layer), lambda x: ()
+
+
 @torch.no_grad()
-@pytest.mark.parametrize("attention", [_wan_attention, _ltx_attention, _z_attention, _klein_attention])
+@pytest.mark.parametrize("attention", [_wan_attention, _ltx_attention, _z_attention, _klein_attention, _h3_attention])
 def test_a_read_that_breaks_the_graph_recompiles_no_frame_per_layer(attention):
     """A DiT compiles with `dynamic=False`, where an int on the module specializes a frame per layer: with a read that
     breaks the graph, six attentions over 48 layers pass the recompile limit, and the frames then run uncompiled."""
@@ -523,3 +546,143 @@ def test_ltx_on_sdpa_at_sp1_declares_no_step_as_main_did():
     shape = LTXShape(frames=1, height=5, width=5, audio_frames=5, fps=24.0, text_len=16)
     handles = node_handles(model, "dit", {}, setup=_on_sdpa(model))
     assert state_steps(sub.declare_step("generate_av", [0], [_inputs(shape)]), handles) is None
+
+
+# MiniMax-H3
+
+
+def _h3_reference() -> list[RaggedAttentionSpec]:
+    """`H3Model.get_node_resources` before the port: the DiT's attention over its rows and their padding, and the
+    refiner's over the prompt, which it didn't narrow by SP."""
+    t = H3Config().transformer
+    return [
+        RaggedAttentionSpec(
+            resource_key=key, nodes={node},
+            config=RaggedAttentionConfig(
+                num_qo_heads=t.num_attention_heads, num_kv_heads=t.num_attention_heads, head_dim=t.attention_head_dim,
+                max_segments_per_request=segments, dtype=torch.bfloat16, shard_over_sp=sharded, workspace_mb=128,
+            ),
+        )
+        for key, node, sharded, segments in ((H3_ATTN, "dit", True, 2), (REFINER_ATTN, "text_encoder", False, 1))
+    ]
+
+
+def _h3_expected() -> list[RaggedAttentionSpec]:
+    """The reference with the refiner narrowed by SP, as every declared read within a step is. No config gives the text
+    encoder an ``sp_size`` (`test_no_h3_config_runs_the_refiner_under_sp`), so its heads narrow by 1."""
+    dit, refiner = _h3_reference()
+    return [dit, replace(refiner, config=replace(refiner.config, shard_over_sp=True))]
+
+
+H3_CONFIGS = ["configs/minimax_h3.yaml", "configs/minimax_h3_2gpu.yaml", "configs/minimax_h3_sp2.yaml",
+              "configs/minimax_h3_sp8.yaml"]
+
+
+@pytest.mark.parametrize("path", H3_CONFIGS)
+def test_no_h3_config_runs_the_refiner_under_sp(path):
+    with open(path) as f:
+        (group,) = [group for group in yaml.safe_load(f)["node_groups"] if "text_encoder" in group["node_names"]]
+    assert node_group_axis_sizes(group)["sp"] == 1, "the refiner's spec would narrow its heads, where main's didn't"
+
+
+def test_h3_specs_equal_the_hand_written_two_but_the_refiners_narrowing():
+    assert node_resources(_h3()) == _h3_expected()
+
+
+def test_h3_specs_equal_the_hand_written_two_after_yaml_overrides():
+    overrides = {"resources": {key: {"max_segments_per_request": 7, "flashinfer_backend": "fa2"}
+                               for key in (H3_ATTN, REFINER_ATTN)}}
+    specs, expected = node_resources(_h3()), _h3_expected()
+    apply_yaml_overrides(specs, overrides)
+    apply_yaml_overrides(expected, overrides)
+    assert specs == expected
+
+
+def test_h3_on_sdpa_builds_no_spec_and_its_declarations_have_no_problems():
+    assert node_resources(_h3(), setup=_on_sdpa(_h3())) == []
+    assert state_declaration_problems(_h3()) == []
+
+
+def _h3_layout() -> H3Layout:
+    """37 rows, which no SP size past 1 divides."""
+    return H3Layout(text_len=5, latent_frames=3, latent_height=4, latent_width=6, audio_latents=4, anchors=("first",))
+
+
+def _h3_dit(world: int) -> H3DenoiseSubmodule:
+    return H3DenoiseSubmodule(SimpleNamespace(sp_group=SimpleNamespace(world_size=world)), H3Config(),
+                              loop_name=DENOISE_LOOP)
+
+
+@pytest.mark.parametrize("world", [1, 2, 4, 8])
+def test_h3_steps_equal_the_hand_written_one_on_every_rank(world):
+    """Every rank plans the whole row, padding a segment of its own, since the exchange gives each rank all of it."""
+    model, layout, sub = _h3(), _h3_layout(), _h3_dit(world)
+    rows, padded = layout.total_rows, sub.num_tokens(layout)
+    assert (padded > rows) == (world > 1)
+    segments = [Segment(request_id=0, label="main", span=span) for span in (rows, padded - rows) if span]
+    reference = SubmoduleStep(
+        segments=segments, steps={H3_ATTN: AttentionStep(causal=False, fixed_layout=True)}, cg_key_info=layout,
+    )
+    for rank in range(world):
+        sp_group = SimpleNamespace(world_size=world, rank=rank)
+        handles = node_handles(model, "dit", {H3_ATTN: _StubRagged()}, sp_group=sp_group)
+        _assert_plans_equal(state_steps(sub.declare_step("gen", [0], [_inputs(layout)]), handles), reference, H3_ATTN)
+        exchanges = (handles[DIT_ROWS]._keys_sharded, handles[DIT_ROWS]._queries_sharded)
+        assert exchanges == (world > 1,) * 2, "a sharded sequence needs the Ulysses exchange"
+
+
+def test_h3_refiner_step_equals_the_hand_written_one():
+    handles = node_handles(_h3(), "text_encoder", {REFINER_ATTN: _StubRagged()})
+    sub = H3TextEncoderSubmodule(nn.Identity(), nn.Identity())
+    declared = sub.declare_step("encode_text", [0], [NodeInputs(tensor_inputs={}, input_seq_len=7)])
+    reference = SubmoduleStep(segments=[Segment(request_id=0, label="text", span=7)],
+                              steps={REFINER_ATTN: AttentionStep(causal=False)})
+    _assert_plans_equal(state_steps(declared, handles), reference, REFINER_ATTN)
+
+
+@torch.no_grad()
+def test_h3_exchanges_a_ranks_share_of_the_whole_padded_row_at_sp2(monkeypatch):
+    sizes = []
+    monkeypatch.setattr("mstar.engine.state.adapters.ulysses_attention",
+                        lambda group, q, k, v, run, seq_sizes, **kwargs: sizes.append(seq_sizes) or q)
+    model, layout, sub = _h3(), _h3_layout(), _h3_dit(2)
+    handles = node_handles(model, "dit", {}, sp_group=SimpleNamespace(world_size=2, rank=0), setup=_on_sdpa(model))
+    step = state_steps(sub.declare_step("gen", [0], [_inputs(layout)]), handles)
+    step.set_ctx(StepContext(request_ids=[0], graph_walk="gen", slot=0, capture=False))
+    step.begin_calls()
+    padded, t = sub.num_tokens(layout), H3Config().transformer
+    x = torch.ones(1, padded // 2, t.num_attention_heads, t.attention_head_dim)
+    handles[DIT_ROWS].add(0, k=x, v=x)
+    handles[DIT_ROWS].read(0, x)
+    assert padded > layout.total_rows and sizes == [sp_seq_split(padded, 2)], "each rank's share of rows and padding"
+
+
+@torch.no_grad()
+def test_h3s_split_guards_on_no_layer_and_no_layout():
+    """H3 compiles its blocks with `dynamic=False`, and the split runs outside them, as H3's own did, so neither a
+    layer nor a step's spans recompile them."""
+    torch._dynamo.reset()
+    array = Array(
+        "tokens", nodes={"dit"}, layers=frozenset({0, 1}), entry=dit_entry(2, 4), max_len=0,
+        reads={"attn": Read(mask=Block(), op=Attend(q_heads=2), packed=False, segmented=True)},
+    )
+    setup, problems = state_setup({"resources": {"attn": {"backend": "sdpa"}}}, [array])
+    assert not problems, problems
+    handle = build_handle(array, {}, setup)
+    built = [_h3_attention(layer)[0] for layer in (0, 1)]
+    for module in built:
+        module.bind_state({array.name: handle})
+    guards = []
+    optimize = torch._dynamo.optimize(
+        lambda graph_module, inputs: graph_module.forward, dynamic=False,
+        guard_fail_fn=lambda failure: guards.append(str(failure.reason)),
+    )
+    for spans in ((6, 2), (5, 3)):
+        step = SubmoduleStep(state={array.name: ArrayStep(segments=tuple(Segment(0, "main", n) for n in spans))})
+        step.set_ctx(StepContext(request_ids=[0], graph_walk="gen", slot=0, capture=False))
+        step.set_state_handles((handle,))
+        step.begin_calls()
+        for module in built:
+            optimize(module)(torch.ones(1, 8, 8))
+        step.end_calls()
+    assert not [guard for guard in guards if "layer" in guard or "lengths" in guard], guards
