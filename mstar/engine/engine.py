@@ -665,7 +665,7 @@ class Engine:
         assert gpu_memory_fraction is None or 0 < gpu_memory_fraction <= 1, (
             f"gpu_memory_fraction is a fraction of the device, got {gpu_memory_fraction}"
         )
-        # before any submodule compiles: every engine-owned and model-owned torch.compile tunes with it
+        # before the first forward, which is when every engine- and model-owned torch.compile compiles and tunes
         keep_split_scans_in_their_workspace()
         self._device = None
         self._device_capability = device_capability

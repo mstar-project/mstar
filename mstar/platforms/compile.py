@@ -44,11 +44,15 @@ def with_inductor_overrides(
     return forward
 
 
+def _split_scan_minimum(meta: dict) -> int:
+    return meta.get("min_split_scan_rblock", 256)  # Inductor's default; it always sets the key
+
+
 def _below_split_scan_minimum(meta: dict, name: str, val: int) -> bool:
     return (
         meta.get("grid_type") == "SplitScanGrid"
         and name.startswith("R") and name.endswith("BLOCK")
-        and val < meta.get("min_split_scan_rblock", 256)
+        and val < _split_scan_minimum(meta)
     )
 
 
@@ -63,7 +67,7 @@ def _raise_split_scan_blocks(tuner: Any) -> None:
             results.append(result)
             continue
         raised = copy.copy(cfg)
-        raised.kwargs = {**cfg.kwargs, **dict.fromkeys(low, meta.get("min_split_scan_rblock", 256))}
+        raised.kwargs = {**cfg.kwargs, **dict.fromkeys(low, _split_scan_minimum(meta))}
         raised.found_by_coordesc = False  # retune from here, and cache what it finds
         if tuner.fn.fn is None:  # compiled in a worker, which dropped the source
             tuner.fn = tuner._reload_kernel().fn
@@ -82,9 +86,9 @@ def keep_split_scans_in_their_workspace() -> None:
     zero, so it can tune below that, and the scan then writes past its workspace: an
     illegal memory access, or a silent overwrite of what follows. Such a pick is then
     cached, and comes back through compile workers, the autotune cache and the FX graph
-    cache. So the tuner refuses to step below the minimum, and every config is raised to
-    it where the parent process turns configs into launchers, which every launch and every
-    tuning baseline passes through. Upstream: pytorch/pytorch#197493.
+    cache. So the tuner refuses to step below the minimum, which bounds the candidates it
+    times, and every other config is raised to it where the parent process builds the
+    launchers it runs and starts tuning from. Upstream: pytorch/pytorch#197493.
     """
     try:
         from torch._inductor.runtime.coordinate_descent_tuner import CoordescTuner

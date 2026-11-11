@@ -16,7 +16,6 @@ from torch._inductor.runtime.coordinate_descent_tuner import CoordescTuner  # no
 from torch._inductor.runtime.triton_heuristics import CachingAutotuner  # noqa: E402
 
 import mstar.engine.engine as engine_module  # noqa: E402
-import mstar.platforms.compile as compile_mod  # noqa: E402
 from mstar.platforms.compile import keep_split_scans_in_their_workspace  # noqa: E402
 from mstar.testing_utils.engine import make_engine  # noqa: E402
 
@@ -62,54 +61,59 @@ def test_installing_twice_wraps_once():
 
 
 class _Result:
-    """A compile result: only its config matters here."""
+    """A compile result: its config, and a launcher that only carries it."""
 
     def __init__(self, cfg):
         self.config = cfg
 
+    def make_launcher(self):
+        return SimpleNamespace(config=self.config)
 
-class _Tuner:
-    """The `CachingAutotuner` fields the clamp reads, and a compile that records its configs."""
 
-    def __init__(self, grid_type: str, rblocks: list[int], *, from_worker: bool = False):
-        self.inductor_meta = _meta(grid_type)
-        self.compile_results = [_Result(triton.Config({"R0_BLOCK": r}, num_warps=4)) for r in rblocks]
-        self.fn = SimpleNamespace(fn=None if from_worker else "source")
-        self._reload_kernel = lambda: SimpleNamespace(fn=SimpleNamespace(fn="reloaded"))
-        self.compiled = []
+def _autotuner(grid_type: str, rblocks: list[int], *, from_worker: bool = False) -> CachingAutotuner:
+    """A real `CachingAutotuner` holding compiled configs, as precompile leaves it before
+    building launchers, with compilation stubbed so it runs on the CPU."""
+    tuner = object.__new__(CachingAutotuner)
+    tuner.inductor_meta = _meta(grid_type)
+    tuner.triton_meta = {"device": 0}
+    tuner.compile_results = [_Result(triton.Config({"R0_BLOCK": r}, num_warps=4)) for r in rblocks]
+    tuner.launchers = []
+    tuner.fn = SimpleNamespace(fn=None if from_worker else "source")
+    tuner._reload_kernel = lambda: SimpleNamespace(fn=SimpleNamespace(fn="reloaded"))
+    # what `DeviceGuard` calls around building the launchers
+    device = SimpleNamespace(exchange_device=lambda index: 0, maybe_exchange_device=lambda index: 0)
+    tuner.get_device_interface = lambda: device
+    tuner.compiled = []
 
-    def _precompile_config(self, cfg):
-        self.compiled.append(cfg)
+    def precompile_config(cfg):
+        tuner.compiled.append(cfg)
         return _Result(cfg)
 
+    tuner._precompile_config = precompile_config
+    return tuner
 
-def _rblocks(tuner) -> list[int]:
-    return [r.config.kwargs["R0_BLOCK"] for r in tuner.compile_results]
+
+def _launched(tuner) -> list[int]:
+    tuner._make_launchers()
+    return [launcher.config.kwargs["R0_BLOCK"] for launcher in tuner.launchers]
 
 
 def test_a_split_scan_config_below_its_minimum_is_raised_before_launch():
-    tuner = _Tuner("SplitScanGrid", [1, MIN_RBLOCK // 2, 2 * MIN_RBLOCK])
-    compile_mod._raise_split_scan_blocks(tuner)
-    assert _rblocks(tuner) == [MIN_RBLOCK, MIN_RBLOCK, 2 * MIN_RBLOCK]
+    tuner = _autotuner("SplitScanGrid", [1, MIN_RBLOCK // 2, 2 * MIN_RBLOCK])
+    assert _launched(tuner) == [MIN_RBLOCK, MIN_RBLOCK, 2 * MIN_RBLOCK]
     assert len(tuner.compiled) == 2
     # coordinate descent retunes from the raised config instead of trusting the old pick
     assert all(cfg.found_by_coordesc is False for cfg in tuner.compiled)
 
 
 def test_a_worker_compiled_split_scan_reloads_its_source_to_recompile():
-    tuner = _Tuner("SplitScanGrid", [MIN_RBLOCK // 2], from_worker=True)
-    compile_mod._raise_split_scan_blocks(tuner)
-    assert tuner.fn.fn == "reloaded" and _rblocks(tuner) == [MIN_RBLOCK]
+    tuner = _autotuner("SplitScanGrid", [MIN_RBLOCK // 2], from_worker=True)
+    assert _launched(tuner) == [MIN_RBLOCK] and tuner.fn.fn == "reloaded"
 
 
 def test_other_kernels_launch_their_configs_as_tuned():
-    tuner = _Tuner("Grid2D", [MIN_RBLOCK // 2])
-    compile_mod._raise_split_scan_blocks(tuner)
-    assert _rblocks(tuner) == [MIN_RBLOCK // 2] and not tuner.compiled
-
-
-def test_launchers_go_through_the_clamp():
-    assert "keep_split_scans_in_their_workspace" in CachingAutotuner._make_launchers.__qualname__
+    tuner = _autotuner("Grid2D", [MIN_RBLOCK // 2])
+    assert _launched(tuner) == [MIN_RBLOCK // 2] and not tuner.compiled
 
 
 def test_the_engine_installs_it(monkeypatch):
