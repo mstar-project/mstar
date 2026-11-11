@@ -236,7 +236,7 @@ def test_process_prompt_builds_features_and_prompt():
         ]
         pre = ids.index(AUDIO_PAD)
         assert [span.length for span in spans] == [pre, n_tokens, len(ids) - pre - n_tokens]
-        assert set(out.metadata) == {MEDIA_LAYOUT, "state_layout"}
+        assert set(out.metadata) == {MEDIA_LAYOUT, "state_layout", "keyed_spans"}
     assert torch.equal(out.new_input_tensors["audio"][0], wave)  # samples as they are; the encoder makes the mel
 
     # the request's layout and any other attachment are ignored, as they always were
