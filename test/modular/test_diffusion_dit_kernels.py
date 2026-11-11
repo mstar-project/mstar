@@ -260,3 +260,14 @@ def test_dit_kernels_round_as_the_eager_ops():
     assert torch.equal(dit_kernels.norm_modulate(x, scale1p, shift, 16, layer_norm.eps), modulated(layer_norm(x)))
     got = dit_kernels.gated_norm_modulate(x, gate, y, scale1p, shift, 16, layer_norm.eps)
     assert all(map(torch.equal, got, (residual, modulated(layer_norm(residual)))))
+
+
+def test_dit_kernels_refuse_inputs_they_would_read_wrongly():
+    """The rotation kernel reads x with a unit last stride and freqs with one row or one per x row; anything else
+    would read the wrong memory, so it is an error, not a silent mis-rotation."""
+    x, w = torch.zeros(2, 5, 3, 128), torch.ones(128)
+    strided = x.transpose(-1, -2).contiguous().transpose(-1, -2)  # the same shape, last stride 3
+    with pytest.raises(ValueError, match="contiguous"):
+        dit_kernels.qk_norm_rope(strided, w, torch.ones(5, 64, dtype=torch.complex64), 1e-6)
+    with pytest.raises(ValueError, match="rows 1 or 2"):
+        dit_kernels.qk_norm_rope(x, w, torch.ones(3, 5, 64, dtype=torch.complex64), 1e-6)

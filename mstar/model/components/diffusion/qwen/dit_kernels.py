@@ -214,11 +214,20 @@ def _norm_rope_into(x: torch.Tensor, weight: torch.Tensor, freqs: torch.Tensor, 
     """``out = rope(norm(x))``, and for ``pair = (x2, weight2, out2)`` (same shape and strides) the same with the
     same rotation in the one launch."""
     rows, seq, heads, _ = x.shape
-    f = torch.view_as_real(freqs.contiguous())
-    sf_r, sf_s = (0, f.stride(0)) if f.dim() == 3 else (f.stride(0), f.stride(1))
     x2, w2, o2 = pair if pair is not None else (x, weight, out)
     if pair is not None and (x2.stride() != x.stride() or o2.stride() != out.stride()):
         raise ValueError("qk_norm_rope pair: both parts must share the strides")
+    if x.stride(-1) != 1 or x2.stride(-1) != 1:
+        raise ValueError("qk_norm_rope: the head dim must be contiguous")
+    f = torch.view_as_real(freqs.contiguous())
+    if f.dim() == 3:
+        sf_r, sf_s, f_rows, f_seq = 0, f.stride(0), 1, f.shape[0]
+    else:
+        f_rows, f_seq = f.shape[0], f.shape[1]
+        sf_r, sf_s = (0 if f_rows == 1 else f.stride(0)), f.stride(1)
+    if f_rows not in (1, rows) or f_seq != seq:
+        raise ValueError(f"qk_norm_rope: freqs {tuple(freqs.shape)} do not fit x {tuple(x.shape)} (rows 1 or {rows})")
+    weight, w2 = weight.contiguous(), w2.contiguous()
     _qk_norm_rope_kernel[(rows * seq,)](
         x, weight, f, out, x2, w2, o2, seq, heads, eps, x.stride(0), x.stride(1), x.stride(2), sf_r, sf_s,
         out.stride(0), out.stride(1), out.stride(2), HB=triton.next_power_of_2(heads), PAIR=pair is not None,
@@ -288,6 +297,7 @@ def modulate(x: torch.Tensor, scale1p: torch.Tensor, shift: torch.Tensor, split:
     """``x * scale1p + shift`` for ``x [R, L, D]`` contiguous and ``[sets * R, D]`` parameters: a token before
     ``split`` takes set 0's row, from it set 1's (one set: ``split = L``)."""
     rows, length, dim = x.shape
+    scale1p, shift = scale1p.contiguous(), shift.contiguous()
     out = torch.empty_like(x)
     _modulate_kernel[(rows * length, triton.cdiv(dim, _BLOCK))](
         x, scale1p, shift, out, length, dim, rows, split, BLOCK=_BLOCK, enable_fp_fusion=False,
@@ -304,6 +314,7 @@ def _(x, scale1p, shift, split):
 def gated_add(x: torch.Tensor, gate: torch.Tensor, y: torch.Tensor, split: int) -> torch.Tensor:
     """``x + gate * y`` (``x``, ``y`` ``[R, L, D]`` contiguous), ``gate`` by token as in :func:`modulate`."""
     rows, length, dim = x.shape
+    gate = gate.contiguous()
     out = torch.empty_like(x)
     _gated_add_kernel[(rows * length, triton.cdiv(dim, _BLOCK))](
         x, gate, y, out, length, dim, rows, split, BLOCK=_BLOCK, enable_fp_fusion=False,
@@ -340,7 +351,7 @@ def norm_modulate(x: torch.Tensor, scale1p: torch.Tensor, shift: torch.Tensor, s
     """``modulate(layer_norm(x, eps), scale1p, shift, split)``: no affine, ``x`` as :func:`norm_fits` takes, the
     parameters as :func:`modulate`'s."""
     out = torch.empty_like(x)
-    _norm_modulate_launch(x, x, x, x, scale1p, shift, out, split, eps, gated=False)
+    _norm_modulate_launch(x, x, x, x, scale1p.contiguous(), shift.contiguous(), out, split, eps, gated=False)
     return out
 
 
@@ -357,7 +368,8 @@ def gated_norm_modulate(
     """``r = gated_add(x, gate, y, split)`` and ``norm_modulate(r, scale1p, shift, split, eps)``, returned as
     ``(r, out)``; ``y`` contiguous as ``x``."""
     residual, out = torch.empty_like(x), torch.empty_like(x)
-    _norm_modulate_launch(x, gate, y, residual, scale1p, shift, out, split, eps, gated=True)
+    _norm_modulate_launch(x, gate.contiguous(), y, residual, scale1p.contiguous(), shift.contiguous(), out, split, eps,
+                          gated=True)
     return residual, out
 
 
