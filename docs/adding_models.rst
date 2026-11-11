@@ -3654,7 +3654,9 @@ iteration past the schedule. The hooks:
 
     class MyDenoise(DenoiseLoopSubmodule):
         def bucket_key_for(self, fwd_info): ...       # hashable: latent grid, text length, ...
-        def schedule_for(self, walk, num_steps, key): ...  # FlowMatchSchedule (flow_match.py), memoized
+        def schedule_for(self, walk, settings, key): ...  # FlowMatchSchedule (flow_match.py), memoized
+        # optional: what the request sets of its schedule; its step count by default
+        def schedule_settings(self, fwd_info): ...
         def seed_latents(self, key, gen): ...         # [L, C] initial noise, seeded
         def request_inputs(self, fwd_info, inputs, key): ...  # per-row conditioning tensors
         def num_tokens(self, key): ...                # image tokens for the attention step
