@@ -5530,6 +5530,11 @@ class KVManager(AttentionResource):
             )
         self._sequence_shard = shard
 
+    def opens_label(self, rid: int, label: str) -> bool:
+        """Whether request ``rid`` opened ``label``. A padding row has no config, and opens any."""
+        overrides = self._overrides.get(rid)
+        return overrides is None or label in overrides.opened_labels(self._nodes)
+
     @torch.compiler.disable
     def write_target(self, layer_idx: int = None, label: str = None):
         """Where this step's K/V go, for a layer that writes them itself in a

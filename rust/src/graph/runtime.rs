@@ -184,6 +184,10 @@ pub struct GraphRuntime {
     /// (`Connection.consumer_walk`): they keep INPUT_SIGNALS, whose request
     /// info carries that walk; EDGE_ITEMS has no room for it.
     walk_driven_signals: FxHashSet<String>,
+    /// (node, signal) pairs whose streamed items go as values when the route
+    /// carries the signal inline (a `by_value` `Connection`'s); any other
+    /// stream keeps its tensors, whatever rides inline to the client.
+    inline_streams: FxHashSet<(String, String)>,
 
     /// A share of the SAME bookkeeper Python handed TensorStore, taken at
     /// construction. Routing reads descriptors and adjusts refcounts through
@@ -1185,6 +1189,8 @@ pub struct WireEdge {
     pub streaming: bool,
     pub shard_dim: Option<u32>,
     pub total_fanin: u32,
+    /// A streamed item sent as its value (no tensors then).
+    pub value: Option<i64>,
 }
 
 /// What a completion has to send. Grouped by kind rather than by message so
@@ -1193,6 +1199,8 @@ pub struct WireEdge {
 #[derive(Default)]
 pub struct SendPlan {
     #[pyo3(get)] pub partition: String,
+    /// The completed node, the source a frame of inline items names.
+    pub node_name: String,
     pub to_workers: Vec<WireEdge>,
     /// (rid, signal, uuids). Python's `to_conductor` is built BEFORE the
     /// fanout, so a persist signal reports the whole tensor.
@@ -1323,6 +1331,12 @@ pub struct RouteOut {
     #[pyo3(get)] pub local_streaming_signals: Vec<String>,
     #[pyo3(get)] pub local_streaming_rids: Vec<Vec<u32>>,
     #[pyo3(get)] pub local_streaming_uuids: Vec<Vec<u64>>,
+    /// Inline items of a local stream whose edge carried no tensor (the step
+    /// kept its rows on the device): grouped as `local_streaming_*`, with each
+    /// rid's value in place of a uuid.
+    #[pyo3(get)] pub local_stream_value_signals: Vec<String>,
+    #[pyo3(get)] pub local_stream_value_rids: Vec<Vec<u32>>,
+    #[pyo3(get)] pub local_stream_values: Vec<Vec<i64>>,
     /// Consumed inputs the completion itself dropped to zero, with each one's
     /// `mem_registered` flag -- empty in the normal order, where
     /// `cleanup_consumed_inputs` has already taken them.
@@ -1381,6 +1395,9 @@ pub struct Completion {
     /// Per rid: (signal, modality, value) of the emit edge that rides inline
     /// instead of as a tensor. Empty unless the route carried inline values.
     pub emit_inline: FxHashMap<u32, (Sym, Sym, i64)>,
+    /// (rid, signal) -> the value of a streamed edge to another worker that
+    /// rides inline instead of as a tensor (`EdgeItems` values).
+    pub stream_inline: FxHashMap<(u32, Sym), i64>,
     /// Per rid: the log-prob its client emits carry (`RouteArg::logprobs`).
     pub logprobs: FxHashMap<u32, f64>,
 }
@@ -1657,6 +1674,7 @@ impl GraphRuntime {
             spec_counter: 0,
             combined_walk_of,
             walk_driven_signals: FxHashSet::default(),
+            inline_streams: FxHashSet::default(),
             postprocess: None,
             bookkeeping: bookkeeping.share(),
             communicator: communicator.map(|c| c.share()),
@@ -1667,6 +1685,12 @@ impl GraphRuntime {
     /// `walk_driven_signals`). Set once, at construction.
     fn set_walk_driven_signals(&mut self, signals: Vec<String>) {
         self.walk_driven_signals = signals.into_iter().collect();
+    }
+
+    /// The (node, signal) pairs whose streamed items go as values (see
+    /// `inline_streams`). Set once, when the worker's submodules have loaded.
+    fn set_inline_streams(&mut self, keys: Vec<(String, String)>) {
+        self.inline_streams = keys.into_iter().collect();
     }
 
     /// The three sets are node NAMES. A name this worker does not host is
@@ -2692,6 +2716,8 @@ impl GraphRuntime {
         // once at the end: the interner cannot be borrowed while the loop
         // below holds `&mut self`, and a name per stream is cheaper anyway.
         let mut streaming_by_signal: Vec<(Sym, Vec<u32>, Vec<u64>)> = vec![];
+        // the same for a local stream's inline items, by value
+        let mut stream_values_by_signal: Vec<(Sym, Vec<u32>, Vec<i64>)> = vec![];
         let mut sends_a_frame: FxHashSet<u32> = FxHashSet::default();
         let mut nested_snapshot: FxHashMap<u32, (Vec<Sym>, Vec<(Sym, u32)>, u32)> =
             FxHashMap::default();
@@ -2706,6 +2732,17 @@ impl GraphRuntime {
         let inline_on = inline_sym.is_some()
             && input.inline_values.len() == input.rids.len();
         let mut emit_inline: FxHashMap<u32, (Sym, Sym, i64)> = FxHashMap::default();
+        // A streamed edge of the inline signal carries its value too, when the
+        // node streams that signal inline, unless its consumer's walk follows
+        // the producer's (a walk-driven stream tags every item with it), which
+        // only a tensor's descriptor carries.
+        let inline_streams = inline_on
+            && inline_sym.is_some_and(|s| {
+                let signal = self.interner.name(s);
+                !self.walk_driven_signals.contains(signal)
+                    && self.inline_streams.contains(&(input.node_name.clone(), signal.to_string()))
+            });
+        let mut stream_inline: FxHashMap<(u32, Sym), i64> = FxHashMap::default();
         let logprobs: FxHashMap<u32, f64> = input
             .rids
             .iter()
@@ -3052,6 +3089,15 @@ impl GraphRuntime {
                 // when it lives in a SIBLING worker graph on this worker, which
                 // compiles to External (Orpheus streams new_token from the LLM
                 // graph into the snac_decoder graph).
+                let inline_stream = inline_streams
+                    && inline_value.is_some()
+                    && e.streaming
+                    && matches!(e.dest, Dest::External(_))
+                    && Some(e.name) == inline_sym
+                    && !e.persist;
+                if let (true, Some(value)) = (inline_stream, inline_value) {
+                    stream_inline.insert((rid, e.name), value);
+                }
                 if e.streaming && is_local && !e.tensors.is_empty() {
                     let slot = match streaming_by_signal
                         .iter()
@@ -3068,6 +3114,23 @@ impl GraphRuntime {
                     for t in &e.tensors {
                         rids_for_edge.push(rid);
                         uuids_for_edge.push(t.uuid);
+                    }
+                } else if let (true, true, Some(value)) = (inline_stream, is_local, inline_value) {
+                    // No tensor: the step kept its rows on the device, and the
+                    // item rides inline into this worker's buffer.
+                    {
+                        let slot = match stream_values_by_signal
+                            .iter()
+                            .position(|(name, _, _)| *name == e.name)
+                        {
+                            Some(i) => i,
+                            None => {
+                                stream_values_by_signal.push((e.name, vec![], vec![]));
+                                stream_values_by_signal.len() - 1
+                            }
+                        };
+                        stream_values_by_signal[slot].1.push(rid);
+                        stream_values_by_signal[slot].2.push(value);
                     }
                 }
                 // What a remote consumer will read. Every tensor on the edge,
@@ -3089,6 +3152,7 @@ impl GraphRuntime {
                     || e.declined_local
                     || (!is_local
                         && !inline_edge
+                        && !inline_stream
                         && matches!(e.dest, Dest::External(_) | Dest::EmitToClient));
                 if remote {
                     for t in &e.tensors {
@@ -3149,6 +3213,9 @@ impl GraphRuntime {
                         Dest::EmitToClient => i64::from(
                             !(inline_value.is_some() && Some(e.name) == inline_sym && !e.persist),
                         ),
+                        // Nor does a streamed item sent as its value: no
+                        // consumer reads the tensor.
+                        Dest::External(_) if stream_inline.contains_key(&(rid, e.name)) => 0,
                         // One reference per destination WORKER, minus this
                         // one when the edge was already ingested into a local
                         // graph -- that copy is in local_counts. Python does
@@ -3263,6 +3330,19 @@ impl GraphRuntime {
                 }
             }
         }
+        for (name, rids_for_edge, _) in &stream_values_by_signal {
+            for &rid in rids_for_edge {
+                if let Some(info) = self.requests[rid as usize].as_mut() {
+                    info.pending.add_stream_items(*name, me, 1);
+                }
+            }
+        }
+        for (name, rids_for_edge, values) in stream_values_by_signal {
+            out.local_stream_value_signals
+                .push(self.interner.name(name).to_string());
+            out.local_stream_value_rids.push(rids_for_edge);
+            out.local_stream_values.push(values);
+        }
         // One string per stream, resolved now that `&mut self` is released.
         for (name, rids_for_edge, uuids_for_edge) in streaming_by_signal {
             out.local_streaming_signals
@@ -3287,6 +3367,7 @@ impl GraphRuntime {
                 speculative,
                 nested: nested_snapshot,
                 emit_inline,
+                stream_inline,
                 logprobs,
             },
         );
@@ -3626,8 +3707,10 @@ impl GraphRuntime {
         // The graph is resolved per walk in the loop below: a completion that
         // spans a combined walk has no single `c.wg`.
         let emit_inline = std::mem::take(&mut c.emit_inline);
+        let stream_inline = std::mem::take(&mut c.stream_inline);
         let mut plan = SendPlan {
             partition: c.partition.clone(),
+            node_name: c.node_name.clone(),
             nested: c.nested.clone(),
             logprobs: std::mem::take(&mut c.logprobs),
             ..Default::default()
@@ -3731,15 +3814,18 @@ impl GraphRuntime {
                             }
                             let (shard_dim, total_fanin) =
                                 wire_shape(e.name, dest, e.streaming, worker);
+                            // an item sent as its value goes without its tensor
+                            let value = stream_inline.get(&(rid, e.name)).copied();
                             plan.to_workers.push(WireEdge {
                                 rid,
                                 worker,
                                 signal: name.clone(),
                                 next_node: self.interner.name(dest).to_string(),
-                                tensors: e.tensors.clone(),
+                                tensors: if value.is_some() { Vec::new() } else { e.tensors.clone() },
                                 streaming: e.streaming,
                                 shard_dim,
                                 total_fanin,
+                                value,
                             });
                         }
                     }
@@ -3761,6 +3847,7 @@ impl GraphRuntime {
                             streaming: e.streaming,
                             shard_dim,
                             total_fanin,
+                            value: None,
                         });
                     }
                     Dest::Local(_) | Dest::Empty => {}
@@ -3959,12 +4046,42 @@ impl GraphRuntime {
             // items once. Worker order kept as first seen.
             let mut streamed: Vec<(Sym, frames::EdgeItems)> = Vec::new();
             let mut streamed_at: FxHashMap<Sym, usize> = FxHashMap::default();
+            // The same for items sent as their values, which go in frames of
+            // their own: a frame carries descriptors or values, not both.
+            let mut valued: Vec<(Sym, frames::EdgeItems)> = Vec::new();
+            let mut valued_at: FxHashMap<Sym, usize> = FxHashMap::default();
+            let source_entity = self.interner.name(self.shard.me).to_string();
             {
                 // One acquisition for every descriptor lookup in the batch, not
                 // one per edge. Released before the sends -- holding it across
                 // zmq would park the GPU and plan threads on our I/O.
                 let bk = self.bookkeeping.lock().unwrap();
                 for w in plan.to_workers {
+                    if let Some(value) = w.value {
+                        // Only an unsharded edge of one producer has a frame to
+                        // ride, and the item has no tensor to go any other way;
+                        // the route takes a value only for such an edge.
+                        if w.shard_dim.is_some() || w.total_fanin != 1 {
+                            return Err(PyValueError::new_err(format!(
+                                "the inline item of {} to {} is sharded; it has no frame to go in",
+                                w.signal, w.next_node,
+                            )));
+                        }
+                        stream_items.push((w.rid, w.signal.clone(), w.worker, 1));
+                        let request_id = self.rids.name(w.rid).ok_or_else(|| {
+                            PyValueError::new_err(format!("unknown rid handle {}", w.rid))
+                        })?;
+                        let i = *valued_at.entry(w.worker).or_insert_with(|| {
+                            valued.push((w.worker, frames::EdgeItems::new(&partition)));
+                            valued.len() - 1
+                        });
+                        // the producer names itself: nothing reads or acks a value
+                        valued[i].1.try_add_values(
+                            request_id, &w.signal, &w.next_node, None, &[value],
+                            ("", &source_entity, Some(&plan.node_name), 1, 0),
+                        );
+                        continue;
+                    }
                     let infos = Self::sliced_infos_locked(&bk, &w.tensors);
                     if w.streaming && !infos.is_empty() {
                         stream_items.push((
@@ -4029,7 +4146,7 @@ impl GraphRuntime {
                         .encode(bk.strings()),
                     ));
                 }
-                for (worker, items) in &streamed {
+                for (worker, items) in streamed.iter().chain(&valued) {
                     if !items.is_empty() {
                         frames_out.push((*worker, items.encode(bk.strings())));
                     }

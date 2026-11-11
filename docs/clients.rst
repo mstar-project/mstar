@@ -203,8 +203,7 @@ not the end of a request, and the call goes on. A live call that opens while the
 is at ``max_concurrent_requests`` ends at once with ``status`` 503, rather than wait for a
 slot and start that far behind its input; a one-shot request waits in the queue. Other
 models ignore ``end_input``, and an append to them is rejected.
-Live input needs the Python frontend: ``--rust-frontend`` serves no ``/generate/ws``
-or ``/v1/realtime``. On either route, a model that declares its audio frame (Nemotron
+On either route, a model that declares its audio frame (Nemotron
 VoiceChat: 80 ms, 1280 samples at 16 kHz) gets a live call's audio in whole frames: each
 whole frame of an append goes on as a step of its own and the rest waits for the next
 append, or goes with the stream's end, so appends of any size keep the call on the steps
@@ -256,8 +255,8 @@ On a server with the block, ``GET /healthz`` answers ``OK`` without a key, as op
 server does, and with ``--api-key`` the handshake takes ``Authorization: Api-Key <key>``
 (what the client sends for ``api_key``) as well as ``Bearer``. Every other route still
 takes only ``Bearer``. A server without the block has none of this: it refuses the
-handshake and has no ``/healthz``. Only the Python frontend serves this route;
-``--rust-frontend`` and the Dynamo worker log a warning and serve without it.
+handshake and has no ``/healthz``. Both of ``mstar serve``'s frontends serve this
+route; the Dynamo worker logs a warning and serves without it.
 
 ``openpi_client`` sets no size limit on its messages, but the server does:
 ``ws_max_message_mb`` (by default ``MSTAR_MAX_BODY_MB``, see :doc:`serving`). A larger
