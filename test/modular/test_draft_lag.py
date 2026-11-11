@@ -76,6 +76,25 @@ def test_a_model_never_declares_a_lag_and_a_verify_step_carries_every_step_it_ri
         lag_step(missing, WALK, LAG)
 
 
+def test_only_a_verify_step_stores_a_lagged_drafters_keep_flag():
+    """A prompt step writes every prompt row unlagged, so it stores the carry and not the keep flag;
+    a verify step stores both. (The engine's share is built from the same two functions, which
+    the draft model's share test pins on a built engine.)"""
+    from mstar.engine.resources.draft.drafter import DRAFT_CARRY, CarrySpec, carry_writes
+
+    needs = DrafterNeeds(kv=DRAFT, lag=LAYOUT, carry=CarrySpec(4, torch.float32))
+    share = DrafterShare(
+        verify_walk=WALK, sampler_key="sampler", num_draft_tokens=K, prompt_walks=frozenset({"prefill"}),
+        prompt_writes=carry_writes(needs), verify_writes=verify_writes(needs), prompt_steps={}, verify_steps={},
+        lag=LAG,
+    )
+    prompt = drafter_step(SubmoduleStep(segments=[Segment(1, "main", 5)], steps={"sampler": SamplerStep()}),
+                          "prefill", share)
+    verify = drafter_step(_step(), WALK, share)
+    assert prompt.steps["sampler"].loopback_writes == {DRAFT_CARRY}
+    assert verify.steps["sampler"].loopback_writes == {DRAFT_CARRY, DRAFT_KEEP_FIRST}
+
+
 def _specs(binding: bool = True, positions: int = 1) -> dict:
     pool = PagedKVConfig(num_layers=2, num_kv_heads=2, head_dim=8, max_seq_len=64, max_num_pages=8, page_size=4)
     pool.join(DRAFT)
