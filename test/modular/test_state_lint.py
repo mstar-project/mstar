@@ -19,8 +19,7 @@ import pytest
 PORTED = (
     "mstar/model/qwen3_5", "mstar/model/command_a_plus", "mstar/model/wan22", "mstar/model/flux2_klein",
     "mstar/model/z_image", "mstar/model/ltx2_5", "mstar/model/qwen3_omni", "mstar/model/kokoro",
-    "mstar/model/omnilingual_asr", "mstar/model/omnivoice", "mstar/model/orpheus",
-    "mstar/model/higgs_audio", "mstar/model/voxcpm2",
+    "mstar/model/omnilingual_asr", "mstar/model/omnivoice", "mstar/model/orpheus", "mstar/model/voxcpm2",
 )
 FORBIDDEN_ATTRIBUTES = {
     "node_resources", "resources", "request_state", "request_states", "per_request_states",
@@ -131,10 +130,8 @@ def test_the_lint_lets_a_named_function_keep_its_break_and_no_other():
     assert len(found) == 1 and "at line 3" in found[0]
 
 
-def test_the_lint_reads_the_six_speech_packages():
-    assert {path.parts[2] for path in _sources()} >= {
-        "kokoro", "omnilingual_asr", "omnivoice", "orpheus", "higgs_audio", "voxcpm2",
-    }
+def test_the_lint_reads_the_five_speech_packages():
+    assert {path.parts[2] for path in _sources()} >= {"kokoro", "omnilingual_asr", "omnivoice", "orpheus", "voxcpm2"}
 
 
 def test_the_lint_reads_all_five_reference_packages():

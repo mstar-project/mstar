@@ -2,7 +2,7 @@
 
 Nothing in the engine changes when a model moves to declarations, because it sees the same objects. The hand-written
 specs and steps below are the reference, copied from the models as they stood before the port, so the adapter can't pass
-by agreeing with itself. Higgs's position spec is the one named difference, and its reference says why.
+by agreeing with itself.
 """
 
 from __future__ import annotations
@@ -56,10 +56,6 @@ from mstar.engine.state.adapters import (
 )
 from mstar.engine.state.analysis import state_declaration_problems
 from mstar.model.base import LabelLayout, keyed_labels, serving_resources
-from mstar.model.higgs_audio.components.llm import HiggsAudioLLM
-from mstar.model.higgs_audio.config import HiggsAudioModelConfig
-from mstar.model.higgs_audio.higgs_audio_model import HiggsAudioModel
-from mstar.model.higgs_audio.submodules import HiggsAudioLLMSubmodule
 from mstar.model.kokoro.kokoro_model import KokoroModel
 from mstar.model.omnilingual_asr.config import ctc_config
 from mstar.model.omnilingual_asr.omnilingual_asr_model import OmnilingualASRModel
@@ -87,10 +83,6 @@ PROMPT = Span("ids", "prefill", 7, 7, "text_inputs")
 
 def _orpheus() -> OrpheusModel:
     return _bare(OrpheusModel, config=OrpheusModelConfig())
-
-
-def _higgs() -> HiggsAudioModel:
-    return _bare(HiggsAudioModel, config=HiggsAudioModelConfig())
 
 
 def _omnilingual(dtype: torch.dtype = torch.bfloat16, size: str = "300m") -> OmnilingualASRModel:
@@ -125,31 +117,6 @@ def _orpheus_reference(model) -> list:
                 old_context_len=c.rope_scaling["original_max_position_embeddings"],
             ),
         ),
-    ]
-
-
-def _higgs_reference(model) -> list:
-    c = model.config
-    return [
-        KVSpec(
-            resource_key=KV_CACHE, nodes={"LLM"},
-            config=PagedKVConfig(
-                num_layers=c.num_hidden_layers, num_kv_heads=c.num_key_value_heads, head_dim=c.head_dim,
-                max_seq_len=c.max_position_embeddings, num_qo_heads=c.num_attention_heads, max_num_pages=256,
-            ),
-        ),
-        AttentionSpec(resource_key=ATTN, nodes={"LLM"}, config=AttentionConfig(kv_cache=KV_CACHE)),
-        # The hand-written config set only rope_theta, and its layers passed these three on every call, which call
-        # arguments win over the config. Layers on the contract pass nothing, so the declaration carries them, and
-        # flashinfer's Llama 3.1 kernel stays.
-        PositionSpec(
-            resource_key=ROPE, nodes={"LLM"},
-            config=PositionConfig(
-                kv_cache=KV_CACHE, rope_theta=c.rope_theta, low_freq_factor=1.0, high_freq_factor=1.0,
-                old_context_len=8192,
-            ),
-        ),
-        SamplerSpec(resource_key=SAMPLER, nodes={"LLM"}, vocab_size=c.vocab_size, enable_repetion_penalty=False),
     ]
 
 
@@ -199,20 +166,19 @@ def _voxcpm2_reference(model) -> list:
 _PAGES = {"page_size": 64, "max_num_pages": 512}
 MODELS = {
     "orpheus": (_orpheus, _orpheus_reference, {KV_CACHE: _PAGES}),
-    "higgs": (_higgs, _higgs_reference, {KV_CACHE: _PAGES}),
     "omnivoice": (_omnivoice, _omnivoice_reference, {BACKBONE_ATTN: {"max_segments_per_request": 4}}),
     "omnilingual": (_omnilingual, _omnilingual_reference, {ENCODER_ATTN: {"max_segments_per_step": 8}}),
     "voxcpm2": (_voxcpm2, _voxcpm2_reference, {BASE_KV: _PAGES, RES_KV: _PAGES}),
 }
 _COMPARED = {
-    "OrpheusModel": "orpheus", "HiggsAudioModel": "higgs", "OmniVoiceModel": "omnivoice",
+    "OrpheusModel": "orpheus", "OmniVoiceModel": "omnivoice",
     "OmnilingualASRModel": "omnilingual", "VoxCPM2Model": "voxcpm2",
 }
 _PUBLISHED = [(path, name) for cls, name in _COMPARED.items() for path in _published(cls)]
 
 
 def test_the_published_configs_are_found():
-    assert [sum(name == other for _, name in _PUBLISHED) for other in MODELS] == [4, 1, 2, 4, 1]
+    assert [sum(name == other for _, name in _PUBLISHED) for other in MODELS] == [4, 2, 4, 1]
     assert len(_published("KokoroModel")) == 2, "an empty list would skip their tests"
 
 
@@ -294,36 +260,6 @@ def test_orpheus_steps_equal_the_hand_written_ones(walk):
     tokens = {rid: inp.input_ids for rid, inp, (own, _) in zip(rids, inputs, rows, strict=True) if own == "prefill"}
     step = engine_step(_orpheus_llm(), graph_walk=walk, request_ids=rids, inputs=inputs)
     _assert_steps_equal(step, _orpheus_reference_step(rids, inputs, tokens))
-
-
-def _higgs_llm() -> HiggsAudioLLMSubmodule:
-    return _bind(HiggsAudioLLMSubmodule(None, HiggsAudioModelConfig()), _higgs())
-
-
-def _higgs_reference_step(rids, inputs, kept_rids) -> SubmoduleStep:
-    return SubmoduleStep(
-        segments=_segments(rids, inputs),
-        steps={
-            KV_CACHE: KVStep(),
-            ATTN: AttentionStep(causal=True),
-            SAMPLER: SamplerStep(apply_penalty=False, kept_rids=kept_rids),
-            ROPE: PositionStep(),
-        },
-    )
-
-
-@pytest.mark.parametrize("last", [frozenset(), frozenset({2})])
-def test_higgs_prefill_step_equals_the_hand_written_one(last):
-    rids, inputs = [1, 2], [ARNodeInputs(input_seq_len=5), ARNodeInputs(input_seq_len=3)]
-    info = {rid: SimpleNamespace(step_metadata={"is_last_prefill": rid in last}) for rid in rids}
-    step = engine_step(_higgs_llm(), graph_walk="prefill_audio", request_ids=rids, inputs=inputs, per_request_info=info)
-    _assert_steps_equal(step, _higgs_reference_step(rids, inputs, last))
-
-
-def test_higgs_decode_step_equals_the_hand_written_one():
-    rids, inputs = [1, 2], [ARNodeInputs(input_seq_len=1), ARNodeInputs(input_seq_len=1)]
-    step = engine_step(_higgs_llm(), graph_walk="decode", request_ids=rids, inputs=inputs)
-    _assert_steps_equal(step, _higgs_reference_step(rids, inputs, None))
 
 
 def _within_step_reference(segments, key) -> SubmoduleStep:
@@ -461,20 +397,6 @@ def test_orpheus_layout_converts_to_the_hand_written_one_with_its_keys():
     assert keys.tensor == "text_inputs" and keys.walks == ("prefill",)
 
 
-def test_higgs_layout_converts_to_the_hand_written_one_with_no_keys():
-    from test_model_kv_layouts import _higgs as _higgs_with_a_processor
-
-    model = _higgs_with_a_processor()
-    output = model.process_prompt("transcribe", ["audio"], ["text"], tensors={"audio_inputs": [torch.zeros(16000)]})
-    [layout] = output.metadata["state_layout"][KV_CACHE].values()
-    converted = kv_layouts(model.declare_state(), output.metadata["state_layout"], {})[KV_CACHE]["main"]
-    (span,) = layout.spans
-    assert span.kind == "rows" and span.walk == "prefill_audio" and span.source == "audio_features"
-    reference = LabelLayout(spans=(span,), growth=(("decode_loop", 1),))
-    assert converted == reference and converted.row() == reference.row()
-    assert converted.keyed_count() == 0 and model.kv_labels()[KV_CACHE]["main"].keys is None
-
-
 @pytest.fixture
 def tiny_voxcpm2(tmp_path, monkeypatch) -> VoxCPM2Model:
     (tmp_path / "config.json").write_text(json.dumps(TINY))
@@ -498,17 +420,14 @@ def test_voxcpm2_layout_converts_to_the_hand_written_one_for_both_arrays(tiny_vo
         temperature=OrpheusModelConfig().temperature, top_p=OrpheusModelConfig().top_p,
         repetition_penalty=OrpheusModelConfig().repetition_penalty, ignore_eos=OrpheusModelConfig().ignore_eos,
     )),
-    (_higgs, {"temperature": 0.7, "top_p": 0.5, "ignore_eos": True},
-     SamplingReqConfig(temperature=0.7, top_p=0.5, ignore_eos=True)),
-    (_higgs, {}, SamplingReqConfig(temperature=0.0, top_p=1.0, ignore_eos=False)),
-], ids=["orpheus", "orpheus-defaults", "higgs", "higgs-greedy-by-default"])
+], ids=["orpheus", "orpheus-defaults"])
 def test_request_settings_equal_the_hand_written_config(build, kwargs, reference):
     model = build()
     configs = sampling_configs(model.get_request_resource_configs({}, kwargs), model.declare_state())
     assert configs == {SAMPLER: reference}
 
 
-@pytest.mark.parametrize("build", [_orpheus, _higgs, _omnivoice, _omnilingual], ids=lambda build: build.__name__)
+@pytest.mark.parametrize("build", [_orpheus, _omnivoice, _omnilingual], ids=lambda build: build.__name__)
 def test_declarations_have_no_problems(build):
     assert state_declaration_problems(build()) == []
 
@@ -560,10 +479,7 @@ def _kernel_arguments(manager: RopeManager, monkeypatch, **call) -> tuple:
         low_freq_factor=c.rope_scaling["low_freq_factor"], high_freq_factor=c.rope_scaling["high_freq_factor"],
         old_context_len=c.rope_scaling["original_max_position_embeddings"],
     )),
-    (_higgs, lambda c: dict(
-        rope_theta=c.rope_theta, rope_scale=1.0, low_freq_factor=1.0, high_freq_factor=1.0, old_context_len=8192,
-    )),
-], ids=["orpheus", "higgs"])
+], ids=["orpheus"])
 def test_a_declared_rope_reaches_the_kernel_with_what_the_layers_passed_on_every_call(build, passed, monkeypatch):
     """The layers named these five values per call, and call arguments win over the config, so a declaration that left
     any out would pick another kernel with no error."""
@@ -622,7 +538,6 @@ def _paged_stack(stack_class, model_class, config_class, layers: int):
 
 
 _orpheus_stack = partial(_paged_stack, OrpheusLanguageModel, OrpheusModel, OrpheusModelConfig)
-_higgs_stack = partial(_paged_stack, HiggsAudioLLM, HiggsAudioModel, HiggsAudioModelConfig)
 
 
 def _voxcpm2_stack(layers: int):
@@ -638,7 +553,7 @@ def _voxcpm2_stack(layers: int):
     return stack, handles, (torch.zeros(3, 64),)
 
 
-STACKS = {"orpheus": _orpheus_stack, "higgs": _higgs_stack, "voxcpm2": _voxcpm2_stack}
+STACKS = {"orpheus": _orpheus_stack, "voxcpm2": _voxcpm2_stack}
 
 
 def _ops(graph_module) -> set[str]:
@@ -646,7 +561,7 @@ def _ops(graph_module) -> set[str]:
 
 
 @torch.no_grad()
-@pytest.mark.parametrize("build", [_orpheus_stack, _higgs_stack], ids=["orpheus", "higgs"])
+@pytest.mark.parametrize("build", [_orpheus_stack], ids=["orpheus"])
 def test_the_rotation_compiles_in_the_frame_that_projects_q_and_k(build):
     """Without a QK norm, q and k are views of one projection. In a frame of their own they are aliased inputs to an
     in-place kernel, and a compiled capture fails Inductor's size check at its first run, at boot."""
