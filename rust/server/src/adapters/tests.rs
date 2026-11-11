@@ -317,15 +317,14 @@ fn the_tool_fields_clients_send_by_default_pass() {
         r#""response_format":{"type":"text"}"#,
         r#""stream_options":{"include_usage":true},"user":"u1","store":false,"metadata":{"k":"v"},"service_tier":"auto","parallel_tool_calls":true"#,
     ] {
-        for (name, adapter) in ADAPTERS.iter().filter(|(_, a)| a.supports_chat()) {
+        // an adapter that serves tool calls refuses listed legacy functions: send tools
+        let functions = fields.contains(r#""functions":[{"#);
+        for (name, adapter) in ADAPTERS.iter().filter(|(_, a)| a.supports_chat() && !(functions && a.serves_tool_calls())) {
             let args = adapter.chat_to_request(&chat_with(fields), Path::new("/unused"), false);
             assert!(args.is_ok(), "{fields} refused a plain chat on {name}: {args:?}");
             let mk = args.unwrap().model_kwargs;
             let sent: serde_json::Value = serde_json::from_str(&format!("{{{fields}}}")).unwrap();
-            // GlmChatAdapter checks the tool fields itself and passes the legacy
-            // `functions` / `function_call` on as the Python adapter does
-            let legacy = |key: &str| adapter.serves_tool_calls() && matches!(key, "functions" | "function_call");
-            for key in sent.as_object().unwrap().keys().filter(|k| !legacy(k)) {
+            for key in sent.as_object().unwrap().keys() {
                 assert!(!mk.contains_key(key), "{key} reached the backend from {fields} on {name}");
             }
         }

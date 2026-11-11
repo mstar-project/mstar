@@ -1,5 +1,9 @@
 //! Stop strings, matched on the decoded answer as it streams.
 
+/// The longest stop string a request takes, in characters
+/// (`adapters.MAX_STOP_CHARS`): each feed scans the held text for every stop.
+pub const MAX_STOP_CHARS: usize = 256;
+
 /// Ends a text at the first of its stops to appear. `feed` holds back the end
 /// that may be the start of a stop (at most the longest stop less one
 /// character) and returns the text that may go out, with the stop once one has

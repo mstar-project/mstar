@@ -18,7 +18,7 @@ use serde::Deserialize;
 use super::glm_reply::{self, ReplyParser, Tools};
 use super::*;
 use crate::generation_kwargs as gk;
-use crate::reply::OutputParser;
+use crate::reply::{OutputParser, MAX_STOP_CHARS};
 
 /// What the launcher knows of the model's chat template, as
 /// `MSTAR_CHAT_TEMPLATE` (`chat_template_facts`).
@@ -128,7 +128,8 @@ impl OpenAIAdapter for GlmChat {
     }
 
     /// `stop`, as OpenAI takes it: a string or up to 4. The chat route matches
-    /// them on the decoded answer and ends the request at the first.
+    /// them on the decoded answer and ends the request at the first; their
+    /// length is capped, as every token is matched against each.
     fn stop_strings(&self, req: &ChatCompletionRequest) -> Result<Vec<String>, String> {
         let stops: Vec<String> = match &req.stop {
             None | Some(Value::Null) => Vec::new(),
@@ -145,6 +146,11 @@ impl OpenAIAdapter for GlmChat {
         }
         if stops.iter().any(String::is_empty) {
             return Err("a stop string cannot be empty".to_string());
+        }
+        if stops.iter().any(|s| s.chars().count() > MAX_STOP_CHARS) {
+            return Err(format!(
+                "a stop string takes at most {MAX_STOP_CHARS} characters"
+            ));
         }
         Ok(stops)
     }
@@ -189,6 +195,15 @@ impl OpenAIAdapter for GlmChat {
 fn options(mk: &mut Map<String, Value>) -> Result<Options, String> {
     if mk.contains_key("reply_prefix") {
         return Err("reply_prefix is not a request field; tool_choice sets it".to_string());
+    }
+    // the deprecated names of tools and tool_choice: an off value drops
+    let functions = mk.shift_remove("functions").unwrap_or(Value::Null);
+    let function_call = mk.shift_remove("function_call").unwrap_or(Value::Null);
+    let listed = !functions.is_null() && functions.as_array().is_none_or(|f| !f.is_empty());
+    if listed || !(function_call.is_null() || function_call == "none" || function_call == "auto") {
+        return Err(
+            "functions and function_call are not served; send tools and tool_choice".to_string(),
+        );
     }
     // false ends the reply at its first call; read, not sent on
     match mk.shift_remove("parallel_tool_calls") {

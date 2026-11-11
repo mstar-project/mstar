@@ -20,6 +20,7 @@ use crate::adapters::SubmitArgs;
 use crate::serving::{AppState, Out, OutStream, Outcome};
 use crate::utf8::Utf8Stream;
 use stop::StopMatcher;
+pub use stop::MAX_STOP_CHARS;
 
 /// A tool call's id and name, on its first [`Delta::Call`].
 #[derive(Debug, Clone, PartialEq)]
