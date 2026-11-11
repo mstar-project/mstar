@@ -14,6 +14,7 @@ import torch
 from mstar.distributed.communication import JointGroups
 from mstar.engine.resources.base import (
     AttentionResource,
+    CachedLease,
     CachedPrefix,
     CGSlotSpec,
     EngineResourceInfo,
@@ -220,7 +221,7 @@ class SpanCursor:
 
 
 @dataclass(slots=True)
-class Lease:
+class Lease(CachedLease):
     """The pages the index matched for a stream and holds for it, from the probe until `admit` converts
     them: in each group of its pool, the first group's first, the pages a stream holds once it has written
     ``end`` tokens (`KVManager._held_at`), whole pages only. In a pool of one group, a hit past a cached image end

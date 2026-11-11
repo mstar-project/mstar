@@ -49,7 +49,7 @@ from mstar.engine.resources import (
     StepRunner,
     SubmoduleStep,
 )
-from mstar.engine.resources.base import EngineResourceInfo, KeyedWalks, StepAllowance, build_resource
+from mstar.engine.resources.base import CachedLease, EngineResourceInfo, KeyedWalks, StepAllowance, build_resource
 from mstar.engine.resources.kv.config import instance_size, opening_prefix_caches, unrestorable
 from mstar.engine.resources.kv.keys import fingerprint
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
@@ -1652,7 +1652,7 @@ class Engine:
                     keys=keys,
                 )
 
-    def decide_cached_prefix(self, batch: ExecutingBatch) -> dict[str, dict[str, Any]]:
+    def decide_cached_prefix(self, batch: ExecutingBatch) -> dict[str, dict[str, CachedLease]]:
         """Rank 0's cached-prefix leases for the step it is sending, by wire id, taken now so the
         followers can take the same pages before they build it."""
         keyed = self._keyed_walks.get(batch.node_name)

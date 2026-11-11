@@ -1,11 +1,11 @@
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field
 from enum import Enum, IntEnum
-from typing import Any, NamedTuple
+from typing import NamedTuple
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.resources import PublishedInfo
-from mstar.engine.resources.base import MoveKind
+from mstar.engine.resources.base import CachedLease, MoveKind
 from mstar.graph.base import GraphEdge, TensorPointerInfo
 from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.observability.recorders import MetricSnapshot
@@ -318,7 +318,7 @@ class ScheduleTPNode(MessageBody):
     walk_idx: list[int] = field(default_factory=list)
     # rank 0's prefix-cache leases, by wire request id and then resource, each the resource's own
     # (`Resource.lease_cached_prefix`)
-    prefix_hits: dict[str, dict[str, Any]] = field(default_factory=dict)
+    prefix_hits: dict[str, dict[str, CachedLease]] = field(default_factory=dict)
     page_trails: dict[str, tuple[int, ...]] = field(default_factory=dict)
     # A row of the step takes an input a follower reads from elsewhere: every
     # rank agrees on whose read failed before preparing the step

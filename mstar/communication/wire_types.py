@@ -22,7 +22,7 @@ from mstar.api_server.request_types import (
 )
 from mstar.communication.wire import _set_polymorphic, register
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.resources.base import PublishedInfo
+from mstar.engine.resources.base import CachedLease, PublishedInfo
 from mstar.engine.resources.kv.config import KVReqConfig
 from mstar.engine.resources.kv.manager import Lease, PublishedKVInfo
 from mstar.engine.resources.kv.rolling.config import RollingKVReqConfig
@@ -65,7 +65,7 @@ from mstar.utils.ipc_format import (
 )
 
 # The abstract field types; a value of one of these carries [tag, body].
-_set_polymorphic(MessageBody, PublishedInfo, ResourceReqConfig, KVTransferInfo)
+_set_polymorphic(MessageBody, PublishedInfo, CachedLease, ResourceReqConfig, KVTransferInfo)
 
 _TYPES: dict[str, type] = {
     # top-level envelopes

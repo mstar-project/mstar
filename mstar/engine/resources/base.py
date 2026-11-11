@@ -118,6 +118,12 @@ class CachedPrefix(NamedTuple):
     position: int
 
 
+@dataclass(slots=True)
+class CachedLease:
+    """Rank 0's lease of a resource's cached prefix, which a TP follower takes as given. Each resource that
+    leases subclasses it with what its followers need."""
+
+
 class Residency(IntEnum):
     """Where a request's state on a node is: on the device, copied to the host, or dropped for a rebuild
     from its ids. Ordered by how far the state is from the device."""
@@ -304,14 +310,13 @@ class Resource(ResidentHooks, ABC):
         """Called for a walk the cache served whole, since that walk never admits or commits."""
         return
 
-    def lease_cached_prefix(self, rid: str, node_name: str, graph_walk: str) -> Any:
+    def lease_cached_prefix(self, rid: str, node_name: str, graph_walk: str) -> CachedLease | None:
         """On rank 0 of a TP node, lease the request's cached prefix as its step is sent and
-        return the lease, or None. The followers' `adopt_cached_prefix` takes it back as it is,
-        so it must be an mstar dataclass or a value the wire carries as data (`wire._dynamic`)."""
+        return the lease, or None. The followers' `adopt_cached_prefix` takes it back as it is."""
         return None
 
     def adopt_cached_prefix(
-        self, rid: str, node_name: str, graph_walk: str, lease: Any, caught_up: bool,
+        self, rid: str, node_name: str, graph_walk: str, lease: CachedLease, caught_up: bool,
     ) -> bool:
         """On a TP follower, take rank 0's ``lease``, the pages it counts lent included. False until this rank
         holds its pages too, and raises if it still lacks them once ``caught_up``."""

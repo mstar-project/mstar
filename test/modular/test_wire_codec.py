@@ -195,6 +195,7 @@ def test_rank_0s_leases_and_page_trails_round_trip_typed():
 
     assert got.prefix_hits == body.prefix_hits, "a follower would take another lease than rank 0's"
     assert got.page_trails == body.page_trails, "a follower would check another trail than rank 0's"
+    assert type(got.prefix_hits["r"]["kv"]) is Lease, "the lease came back as the base type"
 
 
 def test_unregistered_payloads_still_round_trip():
