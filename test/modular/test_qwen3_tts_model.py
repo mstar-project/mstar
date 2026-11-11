@@ -301,11 +301,21 @@ def test_qwen3_tts_1p7b_variants_share_class_configs_and_adapter():
         assert deployment["model"] == key
         # the same attention backend; pool sizes are per deployment
         assert deployment["resources"]["talker_attn"] == base_yaml["resources"]["talker_attn"]
-        ranks = {name: group["ranks"] for group in deployment["node_groups"] for name in group["node_names"]}
-        base_ranks = {name: group["ranks"] for group in base_yaml["node_groups"] for name in group["node_names"]}
-        assert ranks["Talker"] == base_ranks["Talker"] and ranks["Codec"] == base_ranks["Codec"]
         if key == "qwen3_tts_base":
+            # The default keeps the 0.6B's layout, the RefEncoder beside the Talker; the split config
+            # gives every node a worker of its own, all on one GPU under MPS, with the default's settings.
+            ranks = {name: group["ranks"] for group in deployment["node_groups"] for name in group["node_names"]}
+            base_ranks = {name: group["ranks"] for group in base_yaml["node_groups"] for name in group["node_names"]}
+            assert ranks["Talker"] == base_ranks["Talker"] and ranks["Codec"] == base_ranks["Codec"]
             assert ranks["RefEncoder"] == ranks["Talker"]   # the clone prefill runs on the Talker's GPU
+            assert not deployment.get("mps", False)
+            split = yaml.safe_load((CONFIG_PATH.parent / "qwen3tts_base_split.yaml").read_text(encoding="utf-8"))
+            devices = split.get("rank_devices", {})
+            split_ranks = [rank for group in split["node_groups"] for rank in group["ranks"]]
+            assert split["mps"] is True and {devices.get(rank, rank) for rank in split_ranks} == {0}
+            assert len(set(split_ranks)) == 3
+            shared = ("model", "max_seq_len", "model_kwargs", "resources", "knobs")
+            assert {k: split.get(k) for k in shared} == {k: deployment.get(k) for k in shared}
         else:
             assert deployment["node_groups"] == base_yaml["node_groups"]
         assert isinstance(get_adapter(key), Qwen3TTSAdapter)
@@ -637,16 +647,17 @@ def test_qwen3_tts_base_declares_clone_walks_and_plans_them_for_reference_audio(
     # The codec runs its one walk
     assert [step.walk for step in model.walk_plan("Codec", ["audio", "text"], ["audio"], {}, {})] == ["codec_chunk"]
 
-    # The Base deployment maps the extra node and walks.
-    deployment = yaml.safe_load((CONFIG_PATH.parent / "qwen3tts_base.yaml").read_text(encoding="utf-8"))
-    groups = {name: group for group in deployment["node_groups"] for name in group["node_names"]}
-    assert "RefEncoder" in groups
-    assert "talker_prefill_clone" in groups["RefEncoder"]["graph_walks"]
-    assert groups["Codec"]["graph_walks"] == ["codec_chunk"]
-    by_walk = {}
-    for worker_graph in model.get_worker_graphs(str(CONFIG_PATH.parent / "qwen3tts_base.yaml")):
-        by_walk.setdefault(next(iter(worker_graph.graph_walks)), worker_graph)
-    assert {"talker_prefill_clone", "codec_chunk"} <= set(by_walk)
+    # The Base deployments, colocated and split (MPS), map the extra node and walks.
+    for name in ("qwen3tts_base.yaml", "qwen3tts_base_split.yaml"):
+        deployment = yaml.safe_load((CONFIG_PATH.parent / name).read_text(encoding="utf-8"))
+        groups = {node: group for group in deployment["node_groups"] for node in group["node_names"]}
+        assert "RefEncoder" in groups, name
+        assert "talker_prefill_clone" in groups["RefEncoder"]["graph_walks"], name
+        assert groups["Codec"]["graph_walks"] == ["codec_chunk"], name
+        by_walk = {}
+        for worker_graph in model.get_worker_graphs(str(CONFIG_PATH.parent / name)):
+            by_walk.setdefault(next(iter(worker_graph.graph_walks)), worker_graph)
+        assert {"talker_prefill_clone", "codec_chunk"} <= set(by_walk), name
 
 
 def test_qwen3_tts_config_rejects_unknown_variant():
