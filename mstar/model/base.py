@@ -1244,7 +1244,10 @@ class Model(ABC):
         a node in ``cfg_enabled_nodes`` whose group sets ``cfg_size > 1``
         (passed only then): each rank runs its ``my_rows(cfg_group,
         branches)`` share of the branches and ``cfg_group.all_gather``
-        reassembles them. Nothing else about the node changes.
+        reassembles them. Each cfg rank keeps its own copy of the node's
+        resources, so a step the node declares to a pool whose ranks must take
+        the same pages (a paged KV) must not depend on the rank's share:
+        declare it over every branch.
 
         ``moe_parallel`` is the node group's ``ep_config``: TP or EP for the
         node's routed experts. Passed only for a node in ``ep_enabled_nodes``
