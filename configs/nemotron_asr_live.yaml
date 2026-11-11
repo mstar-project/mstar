@@ -2,7 +2,9 @@ model: "nemotron_asr"
 max_seq_len: 8192
 # Whole clips and live calls (/v1/realtime?intent=transcription, /generate/ws). A
 # request holds one decoder state slot from its first decode iteration until it is
-# torn down; the pool holds max_concurrent_requests of them plus its sink slot.
+# torn down; the pool holds max_concurrent_requests of them plus its sink slot. A live
+# call also holds a slot in stream_kv, stream_conv and stream_front: size their max_slots
+# too (stream_kv holds the cap itself, the other two the cap plus a sink slot).
 max_concurrent_requests: 128
 resources:
   transducer_state:

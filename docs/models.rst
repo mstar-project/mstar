@@ -542,7 +542,9 @@ FastConformer ASR (``canary``, ``canary_qwen``, ``parakeet``, ``nemotron_asr``) 
   cursor) sits in a recurrent state slot from its first decode iteration until the request
   is torn down; the YAMLs size ``resources.transducer_state.max_slots`` (129) for
   ``max_concurrent_requests`` (128) and the sink slot, and startup refuses a cap the pool
-  can't hold. A decode iteration is 64 greedy steps, and its tokens stream out as it ends. ``compile_step: false`` in
+  can't hold. A live deployment also sizes ``stream_kv``, ``stream_conv`` and
+  ``stream_front`` ``max_slots`` (``stream_kv`` holds the cap, the other two the cap plus
+  a sink slot). A decode iteration is 64 greedy steps, and its tokens stream out as it ends. ``compile_step: false`` in
   their ``model_kwargs`` decodes with eager kernels instead of the compiled step.
 - Canary's and Canary-Qwen's YAMLs size the KV caches for ``max_concurrent_requests`` (64),
   and startup refuses a cap the caches can't hold.
