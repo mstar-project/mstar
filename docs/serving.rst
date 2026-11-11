@@ -579,7 +579,7 @@ attention takes no split steps runs on ``sp_size`` above 1. Raise ``max_num_page
 factor to turn the freed memory into context. A node on SP ranks needs at least one of the two.
 
 The sequence shard's ``exchange`` picks how a split step reaches the node's paged attentions,
-from where their KV is stored. ``auto`` (the default) splits by Ulysses over KV stored by head,
+from where their KV is stored. ``auto`` (the default; Qwen3-Omni's Thinker and Qwen3.5 default to ``none``) splits by Ulysses over KV stored by head,
 and over KV stored by position runs the node's steps copied (KV capacity alone). Over KV stored by
 position, ``all_gather`` splits them, and ``ring`` also bounds the attention phase's memory to
 this rank's tokens and runs eager only. ``ulysses`` (by head) states the default, and ``none``

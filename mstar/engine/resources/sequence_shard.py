@@ -872,7 +872,7 @@ def sequence_parallel_refusals(
         if placed:
             return []
         if shard is not None:
-            # a model may default its shard to none (Qwen3-Omni's Thinker), leaving Ulysses over its
+            # a model may default its shard to none (Qwen3-Omni's Thinker, Qwen3.5's LLM), leaving Ulysses over its
             # pools stored by head the deployment's opt-in
             opt_in = (
                 f", split its steps by Ulysses (resources: {shard.resource_key}: exchange: ulysses)"
