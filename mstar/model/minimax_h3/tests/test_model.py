@@ -213,7 +213,7 @@ def _data_worker(model):
     from mstar.api_server.data_worker import PreprocessWorkerThread
 
     worker = PreprocessWorkerThread.__new__(PreprocessWorkerThread)
-    worker.model, worker.device, worker._keyed_labels = model, "cpu", None
+    worker.model, worker.device, worker._keyed_labels = model, "cpu", {}
     return worker
 
 
