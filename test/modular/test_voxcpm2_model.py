@@ -49,6 +49,7 @@ from mstar.model.voxcpm2.config import (
     REF_AUDIO_END_TOKEN,
     REF_AUDIO_START_TOKEN,
     REF_DIGEST_KEY,
+    TALKER_DECODE_METADATA,
     TALKER_STEP,
     VoxCPM2Config,
 )
@@ -323,6 +324,11 @@ def _info(rid: str, seed: int = 0, step_metadata: dict | None = None) -> SimpleN
     return SimpleNamespace(rid_handle=rid, request_id=rid, random_seed=seed, step_metadata=step_metadata or {})
 
 
+def _decode_info(rid: str, seed: int, prefill_metadata: dict) -> SimpleNamespace:
+    """A decode step's info, with only the keys the walk plan's decode step carries."""
+    return _info(rid, seed, {key: prefill_metadata[key] for key in TALKER_DECODE_METADATA})
+
+
 def _layout(metadata: dict) -> list:
     return [metadata[PROMPT_MODE_KEY], metadata[PATCH_BUDGET_KEY], metadata[MIN_LEN_KEY]]
 
@@ -421,16 +427,16 @@ def test_talker_caps_decode_where_its_stop_check_ends_it(model, budget):
     iteration fewer than the budget, since the prefill's patch counts."""
     talker, _, _ = _talker(model)
     edges, meta = _request(model, "hello world", max_new_tokens=budget)
-    info = _info("a", 5, meta)
+    infos = {"talker_prefill": _info("a", 5, meta), "talker_decode": _decode_info("a", 5, meta)}
     patch = torch.zeros(model.config.patch_size, model.config.feat_dim)
     walk, inputs, iterations = "talker_prefill", edges, 0
     while True:
-        prepared = talker.prepare_inputs(walk, info, inputs)
+        prepared = talker.prepare_inputs(walk, infos[walk], inputs)
         # the stop head never fires, so only the budget ends decode
         out = {"latent_patch": [patch], "stop_flag": [torch.tensor([0, prepared.kwargs["step"]])]}
         _commit(talker, walk, ["a"], [prepared])
         inputs = {"latent_patch": out["latent_patch"]}
-        stop = talker.check_stop("a", info, out)
+        stop = talker.check_stop("a", infos[walk], out)
         if walk == "talker_decode":
             iterations += 1
             if stop:
@@ -765,6 +771,7 @@ def _run(talker, plan, requests: dict, steps: int, trace: dict | None = None, ru
     noise per request."""
     rids = list(requests)
     infos = {rid: _info(rid, seed, meta) for rid, ((_, meta), seed) in requests.items()}
+    decode_infos = {rid: _decode_info(rid, seed, meta) for rid, ((_, meta), seed) in requests.items()}
     engine = SimpleNamespace(request_ids=rids, piecewise_runners=runners or {}, captured=False)
     prepared = [talker.prepare_inputs("talker_prefill", infos[rid], requests[rid][0][0]) for rid in rids]
     plan([p.input_seq_len for p in prepared])
@@ -775,7 +782,8 @@ def _run(talker, plan, requests: dict, steps: int, trace: dict | None = None, ru
         talker.postprocess(rid, infos[rid], out[rid], inputs=p)
     for _ in range(steps - 1):
         prepared = [
-            talker.prepare_inputs("talker_decode", infos[rid], {"latent_patch": [patches[rid][-1]]}) for rid in rids
+            talker.prepare_inputs("talker_decode", decode_infos[rid], {"latent_patch": [patches[rid][-1]]})
+            for rid in rids
         ]
         plan([1] * len(rids))
         out = talker.forward_batched("talker_decode", engine, **talker.preprocess("talker_decode", engine, prepared))
@@ -911,10 +919,10 @@ def test_talker_vetoes_steps_past_the_patch_budget(model):
     info = _info("r", 0, meta)
     _commit(talker, "talker_prefill", ["r"], [talker.prepare_inputs("talker_prefill", info, request)])
     patch = torch.zeros(4, 8)
-    first = talker.prepare_inputs("talker_decode", info, {"latent_patch": [patch]})
+    first = talker.prepare_inputs("talker_decode", _decode_info("r", 0, meta), {"latent_patch": [patch]})
     assert first is not None and first.kwargs["step"] == 1
     _commit(talker, "talker_decode", ["r"], [first])
-    assert talker.prepare_inputs("talker_decode", info, {"latent_patch": [patch]}) is None
+    assert talker.prepare_inputs("talker_decode", _decode_info("r", 0, meta), {"latent_patch": [patch]}) is None
 
 
 def test_talker_reprepares_a_refused_step_with_the_same_index_and_noise(model):
@@ -925,8 +933,8 @@ def test_talker_reprepares_a_refused_step_with_the_same_index_and_noise(model):
     info = _info("r", 0, meta)
     _commit(talker, "talker_prefill", ["r"], [talker.prepare_inputs("talker_prefill", info, request)])
     patch = torch.zeros(4, 8)
-    refused = talker.prepare_inputs("talker_decode", info, {"latent_patch": [patch]})
-    retry = talker.prepare_inputs("talker_decode", info, {"latent_patch": [patch]})
+    refused = talker.prepare_inputs("talker_decode", _decode_info("r", 0, meta), {"latent_patch": [patch]})
+    retry = talker.prepare_inputs("talker_decode", _decode_info("r", 0, meta), {"latent_patch": [patch]})
     assert retry is not None and retry.kwargs["step"] == 1
     assert torch.equal(retry.tensor_inputs["noise"], refused.tensor_inputs["noise"])
 
@@ -940,7 +948,9 @@ def test_talker_host_writes_rely_on_exec_declaring_again_after_a_pre_plan(model)
     step instead of declaring its own, ``generated`` and ``rng`` would never move and every decode step would draw the
     prefill's next noise again."""
     talker, _, _ = _talker(model)
-    *_, graph = talker.get_accelerator_graph_configs(torch.device("cpu"))  # the decode capture
+    [graph] = [
+        g for g in talker.get_accelerator_graph_configs(torch.device("cpu")) if g.capture_graph_walk == "talker_decode"
+    ]
     request, meta = _request(model, "hello")
     info = _info("r", 0, meta)
     _commit(talker, "talker_prefill", ["r"], [talker.prepare_inputs("talker_prefill", info, request)])
@@ -949,7 +959,8 @@ def test_talker_host_writes_rely_on_exec_declaring_again_after_a_pre_plan(model)
     rows = graph.get_node_inputs(2, 0)
     runner = SimpleNamespace(declare_inputs_for=lambda lease: rows, step_ids=lambda lease, rids: [*rids, "pad"])
     context = StepContext(("r",), "talker_decode", 0, False)
-    batch = SimpleNamespace(node_name="Talker", inputs=None, request_ids=["r"], per_request_info={"r": info}, step=None,
+    batch = SimpleNamespace(node_name="Talker", inputs=None, request_ids=["r"],
+                            per_request_info={"r": _decode_info("r", 0, meta)}, step=None,
                             step_context=context)
     engine = Engine.__new__(Engine)
     # a refused pre-admit ends the pre-plan with everything this test reads already decided
@@ -962,7 +973,7 @@ def test_talker_host_writes_rely_on_exec_declaring_again_after_a_pre_plan(model)
     assert reused == [None], "exec reuses a pre-planned step only for a walk with no input in its declaration"
     assert _committed(talker, "r") == before, "a pre-plan writes nothing"
 
-    prepared = talker.prepare_inputs("talker_decode", info, {"latent_patch": [torch.zeros(4, 8)]})
+    prepared = talker.prepare_inputs("talker_decode", _decode_info("r", 0, meta), {"latent_patch": [torch.zeros(4, 8)]})
     step = engine_step(talker, graph_walk="talker_decode", request_ids=["r", "pad"], inputs=[prepared, rows[1]])
     context.is_preplan = False
     step.set_ctx(context)
@@ -999,11 +1010,13 @@ def test_talker_padded_replay_writes_the_real_rows_and_stages_each_rows_cfg(mode
     """``preprocess`` sees padding rows as copies of the template, and ``declare_step`` tells them from real rows by
     ``rng``, so one real row in a padded bucket advances and the padding rows touch no store."""
     talker, _, _ = _talker(model)
-    *_, graph = talker.get_accelerator_graph_configs(torch.device("cpu"))  # the decode capture
+    [graph] = [
+        g for g in talker.get_accelerator_graph_configs(torch.device("cpu")) if g.capture_graph_walk == "talker_decode"
+    ]
     request, meta = _request(model, "hello", cfg_value=1.5)
     info = _info("r", 0, meta)
     _commit(talker, "talker_prefill", ["r"], [talker.prepare_inputs("talker_prefill", info, request)])
-    prepared = talker.prepare_inputs("talker_decode", info, {"latent_patch": [torch.zeros(4, 8)]})
+    prepared = talker.prepare_inputs("talker_decode", _decode_info("r", 0, meta), {"latent_patch": [torch.zeros(4, 8)]})
     rows, rids = [prepared, *graph.get_node_inputs(3, 0)], ["r", 91, 92, 93]
 
     packed = talker.preprocess("talker_decode", SimpleNamespace(request_ids=rids), rows)
@@ -1036,7 +1049,7 @@ def test_talker_fields_go_with_the_request_when_the_engine_removes_it(model):
     engine.remove_request("r")
     assert talker.progress.host_fields._fields == {}, "a recycled handle would read this request's progress"
     with pytest.raises(ValueError, match="no host fields"):
-        talker.prepare_inputs("talker_decode", info, {"latent_patch": [torch.zeros(4, 8)]})
+        talker.prepare_inputs("talker_decode", _decode_info("r", 0, meta), {"latent_patch": [torch.zeros(4, 8)]})
 
 
 @pytest.mark.parametrize("no_rope", [True, False])
@@ -1182,7 +1195,10 @@ def test_talker_packs_a_mixed_batch_like_per_request_prompts(model):
     _commit(talker, "talker_prefill_clone", rids, prepared)
     design = ARNodeInputs(input_seq_len=1, kwargs={"step": 1, "rng": prepared[1].kwargs["rng"]})
     _commit(talker, "talker_decode", ["design"], [design])  # one row a patch ahead
-    prepared = [talker.prepare_inputs("talker_decode", infos[rid], {"latent_patch": [patches[rid]]}) for rid in rids]
+    decode_infos = {rid: _decode_info(rid, i, meta) for i, (rid, (_, meta)) in enumerate(requests.items())}
+    prepared = [
+        talker.prepare_inputs("talker_decode", decode_infos[rid], {"latent_patch": [patches[rid]]}) for rid in rids
+    ]
     packed = talker.preprocess("talker_decode", engine, prepared)
     assert list(packed) == ["noise", "cfg", "step_index", "prev_patch"]
     assert packed["step_index"].dtype == torch.long and packed["step_index"].tolist() == [1, 2, 1, 1]
