@@ -426,7 +426,7 @@ def test_cosmos3_windowed_captured_step_prep_reads_no_tensor(monkeypatch):
         assert host.reads == [], f"step {k}: host reads {host.reads}"
         assert got is not None
     ni = prepare(4)
-    assert ni.resource_step_info.capture_key == (1, ch, 3, 4, 4)
+    assert ni.resource_step_info.capture_key == ((1, ch, 3, 4, 4), "cfg")
     assert torch.equal(ni.tensor_inputs["vision_timesteps"],
                        st["scheduler"].timesteps[1].to(torch.float32).expand(12))
 
