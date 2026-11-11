@@ -23,6 +23,7 @@ from mstar.engine.node_dtype import resolve_model_dtype
 from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec, AttentionStep
 from mstar.engine.resources.attn.ragged.config import RaggedAttentionConfig, RaggedAttentionSpec
 from mstar.engine.resources.kv.config import KVSpec, KVStep, PagedKVConfig
+from mstar.engine.resources.lora.config import LORA_RESOURCE_KEY
 from mstar.engine.resources.position.config import PositionConfig, PositionSpec, PositionStep
 from mstar.engine.resources.recurrent.config import (
     RecurrentBlockConfig,
@@ -34,19 +35,21 @@ from mstar.engine.resources.sampler.config import SamplerSpec, SamplerStep, Samp
 from mstar.engine.resources.spec import apply_yaml_overrides
 from mstar.engine.resources.step import Segment, SubmoduleStep
 from mstar.engine.state import Span
-from mstar.engine.state.adapters import kv_layouts, node_resources, sampling_configs, state_steps
+from mstar.engine.state.adapters import StateSetup, kv_layouts, node_resources, sampling_configs, state_steps
 from mstar.engine.state.analysis import declaration_digest, state_declaration_problems
-from mstar.model.base import LabelLayout, parse_autocast_dtype, serving_resources
+from mstar.model.base import LabelLayout, enabled_resources, parse_autocast_dtype, serving_resources
 from mstar.model.canary_qwen.canary_qwen_model import CanaryQwenModel
 from mstar.model.canary_qwen.submodules import CanaryQwenLLMSubmodule
 from mstar.model.components.aut_submodule import AUT_ENCODE
 from mstar.model.components.fastconformer import FastConformerConfig
+from mstar.model.components.request_kwargs import sampler_capabilities, sampling_config
 from mstar.model.components.transducer import TransducerConfig
 from mstar.model.fish_s2_pro.components.dac import FishDACDecoder
 from mstar.model.fish_s2_pro.components.incremental_dac import FRAMES, IncrementalDACDecoder, _state_width
 from mstar.model.fish_s2_pro.fish_s2_pro_model import FishS2ProModel
 from mstar.model.fish_s2_pro.submodules import ARSubmodule
 from mstar.model.fish_s2_pro.submodules import CodecSubmodule as FishCodecSubmodule
+from mstar.model.multimodal_decoder import MultimodalDecoderModel
 from mstar.model.parakeet.config import ParakeetModelConfig
 from mstar.model.parakeet.parakeet_model import ParakeetModel
 from mstar.model.parakeet.submodules import TransducerSubmodule
@@ -107,7 +110,10 @@ def _canary_reference(model, page_size=None) -> list:
         PositionSpec(
             resource_key="rope", nodes={"llm"}, config=PositionConfig(kv_cache="kv_cache", rope_theta=llm.rope_theta),
         ),
-        SamplerSpec(resource_key="sampler", nodes={"llm"}, vocab_size=llm.vocab_size, enable_repetion_penalty=False),
+        SamplerSpec(
+            resource_key="sampler", nodes={"llm"}, vocab_size=llm.vocab_size,
+            **sampler_capabilities(model.sampling_defaults),
+        ),
     ]
 
 
@@ -135,7 +141,10 @@ def _asr_reference(model) -> list:
         PositionSpec(
             resource_key="rope", nodes={"LLM"}, config=PositionConfig(kv_cache="kv_cache", rope_theta=text.rope_theta),
         ),
-        SamplerSpec(resource_key="sampler", nodes={"LLM"}, vocab_size=text.vocab_size, enable_repetion_penalty=False),
+        SamplerSpec(
+            resource_key="sampler", nodes={"LLM"}, vocab_size=text.vocab_size,
+            **sampler_capabilities(model.sampling_defaults),
+        ),
     ]
 
 
@@ -190,7 +199,7 @@ def _fish_reference(model) -> list:
         ),
         SamplerSpec(
             resource_key="semantic_sampler", nodes={"AR"}, vocab_size=model.config.semantic_head_size,
-            enable_repetion_penalty=True,
+            enable_repetition_penalty=True,
         ),
         RecurrentStateSpec(
             resource_key="codec_state", nodes={"Codec"},
@@ -226,8 +235,10 @@ def _tts_codec_blocks(config, dtype: torch.dtype) -> dict[str, RecurrentBlockCon
     return blocks
 
 
+# Less the opt-in LoRA spec, which `enabled_resources` builds only when a deployment names it
 def _tts_reference(model) -> list:
     talker = model.config.talker
+    defaults = model._generation_defaults()
     return [
         KVSpec(
             resource_key="talker_kv", nodes={"Talker"},
@@ -246,11 +257,11 @@ def _tts_reference(model) -> list:
         ),
         SamplerSpec(
             resource_key="talker_sampler", nodes={"Talker"}, vocab_size=talker.vocab_size,
-            enable_repetion_penalty=True,
+            enable_repetition_penalty=True, enable_min_p=bool(defaults.get("min_p")),
         ),
         SamplerSpec(
             resource_key="code_predictor", nodes={"Talker"}, vocab_size=talker.code_predictor.vocab_size,
-            enable_repetion_penalty=False,
+            enable_repetition_penalty=False, enable_min_p=bool(defaults.get("code_predictor_min_p")),
         ),
         RecurrentStateSpec(
             resource_key="codec_state", nodes={"Codec"},
@@ -291,7 +302,7 @@ OVERRIDES |= dict.fromkeys(("qwen3_tts_1p7b", "qwen3_tts_voicedesign", "qwen3_tt
 def test_specs_equal_the_hand_written_ones(name):
     build, reference = MODELS[name]
     model = build()
-    _assert_equal_per_key(node_resources(model), reference(model))
+    _assert_equal_per_key(enabled_resources(model, {}, StateSetup()), reference(model))
 
 
 @pytest.mark.parametrize("name", MODELS)
@@ -331,6 +342,10 @@ def test_specs_equal_the_hand_written_ones_on_every_published_config(path, tmp_p
     apply_yaml_overrides(expected, deployment)
     kv_dtype = parse_autocast_dtype(resolve_model_dtype(model, deployment))
     _assert_equal_per_key(serving_resources(model, deployment), expected, kv_dtype)
+
+
+def test_qwen3_tts_writes_only_lora_by_hand():
+    assert {spec.resource_key for spec in _tts().get_node_resources()} == {LORA_RESOURCE_KEY}
 
 
 def test_canary_qwen_differs_only_in_a_page_size_that_means_the_same_pages():
@@ -379,6 +394,12 @@ def _rows(*spans) -> list[ARNodeInputs]:
     return [ARNodeInputs(input_seq_len=span) for span in spans]
 
 
+def _decoder_rows(walk: str, spans) -> tuple[list[ARNodeInputs], dict]:
+    """Rows with their ids, and the prompt tokens `SampledTokenDecoder` tracks for the penalty."""
+    rows = [ARNodeInputs(input_ids=torch.arange(span), input_seq_len=span) for span in spans]
+    return rows, {} if walk == "decode" else {rid: row.input_ids for rid, row in zip([1, 2], rows, strict=True)}
+
+
 def _reference_step(steps: dict, rids, spans, cg_key_info=None) -> SubmoduleStep:
     segments = [Segment(request_id=rid, label="main", span=span) for rid, span in zip(rids, spans, strict=True)]
     return SubmoduleStep(segments=segments, steps=steps, cg_key_info=cg_key_info)
@@ -387,20 +408,22 @@ def _reference_step(steps: dict, rids, spans, cg_key_info=None) -> SubmoduleStep
 @pytest.mark.parametrize("walk, spans", [("prefill", (7, 3)), ("decode", (1, 1))])
 def test_canary_qwen_steps_equal_the_hand_written_ones(walk, spans):
     node = _bind(_node(CanaryQwenLLMSubmodule), _canary(), "llm")
-    step = engine_step(node, walk, [1, 2], _rows(*spans))
+    rows, prompt = _decoder_rows(walk, spans)
+    step = engine_step(node, walk, [1, 2], rows)
     _assert_steps_equal(step, _reference_step({
-        "kv_cache": KVStep(), "attn": AttentionStep(causal=True), "sampler": SamplerStep(apply_penalty=False),
-        "rope": PositionStep(),
+        "kv_cache": KVStep(), "attn": AttentionStep(causal=True),
+        "sampler": SamplerStep(apply_penalty=True, prefill_tracked_tokens=prompt), "rope": PositionStep(),
     }, [1, 2], spans))
 
 
 @pytest.mark.parametrize("walk, spans", [("prefill", (7, 3)), ("decode", (1, 1))])
 def test_qwen3_asr_llm_steps_equal_the_hand_written_ones(walk, spans):
     node = _bind(_node(Qwen3ASRLLMSubmodule), _asr(), "LLM")
-    step = engine_step(node, walk, [1, 2], _rows(*spans))
+    rows, prompt = _decoder_rows(walk, spans)
+    step = engine_step(node, walk, [1, 2], rows)
     _assert_steps_equal(step, _reference_step({
-        "kv_cache": KVStep(), "attn": AttentionStep(causal=True), "sampler": SamplerStep(apply_penalty=False),
-        "rope": PositionStep(),
+        "kv_cache": KVStep(), "attn": AttentionStep(causal=True),
+        "sampler": SamplerStep(apply_penalty=True, prefill_tracked_tokens=prompt), "rope": PositionStep(),
     }, [1, 2], spans))
 
 
@@ -540,22 +563,23 @@ def test_canary_qwen_layout_converts_to_the_hand_written_one():
 
     model = _model_with_word_tokenizer()
     model.config = _canary().config
-    model.audio_token_id = 3
-    model.prompt_ids = lambda frames, instruction: list(range(frames + 4))
+    model.audio_token_id = model.tokenizer.encode(model.config.audio_locator_tag)[0]
     out = model.process_prompt(None, ["audio", "text"], ["text"], tensors={"audio_inputs": [torch.zeros(16000)]})
     n = out.new_input_tensors["text_inputs"][0].shape[0]
     span = Span("rows", "prefill", n, n, "text_inputs")
     _assert_layout_converts(model, out.metadata, "kv_cache", span, "decode_loop")
 
 
-def test_qwen3_asr_layout_converts_to_the_hand_written_one():
+def test_qwen3_asr_layout_converts_to_the_scaffolds():
+    """The scaffold keys none of a media prompt's spans. The state layout holds no count, so it rides beside it."""
     from test_qwen3_asr_model import _make_model
 
     model = _make_model()
-    out = model.process_prompt(None, ["audio", "text"], ["text"], tensors={"audio_inputs": [torch.zeros(16000)]})
-    n = out.new_input_tensors["text_inputs"][0].shape[0]
-    span = Span("rows", "prefill", n, n, "text_inputs")
-    _assert_layout_converts(model, out.metadata, "kv_cache", span, "decode_loop")
+    args = (None, ["audio", "text"], ["text"], {"audio_inputs": [torch.zeros(16000)]})
+    scaffold = MultimodalDecoderModel.process_prompt(model, *args).metadata["kv_layout"]
+    metadata = model.process_prompt(*args).metadata
+    assert "kv_layout" not in metadata, "a ported model returns its layout under state_layout"
+    assert kv_layouts(model.declare_state(), metadata["state_layout"], metadata["keyed_spans"]) == scaffold
 
 
 @pytest.mark.parametrize("clone", [False, True])
@@ -587,22 +611,22 @@ def test_qwen3_tts_layout_converts_to_the_hand_written_one():
 def test_canary_qwen_request_settings_equal_the_hand_written_config():
     model = _canary()
     kwargs = {"temperature": 0.5, "top_p": 0.9, "ignore_eos": True}
-    configs = sampling_configs(model.get_request_resource_configs({}, kwargs), model.declare_state())
-    assert configs == {"sampler": SamplingReqConfig(temperature=0.5, top_p=0.9, ignore_eos=True)}
-    configs = sampling_configs(model.get_request_resource_configs({}, {}), model.declare_state())
-    assert configs == {"sampler": SamplingReqConfig(temperature=0.0, top_p=1.0, ignore_eos=False)}, "NeMo is greedy"
+    configs = sampling_configs(model.get_request_resource_configs([], [], kwargs), model.declare_state())
+    assert configs == {"sampler": sampling_config(model.sampling_defaults, kwargs)}
+    configs = sampling_configs(model.get_request_resource_configs([], [], {}), model.declare_state())
+    assert configs == {"sampler": sampling_config(model.sampling_defaults, {})}
 
 
 def test_qwen3_asr_request_settings_equal_the_hand_written_config():
     model = _asr()
-    configs = sampling_configs(model.get_request_resource_configs({}, {}), model.declare_state())
-    assert configs == {"sampler": SamplingReqConfig(temperature=0.0, top_p=1.0, ignore_eos=False)}
+    configs = sampling_configs(model.get_request_resource_configs([], [], {}), model.declare_state())
+    assert configs == {"sampler": sampling_config(model.sampling_defaults, {})}
 
 
 def test_fish_request_settings_equal_the_hand_written_config():
     model = _fish()
     generation = model.config.generation
-    configs = sampling_configs(model.get_request_resource_configs({}, {"ignore_eos": True}), model.declare_state())
+    configs = sampling_configs(model.get_request_resource_configs([], [], {"ignore_eos": True}), model.declare_state())
     assert configs == {"semantic_sampler": SamplingReqConfig(
         temperature=generation.temperature, top_k=generation.top_k, top_p=generation.top_p,
         repetition_penalty=generation.repetition_penalty, penalize_prompt=False, ignore_eos=True,
@@ -611,16 +635,16 @@ def test_fish_request_settings_equal_the_hand_written_config():
 
 def test_qwen3_tts_request_settings_equal_the_hand_written_config():
     model = _tts()
-    g = model.config.generation
-    configs = sampling_configs(model.get_request_resource_configs({}, {}), model.declare_state())
+    d = model._generation_defaults()
+    configs = sampling_configs(model.get_request_resource_configs([], [], {}), model.declare_state())
     assert configs == {
         "talker_sampler": SamplingReqConfig(
-            temperature=g.temperature if g.do_sample else 0.0, top_k=g.top_k, top_p=g.top_p,
-            repetition_penalty=g.repetition_penalty, ignore_eos=False,
+            temperature=d["temperature"], top_k=d["top_k"], top_p=d["top_p"],
+            repetition_penalty=d["repetition_penalty"], ignore_eos=False,
         ),
         "code_predictor": SamplingReqConfig(
-            temperature=g.subtalker_temperature if g.subtalker_dosample else 0.0, top_k=g.subtalker_top_k,
-            top_p=g.subtalker_top_p,
+            temperature=d["code_predictor_temperature"], top_k=d["code_predictor_top_k"],
+            top_p=d["code_predictor_top_p"],
         ),
     }
 
