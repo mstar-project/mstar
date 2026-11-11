@@ -3795,8 +3795,13 @@ impl GraphRuntime {
                                 self.interner.name(modality).to_string(),
                                 value,
                             ));
-                            // one row of the frame per iteration, in order
-                            for tail in emit_inline_tails.remove(&rid).unwrap_or_default() {
+                            // one row of the frame per iteration, in order: a step that repeated
+                            let tails = if emit_inline_tails.is_empty() {
+                                Vec::new()
+                            } else {
+                                emit_inline_tails.remove(&rid).unwrap_or_default()
+                            };
+                            for tail in tails {
                                 plan.emit_inline.push((
                                     rid,
                                     name.clone(),
