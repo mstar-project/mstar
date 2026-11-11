@@ -595,9 +595,10 @@ def test_a_second_update_of_a_field_in_a_layer_raises():
 @pytest.mark.parametrize("call, name", [
     (lambda h, q, k, v: h.add(1, k=k, v=v), "add"),
     (lambda h, q, k, v: h.read(1, q), "read"),
+    (lambda h, q, k, v: add_read(h, 1, q, k=k, v=v), "add_read"),
     (lambda h, q, k, v: at_last_token(h, q), "at_last_token"),
     (lambda h, q, k, v: kernel_setting(h, "d", "splits"), "kernel_setting of 'd'"),
-], ids=["add", "read", "at_last_token", "kernel_setting"])
+], ids=["add", "read", "add_read", "at_last_token", "kernel_setting"])
 def test_a_call_a_value_does_not_run_has_no_layout_yet(call, name):
     h = _value_handle()
     _begin(h)
