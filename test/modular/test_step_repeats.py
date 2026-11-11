@@ -222,7 +222,8 @@ def test_the_spec_cap_counts_steps_not_the_iterations_a_step_asked_for():
 def test_the_link_libraries_are_looked_for_next_to_nvrtc_before_the_toolkit(
     tmp_path, monkeypatch, which, name, sibling,
 ):
-    """Both have to come from the NVRTC's own CUDA release, which a toolkit on the box may not be."""
+    """Both have to come from one CUDA release, the NVRTC's own before a toolkit that may not be."""
+    link_name, devrt_name = "libnvJitLink.so.13", "libcudadevrt.a"
     monkeypatch.setattr(torch.version, "cuda", "13.0")
     nvrtc, toolkit = tmp_path / "cu13" / "lib", tmp_path / "cuda" / "lib64"
     for d in (nvrtc, toolkit):
@@ -231,17 +232,24 @@ def test_the_link_libraries_are_looked_for_next_to_nvrtc_before_the_toolkit(
     # the wheels that split NVRTC and the rest into directories: ``nvidia/<pkg>/lib``
     split = tmp_path / "nvidia" / "cuda_nvrtc" / "lib"
     split.mkdir(parents=True)
-    (tmp_path / "nvidia" / sibling / "lib").mkdir(parents=True)
+    for pkg in ("nvjitlink", "cuda_runtime"):
+        (tmp_path / "nvidia" / pkg / "lib").mkdir(parents=True)
 
     def found(nvrtc_dir):
-        return CudaWhile.link_libraries(str(nvrtc_dir))[which]
+        return CudaWhile.link_libraries(str(nvrtc_dir))
 
+    other, other_sibling = (devrt_name, "cuda_runtime") if which == 0 else (link_name, "nvjitlink")
+    (nvrtc / other).touch()
     (toolkit / name).touch()
-    assert found(nvrtc) == str(toolkit / name)
+    assert found(nvrtc) == (None, None), "a toolkit with only one of them is not the release of the other"
+    (toolkit / other).touch()
+    assert found(nvrtc) == (str(toolkit / link_name), str(toolkit / devrt_name))
     (tmp_path / "nvidia" / sibling / "lib" / name).touch()
-    assert found(split) == str(split / ".." / ".." / sibling / "lib" / name)
+    (tmp_path / "nvidia" / other_sibling / "lib" / other).touch()
+    split_dir = str(split / ".." / ".." / "%s" / "lib")
+    assert found(split) == (split_dir % "nvjitlink" + "/" + link_name, split_dir % "cuda_runtime" + "/" + devrt_name)
     (nvrtc / name).touch()
-    assert found(nvrtc) == str(nvrtc / name)
+    assert found(nvrtc) == (str(nvrtc / link_name), str(nvrtc / devrt_name))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="compiles and launches the stop kernel")

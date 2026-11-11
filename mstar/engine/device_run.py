@@ -116,7 +116,7 @@ class RunState:
         return {name: self.tokens[:, :repeats] for name in names}
 
 
-_KERNELS: tuple[ctypes.c_void_p, ctypes.c_void_p] | None = None
+_KERNELS: dict[int, tuple[ctypes.c_void_p, ctypes.c_void_p]] = {}
 
 
 class _DlInfo(ctypes.Structure):
@@ -163,20 +163,23 @@ class CudaWhile:
     @staticmethod
     def link_libraries(nvrtc_dir: str | None) -> tuple[str | None, str | None]:
         """The paths of ``libnvJitLink`` and ``libcudadevrt.a`` (``cudaGraphSetConditional`` links against it), or
-        ``None`` for one not found. Both have to come from the NVRTC's own CUDA release (a newer devrt or linker
-        fails the link), so each is looked for next to the NVRTC torch loaded (in the one ``nvidia/cu13/lib``
-        directory, or the older wheels' sibling ``nvidia/nvjitlink/lib`` and ``nvidia/cuda_runtime/lib``), then in
-        the toolkit."""
-        toolkit = [os.path.join(root, "lib64") for root in (os.environ.get("CUDA_HOME"), "/usr/local/cuda") if root]
-
-        def find(name: str, sibling: str) -> str | None:
-            dirs = [nvrtc_dir, nvrtc_dir and os.path.join(nvrtc_dir, "..", "..", sibling, "lib"), *toolkit]
-            return next((os.path.join(d, name) for d in dirs if d and os.path.exists(os.path.join(d, name))), None)
-
-        return (
-            find(f"libnvJitLink.so.{torch.version.cuda.split('.')[0]}", "nvjitlink"),
-            find("libcudadevrt.a", "cuda_runtime"),
-        )
+        ``(None, None)`` when no CUDA release has both. They have to come from one release, the NVRTC's own (a newer
+        devrt or linker fails the link), so the places are tried as pairs: next to the NVRTC torch loaded (the one
+        ``nvidia/cu13/lib`` directory, or the older wheels' sibling ``nvidia/nvjitlink/lib`` and
+        ``nvidia/cuda_runtime/lib``), then each toolkit."""
+        nvjitlink, devrt = f"libnvJitLink.so.{torch.version.cuda.split('.')[0]}", "libcudadevrt.a"
+        places = []
+        if nvrtc_dir:
+            places += [
+                (nvrtc_dir, nvrtc_dir),
+                tuple(os.path.join(nvrtc_dir, "..", "..", package, "lib") for package in ("nvjitlink", "cuda_runtime")),
+            ]
+        toolkits = [os.path.join(root, "lib64") for root in (os.environ.get("CUDA_HOME"), "/usr/local/cuda") if root]
+        places += [(lib64, lib64) for lib64 in toolkits]
+        for link_dir, devrt_dir in places:
+            if os.path.exists(os.path.join(link_dir, nvjitlink)) and os.path.exists(os.path.join(devrt_dir, devrt)):
+                return os.path.join(link_dir, nvjitlink), os.path.join(devrt_dir, devrt)
+        return None, None
 
     @staticmethod
     def _invoke(lib: ctypes.CDLL, name: str, *args, log=None) -> None:
@@ -220,8 +223,8 @@ class CudaWhile:
         path, devrt = self.link_libraries(nvrtc_dir)
         if devrt is None or path is None:
             raise RuntimeError(
-                "linking the device stop kernel needs libcudadevrt.a and libnvJitLink "
-                f"(found {devrt!r} and {path!r}); set CUDA_HOME to a toolkit that has them"
+                "linking the device stop kernel needs libnvJitLink and libcudadevrt.a from one CUDA release, "
+                "and none was found; set CUDA_HOME to a toolkit that has them"
             )
         lib, handle = ctypes.CDLL(path), ctypes.c_void_p()
 
@@ -251,9 +254,10 @@ class CudaWhile:
         return linked
 
     def load_kernels(self) -> tuple[ctypes.c_void_p, ctypes.c_void_p]:
-        """The stop and condition kernels, compiled once a process (the module loads on one thread, so no lock)."""
-        global _KERNELS
-        if _KERNELS is None:
+        """The stop and condition kernels of the current device, compiled once a device (a module belongs to a
+        context; the module loads on one thread, so no lock)."""
+        device = torch.cuda.current_device()
+        if device not in _KERNELS:
             arch = "sm_{}{}".format(*torch.cuda.get_device_capability())
             nvrtc, nvrtc_dir = self.nvrtc()
             linked = self._link_stop(arch, self._compile_stop(arch, nvrtc), nvrtc_dir)
@@ -261,8 +265,8 @@ class CudaWhile:
             self._driver_call("cuModuleLoadData", ctypes.byref(module), linked)
             self._driver_call("cuModuleGetFunction", ctypes.byref(stop), module, b"run_stop")
             self._driver_call("cuModuleGetFunction", ctypes.byref(condition), module, b"set_graph_condition")
-            _KERNELS = stop, condition
-        return _KERNELS
+            _KERNELS[device] = stop, condition
+        return _KERNELS[device]
 
     def stop(self, state: RunState, tokens: torch.Tensor, stream: int) -> None:
         """Inside the step's capture: ``run_stop`` on ``stream``."""

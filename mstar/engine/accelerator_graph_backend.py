@@ -219,9 +219,11 @@ class CUDAGraphBackend(_TorchGraphBackend):
             nvjitlink, devrt = CudaWhile.link_libraries(CudaWhile.nvrtc()[1])
         except OSError as error:
             return f"no NVRTC to compile its stop kernel with: {error}"
-        missing = [name for name, path in (("libnvJitLink", nvjitlink), ("libcudadevrt.a", devrt)) if path is None]
-        if missing:
-            return f"no {' and '.join(missing)} of the NVRTC's CUDA release to link the stop kernel (set CUDA_HOME)"
+        if nvjitlink is None or devrt is None:
+            return (
+                "no one CUDA release has both libnvJitLink and libcudadevrt.a to link the stop kernel "
+                "(the NVRTC's own, else set CUDA_HOME)"
+            )
         return None
 
     def while_runtime(self) -> Any:
