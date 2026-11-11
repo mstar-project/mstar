@@ -766,7 +766,7 @@ reply: chat ``response_format`` (``json_object``, or ``json_schema`` with its ``
 JSON schema), ``json_object``, ``regex``, ``choice`` (a list of strings) or ``grammar`` (EBNF),
 as vLLM takes it. ``"after": "</think>"`` starts the constraint once the reply holds that text,
 so a reasoning model thinks freely first; a model that declares the text that ends its
-reasoning (Qwen3.5's and MiniCPM-o's ``</think>``, Muse Glimmer's ``to=user<|message|>``, the end of its
+reasoning (Qwen3.5's ``</think>``, Muse Glimmer's ``to=user<|message|>``, the end of its
 answer's header) sets it on any turn whose prompt leaves the reasoning open. An unsupported
 schema is a 400, and so is a request on a deployment without ``enable_grammar`` or a grammar
 and ``after`` over 131072 characters, or one that also sends ``min_tokens`` or ``ignore_eos``.
@@ -780,8 +780,9 @@ failed mask fill fails its request with an error on a single-GPU deployment: its
 anything but a stop that once, and the next step's
 admit reports the error (unless the reply reaches its length limit at that draw; one row's own
 fill failing fails only that row). Under tensor parallelism only the first rank fills, so the
-row may only stop there, and the reply ends at that stop. A drawn token the grammar refuses (only a mask that failed to cover the draw lets
-one through) fails its request at the step after the next, and meanwhile the reply may only draw
+row may only stop there, and the reply ends at that stop. A drawn token the grammar refuses
+(only a mask that failed to cover the draw lets one through) fails its request at the step after
+the next, and meanwhile the reply may only draw
 one of the model's stop tokens; when the reply finishes first (a stop or its length limit;
 always without async scheduling), it ends normally with the refused token in it. The stops here
 are the ones the model's ``text_output()`` declares, else, for a Hugging Face tokenizer, the
@@ -789,8 +790,9 @@ stops xgrammar finds for it (its EOS); a model with neither gets none, and its r
 unmasked, so a model whose loop stops on tokens of its own should declare them there. Not served
 with it yet: speculative decoding (no model that declares ``text_output()`` drafts outside its
 sampler), resident planning, a declared ``Sampler`` with ``draws`` above 1 (its capture would
-split twice), and a text sampler whose walks run on different ranks (a prefill/decode split); the deployment is refused at startup for the last, and for
-``enable_grammar`` on more than one sampler or on one narrower than the text vocabulary.
+split twice), and a text sampler whose walks run on different ranks (a prefill/decode split);
+the deployment is refused at startup for the last, and for ``enable_grammar`` on more than one
+sampler or on one narrower than the text vocabulary.
 
 **LoRA adapters.** A ``resources: lora:`` block in the serving config serves
 per-request LoRA adapters (PEFT ``adapter_model.safetensors``; the scaling comes
