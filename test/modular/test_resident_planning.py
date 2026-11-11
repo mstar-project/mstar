@@ -298,6 +298,12 @@ def test_a_repeat_feeds_each_replay_the_last_one_s_token_and_keeps_a_column_per_
     assert wide["new_token"].tolist() == [[5, 6, 7], [7, 8, 9]]
     assert wide["text_inputs"] is wide["new_token"]
 
+    # a walk that never accepted repeats can't run several: every resource would commit them
+    runner._repeat_carries = {}
+    assert runner.repeat(lease, outputs, 1) is outputs
+    with pytest.raises(ValueError, match="never accepted repeats"):
+        runner.repeat(lease, outputs, 3)
+
 
 def test_a_row_a_host_step_moved_does_not_rewind_on_each_replay():
     """A one-token host step leaves a row's length to be refreshed. A run after
