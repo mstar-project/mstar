@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-pytest.importorskip("xgrammar")
+xgrammar = pytest.importorskip("xgrammar")
 
 from mstar.api_server.openai.adapters import _refuse_unserved_chat  # noqa: E402
 from mstar.conductor.conductor import Conductor  # noqa: E402
@@ -184,10 +184,10 @@ def test_a_request_whose_grammar_compiles_holds_back_no_other(ranks):
     assert runner.admit_retrieve("a", "LLM", "w").ready
 
 
-@pytest.mark.parametrize("failure", ["compile", "refused draw", "two rows"])
-def test_a_grammar_that_can_no_longer_hold_fails_its_request(failure):
+@pytest.mark.parametrize("failure", ["compile", "start", "refused draw", "two rows"])
+def test_a_grammar_that_can_no_longer_hold_fails_its_request(monkeypatch, failure):
     """A grammar that fails to compile is the request's error at its next admit;
-    a draw it refuses, at the admit after the step that accepts it, and past it
+    a matcher that fails to start, the same; a draw it refuses, at the admit after the step that accepts it, and past it
     the row may only stop; two rows of one step (a draft's), at that step's admit.
     A pre-admit gives the same answer as a full admit, as a pre-admitted step
     skips its full admit on one TP rank and not another."""
@@ -197,6 +197,9 @@ def test_a_grammar_that_can_no_longer_hold_fails_its_request(failure):
     if failure == "compile":
         # past the tokenizer-free check, as a grammar xgrammar compiles differently would be
         res.ingest_request(0, SamplingReqConfig(grammar=GrammarRequest("grammar", "root ::= undefined_rule")))
+    elif failure == "start":
+        res.ingest_request(0, SamplingReqConfig(grammar=grammar_request({"choice": ["ab"]})))
+        monkeypatch.setattr(xgrammar, "GrammarMatcher", lambda compiled: 1 / 0)
     elif failure == "two rows":
         res.ingest_request(0, SamplingReqConfig(grammar=grammar_request({"choice": ["ab"]})))
     else:
@@ -222,8 +225,11 @@ def test_a_grammar_that_can_no_longer_hold_fails_its_request(failure):
 @pytest.mark.parametrize("ranks", [1, 2])
 def test_a_fill_or_accept_that_raises_fails_what_every_rank_agrees_on(monkeypatch, ranks):
     """A replay fills the masks between its forward and its draw: a fill that raises
-    still draws, and the row may only stop; it fails its request only on a lone rank,
-    since a fill runs on rank 0 alone. An accept runs on every rank, so one that raises
+    still draws. On a lone rank the row is left unmasked for that draw, so its request
+    reaches the next admit and fails there with the error (a stop would end the reply
+    first, as a 200); under several ranks the row may only stop, since a fill runs on
+    rank 0 alone and an error set there would split the admits. One row's own fill
+    raising fails only that row. An accept runs on every rank, so one that raises
     fails its row's request on each, and the other rows' draws are still accepted."""
     res = _resource(graph=True, comm_group=SimpleNamespace(world_size=ranks, rank=0))
     res.ingest_request(0, SamplingReqConfig(grammar=grammar_request({"choice": ["ab"]})))
@@ -241,8 +247,24 @@ def test_a_fill_or_accept_that_raises_fails_what_every_rank_agrees_on(monkeypatc
     logits = torch.zeros(4, V)
     logits[:, VOCAB.index(b"a")] = 1.0
     res._grammar.apply(logits, res._grammar_mask)
-    assert logits[0].argmax().item() == EOS, "a row whose fill raised drew past its grammar"
+    forced_stop = logits[0].argmax().item() == EOS
+    assert forced_stop == (ranks > 1), "a lone rank's failed fill must not end the reply before its error"
     assert res.admit(step, ctx).ok == (ranks > 1)
+
+    res = _resource(graph=True, comm_group=SimpleNamespace(world_size=ranks, rank=0))
+    for rid in (1, 2):
+        res.ingest_request(rid, SamplingReqConfig(grammar=grammar_request({"choice": ["ab"]})))
+    ctx2 = StepContext(request_ids=(1, 2), graph_walk="w", slot=0, capture=False, slot_lease=lease)
+    res.plan(step, ctx2)
+    real = res._grammar._rows[1].matcher
+    res._grammar._rows[1]._matcher = SimpleNamespace(
+        is_terminated=real.is_terminated, fill_next_token_bitmask=lambda mask, i: 1 / 0)
+    res._fill_grammar()
+    res._grammar.apply(logits := torch.zeros(4, V), res._grammar_mask)
+    assert logits[0].argmax().item() == (EOS if ranks > 1 else 0), "the failed row's mask"
+    assert logits[1, VOCAB.index(b"a")] == 0 and logits[1, VOCAB.index(b"b")] == float("-inf"), \
+        "the healthy row lost its mask"
+    assert [r for r in (1, 2) if res._grammar.failures([r])] == ([] if ranks > 1 else [1])
 
     outcomes, accept = [], grammar._Row.accept
     for rank in range(ranks):
@@ -269,19 +291,29 @@ def test_a_fill_or_accept_that_raises_fails_what_every_rank_agrees_on(monkeypatc
     assert outcomes == [(False, {1})] * ranks
 
 
-def test_only_rank_0_fills_masks_and_every_rank_fails_a_refused_draw_alike():
+@pytest.mark.parametrize("batched", [False, True])
+def test_only_rank_0_fills_masks_and_every_rank_fails_a_refused_draw_alike(monkeypatch, batched):
     """Rank 0's draw is every rank's, so only it fills masks; every rank accepts
-    the draws, so a refused one fails its request at the same admit on each."""
+    the draws, so a refused one fails its request at the same admit on each. The
+    fill gives the same masks serially and through xgrammar's batch matcher."""
+    if batched:
+        monkeypatch.setattr(grammar, "FILL_ROWS_PER_THREAD", 1)
     lease = SlotLease(slot=0, bucket=SimpleNamespace(bs=4))
     step = SamplerStep(apply_penalty=False)
-    ctx = StepContext(request_ids=(0,), graph_walk="w", slot=0, capture=False, slot_lease=lease)
+    ctx = StepContext(request_ids=(0, 1), graph_walk="w", slot=0, capture=False, slot_lease=lease)
     filled, outcomes = [], []
     for rank in (0, 1):
         res = _resource(graph=True, comm_group=SimpleNamespace(world_size=2, rank=rank))
-        res.ingest_request(0, SamplingReqConfig(grammar=grammar_request({"choice": ["ab"]})))
+        res._grammar._fill_threads = 2 if batched else 1
+        for rid in (0, 1):
+            res.ingest_request(rid, SamplingReqConfig(grammar=grammar_request({"choice": ["ab"]})))
         res.plan(step, ctx)
         res._fill_grammar()
-        filled.append(bool((res._grammar_mask[0] != -1).any()))
+        filled.append([bool((res._grammar_mask[i] != -1).any()) for i in (0, 1)])
+        if rank == 0:
+            assert bool(res._grammar._batches) == batched
+            res._grammar.apply(logits := torch.zeros(4, V), res._grammar_mask)
+            assert (logits[:2] == 0).sum().item() == 2 and logits[:2, VOCAB.index(b"a")].eq(0).all()
         # a draw the mask did not cover
         res._cg_sampler.last_token_buf.fill_(VOCAB.index(b"x"))
         res.commit(step, ctx)
@@ -289,8 +321,8 @@ def test_only_rank_0_fills_masks_and_every_rank_fails_a_refused_draw_alike():
         res._fill_grammar()
         outcome = res.admit(step, ctx)
         outcomes.append((outcome.ok, outcome.reason and outcome.reason.request_ids))
-    assert filled == [True, False]
-    assert outcomes == [(False, {0}), (False, {0})]
+    assert filled == [[True, True], [False, False]]
+    assert outcomes == [(False, {0, 1}), (False, {0, 1})]
 
 
 def test_after_starts_the_grammar_once_the_reply_holds_its_text():

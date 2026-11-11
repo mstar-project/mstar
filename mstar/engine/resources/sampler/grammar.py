@@ -39,7 +39,9 @@ GRAMMAR_KINDS = ("json", "json_object", "regex", "choice", "grammar")
 # a grammar compiles while its request waits for admission, so its size is bounded
 MAX_GRAMMAR_CHARS = 1 << 17
 # xgrammar's batch fill starts every one of its threads on each call, however few the rows
-# (about 25 us of the caller's time per thread), so a fill takes a thread per this many rows
+# (about 25 us of the caller's time per thread), so a fill takes a thread per this many rows,
+# up to 8 threads: a microbench had a large pool cost bs=6 about 2.5 ms, and bs=64 on 8
+# threads take 1.1 ms; below 16 rows a serial loop wins
 FILL_ROWS_PER_THREAD = 8
 
 
@@ -309,12 +311,14 @@ class GrammarRows:
         host. A row whose accept raises fails (`failures`), and the rest go on: the
         same on every rank, which accept the same draws."""
         pending = self._pending
-        while pending:
-            rows, index, host, event = pending[0]
+        # one sample per step, however many steps' draws are pending
+        waited = phase_start() if pending else None
+        for *_, event in pending:
             if event is not None:
-                waited = phase_start()
                 event.synchronize()
-                phase_end("res.grammar.draw_wait", waited)
+        phase_end("res.grammar.draw_wait", waited)
+        while pending:
+            rows, index, host, _ = pending[0]
             drawn = host.tolist()
             # taken before its accepts, so no draw is accepted twice, and none is lost
             # to a raise above, which leaves this step's draws and every later one queued
@@ -343,9 +347,11 @@ class GrammarRows:
                     mask[i] = self._stops
         return mask
 
-    def fill(self, rids) -> torch.Tensor:
+    def fill(self, rids, fail_rows: bool) -> torch.Tensor:
         """The host bitmask for a step's rows: all ones for a free row, and only
-        the stop ids for a failed one."""
+        the stop ids for a failed one. A row whose own fill raises (below the batch
+        size) is failed (`failures`) and left all ones when ``fail_rows``, else
+        left only a stop; the other rows fill as usual."""
         mask = torch.full((len(rids), self.words), -1, dtype=torch.int32)
         matchers, index = [], []
         for i, rid in enumerate(rids):
@@ -362,7 +368,15 @@ class GrammarRows:
         threads = min(self._fill_threads, len(matchers) // FILL_ROWS_PER_THREAD)
         if threads < 2:
             for matcher, i in zip(matchers, index, strict=True):
-                matcher.fill_next_token_bitmask(mask, i)
+                try:
+                    matcher.fill_next_token_bitmask(mask, i)
+                except Exception as exc:  # noqa: BLE001 - that request's error, not the step's
+                    logger.exception("structured_outputs: filling a row's grammar mask failed")
+                    mask[i] = -1
+                    if fail_rows:
+                        self.fail([rids[i]], f"structured_outputs grammar failed to fill its mask: {exc}")
+                    elif self._stops is not None:
+                        mask[i] = self._stops
         else:
             batch = self._batches.get(threads)
             if batch is None:
