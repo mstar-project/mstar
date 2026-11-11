@@ -306,6 +306,12 @@ class OpenAIAdapter:
     supports_videos: bool = False   # POST /v1/videos/generations
     supports_realtime: bool = False  # /v1/realtime (bidirectional speech WebSocket)
     supports_transcriptions: bool = False  # POST /v1/audio/transcriptions
+    # POST /v1/messages (Anthropic) and /v1/responses, translated onto chat: a
+    # text-only chat that serves roles and tools
+    supports_messages: bool = False
+    supports_responses: bool = False
+    # the chat template's reasoning_effort levels, least first, which /v1/responses maps onto
+    reasoning_efforts: tuple[str, ...] = ()
     # Longest clip the model transcribes in one request. Longer uploads are cut
     # into windows of this length by the transcription route (None means unlimited).
     max_audio_seconds: float | None = None
@@ -1745,6 +1751,8 @@ class GlmChatAdapter(TextChatAdapter):
     """GLM-5.2 / GLM-5.3: the messages with their roles, and ``tools``, go to
     the checkpoint's chat template; the reply comes back with
     ``reasoning_content`` and ``tool_calls`` split out (see ``glm_chat``).
+    Anthropic's ``/v1/messages`` and OpenAI's ``/v1/responses`` are translated
+    onto this chat.
 
     ``tool_choice`` is ``"auto"`` (default), ``"none"`` (the tools stay out of
     the prompt), ``"required"`` or a named function. With no grammar, the
@@ -1760,11 +1768,15 @@ class GlmChatAdapter(TextChatAdapter):
     template keys are dropped, as vLLM drops the ones a template does not read.
     """
 
+    supports_messages = True
+    supports_responses = True
     serves_tool_calls = True
     serves_stop_strings = True
 
-    def __init__(self, *, always_thinks: bool):
+    def __init__(self, *, always_thinks: bool, reasoning_efforts: tuple[str, ...]):
         self.always_thinks = always_thinks
+        # the template's reasoning_effort levels, least first; it reads any other as the last
+        self.reasoning_efforts = reasoning_efforts
 
     def chat_to_request(self, req: ChatCompletionRequest, upload_dir: Path) -> SubmitArgs:
         # flatten_messages refuses a tool turn; the template takes each turn's role
@@ -1935,8 +1947,8 @@ ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
     "flux2_klein": DiffusionImageAdapter(),
     "flux2_klein_9b": DiffusionImageAdapter(),
     "z_image_turbo": DiffusionImageAdapter(),
-    "glm52": GlmChatAdapter(always_thinks=False),
-    "glm5_next": GlmChatAdapter(always_thinks=True),
+    "glm52": GlmChatAdapter(always_thinks=False, reasoning_efforts=("high", "max")),
+    "glm5_next": GlmChatAdapter(always_thinks=True, reasoning_efforts=("low", "high", "max")),
     # chat with images; reasoning_effort and the sampling defaults are the model's
     "muse_glimmer": Qwen3_5Adapter(),
     "ripple_65b": TextChatAdapter(),

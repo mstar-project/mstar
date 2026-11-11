@@ -240,6 +240,19 @@ def test_chat_completions_stream_releases_its_request(monkeypatch):
     assert stub.released == [stub.last_submit["request_id"]]
 
 
+@pytest.mark.parametrize("route, model, body", [
+    ("/v1/messages", "glm52",
+     {"model": "glm-5.2", "max_tokens": 16, "stream": True, "messages": [{"role": "user", "content": "hi"}]}),
+    ("/v1/responses", "glm5_next",
+     {"model": "glm-5.3", "stream": True, "store": False, "input": [{"role": "user", "content": "hi"}]}),
+])
+def test_an_agent_api_stream_releases_its_request(monkeypatch, route, model, body):
+    stub = _router_stub(model)
+    client = _client(monkeypatch, stub)
+    client.post(route, json=body)
+    assert stub.released == [stub.last_submit["request_id"]]
+
+
 def test_video_stream_releases_its_request(monkeypatch):
     stub = _router_stub("cosmos3")
     client = _client(monkeypatch, stub)

@@ -1,5 +1,6 @@
 """A chat reply as protocol-neutral events, which chat completions
-(``serving_chat``) writes in its shape.
+(``serving_chat``), Anthropic messages (``serving_messages``) and responses
+(``serving_responses``) each write in their own shape.
 
 ``reply_events`` yields a list of events per batch of result chunks:
 
@@ -12,6 +13,9 @@
 * :class:`Finish`, last, with why the reply ended and its usage.
 
 A failed reply has no ``Finish``.
+
+``template_level`` is the request side the two agent routes share: the
+template's reasoning level for the effort a client names.
 """
 
 from __future__ import annotations
@@ -34,10 +38,10 @@ _DISCONNECT_POLL_S = 0.05
 class Usage:
     """A reply's token counts and why the engine ended it. The text chunks add
     up ``completion`` as they are read and carry ``prompt`` (``ResultChunk``'s
-    ``num_tokens`` and ``prompt_tokens``), so a reply its handler ends early
-    has both. The ``usage`` chunk that closes a reply which ran to its end
-    (``APIServer.submit_request``'s ``report_usage``) restates them and gives
-    its ``finish_reason``."""
+    ``num_tokens`` and ``prompt_tokens``), so a stream can open with the
+    prompt's count and a reply its handler ends early has both. The ``usage``
+    chunk that closes a reply which ran to its end (``APIServer.submit_request``'s
+    ``report_usage``) restates them and gives its ``finish_reason``."""
 
     prompt: int = 0
     completion: int = 0
@@ -144,6 +148,16 @@ def _passed(deltas: list[dict], matcher: StopMatcher | None, out: list) -> str |
     return None
 
 
+def template_level(rank: int, efforts: tuple[str, ...], asked: str) -> str:
+    """The template's reasoning level for an effort of ``rank`` (0 low, 1 medium,
+    2 high, 3 the client's top), by GLM's level names; a template without that one
+    takes its lowest. High stays high: GLM's max nearly doubles an agent's output tokens."""
+    if not efforts:
+        raise ValueError(f"{asked}: this model has no reasoning levels")
+    wanted = ("low", "high", "high", "max")[rank]
+    return wanted if wanted in efforts else efforts[0]
+
+
 def submit(api, request_id: str, model_name: str, req, args) -> str:
     """Submits a chat request's ``args`` under the LoRA adapter its ``model``
     field or ``lora_adapter`` kwarg picks. Returns the model name the reply
@@ -163,13 +177,13 @@ def submit(api, request_id: str, model_name: str, req, args) -> str:
     return (model_kwargs or {}).get(LORA_ADAPTER_KWARG) or model_name
 
 
-async def stream_events(api, request_id: str, raw_request, parser=None, stops=None):
+async def stream_events(api, request_id: str, raw_request, parser=None, stops=None, usage=None):
     """``reply_events`` of a streamed request once its results start: a
     request the engine refuses raises its status here rather than inside a 200."""
     # named before the wait, which a resubmission under the id could outlast
     key = api.submission_key(request_id)
     batches = await api.open_result_stream(request_id, raw_request, batches=True)
-    return reply_events(api, request_id, parser, stops, batches=batches, key=key)
+    return reply_events(api, request_id, parser, stops, usage, batches=batches, key=key)
 
 
 def sse_response(api, request_id: str, body) -> ReleasingStreamingResponse:
@@ -186,7 +200,7 @@ def finish_reason(parser, usage: Usage, stop_string: str | None, called: bool) -
 
 
 def reply_events(api, request_id: str, parser=None, stops: list[str] | None = None,
-                 batches=None, key=None):
+                 usage: Usage | None = None, batches=None, key=None):
     """The events of a request's reply, one list per batch of result chunks.
     Bound to the submission when called, as Starlette iterates a stream's body
     later.
@@ -198,15 +212,17 @@ def reply_events(api, request_id: str, parser=None, stops: list[str] | None = No
     token read until then, the stop's own included, as vLLM counts them, and
     can count a few past it: the rest of the stop's chunk (up to k under MTP),
     and what was read while the parser held the stop's end back.
-    ``batches`` and ``key`` are the chunk batches already opened
-    (``api.open_result_stream``) and the submission, named when it was
-    submitted.
+    ``usage``, when given, is filled as the chunks arrive, for a stream that
+    opens with the prompt's count. ``batches`` and ``key`` are the chunk
+    batches already opened (``api.open_result_stream``) and the submission,
+    named when it was submitted.
     """
     if batches is None:
         batches = api.iter_result_chunk_batches(request_id)
     if key is None:
         key = api.submission_key(request_id)
-    return _events(batches, lambda: api.abort_submission(key, outcome="success"), parser, stops, Usage())
+    return _events(batches, lambda: api.abort_submission(key, outcome="success"), parser, stops,
+                   Usage() if usage is None else usage)
 
 
 async def _events(batches, served, parser, stops, usage):
