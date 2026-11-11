@@ -228,7 +228,7 @@ class ToyLM(ARNodeSubmodule):
                 kind.append(torch.full((inp.input_seq_len,), -1))
         return {"ids": torch.cat(ids), MIXED_KIND: torch.cat(kind)}
 
-    def _target(self, engine_inputs, ids: torch.Tensor) -> torch.Tensor:
+    def _target(self, engine_inputs, ids: torch.Tensor) -> TargetOutput:
         """Write ``ids`` to the KV cache, then each row's logits: a one-hot at
         its next token, which reads the cache up to and including itself."""
         kv, rope = engine_inputs.resources["kv"], engine_inputs.resources["rope"]
@@ -241,7 +241,7 @@ class ToyLM(ARNodeSubmodule):
             before = view.length - view.to_compute
             sums.append(seen.cumsum(0)[before:])
         token = next_token(ids, positions[: ids.numel()], torch.cat(sums))
-        return torch.nn.functional.one_hot(token, VOCAB).float() * 20.0
+        return TargetOutput(torch.nn.functional.one_hot(token, VOCAB).float() * 20.0)
 
     def forward(self, graph_walk, engine_inputs, ids, **kwargs):
         return self.forward_batched(graph_walk, engine_inputs, ids, **kwargs)
@@ -251,7 +251,7 @@ class ToyLM(ARNodeSubmodule):
         kv = engine_inputs.resources["kv"]
         kv._current_plan_outputs_for_toy = engine_inputs.step.ctx.plan_results["kv"]["main"].views
         if graph_walk == "prefill":
-            logits = self._target(engine_inputs, ids)
+            logits = self._target(engine_inputs, ids).logits
             ends = torch.tensor([v.to_compute for v in _views(kv)]).cumsum(0) - 1
             # a verifying sampler draws a prompt's token as a mixed step's prompt row (`first_draw`), on any device
             tokens = engine_inputs.resources["sampler"].sample(list(rids), logits[ends])
@@ -268,15 +268,11 @@ class ToyLM(ARNodeSubmodule):
             qo = torch.nn.functional.pad(counts.cumsum(0), (1, 0))
             rows = mixed_rows(qo, kwargs["mixed_kind"], self.k + 1)
             result = self.draft_mixed_step(
-                engine_inputs, ids, rows, lambda block_ids, at: self._target(engine_inputs, block_ids)[at],
+                engine_inputs, ids, rows, lambda block_ids, at: self._target(engine_inputs, block_ids).logits[at],
             )
             return self.verify_output(result)
         n = len(rids)
-        def target(block):
-            out = self._target(engine_inputs, block)
-            return out if isinstance(out, TargetOutput) else TargetOutput(out)
-
-        result = self.draft_verify_step(engine_inputs, ids.view(n), target)
+        result = self.draft_verify_step(engine_inputs, ids.view(n), lambda block: self._target(engine_inputs, block))
         return self.verify_output(result)
 
 
