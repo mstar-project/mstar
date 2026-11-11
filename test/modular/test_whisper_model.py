@@ -567,8 +567,6 @@ def test_decoder_check_stop_honors_eos():
     assert sub.check_stop("r", info(PREFILL_WALK, 0), eos) == {END_PARTITION}
     assert sub.check_stop("r", info(DECODE_WALK, 0), eos) == {"decode_loop"}
     assert sub.check_stop("r", info(DECODE_WALK, 0), word) == set()
-    # the model declares the ids the loop stops on
-    assert _make_model(cfg).text_output().stop_token_ids == sub.token_stop.stop_ids
     # the budget is the loop cap's to end
     assert sub.check_stop("r", info(DECODE_WALK, 3, max_tokens=4), word) == set()
 

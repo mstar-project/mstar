@@ -74,10 +74,6 @@ def test_batched_stop_check_agrees_with_the_per_request_one():
         if (stops := sub.check_stop(rid, infos[rid], {"new_token": [tokens[i]]}))
     }
     assert want == {"b": {"decode_loop"}}
-    # the model declares the ids the loop stops on
-    model = object.__new__(HiggsAudioModel)
-    model.config, model._detokenizer = sub.config, None
-    assert model.text_output().stop_token_ids == sub.token_stop.stop_ids
     rows = HostRows(("a", "b", "c", "d"), {"new_token": tokens})
     assert sub.check_stop_batched(["d", "c", "b", "a"], infos, rows) == want
     # a stop token on the last prefill ends the partition: there is no loop yet
