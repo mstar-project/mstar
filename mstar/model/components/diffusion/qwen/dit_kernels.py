@@ -15,6 +15,8 @@ the callers run the eager ops (``fits``).
 * :func:`modulate`: ``x * (1 + scale) + shift`` with two parameter sets along the tokens (``zero_cond_t``: the
   target's tokens take the step's, the references' timestep 0's), one pass instead of the per-token select.
 * :func:`gated_add`: ``x + gate * y``, the same two parameter sets.
+* :func:`gelu_tanh`: ``F.gelu(x, approximate="tanh")``, the same fp32 formula and roundings (checked on every bf16
+  value), at a wider access than PyTorch's elementwise kernel.
 
 Every launch turns Triton's fp fusion off: with it on, the compiler folds a bf16 round trip between a multiply and
 an add into one fused multiply-add, which drops the rounding the eager ops make there.
@@ -27,10 +29,15 @@ import torch
 try:
     import triton
     import triton.language as tl
+    from triton.language.extra import libdevice
 except ImportError:  # pragma: no cover - CPU-only installs
     triton = None
 
 _BLOCK = 1024
+_GELU_BLOCK = 4096
+# PyTorch's tanh-GELU constants, as its CUDA kernel rounds them to fp32
+_GELU_BETA = 0.7978845608028654  # sqrt(2) * (2 / sqrt(pi)) * 0.5
+_GELU_KAPPA = 0.044715
 
 if triton is not None:
 
@@ -116,6 +123,17 @@ if triton is not None:
         gate = _params(gate_ptr, rows_per_set, row, token, split, D, col, mask)
         gy = (gate * y).to(tl.bfloat16).to(tl.float32)
         tl.store(o_ptr + tok * D + col, (x + gy).to(tl.bfloat16), mask=mask)
+
+    @triton.jit
+    def _gelu_tanh_kernel(x_ptr, o_ptr, n, beta, kappa, BLOCK: tl.constexpr):
+        off = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+        mask = off < n
+        x = tl.load(x_ptr + off, mask=mask, other=0.0).to(tl.float32)
+        cube = (x * x) * x
+        # nvcc contracts PyTorch's ``x + kappa * cube`` into one fma
+        inner = beta * tl.fma(kappa, cube, x)
+        y = (0.5 * x) * (1.0 + libdevice.tanh(inner))
+        tl.store(o_ptr + off, y.to(tl.bfloat16), mask=mask)
 
 
 def fits(*tensors: torch.Tensor) -> bool:
@@ -228,4 +246,21 @@ def gated_add(x: torch.Tensor, gate: torch.Tensor, y: torch.Tensor, split: int) 
 
 @gated_add.register_fake
 def _(x, gate, y, split):
+    return torch.empty_like(x)
+
+
+@torch.library.custom_op("mstar::qwen_image_gelu_tanh", mutates_args=())
+def gelu_tanh(x: torch.Tensor) -> torch.Tensor:
+    """``F.gelu(x, approximate="tanh")`` for a contiguous bf16 ``x``: PyTorch's formula in its order, read and written
+    in wide blocks."""
+    out = torch.empty_like(x)
+    n = x.numel()
+    _gelu_tanh_kernel[(triton.cdiv(n, _GELU_BLOCK),)](
+        x, out, n, _GELU_BETA, _GELU_KAPPA, BLOCK=_GELU_BLOCK, num_warps=8, enable_fp_fusion=False,
+    )
+    return out
+
+
+@gelu_tanh.register_fake
+def _(x):
     return torch.empty_like(x)

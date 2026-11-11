@@ -10,6 +10,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 import torch
+import torch.nn.functional as F
 
 diffusers = pytest.importorskip("diffusers")
 
@@ -243,6 +244,10 @@ def test_the_fused_kernels_round_as_the_eager_ops(zero_cond_t, monkeypatch):
     x = torch.randn(40, 3, 128, generator=g).to("cuda", torch.bfloat16)
     want = apply_rope(attn.norm_q(x[None]), layout.img_freqs)[0]
     assert torch.equal(kernels.qk_norm_rope(x, attn.norm_q.weight, layout.img_freqs, attn.norm_q.eps), want)
+    # the GELU on every bf16 value (NaNs compared as NaNs)
+    every = torch.arange(-32768, 32768, dtype=torch.int32).to(torch.int16).view(torch.bfloat16).cuda()
+    torch.testing.assert_close(kernels.gelu_tanh(every), F.gelu(every, approximate="tanh"), rtol=0, atol=0,
+                               equal_nan=True)
 
 
 def _vaes():
