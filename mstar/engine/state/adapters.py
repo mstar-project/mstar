@@ -25,6 +25,7 @@ from mstar.engine.resources.linear_attn.config import (
     LinearAttnSpec,
     LinearAttnStep,
     LinearAttnVariant,
+    bf16_gdn_state_fits,
 )
 from mstar.engine.resources.position.config import PositionConfig, PositionSpec, PositionStep
 from mstar.engine.resources.recurrent.config import (
@@ -623,9 +624,9 @@ class GDN(LinearAttnBinding):
         )]
 
     def block(self, tensor: TensorType) -> RecurrentBlockConfig:
-        """Stored in fp32 unless the decode kernel takes the declared dtype, as it does for bf16 only at K = V = 128."""
+        """Stored in fp32 unless the decode kernel takes the declared dtype (`bf16_gdn_state_fits`)."""
         h_v, d_k, d_v = tensor.shape
-        dtype = torch.bfloat16 if tensor.dtype is torch.bfloat16 and d_k == d_v == 128 else torch.float32
+        dtype = torch.bfloat16 if tensor.dtype is torch.bfloat16 and bf16_gdn_state_fits(d_k, d_v) else torch.float32
         # the head axis stays first, and the last two swap
         shard = None if tensor.shard is None else (0, 2, 1)[tensor.shard]
         return _block(TensorType((h_v, d_v, d_k), dtype=dtype, shard=shard))
