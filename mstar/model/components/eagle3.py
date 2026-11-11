@@ -1,6 +1,6 @@
 """EAGLE-3 (``model_kwargs.draft: {method: eagle3, model: RedHatAI/Qwen3-8B-speculator.eagle3}``): one decoder
-layer that reads taps of three target layers and chains ``k`` passes like MTP, drafting over a reduced vocabulary
-that a token map takes back to the target's.
+layer that reads taps of three target layers and chains ``k`` one-token passes (``chain_drafts``), drafting over a
+reduced vocabulary that a token map takes back to the target's.
 
 A row at position ``p`` reads the token at ``p + 1`` (its embedding) and a hidden vector: ``fc`` of the target's taps
 at ``p`` on a prompt step and over a verify block (`observe`), or the layer's own output at ``p - 1`` in a chained
@@ -151,7 +151,8 @@ class Eagle3(HostedDrafterDecl):
             kv=geometry.layer_set(self.kv_key, LAYER_SET),
             carry=CarrySpec(cfg.hidden_size, CARRY_DTYPE),
             # no chunk_boundary (UNDECLARED): the prefill reads the token sampled at each prompt's last row, so a
-            # chunked prompt would need a next-ids input like MTP's, and the startup gate refuses a chunking target
+            # chunk's last row would need the next prompt token, which no input carries; the startup gate refuses
+            # a chunking target
             geometry=geometry,
         )
 
