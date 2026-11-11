@@ -365,6 +365,22 @@ class Driver:
         return self.out
 
 
+def stub_offload(monkeypatch, snapshots: dict[int, int] | None = None) -> None:
+    """KV's host copy needs CUDA: an offload records the length it would snapshot in ``snapshots`` instead, and
+    the request stays on the device."""
+    from mstar.engine.resources.kv.manager import KVManager
+
+    def offload(self, rid):
+        if snapshots is not None:
+            snapshots[rid] = self._streams[rid]["main"].stored_len
+        return 1
+
+    monkeypatch.setattr(KVManager, "supports_eviction", property(lambda self: True))
+    monkeypatch.setattr(KVManager, "offload", offload)
+    monkeypatch.setattr(KVManager, "reload", lambda self, rid: True)
+    monkeypatch.setattr(KVManager, "is_offloaded", lambda self, rid: False)
+
+
 def _views_of(kv, rid):
     """A stream's pages, as `_read_ids` reads a plan's view."""
     return SimpleNamespace(page_idxs=list(kv._streams[rid]["main"].page_indices))

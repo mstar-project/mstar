@@ -392,7 +392,8 @@ Under `MSTAR_KV_DEBUG_ASSERTS`:
 - The invariant of §2, on each grant.
 - After a drop or a move to the host, the victim holds no page in the pool, and the pool's pages are conserved.
 - On a node that verifies drafts, no victim moved or dropped holds an unrecorded verify step, and none asked again
-  holds a verify result.
+  holds a verify result unless it is back from the host: a returning request holds an allotment and no page until
+  it reloads, so the pool can ask it again, and its results stay held until its first admit back.
 
 ---
 
