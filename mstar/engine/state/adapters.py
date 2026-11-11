@@ -1611,8 +1611,8 @@ class PagedStorage(Storage):
         resolved = Resolved({}, {}, {}, {})
         for array in arrays:
             bound = resolved.bound[array.name] = _bindings(self, array, setup.by_read)
-            # `_bindings` gives the reads first
-            reads, others = bound[:len(array.reads)], bound[len(array.reads):]
+            reads = [each for each in bound if each.key in array.reads]
+            others = [each for each in bound if each.key not in array.reads]
             specs, resource_of = self._read_specs(array, reads)
             resolved.specs[array.name] = [self._pool(array, setup.walks), *specs, *_op_specs(array, others)]
             resolved.resource_of.update(resource_of | _resources_of(array, others))
