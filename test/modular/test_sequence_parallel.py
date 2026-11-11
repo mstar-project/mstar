@@ -810,6 +810,35 @@ def test_a_recurrent_layer_plans_after_its_nodes_shard_and_refuses_a_step_withou
         manager.plan(LinearAttnStep(segments=(Segment("r0", "main", 4),)), ctx)
 
 
+@pytest.mark.parametrize("variant, tp, sp, want", [
+    ("gdn", 1, 2, "ulysses"),
+    ("gdn", 1, 4, "state_passing"),
+    ("gdn", 2, 2, "state_passing"),
+    # one B/C group under three ranks reads as one; its six heads split three ways, not four
+    ("mamba2", 1, 3, "ulysses"),
+    ("mamba2", 1, 4, "state_passing"),
+], ids=["gdn-split", "gdn-uneven", "gdn-uneven-per-tp-rank", "mamba2-group-repeated", "mamba2-uneven"])
+def test_a_recurrent_layer_takes_the_exchange_its_head_counts_allow(variant, tp, sp, want):
+    """The spec picks, so no deployment names it and every rank (built alike) agrees."""
+    from mstar.engine.resources.linear_attn.base import LinearAttnManager
+    from mstar.engine.resources.linear_attn.config import LinearAttnConfig, LinearAttnSpec, LinearAttnVariant
+
+    config = LinearAttnConfig(
+        "state", LinearAttnVariant.GDN if variant == "gdn" else LinearAttnVariant.MAMBA2,
+    )
+    pool = RecurrentStateSpec("state", {"n"}, RecurrentStateConfig(
+        num_layers=1, blocks=LINEAR_GEOMETRIES[variant].to_blocks(conv_dtype=torch.float32), max_slots=LINEAR_SLOTS,
+    ))
+    joint = JointGroups(
+        tp_group=CommGroup(0, 0, list(range(tp))), sp_group=CommGroup(0, 0, list(range(sp))),
+        instance=CommGroup(0, 0, list(range(tp * sp))),
+    )
+    info = EngineResourceInfo(
+        device=CPU, joint_comm_group=joint, dependencies={"state": pool}, replicated_over_sp=True,
+    )
+    assert LinearAttnManager.build(LinearAttnSpec("linear", {"n"}, config), info)._split_exchange == want
+
+
 @pytest.mark.parametrize("placed, choice, want", [
     (True, None, (False, None, "none")),
     (True, "all_gather", (True, None, "ulysses")),

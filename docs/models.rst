@@ -719,7 +719,7 @@ has run on CPU only. With ``llm_shard: {exchange: all_gather}`` a
 step of at least ``llm_shard.min_tokens`` tokens splits over
 the SP ranks: each runs the layers on its part of the prompt, attention gathers
 the step's queries, keys and values, and the gated DeltaNet layers trade tokens
-for heads (``ulysses``; ``linear_attn: {sp_exchange: state_passing}`` where
+for heads (``ulysses``, or ``state_passing`` where
 their heads per TP rank don't divide by ``sp_size``). The DeltaNet split runs
 eagerly only, so the LLM doesn't capture its text prefill, vision prefill and
 mixed buckets of ``min_tokens`` tokens and up: those steps run eagerly and

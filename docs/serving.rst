@@ -534,7 +534,7 @@ them by that name:
      seq_shard:                 # a node's sequence shard (SP ranks)
        min_tokens: 2048         # steps below this run copied on every SP rank; also: exchange
      linear_attn:               # a recurrent layer's resource (GDN, Mamba-2)
-       sp_exchange: ulysses     # also: backend; ulysses / state_passing
+       backend: flashinfer
      sampler:
        greedy_capture: false    # also: enable_logprobs, enable_processed_logprobs
 
@@ -586,8 +586,9 @@ this rank's tokens and runs eager only. ``ulysses`` (by head) states the default
 never splits. What every SP rank stores whole takes its own exchange wherever the node splits:
 a sliding-window attention over KV stored by position (whose window layers stay whole on each
 rank, so its decode needs no collective; CPU-tested only) gathers the
-step's keys (``kv_gather``); a recurrent layer's resource (``linear_attn``) takes ``ulysses``, or its own
-``sp_exchange: state_passing`` (CPU-tested only, as Mamba-2's split is). A value the node's
+step's keys (``kv_gather``); a recurrent layer's resource (``linear_attn``) takes ``ulysses`` where each TP rank's
+heads split ``sp_size`` ways, and ``state_passing`` where they don't (CPU-tested only, as
+Mamba-2's split is), picked from the model's head counts. A value the node's
 storage can't take fails at load, at any SP size, and so does ``ring`` over an attention backend
 other than ``flashinfer`` (when the engine builds it); ``ring`` beside a ``kv_gather`` attention or
 a recurrent layer fails at load on SP ranks:

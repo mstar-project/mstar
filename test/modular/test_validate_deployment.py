@@ -414,15 +414,11 @@ def test_a_kv_placement_the_node_cannot_take_is_refused(model, group, kv, patter
     # the attention spans a node the shard doesn't, so it would split on one and not the other: at any SP size
     ([_shard(), _attention(nodes=("llm", "post"))], dict(sp_size=1), {},
      r"resources.attn: spans nodes \['post'\] without the sequence shard 'shard'"),
-    # a recurrent layer's split exchanges
-    ([_shard(), _attention(), *_linear(k_heads=3, v_heads=6)], dict(sp_size=2), {},
-     r"node_groups\[0\]: linear attention 'linear' trades tokens for heads over 2 SP ranks \(ulysses\), and its "
-     r"3 key heads don't split 2 ways per TP rank: set its sp_exchange to state_passing"),
+    # a recurrent layer's split exchange: its heads don't split 3 ways, so it hands state on
     ([_shard(), _attention(), *_linear(v_dim=16)], dict(sp_size=3),
-     {"kv": {"context_parallel": True, "page_size": 18}, "shard": {"exchange": "all_gather"},
-      "linear": {"sp_exchange": "state_passing"}},
-     r"linear attention 'linear' hands state on over 3 SP ranks \(state_passing\), whose middle pieces' "
-     r"transition needs equal key and value head dims; they are 8 and 16"),
+     {"kv": {"context_parallel": True, "page_size": 18}, "shard": {"exchange": "all_gather"}},
+     r"linear attention 'linear''s heads don't split 3 ways per TP rank, so it hands state on over 3 SP ranks "
+     r"\(state_passing\), whose middle pieces' transition needs equal key and value head dims; they are 8 and 16"),
     ([SeqShardSpec("shard", {"llm"}, ("main",), 1), _attention(), *_linear()], dict(sp_size=2), {},
      r"linear attention 'linear' splits a step's rows into contiguous pieces, and node 'llm''s shard splits each "
      r"row \(axis 1\)"),
@@ -433,15 +429,10 @@ def test_a_kv_placement_the_node_cannot_take_is_refused(model, group, kv, patter
     # whatever its heads: no exchange of the linear resource's serves it
     ([_shard(), _attention(), *_linear(k_heads=3, v_heads=3, variant=LinearAttnVariant.KDA)], dict(sp_size=2), {},
      r"linear attention 'linear' is Kimi delta attention, which takes no split steps"),
-    ([_shard(), _attention(), *_linear()], dict(sp_size=2), {"linear": {"sp_exchange": "ring"}},
-     r"resources.linear: sp_exchange must be one of ulysses, state_passing; got 'ring'"),
-    # a paged attention's split is its node's shard's exchange, not a setting of its own
-    ([_shard(), _attention()], dict(sp_size=2), {"attn": {"sp_exchange": "all_gather"}},
-     r"resources.attn: resource 'attn' takes no sp_exchange; got 'all_gather'"),
 ], ids=["no_attention", "heads_by_head", "axis1_over_positions", "ring_by_head", "all_gather_by_head",
         "ulysses_by_position", "unknown_exchange", "none_by_head", "ring_beside_ragged_ulysses", "ulysses_heads",
-        "axis0_cross", "shard_misses_a_node", "linear_ulysses_heads", "linear_state_passing_head_dims",
-        "linear_axis1", "linear_beside_a_ring", "kda", "linear_unknown_exchange", "attention_exchange"])
+        "axis0_cross", "shard_misses_a_node", "linear_state_passing_head_dims",
+        "linear_axis1", "linear_beside_a_ring", "kda"])
 def test_a_node_whose_sp_ranks_cant_split_its_steps_is_refused(specs, group, resources, pattern, tmp_path):
     size = group.get("sp_size", 1)
     cfg = _cfg(tmp_path, [{"node_names": ["llm"], "ranks": list(range(size)), **group}], resources=resources)

@@ -8,7 +8,7 @@ geometry is read off its blocks rather than declared here.
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Literal, get_args
+from typing import TYPE_CHECKING, Literal
 
 from mstar.engine.resources.spec import CombinedSplit, NodeResourceSpec
 from mstar.engine.resources.step import ResourceStep
@@ -58,7 +58,8 @@ class LinearAttnConfig:
 
 
 # How a split step's prompt rows reach the recurrence (`linear_attn.base`): "ulysses" trades tokens
-# for heads, "state_passing" hands each rank's state on to the next
+# for heads, "state_passing" hands each rank's state on to the next. The spec picks, from the
+# pool's head counts (`LinearAttnSpec.split_exchange`)
 LinearSpExchange = Literal["ulysses", "state_passing"]
 
 
@@ -67,8 +68,6 @@ class LinearAttnSpec(NodeResourceSpec):
     config: LinearAttnConfig
     # the sequence shard over its nodes, if any (`derive`)
     shard_key: str | None = field(default=None, init=False, repr=False)
-    # a deployment's ``sp_exchange``, ulysses unset
-    sp_exchanges = get_args(LinearSpExchange)
 
     def depends_on(self) -> set[str]:
         keys = {self.config.recurrent_state}
@@ -82,13 +81,27 @@ class LinearAttnSpec(NodeResourceSpec):
         return take_shard_edge(self, specs)
 
     def resolve_exchange(self, specs: Mapping[str, NodeResourceSpec]) -> str:
-        return self.own_exchange(specs)
+        """``none`` where the node's shard never splits, else ``ulysses``: the shard reads only
+        whether this resource takes split steps, and which exchange they take needs the ranks
+        (``split_exchange``)."""
+        from mstar.engine.resources.sequence_shard import shard_exchange
+
+        return "none" if shard_exchange(self, specs) == "none" else "ulysses"
+
+    def split_exchange(self, pool: "RecurrentStateConfig", tp: int, sp: int) -> LinearSpExchange:
+        """How a split step's prompt rows reach the recurrence, from the head counts the model
+        declared: ``ulysses`` where each TP rank's heads split ``sp`` ways (Mamba-2's B/C groups may
+        also be fewer a TP rank than SP ranks: each SP rank's heads then read one group, repeated
+        to it), ``state_passing`` where they don't. Alike on every rank."""
+        uneven = any(
+            (n // tp) % sp and not (what == "B/C groups" and sp % (n // tp) == 0)
+            for what, n in _unsharded_heads(pool, self.config.variant).items()
+        )
+        return "state_passing" if uneven else "ulysses"
 
     def split_step_refusals(
         self, node: str, shard: "SeqShardSpec", tp: int, sp: int, specs: Mapping[str, "NodeResourceSpec"],
     ) -> list[str]:
-        # only a node whose shard splits gets here, so the choice is what its split steps take
-        exchange = self.split_exchange
         pool = specs[self.config.recurrent_state].config
         name = f"linear attention {self.resource_key!r}"
         if self.config.variant is LinearAttnVariant.KDA:
@@ -103,25 +116,14 @@ class LinearAttnSpec(NodeResourceSpec):
         if shard.axis == 1 or shard.stripe_pool is not None:
             how = "each row (axis 1)" if shard.axis == 1 else f"by KV {shard.stripe_pool!r}'s stored positions"
             return [f"{name} splits a step's rows into contiguous pieces, and node {node!r}'s shard splits {how}"]
-        heads = _unsharded_heads(pool, self.config.variant)
-        if exchange == "ulysses":
-            # Mamba-2's B/C groups may also be fewer a TP rank than SP ranks: each SP rank's heads
-            # then read one group, repeated to it
-            uneven = [
-                f"{n} {what}" for what, n in heads.items()
-                if (n // tp) % sp and not (what == "B/C groups" and sp % (n // tp) == 0)
-            ]
-            if uneven:
-                return [
-                    f"{name} trades tokens for heads over {sp} SP ranks (ulysses), and its {', '.join(uneven)} "
-                    f"don't split {sp} ways per TP rank: set its sp_exchange to state_passing"
-                ]
-        if exchange == "state_passing" and sp >= 3 and self.config.variant is not LinearAttnVariant.MAMBA2:
+        hands_state = self.split_exchange(pool, tp, sp) == "state_passing"
+        if hands_state and sp >= 3 and self.config.variant is not LinearAttnVariant.MAMBA2:
             dk, dv = _unsharded_head_dims(pool)
             if dk != dv:
                 return [
-                    f"{name} hands state on over {sp} SP ranks (state_passing), whose middle pieces' transition "
-                    f"needs equal key and value head dims; they are {dk} and {dv}"
+                    f"{name}'s heads don't split {sp} ways per TP rank, so it hands state on over {sp} SP ranks "
+                    f"(state_passing), whose middle pieces' transition needs equal key and value head dims; "
+                    f"they are {dk} and {dv}"
                 ]
         return []
 
@@ -145,8 +147,7 @@ class LinearAttnSpec(NodeResourceSpec):
         return LinearAttnManager
 
     def apply_yaml_overrides(self, backend: str | LinearAttnBackend | None = None):
-        """Let the deployment pick the backend (and, as every spec, ``sp_exchanges``' choice);
-        slot capacity is tuned on the pool."""
+        """Let the deployment pick the backend; slot capacity is tuned on the pool."""
         if backend is not None:
             self.config.backend = LinearAttnBackend(backend)
 

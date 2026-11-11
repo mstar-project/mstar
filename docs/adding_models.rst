@@ -2848,9 +2848,9 @@ resource takes its own exchange wherever the node's shard splits, whatever the s
   step leaves the same bytes in every replica. On a split step the conv runs on each rank's tokens
   from the earlier ranks' last inputs (``conv_halo``, one all-gather a layer), and every row's final
   window is written on every rank. A combined walk's leading decode rows run copied. The prompt
-  rows take the linear resource's ``sp_exchange`` (a ``resources:`` override, the one per-resource
-  choice): ``ulysses`` by default (one all-to-all to a block of heads, the chunked kernel over that
-  block of the state, the block's final states gathered, one all-to-all back) or ``state_passing``
+  rows take the exchange the linear resource picks from the model's head counts: ``ulysses`` where each TP
+  rank's heads split ``sp_size`` ways (one all-to-all to a block of heads, the chunked kernel over that
+  block of the state, the block's final states gathered, one all-to-all back), ``state_passing`` where they don't
   (each rank runs its pieces, hands its state on in one fixed-size gather, and runs a row
   continuing into it from the state it gets). Mamba-2's scan is a loop over tokens, so ``ulysses``
   saves memory there, not time. ``state_passing`` and Mamba-2's split are tested on CPU only and no
@@ -2875,9 +2875,8 @@ before a worker starts (and the engine again at load): a node on SP ranks that n
 position; a head-stored pool whose query and KV heads per TP rank don't divide by ``sp_size``; a
 ragged ``sp_exchange`` whose heads don't divide by ``tp * sp``, or beside a ring; a ragged
 cross-attention under a shard on axis 0 or with ``exchanges=False`` (either can leave a rank none of
-a row); a linear ``ulysses`` whose key or value heads (Mamba-2's heads, or B/C groups neither
-dividing nor divided by ``sp_size``) per TP rank don't divide by ``sp_size`` (use
-``state_passing``); a ``state_passing`` with unequal key and value head dims at ``sp_size`` 3 or
+a row); a linear layer (not Mamba-2) whose heads per TP rank don't divide by ``sp_size`` (so it takes
+``state_passing``) and whose key and value head dims differ, at ``sp_size`` 3 or
 more; a linear layer under a shard on axis 1 or a ring's; a ``kv_gather`` attention under a ring's
 (it plans contiguous pieces); a window page that doesn't split ``sp_size`` ways; expert
 parallelism. The engine alone refuses a resource without ``supports_split_steps`` at load, and, at
@@ -2948,14 +2947,14 @@ And for the copied resources, under any ``exchange`` that splits:
      - ``kv_gather``, eager only (CPU-tested only)
      - as on one rank, no collective
      - always; its window pages must split ``sp_size`` ways
-   * - recurrent layer, ``sp_exchange: ulysses`` (the default)
+   * - recurrent layer, ``ulysses``
      - conv halo; all-to-all to heads; eager only
      - as on one rank
-     - heads (and Mamba-2's B/C groups) per TP rank divide by ``sp_size`` (Qwen3.5)
-   * - recurrent layer, ``sp_exchange: state_passing``
+     - chosen where the heads (and Mamba-2's B/C groups) per TP rank divide by ``sp_size`` (Qwen3.5)
+   * - recurrent layer, ``state_passing``
      - conv halo; one state hand-off; eager only
      - as on one rank
-     - heads that don't divide; a hand-off's bytes don't grow with the prompt (at ``P = 2`` it
+     - chosen where the heads per TP rank don't divide; a hand-off's bytes don't grow with the prompt (at ``P = 2`` it
        waits on the previous rank, so it isn't faster). CPU-tested only
 
 ``ulysses`` over KV stored by position, and ``all_gather`` or ``ring`` over KV stored by head, are

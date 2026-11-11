@@ -199,7 +199,7 @@ class RaggedAttentionSpec(_RaggedSpecBase):
     ``"none"`` (the default) attends only copied labels, heads over TP. ``ulysses`` is a no-op on a
     node with no ``SeqShardSpec``, or one whose sequence shard never splits."""
 
-    # the model's declaration, not a deployment's (``sp_exchanges`` stays empty)
+    # the model's declaration, not a deployment's (no deployment sets it)
     sp_exchange: Literal["none", "ulysses"] = field(default="none", kw_only=True)
 
     def __post_init__(self):
