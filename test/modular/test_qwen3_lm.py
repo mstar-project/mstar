@@ -287,8 +287,11 @@ def test_a_layer_whose_steps_may_split_writes_its_kv_through_the_exchange(monkey
 
     class Attend:
         # Ulysses' plan states attend only the pages: reads_step_kv is False
-        attn = types.SimpleNamespace(splits=splits, reads_step_kv=lambda: False, run=lambda q, kv_cache_layer: q)
+        attn = types.SimpleNamespace(reads_step_kv=lambda: False, run=lambda q, kv_cache_layer: q)
         kv = types.SimpleNamespace(write_target=lambda: (None, None, None, 4), layer_view=lambda: None)
+
+        def _exchanges(self):
+            return splits
 
         def __call__(self, q, k, v):
             calls.append("attend")
