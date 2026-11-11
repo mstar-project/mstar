@@ -109,6 +109,14 @@ def test_conditional_only_capture_when_guidance_is_off(monkeypatch) -> None:
     )
     assert step.cg_key_info == image_key
     assert {seg.label for seg in step.segments} == {COND_LABEL}
+    # conditional-only rows never batch, so a step holds one and leases the bs=1 graph
+    assert sub.max_batch_size(C.IMAGE_GEN_WALK) == 1 and sub.max_batch_size(C.PREFILL_WALK) == 1
+
+
+def test_two_branch_deployment_keeps_its_batch_caps(monkeypatch) -> None:
+    sub, _ = _dit_with_buckets(monkeypatch)
+    assert sub.max_batch_size(C.IMAGE_GEN_WALK) == sub.max_gen_batch_size
+    assert sub.max_batch_size(C.PREFILL_WALK) is None
 
 
 def test_windowed_captured_inputs_carry_the_window_layout(monkeypatch) -> None:
