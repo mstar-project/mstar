@@ -3279,9 +3279,8 @@ class Engine:
             return False
         if batch.inputs is not None or (
             not submodule_mgmt.piecewise_runners
-            and submodule_mgmt.submodule.step_is_input_free(
-                batch.step_context.graph_walk,
-            )
+            # the walk the leased capture ran, whose template rows the step was declared over
+            and submodule_mgmt.submodule.step_is_input_free(lease.bucket.graph_walk)
         ):
             # exec drives this step as declared here, and its admit skips
             # the resources pre_admit covered

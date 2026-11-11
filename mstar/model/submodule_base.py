@@ -1166,7 +1166,9 @@ class NodeSubmodule(torch.nn.Module, ABC):
         but their spans, and every real row has the span of the template row.
         Then the step a pre-plan declared over the bucket's template rows is
         the step the forward would declare, and the engine runs it instead of
-        declaring and admitting a second time."""
+        declaring and admitting a second time. ``graph_walk`` is the walk the
+        leased capture ran; a replay walk must declare as that walk does over
+        its template rows."""
         del graph_walk
         return False
 
