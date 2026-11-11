@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import os
 import re
@@ -55,7 +56,7 @@ async def create_images(api, model_name, adapter, req, raw_request=None):  # noq
         for request_id in request_ids:
             try:
                 chunks = await api.collect_results(request_id, raw_request)
-            except HTTPException:
+            except (HTTPException, asyncio.CancelledError):
                 read += 1  # collect_results released it before raising
                 raise
             read += 1

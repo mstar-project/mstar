@@ -8,7 +8,7 @@ One denoise step over a row's tokens, ``[txt (Lt) | img (target + references)]``
     drop txt tokens -> AdaLN (norm_out) -> proj_out (D -> 64)
 
 ``zero_cond_t`` (Edit-2511): the reference images' tokens are modulated as at timestep 0,
-the target's at the step's timestep (the layout's ``modulate_index``).
+the target's at the step's timestep (the layout's ``target_tokens`` splits them).
 
 Each row's text is left-padded to the step's ``Lt``, so the joint sequence of a row is
 ``[pad | txt | img]`` and attends within the segments the step declares: the pad on its own,
@@ -16,9 +16,14 @@ and the real ``[txt | img]`` as the reference attends it. RoPE follows ``QwenEmb
 (``scale_rope``): the target at frame 0 and reference ``i`` at frame ``i``, heights and widths
 centred, text from ``max(h/2, w/2)`` over every image. The rotation is the reference's
 complex product itself: its rounding is the device's complex multiply (fused multiply-adds on
-CUDA), which no one real-arithmetic formula reproduces on every device. Under ``torch.compile``
-inductor runs that product as an aten fallback outside its fused kernels, which a compile on/off
-comparison has to account for.
+CUDA), which no one real-arithmetic formula reproduces on every device.
+
+On CUDA the elementwise work between the GEMMs runs as fused kernels (``kernels``) that round where
+the eager ops do: the q/k norms with the rotation, the LayerNorms with the modulation after them (the
+attention's gated residual too) and the gated residuals. Those are bit-identical to the eager ops (the CPU path),
+in a fraction of the memory traffic. The one fusion that is not is the MLP's bias and tanh-GELU, in the
+up-projection's GEMM epilogue (``ffn.addmm_gelu_tanh``, as SGLang runs it): it rounds once from the fp32
+accumulator where eager rounds the GEMM and then the GELU, so it is held to the fp32 yardstick, not to bits.
 
 Linears are tensor-parallel (``comm_group``): q/k/v and the MLP's first linear split by
 column, the attention outputs and the MLP's second by row; the modulation linears stay whole.
@@ -26,6 +31,7 @@ column, the attention outputs and the MLP's second by row; the modulation linear
 
 from __future__ import annotations
 
+import functools
 import math
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -37,7 +43,8 @@ from torch import nn
 
 from mstar.distributed.communication import CommGroup
 from mstar.distributed.utils import divide
-from mstar.model.components.diffusion.rope import qwen_rope_params
+from mstar.model.components.diffusion.ffn import addmm_gelu_tanh
+from mstar.model.components.diffusion.qwen import dit_kernels as kernels
 from mstar.model.components.distributed.linear import ColumnParallelLinear, RowParallelLinear
 from mstar.model.components.norm import QwenRMSNorm
 
@@ -82,11 +89,43 @@ class QwenImageTransformerConfig:
 
 
 class QwenStepLayout(NamedTuple):
-    """Per-step derived tensors (``build_layout``): complex64 rotary tables and the modulation index."""
+    """Per-step derived tables (``build_layout``): complex64 rotary tables and where the target's tokens end."""
 
     img_freqs: torch.Tensor        # [L_img, head_dim / 2]
     txt_freqs: torch.Tensor        # [branches, Lt, head_dim / 2], one row per local branch
-    modulate_index: torch.Tensor   # [L_img] int: 0 the target's tokens, 1 the references'
+    target_tokens: int             # the image tokens before the references'; zero_cond_t modulates the rest at t=0
+
+
+def _rope_axis(index: torch.Tensor, dim: int, theta: float) -> torch.Tensor:
+    """``QwenEmbedRope.rope_params``: complex64 ``[len(index), dim / 2]``."""
+    freqs = torch.outer(index, 1.0 / torch.pow(theta, torch.arange(0, dim, 2).to(torch.float32).div(dim)))
+    return torch.polar(torch.ones_like(freqs), freqs)
+
+
+@functools.lru_cache(maxsize=4)
+def _rope_axes(axes_dims: tuple[int, ...], theta: float) -> tuple[list[torch.Tensor], list[torch.Tensor], torch.Tensor]:
+    """Each axis's rotations at positions ``0..ROPE_POSITIONS-1`` and at the negative ones, and the positive axes
+    side by side (the text's table): constants, built once."""
+    pos_index = torch.arange(ROPE_POSITIONS)
+    neg_index = torch.arange(ROPE_POSITIONS).flip(0) * -1 - 1
+    pos = [_rope_axis(pos_index, d, theta) for d in axes_dims]
+    neg = [_rope_axis(neg_index, d, theta) for d in axes_dims]
+    return pos, neg, torch.cat(pos, dim=1)
+
+
+@functools.lru_cache(maxsize=16)
+def _image_rope(axes_dims: tuple[int, ...], img_grids: tuple[tuple[int, int], ...], theta: float) -> torch.Tensor:
+    """The image tokens' table, a function of the grids alone. Cached: building it is ~10^6-element host ops
+    that run on torch's intra-op pool, and two ranks of one host building at once (cfg-parallel, each rank's
+    first step of a request) contend for the cores: ~4 ms alone, ~300-400 ms together."""
+    pos, neg, _ = _rope_axes(axes_dims, theta)
+    img = []
+    for frame, (h, w) in enumerate(img_grids):
+        t_freqs = pos[0][frame:frame + 1].view(1, 1, 1, -1).expand(1, h, w, -1)
+        h_freqs = torch.cat([neg[1][-(h - h // 2):], pos[1][:h // 2]]).view(1, h, 1, -1).expand(1, h, w, -1)
+        w_freqs = torch.cat([neg[2][-(w - w // 2):], pos[2][:w // 2]]).view(1, 1, w, -1).expand(1, h, w, -1)
+        img.append(torch.cat([t_freqs, h_freqs, w_freqs], dim=-1).reshape(h * w, -1))
+    return torch.cat(img).contiguous()
 
 
 def qwen_rope_tables(
@@ -95,27 +134,19 @@ def qwen_rope_tables(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """``(img_freqs, txt_freqs)`` on the host, complex64, as ``QwenEmbedRope`` (``scale_rope``)
     builds them: ``img_grids`` are the target's then each reference's ``(h, w)`` in tokens, and
-    ``text_lengths`` the real text of each local branch, left-padded to ``text_rows``."""
-    pos_index = torch.arange(ROPE_POSITIONS)
-    neg_index = torch.arange(ROPE_POSITIONS).flip(0) * -1 - 1
-    pos = [qwen_rope_params(pos_index, d, theta) for d in axes_dims]
-    neg = [qwen_rope_params(neg_index, d, theta) for d in axes_dims]
-    img = []
-    for frame, (h, w) in enumerate(img_grids):
-        t_freqs = pos[0][frame:frame + 1].view(1, 1, 1, -1).expand(1, h, w, -1)
-        h_freqs = torch.cat([neg[1][-(h - h // 2):], pos[1][:h // 2]]).view(1, h, 1, -1).expand(1, h, w, -1)
-        w_freqs = torch.cat([neg[2][-(w - w // 2):], pos[2][:w // 2]]).view(1, 1, w, -1).expand(1, h, w, -1)
-        img.append(torch.cat([t_freqs, h_freqs, w_freqs], dim=-1).reshape(h * w, -1))
-    img_freqs = torch.cat(img)
+    ``text_lengths`` the real text of each local branch, left-padded to ``text_rows``. ``img_freqs`` is
+    shared between calls: read it, don't write it."""
+    axes_dims, img_grids = tuple(axes_dims), tuple(tuple(g) for g in img_grids)
+    img_freqs = _image_rope(axes_dims, img_grids, theta)
     start = max(max(h // 2, w // 2) for h, w in img_grids)
-    all_axes = torch.cat(pos, dim=1)
+    all_axes = _rope_axes(axes_dims, theta)[2]
     txt = []
     for length in text_lengths:
         # a pad row reads the first real position; it attends only itself
         index = (torch.arange(text_rows) - (text_rows - length)).clamp(min=0) + start
         txt.append(all_axes[index])
     txt_freqs = torch.stack(txt)
-    return img_freqs.contiguous(), txt_freqs.contiguous()
+    return img_freqs, txt_freqs.contiguous()
 
 
 def apply_rope(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
@@ -157,13 +188,17 @@ class _TimeTextEmbed(nn.Module):
 
 
 class _GeluProj(nn.Module):
-    """diffusers ``GELU(approximate="tanh")``: a column-parallel projection and the activation."""
+    """diffusers ``GELU(approximate="tanh")``: a column-parallel projection and the activation, on CUDA in one
+    GEMM (the bias and the GELU in its epilogue). The column shard is a local GEMM with its bias on every rank."""
 
     def __init__(self, comm_group: CommGroup, dim: int, inner: int):
         super().__init__()
         self.proj = ColumnParallelLinear(comm_group, dim, inner, bias=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # a LoRA-bound projection adds its delta in its forward, before the GELU: only a plain one takes the GEMM
+        if _plain(self.proj, ColumnParallelLinear):
+            return addmm_gelu_tanh(x, self.proj.weight, self.proj.bias)
         return F.gelu(self.proj(x), approximate="tanh")
 
 
@@ -204,32 +239,129 @@ class QwenImageJointAttention(nn.Module):
         def heads(x: torch.Tensor) -> torch.Tensor:
             return x.unflatten(-1, (-1, self.head_dim))
 
-        q_i = apply_rope(self.norm_q(heads(self.to_q(img))), layout.img_freqs)
-        k_i = apply_rope(self.norm_k(heads(self.to_k(img))), layout.img_freqs)
-        q_t = apply_rope(self.norm_added_q(heads(self.add_q_proj(txt))), txt_freqs)
-        k_t = apply_rope(self.norm_added_k(heads(self.add_k_proj(txt))), txt_freqs)
-        q = torch.cat([q_t, q_i], dim=1)
-        k = torch.cat([k_t, k_i], dim=1)
-        v = torch.cat([heads(self.add_v_proj(txt)), heads(self.to_v(img))], dim=1)
+        q, k = self._norm_rope(
+            (heads(self.add_q_proj(txt)), heads(self.to_q(img)), self.norm_added_q, self.norm_q),
+            (heads(self.add_k_proj(txt)), heads(self.to_k(img)), self.norm_added_k, self.norm_k),
+            txt_freqs, layout.img_freqs,
+        )
+        v = heads(_joint_linear(self.add_v_proj, txt, self.to_v, img))
         out = attend(q, k, v).flatten(2, 3).to(q.dtype)
         num_txt = txt.shape[1]
-        return self.to_out[0](out[:, num_txt:].contiguous()), self.to_add_out(out[:, :num_txt].contiguous())
+        return _rows_linear(self.to_out[0], out[:, num_txt:]), _rows_linear(self.to_add_out, out[:, :num_txt])
 
-
-def _modulate(x: torch.Tensor, params: torch.Tensor, index: torch.Tensor | None = None):
-    """``(x (1 + scale) + shift, gate)`` from ``params [B, 3D]``; with ``index`` (``zero_cond_t``),
-    ``params`` is ``[2B, 3D]`` (the step's timestep rows, then timestep 0's) and each token takes
-    the half its index names."""
-    shift, scale, gate = params.chunk(3, dim=-1)
-    if index is None:
-        shift, scale, gate = shift.unsqueeze(1), scale.unsqueeze(1), gate.unsqueeze(1)
-    else:
-        rows = shift.shape[0] // 2
-        pick = index.view(1, -1, 1) == 0
-        shift, scale, gate = (
-            torch.where(pick, p[:rows].unsqueeze(1), p[rows:].unsqueeze(1)) for p in (shift, scale, gate)
+    @staticmethod
+    def _norm_rope(q_parts, k_parts, txt_freqs, img_freqs) -> tuple[torch.Tensor, torch.Tensor]:
+        """q and k, each ``[txt | img]`` along the tokens with every part per-head normed and rotated: one fused
+        pass per part for both on CUDA. Each ``*_parts`` is ``(txt, img, txt_norm, img_norm)``."""
+        (q_txt, q_img, q_txt_norm, q_img_norm), (k_txt, k_img, k_txt_norm, k_img_norm) = q_parts, k_parts
+        norms = (q_txt_norm, q_img_norm, k_txt_norm, k_img_norm)
+        if (kernels.fits(q_txt, q_img, k_txt, k_img) and q_txt.shape[-1] == 128 and len({n.eps for n in norms}) == 1
+                and q_txt.stride() == k_txt.stride() and q_img.stride() == k_img.stride()):
+            return kernels.joint_qk_pair_norm_rope(
+                q_txt, q_img, k_txt, k_img, *(n.weight for n in norms), txt_freqs, img_freqs, q_txt_norm.eps,
+            )
+        return tuple(
+            torch.cat([apply_rope(tn(t), txt_freqs), apply_rope(im(i), img_freqs)], dim=1)
+            for t, i, tn, im in (q_parts, k_parts)
         )
-    return x * (1 + scale) + shift, gate
+
+
+def _plain(linear: nn.Module, cls: type) -> bool:
+    """A plain tensor-parallel linear (not a LoRA twin) whose forward is its GEMM with the bias."""
+    return type(linear) is cls and linear.bias is not None and not linear.skip_bias_add
+
+
+def _joint_linear(txt_linear: ColumnParallelLinear, txt: torch.Tensor, img_linear: ColumnParallelLinear,
+                  img: torch.Tensor) -> torch.Tensor:
+    """``cat([txt_linear(txt), img_linear(img)], dim=1)``, each row's GEMMs writing straight into its slice of the
+    joint ``[R, Lt + Li, N]`` (a column shard is a local GEMM on every rank). Bit-exact with the cat at the served shape
+    on H200 (a different GEMM shape may round differently elsewhere: the CUDA test holds it to bf16 rounding)."""
+    if not (txt.is_cuda and _plain(txt_linear, ColumnParallelLinear) and _plain(img_linear, ColumnParallelLinear)
+            and not txt_linear._local_output_start and not img_linear._local_output_start
+            and not (txt_linear.gather_output and txt_linear.tp_size > 1)
+            and not (img_linear.gather_output and img_linear.tp_size > 1)):
+        return torch.cat([txt_linear(txt), img_linear(img)], dim=1)
+    lt = txt.shape[1]
+    out = img.new_empty(img.shape[0], lt + img.shape[1], img_linear.weight.shape[0])
+    for r in range(img.shape[0]):
+        torch.addmm(txt_linear.bias, txt[r], txt_linear.weight.t(), out=out[r, :lt])
+        torch.addmm(img_linear.bias, img[r], img_linear.weight.t(), out=out[r, lt:])
+    return out
+
+
+def _rows_linear(linear: RowParallelLinear, x: torch.Tensor) -> torch.Tensor:
+    """``linear(x)`` for a token slice ``x [R, L, K]`` of a larger tensor, one GEMM per row from its contiguous
+    rows instead of a copy of the slice (one GPU; under TP the row shard's all-reduce runs as usual). Bit-exact with
+    the copy at the served shape on H200 (see :func:`_joint_linear`)."""
+    if not (x.is_cuda and _plain(linear, RowParallelLinear) and linear.tp_size == 1 and x[0].is_contiguous()):
+        return linear(x.contiguous())
+    out = x.new_empty(*x.shape[:2], linear.weight.shape[0])
+    for r in range(x.shape[0]):
+        torch.addmm(linear.bias, x[r], linear.weight.t(), out=out[r])
+    return out
+
+
+def _by_token(fn, split: int, tokens: tuple[torch.Tensor, ...], params: tuple[torch.Tensor, ...]) -> torch.Tensor:
+    """``fn(*tokens, *params)`` with ``params [sets * R, D]`` broadcast over the tokens: one set for every token, or
+    (``zero_cond_t``) set 0 for the tokens before ``split`` and set 1 from it."""
+    rows = tokens[0].shape[0]
+    if params[0].shape[0] == rows:
+        return fn(*tokens, *(p[:, None] for p in params))
+    return torch.cat([fn(*(t[:, :split] for t in tokens), *(p[:rows, None] for p in params)),
+                      fn(*(t[:, split:] for t in tokens), *(p[rows:, None] for p in params))], dim=1)
+
+
+class _Mod(NamedTuple):
+    """One modulation's parameters, each a contiguous ``[sets * B, D]`` (``zero_cond_t``: the step's timestep rows,
+    then timestep 0's, the second set from token ``split``)."""
+
+    shift: torch.Tensor
+    scale1p: torch.Tensor
+    gate: torch.Tensor
+
+
+def _block_mods(linear: nn.Module, act: torch.Tensor) -> tuple[_Mod, _Mod]:
+    """A block's two modulations from ``linear(act) [sets * B, 6D]``: one copy lays the six ``[sets * B, D]`` parts
+    out contiguously (instead of one per part) and one add makes both ``1 + scale``."""
+    params = linear(act)
+    rows, dim = params.shape[0], params.shape[1] // 6
+    parts = params.view(rows, 6, dim).transpose(0, 1).contiguous()
+    scale1p = 1 + parts[1::3]
+    return _Mod(parts[0], scale1p[0], parts[2]), _Mod(parts[3], scale1p[1], parts[5])
+
+
+def _modulate(x: torch.Tensor, mod: _Mod, split: int):
+    """``(x (1 + scale) + shift, gate)``; ``gate`` stays ``[sets * B, D]`` for :func:`_gated_add`."""
+    shift, scale1p, gate = mod
+    if kernels.fits(x, shift) and x.is_contiguous():
+        return kernels.modulate(x, scale1p, shift, split), gate
+    return _by_token(lambda t, s1p, sh: t * s1p + sh, split, (x,), (scale1p, shift)), gate
+
+
+def _gated_add(x: torch.Tensor, gate: torch.Tensor, y: torch.Tensor, split: int) -> torch.Tensor:
+    """``x + gate * y``, ``gate`` by token as in :func:`_modulate`."""
+    if kernels.fits(x, gate, y) and x.is_contiguous() and y.is_contiguous():
+        return kernels.gated_add(x, gate, y, split)
+    return _by_token(lambda t, u, g: t + g * u, split, (x, y), (gate,))
+
+
+def _norm_modulate(norm: nn.LayerNorm, x: torch.Tensor, mod: _Mod, split: int):
+    """:func:`_modulate` of ``norm(x)``, in one pass where the kernel takes ``x``."""
+    if kernels.norm_fits(x, mod.shift):
+        return kernels.norm_modulate(x, mod.scale1p, mod.shift, split, norm.eps), mod.gate
+    return _modulate(norm(x), mod, split)
+
+
+def _gated_norm_modulate(
+    x: torch.Tensor, gate: torch.Tensor, y: torch.Tensor, norm: nn.LayerNorm, mod: _Mod, split: int,
+):
+    """``r = _gated_add(x, gate, y)`` and ``_modulate(norm(r), mod)``: ``(r, modulated, next gate)``, from one
+    read of ``x`` and ``y`` where the kernel takes them."""
+    if kernels.norm_fits(x, gate, y, mod.shift) and y.is_contiguous():
+        residual, out = kernels.gated_norm_modulate(x, gate, y, mod.scale1p, mod.shift, split, norm.eps)
+        return residual, out, mod.gate
+    residual = _gated_add(x, gate, y, split)
+    return (residual, *_modulate(norm(residual), mod, split))
 
 
 class QwenImageBlock(nn.Module):
@@ -250,24 +382,26 @@ class QwenImageBlock(nn.Module):
         self.txt_mlp = _FeedForward(comm_group, dim)
 
     def forward(
-        self, img: torch.Tensor, txt: torch.Tensor, temb: torch.Tensor, layout: QwenStepLayout,
+        self, img: torch.Tensor, txt: torch.Tensor, temb_act: torch.Tensor, layout: QwenStepLayout,
         txt_freqs: torch.Tensor, attend,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        index = layout.modulate_index if self.zero_cond_t else None
-        img_mod1, img_mod2 = self.img_mod(temb).chunk(2, dim=-1)
-        txt_temb = temb.chunk(2, dim=0)[0] if self.zero_cond_t else temb
-        txt_mod1, txt_mod2 = self.txt_mod(txt_temb).chunk(2, dim=-1)
+        """``temb_act``: ``silu(temb)``, the modulations' input, the same for every block (``img_mod`` /
+        ``txt_mod`` are ``SiLU`` then the linear)."""
+        # zero_cond_t: the references' tokens (from target_tokens on) take timestep 0's parameters
+        split = layout.target_tokens if self.zero_cond_t else img.shape[1]
+        img_mod1, img_mod2 = _block_mods(self.img_mod[1], temb_act)
+        txt_act = temb_act.chunk(2, dim=0)[0] if self.zero_cond_t else temb_act
+        txt_mod1, txt_mod2 = _block_mods(self.txt_mod[1], txt_act)
+        txt_split = txt.shape[1]
 
-        img_in, img_gate1 = _modulate(self.img_norm1(img), img_mod1, index)
-        txt_in, txt_gate1 = _modulate(self.txt_norm1(txt), txt_mod1)
+        img_in, img_gate1 = _norm_modulate(self.img_norm1, img, img_mod1, split)
+        txt_in, txt_gate1 = _norm_modulate(self.txt_norm1, txt, txt_mod1, txt_split)
         img_attn, txt_attn = self.attn(img_in, txt_in, layout, txt_freqs, attend)
-        img = img + img_gate1 * img_attn
-        txt = txt + txt_gate1 * txt_attn
 
-        img_in, img_gate2 = _modulate(self.img_norm2(img), img_mod2, index)
-        img = img + img_gate2 * self.img_mlp(img_in)
-        txt_in, txt_gate2 = _modulate(self.txt_norm2(txt), txt_mod2)
-        txt = txt + txt_gate2 * self.txt_mlp(txt_in)
+        img, img_in, img_gate2 = _gated_norm_modulate(img, img_gate1, img_attn, self.img_norm2, img_mod2, split)
+        img = _gated_add(img, img_gate2, self.img_mlp(img_in), split)
+        txt, txt_in, txt_gate2 = _gated_norm_modulate(txt, txt_gate1, txt_attn, self.txt_norm2, txt_mod2, txt_split)
+        txt = _gated_add(txt, txt_gate2, self.txt_mlp(txt_in), txt_split)
         return img, txt
 
 
@@ -282,6 +416,8 @@ class _AdaNormOut(nn.Module):
 
     def forward(self, x: torch.Tensor, temb: torch.Tensor) -> torch.Tensor:
         scale, shift = self.linear(self.silu(temb).to(x.dtype)).chunk(2, dim=1)
+        if kernels.norm_fits(x, shift):
+            return kernels.norm_modulate(x, 1 + scale, shift, x.shape[1], self.norm.eps)
         return self.norm(x) * (1 + scale)[:, None, :] + shift[:, None, :]
 
 
@@ -324,8 +460,10 @@ class QwenImageTransformer(nn.Module):
             # compiled blocks: one graph for any prompt length, the image dims static
             for tensor in (txt, txt_freqs):
                 torch._dynamo.mark_dynamic(tensor, 1)
+        temb_act = F.silu(temb)
+        kernels.fits(img)  # the kernels' one-time self-check runs here, in eager, before any compiled block
         for block in self.transformer_blocks:
-            img, txt = block(img, txt, temb, layout, txt_freqs, attend)
+            img, txt = block(img, txt, temb_act, layout, txt_freqs, attend)
         if self.config.zero_cond_t:
             temb = temb.chunk(2, dim=0)[0]
         return self.proj_out(self.norm_out(img, temb))

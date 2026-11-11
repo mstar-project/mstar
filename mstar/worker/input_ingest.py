@@ -6,8 +6,10 @@ teardown point, and TP-follow messages go to ``Lockstep``."""
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable, Collection
+from typing import TYPE_CHECKING
 
-from mstar.communication.edge_items import frame_dtypes, row_infos, row_input_signals
+from mstar.communication.edge_items import frame_dtypes, row_infos, row_input_signals, row_values_frame
 from mstar.communication.edge_items import rows as stream_rows
 from mstar.communication.event import EventWakeup
 from mstar.engine.resources.kv.config import without_layouts
@@ -35,6 +37,9 @@ from mstar.worker.lora_loads import LoraLoads
 from mstar.worker.request_lifecycle import RequestLifecycle
 from mstar.worker.services import WorkerLayout, WorkerServices
 from mstar.worker.worker_metrics import WorkerMetrics
+
+if TYPE_CHECKING:
+    from mstar.engine.resources import ResourceReqConfig
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +69,7 @@ class InputIngest:
         self, services: WorkerServices, layout: WorkerLayout,
         lifecycle: RequestLifecycle, lockstep: Lockstep, wakeup_event: EventWakeup,
         *, metrics: WorkerMetrics | None = None, enable_nvtx: bool = False,
+        set_rebuildable: Callable[[int, dict[str, ResourceReqConfig]], Collection[str]] | None = None,
     ):
         self._worker_id = services.worker_id
         self._runtime = services.graph_runtime
@@ -77,6 +83,9 @@ class InputIngest:
         self._lockstep = lockstep
         self._wakeup_event = wakeup_event
         self._enable_nvtx = enable_nvtx
+        # marks each paged KV cache of a request's first NewRequest rebuildable or not, before the engine adds it,
+        # and returns the nodes whose log of the request the rebuild pool couldn't hold
+        self._set_rebuildable = set_rebuildable
         self.lora_loads = LoraLoads(services)
         self._handlers = {
             WorkerMessageType.NEW_REQUEST: self._add_new_request,
@@ -166,8 +175,10 @@ class InputIngest:
     def _add_new_request(self, body: NewRequest) -> None:
         wire_rid = body.request_id
         lifecycle = self._lifecycle
-        if not lifecycle.takes_input(wire_rid):
-            return
+        # Any worker can handle a DRAIN before the conductor's NEW_REQUEST, and a TP follower gets rank 0's. After
+        # READS_DONE the worker still takes the request in, without reads, since on a follower rank 0's moves for the
+        # request wait until it holds the request.
+        unread = not lifecycle.takes_input(wire_rid)
         logger.debug("Worker %s received request %s", self._worker_id, wire_rid)
         laps = PhaseLaps("worker.msg.new_request.")
         runtime = self._runtime
@@ -197,33 +208,48 @@ class InputIngest:
         laps.lap("worker_state")
         try:
             if first:
+                unheld = () if self._set_rebuildable is None else self._set_rebuildable(
+                    rid, body.request_info.resource_configs,
+                )
                 self._engines.add_request(
                     rid, body.request_info.resource_configs, body.request_info,
                 )
+                # Rank 0 journals each refused log once the engine holds the request, since a follower's replay
+                # changes the request's KV config.
+                for node in unheld:
+                    self._engines.get_engine(node).keeps_no_ids(node, rid)
                 laps.lap("engine_add")
                 self._skip_unshared_publish(rid, body.worker_graph_to_workers)
                 laps.lap("skip_publish")
             body.request_info.resource_configs = without_layouts(body.request_info.resource_configs)
 
-            self._streams.add_request(rid, body.request_info)
-            laps.lap("stream_buffers")
+            if not unread:
+                self._streams.add_request(rid, body.request_info)
+                laps.lap("stream_buffers")
 
-            # Start RDMA reads for tensors that have tensor_info
-            self._wakeup_event.register_futures(self._tensors.start_read_tensors(
-                rid, body.initial_inputs, graph_walk=body.request_info.graph_walk,
-            ))
-            laps.lap("start_reads")
+                # Start RDMA reads for tensors that have tensor_info
+                self._wakeup_event.register_futures(self._tensors.start_read_tensors(
+                    rid, body.initial_inputs, graph_walk=body.request_info.graph_walk,
+                ))
+                laps.lap("start_reads")
 
-            # Signal-only edges (tensor_info is None) can be processed immediately
-            signal_only = [edge for edge in body.initial_inputs if len(edge.tensor_info) == 0]
-            if signal_only:
-                runtime.ingest_inputs_batch(_one_rids_edges(rid, signal_only), can_buffer=True)
-            laps.lap("ingest_signals")
+                # Signal-only edges (tensor_info is None) can be processed immediately
+                signal_only = [edge for edge in body.initial_inputs if len(edge.tensor_info) == 0]
+                if signal_only:
+                    runtime.ingest_inputs_batch(_one_rids_edges(rid, signal_only), can_buffer=True)
+                laps.lap("ingest_signals")
         except Exception as err:
             # a failed engine ingest rolled itself back; the conductor's REMOVE
             # tears down what else the request has here
             self._fail_intake([rid], err, f"ingest of request {wire_rid} failed")
-        self._dispatch(lifecycle.take_parked(wire_rid))
+        parked = lifecycle.take_parked(wire_rid)
+        if unread:
+            # its parked inputs are never read, so they are ACKed unread as for a removed request
+            for message in parked:
+                if message.message_type == WorkerMessageType.INPUT_SIGNALS:
+                    self.drop_for_removed(message)
+            parked = [message for message in parked if message.message_type != WorkerMessageType.INPUT_SIGNALS]
+        self._dispatch(parked)
 
     def _remove_request(self, body: RemoveRequest) -> None:
         rid = self._runtime.get_rid_handle(body.request_id)
@@ -381,6 +407,9 @@ class InputIngest:
         """A step's streamed tensors from one producer (EDGE_ITEMS): each
         row is what one INPUT_SIGNALS of a single streamed edge did, and the
         frame's reads start in one call."""
+        if frame.values:
+            self._process_edge_values(frame)
+            return
         reads: list[tuple[int, list[GraphEdge]]] = []
         dtypes = frame_dtypes(frame)
         per_request_info = self._request_state.per_request_info
@@ -417,6 +446,26 @@ class InputIngest:
                 self._fail_intake([rid for rid, _ in reads], err, "streamed input read failed")
                 return
             self._wakeup_event.register_futures(futures)
+
+    def _process_edge_values(self, frame: EdgeItems) -> None:
+        """A frame of inline items: each row's values go straight into its
+        stream buffer, with nothing to read or acknowledge. A row for a request
+        not here yet is parked as a frame of its own, as its tensors would be."""
+        per_request_info = self._request_state.per_request_info
+        values = frame.values
+        for row in stream_rows(frame):
+            rid = self._runtime.get_rid_handle(row.request_id)
+            if rid is None or rid not in per_request_info:
+                # a removed request's row holds nothing to release
+                self._lifecycle.park(WorkerMessage(
+                    message_type=WorkerMessageType.EDGE_ITEMS, body=row_values_frame(frame, row),
+                ))
+                continue
+            if not self._lifecycle.takes_input(row.request_id) or rid in self._lifecycle.pending_removes:
+                continue
+            stream_buf = per_request_info[rid].stream_buffers.get(row.signal)
+            if stream_buf is not None:
+                stream_buf.put_values(values[row.start:row.start + row.count])
 
     def _fail_intake(self, rids: list[int], err: Exception, what: str) -> None:
         """Fail ``rids`` for an error taking in their inputs (a CUDA OOM in

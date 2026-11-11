@@ -77,6 +77,7 @@ from mstar.engine.resources import (
     SamplingReqConfig,
 )
 from mstar.engine.resources.attn.ragged.config import RaggedAttentionConfig, RaggedAttentionSpec, RaggedAttnBackend
+from mstar.engine.resources.spec import CombinedSplit
 from mstar.engine.windowing import WindowSchedule
 from mstar.graph.base import (
     GraphEdge,
@@ -128,7 +129,7 @@ from mstar.model.cosmos3.submodules import (
     latent_frames,
     sound_frames,
 )
-from mstar.model.keys import ROPE, VISION_ATTN
+from mstar.model.keys import MIXED, ROPE, VISION_ATTN
 from mstar.model.media_limits import UndecodableMediaError, VideoBudget
 from mstar.model.multimodal import (
     MEDIA_LAYOUT,
@@ -139,9 +140,8 @@ from mstar.model.multimodal import (
     media_prefill_step,
     media_walks,
     parts_from_modalities,
-    text_combined_walks,
 )
-from mstar.model.multimodal_decoder import MIXED_SPLIT
+from mstar.model.submodule_base import ChunkingPolicy
 from mstar.model.utils import load_generation_defaults
 from mstar.streaming.chunk_policy import FixedChunkPolicy
 from mstar.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
@@ -154,6 +154,10 @@ VAE_DECODER_NODE = "vae_decoder"
 AUDIO_DECODER_NODE = "audio_decoder"
 VAE_DECODER_AR_NODE = "vae_decoder_ar"
 VISION_ENCODER_NODE = "vision_encoder"
+# A mixed step's prompt rows, text or media, take the prefill kernels
+REASONER_MIXED_SPLIT = CombinedSplit(
+    MIXED, prefill_walks=(constants.REASONER_PREFILL_WALK, constants.REASONER_PREFILL_VISION_WALK),
+)
 REASONER_NODE = "reasoner"
 
 # every request key the model reads; the Cosmos3 adapters map onto these names
@@ -435,8 +439,8 @@ class Cosmos3Model(Model):
                 nodes=kv_nodes,
                 config=AttentionConfig(
                     kv_cache=KV_CACHE, backend=AttnBackend.AUTO,
-                    # only the reasoner runs mixed (text prefill + decode) steps
-                    splits=(MIXED_SPLIT,) if self._reasoner_enabled() else (),
+                    # only the reasoner runs mixed (prompt + decode) steps
+                    splits=(REASONER_MIXED_SPLIT,) if self._reasoner_enabled() else (),
                 ),
             ),
         ]
@@ -496,8 +500,26 @@ class Cosmos3Model(Model):
         )
 
     def get_combined_graph_walks(self) -> dict[str, dict[str, set[str]]]:
-        # the reasoner's text prefill and decode rows share a step
-        return text_combined_walks(node=REASONER_NODE) if self._reasoner_enabled() else {}
+        # the reasoner's text and media prompt rows share steps with its decode rows
+        if not self._reasoner_enabled():
+            return {}
+        return {REASONER_NODE: {MIXED: set(REASONER_MIXED_SPLIT.prefill_walks) | {self.REASONER_DECODE_WALK}}}
+
+    def get_chunking_policies(self) -> dict[str, tuple[ChunkingPolicy, ...]]:
+        # the reasoner's text and media prompts split by its token budget; the
+        # mixed walk carries it for the steps a chunk shares with decode rows
+        if not self._reasoner_enabled():
+            return {}
+        from mstar.model.cosmos3.submodules import Cosmos3ReasonerSubmodule
+
+        budget = Cosmos3ReasonerSubmodule.MAX_BATCH_TOKENS
+        return {REASONER_NODE: (
+            ChunkingPolicy(
+                walks=(self.REASONER_PREFILL_WALK, self.REASONER_PREFILL_VISION_WALK),
+                chunkable=True, max_batch_tokens=budget,
+            ),
+            ChunkingPolicy(walks=(MIXED,), max_batch_tokens=budget),
+        )}
 
     def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
         return {**super().get_loop_caps(**model_kwargs), **(model_kwargs.get(self.DENOISE_CAP) or {})}
@@ -569,11 +591,7 @@ class Cosmos3Model(Model):
         """The reasoner's one medium: the vision encoder's tokens fill the
         prompt's image and video pads, in prompt order, on the scaffold's
         ``prefill_vision`` walk (beside the DiT's own ``prefill*`` walks)."""
-        r = self.config.reasoner
-        return MediaEncoder(
-            "vision", VISION_ENCODER_NODE, ("pixel_values",), "vision_embeds",
-            (r.image_token_id, r.video_token_id),
-        )
+        return MediaEncoder("vision", VISION_ENCODER_NODE, ("pixel_values",), "vision_embeds")
 
     def _reasoner_enabled(self) -> bool:
         """Whether the reasoner walks (and the vision_encoder + reasoner

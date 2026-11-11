@@ -6,7 +6,9 @@ max_seq_len: 8192
 
 # Qwen-Image-Edit-2511 on one GPU (141 GB: the 41 GB DiT, the 16 GB text encoder and the VAE,
 # all colocated). Serving knobs (forwarded to QwenImageModel.__init__): attention_backend
-# sdpa|flashinfer, compile (each transformer block, static but for the text length).
+# sdpa|flashinfer, compile (EXPERIMENTAL, off: each transformer block, static but for the text length, and the
+# VAE's encoder and decoder, dynamic; it failed the fp32 yardstick on one prompt, served slower than eager and
+# recompiled the DiT on its first batched step).
 # Edit-2509: model_kwargs.model_path_hf: Qwen/Qwen-Image-Edit-2509.
 model_kwargs:
   attention_backend: flashinfer

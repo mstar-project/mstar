@@ -10,6 +10,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 import torch
+import torch.nn.functional as F
 
 diffusers = pytest.importorskip("diffusers")
 
@@ -205,6 +206,82 @@ def test_rope_rounds_as_the_reference(device):
         assert torch.equal(apply_rope(x, freqs), apply_rotary_emb_qwen(x, freqs, use_real=False))
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the fused kernels run on CUDA")
+@pytest.mark.parametrize("zero_cond_t", [True, False])
+def test_the_fused_kernels_round_as_the_eager_ops(zero_cond_t, monkeypatch):
+    """On CUDA the q/k norms with the rotation, the LayerNorms with the modulation, and the gated residuals run as
+    fused kernels. They round where the eager ops do (the LayerNorm's statistics in torch's own order), so a bf16
+    forward is the forward with the eager elementwise ops bit for bit (the MLP's GELU epilogue, the one fusion that
+    is not exact, runs in both: the next test's). The copy-free GEMMs are held to bf16 rounding of the plain path.
+    The kernels alone: ``test/modular/test_diffusion_dit_kernels.py``."""
+    from mstar.model.components.diffusion.attention import joint_attention
+    from mstar.model.components.diffusion.qwen import dit_kernels as kernels
+    from mstar.model.qwen_image.components import transformer
+    from mstar.model.qwen_image.components.transformer import QwenStepLayout, _GeluProj, qwen_rope_tables
+
+    # four 128-wide heads: a 512-wide model, the narrowest the LayerNorm kernel takes
+    config = QwenImageTransformerConfig(
+        **{**TINY, "attention_head_dim": 128, "num_attention_heads": 4, "axes_dims_rope": (16, 56, 56)},
+        zero_cond_t=zero_cond_t)
+    torch.manual_seed(0)
+    dit = QwenImageTransformer(config).eval()
+    with torch.no_grad():
+        for p in dit.parameters():
+            p.normal_(std=0.2)
+    dit = dit.to("cuda", torch.bfloat16)
+    # two rows (the guidance branches), the target 4x4 then a 4x6 reference, the second prompt left-padded
+    img_freqs, txt_freqs = qwen_rope_tables(config.axes_dims_rope, [(4, 4), (4, 6)], [7, 5], 7)
+    layout = QwenStepLayout(img_freqs.cuda(), txt_freqs.cuda(), 16)
+    g = torch.Generator().manual_seed(1)
+    img = torch.randn(2, 40, 64, generator=g).to("cuda", torch.bfloat16)
+    txt = torch.randn(2, 7, 24, generator=g).to("cuda", torch.bfloat16)
+    timestep = torch.tensor([0.3, 0.7], device="cuda", dtype=torch.bfloat16)
+
+    def forward():
+        with torch.no_grad():
+            return dit(img, txt, timestep, layout, joint_attention)
+
+    fused = forward()
+    # the fused kernels ran: the self-check passed on this device, so this is not eager against eager
+    assert kernels._VERIFIED[(img.device, torch.bfloat16)] is True
+    monkeypatch.setattr(kernels, "fits", lambda *tensors: False)
+    assert torch.equal(fused, forward())
+    # the copy-free GEMMs (v written into the joint tensor, the output projections reading in place) against the
+    # plain cat / contiguous path: the same math in a different GEMM shape, so cuBLAS may split K differently
+    # and the bits are not promised (bit-exact at the served shape on H200). The GELU epilogue's
+    # projections stay as they are.
+    gelu_projs = {id(m.proj) for m in dit.modules() if isinstance(m, _GeluProj)}
+    monkeypatch.setattr(transformer, "_plain", lambda linear, cls: id(linear) in gelu_projs)
+    torch.testing.assert_close(fused, forward(), rtol=3e-2, atol=3e-2)  # a few bf16 steps (2^-7 each)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the GELU epilogue runs on CUDA")
+def test_the_mlp_up_projection_takes_its_bias_and_gelu_in_the_gemm():
+    """On CUDA the MLP's up-projection is one GEMM with the bias and the tanh-GELU in cuBLASLt's epilogue (as SGLang
+    runs it). That rounds once, from the fp32 accumulator, where eager rounds the GEMM's output and then the GELU's:
+    not eager's bits, but within one bf16 step of the exact result everywhere and nearer it than eager on average."""
+    from mstar.distributed.communication import CommGroup
+    from mstar.model.qwen_image.components.transformer import _GeluProj
+
+    torch.manual_seed(0)
+    # the served width (3072 -> 12288), two rows of an odd token count
+    up = _GeluProj(CommGroup.trivial(), 3072, 4 * 3072)
+    with torch.no_grad():
+        up.proj.weight.normal_(std=3072 ** -0.5)
+        up.proj.bias.normal_(std=0.5)
+    up = up.to("cuda", torch.bfloat16)
+    x = torch.randn(2, 37, 3072).to("cuda", torch.bfloat16)
+    weight, bias = up.proj.weight, up.proj.bias
+    with torch.no_grad():
+        got = up(x)
+        eager = F.gelu(up.proj(x), approximate="tanh")
+        exact = F.gelu(torch.addmm(bias.double(), x.flatten(0, 1).double(), weight.double().t()),
+                       approximate="tanh").view(got.shape)
+    # one bf16 step (2^-7 relative); the absolute floor covers the fp32 accumulation where the GELU is near zero
+    torch.testing.assert_close(got.double(), exact, rtol=2 ** -7, atol=1e-5)
+    assert (got.double() - exact).abs().mean() < (eager.double() - exact).abs().mean()
+
+
 def _vaes():
     from diffusers import AutoencoderKLWan
     from diffusers.models.autoencoders.autoencoder_kl_qwenimage import AutoencoderKLQwenImage
@@ -222,8 +299,9 @@ def _vaes():
 def test_the_vae_nodes_match_the_pipelines_math():
     """Encode: the image processor's pixels, to the bit and memory layout (on an H200 a contiguous input moved the
     latents 1e-3, cuDNN picking kernels by layout), then the posterior's mode, (z - mean) / std, packed; decode:
-    unpacked, z / (1 / std) + mean, rounded as the pipeline's image processor does. The Wan class holds the
-    QwenImage checkpoint."""
+    unpacked, z / (1 / std) + mean, rounded as the pipeline's image processor does. The nodes skip the VAE's
+    one-frame feature cache (written, never read): a diffusers change that reads it would break this. The Wan
+    class holds the QwenImage checkpoint."""
     from diffusers.image_processor import VaeImageProcessor
     from diffusers.pipelines.qwenimage.pipeline_qwenimage_edit_plus import QwenImageEditPlusPipeline as P
     from PIL import Image
@@ -232,8 +310,8 @@ def test_the_vae_nodes_match_the_pipelines_math():
     image = torch.randint(0, 256, (3, 32, 48), dtype=torch.uint8)
     pil = Image.fromarray(image.permute(1, 2, 0).numpy())
     pixels = VaeImageProcessor(vae_scale_factor=16).preprocess(pil, height=32, width=48).unsqueeze(2)
-    seen, encode = [], wan.encode
-    wan.encode = lambda x: seen.append(x) or encode(x)
+    seen = []
+    wan.encoder.register_forward_pre_hook(lambda module, args: seen.append(args[0]))
     encoder = QwenImageVaeEncoderSubmodule(wan)
     encoder.get_device = lambda: torch.device("cpu")
     with torch.no_grad():
@@ -254,6 +332,30 @@ def test_the_vae_nodes_match_the_pipelines_math():
         decoded = qwen.decode(latents, return_dict=False)[0][:, :, 0]
         want_out = ((decoded * 0.5 + 0.5).clamp(0, 1).float() * 255).round().to(torch.uint8)
     assert torch.equal(image_out, want_out)
+
+
+def test_the_compiled_vae_regions_serve_other_sizes_without_recompiling():
+    """Each region warmed on its ``compile_regions`` examples (the engine compiles it with dynamic=True) must take a
+    live request's input as it comes, any size and decode batch: a recompile there stalls that request for minutes."""
+    _, wan = _vaes()
+    encoder, decoder = QwenImageVaeEncoderSubmodule(wan, compile=True), QwenImageVaeDecoderSubmodule(
+        wan, QwenImageConfig(), compile=True)
+    for sub in (encoder, decoder):
+        sub.get_device = lambda: torch.device("cpu")
+        for path, examples in sub.compile_regions().items():
+            module = sub.get_submodule(path)
+            module.forward = torch.compile(module.forward, dynamic=True, backend="eager")
+            with torch.no_grad():
+                for args in examples:
+                    module.forward(*args)
+    try:  # sizes above the warm-up's: on CPU (not CUDA) the conv backend switches below a size, a guard of its own
+        with torch._dynamo.config.patch(error_on_recompile=True), torch.no_grad():
+            for (h, w), batch in (((464, 336), 1), ((480, 480), 3)):
+                encoder.forward(IMAGE_INPUTS, None, image_0=torch.zeros(3, h, w, dtype=torch.uint8))
+                grid = (h // 16, w // 16)
+                decoder.run_batch(torch.randn(batch, grid[0] * grid[1], 64), grid)
+    finally:
+        torch._dynamo.reset()
 
 
 class _FakeProcessor:

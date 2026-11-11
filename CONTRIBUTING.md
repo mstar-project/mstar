@@ -35,7 +35,7 @@ validation commands. The generated Python API reference remains on Sphinx.
 
 ### Automated review
 
-A bot posts an advisory review when someone comments `/review` on a PR, from a fork or not; it never runs on its own when a PR is opened or pushed to. A contributor (the team, or anyone who has had a PR merged here) can comment `/review` on their own PR, and someone with write access can do so on any PR, or comment `/review thorough` for the thorough mode. It checks the invariants in [AGENTS.md](AGENTS.md) (the model/engine boundary, resource declarations, rank lockstep, Python/Rust parity, documented environment variables) and cites them by number. It is not a merge gate and a maintainer still reviews your PR. Comment `/review` again for a re-review after pushes. Reply to disagree. Details in [.github/review/](.github/review/).
+A bot posts a review when someone asks for one with a `/review` command on a PR, from a fork or not; it never runs on its own when a PR is opened or pushed to. A contributor (the team, or anyone who has had a PR merged here) can comment `/review light` on their own PR for a light review, and someone with write access can do so on any PR, or, on a PR whose author has write access, comment `/review nogpu` for the nogpu mode, which also reports P3 improvements and design questions, or `/review`, which adds a live GPU test and can approve a PR that meets a fixed rule. It checks the invariants in [AGENTS.md](AGENTS.md) (the model/engine boundary, resource declarations, rank lockstep, one graph runtime, documented environment variables) and cites them by number. Light and nogpu reviews are advisory, and a maintainer still reviews your PR. Comment the same command again for a re-review after pushes. Reply to disagree. Details in [.github/review/](.github/review/).
 
 ### AI-assisted contributions
 
@@ -139,10 +139,13 @@ The **CPU Core** job runs every test module under the directories in
 `CPU_TEST_PATHS` ([scripts/ci/select_cpu_tests.py](scripts/ci/select_cpu_tests.py)):
 `test/modular/`, `test/distributed/`, the model-local `mstar/model/*/tests/`
 and a few more, on a GitHub-hosted Ubuntu runner whenever a PR targeting `main`
-is opened, updated or reopened, split over the runner's 4 cores with
-pytest-xdist; `test_tp_async_lockstep_sim.py` runs in a second shard beside it,
-"CPU Core (TP lockstep sim)". It needs no GPU or model weights. New updates cancel an older CPU
-Core run for the same PR. The installation and invocation commands are in
+is opened, updated or reopened. It runs as two shards on two runners, "CPU Core 1/2"
+and "CPU Core 2/2", each split over the runner's 4 cores with pytest-xdist; a test
+file goes whole to one shard, by a stable hash of its path
+([scripts/ci/shard_plugin.py](scripts/ci/shard_plugin.py), `MSTAR_CI_SHARD=i/n`). `test_tp_async_lockstep_sim.py`
+runs in a third job beside them, "CPU Core (TP lockstep sim)", and a "CPU Core" job
+passes only when all three did. It needs no GPU or model weights. New updates cancel
+an older CPU Core run for the same PR. The installation and invocation commands are in
 [the CI workflow](.github/workflows/ci.yml).
 
 There is no list of test files to add to: a new module under one of those
