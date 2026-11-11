@@ -786,7 +786,20 @@ def test_a_drafters_layer_set_bound_by_other_than_its_layers_is_refused():
         return layers
 
     assert _layer_set_problem(stack("draft", "draft"), {"kv": pool}, joined) is None
-    assert stack("draft")[0].attend._layer_offset == 4
+    # what a set's layer writes and attends: its own index from where the pool placed the set
+    seen = []
+
+    class _Cursor:
+        def set_default_layer_idx(self, idx):
+            seen.append(idx)
+
+    kv, attn = _Cursor(), _Cursor()
+    kv.layer_set = pool.layer_set
+    AttentionCallable(kv=kv, attn=attn, layer_set="draft").set_layer_idx(1)
+    assert seen == [5, 5]
+    seen.clear()
+    AttentionCallable(kv=kv, attn=attn).set_layer_idx(1)
+    assert seen == [1, 1]
     for wrong in (stack("draft"), stack(None, None), stack("draft", "draft", "draft")):
         assert "attention layers declare it" in _layer_set_problem(wrong, {"kv": pool}, joined)
     assert _layer_set_problem(stack(None), {"kv": pool}, None) is None
@@ -929,6 +942,49 @@ def test_flashinfers_capabilities_say_what_this_gpu_cant_and_bind_picks_the_kern
     assert manager._verify_fa3 is False  # asking changes nothing
     manager.bind_verify_walk("decode", 4, 8)
     assert manager._verify_fa3 is (backend != "flashinfer" and reason is None)
+
+
+@pytest.mark.parametrize("refusal", ["verify", "async", None])
+def test_a_workers_own_capability_refusal_enters_the_one_agreement(monkeypatch, refusal):
+    """Invariant 11: a rank's own resource refusal is folded into the lockstep instance's one
+    reduction, never raised before it (its peers would wait in it) nor applied after it (the ranks
+    would run different modes). With none here, a peer's refusal makes this rank synchronous too."""
+    from spec_toy import ToyModel
+
+    from mstar.engine.resources.spec import ResourceCapabilities
+
+    eng = engine(3, oracle, mode="auto")
+    mgmt = eng._submodules[NODE]
+    joint = mgmt.joint_comm_group = _Joint(0 if refusal is None else 1)
+    caps = ResourceCapabilities(
+        verify_refusal="cannot here" if refusal == "verify" else None,
+        async_verify_refusal="cannot here" if refusal == "async" else None,
+    )
+    monkeypatch.setattr(mgmt.resources["kv"], "capabilities", lambda: caps)
+    decl = ToyModel(3, "auto").verify_nodes()[0]
+    if refusal == "verify":
+        with pytest.raises(RuntimeError, match="resource 'kv': cannot here"):
+            eng._agreed_mode(decl, mgmt, _toy_specs(), (True, ""))
+        # asked, can't verify: every rank raises after the one reduction
+        assert joint.asked == [[1, 0]]
+        return
+    got, reason = eng._agreed_mode(decl, mgmt, _toy_specs(), (True, ""))
+    assert got.value == "synchronous"
+    if refusal == "async":
+        assert joint.asked == [[0, 1]] and "resource 'kv': cannot here" in reason
+    else:
+        assert joint.asked == [[1, 1]] and "another rank" in reason
+
+
+def test_the_built_resources_must_be_the_declared_ones():
+    from spec_toy import ToyModel
+
+    eng = engine(3, oracle)
+    mgmt = eng._submodules[NODE]
+    specs = dict(_toy_specs())
+    specs.pop(next(iter(specs)))
+    with pytest.raises(RuntimeError, match="specs .* and resources .* differ"):
+        eng._agreed_mode(ToyModel(3).verify_nodes()[0], mgmt, specs, (True, ""))
 
 
 @pytest.mark.parametrize("refusal,mode,raises", [
