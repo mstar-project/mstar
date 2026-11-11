@@ -12,6 +12,7 @@ from typing import Any, NamedTuple
 
 from mstar.distributed.base import ShardingConfig
 from mstar.engine.resources.lora.serving import refuse_unresolved_lora_adapters
+from mstar.engine.state.analysis import deployment_problems, state_declaration_problems
 from mstar.model.base import (
     Model,
     WorkerGraph,
@@ -147,15 +148,22 @@ def validate_deployment(
     # problems found so far, and only the checks that need the specs are skipped
     specs = None
     try:
-        # a `resources:` block check_resources refuses turns no resource on
-        specs = enabled_resources(model, config if resources_readable else {**config, "resources": None})
+        declaration_problems = state_declaration_problems(model)
+        problems += declaration_problems
+        if declaration_problems:
+            problems.append("the `resources:` checks, which need the declarations, were skipped")
+        else:
+            # a `resources:` block check_resources refuses turns no resource on
+            specs = enabled_resources(model, config if resources_readable else {**config, "resources": None})
+            if resources_readable:
+                problems += deployment_problems(model, config.get("resources") or {})
     except (ValueError, OSError) as e:
         problems.append(
             f"declaring the node resources failed: {type(e).__name__}: {e}; "
             "the `resources:` checks, which need the declarations, were skipped"
         )
     except _UNREADABLE as e:
-        problems.append(_unreadable("get_node_resources", e))
+        problems.append(_unreadable("declaring the node resources", e))
     if specs is not None:
         problems += _checked("checking the node resources", check_resources, model, specs, config)
         # the placement checks see what the workers build of them

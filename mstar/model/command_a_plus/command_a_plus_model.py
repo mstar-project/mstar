@@ -9,24 +9,28 @@ import torch
 
 from mstar.conductor.request_info import FINAL_PREFILL
 from mstar.distributed.base import ShardingConfig
-from mstar.engine.resources import (
-    AttentionConfig,
-    AttentionSpec,
-    KVSpec,
-    PagedKVConfig,
-    PositionConfig,
-    PositionSpec,
-    SamplerSpec,
+from mstar.engine.state import (
+    Array,
+    Attend,
+    Causal,
+    KVEntry,
+    Layout,
+    Positions,
+    Read,
+    Rope,
+    Sampler,
+    SampleSettings,
+    Span,
+    Window,
 )
 from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import KVLabel, LabelLayout, Model, ProcessPromptOutput, Span, WalkStep
+from mstar.model.base import KVLabel, Model, ProcessPromptOutput, WalkStep
 from mstar.model.command_a_plus.assets import resolve_metadata
 from mstar.model.command_a_plus.config import (
     GLOBAL_ATTN,
     KV_CACHE,
     LOCAL_ATTN,
-    ROPE,
     SAMPLER,
     CommandAPlusConfig,
 )
@@ -123,31 +127,32 @@ class CommandAPlusModel(Model):
         # one prefill over the prompt, then decode until the stop check ends it
         return [prefill, WalkStep("decode", bind={"text_inputs": "new_token"})]
 
-    def get_node_resources(self):
+    def declare_state(self) -> list[Array | Sampler]:
         config = self.config
-        local = tuple(i for i, kind in enumerate(config.layer_types) if kind == "sliding_attention")
+        every = frozenset(range(config.num_hidden_layers))
+        local = frozenset(i for i, kind in enumerate(config.layer_types) if kind == "sliding_attention")
+        attend = Attend(q_heads=config.num_attention_heads)
+        capabilities = sampler_capabilities(self.sampling_defaults)
         return [
-            KVSpec(resource_key=KV_CACHE, nodes={"LLM"}, config=PagedKVConfig(
-                num_layers=config.num_hidden_layers, num_qo_heads=config.num_attention_heads,
-                num_kv_heads=config.num_key_value_heads, head_dim=config.head_dim,
-                max_seq_len=self.max_seq_len,
-            )),
-            AttentionSpec(resource_key=LOCAL_ATTN, nodes={"LLM"}, config=AttentionConfig(
-                kv_cache=KV_CACHE, sliding_window=config.sliding_window, layers=local,
-            )),
-            AttentionSpec(resource_key=GLOBAL_ATTN, nodes={"LLM"}, config=AttentionConfig(
-                kv_cache=KV_CACHE,
-            )),
-            PositionSpec(resource_key=ROPE, nodes={"LLM"}, config=PositionConfig(
-                kv_cache=KV_CACHE, rotary_dim=config.head_dim, interleave=True,
-                rope_theta=config.rope_theta,
-            )),
-            SamplerSpec(resource_key=SAMPLER, nodes={"LLM"}, vocab_size=config.vocab_size,
-                        **sampler_capabilities(self.sampling_defaults)),
+            Array(
+                KV_CACHE, nodes={"LLM"}, layers=every,
+                entry=KVEntry(heads=config.num_key_value_heads, head_dim=config.head_dim),
+                max_len=self.max_seq_len,
+                positions=Positions(rope=Rope(theta=config.rope_theta, rotary_dim=config.head_dim, interleave=True)),
+                reads={
+                    LOCAL_ATTN: Read(mask=Window(config.sliding_window), op=attend, layers=local),
+                    GLOBAL_ATTN: Read(mask=Causal(), op=attend, layers=every - local),
+                },
+            ),
+            Sampler(
+                SAMPLER, nodes={"LLM"}, vocab_size=config.vocab_size,
+                penalty=capabilities["enable_repetition_penalty"], min_p=capabilities["enable_min_p"],
+            ),
         ]
 
     def get_request_resource_configs(self, input_modalities, output_modalities, model_kwargs):
-        return {SAMPLER: sampling_config(self.sampling_defaults, model_kwargs)}
+        config = sampling_config(self.sampling_defaults, model_kwargs)
+        return {SAMPLER: SampleSettings(**{key: getattr(config, key) for key in SAMPLING_KEYS})}
 
     def request_kwargs(self):
         return frozenset({"messages", "max_output_tokens", *SAMPLING_KEYS})
@@ -257,10 +262,10 @@ class CommandAPlusModel(Model):
         # Image rows are not keyed by the placeholder ids they replace.
         span = Span("rows" if pixel_values else "ids", self.image_walk if pixel_values else "prefill",
                     ids.numel(), ids.numel(), "text_inputs")
-        layout = LabelLayout(spans=(span,), growth=(("decode_loop", 1),))
+        layout = Layout(spans=(span,), growth=(("decode_loop", 1),))
         # always set, so a layout the client sent never reaches the LLM
         media = media_layout(pads)
-        return ProcessPromptOutput(result, {MEDIA_LAYOUT: media, "kv_layout": {KV_CACHE: {"main": layout}}})
+        return ProcessPromptOutput(result, {MEDIA_LAYOUT: media, "state_layout": {KV_CACHE: {"main": layout}}})
 
     @staticmethod
     def _chat_messages(prompt, input_modalities, prompt_parts, messages):

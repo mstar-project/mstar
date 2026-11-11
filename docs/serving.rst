@@ -324,7 +324,8 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        55-90% as binary PCM, and digital silence to 1-2%, but compressing every frame
        costs the event loop: about 8% of it at 32 live Nemotron VoiceChat calls on
        ``/generate/ws``, whose configs turn it off. Turn it off where the server's
-       event loop, not the network, is the bottleneck.
+       event loop, not the network, is the bottleneck. The Rust frontend
+       (``--rust-frontend``) offers no deflate, whatever this says.
    * - ``ws_max_message_mb``
      - *(optional)* The largest WebSocket message the server reads, in MiB, on every
        WebSocket route; by default the HTTP body limit, ``MSTAR_MAX_BODY_MB``. A larger one

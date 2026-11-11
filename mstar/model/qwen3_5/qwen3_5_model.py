@@ -5,22 +5,25 @@ import torch
 from jinja2 import TemplateError
 from transformers import AutoTokenizer
 
-from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec
-from mstar.engine.resources.attn.ragged.config import (
-    RaggedAttentionConfig,
-    RaggedAttentionSpec,
-)
-from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
-from mstar.engine.resources.linear_attn.config import (
-    LinearAttnConfig,
-    LinearAttnSpec,
-    LinearAttnVariant,
-)
-from mstar.engine.resources.position.config import PositionConfig, PositionSpec
-from mstar.engine.resources.recurrent.config import DeltaNetGeometry, RecurrentStateConfig, RecurrentStateSpec
 from mstar.engine.resources.sequence_shard import SeqShardSpec
-from mstar.engine.resources.spec import NodeResourceSpec
-from mstar.model.base import TensorAndMetadata
+from mstar.engine.state import (
+    Array,
+    Attend,
+    Block,
+    Causal,
+    CausalConv,
+    Entry,
+    GatedDeltaNet,
+    KVEntry,
+    Layout,
+    Positions,
+    Read,
+    Sampler,
+    SampleSettings,
+    TensorType,
+    Value,
+)
+from mstar.model.base import ProcessPromptOutput, TensorAndMetadata
 from mstar.model.components.mrope import image_position_advance
 from mstar.model.keys import MIXED, PREFILL_TEXT
 from mstar.model.media_limits import read_image
@@ -34,6 +37,7 @@ from mstar.model.multimodal import (
 )
 from mstar.model.multimodal_decoder import (
     MIXED_SPLIT,
+    SAMPLING_KEYS,
     MediaIntake,
     MultimodalDecoderModel,
     PreparedMedia,
@@ -41,12 +45,14 @@ from mstar.model.multimodal_decoder import (
 from mstar.model.qwen3_5.components.language_model import Qwen3_5ForCausalLM
 from mstar.model.qwen3_5.config import (
     ATTN,
+    CONV,
     GDN_STATE,
     KV_CACHE,
     LINEAR_ATTN,
     LLM_SHARD,
-    ROPE,
+    SAMPLER,
     VISION_ATTN,
+    VISION_TOKENS,
     Qwen3_5Config,
     Qwen3_5VisionConfig,
 )
@@ -115,74 +121,58 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
     # Model ABC: resources
     # -----------------------------------------------------------------------
 
-    def _gdn_state_dtype(self) -> torch.dtype:
-        """The checkpoint's ``mamba_ssm_dtype`` (fp32 for the released ones);
-        fp32 wherever the pool's decode kernels cannot take it.
-
-        ``gdn_state.state_dtype: bfloat16`` in the yaml overrides this. bf16
-        halves state traffic, but only FlashInfer's fused bf16 decode kernel
-        takes it, and that is K=V=128 only.
-        """
-        dtype = getattr(torch, self.config.mamba_ssm_dtype, None)
-        head_dims_ok = (
-            self.config.linear_key_head_dim == 128
-            and self.config.linear_value_head_dim == 128
+    def declare_state(self) -> list[Array | Sampler]:
+        c, v = self.config, self.vision_config
+        conv_dim = (
+            2 * c.linear_num_key_heads * c.linear_key_head_dim
+            + c.linear_num_value_heads * c.linear_value_head_dim
         )
-        if dtype is torch.bfloat16 and head_dims_ok:
-            return torch.bfloat16
-        return torch.float32
+        gdn = Entry({
+            "state": TensorType(
+                (c.linear_num_value_heads, c.linear_key_head_dim, c.linear_value_head_dim),
+                dtype=getattr(torch, c.mamba_ssm_dtype, torch.float32), shard=0,
+            ),
+            "conv": TensorType((conv_dim, c.linear_conv_kernel_dim - 1), dtype=None, shard=0),
+        })
+        state = [
+            Array(
+                KV_CACHE, nodes={"LLM"}, layers=c.full_layer_indices,
+                entry=KVEntry(heads=c.num_key_value_heads, head_dim=c.head_dim),
+                max_len=c.max_position_embeddings,
+                positions=Positions(),
+                reads={ATTN: Read(mask=Causal(), op=Attend(q_heads=c.num_attention_heads))},
+            ),
+            # written out because Qwen3.5 diverges silently without qk_l2norm
+            Value(
+                GDN_STATE, nodes={"LLM"}, layers=c.linear_layer_indices, entry=gdn,
+                updates={CONV: CausalConv(), LINEAR_ATTN: GatedDeltaNet(qk_l2norm=True)},
+            ),
+            Sampler(
+                SAMPLER, nodes={"LLM"}, vocab_size=c.vocab_size, penalty=True,
+                min_p=self._sampler_spec(c.vocab_size).enable_min_p,
+            ),
+        ]
+        if v is not None:
+            state.append(Array(
+                VISION_TOKENS, nodes={"vision_encoder"}, layers=frozenset(range(v.depth)),
+                entry=KVEntry(heads=v.num_heads, head_dim=v.head_dim), max_len=0,
+                reads={VISION_ATTN: Read(mask=Block(), op=Attend(q_heads=v.num_heads))},
+            ))
+        return state
 
-    def get_node_resources(self) -> list[NodeResourceSpec]:
+    def kernel_settings(self) -> dict[str, dict[str, Any]]:
+        settings = {
+            ATTN: {"splits": (MIXED_SPLIT,), "decode_fmha": True},
+            LINEAR_ATTN: {"splits": (MIXED_SPLIT,)},
+        }
+        if self.vision_config is not None:
+            settings[VISION_ATTN] = {"max_segments_per_step": self._vision_segment_ceiling()}
+        return settings
+
+    def get_node_resources(self):
         from mstar.model.qwen3_5.lora import qwen3_5_lora_spec
 
-        num_kv_layers = len(self.config.full_layer_indices)
-        num_gdn_layers = len(self.config.linear_layer_indices)
         return [
-            KVSpec(
-                resource_key=KV_CACHE, nodes={"LLM"},
-                config=PagedKVConfig(
-                    num_layers=num_kv_layers,
-                    num_kv_heads=self.config.num_key_value_heads,
-                    head_dim=self.config.head_dim,
-                    max_seq_len=self.config.max_position_embeddings,
-                    num_qo_heads=self.config.num_attention_heads
-                )
-            ),
-            AttentionSpec(
-                resource_key=ATTN, nodes={"LLM"},
-                config=AttentionConfig(
-                    kv_cache=KV_CACHE,
-                    splits=(MIXED_SPLIT,),
-                    decode_fmha=True,
-                ),
-            ),
-            PositionSpec(
-                resource_key=ROPE, nodes={"LLM"},
-                config=PositionConfig(kv_cache=KV_CACHE),
-            ),
-            RecurrentStateSpec(
-                resource_key=GDN_STATE, nodes={"LLM"},
-                config=RecurrentStateConfig(
-                    num_layers=num_gdn_layers,
-                    blocks=DeltaNetGeometry(
-                        num_k_heads=self.config.linear_num_key_heads,
-                        num_v_heads=self.config.linear_num_value_heads,
-                        head_k_dim=self.config.linear_key_head_dim,
-                        head_v_dim=self.config.linear_value_head_dim,
-                        conv_kernel_size=self.config.linear_conv_kernel_dim
-                    ).to_blocks(state_dtype=self._gdn_state_dtype()),
-                    kv_cache=KV_CACHE,
-                )
-            ),
-            LinearAttnSpec(
-                resource_key=LINEAR_ATTN, nodes={"LLM"},
-                config=LinearAttnConfig(
-                    recurrent_state=GDN_STATE,
-                    variant=LinearAttnVariant.GDN,
-                    splits=(MIXED_SPLIT,),
-                ),
-            ),
-            self._sampler_spec(self.config.vocab_size),
             # a step split over the LLM's SP ranks, where the deployment sets the shard's exchange:
             # all_gather over KV stored by position, ulysses over KV stored by head. "none" by default,
             # so one SP rank, or KV stored by position, runs every step copied, and the LLM on SP
@@ -193,36 +183,24 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
                 LLM_SHARD, {"LLM"}, labels=("main",), axis=0,
                 walks=(PREFILL_TEXT, *media_walk_names(self.encoders), MIXED), exchange="none",
             ),
-            *self._vision_resources(),
             qwen3_5_lora_spec(self.config, self.vision_config),
         ]
 
-    def _vision_resources(self) -> list[NodeResourceSpec]:
-        """The ViT tower's attention, its only resource; none when text-only."""
-        if self.vision_config is None:
-            return []
+    def _vision_segment_ceiling(self) -> int:
+        """Segments a captured block loop's plan holds. A segment per image, not per request: the resize floors each
+        image at `shortest_edge` pixels. A video frame group has no floor; a step with more segments runs the block
+        loop eagerly (`PackedBlockLoopEncoder._fits_capture`)."""
         from mstar.model.qwen3_5.submodules import VisionEncoderSubmodule
 
-        vision = self.vision_config
         processor = self.image_processor
         min_patches = processor.size["shortest_edge"] // processor.patch_size ** 2
-        return [
-            RaggedAttentionSpec(
-                resource_key=VISION_ATTN, nodes={"vision_encoder"},
-                config=RaggedAttentionConfig(
-                    num_qo_heads=vision.num_heads,
-                    num_kv_heads=vision.num_heads,
-                    head_dim=vision.head_dim,
-                    # A segment per image, not per request: the resize floors
-                    # each image at `shortest_edge` pixels. A video frame group
-                    # has no floor; a step with more segments runs the block
-                    # loop eagerly (`VisionEncoderSubmodule._fits_capture`).
-                    max_segments_per_step=(
-                        VisionEncoderSubmodule.BLOCK_LOOP_PATCH_BUCKETS[-1] // min_patches
-                    ),
-                ),
-            ),
-        ]
+        return VisionEncoderSubmodule.BLOCK_LOOP_PATCH_BUCKETS[-1] // min_patches
+
+    def get_request_resource_configs(
+        self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
+    ) -> dict[str, SampleSettings]:
+        config = super().get_request_resource_configs(input_modalities, output_modalities, model_kwargs)[SAMPLER]
+        return {SAMPLER: SampleSettings(**{k: getattr(config, k) for k in SAMPLING_KEYS})}
 
     # -----------------------------------------------------------------------
     # Chunked prefill
@@ -431,6 +409,16 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
 
     def request_kwargs(self) -> frozenset[str]:
         return super().request_kwargs() | {"enable_thinking"}
+
+    def process_prompt(self, *args: Any, **kwargs: Any) -> ProcessPromptOutput:
+        out = super().process_prompt(*args, **kwargs)
+        kv = out.metadata.pop("kv_layout")[KV_CACHE]["main"]
+        out.metadata["state_layout"] = {
+            KV_CACHE: {"main": Layout(spans=kv.spans, growth=kv.growth)}, GDN_STATE: {"main": Layout()},
+        }
+        if kv.keyed_spans is not None:
+            out.metadata["keyed_spans"] = {KV_CACHE: {"main": kv.keyed_spans}}
+        return out
 
     # ------------------------------------------------------------------
     # Model ABC: submodule loading
