@@ -4,6 +4,7 @@ inputs it refuses. Models with a general test module keep theirs there."""
 
 from __future__ import annotations
 
+import dataclasses
 import glob
 import importlib
 import json
@@ -539,13 +540,20 @@ def test_qwen3_omni_plain_keys_target_the_thinker_and_prefixed_keys_win(omni_rel
 
 
 def test_qwen3_omni_code_predictor_gets_no_penalty_and_refuses_one(omni_released):
-    spec = SimpleNamespace(enable_repetition_penalty=False, enable_min_p=False, verifies=False)
+    # the code predictor's spec as the model declares it; the fixture's model can't build its own
+    spec = SamplerSpec(resource_key=CODE_PRED_SAMPLER, nodes={"Talker"}, vocab_size=None,
+                       enable_repetition_penalty=False, enable_min_p=False)
     config = _omni_samplers(omni_released, {})[CODE_PRED_SAMPLER]
     assert config.repetition_penalty == 1
     config.validate(spec)
     asked = _omni_samplers(omni_released, {"code_predictor_repetition_penalty": 1.2})
     with pytest.raises(ValueError, match="repetition_penalty"):
         asked[CODE_PRED_SAMPLER].validate(spec)
+    # on a sampler that verifies drafts, the penalty is refused for that reason first
+    verifying = dataclasses.replace(spec, verifies=True)
+    config.validate(verifying)
+    with pytest.raises(ValueError, match="speculative decoding"):
+        asked[CODE_PRED_SAMPLER].validate(verifying)
 
 
 def test_qwen3_omni_checkpoint_min_p_turns_the_capability_on(tmp_path):
