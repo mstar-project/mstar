@@ -37,6 +37,9 @@ STRUCTURED_OUTPUTS_KWARG = "structured_outputs"
 GRAMMAR_KINDS = ("json", "json_object", "regex", "choice", "grammar")
 # a grammar compiles while its request waits for admission, so its size is bounded
 MAX_GRAMMAR_CHARS = 1 << 17
+# xgrammar's batch fill starts every one of its threads on each call, however few the rows
+# (about 25 us of the caller's time per thread), so a fill takes a thread per this many rows
+FILL_ROWS_PER_THREAD = 8
 
 
 @dataclass(frozen=True)
@@ -249,7 +252,8 @@ class GrammarRows:
         self._compiler = xgr.GrammarCompiler(self.info, max_threads=min(8, cpus), cache_limit_bytes=cache_bytes)
         # compiles run off the worker's threads (xgrammar releases the GIL)
         self._compile_pool = ThreadPool(max_workers=min(2, cpus), thread_name_prefix="grammar-compile")
-        self._batch = xgr.BatchGrammarMatcher(max_threads=max(1, cpus // 2))
+        self._fill_threads = max(1, min(8, cpus // 2))
+        self._batches: dict[int, Any] = {}  # a batch matcher by its thread count
         self._device = device
         self._rows: dict[Any, _Row] = {}
         # (rows, their indices in the step, the step's whole row of draws on the host, the
@@ -352,10 +356,17 @@ class GrammarRows:
             elif not matcher.is_terminated():
                 matchers.append(matcher)
                 index.append(i)
-        if len(matchers) == 1:
-            matchers[0].fill_next_token_bitmask(mask, index[0])
-        elif matchers:
-            self._batch.batch_fill_next_token_bitmask(matchers, mask, index)
+        threads = min(self._fill_threads, len(matchers) // FILL_ROWS_PER_THREAD)
+        if threads < 2:
+            for matcher, i in zip(matchers, index, strict=True):
+                matcher.fill_next_token_bitmask(mask, i)
+        else:
+            batch = self._batches.get(threads)
+            if batch is None:
+                import xgrammar as xgr
+
+                batch = self._batches[threads] = xgr.BatchGrammarMatcher(max_threads=threads)
+            batch.batch_fill_next_token_bitmask(matchers, mask, index)
         return mask
 
     def apply(self, logits: torch.Tensor, mask: torch.Tensor) -> None:
