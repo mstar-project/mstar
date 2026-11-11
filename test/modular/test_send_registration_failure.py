@@ -348,7 +348,9 @@ def test_a_step_of_only_failed_rids_still_waits_for_its_gpu_work(monkeypatch, ha
     pending, outputs = _decode_step([0])
     waits = []
     if has_event:
-        pending.node_batch.completion_event = SimpleNamespace(synchronize=lambda: waits.append("event"))
+        pending.node_batch.completion_event = SimpleNamespace(
+            query=lambda: False, synchronize=lambda: waits.append("event"),
+        )
     monkeypatch.setattr(torch.accelerator, "synchronize", lambda device=None: waits.append("device"))
 
     w.pipeline._finish_step(pending, outputs)
