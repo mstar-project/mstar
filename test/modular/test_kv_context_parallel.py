@@ -328,15 +328,27 @@ def test_attention_over_a_placed_pool_that_cant_plan_it_is_refused_at_load(kv, a
         )
 
 
-def test_a_node_that_splits_its_steps_refuses_a_resource_that_cant_take_them(tmp_path, monkeypatch):
-    """Qwen3.5's recurrent state holds no split strategy: a node splitting its steps over SP ranks
-    can't own one."""
+@pytest.mark.parametrize("kind", ["recurrent_state", "block_causal"])
+def test_a_node_that_splits_its_steps_refuses_a_resource_that_cant_take_them(kind, tmp_path, monkeypatch):
+    """Qwen3.5's recurrent state holds no split strategy, nor does block-causal attention (its
+    builder sets no sequence shard): a node splitting its steps over SP ranks can't own one."""
     from mstar.model.base import enabled_resources
 
     groups = _sp_groups(NODE)
-    # what a deployment without a `lora:` block builds
-    specs = enabled_resources(_qwen3_5(NODE, {}, tmp_path, monkeypatch), {})
-    apply_yaml_overrides(specs, {"resources": {KV_CACHE: {"max_num_pages": 8}, GDN_STATE: {"max_slots": 4}}})
+    if kind == "recurrent_state":
+        # what a deployment without a `lora:` block builds
+        specs = enabled_resources(_qwen3_5(NODE, {}, tmp_path, monkeypatch), {})
+        apply_yaml_overrides(specs, {"resources": {KV_CACHE: {"max_num_pages": 8}, GDN_STATE: {"max_slots": 4}}})
+    else:
+        specs = [
+            KVSpec(resource_key="kv", nodes={NODE}, config=PagedKVConfig(
+                num_layers=1, num_kv_heads=2, head_dim=64, max_seq_len=256, num_qo_heads=4, max_num_pages=8,
+                page_size=PAGE_SIZE,
+            )),
+            BlockCausalAttentionSpec(resource_key="attn", nodes={NODE}, block_size=8, config=AttentionConfig(
+                kv_cache="kv", backend=AttnBackend.FLASHINFER,
+            )),
+        ]
     specs.append(SeqShardSpec("shard", {NODE}, ("main",), 0))
     with pytest.raises(ValueError, match="does not support steps split over SP ranks"):
         Engine(graph_runtime=None).load_model(
