@@ -24,7 +24,8 @@ What is compared, and how:
   a repeated prompt as accepted as its first run, and a sampled run at the
   checkpoint's defaults above 1.5;
 - a repeated prompt hits the prefix cache (16-token pages, so the chat prompts
-  fill whole pages; the hit counter must grow), and a KV-pressure run offloads.
+  fill whole pages; the hit counter must grow), and a KV-pressure run preempts
+  requests to the host and reloads them (the preemption counters, the reload lines).
 
 The module never downloads weights: it skips a drafter unless every shard of its
 checkpoint and the target's is in a standard Hugging Face cache, and serves with
@@ -73,6 +74,8 @@ PAGE = 16
 ROUNDS = 4
 # a pool of 16-token pages too small for 32 requests at once
 PRESSURE_PAGES = 128
+# requests preempted for pages, and those of them dropped (main's `Preemption` counts)
+PREEMPTION_COUNTERS = ("mstar_kv_preemptions_total", "mstar_kv_drops_total")
 
 TOKENS = 128
 
@@ -213,13 +216,16 @@ def _run(tmp_path_factory, drafter: Drafter, name: str, *, sampled_too: bool = F
         speculative = bool(kw.get("draft_mode"))
         if pressure:
             start = _counters(url, wait=False) if speculative else None
+            moved = _totals(url, *PREEMPTION_COUNTERS)
             run["rounds"] = fp32_screen.rounds(_reply, url, name, PROMPTS, 4, ROUNDS)
             if speculative:
                 run["tau"] = _tau(start, _counters(url))
-            # the worker logs each request it offloads for pages (`Admission.relieve`) and reloads
-            log = Path(server.log_path).read_text()
-            run["offloads"] = log.count("offloaded victim=")
-            run["events"] = fp32_screen.events(log)
+            # the requests preempted for pages (`Preemption`), and those dropped rather than moved to the host;
+            # the log rate-limits its preemption lines, so they are read off the counters
+            run["preempted"], run["drops"] = (
+                after - before for after, before in zip(_totals(url, *PREEMPTION_COUNTERS), moved, strict=True))
+            # each reload the engine logs
+            run["events"] = fp32_screen.events(Path(server.log_path).read_text())
         else:
             start = _counters(url, wait=False) if speculative else None
             run["sequential"] = [_ids(url, p) for p in PROMPTS]
@@ -400,10 +406,13 @@ def test_kv_pressure_offloads_and_completes(tmp_path_factory, drafter, fp32):
                  pressure=True)
     run = _run(tmp_path_factory, drafter, "async_pressure", draft_mode="asynchronous",
                max_num_pages=PRESSURE_PAGES, pressure=True)
-    assert run["offloads"] > 0, "the pool never ran out of pages"
-    reloads = sum(e[1] == "reload" for e in run["events"])
-    print(f"{drafter.id} pressure: offloads {run['offloads']}, reloads {reloads} (plain: offloads "
-          f"{plain['offloads']}), tau {run['tau']:.3f}")
+    reloads = len(run["events"])
+    print(f"{drafter.id} pressure: preempted {run['preempted']:.0f}, dropped {run['drops']:.0f}, reloads {reloads} "
+          f"(plain: preempted {plain['preempted']:.0f}, dropped {plain['drops']:.0f}), tau {run['tau']:.3f}")
+    assert run["preempted"] > 0, "the pool never ran out of pages"
+    # a verifying node has no rebuild policy, so its victims move to the host and come back
+    assert run["drops"] == 0, "a verifying node dropped a request"
+    assert reloads > 0, "no preempted request came back from the host"
     try:
         failed = fp32_screen.screen(f"{drafter.id} pressure", [
             (fp32_screen.pairs_rounds(plain, run, PROMPTS), None, run["events"])], fp32, GATES)
