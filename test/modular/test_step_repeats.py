@@ -3,7 +3,6 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from mstar.engine.device_run import WalkAsk
 from mstar.model.submodule_base import (
     ARNodeSubmodule,
     DeviceLoopback,
@@ -30,7 +29,7 @@ def test_a_plain_ar_node_is_refused_until_it_declares_what_a_repeat_reads():
     )
     engine = make_engine(_submodules={NODE: make_mgmt(node, resources={"sampler": sampler})})
 
-    engine.enable_repeats(NODE, {WALK: WalkAsk(frozenset({"text_inputs"}))})
+    engine.enable_repeats(NODE, {WALK})
 
     assert not node.resident_walks() and node.device_loopback is None
     assert node.get_stop_policies(WALK) is None, "a walk that can't repeat keeps check_stop"
