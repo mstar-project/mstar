@@ -284,7 +284,7 @@ def test_a_pre_plan_keeps_its_step_when_its_capture_walk_is_input_free(monkeypat
         _order_after_pre_plans=lambda: None,
         _runner=SimpleNamespace(pre_admit=lambda step: SimpleNamespace(ok=True), pre_plan=lambda step: None),
     )
-    step = SimpleNamespace(set_ctx=lambda ctx: None)
+    step = SimpleNamespace(set_ctx=lambda ctx: None, state={})
     submodule = SimpleNamespace(declare_step=lambda **kw: step)
     submodule.step_is_input_free = lambda walk: input_free and walk == "decode"
     cg_runner = SimpleNamespace(
