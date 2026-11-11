@@ -36,7 +36,3 @@ def qwen3_lm_config(hf: dict) -> Qwen3Config:
         raise ValueError(f"hidden_act {hf['hidden_act']!r} is not supported for Qwen3")
     return Qwen3Config.from_hf({k: v for k, v in hf.items() if k != "stop_token_ids"})
 
-
-def checkpoint_dtype(hf: dict) -> str:
-    """The weight dtype ``config.json`` names (``torch_dtype``, or ``dtype``)."""
-    return str(hf.get("torch_dtype") or hf.get("dtype") or "bfloat16")

@@ -22,10 +22,11 @@ from mstar.engine.resources.draft.drafter import ModelGeometry, drafter_resource
 from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
 from mstar.engine.resources.position.config import PositionConfig, PositionSpec
 from mstar.engine.resources.spec import NodeResourceSpec
+from mstar.model.hf_config import hf_weight_dtype
 from mstar.model.keys import KV_CACHE, ROPE
 from mstar.model.multimodal import TEXT, PromptPart, chat_turns
 from mstar.model.multimodal_decoder import MultimodalDecoderModel
-from mstar.model.qwen3.config import ATTN, LLM_NODE, checkpoint_dtype, qwen3_lm_config
+from mstar.model.qwen3.config import ATTN, LLM_NODE, qwen3_lm_config
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.utils.fast_tokenize import encode_ids
 from mstar.utils.hf_snapshot import resolve_snapshot_dir
@@ -142,7 +143,7 @@ class Qwen3Model(MultimodalDecoderModel):
             target=ModelGeometry(
                 num_layers=cfg.num_hidden_layers, num_kv_heads=cfg.num_key_value_heads,
                 head_dim=cfg.head_dim, hidden_size=cfg.hidden_size, vocab_size=cfg.vocab_size,
-                dtype=checkpoint_dtype(self.hf_config),
+                dtype=hf_weight_dtype(self.hf_config),
             ),
             checkpoint=str(self._drafter_dir),
             prefill_steps=self.drafter_decl.prefill_steps(), verify_steps=self.drafter_decl.verify_steps(),
