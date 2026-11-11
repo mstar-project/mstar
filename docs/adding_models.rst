@@ -2167,7 +2167,9 @@ handled as special cases. BAGEL and Whisper use today's forms of them:
   example in ``preprocess`` before the replay. Their addressing stays an ordinary plan rather
   than the slot's static buffers, which are sized for the bucket's in-graph tokens. Whisper's
   prefill uses it to write its 1500-token encoder context while replaying a graph sized by
-  its few prompt tokens.
+  its few prompt tokens. The reads of such a step attend the pages alone, so one that needs the
+  step's own k and v (an attention through an exchange, a context-parallel pool on a multi-token
+  step, the dense backend) is refused at the first add.
 
 ``combined_labels`` is declared once, on the ``SubmoduleStep``. Only a model off the contract can
 combine labels today: an array's handle refuses a step that touches more than one of its labels

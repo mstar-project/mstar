@@ -556,11 +556,12 @@ class _PlacedKV:
         self._current_plan_states = {("main", 0): types.SimpleNamespace(
             ready=None, token_to_page=page, token_to_cache=slot, total_tokens=len(logical),
         )}
-        self.kv_cache = types.SimpleNamespace(
-            write_tokens=lambda layer_idx, k, v, page_idx, cache_idx: _kv_scatter_nhd_eager(
-                self.cache, k, v, page_idx, cache_idx,
-            ),
-        )
+        self.writes = 0
+        self.kv_cache = types.SimpleNamespace(write_tokens=self._write_tokens)
+
+    def _write_tokens(self, layer_idx, k, v, page_idx, cache_idx):
+        self.writes += 1
+        _kv_scatter_nhd_eager(self.cache, k, v, page_idx, cache_idx)
 
     def bind_sequence_shard(self, shard):
         self._sequence_shard = shard
@@ -1093,6 +1094,7 @@ def _layer_over_ranks(rank, world, store, split=None):
         handle.end_step(step)
         # the step's k and v, in the slots this rank stores (SINK_PAGE takes the rest)
         torch.testing.assert_close(pool.cache[1:], case.cache(placement)[1:], equal_nan=True)
+        assert pool.writes == 1, "the step's k and v are written once"
     finally:
         group.device_group = None
         dist.destroy_process_group()
