@@ -74,13 +74,14 @@ class Glm5NextMLAAttention(MLAAttention):
                          pos_key=None, kv_label=LABEL, cache_layer=kv_plane)
         self.kv_plane = kv_plane
         if config.mtp_num_draft_tokens > 0:
-            # With MTP a verify step's rejected rows stay in the cache as holes with a very
-            # negative rope slot: a query rope part of ones adds 0 to a real key (its slot is 0).
+            # With MTP the rows a query must not see (rejected drafts left as holes, or a sparse
+            # plan's padding) carry a very negative rope slot: a query rope part of ones adds 0
+            # to a real key (its slot is 0).
             self.kpe_query_fill = 1.0
         # every full-attention layer, the MTP layer's too, ships its own indexer
         self.indexer = Glm5NextIndexer(config)
-        # dsa_long_context: this layer's index plane (its latent plane's, on the same pages),
-        # and the DSA resource whose context the submodule opens per forward
+        # dsa_long_context: this layer's index plane (its latent plane's, on the same pages; the
+        # MTP layer's too), and the DSA resource, which holds the step's plan (DSAStep)
         self.index_plane = kv_plane if config.dsa_long_context else None
         self._dsa: DSAManager | None = None
         self.dsa_group = (comm_group or CommGroup.trivial()) if config.dsa_shard_prefill else None
@@ -109,10 +110,31 @@ class Glm5NextMLAAttention(MLAAttention):
         self._kv.write_kv(latent, None, layer_idx=self.kv_plane, label=LABEL)
         return self._dsa.attend(self.kv_plane, q_nope, q_pe, slots, label=LABEL)
 
+    def _select_block(self, hidden_states, q_c, position_ids, row, rows):
+        """The draft row's slots under dsa_long_context: its index key joins the block's rows
+        so far (``rows["index"]``), then every block row selects (only ``row`` has a query; the
+        rest go unused)."""
+        if self._dsa is None:
+            return None
+        keys, gates = rows["index"]
+        n, block = keys.shape[:2]
+        keys[:, row], gates[:, row] = self.indexer.keys_and_gate(hidden_states)
+        self._dsa.write_index(self.index_plane, keys.view(n * block, -1),
+                              gate=gates.view(n * block, -1),
+                              ape=self.indexer.index_kpool_compress_ape, label=LABEL)
+        q, w = self.indexer.query_and_weights(q_c, hidden_states)
+        qs = q.new_zeros(n, block, *q.shape[1:])
+        ws = w.new_zeros(n, block, w.shape[-1])
+        qs[:, row], ws[:, row] = q, w
+        return self._dsa.select(self.index_plane, qs.view(n * block, *q.shape[1:]),
+                                ws.view(n * block, -1), self.dsa_group, LABEL)
+
     def forward_block_row(
         self, hidden_states: torch.Tensor, row: int, latents: torch.Tensor,
+        index_rows: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """``MLAAttention.forward_block_row`` over ``latents (N, block, L + kpe)``, the step's
-        cache rows so far, which the MTP step allocates."""
+        cache rows so far, which the MTP step allocates. Under dsa_long_context ``index_rows``
+        are the block's index keys and gates so far, kept the same way."""
         return super().forward_block_row(
-            hidden_states, None, row, latents.shape[1], {"latent": latents})
+            hidden_states, None, row, latents.shape[1], {"latent": latents, "index": index_rows})

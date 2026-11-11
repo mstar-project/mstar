@@ -117,6 +117,29 @@ def test_mtp_refuses_a_max_tokens_the_window_cant_hold(past):
         model.process_prompt(prompt, ["text"], ["text"], max_output_tokens=room)
 
 
+@pytest.mark.parametrize("long_context", [False, True], ids=["window", "long_context"])
+def test_mtp_serves_the_max_tokens_decode_emits_with_no_draft_accepted(long_context):
+    """The largest max_tokens process_prompt takes under MTP is what _mtp_check_stop lets a
+    request emit when every draft is rejected, within the 2048-token window or, with
+    dsa_long_context, the rows of a longer one."""
+    import re
+
+    from test_glm5next_mtp_cpu import _stop_after
+
+    model = _model(mtp_num_draft_tokens=3, **({"dsa_long_context": True, "max_seq_len": 8192}
+                                              if long_context else {}))
+    prompt = "x" * 3000 if long_context else "x" * 1000
+    with pytest.raises(ValueError, match="emits at most") as refused:
+        model.process_prompt(prompt, ["text"], ["text"], max_output_tokens=10 ** 9)
+    room = int(re.search(r"at most (-?\d+)", str(refused.value)).group(1))
+    assert room > 0
+    model.process_prompt(prompt, ["text"], ["text"], max_output_tokens=room)
+    cfg = model.config
+    emitted = lambda max_tokens: _stop_after(len(prompt), max_tokens, 1, index_topk=cfg.context_limit,  # noqa: E731
+                                             kv_rows=cfg.kv_rows)[1]
+    assert emitted(room) >= room and emitted(room + 1) < room + 1
+
+
 @pytest.mark.parametrize("past", [0, 1])
 def test_max_tokens_past_the_rows_its_prompt_leaves_is_a_400(tmp_path, monkeypatch, past):
     """Without MTP the conductor refuses it; under MTP the window binds first."""

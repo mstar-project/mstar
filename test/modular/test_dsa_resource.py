@@ -10,8 +10,11 @@ import torch
 from mstar.engine.resources.base import EngineResourceInfo, build_resource
 from mstar.engine.resources.dsa.config import INDEX_PLANES, DSAConfig, DSASpec, DSAStep
 from mstar.engine.resources.dsa.manager import DSAManager
+from mstar.engine.resources.dsa.paged import attn_lens
+from mstar.engine.resources.kv.cache import KVCache
 from mstar.engine.resources.kv.config import AuxPlanes, KVLayout, KVSpec, PagedKVConfig
-from mstar.engine.resources.kv.plan import PagedIndptrs, SequenceView
+from mstar.engine.resources.kv.manager import KVManager, KVPlanState
+from mstar.engine.resources.kv.plan import SINK_PAGE, PagedIndptrs, SequenceView
 from mstar.engine.resources.step import BucketKey, SlotLease, StepContext
 
 KV = "kv"
@@ -27,22 +30,25 @@ def _spec(topk=TOPK, **config) -> DSASpec:
                    config=DSAConfig(kv_cache=KV, topk=topk, **config))
 
 
-def _kv_spec(index_planes: bool = True, width: int = D, page_size: int = PAGE) -> KVSpec:
+def _kv_spec(index_planes: bool = True, width: int = D, page_size: int = PAGE,
+             rope: int = 16) -> KVSpec:
     return KVSpec(resource_key=KV, nodes={"LLM"}, config=PagedKVConfig(
-        num_layers=2, num_kv_heads=1, head_dim=48, max_seq_len=MAX_SEQ_LEN,
+        num_layers=2, num_kv_heads=1, head_dim=32 + rope, max_seq_len=MAX_SEQ_LEN,
         max_num_pages=32, page_size=page_size, num_qo_heads=HEADS, layout=KVLayout.MLA,
-        kv_lora_rank=32, qk_rope_head_dim=16,
+        kv_lora_rank=32, qk_rope_head_dim=rope,
         aux_planes={INDEX_PLANES: AuxPlanes(num_layers=2, width=width)} if index_planes else {}))
 
 
 def _manager(world_size: int = 1, kpool: int = 1, topk: int = TOPK, page_size: int = PAGE,
-             device: str = "cpu", kv_dtype: torch.dtype = torch.bfloat16) -> DSAManager:
+             device: str = "cpu", kv_dtype: torch.dtype = torch.bfloat16, rope: int = 16,
+             **config) -> DSAManager:
     """The resource as the engine builds it, from its spec and its cache's spec."""
     info = EngineResourceInfo(
         device=torch.device(device), kv_dtype=kv_dtype,
         joint_comm_group=SimpleNamespace(world_size=world_size),
-        dependencies={KV: _kv_spec(width=D if kpool == 1 else 3 * D, page_size=page_size)})
-    return build_resource(_spec(topk=topk, kpool=kpool, sm_scale=0.1), info)
+        dependencies={KV: _kv_spec(width=D if kpool == 1 else 3 * D, page_size=page_size,
+                                   rope=rope)})
+    return build_resource(_spec(topk=topk, kpool=kpool, sm_scale=0.1, **config), info)
 
 
 def _step(walk: str, pages, lengths, to_compute, lease=None, is_preplan=False) -> StepContext:
@@ -61,9 +67,10 @@ def _step(walk: str, pages, lengths, to_compute, lease=None, is_preplan=False) -
         plan_results={KV: {"main": plan}}, slot_lease=lease, is_preplan=is_preplan)
 
 
-def _stage(dsa: DSAManager, walk: str, pages, lengths, to_compute, lease=None):
+def _stage(dsa: DSAManager, walk: str, pages, lengths, to_compute, lease=None,
+           step: DSAStep | None = None):
     """The step's plan for its one label, as the engine runs it (``DSAStep()``)."""
-    return dsa.plan(DSAStep(), _step(walk, pages, lengths, to_compute, lease))["main"]
+    return dsa.plan(step or DSAStep(), _step(walk, pages, lengths, to_compute, lease))["main"]
 
 
 def _prefill(dsa: DSAManager, pages=([0], [5, 6, 7])):
@@ -270,3 +277,67 @@ def test_a_node_with_dsa_double_buffers_its_captures_without_pre_plan(monkeypatc
         submodule=None, forward=None, forward_batched=None, joint_comm_group=None,
         resources={"dsa": _manager()})
     assert mgmt.num_slots == 2 and mgmt.needs_slot_fence
+
+
+# ---------------------------------------------------------------------------
+# move_rows: an MTP verify block at its true rows (glm5_next's mtp_trims)
+# ---------------------------------------------------------------------------
+
+
+def _kv_writing(tokens: int) -> KVManager:
+    """A KV resource with a step's write addressing current: its real cache and slots."""
+    kv = KVManager.__new__(KVManager)
+    kv.kv_cache = KVCache(_kv_spec().config, torch.device("cpu"), torch.float32)
+    kv._groups, kv._default_label = [None], "main"
+    zeros = torch.zeros(tokens, dtype=torch.long)
+    kv._current_plan_states = {("main", 0): KVPlanState(zeros, zeros.clone(), tokens)}
+    return kv
+
+
+@pytest.mark.parametrize("captured", [False, True])
+def test_move_rows_writes_and_attends_a_block_at_its_true_rows(captured):
+    """A block the host planned after its request's last whole block moves to the rows the
+    device says it holds; captured, the host's plan stays and each row's entries past its own
+    length attend the cache's spare row, masked in its rope slot."""
+    dsa, kpe = _manager(kpool=2, rope_slot_masks=True), -1.0e4
+    kv = _kv_writing(8)
+    dsa.bind_dependencies({KV: kv})
+    # two 4-row blocks planned at positions 8-11 and 5-8; the first request holds 6 rows
+    lease = SlotLease(slot=0, bucket=BucketKey("decode", bs=2, num_tokens=8)) if captured else None
+    ctx = _stage(dsa, "decode", pages=[[1, 2, 3], [4, 5, 6]], lengths=[12, 9], to_compute=[4, 4],
+                 lease=lease, step=DSAStep(rows_may_move=True))
+    assert ctx.captured == captured
+    pos = torch.tensor([6, 7, 8, 9, 5, 6, 7, 8])
+    dsa.move_rows(pos, kpe)
+    assert dsa.current() is ctx  # the step's plan, moved in place
+    pages, offsets = kv.write_slots()
+    assert pages.tolist() == [2, 2, 3, 3, 5, 5, 5, 6] and offsets.tolist() == [2, 3, 0, 1, 1, 2, 3, 0]
+    assert ctx.pos.tolist() == pos.tolist() and ctx.pages[:6].tolist() == [1, 2, 3, 4, 5, 6]
+    slot, row = kv.spare_row()
+    if not captured:
+        assert ctx.host_pos == pos.tolist() and ctx.valid is None
+        assert bool((row == 0).all())
+        return
+    assert ctx.valid.tolist() == attn_lens(pos.tolist(), TOPK, 2)
+    # the spare row: on the sink page, no request's, and masked in every layer
+    assert ctx.pad_slot == slot and slot // PAGE == SINK_PAGE
+    assert SINK_PAGE not in ctx.pages[:6].tolist()
+    assert bool((row[:, 32:] == kpe).all()) and bool((row[:, :32] == 0).all())
+    assert kv.kv_cache.layer_view(1).reshape(-1, 48)[slot].data_ptr() == row[1].data_ptr()
+
+
+def test_a_step_whose_rows_may_move_needs_a_rope_slot_that_masks():
+    """Its captured plan pads with entries masked in the rope slot. Where the slot holds a real
+    RoPE key a padded entry would score instead, so no such step is planned unless the model
+    declares the slot masks."""
+    dsa = _manager(kpool=2)
+    dsa.bind_dependencies({KV: _kv_writing(8)})
+    lease = SlotLease(slot=0, bucket=BucketKey("decode", bs=2, num_tokens=8))
+    with pytest.raises(ValueError, match="rope_slot_masks"):
+        _stage(dsa, "decode", pages=[[1, 2, 3], [4, 5, 6]], lengths=[12, 9], to_compute=[4, 4],
+               lease=lease, step=DSAStep(rows_may_move=True))
+
+
+def test_rope_slot_masks_on_a_cache_without_a_rope_slot_is_refused_at_build():
+    with pytest.raises(ValueError, match="rope slot"):
+        _manager(kpool=2, rope=0, rope_slot_masks=True)

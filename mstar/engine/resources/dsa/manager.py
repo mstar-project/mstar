@@ -16,7 +16,7 @@ from mstar.engine.resources.attn.workspace import WorkspacePool
 from mstar.engine.resources.base import CGSlotSpec, EngineResourceInfo, Resource
 from mstar.engine.resources.dsa import paged, sparse_mla
 from mstar.engine.resources.dsa.config import INDEX_PLANES, DSAConfig, DSASpec, DSAStep
-from mstar.engine.resources.dsa.paged import DSAContext, attn_lens
+from mstar.engine.resources.dsa.paged import DSAContext, attn_lens, attn_lens_device
 from mstar.engine.resources.step import BucketKey, StepContext
 from mstar.utils.h2d import PinnedStager
 
@@ -44,6 +44,9 @@ class DSAManager(Resource):
                              f"declares {planes.width}")
         if spec.config.sm_scale is None:
             raise ValueError("DSA attends at DSAConfig.sm_scale: declare it")
+        if spec.config.rope_slot_masks and not kv_config.qk_rope_head_dim:
+            raise ValueError(f"DSAConfig.rope_slot_masks masks entries in {spec.config.kv_cache}'s "
+                             "rope slot, and its rows have none (qk_rope_head_dim 0)")
         page, kpool = kv_config.tokens_per_page, spec.config.kpool
         if page % kpool:
             # a pool's key sits in its last token's row: pools must not straddle pages
@@ -149,11 +152,16 @@ class DSAManager(Resource):
     def plan(self, step: DSAStep, ctx: StepContext) -> dict[str, DSAContext]:
         """Each label's rows from the KV plan (``ctx.plan_results``), the plan the layers read
         until the next. A pre-plan is kept and the next call promotes it."""
-        del step
+        if step.rows_may_move and not self.config.rope_slot_masks:
+            # with a real rope key in the slot, a padded entry would score instead of masking
+            raise ValueError("DSAStep(rows_may_move=True) pads a captured plan with entries "
+                             "masked in the cache's rope slot: declare "
+                             "DSAConfig(rope_slot_masks=True), for a cache whose rope slot "
+                             "holds no key and queries that fill it with ones")
         if self._preplanned is not None and not ctx.is_preplan:
             self._current, self._preplanned = dict(self._preplanned), None
             return self._current
-        plans = {label: self._plan_label(ctx, kv_out)
+        plans = {label: self._plan_label(ctx, kv_out, step.rows_may_move)
                  for label, kv_out in ctx.plan_results[self.config.kv_cache].items()}
         if ctx.is_preplan:
             self._preplanned = plans
@@ -161,11 +169,12 @@ class DSAManager(Resource):
             self._current = dict(plans)
         return plans
 
-    def _plan_label(self, step_ctx: StepContext, kv_out) -> DSAContext:
+    def _plan_label(self, step_ctx: StepContext, kv_out,
+                    rows_may_move: bool = False) -> DSAContext:
         """One label's rows: per row its position and request, per request its first entry in
         the flat page list. Under a lease every row scores on its own, the score width spans
         the serving window (a prefill bucket's own rows) and the slot's sparse plan is
-        re-planned here."""
+        re-planned here; ``rows_may_move`` (``DSAStep``) plans it for each row's longest."""
         lease = step_ctx.slot_lease
         graph = lease is not None and lease.bucket is not None
         walk = step_ctx.graph_walk
@@ -211,8 +220,12 @@ class DSAManager(Resource):
             else:
                 max_pools, needs_selection = self.kv_rows // kpool, True
             if (needs_selection or not self.config.dense_below_topk) and self._device.type == "cuda":
-                sparse_plan = self._graph_plan(walk, step_ctx.slot, rows,
-                                               attn_lens(pos, topk, kpool))
+                lens = attn_lens(pos, topk, kpool)  # a padding row's is 1
+                if rows_may_move:
+                    # a row sits at or past its true position: plan it for the longest it can
+                    # be, its spare entries masked (SparseGraphPlan.attend's valid)
+                    lens = [min(p + 1, topk + kpool - 1) for p in pos]
+                sparse_plan = self._graph_plan(walk, step_ctx.slot, rows, lens)
         return DSAContext(
             pos=staged[:rows], row_req=staged[rows:2 * rows],
             page_start=staged[2 * rows:2 * rows + n_req], pages=staged[2 * rows + reqs:],
@@ -220,7 +233,8 @@ class DSAManager(Resource):
             host_page_start=None if graph else indptr[:-1].tolist(),
             max_pools=max(max_pools, 1), page_size=self.page_size, topk=topk, kpool=kpool,
             needs_selection=needs_selection, decode_rows=graph or walk == "decode",
-            sparse_plan=sparse_plan, eager=self._eager, stager=self._int_stager)
+            sparse_plan=sparse_plan, eager=self._eager, captured=graph,
+            stager=self._int_stager)
 
     def _graph_plan(self, walk: str, slot: int, rows: int,
                     lens: list[int]) -> sparse_mla.SparseGraphPlan:
@@ -276,6 +290,32 @@ class DSAManager(Resource):
         if self._kv is None:
             raise RuntimeError(f"dsa: bind_dependencies never handed it {self.config.kv_cache}")
         return self._kv
+
+    def move_rows(self, pos: torch.Tensor, pad_kpe: float, label: str | None = None) -> None:
+        """Move this step's rows to the device positions ``pos``, each at or before the one the
+        host planned (an MTP verify block placed after the last step's accepted rows, not its
+        whole block): the cache slots its latents and index keys go to, and the positions it
+        selects and attends from. A captured plan stays as made (``DSAStep(rows_may_move=True)``):
+        each row's entries past its own length attend the cache's spare row, whose rope slot
+        gets ``pad_kpe`` for the caller's queries to mask. An eager plan takes exact rows, from
+        one host read of ``pos``."""
+        ctx, kv = self.current(label), self._need_kv()
+        size = ctx.page_size
+        pages, offsets = kv.write_slots(label)
+        page = ctx.pages[(ctx.page_start[ctx.row_req.long()] + pos // size).long()]
+        pages.copy_(page.to(pages.dtype))
+        offsets.copy_((pos % size).to(offsets.dtype))
+        ctx.pos = pos.to(ctx.pos.dtype)
+        if not ctx.captured:
+            ctx.host_pos = pos.tolist()
+            return
+        if not self.config.rope_slot_masks:
+            raise ValueError("a captured step's spare entries are masked in the rope slot: "
+                             "declare DSAConfig(rope_slot_masks=True)")
+        slot, row = kv.spare_row()
+        row[:, self.kv_lora_rank:].fill_(pad_kpe)
+        ctx.valid = attn_lens_device(pos, ctx.topk, ctx.kpool).to(torch.int32)
+        ctx.pad_slot = slot
 
     def write_index(self, plane: int, k: torch.Tensor, gate: torch.Tensor | None = None,
                     ape: torch.Tensor | None = None, label: str | None = None) -> None:

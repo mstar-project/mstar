@@ -5567,6 +5567,16 @@ class KVManager(AttentionResource):
             cache_idx=plan_state.token_to_cache[:n],
         )
 
+    def spare_row(self) -> tuple[int, torch.Tensor]:
+        """A cache row no request holds, for entries a kernel must address and the caller
+        masks: its flat slot (``page * tokens_per_page + offset``) and its row in every layer,
+        ``[num_layers, width]`` (a view). SINK_PAGE's last row; a padding row writes the sink
+        from its first row and may reach it, so the caller refills it before each use. MLA only."""
+        if self.kv_cache.layout != KVLayout.MLA:
+            raise NotImplementedError(f"spare_row is not implemented for layout {self.kv_cache.layout}")
+        size = self.kv_cache.page_size
+        return SINK_PAGE * size + size - 1, self.kv_cache.tensor[:, SINK_PAGE, size - 1]
+
     @torch.compiler.disable
     def write_slots(self, label: str=None) -> tuple[torch.Tensor, torch.Tensor]:
         """The (page, offset-in-page) slots ``write_kv`` scatters this step's tokens to, as
@@ -5581,41 +5591,33 @@ class KVManager(AttentionResource):
         return plan_state.token_to_page[:n], plan_state.token_to_cache[:n]
 
     @contextmanager
-    def token_window(self, start: int, end: int, label: str | None = None) -> Iterator[None]:
-        """Narrow this step's write addressing to its tokens ``[start, end)``, for a forward
-        that runs a long step's tokens in windows: each window writes at its own slots."""
+    def _narrowed(self, index, tokens: int, label: str | None) -> Iterator[None]:
+        """This step's write addressing under ``label`` held to its ``tokens`` tokens at
+        ``index`` (a slice or a device index) until the context exits."""
         if label is None:
             label = self._default_label
         # the label's addressing in each group of the pool
         full = {(label, g): self._current_plan_states[label, g] for g in range(len(self._groups))}
         for key, state in full.items():
             self._current_plan_states[key] = KVPlanState(
-                token_to_page=state.token_to_page[start:end],
-                token_to_cache=state.token_to_cache[start:end],
-                total_tokens=end - start,
+                token_to_page=state.token_to_page[index],
+                token_to_cache=state.token_to_cache[index],
+                total_tokens=tokens,
             )
         try:
             yield
         finally:
             self._current_plan_states.update(full)
 
-    @contextmanager
-    def token_rows(self, rows: torch.Tensor, label: str | None = None) -> Iterator[None]:
+    def token_window(self, start: int, end: int, label: str | None = None):
+        """Narrow this step's write addressing to its tokens ``[start, end)``, for a forward
+        that runs a long step's tokens in windows: each window writes at its own slots."""
+        return self._narrowed(slice(start, end), end - start, label)
+
+    def token_rows(self, rows: torch.Tensor, label: str | None = None):
         """Narrow this step's write addressing to its tokens ``rows`` (a device index, any
         order), for a pass over some of a step's rows: each writes at its own slot."""
-        if label is None:
-            label = self._default_label
-        full = {(label, g): self._current_plan_states[label, g] for g in range(len(self._groups))}
-        for key, state in full.items():
-            self._current_plan_states[key] = KVPlanState(
-                token_to_page=state.token_to_page[rows],
-                token_to_cache=state.token_to_cache[rows],
-                total_tokens=rows.numel(),
-            )
-        try:
-            yield
-        finally:
-            self._current_plan_states.update(full)
+        return self._narrowed(rows, rows.numel(), label)
 
     @torch.compiler.disable
     def write_kv(

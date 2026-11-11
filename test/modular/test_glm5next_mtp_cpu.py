@@ -18,11 +18,12 @@ from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine.engine import Engine, ExecutingBatch
 from mstar.engine.resources import SamplingReqConfig
+from mstar.engine.resources.dsa.config import INDEX_PLANES
 from mstar.engine.resources.kv import manager as kv_mod
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.step import StepContext
 from mstar.model.glm5_next.components.causal_lm import Glm5NextForCausalLM
-from mstar.model.glm5_next.config import KDA_STATE, KV_CACHE, SAMPLER, Glm5NextModelConfig
+from mstar.model.glm5_next.config import KDA_STATE, KV_CACHE, MTP_LEN, SAMPLER, Glm5NextModelConfig
 from mstar.model.glm5_next.glm5_next_model import Glm5NextModel, process_weights_after_loading
 from mstar.model.glm5_next.submodules import Glm5NextLLMSubmodule
 from mstar.model.submodule_base import InputMetadata
@@ -82,12 +83,17 @@ def _stubs(monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
 
 
-def _build_engine(k: int, seed: int = 0):
+def _build_engine(k: int, seed: int = 0, long_context: bool = False, max_seq_len: int | None = None,
+                  page_size: int | None = None):
     torch.manual_seed(seed)
-    cfg = Glm5NextModelConfig.reduced()
+    cfg = (Glm5NextModelConfig.reduced_long_context(**({"max_seq_len": max_seq_len} if max_seq_len else {}))
+           if long_context else Glm5NextModelConfig.reduced())
     cfg.mtp_num_draft_tokens = k
+    if long_context:
+        cfg.prefill_window_tokens = 48  # long prompts run in several windows
     model = Glm5NextModel("x", config_variant="reduced", kda_conv_dtype=torch.float32,
                           kda_max_requests=4, mtp_num_draft_tokens=k)
+    model.config = cfg
     lm = Glm5NextForCausalLM(cfg)
     # the trunk's parameters come first, so both engines draw the same trunk (building
     # the MTP layer draws from the generator too, hence the reseed)
@@ -99,8 +105,13 @@ def _build_engine(k: int, seed: int = 0):
     lm.eval()
     sub = Glm5NextLLMSubmodule(lm, cfg)
     engine = Engine(None)  # no offload, so no runtime
+    specs = model.get_node_resources()
+    if page_size is not None:
+        for spec in specs:
+            if spec.resource_key == KV_CACHE:
+                spec.config.page_size = page_size
     engine.load_model(
-        {"LLM": sub}, model.get_node_resources(),
+        {"LLM": sub}, specs,
         parallel_groups=WorkerParallelGroups(num_workers=1, global_rank=0),
         device=torch.device("cpu"),
         transfer_engine_info=TransferEngineInfo(
@@ -235,7 +246,14 @@ def _oracle(sub, reference, wrong_every: int | None):
             nxt.append(at(rid, done[rid] + accepted + 1))
         return emit(rids, nxt, fresh=True)
 
+    real_windows = sub._prefill_windows
+
+    def windows(engine_inputs, *args):  # dsa_long_context's eager prefill
+        where.update(rids=list(engine_inputs.request_ids), row=None)
+        return real_windows(engine_inputs, *args)
+
     sub._mtp_prefill, sub._mtp_decode, sub._draft_tokens = prefill, decode, draft
+    sub._prefill_windows = windows
 
 
 def test_reference_depends_on_context(reference):
@@ -310,7 +328,8 @@ def _stop_after(prompt_len, max_tokens, per_step, k=3, index_topk=2048, kv_rows=
     state.add("prompt_len", prompt_len)
     sub = types.SimpleNamespace(
         request_state=lambda rid: state, mtp_block=k + 1,
-        config=types.SimpleNamespace(eos_token_ids=(), index_topk=index_topk, kv_rows=kv_rows),
+        config=types.SimpleNamespace(eos_token_ids=(), context_limit=index_topk, kv_rows=kv_rows,
+                                     mtp_trims=False),
     )
     sampler = {SAMPLER: types.SimpleNamespace(ignore_eos=True)}
 
@@ -410,7 +429,8 @@ def test_the_stop_counts_this_steps_tokens_not_the_next_ones():
     state.add("prompt_len", 16)
     sub = types.SimpleNamespace(
         request_state=lambda rid: state, mtp_block=4,
-        config=types.SimpleNamespace(eos_token_ids=(), index_topk=2048, kv_rows=4096),
+        config=types.SimpleNamespace(eos_token_ids=(), context_limit=2048, kv_rows=4096,
+                                     mtp_trims=False),
     )
     sampler = {SAMPLER: types.SimpleNamespace(ignore_eos=True)}
 
@@ -425,6 +445,241 @@ def test_the_stop_counts_this_steps_tokens_not_the_next_ones():
     state.add("mtp_generated", 9)  # and the second
     assert not check("decode", 0, 4)
     assert check("decode", 1, 4)
+
+
+# -- dsa_long_context: verify steps trim their rejected rows ---------------------------------
+
+LONG_PROMPTS = {"a": (torch.arange(100) * 37 + 11) % 240, "b": (torch.arange(75) * 53 + 5) % 240}
+LONG_MAX_TOKENS = 30
+
+
+def _generate_long(engine, sub, prompts, max_tokens):
+    """``_generate``, checking after each step that the host books every verify step's whole
+    block (the same on every rank) and ``MTP_LEN`` only the accepted rows."""
+    kv, pool = engine._resources[KV_CACHE], engine._resources[KDA_STATE]
+    rows = {rid: len(ids) for rid, ids in prompts.items()}
+    host = dict(rows)
+    for rid in prompts:
+        engine.add_request(rid, {SAMPLER: SamplingReqConfig(temperature=0.0)})
+    out, stops = _step(engine, "prefill", prompts, max_tokens)
+    seqs = {rid: out[rid]["new_token"][0].tolist() for rid in prompts}
+    nxt = {rid: out[rid]["text_inputs"][0] for rid in prompts}
+    live = [rid for rid in prompts if not stops.get(rid)]
+    step = 0
+    while live:
+        out, stops = _step(engine, "decode", {rid: nxt[rid] for rid in live}, max_tokens, step)
+        step += 1
+        for rid in live:
+            seqs[rid] += out[rid]["new_token"][0].tolist()
+            nxt[rid] = out[rid]["text_inputs"][0]
+            if sub.mtp_k:
+                rows[rid] += sub._read_verdicts([rid])[0][1] + 1
+                host[rid] += sub.mtp_block
+                assert kv._streams[rid]["main"].stored_len == host[rid], (rid, step)
+                assert sub.request_state(rid).get("context") == host[rid], (rid, step)
+                slot = pool._slots[rid]["main"].index
+                assert int(pool.block(MTP_LEN)[slot, 0]) == rows[rid], (rid, step)
+        live = [rid for rid in live if not stops.get(rid)]
+    for rid in prompts:
+        engine.remove_request(rid)
+    return seqs
+
+
+@pytest.fixture
+def long_reference():
+    engine, sub, _ = _build_engine(0, long_context=True)
+    return _generate_long(engine, sub, dict(LONG_PROMPTS), LONG_MAX_TOKENS)
+
+
+@pytest.mark.parametrize("k", [1, 3])
+@pytest.mark.parametrize("drafts", ["mtp", "oracle", "oracle_partial"])
+def test_long_context_mtp_output_equals_greedy_without_mtp(long_reference, k, drafts):
+    """Prompts past index_topk, prefilled in windows: drafting gives greedy's tokens, whatever
+    the drafts."""
+    assert all(len(v) == LONG_MAX_TOKENS for v in long_reference.values()), long_reference
+    engine, sub, cfg = _build_engine(k, long_context=True)
+    assert cfg.mtp_trims and min(map(len, LONG_PROMPTS.values())) > cfg.index_topk
+    if drafts != "mtp":
+        _oracle(sub, long_reference, wrong_every=3 if drafts == "oracle_partial" else None)
+    got = _generate_long(engine, sub, dict(LONG_PROMPTS), LONG_MAX_TOKENS)
+    assert got == long_reference
+
+
+# hundreds of index pools against the 16 a query selects, on 16-token pages
+REAL_PROMPTS = {"a": (torch.arange(700) * 37 + 11) % 240, "b": (torch.arange(450) * 53 + 5) % 240}
+REAL_MAX_TOKENS = 60
+
+
+def test_long_context_mtp_at_a_real_geometry():
+    """The same parity where the trims bookkeeping can drift: ~175 pools against the 16
+    selected, on 16-token pages, with the host's rows pages past the device's."""
+    geometry = {"long_context": True, "max_seq_len": 2048, "page_size": 16}
+    engine, sub, _ = _build_engine(0, **geometry)
+    reference = _generate_long(engine, sub, dict(REAL_PROMPTS), REAL_MAX_TOKENS)
+    assert all(len(v) == REAL_MAX_TOKENS for v in reference.values()), reference
+    for drafts in ("mtp", "oracle_partial"):
+        engine, sub, cfg = _build_engine(3, **geometry)
+        assert cfg.mtp_trims and min(map(len, REAL_PROMPTS.values())) > 4 * cfg.index_topk
+        if drafts != "mtp":
+            _oracle(sub, reference, wrong_every=2)
+        assert _generate_long(engine, sub, dict(REAL_PROMPTS), REAL_MAX_TOKENS) == reference, drafts
+
+
+def test_long_context_mtp_pass_keys_every_prompt_row_on_its_own_plane():
+    """The prompt's MTP pass writes every prompt row's index key to the MTP layer's own plane,
+    which its drafts select over (that they select well shows only as acceptance)."""
+    engine, sub, cfg = _build_engine(2, long_context=True)
+    attn = sub.language_model.mtp.transformer_layer.self_attn
+    assert attn.index_plane == attn.kv_plane
+    assert cfg.index_planes.num_layers == cfg.num_kv_planes
+    prompt = {"a": LONG_PROMPTS["a"]}
+    engine.add_request("a", {SAMPLER: SamplingReqConfig(temperature=0.0)})
+    _step(engine, "prefill", prompt, LONG_MAX_TOKENS)
+    kv = engine._resources[KV_CACHE]
+    pages, size = kv._streams["a"]["main"].page_indices, kv.kv_cache.page_size
+    plane, d = kv.aux_view(INDEX_PLANES, attn.index_plane), cfg.index_head_dim
+    keys = torch.stack([plane[pages[p // size], p % size, :d] for p in range(len(prompt["a"]))])
+    assert bool(keys.abs().sum(-1).gt(0).all())
+    engine.remove_request("a")
+
+
+def test_long_context_decode_stops_while_the_next_block_fits():
+    """Under trims the host counts every verify step's whole block against kv_rows (here
+    max_seq_len): decode stops while the step that may already be scheduled still fits, and
+    that step runs."""
+    k = 3
+    engine, sub, cfg = _build_engine(k, long_context=True)
+    block, limit = k + 1, cfg.max_seq_len
+    assert cfg.mtp_trims and cfg.kv_rows == cfg.context_limit == limit
+    prompt = (torch.arange(limit - 2 * block - 9) * 37 + 11) % 240
+    engine.add_request("r", {SAMPLER: SamplingReqConfig(temperature=0.0)})
+    out, stops = _step(engine, "prefill", {"r": prompt}, 10 * limit, ignore_eos=True)
+    step = 0
+    while not stops.get("r"):
+        out, stops = _step(engine, "decode", {"r": out["r"]["text_inputs"][0]}, 10 * limit,
+                           step, ignore_eos=True)
+        step += 1
+    rows = len(prompt) + step * block
+    assert rows + block <= limit < rows + 2 * block
+    _step(engine, "decode", {"r": out["r"]["text_inputs"][0]}, 10 * limit, step,
+          ignore_eos=True)
+    assert sub.request_state("r").get("context") <= limit
+    pool = engine._resources[KDA_STATE]
+    assert int(pool.block(MTP_LEN)[pool._slots["r"]["main"].index, 0]) <= limit
+    engine.remove_request("r")
+
+
+@pytest.mark.xfail(strict=True, reason=(
+    "under mtp_trims the host books every verify step's whole block and never takes the "
+    "rejected rows back, so a request holds up to k + 1 pages' rows a token and process_prompt "
+    "refuses max_tokens past (kv_rows - prompt) / (k + 1); follow-up: release step N - 1's "
+    "rejected rows when planning N + 1, from its verdict (the same on every rank)"))
+def test_long_context_mtp_books_at_most_a_block_past_the_rows_it_holds(long_reference):
+    """Rejected drafts cost no cache rows: the host's rows stay within a block of the device's."""
+    engine, sub, _ = _build_engine(3, long_context=True)
+    _oracle(sub, long_reference, wrong_every=1)  # every draft rejected
+    kv, pool = engine._resources[KV_CACHE], engine._resources[KDA_STATE]
+    engine.add_request("a", {SAMPLER: SamplingReqConfig(temperature=0.0)})
+    out, _ = _step(engine, "prefill", {"a": LONG_PROMPTS["a"]}, LONG_MAX_TOKENS)
+    for step in range(6):
+        out, _ = _step(engine, "decode", {"a": out["a"]["text_inputs"][0]}, LONG_MAX_TOKENS, step)
+        held = int(pool.block(MTP_LEN)[pool._slots["a"]["main"].index, 0])
+        assert kv._streams["a"]["main"].stored_len <= held + sub.mtp_block, (step, held)
+    engine.remove_request("a")
+
+
+def _serve_joining(engine, sub, prompts, arrivals, max_tokens):
+    """Requests served as a worker does: each prefills alone before decode step ``arrivals``
+    names, joins the decode batch and leaves at its own stop, its KDA slot free for a later
+    one. Checks after each verify step that ``MTP_LEN`` is the rows the device holds."""
+    pool = engine._resources[KDA_STATE]
+    seqs, nxt, iters, live, slots, step = {}, {}, {}, [], {}, 0
+
+    def run(walk, inputs):
+        rids = list(inputs)
+        batch = _batch(
+            node_name="LLM",
+            per_request_info={rid: _info(rid, walk, max_tokens[rid], iters.get(rid, 0))
+                              for rid in rids},
+            per_request_input_tensors={rid: {"text_inputs": [t]} for rid, t in inputs.items()},
+            step_context=StepContext(request_ids=tuple(rids), graph_walk=walk, slot=0,
+                                     capture=False),
+        )
+        engine.prepare_inputs(batch)
+        assert not batch.failed_requests, batch.failed_requests
+        outputs = engine.exec_and_postprocess(batch)
+        assert batch.admit_error is None, batch.admit_error
+        engine.finalize_batch(batch)
+        return outputs.per_rid_outputs, engine.check_stop_for_batch(batch, outputs)
+
+    while live or any(s >= step for s in arrivals):
+        for rid in arrivals.get(step, []):
+            engine.add_request(rid, {SAMPLER: SamplingReqConfig(temperature=0.0)})
+            out, _ = run("prefill", {rid: prompts[rid]})
+            seqs[rid], nxt[rid], iters[rid] = out[rid]["new_token"][0].tolist(), out[rid]["text_inputs"][0], 0
+            slots[rid] = pool._slots[rid]["main"].index
+            live.append(rid)
+        if live:
+            out, stops = run("decode", {rid: nxt[rid] for rid in live})
+            for rid in live:
+                seqs[rid] += out[rid]["new_token"][0].tolist()
+                nxt[rid] = out[rid]["text_inputs"][0]
+                iters[rid] += 1
+                if sub.mtp_k and not stops.get(rid):  # the prompt and every token but the next input
+                    held = int(pool.block(MTP_LEN)[slots[rid], 0])
+                    assert held == len(prompts[rid]) + len(seqs[rid]) - 1, (rid, step, held)
+            for rid in [rid for rid in live if stops.get(rid)]:
+                engine.remove_request(rid)
+                live.remove(rid)
+        step += 1
+    assert pool.num_free_slots == pool.config.usable_slots
+    return seqs, slots
+
+
+def _ids(n, a, b):
+    return (torch.arange(n) * a + b) % 240
+
+
+# past index_topk (64), on it, crossing it mid-decode, and short; "e" and "f" arrive after
+# "a" has left, "e" into its slot (4 slots)
+SERVE_PROMPTS = {"a": _ids(100, 37, 11), "b": _ids(75, 53, 5), "c": _ids(58, 29, 3),
+                 "d": _ids(64, 41, 7), "e": _ids(130, 31, 17), "f": _ids(3, 19, 2)}
+SERVE_ARRIVALS = {0: ["a", "b"], 1: ["c", "d"], 6: ["e"], 14: ["f"]}
+SERVE_MAX_TOKENS = {"a": 5, "b": 23, "c": 12, "d": 11, "e": 21, "f": 8}
+
+
+@pytest.fixture
+def served_reference():
+    engine, sub, _ = _build_engine(0, long_context=True, page_size=8)
+    seqs, slots = _serve_joining(engine, sub, SERVE_PROMPTS, SERVE_ARRIVALS, SERVE_MAX_TOKENS)
+    assert slots["e"] == slots["a"]
+    assert {rid: len(s) for rid, s in seqs.items()} == SERVE_MAX_TOKENS, seqs
+    return seqs
+
+
+@pytest.mark.parametrize("k", [1, 3])
+@pytest.mark.parametrize("drafts", ["mtp", "oracle", "oracle_partial"])
+def test_long_context_mtp_serves_arrivals_and_departures_as_greedy(served_reference, k, drafts):
+    """Requests joining and leaving the decode batch, one into a freed slot, on 8-token pages:
+    each one's tokens are greedy's, and its MTP_LEN its true rows after every step."""
+    engine, sub, cfg = _build_engine(k, long_context=True, page_size=8)
+    assert cfg.mtp_trims
+    if drafts != "mtp":
+        _oracle(sub, served_reference, wrong_every=2 if drafts == "oracle_partial" else None)
+    seqs, _ = _serve_joining(engine, sub, SERVE_PROMPTS, SERVE_ARRIVALS, SERVE_MAX_TOKENS)
+    assert seqs == served_reference
+
+
+@pytest.mark.parametrize("k", [0, 3])
+def test_long_context_mtp_stops_at_a_stop_token_among_accepted_drafts(served_reference, k):
+    """A stop token inside a step's accepted drafts ends the reply there, as greedy's does."""
+    stop = served_reference["b"][9]
+    engine, sub, cfg = _build_engine(k, long_context=True, page_size=8)
+    cfg.eos_token_ids = (stop,)
+    if k:
+        _oracle(sub, served_reference, wrong_every=None)  # every draft accepted
+    seqs, _ = _serve_joining(engine, sub, SERVE_PROMPTS, SERVE_ARRIVALS, SERVE_MAX_TOKENS)
+    assert seqs["b"] == served_reference["b"][:served_reference["b"].index(stop) + 1]
 
 
 # -- a stop on the prefill walk -----------------------------------------------

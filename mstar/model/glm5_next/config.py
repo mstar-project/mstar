@@ -20,9 +20,10 @@ KDA_STATE = "kda_state"    # recurrent pool: the conv and delta-rule state of th
 KDA = "kda"                # the KDA linear attention run against KDA_STATE
 DSA = "dsa"                # dsa_long_context: the k-pool DSA over KV_CACHE's index planes
 # KDA_STATE blocks held per request with MTP: the MTP state that drafts the next
-# step's first token, and that draft
+# step's first token, and that draft; under mtp_trims, the request's tokens in cache
 MTP_HIDDEN = "mtp_hidden"
 MTP_DRAFT = "mtp_draft"
+MTP_LEN = "mtp_len"
 # The one cache stream label glm5_next uses (single-label model).
 LABEL = "main"
 
@@ -303,7 +304,8 @@ class Glm5NextModelConfig:
     @property
     def mla_cache_kpe(self) -> int:
         """Rope-slot width of the MLA latent cache. NoPE needs none; MTP keeps
-        a 64-wide slot to mask rejected draft rows."""
+        a 64-wide slot to mask rows a query must not see: rejected draft rows, or
+        under dsa_long_context the sparse plan's padding."""
         return 64 if self.mtp_num_draft_tokens > 0 else 0
 
     @property
@@ -326,15 +328,12 @@ class Glm5NextModelConfig:
             return None
         return AuxPlanes(num_layers=self.num_kv_planes, width=3 * self.index_head_dim)
 
-    def check_long_context(self) -> None:
-        """Refuse a dsa_long_context setup the model cannot serve (the DSA resource refuses
-        the cache it cannot use)."""
+    def check_long_context(self, page_size: int | None = None) -> None:
+        """Refuse a dsa_long_context setup the model cannot serve, and with the cache's
+        ``page_size`` one an MTP block does not fit (the DSA resource refuses the cache it
+        cannot use)."""
         if not self.dsa_long_context:
             return
-        if self.mtp_num_draft_tokens > 0:
-            raise ValueError(
-                "dsa_long_context with MTP is not supported: a verify step leaves rejected "
-                "drafts in the cache as holes, which the k-pool indexer would pool as tokens")
         if self.max_seq_len <= self.index_topk:
             # dense MLA already serves index_topk: the window is model_kwargs.max_seq_len
             raise ValueError(
@@ -342,6 +341,20 @@ class Glm5NextModelConfig:
                 f"model_kwargs.max_seq_len is {self.max_seq_len}")
         if self.prefill_window_tokens < 1:
             raise ValueError(f"prefill_window_tokens={self.prefill_window_tokens} must be >= 1")
+        if self.mtp_trims and page_size is not None and page_size < self.mtp_num_draft_tokens + 2:
+            # padding requests write the sink page's first k + 1 rows; its last row is the
+            # masked one a sparse plan's spare entries attend
+            raise ValueError(f"page_size={page_size} must exceed an MTP block of "
+                             f"{self.mtp_num_draft_tokens + 1} rows")
+
+    @property
+    def mtp_trims(self) -> bool:
+        """MTP under dsa_long_context: the next step's block overwrites a verify step's
+        rejected rows instead of leaving them as holes, which the k-pool indexer would pool
+        as tokens. The host plans each block after the last one's whole block, before that
+        one's verdict exists, and never takes rows back; the device moves the block to the
+        request's true rows (Glm5NextLLMSubmodule._trim_on_device)."""
+        return self.mtp_num_draft_tokens > 0 and self.dsa_long_context
 
     @property
     def kv_rows(self) -> int:
@@ -349,8 +362,12 @@ class Glm5NextModelConfig:
         max_seq_len; under MTP each verify step also leaves its rejected drafts
         as holes. Admission books every step's whole block (no draft accepted),
         so k + 1 rows a token keep the rows from refusing a request its context
-        holds. Pages are taken as the rows fill, so the bound allocates nothing."""
-        return self.max_seq_len * (self.mtp_num_draft_tokens + 1)
+        holds. Pages are taken as the rows fill, so the bound allocates nothing.
+        Under mtp_trims the device rewrites rejected rows, so the bound is max_seq_len,
+        though the host still books whole blocks against it: a decode score k + 1 windows
+        wide would cost k + 1 times the memory."""
+        holes = self.mtp_num_draft_tokens > 0 and not self.mtp_trims
+        return self.max_seq_len * (self.mtp_num_draft_tokens + 1 if holes else 1)
 
     @property
     def padded_head_dim(self) -> int:

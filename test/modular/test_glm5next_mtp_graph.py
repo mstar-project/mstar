@@ -39,9 +39,12 @@ DEV = torch.device("cuda", 0)
 MAX_TOKENS = 24
 
 
-def _config(k):
+def _config(k, long_context=False):
     n = 5  # layers 0-2 dense KDA, 3 MLA + MoE, 4 KDA + MoE; MTP = layer 5
+    long = dict(dsa_long_context=True, index_topk=64, max_seq_len=1024,
+                prefill_window_tokens=48) if long_context else {}
     return Glm5NextModelConfig(
+        **long,
         vocab_size=512, hidden_size=256, num_hidden_layers=n,
         num_attention_heads=8, num_key_value_heads=8,
         layer_types=build_layer_types(n), mlp_layer_types=build_mlp_layer_types(n, 3),
@@ -98,8 +101,8 @@ class _Engine:
     """The submodule, its real resources and a AcceleratorGraphRunner, stepped like Engine
     (prepare -> declare -> admit -> plan -> preprocess -> run -> commit -> unpack)."""
 
-    def __init__(self, k, seed=0):
-        cfg = _config(k)
+    def __init__(self, k, seed=0, long_context=False):
+        cfg = _config(k, long_context)
         with torch.device("meta"):
             lm = Glm5NextForCausalLM(cfg)
         lm = lm.to(torch.bfloat16)
@@ -120,6 +123,9 @@ class _Engine:
             info = EngineResourceInfo(device=DEV, dependencies={
                 key: by_key[key] for key in spec.depends_on()})
             self.resources[spec.resource_key] = build_resource(spec, info)
+        for spec in specs:  # as the engine binds them (the DSA resource reads its KV pool)
+            self.resources[spec.resource_key].bind_dependencies(
+                {key: self.resources[key] for key in spec.depends_on()})
         self.runner = StepRunner(self.resources, node_resources={"LLM": list(self.resources)})
         self.sub = Glm5NextLLMSubmodule(self.lm, cfg)
         self.sub.bind_node_resources(self.resources)
@@ -290,6 +296,57 @@ def test_captured_verify_matches_eager_and_greedy(greedy, k, batch):
     # the graph runner's padding streams stay resident; the requests' are gone
     assert not any(rid in kv._streams for rid in _prompts(lengths))
     assert pool.num_free_slots == pool.config.usable_slots
+
+
+# past index_topk (64), several windows; "three" replays bucket 4 with a padding request
+LONG_LENGTHS = {"one": [150], "two": [100, 70], "three": [100, 70, 90]}
+
+
+@pytest.fixture(scope="module")
+def greedy_long():
+    eng = _Engine(k=0, long_context=True)
+    return {n: eng.generate(_prompts(lengths, seed=3), captured_decode=True)[0]
+            for n, lengths in LONG_LENGTHS.items()}
+
+
+@pytest.fixture(scope="module")
+def greedy_long_captured():
+    """Greedy with the prefill captured too, for the batches the one 256-token bucket holds.
+    A captured prefill rounds apart from the eager windows (its KDA and GEMM shapes differ),
+    so each is compared with its own kind."""
+    eng = _Engine(k=0, long_context=True)
+    return {n: eng.generate(_prompts(lengths, seed=3), captured_decode=True,
+                            captured_prefill=True)[0]
+            for n, lengths in LONG_LENGTHS.items() if sum(lengths) <= 256}
+
+
+@pytest.mark.parametrize("k", [1, 3])
+@pytest.mark.parametrize("batch", list(LONG_LENGTHS))
+def test_long_context_captured_verify_matches_eager_and_greedy(greedy_long, greedy_long_captured,
+                                                              k, batch):
+    """Under dsa_long_context: captured (planned for the longest rows, spare entries masked)
+    == eager (exact rows) == pre-planned, and greedy without MTP to the near-tie rule above."""
+    lengths = LONG_LENGTHS[batch]
+    eng = _Engine(k=k, long_context=True)
+    assert eng.sub.config.mtp_trims
+    eager, steps_e = eng.generate(_prompts(lengths, seed=3), captured_decode=False)
+    graph, steps_g = eng.generate(_prompts(lengths, seed=3), captured_decode=True)
+    assert graph == eager, ("graph", graph, "eager", eager)
+    assert steps_g == steps_e
+    for rid in eager:
+        split = _split(eager[rid], greedy_long[batch][rid])
+        print(f"long k={k} {batch} {rid}: MTP vs greedy first split {split}")
+        assert split is None or split >= 4, (rid, split, eager[rid], greedy_long[batch][rid])
+    ahead, _ = eng.generate(_prompts(lengths, seed=3), captured_decode=True, preplan=True)
+    assert ahead == graph, ("preplanned", ahead, "graph", graph)
+    if batch in greedy_long_captured:  # a captured prefill seeds MTP_LEN too
+        full, _ = eng.generate(_prompts(lengths, seed=3), captured_decode=True,
+                               captured_prefill=True)
+        for rid in eager:
+            split = _split(full[rid], greedy_long_captured[batch][rid])
+            print(f"long k={k} {batch} {rid}: fully captured vs its greedy first split {split}")
+            assert split is None or split >= 4, (rid, split, full[rid],
+                                                 greedy_long_captured[batch][rid])
 
 
 @torch.no_grad()
