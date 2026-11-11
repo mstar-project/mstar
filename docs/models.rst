@@ -2175,7 +2175,9 @@ tokens over a pair of ranks (``cfg_size: 2, sp_size: 2``, Ulysses on the dit's
 self-attention) to cut one request's latency. Split the guidance branches
 first (``cfg_size: 2``), then add ``sp_size`` on top: on two GPUs,
 ``sp_size: 2`` alone is slower than ``cfg_size: 2``.
-``sp_size`` must divide the dit's 24 attention heads. Under concurrency, data
+``sp_size`` must divide the dit's 24 attention heads, and SP needs
+``attention_backend: flashinfer`` (``sdpa`` runs outside the engine's resources, so it is
+refused on SP ranks). Under concurrency, data
 parallelism stays the throughput layout: at 1280x704x81 and 4 concurrent, four
 replicas (``wan22_dp2.yaml``'s layout over four ranks) serve 8.6 videos/min
 against 7.2 for this layout on H200s, and 11.0 against 7.4 in a separate run on
@@ -2292,7 +2294,8 @@ Deployment knobs (``model_kwargs``; the SP configs set ``compile``, ``vae_tile_b
 - ``vae_compile``: the decoder's blocks, static per tile batch; a canvas or clip share with
   another tile count compiles again. A 768p clip's share decodes in 2.1 s instead of 3.2 s
   on one H200, within 62.9 dB of eager.
-- ``attention_backend``: ``flashinfer``, or ``sdpa`` (the reference's kernel).
+- ``attention_backend``: ``flashinfer``, or ``sdpa`` (the reference's kernel; refused on SP ranks,
+  which every shipped config but ``minimax_h3_2gpu.yaml`` is).
 
 Async scheduling is on for the DiT and the decoder, the default for parallel nodes
 (``tp_async_sched: false`` turns it off); on and off measured within noise. Runtime needs:
@@ -2309,7 +2312,8 @@ seeds), clips are 23.7-32.8 dB (video) and 17.8-22.3 dB (audio) from diffusers',
 reference on another SDPA kernel is 23.5-33.1 and 21.6-22.3 dB from itself; per seed, the
 served clip is below that spread on one seed's video and another's audio.
 
-Seconds per clip, one request at a time, each engine on the same H200s (M* on torch
+Seconds per clip, one request at a time, each engine on the same H200s, M* measured before the
+DiT and the decoder moved onto the sequence shard (M* on torch
 2.12.1+cu132 and FlashInfer 0.7.2; text only, 1344x768, 124 frames, 49 DiT forwards, seed 0,
 median of 3 after a warmup; ``benchmark/minimax_h3/bench_video.py --seed 0`` sends these
 requests):

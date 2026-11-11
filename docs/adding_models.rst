@@ -876,8 +876,8 @@ The spec types are:
        ``disable_sink_slot`` unset. Parakeet's transducer decode is the example.
    * - ``SeqShardSpec(labels=..., axis=..., walks=None)``
      - Whether a step's tokens split over the node's sequence-parallel ranks, and each
-       listed label's per-rank ranges. ``declare_step`` gives every step of the node a
-       ``SeqShardStep``, and the model brackets its layer stack with the resource's
+       listed label's per-rank ranges. Its step is the node's segments (declared by the
+       model, as for every resource), and the model brackets its layer stack with the resource's
        ``scatter`` / ``gather``. See **Sequence and context parallelism** under
        `Tuning resources per deployment`_.
    * - ``LinearAttnSpec(config=LinearAttnConfig(recurrent_state=..., variant=...))``
@@ -2792,10 +2792,12 @@ Splitting is declared in four places:
   request's clips this way, reading ``shard.split_range(label)`` for its range and gathering the
   decoded clips with ``shard.gather`` (``mstar/model/minimax_h3/submodules.py``); such a shard
   is refused beside an attention that takes split steps.
-- **Every** ``declare_step`` branch of the node puts a ``SeqShardStep`` in its step, at any SP size
-  (at one rank its plan is a constant); the attention resources refuse a step without one, so a
-  forgotten branch fails on one GPU. ``SubmoduleStep`` fills its segments and its
-  ``combined_labels``, so a combined plan label gets a range too.
+- The model declares **no step** for the shard: its step is the node's segments and
+  ``combined_labels`` (``SubmoduleStep``, as ``Resource.steps_from_segments`` says), added at any
+  SP size (at one rank its plan is a constant), so a combined plan label gets a range too. A step
+  that declares no segments has no shard plan, and the attention resources refuse it, so it fails
+  on one GPU. A step whose segments differ from the node's (LTX-2.5's video alone) sets
+  them on the ``SubmoduleStep`` and gives the other resources' steps their own.
 - The forward **brackets** its layer stack: ``shard.scatter(label, *xs, dim=None)`` before it
   (this rank's share of each tensor, ``dim`` the spec's axis by default; ``None`` passes through),
   ``shard.gather(label, x)`` after it. Both are the identity on a copied step, at one SP rank, and
@@ -2815,17 +2817,18 @@ Splitting is declared in four places:
 
 Every resource of a splitting node must support split steps (``Resource.supports_split_steps``:
 the KV pool, paged FlashInfer and dense attention, ragged self and cross attention, positions, the
-sampler); recurrent state doesn't, so a splitting node can't own any. The engine and the conductor
-also refuse, before a worker starts: a node on SP ranks that neither declares a ``SeqShardSpec``
+sampler); recurrent state doesn't, so a splitting node can't own any. The conductor
+refuses, before a worker starts (and the engine again at load): a node on SP ranks that neither declares a ``SeqShardSpec``
 nor places its pools by position; a shard with no attention that can take split tokens (unless
 ``exchanges=False``); a
 pool stored by position (``context_parallel``) on a node that splits its steps, not yet supported; a
 head-stored pool whose query and KV heads per TP rank don't divide by ``sp_size``; a ragged
 ``sp_exchange`` whose heads don't divide by ``tp * sp``; a ragged cross-attention under a shard on
-axis 0 (a packed split can leave a rank none of a row); expert
-parallelism; piecewise captures; a capture replayed under listed and unlisted walks; and a packed
-capture of a listed walk unless the shard lists one label on axis 0 (its padding joins that
-label). Each attention resource of a splitting node logs at load how it takes split steps.
+axis 0 (a packed split can leave a rank none of a row); and expert
+parallelism. The engine alone refuses a resource without ``supports_split_steps`` at load, and, at
+warmup (after the weights load and the compiles), piecewise captures, a capture replayed under
+listed and unlisted walks, and a packed capture of a listed walk unless the shard lists one label
+on axis 0 (its padding joins that label). Each attention resource of a splitting node logs at load how it takes split steps.
 
 **Context parallelism.** ``context_parallel: true`` on a paged KV pool stripes each page's slots
 over the ranks that would otherwise store the same KV heads: slot ``s`` lives on partner
