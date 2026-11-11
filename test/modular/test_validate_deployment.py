@@ -317,7 +317,7 @@ def test_a_paged_kv_cache_on_cfg_ranks_stays_on_one_instance(tmp_path, ranks):
     if len(ranks) == 2:
         _validate(model, cfg)
     else:
-        _refused(model, cfg, r"KV kv: its nodes span more than one lockstep instance, and .* has cfg_size 2")
+        _refused(model, cfg, r"Resource kv: its nodes span more than one lockstep instance, and .* has cfg_size 2")
 
 
 class _WideModel(_Model):

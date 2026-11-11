@@ -9,7 +9,6 @@ from typing import Any
 from mstar.conductor.routing import RoutingWeights
 from mstar.distributed.base import PARALLEL_AXES, ShardingConfig, node_group_axis_sizes
 from mstar.distributed.communication import GlobalParallelConfig
-from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
 from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.graph.base import GraphSection, self_triggered, top_level_entities
 from mstar.model.base import Model, WorkerGraph
@@ -528,19 +527,19 @@ def _worker_parallelism(
                 f"Resource spec {spec.resource_key} nodes {sorted(spec.nodes)} "
                 "must use the same parallel shape across replicas"
             )
-        # Every cfg rank of an instance holds a full copy of the pool, but a transfer to another
-        # instance (`PublishedKVInfo`) pairs ranks by instance rank, as head shards
+        # Every cfg rank of an instance holds a full copy of a resource rank 0 decides for, but a transfer to
+        # another instance (`PublishedKVInfo`) pairs ranks by instance rank, as head shards
         cfg = next((
             wg for wg in worker_graphs if wg.cfg_size > 1 and spec.nodes & wg.section.get_nodes().keys()
         ), None)
         if (
-            cfg is not None and isinstance(spec, KVSpec) and isinstance(spec.config, PagedKVConfig)
+            cfg is not None and spec.resource_class.journals_resident_moves()
             and any_worker.resource_needs_remote_transfer(spec.nodes, set())
         ):
             yield (
-                f"KV {spec.resource_key}: its nodes span more than one lockstep instance, and "
-                f"{_describe(cfg)} has cfg_size {cfg.cfg_size}. A paged KV cache on cfg ranks must stay "
-                "on one instance: serve its nodes from one node group with one replica."
+                f"Resource {spec.resource_key}: its nodes span more than one lockstep instance, and "
+                f"{_describe(cfg)} has cfg_size {cfg.cfg_size}. A resource that rank 0 decides for (a paged KV "
+                "cache) must stay on one instance on cfg ranks: serve its nodes from one node group with one replica."
             )
         shared: dict[tuple[str, ...], list[str]] = {}
         for wid, nodes in deployed.items():
