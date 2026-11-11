@@ -776,7 +776,7 @@ class RecurrentStatePool(Resource):
     def take_back(self, rids, counts, label: str) -> None:
         """A verify step's rejected tokens out of each row's count: the state
         itself was rerun to the kept ones in the step's own graph. Startup refuses
-        a pool no linear-attention resource reruns (`unsettled_problems`)."""
+        a pool no linear-attention resource reruns (`uncorrected_problems`)."""
         with self._lock:
             for rid, n in zip(rids, counts, strict=True):
                 labels = self._slots.get(rid)

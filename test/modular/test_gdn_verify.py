@@ -279,15 +279,15 @@ def test_the_settle_kernel_matches_its_reference_on_the_cpu_path():
 def test_a_pool_whose_state_nothing_settles_is_refused():
     """A pool with no linear-attention resource rerunning it would keep rejected
     tokens folded in: startup refuses it from the specs."""
-    from mstar.engine.resources.draft.startup import unsettled_problems
+    from mstar.engine.resources.draft.startup import uncorrected_problems
 
     pool_spec = RecurrentStateSpec(POOL, {"LLM"}, RecurrentStateConfig(
         num_layers=LAYERS, blocks=GEOMETRY.to_blocks(), max_slots=8,
     ))
     rerun = LinearAttnSpec(LIN, {"LLM"}, LinearAttnConfig(recurrent_state=POOL, variant=LinearAttnVariant.GDN))
     decl = SimpleNamespace(node="LLM")
-    assert unsettled_problems(decl, {POOL: pool_spec, LIN: rerun}) == []
-    (problem,) = unsettled_problems(decl, {POOL: pool_spec})
+    assert uncorrected_problems(decl, {POOL: pool_spec, LIN: rerun}) == []
+    (problem,) = uncorrected_problems(decl, {POOL: pool_spec})
     assert "no linear-attention resource reruns its state" in problem
 
 

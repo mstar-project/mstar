@@ -5,7 +5,7 @@ A verify step runs the target over ``k + 1`` rows a request: the last emitted
 token, which has no KV yet, then ``k`` drafts. The engine fixes the order
 (`draft_verify_step`): draft (from the row's carry, for a drafter that declares
 one), agree on rank 0's drafts, run the target, verify in the sampler, let each
-resource with state the block overwrote settle it (``correct_verify_state``), let a
+resource with state the block overwrote correct it (``correct_verify_state``), let a
 stateful drafter observe and keep its new carry, and record what the step's
 resources correct themselves from. A model holds the declaration, the target
 function and the drafter's weights, and no state across steps.
@@ -257,14 +257,14 @@ def draft_verify_step(
     drafter: Drafter,
     resources: dict[str, Any],
     resident: CapturedResidentStep | None = None,
-    settle_keys: Sequence[str] = (),
+    correcting_keys: Sequence[str] = (),
 ) -> VerifyResult:
     """One verify step, in the engine's order. ``target`` maps the block's ids
     ``[n * (k + 1)]`` to a `TargetOutput`: logits ``[n * (k + 1), V]``, and with
     the drafter's ``needs.target_hidden`` the hidden states; ``sampler`` is the node's
     verifying `SamplerResource`, which also keeps a carrying drafter's
-    `DRAFT_CARRY`; ``settle_keys`` the resources that correct the block's state
-    (`DrafterShare.settle_keys`). Capturable: nothing here reads the device on the host."""
+    `DRAFT_CARRY`; ``correcting_keys`` the resources that correct the block's state
+    (`DrafterShare.correcting_keys`). Capturable: nothing here reads the device on the host."""
     k = sampler.verify_draft_tokens
     n = input_ids.shape[0]
     needs = drafter.needs
@@ -280,7 +280,7 @@ def draft_verify_step(
         raise RuntimeError("the drafter reads the target's hidden states (DrafterNeeds.target_hidden), and the "
                            "target returned none")
     result = sampler.verify(request_ids, logits.view(n, k + 1, -1), drafts)
-    for key in settle_keys:
+    for key in correcting_keys:
         # a resource whose state the block wrote in place (GDN's) corrects it here, in the graph
         resources[key].correct_verify_state(result)
     carry = drafter.observe(ObserveInputs(block, result, hidden))

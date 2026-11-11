@@ -1644,7 +1644,7 @@ class ARNodeSubmodule(NodeSubmodule):
             raise RuntimeError(f"{type(self).__name__}: a verify step on a node the engine never bound a drafter to")
         return draft_verify_step(
             engine_inputs.resources[share.sampler_key], engine_inputs.request_ids, input_ids, target,
-            self.drafter, engine_inputs.resources, engine_inputs.resident, share.settle_keys,
+            self.drafter, engine_inputs.resources, engine_inputs.resident, share.correcting_keys,
         )
 
     def verify_output(self, result: "VerifyResult", **row_outputs: torch.Tensor) -> "BatchedModelOutput":

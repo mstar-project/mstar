@@ -39,7 +39,7 @@ class DrafterShare(NamedTuple):
     prompt_steps: Mapping[str, ResourceStep]
     verify_steps: Mapping[str, ResourceStep]
     # the node's resources that correct a verify step's state in its graph, in dependency order
-    settle_keys: tuple[str, ...] = ()
+    correcting_keys: tuple[str, ...] = ()
 
     @property
     def block(self) -> int:

@@ -1013,7 +1013,7 @@ class Engine:
         # every check above derives from config and built shapes, so a raise was every rank's; from here
         # every step the engine declares for the node, capture's and each replay's, carries its drafter's share
         # the resources whose state a verify step's block wrote in place (GDN's), in the runner's order
-        settle_keys = tuple(
+        correcting_keys = tuple(
             key for key in self._runner.order
             if key in mgmt.resources
             and type(mgmt.resources[key]).correct_verify_state is not Resource.correct_verify_state
@@ -1021,7 +1021,7 @@ class Engine:
         submodule.bind_draft(DrafterShare(
             decl.walk, stop.sampler, decl.config.num_draft_tokens, stop.prefill_walks,
             carry_writes(decl.needs), decl.prefill_steps, decl.verify_steps,
-            settle_keys,
+            correcting_keys,
         ))
         return draft
 

@@ -349,7 +349,7 @@ class RecurrentStateSpec(NodeResourceSpec):
             verify = "a verify step's padding rows rerun into the sink slot, which disable_sink_slot removes"
         elif len(self.config.labels) != 1:
             # the undo keeps one label's inputs and maps its rows to the sampler's
-            verify = f"a verify step settles one label's state, and this pool declares {list(self.config.labels)}"
+            verify = f"a verify step corrects one label's state, and this pool declares {list(self.config.labels)}"
         # its linear-attention resource's rerun, in the graph, needs nothing of the host
         return ResourceCapabilities(verify_refusal=verify, async_verify_refusal=None)
 

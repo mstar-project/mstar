@@ -284,7 +284,7 @@ def chunking_problem(decl: VerifyNode, chunks_prompts: bool) -> str | None:
     return None
 
 
-def unsettled_problems(decl: VerifyNode, specs: Mapping[str, NodeResourceSpec]) -> list[str]:
+def uncorrected_problems(decl: VerifyNode, specs: Mapping[str, NodeResourceSpec]) -> list[str]:
     """Each recurrent pool of the node that no linear-attention resource reruns
     after a verify step (a `LinearAttnSpec` naming it as its ``recurrent_state``):
     it would keep the rejected tokens in its state. `LinearAttnSpec` refuses the
@@ -309,7 +309,7 @@ def node_problems(
     `check_deployment` (before workers spawn, ``max_seq_len`` the serving config's) and the engine at load (with
     the built submodule's ``token_stop``) run, so the two can't disagree."""
     problems = shape_problems(decl, token_stop, specs) + geometry_problems(decl, specs)
-    problems += resource_problems(decl, specs) + unsettled_problems(decl, specs)
+    problems += resource_problems(decl, specs) + uncorrected_problems(decl, specs)
     for problem in (chunking_problem(decl, chunks_prompts), combined_problem(decl, combined_walk_of or {})):
         if problem is not None:
             problems.append(problem)

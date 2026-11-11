@@ -58,7 +58,7 @@ def _check(out):
 
 
 def test_the_verify_step_corrects_only_the_resources_bound_at_load():
-    """settle_keys: the node's resources that correct the block's state in the graph, found once at
+    """correcting_keys: the node's resources that correct the block's state in the graph, found once at
     load in the runner's order; the verify step calls those and no other."""
     import hybrid_toy as toy
     from spec_toy import NODE as SPEC_NODE
@@ -66,9 +66,9 @@ def test_the_verify_step_corrects_only_the_resources_bound_at_load():
     from spec_toy import oracle
 
     eng = toy.engine(3, toy.ForcedDrafter(_references()))
-    assert eng._submodules[toy.NODE].submodule.drafter_share.settle_keys == ("linear_attn",)
+    assert eng._submodules[toy.NODE].submodule.drafter_share.correcting_keys == ("linear_attn",)
     plain = spec_engine(3, oracle)
-    assert plain._submodules[SPEC_NODE].submodule.drafter_share.settle_keys == ()
+    assert plain._submodules[SPEC_NODE].submodule.drafter_share.correcting_keys == ()
 
 
 @pytest.mark.parametrize("batched", [True, False])

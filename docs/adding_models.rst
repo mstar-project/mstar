@@ -1938,7 +1938,7 @@ steps and undoes nothing.
 recurrent multi-token kernel (``gated_delta_rule_mtp``) for their outputs, and through the
 multi-token short conv (``causal_conv1d_update(..., update_state=False)``), both leaving the
 row's state and conv window as they were. Right after the sampler's verify, the engine calls each
-resource's ``correct_verify_state(result)``, and the GDN resource reruns the delta rule from the slot with
+resource that overrides ``correct_verify_state(result)`` (bound once at load, ``DrafterShare.correcting_keys``), and the GDN resource reruns the delta rule from the slot with
 the rejected tokens' gates closed, the state's one write, and rebuilds each conv window from the
 untouched window and the kept tokens' inputs (one kernel a layer), inside the step's graph. At rest the state then
 equals a plain run over the kept tokens, within the kernel's float precision: nothing else in the model changes. The pool takes back its own token count and keeps no

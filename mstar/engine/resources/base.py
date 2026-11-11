@@ -478,7 +478,7 @@ class Resource(ResidentHooks, ABC):
         ``result`` (accepted counts), inside the verify step's own graph and before
         the drafter observes (`draft_verify_step`). It runs once a verify step,
         capturable, reading nothing on the host. Only an override is called: the
-        engine binds the overriding resources at load (`DrafterShare.settle_keys`)."""
+        engine binds the overriding resources at load (`DrafterShare.correcting_keys`)."""
         return
 
     def plan(self, step: ResourceStep, ctx: StepContext) -> Any:
