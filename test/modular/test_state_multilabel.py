@@ -62,6 +62,8 @@ from mstar.engine.state import (
     at_last_token,
 )
 from mstar.engine.state.adapters import (
+    PAGED,
+    PAGED_BY_WALK,
     StateSetup,
     Walks,
     _leader,
@@ -71,6 +73,7 @@ from mstar.engine.state.adapters import (
     check_capture,
     node_handles,
     state_steps,
+    storage_of,
 )
 from mstar.engine.state.calls import ArrayHandle
 from mstar.model.base import KVLabel, LabelLayout, PrefixKeys
@@ -259,6 +262,12 @@ def test_reads_that_differ_by_walk_share_one_spec_and_plan_causal_per_walk():
         "prefill_text": {"attn": True}, "decode": {"attn": True},
         "prefill_vit": {"attn": False}, "image_gen": {"attn": False},
     }
+
+
+def test_an_array_whose_reads_differ_by_walk_has_a_storage_of_its_own():
+    """Its handle holds each walk's reads, which an array whose reads serve every walk has no use for."""
+    assert storage_of(_per_walk()) is PAGED_BY_WALK
+    assert storage_of(_array()) is PAGED, "every paged array's handle would carry a walk table"
 
 
 def test_a_combined_walk_plans_the_mask_its_walks_read():
