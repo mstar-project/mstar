@@ -143,6 +143,9 @@ Model families and some output formats need extra packages, exposed as pip *extr
    * - ``.[orpheus]``
      - Orpheus TTS runtime: ``transformers``, ``flashinfer-python``, ``safetensors``,
        ``einops``, ``huggingface-hub``, ``mooncake-transfer-engine``.
+   * - ``.[minicpm_o]``
+     - MiniCPM-o 4.5 runtime: ``transformers``, ``flashinfer-python``, ``safetensors``,
+       ``soundfile``, ``torchaudio`` / ``torchcodec``, ``Pillow``, ``huggingface-hub``.
    * - ``.[fish_s2_pro]``
      - Fish Audio S2-Pro runtime: ``transformers``, ``flashinfer-python``, ``safetensors``,
        ``soundfile`` (reference-clip decoding), ``huggingface-hub``, ``mooncake-transfer-engine``.
@@ -600,9 +603,14 @@ frontend (``ADAPTER_REGISTRY`` in ``mstar/api_server/openai/adapters.py``):
 ported class is served. Chat, speech, images, videos and transcriptions are
 served for every model the Python frontend serves them for; a transcription's
 upload is decoded and cut into windows by the API server's ``WindowPlanner``,
-over the bridge, so both frontends read the same formats. The realtime
-WebSocket route is not ported yet; there ``mstar-server`` has no route, and
-``/generate`` still works.
+over the bridge, so both frontends read the same formats. The WebSocket
+routes are served too: ``/generate/ws``, ``/v1/realtime`` (conversations with
+full-duplex models, and transcription, whose server turn detection runs Silero
+through the ONNX Runtime library ``onnxruntime`` ships; ``semantic_vad`` asks the
+API server's Smart Turn), and openpi's socket at
+``/`` where the config has an ``openpi:`` block. ``mstar-server`` does not
+offer per-message deflate, so ``ws_per_message_deflate`` has no effect there:
+a client that asks for it gets uncompressed frames.
 
 Troubleshooting
 ---------------

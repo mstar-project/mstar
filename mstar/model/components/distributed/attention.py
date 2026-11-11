@@ -26,6 +26,7 @@ from torch import nn
 from mstar.distributed.communication import CommGroup
 from mstar.distributed.utils import divide
 from mstar.engine.resources.convenience import AttentionCallable
+from mstar.engine.state import rope
 from mstar.model.components.distributed.linear import (
     ColumnParallelLinear,
     KVColumnParallelLinear,
@@ -57,6 +58,7 @@ class ParallelAttention(nn.Module):
         attn_key: str = "attn",
         kv_key: str = "kv",
         pos_key: str | None = "rope",
+        layer: int | None = None,
     ):
         super().__init__()
         # resource labels this layer calls; see components/attention.py
@@ -66,6 +68,8 @@ class ParallelAttention(nn.Module):
         self.attn = None
         self.kv = None
         self.pos = None
+        self.layer = None if layer is None else torch.tensor(layer, device="cpu")
+        self.state = None
         if comm_group is None:
             comm_group = CommGroup.trivial()
         self.comm_group = comm_group
@@ -141,6 +145,17 @@ class ParallelAttention(nn.Module):
         # see Attention.bind_resources
         self.attend = AttentionCallable(kv=self.kv, attn=self.attn)
 
+    def bind_state(self, handles: dict) -> None:
+        """See ``Attention.bind_state``."""
+        self.state = handles.get(self._kv_key)
+
+    def _attend_state(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        # see Attention._attend_state
+        if self._pos_key is not None:
+            q, k = rope(self.state, q, k)
+        self.state.add(self.layer, k=k, v=v)
+        return self.state.read(self.layer, q)
+
     def _apply_rope(
         self,
         q: torch.Tensor, k: torch.Tensor, label: str,
@@ -167,8 +182,11 @@ class ParallelAttention(nn.Module):
         num_tokens = hidden_states.shape[0]
         q, k, v = self._project_qkv(hidden_states)
         q, k = self._apply_qk_norm(q, k)
-        q, k = self._apply_rope(q, k, self.attend.label)
-        attn_output = self.attend(q, k, v)
+        if self.state is not None:
+            attn_output = self._attend_state(q, k, v)
+        else:
+            q, k = self._apply_rope(q, k, self.attend.label)
+            attn_output = self.attend(q, k, v)
         attn_output = attn_output.reshape(num_tokens, self.num_heads * self.head_dim)
         return self.o_proj(attn_output)
 

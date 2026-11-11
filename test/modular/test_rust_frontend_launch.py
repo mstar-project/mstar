@@ -57,6 +57,27 @@ def test_the_transcription_facts_are_the_launchers_and_never_inherited(launched,
     assert json.loads(launched["env"]["MSTAR_TRANSCRIPTION"]) == facts
 
 
+def test_the_websocket_facts_are_the_launchers_and_never_inherited(launched, monkeypatch):
+    import json
+
+    for name in ("MSTAR_OPENPI", "MSTAR_WS_MAX_BYTES", "MSTAR_REALTIME"):
+        monkeypatch.setenv(name, "stale")
+    monkeypatch.setenv("MSTAR_CLIENT_STREAMS", '["stale"]')
+    rust_frontend.launch_rust_server("bin", "kokoro", 8000, "/b", "/u")
+    env = launched["env"]
+    assert not {"MSTAR_OPENPI", "MSTAR_WS_MAX_BYTES", "MSTAR_REALTIME"} & env.keys()
+    assert json.loads(env["MSTAR_CLIENT_STREAMS"]) == []
+    openpi = {"image_keys": ["cam"], "metadata": ""}
+    realtime = {"onnxruntime": None, "silero": None, "smart_turn_problem": "x", "tokenizer": None}
+    rust_frontend.launch_rust_server("bin", "qwen3_asr", 8000, "/b", "/u", openpi=openpi, ws_max_bytes=1 << 20,
+                                     client_streams={"text", "audio"}, realtime=realtime)
+    env = launched["env"]
+    assert json.loads(env["MSTAR_OPENPI"]) == openpi
+    assert env["MSTAR_WS_MAX_BYTES"] == str(1 << 20)
+    assert json.loads(env["MSTAR_CLIENT_STREAMS"]) == ["audio", "text"]
+    assert json.loads(env["MSTAR_REALTIME"]) == realtime
+
+
 def test_mstar_server_gets_the_libsndfile_soundfile_loaded(launched, monkeypatch):
     monkeypatch.setenv("MSTAR_LIBSNDFILE", "/stale/libsndfile.so")
     monkeypatch.setattr(rust_frontend, "soundfile_library", lambda: None)
@@ -78,3 +99,32 @@ def test_mstar_server_gets_the_api_servers_served_models(launched, monkeypatch):
     import json
     assert json.loads(launched["env"]["MSTAR_SERVED_MODELS"]) == {
         "base": ["Qwen/Qwen3.5-0.8B", "qwen3_5_0.8b"], "adapters": ["sql"], "lora": True}
+
+
+def test_realtime_facts_carry_what_a_conversation_reads_off_the_model(tmp_path):
+    """A model with a ClientAudio stream gets ``conversation`` facts; only one
+    that can converse (turn tokens, one audio stream, mono output) gets its
+    stream and reply settings, which only a conversation reads."""
+    from types import SimpleNamespace
+
+    from mstar.model.base import Model
+    from mstar.streaming.topology import CLIENT, ClientAudio, Connection
+
+    class _Duplex:
+        turn_tokens, turn_idle_steps, turn_silence_rms = (1, 2), 25, 0.01
+        get_output_sample_rate = Model.get_output_sample_rate
+        get_output_audio_channels = Model.get_output_audio_channels
+
+        def get_default_voice(self):
+            return "Aria"
+
+    ear = Connection(CLIENT, "Encoder", "audio_in", chunk_policy_factory=lambda: None, audio=ClientAudio(16000, 1280))
+    server = SimpleNamespace(model=_Duplex(), client_audio=[ear])
+    assert rust_frontend.realtime_facts(server, None, str(tmp_path)) == {"conversation": {
+        "streams": 1, "turn_tokens": True, "channels": 1, "stream": "audio_in", "rate": 16000, "frame_samples": 1280,
+        "output_rate": 24000, "voice": "Aria", "idle_steps": 25, "silence_rms": 0.01,
+    }}
+    server.model.turn_tokens = None
+    assert rust_frontend.realtime_facts(server, None, str(tmp_path)) == {
+        "conversation": {"streams": 1, "turn_tokens": False, "channels": 1}}
+    assert rust_frontend.realtime_facts(SimpleNamespace(model=_Duplex(), client_audio=[]), None, str(tmp_path)) is None

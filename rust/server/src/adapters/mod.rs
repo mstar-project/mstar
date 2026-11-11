@@ -78,6 +78,22 @@ pub struct SubmitArgs {
     pub parts: Vec<Part>,
     /// End the result stream with a `usage` chunk (set by the chat handler).
     pub report_usage: bool,
+    /// Decoded inputs that go to the model without a file (`submit_request`'s
+    /// `raw_inputs`): openpi's camera images.
+    pub raw_inputs: BTreeMap<String, Vec<RawArray>>,
+    /// `submit_request`'s `end_input` (true, or the client streams it ends) and
+    /// `file_streams`, for a model with client streams; `None` elsewhere.
+    pub end_input: Option<Value>,
+    pub file_streams: Option<Value>,
+}
+
+/// An array as numpy holds one: its `dtype.str` (`|u1`, `<f4`), shape and bytes.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RawArray {
+    pub dtype: String,
+    pub shape: Vec<usize>,
+    #[serde(with = "serde_bytes")]
+    pub data: Vec<u8>,
 }
 
 impl Default for SubmitArgs {
@@ -91,6 +107,9 @@ impl Default for SubmitArgs {
             output_modalities: vec!["text".to_string()],
             model_kwargs: Map::new(),
             parts: Vec::new(),
+            raw_inputs: BTreeMap::new(),
+            end_input: None,
+            file_streams: None,
         }
     }
 }
@@ -132,7 +151,7 @@ fn apply_sampling(mk: &mut Map<String, Value>, s: Sampling) {
     }
 }
 
-fn json_num(f: f64) -> Value {
+pub(crate) fn json_num(f: f64) -> Value {
     serde_json::Number::from_f64(f).map(Value::Number).unwrap_or(Value::Null)
 }
 
@@ -190,6 +209,18 @@ pub trait OpenAIAdapter: Send + Sync {
 
     fn supports_transcriptions(&self) -> bool {
         false
+    }
+
+    /// `/v1/realtime`: the model can continue a hypothesis it is handed.
+    fn supports_realtime_transcription(&self) -> bool {
+        false
+    }
+
+    /// One realtime step: transcribe `audio_path` (everything heard so far)
+    /// continuing from `prefix`, the stable part of the previous hypothesis.
+    fn realtime_step_request(&self, req: &crate::transcription::TranscriptionRequest, audio_path: &str, prefix: &str) -> Result<SubmitArgs, String> {
+        let _ = (req, audio_path, prefix);
+        Err("realtime transcription is not supported by this model".to_string())
     }
 
     /// The class attributes that steer `/v1/audio/transcriptions`.
