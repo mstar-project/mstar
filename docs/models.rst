@@ -761,9 +761,9 @@ row may only stop there, and the reply ends at that stop. A drawn token the gram
 one through) fails its request at the step after the next, and meanwhile the reply may only draw
 one of the model's stop tokens; when the reply finishes first (a stop or its length limit;
 always without async scheduling), it ends normally with the refused token in it. The stops here
-are the ones the model's ``text_output()`` declares, else its tokenizer's EOS (none for a model
-with neither, whose row is then left unmasked); a model whose loop stops on other tokens should
-declare them there. Not served
+are the ones the model's ``text_output()`` declares, else, for a Hugging Face tokenizer, the
+stops xgrammar finds for it (its EOS); a model with neither gets none, and its row is left
+unmasked, so a model whose loop stops on tokens of its own should declare them there. Not served
 with it yet: speculative decoding (no model that declares ``text_output()`` drafts outside its
 sampler), resident planning, and a text sampler whose walks run on different ranks (a
 prefill/decode split); the deployment is refused at startup for the last, and for
