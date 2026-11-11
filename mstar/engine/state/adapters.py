@@ -897,11 +897,13 @@ class PagedArrayHandle(ArrayHandle):
                 raise self._refusal(f"at_last_token on label {label!r}, and the step's segments name "
                                     f"{list(step_labels(segments))}")
             first, end = at[0], at[-1] + 1
-        # A span-0 segment adds no token to the plan, which would select the previous segment's last one.
-        empty = next((segment for segment in segments[first:end] if not segment.span), None)
-        if empty is not None:
-            raise self._refusal(f"at_last_token on row {empty.request_id}, label {empty.label!r}, whose segment has "
-                                "span 0 and so no token in this step")
+        # A span-0 segment adds no token to the plan, so its row gets the previous segment's last token. A call over
+        # every row of a one-label step takes that for the rows that pad it.
+        if label is not None or len(step_labels(segments)) > 1:
+            empty = next((segment for segment in segments[first:end] if not segment.span), None)
+            if empty is not None:
+                raise self._refusal(f"at_last_token on row {empty.request_id}, label {empty.label!r}, whose segment "
+                                    "has span 0 and so no token in this step")
         read = self.first_read
         if self.walk_reads is not None:
             # a walk plans only the resources of its own reads
