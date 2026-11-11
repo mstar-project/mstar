@@ -31,6 +31,7 @@ from mstar.engine.state import Array, ArrayStep, Attend, Block, Causal, KVEntry,
 from mstar.engine.state.adapters import (
     SDPA,
     WITHIN_STEP,
+    RaggedAttend,
     StateSetup,
     WithinStepHandle,
     _bindings,
@@ -297,6 +298,30 @@ def test_a_cross_read_whose_query_array_isnt_in_the_step_is_refused():
         state_steps(step, _handles(arrays))
 
 
+def test_a_cross_read_whose_query_array_lists_no_segments_is_refused_naming_it():
+    """The cross read plans first here, so the refusal for an array listed with no segments has to come from its query
+    side, not from the queried array's own turn, which comes after."""
+    arrays = [_array("a"), _array("b", queries="a")]
+    step = SubmoduleStep(state={"b": ArrayStep(segments=(Segment(1, "b", 2),)), "a": ArrayStep()})
+    with pytest.raises(ValueError, match="Array 'a': a step lists it with no segments, its own or the step's"):
+        state_steps(step, _handles(arrays))
+
+
+def test_a_cross_read_whose_query_array_lists_an_empty_tuple_is_refused_naming_it():
+    arrays = [_array("a"), _array("b", queries="a")]
+    step = SubmoduleStep(segments=[Segment(1, "a", 4)], state={
+        "b": ArrayStep(segments=(Segment(1, "b", 2),)), "a": ArrayStep(segments=()),
+    })
+    with pytest.raises(ValueError, match="Array 'a': a step lays it out over an empty list of segments"):
+        state_steps(step, _handles(arrays))
+
+
+def test_a_binding_no_paged_array_holds_is_refused_when_it_attaches():
+    with pytest.raises(ValueError, match="Array 'a': no layout yet: 'a_read' binds through RaggedAttend, which no "
+                                         "paged array holds"):
+        RaggedAttend().attach(SimpleNamespace(reads={}), _array("a"), "a_read", {})
+
+
 def test_a_cross_read_over_other_requests_is_refused_when_it_opens():
     arrays = [_array("a"), _array("b", queries="a")]
     step = SubmoduleStep(state={
@@ -409,6 +434,17 @@ def test_the_exchange_its_step_and_the_narrowed_heads_follow_one_predicate(shard
     handle = _handles(arrays, group=_StubGroup(), setup=_on_sdpa("a_self", "b_cross"))["b"]
     ulysses = sharded and queried_sharded
     assert (handle._ulysses, handle.needs_step, spec.config.shard_over_sp) == (ulysses,) * 3
+
+
+@pytest.mark.parametrize("sharded, queried_sharded", [(True, False), (False, True)])
+def test_a_share_follows_the_reads_exchange_not_the_sharded_flags(monkeypatch, sharded, queried_sharded):
+    """With one side sharded, a read plans that side as the rank's share. If the predicate made that read run Ulysses,
+    the exchange would hand the kernel whole segments, so the plan has to lay out whole segments too."""
+    monkeypatch.setattr(adapters, "both_sharded", lambda array, queried: array.seq_sharded or queried.seq_sharded)
+    h = _within(_array("b", queries="a", sharded=sharded), _StubRagged(),
+                queried=_array("a", sharded=queried_sharded), sp_group=_StubGroup())
+    segments = (Segment(1, "a", 9),)
+    assert h._ulysses and h.query_share(segments) == h.key_share(segments) == segments, "a share of gathered rows"
 
 
 def test_no_flag_exchanges_at_sp1(monkeypatch):
