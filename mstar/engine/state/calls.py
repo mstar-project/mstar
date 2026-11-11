@@ -11,7 +11,7 @@ from typing import Any
 import torch
 
 from mstar.engine.resources.step import Segment, StepHandle
-from mstar.engine.state.contract import Array, ArrayStep, CausalConv, GatedDeltaNet, Op, Sampler
+from mstar.engine.state.contract import EMPTY, Array, ArrayStep, CausalConv, GatedDeltaNet, Op, Sampler
 
 
 def segments_of(declared: ArrayStep, step) -> Sequence[Segment]:
@@ -36,6 +36,9 @@ class ArrayHandle(StepHandle):
 
     # whether a step that lists the array has anything to do for it
     needs_step = True
+    # each read's runner, and the ops bound with their keys, where the storage binds them
+    reads: Mapping[str, Any] = EMPTY
+    _bindings: tuple = ()
 
     def __init__(self, array: Array, resources: Mapping[str, Any], positions_key: str | None):
         self.array = array
@@ -211,7 +214,16 @@ class ArrayHandle(StepHandle):
         raise self._unsupported("at_last_token")
 
     def _kernel_setting(self, read: str, field: str) -> Any:
-        raise self._unsupported(f"kernel_setting of {read!r}")
+        if read not in self.reads:
+            raise self._unsupported(f"kernel_setting of {read!r}")
+        (binding,) = (bound.binding for bound in self._bindings if bound.key == read)
+        if not binding.kernel_settings:
+            raise self._refusal(f"no {field} for read {read!r}, whose binding {type(binding).__name__} takes no "
+                                "kernel settings")
+        if field not in binding.read_back:
+            raise self._refusal(f"no {field} for read {read!r}, whose binding {type(binding).__name__} reports back "
+                                f"{sorted(binding.read_back) or 'none'}")
+        return getattr(self.reads[read], field)
 
     def _update(self, kind: type[Op], field: str, layer: int) -> tuple[Any, torch.Tensor]:
         """Record the update of type ``kind`` on ``layer``'s ``field``, and return the resource that runs it and the

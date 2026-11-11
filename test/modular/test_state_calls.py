@@ -383,12 +383,13 @@ def test_rope_with_no_declared_dtype_rotates_in_qs():
     assert pos.seen == [("main", torch.float64)]
 
 
-def test_at_last_token_and_kernel_setting_read_the_reads_resource():
+def test_at_last_token_reads_the_reads_resource_and_a_paged_read_reports_no_setting_back():
     h = _kv_handle()
     _begin(h)
     x = torch.arange(3.0)
     assert at_last_token(h, x).tolist() == [2.0]
-    assert kernel_setting(h, "attn", "max_segments_per_step") == 7
+    _refused(r"Array 'kv': no max_segments_per_step for read 'attn', whose binding PagedAttend reports back none",
+             lambda: kernel_setting(h, "attn", "max_segments_per_step"))
 
 
 def test_sample_takes_the_steps_rows_padding_included():

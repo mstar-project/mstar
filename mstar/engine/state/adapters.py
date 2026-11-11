@@ -486,6 +486,8 @@ class OpBinding:
 
     # the fields `kernel_settings` may set on the op's spec, until the engine picks kernels itself
     kernel_settings: ClassVar[frozenset[str]] = frozenset()
+    # those of them whose value in effect the bound runner reports, which `kernel_setting` reads back
+    read_back: ClassVar[frozenset[str]] = frozenset()
 
     def check(self, array: Array, key: str, declared: Read | Op) -> None:
         """Raise ``ValueError`` on what today's resources can't run, naming ``array``."""
@@ -560,6 +562,7 @@ class RaggedAttend(WithinStepAttend):
     """`Attend` within a step, on a ragged resource that the reads of one kind, nodes and config share."""
 
     kernel_settings = frozenset({"max_segments_per_request", "max_segments_per_step", "compile_op", "workspace_mb"})
+    read_back = frozenset({"max_segments_per_request", "max_segments_per_step"})
     plans = True
 
     def attend(self, run: Any, label: str, rows: "RowLayout") -> Callable[..., torch.Tensor]:
@@ -718,9 +721,6 @@ class PagedArrayHandle(ArrayHandle):
     def at_last_token(self, x: torch.Tensor) -> torch.Tensor:
         self._check_open("at_last_token")
         return self.first_read.select_last_hidden(x, label=self.label)
-
-    def _kernel_setting(self, read: str, field: str) -> Any:
-        return getattr(self.reads[read], field)
 
 
 class ValueHandle(ArrayHandle):
@@ -996,12 +996,6 @@ class WithinStepHandle(ArrayHandle):
         if self._keys_sharded:
             return attention_over_sharded_keys(self._sp, q, k, v, self._attend)
         return self._attend(q, k, v)
-
-    def _kernel_setting(self, read: str, field: str) -> Any:
-        if not self._binding.kernel_settings:
-            raise self._refusal(f"no {field} for read {read!r}, whose binding {type(self._binding).__name__} takes no "
-                                "kernel settings")
-        return getattr(self.reads[read], field)
 
 
 # Storages
