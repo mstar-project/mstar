@@ -993,7 +993,8 @@ The spec types are:
        A request whose ``MAX_POSITION_KWARG`` (set by ``process_prompt``; the data worker
        drops a client's value) passes
        ``original_max_position_embeddings`` rotates with the long one for its whole life,
-       others with the short one. The spec builds the request's config from that kwarg and
+       others with the short one. Set it to the length the model's reference picks its table
+       by: the prompt's for Phi-3 and Phi-4, not prompt plus ``max_tokens``. The spec builds the request's config from that kwarg and
        names the long table in its prefix keys (``PositionSpec.prefix_variant``), so the two
        cannot disagree. Explicit ``pos_ids`` are refused under it. On resident tables a
        row keeps its table id's offset beside its position's, both fixed between host
