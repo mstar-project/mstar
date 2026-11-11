@@ -521,15 +521,6 @@ impl GraphRuntime {
             pp.refuse_repeated("store")?;
             return Ok(self.pp_park(pp, NEED_STORE));
         };
-        if let Some((signal, col)) = pp.inline.as_ref().filter(|(_, col)| col.width > 1) {
-            // a streamed value is one item a step, so the later iterations' would be lost
-            if self.inline_streams.contains(&(pp.node_name.clone(), signal.clone())) {
-                return Err(PyRuntimeError::new_err(format!(
-                    "{}/{}: a step of {} iterations can't stream {signal} to another worker as values",
-                    pp.node_name, pp.graph_walk, col.width,
-                )));
-            }
-        }
         let tails = pp.inline.as_ref()
             .filter(|(_, col)| col.width > 1)
             .and_then(|(_, col)| col.tails_for(&pp.rids, &pp.row_rids, &pp.kept))

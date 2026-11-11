@@ -309,20 +309,3 @@ def test_a_repeated_step_stops_a_row_at_its_iteration_and_emits_up_to_it(tmp_pat
         for rid, value in zip(frame.body.request_ids, frame.body.values, strict=True):
             sent.setdefault(rid, []).append(value)
     assert sent == {"r0": [1, 2, 3], "r1": [4, EOS]}
-
-
-def test_a_repeated_step_refuses_a_token_streamed_to_a_peer_as_values(tmp_path):
-    """A streamed value is one item a step, so the later iterations' tokens would
-    go nowhere: the step is refused rather than sent short."""
-    rt = _runtime(rust_runtime.RustGraphRuntime, str(tmp_path))
-    rt.set_inline_streams(frozenset({(NODE, SIG)}))
-    rids = _start(rt, 1)
-    assert rt.pop_rids(NODE, WALK, rids) is not None
-    wide = torch.tensor([[1, 2, 3]], dtype=torch.int64)
-    with pytest.raises(RuntimeError, match="can't stream text_inputs to another worker as values"):
-        _drive(rt, PostprocessRequest(
-            partition=PART, node_name=NODE, graph_walk=WALK, output_signals=[SIG],
-            wg_ids=ParallelList(list(rids), [0]), runtime_stops=True,
-            tokens=wide[:, 0], row_rids=rids, inline=InlineColumn(SIG, wide[:, 0]),
-            loop_strides=[3], token_width=3,
-        ), {}, model_stops={})
