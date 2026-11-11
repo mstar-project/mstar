@@ -105,7 +105,10 @@ class NodeDraft:
         self.verify_rows = 0
         self.accepted_hist = np.zeros(decl.config.num_draft_tokens + 1, dtype=np.int64)
         self._warned_low = False
-        self._logged_at = time.monotonic()
+        # the log line's window opens at the first verify step, not at load, which can take longer
+        # than a window; each line reports the window's own counts (`_window_start`)
+        self._logged_at: float | None = None
+        self._window_start = (0, 0, 0, self.accepted_hist.copy())
 
     @property
     def asynchronous(self) -> bool:
@@ -251,19 +254,24 @@ class NodeDraft:
 
     def _count(self, accepted: np.ndarray) -> None:
         k = self.decl.config.num_draft_tokens
+        now = time.monotonic()
+        if self._logged_at is None:
+            self._logged_at = now
         rows = accepted.size
         self.verify_rows += rows
         self.drafted += rows * k
         self.accepted += int(accepted.sum())
         self.accepted_hist += np.bincount(accepted, minlength=k + 1)[: k + 1]
-        now = time.monotonic()
         if now - self._logged_at >= _LOG_EVERY_S:
-            self._logged_at = now
+            rows0, drafted0, accepted0, hist0 = self._window_start
+            rows, drafted, kept = self.verify_rows - rows0, self.drafted - drafted0, self.accepted - accepted0
             logger.info(
-                "speculative decoding on %s: tau %.2f over %d verify rows, %.1f%% of drafts accepted, "
-                "accepted per step %s", self.node, self.acceptance_length(), self.verify_rows,
-                100 * self.accepted / max(self.drafted, 1), self.accepted_hist.tolist(),
+                "speculative decoding on %s, the last %.0f s: tau %.2f over %d verify rows, %.1f%% of drafts "
+                "accepted, accepted per step %s", self.node, now - self._logged_at, (kept + rows) / max(rows, 1),
+                rows, 100 * kept / max(drafted, 1), (self.accepted_hist - hist0).tolist(),
             )
+            self._logged_at = now
+            self._window_start = (self.verify_rows, self.drafted, self.accepted, self.accepted_hist.copy())
         if not self._warned_low and self.drafted >= 4096 and self.accepted < 0.02 * self.drafted:
             self._warned_low = True
             logger.warning(
