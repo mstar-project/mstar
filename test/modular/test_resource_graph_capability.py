@@ -46,7 +46,7 @@ def test_resource_capability_filters_recipes_and_preserves_strict_mode(
     monkeypatch, caplog, piecewise, can_capture,
 ):
     resource = make_resource(can_capture=lambda: can_capture)
-    step = SimpleNamespace(steps={"attention": object()})
+    step = SimpleNamespace(steps={"attention": object()}, state={})
     declare = Mock(return_value=step)
     step_runner = Mock()
     if piecewise:

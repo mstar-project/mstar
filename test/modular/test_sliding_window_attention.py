@@ -4,12 +4,15 @@ check FlashInfer against an explicit FP32 PyTorch attention reference."""
 import importlib.util
 import itertools
 import os
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from typing import NamedTuple
 from unittest.mock import MagicMock, patch
 
 import torch
+import yaml
 
 from mstar.engine.resources.attn import wrappers
 from mstar.engine.resources.attn.base import AttentionManager
@@ -321,6 +324,24 @@ class SlidingWindowTests(unittest.TestCase):
             return kv_capacity.fill(cfg, 64, shards=shards, decode=16, device="cpu")["requests"]
 
         self.assertEqual([requests(1), requests(2)], [2, 2])
+
+    def test_capacity_benchmark_finds_the_pool_a_model_declares_as_state(self):
+        """Command A+ declares its KV pool through `declare_state`, so its `get_node_resources`
+        alone holds none, and `benchmark/kv_capacity.py` raised for every Command A+ config."""
+        from benchmark import kv_capacity
+
+        fixture = Path(__file__).resolve().parents[2] / "mstar/model/command_a_plus/tests/fixtures/tiny_config.json"
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / "config.json").write_text(fixture.read_text())
+            config = Path(directory) / "serving.yaml"
+            config.write_text(yaml.safe_dump({
+                "model": "command_a_plus", "model_kwargs": {"max_seq_len": 64},
+                "resources": {"kv_cache": {"max_num_pages": 32}},
+                "node_groups": [{"node_names": ["LLM"], "ranks": [0, 1], "tp_size": 2}],
+            }))
+            cfg, _, _, shards = kv_capacity.kv_configs(config, model_path=directory)
+        self.assertEqual([g.layers for g in cfg.groups], [(3,), (0, 1, 2)], "layers 0 to 2 keep a window")
+        self.assertEqual((cfg.max_num_pages, cfg.num_kv_heads, shards), (32, 1, 2), "the YAML's pool, one rank of two")
 
     def test_window_pool_refusals(self):
         # what depends on the device is refused as the attention builds: FlashInfer's fa3 is SM90's only

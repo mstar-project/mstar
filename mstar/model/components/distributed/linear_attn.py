@@ -8,9 +8,8 @@ sliced separately: a plain ``chunk(conv_dim, tp)`` would give rank 0 all of q
 plus half of k and still pass shape checks. ``_shard_blocks`` does this, hence
 the own loaders on the conv weight and ``in_proj_qkv``.
 
-The state pool shards to match via ``DeltaNetGeometry.to_blocks``
-(``shard_dims=(0,)``). The forward is inherited: it reads the rank-local
-``self.num_k_heads`` / ``self.key_dim`` etc.
+The state pool shards to match (``shard_dims=(0,)``). The forward is
+inherited: it reads the rank-local ``self.num_k_heads`` / ``self.key_dim`` etc.
 """
 from __future__ import annotations
 
@@ -132,9 +131,9 @@ class ParallelGatedDeltaNet(GatedDeltaNet):
         proj_bias: bool = False,
         conv_bias: bool = False,
         rms_norm_eps: float = 1e-6,
-        linear_attn_key: str = "linear_attn",
         state_key: str = "gdn_state",
         comm_group: CommGroup | None = None,
+        layer: int | None = None,
     ):
         if comm_group is None:
             comm_group = CommGroup.trivial()
@@ -159,8 +158,8 @@ class ParallelGatedDeltaNet(GatedDeltaNet):
             proj_bias=proj_bias,
             conv_bias=conv_bias,
             rms_norm_eps=rms_norm_eps,
-            linear_attn_key=linear_attn_key,
             state_key=state_key,
+            layer=layer,
         )
         self.comm_group = comm_group
         # Totals describe the checkpoint, which the loaders slice.
