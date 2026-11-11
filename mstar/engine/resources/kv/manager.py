@@ -4984,6 +4984,8 @@ class KVManager(AttentionResource):
     def _earmark(self, earmark: Earmark, victims: Victims) -> Victims:
         """Set aside what ``victims`` free for ``earmark.rid``. Caller holds the lock."""
         moving = [*victims.to_host, *victims.to_drop, *victims.to_ask]
+        # before `_mark_victims`, which settles what unwritten victims free into what the request lent
+        takes_back = self._takes_back(earmark.rid)
         if self.journal is not None:
             # A waiting request takes the room whole once it covers all it asks for (`_settle`), so the other ranks
             # replay its earmark with what it asks for, and then rank 0's reservation.
@@ -4991,7 +4993,7 @@ class KVManager(AttentionResource):
             self.journal(kind, earmark.rid, earmark.pages, moving)
         self._mark_victims(earmark, moving)
         self._host(earmark.rid, victims.to_host)
-        return victims._replace(takes_back=self._takes_back(earmark.rid))
+        return victims._replace(takes_back=takes_back)
 
     def _takes_back(self, rid: str) -> bool:
         """Whether moves made for ``rid`` now take back pages it lent. A guaranteed request that lends nothing runs

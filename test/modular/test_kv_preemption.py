@@ -1327,6 +1327,22 @@ def test_moves_for_a_guaranteed_request_that_runs_past_its_footprint_take_nothin
     assert victims.to_drop == ["v"] and not victims.takes_back, "moves for a grant past g's footprint took back"
 
 
+def test_a_take_back_whose_victims_wrote_nothing_counts_as_one():
+    """o borrowed what g hasn't written, and v, the newest, wrote nothing yet. g's grant moves v, whose allotment
+    covers all g still lends, and the move wasn't counted as a take-back."""
+    kv = _pool()
+    _running(kv, "o", 3, arrival=0, decodes=8 * PAGE_SIZE)
+    _running(kv, "g", 1, arrival=1, guaranteed=True)
+    _request(kv, "v", 2, arrival=2)
+    assert _ready(kv, "v") and kv._unwritten("v")
+    assert _step(kv, "o", 2 * PAGE_SIZE).ok, "o ran short with the pages it needs free in g's allotment"
+
+    victims = _preempt(kv, "g", _step(kv, "g", 4 * PAGE_SIZE).reason.pages_short, droppable=lambda rid: True)
+
+    assert victims.to_ask == ["v"] and kv._allotments["g"].lends == 0
+    assert victims.takes_back, "moving v took back what g lent but didn't count"
+
+
 def test_a_preemptible_grant_past_its_allotment_reads_no_waiting_request_while_nothing_is_lent():
     """Nothing is guaranteed, so nothing is lent, but each grant past an allotment still read every waiting request
     to see whether one was taking pages back."""
