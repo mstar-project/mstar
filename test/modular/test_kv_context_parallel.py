@@ -71,6 +71,8 @@ from mstar.engine.resources.step import BucketKey, ResourceStep, Segment, SlotLe
 from mstar.model.base import declared_resources
 from mstar.model.qwen3_5.config import GDN_STATE, KV_CACHE
 from mstar.model.submodule_base import NodeInputs, engine_step, with_segment_steps
+from mstar.testing_utils.engine import make_engine, make_mgmt
+from mstar.testing_utils.model import make_model
 
 P = 2
 CPU = torch.device("cpu")
@@ -692,6 +694,9 @@ def _split_step(joint: JointGroups, device: torch.device, dtype: torch.dtype, sp
         kv.cache = case.cache(kv.placement, stored_only=True)
         _plan(attn, case, shard=shard, causal=causal)
         assert (shard.split_range("main") is not None) == split_it
+        # a copied step over a pool stored by position attends as a node without a shard does, so a
+        # layer's fused norm/RoPE/KV write stays on (`AttentionCallable.norm_rope_attend`)
+        assert attn.exchanges() == split_it
         if split_it:
             # a K/V write without attention lands each token on the rank storing it (page 0, the sink, aside)
             attend.write(*shard.scatter("main", k, v))
@@ -1532,6 +1537,14 @@ def _thinker_over_ranks(rank, world, store, placed, exchange):
             }
             for key, spec in by_key.items():
                 res[key].bind_dependencies({dep: res[dep] for dep in spec.depends_on()})
+            # the Thinker declares a rebuild policy, which the engine refuses beside a resource that
+            # can't drop a request's state: its shard and attention must load on every storage
+            node = make_mgmt(
+                resources=res, submodule=types.SimpleNamespace(split_batches_by_capture_key=lambda walk: False),
+            )
+            make_engine(_submodules={"Thinker": node})._check_rebuild_policies(
+                make_model(rebuild_policies=omni.rebuild_policies, combined_walk_of=dict)
+            )
             for module in thinker.modules():
                 if hasattr(module, "bind_resources"):
                     module.bind_resources(res)
@@ -1552,6 +1565,8 @@ def _thinker_over_ranks(rank, world, store, placed, exchange):
                 assert runner.admit(step).ok
                 runner.plan(step)
                 assert (res[THINKER_SHARD].split_range("main") is not None) == split
+                # a copied step over KV stored by head still slices its heads, so no fused write
+                assert res[THINKER_ATTN].exchanges() == (split or not placed)
                 with torch.no_grad():
                     hidden, layer_0, layer_n = forward(**step_inputs)
                 # what the Thinker samples a prefill from: each row's last token of the whole step
