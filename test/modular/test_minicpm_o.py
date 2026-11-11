@@ -292,6 +292,51 @@ def test_the_spoken_decode_hands_the_tts_each_rows_id_and_hidden(tmp_path):
     ptrs = {h.untyped_storage().data_ptr() for h in (*spoken, rows[ROW_HIDDEN])}
     assert len(ptrs) == 3 and spoken[0].untyped_storage().nbytes() == spoken[0].nbytes
 
+
+@pytest.mark.parametrize("prompt", [False, True])
+def test_a_mixed_step_without_a_prompt_row_leases_the_batched_decode_capture(tmp_path, prompt):
+    """A mixed step of a text and a spoken reply's decode rows leases the batched decode
+    capture before its inputs exist, so its plan can run a step ahead; one holding a
+    text prompt leases nothing then (it waits for its inputs and a packed capture). The
+    step the LLM declares names the capture its lease holds, over the capture's
+    template rows as a pre-plan declares it, and over its own rows."""
+    from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner
+    from mstar.engine.resources.step import StepContext
+    from mstar.model.submodule_base import ARNodeInputs
+    from mstar.testing_utils.engine import make_engine, make_mgmt
+
+    model = a_model(tmp_path)
+    llm = an_llm(model, _Decoder())
+    runner = object.__new__(AcceleratorGraphRunner)
+    runner._buckets, runner._twins, runner._resources, runner._num_slots = {}, {}, {}, 2
+    runner._capture_configs = llm.get_accelerator_graph_configs(torch.device("cpu"))
+    for spec in runner._get_slot_specs():
+        for key_spec in [spec, *runner._get_addtl_slot_specs(spec)]:
+            runner._register_slot(key_spec, object())
+    engine = make_engine(_submodules={"LLM": make_mgmt(llm, accelerator_graph_runner=runner)})
+
+    walks = {1: "decode", 2: DECODE_SPOKEN, 3: DECODE_SPOKEN, **({4: "prefill_text"} if prompt else {})}
+    infos = {rid: SimpleNamespace(graph_walk=walk) for rid, walk in walks.items()}
+    batch = SimpleNamespace(
+        node_name="LLM", slot=0, request_ids=list(walks), inputs=None, cg_key_info=None,
+        per_request_info_wrapped=infos, per_request_input_metadata={},
+        step_context=StepContext(request_ids=tuple(walks), graph_walk="mixed", slot=0, capture=False),
+    )
+    batch.lease_slot = lambda lease: setattr(batch.step_context, "slot_lease", lease)
+    lease = engine.reserve_replay_slot(batch)
+    if prompt:
+        assert lease is None
+        return
+    assert lease is not None and not runner.is_packed(lease)
+    template = runner.config_for(lease).single_request_inputs
+    rows = [ARNodeInputs(input_seq_len=1, graph_walk=walk) for walk in walks.values()]
+    for inputs in ([template] * lease.bucket.bs, rows):
+        rids = list(walks) + [-1] * (len(inputs) - len(walks))
+        step = llm.declare_step("mixed", rids, inputs, per_request_info=infos)
+        assert step.cg_key_info == lease.bucket.cg_key_info
+        assert not step.steps[SAMPLER].prefill_tracked_tokens
+
+
 def test_a_tts_decode_step_keeps_its_code_on_the_device_and_streams_it_inline():
     """The TTS decode reads its last code off the sampler's slot masters and
     sends the same code to the vocoder by value, so every output of the step is

@@ -448,7 +448,9 @@ class NodeInputs:
     # it. 0 for a submodule whose inputs aren't sequence-shaped.
     input_seq_len: int = 0
 
-    # The request's real walk, stamped by the engine; None on capture templates
+    # The request's real walk, stamped by the engine. A capture template may
+    # name the walk its rows stand for (a decode row under a mixed step's
+    # label), else None.
     graph_walk: str | None = None
 
     # Set by the engine on a chunk of a split input: where it starts, and the

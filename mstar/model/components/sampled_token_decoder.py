@@ -104,6 +104,10 @@ MEDIA_MASK = "media_mask"
 # routes them (`DecoderWalks.hidden`)
 ROW_IDS = "row_ids"
 ROW_HIDDEN = "row_hidden"
+# The packed mixed capture's key, which a mixed step holding a prompt row
+# replays; one of decode rows alone replays the batched decode capture
+# (`SampledTokenDecoder.cg_key_info`)
+PROMPT_ROWS = "prompt_rows"
 
 
 class DecoderWalks(NamedTuple):
@@ -151,6 +155,8 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
     PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16]
     # A mixed step carries the decode batch beside its prompt rows, so its
     # captures run to the decode batch: one capped below it splits the batch.
+    # Under more than one decode walk its largest is the decode ladder's
+    # (`_decode_rows_mix`).
     MIXED_CAPTURE_BATCH_SIZES = [4, 16, 64, 128]
     # The largest is also the scheduler's cap on rows per decode step, and a
     # step pads to the next bucket. MSTAR_DECODE_BUCKETS narrows the ladder.
@@ -306,11 +312,18 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
                 },
             )
 
+        # a mixed step of decode rows alone replays the decode capture, keyed apart
+        # from the packed one its prompt rows need (`cg_key_info`)
+        mix = self._decode_rows_mix
+        top = max(self.DECODE_CAPTURE_BATCH_SIZES)
         configs: list[AcceleratorGraphConfig] = [
             BatchedAcceleratorGraphConfig(
                 capture_graph_walk=self.DECODE_WALK,
-                replay_graph_walks=[self.DECODE_WALK, *sorted(self._decode_walks - {self.DECODE_WALK})],
-                single_request_inputs=ids(1),
+                replay_graph_walks=[
+                    self.DECODE_WALK, *sorted(self._decode_walks - {self.DECODE_WALK}), *([MIXED] if mix else []),
+                ],
+                # a decode row, as a pre-plan under another walk declares the template
+                single_request_inputs=replace(ids(1), graph_walk=self.DECODE_WALK),
                 capture_batch_sizes=self.DECODE_CAPTURE_BATCH_SIZES,
                 compile_mode=self.capture_compile_mode(self.DECODE_WALK),
             ),
@@ -329,7 +342,14 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
                     self.PREFILL_TOKEN_BUCKETS if self.MIXED_TOKEN_BUCKETS is None else self.MIXED_TOKEN_BUCKETS
                 ),
                 make_node_input=media if self._mixes_media else ids,
-                capture_batch_sizes=self.MIXED_CAPTURE_BATCH_SIZES,
+                # Both captures replay a mixed step, so the scheduler caps one at the
+                # larger top (`max_batch_size_for`): topped at the decode ladder's,
+                # neither kind of step runs past its own ladder, eager.
+                capture_batch_sizes=(
+                    [b for b in self.MIXED_CAPTURE_BATCH_SIZES if b < top] + [top] if mix
+                    else self.MIXED_CAPTURE_BATCH_SIZES
+                ),
+                additional_key_info=PROMPT_ROWS if mix else None,
                 compile_mode=self.capture_compile_mode(MIXED),
                 # the layout the resources split; a replay's padding rows stay empty
                 token_layout=decode_rows_then_prompt,
@@ -358,6 +378,28 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
 
     def max_batch_size(self, graph_walk: str) -> int | None:
         return max(self.PREFILL_MEDIA_CAPTURE_BATCH_SIZES) if graph_walk in self._media_walks else None
+
+    @property
+    def _decode_rows_mix(self) -> bool:
+        """Whether a mixed step can hold decode rows of more than one walk and no
+        prompt row: one decode walk's rows alone are relabelled to it by the
+        scheduler, and so replay the decode capture already."""
+        return len(self._decode_walks) > 1 and self._text_prompts and self.CAPTURE_PREFILL
+
+    def cg_key_info(
+        self, graph_walk: str,
+        per_request_info: Mapping[int, CurrentForwardPassInfo],
+        per_request_input_metadata=None,
+        **kwargs: Any,
+    ) -> str | None:
+        """A mixed step holding a row of a walk outside the decode loop replays
+        the packed mixed capture; one of decode rows alone, the batched decode
+        capture, which a pre-plan can lease before the step's inputs exist."""
+        del per_request_input_metadata, kwargs
+        if graph_walk != MIXED or not self._decode_rows_mix:
+            return None
+        decode = self._decode_walks
+        return PROMPT_ROWS if any(info.graph_walk not in decode for info in per_request_info.values()) else None
 
     @property
     def _mixes_media(self) -> bool:
@@ -630,6 +672,8 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
             )
 
         return SubmoduleStep(
+            # the capture the lease took, from the same rows' walks
+            cg_key_info=self.cg_key_info(graph_walk, per_request_info or {}),
             segments=[
                 Segment(request_id=rid, label="main", span=inp.input_seq_len)
                 for rid, inp in zip(request_ids, inputs, strict=True)
