@@ -18,8 +18,10 @@ import torch.nn.functional as F
 from torch import nn
 
 from mstar.model.components.diffusion import modulation, qk_norm_rope
+from mstar.model.components.diffusion.qwen import dit_kernels
 from mstar.model.components.diffusion.ffn import gelu_tanh_ffn
 from mstar.model.components.mlp import MLP
+from mstar.model.components.norm import QwenRMSNorm
 from mstar.model.wan22.components.dit import Wan22RoPE3D
 from mstar.model.wan22.config import Wan22Config
 
@@ -204,3 +206,51 @@ def test_gelu_epilogue_matches_eager():
     # the down-projection sums thousands of rounded activations, so fewer elements
     # come out equal than for the single-pass kernels
     _assert_bf16_close(got, want, min_equal=0.3)
+
+
+@pytest.mark.skipif(not CUDA or dit_kernels.triton is None, reason="needs CUDA and Triton")
+def test_dit_kernels_round_as_the_eager_ops():
+    """The Qwen-Image DiTs' fused kernels (``qwen/dit_kernels.py``) are bit for bit the eager ops they replace:
+    the per-head QwenRMSNorm then the complex rotary product, the modulation and gated residual with two parameter
+    sets along the tokens, and the LayerNorms with them (the statistics in torch's own order)."""
+    dev, bf16 = "cuda", torch.bfloat16
+    g = torch.Generator().manual_seed(1)
+
+    def rand(*shape, scale=1.0, shift=0.0):
+        return (torch.randn(*shape, generator=g) * scale + shift).to(dev, bf16)
+
+    def rope(x, freqs):
+        pairs = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
+        return torch.view_as_real(pairs * freqs.unsqueeze(-2)).flatten(-2).type_as(x)
+
+    def freqs(*shape):
+        return torch.polar(torch.ones(*shape, 64), torch.randn(*shape, 64, generator=g)).to(dev)
+
+    # three heads: a head count that is not a power of two (the masked lanes); one token axis, then [R, S, H, 128]
+    norm = QwenRMSNorm(128, 1e-6).to(dev, bf16)
+    with torch.no_grad():
+        norm.weight.normal_(std=0.2)
+    x, f = rand(40, 3, 128), freqs(40)
+    assert torch.equal(dit_kernels.qk_norm_rope(x, norm.weight, f, norm.eps), rope(norm(x), f))
+    x = rand(2, 40, 3, 128)
+    for f in (freqs(40), freqs(2, 40)):
+        assert torch.equal(dit_kernels.qk_norm_rope(x, norm.weight, f, norm.eps), rope(norm(x), f))
+
+    # the served width (3072) on rows far from zero mean (the statistics' order shows), an odd token count
+    x, y = rand(2, 37, 3072, scale=4, shift=30), rand(2, 37, 3072)
+    gate, shift, scale = rand(4, 3072), rand(4, 3072), rand(4, 3072)
+    scale1p = 1 + scale
+    layer_norm = torch.nn.LayerNorm(3072, elementwise_affine=False, eps=1e-6)
+
+    def per_token(p):  # set 0 (rows 0:2) for the first 16 tokens, set 1 (rows 2:4) from there
+        return torch.cat([p[:2, None].expand(2, 16, 3072), p[2:, None].expand(2, 21, 3072)], dim=1)
+
+    def modulated(a):
+        return a * per_token(scale1p) + per_token(shift)
+
+    assert torch.equal(dit_kernels.modulate(x, scale1p, shift, 16), modulated(x))
+    residual = x + per_token(gate) * y
+    assert torch.equal(dit_kernels.gated_add(x, gate, y, 16), residual)
+    assert torch.equal(dit_kernels.norm_modulate(x, scale1p, shift, 16, layer_norm.eps), modulated(layer_norm(x)))
+    got = dit_kernels.gated_norm_modulate(x, gate, y, scale1p, shift, 16, layer_norm.eps)
+    assert all(map(torch.equal, got, (residual, modulated(layer_norm(residual)))))

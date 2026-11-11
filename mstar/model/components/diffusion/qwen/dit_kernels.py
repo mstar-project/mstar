@@ -225,7 +225,7 @@ def _norm_rope_into(x: torch.Tensor, weight: torch.Tensor, freqs: torch.Tensor, 
     )
 
 
-@torch.library.custom_op("mstar::qwen_image_qk_norm_rope", mutates_args=())
+@torch.library.custom_op("mstar::dit_qk_norm_rope", mutates_args=())
 def qk_norm_rope(x: torch.Tensor, weight: torch.Tensor, freqs: torch.Tensor, eps: float) -> torch.Tensor:
     """``apply_rope(QwenRMSNorm(x), freqs)``: ``x [N, H, 128]`` with ``freqs`` complex64 ``[N, 64]``, or
     ``x [R, S, H, 128]`` with ``[S, 64]`` / ``[R, S, 64]``; bf16, last dim contiguous. Returns a new tensor."""
@@ -261,7 +261,7 @@ def _(txt, img, txt_weight, img_weight, txt_freqs, img_freqs, eps):
     return txt.new_empty((rows, lt + img.shape[1], heads, dim))
 
 
-@torch.library.custom_op("mstar::qwen_image_joint_qk_pair_norm_rope", mutates_args=())
+@torch.library.custom_op("mstar::dit_joint_qk_pair_norm_rope", mutates_args=())
 def joint_qk_pair_norm_rope(
     q_txt: torch.Tensor, q_img: torch.Tensor, k_txt: torch.Tensor, k_img: torch.Tensor,
     q_txt_weight: torch.Tensor, q_img_weight: torch.Tensor, k_txt_weight: torch.Tensor, k_img_weight: torch.Tensor,
@@ -283,7 +283,7 @@ def _(q_txt, q_img, k_txt, k_img, q_txt_weight, q_img_weight, k_txt_weight, k_im
     return q, torch.empty_like(q)
 
 
-@torch.library.custom_op("mstar::qwen_image_modulate", mutates_args=())
+@torch.library.custom_op("mstar::dit_modulate", mutates_args=())
 def modulate(x: torch.Tensor, scale1p: torch.Tensor, shift: torch.Tensor, split: int) -> torch.Tensor:
     """``x * scale1p + shift`` for ``x [R, L, D]`` contiguous and ``[sets * R, D]`` parameters: a token before
     ``split`` takes set 0's row, from it set 1's (one set: ``split = L``)."""
@@ -300,7 +300,7 @@ def _(x, scale1p, shift, split):
     return torch.empty_like(x)
 
 
-@torch.library.custom_op("mstar::qwen_image_gated_add", mutates_args=())
+@torch.library.custom_op("mstar::dit_gated_add", mutates_args=())
 def gated_add(x: torch.Tensor, gate: torch.Tensor, y: torch.Tensor, split: int) -> torch.Tensor:
     """``x + gate * y`` (``x``, ``y`` ``[R, L, D]`` contiguous), ``gate`` by token as in :func:`modulate`."""
     rows, length, dim = x.shape
@@ -335,7 +335,7 @@ def _norm_modulate_launch(x, gate, y, residual, scale1p, shift, out, split, eps,
     )
 
 
-@torch.library.custom_op("mstar::qwen_image_norm_modulate", mutates_args=())
+@torch.library.custom_op("mstar::dit_norm_modulate", mutates_args=())
 def norm_modulate(x: torch.Tensor, scale1p: torch.Tensor, shift: torch.Tensor, split: int, eps: float) -> torch.Tensor:
     """``modulate(layer_norm(x, eps), scale1p, shift, split)``: no affine, ``x`` as :func:`norm_fits` takes, the
     parameters as :func:`modulate`'s."""
@@ -349,7 +349,7 @@ def _(x, scale1p, shift, split, eps):
     return torch.empty_like(x)
 
 
-@torch.library.custom_op("mstar::qwen_image_gated_norm_modulate", mutates_args=())
+@torch.library.custom_op("mstar::dit_gated_norm_modulate", mutates_args=())
 def gated_norm_modulate(
     x: torch.Tensor, gate: torch.Tensor, y: torch.Tensor, scale1p: torch.Tensor, shift: torch.Tensor, split: int,
     eps: float,
