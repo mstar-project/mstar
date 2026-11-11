@@ -1,22 +1,19 @@
 """Plain Qwen3 served from real weights against transformers' Qwen3ForCausalLM (GPU).
 
-Qwen3-8B, the registered size, serves (its head is untied). Each prompt's greedy reply,
-as token ids from the server, is teacher-forced through transformers in full float32
-(no TF32). At each reply token the deficit is how far its fp32 log-prob sits below the
-fp32 argmax's: 0 where they agree, else the fp32 margin the server's choice gave up.
+Qwen3-8B, the registered size, serves (its head is untied). Each prompt's greedy reply
+comes back with the server's own log-prob of each token (the sampler's raw log-softmax,
+T = 1). The reply is teacher-forced through transformers in full float32 (no TF32) and
+in bf16. At every reply position t, with s_t the served token and f, b the fp32 and bf16
+log-probs:
 
-A greedy implementation in bf16 picks another token than fp32's only where its error on
-the difference of the two logits exceeds that margin. transformers' own bf16 error on
-that difference is the spread: the largest ``|(b_top - b_other) - (f_top - f_other)|``
-over the positions of a sequence, ``other`` the token compared (the reply's, or fp32's
-second). It is taken on the served replies and on transformers' own fp32 greedy replies,
-which no server bug can widen, and the smaller is the tolerance; the spread itself must
-stay under ``SPREAD_CEILING``. The served replies' largest deficit must be within the
-tolerance. Each control (``CONTROLS``, a checkpoint edited the way a port bug would
-read it) must miss it by more than ``CONTROL_FACTOR`` times.
+    e_srv(t) = |served(s_t) - f[t, s_t]|      e_bf(t) = |b[t, s_t] - f[t, s_t]|
 
-The bound and ceiling are first estimates, to be set from the GPU runs' printed
-deficits and spreads.
+The gate is the ratio of pooled means over all positions, R = mean(e_srv) / mean(e_bf):
+a bf16 port matches transformers' own bf16 error, so the real model needs R <= R_MAX,
+and each control (``CONTROLS``, a checkpoint edited the way a port bug would read it)
+needs R >= R_CONTROL_MIN. Both are placeholders until a GPU calibration run sets them.
+The deficit (fp32's margin given up at a greedy flip) and the bf16 spread are printed
+only: they see a bug only where it flips a near-tie.
 
 Qwen3-0.6B ties its head to the embedding (its file also ships the head, equal to
 the embedding); it is not a registered size, so the loader's tie path is checked
@@ -56,10 +53,11 @@ PROMPTS = [
     "What is 17 * 23? Answer with the computation.",
 ]
 TOKENS = 128
-# nats: a spread past this is a reference too noisy to bound anything
-SPREAD_CEILING = 1.0
-# a control counts only past this many tolerances
-CONTROL_FACTOR = 4.0
+# placeholders, to be set from the GPU calibration run (real model and both controls)
+R_MAX = 2.0
+R_CONTROL_MIN = 4.0
+# the positions where a log-prob error isn't compressed by p near 1, reported apart
+MID = (0.05, 0.95)
 
 
 def _scale_rope_theta(config: dict) -> None:
@@ -105,26 +103,35 @@ def _server_module():
     return sys.modules[key]
 
 
-def _ids(url: str, prompt: str) -> list[int]:
-    """One streamed greedy reply's token ids."""
-    kwargs = {"max_output_tokens": TOKENS, "enable_thinking": False, "return_token_ids": True, "temperature": 0}
+class _Served(NamedTuple):
+    ids: list[int]
+    logprobs: list[float]  # the server's log-prob of each of ``ids``
+
+
+def _ids(url: str, prompt: str) -> _Served:
+    """One streamed greedy reply's token ids and the server's log-prob of each."""
+    kwargs = {"max_output_tokens": TOKENS, "enable_thinking": False, "return_token_ids": True, "temperature": 0,
+              "return_logprobs": True}
     data = {"text": prompt, "output_modalities": "text", "streaming": "true", "model_kwargs": json.dumps(kwargs)}
     r = requests.post(url + "/generate", data=data, stream=True, timeout=900)
     r.raise_for_status()
-    ids = []
+    ids, logprobs = [], []
     for line in r.iter_lines():
         if line:
             chunk = json.loads(line)
             if chunk["modality"] == "error":
                 raise AssertionError(base64.b64decode(chunk["data"]).decode(errors="replace"))
-            ids += (chunk.get("metadata") or {}).get("token_ids", [])
-    return ids
+            metadata = chunk.get("metadata") or {}
+            ids += metadata.get("token_ids", [])
+            logprobs += metadata.get("logprobs", [])
+    assert len(logprobs) == len(ids), f"{len(ids)} token ids and {len(logprobs)} log-probs"
+    return _Served(ids, logprobs)
 
 
 class _Reference:
     """The prompts' ids as the model renders them, and transformers in fp32 and bf16 over a
-    sequence: each reply position's log-probs, and its own fp32 greedy replies. Loaded only
-    once the server it is compared against has stopped."""
+    sequence: each reply position's log-probs. Loaded only once the server it is compared
+    against has stopped."""
 
     def __init__(self, transformers, snap: Path):
         from mstar.model.qwen3.qwen3_model import Qwen3Model
@@ -166,63 +173,62 @@ class _Reference:
             torch.cuda.empty_cache()
         return out
 
-    def greedy(self) -> list[list[int]]:
-        """transformers' own fp32 greedy replies, a sequence no server touches."""
-        lm, out = self._load(torch.float32), []
-        try:
-            with torch.no_grad(), self._scope(torch.float32):
-                for prompt in self.prompts:
-                    ids = torch.tensor([prompt], device="cuda")
-                    out.append(lm.generate(ids, max_new_tokens=TOKENS, do_sample=False)[0, len(prompt):].tolist())
-        finally:
-            del lm
-            torch.cuda.empty_cache()
-        return out
+
+class _Errors(NamedTuple):
+    """One prompt's per-position errors against fp32, at the served tokens."""
+    served: torch.Tensor  # e_srv
+    bf16: torch.Tensor  # e_bf
+    mid: torch.Tensor  # fp32 p(s_t) in MID
+    deficit: float  # fp32's margin given up at a greedy flip, the largest
+    spread: float  # bf16's largest error on the top-2 (or top and served) logit difference
 
 
-class _Measure(NamedTuple):
-    deficits: list[float]  # each prompt's largest fp32 deficit
-    spreads: list[float]  # each prompt's bf16 spread
-
-    @property
-    def deficit(self) -> float:
-        return max(self.deficits)
-
-    @property
-    def spread(self) -> float:
-        return max(self.spreads)
-
-
-def _measure(ref: _Reference, replies: list[list[int]]) -> _Measure:
-    """Each prompt's largest fp32 deficit over ``replies``, and transformers' bf16 spread over
-    the same positions: the error of the logit difference between fp32's top token and the
-    compared one (the reply's where it differs from the top, else fp32's second)."""
+def _errors(ref: _Reference, served: list[_Served]) -> list[_Errors]:
+    replies = [s.ids for s in served]
     fp32 = ref.log_probs(torch.float32, replies)
     bf16 = ref.log_probs(torch.bfloat16, replies)
-    deficits, spreads = [], []
-    for f, b, reply in zip(fp32, bf16, replies, strict=True):
-        if not reply:
-            deficits.append(0.0)
-            spreads.append(0.0)
-            continue
-        rows = torch.arange(len(reply))
-        served = torch.tensor(reply)
+    out = []
+    for f, b, s in zip(fp32, bf16, served, strict=True):
+        rows, tokens = torch.arange(len(s.ids)), torch.tensor(s.ids, dtype=torch.long)
+        f_s = f[rows, tokens]
         top2 = f.topk(2, dim=-1).indices
         top = top2[:, 0]
-        other = torch.where(served == top, top2[:, 1], served)
-        deficits.append(float((f[rows, top] - f[rows, served]).max()))
-        error = (b[rows, top] - b[rows, other]) - (f[rows, top] - f[rows, other])
-        spreads.append(float(error.abs().max()))
-    return _Measure(deficits, spreads)
+        other = torch.where(tokens == top, top2[:, 1], tokens)
+        spread = (b[rows, top] - b[rows, other]) - (f[rows, top] - f[rows, other])
+        p = f_s.exp()
+        out.append(_Errors(
+            served=(torch.tensor(s.logprobs, dtype=torch.float32) - f_s).abs(),
+            bf16=(b[rows, tokens] - f_s).abs(),
+            mid=(p >= MID[0]) & (p <= MID[1]),
+            deficit=float((f[rows, top] - f_s).max()) if len(s.ids) else 0.0,
+            spread=float(spread.abs().max()) if len(s.ids) else 0.0,
+        ))
+    return out
 
 
-def _report(label: str, served: _Measure, own: _Measure) -> float:
-    """Print each prompt's numbers (the PR quotes them) and return the tolerance."""
-    tolerance = min(served.spread, own.spread)
-    for i, (d, s, o) in enumerate(zip(served.deficits, served.spreads, own.spreads, strict=True)):
-        print(f"{label}: prompt {i} deficit {d:.4f} spread served {s:.4f} transformers-greedy {o:.4f}")
-    print(f"{label}: largest deficit {served.deficit:.4f}, tolerance {tolerance:.4f}")
-    return tolerance
+def _ratio(errors: list[_Errors], mid: bool = False) -> float:
+    """R: the pooled mean served error over the pooled mean bf16 error."""
+    pick = (lambda e: e.mid) if mid else (lambda e: torch.ones_like(e.mid))
+    srv = torch.cat([e.served[pick(e)] for e in errors])
+    bf = torch.cat([e.bf16[pick(e)] for e in errors])
+    assert bf.numel() and float(bf.mean()) > 0, "no positions to compare"
+    return float(srv.mean() / bf.mean())
+
+
+def _report(label: str, errors: list[_Errors]) -> float:
+    """Print what the calibration reads (the PR quotes it) and return R."""
+    def stats(x: torch.Tensor) -> str:
+        return f"mean {float(x.mean()):.4f} p90 {float(x.quantile(0.9)):.4f}" if x.numel() else "none"
+
+    for i, e in enumerate(errors):
+        print(f"{label}: prompt {i} ({len(e.served)} tokens, {int(e.mid.sum())} mid) e_srv {stats(e.served)} "
+              f"e_bf {stats(e.bf16)} deficit {e.deficit:.4f} spread {e.spread:.4f}")
+    srv, bf = torch.cat([e.served for e in errors]), torch.cat([e.bf16 for e in errors])
+    ratio = _ratio(errors)
+    mid = _ratio(errors, mid=True) if any(e.mid.any() for e in errors) else float("nan")
+    print(f"{label}: pooled e_srv {stats(srv)} e_bf {stats(bf)}; R {ratio:.3f}, R on p in {MID} {mid:.3f}; "
+          f"largest deficit {max(e.deficit for e in errors):.4f}, spread {max(e.spread for e in errors):.4f}")
+    return ratio
 
 
 CASES = [("qwen3_8b", "Qwen/Qwen3-8B")]
@@ -230,9 +236,10 @@ CASES = [("qwen3_8b", "Qwen/Qwen3-8B")]
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 
 
-def _served_ids(tmp_path, name: str, model_path: Path | None = None) -> list[list[int]]:
+def _served_ids(tmp_path, name: str, model_path: Path | None = None) -> list[_Served]:
     # max_seq_len is required and unread; the checkpoint's context bounds a request
-    config = {"model": name, "max_seq_len": 4096, "resources": {"kv_cache": {"max_num_pages": 1024}},
+    config = {"model": name, "max_seq_len": 4096,
+              "resources": {"kv_cache": {"max_num_pages": 1024}, "sampler": {"enable_logprobs": True}},
               "node_groups": [{"node_names": ["LLM"], "ranks": [0]}]}
     if model_path is not None:
         config["model_kwargs"] = {"model_path_hf": str(model_path)}
@@ -270,36 +277,24 @@ def _edited(tmp_path, snap: Path, edit) -> Path:
 
 @pytest.fixture(scope="module")
 def reference():
-    """transformers' fp32 greedy replies and their spread, once for the module."""
+    """The rendered prompts and transformers, once for the module."""
     transformers = pytest.importorskip("transformers")
-    ref = _Reference(transformers, _snapshot_or_skip(CASES[0][1]))
-    own = _measure(ref, ref.greedy())
-    assert own.spread < SPREAD_CEILING, f"transformers' own bf16 spread {own.spread:.4f} is past {SPREAD_CEILING}"
-    return ref, own
+    return _Reference(transformers, _snapshot_or_skip(CASES[0][1]))
 
 
 @pytest.mark.parametrize("name, repo", CASES, ids=[c[0] for c in CASES])
-def test_plain_greedy_tokens_are_within_transformers_bf16_spread(tmp_path, name, repo, reference):
-    ref, own = reference
-    served = _measure(ref, _served_ids(tmp_path, name))
-    tolerance = _report(name, served, own)
-    assert served.spread < SPREAD_CEILING, f"bf16 spread over the served replies {served.spread:.4f}"
-    assert served.deficit <= tolerance, (
-        f"{name}: a served token sits {served.deficit:.4f} below fp32's top log-prob, past transformers' "
-        f"bf16 spread ({tolerance:.4f})"
-    )
+def test_served_log_probs_err_from_fp32_as_transformers_bf16_does(tmp_path, name, repo, reference):
+    ratio = _report(name, _errors(reference, _served_ids(tmp_path, name)))
+    assert ratio <= R_MAX, f"{name}: served log-probs err {ratio:.3f}x transformers' bf16 from fp32, past {R_MAX}"
 
 
 @pytest.mark.parametrize("control, edit", CONTROLS, ids=[c[0] for c in CONTROLS])
 def test_a_port_bug_fails_the_check(tmp_path, control, edit, reference):
-    """The negative controls: each must miss the tolerance by ``CONTROL_FACTOR``."""
-    ref, own = reference
+    """The negative controls: each must err at least ``R_CONTROL_MIN`` times transformers' bf16."""
     name, repo = CASES[0]
-    served = _measure(ref, _served_ids(tmp_path, name, model_path=_edited(tmp_path, _snapshot_or_skip(repo), edit)))
-    tolerance = _report(f"{name} ({control})", served, own)
-    assert served.deficit > CONTROL_FACTOR * tolerance, (
-        f"{control} is not caught by a clear margin: deficit {served.deficit:.4f}, tolerance {tolerance:.4f}"
-    )
+    served = _served_ids(tmp_path, name, model_path=_edited(tmp_path, _snapshot_or_skip(repo), edit))
+    ratio = _report(f"{name} ({control})", _errors(reference, served))
+    assert ratio >= R_CONTROL_MIN, f"{control} is not caught: R {ratio:.3f}, below {R_CONTROL_MIN}"
 
 
 def test_a_tied_head_checkpoint_loads_its_head_from_the_embedding():
