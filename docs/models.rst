@@ -1315,15 +1315,32 @@ Qwen3-TTS notes
   the bf16 codec measured slower while those convs still ran dilated; measure
   there before switching. The decode is compiled (Inductor) twice per chunk
   width, batch 1 apart: its batch dimension is dynamic.
-- ``model_kwargs: {audio_watermark: {enabled: true}}`` fails startup: the watermark's
-  per-stream state has no home a captured codec step can write yet. The watermarker and
-  its detector stay in ``mstar/model/audio_watermark.py``. Check files with
-  ``python -m mstar.model.audio_watermark detect --message 0xBEEF out.wav``
-  (``--message``, the payload: without it the verdict is the score alone, and an unmarked
-  file re-encoded as MP3 can score above 0.5; ``--threshold``, default 0.5; ``--device``;
-  needs ``.[audio]`` for ``soundfile``); a file at another rate than 24 kHz is resampled
-  to 24 kHz first, since the mark is found only at the rate it was added at. Detect on
-  whole utterances: a clip under a few seconds can miss the mark.
+- Opt-in AudioSeal watermark on the codec's output (off by default; install
+  ``pip install -e '.[audioseal]'``). Turn it on in the deployment YAML::
+
+     model_kwargs:
+       audio_watermark:
+         enabled: true      # default false
+         message: 0xBEEF    # 16-bit payload: int 0..65535 or a 16-character 0/1 string (default 0)
+         alpha: 1.0         # strength, in (0, 4] (default 1.0)
+         generator: audioseal_wm_streaming   # AudioSeal card name or checkpoint path (default)
+
+  Unknown keys or out-of-range values fail startup, and so does ``enabled: true``
+  without the package. Each request's PCM is marked chunk by chunk with its own
+  streaming state, so a streamed utterance carries the same mark as a whole one.
+  At startup the engine captures the generator per chunk length of the codec
+  schedule (by default 1, 3, 8, 16 and 25 frames) and batch bucket, so marking a step's
+  chunks costs one graph replay per distinct length. The captures hold GPU memory: about
+  2.5 GiB for the default 30 graphs (5 lengths, 6 batch buckets) on an H200, 5.7 GiB with
+  25 lengths. A chunk outside them (another length, more rows than the largest bucket,
+  a partial frame) runs eagerly, and the first one of each kind is logged.
+  Check files with ``python -m mstar.model.audio_watermark detect --message 0xBEEF out.wav``
+  (``--message``, the deployment's payload: without it the verdict is the
+  score alone, and an unmarked file re-encoded as MP3 can score above 0.5;
+  ``--threshold``, default 0.5; ``--device``; needs ``.[audio]`` for
+  ``soundfile``); a file at another rate than 24 kHz is resampled to 24 kHz
+  first, since the mark is found only at the rate it was added at. Detect on
+  whole utterances: a clip under a few seconds can miss the mark. The helper lives in ``mstar/model/audio_watermark.py``.
 - Weight loading checks coverage in both directions: a parameter the checkpoint
   does not fill, or a checkpoint tensor the port does not load, fails startup.
 - The 12 Hz codec does not require the system SoX executable. M* imports only
@@ -2307,7 +2324,9 @@ Deployment knobs (``model_kwargs``; the SP configs set ``compile``, ``vae_tile_b
 - ``vae_compile``: the decoder's blocks, static per tile batch; a canvas or clip share with
   another tile count compiles again. A 768p clip's share decodes in 2.1 s instead of 3.2 s
   on one H200, within 62.9 dB of eager.
-- ``attention_backend``: ``flashinfer``, or ``sdpa`` (the reference's kernel).
+
+The attention kernel is a resource's setting: ``backend: sdpa`` on the ``dit_attn`` and
+``refiner_attn`` resources runs the reference's kernel, and FlashInfer runs without it.
 
 Async scheduling is on for the DiT and the decoder, the default for parallel nodes
 (``tp_async_sched: false`` turns it off); on and off measured within noise. Runtime needs:
@@ -2316,9 +2335,9 @@ torchaudio built for another torch, refuses to start), FlashInfer, and ``ffmpeg`
 rank holds the whole DiT, and the SP configs put the conditioner beside it on rank 0 (117 GiB
 in use once loaded), so they need 141 GB GPUs (H200); no config has been run on 80 GB cards.
 
-At ``attention_backend: sdpa`` the nodes' modules, driven by ``test/minimax_h3/parity.py``
-(fp32 matmuls at "highest"), are bit-identical to diffusers' MiniMax-H3 pipeline end to end
-(latents, frames, waveform); with ``--exact`` the script exits nonzero when one isn't.
+On SDPA the nodes' modules, driven by ``test/minimax_h3/parity.py`` (fp32 matmuls at
+"highest"), were bit-identical to diffusers' MiniMax-H3 pipeline end to end (latents, frames,
+waveform), measured at ``f6260f2677``; with ``--exact`` the script exits nonzero when one isn't.
 FA3 and the compiled DiT are not bit-exact. Served at 768p (50 steps, SP2 on H200, three
 seeds), clips are 23.7-32.8 dB (video) and 17.8-22.3 dB (audio) from diffusers', where the
 reference on another SDPA kernel is 23.5-33.1 and 21.6-22.3 dB from itself; per seed, the

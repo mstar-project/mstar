@@ -22,6 +22,7 @@ from mstar.engine.state.adapters import (
     HOST_VALUE,
     VALUE_WITH_HOST,
     StateSetup,
+    _resolve,
     build_handle,
     build_specs,
     kv_layouts,
@@ -219,7 +220,8 @@ def test_a_write_for_a_request_with_no_open_fields_is_refused():
 def test_a_write_on_an_array_that_holds_no_host_fields_is_refused():
     array = Array("kv", nodes={"talker"}, layers={0}, entry=KVEntry(heads=2, head_dim=4), max_len=8,
                   reads={"attn": Read(mask=Causal(), op=Attend(q_heads=2))})
-    h = build_handle(array, {"kv": SimpleNamespace(layer_view=lambda i: None), "attn": SimpleNamespace()})
+    resources = {"kv": SimpleNamespace(layer_view=lambda i: None), "attn": SimpleNamespace()}
+    h = build_handle(array, resources, _resolve([array], StateSetup()))
     declared = ArrayStep(host={(RID, "main", 0): {"sent": True}})
     step = SubmoduleStep(segments=(Segment(RID, "main", 1),), state={"kv": declared})
     step.set_ctx(StepContext(request_ids=[RID], graph_walk="decode", slot=0, capture=False))

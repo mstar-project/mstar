@@ -66,6 +66,7 @@ from mstar.engine.state import (
     host,
     sample,
 )
+from mstar.model.audio_watermark import AudioSealWatermarker, WatermarkStream
 from mstar.model.components.audio_features import MatchaLogMel
 from mstar.model.components.code_predictor_kernels import ResidualCodePredictor
 from mstar.model.qwen3_tts.components import depth_frame
@@ -1009,11 +1010,22 @@ class CodecSubmodule(ARNodeSubmodule):
     # costs a real row's decode: the buckets are dense.
     CAPTURE_BATCH_SIZES = [1, 2, 3, 4, 5, 6, 8, 10, 12, 16, 20, 24, 28, 32]
     MAX_BATCH_SIZE = CAPTURE_BATCH_SIZES[-1]
+    # The opt-in watermark's captures are per chunk length and cost far more
+    # memory each (see docs/models.rst), so they keep power-of-two buckets.
+    WATERMARK_BATCH_SIZES = [1, 2, 4, 8, 16, 32]
 
-    def __init__(self, decoder: torch.nn.Module, config: Qwen3TTSModelConfig):
+    def __init__(
+        self,
+        decoder: torch.nn.Module,
+        config: Qwen3TTSModelConfig,
+        watermarker: AudioSealWatermarker | None = None,
+    ):
         super().__init__()
         self.decoder = decoder
         self.config = config
+        # Opt-in (``audio_watermark`` in model_kwargs): marks each request's
+        # trimmed PCM in ``batch_postprocess``; None leaves it untouched.
+        self.watermarker = watermarker
         codec = config.codec
         widths = {*codec.chunk_schedule, codec.chunk_frames}
         if config.supports_reference_audio:
@@ -1085,7 +1097,10 @@ class CodecSubmodule(ARNodeSubmodule):
         # this one is postprocessed, so request state would be overwritten.
         return ARNodeInputs(
             tensor_inputs={"codec_tokens": codes},
-            kwargs={"frames": frames, "bucket": bucket, "context": context},
+            kwargs={
+                "frames": frames, "bucket": bucket, "context": context,
+                "is_final": chunk is not None and chunk.is_final,
+            },
         )
 
     def declare_step(
@@ -1199,6 +1214,57 @@ class CodecSubmodule(ARNodeSubmodule):
             )
         outputs["audio_chunk"][0] = audio[start:end]
         logger.debug("codec %s: emit %d samples", request_id, max(end - start, 0))
+
+    def batch_postprocess(
+        self,
+        outputs: BatchedModelOutput,
+        request_infos: dict[str, CurrentForwardPassInfo],
+        inputs: list[ARNodeInputs],
+        piecewise_runners: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Watermark the step's trimmed chunks, one AudioSeal call per chunk
+        length, each a replay of its capture (``get_piecewise_accelerator_graph_configs``)
+        where there is one. Each request's stream state lives in its request
+        state, so it goes when the request does."""
+        if self.watermarker is None:
+            return
+        rids, chunks, streams, finals = [], [], [], []
+        for request_id, item in zip(request_infos, inputs, strict=True):
+            out = outputs.get(request_id, {})
+            if "audio_chunk" not in out:
+                continue
+            state = self.request_state(request_id)
+            stream = state.get("watermark_stream")
+            if stream is None:
+                stream = WatermarkStream()
+                state.add("watermark_stream", stream)
+            rids.append(request_id)
+            chunks.append(out["audio_chunk"][0])
+            streams.append(stream)
+            finals.append(bool(item.kwargs.get("is_final", False)))
+        if not rids:
+            return
+        marked = self.watermarker.apply_pcm16(chunks, streams, finals, runners=piecewise_runners)
+        for request_id, chunk in zip(rids, marked, strict=True):
+            outputs.get(request_id)["audio_chunk"][0] = chunk
+
+    def get_piecewise_accelerator_graph_configs(
+        self, device: torch.device, autocast_dtype: torch.dtype, tp_world_size: int = 1,
+    ) -> dict[str, PiecewiseAcceleratorGraphConfig]:
+        """With the watermark on, its generator call per chunk length of the
+        schedule (a shorter final chunk pads into the next) and batch bucket.
+        Only lengths of whole watermark frames; other chunks run eagerly."""
+        del device, autocast_dtype, tp_world_size
+        if self.watermarker is None:
+            return {}
+        codec = self.config.codec
+        lengths = [
+            frames * self.total_upsample for frames in {*codec.chunk_schedule, codec.chunk_frames}
+            if frames * self.total_upsample % self.watermarker.hop == 0
+        ]
+        if not lengths:
+            return {}
+        return self.watermarker.piecewise_configs(lengths, self.WATERMARK_BATCH_SIZES)
 
     def can_batch(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
         """Any mix of chunks batches (``preprocess`` pads to the widest)."""

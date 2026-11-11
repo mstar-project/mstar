@@ -27,12 +27,13 @@ from mstar.engine.resources.attn.ragged.config import (
     RaggedCrossAttentionStep,
     cross_label,
 )
-from mstar.engine.resources.kv.config import KVSpec, KVStep, PagedKVConfig
+from mstar.engine.resources.kv.config import KVLayout, KVSpec, KVStep, PagedKVConfig
 from mstar.engine.resources.linear_attn.config import (
     LinearAttnConfig,
     LinearAttnSpec,
     LinearAttnStep,
     LinearAttnVariant,
+    bf16_gdn_state_fits,
 )
 from mstar.engine.resources.position.config import PositionConfig, PositionSpec, PositionStep
 from mstar.engine.resources.recurrent.config import (
@@ -44,8 +45,16 @@ from mstar.engine.resources.recurrent.config import (
 from mstar.engine.resources.sampler.config import SamplerSpec, SamplerStep, SamplingReqConfig
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
 from mstar.engine.resources.step import Segment, SubmoduleStep
-from mstar.engine.state.analysis import combined_walks, position_key, reads_differ_by_walk, written_by_step
-from mstar.engine.state.calls import ArrayHandle, SamplerHandle
+from mstar.engine.state.analysis import (
+    both_sharded,
+    combined_walks,
+    narrows_heads,
+    position_key,
+    query_array,
+    reads_differ_by_walk,
+    written_by_step,
+)
+from mstar.engine.state.calls import ArrayHandle, SamplerHandle, pool_layers, segments_of
 from mstar.engine.state.contract import (
     EMPTY,
     Array,
@@ -60,6 +69,8 @@ from mstar.engine.state.contract import (
     KVEntry,
     Layout,
     Op,
+    PagedNHDTarget,
+    Positions,
     Reached,
     Read,
     Sampler,
@@ -68,9 +79,10 @@ from mstar.engine.state.contract import (
     TensorType,
     Window,
     is_value,
+    read_layers,
 )
 from mstar.engine.state.host_fields import HostFields, is_host_value
-from mstar.model.components.diffusion.attention import joint_attention, sdpa_attention
+from mstar.model.components.diffusion.attention import FrameSDPA, joint_attention, sdpa_attention
 from mstar.model.components.distributed.sequence_parallel import (
     attention_over_sharded_keys,
     sp_seq_split,
@@ -78,6 +90,7 @@ from mstar.model.components.distributed.sequence_parallel import (
 )
 
 if TYPE_CHECKING:
+    from mstar.engine.state.state_op import StateOp
     from mstar.model.base import LabelLayout, Model
 
 
@@ -106,8 +119,8 @@ def build_specs(
     setup: "StateSetup | None" = None,
 ) -> list[NodeResourceSpec]:
     """Each array's specs, from its storage and its ops' bindings, under the names the declarations give, then a
-    `PositionSpec` for each array that declares positions and a `SamplerSpec` per sampler. A read that ``setup`` binds
-    takes that binding, and a pool on several nodes takes its leader from the walks ``setup`` gives.
+    `SamplerSpec` per sampler. A read that ``setup`` binds takes that binding, and a pool on several nodes takes its
+    leader from the walks ``setup`` gives.
 
     Raises ``ValueError`` on an array today's specs can't hold, naming what they lack. That includes a second update of
     one type on an array, a temporary limit: an update call finds its op by type, which today's resources need and the
@@ -118,10 +131,8 @@ def build_specs(
     specs: list[NodeResourceSpec] = []
     for array in arrays:
         specs += resolved.specs[array.name]
-        if array.positions is not None:
-            specs.append(_position_spec(array))
     specs += [_sampler_spec(declared) for declared in declarations if isinstance(declared, Sampler)]
-    _apply_kernel_settings(specs, arrays, resolved.resource_of, kernel_settings)
+    _apply_kernel_settings(specs, arrays, resolved, kernel_settings)
     return specs
 
 
@@ -129,18 +140,24 @@ def _resolve(arrays: Sequence[Array], setup: "StateSetup") -> "Resolved":
     """``arrays`` resolved by their storages, all of one storage's arrays in one call."""
     by_storage: dict[Storage, list[Array]] = {}
     for array in arrays:
-        by_storage.setdefault(storage_of(array), []).append(array)
+        storage = storage_of(array)
+        if array.seq_sharded and not storage.takes_seq_sharded:
+            raise _no_layout(array, "seq_sharded takes max_len 0, and an array that keeps entries keeps them whole on "
+                                    "each rank")
+        by_storage.setdefault(storage, []).append(array)
     specs: dict[str, list[NodeResourceSpec]] = {}
+    bound: dict[str, tuple[BoundOp, ...]] = {}
     resource_of: dict[str, str] = {}
-    queried: dict[str, Array] = {}
+    queries: dict[str, Queries] = {}
     walk_reads: dict[str, WalkReads] = {}
     for storage, held in by_storage.items():
         each = storage.resolve(held, arrays, setup)
         specs |= each.specs
+        bound |= each.bound
         resource_of |= each.resource_of
-        queried |= each.queried
+        queries |= each.queries
         walk_reads |= each.walk_reads
-    return Resolved(specs, resource_of, queried, walk_reads)
+    return Resolved(specs, bound, resource_of, queries, walk_reads)
 
 
 def state_setup(config: Mapping[str, Any], declarations: Sequence[Array | Sampler]) -> tuple["StateSetup", list[str]]:
@@ -153,7 +170,8 @@ def state_setup(config: Mapping[str, Any], declarations: Sequence[Array | Sample
         for i, group in enumerate(config.get("node_groups") or ()) if "attention_backend" in group
     ]
     arrays = [declared for declared in declarations if isinstance(declared, Array)]
-    resource_of = _resolve(arrays, StateSetup()).resource_of
+    resolved = _resolve(arrays, StateSetup())
+    resource_of = {read: resolved.resource_of[read] for array in arrays for read in array.reads}
     by_read: dict[str, OpBinding] = {}
     for key, block in _sdpa_blocks(config).items():
         reads = [(array, read) for array in arrays for read in array.reads if resource_of[read] == key]
@@ -200,10 +218,6 @@ def spec_overrides(config: Mapping[str, Any]) -> Mapping[str, Any]:
     if not sdpa:
         return config
     return {**config, "resources": {key: block for key, block in config["resources"].items() if key not in sdpa}}
-
-
-def _positions_key(array: Array) -> str | None:
-    return None if array.positions is None else position_key(array)
 
 
 def _no_layout(array: Array, missing: str) -> ValueError:
@@ -262,37 +276,34 @@ def _sampler_spec(sampler: Sampler) -> SamplerSpec:
 
 
 def _apply_kernel_settings(
-    specs: Sequence[NodeResourceSpec], arrays: Sequence[Array], resource_of: Mapping[str, str],
+    specs: Sequence[NodeResourceSpec], arrays: Sequence[Array], resolved: "Resolved",
     kernel_settings: Mapping[str, Mapping[str, Any]],
 ) -> None:
     """Set the kernel choices, capture sizes and default pool sizes the contract leaves to the engine, and refuse any
     other, so this hook can't carry other physical choices until the engine picks kernels and sizes its pools itself."""
-    owners = {array.name: (array, storage_of(array)) for array in arrays} | {
-        bound.key: (array, bound.binding)
-        for array in arrays for bound in _bindings(storage_of(array), array) if bound.binding.kernel_settings
+    owners = {array.name: (array, storage_of(array), array.name) for array in arrays} | {
+        bound.key: (array, bound.binding, resolved.resource_of[bound.key])
+        for array in arrays for bound in resolved.bound[array.name] if bound.binding.kernel_settings
     }
     by_key = {spec.resource_key: spec for spec in specs}
-    # (spec, field) -> the key of `kernel_settings` that set it and its value
+    # a resource that several reads share holds one value per field
     set_by: dict[tuple[str, str], tuple[str, Any]] = {}
     for key, settings in kernel_settings.items():
         if key not in owners:
             raise ValueError(f"kernel_settings[{key!r}] names no read or update of the declarations that takes kernel "
                              f"settings, and no array, of {sorted(owners)}")
-        array, owner = owners[key]
+        array, owner, resource = owners[key]
         refused = settings.keys() - owner.kernel_settings
         if refused:
             raise ValueError(f"Array {array.name!r}: kernel_settings[{key!r}] sets {sorted(refused)}; "
                              f"it may set only {sorted(owner.kernel_settings)}")
-        # A read's settings go on the spec of the resource it runs on, which SDPA has none of. An update's or an
-        # array's go on its own spec.
-        spec = by_key.get(resource_of.get(key, key))
-        for field, value in settings.items() if spec is not None else ():
-            other, earlier = set_by.setdefault((spec.resource_key, field), (key, value))
-            if earlier != value:
-                raise ValueError(f"Array {array.name!r}: kernel_settings[{other!r}] and kernel_settings[{key!r}] set "
-                                 f"{field} to {earlier!r} and {value!r}, and both reads run on {spec.resource_key!r}")
+        for field, value in settings.items():
+            other, was = set_by.setdefault((resource, field), (key, value))
+            if was != value:
+                raise ValueError(f"kernel_settings[{other!r}] and kernel_settings[{key!r}] set {field} to {was!r} and "
+                                 f"{value!r}, and both reads run on the resource {resource!r}, which holds one value")
         try:
-            owner.set_kernel_settings(array, spec, settings)
+            owner.apply(by_key.get(resource), settings)
         except ValueError as e:
             raise ValueError(f"Array {array.name!r}: kernel_settings[{key!r}]: {e}") from e
 
@@ -316,19 +327,18 @@ def node_handles(
     resolved = _resolve([declared for declared in declarations if isinstance(declared, Array)], setup)
     for declared in declarations:
         if node in declared.nodes and declared.name not in built:
-            built[declared.name] = build_handle(declared, resources, setup, resolved, sp_group)
+            built[declared.name] = build_handle(declared, resources, resolved, setup, sp_group)
     return {declared.name: built[declared.name] for declared in declarations if node in declared.nodes}
 
 
 def build_handle(
-    declared: Array | Sampler, resources: Mapping[str, Any], setup: "StateSetup | None" = None,
-    resolved: "Resolved | None" = None, sp_group: CommGroup | None = None,
+    declared: Array | Sampler, resources: Mapping[str, Any], resolved: "Resolved",
+    setup: "StateSetup | None" = None, sp_group: CommGroup | None = None,
 ) -> ArrayHandle | SamplerHandle:
-    """``declared``'s handle over the built ``resources``, with each of its ops bound. Each read runs on the resource
-    ``resolved`` gives it, or on its own key when ``resolved`` is None."""
+    """``declared``'s handle over the built ``resources``, with each of its ops bound to the resource ``resolved``
+    gives it."""
     if isinstance(declared, Sampler):
         return SamplerHandle(declared, resources[declared.name])
-    resolved = resolved or Resolved({}, {}, {})
     return storage_of(declared).handle(declared, resources, setup or StateSetup(), resolved, sp_group)
 
 
@@ -348,7 +358,7 @@ def state_steps(
         handle = handles.get(name)
         # the step's type first: a check against a handle's class goes through `ABCMeta` and costs more
         if isinstance(declared, ArrayStep) and isinstance(handle, ArrayHandle):
-            if declared.segments is None and step.segments is None:
+            if segments_of(declared, step) is None:
                 raise ValueError(f"Array {name!r}: a step lists it with no segments, its own or the step's")
             builder = builders.get(handle.storage)
             if builder is None:
@@ -397,27 +407,6 @@ def _forks(array: Array, declared: ArrayStep) -> tuple[tuple, tuple, frozenset |
     )
 
 
-def _queries_step(handle: "PagedCrossHandle | WithinStepHandle", step: SubmoduleStep) -> ArrayStep:
-    """What ``step`` lists for the array whose segments lay out the queries of ``handle``'s cross read."""
-    queries = step.state.get(handle.queried.name)
-    if queries is None:
-        raise ValueError(f"Array {handle.name!r}: a step lists it without {handle.queried.name!r}, whose segments lay "
-                         "out its queries")
-    return queries
-
-
-def _query_segments(
-    handle: "PagedCrossHandle | WithinStepHandle", step: SubmoduleStep, segments: Sequence[Segment],
-) -> Sequence[Segment]:
-    """The segments that lay out the queries of ``handle``'s cross read in ``step``, refused unless they name the
-    requests of ``segments``, the array's own, in their order."""
-    queries = step.state[handle.queried.name].segments or step.segments or ()
-    if [s.request_id for s in queries] != [s.request_id for s in segments]:
-        raise handle._refusal(f"its segments and those of {handle.queried.name!r}, which lay out its queries, must "
-                              "name the same requests in the same order, with one segment to one")
-    return queries
-
-
 class StepBuilder(ABC):
     """Today's steps of one storage's arrays in one step."""
 
@@ -438,16 +427,10 @@ class ArraySteps(StepBuilder):
         self._steps: dict[str, Any] = {}
 
     def add(self, handle: ArrayHandle, declared: ArrayStep, step: SubmoduleStep, walk: str | None = None) -> None:
-        segments = declared.segments
+        segments = segments_of(declared, step)
         self._storage.steps(handle, declared, step, self._steps)
         for key, bound in handle._step_ops(walk):
-            bound.binding.steps(key, bound.declared, segments, self._steps)
-        if handle.array.positions is not None:
-            # a step that keeps nothing doesn't advance the counter
-            advance = declared.advance if declared.keep else (0,) * len(segments or step.segments)
-            self._steps[handle.positions_key] = PositionStep(
-                segments=segments, advance=advance, pos_ids=declared.position_ids,
-            )
+            bound.binding.steps(key, bound.declared, declared, segments, self._steps)
 
     def steps(self) -> dict[str, Any]:
         return self._steps
@@ -460,6 +443,8 @@ class WithinStepSteps(StepBuilder):
     def __init__(self):
         self._labels: dict[str, dict[str, Sequence[Segment]]] = {}
         self._pairs: dict[str, list[tuple[str, str]]] = {}
+        # how the reads on each resource lay out their queries, which is one way per resource
+        self._queries: dict[str, Queries] = {}
         # a resource's layout is fixed only if every read on it declares it so
         self._fixed: dict[str, bool] = {}
 
@@ -470,18 +455,24 @@ class WithinStepSteps(StepBuilder):
         exchange, and any other over this rank's share of a sharded side."""
         if not handle._plans:
             return
-        key, name, segments = handle.resource_key, handle.name, declared.segments or step.segments
+        key = handle.resource_key
         self._fixed[key] = self._fixed.get(key, True) and declared.fixed_layout
-        if handle.queried is None:
-            self._label(key, name, segments)
-            return
-        q_label = self._label(key, name, handle.query_share(_queries_step(handle, step).segments or step.segments))
-        self._pairs.setdefault(key, []).append((q_label, self._label(key, name, handle.key_share(segments))))
+        self._queries[key] = handle.queries
+        handle.queries.plan(self, handle, segments_of(declared, step), step)
 
-    def _label(self, key: str, name: str, segments: Sequence[Segment]) -> str:
-        label = segments[0].label
+    def _label(self, key: str, array: Array, segments: Sequence[Segment]) -> str:
+        """Hold ``segments``, ``array``'s in this step, under its label on the resource ``key``, and give the label."""
+        if not segments:
+            raise ValueError(f"Array {array.name!r}: a step lays it out over an empty list of segments")
+        label = _plan_label(array)
+        # on a replay too, whose step `_check_step` doesn't see
+        for segment in segments:
+            if segment.label != label:
+                raise ValueError(f"Array {array.name!r}: a step lays it out under labels "
+                                 f"{sorted({segment.label for segment in segments} - {label})}, and its plans run "
+                                 f"under its label {label!r}")
         if tuple(self._labels.setdefault(key, {}).setdefault(label, segments)) != tuple(segments):
-            raise ValueError(f"Array {name!r}: label {label!r} on its resource already holds other segments")
+            raise ValueError(f"Array {array.name!r}: label {label!r} on its resource already holds other segments")
         return label
 
     def steps(self) -> dict[str, Any]:
@@ -490,10 +481,7 @@ class WithinStepSteps(StepBuilder):
             segments = tuple(s for each in by_label.values() for s in each) if len(by_label) > 1 else (
                 next(iter(by_label.values()))
             )
-            if key in self._pairs:
-                steps[key] = RaggedCrossAttentionStep(segments=tuple(segments), pairs=tuple(self._pairs[key]))
-            else:
-                steps[key] = AttentionStep(segments=segments, causal=False, fixed_layout=self._fixed[key])
+            steps[key] = self._queries[key].step(segments, self._pairs.get(key, ()), self._fixed[key])
         return steps
 
 
@@ -552,10 +540,10 @@ def sampling_configs(
 
 
 class BoundOp(NamedTuple):
-    """One of an array's reads or updates, under its key, with the binding that runs it."""
+    """One of an array's reads or updates, or its positions, under its key, with the binding that runs it."""
 
     key: str
-    declared: Read | Op
+    declared: Read | Op | Positions
     binding: "OpBinding"
 
 
@@ -564,16 +552,20 @@ class OpBinding:
 
     # the fields `kernel_settings` may set on the op's spec, until the engine picks kernels itself
     kernel_settings: ClassVar[frozenset[str]] = frozenset()
+    # those of them whose value in effect the bound runner reports, which `kernel_setting` reads back
+    read_back: ClassVar[frozenset[str]] = frozenset()
 
-    def check(self, array: Array, key: str, declared: Read | Op) -> None:
+    def check(self, array: Array, key: str, declared: Read | Op | Positions) -> None:
         """Raise ``ValueError`` on what today's resources can't run, naming ``array``."""
         return
 
-    def specs(self, array: Array, key: str, declared: Read | Op) -> list[NodeResourceSpec]:
+    def specs(self, array: Array, key: str, declared: Read | Op | Positions) -> list[NodeResourceSpec]:
         return []
 
-    def steps(self, key: str, declared: Read | Op, segments, steps: dict[str, Any]) -> None:
-        """Add the step of the op's resource under ``key``, over ``segments``."""
+    def steps(
+        self, key: str, op: Read | Op | Positions, declared: ArrayStep, segments, steps: dict[str, Any],
+    ) -> None:
+        """Add the step of ``op``'s resource under ``key``, for the array's ``declared`` step over ``segments``."""
         return
 
     def block(self, tensor: TensorType) -> RecurrentBlockConfig:
@@ -588,15 +580,22 @@ class OpBinding:
         """``stored``, read from the pool, in the layout the op declares its field in."""
         return stored
 
+    def resource(self, array: Array, key: str) -> str:
+        """The key of the resource the op under ``key`` runs on."""
+        return key
+
+    def apply(self, spec: NodeResourceSpec | None, settings: Mapping[str, Any]) -> None:
+        """Set ``settings``, the op's `kernel_settings`, on ``spec``, its resource's."""
+        for field, value in settings.items():
+            setattr(spec.config, field, value)
+
     def bind(self, array: Array, key: str, resources: Mapping[str, Any]) -> Any:
-        """What a handle calls to run the op."""
+        """What a handle calls to run the op, on the resource under ``key``."""
         return resources[key]
 
-    def set_kernel_settings(self, array: Array, spec: NodeResourceSpec | None, settings: Mapping[str, Any]) -> None:
-        """Set ``settings`` on the op's ``spec``, which is None for a read on SDPA."""
-        if spec is not None:
-            for field, value in settings.items():
-                setattr(spec.config, field, value)
+    def attach(self, handle: "PagedArrayHandle", key: str, run: Any) -> None:
+        """Give a paged ``handle`` ``run``, what it calls for the op under ``key``."""
+        raise _no_layout(handle.array, f"{key!r} binds through {type(self).__name__}, which no paged array holds")
 
 
 class PagedAttend(OpBinding):
@@ -611,26 +610,29 @@ class PagedAttend(OpBinding):
 
     def specs(self, array: Array, key: str, read: Read) -> list[NodeResourceSpec]:
         windowed = isinstance(read.mask, Window)
-        # the pool holds only the array's layers, so AttentionConfig.layers counts among them
-        kv_layer = {layer: i for i, layer in enumerate(sorted(array.layers))}
+        # AttentionConfig.layers counts among the pool's layers
+        kv_layer = pool_layers(array)
         return [AttentionSpec(
             resource_key=key, nodes=array.nodes,
             config=AttentionConfig(
                 kv_cache=array.name,
                 sliding_window=read.mask.size if windowed else None,
-                layers=tuple(kv_layer[layer] for layer in sorted(read.layers or array.layers)) if windowed else None,
+                layers=tuple(kv_layer[layer] for layer in sorted(read_layers(array, read))) if windowed else None,
             ),
         )]
 
-    def steps(self, key: str, read: Read, segments, steps: dict[str, Any]) -> None:
+    def steps(self, key: str, read: Read, declared: ArrayStep, segments, steps: dict[str, Any]) -> None:
         steps[key] = AttentionStep(segments=segments, causal=not isinstance(read.mask, Bidirectional))
 
-    def set_kernel_settings(self, array: Array, spec: NodeResourceSpec | None, settings: Mapping[str, Any]) -> None:
+    def apply(self, spec: NodeResourceSpec | None, settings: Mapping[str, Any]) -> None:
         """The decode keys go through the spec's own YAML path and its checks, as they do under `resources:`."""
         decode = {field: settings[field] for field in settings.keys() & {"decode_tensor_cores", "decode_fmha"}}
-        super().set_kernel_settings(array, spec, {field: settings[field] for field in settings.keys() - decode.keys()})
+        super().apply(spec, {field: settings[field] for field in settings.keys() - decode.keys()})
         if decode:
             spec.apply_yaml_overrides(**decode)
+
+    def attach(self, handle: "PagedArrayHandle", key: str, run: Any) -> None:
+        handle.reads[key] = run
 
 
 class PagedCrossAttend(PagedAttend):
@@ -652,17 +654,37 @@ class PagedCrossAttend(PagedAttend):
         return [CrossAttentionSpec(
             resource_key=key, nodes=array.nodes,
             config=CrossAttentionConfig(
-                kv_cache=array.name, query_kv_cache=read.queries, context_label=min(array.labels),
+                kv_cache=array.name, query_kv_cache=read.queries, context_label=_plan_label(array),
             ),
         )]
 
-    def steps(self, key: str, read: Read, segments, steps: dict[str, Any]) -> None:
+    def steps(self, key: str, read: Read, declared: ArrayStep, segments, steps: dict[str, Any]) -> None:
         steps[key] = AttentionStep(segments=segments, causal=False)
+
+
+class PositionsBinding(OpBinding):
+    """An array's `Positions`, which a position resource keeps per request under `position_key`, with the `Rope` its
+    calls rotate by."""
+
+    def specs(self, array: Array, key: str, declared: Positions) -> list[NodeResourceSpec]:
+        return [_position_spec(array)]
+
+    def steps(self, key: str, positions: Positions, declared: ArrayStep, segments, steps: dict[str, Any]) -> None:
+        # a step that keeps nothing doesn't advance the counter
+        advance = declared.advance if declared.keep else (0,) * len(segments)
+        steps[key] = PositionStep(segments=segments, advance=advance, pos_ids=declared.position_ids)
+
+    def attach(self, handle: "PagedArrayHandle", key: str, run: Any) -> None:
+        """Set the handle's position resource, and the dtype the declared `Rope` rotates in, None for the query's."""
+        rope = handle.array.positions.rope
+        handle.positions, handle.rope_dtype = run, None if rope is None else rope.dtype
 
 
 class WithinStepAttend(OpBinding, ABC):
     """`Attend` within a step, over the step's own adds."""
 
+    # the model's settings are for the ragged kernel, whichever binding the deployment picks
+    kernel_settings = frozenset({"max_segments_per_request", "max_segments_per_step", "compile_op", "workspace_mb"})
     # whether the read runs a plan its step builds, so its resource has a spec and its calls need the step open
     plans: ClassVar[bool]
 
@@ -673,17 +695,17 @@ class WithinStepAttend(OpBinding, ABC):
             raise _no_layout(array, f"reads[{key!r}].walks must be None, since a read within a step has no walk")
 
     @abstractmethod
-    def attend(self, run: Any, label: str) -> Callable[..., torch.Tensor]:
+    def attend(self, run: Any, label: str, rows: "RowLayout") -> Callable[..., torch.Tensor]:
         """The attention over rows of one length that the read's exchange runs, where ``run`` is what `bind` gave."""
 
 
 class RaggedAttend(WithinStepAttend):
     """`Attend` within a step, on a ragged resource that the reads of one kind, nodes and config share."""
 
-    kernel_settings = frozenset({"max_segments_per_request", "max_segments_per_step", "compile_op", "workspace_mb"})
+    read_back = frozenset({"max_segments_per_request", "max_segments_per_step"})
     plans = True
 
-    def attend(self, run: Any, label: str) -> Callable[..., torch.Tensor]:
+    def attend(self, run: Any, label: str, rows: "RowLayout") -> Callable[..., torch.Tensor]:
         return functools.partial(joint_attention, ragged=functools.partial(run.run, label=label))
 
 
@@ -698,11 +720,14 @@ class SdpaAttend(WithinStepAttend):
             raise _no_layout(array, f"reads[{key!r}] runs SDPA, which can't tell one segment of packed queries from "
                                     "the next, and a read of rows of one length declares packed=False")
 
+    def apply(self, spec: NodeResourceSpec | None, settings: Mapping[str, Any]) -> None:
+        """Nothing: SDPA builds no resource to set."""
+
     def bind(self, array: Array, key: str, resources: Mapping[str, Any]) -> Any:
         return sdpa_attention
 
-    def attend(self, run: Any, label: str) -> Callable[..., torch.Tensor]:
-        return run
+    def attend(self, run: Any, label: str, rows: "RowLayout") -> Callable[..., torch.Tensor]:
+        return rows.sdpa(run)
 
 
 class LinearAttnBinding(OpBinding):
@@ -711,7 +736,7 @@ class LinearAttnBinding(OpBinding):
 
     kernel_settings = frozenset({"splits"})
 
-    def steps(self, key: str, op: Op, segments, steps: dict[str, Any]) -> None:
+    def steps(self, key: str, op: Op, declared: ArrayStep, segments, steps: dict[str, Any]) -> None:
         steps[key] = LinearAttnStep(segments=segments)
 
     @staticmethod
@@ -741,9 +766,9 @@ class GDN(LinearAttnBinding):
         )]
 
     def block(self, tensor: TensorType) -> RecurrentBlockConfig:
-        """Stored in fp32 unless the decode kernel takes the declared dtype, as it does for bf16 only at K = V = 128."""
+        """Stored in fp32 unless the decode kernel takes the declared dtype (`bf16_gdn_state_fits`)."""
         h_v, d_k, d_v = tensor.shape
-        dtype = torch.bfloat16 if tensor.dtype is torch.bfloat16 and d_k == d_v == 128 else torch.float32
+        dtype = torch.bfloat16 if tensor.dtype is torch.bfloat16 and bf16_gdn_state_fits(d_k, d_v) else torch.float32
         # the head axis stays first, and the last two swap
         shard = None if tensor.shard is None else (0, 2, 1)[tensor.shard]
         return _block(TensorType((h_v, d_v, d_k), dtype=dtype, shard=shard))
@@ -766,8 +791,8 @@ class ConvOnLinearAttn(OpBinding):
             raise _no_layout(array, f"updates[{key!r}].activation is {op.activation!r}, and LinearAttnConfig has no "
                                     "activation but silu")
 
-    def bind(self, array: Array, key: str, resources: Mapping[str, Any]) -> Any:
-        return resources[self._linear_key(array, key)]
+    def resource(self, array: Array, key: str) -> str:
+        return self._linear_key(array, key)
 
     def _linear_key(self, array: Array, key: str) -> str:
         storage = storage_of(array)
@@ -785,26 +810,27 @@ class ConvOnLinearAttn(OpBinding):
 
 
 class PagedArrayHandle(ArrayHandle):
-    """Adds and reads through the KV pages of an array that keeps entries. Each read runs on the resource
-    ``resource_of`` gives it."""
+    """Adds and reads through the KV pages of an array that keeps entries. Each read runs on the resource its
+    `Resolved` gives it."""
 
     def __init__(
-        self, array: Array, resources: Mapping[str, Any], positions_key: str | None, bindings: tuple[BoundOp, ...], *,
-        resource_of: Mapping[str, str] = EMPTY,
+        self, array: Array, resources: Mapping[str, Any], bindings: tuple[BoundOp, ...], resolved: "Resolved",
     ):
-        super().__init__(array, resources, positions_key)
+        super().__init__(array, resources)
         self._bindings = bindings
-        resource = {bound.key: resource_of.get(bound.key, bound.key) for bound in bindings}
-        self.reads = {bound.key: bound.binding.bind(array, resource[bound.key], resources) for bound in bindings}
+        self.reads = {}
+        for bound in bindings:
+            run = bound.binding.bind(array, resolved.resource_of[bound.key], resources)
+            bound.binding.attach(self, bound.key, run)
         self.first_read = next(iter(self.reads.values()))
         self._attn = {
             layer: self.reads[key]
-            for key, read in array.reads.items() for layer in read.layers or array.layers
+            for key, read in array.reads.items() for layer in read_layers(array, read)
         }
         self._kv = resources[array.name]
         self._views = {layer: self._kv.layer_view(i) for layer, i in self._pool_layer.items()}
         # each op with its resource, built once since `state_steps` runs on every step, replays too
-        self._ops = [(resource[bound.key], bound) for bound in bindings]
+        self._ops = [(resolved.resource_of[bound.key], bound) for bound in bindings]
         # whether `check_step` needs an add, for a step that lists a row on the pages at span above 0
         self._grows = False
 
@@ -915,8 +941,20 @@ class PagedArrayHandle(ArrayHandle):
     def _step_ops(self, walk: str | None) -> Sequence[tuple[str, BoundOp]]:
         return self._ops
 
-    def _kernel_setting(self, read: str, field: str) -> Any:
-        return getattr(self.reads[read], field)
+    def takes_fused(self, op: "StateOp") -> bool:
+        """An op that adds to the array, on a pool in one of its formats, while no layer's read takes k and v at its
+        kernel, which would never see the pages the op writes."""
+        cache = self._kv.kv_cache
+        dtype, device = cache.dtype, cache.device.type
+        return bool(op.adds) and cache.layout is KVLayout.NHD and not any(map(self._holds, self.array.layers)) and any(
+            (fmt.dtypes is None or dtype in fmt.dtypes) and (fmt.devices is None or device in fmt.devices)
+            for fmt in op.formats
+        )
+
+    def fused_target(self, layer: int) -> PagedNHDTarget:
+        """Record ``layer``'s add, which a fused op makes, and give where it writes the step's entries."""
+        self._record_add(layer, None)
+        return PagedNHDTarget(*self._kv.write_target(layer_idx=self._pool_layer[layer], label=self.label))
 
 
 class PagedByWalkHandle(PagedArrayHandle):
@@ -924,15 +962,15 @@ class PagedByWalkHandle(PagedArrayHandle):
     which ``walk_reads`` gives."""
 
     def __init__(
-        self, array: Array, resources: Mapping[str, Any], positions_key: str | None, bindings: tuple[BoundOp, ...], *,
-        resource_of: Mapping[str, str], walk_reads: "WalkReads",
+        self, array: Array, resources: Mapping[str, Any], bindings: tuple[BoundOp, ...], resolved: "Resolved",
     ):
-        super().__init__(array, resources, positions_key, bindings, resource_of=resource_of)
-        self.walk_reads = walk_reads
+        super().__init__(array, resources, bindings, resolved)
+        self.walk_reads = walk_reads = resolved.walk_reads[array.name]
         by_key = {bound.key: bound for bound in bindings}
-        # each walk's ops with their resources, under None for a walk no read names
+        every = [(resolved.resource_of[bound.key], bound) for bound in bindings if bound.key not in array.reads]
+        # each walk's ops with their resources, under None for a walk no read names: its reads, then the other ops
         self._walk_ops = {
-            walk: [(resource, by_key[key]) for resource, key in reads.items()]
+            walk: [*((resource, by_key[key]) for resource, key in reads.items()), *every]
             for walk, reads in walk_reads.reads.items()
         }
         # the layers some read covers on the step's walk `_walk`
@@ -973,26 +1011,27 @@ class PagedByWalkHandle(PagedArrayHandle):
 
 
 class PagedCrossHandle(PagedArrayHandle):
-    """A paged array read with the queries of ``queried``, whose segments lay them out. Its adds go to the pages, and
+    """A paged array read with the queries of another array, whose segments lay them out. Its adds go to the pages, and
     its read runs under the query side's label, which the cross resource keys its plans by."""
 
     def __init__(
-        self, array: Array, resources: Mapping[str, Any], positions_key: str | None, bindings: tuple[BoundOp, ...], *,
-        queried: Array,
+        self, array: Array, resources: Mapping[str, Any], bindings: tuple[BoundOp, ...], resolved: "Resolved",
     ):
-        super().__init__(array, resources, positions_key, bindings)
-        self.queried = queried
+        super().__init__(array, resources, bindings, resolved)
+        ((key, _),) = array.reads.items()
+        self.queries = resolved.queries[key]
         self._query_label = "main"
 
     def begin_step(self, step) -> None:
         super().begin_step(step)
         if step.ctx.replays:
             return
-        labels = step_labels(_queries_step(self, step).segments or step.segments or ())
+        queries = self.queries.segments(self, step)
+        labels = step_labels(queries)
         if len(labels) > 1:
-            raise self._no_layout(f"a step over labels {sorted(labels)} on {self.queried.name!r}, whose segments lay "
-                                  "out this read's queries")
-        queries = _query_segments(self, step, self._segments)
+            raise self._no_layout(f"a step over labels {sorted(labels)} on {self.queries.array.name!r}, whose segments "
+                                  "lay out this read's queries")
+        self.queries.check(self, self._segments, step)
         if queries:
             self._query_label = queries[0].label
 
@@ -1006,7 +1045,7 @@ class PagedCrossHandle(PagedArrayHandle):
     def at_last_token(self, x: torch.Tensor, *, label: str | None = None) -> torch.Tensor:
         self._check_open("at_last_token")
         raise self._refusal(f"at_last_token lays x out by this array's segments, and its read's queries are laid out "
-                            f"by {self.queried.name!r}; call it on that array")
+                            f"by {self.queries.array.name!r}; call it on that array")
 
 
 class ValueHandle(ArrayHandle):
@@ -1014,17 +1053,20 @@ class ValueHandle(ArrayHandle):
     fields."""
 
     def __init__(
-        self, array: Array, resources: Mapping[str, Any], positions_key: str | None, bindings: tuple[BoundOp, ...],
+        self, array: Array, resources: Mapping[str, Any], bindings: tuple[BoundOp, ...], resolved: "Resolved",
     ):
-        super().__init__(array, resources, positions_key)
+        super().__init__(array, resources)
         self._bindings = bindings
         self._pool = resources[array.name]
         self._blocks = {
             field: {layer: self._pool.block(field, i) for layer, i in self._pool_layer.items()}
             for field in array.entry.tensors
         }
-        self._runners = {type(bound.declared): bound.binding.bind(array, bound.key, resources) for bound in bindings}
-        self._layouts = _field_layouts(bindings)
+        self._runners = {
+            type(bound.declared): bound.binding.bind(array, resolved.resource_of[bound.key], resources)
+            for bound in bindings
+        }
+        self._layouts = _field_layouts(array, bindings)
         # `_step_written` holds the fields a kept step writes itself, and `_written` those each layer's write set.
         # `_start` holds each layer's start state from `set_start`, in the pool's layout, fixed from the first step on.
         self._step_written = written_by_step(array)
@@ -1097,18 +1139,17 @@ class ValueHandle(ArrayHandle):
     def _stored(self, field: str, layer: int, value: torch.Tensor, shape: torch.Size, what: str) -> torch.Tensor:
         """``value``, whose entries are of ``shape``, in the layout and dtype the pool stores ``field`` in."""
         block = self.block(field, layer)
-        layout = self._layouts.get(field)
-        expected = block.shape[1:] if layout is None else layout.from_stored(block).shape[1:]
+        layout = self._layouts[field]
+        expected = layout.from_stored(block).shape[1:]
         dtype = self.array.entry.tensors[field].dtype or block.dtype
         if tuple(shape) != tuple(expected) or value.dtype != dtype:
             raise self._refusal(f"{what} of field {field!r} on layer {layer} is {tuple(shape)} of {value.dtype}, and "
                                 f"the field is {tuple(expected)} of {dtype} on this rank")
-        return (value if layout is None else layout.stored(value)).to(block.dtype)
+        return layout.stored(value).to(block.dtype)
 
     def _declared(self, field: str, stored: torch.Tensor) -> torch.Tensor:
         """``stored``, read from the pool, in ``field``'s declared layout and dtype."""
-        layout = self._layouts.get(field)
-        value = stored if layout is None else layout.from_stored(stored)
+        value = self._layouts[field].from_stored(stored)
         return value.to(self.array.entry.tensors[field].dtype or value.dtype)
 
     @torch.compiler.disable
@@ -1161,20 +1202,24 @@ class _HostCalls:
         if not declared.keep:
             raise self._refusal("a host write on a step that keeps nothing, which has no commit to apply it at")
         for (row, label, layer), written in declared.host.items():
-            where = f"a host write on row {row}, label {label!r}, layer {layer}"
             if not ctx.is_real_row(row):
-                raise self._refusal(f"{where}, and that row isn't one of the step's requests")
+                raise self._write_refusal(row, label, layer, ", and that row isn't one of the step's requests")
             if label not in self.array.labels or layer not in self.array.layers:
-                raise self._refusal(f"{where}, and the array declares labels {sorted(self.array.labels)} and layers "
-                                    f"{sorted(self.array.layers)}")
+                raise self._write_refusal(row, label, layer, f", and the array declares labels "
+                                          f"{sorted(self.array.labels)} and layers {sorted(self.array.layers)}")
             if not self.host_fields.is_open(row):
-                raise self._refusal(f"{where}, and that request has no open fields")
+                raise self._write_refusal(row, label, layer, ", and that request has no open fields")
             for field, value in written.items():
                 kind = self.array.entry.host.get(field)
                 if kind is None:
-                    raise self._refusal(f"{where}: field {field!r} isn't declared, of {sorted(self.array.entry.host)}")
+                    raise self._write_refusal(row, label, layer, f": field {field!r} isn't declared, of "
+                                              f"{sorted(self.array.entry.host)}")
                 if not is_host_value(value, kind):
-                    raise self._refusal(f"{where}: field {field!r} takes {kind}, and got {value!r}")
+                    raise self._write_refusal(row, label, layer, f": field {field!r} takes {kind}, and got {value!r}")
+
+    def _write_refusal(self, row: int, label: str, layer: int, cause: str) -> ValueError:
+        # built only on a refusal: every row of every step passes the checks above
+        return self._refusal(f"a host write on row {row}, label {label!r}, layer {layer}{cause}")
 
     def commit_step(self, step) -> None:
         self.host_fields.commit(self.array, step.state[self.name], step.ctx.request_ids)
@@ -1190,8 +1235,7 @@ class HostValueHandle(_HostCalls, ArrayHandle):
     """The calls on a Value of host fields only."""
 
     def __init__(self, array: Array, host_fields: HostFields):
-        super().__init__(array, EMPTY, None)
-        self._bindings: tuple[BoundOp, ...] = ()
+        super().__init__(array, EMPTY)
         self.host_fields = host_fields
         host_fields.declare(array)
 
@@ -1203,12 +1247,174 @@ class ValueWithHostHandle(_HostCalls, ValueHandle):
     """The calls on a Value with host fields beside its tensor fields."""
 
     def __init__(
-        self, array: Array, resources: Mapping[str, Any], positions_key: str | None, bindings: tuple[BoundOp, ...],
+        self, array: Array, resources: Mapping[str, Any], bindings: tuple[BoundOp, ...], resolved: "Resolved",
         host_fields: HostFields,
     ):
-        super().__init__(array, resources, positions_key, bindings)
+        super().__init__(array, resources, bindings, resolved)
         self.host_fields = host_fields
         host_fields.declare(array)
+
+
+class RowLayout(ABC):
+    """How a within-step read's rows hold a step's segments. Its handle picks one at bind, from the read."""
+
+    # whether a step that lists the array opens, whatever the read's binding
+    must_open: ClassVar[bool]
+
+    def __init__(self, handle: "WithinStepHandle"):
+        self._handle = handle
+
+    @abstractmethod
+    def begin(self, segments: Sequence[Segment], world_size: int | None) -> list[int] | None:
+        """Take a step's ``segments``, and give each rank's share of a row under a Ulysses exchange over
+        ``world_size`` ranks, None with no exchange."""
+
+    @abstractmethod
+    def end(self) -> None:
+        """Drop what the step's segments gave."""
+
+    def sdpa(self, run: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]:
+        """The SDPA a read on these rows runs, given ``run`` over whole rows."""
+        return run
+
+
+class SpanRows(RowLayout):
+    """A row a segment, all of one span."""
+
+    must_open = False
+
+    def begin(self, segments: Sequence[Segment], world_size: int | None) -> list[int] | None:
+        if world_size is None:
+            return None
+        spans = {s.span for s in segments}
+        if len(spans) > 1:
+            raise self._handle._no_layout(f"a Ulysses exchange over spans {sorted(spans)}, and mixed lengths need a "
+                                          "permutation in the unpack")
+        return sp_seq_split(spans.pop(), world_size) if spans else None
+
+    def end(self) -> None:
+        """A span row keeps nothing of its step."""
+
+
+class SegmentedRows(RowLayout):
+    """A request's segments end to end in one row (`Read.segmented`), which SDPA attends within each segment of."""
+
+    must_open = True
+
+    def __init__(self, handle: "WithinStepHandle"):
+        super().__init__(handle)
+        self._frames = FrameSDPA()
+        self._frames.lengths = None
+        # One callable per array, as the handle's attend is. The disable keeps the spans out of a compiled caller's
+        # guards, so its blocks don't retrace per layout.
+        self._split = functools.partial(joint_attention, ragged=torch.compiler.disable(self._run))
+
+    def begin(self, segments: Sequence[Segment], world_size: int | None) -> list[int] | None:
+        if len({s.request_id for s in segments}) > 1:
+            raise self._handle._no_layout("a segmented read in a step of several requests, whose rows need a split "
+                                          "each")
+        self._frames.lengths = [s.span for s in segments]
+        if world_size is None or not segments:
+            return None
+        return sp_seq_split(sum(self._frames.lengths), world_size)
+
+    def end(self) -> None:
+        self._frames.lengths = None
+
+    def sdpa(self, run: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]:
+        return self._split
+
+    def _run(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        if self._frames.lengths is None:
+            raise self._handle._refusal("read in a step that doesn't list the array")
+        return self._frames.run(q, k, v)
+
+
+def _plan_label(array: Array) -> str:
+    """The label an array's plans run under, its one declared label, on an array with ``max_len`` 0
+    (`_within_step_read`) or with a kept cross read (`PagedCrossAttend.check`)."""
+    (label,) = array.labels
+    return label
+
+
+class Queries(ABC):
+    """Whose segments lay out a within-step read's queries, picked once per read at resolve: its own array's, or those
+    of the array its ``queries`` names. A paged cross read takes a `CrossQueries` for its array and its checks, and its
+    own resource plans it."""
+
+    # the spec of the resource the read plans on
+    spec_class: ClassVar[type[NodeResourceSpec]]
+
+    def __init__(self, array: Array):
+        # the array whose segments lay out the queries
+        self.array = array
+
+    @abstractmethod
+    def plan_label(self, keys: Array) -> str:
+        """The label the read's plan runs under, where ``keys`` is the read's own array."""
+
+    @abstractmethod
+    def plan(self, steps: WithinStepSteps, handle: "WithinStepHandle", segments, step: SubmoduleStep) -> None:
+        """Lay out ``handle``'s read in ``steps``, over ``segments``, its own array's in ``step``."""
+
+    @abstractmethod
+    def step(self, segments, pairs: Sequence[tuple[str, str]], fixed: bool) -> Any:
+        """The step of a resource whose reads lay out their queries this way."""
+
+    def check(self, handle: ArrayHandle, segments, step: SubmoduleStep) -> None:
+        """Refuse a step whose queries don't line up with ``segments``, the read's own array's."""
+        return
+
+
+class OwnQueries(Queries):
+    """A read whose queries are its own array's."""
+
+    spec_class = RaggedAttentionSpec
+
+    def plan_label(self, keys: Array) -> str:
+        return _plan_label(keys)
+
+    def plan(self, steps: WithinStepSteps, handle: "WithinStepHandle", segments, step: SubmoduleStep) -> None:
+        steps._label(handle.resource_key, handle.array, segments)
+
+    def step(self, segments, pairs: Sequence[tuple[str, str]], fixed: bool) -> Any:
+        return AttentionStep(segments=segments, causal=False, fixed_layout=fixed)
+
+
+class CrossQueries(Queries):
+    """A read whose queries are another array's, which a step lists over the same requests in the same order."""
+
+    spec_class = RaggedCrossAttentionSpec
+
+    def plan_label(self, keys: Array) -> str:
+        # Both sides fix the plan's label, so it is one string for the life of the handle. See `cross_label`.
+        return cross_label(_plan_label(self.array), _plan_label(keys))
+
+    def plan(self, steps: WithinStepSteps, handle: "WithinStepHandle", segments, step: SubmoduleStep) -> None:
+        key = handle.resource_key
+        q_label = steps._label(key, self.array, handle.query_share(self.segments(handle, step)))
+        steps._pairs.setdefault(key, []).append((q_label, steps._label(key, handle.array, handle.key_share(segments))))
+
+    def step(self, segments, pairs: Sequence[tuple[str, str]], fixed: bool) -> Any:
+        return RaggedCrossAttentionStep(segments=tuple(segments), pairs=tuple(pairs))
+
+    def segments(self, handle: ArrayHandle, step: SubmoduleStep) -> Sequence[Segment]:
+        """The segments that lay out ``handle``'s queries in ``step``, refused where it lists none."""
+        name = self.array.name
+        queries = step.state.get(name)
+        if queries is None:
+            raise ValueError(f"Array {handle.name!r}: a step lists it without {name!r}, whose segments lay out its "
+                             "queries")
+        query_segments = segments_of(queries, step)
+        if query_segments is None:
+            raise ValueError(f"Array {name!r}: a step lists it with no segments, its own or the step's")
+        return query_segments
+
+    def check(self, handle: ArrayHandle, segments, step: SubmoduleStep) -> None:
+        queries = self.segments(handle, step)
+        if [s.request_id for s in queries] != [s.request_id for s in segments]:
+            raise handle._refusal(f"its segments and those of {self.array.name!r}, which lay out its queries, must "
+                                  "name the same requests in the same order, with one segment to one")
 
 
 class WithinStepHandle(ArrayHandle):
@@ -1216,50 +1422,49 @@ class WithinStepHandle(ArrayHandle):
     stays in that graph through ``mstar::ragged_attention``. A check here runs only while not compiling: it would guard
     on the layer, and the block would retrace per layer.
 
-    ``queried`` is the array whose segments lay out the queries of a cross read. Under sequence parallelism the two
-    flags pick the exchange: Ulysses when both sides are sharded, none when only the queries are, and a merge of the
+    ``queries`` says whose segments lay out the read's queries. Under sequence parallelism the two flags pick the
+    exchange: Ulysses when both sides are sharded, none when only the queries are, and a merge of the
     ranks' partial attentions when only the keys are. The read's binding supplies the attention each exchange runs.
     """
 
     def __init__(
-        self, array: Array, resources: Mapping[str, Any], positions_key: str | None, bindings: tuple[BoundOp, ...], *,
-        resource_key: str | None = None, queried: Array | None = None, sp_group: CommGroup | None = None,
+        self, array: Array, resources: Mapping[str, Any], bindings: tuple[BoundOp, ...], resolved: "Resolved", *,
+        sp_group: CommGroup | None = None,
     ):
-        super().__init__(array, resources, positions_key)
+        super().__init__(array, resources)
         self._bindings = bindings
         ((key, read, self._binding),) = bindings
-        self.resource_key = resource_key or key
+        self.resource_key = resolved.resource_of[key]
         self.reads = {key: self._binding.bind(array, self.resource_key, resources)}
         self.first_read = self.reads[key]
-        self.queried = queried
+        self.queries = queries = resolved.queries[key]
         self._packed = read.packed
         # a plain attribute, which a compiled caller's trace reads as a constant
         self._plans = self._binding.plans
         self._sp = sp_group
         sharded = sp_group is not None and sp_group.world_size > 1
         self._keys_sharded = sharded and array.seq_sharded
-        self._queries_sharded = sharded and (array if queried is None else queried).seq_sharded
+        self._queries_sharded = sharded and queries.array.seq_sharded
+        self._ulysses = sharded and both_sharded(array, queries.array)
+        self._rows = (SegmentedRows if read.segmented else SpanRows)(self)
         # A read on SDPA plans nothing, so a step needs to run for it only to learn a Ulysses exchange's rank sizes.
-        self.needs_step = self._plans or (self._keys_sharded and self._queries_sharded)
+        self.needs_step = self._plans or self._rows.must_open or self._ulysses
         self._seq_sizes: list[int] | None = None
-        # Both sides fix the plan's label, so it is one string for the life of the handle. See `cross_label`.
-        self._plan_label = min(array.labels) if queried is None else cross_label(min(queried.labels), min(array.labels))
+        self._plan_label = queries.plan_label(array)
         # One callable per array, not per layer: Dynamo specializes `ulysses_attention` on the identity of the callable
         # it runs, so a callable per layer would retrace that frame per layer.
-        self._attend = self._binding.attend(self.first_read, self._plan_label)
+        self._attend = self._binding.attend(self.first_read, self._plan_label, self._rows)
 
     def begin_step(self, step) -> None:
         super().begin_step(step)
         if step.ctx.replays:
             return
-        if self.queried is not None:
-            _query_segments(self, step, self._segments)
-        if self._keys_sharded and self._queries_sharded:
-            spans = {s.span for s in self._segments}
-            if len(spans) > 1:
-                raise self._no_layout(f"a Ulysses exchange over spans {sorted(spans)}, and mixed lengths need a "
-                                      "permutation in the unpack")
-            self._seq_sizes = sp_seq_split(spans.pop(), self._sp.world_size) if spans else None
+        self.queries.check(self, self._segments, step)
+        self._seq_sizes = self._rows.begin(self._segments, self._sp.world_size if self._ulysses else None)
+
+    def end_step(self, step) -> None:
+        super().end_step(step)
+        self._rows.end()
 
     def check_step(self, step) -> None:
         """Every add is scratch, so a step keeps none and has nothing to refuse as a whole."""
@@ -1271,11 +1476,11 @@ class WithinStepHandle(ArrayHandle):
 
     def query_share(self, segments: Sequence[Segment]) -> tuple[Segment, ...]:
         """The query layout this read's plan sees of ``segments``, the query array's in this step."""
-        return self._share(segments) if self._queries_sharded and not self._keys_sharded else tuple(segments)
+        return self._share(segments) if self._queries_sharded and not self._ulysses else tuple(segments)
 
     def key_share(self, segments: Sequence[Segment]) -> tuple[Segment, ...]:
         """The key layout this read's plan sees of ``segments``, this array's in this step."""
-        return self._share(segments) if self._keys_sharded and not self._queries_sharded else tuple(segments)
+        return self._share(segments) if self._keys_sharded and not self._ulysses else tuple(segments)
 
     def _share(self, segments: Sequence[Segment]) -> tuple[Segment, ...]:
         world_size, rank = self._sp.world_size, self._sp.rank
@@ -1306,7 +1511,7 @@ class WithinStepHandle(ArrayHandle):
             if not self._packed:
                 raise self._refusal("packed queries on a read declared packed=False")
             return self.first_read.run(q, k, v, label=self._plan_label)
-        if self._keys_sharded and self._queries_sharded:
+        if self._ulysses:
             return ulysses_attention(self._sp, q, k, v, self._attend, self._seq_sizes, seq_dim=1, head_dim=2)
         if self._keys_sharded:
             return attention_over_sharded_keys(self._sp, q, k, v, self._attend)
@@ -1315,12 +1520,6 @@ class WithinStepHandle(ArrayHandle):
     def _check_add_read(self, call: str) -> None:
         raise self._refusal(f"{call} with max_len 0, whose read a compiled block traces: a break here takes the read "
                             "out of that graph")
-
-    def _kernel_setting(self, read: str, field: str) -> Any:
-        if not self._binding.kernel_settings:
-            raise self._refusal(f"no {field} for read {read!r}, whose binding {type(self._binding).__name__} takes no "
-                                "kernel settings")
-        return getattr(self.reads[read], field)
 
 
 # Storages
@@ -1336,13 +1535,14 @@ class WalkReads(NamedTuple):
 
 
 class Resolved(NamedTuple):
-    """Arrays resolved into today's resources: each array's specs, its ops' included, by its name, each read's resource
-    key, the array that lays out the queries of each read with ``queries``, and the `WalkReads` of each array whose
-    reads differ by walk."""
+    """Arrays resolved into today's resources: each array's specs, its ops' included, and its ops with the bindings that
+    run them, by its name, the key of the resource each op runs on, how each read within a step or with ``queries``
+    lays out its queries, and the `WalkReads` of each array whose reads differ by walk."""
 
     specs: dict[str, list[NodeResourceSpec]]
+    bound: dict[str, tuple[BoundOp, ...]]
     resource_of: dict[str, str]
-    queried: dict[str, Array]
+    queries: dict[str, Queries]
     walk_reads: Mapping[str, WalkReads] = EMPTY
 
 
@@ -1352,6 +1552,8 @@ class Storage(ABC):
     handle_class: ClassVar[type[ArrayHandle]]
     # the pool sizes `kernel_settings` may set under the array's name, until the engine sizes its pools itself
     kernel_settings: ClassVar[frozenset[str]] = frozenset()
+    # whether an array here may be seq_sharded, so its calls carry a rank's share of a step's tokens
+    takes_seq_sharded: ClassVar[bool] = False
 
     def __init__(self):
         # `state_steps` reaches a handle's storage, for its step builder, through the handle's class
@@ -1367,7 +1569,7 @@ class Storage(ABC):
         sp_group: CommGroup | None,
     ) -> ArrayHandle:
         """``array``'s handle over a node's built ``resources``."""
-        return self.handle_class(array, resources, _positions_key(array), _bindings(self, array, setup.by_read))
+        return self.handle_class(array, resources, resolved.bound[array.name], resolved)
 
     def steps(self, handle: ArrayHandle, declared: ArrayStep, step: SubmoduleStep, steps: dict[str, Any]) -> None:
         """Add the step of the array's own resource, under its name, for ``declared`` in ``step``."""
@@ -1383,7 +1585,7 @@ class Storage(ABC):
         """Today's `LabelLayout` per label, or None where the array's pool takes no layout."""
         return None
 
-    def set_kernel_settings(self, array: Array, spec: NodeResourceSpec | None, settings: Mapping[str, Any]) -> None:
+    def apply(self, spec: NodeResourceSpec, settings: Mapping[str, Any]) -> None:
         """Size the array's pool ``spec`` through its own YAML path, so a value here means what the same key under
         `resources:` means."""
         if settings:
@@ -1399,26 +1601,18 @@ class PagedStorage(Storage):
     kernel_settings = frozenset({"max_num_pages"})
 
     def resolve(self, arrays: Sequence[Array], declared: Sequence[Array], setup: "StateSetup") -> Resolved:
-        resolved = Resolved({}, {}, {})
+        resolved = Resolved({}, {}, {}, {})
         for array in arrays:
-            reads, resource_of = self._read_specs(array, _bindings(self, array, setup.by_read))
-            resolved.specs[array.name] = [self._pool(array, setup.walks), *reads]
-            resolved.resource_of.update(resource_of)
+            bound = resolved.bound[array.name] = _bindings(self, array, setup.by_read)
+            # `_bindings` gives the reads first
+            reads, others = bound[:len(array.reads)], bound[len(array.reads):]
+            specs, resource_of = self._read_specs(array, reads)
+            resolved.specs[array.name] = [self._pool(array, setup.walks), *specs, *_op_specs(array, others)]
+            resolved.resource_of.update(resource_of | _resources_of(array, others))
         return resolved
-
-    def handle(
-        self, array: Array, resources: Mapping[str, Any], setup: "StateSetup", resolved: Resolved,
-        sp_group: CommGroup | None,
-    ) -> ArrayHandle:
-        return self.handle_class(
-            array, resources, _positions_key(array), _bindings(self, array, setup.by_read),
-            resource_of=resolved.resource_of,
-        )
 
     def _pool(self, array: Array, walks: "Walks") -> KVSpec:
         heads, head_dim = _kv_shape(array)
-        if array.seq_sharded:
-            raise _no_layout(array, "seq_sharded takes max_len 0, and a paged pool plans whole segments")
         if not array.reads:
             raise _no_layout(array, "reads is empty, and PagedKVConfig needs num_qo_heads from an Attend read")
         joined = sorted(label for label in array.labels if "+" in label)
@@ -1454,7 +1648,7 @@ class PagedStorage(Storage):
             specs.setdefault(resource_of[key], spec)
         reader: dict[int, str] = {}
         for key, read in array.reads.items():
-            for layer in sorted(read.layers or array.layers):
+            for layer in sorted(read_layers(array, read)):
                 other = reader.setdefault(layer, key)
                 if resource_of[other] != resource_of[key]:
                     raise _no_layout(array, f"reads[{other!r}] and reads[{key!r}] build different specs and both cover "
@@ -1463,9 +1657,9 @@ class PagedStorage(Storage):
 
     def steps(self, handle: ArrayHandle, declared: ArrayStep, step: SubmoduleStep, steps: dict[str, Any]) -> None:
         pre, post, rows = _forks(handle.array, declared)
-        ordered = declared.segments or step.segments
+        ordered = segments_of(declared, step)
         # label-major, so a step over several labels starts and ends on different ones
-        labels = step_labels(ordered) if ordered[0].label != ordered[-1].label else ()
+        labels = step_labels(ordered) if ordered and ordered[0].label != ordered[-1].label else ()
         steps[handle.name] = KVStep(
             segments=declared.segments, commit=declared.keep, pre_forks=pre, post_forks=post, fork_rids=rows,
             sink=declared.placeholders, eager_write=declared.eager_add,
@@ -1503,7 +1697,7 @@ def _walk_reads(array: Array, resource_of: Mapping[str, str], combined: Mapping[
     for walk in (None, *{walk for read in array.reads.values() for walk in read.walks or ()}):
         covering = [key for key, read in array.reads.items() if read.walks is None or walk in read.walks]
         reads[walk] = {resource_of[key]: key for key in covering}
-        covers[walk] = frozenset().union(*(array.reads[key].layers or array.layers for key in covering))
+        covers[walk] = frozenset().union(*(read_layers(array, array.reads[key]) for key in covering))
     for walk, members in combined.items():
         reads[walk] = {
             resource: key for member in sorted(members) for resource, key in reads.get(member, reads[None]).items()
@@ -1525,15 +1719,6 @@ class PagedByWalkStorage(PagedStorage):
             for array in arrays
         })
 
-    def handle(
-        self, array: Array, resources: Mapping[str, Any], setup: "StateSetup", resolved: Resolved,
-        sp_group: CommGroup | None,
-    ) -> ArrayHandle:
-        return PagedByWalkHandle(
-            array, resources, _positions_key(array), _bindings(self, array, setup.by_read),
-            resource_of=resolved.resource_of, walk_reads=resolved.walk_reads[array.name],
-        )
-
 
 class PagedCrossStorage(PagedStorage):
     """An append-only array that keeps entries, read with another array's queries: a cross resource over its pages,
@@ -1551,25 +1736,15 @@ class PagedCrossStorage(PagedStorage):
         resolved = super().resolve(arrays, declared, setup)
         for array in arrays:
             ((key, read),) = array.reads.items()
-            queried = by_name[read.queries]
+            queried = query_array(array, read, by_name)
             if not isinstance(storage_of(queried), PagedStorage):
                 raise _no_layout(array, f"reads[{key!r}] keeps entries and reads the queries of {read.queries!r}, "
                                         "which isn't an append-only array that keeps entries")
-            resolved.queried[key] = queried
+            resolved.queries[key] = CrossQueries(queried)
         return resolved
 
-    def handle(
-        self, array: Array, resources: Mapping[str, Any], setup: "StateSetup", resolved: Resolved,
-        sp_group: CommGroup | None,
-    ) -> ArrayHandle:
-        (key,) = array.reads
-        return PagedCrossHandle(
-            array, resources, _positions_key(array), _bindings(self, array, setup.by_read),
-            queried=resolved.queried[key],
-        )
-
     def steps(self, handle: ArrayHandle, declared: ArrayStep, step: SubmoduleStep, steps: dict[str, Any]) -> None:
-        _queries_step(handle, step)
+        handle.queries.segments(handle, step)
         super().steps(handle, declared, step, steps)
 
 
@@ -1580,39 +1755,36 @@ class ValueStorage(Storage):
     kernel_settings = frozenset({"max_slots"})
 
     def resolve(self, arrays: Sequence[Array], declared: Sequence[Array], setup: "StateSetup") -> Resolved:
-        return Resolved({array.name: self._specs(array, declared) for array in arrays}, {}, {})
+        resolved = Resolved({}, {}, {}, {})
+        for array in arrays:
+            resolved.specs[array.name], resolved.bound[array.name] = self._specs(array, declared)
+            resolved.resource_of.update(_resources_of(array, resolved.bound[array.name]))
+        return resolved
 
-    def _specs(self, array: Array, arrays: Sequence[Array]) -> list[NodeResourceSpec]:
-        if array.reads:
-            raise _no_layout(array, "reads must be empty, since RecurrentStateConfig has no read")
-        if array.seq_sharded:
-            raise _no_layout(array, "seq_sharded takes max_len 0, and a Value's entries stay whole on each rank")
+    def _specs(self, array: Array, arrays: Sequence[Array]) -> tuple[list[NodeResourceSpec], tuple[BoundOp, ...]]:
         bound = _bindings(self, array)
         kv_cache = None
         if bound:
             # the snapshots its update kernels take are keyed by the pages of the one paged array on its nodes
             holders = [
-                other for other in arrays if isinstance(storage_of(other), PagedStorage) and other.nodes & array.nodes
+                other for other in arrays if storage_of(other) in (PAGED, PAGED_BY_WALK) and other.nodes & array.nodes
             ]
             if len(holders) != 1 or not array.nodes <= holders[0].nodes:
                 raise _no_layout(array, f"its nodes must hold one append-only array, the one "
                                         f"RecurrentStateConfig.kv_cache links to, and they hold "
                                         f"{[other.name for other in holders]}")
             kv_cache = holders[0].name
-        layouts = _field_layouts(bound)
+        layouts = _field_layouts(array, bound)
         pool = RecurrentStateSpec(
             resource_key=array.name, nodes=array.nodes,
             config=RecurrentStateConfig(
                 num_layers=len(array.layers),
-                blocks={
-                    field: layouts[field].block(tensor) if field in layouts else _block(tensor)
-                    for field, tensor in array.entry.tensors.items()
-                },
+                blocks={field: layouts[field].block(tensor) for field, tensor in array.entry.tensors.items()},
                 kv_cache=kv_cache,
                 labels=tuple(sorted(array.labels)),
             ),
         )
-        return [pool, *_op_specs(array, bound)]
+        return [pool, *_op_specs(array, bound)], bound
 
     def steps(self, handle: ArrayHandle, declared: ArrayStep, step: SubmoduleStep, steps: dict[str, Any]) -> None:
         pre, post, rows = _forks(handle.array, declared)
@@ -1629,9 +1801,7 @@ class ValueWithHostStorage(ValueStorage):
         self, array: Array, resources: Mapping[str, Any], setup: "StateSetup", resolved: Resolved,
         sp_group: CommGroup | None,
     ) -> ArrayHandle:
-        return ValueWithHostHandle(
-            array, resources, _positions_key(array), _bindings(self, array, setup.by_read), setup.host_fields,
-        )
+        return ValueWithHostHandle(array, resources, resolved.bound[array.name], resolved, setup.host_fields)
 
 
 class HostValueStorage(Storage):
@@ -1640,10 +1810,9 @@ class HostValueStorage(Storage):
     handle_class = HostValueHandle
 
     def resolve(self, arrays: Sequence[Array], declared: Sequence[Array], setup: "StateSetup") -> Resolved:
-        for array in arrays:
-            if array.reads or array.updates:
-                raise _no_layout(array, "a Value of host fields only takes no read or update")
-        return Resolved({array.name: [] for array in arrays}, {}, {})
+        return Resolved(
+            {array.name: [] for array in arrays}, {array.name: _bindings(self, array) for array in arrays}, {}, {},
+        )
 
     def handle(
         self, array: Array, resources: Mapping[str, Any], setup: "StateSetup", resolved: Resolved,
@@ -1656,6 +1825,7 @@ class WithinStepStorage(Storage):
     """An array with ``max_len`` 0, whose adds last only the step, so it has no pool."""
 
     handle_class = WithinStepHandle
+    takes_seq_sharded = True
 
     def step_builder(self) -> StepBuilder:
         return WithinStepSteps()
@@ -1664,28 +1834,26 @@ class WithinStepStorage(Storage):
         """A ragged spec per read, a `RaggedCrossAttentionSpec` for a read with ``queries``. Reads of one kind, on one
         node set and with one config share the spec of the first of them, under its key, so each read is a plan on that
         resource rather than a resource of its own."""
-        sharded_nodes = {node for array in declared if array.seq_sharded for node in array.nodes}
         by_name = {array.name: array for array in declared}
-        resolved = Resolved({}, {}, {})
+        resolved = Resolved({}, {}, {}, {})
         shared: dict[tuple, NodeResourceSpec] = {}
         for array in arrays:
             bound, heads, head_dim, dtype = _within_step_read(array, setup)
+            resolved.bound[array.name] = (bound,)
             key, read = bound.key, bound.declared
-            queried = by_name.get(read.queries, array)
-            if read.queries is not None:
-                if len(queried.labels) != 1:
-                    raise _no_layout(array, f"reads[{key!r}] reads the queries of {read.queries!r}, which has labels "
-                                            f"{sorted(queried.labels)}, and a max_len 0 read plans the queries of one "
-                                            "label")
-                resolved.queried[key] = queried
+            queries = resolved.queries[key] = (OwnQueries if read.queries is None else CrossQueries)(
+                query_array(array, read, by_name),
+            )
+            if len(queries.array.labels) != 1:
+                raise _no_layout(array, f"reads[{key!r}] reads the queries of {read.queries!r}, which has labels "
+                                        f"{sorted(queries.array.labels)}, and a max_len 0 read plans the queries of "
+                                        "one label")
             config = RaggedAttentionConfig(
                 num_qo_heads=read.op.q_heads, num_kv_heads=heads, head_dim=head_dim, dtype=dtype,
-                # the heads narrow by SP only where the exchange runs over them
-                shard_over_sp=not array.nodes & sharded_nodes or (array.seq_sharded and queried.seq_sharded),
+                shard_over_sp=narrows_heads(array, queries.array, declared),
             )
-            spec_class = RaggedAttentionSpec if read.queries is None else RaggedCrossAttentionSpec
-            spec = spec_class(resource_key=key, nodes=array.nodes, config=config)
-            spec = shared.setdefault((spec_class, array.nodes, astuple(config)), spec)
+            spec = queries.spec_class(resource_key=key, nodes=array.nodes, config=config)
+            spec = shared.setdefault((queries.spec_class, array.nodes, astuple(config)), spec)
             resolved.resource_of[key] = spec.resource_key
             resolved.specs[array.name] = [spec] if bound.binding.plans and spec.resource_key == key else []
         return resolved
@@ -1694,11 +1862,7 @@ class WithinStepStorage(Storage):
         self, array: Array, resources: Mapping[str, Any], setup: "StateSetup", resolved: Resolved,
         sp_group: CommGroup | None,
     ) -> ArrayHandle:
-        (key,) = array.reads
-        return WithinStepHandle(
-            array, resources, None, _bindings(self, array, setup.by_read),
-            resource_key=resolved.resource_of.get(key, key), queried=resolved.queried.get(key), sp_group=sp_group,
-        )
+        return WithinStepHandle(array, resources, resolved.bound[array.name], resolved, sp_group=sp_group)
 
 
 PAGED = PagedStorage()
@@ -1727,10 +1891,13 @@ def storage_of(array: Array) -> Storage:
 
 # `Attend` is an `AttentionSpec` on a paged array, a `CrossAttentionSpec` on one read with another array's queries and a
 # `RaggedAttentionSpec` within a step, so a binding is per storage and op type.
-BINDINGS: dict[tuple[Storage, type[Op]], OpBinding] = {
+BINDINGS: dict[tuple[Storage, type[Op | Positions]], OpBinding] = {
     (PAGED, Attend): PagedAttend(),
+    (PAGED, Positions): PositionsBinding(),
     (PAGED_BY_WALK, Attend): PagedAttend(),
+    (PAGED_BY_WALK, Positions): PositionsBinding(),
     (PAGED_CROSS, Attend): PagedCrossAttend(),
+    (PAGED_CROSS, Positions): PositionsBinding(),
     (WITHIN_STEP, Attend): RaggedAttend(),
     (VALUE, GatedDeltaNet): GDN(),
     (VALUE, CausalConv): ConvOnLinearAttn(),
@@ -1761,18 +1928,18 @@ class StateSetup:
 def _bindings(
     storage: Storage, array: Array, chosen: Mapping[str, OpBinding] = EMPTY,
 ) -> tuple[BoundOp, ...]:
-    """``array``'s reads, then its updates, each with the binding that runs it on ``storage``: ``chosen``'s for a read
-    it names, and `BINDINGS`' for the rest. Each binding checks its op. Refuses a pair `BINDINGS` has no entry for, and
-    a second update of one type."""
+    """``array``'s reads, then its updates, then its positions, each with the binding that runs it on ``storage``:
+    ``chosen``'s for a read it names, and `BINDINGS`' for the rest. Each binding checks its op. Refuses a pair
+    `BINDINGS` has no entry for, and a second update of one type."""
     bound = []
     for key, read in array.reads.items():
         binding = BINDINGS.get((storage, type(read.op)))
         if binding is None:
-            raise _no_binding(storage, array, f"reads[{key!r}].op")
+            raise _no_binding(storage, array, f"reads[{key!r}].op", update=False)
         bound.append(BoundOp(key, read, chosen.get(key, binding)))
     unbound = sorted(key for key, op in array.updates.items() if (storage, type(op)) not in BINDINGS)
     if unbound:
-        raise _no_binding(storage, array, f"updates {unbound}")
+        raise _no_binding(storage, array, f"updates {unbound}", update=True)
     by_type: dict[type[Op], str] = {}
     for key, op in array.updates.items():
         other = by_type.setdefault(type(op), key)
@@ -1780,22 +1947,39 @@ def _bindings(
             raise _no_layout(array, f"updates[{other!r}] and updates[{key!r}] are both {type(op).__name__}, and an "
                                     "update call finds its op by type")
         bound.append(BoundOp(key, op, BINDINGS[storage, type(op)]))
+    if array.positions is not None:
+        binding = BINDINGS.get((storage, Positions))
+        if binding is None:
+            raise _no_layout(array, "positions, which only an append-only array that keeps entries holds")
+        bound.append(BoundOp(position_key(array), array.positions, binding))
     for each in bound:
         each.binding.check(array, each.key, each.declared)
     return tuple(bound)
 
 
-def _no_binding(storage: Storage, array: Array, where: str) -> ValueError:
-    kinds = " or ".join(sorted(kind.__name__ for held, kind in BINDINGS if held is storage))
+def _no_binding(storage: Storage, array: Array, where: str, *, update: bool) -> ValueError:
+    """The refusal of ``where``, a read's op or an update ``storage`` has no binding for, naming the ops of that kind it
+    binds: a read's op changes no field, and an update writes one."""
+    kinds = sorted(
+        kind.__name__ for held, kind in BINDINGS
+        if held is storage and kind is not Positions and bool(kind.writes) == update
+    )
+    side = "update" if update else "read"
     if not kinds:
-        return _no_layout(array, f"{where}, and today's resources run no op on this array")
-    return _no_layout(array, f"{where} must be {kinds}, the ops today's resources run on this array")
+        return _no_layout(array, f"{where}: today's resources run no {side} on this array")
+    return _no_layout(array, f"{where} must be {' or '.join(kinds)}, the {side}s today's resources run on this array")
+
+
+def _resources_of(array: Array, bound: Sequence[BoundOp]) -> dict[str, str]:
+    return {each.key: each.binding.resource(array, each.key) for each in bound}
 
 
 def _op_specs(array: Array, bound: Sequence[BoundOp]) -> list[NodeResourceSpec]:
     return [spec for each in bound for spec in each.binding.specs(array, each.key, each.declared)]
 
 
-def _field_layouts(bound: Sequence[BoundOp]) -> dict[str, OpBinding]:
-    """Each field an update writes, with that update's binding, which lays the field out in the pool."""
-    return {field: each.binding for each in bound for field in each.declared.writes}
+def _field_layouts(array: Array, bound: Sequence[BoundOp]) -> dict[str, OpBinding]:
+    """Each of ``array``'s fields with the binding that lays it out in the pool: the update's that writes it, or the
+    base binding's layout as declared."""
+    written = {field: each.binding for each in bound for field in each.declared.writes}
+    return {field: written.get(field, OpBinding()) for field in array.entry.tensors}

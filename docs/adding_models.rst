@@ -787,6 +787,10 @@ only the queries sharded, and a merge of the ranks' partial attentions with only
 A read takes its queries packed, ``(tokens, heads, head_dim)`` over every row. A read whose layers
 pass rows of one length, ``(rows, len, heads, head_dim)``, as a DiT's do, declares
 ``packed=False``, and a packed call to it is refused.
+A read whose request's segments lie end to end in one row, as a DiT's packed rows and their pad
+do, declares ``segmented=True``. It takes ``Block()``, ``packed=False`` and no ``queries``, and it
+runs one request a step. Under sequence parallelism the ranks split each request's whole row by
+``sp_seq_split``, not each segment.
 
 A ``Value`` may hold only host fields, small values a step changes, as
 ``Entry({}, host={"eos_sent": bool})``. Each starts at its type's zero value. ``host(h, request,
@@ -2352,6 +2356,9 @@ predictor's frame-local KV is scratch.
 A model on the contract reads no ``node_resources``, ``engine_inputs.resources``,
 ``request_state`` or ``per_request_states``, and imports the engine only through
 ``mstar.engine.state``; ``test/modular/test_state_lint.py`` holds each ported package to that.
+Qwen3-TTS's ``batch_postprocess`` keeps the opt-in watermark's per-stream state in
+``request_state`` under one named lint exception, until it moves to a watermark node's plain
+Value (the watermark-node issue).
 
 ``ModelInputsFromEngine`` carries six other useful fields:
 
@@ -3701,7 +3708,9 @@ iteration past the schedule. The hooks:
 
     class MyDenoise(DenoiseLoopSubmodule):
         def bucket_key_for(self, fwd_info): ...       # hashable: latent grid, text length, ...
-        def schedule_for(self, walk, num_steps, key): ...  # FlowMatchSchedule (flow_match.py), memoized
+        def schedule_for(self, walk, settings, key): ...  # FlowMatchSchedule (flow_match.py), memoized
+        # optional: what the request sets of its schedule; its step count by default
+        def schedule_settings(self, fwd_info): ...
         def seed_latents(self, key, gen): ...         # [L, C] initial noise, seeded
         def request_inputs(self, fwd_info, inputs, key): ...  # per-row conditioning tensors
         def num_tokens(self, key): ...                # image tokens for the attention step

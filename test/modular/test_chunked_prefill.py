@@ -1043,7 +1043,7 @@ def _tower_with_ladder(tower: str, ladder: list[int], walk: str | None = None):
     and its attention resource sized from the class's own top bucket, as the models
     declare it: the node and its region's runner."""
     from mstar.engine.state import Array, Attend, Block, KVEntry, Read
-    from mstar.engine.state.adapters import build_handle
+    from mstar.engine.state.adapters import StateSetup, _resolve, build_handle
     from mstar.model.components.aut_encoder import AuTEncoderConfig
     from mstar.model.components.aut_submodule import AuTEncoderSubmodule
     from mstar.model.components.block_loop_encoder import VISION_BLOCK_LOOP, PackedBlockLoopEncoder
@@ -1066,7 +1066,8 @@ def _tower_with_ladder(tower: str, ladder: list[int], walk: str | None = None):
         ragged = SimpleNamespace(
             max_segments_per_request=AuTEncoderSubmodule.max_windows_per_replay(config), run=lambda q, k, v, label: q,
         )
-        node.bind_node_state({"audio_tokens": build_handle(tokens, {"audio_attn": ragged})})
+        resolved = _resolve([tokens], StateSetup())
+        node.bind_node_state({"audio_tokens": build_handle(tokens, {"audio_attn": ragged}, resolved)})
         label = "aut_encode"
     named = {"token_ladders": {walk: ladder}} if walk else {"region_ladders": {label: ladder}}
     mgmt = make_mgmt(node, joint_comm_group=SimpleNamespace(world_size=1), **named)

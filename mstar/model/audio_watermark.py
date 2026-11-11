@@ -1,7 +1,6 @@
-"""AudioSeal watermark for generated speech. Qwen3-TTS, the one model that reads its settings, refuses ``enabled`` at
-init, since a captured codec step has nowhere to write the watermark's per-stream state.
+"""Opt-in AudioSeal watermark for generated speech.
 
-Its settings come from a deployment's ``model_kwargs``::
+A deployment turns it on in its YAML ``model_kwargs``::
 
     model_kwargs:
       audio_watermark:
@@ -64,7 +63,7 @@ logger = logging.getLogger(__name__)
 MESSAGE_BITS = 16
 DEFAULT_GENERATOR = "audioseal_wm_streaming"
 DEFAULT_DETECTOR = "audioseal_detector_streaming"
-# the rate the mark is added at
+# the rate the mark is added at: Qwen3-TTS's output, the only codec that adds it
 MARK_SAMPLE_RATE = 24_000
 _INSTALL_HINT = "pip install 'mstar-ai[audioseal]' (or pip install 'audioseal>=0.2,<0.3')"
 

@@ -37,13 +37,22 @@ from mstar.engine.state import (
     Entry,
     GatedDeltaNet,
     KVEntry,
+    Positions,
     Read,
     Sampler,
     TensorType,
     Value,
     Window,
 )
-from mstar.engine.state.adapters import BINDINGS, VALUE, LinearAttnBinding, StateSetup, build_specs, node_resources
+from mstar.engine.state.adapters import (
+    BINDINGS,
+    VALUE,
+    LinearAttnBinding,
+    StateSetup,
+    _resolve,
+    build_specs,
+    node_resources,
+)
 from mstar.engine.state.contract import Mask, Op
 from mstar.model.base import Model, enabled_resources, serving_resources
 from mstar.model.qwen3_5.config import GDN_STATE
@@ -301,7 +310,7 @@ NO_LAYOUT = {
     "a read on a value": ("gdn", lambda: [_kv(), Array(
         "gdn", nodes={"llm"}, layers={0}, entry=_gdn_entry(), max_len=1, rewritable=True,
         reads={"r": Read(mask=Causal())},
-    )], "reads must be empty"),
+    )], "today's resources run no read on this array"),
     "a value of one tensor": (
         "gdn",
         lambda: [_kv(), _gdn(entry=Entry({"state": TensorType((8, 128, 64), dtype=None)}),
@@ -364,6 +373,23 @@ def test_an_op_with_no_binding_on_its_storage_is_refused_as_no_layout_yet():
     refusal = "Array 'gdn': no layout yet: updates ['other'] must be CausalConv or GatedDeltaNet"
     with pytest.raises(ValueError, match=re.escape(refusal)):
         build_specs([_kv(), _gdn(updates={"delta": GatedDeltaNet(), "other": _OtherRecurrence()})])
+
+
+def test_resolve_records_the_resource_every_op_runs_on():
+    resolved = _resolve([_kv(positions=Positions()), _gdn()], StateSetup())
+    assert resolved.resource_of == {"attn": "attn", "rope": "rope", "delta": "delta", "conv": "delta"}, (
+        "an op with no resource here falls back to its own key, and the conv has no resource of its own"
+    )
+
+
+@pytest.mark.parametrize("field, refusal", [
+    ({"seq_sharded": True}, "seq_sharded takes max_len 0"),
+    ({"positions": Positions()}, "positions, which only an append-only array that keeps entries holds"),
+])
+def test_a_host_value_is_refused_what_only_another_storage_holds(field, refusal):
+    flags = replace(Value("flags", nodes={"talker"}, layers={0}, entry=Entry({}, host={"sent": bool})), **field)
+    with pytest.raises(ValueError, match=f"Array 'flags': no layout yet: {refusal}"):
+        build_specs([flags])
 
 
 def test_a_within_step_read_of_another_mask_is_refused_as_no_layout_yet():
@@ -746,7 +772,7 @@ def test_kernel_settings_sizes_a_plain_value_and_yaml_overrides_it():
 
 
 @pytest.mark.parametrize("build, cause", [
-    (lambda: replace(_plain(), reads={"r": Read(mask=Causal())}), "reads must be empty"),
+    (lambda: replace(_plain(), reads={"r": Read(mask=Causal())}), r"reads\['r'\]\.op: today's resources run no read"),
     (lambda: replace(_plain(), seq_sharded=True), "seq_sharded"),
 ])
 def test_a_plain_value_refuses_what_a_pool_cant_hold(build, cause):

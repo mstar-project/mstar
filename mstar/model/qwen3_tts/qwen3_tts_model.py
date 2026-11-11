@@ -68,7 +68,7 @@ from mstar.graph.base import (
     TensorPointerInfo,
 )
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.audio_watermark import AudioWatermarkConfig
+from mstar.model.audio_watermark import AudioSealWatermarker, AudioWatermarkConfig, import_audioseal
 from mstar.model.base import (
     ClientChunk,
     KVLabel,
@@ -457,11 +457,12 @@ class Qwen3TTSModel(Model):
         # bit for bit. bfloat16 is not faster on B300: cuDNN's heuristics run
         # several of its convs on a kernel without tensor cores.
         self.codec_dtype = codec_dtype(kwargs.get("codec_dtype", "float32"))
-        if AudioWatermarkConfig.parse(kwargs.get("audio_watermark")).enabled:
-            raise ValueError(
-                "audio_watermark.enabled: the watermark's per-stream state has no home a captured codec step can "
-                "write yet"
-            )
+        # Server-init knob: opt-in AudioSeal watermark on the codec's output
+        # (``mstar.model.audio_watermark``). Checked here so a missing package
+        # fails the server at startup, not at the first request.
+        self.audio_watermark = AudioWatermarkConfig.parse(kwargs.get("audio_watermark"))
+        if self.audio_watermark.enabled:
+            import_audioseal()
         # Server-init knob: the 1.7B CodePredictor's depth loop as one persistent kernel on Hopper
         # (``mstar.model.qwen3_tts.components.depth_frame``). Its codes can differ from the loop's in the last bits.
         self.depth_kernel = bool(kwargs.get("depth_kernel", False))
@@ -1290,7 +1291,9 @@ class Qwen3TTSModel(Model):
         decoder.eval()
         if self.codec_dtype != torch.float32:
             decoder.to(dtype=self.codec_dtype)
-        return CodecSubmodule(decoder, self.config)
+        watermark = getattr(self, "audio_watermark", AudioWatermarkConfig())
+        watermarker = AudioSealWatermarker.build(watermark, device) if watermark.enabled else None
+        return CodecSubmodule(decoder, self.config, watermarker=watermarker)
 
     def _create_ref_encoder_submodule(
         self, device: str, autocast_dtype: torch.dtype | None = None,

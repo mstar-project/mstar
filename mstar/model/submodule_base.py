@@ -1445,7 +1445,8 @@ class NodeSubmodule(torch.nn.Module, ABC):
         inputs: list[NodeInputs],
         piecewise_runners: Mapping[str, PiecewiseAcceleratorGraphRunner] | None = None,
     ) -> None:
-        """Once per step, for work that batches across the step's requests. Works on
+        """Once per step, for work that batches across the step's requests
+        (e.g. watermarking the audio chunks ``postprocess`` trimmed). Works on
         ``outputs`` in place: its rows on a rows-only step, which has no
         per-request outputs, and otherwise the per-request outputs after
         every request's ``postprocess``, for the requests whose

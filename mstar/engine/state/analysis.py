@@ -2,14 +2,14 @@
 
 import hashlib
 import json
-from collections.abc import Collection, Mapping, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import fields, is_dataclass
 from itertools import product
 from typing import TYPE_CHECKING, get_origin
 
 import torch
 
-from mstar.engine.state.contract import EMPTY, Array, Bidirectional, Block, Sampler, is_value
+from mstar.engine.state.contract import EMPTY, Array, Bidirectional, Block, Read, Sampler, is_value, read_layers
 
 if TYPE_CHECKING:
     from mstar.model.base import Model
@@ -63,8 +63,30 @@ def combined_walks(array: Array, by_node: Mapping[str, Mapping[str, Collection[s
 
 
 def written_by_step(array: Array) -> frozenset[str]:
-    """The fields of a Value's entry that its step writes itself, the ones no update op writes in place."""
+    """The fields of a Value's entry that its step writes itself, the ones no update op writes in place, and none for
+    any other array."""
+    if not is_value(array):
+        return frozenset()
     return frozenset(array.entry.tensors.keys() - {field for op in array.updates.values() for field in op.writes})
+
+
+def query_array(array: Array, read: Read, arrays: Mapping[str, Array]) -> Array:
+    """The array whose segments lay out the queries of ``array``'s ``read``: the one of ``arrays`` its ``queries``
+    names, or else ``array``."""
+    return arrays.get(read.queries, array)
+
+
+def both_sharded(array: Array, queried: Array) -> bool:
+    """Whether a read of ``array``, with ``queried`` laying out its queries, runs a Ulysses exchange under sequence
+    parallelism."""
+    return array.seq_sharded and queried.seq_sharded
+
+
+def narrows_heads(array: Array, queried: Array, arrays: Iterable[Array]) -> bool:
+    """Whether a read within a step of ``array``, with ``queried`` laying out its queries, splits its heads over the SP
+    ranks as well as TP's: where its Ulysses exchange runs over them, and on nodes where none of ``arrays`` is
+    sequence sharded."""
+    return both_sharded(array, queried) or not any(other.seq_sharded and other.nodes & array.nodes for other in arrays)
 
 
 def _name_problems(arrays: Sequence[Array], samplers: Sequence[Sampler]) -> list[str]:
@@ -183,7 +205,7 @@ def _reads_input(graphs: Mapping[str, object], walk: str, node: str, tensor: str
 def _value_problems(arrays: Sequence[Array], kv_labels: Mapping[str, Mapping[str, object]]) -> list[str]:
     """What a Value's entry can't hold yet. A prefix hit restores a Value's snapshot, and a snapshot carries neither its
     host fields nor a field its step writes itself, which no kernel writes mid-prefill."""
-    plain = [array for array in arrays if is_value(array) and written_by_step(array)]
+    plain = [array for array in arrays if written_by_step(array)]
     if not plain and not any(array.entry.host for array in arrays):
         return []
     keyed = {
@@ -234,7 +256,7 @@ def _read_problems(array: Array, walks: Mapping[str, set[str]], combined: set[st
                 problems.append(f"{where}.walks: {walk!r} is not a walk of the model, which has {sorted(walks)}")
             elif walk not in array_walks:
                 problems.append(f"{where}.walks: {walk!r} runs none of the array's nodes {sorted(array.nodes)}")
-        for layer, walk in product(sorted(read.layers or array.layers), sorted(read.walks or array_walks)):
+        for layer, walk in product(sorted(read_layers(array, read)), sorted(read.walks or array_walks)):
             other = reader.setdefault((layer, walk), key)
             if other != key and (other, key) not in clashes:
                 clashes.add((other, key))
@@ -251,7 +273,7 @@ def _combined_walk_problems(array: Array, combined: Mapping[str, Collection[str]
         for layer in sorted(array.layers):
             reads = [
                 (member, key, read.mask) for member in sorted(members) for key, read in array.reads.items()
-                if layer in (read.layers or array.layers) and (read.walks is None or member in read.walks)
+                if layer in read_layers(array, read) and (read.walks is None or member in read.walks)
             ]
             clash = next(((a, b) for a in reads for b in reads if a[2] != b[2]), None)
             if clash is not None:
@@ -269,7 +291,7 @@ def deployment_problems(
     model: "Model", resources: Mapping[str, Mapping[str, object]], *, head_shards: Mapping[str, int] = EMPTY,
 ) -> list[str]:
     """What a deployment asks of the declarations that they can't do: its ``resources:`` block of a sampler, and
-    ``head_shards``, TP times SP per node above SP1, of a read sharded on both sides."""
+    ``head_shards``, TP times SP per node above SP1, of a read within a step that narrows its heads by them."""
     declarations = model.declare_state()
     arrays = {declared.name: declared for declared in declarations if isinstance(declared, Array)}
     problems = [
@@ -286,9 +308,10 @@ def deployment_problems(
                             "itself, where only a field an update op writes takes a stored dtype")
         for key, read in array.reads.items():
             shards = max((head_shards.get(node, 1) for node in array.nodes), default=1)
-            if array.seq_sharded and arrays.get(read.queries, array).seq_sharded and read.op.q_heads % shards:
+            narrows = not array.max_len and narrows_heads(array, query_array(array, read, arrays), arrays.values())
+            if narrows and read.op.q_heads % shards:
                 problems.append(f"Array {array.name!r}.reads[{key!r}]: q_heads {read.op.q_heads} doesn't divide by "
-                                f"{shards}, TP times SP, which a read sharded on both sides narrows its heads by")
+                                f"{shards}, TP times SP, which the read narrows its heads by")
     return problems
 
 

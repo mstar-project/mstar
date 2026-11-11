@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Checks behind the AudioSeal watermark (``mstar/model/audio_watermark.py``).
+"""Checks behind the opt-in AudioSeal watermark (``mstar/model/audio_watermark.py``).
 
 Needs ``pip install -e '.[audioseal,audio]'``; ``quality`` also needs ``pesq``.
 
@@ -24,10 +24,10 @@ int16 difference to another run, e.g. the same command on another commit::
     python -m benchmark.audio_watermark_check stream --wavs off_wav --out marked --captured
 
 ``quality``: from the per-request WAVs ``benchmark.tts_speech_bench
---save-audio-dir`` writes, and a marked directory from ``stream``. The clean
-files are marked here chunk by chunk along the codec's schedule (served greedy
-speech does not repeat across server restarts, so served on/off pairs are not
-the same speech) for SNR, PESQ and
+--save-audio-dir`` writes, one directory served with the watermark off and
+one with it on. The clean files are marked here chunk by chunk along the
+codec's schedule (served greedy speech does not repeat across server
+restarts, so served on/off pairs are not the same speech) for SNR, PESQ and
 streamed-vs-whole; the detector then scores every served file, whole and one
 codec chunk at a time, and whole copies resampled to 16 and 48 kHz::
 
@@ -129,7 +129,8 @@ class _NoResources:
 
 
 def captured_runners(wmk: AudioSealWatermarker, batch_sizes=CAPTURE_BATCH_SIZES) -> dict:
-    """The engine's captures of the codec schedule's lengths (CUDA only)."""
+    """The engine's captures of the codec's watermark lengths, as Qwen3-TTS's
+    ``get_piecewise_accelerator_graph_configs`` declares them (CUDA only)."""
     from mstar.engine.accelerator_graph_backend import get_accelerator_graph_backend
     from mstar.engine.accelerator_graph_runner import PiecewiseAcceleratorGraphRunner
 
@@ -344,7 +345,7 @@ def main() -> None:
             p.add_argument("--compare", default=None, help="marked WAVs of another run to compare against")
         if name == "quality":
             p.add_argument("--clean", required=True, help="WAVs served with the watermark off")
-            p.add_argument("--marked", default=None, help="marked WAVs, as `stream` writes them")
+            p.add_argument("--marked", default=None, help="WAVs served with the watermark on")
             p.add_argument("--threshold", type=float, default=0.5)
     args = ap.parse_args()
     if args.command == "stream" and not args.out:

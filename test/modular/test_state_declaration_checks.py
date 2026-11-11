@@ -652,6 +652,8 @@ _FIELD_CHANGES = {
     "tensor name": _array(entry=Entry({"k": _T, "w": _T}), reads={"r": Read(mask=Causal())}),
     "labels": _array(labels={"main", "cfg"}, reads={"r": _READ}),
     "a block read": _array(max_len=0, reads={"r": Read(mask=Block(), op=_ATTEND)}),
+    "an unpacked block read": _array(max_len=0, reads={"r": Read(mask=Block(), op=_ATTEND, packed=False)}),
+    "a segmented read": _array(max_len=0, reads={"r": Read(mask=Block(), op=_ATTEND, packed=False, segmented=True)}),
     "a cross read": _array(max_len=0, reads={"r": Read(mask=Block(), op=_ATTEND, queries="video")}),
     "seq_sharded": _array(max_len=0, seq_sharded=True, reads={"r": Read(mask=Block(), op=_ATTEND)}),
     "a counter": _array(positions=Positions(), reads={"r": _READ}),
