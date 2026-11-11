@@ -541,6 +541,86 @@ def test_flashinfers_resident_gather_fills_a_real_fa3_paged_wrapper_off_the_tabl
     assert wrapper._seqused.tolist() == (kv_len + SPAN - hide_last).clamp(min=1).tolist()
 
 
+
+def test_a_lagged_fa3_binding_plans_each_pass_and_its_gather_fills_them_off_the_tables():
+    """A lagged binding on FA3 (`AttentionStep.lag`): `_plan_lagged` builds a wrapper a pass over the
+    verify block's KV plan (``plan_span`` the block, ``kv_extent`` the pass's), and the replay's gather
+    fills every pass's page table and lengths off the tables, so the step keeps no host plan. A step
+    whose stream reads keys planned on the host falls back to them."""
+    from mstar.engine.resources.attn.config import AttentionStep
+    from mstar.engine.resources.attn.flashinfer import FlashInferManager
+    from mstar.engine.resources.resident import ResidentStream
+
+    bs = 2
+    node = _Node({1: 5, 2: 9}, max_bs=bs, lag=1)
+    res, planner, layout = node.res, node.planner, node.layout
+    bucket = BucketKey(graph_walk=WALK, bs=bs, num_tokens=bs * SPAN)
+    manager = FlashInferManager.__new__(FlashInferManager)
+    manager._kv_cache_name, manager._cg_plan_states, manager._lagged_cg = "kv", {}, {}
+    manager._verify_wrappers, manager._verify_fa3, manager._window_left = {}, True, -1
+    manager._group, manager._kv_config = SimpleNamespace(page_size=PAGE), res["kv"].config
+    manager._device, manager._dtype = CPU, torch.float32
+
+    rids = (1, 2)
+    lease = SlotLease(slot=0, bucket=bucket)
+    segments = tuple(Segment(r, "main", SPAN) for r in rids)
+    kv, rope = KVStep(segments=segments, lag=node.lag), PositionStep(segments=segments, lag=layout)
+    step = SubmoduleStep(steps={"kv": kv}, segments=list(segments))
+    ctx = StepContext(request_ids=rids, graph_walk=WALK, slot=0, capture=False, slot_lease=lease)
+    ctx.set_padded_rids(rids)
+    assert res["kv"].admit(kv, ctx).ok
+    first = StepContext(request_ids=rids, graph_walk=WALK, slot=0, capture=True, slot_lease=lease)
+    first.plan_results["kv"] = res["kv"].plan(kv, first)
+    res["rope"].plan(rope, first)
+    captured = planner.capture_step(bucket, 0, step)
+    ctx.resident = planner
+    planner.plan(step, ctx)
+    ctx.plan_results["kv"] = res["kv"].plan(kv, ctx)
+    res["rope"].plan(rope, ctx)
+    states = {}
+    manager._plan_lagged(AttentionStep(verify=True, lag=layout), ctx, ctx.plan_results["kv"], states)
+    wrappers = manager._lagged_cg[(bucket, 0)]
+    assert [states[("main", "lag", p)] for p in range(len(layout.passes))] == wrappers
+    assert [(w.span, w.plan_span, w.kv_extent) for w in wrappers] == [
+        (n, SPAN, layout.extent(p)) for p, n in enumerate(layout.passes)]
+    # the host plan: each row's stored length, then through the pass's extent
+    stored = [5, 9]
+    for p, w in enumerate(wrappers):
+        assert w._seqused.tolist() == [n + layout.extent(p) for n in stored]
+    planner.flush(ctx.resident_plan)
+    planner.gather(captured)
+    for w in wrappers:
+        w._seqused.zero_()
+        w._page_table.zero_()
+
+    manager.resident_gather(captured)
+
+    assert captured.reads_tables and not captured.host_planned
+    table = captured.block_tables["kv"]
+    columns = captured.store.view(-1, table.stride)[:, table.col: table.col + table.width]
+    kv_len = captured.buffers.kv_len["kv"]
+    for p, w in enumerate(wrappers):
+        assert w.width == table.width
+        assert w._page_table.tolist() == columns.index_select(0, captured.slots).tolist()
+        assert w._seqused.tolist() == (kv_len + layout.extent(p)).clamp(min=1).tolist()
+
+    captured.reads_tables = False
+    stream = captured.streams["kv"]
+    captured.streams = {**captured.streams, "kv": ResidentStream(stream.label, True, stream.span)}
+    manager.resident_gather(captured)
+    assert captured.host_planned and not captured.reads_tables
+
+
+def test_a_lagged_fa3_pass_attends_past_its_queries_never_past_the_plans_rows():
+    from mstar.engine.resources.attn.fa3_paged import FA3PagedWrapper
+
+    def wrapper(kv_extent):
+        return FA3PagedWrapper(page_size=PAGE, table_width=8, device=CPU, span=1, plan_span=4, kv_extent=kv_extent)
+
+    assert wrapper(4).kv_extent == 4
+    with pytest.raises(ValueError, match="kv_extent 5 outside a plan span of 4"):
+        wrapper(5)
+
 def test_a_lagged_set_writes_one_position_behind_the_device_length():
     """A draft model's layer set lagged one row in passes (`KVStep.lag`, `PositionStep.lag`): under
     random acceptance, each replay's gather puts each pass's writes and positions at the row's true
