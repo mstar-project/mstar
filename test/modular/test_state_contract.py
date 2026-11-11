@@ -19,12 +19,17 @@ import torch
 from mstar.engine.state import (
     Array,
     Attend,
+    Block,
     Causal,
     CausalConv,
     Entry,
+    Fork,
     GatedDeltaNet,
     KVEntry,
+    Positions,
     Read,
+    Rope,
+    Sampler,
     TensorType,
     Value,
     Window,
@@ -100,7 +105,9 @@ REFUSALS = {
         "Array 'kv'.entry.tensors['k'].shape",
     ),
     "negative layer": (lambda: _array(layers={-1}), "Array 'kv'.layers"),
-    "max_len of zero": (lambda: _array(max_len=0), "Array 'kv'.max_len"),
+    "negative max_len": (lambda: _array(max_len=-1), "Array 'kv'.max_len"),
+    "no labels": (lambda: _array(labels=set()), "Array 'kv'.labels"),
+    "sampler with no nodes": (lambda: Sampler("s", nodes=set(), vocab_size=8), "Sampler 's'.nodes"),
     "read layer outside": (lambda: _array(reads={"r": _read(layers={7})}), "Array 'kv'.reads['r'].layers"),
     "attend without v": (
         lambda: _array(entry=Entry({"k": TensorType((4, 8), dtype=None)}), reads={"r": _read()}),
@@ -197,6 +204,9 @@ def test_a_new_op_brings_its_own_check():
     lambda: _array(reads={"local": _read(mask=Window(4), layers={0, 1}), "global": _read(layers={2})}),
     lambda: _value(updates={"conv": CausalConv(), "delta": GatedDeltaNet(qk_l2norm=True)}),
     lambda: Entry({}, host={"eos_sent": bool, "seen": tuple[int, ...], "pair": tuple[int, str]}),
+    lambda: _array(labels={"main", "cfg"}, positions=Positions(rope=Rope(theta=5.0, dtype=torch.bfloat16))),
+    lambda: _array(max_len=0, reads={"r": _read(mask=Block())}),
+    lambda: Sampler("s", nodes={"LLM"}, vocab_size=8, eos_ids=(1, 2), draws=15),
 ])
 def test_a_declaration_hashes_and_equals_one_built_the_same(build):
     assert hash(build()) == hash(build())
@@ -229,6 +239,11 @@ def test_a_declaration_cannot_be_assigned_to():
         array.reads["r"] = _read()
 
 
+def test_an_array_opens_main_unless_it_declares_other_labels():
+    assert _array().labels == {"main"}
+    assert _array(labels=["main", "cfg"]).labels == frozenset({"main", "cfg"})
+
+
 def test_a_value_is_a_rewritable_array_of_one_entry():
     value = _value()
     assert value.rewritable and value.max_len == 1
@@ -248,3 +263,14 @@ def test_kv_entry_is_k_and_v_sharded_on_the_heads():
 
 def test_an_entry_may_hold_only_host_fields():
     assert Entry({}, host={"eos_sent": bool}).tensors == {}, "a Value of host fields has no tensors"
+
+
+def test_a_fork_refuses_a_time_it_doesnt_have():
+    assert Fork(src="main", dst="cfg", at="end").at == "end"
+    with pytest.raises(ValueError, match="Fork.at must be 'start' or 'end', got 'begin'"):
+        Fork(src="main", dst="cfg", at="begin")
+
+
+def test_a_sampler_with_a_list_of_eos_ids_stays_hashable():
+    sampler = Sampler("s", nodes={"LLM"}, vocab_size=8, eos_ids=[1, 2])
+    assert hash(sampler) == hash(Sampler("s", nodes={"LLM"}, vocab_size=8, eos_ids=(1, 2)))

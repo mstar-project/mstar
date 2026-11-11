@@ -67,7 +67,6 @@ from mstar.engine.accelerator_graph_config import (
 )
 from mstar.engine.resources.position.config import PositionStep
 from mstar.engine.resources.sampler.config import SamplerStep
-from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.engine.resources.step import ResourceStep, Segment, SubmoduleStep
 from mstar.model.components.token_step import TokenStepNode
 from mstar.model.keys import MIXED, PREFILL_TEXT, ROPE, SAMPLER
@@ -222,6 +221,38 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
         ``(None, None)``, leaves the position resource to place every token."""
         return None, None
 
+    def node_step(
+        self, segments: list[Segment], prefill_tokens: Mapping[int, torch.Tensor], advance: tuple[int, ...] | None,
+    ) -> SubmoduleStep:
+        """`layer_steps` over ``segments``, with the sampler's step and the position resource's step around it."""
+        return SubmoduleStep(
+            segments=segments,
+            steps={
+                **self.layer_steps(),
+                SAMPLER: SamplerStep(
+                    apply_penalty=True,
+                    prefill_tracked_tokens=prefill_tokens,
+                ),
+                self.POS_KEY: PositionStep(advance=advance),
+            },
+        )
+
+    def next_position(self, rid_handle: int) -> int:
+        """The position resource's counter for the request at worker handle ``rid_handle``."""
+        return self.node_resources[self.POS_KEY].position(rid=rid_handle, label="main")
+
+    def loopback_tokens(self, engine_inputs: ModelInputsFromEngine) -> torch.Tensor:
+        """Each row's last sampled token, read off the sampler resource's slots."""
+        return engine_inputs.resources[SAMPLER].loopback_tokens(engine_inputs.request_ids)
+
+    def last_token_hidden(self, engine_inputs: ModelInputsFromEngine, hidden: torch.Tensor) -> torch.Tensor:
+        """``hidden`` at each row's last token, picked by the plan of the attention resource under ``ATTN_KEY``."""
+        return engine_inputs.resources[self.ATTN_KEY].select_last_hidden(hidden)
+
+    def sample_tokens(self, engine_inputs: ModelInputsFromEngine, logits: torch.Tensor) -> torch.Tensor:
+        """One token per row of ``logits``, drawn by the sampler resource."""
+        return engine_inputs.resources[SAMPLER].sample(engine_inputs.request_ids, logits=logits)
+
     def decoder_kwargs(
         self, graph_walk: str, engine_inputs: ModelInputsFromEngine,
         num_tokens: int, **tensors: torch.Tensor,
@@ -374,7 +405,7 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
             embeds = torch.cat(pieces) if pieces else None
         media = {} if embeds is None else {MEDIA_EMBEDS: embeds, MEDIA_MASK: mask}
         # the stream's counter is keyed by the worker's handle (AGENTS.md invariant 14)
-        start = self.node_resources[self.POS_KEY].position(rid=fwd_info.rid_handle, label="main")
+        start = self.next_position(fwd_info.rid_handle)
         pos_ids, advance = self.prompt_positions(start, layout, ids.shape[0])
         if pos_ids is not None:
             pos_ids = to_device_nonblocking(pos_ids, self.get_device())
@@ -505,10 +536,9 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
         if self._has_loopback_rows(inputs):
             # every row's last sampled token, read by slot (padding rows read
             # slot 0); a row whose last step ran elsewhere brought its own
-            sampler: SamplerResource = engine_inputs.resources[SAMPLER]
             t0 = perf_counter() if PHASE_PERIOD else 0.0
             laps = PhaseLaps("engine.preprocess.loopback.")
-            ids = sampler.loopback_tokens(engine_inputs.request_ids)
+            ids = self.loopback_tokens(engine_inputs)
             laps.lap("tokens")
             decode = graph_walk == self.DECODE_WALK
             if not decode or any(inp.input_ids is not None and inp.input_seq_len for inp in inputs):
@@ -583,19 +613,13 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
                 int(inp.resource_step_info) if places_own(inp) else int(inp.input_seq_len) for inp in inputs
             )
 
-        return SubmoduleStep(
-            segments=[
+        return self.node_step(
+            [
                 Segment(request_id=rid, label="main", span=inp.input_seq_len)
                 for rid, inp in zip(request_ids, inputs, strict=True)
             ],
-            steps={
-                **self.layer_steps(),
-                SAMPLER: SamplerStep(
-                    apply_penalty=True,
-                    prefill_tracked_tokens=prefill_tokens,
-                ),
-                self.POS_KEY: PositionStep(advance=advance),
-            },
+            prefill_tokens,
+            advance,
         )
 
     # ------------------------------------------------------------------
@@ -613,9 +637,8 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
         assert all(isinstance(t, torch.Tensor) for t in tensors.values()), (
             f"preprocess outputs the forward reads must be tensors: {sorted(tensors)}"
         )
-        sampler: SamplerResource = engine_inputs.resources[SAMPLER]
         if input_ids is None:
-            input_ids = sampler.loopback_tokens(engine_inputs.request_ids)
+            input_ids = self.loopback_tokens(engine_inputs)
         media, mask = tensors.pop(MEDIA_EMBEDS, None), tensors.pop(MEDIA_MASK, None)
         decoder_kwargs = self.decoder_kwargs(graph_walk, engine_inputs, input_ids.shape[0], **tensors)
         embeds = self.model.embed(input_ids)
@@ -625,8 +648,8 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
         hidden = self.model(embeds, label="main", **decoder_kwargs)
         if graph_walk != self.DECODE_WALK:
             # only the last token of each prefill row feeds the head
-            hidden = engine_inputs.resources[self.ATTN_KEY].select_last_hidden(hidden)
-        return sampler.sample(engine_inputs.request_ids, logits=self.model.logits(hidden))
+            hidden = self.last_token_hidden(engine_inputs, hidden)
+        return self.sample_tokens(engine_inputs, self.model.logits(hidden))
 
     def forward(
         self,

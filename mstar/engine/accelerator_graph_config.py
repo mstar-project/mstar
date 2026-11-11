@@ -8,6 +8,7 @@ from typing import Any, Callable
 import torch
 
 from mstar.engine.resources import AttentionStep, Segment, SubmoduleStep
+from mstar.engine.state.contract import ArrayStep
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs
 from mstar.model.utils import capture_ladder
 
@@ -628,28 +629,32 @@ class PiecewisePackedConfig(PiecewiseAcceleratorGraphConfig):
     # non-causal "main" segment per row on it; a `one_row_per_step` region's
     # lengths are all segments of its one row.
     attn_key: str | None = None
+    # The same for a node on the state contract: the declared array, whose reads the region runs.
+    array: str | None = None
 
     def __post_init__(self):
         super().__post_init__()
         if self.attn_key is not None and self.declare_step is not None:
             raise ValueError("attn_key declares the region's step; leave declare_step None")
+        if self.array is not None and (self.attn_key is not None or self.declare_step is not None):
+            raise ValueError("array declares the region's step; leave attn_key and declare_step None")
 
     def region_step(
         self, request_ids: list[str], seq_lens: list[int],
         label_seq_lens: dict[str, list[int]] | None = None,
     ) -> SubmoduleStep | None:
-        if self.attn_key is None:
+        if self.attn_key is None and self.array is None:
             return super().region_step(request_ids, seq_lens, label_seq_lens)
         if self.one_row_per_step:
             (rid,) = request_ids
             request_ids = [rid] * len(seq_lens)
-        return SubmoduleStep(
-            segments=[
-                Segment(request_id=rid, label="main", span=n)
-                for rid, n in zip(request_ids, seq_lens, strict=True)
-            ],
-            steps={self.attn_key: AttentionStep(causal=False)},
-        )
+        segments = [
+            Segment(request_id=rid, label="main", span=n)
+            for rid, n in zip(request_ids, seq_lens, strict=True)
+        ]
+        if self.array is not None:
+            return SubmoduleStep(segments=segments, state={self.array: ArrayStep()})
+        return SubmoduleStep(segments=segments, steps={self.attn_key: AttentionStep(causal=False)})
 
     def get_config_type(self) -> PiecewiseConfigType:
         return PiecewiseConfigType.PACKED

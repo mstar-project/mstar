@@ -1,3 +1,4 @@
+import enum
 import functools
 import itertools
 import math
@@ -25,7 +26,7 @@ from mstar.distributed.base import (
     node_group_axis_sizes,
 )
 from mstar.engine.resources import NodeResourceSpec, ResourceReqConfig
-from mstar.engine.resources.kv.config import RetentionPolicy, SpanKind
+from mstar.engine.resources.kv.config import RetentionPolicy, Span, SpanKind
 from mstar.engine.resources.lora.config import LORA_ADAPTER_KWARG, LORA_DIGEST_KWARG
 from mstar.engine.resources.sampler.utils import SamplingConfig
 from mstar.graph.base import (
@@ -142,7 +143,7 @@ if TYPE_CHECKING:
     from mstar.model.components.moe_parallel import MoeParallelConfig
 
 if TYPE_CHECKING:
-    from mstar.engine.state import Array
+    from mstar.engine.state import Array, Sampler, SampleSettings
     from mstar.worker.scheduling_policy import WalkPriority
 
 DECODE = "decode"
@@ -164,15 +165,30 @@ class RobotIO(NamedTuple):
     action_dim: int
 
 
+class KeepAdapter(enum.Enum):
+    """``ProcessPromptOutput.lora_adapter`` left unset."""
+    KEEP = "keep"
+
+
+# the request runs on the adapter its client named, or on the base model
+KEEP_ADAPTER = KeepAdapter.KEEP
+
+
 class ProcessPromptOutput(NamedTuple):
     """Tensors from `process_prompt`, and metadata to carry beside them.
 
     The data worker folds ``metadata`` into the request's ``model_kwargs``, so
     what a model settles while tokenizing reaches
     `get_request_resource_configs` without a field of its own on the request.
+
+    ``lora_adapter`` is the LoRA adapter the model runs this prompt on, one of
+    ``Model.prompt_lora_adapters``, or None for the base model; the data worker
+    gives the request what the API server gives a client that names it
+    (``ServedModels.model_chose``). Unset keeps the client's choice.
     """
     new_input_tensors: NameToTensorList
     metadata: dict
+    lora_adapter: str | None | KeepAdapter = KEEP_ADAPTER
 
 
 class ClientChunk(NamedTuple):
@@ -187,32 +203,6 @@ class ClientChunk(NamedTuple):
     # this append's model_kwargs, and the opening message's
     model_kwargs: dict
     request_kwargs: dict
-
-
-class Span(NamedTuple):
-    """One write to a KV stream. A layout lists them in the order the walks write.
-
-    Each span is one step's row, unless a span sets ``opens_step`` False: the step of
-    the span before it then writes it too, in the same row, as text around an attachment is.
-    That span is of the same walk, since a step runs one.
-
-    ``length`` is how many KV slots the write fills, and ``advance`` is how far
-    it moves the position counter, which is the length for text. ``source`` is
-    the tensor whose next entry an ids span keys, or the file of a digest span
-    as ``(modality, index)``. ``params`` are the preprocessing arguments that
-    change the tensors made from the file. A ``rows`` span writes KV made from
-    anything else, such as another node's outputs, and is never keyed.
-    ``scratch`` is the most a non-committing step writes before the span
-    commits into those slots, as a denoised window does.
-    """
-    kind: SpanKind
-    walk: str
-    length: int
-    advance: int
-    source: str | tuple[str, int]
-    params: tuple = ()
-    scratch: int = 0
-    opens_step: bool = True
 
 
 class LabelLayout(NamedTuple):
@@ -787,7 +777,6 @@ class Model(ABC):
             for node in graph.get_nodes()
         })
 
-    @abstractmethod
     def get_node_resources(self) -> list[NodeResourceSpec]:
         """Declare the resources the engine builds, and which nodes share each.
 
@@ -797,9 +786,9 @@ class Model(ABC):
         An opt-in spec (per-request LoRA adapters) is declared here too, and built
         only for a deployment whose ``resources:`` block names it.
         """
-        pass
+        return []
 
-    def declare_state(self) -> "list[Array]":
+    def declare_state(self) -> "list[Array | Sampler]":
         """The state the model keeps between steps, from which the engine builds the specs for it.
 
         A pure function of the model's config and the deployment's settings, since each process calls it.
@@ -807,7 +796,8 @@ class Model(ABC):
         return []
 
     def kernel_settings(self) -> dict[str, dict[str, Any]]:
-        """``splits`` and ``decode_fmha`` by read or update key, until the engine picks kernels itself."""
+        """``splits``, ``decode_fmha`` and a within-step read's ``max_segments_per_step`` and ``compile_op``, by read or
+        update key, until the engine picks kernels itself."""
         return {}
 
     def checkpoint_path(self) -> str | None:
@@ -880,7 +870,7 @@ class Model(ABC):
         """The paged KV labels the model's walks write, by resource and label.
 
         `process_prompt` returns a `LabelLayout` for each under ``kv_layout``, as
-        ``{resource: {label: LabelLayout}}``. A label with keys opts its node into
+        ``{resource: {label: LabelLayout}}``, or a `Layout` under ``state_layout``. A label with keys opts its node into
         cross-request prefix reuse: the preprocess worker keys its layout's keyed
         spans and the KV resource matches what it already holds. With no keyed
         label the model is uncached whatever the deployment asks for.
@@ -892,7 +882,7 @@ class Model(ABC):
         input_modalities: list[str],
         output_modalities: list[str],
         model_kwargs: dict,
-    ) -> dict[str, ResourceReqConfig]:
+    ) -> "dict[str, ResourceReqConfig | SampleSettings]":
         """Per-resource config a new request is opened with, by resource label.
 
         Where a request's knobs live now: sampling params, whether it needs
@@ -1067,10 +1057,17 @@ class Model(ABC):
     def prompt_tokens(self, tensors: NameToTensorList, kv_layout: dict[str, dict[str, LabelLayout]]) -> int:
         """A response's ``usage.prompt_tokens``: the positions the prompt fills,
         attachments included, as OpenAI and vLLM count them. ``tensors`` and
-        ``kv_layout`` are what `process_prompt` returned. By default the ids in
+        ``kv_layout`` are what `process_prompt` returned, with a ``state_layout``
+        converted to a ``kv_layout``. By default the ids in
         ``text_inputs``, which hold each attachment's pads in place; a model
         that splits ``text_inputs`` around its attachments adds theirs."""
         return sum(ids.numel() for ids in tensors.get("text_inputs", ()))
+
+    def prompt_lora_adapters(self) -> frozenset[str]:
+        """The LoRA adapters ``process_prompt`` may run a prompt on
+        (``ProcessPromptOutput.lora_adapter``). The API server refuses, at startup, a
+        deployment whose ``resources: lora: adapters:`` block does not serve them all."""
+        return frozenset()
 
     def max_input_files(self) -> dict[str, int]:
         """Most files of each input modality one request may attach, e.g.
