@@ -26,6 +26,7 @@ from mstar.engine.resources.draft.drafter import (
     DrafterNeeds,
     DraftInputs,
     ObserveInputs,
+    TargetOutput,
     VerifyNode,
     drafter_resources,
     mixed_rows,
@@ -271,7 +272,11 @@ class ToyLM(ARNodeSubmodule):
             )
             return self.verify_output(result)
         n = len(rids)
-        result = self.draft_verify_step(engine_inputs, ids.view(n), lambda block: self._target(engine_inputs, block))
+        def target(block):
+            out = self._target(engine_inputs, block)
+            return out if isinstance(out, TargetOutput) else TargetOutput(out)
+
+        result = self.draft_verify_step(engine_inputs, ids.view(n), target)
         return self.verify_output(result)
 
 
