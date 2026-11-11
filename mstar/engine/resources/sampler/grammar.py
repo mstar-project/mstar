@@ -246,9 +246,10 @@ class GrammarRows:
         self._batch = xgr.BatchGrammarMatcher(max_threads=max(1, cpus // 2))
         self._device = device
         self._rows: dict[Any, _Row] = {}
-        # (rows, host tokens, event) per committed step not yet accepted, oldest first.
-        # Rows, not handles: a request removed meanwhile leaves its row here, and its
-        # last draw never reaches the next request given its handle.
+        # (rows, their indices in the step, the step's whole row of draws on the host, the
+        # event its copy waits on) per committed step not yet accepted, oldest first. Rows,
+        # not handles: a request removed meanwhile leaves its row here, and its last draw
+        # never reaches the next request given its handle.
         self._pending: list[tuple[list[_Row], list[int], torch.Tensor, Any]] = []
         self._shifts = torch.arange(32, dtype=torch.int32, device=device)
 
