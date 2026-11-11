@@ -10,7 +10,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Tuple
 
 sys.path.insert(0, ".")
@@ -21,12 +21,16 @@ import torch
 from mstar.engine.state import (
     Array,
     Attend,
+    Block,
     Causal,
     CausalConv,
     Entry,
     GatedDeltaNet,
     KVEntry,
+    Positions,
     Read,
+    Rope,
+    Sampler,
     TensorType,
     Value,
     Window,
@@ -41,9 +45,13 @@ _ATTEND = Attend(q_heads=8)
 class _StubModel:
     """Serves declarations and walks without building anything."""
 
-    def __init__(self, *arrays, combined=None):
+    def __init__(self, *arrays, combined=None, kv_labels=None):
         self.arrays = list(arrays)
         self.combined = combined or {}
+        self.labels = kv_labels or {}
+
+    def kv_labels(self):
+        return self.labels
 
     def declare_state(self):
         return self.arrays
@@ -107,6 +115,20 @@ def test_two_arrays_may_not_share_a_name():
     assert _one_problem(_array(), _array()).startswith("Array 'kv'.name: the name 'kv'")
 
 
+def test_two_arrays_may_not_derive_one_positions_key():
+    problem = _one_problem(
+        _array(positions=Positions()), _array("mem", reads={"other": _read()}, positions=Positions()),
+    )
+    assert problem == "Array 'mem'.positions: the name 'rope' is declared twice, also by Array 'kv'.positions"
+
+
+def test_a_positions_key_may_not_equal_another_declared_name():
+    problem = _one_problem(_array("thinker_kv", reads={"thinker_pos": _read()}, positions=Positions()))
+    assert problem == (
+        "Array 'thinker_kv'.positions: the name 'thinker_pos' is declared twice, also by Array 'thinker_kv'.reads"
+    )
+
+
 def test_a_read_may_not_reuse_an_array_name():
     problem = _one_problem(_array(), _array("other", reads={"kv": _read()}))
     assert problem.startswith("Array 'other'.reads: the name 'kv'")
@@ -165,6 +187,79 @@ def test_two_reads_may_share_a_layer_on_different_walks():
 
 def test_a_layer_with_no_read_is_allowed():
     assert state_declaration_problems(_StubModel(_array(reads={"r": _read(layers={0})}))) == []
+
+
+def _gdn_entry() -> Entry:
+    return Entry({"state": TensorType((4, 8, 8), dtype=torch.float32), "conv": TensorType((32, 3), dtype=None)})
+
+
+def test_a_sampler_may_not_reuse_a_declared_name():
+    problem = _one_problem(_array(reads={"r": _read()}), Sampler("r", nodes={"LLM"}, vocab_size=8))
+    assert problem.startswith("Sampler 'r'.name") and "declared twice" in problem
+
+
+def test_a_block_read_needs_max_len_zero():
+    problem = _one_problem(_array(reads={"r": _read(mask=Block())}))
+    assert problem.startswith("Array 'kv'.reads['r'].mask") and "Block needs max_len 0" in problem
+
+
+def test_every_read_of_an_array_with_max_len_zero_is_a_block_read():
+    problem = _one_problem(_array(max_len=0, reads={"r": _read()}))
+    assert problem.startswith("Array 'kv'.reads['r'].mask") and "is Causal" in problem
+
+
+def test_a_block_read_on_max_len_zero_has_no_problem():
+    assert state_declaration_problems(_StubModel(_array(max_len=0, reads={"r": _read(mask=Block())}))) == []
+
+
+@pytest.mark.parametrize("array", [
+    Value("kv", nodes={"LLM"}, layers={0}, entry=_gdn_entry()),
+    Array("kv", nodes={"LLM"}, layers={0}, entry=KVEntry(heads=4, head_dim=8), max_len=0),
+])
+def test_positions_sit_only_on_an_append_only_array_that_keeps_entries(array):
+    with_positions = replace(array, positions=Positions())
+    problem = _one_problem(with_positions)
+    assert problem.startswith("Array 'kv'.positions") and "append-only" in problem
+
+
+@pytest.mark.parametrize("rope", [
+    Rope(low_freq_factor=1.0),
+    Rope(low_freq_factor=1.0, high_freq_factor=1.0),
+    Rope(old_context_len=8192),
+])
+def test_a_rope_sets_all_three_llama_fields_or_none(rope):
+    problem = _one_problem(_array(positions=Positions(rope=rope)))
+    assert problem.startswith("Array 'kv'.positions.rope") and "all set or all None" in problem
+
+
+@pytest.mark.parametrize("positions", [
+    Positions(),
+    Positions(rope=Rope()),
+    Positions(rope=Rope(low_freq_factor=1.0, high_freq_factor=4.0, old_context_len=8192)),
+])
+def test_a_good_rope_has_no_problem(positions):
+    assert state_declaration_problems(_StubModel(_array(positions=positions))) == []
+
+
+def test_kv_labels_may_name_only_declared_labels():
+    problem = _one_problem(_array(), kv_labels={"kv": {"main": None, "cfg": None}})
+    assert problem.startswith("kv_labels()['kv']['cfg']") and "Array 'kv'.labels" in problem
+
+
+def test_kv_labels_may_name_only_declared_arrays():
+    problem = _one_problem(_array(), kv_labels={"other": {"main": None}})
+    assert problem.startswith("kv_labels()['other']") and "no declared array" in problem
+
+
+def test_a_sampler_node_must_be_in_the_model():
+    problem = _one_problem(Sampler("s", nodes={"talker"}, vocab_size=8))
+    assert problem.startswith("Sampler 's'.nodes") and "'talker' is not a node" in problem
+
+
+@pytest.mark.parametrize("field, value", [("vocab_size", 0), ("draws", 0)])
+def test_a_sampler_field_must_be_at_least_one(field, value):
+    problem = _one_problem(Sampler("s", **{"nodes": {"LLM"}, "vocab_size": 8, field: value}))
+    assert problem.startswith(f"Sampler 's'.{field}") and "at least 1" in problem
 
 
 def test_every_problem_is_reported():
@@ -257,6 +352,18 @@ _FIELD_CHANGES = {
     "host field": _array(entry=Entry({"k": _T, "v": _T}, host={"done": bool}), reads={"r": _READ}),
     "host type": _array(entry=Entry({"k": _T, "v": _T}, host={"done": tuple[bool, ...]}), reads={"r": _READ}),
     "typing host type": _array(entry=Entry({"k": _T, "v": _T}, host={"done": Tuple[int, ...]}), reads={"r": _READ}),
+    "labels": _array(labels={"main", "cfg"}, reads={"r": _READ}),
+    "a block read": _array(max_len=0, reads={"r": Read(mask=Block(), op=_ATTEND)}),
+    "a counter": _array(positions=Positions(), reads={"r": _READ}),
+    "a rope": _array(positions=Positions(rope=Rope()), reads={"r": _READ}),
+    **{
+        f"rope {field}": _array(positions=Positions(rope=Rope(**{field: value})), reads={"r": _READ})
+        for field, value in (
+            ("theta", 5.0), ("rotary_dim", 8), ("interleave", True), ("scale", 2.0), ("low_freq_factor", 1.0),
+            ("high_freq_factor", 4.0), ("old_context_len", 8192), ("dtype", torch.bfloat16),
+            ("table_dtype", torch.float32),
+        )
+    },
 }
 
 
@@ -265,6 +372,18 @@ def test_every_field_change_moves_the_digest():
     digests = {name: declaration_digest([array]) for name, array in _FIELD_CHANGES.items()}
     assert all(digest != base for digest in digests.values()), [n for n, d in digests.items() if d == base]
     assert len(set(digests.values())) == len(digests), "two changes landed on one digest"
+
+
+def _sampler(**overrides) -> Sampler:
+    return Sampler("s", **{"nodes": {"LLM"}, "vocab_size": 8, **overrides})
+
+
+@pytest.mark.parametrize("changed", [
+    _sampler(nodes={"vision"}), _sampler(vocab_size=9), _sampler(penalty=False), _sampler(min_p=True),
+    _sampler(eos_ids=(1,)), _sampler(draws=2),
+])
+def test_a_sampler_field_change_moves_the_digest(changed):
+    assert declaration_digest([_sampler()]) != declaration_digest([changed])
 
 
 @pytest.mark.parametrize("first, second", [

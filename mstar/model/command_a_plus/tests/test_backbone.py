@@ -1,6 +1,6 @@
 """CPU backbone checks using in-memory resource doubles and dense reference math.
 
-These exercise real projections, MoE dispatch and AttentionCallable plumbing;
+These exercise real projections, MoE dispatch and the state handles' calls;
 they do not substitute for FlashInfer or Hugging Face end-to-end parity.
 """
 
@@ -9,12 +9,16 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 import torch.nn.functional as F
 
 from mstar.distributed.communication import CommGroup
-from mstar.engine.state.adapters import node_resources
+from mstar.engine.resources.step import Segment, StepContext, SubmoduleStep
+from mstar.engine.state import ArrayStep
+from mstar.engine.state.adapters import node_handles, node_resources
+from mstar.model.command_a_plus.command_a_plus_model import CommandAPlusModel
 from mstar.model.command_a_plus.components.language_model import (
     CommandAPlusAttention,
     CommandAPlusLanguageModel,
@@ -35,22 +39,20 @@ class MemoryKV:
         self.cache = {}
         self.writes = []
 
-    def set_default_label(self, label):
-        self.default_label = label
+    def layer_view(self, layer_idx):
+        # the attention double holds the entries itself, so no read goes through this view
+        return torch.empty(0)
 
-    def set_default_layer_idx(self, index):
-        self.layer_idx = index
+    def opens_label(self, rid, label):
+        return True
 
-    def write_kv(self, k, v):
-        key = (self.default_label, self.layer_idx)
+    def write_kv(self, k, v, layer_idx, label):
+        key = (label, layer_idx)
         self.writes.append(key)
         if key in self.cache:
             old_k, old_v = self.cache[key]
             k, v = torch.cat([old_k, k]), torch.cat([old_v, v])
         self.cache[key] = (k, v)
-
-    def layer_view(self):
-        return self.cache[self.default_label, self.layer_idx]
 
 
 class TorchAttention:
@@ -61,16 +63,9 @@ class TorchAttention:
         self.window = window
         self.calls = []
 
-    def set_default_label(self, label):
-        self.label = label
-
-    def set_default_layer_idx(self, index):
-        self.layer_idx = index
-
-    def run(self, q, *, kv_cache_layer, k, v):
-        assert (self.label, self.layer_idx) == (self.kv.default_label, self.kv.layer_idx)
-        self.calls.append((self.label, self.layer_idx))
-        return attend_last(q, *kv_cache_layer, self.window)
+    def run(self, q, *, label, kv_cache_layer, k, v, layer_idx):
+        self.calls.append((label, layer_idx))
+        return attend_last(q, *self.kv.cache[label, layer_idx], self.window)
 
 
 def attend_last(q, k, v, window=None):
@@ -97,15 +92,9 @@ class PagedTorchAttention:
     def __init__(self, window=None, group=0):
         self.window, self.group, self.plans = window, group, None
 
-    def set_default_label(self, label):
-        self.label = label
-
-    def set_default_layer_idx(self, index):
-        pass
-
-    def run(self, q, *, kv_cache_layer, k, v):
+    def run(self, q, *, label, kv_cache_layer, k, v, layer_idx):
         plans = self.plans.groups[self.group]
-        (view,) = plans[self.label].views
+        (view,) = plans[label].views
         slots = torch.arange(view.start, view.start + view.length)
         page_size = kv_cache_layer.shape[2]
         kept = kv_cache_layer[torch.tensor(view.page_idxs)[slots // page_size], :, slots % page_size]
@@ -113,18 +102,18 @@ class PagedTorchAttention:
 
 
 class TorchPositions:
-    def __init__(self):
+    def __init__(self, rope_theta):
+        self.rope_theta = rope_theta
         self.positions = {}
         self.calls = []
 
-    def apply_qk(self, q, k, *, label, rotary_dim, interleave,
-                 rope_theta, rope_scale, rope_dtype):
+    def apply_qk(self, q, k, *, label, rope_dtype):
         # Signature deliberately rejects accidental Llama scaling arguments.
-        assert interleave and rotary_dim == q.shape[-1] and rope_scale == 1.0
         assert rope_dtype == q.dtype
         self.calls.append(label)
+        rotary_dim = q.shape[-1]
         angles = self.positions[label].float()[:, None] * (
-            rope_theta ** (-torch.arange(0, rotary_dim, 2).float() / rotary_dim)
+            self.rope_theta ** (-torch.arange(0, rotary_dim, 2).float() / rotary_dim)
         )
         phase = torch.polar(torch.ones_like(angles), angles)[:, None, :]
 
@@ -135,13 +124,29 @@ class TorchPositions:
         return rotate(q), rotate(k)
 
 
-def bind_test_resources(model, config):
-    kv, pos = MemoryKV(), TorchPositions()
-    local, global_ = TorchAttention(kv, config.sliding_window), TorchAttention(kv)
-    resources = {KV_CACHE: kv, ROPE: pos, LOCAL_ATTN: local, GLOBAL_ATTN: global_}
+def bind_test_state(model, config, resources, labels=("main",)):
+    """Bind ``model``'s attention layers to a handle over ``resources``, as the engine does at load."""
+    model_stub = SimpleNamespace(config=config, max_seq_len=config.max_position_embeddings, sampling_defaults={})
+    array = replace(CommandAPlusModel.declare_state(model_stub)[0], labels=labels)
+    handles = node_handles(SimpleNamespace(declare_state=lambda: [array]), "LLM", resources)
     for module in model.modules():
         if isinstance(module, CommandAPlusAttention):
-            module.bind_resources(resources)
+            module.bind_state(handles)
+
+
+def begin_test_step(model, tokens, label="main", rid="r"):
+    """What the engine does for ``model``'s handle, ahead of a step of ``tokens``."""
+    handle = next(module.state for module in model.modules() if isinstance(module, CommandAPlusAttention))
+    step = SubmoduleStep(segments=[Segment(rid, label, tokens)], state={handle.name: ArrayStep()})
+    step.set_ctx(StepContext((rid,), "walk", 0, False))
+    handle.end_step(step)
+    handle.begin_step(step)
+
+
+def bind_test_resources(model, config, labels=("main",)):
+    kv, pos = MemoryKV(), TorchPositions(config.rope_theta)
+    local, global_ = TorchAttention(kv, config.sliding_window), TorchAttention(kv)
+    bind_test_state(model, config, {KV_CACHE: kv, ROPE: pos, LOCAL_ATTN: local, GLOBAL_ATTN: global_}, labels)
     return kv, pos, local, global_
 
 
@@ -219,7 +224,8 @@ class BackboneTests(unittest.TestCase):
         with torch.inference_mode():
             for start, stop in [(0, 5), (5, 6), (6, 7), (7, 8), (8, 9)]:
                 pos.positions["main"] = torch.arange(start, stop)
-                actual = model(model.embed_tokens(token_ids[start:stop]), label="main")
+                begin_test_step(model, stop - start)
+                actual = model(model.embed_tokens(token_ids[start:stop]))
                 expected = dense_reference(model, token_ids[:stop], self.config)[start:stop]
                 torch.testing.assert_close(actual, expected, atol=2e-5, rtol=2e-5)
         self.assertEqual(kv.writes, [("main", i) for _ in range(5) for i in range(4)])
@@ -236,8 +242,6 @@ class BackboneTests(unittest.TestCase):
         from mstar.engine.resources.kv.manager import KVManager
         from mstar.engine.resources.kv.transfer import TransferEngineInfo
         from mstar.engine.resources.spec import apply_yaml_overrides
-        from mstar.engine.resources.step import Segment, StepContext
-        from mstar.model.command_a_plus.command_a_plus_model import CommandAPlusModel
 
         with tempfile.TemporaryDirectory() as directory:
             shutil.copyfile(FIXTURE, Path(directory) / "config.json")
@@ -249,12 +253,9 @@ class BackboneTests(unittest.TestCase):
         kv = KVManager(cfg=cfg, name=KV_CACHE, joint_comm_group=None,
                        transfer_engine_info=TransferEngineInfo("h", "h", LocalTransferEngine("h")),
                        device=torch.device("cpu"), dtype=torch.float32)
-        model, pos = self.make_model(), TorchPositions()
+        model, pos = self.make_model(), TorchPositions(self.config.rope_theta)
         local, global_ = PagedTorchAttention(self.config.sliding_window, group=1), PagedTorchAttention()
-        resources = {KV_CACHE: kv, ROPE: pos, LOCAL_ATTN: local, GLOBAL_ATTN: global_}
-        for module in model.modules():
-            if isinstance(module, CommandAPlusAttention):
-                module.bind_resources(resources)
+        bind_test_state(model, self.config, {KV_CACHE: kv, ROPE: pos, LOCAL_ATTN: local, GLOBAL_ATTN: global_})
         token_ids = torch.randint(4, 128, (40,), generator=torch.Generator().manual_seed(5))
         kv.ingest_request("r")
         with torch.inference_mode():
@@ -263,7 +264,8 @@ class BackboneTests(unittest.TestCase):
                 self.assertTrue(kv.admit(step, ctx).ok)
                 local.plans = global_.plans = kv.plan(step, ctx)
                 pos.positions["main"] = torch.arange(start, stop)
-                actual = model(model.embed_tokens(token_ids[start:stop]), label="main")
+                begin_test_step(model, stop - start)
+                actual = model(model.embed_tokens(token_ids[start:stop]))
                 kv.commit(step, ctx)
                 expected = dense_reference(model, token_ids[:stop], self.config)[start:stop]
                 torch.testing.assert_close(actual, expected, atol=2e-5, rtol=2e-5)
@@ -276,18 +278,20 @@ class BackboneTests(unittest.TestCase):
 
     def test_bf16_cached_execution_and_label_switching(self):
         model = self.make_model(torch.bfloat16)
-        kv, pos, _, _ = bind_test_resources(model, self.config)
         sequences = {"first": torch.tensor([2, 4, 9, 12, 17, 19]),
                      "second": torch.tensor([3, 5, 11, 21, 25, 29])}
+        kv, pos, _, _ = bind_test_resources(model, self.config, labels=sequences)
         with torch.inference_mode():
             for start, stop in [(0, 5), (5, 6)]:
                 for label, tokens in sequences.items():
                     pos.positions[label] = torch.arange(start, stop)
-                    actual = model(model.embed_tokens(tokens[start:stop]), label=label)
+                    begin_test_step(model, stop - start, label)
+                    actual = model(model.embed_tokens(tokens[start:stop]))
                     full = self.make_model(torch.bfloat16)
-                    _, full_pos, _, _ = bind_test_resources(full, self.config)
+                    _, full_pos, _, _ = bind_test_resources(full, self.config, labels=sequences)
                     full_pos.positions[label] = torch.arange(stop)
-                    expected = full(full.embed_tokens(tokens[:stop]), label=label)[start:stop]
+                    begin_test_step(full, stop, label)
+                    expected = full(full.embed_tokens(tokens[:stop]))[start:stop]
                     self.assertEqual(actual.dtype, torch.bfloat16)
                     torch.testing.assert_close(actual, expected, atol=0.02, rtol=0.02)
         self.assertEqual(len(kv.cache), 8)

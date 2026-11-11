@@ -58,6 +58,7 @@ DEFAULT_CONFIGS: dict[str, str] = {
     "qwen3_asr": "qwen3_asr.yaml",
     "qwen3_asr_realtime": "qwen3_asr_realtime.yaml",
     "higgs_audio": "higgs_audio.yaml",
+    "phi4mm": "phi4mm.yaml",
     "omnilingual_asr_ctc_300m": "omnilingual_asr_ctc_300m.yaml",
     "omnilingual_asr_ctc_1b": "omnilingual_asr_ctc_1b.yaml",
     "omnilingual_asr_ctc_3b": "omnilingual_asr_ctc_3b.yaml",
@@ -221,11 +222,11 @@ def _next_steps(model: str, host: str, port: int, api_key_set: bool = False) -> 
     if model in ("bagel", "qwen3_omni", "orpheus", "kokoro", "cosmos3", "cosmos3_super",
                  "whisper_large", "whisper_large_v3_turbo", "higgs_audio", "qwen3_asr", "qwen3_asr_realtime",
                  "flux2_klein", "flux2_klein_9b", "z_image_turbo", "ltx2_5", "minimax_h3",
-                 "muse_glimmer", "ripple_65b"):
+                 "muse_glimmer", "ripple_65b", "phi4mm"):
         lines += ["", "  OpenAI-compatible:",
                   "    from openai import OpenAI",
                   f"    oai = OpenAI(base_url=\"{base}/v1\", api_key=\"{oai_key}\")"]
-        if model in ("bagel", "qwen3_omni", "muse_glimmer", "ripple_65b"):
+        if model in ("bagel", "qwen3_omni", "muse_glimmer", "ripple_65b", "phi4mm"):
             lines.append(f"    oai.chat.completions.create(model=\"{model}\", "
                          "messages=[{\"role\":\"user\",\"content\":\"hi\"}])")
         if model in ("orpheus", "qwen3_omni", "kokoro"):

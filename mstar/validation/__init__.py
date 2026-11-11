@@ -12,7 +12,7 @@ from typing import Any, NamedTuple
 
 from mstar.distributed.base import ShardingConfig
 from mstar.engine.resources.lora.serving import refuse_unresolved_lora_adapters
-from mstar.engine.state.analysis import state_declaration_problems
+from mstar.engine.state.analysis import deployment_problems, state_declaration_problems
 from mstar.model.base import Model, WorkerGraph, built_resources, enabled_resources, parse_autocast_dtype
 from mstar.model.multimodal import SUPPORTED_MODALITIES
 from mstar.validation.client_streams import check_client_streams
@@ -148,6 +148,8 @@ def validate_deployment(
         else:
             # a `resources:` block check_resources refuses turns no resource on
             specs = enabled_resources(model, config if resources_readable else {**config, "resources": None})
+            if resources_readable:
+                problems += deployment_problems(model, config.get("resources") or {})
     except (ValueError, OSError) as e:
         problems.append(
             f"declaring the node resources failed: {type(e).__name__}: {e}; "

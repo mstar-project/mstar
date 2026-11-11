@@ -10,7 +10,7 @@ import torch
 from torch import nn
 
 from mstar.model.components.qwen3_vit import VisionBlock, VisionPatchEmbed, VisionRotaryEmbedding
-from mstar.model.qwen3_5.config import VISION_ATTN, Qwen3_5VisionConfig
+from mstar.model.qwen3_5.config import VISION_ATTN, VISION_TOKENS, Qwen3_5VisionConfig
 
 
 class VisionPatchMerger(nn.Module):
@@ -45,7 +45,7 @@ class Qwen3_5VisionModel(nn.Module):
         )
         self.rotary_pos_emb = VisionRotaryEmbedding(config)
         self.blocks = nn.ModuleList(
-            VisionBlock(config, VISION_ATTN) for _ in range(config.depth)
+            VisionBlock(config, VISION_ATTN, array=VISION_TOKENS, layer=layer) for layer in range(config.depth)
         )
         self.merger = VisionPatchMerger(config)
 
