@@ -2028,29 +2028,23 @@ implementation on H100 and GH200 GPUs:
   on a live server; a 20-minute mixed-load soak kept
   GPU memory flat.
 - The LM's generate step runs from CUDA graphs captured at batch sizes up to
-  ``max_batch_size`` (conditioning frames run eagerly). On one H100 over HTTP
-  (``benchmark.runner``, closed loop, a 17.7 s clip, ``max_batch_size`` 32;
-  medians of three rounds in one container, a fresh server per run), M*
-  delivered 3.9 seconds of audio per second at one request, 11.4 at four and
-  30 at 32. With the graphs off it delivered 1.7, 5.8 and 23; with the graphs
-  off and the depformer running all 16 steps, 1.3, 4.2 and 19. At one
-  request, all 90 greedy responses across the three were byte-identical.
-  The eager step is bound by CPU overhead
-  (``benchmark/worker_phases``), so speed also varies between hosts: another
-  H100 run gave 3.4 seconds of audio per second at one request and 25 at 32.
-  Streaming the audio costs an estimated 0 to 8% of throughput, more at higher
-  concurrency. In streamed playback (the whole clip uploaded at
-  once, not live input; a 320 ms client buffer), 8 concurrent requests played
-  without underruns; at 16, 17 of 48 requests had at least one.
-- Goodput, on one GH200 with N simultaneous streamed requests of a 17.7 s clip and
-  ``max_batch_size`` N: every request stayed under 10 ms of total stall up to 8
-  requests (11.5 seconds of audio per second); from 16 requests none did. Throughput
-  levelled off at 18 to 22 seconds of audio per second from 32 to 128 requests. Time
-  to first audio was 2.8 s at one request and 30 s at 128, since conditioning runs
-  before the first frame, so no request met a 200 ms limit. On an 18 s clip, one wave
-  per N, setup (upload, Mimi encode, conditioning and the first generated frame) took
-  2.6, 4.3 and 9.1 s at 1, 8 and 32 requests, and the first audio came 63, 190 and
-  511 ms after it.
+  ``max_batch_size`` (conditioning frames run eagerly). On one GH200 with N
+  simultaneous streamed requests of a 17.7 s clip and ``max_batch_size`` N,
+  three waves per N, M* delivered 3.6 seconds of audio per second at one
+  request, 21 at 8, 53 at 32 and 93 at 128. Every request stayed under 10 ms
+  of total stall up to 32 requests; at 128, 372 of 384 did, and the worst
+  stalled 2.1 s. Time to first audio was 2.5 s at one request and 16 s at
+  128, since conditioning runs before the first frame, so no request met a
+  200 ms limit. On an 18 s clip, one wave per N, setup (upload, Mimi encode,
+  conditioning and the first generated frame) took 2.4, 3.4 and 5.8 s at 1,
+  8 and 32 requests, and the first audio came 53, 145 and 174 ms after it.
+- In an Nsight Systems profile of one wave of 32 requests, the GPU was busy
+  for 32% of the wave. About 272,000 kernels per wave are launched eagerly,
+  outside the captured graphs. The numbers above were measured with async
+  scheduling off. The LM now runs with it on: in an A/B on one GH200 (four rounds each,
+  alternated), that gave about 5% more throughput at 1, 8 and 32 requests
+  and earlier first audio after setup, with byte-identical greedy output at
+  batch 1; setup took 0.3 to 0.5 s longer at 8 and 32 requests.
 - Audio is checked by transcription and by ear. Whisper transcripts of M*'s
   and NVIDIA's responses matched on an English clip (word error rate 0) and
   differed on a second clip, after their tokens diverge. Listening to matched

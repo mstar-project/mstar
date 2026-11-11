@@ -138,7 +138,8 @@ class PersonaPlexModel(Model):
 
     def _request_kv_pages(self, page_size: int) -> int:
         """Pages one request can hold: one KV entry per temporal forward, at most
-        ``MAX_TEMPORAL_FORWARDS`` (async scheduling is off, so no overshoot step)."""
+        ``MAX_TEMPORAL_FORWARDS``: each loop's cap is its frame count (``get_loop_caps``), and
+        ``prepare_inputs`` declines any step past it."""
         return -(-cfg.MAX_TEMPORAL_FORWARDS // page_size)
 
     def validate_config_yaml(self, config: dict, config_path: str) -> None:
@@ -182,7 +183,6 @@ class PersonaPlexModel(Model):
         return GraphNode(
             name=cfg.LM_NODE, input_names=inputs,
             outputs=[GraphEdge(next_node=cfg.LM_NODE, name=name) for name in LM_LOOP_BACKS[walk]],
-            enable_async_scheduling=False,
         )
 
     def _generate_walk(self, with_text: bool) -> GraphSection:

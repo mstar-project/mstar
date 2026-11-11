@@ -76,13 +76,13 @@ def _signals(n_emb=4, n_text=9, samples=1920 * 20 + 7):
 # --------------------------------------------------------------------------- walks and schedule
 
 
-def test_walks_instantiate_with_one_lm_per_walk_and_async_off():
+def test_walks_instantiate_with_one_lm_per_walk_and_async_only_on_the_lm():
     walks = _model().get_graph_walk_graphs()
     assert set(walks) == {cfg.ENCODE_USER_AUDIO_WALK, *LM_WALKS, cfg.CODEC_WALK}
     assert set(walks[cfg.ENCODE_USER_AUDIO_WALK].get_nodes()) == {"MimiEncoder"}
     for walk in LM_WALKS:
         assert set(walks[walk].get_nodes()) == {"LM"}
-        assert walks[walk].get_nodes()["LM"].enable_async_scheduling is False
+        assert walks[walk].get_nodes()["LM"].enable_async_scheduling is True
     decoder = walks[cfg.CODEC_WALK]
     assert set(decoder.get_nodes()) == {"MimiDecoder"}
     # The decoder updates its per-request context in the forward, so no step is prepared ahead.
