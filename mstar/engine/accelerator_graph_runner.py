@@ -34,6 +34,8 @@ from mstar.engine.node_dtype import node_scope
 from mstar.engine.resources import BucketKey, CGSlotSpec, Resource, SlotLease, StepContext, StepRunner
 from mstar.engine.resources.resident import ResidentPlanner
 from mstar.engine.resources.step import PIECEWISE_WALK, lean_subsets
+from mstar.engine.state.adapters import state_steps
+from mstar.engine.state.contract import EMPTY
 from mstar.model.submodule_base import (
     BatchedModelOutput,
     ModelInputsFromEngine,
@@ -1343,7 +1345,7 @@ class AcceleratorGraphRunner:
             slot_lease=lease, per_request_info=engine_inputs.per_request_info,
         )
         if step is not None:
-            step = replace(step, _ctx=StepContext(
+            step.set_ctx(StepContext(
                 request_ids=tuple(dummy_rids),
                 graph_walk=walk,
                 slot=spec.slot,
@@ -1364,11 +1366,17 @@ class AcceleratorGraphRunner:
                         f"capture admit failed for {spec.bucket}: {outcome.reason}"
                     )
                 self._step_runner.plan(step)
-            return self._submodule.preprocess(
-                graph_walk=walk,
-                engine_inputs=engine_inputs,
-                inputs=dummy_inputs,
-            )
+            try:
+                if step is not None:
+                    step.begin_calls()
+                return self._submodule.preprocess(
+                    graph_walk=walk,
+                    engine_inputs=engine_inputs,
+                    inputs=dummy_inputs,
+                )
+            finally:
+                if step is not None:
+                    step.end_calls()
 
         try:
             static_inputs = prepare()
@@ -1399,11 +1407,19 @@ class AcceleratorGraphRunner:
             def run_forward():
                 if resident is not None:
                     planner.gather(resident)
-                out = forward(
-                    graph_walk=walk,
-                    engine_inputs=engine_inputs,
-                    **static_inputs,
-                )
+                try:
+                    if step is not None:
+                        step.begin_calls()
+                    out = forward(
+                        graph_walk=walk,
+                        engine_inputs=engine_inputs,
+                        **static_inputs,
+                    )
+                    if step is not None:
+                        step.check_calls()
+                finally:
+                    if step is not None:
+                        step.end_calls()
                 if resident is not None:
                     planner.commit_in_graph(resident)
                 return out
@@ -2017,12 +2033,14 @@ class PiecewiseAcceleratorGraphRunner:
         device_capability: DeviceCapability | None = None,
         capture_stream: Any = None,
         segment_keys: tuple[str, ...] = (),
+        state_handles: Mapping[str, Any] = EMPTY,
     ):
         self._label = label
         self._capture_stream = capture_stream
         self._config = config
         # the node's resources whose step is its segments (`_region_step`)
         self._segment_keys = segment_keys
+        self._state_handles = state_handles
         self._resources = resources
         # A `one_row_per_step` region replays every row as its first request's, so it
         # runs the node's lean resources lean (`_bucket`) and leases only a step whose
@@ -2382,7 +2400,16 @@ class PiecewiseAcceleratorGraphRunner:
             )
 
         def run_fn():
-            return self._normalize_output(fn(call))
+            try:
+                if step is not None:
+                    step.begin_calls()
+                out = self._normalize_output(fn(call))
+                if step is not None:
+                    step.check_calls()
+            finally:
+                if step is not None:
+                    step.end_calls()
+            return out
 
         try:
             self._plan(step, shape)
@@ -2473,11 +2500,13 @@ class PiecewiseAcceleratorGraphRunner:
         label_seq_lens: dict[str, list[int]] | None = None,
     ):
         """The config's step for the region, with a step of its own segments under each of
-        the node's resources that takes them (``with_segment_steps``)."""
-        return with_segment_steps(
+        the node's resources that takes them (``with_segment_steps``), and what it declares
+        about its state expanded (``state_steps``)."""
+        step = with_segment_steps(
             self._config.region_step(list(request_ids), list(seq_lens), label_seq_lens),
             self._segment_keys,
         )
+        return state_steps(step, self._state_handles)
 
     def _plan(self, step, shape: PiecewiseCaptureShape) -> None:
         if step is None:

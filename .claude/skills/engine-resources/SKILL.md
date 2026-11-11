@@ -7,6 +7,10 @@ description: Pitfalls when writing or changing an engine Resource under mstar/en
 
 A resource's `plan` writes device buffers that a captured graph later reads, while the async worker is already planning the next step. Mistakes here rarely raise; they make a replay read the wrong layout, or read out of bounds several frames away from the cause. Read `Resource` in [mstar/engine/resources/base.py](../../../mstar/engine/resources/base.py) and an existing manager (`kv/manager.py`, `attn/flashinfer.py`) before starting, and the [async-worker skill](../async-worker/SKILL.md) for what is in flight when `plan` runs.
 
+## Declared state and the table below
+
+A model declares the state it keeps between steps in `declare_state` and any other resource in `get_node_resources` (AGENTS.md invariant 1). For declared state, the engine builds the resources in `mstar/engine/state/adapters.py`, whose `BINDINGS` lists the reads and updates it can build today, so a model on the contract doesn't name the specs below for its state. Read this skill to write or change a resource, or to add a binding to that layer.
+
 ## Which resource for which state
 
 Entries marked *open PR* are not on `main` yet. Check the checkout; if your port needs one, stack on that PR or say in the description which resource you used instead.
