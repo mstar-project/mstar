@@ -49,6 +49,8 @@ ROUTES = {
     "videos": ("/v1/videos/generations", {"prompt": "a cat"}),
     # a JSON body carries no upload: a served route refuses it with a 400, not a 404
     "transcriptions": ("/v1/audio/transcriptions", {"model": "m"}),
+    "messages": ("/v1/messages", {"model": "m", "max_tokens": 8, "messages": [{"role": "user", "content": "hi"}]}),
+    "responses": ("/v1/responses", {"model": "m", "input": "hi"}),
 }
 # Surfaces the Python adapter serves and mstar-server does not yet (#742).
 NOT_PORTED: set[tuple[str, str]] = set()

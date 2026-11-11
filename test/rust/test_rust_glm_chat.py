@@ -225,6 +225,102 @@ class _GlmStub(_StubAPIServer):
         super().abort_submission(key)
 
 
+class _CountingModel:
+    """``process_prompt`` as count_tokens calls it: a "prompt" whose length is
+    that of its arguments written out, the template's messages and tools in
+    their order, so two frontends count alike only for the same arguments."""
+
+    def process_prompt(self, text, input_modalities, output_modalities, prompt_parts=None, **model_kwargs):
+        from types import SimpleNamespace
+
+        parts = [asdict(p) for p in prompt_parts or []]
+        kwargs = {k: model_kwargs[k] for k in sorted(model_kwargs)}
+        n = len(json.dumps([text, input_modalities, output_modalities, parts, kwargs], ensure_ascii=False))
+        return {"text_inputs": [SimpleNamespace(numel=lambda: n)]}
+
+
+# what differs per request, per frontend: ids, timestamps, a call's id
+BLANKED = {"id", "created", "created_at", "item_id", "call_id"}
+
+
+def _blank(obj):
+    if isinstance(obj, dict):
+        return {k: ("*" if k in BLANKED else _blank(v)) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_blank(v) for v in obj]
+    return obj
+
+
+def _answer(status, data: bytes, stream: bool):
+    """The body with ids blanked; a stream as its (event, data) pairs."""
+    if not stream or status != 200:
+        return status, _blank(json.loads(data))
+    events = []
+    for block in data.decode().split("\n\n"):
+        fields = {}
+        for line in block.splitlines():
+            if line and not line.startswith(":"):
+                name, _, value = line.partition(":")
+                fields[name] = value[1:] if value.startswith(" ") else value
+        if "data" in fields:
+            events.append([fields.get("event"), _blank(json.loads(fields["data"]))])
+    return status, events
+
+
+def _submission(text, input_modalities, output_modalities, model_kwargs, prompt_parts):
+    """What a submit carried, the template's messages and tools also as text,
+    which keeps their key order."""
+    mk = model_kwargs or {}
+    return {"text": text, "in": list(input_modalities), "out": list(output_modalities), "mk": mk,
+            "parts": [asdict(p) for p in prompt_parts or []],
+            "ordered": [json.dumps(mk.get("messages")), json.dumps(mk.get("tools"))]}
+
+
+def _rust_answer(port, stub, path, body, stream=False, headers=None):
+    """mstar-server's answer, the outcomes the bridge stopped the request with,
+    and what it submitted."""
+    import time
+    import urllib.error
+    import urllib.request
+
+    stub.outcomes, before = {}, len(stub.submitted)
+    data = body if isinstance(body, bytes) else json.dumps(body).encode()
+    req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", data=data,
+                                 headers={"Content-Type": "application/json", **(headers or {})})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            status, raw = r.status, r.read()
+    except urllib.error.HTTPError as e:
+        status, raw = e.code, e.read()
+    submitted = None
+    if len(stub.submitted) > before:
+        sub = stub.submitted[-1]
+        deadline = time.time() + 15
+        while sub["rid"] not in stub.finished and time.time() < deadline:
+            time.sleep(0.01)
+        submitted = _submission(sub["text"], sub["in"], sub["out"], sub["mk"], sub["parts"])
+    return _answer(status, raw, stream), sorted(stub.outcomes.values()), submitted
+
+
+def _translated_alike(answer, submitted, want, model, tmp_path):
+    """mstar-server's answer to a request another API translates onto chat,
+    held to ``want``: the chat Python translated it into, as written out from
+    the Python routes, submitted as the live ``GlmChatAdapter`` builds it or
+    refused as it refuses; or the refusal's text."""
+    status, body = answer
+    if isinstance(want, dict):
+        try:
+            args = ADAPTER_REGISTRY[model].chat_to_request(_python_request(want), tmp_path)
+        except ValueError as e:
+            want = str(e)
+        else:
+            assert status == 200, body
+            mk, parts = args.model_kwargs, args.prompt_parts
+            assert submitted == _submission(args.text, args.input_modalities, args.output_modalities, mk, parts)
+            return
+    assert (status, body["error"]["message"], submitted) == (400, want, None)
+
+
 TIME_CALL = "<tool_call>get_time</tool_call>"
 UNOFFERED = "ok</think><tool_call>rm_rf<arg_key>path</arg_key><arg_value>/</arg_value></tool_call>"
 # name: (model, request fields, the model's reply, its finish reason, whether the frontend ends it)
@@ -280,6 +376,11 @@ def _rust_reply(port, stub, body, stream):
     return _normalized(status, data, stream), sorted(stub.outcomes.values())
 
 
+def _collapsed(names):
+    """Event names with each run of one name as one."""
+    return [n for i, n in enumerate(names) if i == 0 or names[i - 1] != n]
+
+
 def _folded(answer):
     """What a client makes of an answer in any chunking: a stream joined into
     its reply, and no usage, whose token counts follow the chunks."""
@@ -288,21 +389,37 @@ def _folded(answer):
         return answer
     if isinstance(body, dict):
         return status, {k: v for k, v in body.items() if k != "usage"}
-    reply = {"reasoning_content": "", "content": "", "tool_calls": [], "finish_reason": None, "tail": []}
-    for event in body:
-        if event == "[DONE]" or "error" in event:
-            reply["tail"].append(event)
-            continue
-        for choice in event["choices"]:
-            delta = choice["delta"]
-            for key in ("reasoning_content", "content"):
-                reply[key] += delta.get(key) or ""
-            for call in delta.get("tool_calls", []):
-                if "id" in call:
-                    reply["tool_calls"].append({"name": call["function"]["name"], "arguments": ""})
-                reply["tool_calls"][call["index"]]["arguments"] += call["function"]["arguments"]
-            reply["finish_reason"] = choice["finish_reason"] or reply["finish_reason"]
-    return status, reply
+    if body and isinstance(body[0], dict | str):  # chat: data lines
+        reply = {"reasoning_content": "", "content": "", "tool_calls": [], "finish_reason": None, "tail": []}
+        for event in body:
+            if event == "[DONE]" or "error" in event:
+                reply["tail"].append(event)
+                continue
+            for choice in event["choices"]:
+                delta = choice["delta"]
+                for key in ("reasoning_content", "content"):
+                    reply[key] += delta.get(key) or ""
+                for call in delta.get("tool_calls", []):
+                    if "id" in call:
+                        reply["tool_calls"].append({"name": call["function"]["name"], "arguments": ""})
+                    reply["tool_calls"][call["index"]]["arguments"] += call["function"]["arguments"]
+                reply["finish_reason"] = choice["finish_reason"] or reply["finish_reason"]
+        return status, reply
+    names = _collapsed([name for name, _ in body])
+    final = [data["response"] for _, data in body if "response" in data]
+    if final:  # responses: the last response object holds every item whole
+        return status, (names, {k: v for k, v in final[-1].items() if k != "usage"})
+    blocks, stop = {}, None  # messages
+    for name, data in body:
+        if name == "content_block_start":
+            blocks[data["index"]] = dict(data["content_block"])
+        elif name == "content_block_delta":
+            for key, value in data["delta"].items():
+                if key != "type":
+                    blocks[data["index"]][key] = blocks[data["index"]].get(key, "") + value
+        elif name in ("message_delta", "error"):
+            stop = data.get("delta", data)
+    return status, (names, blocks, stop)
 
 
 @pytest.mark.parametrize("case", sorted(REPLY_CASES))
