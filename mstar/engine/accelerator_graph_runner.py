@@ -1720,11 +1720,16 @@ class AcceleratorGraphRunner:
         its stop buffers gain a column per iteration. The graph replays,
         copying every loop-back signal's output into the static input it feeds
         before each replay, and each column out on the stream before the next
-        replay overwrites it. A walk that can't repeat returns ``out`` as it is."""
+        replay overwrites it. A walk that can't repeat returns ``out`` as it is
+        for one iteration, and refuses more: every resource would commit them."""
         slot = self.slot_for(lease)
         walk = lease.bucket.graph_walk
         carries = self._repeat_carries.get(walk)
         if carries is None:
+            if repeats > 1:
+                raise ValueError(
+                    f"a step of {walk!r} asks for {repeats} iterations, but the walk never accepted repeats"
+                )
             return out
         profiler.phase_record(f"repeats.{walk}#", repeats)
         if repeats == 1:

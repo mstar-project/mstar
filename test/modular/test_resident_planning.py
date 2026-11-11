@@ -299,6 +299,12 @@ def test_a_repeat_feeds_each_replay_the_last_one_s_token_and_keeps_a_column_per_
     assert wide["new_token"].tolist() == [[5, 6, 7], [7, 8, 9]]
     assert wide["text_inputs"] is wide["new_token"]
 
+    # a walk that never accepted repeats can't run several: every resource would commit them
+    runner._repeat_carries = {}
+    assert runner.repeat(lease, outputs, 1) is outputs
+    with pytest.raises(ValueError, match="never accepted repeats"):
+        runner.repeat(lease, outputs, 3)
+
 
 @pytest.mark.parametrize(("in_chain", "fresh", "same_node", "room", "want"), [
     (1, 0, True, 100, 8),
@@ -1761,6 +1767,7 @@ class _Fmha:
 
     plans_in_graph = True
     supports_gather_resident = False
+    supports_repeats = True
 
     def __init__(self):
         self.calls = []
@@ -2246,3 +2253,16 @@ def test_a_cross_attention_without_a_query_pool_plans_on_the_host():
     step = SimpleNamespace(streams={}, host_planned=False, bucket=None, slot=0, lengths_only=set())
     manager.resident_gather(step)
     assert step.host_planned and not step.lengths_only
+
+
+def test_a_walk_repeats_only_if_every_captured_wrapper_says_it_sees_each_replays_lengths():
+    from mstar.engine.resources.attn.wrappers import FlashInferPrefillWrapper
+
+    fmha = _fmha_manager("kv", _Fmha())
+    fmha._repeat_walks = {}
+    ctx = SimpleNamespace(graph_walk=WALK)
+    assert fmha.max_repeats(None, ctx) > 1
+    # a prefill wrapper's host plan fixes the lengths its replays see
+    prefill = _fmha_manager("kv", FlashInferPrefillWrapper.__new__(FlashInferPrefillWrapper))
+    prefill._repeat_walks = {}
+    assert prefill.max_repeats(None, ctx) == 1
