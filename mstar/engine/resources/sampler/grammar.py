@@ -304,16 +304,20 @@ class GrammarRows:
             for row, i in zip(rows, index, strict=True):
                 row.accept(drawn[i])
 
-    def fill(self, rids, failed: bool = False) -> torch.Tensor:
-        """The host bitmask for a step's rows: all ones for a free row, and only
-        the stop ids for a failed one, or with ``failed``, for every grammar row."""
+    def stop_masks(self, rids) -> torch.Tensor:
+        """The host bitmask for a step's rows whose fill failed: all ones for a
+        free row, and only the stop ids for every grammar row."""
         mask = torch.full((len(rids), self.words), -1, dtype=torch.int32)
-        if failed:
-            if self._stops is not None:
-                for i, rid in enumerate(rids):
-                    if rid in self._rows:
-                        mask[i] = self._stops
-            return mask
+        if self._stops is not None:
+            for i, rid in enumerate(rids):
+                if rid in self._rows:
+                    mask[i] = self._stops
+        return mask
+
+    def fill(self, rids) -> torch.Tensor:
+        """The host bitmask for a step's rows: all ones for a free row, and only
+        the stop ids for a failed one."""
+        mask = torch.full((len(rids), self.words), -1, dtype=torch.int32)
         matchers, index = [], []
         for i, rid in enumerate(rids):
             row = self._rows.get(rid)

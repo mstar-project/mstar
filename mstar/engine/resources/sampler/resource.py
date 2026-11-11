@@ -1008,7 +1008,7 @@ class GrammarSamplerResource(SamplerResource):
             logger.exception("structured_outputs: filling a step's grammar masks failed; its rows may only stop")
             if not self._fills_masks:
                 return
-            masks = grammar.fill(rids, failed=True)
+            masks = grammar.stop_masks(rids)
         if masks is not None:
             self._grammar_stager.copy_(self._grammar_mask, masks.numpy().reshape(-1), pad_value=-1)
             if slot is not None:
