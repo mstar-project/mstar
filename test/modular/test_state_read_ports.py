@@ -43,6 +43,8 @@ from mstar.engine.resources.spec import apply_yaml_overrides
 from mstar.engine.resources.step import Segment, StepContext, SubmoduleStep
 from mstar.engine.state import ArrayStep
 from mstar.engine.state.adapters import (
+    StateSetup,
+    _resolve,
     build_handle,
     kv_layouts,
     node_handles,
@@ -455,7 +457,9 @@ def _pi05_expert(expert_class, num_layers: int = TINY_PI05.num_layers):
     generator = torch.Generator().manual_seed(0)
     for parameter in expert.parameters():
         parameter.data.normal_(0, 0.02, generator=generator)
-    handle = build_handle(array, {LLM_KV: _QwenKV(array), LLM_ATTN: _QwenAttn(), ROPE: _Positions()})
+    handle = build_handle(
+        array, {LLM_KV: _QwenKV(array), LLM_ATTN: _QwenAttn(), ROPE: _Positions()}, _resolve([array], StateSetup()),
+    )
     expert.eval()
     for module in expert.modules():
         if hasattr(module, "bind_state"):

@@ -30,19 +30,29 @@ from mstar.engine.resources.spec import CombinedSplit, apply_yaml_overrides, spe
 from mstar.engine.state import (
     Array,
     Attend,
+    Bidirectional,
     Block,
     Causal,
     CausalConv,
     Entry,
     GatedDeltaNet,
     KVEntry,
+    Positions,
     Read,
     Sampler,
     TensorType,
     Value,
     Window,
 )
-from mstar.engine.state.adapters import BINDINGS, VALUE, LinearAttnBinding, StateSetup, build_specs, node_resources
+from mstar.engine.state.adapters import (
+    BINDINGS,
+    VALUE,
+    LinearAttnBinding,
+    StateSetup,
+    _resolve,
+    build_specs,
+    node_resources,
+)
 from mstar.engine.state.contract import Mask, Op
 from mstar.model.base import Model, enabled_resources, serving_resources
 from mstar.model.qwen3_5.config import GDN_STATE
@@ -157,6 +167,12 @@ def test_an_append_only_array_on_other_nodes_does_not_stop_the_link():
     other = Array("vision_kv", nodes={"vision"}, layers={0}, entry=KVEntry(heads=4, head_dim=16), max_len=512,
                   reads={"vision_attn": _read()})
     assert _by_key(other, _kv(), _gdn())["gdn"].config.kv_cache == "kv", "only an array on the value's nodes can link"
+
+
+def test_a_cross_read_array_on_the_value_nodes_does_not_stop_the_link():
+    context = Array("context", nodes={"llm"}, layers={2, 5}, entry=KVEntry(heads=4, head_dim=16), max_len=64,
+                    reads={"cross": _read(mask=Bidirectional(), queries="kv")})
+    assert _by_key(_kv(), context, _gdn())["gdn"].config.kv_cache == "kv", "a context holds no row's own entries"
 
 
 def test_a_value_specs_sit_on_the_value_nodes_not_the_pool_nodes():
@@ -297,7 +313,7 @@ NO_LAYOUT = {
     "a read on a value": ("gdn", lambda: [_kv(), Array(
         "gdn", nodes={"llm"}, layers={0}, entry=_gdn_entry(), max_len=1, rewritable=True,
         reads={"r": Read(mask=Causal())},
-    )], "reads must be empty"),
+    )], "today's resources run no read on this array"),
     "a value of one tensor": (
         "gdn",
         lambda: [_kv(), _gdn(entry=Entry({"state": TensorType((8, 128, 64), dtype=None)}),
@@ -361,6 +377,23 @@ def test_an_op_with_no_binding_on_its_storage_is_refused_as_no_layout_yet():
     refusal = "Array 'gdn': no layout yet: updates ['other'] must be CausalConv or GatedDeltaNet"
     with pytest.raises(ValueError, match=re.escape(refusal)):
         build_specs([_kv(), _gdn(updates={"delta": GatedDeltaNet(), "other": _OtherRecurrence()})])
+
+
+def test_resolve_records_the_resource_every_op_runs_on():
+    resolved = _resolve([_kv(positions=Positions()), _gdn()], StateSetup())
+    assert resolved.resource_of == {"attn": "attn", "rope": "rope", "delta": "delta", "conv": "delta"}, (
+        "an op with no resource here falls back to its own key, and the conv has no resource of its own"
+    )
+
+
+@pytest.mark.parametrize("field, refusal", [
+    ({"seq_sharded": True}, "seq_sharded takes max_len 0"),
+    ({"positions": Positions()}, "positions, which only an append-only array that keeps entries holds"),
+])
+def test_a_host_value_is_refused_what_only_another_storage_holds(field, refusal):
+    flags = replace(Value("flags", nodes={"talker"}, layers={0}, entry=Entry({}, host={"sent": bool})), **field)
+    with pytest.raises(ValueError, match=f"Array 'flags': no layout yet: {refusal}"):
+        build_specs([flags])
 
 
 def test_a_within_step_read_of_another_mask_is_refused_as_no_layout_yet():
