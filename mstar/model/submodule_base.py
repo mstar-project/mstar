@@ -1443,6 +1443,12 @@ class NodeSubmodule(torch.nn.Module, ABC):
         """
         return
 
+    @property
+    def runs_batch_postprocess(self) -> bool:
+        """Whether the engine calls `batch_postprocess` for this node: when the
+        class overrides it, unless the node says its override has nothing to do."""
+        return type(self).batch_postprocess is not NodeSubmodule.batch_postprocess
+
     def batch_postprocess(
         self, outputs: BatchedModelOutput,
         request_infos: dict[int, CurrentForwardPassInfo],
@@ -1456,7 +1462,7 @@ class NodeSubmodule(torch.nn.Module, ABC):
         every request's ``postprocess``, for the requests whose
         ``postprocess`` succeeded (``request_infos``' keys, in the order of
         ``inputs``); a raise then fails every one of them. Optional; only
-        called when overridden.
+        called when `runs_batch_postprocess` says so.
 
         ``piecewise_runners`` are this node's captured regions
         (``get_piecewise_accelerator_graph_configs``), as ``engine_inputs`` hands

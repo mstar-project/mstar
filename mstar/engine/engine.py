@@ -2458,7 +2458,7 @@ class Engine:
                 )
             except Exception as error:
                 batch.register_failure(rid, error)
-        if type(submodule).batch_postprocess is not NodeSubmodule.batch_postprocess:
+        if submodule.runs_batch_postprocess:
             live = [
                 (rid, node_inputs)
                 for rid, node_inputs in zip(batch.request_ids, batch.inputs, strict=True)
@@ -2502,7 +2502,7 @@ class Engine:
             else:
                 submodule_mgmt = self._submodules[batch.node_name]
                 submodule = submodule_mgmt.submodule
-                if type(submodule).batch_postprocess is not NodeSubmodule.batch_postprocess:
+                if submodule.runs_batch_postprocess:
                     submodule.batch_postprocess(
                         outputs, batch.per_request_info_wrapped, batch.inputs,
                         piecewise_runners=submodule_mgmt.piecewise_runners,

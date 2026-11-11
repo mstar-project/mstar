@@ -817,24 +817,32 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
             return {loopback.signal: loopback.buffer}
         return super().inline_signals(graph_walk)
 
-    def postprocess(
+    @property
+    def runs_batch_postprocess(self) -> bool:
+        # only a node whose graph routes hidden rows has rows to keep or drop
+        return bool(self._hidden_walks)
+
+    def batch_postprocess(
         self,
-        request_id: str,
-        request_info: CurrentForwardPassInfo,
-        outputs: dict[str, list[torch.Tensor]],
-        **kwargs,
-    ):
+        outputs: BatchedModelOutput,
+        request_infos: Mapping[str, CurrentForwardPassInfo],
+        inputs: list[ARNodeInputs],
+        piecewise_runners: Mapping[str, Any] | None = None,
+    ) -> None:
         """A row whose own walk (in a mixed step too) routes `ROW_IDS` and
         `ROW_HIDDEN` keeps them, each in its own copy: its loop may accumulate
         them for the reply's life, and a view of the step's batch clone, or of
         any copy shared with its step-mates, would keep all their rows alive
-        that long. Any other row drops them. Per row, so a node without hidden
-        walks runs no batch tail."""
-        super().postprocess(request_id, request_info, outputs, **kwargs)
-        if not self._hidden_walks or ROW_HIDDEN not in outputs:
+        that long. Any other row drops them. A rows-only step routes nothing
+        off the device."""
+        if not self._hidden_walks or not outputs.per_rid_outputs:
             return
-        if request_info.graph_walk in self._hidden_walks:
-            for name in (ROW_IDS, ROW_HIDDEN):
-                outputs[name] = [row.clone() for row in outputs[name]]
-        else:
-            del outputs[ROW_IDS], outputs[ROW_HIDDEN]
+        for rid, info in request_infos.items():
+            out = outputs.get(rid)
+            if out is None or ROW_HIDDEN not in out:
+                continue
+            if info.graph_walk in self._hidden_walks:
+                for name in (ROW_IDS, ROW_HIDDEN):
+                    out[name] = [row.clone() for row in out[name]]
+            else:
+                del out[ROW_IDS], out[ROW_HIDDEN]

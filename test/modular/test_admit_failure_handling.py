@@ -1003,6 +1003,7 @@ def test_per_request_drains_and_releases_when_the_loop_itself_raises(monkeypatch
 
 class _TailSubmodule:
     batch_postprocess = NodeSubmodule.batch_postprocess
+    runs_batch_postprocess = False
 
     def __init__(self):
         self.postprocessed: list[str] = []

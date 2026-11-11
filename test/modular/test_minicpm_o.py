@@ -287,8 +287,8 @@ def test_the_spoken_decode_hands_the_tts_each_rows_id_and_hidden(tmp_path):
     outputs = BatchedModelOutput(per_rid_outputs={
         rid: {name: [rows[name][i:i + 1]] for name in rows} for i, rid in enumerate(walks)
     })
-    for rid in walks:
-        llm.postprocess(request_id=rid, request_info=infos[rid], outputs=outputs.get(rid))
+    assert llm.runs_batch_postprocess
+    llm.batch_postprocess(outputs, infos, [None] * len(walks))
     assert ROW_IDS not in outputs.get("text") and ROW_HIDDEN not in outputs.get("text")
     spoken = [outputs.get(rid)[ROW_HIDDEN][0] for rid in ("spoken", "spoken2")]
     assert [h.tolist() for h in spoken] == [[[6.0, 7.0]], [[7.0, 8.0]]]
@@ -297,9 +297,9 @@ def test_the_spoken_decode_hands_the_tts_each_rows_id_and_hidden(tmp_path):
     ptrs = {h.untyped_storage().data_ptr() for h in (*spoken, rows[ROW_HIDDEN])}
     assert len(ptrs) == 3 and spoken[0].untyped_storage().nbytes() == spoken[0].nbytes
 
-    # kept or dropped per row, so the engine runs no batch tail for any decoder
-    from mstar.model.submodule_base import NodeSubmodule
-    assert type(llm).batch_postprocess is NodeSubmodule.batch_postprocess
+    # a decoder with no hidden walks runs no batch tail
+    llm._hidden_walks = frozenset()
+    assert not llm.runs_batch_postprocess
 
 @pytest.mark.parametrize("prompt", [False, True])
 def test_a_mixed_step_without_a_prompt_row_leases_the_batched_decode_capture(tmp_path, prompt):
