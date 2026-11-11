@@ -676,6 +676,9 @@ class KVManager(AttentionResource):
         self._lagged_captures: dict[tuple, tuple[tuple[str, str, Lag], ...]] = {}
         # the pass of a lagged step its lagged sets' layers write (`select_pass`)
         self._draft_pass: int | None = None
+        # set once a step first lags a layer set: until then no write can take a lagged addressing, so a
+        # pool that never lags (every pool off a draft model's node) skips the lookup on every write
+        self._lags = False
         # (node, walk) -> (label, stop buffer name) per request, for the
         # decode-step chain extension; dropped with the request
         self._chain_lookup: dict[str, dict[tuple[str, str], tuple]] = {}
@@ -2667,6 +2670,7 @@ class KVManager(AttentionResource):
         unknown = set(lag) - set(self.config.layer_sets)
         if unknown:
             raise KeyError(f"KV {self.name}: a step lags layer sets {sorted(unknown)} the pool doesn't hold")
+        self._lags = True
         page_size = self._groups[0].page_size
         states = self._preplan_states if ctx.is_preplan else self._current_plan_states
         lagged = []
@@ -2710,7 +2714,7 @@ class KVManager(AttentionResource):
     def _write_state(self, label: str, layer_idx: int) -> KVPlanState:
         """Layer ``layer_idx``'s write addressing this step: its set's lagged one, for the selected pass,
         if the step lags it."""
-        name = self._layer_set_of[layer_idx]
+        name = self._layer_set_of[layer_idx] if self._lags else None
         if name is not None and (label, ("lag", name, 0)) in self._current_plan_states:
             if self._draft_pass is None:
                 raise RuntimeError(f"KV {self.name}: layer {layer_idx} of lagged set {name!r} writes outside a pass "
