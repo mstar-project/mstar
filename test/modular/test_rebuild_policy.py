@@ -843,7 +843,7 @@ def test_only_a_rows_kept_sample_is_appended(sampled):
 
 def test_a_step_that_repeated_keeps_each_iteration_s_sample():
     rebuilds = _rebuilds()
-    rebuilds.keep_prompts(_ran(PREFILL, _rows(R, A)))
+    rebuilds.record(_ran(PREFILL, _rows(R, A)))
     batch = _batch((R, A))
     batch.step_context.repeats = 2
     rebuilds.keep_samples(batch, {}, HostRows((R, A), {"new_token": torch.tensor([[4, 5], [6, 7]])}))
