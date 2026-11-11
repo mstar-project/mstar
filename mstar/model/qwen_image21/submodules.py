@@ -114,9 +114,10 @@ class QwenImage21TextEncoderSubmodule(NodeSubmodule):
 # vae_encoder / vae_decoder
 # ---------------------------------------------------------------------------
 
-# the latent grid the compiled encoder and decoder are warmed on (1024 x 768 pixels): not square, so the dynamic
-# graph keeps height and width apart and serves every size
-_WARM_GRID = (64, 48)
+# the latent grid the compiled encoder and decoder are warmed on (896 x 640 pixels). Dynamo gives equal sizes one
+# symbol (duck sizing), and a symbol tied to a fixed size is fixed: height == width would tie the two, and a side
+# of 64 (the latent channels) would pin it to 64, so every other size would recompile on a live request
+_WARM_GRID = (56, 40)
 
 
 def _encode_mode(vae: nn.Module, pixels: torch.Tensor) -> torch.Tensor:
@@ -146,7 +147,9 @@ class QwenImage21VaeEncoderSubmodule(NodeSubmodule):
         if not self._compile:
             return {}
         h, w = (n * self.vae.spatial_compression_ratio for n in _WARM_GRID)
-        pixels = torch.zeros(1, self.vae.config.in_channels, 1, h, w, device=self.get_device(), dtype=self.vae.dtype)
+        # laid out as forward's input (vae_pixels' NHWC strides): Dynamo guards on strides
+        image = torch.zeros(self.vae.config.in_channels, h, w, dtype=torch.uint8)
+        pixels = vae_pixels(image).to(device=self.get_device(), dtype=self.vae.dtype)
         return {"vae.encoder": [(pixels, None, None)]}
 
     def prepare_inputs(self, graph_walk, fwd_info, inputs: NameToTensorList, **kwargs) -> NodeInputs:
