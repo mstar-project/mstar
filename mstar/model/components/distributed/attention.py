@@ -218,6 +218,9 @@ class ParallelCrossAttention(nn.Module):
         layer: int | None = None,
     ):
         super().__init__()
+        if layer is not None and context_kv_key is None:
+            raise ValueError("ParallelCrossAttention: a layer id picks the handle path, which reads the array "
+                             "context_kv_key names, and context_kv_key is None")
 
         if comm_group is None:
             comm_group = CommGroup.trivial()

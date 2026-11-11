@@ -474,12 +474,9 @@ def test_the_handle_path_needs_nothing_from_the_resources():
     assert layer.cross is None and layer.context_kv is None, "layer id 0 still selects the handle path"
 
 
-@torch.no_grad()
-def test_a_layer_with_no_handle_key_fails_at_its_first_call():
-    layer = _cross_attention(layer=0)
-    layer.bind_state({"context": _StubContext()})
-    with pytest.raises(AttributeError):
-        layer(torch.randn(2, 8))
+def test_a_layer_with_no_handle_key_is_refused_when_built():
+    with pytest.raises(ValueError, match="a layer id picks the handle path.*context_kv_key is None"):
+        _cross_attention(layer=0)
 
 
 @torch.no_grad()
