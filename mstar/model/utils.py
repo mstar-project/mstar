@@ -716,7 +716,8 @@ def check_kv_pools_fit(
     model, config: dict, config_path: str, log: logging.Logger,
     request_layouts: "Mapping[str, Mapping[str, Layout]] | None" = None, loop_caps: Mapping[str, int] | None = None,
 ) -> None:
-    """Refuse a ``max_concurrent_requests`` the model's KV caches or recurrent pools cannot hold.
+    """Refuse a ``max_concurrent_requests`` a resource the model builds cannot hold, as its
+    spec's `capacity_problem` answers: the first problem raises.
 
     A request keeps its pages from prefill to its last token. Past a pool, a
     step is refused and waits for pages, or, where the pool has host pages
@@ -726,12 +727,9 @@ def check_kv_pools_fit(
     queues the rest. Warnings go to the model's ``log``. ``request_layouts``
     gives the `Layout` per array and label of the request the deployment is
     sized for, with its loops at ``loop_caps``, and a pool it doesn't name
-    holds one stream of its ``max_seq_len``. A recurrent pool must
-    hold a slot for each label of each of the cap's requests, since a request
-    keeps them until it is torn down, and offloading frees none.
+    holds one stream of its ``max_seq_len``.
     """
-    from mstar.engine.resources import KVReqConfig, KVSpec, PagedKVConfig
-    from mstar.engine.resources.recurrent.config import RecurrentStateSpec
+    from mstar.engine.resources import KVReqConfig
     from mstar.engine.state.adapters import kv_layouts
     from mstar.model.base import serving_resources
 
@@ -761,32 +759,6 @@ def check_kv_pools_fit(
         requests[key] = KVReqConfig(needed_labels=list(rows))
         requests[key].apply_conductor_config(kv_layout=rows, loop_caps=loop_caps)
     for spec in specs:
-        if isinstance(spec, RecurrentStateSpec):
-            state = spec.config
-            if cap * len(state.labels) > state.usable_slots:
-                raise ValueError(
-                    f"{config_path}: {cap} concurrent requests (max_concurrent_requests) need "
-                    f"{cap * len(state.labels)} slots of resources.{spec.resource_key} ({len(state.labels)} per "
-                    f"request), which leaves {state.usable_slots} of its {state.max_slots} to requests; raise "
-                    "max_slots or lower max_concurrent_requests"
-                )
-            continue
-        # paged caches only: a ring buffer is sized by its window, not by requests
-        if not isinstance(spec, KVSpec) or not isinstance(spec.config, PagedKVConfig):
-            continue
-        kv = spec.config
-        request = requests.get(spec.resource_key)
-        # In arena pages. A stream of max_seq_len holds every token of every group, a window's too, since a one-step
-        # prefill keeps its whole prompt until it commits.
-        per_request = request.pages(spec.nodes, request.loop_caps or {}, kv) if request is not None else sum(
-            -(-kv.max_seq_len // group.page_size) for group in kv.groups
-        )
-        need = 1 + cap * per_request
-        if need > kv.num_units:
-            raise ValueError(
-                f"{config_path}: {cap} concurrent requests (max_concurrent_requests) "
-                f"need {kv.pages_of(need, round_up=True)} pages of resources.{spec.resource_key} "
-                f"({kv.pages_of(per_request, round_up=True)} per request and the sink page), "
-                f"which has {kv.max_num_pages}; raise max_num_pages, or lower max_concurrent_requests or the "
-                "tokens a request may hold"
-            )
+        problem = spec.capacity_problem(cap, requests.get(spec.resource_key))
+        if problem is not None:
+            raise ValueError(f"{config_path}: {problem}")

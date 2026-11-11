@@ -177,6 +177,11 @@ class NodeResourceSpec(ABC):
         settings."""
         return None
 
+    def capacity_problem(self, requests: int, request: "ResourceReqConfig | None") -> str | None:
+        """Why this resource can't hold ``requests`` requests at once, each opened with ``request``, or None. None by
+        default: a resource that requests don't size holds any number."""
+        return None
+
     def apply_yaml_overrides(self, **kwargs):
         """Patch declared parameters from this resource's YAML block.
 
