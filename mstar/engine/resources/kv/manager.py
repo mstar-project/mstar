@@ -764,9 +764,6 @@ class KVManager(AttentionResource):
         self._sink_pages = self._arena.new_stream()
         # the reserved length's slack past the verified one, on a pool a verifying node uses
         self._verify_slack = 0
-        # (rid, label) streams whose span the last commit dropped (offloaded
-        # mid-step), read by `committed_spans` right after it; reset by the next commit
-        self._dropped_spans: set[tuple[str, str]] = set()
         # FlashInfer's index arrays from page-locked memory (see PinnedIndexRing)
         self._indptr_ring = (
             PinnedIndexRing() if kv_pinned_indptrs() and torch.cuda.is_available() else None
@@ -3151,9 +3148,6 @@ class KVManager(AttentionResource):
     def commit(self, step: KVStep, ctx: StepContext):
         streams = self._streams
         retention = step.retention
-        if self._dropped_spans:
-            # what `committed_spans` reads is this commit's alone
-            self._dropped_spans = set()
         if not step.commit:
             self._readonly_epoch += 1
         rows = self._readonly_rows
@@ -3205,8 +3199,8 @@ class KVManager(AttentionResource):
                             segment.request_id, segment.label,
                         )
                         self._readonly_epoch += 1
-                        # a verify step's take-back then has nothing to take
-                        self._dropped_spans.add((segment.request_id, segment.label))
+                        # a verify step's take-back then has nothing to take (`committed_spans`)
+                        object.__setattr__(step, "dropped", step.dropped | {(segment.request_id, segment.label)})
                         continue
                     stream.stored_len += span
                     if stream.converted and self._world_size > 1 and stream.chain is not None:
@@ -5619,12 +5613,11 @@ class KVManager(AttentionResource):
     # Speculative decoding: a verify step commits its whole block, and its
     # result later takes the rejected tokens back off the length
 
-    def committed_spans(self, rids: Sequence[int], label: str, span: int) -> list[int]:
-        """The span the last commit counted for each of ``rids``' ``label``
-        stream: ``span``, or 0 where the stream was offloaded mid-step and
-        commit dropped it. Read right after that commit, on its thread."""
-        with self._lock:
-            dropped, self._dropped_spans = self._dropped_spans, set()
+    def committed_spans(self, step: KVStep | None, rids: Sequence[int], label: str, span: int) -> list[int]:
+        """The span ``step``'s commit counted for each of ``rids``' ``label``
+        stream: ``span``, or 0 where the stream was offloaded mid-step and the
+        commit dropped it (`KVStep.dropped`)."""
+        dropped = step.dropped if step is not None else frozenset()
         if not dropped:
             return [span] * len(rids)
         return [0 if (rid, label) in dropped else span for rid in rids]

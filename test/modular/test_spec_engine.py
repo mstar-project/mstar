@@ -175,6 +175,45 @@ def test_a_stop_token_inside_a_block_ends_the_reply_there():
     assert out[1][-1] == STOP
 
 
+def test_a_row_offloaded_mid_verify_step_is_recorded_with_nothing_to_take_back(monkeypatch):
+    """The engine path from KV's commit to the ledger: a stream offloaded while its verify step runs has its
+    span dropped by the commit, which records it on the step (`KVStep.dropped`); `NodeDraft.committed` reads it
+    there, so the ledger records that row with a counted span of 0 and the others with the whole block."""
+    k = 3
+    eng = engine(k, oracle)
+    driver = Driver(eng)
+    for rid, prompt in PROMPTS.items():
+        driver.add(rid, prompt, 24)
+    ledger = eng._drafts[NODE].ledger
+    recorded = []
+    record = ledger.committed
+
+    def committed(rids, labels=None, counted=None):
+        if rids is not None:
+            recorded.append((list(rids), list(counted)))
+        return record(rids, labels, counted)
+
+    monkeypatch.setattr(ledger, "committed", committed)
+    victim = 2
+    real_commit = KVManager.commit
+
+    def commit(self, step, ctx):
+        stream = self._streams[victim]["main"]
+        if ctx.graph_walk != "decode" or recorded:
+            return real_commit(self, step, ctx)
+        # what an offload's claim leaves on the stream while its copy runs with the lock down
+        stream.offloaded = True
+        try:
+            return real_commit(self, step, ctx)
+        finally:
+            stream.offloaded = False
+
+    monkeypatch.setattr(KVManager, "commit", commit)
+    driver.step(list(PROMPTS))
+    (rids, counted), = recorded
+    assert dict(zip(rids, counted, strict=True)) == {rid: 0 if rid == victim else k + 1 for rid in PROMPTS}
+
+
 def test_a_removed_request_leaves_no_results_for_its_handle():
     eng = engine(3, every(2))
     driver = Driver(eng)

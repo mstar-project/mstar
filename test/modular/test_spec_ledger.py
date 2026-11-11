@@ -161,7 +161,7 @@ def _rows(rids, tokens, accepted):
 
 # a verify step's declaration and its KV pool, as `NodeDraft.committed` reads them
 _STEP = SimpleNamespace(get=lambda key: None, segments=[SimpleNamespace(label="main", span=K + 1)])
-_KV = {"kv": SimpleNamespace(committed_spans=lambda rids, label, span: [span] * len(rids))}
+_KV = {"kv": SimpleNamespace(committed_spans=lambda step, rids, label, span: [span] * len(rids))}
 
 
 def test_the_cut_keeps_accepted_plus_one_up_to_a_stop_id():
@@ -220,8 +220,8 @@ def test_a_span_kv_dropped_is_taken_back_by_no_resource():
     node = _node()
     node.take_back_keys = ("kv", "rope")
     resources = {
-        "kv": SimpleNamespace(committed_spans=lambda rids, label, span: [0 if r == 2 else span for r in rids]),
-        "rope": SimpleNamespace(committed_spans=lambda rids, label, span: [span] * len(rids)),
+        "kv": SimpleNamespace(committed_spans=lambda step, rids, label, span: [0 if r == 2 else span for r in rids]),
+        "rope": SimpleNamespace(committed_spans=lambda step, rids, label, span: [span] * len(rids)),
     }
     seq = node.committed("decode", [1, 2], _STEP, resources)
     node.cut(seq, _rows([1, 2], [[1, 2, 3, 4], [1, 2, 3, 4]], [0, 0]), {1: _info(100), 2: _info(100)})
@@ -237,8 +237,8 @@ def test_resources_counting_different_spans_for_a_row_are_refused():
     node = _node()
     node.take_back_keys = ("kv", "rope")
     resources = {
-        "kv": SimpleNamespace(committed_spans=lambda rids, label, span: [span] * len(rids)),
-        "rope": SimpleNamespace(committed_spans=lambda rids, label, span: [span - 1] * len(rids)),
+        "kv": SimpleNamespace(committed_spans=lambda step, rids, label, span: [span] * len(rids)),
+        "rope": SimpleNamespace(committed_spans=lambda step, rids, label, span: [span - 1] * len(rids)),
     }
     with pytest.raises(RuntimeError, match="another resource"):
         node.committed("decode", [1], _STEP, resources)
