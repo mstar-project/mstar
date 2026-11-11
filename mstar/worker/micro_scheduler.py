@@ -660,11 +660,13 @@ class MicroScheduler:
         # only for the chunk sizing below, never to gate admission, so a walk
         # with no budget skips it: measuring a row costs an input-tensor build
         # and a cached-prefix probe (memoized for a backlogged row, `_row_lens`)
+        # rid -> walk of the rows measured past a cached prefix this pass
+        measured_past: dict[int, str] = {}
         if max_tokens is not None:
             taken = set(pick.taken)
             for batch in (backlogged, fresh):
                 if batch:
-                    tokens, chunks = self._measure_rows(batch, started, resumed, taken)
+                    tokens, chunks = self._measure_rows(batch, started, resumed, taken, measured_past)
                     row_tokens.update(tokens)
                     chunkable |= chunks
             if continuing is not None:
@@ -676,7 +678,7 @@ class MicroScheduler:
             seq_lens = pre_existing_seq_lens() if pre_existing_seq_lens is not None else ()
             max_tokens -= _pre_existing_tokens(seq_lens, pre_existing_batch_size)
         budgeted = max_tokens is not None and bool(row_tokens)
-        return self._build_and_schedule(BatchBuildRequest(
+        scheduled = self._build_and_schedule(BatchBuildRequest(
             node_name=node_walk[0], graph_walk=node_walk[1],
             backlog=backlogged, fresh=fresh, pick=pick, continuing=continuing,
             max_batch_tokens=max_tokens if budgeted else None,
@@ -687,6 +689,26 @@ class MicroScheduler:
             chunk_alignment=align,
             start_order=started,
         ), starts, resumed)
+        if measured_past:
+            self._give_back_cached_prefixes(node_walk, measured_past, scheduled)
+        return scheduled
+
+    def _give_back_cached_prefixes(
+        self, node_walk: tuple[str, str], rows: dict[int, str], scheduled: ScheduledBatch | None,
+    ) -> None:
+        """Of ``rows``, measured past a cached prefix, those the step left out give the
+        prefix's lease back where the engine took it for that step alone, and are
+        measured again when a step takes them (`Engine.give_back_cached_prefix`)."""
+        node = node_walk[0]
+        engine = self.engine_manager.get_engine(node)
+        kept = scheduled.request_to_worker_graph if scheduled is not None else {}
+        waiting = self.backlog.get(node_walk)
+        for rid, walk in rows.items():
+            if rid in kept or not engine.give_back_cached_prefix(node, rid, walk):
+                continue
+            self.cached_prefix.pop((rid, node), None)
+            if waiting is not None:
+                waiting.row_lens.pop(rid, None)
 
     def _mid_prefill_rows(
         self, node_walk: tuple[str, str], rows: Collection[MidPrefillRow],
@@ -1002,17 +1024,19 @@ class MicroScheduler:
     def _measure_rows(
         self, batch: ScheduledBatch,
         started: dict[int, int], resumed: dict[int, tuple[int, int]],
-        only: Collection[int],
+        only: Collection[int], measured_past: dict[int, str],
     ) -> tuple[dict[int, int], set[int]]:
         """For a node that reports row lengths: the remaining tokens of each
         of ``batch``'s rows in ``only`` (the step's), and the ones that may be
         chunked. A row mid-prefill goes in ``started`` with its start order and
         in ``resumed`` with where its chunk Loop stands
-        (``_chunk_loop_progress``)."""
+        (``_chunk_loop_progress``). A row measured now past a cached prefix goes
+        in ``measured_past`` with its walk."""
         node = batch.node_name
         engine = self.engine_manager.get_engine(node)
         rids = [rid for rid in batch.request_to_worker_graph if rid in only]
         progress = self._chunk_loop_progress(batch, rids)
+        unmeasured = {rid for rid in rids if rid not in batch.row_lens}
         lens = self._row_lens(
             batch, [rid for rid in rids if rid not in progress],
         )
@@ -1033,6 +1057,8 @@ class MicroScheduler:
                     continue
                 if info.cached_prefix:
                     self.cached_prefix[(rid, node)] = info.cached_prefix
+                    if rid in unmeasured:
+                        measured_past[rid] = walk
                 tokens[rid] = info.seq_len
             if engine.supports_chunked_prefill(node, walk):
                 chunkable.add(rid)

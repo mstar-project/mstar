@@ -13,7 +13,14 @@ from dataclasses import replace
 from typing import Any
 
 from mstar.engine.resources.admission import Admission, Refusal
-from mstar.engine.resources.base import CachedLease, CachedPrefix, CGSlotSpec, PublishedInfo, Resource
+from mstar.engine.resources.base import (
+    CachedLease,
+    CachedPrefix,
+    CachedSnapshot,
+    CGSlotSpec,
+    PublishedInfo,
+    Resource,
+)
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
 from mstar.engine.resources.step import (
     FULL_ADMIT_NOT_READY,
@@ -178,7 +185,7 @@ class StepRunner:
 
     def lease_cached_prefix(
         self, rid: str, node_name: str, graph_walk: str,
-    ) -> dict[str, CachedLease]:
+    ) -> dict[str, CachedLease | CachedSnapshot]:
         leases = {}
         for key in self._sweep(self._node_order, self._order, node_name):
             lease = self._resources[key].lease_cached_prefix(rid, node_name, graph_walk)
@@ -187,7 +194,8 @@ class StepRunner:
         return leases
 
     def adopt_cached_prefix(
-        self, rid: str, node_name: str, graph_walk: str, leases: dict[str, CachedLease], caught_up: bool,
+        self, rid: str, node_name: str, graph_walk: str, leases: dict[str, CachedLease | CachedSnapshot],
+        caught_up: bool,
     ) -> bool:
         ready = True
         for key, lease in leases.items():

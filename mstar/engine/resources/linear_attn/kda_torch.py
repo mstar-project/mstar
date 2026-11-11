@@ -219,12 +219,21 @@ class TorchKDAKernels:
 
     # the prefill loops over the spans on the host
     prefill_capturable = False
+    # `chunk_kda`'s chunk length, which a window keeps each row's chunks aligned to
+    chunk = 64
 
-    def layout(self, spans, num_tokens, fixed):
+    def layout(self, spans, num_tokens, fixed, snapshots=None):
         return None
 
     @torch.compiler.disable
-    def run_paged(self, qkv, g, beta, plan, conv_state, rec_state, p, gate=None):
+    def run_paged(self, qkv, g, beta, plan, conv_state, rec_state, p, gate=None, out=None):
+        """``out``: ``[T, P]`` memory the result is copied into and returned in."""
+        res = self._run_paged(qkv, g, beta, plan, conv_state, rec_state, p, gate)
+        if out is None:
+            return res
+        return out.view(res.shape).copy_(res)
+
+    def _run_paged(self, qkv, g, beta, plan, conv_state, rec_state, p, gate):
         h, d = p.num_heads, p.head_dim
         t = qkv.shape[0]
         f = F.linear(g, p.f_b) if p.f_b is not None else g
@@ -256,6 +265,15 @@ class TorchKDAKernels:
     def _prefill(qkv, g_log, beta, plan, conv_state, rec_state, weight, h, d):
         out = torch.empty(qkv.shape[0], h, d, dtype=qkv.dtype, device=qkv.device)
         slots = plan.slot_ids.long()
+        keep: dict[int, list[tuple[int, int]]] = {}
+        for i, (row, offset, _) in enumerate(plan.snapshots):
+            keep.setdefault(row, []).append((offset, i))
+        if keep:
+            # one copy a step for every layer, not a synchronous one per snapshot per layer
+            snaps = plan.cached("snapshot_slots", lambda: torch.tensor(
+                [slot for _, _, slot in plan.snapshots], dtype=torch.long,
+                pin_memory=slots.device.type == "cuda",
+            ).to(slots.device, non_blocking=True))
         start = 0
         for i, n in enumerate(plan.spans):
             rows = slice(start, start + n)
@@ -267,16 +285,27 @@ class TorchKDAKernels:
             slot = slots[i:i + 1]
             conv = conv_state.index_select(0, slot)
             rec = rec_state.index_select(0, slot).transpose(-1, -2).contiguous()
+            width = conv.shape[-1]
             extended = torch.cat([conv, qkv[rows].t().unsqueeze(0)], dim=-1)
             y = causal_conv1d_prefill(extended, weight)[:, :, -n:].transpose(1, 2)
-            conv_state.index_copy_(0, slot, extended[:, :, -conv.shape[-1]:].to(conv_state.dtype))
+            conv_state.index_copy_(0, slot, extended[:, :, -width:].to(conv_state.dtype))
             q, k, v = (x.reshape(1, n, h, d) for x in y.split(h * d, dim=-1))
-            core, final = chunk_kda(
-                q, k, v, g_log[rows].unsqueeze(0), beta[rows].unsqueeze(0),
-                initial_state=rec,
-            )
-            rec_state.index_copy_(0, slot, final.transpose(-1, -2))
-            out[rows] = core[0]
+            # the span in pieces that end at its snapshots, each continuing the last's state
+            at = 0
+            for end, snap in [*sorted(keep.get(i, ())), (n, None)]:
+                if end > at:
+                    piece = slice(at, end)
+                    core, rec = chunk_kda(
+                        q[:, piece], k[:, piece], v[:, piece], g_log[rows][piece].unsqueeze(0),
+                        beta[rows][piece].unsqueeze(0), initial_state=rec,
+                    )
+                    out[rows][piece] = core[0]
+                    at = end
+                if snap is not None:
+                    index = snaps[snap:snap + 1]
+                    rec_state.index_copy_(0, index, rec.transpose(-1, -2).to(rec_state.dtype))
+                    conv_state.index_copy_(0, index, extended[:, :, end:end + width].to(conv_state.dtype))
+            rec_state.index_copy_(0, slot, rec.transpose(-1, -2))
         return out
 
     @torch.compiler.disable

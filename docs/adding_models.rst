@@ -571,15 +571,17 @@ the pool's ``resources:`` key. Each snapshot slot costs as much as a request slo
 - A prefill keeps the state at its last page boundary before its end, since a resend's KV
   hit always leaves the last page to recompute, and at its KV hit's last page
   boundary when that is past what it restored. A shared prefix is then served from the third request
-  that shares it. A step longer than the largest captured bucket checkpoints less often, so that
-  its checkpoints fit the captured steps' buffer, and keeps its boundaries on that interval.
+  that shares it. Under GDN, a step longer than the largest captured bucket checkpoints less often,
+  so that its checkpoints fit the captured steps' buffer, and keeps its boundaries on that interval;
+  KDA's kernels store each snapshot themselves and keep every page, at the end of one of
+  their 64-token chunks, so loading refuses a KV ``page_size`` that isn't a multiple of 64.
 - A prompt the step budget cuts into chunks keeps each chunk's last boundary (a chunk with
   more of its prompt to come keeps its own end), so a resend restores past its first chunk,
   and a later chunk's snapshot makes the earlier one the first to evict, as a reply's is.
   Checkpoints fall a page apart from where a chunk starts, so the pool declares a page as its
   ``chunk_alignment`` and the scheduler cuts its chunks whole pages long.
-- A decode step that ends a page keeps the state there, so a later turn that re-sends the
-  reply restores it. It replaces the request's previous decode snapshot once the KV chain
+- A decode step that ends a page keeps the state there, where the KV cache keys the decode walk,
+  so a later turn that re-sends the reply restores it. It replaces the request's previous decode snapshot once the KV chain
   keys its page; a step whose token never reaches the chain, such as the one speculated
   past the reply's end, leaves the previous one in place.
 - A snapshot is keyed by the KV chain's key at its page. A full set of slots evicts the
@@ -587,12 +589,15 @@ the pool's ``resources:`` key. Each snapshot slot costs as much as a request slo
   so the slots hold about one prompt each. A decode snapshot that a later prompt restores
   is kept like a prompt's from then on.
 
-Snapshots stay off without ``prefix_slots``, and also above one rank, without a named KV
-cache, when that cache isn't on every node of the pool, or when its ``prefix_cache`` is
-off or can't open at the pool's world size; in those cases the pool allocates no snapshot
-slots. Neither does a pool whose cache the engine keeps shut for another reason, such as a
-model that names no checkpoint and sets no salt. Every cache on the node of a pool without
-snapshots stays shut, and the engine logs which pool kept it shut.
+Snapshots stay off without ``prefix_slots``, and also without a named KV cache, when that
+cache isn't on every node of the pool, or when its ``prefix_cache`` is off or can't open at
+the pool's world size (above one rank, only with ``prefix_cache_tp``); in those cases the
+pool allocates no snapshot slots. Neither does a pool whose cache the engine keeps shut for
+another reason, such as a model that names no checkpoint and sets no salt. Every cache on
+the node of a pool without snapshots stays shut, and the engine logs which pool kept it shut.
+Above one rank rank 0 leases a request's snapshot as it sends the step, as it does the KV
+pages, and the other ranks restore the same slot. A prompt cut into chunks is leased as rank 0
+measures it, so every chunk starts past the hit, and only its first chunk carries the lease.
 ``opening_prefix_caches`` in ``mstar/engine/resources/kv/config.py`` is that rule over the
 specs. The engine evaluates it once, before it builds any resource, and opens exactly the
 caches it returns of those it holds; the conductor's routing and the API server's prompt

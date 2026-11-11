@@ -68,14 +68,20 @@ class _StubChains:
     def chain_keys(self, rid, label, pages):
         return self.keys.get(rid, [])[:pages]
 
+    def keyed_walks(self, label):
+        return frozenset({WALK})
     def bind_snapshots(self, pool):
         del pool
 
 
-def _build(config: RecurrentStateConfig, world_size: int = 1, prefix_cache: bool = True) -> RecurrentStatePool:
+
+def _build(
+    config: RecurrentStateConfig, world_size: int = 1, prefix_cache: bool = True, prefix_cache_tp: bool = True,
+) -> RecurrentStatePool:
     """The pool as the engine builds it, over a KV cache whose `prefix_cache` is ``prefix_cache``."""
     kv = _specs(0)["kv"]
     kv.config.prefix_cache = prefix_cache
+    kv.config.prefix_cache_tp = prefix_cache_tp
     tp = CommGroup(my_global_rank=0, my_group_rank=0, group_members=list(range(world_size)))
     group = JointGroups(tp_group=tp, sp_group=CommGroup.trivial(), instance=tp) if world_size > 1 else None
     spec = RecurrentStateSpec(resource_key="state", nodes=set(kv.nodes), config=config)
@@ -86,12 +92,14 @@ def _build(config: RecurrentStateConfig, world_size: int = 1, prefix_cache: bool
     ))
 
 
-def _pool(prefix_slots: int = 2, world_size: int = 1, prefix_cache: bool = True) -> RecurrentStatePool:
+def _pool(
+    prefix_slots: int = 2, world_size: int = 1, prefix_cache: bool = True, prefix_cache_tp: bool = True,
+) -> RecurrentStatePool:
     config = RecurrentStateConfig(
         num_layers=2, blocks={"state": RecurrentBlockConfig(shape=(3,), dtype=torch.float32)},
         max_slots=4, prefix_slots=prefix_slots, kv_cache="kv",
     )
-    pool = _build(config, world_size, prefix_cache)
+    pool = _build(config, world_size, prefix_cache, prefix_cache_tp)
     pool.bind_kv(_StubChains())
     return pool
 
@@ -196,12 +204,20 @@ def test_a_full_set_evicts_the_oldest_snapshot_nothing_holds():
 
 
 
-@pytest.mark.parametrize("closed", [{"world_size": 2}, {"prefix_cache": False}, {"prefix_slots": 0}])
+@pytest.mark.parametrize("closed", [
+    {"world_size": 2, "prefix_cache_tp": False}, {"prefix_cache": False}, {"prefix_slots": 0},
+])
 def test_snapshots_stay_off_and_unallocated_where_the_cache_cant_open(closed):
     pool = _pool(**closed)
     assert pool._kv is None, "a pool that can't restore keys snapshots"
     assert pool.block("state", 0).shape[0] == pool.config.max_slots, "allocated snapshot slots nothing can use"
     assert _pool()._kv is not None
+
+
+def test_snapshots_open_above_one_rank_where_rank_0_decides_the_hits():
+    pool = _pool(world_size=2)
+    assert pool._kv is not None, "prefix_cache_tp leases each hit's snapshot from rank 0"
+    assert pool.block("state", 0).shape[0] == pool.config.max_slots + 2
 
 
 def test_a_pool_keeps_snapshot_slots_only_for_a_cache_the_engine_opens():
@@ -332,7 +348,7 @@ def _specs(prefix_slots: int) -> dict[str, NodeResourceSpec]:
         max_slots=4, prefix_slots=prefix_slots, kv_cache="kv",
     )
     return {
-        # prefix_cache_tp, so above one rank only the pool keeps the cache shut
+        # prefix_cache_tp, so the cache and its snapshots open above one rank too
         "kv": KVSpec(resource_key="kv", nodes={"LLM"}, config=PagedKVConfig(
             num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=64, max_num_pages=8,
             page_size=PAGE, prefix_cache_salt="a salt", prefix_cache_tp=True,
@@ -361,17 +377,17 @@ def _open(monkeypatch, prefix_slots: int = 2, world_size: int = 1) -> Engine:
     return engine
 
 
-def test_a_node_whose_pool_keeps_snapshots_opens_its_caches(monkeypatch):
-    engine = _open(monkeypatch)
+@pytest.mark.parametrize("world_size", [1, 2])
+def test_a_node_whose_pool_keeps_snapshots_opens_its_caches(monkeypatch, world_size):
+    engine = _open(monkeypatch, world_size=world_size)
     assert engine._resources["kv"]._index is not None
     assert engine._resources["state"]._kv is engine._resources["kv"]
     assert WALK in engine._keyed_walks["LLM"]
 
 
-@pytest.mark.parametrize("prefix_slots, world_size", [(0, 1), (2, 2)])
-def test_a_node_whose_pool_keeps_no_snapshots_opens_no_cache(monkeypatch, caplog, prefix_slots, world_size):
+def test_a_node_whose_pool_keeps_no_snapshots_opens_no_cache(monkeypatch, caplog):
     with caplog.at_level(logging.INFO):
-        engine = _open(monkeypatch, prefix_slots, world_size)
+        engine = _open(monkeypatch, prefix_slots=0)
     assert engine._resources["kv"]._index is None, "a KV hit would skip tokens the GDN state never saw"
     assert "LLM" not in engine._keyed_walks
     assert "state on LLM" in caplog.text
@@ -412,7 +428,10 @@ _SHAPES = {
     "snapshots": ([_kv_spec("kv", {"LLM"}), *_pool_specs({"LLM"})], {"kv"}, {"LLM": 1}, {"kv", "state"}),
     "no_prefix_slots": ([_kv_spec("kv", {"LLM"}), *_pool_specs({"LLM"}, prefix_slots=0)], {"kv"}, {"LLM": 1}, set()),
     "two_ranks": (
-        [_kv_spec("kv", {"LLM"}, prefix_cache_tp=True), *_pool_specs({"LLM"})], {"kv"}, {"LLM": 2}, set(),
+        [_kv_spec("kv", {"LLM"}, prefix_cache_tp=True), *_pool_specs({"LLM"})], {"kv"}, {"LLM": 2}, {"kv", "state"},
+    ),
+    "two_ranks_without_prefix_cache_tp": (
+        [_kv_spec("kv", {"LLM"}), *_pool_specs({"LLM"})], {"kv"}, {"LLM": 2}, set(),
     ),
     "kv_not_opening": (
         [_kv_spec("kv", {"LLM"}, prefix_cache=False), *_pool_specs({"LLM"})], {"kv"}, {"LLM": 1}, set(),
@@ -482,11 +501,10 @@ def test_a_keyed_node_loads_with_a_recurrent_pool_and_the_resource_over_it():
     )
 
 
-@pytest.mark.parametrize("variant", [LinearAttnVariant.KDA, LinearAttnVariant.MAMBA2])
-def test_a_keyed_node_refuses_a_pool_whose_backend_writes_no_snapshots(variant):
+def test_a_keyed_node_refuses_a_pool_whose_backend_writes_no_snapshots():
     specs = _specs(prefix_slots=2)
     specs["gdn"] = LinearAttnSpec(resource_key="gdn", nodes={"LLM"}, config=LinearAttnConfig(
-        recurrent_state="state", variant=variant,
+        recurrent_state="state", variant=LinearAttnVariant.MAMBA2,
     ))
     problems = list(_unskippable_resources(list(specs.values()), _Keyed()))
     assert problems and "'state' cannot serve a request" in problems[0], problems
@@ -696,6 +714,19 @@ def test_a_decode_step_onto_a_page_boundary_saves_its_state():
     assert decode.tokens == 4 and decode.key == pool._kv.chain_key("a", "main", 1)
     assert pool._snap_by_key[decode.key] == decode.slot
     assert bool((pool._blocks["state"][:, decode.slot] == 3.0).all()), "the snapshot is not the state at 4"
+
+
+def test_a_decode_on_a_walk_the_kv_cache_doesnt_key_saves_no_snapshot():
+    """Above one rank, or under MTP, the KV cache keys no reply: a decode snapshot would never be
+    filed, and would only push a prompt's out of the pool."""
+    pool = _pool()
+    _reply(pool)
+    step = _step("a", 1)
+    ctx = StepContext(request_ids=("a",), graph_walk="decode", slot=0, capture=False)
+    assert pool.admit(step, ctx).ok
+    pool.plan(step, ctx)
+    pool.commit(step, ctx)
+    assert not pool._decode and len(pool._snap_free) == 2
 
 
 def test_a_decode_snapshot_is_filed_once_the_chain_keys_its_page():

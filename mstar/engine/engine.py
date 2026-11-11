@@ -1668,9 +1668,15 @@ class Engine:
         ):
             return {}
         hits = {}
+        chunks = batch.chunk_ranges
         for rid in batch.request_ids:
             walk = ctx.walk_of(rid)
             if walk not in keyed:
+                continue
+            chunk = chunks.get(rid) if chunks else None
+            if chunk is not None and not chunk.is_first:
+                # the first chunk applied or declined the row's lease, and one taken again before
+                # that chunk commits would restore over what it wrote
                 continue
             leases = self._runner.lease_cached_prefix(rid, batch.node_name, walk)
             if leases:
@@ -3084,19 +3090,24 @@ class Engine:
         cache holds, which ``rid``'s lease keeps until its first chunk applies it.
         A row the cache holds whole measures 0, so the budget never cuts it and
         prepare serves it (`_skip_cached_prefix`): a chunk cut from 0 would
-        write over the lease the walks before it were served from."""
+        write over the lease the walks before it were served from.
+
+        Above one rank the probe answers only from rank 0's lease, so rank 0
+        takes it here, for the step that runs the row to send. A row the step
+        leaves out gives it back (`give_back_cached_prefix`)."""
         submodule = self._submodules[node_name].submodule
         info = submodule.get_input_sequence_len(graph_walk, request_info, inputs)
         if info is None or rid is None:
             return info
-        return self.unserved_len(node_name, graph_walk, request_info, rid, info.seq_len, info.seq_len)
+        return self.unserved_len(node_name, graph_walk, request_info, rid, info.seq_len, info.seq_len, lease=True)
 
     def unserved_len(
         self, node_name: str, graph_walk: str, request_info: CurrentForwardPassInfo, rid: int,
-        length: int, end: int,
+        length: int, end: int, lease: bool = False,
     ) -> InputSeqLenInfo:
         """The tokens up to ``end`` of ``rid``'s ``length``-token row, as `input_sequence_len` measures them. A
-        rebuild of a prompt mid-prefill writes only the tokens before ``end``."""
+        rebuild of a prompt mid-prefill writes only the tokens before ``end``. ``lease``: rank 0 of a TP instance
+        takes the row's lease first (`input_sequence_len`); a rebuild's step takes its own as it is sent."""
         policy = self._chunking.policy(node_name, graph_walk)
         if (
             graph_walk not in self._keyed_walks.get(node_name, ())
@@ -3107,11 +3118,28 @@ class Engine:
                 and not policy.reuses_cached_prefix(request_info))
         ):
             return InputSeqLenInfo(end)
+        leads = lease and node_name in self._tp_leader_nodes
+        if leads:
+            self._runner.lease_cached_prefix(rid, node_name, graph_walk)
         prefix = self._runner.resolve_cached_prefix(
             rid, node_name, graph_walk, _MeasuredRow(length),
         )
         matched = min(prefix.tokens if prefix is not None else 0, end)
+        if matched <= 0 and leads:
+            # cut from 0, the row holds nothing while it waits; its first chunk declines
+            # whatever its send leases
+            self._runner.release_cached_prefix(rid, node_name, graph_walk)
         return InputSeqLenInfo(end - matched, cached_prefix=matched)
+
+    def give_back_cached_prefix(self, node_name: str, rid: int, graph_walk: str) -> bool:
+        """For a row measured past a cached prefix that its step left out. On rank 0 of a TP
+        instance, give back the lease `input_sequence_len` took and return True: the step that
+        takes the row measures it again. Held while the row waits, the lease would pin pages on
+        rank 0 alone, and the ranks would evict apart. Elsewhere the lease waits with the row."""
+        if node_name not in self._tp_leader_nodes:
+            return False
+        self._runner.release_cached_prefix(rid, node_name, graph_walk)
+        return True
 
     def check_ready(
         self, node_name: str, request_id: str,

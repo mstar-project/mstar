@@ -1482,6 +1482,19 @@ class KVManager(AttentionResource):
         """The walks whose writes under ``label`` the prefix cache keys."""
         return self._keyed_walks.get(label, frozenset())
 
+    def lease_tokens(self, rid: str, label: str) -> int:
+        """The tokens the stream's prefix lease holds, 0 without one."""
+        with self._lock:
+            stream = self._streams.get(rid, {}).get(label)
+            return stream.lease_len if stream is not None and stream.lease is not None else 0
+
+    def prefix_converted(self, rid: str, label: str) -> bool:
+        """Whether an admit took the stream's prefix lease onto the stream and no commit followed:
+        a refused admit leaves the pages there, for the retry's probe to answer."""
+        with self._lock:
+            stream = self._streams.get(rid, {}).get(label)
+            return stream is not None and stream.converted
+
     def chain_key(self, rid: str, label: str, pages: int) -> bytes | None:
         """The index key of the stream's first ``pages`` pages, or None until
         its chain keys that many whole pages."""

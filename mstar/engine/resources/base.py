@@ -126,6 +126,16 @@ class CachedLease:
     lent: list[int]
 
 
+@dataclass
+class CachedSnapshot:
+    """Rank 0's lease of the recurrent state under a stream's cached prefix, which a TP follower takes as given:
+    the snapshot ``slot`` (-1 where none fits), the ``tokens`` it restores and the KV cache's ``hit`` it was cut
+    from."""
+    slot: int
+    tokens: int
+    hit: int
+
+
 class Residency(IntEnum):
     """Where a request's state on a node is: on the device, copied to the host, or dropped for a rebuild
     from its ids. Ordered by how far the state is from the device."""
@@ -312,13 +322,15 @@ class Resource(ResidentHooks, ABC):
         """Called for a walk the cache served whole, since that walk never admits or commits."""
         return
 
-    def lease_cached_prefix(self, rid: str, node_name: str, graph_walk: str) -> CachedLease | None:
+    def lease_cached_prefix(
+        self, rid: str, node_name: str, graph_walk: str,
+    ) -> CachedLease | CachedSnapshot | None:
         """On rank 0 of a TP node, lease the request's cached prefix as its step is sent and
         return the lease, or None."""
         return None
 
     def adopt_cached_prefix(
-        self, rid: str, node_name: str, graph_walk: str, lease: CachedLease, caught_up: bool,
+        self, rid: str, node_name: str, graph_walk: str, lease: CachedLease | CachedSnapshot, caught_up: bool,
     ) -> bool:
         """On a TP follower, take rank 0's ``lease``. False until this rank holds its pages too, and
         raises if it still lacks them once ``caught_up``."""

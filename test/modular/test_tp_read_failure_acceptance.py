@@ -696,7 +696,7 @@ def _probe(engine, rid, tokens):
     from mstar.engine.resources.step import StepContext
     engine.add_request(rid, {KV: _kv_config(tokens)})
     batch = SimpleNamespace(
-        node_name=NODE, request_ids=(rid,),
+        node_name=NODE, request_ids=(rid,), chunk_ranges={},
         step_context=StepContext(request_ids=(rid,), graph_walk=TEXT_WALK, slot=0, capture=False),
     )
     hits = engine.decide_cached_prefix(batch)
