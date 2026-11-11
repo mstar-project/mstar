@@ -71,6 +71,31 @@ def test_the_verify_step_corrects_only_the_resources_bound_at_load():
     assert plain._submodules[SPEC_NODE].submodule.drafter_share.correcting_keys == ()
 
 
+def test_a_verifying_node_with_a_pool_nothing_reruns_is_refused_before_and_at_load(monkeypatch):
+    """A second recurrent pool on the node that no linear-attention resource names would keep a
+    verify step's rejected tokens folded into its state. The spec check is the only guard, so it
+    is tested where it runs: validation's `check_deployment` and the engine's load."""
+    import hybrid_toy as toy
+    import torch
+
+    from mstar.engine.resources.draft.startup import check_deployment
+    from mstar.engine.resources.recurrent.config import RecurrentStateConfig, RecurrentStateSpec
+
+    orphan = RecurrentStateSpec("orphan_state", {toy.NODE}, RecurrentStateConfig(
+        num_layers=1, blocks=toy.CPU_SHAPES.geometry.to_blocks(state_dtype=torch.float32, conv_dtype=torch.float32),
+        max_slots=16,
+    ))
+    specs = toy.specs(3) + [orphan]
+    decls = toy.HybridModel(3, "synchronous", None, True, False).verify_nodes()
+    problems = check_deployment(decls, {s.resource_key: s for s in specs}, {}, (), {}, True)
+    assert any("'orphan_state'" in p and "no linear-attention resource reruns its state" in p for p in problems)
+
+    real = toy.specs
+    monkeypatch.setattr(toy, "specs", lambda *args, **kwargs: real(*args, **kwargs) + [orphan])
+    with pytest.raises(RuntimeError, match="no linear-attention resource reruns its state"):
+        toy.engine(3, toy.ForcedDrafter(_references()))
+
+
 @pytest.mark.parametrize("batched", [True, False])
 @pytest.mark.parametrize("k, first_wrong", [
     (k, wrong) for k in (1, 3) for wrong in (None, 0, 1, 2) if wrong is None or wrong < k
