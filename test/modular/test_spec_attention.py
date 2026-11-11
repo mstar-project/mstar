@@ -160,7 +160,7 @@ def test_a_captured_plan_stages_the_tables_an_eager_plan_builds(hide, dim):
 @pytest.mark.parametrize("causal,hide", [(True, 0), (False, 1)])
 # 128: Qwen3 and DSpark; 256: Qwen3.5's full-attention layers and its MTP head
 @pytest.mark.parametrize("dim", [128, 256])
-def test_fa3_verify_attention_matches_a_dense_reference(causal, hide, dim):
+def test_fa3_paged_attention_matches_a_dense_reference(causal, hide, dim):
     reason = fa3_paged_unavailable_reason(torch.device("cuda"), dim, torch.bfloat16)
     if reason is not None:
         pytest.skip(reason)
@@ -253,9 +253,10 @@ def test_the_page_table_is_the_pools_block_table_width():
     assert small.block_table_width(PAGE) == small.request_pages == 5
 
 
-def test_a_span_short_of_its_extent_is_refused():
+@pytest.mark.parametrize("kv_extent", [5, 0], ids=["past_the_span", "no_keys"])
+def test_a_kv_extent_outside_its_span_is_refused(kv_extent):
     with pytest.raises(ValueError, match="kv_extent"):
-        FA3PagedWrapper(page_size=PAGE, table_width=4, device=CPU, span=4, kv_extent=5)
+        FA3PagedWrapper(page_size=PAGE, table_width=4, device=CPU, span=4, kv_extent=kv_extent)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
