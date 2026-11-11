@@ -33,7 +33,7 @@ def ragged_denoise(config, dit, shape, batch, device, joint):
     from mstar.engine.resources.spec import resolve_spec_dependencies
     from mstar.model.ltx2_5 import submodules as S
     from mstar.model.ltx2_5.ltx2_5_model import LTX25Model
-    from mstar.model.submodule_base import NodeInputs
+    from mstar.model.submodule_base import NodeInputs, engine_step
 
     model = LTX25Model(skip_weight_loading=True)
     model.set_config(config)
@@ -45,7 +45,7 @@ def ragged_denoise(config, dit, shape, batch, device, joint):
     sub = S.LTXDenoiseSubmodule(dit, config, loop_name="x", use_ragged_attention=True)
     sub.bind_node_resources(res)
     rids = list(range(batch))
-    step = sub.declare_step("g", rids, [NodeInputs(resource_step_info=shape)] * batch)
+    step = engine_step(sub, "g", rids, [NodeInputs(resource_step_info=shape)] * batch)
     step.set_ctx(StepContext(request_ids=rids, graph_walk="g", slot=0, capture=False))
     StepRunner(res).plan(step)
     return sub
