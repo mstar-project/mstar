@@ -283,7 +283,10 @@ def _apply_kernel_settings(
             if earlier != value:
                 raise ValueError(f"Array {array.name!r}: kernel_settings[{other!r}] and kernel_settings[{key!r}] set "
                                  f"{field} to {earlier!r} and {value!r}, and both reads run on {spec.resource_key!r}")
-        owner.set_kernel_settings(array, spec, settings)
+        try:
+            owner.set_kernel_settings(array, spec, settings)
+        except ValueError as e:
+            raise ValueError(f"Array {array.name!r}: kernel_settings[{key!r}]: {e}") from e
 
 
 def node_handles(
@@ -616,10 +619,7 @@ class PagedAttend(OpBinding):
         decode = {field: settings[field] for field in settings.keys() & {"decode_tensor_cores", "decode_fmha"}}
         super().set_kernel_settings(array, spec, {field: settings[field] for field in settings.keys() - decode.keys()})
         if decode:
-            try:
-                spec.apply_yaml_overrides(**decode)
-            except ValueError as e:
-                raise ValueError(f"Array {array.name!r}: kernel_settings[{spec.resource_key!r}]: {e}") from e
+            spec.apply_yaml_overrides(**decode)
 
 
 class PagedCrossAttend(PagedAttend):
@@ -1360,10 +1360,7 @@ class Storage(ABC):
         """Size the array's pool ``spec`` through its own YAML path, so a value here means what the same key under
         `resources:` means."""
         if settings:
-            try:
-                spec.apply_yaml_overrides(**settings)
-            except ValueError as e:
-                raise ValueError(f"Array {array.name!r}: kernel_settings[{array.name!r}]: {e}") from e
+            spec.apply_yaml_overrides(**settings)
 
 
 class PagedStorage(Storage):
