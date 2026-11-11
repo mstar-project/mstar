@@ -283,6 +283,17 @@ def _verify_nodes(model) -> list:
     verify_nodes = getattr(model, "verify_nodes", None)
     return list(verify_nodes()) if verify_nodes is not None else []
 
+
+def rebuild_policies_of(model) -> "dict[str, RebuildPolicy]":
+    """The model's rebuild policies less its verifying nodes', which the engine's
+    check and the worker's rebuilds read. A rebuild replays the prompt and the
+    kept samples, which nothing checks against a request's verify state (its
+    pending take-backs, the drafter's carry), so a verifying node never drops a
+    request. From the model's declarations alone, so every rank and worker
+    agrees."""
+    verifying = {decl.node for decl in _verify_nodes(model)}
+    return {node: policy for node, policy in model.rebuild_policies().items() if node not in verifying}
+
 @dataclass
 class SubmoduleManagement:
     submodule: NodeSubmodule
@@ -1007,18 +1018,14 @@ class Engine:
             self._check_rebuild_policies(model)
 
     def rebuild_policies(self, model: "Model") -> "dict[str, RebuildPolicy]":
-        """The model's rebuild policies less its verifying nodes', which this
-        and the worker's rebuilds read. A rebuild replays the prompt and the
-        kept samples, which nothing checks against a request's verify state
-        (its pending take-backs, the drafter's carry), so a verifying node
-        never drops a request. From the model's declarations, so every rank
-        and worker agrees."""
+        """`rebuild_policies_of` the model, logging once for each verifying node
+        here that declared a policy."""
         verifying = {decl.node for decl in _verify_nodes(model)}
-        policies = model.rebuild_policies()
-        for node in sorted((verifying & policies.keys() & self._submodules.keys()) - self._rebuild_off_logged):
+        for node in sorted((verifying & model.rebuild_policies().keys() & self._submodules.keys())
+                           - self._rebuild_off_logged):
             self._rebuild_off_logged.add(node)
             logger.info("speculative decoding on %s: rebuild is off, so the node never drops a request", node)
-        return {node: policy for node, policy in policies.items() if node not in verifying}
+        return rebuild_policies_of(model)
 
     def _check_rebuild_policies(self, model: "Model") -> None:
         """Raise for a node here whose rebuild policy a rebuild row couldn't run under."""
