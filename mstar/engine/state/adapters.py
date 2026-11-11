@@ -386,12 +386,19 @@ class WithinStepSteps(StepBuilder):
         self._queries[key] = handle.queries
         handle.queries.plan(self, handle, segments_of(declared, step), step)
 
-    def _label(self, key: str, name: str, segments: Sequence[Segment]) -> str:
+    def _label(self, key: str, array: Array, segments: Sequence[Segment]) -> str:
+        """Hold ``segments``, ``array``'s in this step, under its label on the resource ``key``, and give the label."""
         if not segments:
-            raise ValueError(f"Array {name!r}: a step lays it out over an empty list of segments")
-        label = segments[0].label
+            raise ValueError(f"Array {array.name!r}: a step lays it out over an empty list of segments")
+        label = _plan_label(array)
+        # on a replay too, whose step `_check_step` doesn't see
+        for segment in segments:
+            if segment.label != label:
+                raise ValueError(f"Array {array.name!r}: a step lays it out under labels "
+                                 f"{sorted({segment.label for segment in segments} - {label})}, and its plans run "
+                                 f"under its label {label!r}")
         if tuple(self._labels.setdefault(key, {}).setdefault(label, segments)) != tuple(segments):
-            raise ValueError(f"Array {name!r}: label {label!r} on its resource already holds other segments")
+            raise ValueError(f"Array {array.name!r}: label {label!r} on its resource already holds other segments")
         return label
 
     def steps(self) -> dict[str, Any]:
@@ -910,6 +917,12 @@ class SegmentedRows(RowLayout):
         return self._frames.run(q, k, v)
 
 
+def _plan_label(array: Array) -> str:
+    """The label a within-step array's plans run under, its one declared label (`_within_step_read`)."""
+    (label,) = array.labels
+    return label
+
+
 class Queries(ABC):
     """Whose segments lay out a within-step read's queries, picked once per read at resolve: its own array's, or those
     of the array its ``queries`` names."""
@@ -944,10 +957,10 @@ class OwnQueries(Queries):
     spec_class = RaggedAttentionSpec
 
     def plan_label(self, keys: Array) -> str:
-        return min(keys.labels)
+        return _plan_label(keys)
 
     def plan(self, steps: WithinStepSteps, handle: "WithinStepHandle", segments, step: SubmoduleStep) -> None:
-        steps._label(handle.resource_key, handle.name, segments)
+        steps._label(handle.resource_key, handle.array, segments)
 
     def step(self, segments, pairs: Sequence[tuple[str, str]], fixed: bool) -> Any:
         return AttentionStep(segments=segments, causal=False, fixed_layout=fixed)
@@ -960,7 +973,7 @@ class CrossQueries(Queries):
 
     def plan_label(self, keys: Array) -> str:
         # Both sides fix the plan's label, so it is one string for the life of the handle. See `cross_label`.
-        return cross_label(min(self.array.labels), min(keys.labels))
+        return cross_label(_plan_label(self.array), _plan_label(keys))
 
     def plan(self, steps: WithinStepSteps, handle: "WithinStepHandle", segments, step: SubmoduleStep) -> None:
         name = self.array.name
@@ -972,8 +985,8 @@ class CrossQueries(Queries):
         if query_segments is None:
             raise ValueError(f"Array {name!r}: a step lists it with no segments, its own or the step's")
         key = handle.resource_key
-        q_label = steps._label(key, name, handle.query_share(query_segments))
-        steps._pairs.setdefault(key, []).append((q_label, steps._label(key, handle.name, handle.key_share(segments))))
+        q_label = steps._label(key, self.array, handle.query_share(query_segments))
+        steps._pairs.setdefault(key, []).append((q_label, steps._label(key, handle.array, handle.key_share(segments))))
 
     def step(self, segments, pairs: Sequence[tuple[str, str]], fixed: bool) -> Any:
         return RaggedCrossAttentionStep(segments=tuple(segments), pairs=tuple(pairs))
