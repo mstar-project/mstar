@@ -275,6 +275,8 @@ def test_a_fill_or_accept_that_raises_fails_what_every_rank_agrees_on(monkeypatc
         "the healthy row lost its mask"
     assert [r for r in (1, 2) if res._grammar.failures([r])] == ([] if ranks > 1 else [1])
 
+    if tokenizer_eos:
+        return  # the accept half below does not depend on where the stops come from
     outcomes, accept = [], grammar._Row.accept
     for rank in range(ranks):
         res = _resource(graph=True, comm_group=SimpleNamespace(world_size=ranks, rank=rank))

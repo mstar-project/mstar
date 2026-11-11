@@ -754,15 +754,16 @@ forward, then waits for its rows' last draws to reach the host and fills their m
 forward runs, before it launches the draw (its capture is split there). A grammar that fails to
 compile, or whose matcher fails to start or to accept a draw, fails its request with an error. A
 failed mask fill fails its request with an error on a single-GPU deployment: its row draws
-anything but a stop that once (any token, for a model with no stop token), and the next step's
+anything but a stop that once, and the next step's
 admit reports the error (unless the reply reaches its length limit at that draw; one row's own
 fill failing fails only that row). Under tensor parallelism only the first rank fills, so the
-row may only stop there (it runs unmasked, for a model with no stop token), and the reply ends
-at that stop. A drawn token the grammar refuses (only a mask that failed to cover the draw lets
+row may only stop there, and the reply ends at that stop. A drawn token the grammar refuses (only a mask that failed to cover the draw lets
 one through) fails its request at the step after the next, and meanwhile the reply may only draw
-one of the model's stop tokens (any token, for a model with no stop token); when the reply
-finishes first (a stop or its length limit; always without async scheduling), it ends normally
-with the refused token in it. Not served
+one of the model's stop tokens; when the reply finishes first (a stop or its length limit;
+always without async scheduling), it ends normally with the refused token in it. The stops here
+are the ones the model's ``text_output()`` declares, else its tokenizer's EOS (none for a model
+with neither, whose row is then left unmasked); a model whose loop stops on other tokens should
+declare them there. Not served
 with it yet: speculative decoding (no model that declares ``text_output()`` drafts outside its
 sampler), resident planning, and a text sampler whose walks run on different ranks (a
 prefill/decode split); the deployment is refused at startup for the last, and for
