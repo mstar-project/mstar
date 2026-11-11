@@ -568,7 +568,7 @@ class KVReqConfig(ResourceReqConfig):
 
     def apply_spec(self, spec: "KVSpec | None" = None) -> None:
         """Each of the request's layouts as its pool holds it (`KVSpec.request_layout`)."""
-        if isinstance(spec, KVSpec) and self.kv_layout:
+        if isinstance(spec, KVSpec) and spec.draft_slack and self.kv_layout:
             self.kv_layout = {label: spec.request_layout(layout) for label, layout in self.kv_layout.items()}
 
     def loop_room(self, spec: "KVSpec | None" = None) -> dict[str, int]:
