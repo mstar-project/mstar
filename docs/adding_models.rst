@@ -2166,8 +2166,9 @@ handled as special cases. BAGEL and Whisper use today's forms of them:
   prefill uses it to write its 1500-token encoder context while replaying a graph sized by
   its few prompt tokens.
 
-``combined_labels`` is declared once, on the ``SubmoduleStep``, contract or not. On the contract, a
-step's calls cover all of its rows in segment order.
+``combined_labels`` is declared once, on the ``SubmoduleStep``. Only a model off the contract can
+combine labels today: an array's handle refuses a step that touches more than one of its labels
+(no layout yet), since a plan holds one label per call.
 
 **Writing K/V yourself.** A layer that hasn't moved and writes its K/V inside a fused kernel
 of its own, rather than through ``write_kv``, asks the KV resource where the step's tokens go:
@@ -3191,8 +3192,9 @@ attention,
 cross-attention, DSA and ``sliding_window`` don't, and a ring or bounded KV pool can't set the key.
 A decode/prefill ``splits`` and ``decode_fmha`` are ignored over a placed pool, and a node over
 one plans on the host rather than resident (``resident_planning``). A node that captures a step
-combining labels into one plan (``KVStep.combined_labels``, as classifier-free guidance does) at a
-batch size above 1 is refused at load: a replay's padding rows would sit between its real ones.
+combining labels into one plan (``SubmoduleStep.combined_labels``, as classifier-free guidance
+does) at a batch size above 1 is refused at load: a replay's padding rows would sit between its real
+ones.
 
 A step of one token a row attends the pages after its KV write (in TP mode on tensor cores
 whatever ``decode_tensor_cores`` says). Any other step attends its stored context on the pages
