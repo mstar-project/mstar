@@ -306,7 +306,8 @@ def test_a_value_with_tensor_fields_pools_only_those():
 def test_a_value_with_tensor_fields_keeps_its_host_fields_beside_them():
     array = _streamed()
     fields = HostFields()
-    h = build_handle(array, {"stream": _StubPool()}, StateSetup(host_fields=fields))
+    setup = StateSetup(host_fields=fields)
+    h = build_handle(array, {"stream": _StubPool()}, _resolve([array], setup), setup)
     fields.open(RID)
     step = _step(h, host={(RID, "main", 0): {"chunks": 2}})
     step.begin_calls()
