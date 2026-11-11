@@ -34,3 +34,6 @@ A worker that dies (an exception during setup, an OOM kill, a segfault) sends no
 2.  The conductor asks the model once, at ingest, for each partition's walk plan (`walk_plan`: e.g. `prefill` then `decode`), and runs it: it sends each walk its inputs and moves to the next walk as each one completes.
 3.  Workers execute the ready graph nodes on GPU through the engine. The engine declares and admits each step's resource work around the forward pass. Workers then route the output tensors to downstream nodes and workers.
 4.  Outputs marked for the client are post-processed (`postprocess`) and streamed back.
+
+Workers service unrelated teardown during completion waits when admission and
+active batches permit it.
