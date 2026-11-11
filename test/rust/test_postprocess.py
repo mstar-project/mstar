@@ -386,7 +386,7 @@ def _through_the_worker(rt, rids, wide):
             get_fwd_info=lambda rid, partition: None, get_pending_publish_info=lambda rid, partition: {},
             flush_publish_info=lambda rid, partition: None, buffer_publish_info=lambda *a: None,
         ),
-        streams=SimpleNamespace(assign_consumer_walks=lambda batch: None, walk_driven_edges={}),
+        streams=SimpleNamespace(assign_consumer_walks=lambda batch: None, walk_driven_edges={}, consumer_node={}),
     )
     w.executor._stop_token_signal[(NODE, WALK)] = "new_token"
     node_batch = ExecutingBatch(

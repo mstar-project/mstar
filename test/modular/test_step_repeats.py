@@ -167,14 +167,13 @@ def test_a_device_run_that_ended_short_settles_its_width_before_anything_reads_i
 
 def test_a_device_run_leaves_a_resources_host_row_whole():
     """A one-iteration run with a log-prob row: that row is one value a row, not a column."""
-    rows = HostRows(
-        (1, 2), {"new_token": torch.tensor([[5], [6]]), "sampled_logprob": torch.tensor([-0.5, -0.7])},
-        torch.tensor([1]),
-    )
+    rows = HostRows((1, 2), {"new_token": torch.tensor([[5], [6]]), "sampled_logprob": torch.tensor([-0.5, -0.7])})
     ctx = SimpleNamespace(repeats=1)
     batch_n = SimpleNamespace(node_batch=SimpleNamespace(step_context=ctx), graph_walk=WALK)
+    run = RunState(2, 1, {2}, torch.device("cpu"))
+    run.ran[0] = 1
 
-    StepExecutor._settle_device_run(batch_n, rows)
+    StepExecutor._settle_run(batch_n, rows, run)
 
     assert rows.buffers["sampled_logprob"].tolist() == pytest.approx([-0.5, -0.7])
     assert rows.buffers["new_token"].tolist() == [[5], [6]]
