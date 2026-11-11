@@ -209,6 +209,40 @@ def test_a_synchronous_verify_node_is_serial_on_leader_and_follower_alike(synchr
     assert follower.speculator.is_tp_follow_pending(pending) is (not synchronous)
 
 
+@pytest.mark.parametrize("synchronous", [True, False])
+def test_a_synchronous_verify_node_off_lockstep_builds_no_speculation(synchronous):
+    """With ``enable_async_scheduling`` on, the runtime calls the walk async-schedulable, so on a node that isn't
+    lockstep `can_speculate` alone keeps a synchronous verify step from being planned ahead of the last one's
+    postprocess. Negative control: an asynchronous verifying node speculates."""
+    from mstar.worker.speculation import SpeculationTarget
+
+    tried = []
+    chain_step = SimpleNamespace(node_batch=SimpleNamespace(node_name=NODE), tp_seq=-1, is_yield_away=False)
+    worker = make_worker(
+        graph_runtime=SimpleNamespace(is_async_schedulable=lambda node, walk: True),
+        verifying_nodes={NODE}, synchronous_verify_nodes={NODE} if synchronous else set(),
+        scheduler=SimpleNamespace(next_batch=lambda exclude_target: None, chunks=lambda node, walk: False),
+        peek=False,
+    )
+    speculator = worker.speculator
+    speculator._choose_spec_target = lambda batch: SpeculationTarget(
+        SimpleNamespace(node_name=NODE, graph_walk=WALK), [1],
+    )
+    speculator._try_speculate_next = lambda pending, target: tried.append(target) or chain_step
+    batch = ScheduledBatch(
+        node_name=NODE, graph_walk=WALK, request_to_worker_graph={1: 0}, output_signals=["new_token"],
+    )
+    pending = SimpleNamespace(
+        batch=batch, node_name=NODE, graph_walk=WALK, node_batch=SimpleNamespace(admit_error=None), tp_seq=-1,
+    )
+    assert speculator.can_speculate(batch) is not synchronous
+    speculation, _ = speculator.build(pending)
+    if synchronous:
+        assert speculation is None and not tried
+    else:
+        assert speculation is chain_step and len(tried) == 1
+
+
 @pytest.mark.parametrize("verify", [True, False])
 def test_a_verify_steps_uncut_outputs_never_reach_the_speculated_step(verify):
     """The next step of a verify walk reads each row's token off the
