@@ -58,6 +58,7 @@ import re
 import sys
 import tempfile
 from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -138,6 +139,56 @@ def _stub_attention(root, lengths, rope=None) -> None:
             module.attend = _Attend(lengths)
             if rope is not None:
                 module._apply_rope = lambda q, k, label, rope=rope: rope(q, k)
+
+
+class _AttendCore:
+    """``_Attend`` as the KV array's read runs it, on the k and v its add held."""
+
+    requires_kv_write = False
+
+    def __init__(self, lengths):
+        self.attend = _Attend(lengths)
+
+    def run(self, q, *, label, kv_cache_layer, k, v, layer_idx):
+        return self.attend(q, k, v)
+
+
+class _Positions:
+    """``rope(q, k)`` in place of the array's position resource (None leaves positions out)."""
+
+    def __init__(self, rope):
+        self.rope = rope
+
+    def apply_qk(self, q, k, *, label, rope_dtype):
+        return (q, k) if self.rope is None else self.rope(q, k)
+
+
+class _Unread:
+    """The KV pages, which the stubbed read never reads."""
+
+    def layer_view(self, i):
+        return None
+
+    def opens_label(self, rid, label):
+        return True
+
+
+@contextmanager
+def _step_over(sub, lengths, array: str):
+    """A step of one row per ``lengths`` with ``sub``'s handle on ``array`` open, as the engine opens it around a
+    forward."""
+    from mstar.engine.resources.step import Segment, StepContext, SubmoduleStep
+    from mstar.engine.state import ArrayStep
+
+    segments = [Segment(rid, "main", n) for rid, n in enumerate(lengths)]
+    step = SubmoduleStep(segments=segments, state={array: ArrayStep()})
+    step.set_state_handles((sub.state_handles[array],))
+    step.set_ctx(StepContext(tuple(range(len(lengths))), "prefill", 0, False))
+    step.begin_calls()
+    try:
+        yield
+    finally:
+        step.end_calls()
 
 
 def _last(hidden, lengths):
@@ -408,16 +459,29 @@ def _qwen3_tts() -> ModelSpec:
 
 
 def _chatterbox() -> ModelSpec:
+    from mstar.engine.state.adapters import node_handles
+    from mstar.model.chatterbox.chatterbox_model import ChatterboxModel
+    from mstar.model.chatterbox.config import T3_ATTN, T3_KV, T3_NODE, T3_POS, T3_SAMPLER
     from mstar.model.submodule_base import engine_step
 
+    def bind(sub, lengths, rope=None):
+        """``sub``'s handles on T3's declared state, over the SDPA stub and ``rope``."""
+        declaring = object.__new__(ChatterboxModel)
+        declaring.config = sub.config
+        sub.bind_node_state(node_handles(declaring, T3_NODE, {
+            T3_KV: _Unread(), T3_ATTN: _AttendCore(lengths), T3_POS: _Positions(rope), T3_SAMPLER: None,
+        }))
+
     def run(sub, ids, lengths, rope=None):
-        _stub_attention(sub.model, lengths, rope)
-        hidden = sub.model.hidden(sub.model.speech_emb(ids), label="main")
+        bind(sub, lengths, rope)
+        with _step_over(sub, lengths, T3_KV):
+            hidden = sub.model.hidden(sub.model.speech_emb(ids))
         return sub.model.logits(_last(hidden, lengths)).float()
 
     def declare(sub, rids, ids):
         from mstar.model.submodule_base import ARNodeInputs
 
+        bind(sub, [len(i) for i in ids])
         # without guidance, a row per request (the CPU test covers guidance's two)
         return engine_step(sub, "prefill", rids, [
             ARNodeInputs(input_seq_len=len(i), input_embeds=sub.model.speech_emb(i), resource_step_info=False)
