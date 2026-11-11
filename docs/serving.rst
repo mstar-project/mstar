@@ -241,7 +241,9 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
    * - ``max_seq_len``
      - Required, but nothing reads it: it neither sizes the KV cache nor caps context.
        A KV cache's length limit is its own ``max_seq_len``, set by the model or under
-       ``resources: <kv>:`` (see the resource overrides below).
+       ``resources: <kv>:`` (see the resource overrides below). On a node that verifies
+       drafts that override is still the client's limit: the pool holds the verify slack
+       past it.
    * - ``node_groups``
      - List of placements. Each entry assigns ``node_names`` to ``ranks``, optionally
        scoped to specific ``graph_walks`` and/or parallelized with ``tp_size``,
