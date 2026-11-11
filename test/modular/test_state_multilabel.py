@@ -47,6 +47,7 @@ from mstar.engine.resources.kv.config import (
     refuse_undeclared_labels,
 )
 from mstar.engine.resources.kv.plan import group_by_plan_label
+from mstar.engine.resources.position.config import PositionStep
 from mstar.engine.resources.recurrent.config import RecurrentBlockConfig, RecurrentStateConfig, RecurrentStateSpec
 from mstar.engine.resources.step import Segment, StepContext, SubmoduleStep
 from mstar.engine.state import (
@@ -57,6 +58,7 @@ from mstar.engine.state import (
     Causal,
     KVEntry,
     Layout,
+    Positions,
     Read,
     Window,
     at_last_token,
@@ -268,6 +270,14 @@ def test_an_array_whose_reads_differ_by_walk_has_a_storage_of_its_own():
     """Its handle holds each walk's reads, which an array whose reads serve every walk has no use for."""
     assert storage_of(_per_walk()) is PAGED_BY_WALK
     assert storage_of(_array()) is PAGED, "every paged array's handle would carry a walk table"
+
+
+def test_an_array_whose_reads_differ_by_walk_steps_its_positions_on_every_walk():
+    """A walk's step plans only that walk's reads, and the array's positions on any walk."""
+    h = _per_walk_handle(_array(positions=Positions(), reads=_per_walk().reads))
+    for walk in ("decode", "prefill_vit", "mixed_text"):
+        steps = state_steps(_step(h), {"kv": h}, graph_walk=walk).steps
+        assert isinstance(steps.get("rope"), PositionStep), f"a step on {walk!r} would leave the positions unplanned"
 
 
 def test_a_combined_walk_plans_the_mask_its_walks_read():
