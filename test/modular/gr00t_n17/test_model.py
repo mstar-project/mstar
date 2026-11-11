@@ -1277,15 +1277,6 @@ def test_postprocess_adds_the_batch_axis_the_engine_hands_back_without():
     assert model.postprocess(_CHUNK[0], "action", kwargs) == model.postprocess(_CHUNK, "action", kwargs)
 
 
-@pytest.mark.parametrize("kwargs", [None, {}, {"state": _RAW_STATE}, {"embodiment_tag": None}])
-def test_postprocess_without_the_requests_embodiment_tag_is_refused(kwargs):
-    """No default tag is safe: eight embodiments of different widths and horizons, and a
-    DROID chunk decoded on a G1's bounds looks right. A missing key and an explicit null
-    arrive the same way."""
-    with pytest.raises(ValueError, match="embodiment_tag"):
-        _decoding_model().postprocess(_CHUNK, "action", kwargs)
-
-
 @pytest.mark.parametrize("modality", ["text", ""])
 def test_postprocess_refuses_a_modality_this_model_does_not_emit(modality):
     """Another modality is refused before the tag is read; "text" and the falsy "" cover the

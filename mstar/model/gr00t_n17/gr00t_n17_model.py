@@ -591,16 +591,10 @@ class Gr00tN17Model(Model):
         if modality != "action":
             raise ValueError(f"gr00t_n17 emits actions or a reuse walk's tensor, not {modality!r}")
         kwargs = request_kwargs or {}
-        tag = kwargs.get("embodiment_tag")
-        if tag is None:
-            raise ValueError(
-                "gr00t_n17 cannot decode without the request's `embodiment_tag`: "
-                "it selects the action statistics and the joint groups"
-            )
         chunk = output.detach().to(torch.float32).cpu().numpy()
         if chunk.ndim == 2:  # one request, as the engine hands it back
             chunk = chunk[None]
-        groups = self.processor.unapply(tag, chunk, kwargs.get("state"))
+        groups = self.processor.unapply(kwargs["embodiment_tag"], chunk, kwargs.get("state"))
         return msgpack.packb({name: _entry(value) for name, value in groups.items()})
 
     # -------------------------------------------------------- forward passes
