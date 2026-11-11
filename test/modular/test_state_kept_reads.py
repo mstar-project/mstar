@@ -44,7 +44,7 @@ from mstar.engine.state import (
     Window,
     at_last_token,
 )
-from mstar.engine.state.adapters import PagedCrossHandle, build_handle, build_specs, node_handles, state_steps
+from mstar.engine.state.adapters import StateSetup, _resolve, build_handle, build_specs, node_handles, state_steps
 from mstar.engine.state.calls import ArrayHandle
 from mstar.engine.state.contract import Entry
 from mstar.model.components.distributed.attention import ParallelCrossAttention
@@ -148,7 +148,7 @@ def _add_and_read(handle, layer, tokens=3) -> None:
 def test_a_kept_reads_mask_picks_the_steps_flag(mask, causal):
     array = Array("kv", nodes={"n"}, layers=LAYERS, entry=ENTRY, max_len=64,
                   reads={"attn": Read(mask=mask, op=Attend(q_heads=HEADS))})
-    handle = build_handle(array, {"kv": _StubKV(), "attn": _StubSelfRead()})
+    handle = build_handle(array, {"kv": _StubKV(), "attn": _StubSelfRead()}, _resolve([array], StateSetup()))
     step = state_steps(SubmoduleStep(segments=[Segment("a", "main", 1)], state={"kv": ArrayStep()}), {"kv": handle})
     assert step.steps["attn"].causal is causal, f"{mask} plans the other flag"
 
@@ -404,24 +404,19 @@ def test_at_last_token_on_a_cross_array_is_refused_by_name():
     step.end_calls()
 
 
-def test_a_handles_queried_array_is_keyword_only():
-    with pytest.raises(TypeError):
-        PagedCrossHandle(_context_array(), {"context": _StubKV(), "cross": _StubCross()}, None, (), _self_array())
-
-
 # State ops and the pages
 
 
-CUDA_ONLY = SimpleNamespace(formats=(PagedNHD(devices={"cuda"}),))
-ANY_DEVICE = SimpleNamespace(formats=(PagedNHD(),))
+CUDA_ONLY = SimpleNamespace(adds=("context",), formats=(PagedNHD(devices={"cuda"}),))
+ANY_DEVICE = SimpleNamespace(adds=("context",), formats=(PagedNHD(),))
 
 
-def test_a_cross_handle_isnt_addressed_by_an_op_whose_formats_dont_list_its_pool():
-    """Grouped wrong, ``queried or requires_kv_write and formats`` addresses every op, and `_call` would then run a
-    fused kernel on a format it doesn't list."""
+def test_a_cross_handle_takes_no_fused_op_whose_formats_dont_list_its_pool():
+    """A cross read holds no layer's k and v, so the op's formats alone decide, and a fused kernel never runs on a
+    format it doesn't list."""
     context = _bound(device="cpu")["context"]
-    assert not state_op_module._addresses(CUDA_ONLY, context)
-    assert state_op_module._addresses(ANY_DEVICE, context), "a listed format may write the pages a cross read attends"
+    assert not context.takes_fused(CUDA_ONLY)
+    assert context.takes_fused(ANY_DEVICE), "a listed format may write the pages a cross read attends"
 
 
 def test_state_ops_bind_on_a_node_with_a_cross_array(monkeypatch):
@@ -430,16 +425,6 @@ def test_state_ops_bind_on_a_node_with_a_cross_array(monkeypatch):
     handles = _bound(device="cpu")
     state_op_module.bind_state_ops(handles)
     assert handles["context"].fused_ops == {"any_device"}
-
-
-class _StubDense(_StubSelfRead):
-    requires_kv_write = False
-
-
-def test_a_backend_that_takes_k_and_v_at_its_read_is_never_addressed():
-    array = _self_array()
-    handle = build_handle(array, {"kv": _StubKV(), "attn": _StubDense(), "rope": object()})
-    assert not state_op_module._addresses(ANY_DEVICE, handle)
 
 
 # ParallelCrossAttention
@@ -561,7 +546,7 @@ def dense(monkeypatch):
                   reads={"attn": Read(mask=Bidirectional(), op=Attend(q_heads=4))})
     for rid in ("a", "b"):
         kv.ingest_request(rid)
-    return kv, attn, build_handle(array, {"kv": kv, "attn": attn})
+    return kv, attn, build_handle(array, {"kv": kv, "attn": attn}, _resolve([array], StateSetup()))
 
 
 def _run_step(kv, attn, handle, spans, keep):
@@ -686,7 +671,7 @@ def test_a_bidirectional_read_on_flashinfers_kernel_matches_sdpa(monkeypatch):
     attn = FlashInferManager(kv_cache="kv", device=torch.device("cuda"), dtype=torch.bfloat16, kv_config=config)
     array = Array("kv", nodes={"n"}, layers=LAYERS, entry=KVEntry(heads=2, head_dim=64), max_len=64,
                   reads={"attn": Read(mask=Bidirectional(), op=Attend(q_heads=4))})
-    handle = build_handle(array, {"kv": pool, "attn": attn})
+    handle = build_handle(array, {"kv": pool, "attn": attn}, _resolve([array], StateSetup()))
     kept: dict = {}
     for spans, keep in (({"a": 18, "b": 3}, True), ({"a": 2, "b": 4}, False)):
         step = state_steps(SubmoduleStep(
