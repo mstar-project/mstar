@@ -1853,6 +1853,35 @@ What the model writes, and nothing more:
   boundary (``DrafterNeeds.chunk_boundary``): ``NONE`` when its state at a row depends on that
   row alone (DSpark).
 
+**On the decoder scaffold.** A ``MultimodalDecoderModel`` whose LLM node is a
+``SampledTokenDecoder`` writes less: the verify path is the scaffold's, and switches on
+only for a node given a drafter, so a model without a draft block runs as before.
+Qwen3 (``mstar/model/qwen3``) is the example. The model:
+
+- sets ``draft`` (``DraftConfig.from_model_kwargs``) and ``drafter_decl`` in its ``__init__``;
+- returns its LLM node's class from ``llm_node_class()`` and its own ``VerifyNode`` fields
+  from ``verify_node_fields()`` (``input_kinds``, the target's ``ModelGeometry``, and a hosted
+  drafter's checkpoint and steps); the base builds the verify node around them, with the
+  node class's ``node_token_stop`` and ``node_device_loopback``;
+- declares its KV pool as for a plain deployment and its attention resources with
+  ``splits=self.mixed_splits()``, and passes its specs through
+  ``drafter_resources(specs, self.drafter_decl, nodes, self.draft)``.
+
+The base then turns off what a verifying node doesn't run yet (combined walks and the mixed
+split; the engine turns rebuild off; ``drafter_resources`` makes the sampler a verifying one with
+no repetition penalty), and refuses at startup a checkpoint whose ``generation_config.json`` defaults a
+``repetition_penalty`` other than 1, since every request would inherit it. A model that
+declares a chunking budget for the mixed step drops it itself while drafting:
+``chunking_policy_of`` refuses a policy for a combined walk the model no longer has.
+
+The node passes ``drafter`` to ``SampledTokenDecoder.__init__``; ``k`` is the engine's to bind
+(``NodeSubmodule.bind_draft``). The
+scaffold then captures and declares ``k + 1`` rows a decode step, runs no mixed capture,
+declares the verify step (``verify_layer_steps()``: ``layer_steps()`` with each attention on
+its verify kernel) and runs it through ``draft_verify_step``. What stays the node's:
+``decoder_kwargs`` (Qwen3's taps) and ``after_prompt_rows`` (the drafter's pass over each
+prompt step, after it samples), both called only with a drafter.
+
 **Drafter resources.** A drafter is declared from config alone (``DrafterDecl``): its
 ``needs`` and ``node_resources(nodes)``, the resources it adds to the node (DSpark's attention
 with the block's mask and its ``TapSpec``). A drafter whose layers write the
@@ -1873,6 +1902,15 @@ engine refuses, at load, a verifying node whose drafter's layer set is not bound
 layers, one attention layer each: a stack that forgot ``kv_layer_set`` would write the target's.
 Declare the pool's tunables (``page_size``, ``max_num_pages``) as for any pool: ``max_num_pages``
 counts pages of every layer, the drafter's included, as it always did.
+
+A target that builds and runs a drafter module (Qwen3) types it as ``HostedDrafterDecl``
+(``mstar/model/components/hosted_drafter.py``): ``num_draft_tokens``, ``tap_key``, ``prefill_steps()``,
+``verify_steps()``, ``build(...)``, and the module's ``prefill``.
+
+``mstar/model/qwen3`` is the worked example: a plain Qwen3 node that, under a draft block,
+adds a DSpark drafter (``mstar/model/components/dspark``) whose layers join the target's KV
+pool as layer set ``"dspark"``, rotate at the target's positions, and attend through a second
+attention resource over that pool with the hidden-last-row mask.
 
 The engine owns everything across steps: the order inside the step (draft, agree on rank 0's
 drafts, target, verify, observe), the bonus token in the sampler's loop-back slot, the KV
@@ -2493,7 +2531,8 @@ the signal, so the worker routes it without a tensor and sends the client's copy
 row whose last step did not keep its value on the device (its first decode step, after
 the prefill) still brings it routed, and that read puts it over the slot's.
 ``SampledTokenDecoder`` declares it for Qwen3.5, Muse Glimmer, Higgs Audio, Qwen3-ASR and the Cosmos3 reasoner,
-and a node on it that reads the routed token sets ``device_loopback = None``; Whisper and
+and a node on it that reads the routed token sets ``device_loopback = None`` on its class,
+which ``node_device_loopback()`` reads for a verify node; Whisper and
 Qwen3-Omni's Thinker declare their own. Qwen3.5 reads the tokens with ``last_sampled``.
 
 A token that also streams to another node can go down the stream by value, when the
@@ -3869,7 +3908,8 @@ from the checkpoint's ``generation_config.json``), the LLM's ``SamplerSpec``
 submodule cache and where the files come from. A model sets ``NAME`` and
 ``METADATA_FILES`` and writes ``__init__`` (setting
 ``config``, ``tokenizer`` and ``media``), its resources (the sampler from
-``_sampler_spec``; ``MIXED_SPLIT`` is the attention resources' split of a mixed step),
+``_sampler_spec``; ``mixed_splits()`` is the attention resources' split of a mixed step,
+none on a drafting node),
 ``_prompt_ids`` and ``_create_submodule``. The scaffold's
 ``rebuild_policies`` lets the KV cache drop a request and reprefill its ids on its prefill
 walk, a media prompt's with host copies of its encoders' outputs. A model whose LLM node
@@ -3903,7 +3943,7 @@ and never syncs on the device.
 
 The ``LLM`` node subclasses ``SampledTokenDecoder``
 (``mstar/model/components/sampled_token_decoder.py``), which owns the capture configs
-(decode, packed text prefill, mixed, and one packed capture every media walk replays,
+(decode, packed text prefill, mixed unless it drafts, and one packed capture every media walk replays,
 which also caps their batches), device loop-back of the sampled token, the splice of
 the encoders' outputs into the prompt's embeddings inside the forward
 (``where(mask, media[cumsum(mask) - 1], embed(ids))``, the media in prompt order and the mask
@@ -3943,7 +3983,7 @@ only. A lone encoder's ``MediaEncoder.walk`` names its media walk when the model
 calls it something other than ``prefill_<name>`` (Qwen3-ASR's and Canary-Qwen's
 ``prefill``). A graph that names its other walks otherwise sets
 ``PREFILL_WALK``, ``DECODE_WALK`` and ``DECODE_LOOP``.
-It reports a text prompt's length and a decode row's one token
+It reports a text prompt's length and a decode row's one token (``k + 1`` when it drafts)
 (``get_input_sequence_len``, ``speculative_input_seq_len``), so a model chunks its text
 prefill by declaring ``get_chunking_policies`` alone, as Qwen3.5 does.
 
