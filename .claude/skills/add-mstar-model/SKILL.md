@@ -17,11 +17,11 @@ Check your own work against both before anything else, because both produce code
 
 **Collapsing the graph onto one node.** The tell is a single node holding the LLM *and* the decoder (or the VAE, or the codec), often named after the model itself. It works, and it throws away disaggregation: nothing in that model can be placed on a separate GPU or scheduled independently again. Fusing stages is a legitimate optimization for capture size — qwen3-omni fuses talker and code predictor deliberately — but it is a choice made after the split, with a reason, not the starting point.
 
-**Drifting to model-owned resources.** State ends up in the submodule because that is the path of least resistance. If you are writing allocation, capacity limits, cleanup or a stable buffer address under `mstar/model/`, that is invariant 1 and the answer is a `Resource`.
+**Drifting to model-owned resources.** State ends up in the submodule because that is the path of least resistance. If you are writing allocation, capacity limits, cleanup or a stable buffer address under `mstar/model/`, that is invariant 1, and the answer is a declaration: state in `declare_state`, anything else in `get_node_resources`.
 
 ## Phase 0 — Verify the contract in the checkout, not in the docs
 
-Read `Model` in `mstar/model/base.py` and list its current abstract hooks; read `NodeSubmodule` and `ARNodeSubmodule` in `mstar/model/submodule_base.py`; read the declarations and implementations under `mstar/engine/resources/` with their focused tests. `docs/adding_models.rst` is the narrative guide and worth reading, but the checkout is authoritative — the docs were wrong about the registry's own type signature for a long time. If a direction you need requires an API that does not exist, record that and stop rather than reviving an older one.
+Read `Model` in `mstar/model/base.py` and list its current abstract hooks and `declare_state`, whose types are in `mstar/engine/state/contract.py`; read `NodeSubmodule` and `ARNodeSubmodule` in `mstar/model/submodule_base.py`; read the declarations and implementations under `mstar/engine/resources/` with their focused tests. `docs/adding_models.rst` is the narrative guide and worth reading, but the checkout is authoritative — the docs were wrong about the registry's own type signature for a long time. If a direction you need requires an API that does not exist, record that and stop rather than reviving an older one.
 
 Then check you can actually run the reference, before any design work:
 
@@ -61,12 +61,14 @@ Diff your `state_dict()` against the checkpoint's safetensors index by **name an
 
 A **resource** is state the engine must admit, plan, commit and clean up per request, and that must survive graph capture: persistent cross-step state, and anything planned over it. Everything else is a submodule.
 
+State a node keeps between steps is declared in `declare_state`, as Step 2a of `docs/adding_models.rst` shows, and its layers reach it through handles. The engine builds the resource behind each declaration, so for that state the pass below decides the declaration and checks the resource the engine builds for it. A declaration the engine can't build yet fails at load with `no layout yet` and names what's missing. The gap is in `mstar/engine/state/adapters.py`, the layer that builds resources from declarations, and sometimes in the resource itself, which the paragraphs below cover.
+
 **Do an explicit resource pass before writing submodules**, one row per piece of per-request or per-step state and per attention, sampling or position operation:
 
 | state or op | lifetime and size | existing resource, as is | existing resource, changed (how; own PR?) | new resource (why nothing fits) | allocated in which walk; what happens when full | how the model reaches it |
 |---|---|---|---|---|---|---|
 
-Each row must hold up: the resource's layout expresses the mask or retention, checked against the reference (read the planner, not the kind's name; when retention isn't obvious, simulate the reference's cache on token ids); capacity becomes engine backpressure, and the request that waits is the one that needs it; eager and captured paths address it the same way; and the model reaches it only through the resource's API (invariant 1). The [engine-resources skill](../engine-resources/SKILL.md) lists what each existing resource expresses. MiniCPM-o (#381-#383, open PRs) is a worked example: paged KV and ragged attention as is, a new block-causal ragged kind, an extended sampler, `RecurrentStatePool` for the vocoder's carry state, and a new bounded KV once paged KV with retention and `RingKVManager` were ruled out.
+Each row must hold up: the resource's layout expresses the mask or retention, checked against the reference (read the planner, not the kind's name; when retention isn't obvious, simulate the reference's cache on token ids); capacity becomes engine backpressure, and the request that waits is the one that needs it; eager and captured paths address it the same way; and the model reaches it only through its handle or, for a resource that isn't state, the resource's API (invariant 1). The [engine-resources skill](../engine-resources/SKILL.md) lists what each existing resource expresses. MiniCPM-o (#381-#383) is a worked example: paged KV and ragged attention as is, a new block-causal ragged kind, an extended sampler, `RecurrentStatePool` for the vocoder's carry state, and a new bounded KV once paged KV with retention and `RingKVManager` were ruled out.
 
 Reuse KV, attention, cross-attention, ragged (cacheless) attention, position and sampler resources wherever their contracts fit. A genuinely new kind is a normal outcome and gets a package under `mstar/engine/resources/<kind>/` with declaration types, a manager, exports and focused tests, built on the existing spec, request-config, step and `Resource` interfaces. Several current model PRs add recurrent-state and linear-attention resources this way, modelled on the KV resource. Read the [engine-resources skill](../engine-resources/SKILL.md) before writing one.
 
@@ -78,9 +80,11 @@ Keep resident capacity separate from one-step batching: a pool may retain many s
 
 ## Phase 4 — Write it, register it, prove eager parity
 
-`mstar/model/<name>/<name>_model.py` with the graph, resource and partition declarations, prompt/input processing and output processing. Per submodule: `prepare_inputs` (set `input_seq_len`), `preprocess`, `forward`, `postprocess`, `check_stop`, `declare_step`. Write forwards tensor-in/tensor-out from the start (invariant 3) — retrofitting that is far more work than doing it once.
+`mstar/model/<name>/<name>_model.py` with the graph, state, resource and partition declarations, prompt/input processing and output processing. Per submodule: `prepare_inputs` (set `input_seq_len`), `preprocess`, `forward`, `postprocess`, `check_stop`, `declare_step`. Write forwards tensor-in/tensor-out from the start (invariant 3) — retrofitting that is far more work than doing it once.
 
 **Register it: [registration.md](references/registration.md) is the checklist.** `test/modular/test_model_registration.py` enforces the registry, the CLI default config and the docs row, so CI catches those three. Forgetting the CLI entry means `mstar serve <model>` exits `unknown model` no matter how correct the code is.
+
+If the model gets OpenAI routes, its adapter lands in both frontends: the Python HTTP frontend is being retired, so the Rust port (`rust/server/src/adapters/`) is part of the adapter, not a follow-up (AGENTS.md invariant 15; [registration.md](references/registration.md) §5).
 
 Grep for callers before overriding any base-model or submodule hook — the hook surface contains refactored-out methods that nothing calls, and overriding one is a silent no-op.
 
@@ -97,7 +101,7 @@ Validate in this order:
 1. Component forwards and weight mapping against the reference.
 2. A standalone eager pipeline from the reference as an independent oracle. Do not wrap the upstream pipeline as the served implementation — oracle only.
 3. Your node forwards against that oracle.
-4. Walks, resource declarations, request configs and step declarations on CPU, before weights (`pytest test/modular/`, dummy mode, `get_submodule` returns `None`).
+4. Walks, state and resource declarations, request layouts and step declarations on CPU, before weights (`pytest test/modular/`, dummy mode, `get_submodule` returns `None`).
 5. Live serving against the oracle on deterministic input, through the API server and not only the engine: the streamed output equals the non-streamed one sample for sample, with the same length (compare decoded audio or frames, not response bytes: a streamed WAV carries an unknown-length header); two identical requests on one server return identical bytes; an edge budget (`max_tokens` of 1 or 2) returns exactly that much; and a malformed field is a 400 and the server serves normally afterwards. Where a route enforces the media rules of #411 (open PR), check that the model's media fields follow them too. Keep the script under `test/<model>/` and exit nonzero on any mismatch.
 
 When a parity check fails, diff per-layer hidden states against the oracle, then split the first bad layer into its parts — each norm, the mixer, the MLP. A mixer compared in isolation can pass while its enclosing layer is wrong, because the isolated comparison feeds both sides the same input; the norms and the residual are where convention mismatches live.
@@ -128,7 +132,6 @@ Each of these is a one-line convention that a reference implementation states so
 - **Under bf16, round rotary frequencies and timesteps after the sinusoid, not before.** `module.to(bfloat16)` (which the engine applies after `get_submodule`) rounds the rotary frequency buffers, and a timestep cast to the module's dtype before the sinusoid loses its low bits in `t * freq`. Keep the frequency buffers fp32 in `_apply`, compute the sinusoid in fp32 from an fp32 timestep, and cast only its output. In CosyVoice3's flow estimator both roundings moved the audio measurably.
 - **Keep an fp32 LM head out of autocast, and load it as fp32.** The engine's bf16 autocast recasts an fp32 head unless it runs outside autocast, and loading the checkpoint into a bf16 module before making the head fp32 rounds its weights first.
 - **Key per-request submodule state by `fwd_info.rid_handle` in `prepare_inputs`**, not `request_id`: the forward and the engine's cleanup use the handle.
-- **The conductor merges each pass's `step_metadata` into the request's `metadata.kwargs`.** A model whose walks send *different* step metadata (multi-stage, multi-resolution) and also keeps request-level facts in kwargs under the same names has those facts overwritten by the previous walk's values: a stage-1 half-resolution `height` becomes the request's height for stage 2. Keep request-level facts under keys step metadata never uses (LTX-2.5 nests them under `kwargs["request"]`).
 
 ## Phase 5 — Batching and accelerator graphs
 
@@ -141,7 +144,7 @@ Per-request state is one struct with one cleanup, called on the completed, faile
 Cross-request batching needs a batched forward, per-request info threading, a row-independence test and a dedicated padding slot; find the knee with a sweep rather than assuming it. Then check the batch sizes the forward actually runs under concurrency: a per-request counter or position in a grouping key silently batches nothing.
 
 - A model with several KV-backed nodes sizes every KV in its yaml; the defaults assume one, and the last resource to build OOMs.
-- A node whose work splits into several piecewise regions runs every call through the runners with `eager_fallback=True` (#383, open PR), with eager-only regions for shapes it never captures, rather than keeping a hand-written eager path: each region then plans exactly the rows it runs.
+- A node whose work splits into several piecewise regions runs every call through the runners with `eager_fallback=True` (#383), with eager-only regions for shapes it never captures, rather than keeping a hand-written eager path: each region then plans exactly the rows it runs.
 - Stream positions derive from what was written, never from a step count.
 
 Consider making capture a separate PR stacked on the eager MVP, and any **system** change your model needed a separate PR underneath — see "Splitting work across PRs" in AGENTS.md. Recommended, not required; large models are painfully slow without capture, so an eager-only merge is not always useful alone.
@@ -169,6 +172,8 @@ Use the [benchmarking skill](../benchmarking/SKILL.md) for methodology — warmu
 Establish CPU-bound or GPU-bound first; the benchmarking skill covers how (`event_sync` near zero means CPU-bound). That much is settled. Beyond it **there is no established best practice in this repo yet** — current tuning work is iterative and exploratory, so treat any confident-sounding recipe with suspicion, including one you generate yourself. What holds regardless: same harness, same box, two sides adjacent in time, and re-check the workloads you are not targeting before calling a change a win.
 
 Two things that are settled: a host sync in your `prepare_inputs` hides inside that phase rather than in `event_sync`, and a host-bound step gets faster by deleting work, not by moving it to another thread. Values already known on the host travel in `step_metadata`.
+
+Phase 4's reuse note holds for tuning too, and for models already in the repo: before optimizing a layer, check `mstar/model/components/` for a shared version of it (for example `snake.py`, a codec decoder's Snake activation in one pass).
 
 If tuning pushes you into the worker or engine rather than your model, read the [async-worker skill](../async-worker/SKILL.md) first.
 

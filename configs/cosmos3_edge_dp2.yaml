@@ -3,6 +3,8 @@ model: "cosmos3_edge"
 # node_groups. Two GPUs, throughput-oriented: a whole replica per GPU, and the
 # conductor sends each request to the replica serving fewer requests.
 max_seq_len: 8192
+knobs:
+  step_threads: serial
 resources:
   kv:
     max_num_pages: 1024

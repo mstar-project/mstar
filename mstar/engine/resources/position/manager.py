@@ -2,6 +2,7 @@
 
 has ownership of per-(request,label) position counter"""
 
+import dataclasses
 from collections.abc import Sequence
 from dataclasses import dataclass, field, fields
 from typing import TYPE_CHECKING
@@ -20,8 +21,10 @@ from mstar.engine.resources.kv.config import KVSpec
 from mstar.engine.resources.kv.keys import fingerprint
 from mstar.engine.resources.kv.plan import KVPlanOutputs
 from mstar.engine.resources.position.config import (
+    LongRoPE,
     PosBackend,
     PositionConfig,
+    PositionReqConfig,
     PositionSpec,
     PositionStep,
     PosScheme,
@@ -32,12 +35,30 @@ from mstar.engine.resources.position.rope import (
 from mstar.engine.resources.resident import gather_column
 from mstar.engine.resources.step import ADMIT_OK, AdmitOutcome, StepContext
 
+# a LongRoPE plan label's table ids, keyed beside its positions
+_TABLE_IDS = "#longrope"
+
 if TYPE_CHECKING:
     from mstar.engine.resources.resident import (
         CapturedResidentStep,
         ResidentPlanner,
         ResidentWrites,
     )
+
+
+def check_table_rotary_dim(device: torch.device, rotary_dim: int, interleave: bool, what: str) -> None:
+    """Widths FlashInfer's cos/sin-cache kernel rotates correctly. It moves 16 elements
+    a thread, so a width that isn't a multiple of 16 reads past each head. With NeoX
+    pairing it is also wrong, without an error, at widths of 16 more than a multiple of
+    32 for some head sizes (measured on H200: 16 of 32, 16 and 48 of 48 and 80, ...);
+    every multiple of 32 passed, and every multiple of 16 passed with GPT-J pairing."""
+    if device.type != "cuda":
+        return
+    align = 16 if interleave else 32
+    if rotary_dim % align:
+        pairing = "GPT-J" if interleave else "NeoX"
+        raise ValueError(f"{what} needs a rotary_dim that is a multiple of {align} on CUDA with "
+                         f"{pairing} pairing, not {rotary_dim}")
 
 
 @dataclass
@@ -67,7 +88,8 @@ class PositionManager(Resource):
         # `dependency` hands back the SPEC; its `.config` is the KVConfig
         kv_spec: KVSpec = info.dependency(spec.config.kv_cache)
         if spec.config.backend == PosBackend.ROPE:
-            return RopeManager(
+            manager = RopeManager if spec.config.longrope is None else LongRopeManager
+            return manager(
                 config=spec.config,
                 device=info.device,
                 max_seq_len=kv_spec.config.max_seq_len,
@@ -140,12 +162,7 @@ class RopeManager(PositionManager):
             rotary_dim = config.rotary_dim or head_dim
             if rotary_dim is None:
                 raise ValueError("rope_table_dtype needs PositionConfig.rotary_dim or the KV cache's head_dim")
-            if device.type == "cuda" and rotary_dim % 16:
-                # FlashInfer's cos/sin-cache kernel moves 16 elements a thread: a narrower
-                # rotation reads past each head and returns garbage, without an error
-                raise ValueError(
-                    f"rope_table_dtype needs a rotary_dim that is a multiple of 16 on CUDA, "
-                    f"not {rotary_dim}")
+            check_table_rotary_dim(device, rotary_dim, config.interleave, "rope_table_dtype")
             self._rope_table = self._build_rope_cache(
                 rotary_dim,
                 config.rope_scale,
@@ -206,6 +223,8 @@ class RopeManager(PositionManager):
         ))
 
     def ingest_request(self, rid: str, overrides=None):
+        # a ceiling (`PositionReqConfig`) reaches only a LongRoPE resource: the
+        # conductor refuses it for any other (`validate`)
         del overrides
         self._counters[rid] = {}
 
@@ -214,6 +233,13 @@ class RopeManager(PositionManager):
 
     def reset_request(self, rid: str, free: bool=False):
         self._counters[rid].clear()
+
+    supports_drop = True
+
+    def drop(self, rid: str, tokens: int) -> int:
+        # Recomputing the KV starts positions from zero, and `apply_cached_prefix` never moves a counter back.
+        self.reset_request(rid)
+        return 0
 
     def correct_len(self, rid: str, label: str, delta: int) -> None:
         """Move a stream's position by ``delta``, as ``KVManager.correct_len`` moves its KV
@@ -322,12 +348,7 @@ class RopeManager(PositionManager):
             return self._current_pos_ids
         if self._preplanned:
             # staged a step early against this same step's KV plan
-            self._current_pos_ids = self._preplan_pos_ids
-            self._preplan_pos_ids = {}
-            self._preplanned = False
-            # Promotion, not abandonment: the staged forks are kept, so the
-            # undo record is dropped rather than replayed.
-            self._preplan_fork_undo = []
+            self._promote_preplan()
             return self._current_pos_ids
 
         lease = ctx.slot_lease
@@ -351,18 +372,41 @@ class RopeManager(PositionManager):
             undo=self._preplan_fork_undo if ctx.is_preplan else None,
         )
 
-        pos_ids_out = self._preplan_pos_ids if ctx.is_preplan else self._current_pos_ids
-        pos_ids_out.clear()
+        pos_ids_out = self._begin_staging(ctx.is_preplan)
         for plan_label, kv_out in plan_outputs.items():
             pos_ids = self._explicit_pos_ids(step, plan_label, len(plan_outputs))
-            if pos_ids is None:
-                rows = kv_out.rows
-                if rows is None:
-                    rows = [(v.request_id, v.label, v.to_compute) for v in kv_out.views]
-                pos_ids = self._build_pos_ids(rows, plan_label, lease)
-            pos_ids_out[plan_label] = self._place(pos_ids, plan_label, lease)
+            if pos_ids is not None:
+                pos_ids_out[plan_label] = self._place_explicit(pos_ids, plan_label, lease)
+                continue
+            rows = kv_out.rows
+            if rows is None:
+                rows = [(v.request_id, v.label, v.to_compute) for v in kv_out.views]
+            pos_ids_out[plan_label] = self._stage_rows(rows, plan_label, lease, ctx.is_preplan)
         self._preplanned = ctx.is_preplan
         return pos_ids_out
+
+    def _promote_preplan(self) -> None:
+        self._current_pos_ids = self._preplan_pos_ids
+        self._preplan_pos_ids = {}
+        self._preplanned = False
+        # Promotion, not abandonment: the staged forks are kept, so the
+        # undo record is dropped rather than replayed.
+        self._preplan_fork_undo = []
+
+    def _begin_staging(self, is_preplan: bool) -> dict[str, torch.Tensor]:
+        """The (emptied) label -> positions dict this plan fills."""
+        out = self._preplan_pos_ids if is_preplan else self._current_pos_ids
+        out.clear()
+        return out
+
+    def _place_explicit(self, pos_ids: torch.Tensor, plan_label: str, lease) -> torch.Tensor:
+        """A step's own positions for ``plan_label`` (``PositionStep.pos_ids``)."""
+        return self._place(pos_ids, plan_label, lease)
+
+    def _stage_rows(self, rows, plan_label: str, lease, is_preplan: bool) -> torch.Tensor:
+        """``plan_label``'s positions on the device, from the stream counters."""
+        del is_preplan
+        return self._place(self._build_pos_ids(rows, plan_label, lease), plan_label, lease)
 
     # Resident planning: a stream's position runs ahead of its stored length by a
     # fixed amount between host-planned steps, so a row keeps that offset
@@ -383,6 +427,10 @@ class RopeManager(PositionManager):
         row[self._resident_delta.col] = self.position(rid, label) - writes.kv_len[self._kv_cache_name]
 
     def resident_gather(self, step: "CapturedResidentStep") -> None:
+        key = CGSlotKey(bucket=step.bucket, slot=step.slot, label=self._resident_label(step))
+        self._gather_offset(step, self._resident_delta, self._static_buffer(key, step.bucket.num_tokens))
+
+    def _resident_label(self, step: "CapturedResidentStep") -> str:
         own, pool = step.streams[self._resident_key], step.streams[self._kv_cache_name]
         if own.label != pool.label or own.reads or pool.reads:
             # the offset holds only while both advance a token a step, as one stream
@@ -390,11 +438,13 @@ class RopeManager(PositionManager):
                 f"positions on stream {own.label!r} over {self._kv_cache_name!r}'s {pool.label!r}: "
                 "a resident step's positions advance with the stream their KV cache appends to"
             )
-        key = CGSlotKey(bucket=step.bucket, slot=step.slot, label=own.label)
-        table = self._resident_delta
+        return own.label
+
+    def _gather_offset(self, step: "CapturedResidentStep", table, out: torch.Tensor) -> None:
+        """``out[i]``: row ``i``'s cell of ``table`` plus its stored length."""
         gather_column(
             self._resident_store.store, step.slots, table.stride, table.col,
-            self._static_buffer(key, step.bucket.num_tokens), plus=step.buffers.kv_len[self._kv_cache_name],
+            out, plus=step.buffers.kv_len[self._kv_cache_name],
         )
 
     def commit(self, step: PositionStep, ctx: StepContext):
@@ -500,6 +550,9 @@ class RopeManager(PositionManager):
                 extend([start] * to_compute)
             else:
                 extend(range(start, start + to_compute))
+        return self._host_ids(pos_ids, plan_label, lease)
+
+    def _host_ids(self, pos_ids: list[int], plan_label: str, lease) -> torch.Tensor:
         if lease is None:
             return torch.tensor(pos_ids, dtype=torch.long)
         key = CGSlotKey(
@@ -539,7 +592,8 @@ class RopeManager(PositionManager):
 
 
     def position(self, rid: str, label: str) -> int:
-        return self._counters.get(rid, {}).get(label, 0)
+        # by the worker's handle (AGENTS.md invariant 14): the wire id raises
+        return self._counters[rid].get(label, 0)
 
     def pos_ids(self, label: str) -> torch.Tensor | None:
         return self._current_pos_ids.get(label)
@@ -590,6 +644,7 @@ class RopeManager(PositionManager):
         rope_scale: float,
         rope_theta: float,
         dtype: torch.dtype,
+        ext_factors: torch.Tensor | None = None,
     ) -> torch.Tensor:
         positions = (
             torch.arange(
@@ -599,19 +654,13 @@ class RopeManager(PositionManager):
             )
             / rope_scale
         )
-        inv_freq = 1.0 / (
-            rope_theta
-            ** (
-                torch.arange(
-                    0,
-                    rotary_dim,
-                    2,
-                    device=self._device,
-                    dtype=torch.float32,
-                )
-                / rotary_dim
-            )
+        wavelengths = rope_theta ** (
+            torch.arange(0, rotary_dim, 2, device=self._device, dtype=torch.float32) / rotary_dim
         )
+        if ext_factors is not None:
+            # LongRoPE stretches each wavelength by its factor
+            wavelengths = ext_factors * wavelengths
+        inv_freq = 1.0 / wavelengths
         freqs = torch.outer(positions, inv_freq)
         return torch.cat((freqs.cos(), freqs.sin()), dim=-1).to(dtype)
 
@@ -702,6 +751,172 @@ class RopeManager(PositionManager):
             **llama31_params,
         )
         return q.to(orig_dtype), None if alone else k.to(orig_dtype)
+
+
+class LongRopeManager(RopeManager):
+    """RoPE from `LongRoPE`'s short and long tables (Phi-3, Phi-4-mini), one per request.
+
+    One table on the device: the short table's ``max_seq_len`` rows, then the long
+    table's. A request opened with a `PositionReqConfig` past the config's original
+    context rotates with the long half for its whole life, so its rows' table ids sit
+    ``max_seq_len`` past their positions. The ids are planned beside the positions,
+    which `pos_ids` keeps publishing unchanged; the spec names the choice in the
+    request's prefix keys (`PositionSpec.prefix_variant`). On resident tables a row
+    keeps its table id's offset from the stored length beside its position's, so a
+    replay builds both from the row.
+    """
+
+    def __init__(
+        self,
+        config: PositionConfig,
+        device: torch.device,
+        max_seq_len: int = 32768,
+        head_dim: int | None = None,
+        dtype: torch.dtype = torch.bfloat16,
+    ):
+        if device.type == "xpu":
+            raise NotImplementedError("LongRoPE is not implemented for XPU")
+        if config.llama31_params or config.rope_scale != 1.0:
+            raise NotImplementedError("LongRoPE does not combine with rope_scale or Llama 3.1 scaling")
+        # the plain manager without a table of its own; this one builds its own below
+        super().__init__(dataclasses.replace(config, rope_table_dtype=None), device, max_seq_len, head_dim, dtype)
+        self._config = config  # what the prefix fingerprint covers
+        self._longrope: LongRoPE = config.longrope
+        rotary_dim = config.rotary_dim or head_dim
+        if rotary_dim is None:
+            raise ValueError("LongRoPE needs PositionConfig.rotary_dim or the KV cache's head_dim")
+        check_table_rotary_dim(device, rotary_dim, config.interleave, "LongRoPE")
+        if len(self._longrope.short_factor) != rotary_dim // 2:
+            raise ValueError(
+                f"LongRoPE needs {rotary_dim // 2} factors per set for rotary_dim {rotary_dim}, "
+                f"got {len(self._longrope.short_factor)}"
+            )
+        dtype = config.rope_table_dtype or torch.float32
+        tables = [
+            self._build_rope_cache(
+                rotary_dim, 1.0, config.rope_theta, torch.float32,
+                ext_factors=torch.tensor(factors, dtype=torch.float32, device=device),
+            ).mul_(self._longrope.attention_scale).to(dtype)
+            for factors in (self._longrope.short_factor, self._longrope.long_factor)
+        ]
+        self._rope_table = torch.cat(tables).float()
+        self._rope_table_key = (rotary_dim, config.rope_scale, config.rope_theta)
+        # requests on the long half
+        self._long_rids: set[str] = set()
+        # plan label -> each row's table row, beside its positions
+        self._current_table_ids: dict[str, torch.Tensor] = {}
+        self._preplan_table_ids: dict[str, torch.Tensor] = {}
+
+    def fusable_rope_theta(self, head_dim: int) -> float | None:
+        return None
+
+    @property
+    def cos_sin_table(self) -> torch.Tensor | None:
+        # indexed by table id, not by position: no fused kernel may read it by position
+        return None
+
+    # Resident planning: the table id runs ahead of the position by the request's
+    # half of the table, fixed at ingest, so a row keeps that offset too
+
+    def bind_resident(self, planner: "ResidentPlanner", key: str) -> None:
+        super().bind_resident(planner, key)
+        self._resident_table_delta = planner.table()
+
+    def resident_row(self, rid: int, slot: int, row: list[int], writes: "ResidentWrites") -> None:
+        super().resident_row(rid, slot, row, writes)
+        half = self._max_seq_len if rid in self._long_rids else 0
+        row[self._resident_table_delta.col] = row[self._resident_delta.col] + half
+
+    def resident_gather(self, step: "CapturedResidentStep") -> None:
+        # the two rows of the buffer `_stage_rows` plans into, which the capture reads
+        width = step.bucket.num_tokens
+        key = CGSlotKey(bucket=step.bucket, slot=step.slot, label=f"{self._resident_label(step)}{_TABLE_IDS}")
+        positions, table_ids = self._static_buffer(key, 2 * width).view(2, width)
+        self._gather_offset(step, self._resident_delta, positions)
+        self._gather_offset(step, self._resident_table_delta, table_ids)
+
+    def ingest_request(self, rid: str, overrides: PositionReqConfig | None = None):
+        super().ingest_request(rid, overrides)
+        self._long_rids.discard(rid)
+        if overrides is not None and self._longrope.is_long(overrides.max_position):
+            self._long_rids.add(rid)
+
+    def remove_request(self, rid: str):
+        super().remove_request(rid)
+        self._long_rids.discard(rid)
+
+    def clear_preplan(self):
+        super().clear_preplan()
+        self._preplan_table_ids = {}
+
+    def _promote_preplan(self) -> None:
+        super()._promote_preplan()
+        self._current_table_ids = self._preplan_table_ids
+        self._preplan_table_ids = {}
+
+    def _begin_staging(self, is_preplan: bool) -> dict[str, torch.Tensor]:
+        (self._preplan_table_ids if is_preplan else self._current_table_ids).clear()
+        return super()._begin_staging(is_preplan)
+
+    def _place_explicit(self, pos_ids: torch.Tensor, plan_label: str, lease) -> torch.Tensor:
+        raise ValueError(
+            "LongRoPE picks each row's table from its request; a step's explicit "
+            "pos_ids don't say which rows are whose"
+        )
+
+    def _stage_rows(self, rows, plan_label: str, lease, is_preplan: bool) -> torch.Tensor:
+        """Positions and table ids in one pass over the rows, staged as the two rows
+        of one buffer per slot. Under a lease each comes back the bucket's width,
+        as `RopeManager._place` hands its buffer over."""
+        block = self._config.scheme == PosScheme.BLOCK
+        counters, long_rids, offset = self._counters, self._long_rids, self._max_seq_len
+        pos_ids: list[int] = []
+        table_ids: list[int] = []
+        pos_append, pos_extend = pos_ids.append, pos_ids.extend
+        table_append, table_extend = table_ids.append, table_ids.extend
+        for rid, label, to_compute in rows:
+            labels = counters.get(rid)
+            start = labels.get(label, 0) if labels is not None else 0
+            row = start + offset if rid in long_rids else start
+            if to_compute == 1:  # a decode row
+                pos_append(start)
+                table_append(row)
+            elif block:
+                pos_extend([start] * to_compute)
+                table_extend([row] * to_compute)
+            else:
+                pos_extend(range(start, start + to_compute))
+                table_extend(range(row, row + to_compute))
+        n = len(pos_ids)
+        if lease is None:
+            both = torch.tensor([pos_ids, table_ids], dtype=torch.long).to(self._device, non_blocking=True)
+        else:
+            width = lease.bucket.num_tokens
+            assert n <= width, (
+                f"plan label {plan_label!r} carries {n} tokens but its captured bucket holds {width}"
+            )
+            key = CGSlotKey(bucket=lease.bucket, slot=lease.slot, label=f"{plan_label}{_TABLE_IDS}")
+            host = self._pinned_pos_ids_buffer(key, 2 * width).view(2, width)
+            staged = host.numpy()
+            staged[0, :n] = pos_ids
+            staged[1, :n] = table_ids
+            # the tail keeps the previous step's ids, in range of the table: padding.
+            # A row at a time: a partly filled bucket's [:, :n] isn't contiguous, and
+            # torch would stage it through a pageable copy and a device temporary.
+            both = self._static_buffer(key, 2 * width).view(2, width)
+            both[0, :n].copy_(host[0, :n], non_blocking=True)
+            both[1, :n].copy_(host[1, :n], non_blocking=True)
+        (self._preplan_table_ids if is_preplan else self._current_table_ids)[plan_label] = both[1]
+        return both[0]
+
+    def apply_qk(self, q, k, label=None, *args, pos_ids=None, **kwargs):
+        if pos_ids is not None:
+            raise ValueError(
+                "LongRoPE picks each row's table from its request; explicit pos_ids don't say "
+                "which rows are whose"
+            )
+        # rows into the short or the long half of the table
+        return super().apply_qk(q, k, label, *args, pos_ids=self._current_table_ids[label], **kwargs)
 
 
 # TODO: mrope / 3D positions (qwen omni, cosmos), learned position embeddings

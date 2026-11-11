@@ -106,11 +106,53 @@ PREFIX_CACHE_HIT_TOKENS = Family(
     "Prompt tokens the prefix cache already held at that lookup.",
     ("component",),
 )
+KV_PREEMPTIONS = Family(
+    "mstar_kv_preemptions_total", COUNTER,
+    "Requests chosen to move to the host or drop when an older request's grant, or their own, ran short of KV pages.",
+    ("component",),
+)
+KV_DROPS = Family(
+    "mstar_kv_drops_total", COUNTER,
+    "Preempted requests whose KV was dropped, to be rebuilt from their token ids and any host copies.",
+    ("component",),
+)
+KV_REBUILD_TOKENS = Family(
+    "mstar_kv_rebuild_tokens_total", COUNTER,
+    "Tokens of kept history the rebuild rows prefilled, cache hits included.",
+    ("component",),
+)
+KV_REBUILD_CACHED_PAGES = Family(
+    "mstar_kv_rebuild_cached_pages_total", COUNTER,
+    "Pages a rebuild row found in the prefix cache.",
+    ("component",),
+)
+KV_PREEMPTED_AGAIN = Family(
+    "mstar_kv_preempted_again_total", COUNTER,
+    "Requests preempted a second time.",
+    ("component",),
+)
+KV_RETURNS_PREEMPTED = Family(
+    "mstar_kv_returns_preempted_total", COUNTER,
+    "Requests preempted again before they sampled a token since they were last preempted. Only requests that "
+    "keep a rebuild log are counted.",
+    ("component",),
+)
 COMPONENT_PENDING_STEPS = Family(
     "mstar_component_pending_steps", GAUGE,
     "Requests whose next step on this graph node is ready (its inputs arrived) "
     "but not in a running step: waiting for a batch slot, or for the worker to "
     "schedule the node.",
+    ("component",),
+)
+REBUILD_HOST_BYTES_USED = Family(
+    "mstar_rebuild_host_bytes_used", GAUGE,
+    "Bytes of a worker's rebuild host pool that hold kept prompt ids and host "
+    "copies, which a request dropped from the KV cache is rebuilt from.",
+    ("component",),
+)
+REBUILD_HOST_BYTES_TOTAL = Family(
+    "mstar_rebuild_host_bytes_total", GAUGE,
+    "Bytes of a worker's rebuild host pool (the serving config's rebuild_host_mb).",
     ("component",),
 )
 
@@ -151,7 +193,9 @@ TRANSFER_SECONDS = Family(
 WORKER_FAMILIES: dict[str, Family] = {
     f.name: f for f in (
         KV_PAGES_USED, KV_PAGES_TOTAL, KV_PAGES_CACHED, STEP_SECONDS, BATCH_SIZE,
-        PREFIX_CACHE_QUERY_TOKENS, PREFIX_CACHE_HIT_TOKENS, COMPONENT_PENDING_STEPS,
+        PREFIX_CACHE_QUERY_TOKENS, PREFIX_CACHE_HIT_TOKENS, KV_PREEMPTIONS, KV_DROPS, KV_REBUILD_TOKENS,
+        KV_PREEMPTED_AGAIN, KV_RETURNS_PREEMPTED, KV_REBUILD_CACHED_PAGES, COMPONENT_PENDING_STEPS,
+        REBUILD_HOST_BYTES_USED, REBUILD_HOST_BYTES_TOTAL,
         TRANSFER_BYTES, TRANSFERS, TRANSFER_SECONDS,
     )
 }

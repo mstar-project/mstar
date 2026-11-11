@@ -7,11 +7,12 @@ configs unchanged, so a model only overrides it to add resources beyond
 what those configs already describe.
 """
 
+import dataclasses
 import logging
 from abc import ABC, abstractmethod
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
+from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, Protocol
 
 if TYPE_CHECKING:
     from mstar.engine.resources.base import Resource
@@ -100,6 +101,18 @@ class NodeResourceSpec(ABC):
     resource_key: str
     nodes: set[str]
 
+    # Built only when the serving config's ``resources:`` block names this spec's key
+    # (``mstar.model.base.serving_resources``): a resource a deployment turns on, such as
+    # per-request LoRA adapters, declared beside the model's other resources.
+    opt_in: ClassVar[bool] = False
+    # Built as one instance per node (``for_node``) rather than one shared by its nodes:
+    # for a resource whose nodes share no state and may sit in different lockstep
+    # instances (a vision tower beside a tensor-parallel LLM). ``serving_resources``
+    # splits it, so every process that builds or validates requests (the conductor and
+    # workers) sees the instances, keyed ``<resource_key>@<node>`` (``instance_key``); the
+    # serving config's block still names the declared key.
+    per_node: ClassVar[bool] = False
+
     def __post_init__(self):
         if not isinstance(self.nodes, set):
             self.nodes = set(self.nodes)
@@ -152,6 +165,25 @@ class NodeResourceSpec(ABC):
         attentions declare), after a deployment's overrides; return what is wrong with it.
         Idempotent: it runs wherever the specs resolve (`resolve_spec_dependencies`)."""
         return []
+    def for_node(self, node: str) -> "NodeResourceSpec | None":
+        """A ``per_node`` spec's instance for ``node`` alone, or None when ``node`` needs
+        none."""
+        return dataclasses.replace(self, resource_key=instance_key(self.resource_key, node), nodes={node})
+
+    def request_config(self, model_kwargs: dict | None) -> "ResourceReqConfig | None":
+        """The config a request is opened with on this resource, built from its kwargs, or
+        None. The conductor adds it to the model's own (``get_request_resource_configs``),
+        so a resource the deployment declares needs no model code to take request
+        settings."""
+        return None
+
+    def prefix_variant(self, model_kwargs: dict) -> bytes | None:
+        """What sets a request's KV on this resource apart from another's for the same
+        tokens (a LongRoPE table picked per request), from the kwargs ``request_config``
+        reads; None (the default) for nothing. The API server's data worker folds it into
+        the request's prefix-cache root, so the two never share pages. Called per request
+        on the data worker's threads, so it reads only ``model_kwargs`` and the spec."""
+        return None
 
     def apply_yaml_overrides(self, **kwargs):
         """Patch declared parameters from this resource's YAML block.
@@ -172,6 +204,12 @@ class NodeResourceSpec(ABC):
                 f"resource {self.resource_key!r} takes no YAML overrides; got "
                 f"{sorted(kwargs)}"
             )
+
+
+def instance_key(resource_key: str, node: str) -> str:
+    """The key of a ``per_node`` spec's instance for ``node``: the same on every rank,
+    since it names the node rather than the worker."""
+    return f"{resource_key}@{node}"
 
 
 class ResourceReqConfig:
@@ -251,6 +289,12 @@ TOP_LEVEL_KV_CACHE = (
     "move it under `resources:` keyed by resource name, e.g.\n"
     "resources:\n  kv_cache:\n    max_num_pages: 1024"
 )
+
+
+def check_sizes(sizes: Mapping[str, Any], smallest: int = 1) -> None:
+    for name, value in sizes.items():
+        if isinstance(value, bool) or not isinstance(value, int) or value < smallest:
+            raise ValueError(f"{name} must be an integer >= {smallest}; got {value!r}")
 
 
 def unknown_overrides_message(unknown: list[str], declared: Collection[str]) -> str:

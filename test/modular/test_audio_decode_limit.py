@@ -154,13 +154,13 @@ def test_a_soundfile_rate_past_the_range_is_refused_before_any_read(monkeypatch,
     # the frame cap is seconds times the file's rate, so the rate is bounded
     # first, and no loader falls back to torchcodec for a refused file
     from mstar.model.chatterbox.chatterbox_model import ChatterboxModel
-    from mstar.model.components.audio_features import load_audio_file
+    from mstar.model.components.audio_features import load_speech_file
     from mstar.model.nemotron_duplex.nemotron_duplex_model import NemotronDuplexModel
 
     for load in (
         lambda: media_io.read_soundfile_capped(clip),
         lambda: media_io.decode_audio(clip, 16000),
-        lambda: load_audio_file(clip),
+        lambda: load_speech_file(clip, 16000, MAX_AUDIO_SECONDS),
         lambda: ChatterboxModel._decode_audio(clip),
         lambda: NemotronDuplexModel.load_audio(None, clip, "cpu"),
     ):
@@ -238,37 +238,30 @@ def test_torchcodec_play_time_counts_from_the_first_timestamp(monkeypatch, clip,
 def test_base_load_audio_is_capped(monkeypatch, clip):
     from mstar.model.base import Model
 
+    model = types.SimpleNamespace(AUDIO_INPUT_RATE=16000, MAX_AUDIO_SECONDS=MAX_AUDIO_SECONDS)
     calls = _fake_torchcodec(monkeypatch, TOO_LONG)
     with pytest.raises(AudioTooLongError):
-        Model.load_audio(None, clip, "cpu")
+        Model.load_audio(model, clip, "cpu")
     assert calls["all"] == 0
     _fake_torchcodec(monkeypatch, 12)
-    assert Model.load_audio(None, clip, "cpu").data.shape == (12 * 16000,)
-
-
-def test_omnivoice_load_audio_is_capped(monkeypatch, clip):
-    from mstar.model.omnivoice.omnivoice_model import OmniVoiceModel
-
-    _fake_torchcodec(monkeypatch, TOO_LONG)
-    model = types.SimpleNamespace(config=types.SimpleNamespace(sample_rate=24000))
-    with pytest.raises(AudioTooLongError):
-        OmniVoiceModel.load_audio(model, clip, "cpu")
+    assert Model.load_audio(model, clip, "cpu").data.shape == (12 * 16000,)
+    # a model's own cap is the decode's bound
+    model.MAX_AUDIO_SECONDS = 10
+    with pytest.raises(AudioTooLongError, match="10 s"):
+        Model.load_audio(model, clip, "cpu")
 
 
 def test_soundfile_loaders_are_capped(monkeypatch, clip):
     from mstar.model.chatterbox.chatterbox_model import ChatterboxModel
-    from mstar.model.components.audio_features import load_audio_file
+    from mstar.model.components.audio_features import load_speech_file
     from mstar.model.nemotron_duplex.nemotron_duplex_model import NemotronDuplexModel
-    from mstar.model.omnivoice.omnivoice_model import OmniVoiceModel
 
-    omnivoice = types.SimpleNamespace(config=types.SimpleNamespace(sample_rate=24000))
     duplex = object.__new__(NemotronDuplexModel)
     for load, error, match, seconds in (
-        (lambda: load_audio_file(clip), AudioTooLongError, None, MAX_AUDIO_SECONDS),
+        (lambda: load_speech_file(clip, 16000, MAX_AUDIO_SECONDS), AudioTooLongError, None, MAX_AUDIO_SECONDS),
         (lambda: ChatterboxModel._decode_audio(clip), AudioTooLongError, None, MAX_AUDIO_SECONDS),
         # capped tighter, at its longest session, and refused with that error
         (lambda: duplex.load_audio(clip, "cpu"), ValueError, "longest session", duplex.max_session_s),
-        (lambda: OmniVoiceModel.load_audio(omnivoice, clip, "cpu"), AudioTooLongError, None, MAX_AUDIO_SECONDS),
     ):
         sf = _use_soundfile(monkeypatch, _FakeSoundfile(TOO_LONG, header_seconds=10))
         # chatterbox falls back to torchcodec on a soundfile failure; the cap must not

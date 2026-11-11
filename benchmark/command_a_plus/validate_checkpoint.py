@@ -40,13 +40,16 @@ def image_messages(case):
 
 
 def encode(adapter, case):
-    """M*'s prompt ids and, for image prompts, its tiles."""
+    """M*'s prompt ids and, for image prompts, its tiles and their layout."""
     if not case.get("images"):
         return adapter.process_prompt(case["prompt"], ["text"], ["text"]).new_input_tensors["text_inputs"][0], None
+    from mstar.model.multimodal import MEDIA_LAYOUT
+
     images = [adapter.load_image(path, "cpu").data for path in case["images"]]
-    inputs, _ = adapter.process_prompt(None, ["image"] * len(images), ["text"], tensors={"image_inputs": images},
-                                       messages=image_messages(case))
-    return inputs["text_inputs"][0], torch.cat(inputs["pixel_values"])
+    prompt = adapter.process_prompt(None, ["image"] * len(images), ["text"],
+                                    tensors={"image_inputs": images}, messages=image_messages(case))
+    inputs, metadata = prompt.new_input_tensors, prompt.metadata
+    return inputs["text_inputs"][0], (torch.cat(inputs["pixel_values"]), metadata[MEDIA_LAYOUT])
 
 
 def sync_all():
@@ -142,6 +145,17 @@ def reference(args):
     ))
 
 
+class _KeepLogits:
+    """The sampler, keeping the logits it last sampled from."""
+
+    def __init__(self, sampler):
+        self.sampler = sampler
+
+    def sample(self, request_ids, logits):
+        self.logits = logits
+        return self.sampler.sample(request_ids, logits=logits)
+
+
 class Runtime:
     def __init__(self, args, group):
         from mstar.communication.tensors import LocalTransferEngine
@@ -150,7 +164,8 @@ class Runtime:
         from mstar.engine.resources.kv.transfer import TransferEngineInfo
         from mstar.engine.resources.runner import StepRunner
         from mstar.engine.resources.spec import apply_yaml_overrides
-        from mstar.model.command_a_plus.config import KV_CACHE
+        from mstar.engine.state.adapters import node_handles, node_resources
+        from mstar.model.command_a_plus.config import KV_CACHE, SAMPLER
 
         self.model = CommandAPlusModel(str(args.checkpoint), max_seq_len=args.context)
         started = time.perf_counter()
@@ -162,17 +177,20 @@ class Runtime:
         # Every rank runs its own encoder here, instead of receiving rank 0's output.
         self.vision = self.model.get_submodule("vision_encoder", device=torch.device("cuda", group.rank),
                                                autocast_dtype=torch.bfloat16) if args.images else None
-        specs = {spec.resource_key: spec for spec in self.model.get_node_resources()}
+        specs = {spec.resource_key: spec for spec in node_resources(self.model)}
         # as a server resolves them, so the pool keeps the local layers' window
         apply_yaml_overrides(list(specs.values()), {"resources": {KV_CACHE: {"max_num_pages": 256}}})
         transfer = TransferEngineInfo(f"validation_{group.rank}", "validation", LocalTransferEngine("localhost"))
         self.resources = {key: build_resource(spec, EngineResourceInfo(
             device=torch.device("cuda", group.rank), kv_dtype=torch.bfloat16,
-            joint_comm_group=JointGroups(group, CommGroup.trivial()), transfer_engine_info=transfer,
+            joint_comm_group=JointGroups(group, CommGroup.trivial(), group), transfer_engine_info=transfer,
             needs_remote_transfer=False, dependencies={dep: specs[dep] for dep in spec.depends_on()},
         )) for key, spec in specs.items()}
         self.runner = StepRunner(self.resources)
         self.node.bind_node_resources(self.resources)
+        # the node samples through its handle, so the handle's sampler keeps the logits `step` reports
+        self.sampler = _KeepLogits(self.resources[SAMPLER])
+        self.node.bind_node_state(node_handles(self.model, "LLM", {**self.resources, SAMPLER: self.sampler}))
         self.initial_free_pages = self.resources[KV_CACHE]._arena.num_free
 
     def start(self, rid):
@@ -183,34 +201,37 @@ class Runtime:
             temperature=0, top_p=1, repetition_penalty=1, ignore_eos=True,
         )})
 
-    def step(self, rids, rows, iteration, pixels=None):
-        from mstar.engine.resources.step import StepContext
-        from mstar.model.command_a_plus.config import LOCAL_ATTN, SAMPLER
-        from mstar.model.submodule_base import ModelInputsFromEngine
+    def step(self, rids, rows, iteration, image=None):
+        """One step through the LLM node's own forward; ``image`` is
+        `encode`'s tiles and layout, on the prefill."""
+        from types import SimpleNamespace
 
-        walk = "decode" if iteration else "prefill" if pixels is None else "prefill_image"
+        from mstar.engine.resources.step import StepContext
+        from mstar.model.multimodal import MEDIA_LAYOUT
+        from mstar.model.submodule_base import ModelInputsFromEngine, engine_step
+
+        walk = "decode" if iteration else "prefill" if image is None else self.model.image_walk
         started = time.perf_counter()
-        extra = {}
-        if pixels is not None:
+        extra, info = {}, None
+        if image is not None:
+            pixels, layout = image
             vision = self.vision.prepare_inputs(walk, None, {"pixel_values": [pixels]})
             extra = self.vision.forward(walk, None, **self.vision.preprocess(walk, None, [vision]))
-        inputs = [self.node.prepare_inputs(walk, None, {"text_inputs": [row], **extra}) for row in rows]
-        step = self.node.declare_step(walk, rids, inputs)
+            info = SimpleNamespace(step_metadata={MEDIA_LAYOUT: layout})
+        inputs = [self.node.prepare_inputs(walk, info, {"text_inputs": [row], **extra}) for row in rows]
+        step = engine_step(self.node, graph_walk=walk, request_ids=rids, inputs=inputs)
         step.set_ctx(StepContext(rids, walk, iteration % 2, False))
         admitted = self.runner.admit(step)
         if not admitted.ok or not admitted.ready:
             raise RuntimeError(admitted)
         self.runner.plan(step)
         planned = time.perf_counter()
+        step.begin_calls()
         engine = ModelInputsFromEngine(rids, {}, self.resources)
-        batch = self.node.preprocess(walk, engine, inputs)
-        lm = self.node.language_model
-        embeds = batch["input_embeds"] if "input_embeds" in batch else lm.model.embed(batch["text_inputs"])
-        hidden = lm(embeds, label="main")
-        if iteration == 0:
-            hidden = self.resources[LOCAL_ATTN].select_last_hidden(hidden, label="main")
-        logits = lm.compute_logits(hidden)
-        tokens = self.resources[SAMPLER].sample(rids, logits=logits)
+        output = self.node.forward_batched(walk, engine, **self.node.preprocess(walk, engine, inputs))
+        step.check_calls()
+        step.end_calls()
+        logits, tokens = self.sampler.logits, output.row_outputs["new_token"]
         self.runner.commit(step)
         torch.cuda.synchronize()
         return logits, tokens, dict(planning_ms=(planned-started)*1000,
@@ -251,14 +272,14 @@ def mstar(args):
         expected = load_file(args.output / "hf_logits.safetensors")
         results, tensors = [], {}
         for index, case in enumerate(reference_info["cases"]):
-            ids, pixels = encode(runtime.model, case)
+            ids, image = encode(runtime.model, case)
             if ids.tolist() != case["input_ids"]:
                 raise AssertionError("HF and M* input tokens differ")
             rid = f"parity_{index}"
             runtime.start(rid)
             rows, metrics, logits_rows = [ids.cuda()], [], []
             for step, reference_token in enumerate(case["generated_ids"]):
-                logits, tokens, timing = runtime.step([rid], rows, step, pixels if step == 0 else None)
+                logits, tokens, timing = runtime.step([rid], rows, step, image if step == 0 else None)
                 ours = logits[0].float().cpu()
                 theirs = expected[f"case_{index}"][step]
                 if not torch.isfinite(ours).all() or not torch.isfinite(theirs).all():
@@ -299,10 +320,10 @@ def mstar(args):
         for index, case in enumerate(reference_info["cases"]):
             rid = f"greedy_{index}"
             runtime.start(rid)
-            ids, pixels = encode(runtime.model, case)
+            ids, image = encode(runtime.model, case)
             rows, generated, timings = [ids.cuda()], [], []
             for step in range(args.tokens):
-                _, tokens, timing = runtime.step([rid], rows, step, pixels if step == 0 else None)
+                _, tokens, timing = runtime.step([rid], rows, step, image if step == 0 else None)
                 token = tokens.item()
                 generated.append(token)
                 timings.append(timing)

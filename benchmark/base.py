@@ -339,7 +339,7 @@ class Qwen3_5_Dense(Model):
         return {RequestType.T2T, RequestType.I2T, RequestType.V2T}
 
     def get_model_kwargs(self, request_type: RequestType):
-        # Greedy everywhere (mstar's sampler defaults to 0.6), and the same prompt
+        # Greedy everywhere (mstar's default sampling isn't greedy), and the same prompt
         # render: mstar opens a <think> block by default, while the 0.8B/2B templates
         # only do when asked. mstar reads the flat enable_thinking and vLLM/SGLang
         # read chat_template_kwargs.
@@ -350,6 +350,35 @@ class Qwen3_8_Dense(Qwen3_5_Dense):
     """Qwen3.8 dense: the Qwen3.5 architecture, defaulting to the 27B."""
 
     DEFAULT_MODEL_ID = "Qwen/Qwen3.8-27B"
+
+
+class MuseGlimmer(Model):
+    """Muse Glimmer 30B (text + image in, text out) benchmark metadata."""
+
+    HF_URL = "meta-models/Muse-Glimmer-30B"
+
+    def get_hf_url(self):
+        return self.HF_URL
+
+    def get_supported_modalities(self):
+        return {RequestType.T2T, RequestType.I2T}
+
+    def get_model_kwargs(self, request_type: RequestType):
+        # the checkpoint samples at temperature 1 by default; every engine
+        # decodes greedily here, so they generate the same tokens
+        return {"temperature": 0.0}
+
+    def get_tokenizer(self):
+        # tokenizer_config.json is in a format older transformers cannot read
+        if self._tokenizer is None:
+            from huggingface_hub import snapshot_download
+
+            from mstar.model.muse.processing import load_tokenizer
+
+            self._tokenizer = load_tokenizer(snapshot_download(
+                self.HF_URL, allow_patterns=["tokenizer.json", "tokenizer_config.json", "chat_template.jinja"],
+            ))
+        return self._tokenizer
 
 
 class Qwen3TTS1p7B(Qwen3TTS):
@@ -426,10 +455,11 @@ class WhisperLarge(Model):
         return {RequestType.A2T}
 
     def get_model_kwargs(self, request_type: RequestType):
+        # 448 positions less the 4-token forced prompt; the server refuses more
         return {
             "temperature": 0.0,
-            "max_tokens": 448,
-            "max_output_tokens": 448,
+            "max_tokens": 444,
+            "max_output_tokens": 444,
         }
 
 
@@ -468,6 +498,69 @@ class HiggsAudio(Model):
             "max_tokens": 448,
             "max_output_tokens": 448,
         }
+
+
+class MiniCPMO45(Model):
+    """MiniCPM-o 4.5, half-duplex chat (LLM -> TTS -> token2wav)."""
+
+    def get_hf_url(self):
+        return "openbmb/MiniCPM-o-4_5"
+
+    def get_supported_modalities(self):
+        return {
+            RequestType.T2T, RequestType.T2S,
+            RequestType.I2T, RequestType.I2S,
+            RequestType.A2T, RequestType.A2S,
+        }
+
+    # vllm-omni's MiniCPM-o examples. Both systems get it: M* would otherwise
+    # follow upstream chat() and put the voice's reference clip in a spoken
+    # reply's system message, which changes the reply and slows its speech
+    # (~11% longer audio for the same text, measured against upstream).
+    SYSTEM_PROMPT = (
+        "You are MiniCPM-o, a helpful multimodal assistant that can understand images, "
+        "audio and video, and respond in text and speech."
+    )
+
+    def get_openai_system_message(self) -> Optional[dict]:
+        return {"role": "system", "content": [{"type": "text", "text": self.SYSTEM_PROMPT}]}
+
+    def get_tokenizer(self):
+        # Qwen2's, as the server loads it: the checkpoint maps AutoTokenizer to its repo code (#509)
+        if self._tokenizer is None:
+            from transformers import Qwen2Tokenizer
+
+            self._tokenizer = Qwen2Tokenizer.from_pretrained(self.get_hf_url())
+        return self._tokenizer
+
+    def get_model_kwargs(self, request_type: RequestType):
+        speech = request_type.get_output_modalities() == "audio"
+        # Greedy LLM, capped, no repetition penalty: vllm-omni's stage-0
+        # defaults. The TTS keeps each system's own sampling defaults (both
+        # upstream's temperature 0.8 / top-p 0.85 / top-k 25), since
+        # vllm-omni applies the request's temperature to stage 0 only.
+        # A spoken reply gets room to end on its own: vllm-omni's talker fails a
+        # reply the LLM's cap cut off before <|tts_eos|>.
+        cap = 1024 if speech else 256
+        kwargs = {
+            "temperature": 0.0,
+            "repetition_penalty": 1.0,
+            "max_tokens": cap,
+            "max_output_tokens": cap,
+            # vllm-omni only: the template thinks unless told not to, and
+            # speaks only with the TTS template
+            "chat_template_kwargs": {"enable_thinking": False, "use_tts_template": speech},
+            # vllm-omni slices images by config.json (one slice); upstream's
+            # chat() and M* default to the processor's nine
+            "max_slice_nums": 1,
+            # M* only: vllm-omni's system message, without the voice clip
+            "system_prompt": self.SYSTEM_PROMPT,
+            "voice_prompt": False,
+        }
+        if speech:
+            # raw 24 kHz int16 chunks, which RequestMetrics' duration maths assumes
+            kwargs["audio"] = {"format": "pcm"}
+        return kwargs
 
 
 class _FastConformerAsr(Model):
@@ -518,8 +611,10 @@ class ModelType(Enum):
     PARAKEET = "parakeet"
     NEMOTRON_ASR = "nemotron_asr"
     QWEN3_5 = "qwen3.5"
+    MINICPMO45 = "minicpmo45"
     QWEN3_8 = "qwen3.8"
     PERSONAPLEX = "personaplex"
+    MUSE_GLIMMER = "muse_glimmer"
 
     def inst(self, **kwargs) -> Model:
         if self == ModelType.BAGEL:
@@ -552,6 +647,8 @@ class ModelType(Enum):
             return Qwen3ASRRealtime(**kwargs)
         if self == ModelType.HIGGS_AUDIO:
             return HiggsAudio(**kwargs)
+        if self == ModelType.MINICPMO45:
+            return MiniCPMO45(**kwargs)
         if self == ModelType.CANARY:
             return Canary(**kwargs)
         if self == ModelType.CANARY_QWEN:
@@ -566,4 +663,6 @@ class ModelType(Enum):
             return Qwen3_8_Dense(**kwargs)
         if self == ModelType.PERSONAPLEX:
             return PersonaPlex(**kwargs)
+        if self == ModelType.MUSE_GLIMMER:
+            return MuseGlimmer(**kwargs)
         raise NotImplementedError(f"Unknown model type {self}")
