@@ -116,26 +116,25 @@ def rounds(reply: Callable[[str, str, str], dict], url: str, name: str, prompts:
     return out
 
 
-_EVENT = re.compile(r"^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d,\d{3}) .*?(?:Reloaded request (\S+) on|offloaded victim=(\S+),)")
+_RELOAD = re.compile(r"^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d,\d{3}) .*?Reloaded request (\S+) on")
 
 
 def events(log: str) -> list[list]:
-    """``[time, "reload" | "offload", request]`` from a server log whose asctime is UTC (serve with
-    ``TZ=UTC``)."""
+    """``[time, request]`` for each reload in a server log whose asctime is UTC (serve with ``TZ=UTC``). The
+    engine logs every reload; the moves to the host are rate-limited in the log, so they are not read here."""
     out = []
     for line in log.splitlines():
-        m = _EVENT.match(line)
+        m = _RELOAD.match(line)
         if m:
             t = datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S,%f").replace(tzinfo=timezone.utc).timestamp()
-            out.append([t, "reload" if m.group(2) else "offload", m.group(2) or m.group(3)])
+            out.append([t, m.group(2)])
     return out
 
 
 def _reloads(events) -> dict[str, list[float]]:
     out: dict[str, list[float]] = {}
-    for t, kind, rid in events or ():
-        if kind == "reload":
-            out.setdefault(rid.split("#")[0], []).append(t)
+    for t, rid in events or ():
+        out.setdefault(rid.split("#")[0], []).append(t)
     return out
 
 

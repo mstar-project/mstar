@@ -123,7 +123,7 @@ def test_private_departures_right_after_a_reload_trip_the_burst_wire(departed, t
     spec = plain[:5] + [100 + j for j in range(35)]
     ref = _Ref({tuple(spec): {j: (1, 0.1) for j in departed}})
     # reloaded once the client had 10 tokens (token 9 at t = 10); the server's rid carries a suffix
-    events = [[10.5, "reload", "arm-c0#2"], [3.0, "offload", "arm-c0#1"]]
+    events = [[10.5, "arm-c0#2"]]
     got = fs.departures([_pair(plain, spec, rid="arm-c0")], ref, "other", GATES, events)
     assert len(got.trips) == trips, got.trips
     if trips:
@@ -134,7 +134,7 @@ def test_departures_before_the_split_are_no_burst():
     plain = list(range(40))
     spec = plain[:30] + [100 + j for j in range(10)]
     ref = _Ref({tuple(spec): {j: (1, 0.1) for j in (10, 12, 14)}})
-    got = fs.departures([_pair(plain, spec, rid="arm-c0")], ref, "other", GATES, [[10.5, "reload", "arm-c0"]])
+    got = fs.departures([_pair(plain, spec, rid="arm-c0")], ref, "other", GATES, [[10.5, "arm-c0"]])
     assert got.private == 0 and got.trips == []
 
 
@@ -197,12 +197,13 @@ def test_scan_logprobs_ranks_and_deficits_the_served_tokens():
 def test_server_events_and_receive_positions():
     log = "\n".join([
         "2026-11-06 01:02:03,456 INFO worker: Reloaded request arm-r0-c3#1 on rank 0",
-        "2026-11-06 01:02:04,000 INFO worker: offloaded victim=arm-r1-c2, pages 4",
+        "2026-11-06 01:02:04,000 INFO worker: KV short on node=LLM: moved arm-r1-c2 to the host, 4 pages freed for "
+        "arm-r0-c3, preempted 1 times (0 earlier moves not logged)",
         "2026-11-06 01:02:05,000 INFO worker: something else",
     ])
     t0 = 1793926923.456  # 2026-11-06 01:02:03.456 UTC
     got = fs.events(log)
-    assert [e[1:] for e in got] == [["reload", "arm-r0-c3#1"], ["offload", "arm-r1-c2"]]
-    assert got[0][0] == pytest.approx(t0) and got[1][0] == pytest.approx(t0 + 0.544)
+    assert [e[1:] for e in got] == [["arm-r0-c3#1"]], "only reloads are read"
+    assert got[0][0] == pytest.approx(t0)
     reply = {"chunks": [[1.0, [5, 6]], [2.0, [7]], [3.5, [8, 9, 10]]]}
     assert [fs.token_at(reply, t) for t in (0.5, 1.0, 2.5, 9.0)] == [0, 2, 3, 6]
