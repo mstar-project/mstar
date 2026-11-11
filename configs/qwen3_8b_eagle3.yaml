@@ -22,6 +22,10 @@ resources:
     # target and drafter KV in one pool: 36 + 1 layers x 8 KV heads x 128 dims x K and V x bf16
     # = 148 KiB a token
     max_num_pages: 1024
+    # host pages to preempt into, ~9.3 GiB of pinned host memory: a verifying node never
+    # drops a request, so with none every request is guaranteed and reserves its whole
+    # footprint at admission
+    cpu_offload_pages: 512
 node_groups:
   - node_names: [LLM]
     ranks: [0]
