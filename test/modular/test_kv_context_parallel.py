@@ -4,6 +4,7 @@ attention over it, each rank's partial over its slots exchanged and merged."""
 
 from __future__ import annotations
 
+import functools
 import itertools
 import logging
 import math
@@ -570,8 +571,11 @@ class _PlacedKV:
     def set_default_layer_idx(self, layer_idx):
         assert layer_idx == 0
 
-    def layer_view(self):
+    def layer_view(self, layer_idx=0):
         return self.cache
+
+    def opens_label(self, request_id, label):
+        return True
 
 
 def _over_ranks(rank, world, backend, store, over_sp, rows, captured=False, padding=(0, 0), causal=True, split=None):
@@ -1019,9 +1023,11 @@ class _OneRank:
         return self.case.want()
 
 
-def _layer_over_ranks(rank, world, store):
+def _layer_over_ranks(rank, world, store, split=None):
     """One rank of an SP placement running a Qwen3.5 attention layer through its KV handle on a
-    prefill, against the same layer attending every key on one rank."""
+    prefill, against the same layer attending every key on one rank. With ``split`` (the shard's
+    ``exchange``) the step splits over a sequence shard, whose exchange makes the handle's write and
+    attention one call, over a pool whose step slots hold NaN until the step writes them."""
     from mstar.engine.state.adapters import build_handle
     from mstar.engine.state.analysis import position_key
     from mstar.engine.state.contract import ArrayStep
@@ -1036,7 +1042,6 @@ def _layer_over_ranks(rank, world, store):
     group.device_group, group.initialized = dist.group.WORLD, True
     try:
         joint = JointGroups(tp_group=CommGroup.trivial(), sp_group=group, instance=group)
-        attn, placement = _cp_attention(joint, CPU, torch.float32)
         (array,) = [a for a in _qwen3_5(NODE, {}, None, None).declare_state() if a.name == KV_CACHE]
         (layer_id,) = array.layers
         torch.manual_seed(0)
@@ -1047,19 +1052,39 @@ def _layer_over_ranks(rank, world, store):
         )
         for param in layer.parameters():
             param.data.normal_(0, 0.1)
-        case = _Case.build(PREFILL_ROWS, CPU, torch.float32)
-        n = case.q.shape[0]
-        hidden = torch.randn(n, 32)
-        # a rotation of none: the handle, not the rope, is under test
-        rope.set(torch.ones(n, 16), torch.zeros(n, 16))
-        layer.bind_state({KV_CACHE: _OneRank(case)})
-        want = layer(hidden)
 
-        _plan(attn, case)
-        cache = case.cache(placement)
-        pool = types.SimpleNamespace(
-            layer_view=lambda i: cache, write_kv=lambda *args, **kwargs: None, opens_label=lambda *args: True,
-        )
+        @torch.no_grad()
+        def forward(x):
+            # a rotation of none: the handle, not the rope, is under test
+            rope.set(torch.ones(x.shape[0], 16), torch.zeros(x.shape[0], 16))
+            return layer(x)
+
+        case = _Case.build(PREFILL_ROWS, CPU, torch.float32)
+        hidden = torch.randn(case.q.shape[0], 32)
+        layer.bind_state({KV_CACHE: _OneRank(case)})
+        want = forward(hidden)
+
+        if split is None:
+            attn, placement = _cp_attention(joint, CPU, torch.float32)
+            _plan(attn, case)
+            cache = case.cache(placement)
+            pool = types.SimpleNamespace(
+                layer_view=lambda i: cache, write_kv=lambda *args, **kwargs: None, opens_label=lambda *args: True,
+            )
+            scatter = gather = lambda x: x
+        else:
+            shard = SequenceShard(
+                ("main",), 0, None, 0, group, stripe_pool="kv" if split == "ring" else None, device=CPU,
+            )
+            built = []
+            attn, _ = _cp_attention(
+                joint, CPU, torch.float32, shard=shard, exchange=split,
+                kv_resource=lambda placement: built.append(_PlacedKV(placement, case)) or built[0],
+            )
+            (pool,) = built
+            _plan(attn, case, shard=shard)
+            assert shard.split_range("main") is not None
+            scatter, gather = (functools.partial(f, "main") for f in (shard.scatter, shard.gather))
         handle = build_handle(array, {KV_CACHE: pool, ATTN: attn, position_key(array): None})
         step = types.SimpleNamespace(
             state={KV_CACHE: ArrayStep()}, segments=tuple(
@@ -1069,16 +1094,18 @@ def _layer_over_ranks(rank, world, store):
         )
         handle.begin_step(step)
         layer.bind_state({KV_CACHE: handle})
-        torch.testing.assert_close(layer(hidden), want)
+        torch.testing.assert_close(gather(forward(scatter(hidden))), want)
         handle.end_step(step)
     finally:
         group.device_group = None
         dist.destroy_process_group()
 
 
-def test_a_qwen3_5_layer_attends_a_placed_pool_through_its_handle_like_one_rank(tmp_path):
-    # a prefill attends its own tokens from the k and v the layer adds, beside the pool
-    mp.spawn(_layer_over_ranks, args=(P, str(tmp_path / "store")), nprocs=P)
+@pytest.mark.parametrize("split", [None, "all_gather", "ring"], ids=["copied", "all-gather", "ring"])
+def test_a_qwen3_5_layer_attends_a_placed_pool_through_its_handle_like_one_rank(tmp_path, split):
+    # a prefill attends its own tokens from the k and v the layer adds, beside the pool; a split one
+    # writes and attends them through the shard's exchange
+    mp.spawn(_layer_over_ranks, args=(P, str(tmp_path / "store"), split), nprocs=P)
 
 
 @pytest.mark.parametrize("attention, refused", [
