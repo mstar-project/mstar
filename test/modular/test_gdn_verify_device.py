@@ -281,9 +281,10 @@ def test_a_padding_rows_unwritten_conv_output_stays_out_of_the_real_rows(monkeyp
     _check(out, twin)
 
 
-def _state_pair(stage: bool, monkeypatch, device: str = "cuda"):
+def _state_pair(stage: bool, monkeypatch, device: str = "cuda", rows: int = 1):
     """Two pools and GDN resources on the device, FlashInfer's kernels, the
-    staged input path or the eager one: one verifies, one runs plainly."""
+    staged input path or the eager one: one verifies, one runs plainly. Each
+    holds requests ``0 .. rows - 1``."""
     from mstar.engine.resources.base import EngineResourceInfo
     from mstar.engine.resources.linear_attn import gdn as gdn_mod
     from mstar.engine.resources.linear_attn.base import LinearAttnManager
@@ -301,7 +302,7 @@ def _state_pair(stage: bool, monkeypatch, device: str = "cuda"):
             num_layers=1, blocks=geometry.to_blocks(
                 state_dtype=torch.float32, conv_dtype=torch.float32 if device.type == "cpu" else torch.bfloat16,
             ),
-            max_slots=4,
+            max_slots=max(4, rows + 1),
         ))
         pool = RecurrentStatePool.build(pool_spec, EngineResourceInfo(device=device))
         manager = LinearAttnManager.build(
@@ -313,23 +314,25 @@ def _state_pair(stage: bool, monkeypatch, device: str = "cuda"):
         if verifies:
             pool.bind_verify_walk("decode", K + 1, 0)
             manager.bind_verify_walk("decode", K + 1, 0)
-        pool.ingest_request(0)
-        if pool.ask(0, "LLM", "prefill") is not None:
-            pool.reserve(0, "LLM", "prefill", None)
+        for rid in range(rows):
+            pool.ingest_request(rid)
+            if pool.ask(rid, "LLM", "prefill") is not None:
+                pool.reserve(rid, "LLM", "prefill", None)
         pairs.append((pool, manager))
     return geometry, pairs
 
 
-def _gdn_step(pool, manager, geometry, span: int, walk: str, x, a, b, weights) -> None:
-    """One row's step through the real resource, as `GatedDeltaNet` drives it: a prompt
-    step on the chunked kernel, a verify step on the multi-token one."""
+def _gdn_step(pool, manager, geometry, span: int, walk: str, x, a, b, weights, rows: int = 1) -> None:
+    """A step of ``span`` tokens for each of requests ``0 .. rows - 1`` (packed in
+    ``x``, ``a``, ``b``) through the real resource, as `GatedDeltaNet` drives it: a
+    prompt step on the chunked kernel, a verify step on the multi-token one."""
     from mstar.engine.resources.linear_attn.config import LinearAttnStep
     from mstar.engine.resources.recurrent.config import RecurrentStep
     from mstar.engine.resources.step import Segment, StepContext
 
-    ctx = StepContext(request_ids=[0], graph_walk=walk, slot=0, capture=False)
+    ctx = StepContext(request_ids=list(range(rows)), graph_walk=walk, slot=0, capture=False)
     ctx.force_prefill = True  # one kernel for every span, a single kept token's too
-    segments = (Segment(0, "main", span),)
+    segments = tuple(Segment(rid, "main", span) for rid in range(rows))
     rstep = RecurrentStep(segments=segments)
     assert pool.admit(rstep, ctx).ok
     ctx.plan_results["gdn_state"] = pool.plan(rstep, ctx)
@@ -436,6 +439,51 @@ def test_the_rerun_leaves_the_state_of_the_kept_tokens_alone(monkeypatch, device
     # the bar tells a wrong undo apart: one more token kept, or none undone
     wrong = upto(min(accepted + 2, K + 1))[0] if accepted < K else upto(accepted)[0]
     assert _rel(vpool.block("state", 0)[slot], wrong) > 20 * STATE_REL
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("rows", [16, 32, 64])
+def test_the_rerun_keeps_finite_states_at_wide_batches(monkeypatch, device, rows):
+    """The rerun at 16 rows and more, where the multi-token kernel runs its
+    wider-batch path, each row accepting a different count: every row's state
+    is finite and that of its prompt and kept tokens, to `STATE_REL`. Guards
+    `CLOSED_GATE`'s finite value, since -inf gave NaN on that path (why is a
+    hypothesis). The CPU case runs `gdn_cpu`'s stand-ins, which checks the test itself."""
+    if device == "cpu":
+        import gdn_cpu
+
+        gdn_cpu.install(monkeypatch)
+    elif (reason := _cuda_reason()) is not None:
+        pytest.skip(reason)
+    from types import SimpleNamespace
+
+    geometry, ((vpool, verifier), _) = _state_pair(False, monkeypatch, device, rows=rows)
+    gen = torch.Generator(device=device).manual_seed(rows)
+    activations = torch.float32 if device == "cpu" else torch.bfloat16
+
+    def draw(*shape, scale=1.0, dtype=activations):
+        return (torch.randn(*shape, generator=gen, device=device) * scale).to(dtype)
+
+    hv = geometry.num_v_heads
+    weights = (draw(geometry.conv_dim, geometry.conv_kernel_size, scale=0.3), draw(hv, scale=0.3, dtype=torch.float32),
+               draw(hv, scale=0.3, dtype=torch.float32))
+    prompts = [(draw(5, geometry.conv_dim), draw(5, hv), draw(5, hv)) for _ in range(rows)]
+    blocks = [(draw(K + 1, geometry.conv_dim), draw(K + 1, hv), draw(K + 1, hv)) for _ in range(rows)]
+    _gdn_step(vpool, verifier, geometry, 5, "prefill", *map(torch.cat, zip(*prompts, strict=True)), weights, rows=rows)
+    _gdn_step(vpool, verifier, geometry, K + 1, "decode", *map(torch.cat, zip(*blocks, strict=True)), weights,
+              rows=rows)
+    accepted = torch.arange(rows, device=device) % (K + 1)
+    verifier.correct_verify_state(SimpleNamespace(accepted=accepted))
+
+    for row in range(rows):
+        kept = int(accepted[row]) + 1
+        state, window, _ = _fp64_reference(
+            geometry, weights, *(torch.cat([p, t[:kept]]) for p, t in zip(prompts[row], blocks[row], strict=True)),
+        )
+        slot = vpool._slots[row]["main"].index
+        assert torch.isfinite(vpool.block("state", 0)[slot]).all(), row
+        assert _rel(vpool.block("state", 0)[slot], state) <= STATE_REL, row
+        assert _rel(vpool.block("conv", 0)[slot], window) <= STATE_REL, row
 
 
 @pytest.mark.parametrize("first_wrong", [None, 0, 1, 2])
