@@ -760,6 +760,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.LoraAdapterPool.prefix_skip_safe"><code class="docutils literal notranslate"><span class="pre">LoraAdapterPool.prefix_skip_safe</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.LoraAdapterPool.remove_request"><code class="docutils literal notranslate"><span class="pre">LoraAdapterPool.remove_request()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.LoraAdapterPool.reserve"><code class="docutils literal notranslate"><span class="pre">LoraAdapterPool.reserve()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.LoraAdapterPool.resident_refusal"><code class="docutils literal notranslate"><span class="pre">LoraAdapterPool.resident_refusal()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.LoraAdapterPool.resident_slot"><code class="docutils literal notranslate"><span class="pre">LoraAdapterPool.resident_slot()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.LoraAdapterPool.rollback_admit"><code class="docutils literal notranslate"><span class="pre">LoraAdapterPool.rollback_admit()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.LoraAdapterPool.runs_adapters"><code class="docutils literal notranslate"><span class="pre">LoraAdapterPool.runs_adapters()</span></code></a></li>
@@ -1219,6 +1220,17 @@ counts like any other.</p>
 </dd></dl>
 
 <dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.lora.pool.LoraAdapterPool.resident_refusal">
+<span class="sig-name descname"><span class="pre">resident_refusal</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/lora/pool.html#LoraAdapterPool.resident_refusal"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.lora.pool.LoraAdapterPool.resident_refusal" title="Link to this definition">#</a></dt>
+<dd><p>Why a node holding this resource can’t run on resident tables, or None if it can.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a> | None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.lora.pool.LoraAdapterPool.resident_slot">
 <span class="sig-name descname"><span class="pre">resident_slot</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">adapter</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/lora/pool.html#LoraAdapterPool.resident_slot"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.lora.pool.LoraAdapterPool.resident_slot" title="Link to this definition">#</a></dt>
 <dd><dl class="field-list simple">
@@ -1583,6 +1595,7 @@ theirs, or None).</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.LoraAdapterPool.prefix_skip_safe"><code class="docutils literal notranslate"><span class="pre">LoraAdapterPool.prefix_skip_safe</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.LoraAdapterPool.remove_request"><code class="docutils literal notranslate"><span class="pre">LoraAdapterPool.remove_request()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.LoraAdapterPool.reserve"><code class="docutils literal notranslate"><span class="pre">LoraAdapterPool.reserve()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.LoraAdapterPool.resident_refusal"><code class="docutils literal notranslate"><span class="pre">LoraAdapterPool.resident_refusal()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.LoraAdapterPool.resident_slot"><code class="docutils literal notranslate"><span class="pre">LoraAdapterPool.resident_slot()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.LoraAdapterPool.rollback_admit"><code class="docutils literal notranslate"><span class="pre">LoraAdapterPool.rollback_admit()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.LoraAdapterPool.runs_adapters"><code class="docutils literal notranslate"><span class="pre">LoraAdapterPool.runs_adapters()</span></code></a></li>
