@@ -91,6 +91,11 @@ class VerifyLedger:
         row the device holds its true length."""
         return rid in self._steps_of
 
+    def returning(self, rid: int) -> bool:
+        """``rid`` was offloaded since its last admit, so everything it holds
+        is due at its next (`mark_offloaded`)."""
+        return rid in self._returning
+
     def unrecorded(self, rid: int) -> bool:
         """``rid`` has a committed verify step whose result postprocess has not
         recorded yet: only the device knows how much of it was kept."""

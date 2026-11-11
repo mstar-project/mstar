@@ -20,11 +20,12 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from spec_toy import NODE, Driver, _batch, engine, every  # noqa: E402
+from spec_toy import NODE, Driver, _batch, engine, every, stub_offload  # noqa: E402
 
 from mstar.engine.resources.kv import manager as manager_mod  # noqa: E402
+from mstar.engine.resources.kv.manager import Victims  # noqa: E402
 from mstar.graph.runtime.base import PhasedPostprocess, PostprocessNeed, PostprocessStep  # noqa: E402
-from mstar.testing_utils.worker import make_worker  # noqa: E402
+from mstar.testing_utils.worker import make_worker, preempting  # noqa: E402
 from mstar.worker.micro_scheduler import ScheduledBatch  # noqa: E402
 from mstar.worker.speculation import Speculator  # noqa: E402
 from mstar.worker.step_executor import PendingBatch  # noqa: E402
@@ -71,9 +72,10 @@ def _worker(eng, stopped=frozenset(), failed=frozenset()):
             pending_loop_stop_rids=lambda walks, loop: set(stopped),
             begin_postprocess=begin,
             supports_inline_emit=False,
+            get_rid_string=str,
         ),
         tensor_manager=SimpleNamespace(cleanup_collectable=lambda *args: None, get_tensor=None),
-        engine_manager=SimpleNamespace(get_engine=lambda node: eng),
+        engine_manager=SimpleNamespace(get_engine=lambda node: eng, engine=eng),
         request_state=SimpleNamespace(buffer_publish_info=lambda *args: None),
         verifying_nodes=eng.verifying_nodes(),
     )
@@ -330,3 +332,51 @@ def test_a_refused_verify_step_finds_every_result_recorded_before_preemption(mon
     assert seen == [{1: False, 2: False, 3: False}], "the refusal never reached the check, or found a row unrecorded"
     # the victim is the row outside the refused step
     assert 3 in worker.admission.held_until
+
+
+def _victims(move: str, rid: int) -> Victims:
+    return Victims(**{name: [rid] if name == move else [] for name in ("to_host", "to_drop", "to_ask")})
+
+
+def _debug_move(monkeypatch, eng, victims: Victims) -> None:
+    """`Preemption._move` of ``victims`` for row 1 over the toy engine's paged KV cache, under
+    ``MSTAR_KV_DEBUG_ASSERTS``."""
+    preemption = preempting(_worker(eng))
+    monkeypatch.setattr(manager_mod, "_DEBUG_ASSERTS", True)
+    preemption._move(preemption._caches["kv"], preemption.counts[NODE], victims, 1)
+
+
+def test_the_debug_victim_check_passes_a_returning_row_asked_again(monkeypatch):
+    """A row moved to the host and admitted back holds an allotment and no page until it reloads, so the pool
+    can ask it again (`KVManager._choose`). Its verify results stay held for its first admit back."""
+    stub_offload(monkeypatch)
+    eng, driver = _setup()
+    driver.step([1, 2])
+    driver.step([1])
+    assert eng.offload_request(NODE, 2) > 0
+    assert eng.verify_pending(NODE, 2) and eng.verify_returning(NODE, 2)
+    _debug_move(monkeypatch, eng, _victims("to_ask", 2))
+    assert eng.verify_pending(NODE, 2) and eng.verify_returning(NODE, 2)
+
+
+@pytest.mark.parametrize("move", ["to_host", "to_drop", "to_ask"])
+def test_the_debug_victim_check_refuses_a_resident_row_with_an_unrecorded_step(monkeypatch, move):
+    stub_offload(monkeypatch)
+    eng, driver = _setup()
+    batch, _, _ = _verify_step(eng, driver, [2])
+    assert not _recorded(eng, batch.verify_seq) and not eng.verify_returning(NODE, 2)
+    with pytest.raises(RuntimeError, match=r"preemption on LLM: .*\[2\]"):
+        _debug_move(monkeypatch, eng, _victims(move, 2))
+
+
+@pytest.mark.parametrize("move", ["to_host", "to_drop", "to_ask"])
+def test_the_debug_victim_check_passes_resident_victims_with_nothing_unrecorded(monkeypatch, move):
+    """Negative control: moved or dropped, a row whose results are recorded and not yet applied; asked again,
+    one that holds none."""
+    stub_offload(monkeypatch)
+    eng, driver = _setup()
+    driver.step([1, 2])
+    driver.add(3, [4, 4], 30)
+    rid = 3 if move == "to_ask" else 2
+    assert not eng.verify_unrecorded(NODE, rid) and eng.verify_pending(NODE, rid) is (rid == 2)
+    _debug_move(monkeypatch, eng, _victims(move, rid))
