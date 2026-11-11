@@ -18,7 +18,7 @@ import pytest
 
 PORTED = (
     "mstar/model/qwen3_5", "mstar/model/command_a_plus", "mstar/model/wan22", "mstar/model/flux2_klein",
-    "mstar/model/z_image", "mstar/model/ltx2_5", "mstar/model/qwen3_omni",
+    "mstar/model/z_image", "mstar/model/ltx2_5", "mstar/model/qwen3_omni", "mstar/model/minimax_h3",
 )
 FORBIDDEN_ATTRIBUTES = {
     "node_resources", "resources", "request_state", "per_request_states",
