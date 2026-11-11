@@ -202,9 +202,11 @@ class _TorchGraphBackend(AcceleratorGraphBackend):
     ) -> Iterator[GraphCapture]:
         """What the runtime's own ``graph`` context does, which ends only the graph it began: after
         a `split_capture` the capture ends in another."""
-        # free as much memory as can be for the graph
+        # free as much memory as can be for the graph; a collect only on request, as torch's own
+        # context does, since it is slow and a capture comes many to a boot
         self.synchronize()
-        gc.collect()
+        if torch.compiler.config.force_cudagraph_gc:
+            gc.collect()
         self._runtime.empty_cache()
         if stream is None:
             if self._capture_stream is None:
