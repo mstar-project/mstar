@@ -480,7 +480,7 @@ def test_a_request_with_no_audio_output_builds_no_talker_masks(thinker, walk):
             "image_grid_thw": [torch.tensor([1, 4, 6])], "text_inputs": [torch.arange(8, 12)],
         },
     }[walk]
-    thinker.node_resources[THINKER_POS]._counters[RID] = {"main": 0}
+    thinker.kv.positions._counters[RID] = {"main": 0}
     info = SimpleNamespace(rid_handle=RID, step_metadata={"text_before": 1, "audio_output": False})
 
     row = thinker.prepare_inputs(walk, info, inputs)

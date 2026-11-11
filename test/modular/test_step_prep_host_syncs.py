@@ -714,7 +714,7 @@ class _ScalarWrites(TorchFunctionMode):
 
 
 def _qwen3_omni_thinker(device: torch.device):
-    from mstar.model.qwen3_omni.config import THINKER_POS, Qwen3OmniModelConfig
+    from mstar.model.qwen3_omni.config import Qwen3OmniModelConfig
     from mstar.model.qwen3_omni.submodules import ThinkerSubmodule
 
     config = Qwen3OmniModelConfig()
@@ -728,7 +728,7 @@ def _qwen3_omni_thinker(device: torch.device):
     thinker.model = SimpleNamespace(model=SimpleNamespace(embed_tokens=embed))
     thinker._vision_bos_embed = thinker._vision_eos_embed = None
     thinker.__dict__["_cached_device"] = device
-    thinker.node_resources = {THINKER_POS: SimpleNamespace(position=lambda rid, label: 5)}
+    thinker.kv = SimpleNamespace(positions=SimpleNamespace(position=lambda rid, label: 5))
     return thinker
 
 
