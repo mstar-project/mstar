@@ -70,16 +70,17 @@ from mstar.model.qwen3_asr.config import (
     SAMPLER,
     Qwen3ASRModelConfig,
 )
+from mstar.model.rebuild import RebuildPolicy
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.utils import ByteLevelDetokenizer, TextOutput
 
 logger = logging.getLogger(__name__)
 
 
-def audio_encoder(pad_id: int) -> MediaEncoder:
+def audio_encoder() -> MediaEncoder:
     """The ``audio_encoder`` node: a clip's samples in, one LLM-space row per
     audio pad out, on the ``prefill`` walk (configs and metrics read walk names)."""
-    return MediaEncoder("audio", ENCODER_NODE, ("audio",), "audio_embeds", (pad_id,), walk="prefill")
+    return MediaEncoder("audio", ENCODER_NODE, ("audio",), "audio_embeds", walk="prefill")
 
 
 class Qwen3ASRModel(MultimodalDecoderModel):
@@ -127,11 +128,15 @@ class Qwen3ASRModel(MultimodalDecoderModel):
         )
         self._detokenizer = ByteLevelDetokenizer(self.tokenizer)
         pad = self.config.audio_token_id
-        self.media = (MediaIntake("audio", audio_encoder(pad), pad, self._audio_intake),)
+        self.media = (MediaIntake("audio", audio_encoder(), pad, self._audio_intake),)
 
     # -------------------------------------------------------------------
     # Model ABC: resources
     # -------------------------------------------------------------------
+
+    def rebuild_policies(self) -> dict[str, RebuildPolicy]:
+        # not yet dropped: no drop and rebuild has run through its captured prefill
+        return {}
 
     @property
     def max_windows_per_request(self) -> int:

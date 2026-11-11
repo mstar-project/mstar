@@ -1090,7 +1090,7 @@ def test_decode_loopback_contract(monkeypatch):
     sub.node_resources = {SAMPLER: type("S", (), {"has_slot_masters": True})()}
     assert sub.device_loopback_signals(DECODE_WALK) == frozenset({"text_inputs", "ts_rules"})
     assert sub.device_loopback_signals(PREFILL_WALK) == frozenset()
-    assert sub.inline_client_signals(DECODE_WALK) == {"text_inputs": "new_token"}
+    assert sub.inline_signals(DECODE_WALK) == {"text_inputs": "new_token"}
     row = sub.prepare_inputs(DECODE_WALK, _fwd(1), {}, has_loopback=True)
     assert row.input_ids is None and row.input_seq_len == 1
     monkeypatch.setenv("MSTAR_DEVICE_LOOPBACK", "0")

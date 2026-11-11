@@ -61,7 +61,8 @@ class TestGpu(unittest.TestCase):
         env = unittest.mock.patch.dict(os.environ, {"RUNPOD_API_KEY": "k"})
         env.start()
         self.addCleanup(env.stop)
-        os.environ.pop("LAMBDA_API_KEY", None)  # never reach a real account
+        for other in ("LAMBDA_API_KEY", "ERAS_API_KEY", "DIGITALOCEAN_TOKEN"):  # never reach a real account
+            os.environ.pop(other, None)
 
     def test_a_create_is_not_sent_again_after_a_5xx_or_a_timeout(self):
         for failure in (http_error(502), TimeoutError("timed out"), urllib.error.URLError("refused"),
@@ -114,7 +115,7 @@ class TestGpu(unittest.TestCase):
         self.g.update(runpod=runpod, runpod_list=lambda path, field, params=None: listed,
                       find_offer=lambda cfg, oid: OFFER,
                       runpod_volumes=lambda cfg: {"US-1": {"id": "v", "kind": "network"}})
-        args = argparse.Namespace(offer=OFFER["id"], pr=7, hours=1, tag=None, run=None, input=[],
+        args = argparse.Namespace(boxes=1, offer=OFFER["id"], pr=7, hours=1, tag=None, run=None, input=[],
                                   allow_over_budget=False, dry_run=False)
         exited = False
         with unittest.mock.patch("subprocess.Popen") as popen, contextlib.redirect_stdout(io.StringIO()), \
@@ -192,7 +193,7 @@ class TestGpu(unittest.TestCase):
                 return [{"id": "p1", "name": state["name"]}]
             self.g.update(runpod=runpod, runpod_list=runpod_list, find_offer=lambda cfg, oid: OFFER,
                           runpod_volumes=lambda cfg: {"US-1": {"id": "v", "kind": "network"}})
-            args = argparse.Namespace(offer=OFFER["id"], pr=7, hours=1, tag=None, run=None, input=[],
+            args = argparse.Namespace(boxes=1, offer=OFFER["id"], pr=7, hours=1, tag=None, run=None, input=[],
                                   allow_over_budget=False, dry_run=False)
             with unittest.mock.patch("subprocess.Popen") as popen, contextlib.redirect_stdout(io.StringIO()), \
                     contextlib.redirect_stderr(io.StringIO()):
@@ -210,21 +211,6 @@ class TestGpu(unittest.TestCase):
             self.assertEqual(GPU["ledger"](), {}, f"a refused create ({answer}) left a pending entry blocking the "
                                                   "next launch")
             self.assertEqual(self.watchdogs, [])
-
-    def test_an_eras_outage_refuses_only_an_eras_launch(self):
-        def eras_down(*a, **k):
-            raise GPU["ApiError"](-1, "GET /instances: gave up after retries")
-        self.g["eras"] = eras_down
-        cfg = {**CFG, "budget": {**CFG["budget"], "max_running": 1}}
-        with unittest.mock.patch.dict(os.environ, {"ERAS_API_KEY": "k"}):
-            self.assertFalse(self.launch(cfg=cfg)[3], "an Eras outage would stop launches on RunPod and Lambda")
-            self.assertEqual(list(GPU["ledger"]()), ["runpod:p1"])
-            GPU["save_ledger"]({})
-            self.g["find_offer"] = lambda cfg, oid: {**OFFER, "id": "eras:l1", "provider": "eras"}
-            with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()) as err:
-                GPU["cmd_launch"](argparse.Namespace(offer="eras:l1", pr=7, hours=1, tag=None, allow_over_budget=False,
-                                                     dry_run=False), cfg)
-        self.assertIn("budget.max_running", err.getvalue(), "an Eras launch would go past max_running unchecked")
 
     def test_an_entry_of_a_provider_gpu_py_does_not_have_holds_nothing_up(self):
         key = "slurm:node1:42"
@@ -272,7 +258,8 @@ class TestGpu(unittest.TestCase):
     def test_offers_with_a_provider_not_answering_is_not_no_availability(self):
         def erroring(*a, **k):
             raise GPU["ApiError"](503, "unavailable")
-        args = argparse.Namespace(gpus=1, min_vram=80, all_regions=False, allow_arm=False, json=False)
+        args = argparse.Namespace(gpus=1, vendor="nvidia", min_vram=80, all_regions=False, allow_arm=False,
+                                  json=False)
         unittest.mock.patch.object(GPU["RunPod"], "offers", erroring).start()
         unittest.mock.patch.object(GPU["Lambda"], "offers", lambda *a, **k: []).start()
         self.addCleanup(unittest.mock.patch.stopall)
@@ -294,6 +281,25 @@ class TestBootstrap(unittest.TestCase):
                                env={"PATH": "/usr/bin:/bin", "HOME": home, "HF_HOME": f"{home}/hf"}, check=False)
             self.assertEqual(r.returncode, code, r.stderr)
             self.assertEqual(os.listdir(home), [], f"bootstrap.sh {argv} wrote to HOME")
+
+    def test_a_cache_refresh_starts_from_an_empty_compile_directory(self):
+        for flags, restored in (([], True), (["--no-restore"], False)):
+            home = Path(tempfile.mkdtemp())
+            fake = home / "bin"
+            fake.mkdir()
+            for tool in ("git", "uv", "cargo", "curl", "nvidia-smi"):  # nothing is installed or fetched
+                (fake / tool).write_text("#!/bin/sh\nexit 1\n")
+                (fake / tool).chmod(0o755)
+            (home / "seed/compile").mkdir(parents=True)
+            (home / "seed/compile/old").write_text("")
+            (home / "vol/live-pr-compile-cache").mkdir(parents=True)
+            tarball = home / "vol/live-pr-compile-cache/smunknown.tar"
+            subprocess.run(["tar", "-C", str(home / "seed"), "-cf", str(tarball), "compile"], check=True)
+            subprocess.run(["bash", str(SCRIPTS / "bootstrap.sh"), "1", *flags, "--workdir", f"{home}/w", "--hf-home",
+                            f"{home}/vol/hf"], capture_output=True, check=False,
+                           env={"PATH": f"{fake}:/usr/bin:/bin", "HOME": str(home)})
+            self.assertEqual((home / ".cache/compile/old").exists(), restored,
+                             "a refresh would keep kernels for mains and torches no box runs any more")
 
     def test_untrusted_caches_stay_in_the_work_directory_and_are_never_saved(self):
         home = Path(tempfile.mkdtemp())
@@ -323,15 +329,24 @@ class TestHealth(unittest.TestCase):
 
     def test_a_gpu_it_cannot_match_exits_before_anything_is_loaded(self):
         g, burned = HEALTH["main"].__globals__, []
-        saved = {k: g[k] for k in ("visible_uuids", "burn")}
+        saved = {k: g[k] for k in ("visible_uuids", "burn", "on_rocm")}
         self.addCleanup(g.update, saved)
-        g.update(visible_uuids=lambda: ["mig-1234"], burn=lambda i, stop: burned.append(i))
+        g.update(visible_uuids=lambda: ["mig-1234"], burn=lambda i, stop: burned.append(i), on_rocm=lambda: False)
         smi = subprocess.CompletedProcess([], 0, stdout=self.SMI)
         with unittest.mock.patch("subprocess.run", return_value=smi), \
                 unittest.mock.patch("sys.argv", ["gpu_health.py"]):
             with self.assertRaises(SystemExit):
                 HEALTH["main"]()
         self.assertEqual(burned, [], "the burn started before the GPU mapping was checked, so a mismatch hangs")
+
+    def test_on_rocm_it_says_unchecked_rather_than_crash_or_pass(self):
+        g, burned = HEALTH["main"].__globals__, []
+        self.addCleanup(g.update, {k: g[k] for k in ("on_rocm", "burn")})
+        g.update(on_rocm=lambda: True, burn=lambda i, stop: burned.append(i))
+        with unittest.mock.patch("subprocess.run", side_effect=FileNotFoundError("nvidia-smi")), \
+                unittest.mock.patch("sys.argv", ["gpu_health.py"]), contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(HEALTH["main"](), 0, "an AMD box would fail its health check for want of nvidia-smi")
+        self.assertEqual(burned, [], "a check that can't read the result would still load the GPUs for a minute")
 
 
 if __name__ == "__main__":

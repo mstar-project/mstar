@@ -46,14 +46,17 @@ name: Claude Review
 #      fixed list), and what it posts goes to gh on stdin.
 #
 # `/review` (full mode) adds a second job, live-test, that runs no model and no PR code
-# here either: it rents GPUs (an open Eras listing),
-# starts the live-test session on that box (gpu_review_box.sh), waits for it,
-# collects its report and media, posts them, and approves the PR when the rule
-# in gpu_review.py holds. The box gets the PR's public code, a fixed brief, the
-# review's notes and the PR's title and description (pr-body.md) as data, and its
-# own Anthropic key (an Eras secret), never a GitHub token or a cloud key; the
-# GPUs go when the box's session ends (or at the Eras Pod's deadline), whether
-# or not this job is still running.
+# here either: it rents GPUs (an open Eras listing, else a DigitalOcean GPU Droplet;
+# and for a PR whose diff names AMD hardware, an AMD box on DigitalOcean too),
+# starts the live-test session on each box (gpu_review_box.sh), waits for them,
+# collects their reports and media, posts them, and approves the PR when the rule
+# in gpu_review.py holds. A box gets the PR's public code, a fixed brief, the
+# review's notes and the PR's title and description (pr-body.md) as data, and an
+# Anthropic key (on Eras a key of its own, an Eras secret; on DigitalOcean the
+# review's own), never a GitHub token or a cloud key. An Eras box's GPUs go when
+# its session ends (or at the Pod's deadline), whether or not this job is still
+# running; a droplet goes when this job deletes it, or failing that at the review
+# monitor's hourly reap (review-monitor.yml).
 
 # When it runs, and who can cause it. Only on request; opening or pushing to
 # a PR never starts a review.
@@ -227,7 +230,7 @@ jobs:
       main_sha: ${{ steps.base.outputs.commit }}
       # The summary's fields as `post` rendered them, with what it carried over and this run's inline findings.
       result: ${{ steps.post.outputs.result }}
-      # Built on an earlier review: the live test's `targeted`, or its `none` on runtime code, needs a live test before it.
+      # Built on an earlier review: one naming something untestable isn't made full (gpu_review.py, carry).
       rereview: ${{ steps.diff.outputs.rereview }}
       # stacked-above.json, for the approval rule's count of findings fixed above.
       above: ${{ steps.diff.outputs.above }}
@@ -328,6 +331,11 @@ jobs:
         # timeout) never turns the PR's check red; the last step reports it.
         continue-on-error: true
         timeout-minutes: ${{ fromJSON(steps.pr.outputs.timeout || '25') }}
+        # Subagents (the slices of a big PR) run in the foreground, so the review waits for each one's report.
+        # By default Claude Code starts them in the background, and a review then returned while its slices
+        # were still running, with their files in `skipped`.
+        env:
+          CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: "1"
         uses: anthropics/claude-code-action@374f254f5efaf968abfe15d399fd90972e8138b9 # v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
@@ -430,6 +438,8 @@ jobs:
           SALVAGED: ${{ steps.review.outcome != 'success' }}
           DETAIL: ${{ steps.salvage.outputs.detail }}
           MAX_GPUS: ${{ vars.REVIEW_GPU_MAX_GPUS }}
+          # The team's turn cap, which reviews every file: a skipped file then means the review didn't finish.
+          TEAM: ${{ needs.preflight.outputs.non_write_user == '' }}
         run: python3 .github/review/bot.py post
 
       # Hide the earlier summaries as outdated, so the PR shows only the latest
@@ -523,6 +533,7 @@ jobs:
       HEAD_SHA: ${{ needs.review.outputs.head_sha }}
       TAG: ${{ github.run_id }}-${{ github.run_attempt }}
       ERAS_API_KEY: ${{ secrets.ERAS_API_KEY }}
+      DIGITALOCEAN_TOKEN: ${{ secrets.DIGITALOCEAN_TOKEN }}
     steps:
       - name: Check out main
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -539,6 +550,7 @@ jobs:
           MAX_USD: ${{ vars.REVIEW_GPU_MAX_USD_PER_HOUR }}
           MAX_RUNS: ${{ vars.REVIEW_GPU_MAX_RUNS }}
           ERAS_SECRET: ${{ vars.ERAS_RUN_SECRET_ID }}
+          ERAS_CACHE_VOLUMES: ${{ vars.ERAS_CACHE_VOLUMES }}
         run: python3 .github/review/gpu_review.py configure
 
       # The review's fields as files for the steps below, whether the PR's author has write access
@@ -554,13 +566,15 @@ jobs:
 
       # Nothing runs while the review left an open P0–P2 finding (by the review's own judgement, as
       # the status line counts them) or a skipped file (`gated`): the comment says what to fix first. Otherwise the review's
-      # call stands unless the PR's last live test didn't pass on an ancestor of this head, or a
-      # re-review's `targeted`, or its `none` on runtime code, has no live test before it: then the live
-      # test runs in full, every kind of check, so a failure is never hidden (gpu_review.py, carry); a
+      # call stands unless the PR's last conclusive live test failed, was partial or left no valid verdict
+      # (an unavailable run leaves the call alone unless the last conclusive one before it failed, was
+      # partial or left no valid verdict), or passed on fewer GPU vendors than this run needs: then the
+      # live test runs in full, every kind of check, so a failure is never hidden (gpu_review.py, carry); a
       # re-review with `untestable` set is exempt, since that PR can't be approved. A
       # `none` that stands runs nothing (verdict `skipped`), which the approval never counts as a pass.
       # It posts no live-test marker: it isn't a live test, so the next run still checks against the
-      # last real one. A failed read of the PR's comments fails this step.
+      # last real one. A failed read of the PR's comments fails this step. `vendors`: nvidia, and amd too
+      # when the PR's title, files or changed lines name AMD hardware (a box each).
       - name: Check the last live test
         if: steps.cfg.outputs.trusted == 'true'
         id: carry
@@ -582,7 +596,10 @@ jobs:
           FORCED: ${{ steps.carry.outputs.forced }}
           ASKED: ${{ steps.carry.outputs.asked }}
           ASKED_CHECKS: ${{ steps.carry.outputs.asked_checks }}
+          VENDORS: ${{ steps.carry.outputs.vendors }}
           TURNS: ${{ vars.CLAUDE_REVIEW_MAX_TURNS_TEAM }}
+          # A DigitalOcean box's Anthropic key, written into its user_data (gpu.py, digitalocean.run_secret_env).
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: python3 .github/review/gpu_review.py start
 
       - name: Wait for the live test
@@ -590,6 +607,9 @@ jobs:
         id: wait
         continue-on-error: true
         timeout-minutes: 340
+        env:
+          # to redact the box's progress lines it prints (the redact step's S2; S3 and S4 are in the job's env)
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: python3 .github/review/gpu_review.py wait
 
       # What the box and the providers wrote, redacted in place before anything reads it, so the
@@ -602,6 +622,7 @@ jobs:
         env:
           S2: ${{ secrets.ANTHROPIC_API_KEY }}
           S3: ${{ secrets.ERAS_API_KEY }}
+          S4: ${{ secrets.DIGITALOCEAN_TOKEN }}
         run: python3 .github/review/gpu_review.py redact
 
       # The media go to the gallery repository (GitHub Pages), never into this
@@ -611,6 +632,8 @@ jobs:
         if: steps.wait.outcome == 'success' && steps.redact.outcome == 'success'
         id: render
         continue-on-error: true
+        env:
+          VENDORS: ${{ steps.carry.outputs.vendors }}
         run: python3 .github/review/gpu_review.py comment
 
       - name: Mint a token for the media repository
@@ -634,6 +657,7 @@ jobs:
           MEDIA_REPO: ${{ vars.REVIEW_MEDIA_REPO }}
           MEDIA_TOKEN: ${{ steps.media-app.outputs.token }}
           OWNER: ${{ github.repository_owner }}
+          VENDORS: ${{ steps.carry.outputs.vendors }}
         run: python3 .github/review/gpu_review.py publish
 
       # Minted here, after the live test, since the app's token lasts an hour:
@@ -673,6 +697,7 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.approver.outputs.token || secrets.GITHUB_TOKEN }}
           VERDICT: ${{ steps.render.outputs.verdict || steps.carry.outputs.verdict }}
+          VENDORS: ${{ steps.carry.outputs.vendors }}
         run: python3 .github/review/gpu_review.py approve
 
       # Model output from untrusted input, posted only from the redacted copies.
@@ -691,6 +716,7 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: python3 .github/review/gpu_review.py post
 
+      # These paths are gpu_review.py's UPLOADED: the redact step leaves only regular files there.
       - name: Keep the report
         if: always() && steps.wait.outcome == 'success' && steps.redact.outcome == 'success'
         continue-on-error: true
@@ -698,8 +724,10 @@ jobs:
         with:
           name: live-test-${{ env.PR }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
-            ${{ runner.temp }}/lt/results/report.md
-            ${{ runner.temp }}/lt/results/result.json
+            ${{ runner.temp }}/lt/*/results/report.md
+            ${{ runner.temp }}/lt/*/results/result.json
+            ${{ runner.temp }}/lt/*/results/claude.err.tail
+            ${{ runner.temp }}/lt/*/results/progress.log
           retention-days: 30
           if-no-files-found: ignore
 

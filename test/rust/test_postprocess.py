@@ -372,7 +372,7 @@ def _through_the_worker(rt, rids, wide):
     has them: its tokens go out as they land, then its route sends the rest."""
     landing, completion = _landing("host")
     engine = SimpleNamespace(
-        inline_client_signals=lambda node, walk: {SIG: "new_token"},
+        inline_signals=lambda node, walk: {SIG: "new_token"},
         device_loopback_signals=lambda node, walk: (SIG,),
         step_finished=lambda *a, **k: None, after_output_copy=lambda batch: None,
         materialize_publish=lambda batch, rids: None, finalize_stopped_requests=lambda batch, rids: None,

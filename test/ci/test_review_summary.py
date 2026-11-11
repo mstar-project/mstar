@@ -274,6 +274,9 @@ class TestReviewSummary(unittest.TestCase):
     def test_a_review_that_skipped_files_is_not_green(self):
         text = render(review(skipped=["mstar/worker/worker.py"]), [], "0123456789", "light", [])
         self.assertIn("\n🟡 **No open findings**", text, "a partial review would read as a clean one")
+        self.assertNotIn("Incomplete review", text, "a contributor's small cap may skip files")
+        text = render(review(skipped=["mstar/worker/worker.py"]), [], "0123456789", "light", [], team=True)
+        self.assertIn("Incomplete review", text, "under the team's cap, skipped files would read as the author's")
 
     def test_a_live_test_call_says_which_kinds_of_check_the_box_runs(self):
         live = SUMMARY["SCHEMA"]["properties"]["live_test"]

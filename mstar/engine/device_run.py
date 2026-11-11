@@ -12,7 +12,9 @@ the device only decides when to end.
 
 torch binds no WHILE node, so ``CudaWhile`` calls the CUDA runtime through
 ctypes, and ``cudaGraphSetConditional`` needs a kernel of ours, compiled with
-NVRTC and linked against ``libcudadevrt``.
+NVRTC to a cubin for the device's own arch and linked against ``libcudadevrt``
+by nvJitLink, so the driver loads machine code and JIT-compiles none: a driver
+older than the NVRTC torch ships can't read its PTX.
 """
 from __future__ import annotations
 
@@ -36,25 +38,33 @@ extern "C" __global__ void run_stop(
     long long* index, const long long* limit, long long* continuation,
     long long* column, int* ran
 ) {
-    int done = 0;
+    // a thread a row; rows past one block (1024) stride
+    int live = 0;
     long long at = *index;
-    for (int row = 0; row < rows; ++row) {
+    for (int row = threadIdx.x; row < rows; row += blockDim.x) {
         long long token = tokens[row * stride];
         column[at * rows + row] = token;
-        if (!immune[row]) {
-            for (int i = 0; i < num_ids; ++i) {
-                if (token == stop_ids[i]) marks[row] = 1;
-            }
+        unsigned char mark = marks[row];
+        if (!mark && !immune[row]) {
+            for (int i = 0; i < num_ids; ++i) mark |= token == stop_ids[i];
+            if (mark) marks[row] = 1;
         }
-        done += marks[row];
+        live |= !mark;
     }
-    long long next = at + 1;
-    *index = next;
-    *continuation = done < rows && next < *limit ? 1 : 0;
-    // the host reads the count, then the columns below it: they must be
-    // visible to it first, over PCIe or C2C (a system-scope fence and release)
+    // the host reads the count, then the columns below it, so they must reach
+    // it first, over PCIe or C2C: each writer's own system-scope fence, then
+    // the barrier, then thread 0's release store of the count
     __threadfence_system();
-    asm volatile("st.release.sys.s32 [%0], %1;" :: "l"(ran), "r"((int)next) : "memory");
+    // a barrier as well as the vote: every row is decided and its column
+    // stored before thread 0, alone, moves the index, sets the continuation
+    // and publishes the count
+    live = __syncthreads_or(live);
+    if (threadIdx.x == 0) {
+        long long next = at + 1;
+        *index = next;
+        *continuation = live && next < *limit ? 1 : 0;
+        asm volatile("st.release.sys.s32 [%0], %1;" :: "l"(ran), "r"((int)next) : "memory");
+    }
 }
 
 extern "C" __global__ void set_graph_condition(
@@ -85,12 +95,14 @@ class RunAsk(NamedTuple):
 
 
 class RunState:
-    """A capture slot's run, on the device. ``marks``: a row's stop in this
-    run, padding rows set, so an earlier EOS doesn't end it. ``tokens``: each
-    iteration's token column, ``[limit, bs]`` in pinned host memory, where the
-    device writes it as the iteration ends; then ``ran``, the iterations run so
-    far. The slot owns both: a step on the other slot can't touch them while
-    the host reads this one's."""
+    """A capture slot's run, on the device. ``marks``: a row's stop, padding
+    rows set. A mark is set only on a token the host stops the row's Loop on,
+    so the step that continues the run's rows in their places starts with
+    them: one speculated past every row's stop ends after one iteration.
+    ``tokens``: each iteration's token column, ``[limit, bs]`` in pinned host
+    memory, where the device writes it as the iteration ends; then ``ran``,
+    the iterations run so far. The slot owns both: a step on the other slot
+    can't touch them while the host reads this one's."""
 
     def __init__(self, bs: int, limit: int, stop_ids: Collection[int], device: torch.device):
         self.index = torch.zeros(1, dtype=torch.long, device=device)
@@ -102,15 +114,22 @@ class RunState:
         self.tokens = torch.zeros(limit, bs, dtype=torch.long, pin_memory=pinned)
         self.ran = torch.zeros(1, dtype=torch.int32, pin_memory=pinned)
         self.stop_ids = torch.tensor(sorted(stop_ids), dtype=torch.long, device=device)
-        self._rows = torch.arange(bs, device=device)
+        self._positions = torch.arange(bs, device=device)
         self._immune_stager = PinnedStager(torch.bool, numel=bs)
         self._staged: tuple | None = None
         # the stop buffers' names, once the capture has named them
         self.names: tuple[str, ...] = ()
+        # the request ids of the step staged last, in row order
+        self.rows: tuple = ()
 
-    def stage(self, real: int, immune: Sequence[bool], limit: int) -> None:
+    def stage(self, rows: Sequence, immune: Sequence[bool], limit: int, previous: RunState | None) -> None:
         """Before the launch, on its stream. A staged value keeps its address:
-        the graph reads it."""
+        the graph reads it. ``rows``: the step's request ids, in row order.
+        ``previous``: the run of the step this one continues
+        (``StepContext.continues``), or None. If it was staged for these rows
+        in these places, they start with its marks (a device copy, after that
+        run in stream order: no host sync), else unmarked."""
+        real = len(rows)
         self.index.zero_()
         self.continuation.fill_(1)
         # on the host: the last step on this slot has landed and been read
@@ -120,7 +139,16 @@ class RunState:
             self._staged = key
             self.limit.fill_(limit)
             self._immune_stager.copy_(self.immune, immune, pad_value=False)
-        torch.ge(self._rows, real, out=self.marks)
+        rows = tuple(rows)
+        same = previous is not None and previous.rows == rows
+        if not (same and previous is self):
+            if same and len(previous.marks) == len(self.marks):
+                self.marks.copy_(previous.marks)  # same rows, same bucket: padding is marked alike
+            else:
+                torch.ge(self._positions, real, out=self.marks)
+                if same:
+                    self.marks[:real].copy_(previous.marks[:real])
+        self.rows = rows
 
     def results(self, repeats: int) -> tuple[dict[str, torch.Tensor], "RunState"]:
         """After the launch: the stop buffers on the host, a column an
@@ -133,6 +161,18 @@ class RunState:
         GIL released. An acquire load, which the device's release store pairs
         with: this thread's reads of the columns below it come after it."""
         return wait_count(self.ran.data_ptr(), after, int(wait_s * 1e6))
+
+
+_KERNELS: dict[int, tuple[ctypes.c_void_p, ctypes.c_void_p]] = {}
+# the most threads a CUDA block holds
+_MAX_BLOCK = 1024
+
+
+class _DlInfo(ctypes.Structure):
+    """``Dl_info``, which ``dladdr`` fills: the library a symbol was loaded from."""
+    _fields_ = [
+        ("path", ctypes.c_char_p), ("base", ctypes.c_void_p), ("name", ctypes.c_char_p), ("addr", ctypes.c_void_p),
+    ]
 
 
 class CudaWhile:
@@ -158,48 +198,125 @@ class CudaWhile:
     def __init__(self):
         self._rt = ctypes.CDLL(f"libcudart.so.{torch.version.cuda.split('.')[0]}")
         self._driver = ctypes.CDLL("libcuda.so.1")
-        self._kernels: tuple[ctypes.c_void_p, ...] | None = None
 
     @staticmethod
-    def devrt_path() -> str | None:
-        """``libcudadevrt.a``: ``cudaGraphSetConditional`` links against it."""
-        for root in (os.environ.get("CUDA_HOME"), "/usr/local/cuda"):
-            path = os.path.join(root, "lib64", "libcudadevrt.a") if root else None
-            if path and os.path.exists(path):
-                return path
-        return None
+    def nvrtc() -> tuple[ctypes.CDLL, str | None]:
+        """The NVRTC torch loads, and the directory it was loaded from."""
+        from torch.cuda._utils import _get_nvrtc_library
+
+        nvrtc = _get_nvrtc_library()
+        info = _DlInfo()
+        found = ctypes.CDLL(None).dladdr(ctypes.cast(nvrtc.nvrtcCreateProgram, ctypes.c_void_p), ctypes.byref(info))
+        return nvrtc, os.path.dirname(info.path.decode()) if found and info.path else None
+
+    @staticmethod
+    def link_libraries(nvrtc_dir: str | None) -> tuple[str | None, str | None]:
+        """The paths of ``libnvJitLink`` and ``libcudadevrt.a`` (``cudaGraphSetConditional`` links against it), or
+        ``(None, None)`` when no CUDA release has both. They have to come from one release, the NVRTC's own (a newer
+        devrt or linker fails the link), so the places are tried as pairs: next to the NVRTC torch loaded (the one
+        ``nvidia/cu13/lib`` directory, or the older wheels' sibling ``nvidia/nvjitlink/lib`` and
+        ``nvidia/cuda_runtime/lib``), then each toolkit."""
+        nvjitlink, devrt = f"libnvJitLink.so.{torch.version.cuda.split('.')[0]}", "libcudadevrt.a"
+        places = []
+        if nvrtc_dir:
+            places += [
+                (nvrtc_dir, nvrtc_dir),
+                tuple(os.path.join(nvrtc_dir, "..", "..", package, "lib") for package in ("nvjitlink", "cuda_runtime")),
+            ]
+        toolkits = [os.path.join(root, "lib64") for root in (os.environ.get("CUDA_HOME"), "/usr/local/cuda") if root]
+        places += [(lib64, lib64) for lib64 in toolkits]
+        for link_dir, devrt_dir in places:
+            if os.path.exists(os.path.join(link_dir, nvjitlink)) and os.path.exists(os.path.join(devrt_dir, devrt)):
+                return os.path.join(link_dir, nvjitlink), os.path.join(devrt_dir, devrt)
+        return None, None
+
+    @staticmethod
+    def _invoke(lib: ctypes.CDLL, name: str, *args, log=None) -> None:
+        status = getattr(lib, name)(*args)
+        if status != 0:
+            raise RuntimeError(f"{name} failed with error {status}" + (f":\n{log()}" if log else ""))
 
     def call(self, name: str, *args) -> None:
-        status = getattr(self._rt, name)(*args)
-        if status != 0:
-            raise RuntimeError(f"{name} failed with CUDA error {status}")
+        self._invoke(self._rt, name, *args)
 
     def _driver_call(self, name: str, *args) -> None:
-        status = getattr(self._driver, name)(*args)
-        if status != 0:
-            raise RuntimeError(f"{name} failed with CUDA error {status}")
+        self._invoke(self._driver, name, *args)
+
+    def _compile_stop(self, arch: str, nvrtc: ctypes.CDLL) -> bytes:
+        """``_STOP_SOURCE`` as a relocatable cubin for ``arch`` (``sm_90``), by torch's NVRTC."""
+        prog = ctypes.c_void_p()
+
+        def log() -> str:
+            size = ctypes.c_size_t()
+            nvrtc.nvrtcGetProgramLogSize(prog, ctypes.byref(size))
+            text = ctypes.create_string_buffer(size.value)
+            nvrtc.nvrtcGetProgramLog(prog, text)
+            return text.value.decode()
+
+        self._invoke(
+            nvrtc, "nvrtcCreateProgram", ctypes.byref(prog), _STOP_SOURCE.encode(), b"run_stop.cu", 0, None, None,
+        )
+        try:
+            options = (ctypes.c_char_p * 2)(f"--gpu-architecture={arch}".encode(), b"-rdc=true")
+            self._invoke(nvrtc, "nvrtcCompileProgram", prog, 2, options, log=log)
+            size = ctypes.c_size_t()
+            self._invoke(nvrtc, "nvrtcGetCUBINSize", prog, ctypes.byref(size))
+            cubin = ctypes.create_string_buffer(size.value)
+            self._invoke(nvrtc, "nvrtcGetCUBIN", prog, cubin)
+        finally:
+            nvrtc.nvrtcDestroyProgram(ctypes.byref(prog))
+        return cubin.raw
+
+    def _link_stop(self, arch: str, cubin: bytes, nvrtc_dir: str | None) -> ctypes.Array:
+        """``cubin`` and ``libcudadevrt`` linked to the device's SASS, by the nvJitLink of the NVRTC's CUDA."""
+        path, devrt = self.link_libraries(nvrtc_dir)
+        if devrt is None or path is None:
+            raise RuntimeError(
+                "linking the device stop kernel needs libnvJitLink and libcudadevrt.a from one CUDA release, "
+                f"and none was found next to torch's NVRTC ({nvrtc_dir}), its sibling wheel directories, "
+                "CUDA_HOME or /usr/local/cuda"
+            )
+        lib, handle = ctypes.CDLL(path), ctypes.c_void_p()
+
+        def log() -> str:
+            size = ctypes.c_size_t()
+            lib.nvJitLinkGetErrorLogSize(handle, ctypes.byref(size))
+            text = ctypes.create_string_buffer(size.value)
+            lib.nvJitLinkGetErrorLog(handle, text)
+            return text.value.decode()
+
+        options = (ctypes.c_char_p * 1)(f"-arch={arch}".encode())
+        self._invoke(lib, "nvJitLinkCreate", ctypes.byref(handle), 1, options)
+        try:
+            # input types: 1 is a cubin, 6 a library
+            self._invoke(
+                lib, "nvJitLinkAddData", handle, 1, ctypes.c_char_p(cubin), ctypes.c_size_t(len(cubin)),
+                b"run_stop.cubin", log=log,
+            )
+            self._invoke(lib, "nvJitLinkAddFile", handle, 6, devrt.encode(), log=log)
+            self._invoke(lib, "nvJitLinkComplete", handle, log=log)
+            size = ctypes.c_size_t()
+            self._invoke(lib, "nvJitLinkGetLinkedCubinSize", handle, ctypes.byref(size), log=log)
+            linked = ctypes.create_string_buffer(size.value)
+            self._invoke(lib, "nvJitLinkGetLinkedCubin", handle, linked, log=log)
+        finally:
+            lib.nvJitLinkDestroy(ctypes.byref(handle))
+        return linked
 
     def load_kernels(self) -> tuple[ctypes.c_void_p, ctypes.c_void_p]:
-        """The stop and condition kernels, compiled once a process."""
-        if self._kernels is None:
-            from torch.cuda._utils import _nvrtc_compile
-
-            ptx = _nvrtc_compile(_STOP_SOURCE, "run_stop", nvcc_options=["-rdc=true"])
-            ptx = ptx[0] if isinstance(ptx, tuple) else ptx
-            link, cubin, size = ctypes.c_void_p(), ctypes.c_void_p(), ctypes.c_size_t()
-            self._driver_call("cuLinkCreate_v2", 0, None, None, ctypes.byref(link))
-            self._driver_call(
-                "cuLinkAddData_v2", link, 1, ctypes.c_char_p(ptx), len(ptx), b"run_stop.ptx", 0, None, None,
-            )
-            self._driver_call("cuLinkAddFile_v2", link, 4, self.devrt_path().encode(), 0, None, None)
-            self._driver_call("cuLinkComplete", link, ctypes.byref(cubin), ctypes.byref(size))
+        """The stop and condition kernels of the current device, compiled once a device (a module belongs to a
+        context; the module loads on one thread, so no lock)."""
+        device = torch.cuda.current_device()
+        if device not in _KERNELS:
+            arch = "sm_{}{}".format(*torch.cuda.get_device_capability())
+            nvrtc, nvrtc_dir = self.nvrtc()
+            linked = self._link_stop(arch, self._compile_stop(arch, nvrtc), nvrtc_dir)
             module, stop, condition = ctypes.c_void_p(), ctypes.c_void_p(), ctypes.c_void_p()
-            self._driver_call("cuModuleLoadData", ctypes.byref(module), cubin)
+            self._driver_call("cuModuleLoadData", ctypes.byref(module), linked)
             self._driver_call("cuModuleGetFunction", ctypes.byref(stop), module, b"run_stop")
             self._driver_call("cuModuleGetFunction", ctypes.byref(condition), module, b"set_graph_condition")
-            self._driver_call("cuLinkDestroy", link)
-            self._kernels = stop, condition
-        return self._kernels
+            _KERNELS[device] = stop, condition
+        return _KERNELS[device]
 
     def device_pointer(self, host: torch.Tensor) -> int:
         """Where the device reaches pinned ``host``: not always its own address
@@ -209,7 +326,7 @@ class CudaWhile:
         return pointer.value
 
     def stop(self, state: RunState, tokens: torch.Tensor, stream: int) -> None:
-        """Inside the step's capture: ``run_stop`` on ``stream``."""
+        """Inside the step's capture: ``run_stop`` on ``stream``, a thread a row."""
         row = tokens.reshape(len(state.marks), -1)
         values = [
             ctypes.c_void_p(row.data_ptr()), ctypes.c_int(row.stride(0)), ctypes.c_int(len(state.marks)),
@@ -220,8 +337,10 @@ class CudaWhile:
             ctypes.c_void_p(self.device_pointer(state.tokens)), ctypes.c_void_p(self.device_pointer(state.ran)),
         ]
         args = (ctypes.c_void_p * len(values))(*(ctypes.cast(ctypes.byref(v), ctypes.c_void_p) for v in values))
+        # one block, a thread a row of the capture: flat in the batch size
+        threads = min(len(state.marks), _MAX_BLOCK)
         self._driver_call(
-            "cuLaunchKernel", self.load_kernels()[0], 1, 1, 1, 1, 1, 1, 0, ctypes.c_void_p(stream), args, None,
+            "cuLaunchKernel", self.load_kernels()[0], 1, 1, 1, threads, 1, 1, 0, ctypes.c_void_p(stream), args, None,
         )
 
     def node_refusal(self, step_graph: int) -> str | None:

@@ -249,7 +249,9 @@ class RecurrentStatePool(Resource):
         # `_snap_meta` maps a filed slot to its key and whether it is a decode snapshot (a reply's),
         # least recently filed or restored first. Eviction takes a reply's first.
         # `_snap_refs` counts the leases and restores holding a slot, which eviction skips.
+        # `filed` counts the snapshots ever filed, which can lower what a request waiting for KV pages needs.
         self._kv: KVManager | None = None
+        self.filed = 0
         first = config.max_slots
         self._snap_free = list(reversed(range(first, first + config.prefix_slots)))
         self._snap_by_key: dict[bytes, int] = {}
@@ -490,9 +492,17 @@ class RecurrentStatePool(Resource):
         return ASKS
 
     def reserve(self, rid: str, node_name: str, graph_walk: str, published: None) -> int | None:
+        return self._reserve(rid, 1)
+
+    def reserve_past(self, rid: str, node_name: str, graph_walk: str, published: None) -> int | None:
+        """`reserve`, leaving the first waiting request its slots."""
+        return self._reserve(rid, 2)
+
+    def _reserve(self, rid: str, requests: int) -> int | None:
+        """Reserve ``rid``'s slots when there is room for ``requests`` requests' slots."""
         with self._lock:
             need, room = len(self.config.labels), len(self._free) - self._kept
-            if need > room:
+            if need * requests > room:
                 return room
             self._reserved[rid] = need
             self._kept += need
@@ -712,7 +722,7 @@ class RecurrentStatePool(Resource):
             if self._admit_restores or self._admit_snaps:
                 self._forget_prefix_admit(lambda key: ctx.is_real_row(key[0]))
             page = self._kv.config.tokens_per_page if self._kv is not None else 0
-            slots, is_pad = self._slots, ctx.is_padding_row
+            slots, is_pad, repeats = self._slots, ctx.is_padding_row, ctx.repeats
             for segment in step.segments or ():
                 if segment.span <= 0 or is_pad(segment.request_id):
                     continue
@@ -724,7 +734,7 @@ class RecurrentStatePool(Resource):
                         slot.has_state = True
                         self._version += 1
                     # a step that repeats ran its span once a replay
-                    slot.tokens += segment.span * ctx.repeats
+                    slot.tokens += segment.span * repeats
                     # a row too short to checkpoint that ends on a page (a decode step) is saved here, after its forward
                     if page and segment.span < page and not slot.tokens % page:
                         self._save_decode(segment.request_id, segment.label, slot)
@@ -780,6 +790,8 @@ class RecurrentStatePool(Resource):
         """Key snapshots by the page chains of ``kv``, the cache `config.kv_cache` names.
         A pool with no snapshot slots keys none."""
         self._kv = kv if self.config.prefix_slots else None
+        if self._kv is not None:
+            kv.bind_snapshots(self)
 
     def close_prefix_cache(self) -> None:
         self._kv = None
@@ -794,7 +806,7 @@ class RecurrentStatePool(Resource):
         """The blocks' shapes and dtypes. The state's dtype changes what the
         recurrent layers output, and so every KV page written after them."""
         return fingerprint(sorted(
-            (name, block.shape, str(block.dtype)) for name, block in self.config.blocks.items()
+            (name, block.shape, str(self._blocks[name].dtype)) for name, block in self.config.blocks.items()
         ))
 
     def resolve_cached_prefix(
@@ -833,12 +845,23 @@ class RecurrentStatePool(Resource):
             if lease is not None and lease.tokens <= prefix.tokens:
                 return self._cut(prefix, lease.tokens)
             self._drop_lease(rid)
-            pages = next((n for n in range(len(keys), 0, -1) if keys[n - 1] in self._snap_by_key), 0)
+            pages = self.restorable(keys)
             snap = self._snap_by_key[keys[pages - 1]] if pages else None
             if snap is not None:
                 self._snap_refs[snap] = self._snap_refs.get(snap, 0) + 1
             self._leases[rid] = SnapshotLease(label, snap, pages * page, prefix.tokens)
         return self._cut(prefix, pages * page)
+
+    def restorable(self, keys: Sequence[bytes]) -> int:
+        """How many of ``keys``' leading pages a hit can skip: up to the longest prefix this pool holds a
+        snapshot for, or all of them while snapshots are off.
+
+        Takes no lock, since this pool calls into the KV cache with its lock held, and the KV cache asks
+        with its own held.
+        """
+        if self._kv is None:
+            return len(keys)
+        return next((n for n in range(len(keys), 0, -1) if keys[n - 1] in self._snap_by_key), 0)
 
     @staticmethod
     def _cut(prefix: CachedPrefix, tokens: int) -> CachedPrefix:
@@ -1016,6 +1039,7 @@ class RecurrentStatePool(Resource):
             return False
         self._snap_by_key[key] = snap
         self._snap_meta[snap] = (key, reply)
+        self.filed += 1
         return True
 
     def _save_decode(self, rid: str, label: str, slot: SlotState) -> None:

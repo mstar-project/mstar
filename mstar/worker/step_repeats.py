@@ -75,7 +75,7 @@ def parse_step_repeats(block: object, nodes: Collection[str]) -> dict[str, Repea
     if not isinstance(block, Mapping):
         raise ValueError(f"step_repeats must map node names to settings, got {block!r}")
     if unknown := sorted(set(block) - set(nodes)):
-        raise ValueError(f"step_repeats names {unknown}, which are not nodes of this worker")
+        raise ValueError(f"step_repeats names {unknown}, which are not nodes of this model")
     return {node: RepeatConfig.parse(node, settings) for node, settings in block.items()}
 
 
@@ -162,11 +162,15 @@ class StepRepeats:
     def may_repeat(self, node: str, walk: str) -> bool:
         return (node, walk) in self._walks
 
-    def owes_run(self, node: str, repeats: int, owed: bool) -> bool:
+    def owes_run(self, node: str, walks: Collection[str], repeats: int, owed: bool) -> bool:
         """Whether the next step is a run that ready rows wait for: once after a
-        step that ran one iteration, so one narrowed to 1 can't keep them out."""
+        step with rows of a walk that may repeat but ran one iteration, so one
+        narrowed to 1 can't keep them out. A step of prompts and chunks alone owes none."""
         config = self._configs.get(node)
-        return config is not None and config.ready_waits and repeats == 1 and not owed
+        return (
+            config is not None and config.ready_waits and repeats == 1 and not owed
+            and any(self.may_repeat(node, walk) for walk in walks)
+        )
 
     def ceiling(self, speculation: Speculation, in_chain: int, loop_room: Callable[[], int]) -> int:
         """The most ``speculation``'s step can repeat. Only a chain's step whose

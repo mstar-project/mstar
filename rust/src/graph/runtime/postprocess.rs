@@ -225,6 +225,7 @@ impl Postprocess {
             || !route.register_uuids.is_empty()
             || !route.new_token_output_idxs.is_empty()
             || !route.local_streaming_signals.is_empty()
+            || !route.local_stream_value_signals.is_empty()
             || !route.rids_needing_request_info.is_empty()
             || !route.freed_input_uuids.is_empty()
     }
@@ -554,7 +555,10 @@ impl GraphRuntime {
                 if let Ok(found) = checked {
                     if found.missing.is_empty() {
                         let loops = self.stop_rule_loops(&pp.node_name, &pp.graph_walk);
-                        pp.kept = found.rids.iter().copied().zip(found.kept.iter().copied()).collect();
+                        // only a step that repeated can stop a row before its last iteration
+                        if pp.tokens.as_ref().is_some_and(|t| t.width > 1) {
+                            pp.kept = found.rids.iter().copied().zip(found.kept.iter().copied()).collect();
+                        }
                         let found: Vec<(u32, Vec<String>)> = found.rids.iter().zip(&found.rules)
                             .map(|(&r, &k)| (r, vec![loops[k as usize].clone()]))
                             .collect();

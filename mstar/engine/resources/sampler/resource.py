@@ -130,6 +130,7 @@ class SamplerResource(Resource):
         # Resident requests that asked for log-probs: with none, no step's
         # log-prob rows are copied to the host.
         self._logprob_rids: set[str] = set()
+        self._logprobs_this_step = False
         # Resident requests that don't sample greedily (`samples_greedy`), so
         # a step over the rest runs lean. Kept like the two sets above, and read
         # per step only when it isn't empty.
@@ -387,8 +388,16 @@ class SamplerResource(Resource):
         return ASKS
 
     def reserve(self, rid: str, node_name: str, graph_walk: str, published: None) -> int | None:
+        return self._reserve(rid, 1)
+
+    def reserve_past(self, rid: str, node_name: str, graph_walk: str, published: None) -> int | None:
+        """`reserve`, leaving the first waiting request its row."""
+        return self._reserve(rid, 2)
+
+    def _reserve(self, rid: str, requests: int) -> int | None:
+        """Give ``rid`` a row when there are rows for ``requests`` requests."""
         room = self._cg_buffers.free_rows
-        if room <= 0:
+        if room < requests:
             return room
         self._cg_buffers.register_request(rid, sampling_config=self._sampler._sampling_config[rid])
         return None
@@ -574,6 +583,10 @@ class SamplerResource(Resource):
             self._set_greedy_flag(ctx)
             self._kept_rids = self._kept_rids_of(step, ctx)
             self._sampled_this_step = False
+            # a step of several iterations keeps no log-prob row: `max_repeats` let it
+            # repeat because none of its rows asked, and a request ingested since is
+            # no row of it. Its one row per request would be the last replay's.
+            self._logprobs_this_step = bool(self._logprob_rids) and ctx.repeats == 1
         if not ctx.is_preplan and self._penalty_live:
             configs = self._sampler._sampling_config
             for rid, tokens in step.prefill_tracked_tokens.items():
@@ -787,7 +800,7 @@ class SamplerResource(Resource):
         token is the row's emitted one, which ``sample`` enforces while
         log-probs are on; a node that samples more than once (a code
         predictor) needs its own path."""
-        if not self._logprob_rids:
+        if not self._logprobs_this_step:
             return {}
         # a replay never calls `sample`: its rows are the slot's static ones
         rows = self._cg_sampler.logprob_buf if self._cg_sampler is not None else self._sampler.logprobs

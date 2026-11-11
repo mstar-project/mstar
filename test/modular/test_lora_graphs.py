@@ -19,7 +19,13 @@ import test_lora_pool as P  # noqa: E402
 from mstar.engine.accelerator_graph_config import PackedAcceleratorGraphConfig  # noqa: E402
 from mstar.engine.resources.base import EngineResourceInfo  # noqa: E402
 from mstar.engine.resources.lora import LORA_RESOURCE_KEY, LoraReqConfig  # noqa: E402
-from mstar.engine.resources.lora.ops import LoraOpsBackend, lora_apply_, lora_expand_, lora_shrink  # noqa: E402
+from mstar.engine.resources.lora.ops import (  # noqa: E402
+    LoraOpsBackend,
+    lora_apply_,
+    lora_expand_,
+    lora_experts_apply_,
+    lora_shrink,
+)
 from mstar.engine.resources.lora.pool import ZERO_SLOT, LoraAdapterPool, _Layout  # noqa: E402
 from mstar.engine.resources.runner import StepRunner  # noqa: E402
 from mstar.engine.resources.step import (  # noqa: E402
@@ -59,12 +65,14 @@ def _llm(paths, with_pool=True):
 
 def test_custom_ops_pass_opcheck():
     """Schemas (``lora_expand_`` declares the ``y`` it writes), fake shapes and the
-    functionalized path, on addressing with a capture bucket's tail."""
+    functionalized path, on addressing with a capture bucket's tail; and the experts op's."""
     widths, ranks, scalings = [6, 3, 5], torch.tensor([0, 1, 4, 3], dtype=torch.int32), torch.tensor([0, 0.5, 2, -1.0])
     token_slots = torch.tensor([2, 0, 1, 3, 2, 2, 1], dtype=torch.int32)
     order = torch.cat([torch.argsort(token_slots, stable=True).to(torch.int32), torch.zeros(3, dtype=torch.int32)])
     indptr = torch.cat([torch.zeros(1, dtype=torch.int32), torch.bincount(token_slots, minlength=4).cumsum(0)])
-    common = (order, indptr.to(torch.int32), ranks)
+    # a capture bucket's tail tokens are on the zero adapter
+    token_slot = torch.cat([token_slots, torch.zeros(3, dtype=torch.int32)])
+    common = (order, indptr.to(torch.int32), token_slot, ranks)
     g = torch.Generator().manual_seed(1)
     a, b = torch.randn(4, 3 * 4, 12, generator=g, dtype=F64), torch.randn(4, 14, 4, generator=g, dtype=F64)
     x, y = torch.randn(10, 12, generator=g, dtype=F64), torch.randn(10, 14, generator=g, dtype=F64)
@@ -72,6 +80,11 @@ def test_custom_ops_pass_opcheck():
     h = lora_shrink(x, a, *common, len(widths))
     torch.library.opcheck(lora_expand_, (y, h, b, *common, scalings, widths))
     torch.library.opcheck(lora_apply_, (y, x, a, b, *common, scalings, widths))
+    # an experts target's, with no alignment (off CUDA); ids past `a`'s 6 rows get nothing
+    ids = torch.tensor([[0, 5], [2, 6], [6, 1]], dtype=torch.int32)
+    a, b = torch.randn(6, 2 * 4, 12, generator=g, dtype=F64), torch.randn(6, 9, 4, generator=g, dtype=F64)
+    y, weight = torch.randn(6, 9, generator=g, dtype=F64), torch.rand(3, 2, generator=g, dtype=F64)
+    torch.library.opcheck(lora_experts_apply_, (x[:3], y, a, b, ids, weight, None, None, None, 2, [4, 5], 0))
 
 
 def test_qwen3_5_stack_with_adapters_compiles_and_matches_eager(qwen_adapters):
@@ -88,18 +101,23 @@ def test_qwen3_5_stack_with_adapters_compiles_and_matches_eager(qwen_adapters):
     plain, _, plain_rows = _llm(qwen_adapters, with_pool=False)
     plain_rows.lengths = rows.lengths
 
-    def breaks(model):
+    tables = Q.no_rope(llm.model.model, x.shape[0])
+
+    def breaks(model, model_rows):
         torch._dynamo.reset()
-        return torch._dynamo.explain(lambda x: model.model.model(x, label="main"))(x).graph_break_count
+        with Q.step_over(model, model_rows):
+            return torch._dynamo.explain(lambda x: model.model.model(x, cos_sin=tables))(x).graph_break_count
 
     def fwd(x):
-        return llm.model.model(x, label="main")
+        return llm.model.model(x, cos_sin=tables)
 
     with torch.no_grad():
-        assert breaks(llm) == breaks(plain)
-        eager = fwd(x)
+        assert breaks(llm, rows) == breaks(plain, plain_rows)
+        with Q.step_over(llm, rows):
+            eager = fwd(x)
         torch._dynamo.reset()
-        compiled = torch.compile(fwd, backend="inductor")(x)
+        with Q.step_over(llm, rows):
+            compiled = torch.compile(fwd, backend="inductor")(x)
     # the stack without LoRA differs between eager and Inductor by ~1e-6 on its own
     torch.testing.assert_close(compiled, eager, rtol=1e-5, atol=1e-5)
 

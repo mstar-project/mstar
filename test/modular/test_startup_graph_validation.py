@@ -704,7 +704,7 @@ def _higgs(name, model_kwargs, tmp_path, monkeypatch):
     from mstar.model.multimodal_decoder import MediaIntake
     config = HiggsAudioModelConfig()
     pad = config.audio_in_token_idx
-    return _bare(HiggsAudioModel, config=config, media=(MediaIntake("audio", audio_encoder(pad), pad, None),))
+    return _bare(HiggsAudioModel, config=config, media=(MediaIntake("audio", audio_encoder(), pad, None),))
 
 
 def _kokoro(name, model_kwargs, tmp_path, monkeypatch):
@@ -714,12 +714,15 @@ def _kokoro(name, model_kwargs, tmp_path, monkeypatch):
 
 def _minicpm_o(name, model_kwargs, tmp_path, monkeypatch):
     from mstar.model.components.qwen3_lm import Qwen3LMConfig
+    from mstar.model.minicpm_o.components.tts import TTSConfig
     from mstar.model.minicpm_o.config import AudioConfig, MiniCPMOConfig, ResamplerConfig, VisionConfig
     from mstar.model.minicpm_o.minicpm_o_model import MiniCPMOModel
     config = MiniCPMOConfig(
         llm=Qwen3LMConfig(), vision=VisionConfig(), resampler=ResamplerConfig(), audio=AudioConfig(),
     )
-    return _bare(MiniCPMOModel, max_seq_len=64, config=config)
+    # the bundled voice's length, read from the checkpoint's clip in a real boot
+    voice = (6.016, 6.016)
+    return _bare(MiniCPMOModel, max_seq_len=64, config=config, tts_config=TTSConfig(), _voice_seconds=lambda: voice)
 
 
 def _orpheus(name, model_kwargs, tmp_path, monkeypatch):
@@ -741,6 +744,32 @@ def _minimax_h3(name, model_kwargs, tmp_path, monkeypatch):
     return model
 
 
+def _phi4mm(name, model_kwargs, tmp_path, monkeypatch):
+    """Phi-4-mini's head and rotary geometry with two layers: the resource rules read
+    the layer and head counts and the rotary width, not the other sizes."""
+    from mstar.model.multimodal_decoder import MediaIntake
+    from mstar.model.phi4mm.audio import audio_encoder
+    from mstar.model.phi4mm.components.audio import Phi4MMAudioConfig
+    from mstar.model.phi4mm.components.vision import Phi4MMVisionConfig
+    from mstar.model.phi4mm.config import AUDIO_PAD_ID, IMAGE_PAD_ID, Phi4MMConfig
+    from mstar.model.phi4mm.phi4mm_model import Phi4MMModel
+    from mstar.model.phi4mm.vision import vision_media_encoder
+    config = Phi4MMConfig.from_hf({
+        "hidden_size": 3072, "intermediate_size": 8192, "num_hidden_layers": 2,
+        "num_attention_heads": 24, "num_key_value_heads": 8, "vocab_size": 1024,
+        "rms_norm_eps": 1e-5, "rope_theta": 10000.0, "partial_rotary_factor": 0.75,
+        "max_position_embeddings": 131072, "original_max_position_embeddings": 4096,
+        "rope_scaling": {"type": "longrope", "short_factor": [1.0] * 48, "long_factor": [1.0] * 48},
+        "tie_word_embeddings": True,
+    })
+    media = (
+        MediaIntake("image", vision_media_encoder(), IMAGE_PAD_ID, None),
+        MediaIntake("audio", audio_encoder(), AUDIO_PAD_ID, None),
+    )
+    return _bare(Phi4MMModel, config=config, vision_config=Phi4MMVisionConfig(),
+                 audio_config=Phi4MMAudioConfig(), media=media, local_dir="/nonexistent")
+
+
 def _qwen3_5(name, model_kwargs, tmp_path, monkeypatch):
     """Small text-only shapes: the resource rules read the layer and head
     counts, not their sizes."""
@@ -758,7 +787,7 @@ def _qwen3_5(name, model_kwargs, tmp_path, monkeypatch):
     )
     return _bare(
         Qwen3_5DenseModel, config=config, vision_config=None,
-        media=(MediaIntake("image", vision_encoder((0,)), 0, None),),
+        media=(MediaIntake("image", vision_encoder(), 0, None),),
     )
 
 
@@ -795,7 +824,7 @@ def _muse_glimmer(name, model_kwargs, tmp_path, monkeypatch):
     config, vision_config = _muse_configs(MuseGlimmerConfig, 131072)
     return _bare(
         MuseGlimmerModel, config=config, vision_config=vision_config,
-        media=(MediaIntake("image", vision_encoder((0,)), 0, None),),
+        media=(MediaIntake("image", vision_encoder(), 0, None),),
     )
 
 
@@ -847,7 +876,7 @@ def _qwen3_asr(name, model_kwargs, tmp_path, monkeypatch):
     from mstar.model.qwen3_asr.qwen3_asr_model import Qwen3ASRModel, audio_encoder
     config = Qwen3ASRModelConfig()
     pad = config.audio_token_id
-    return _bare(Qwen3ASRModel, config=config, media=(MediaIntake("audio", audio_encoder(pad), pad, None),))
+    return _bare(Qwen3ASRModel, config=config, media=(MediaIntake("audio", audio_encoder(), pad, None),))
 
 
 def _voxcpm2(name, model_kwargs, tmp_path, monkeypatch):
@@ -920,6 +949,7 @@ _FACTORIES = {
     "RippleModel": _ripple,
     "OrpheusModel": _orpheus,
     "ParakeetModel": _parakeet,
+    "Phi4MMModel": _phi4mm,
     "Qwen3_5DenseModel": _qwen3_5,
     "Qwen3OmniModel": _qwen3_omni,
     "Qwen3TTSModel": _qwen3_tts,
