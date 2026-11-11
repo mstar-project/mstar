@@ -516,7 +516,7 @@ class PagedArrayHandle(ArrayHandle):
     def _needs_step_kv(self, attn: Any) -> bool:
         """Whether a read through ``attn`` attends the step's own k and v rather than only the pages, or goes through
         its exchange."""
-        return _exchanges(attn) or attn.reads_step_kv(self.label)
+        return _exchanges(attn, self.label) or attn.reads_step_kv(self.label)
 
     @torch.compiler.disable
     def read(self, layer: int | torch.Tensor, q: torch.Tensor | None = None, **mask_args: Any) -> torch.Tensor:
