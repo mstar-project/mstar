@@ -3124,7 +3124,9 @@ Splitting is declared in four places:
   treat this rank's share as the whole step, and on any step over KV stored by head, since it would
   pass the TP heads where the pool holds this rank's slice. ``AttentionCallable.norm_rope_attend``
   and ``norm_rope_table_attend``, which fuse the K/V write into the norm/RoPE kernel, skip the fused
-  write and go through the exchange wherever the attention ``splits``. A cacheless self-attention
+  write and go through the exchange wherever the call exchanges
+  (``AttentionManager.step_exchanges(label)``): a label the step splits, and every step over KV
+  stored by head, copied steps too (each rank's head slice). A cacheless self-attention
   that may see split tokens declares
   ``RaggedAttentionSpec(..., sp_exchange="ulysses")`` (the default is ``"none"``); it is a no-op
   on a node with no ``SeqShardSpec``, or one whose sequence shard never splits
