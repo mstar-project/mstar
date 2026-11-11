@@ -275,7 +275,7 @@ def test_an_array_whose_reads_differ_by_walk_has_a_storage_of_its_own():
 def test_an_array_whose_reads_differ_by_walk_steps_its_positions_on_every_walk():
     """A walk's step plans only that walk's reads, and the array's positions on any walk."""
     h = _per_walk_handle(_array(positions=Positions(), reads=_per_walk().reads))
-    for walk in ("decode", "prefill_vit", "mixed_text"):
+    for walk in ("decode", "prefill_vit", "mixed_text", "vae_decode"):
         steps = state_steps(_step(h), {"kv": h}, graph_walk=walk).steps
         assert isinstance(steps.get("rope"), PositionStep), f"a step on {walk!r} would leave the positions unplanned"
 
