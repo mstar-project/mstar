@@ -88,7 +88,7 @@ from mstar.model.submodule_base import (
     StopPolicy,
     engine_step,
 )
-from mstar.platforms.compile import with_inductor_overrides
+from mstar.platforms.compile import keep_split_scans_in_their_workspace, with_inductor_overrides
 from mstar.profile.worker import ExecTimings
 from mstar.utils import knobs
 from mstar.utils.client_errors import client_error_text
@@ -669,6 +669,8 @@ class Engine:
         assert gpu_memory_fraction is None or 0 < gpu_memory_fraction <= 1, (
             f"gpu_memory_fraction is a fraction of the device, got {gpu_memory_fraction}"
         )
+        # before the first forward, which is when every engine- and model-owned torch.compile compiles and tunes
+        keep_split_scans_in_their_workspace()
         self._device = None
         self._device_capability = device_capability
         # nodes whose steps run beside the worker's chain (``EngineManager.build``)

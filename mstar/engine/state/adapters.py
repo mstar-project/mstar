@@ -305,7 +305,7 @@ def state_steps(step: SubmoduleStep | None, handles: Mapping[str, ArrayHandle | 
     sampler it lists needs it, so the step skips its resources' admit, plan and commit."""
     if step is None or not step.state:
         return step
-    if not any(getattr(handles.get(name), "needs_step", True) for name in step.state):
+    if not step.steps and not any(getattr(handles.get(name), "needs_step", True) for name in step.state):
         return None
     steps = dict(step.steps)
     builders: dict[Storage, StepBuilder] = {}
