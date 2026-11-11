@@ -302,18 +302,33 @@ def test_dit_kernels_refuse_inputs_they_would_read_wrongly():
         dit_kernels.modulate(a.transpose(0, 1), p, p, 6)
     with pytest.raises(ValueError, match="contiguous"):
         dit_kernels.gated_add(a, p, a.transpose(1, 2), 6)
+    with pytest.raises(ValueError, match="contiguous"):
+        dit_kernels.gated_add(a, p, torch.zeros(2, 3, 8), 6)  # y of another shape
     with pytest.raises(ValueError, match="do not fit"):
         dit_kernels.modulate(a, p, p, 3)  # two sets needed: 4 rows
     with pytest.raises(ValueError, match="do not fit"):
         dit_kernels.modulate(a, torch.zeros(4, 8), torch.zeros(4, 8), 6)  # one set: 2 rows
 
 
-def test_dit_kernels_fall_back_to_eager_once_on_a_device_they_do_not_reproduce(monkeypatch, caplog):
-    """A device where a kernel is not bit-equal to the eager ops runs the eager ops, with one warning, checked once."""
+def _mismatch(calls):
+    return lambda device, dtype: calls.append(device) or ["modulate"]
+
+
+def _raises(calls):
+    def check(device, dtype):
+        calls.append(device)
+        raise RuntimeError("no kernel image")
+    return check
+
+
+@pytest.mark.parametrize("check, logged", [(_mismatch, "modulate"), (_raises, "raised RuntimeError")])
+def test_dit_kernels_fall_back_to_eager_once_on_a_device_they_do_not_reproduce(monkeypatch, caplog, check, logged):
+    """A device where a kernel is not bit-equal to the eager ops, or does not compile, runs the eager ops, with one
+    warning, checked once."""
     monkeypatch.setattr(dit_kernels, "_VERIFIED", {})
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)  # no CUDA runtime on a CPU box
     calls = []
-    monkeypatch.setattr(dit_kernels, "_kernels_off_eager", lambda device, dtype: calls.append(device) or ["modulate"])
+    monkeypatch.setattr(dit_kernels, "_kernels_off_eager", check(calls))
     with caplog.at_level(logging.WARNING, logger=dit_kernels.logger.name):
         assert not any(dit_kernels._reproduces_eager(torch.device("cpu"), torch.bfloat16) for _ in range(3))
-    assert len(calls) == 1 and len(caplog.records) == 1 and "modulate" in caplog.text
+    assert len(calls) == 1 and len(caplog.records) == 1 and logged in caplog.text

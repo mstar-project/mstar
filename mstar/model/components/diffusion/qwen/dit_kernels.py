@@ -253,8 +253,9 @@ def _reproduces_eager(device: torch.device, dtype: torch.dtype) -> bool:
 def _kernels_off_eager(device: torch.device, dtype: torch.dtype) -> list[str]:
     """The kernels whose output is not ``torch.equal`` to the eager ops' on a small input, through the entry points
     serving runs: the pair kernels (distinct q and k, as the block calls them), the modulations and the LayerNorms.
-    The head count is the served 24 and the width 3072 (the input's are not known to ``fits``), so these are the
-    Triton compiles serving needs; autocast is off so the eager side is the plain ops."""
+    The width is the served 3072 and the head count TP=1's 24 (the input's are not known to ``fits``): the bits do not
+    depend on the head count, but a TP shard's own Triton specializations are compiled only when it first serves;
+    autocast is off so the eager side is the plain ops."""
     gen = torch.Generator(device=device).manual_seed(0)
     rows, length, split, heads, dim = 2, 8, 3, 24, 3072
     n_txt = 3
@@ -395,8 +396,8 @@ def _(q_txt, q_img, k_txt, k_img, q_txt_weight, q_img_weight, k_txt_weight, k_im
 def _check_args(name: str, x: torch.Tensor, split: int, *params: torch.Tensor, others: tuple = ()) -> None:
     """The kernels read ``x`` (and ``others``) as contiguous ``[R, L, D]`` and each parameter as ``[R, D]`` (one set,
     ``split >= L``) or ``[2R, D]``: anything else would read the wrong memory, so it is an error."""
-    if x.dim() != 3 or not all(t.is_contiguous() for t in (x, *others)):
-        raise ValueError(f"{name}: x and y must be contiguous [R, L, D]")
+    if x.dim() != 3 or not all(t.is_contiguous() for t in (x, *others)) or any(t.shape != x.shape for t in others):
+        raise ValueError(f"{name}: x (and y, of x's shape) must be contiguous [R, L, D]")
     rows, length, dim = x.shape
     want = rows if split >= length else 2 * rows
     for p in params:
