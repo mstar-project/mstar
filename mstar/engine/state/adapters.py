@@ -37,7 +37,7 @@ from mstar.engine.resources.recurrent.config import (
 from mstar.engine.resources.sampler.config import SamplerSpec, SamplerStep, SamplingReqConfig
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
 from mstar.engine.resources.step import Segment, SubmoduleStep
-from mstar.engine.state.analysis import both_sharded, position_key
+from mstar.engine.state.analysis import both_sharded, position_key, query_array
 from mstar.engine.state.calls import ArrayHandle, SamplerHandle, pool_layers, segments_of
 from mstar.engine.state.contract import (
     EMPTY,
@@ -108,13 +108,13 @@ def _resolve(arrays: Sequence[Array], setup: "StateSetup") -> "Resolved":
         by_storage.setdefault(storage_of(array), []).append(array)
     specs: dict[str, list[NodeResourceSpec]] = {}
     resource_of: dict[str, str] = {}
-    queried: dict[str, Array] = {}
+    queries: dict[str, Queries] = {}
     for storage, held in by_storage.items():
         each = storage.resolve(held, arrays, setup)
         specs |= each.specs
         resource_of |= each.resource_of
-        queried |= each.queried
-    return Resolved(specs, resource_of, queried)
+        queries |= each.queries
+    return Resolved(specs, resource_of, queries)
 
 
 def state_setup(config: Mapping[str, Any], declarations: Sequence[Array | Sampler]) -> tuple["StateSetup", list[str]]:
@@ -371,6 +371,8 @@ class WithinStepSteps(StepBuilder):
     def __init__(self):
         self._labels: dict[str, dict[str, Sequence[Segment]]] = {}
         self._pairs: dict[str, list[tuple[str, str]]] = {}
+        # how the reads on each resource lay out their queries, which is one way per resource
+        self._queries: dict[str, Queries] = {}
         # a resource's layout is fixed only if every read on it declares it so
         self._fixed: dict[str, bool] = {}
 
@@ -379,20 +381,10 @@ class WithinStepSteps(StepBuilder):
         exchange, and any other over this rank's share of a sharded side."""
         if not handle._plans:
             return
-        key, name, segments = handle.resource_key, handle.name, segments_of(declared, step)
+        key = handle.resource_key
         self._fixed[key] = self._fixed.get(key, True) and declared.fixed_layout
-        if handle.queried is None:
-            self._label(key, name, segments)
-            return
-        queries = step.state.get(handle.queried.name)
-        if queries is None:
-            raise ValueError(f"Array {name!r}: a step lists it without {handle.queried.name!r}, whose segments lay out "
-                             "its queries")
-        query_segments = segments_of(queries, step)
-        if query_segments is None:
-            raise ValueError(f"Array {handle.queried.name!r}: a step lists it with no segments, its own or the step's")
-        q_label = self._label(key, handle.queried.name, handle.query_share(query_segments))
-        self._pairs.setdefault(key, []).append((q_label, self._label(key, name, handle.key_share(segments))))
+        self._queries[key] = handle.queries
+        handle.queries.plan(self, handle, segments_of(declared, step), step)
 
     def _label(self, key: str, name: str, segments: Sequence[Segment]) -> str:
         if not segments:
@@ -408,10 +400,7 @@ class WithinStepSteps(StepBuilder):
             segments = tuple(s for each in by_label.values() for s in each) if len(by_label) > 1 else (
                 next(iter(by_label.values()))
             )
-            if key in self._pairs:
-                steps[key] = RaggedCrossAttentionStep(segments=tuple(segments), pairs=tuple(self._pairs[key]))
-            else:
-                steps[key] = AttentionStep(segments=segments, causal=False, fixed_layout=self._fixed[key])
+            steps[key] = self._queries[key].step(segments, self._pairs.get(key, ()), self._fixed[key])
         return steps
 
 
@@ -921,13 +910,88 @@ class SegmentedRows(RowLayout):
         return self._frames.run(q, k, v)
 
 
+class Queries(ABC):
+    """Whose segments lay out a within-step read's queries, picked once per read at resolve: its own array's, or those
+    of the array its ``queries`` names."""
+
+    # the spec of the resource the read plans on
+    spec_class: ClassVar[type[NodeResourceSpec]]
+
+    def __init__(self, array: Array):
+        # the array whose segments lay out the queries
+        self.array = array
+
+    @abstractmethod
+    def plan_label(self, keys: Array) -> str:
+        """The label the read's plan runs under, where ``keys`` is the read's own array."""
+
+    @abstractmethod
+    def plan(self, steps: WithinStepSteps, handle: "WithinStepHandle", segments, step: SubmoduleStep) -> None:
+        """Lay out ``handle``'s read in ``steps``, over ``segments``, its own array's in ``step``."""
+
+    @abstractmethod
+    def step(self, segments, pairs: Sequence[tuple[str, str]], fixed: bool) -> Any:
+        """The step of a resource whose reads lay out their queries this way."""
+
+    def check(self, handle: "WithinStepHandle", segments, step: SubmoduleStep) -> None:
+        """Refuse a step whose queries don't line up with ``segments``, the read's own array's."""
+        return
+
+
+class OwnQueries(Queries):
+    """A read whose queries are its own array's."""
+
+    spec_class = RaggedAttentionSpec
+
+    def plan_label(self, keys: Array) -> str:
+        return min(keys.labels)
+
+    def plan(self, steps: WithinStepSteps, handle: "WithinStepHandle", segments, step: SubmoduleStep) -> None:
+        steps._label(handle.resource_key, handle.name, segments)
+
+    def step(self, segments, pairs: Sequence[tuple[str, str]], fixed: bool) -> Any:
+        return AttentionStep(segments=segments, causal=False, fixed_layout=fixed)
+
+
+class CrossQueries(Queries):
+    """A read whose queries are another array's, which a step lists over the same requests in the same order."""
+
+    spec_class = RaggedCrossAttentionSpec
+
+    def plan_label(self, keys: Array) -> str:
+        # Both sides fix the plan's label, so it is one string for the life of the handle. See `cross_label`.
+        return cross_label(min(self.array.labels), min(keys.labels))
+
+    def plan(self, steps: WithinStepSteps, handle: "WithinStepHandle", segments, step: SubmoduleStep) -> None:
+        name = self.array.name
+        queries = step.state.get(name)
+        if queries is None:
+            raise ValueError(f"Array {handle.name!r}: a step lists it without {name!r}, whose segments lay out its "
+                             "queries")
+        query_segments = segments_of(queries, step)
+        if query_segments is None:
+            raise ValueError(f"Array {name!r}: a step lists it with no segments, its own or the step's")
+        key = handle.resource_key
+        q_label = steps._label(key, name, handle.query_share(query_segments))
+        steps._pairs.setdefault(key, []).append((q_label, steps._label(key, handle.name, handle.key_share(segments))))
+
+    def step(self, segments, pairs: Sequence[tuple[str, str]], fixed: bool) -> Any:
+        return RaggedCrossAttentionStep(segments=tuple(segments), pairs=tuple(pairs))
+
+    def check(self, handle: "WithinStepHandle", segments, step: SubmoduleStep) -> None:
+        queries = segments_of(step.state[self.array.name], step)
+        if [s.request_id for s in queries] != [s.request_id for s in segments]:
+            raise handle._refusal(f"its segments and those of {self.array.name!r}, which lay out its queries, must "
+                                  "name the same requests in the same order, with one segment to one")
+
+
 class WithinStepHandle(ArrayHandle):
     """The calls on an array with ``max_len`` 0, which a block compiled alone traces. With ``compile_op`` set, the read
     stays in that graph through ``mstar::ragged_attention``. A check here runs only while not compiling: it would guard
     on the layer, and the block would retrace per layer.
 
-    ``queried`` is the array whose segments lay out the queries of a cross read. Under sequence parallelism the two
-    flags pick the exchange: Ulysses when both sides are sharded, none when only the queries are, and a merge of the
+    ``queries`` says whose segments lay out the read's queries. Under sequence parallelism the two flags pick the
+    exchange: Ulysses when both sides are sharded, none when only the queries are, and a merge of the
     ranks' partial attentions when only the keys are. The read's binding supplies the attention each exchange runs.
     """
 
@@ -941,21 +1005,20 @@ class WithinStepHandle(ArrayHandle):
         self.resource_key = resolved.resource_of[key]
         self.reads = {key: self._binding.bind(array, self.resource_key, resources)}
         self.first_read = self.reads[key]
-        self.queried = queried = resolved.queried.get(key)
+        self.queries = queries = resolved.queries[key]
         self._packed = read.packed
         # a plain attribute, which a compiled caller's trace reads as a constant
         self._plans = self._binding.plans
         self._sp = sp_group
         sharded = sp_group is not None and sp_group.world_size > 1
         self._keys_sharded = sharded and array.seq_sharded
-        self._queries_sharded = sharded and (array if queried is None else queried).seq_sharded
-        self._ulysses = sharded and both_sharded(array, array if queried is None else queried)
+        self._queries_sharded = sharded and queries.array.seq_sharded
+        self._ulysses = sharded and both_sharded(array, queries.array)
         self._rows = (SegmentedRows if read.segmented else SpanRows)(self)
         # A read on SDPA plans nothing, so a step needs to run for it only to learn a Ulysses exchange's rank sizes.
         self.needs_step = self._plans or self._rows.must_open or self._ulysses
         self._seq_sizes: list[int] | None = None
-        # Both sides fix the plan's label, so it is one string for the life of the handle. See `cross_label`.
-        self._plan_label = min(array.labels) if queried is None else cross_label(min(queried.labels), min(array.labels))
+        self._plan_label = queries.plan_label(array)
         # One callable per array, not per layer: Dynamo specializes `ulysses_attention` on the identity of the callable
         # it runs, so a callable per layer would retrace that frame per layer.
         self._attend = self._binding.attend(self.first_read, self._plan_label, self._rows)
@@ -965,11 +1028,7 @@ class WithinStepHandle(ArrayHandle):
         if step.ctx.replays:
             return
         segments = segments_of(step.state[self.name], step) or ()
-        if self.queried is not None:
-            queries = segments_of(step.state[self.queried.name], step)
-            if [s.request_id for s in queries] != [s.request_id for s in segments]:
-                raise self._refusal(f"its segments and those of {self.queried.name!r}, which lay out its queries, must "
-                                    "name the same requests in the same order, with one segment to one")
+        self.queries.check(self, segments, step)
         self._seq_sizes = self._rows.begin(segments, self._sp.world_size if self._ulysses else None)
 
     def end_step(self, step) -> None:
@@ -1033,11 +1092,11 @@ class WithinStepHandle(ArrayHandle):
 
 class Resolved(NamedTuple):
     """Arrays resolved into today's resources: each array's specs, its ops' included, by its name, the key of the
-    resource each op runs on, and the array that lays out the queries of each read with ``queries``."""
+    resource each op runs on, and how each read within a step lays out its queries."""
 
     specs: dict[str, list[NodeResourceSpec]]
     resource_of: dict[str, str]
-    queried: dict[str, Array]
+    queries: dict[str, Queries]
 
 
 class Storage(ABC):
@@ -1090,9 +1149,8 @@ class PagedStorage(Storage):
 
     def _specs(self, array: Array, setup: "StateSetup") -> tuple[list[NodeResourceSpec], tuple[BoundOp, ...]]:
         heads, head_dim = _kv_shape(array)
-        if array.seq_sharded or any(read.queries is not None for read in array.reads.values()):
-            raise _no_layout(array, "seq_sharded and queries take max_len 0, and today's paged reads attend their own "
-                                    "pool")
+        if array.seq_sharded:
+            raise _no_layout(array, "seq_sharded takes max_len 0, and a paged array's entries stay whole on each rank")
         if not array.reads:
             raise _no_layout(array, "reads is empty, and PagedKVConfig needs num_qo_heads from an Attend read")
         bound = _bindings(self, array, setup.by_read)
@@ -1207,17 +1265,16 @@ class WithinStepStorage(Storage):
         for array in arrays:
             bound, heads, head_dim, dtype = _within_step_read(array, setup)
             key, read = bound.key, bound.declared
-            queried = by_name.get(read.queries, array)
-            if read.queries is not None:
-                resolved.queried[key] = queried
+            queries = resolved.queries[key] = (OwnQueries if read.queries is None else CrossQueries)(
+                query_array(array, read, by_name),
+            )
             config = RaggedAttentionConfig(
                 num_qo_heads=read.op.q_heads, num_kv_heads=heads, head_dim=head_dim, dtype=dtype,
                 # the heads narrow by SP only where the exchange runs over them
-                shard_over_sp=not array.nodes & sharded_nodes or both_sharded(array, queried),
+                shard_over_sp=not array.nodes & sharded_nodes or both_sharded(array, queries.array),
             )
-            spec_class = RaggedAttentionSpec if read.queries is None else RaggedCrossAttentionSpec
-            spec = spec_class(resource_key=key, nodes=array.nodes, config=config)
-            spec = shared.setdefault((spec_class, array.nodes, astuple(config)), spec)
+            spec = queries.spec_class(resource_key=key, nodes=array.nodes, config=config)
+            spec = shared.setdefault((queries.spec_class, array.nodes, astuple(config)), spec)
             resolved.resource_of[key] = spec.resource_key
             resolved.specs[array.name] = [spec] if bound.binding.plans and spec.resource_key == key else []
         return resolved

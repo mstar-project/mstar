@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, get_origin
 
 import torch
 
-from mstar.engine.state.contract import EMPTY, Array, Block, Sampler, read_layers
+from mstar.engine.state.contract import EMPTY, Array, Block, Read, Sampler, read_layers
 
 if TYPE_CHECKING:
     from mstar.model.base import Model
@@ -47,6 +47,12 @@ def state_declaration_problems(model: "Model") -> list[str]:
 def position_key(array: Array) -> str:
     """The resource key of ``array``'s positions: ``thinker_pos`` for ``thinker_kv``, ``rope`` for any other name."""
     return f"{array.name.removesuffix('_kv')}_pos" if array.name.endswith("_kv") else "rope"
+
+
+def query_array(array: Array, read: Read, arrays: Mapping[str, Array]) -> Array:
+    """The array whose segments lay out the queries of ``array``'s ``read``: the one of ``arrays`` its ``queries``
+    names, or else ``array``."""
+    return arrays.get(read.queries, array)
 
 
 def both_sharded(array: Array, queried: Array) -> bool:
@@ -198,7 +204,7 @@ def deployment_problems(
     for array in arrays.values():
         for key, read in array.reads.items():
             shards = max((head_shards.get(node, 1) for node in array.nodes), default=1)
-            if both_sharded(array, arrays.get(read.queries, array)) and read.op.q_heads % shards:
+            if both_sharded(array, query_array(array, read, arrays)) and read.op.q_heads % shards:
                 problems.append(f"Array {array.name!r}.reads[{key!r}]: q_heads {read.op.q_heads} doesn't divide by "
                                 f"{shards}, TP times SP, which a read sharded on both sides narrows its heads by")
     return problems
