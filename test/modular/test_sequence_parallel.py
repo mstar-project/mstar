@@ -793,7 +793,7 @@ def test_two_gpus_run_a_gdn_layer_on_a_split_step_like_one(tmp_path, layout, wal
 
 def test_a_recurrent_layer_plans_after_its_nodes_shard_and_refuses_a_step_without_it():
     """At one SP rank too: the runner plans the shard first (the resource depends on it), and a
-    step that doesn't declare it raises rather than planning copied."""
+    step with no shard plan raises rather than planning copied."""
     from mstar.engine.resources.linear_attn.config import LinearAttnStep
     from mstar.engine.resources.recurrent.pool import RecurrentAddressing
     from mstar.engine.resources.runner import topo_sort
@@ -806,7 +806,7 @@ def test_a_recurrent_layer_plans_after_its_nodes_shard_and_refuses_a_step_withou
     ctx.plan_results["state"] = {"main": RecurrentAddressing(
         torch.tensor([3], dtype=torch.int32), torch.tensor([False]), 1, (3,), (False,),
     )}
-    with pytest.raises(ValueError, match="doesn't declare"):
+    with pytest.raises(ValueError, match="doesn't plan"):
         manager.plan(LinearAttnStep(segments=(Segment("r0", "main", 4),)), ctx)
 
 
