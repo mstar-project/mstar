@@ -139,10 +139,9 @@ def test_fp32_port_is_exact(towers, ref, case):
 )
 def test_served_path_matches_full_model_run(towers, ref, case, wav, walk, mode, spread_case):
     """From the wav, through M*'s decoder, the intake and the node on the
-    walk's projection, under the engine's bf16 autocast, against what the
-    reference model's own forward recorded. Autocast keeps the norms and the
-    residual stream in fp32, which only moves the rows toward the fp32
-    reference."""
+    walk's projection, in the tower's own bf16 as the engine runs it
+    (``disable_autocast``), against what the reference model's own forward
+    recorded."""
     from mstar.model.components.audio_features import load_speech_file
 
     record = torch.load(ORACLE / "sdpa" / f"{case}.pt", weights_only=False)
@@ -157,7 +156,8 @@ def test_served_path_matches_full_model_run(towers, ref, case, wav, walk, mode, 
     info = _info("r", walk, [clip.shape[0]])
     inputs = [node.prepare_inputs(walk, info, {AUDIO_FEATURES: [clip]})]
     engine_inputs = ModelInputsFromEngine(request_ids=["r"], per_request_info={"r": info})
-    with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+    assert node.disable_autocast
+    with torch.no_grad():
         embeds = node.forward_batched(walk, engine_inputs, **node.preprocess(walk, engine_inputs, inputs))
         encoded = _run(tower, [clip])["encoded"]
     embeds = embeds["r"][AUDIO_EMBEDS][0].cpu()

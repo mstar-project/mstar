@@ -108,6 +108,29 @@ def test_plan_windows_unfolds_long_clips():
     assert plan.rows == [*range(19), *range(24, 29)]
 
 
+def test_plan_windows_at_a_bucket_width():
+    # a capture bucket's width: every window masked past its frames, the rows
+    # strided by the bucket
+    plan = plan_windows([5, 3], window=8, width=8)
+    assert (plan.width, plan.per_clip, plan.keys) == (8, 1, [5, 3])
+    assert plan.rows == [0, 1, 2, 3, 4, 8, 9, 10]
+    with pytest.raises(ValueError, match="don't run 4 wide"):
+        plan_windows([5], window=8, width=4)
+    with pytest.raises(ValueError, match="don't run 6 wide"):
+        plan_windows([19], window=8, width=6)
+
+
+def test_bucketed_batch_matches_its_own_shape(tiny_tower):
+    """A batch padded to a mel bucket and a window bucket gives the rows its
+    own shape gives (the captured path's batch, run eagerly)."""
+    clips = _clips(0.3, 0.45)
+    with torch.no_grad():
+        own = tiny_tower.encode(audio_batch(clips, tiny_tower.config, torch.device("cpu"), torch.float32))
+        bucketed = audio_batch(clips, tiny_tower.config, torch.device("cpu"), torch.float32, mel_frames=64, width=8)
+        assert bucketed.key_lengths is not None and bucketed.mel.shape[1] == 64
+        torch.testing.assert_close(tiny_tower.encode(bucketed), own, rtol=1e-5, atol=1e-5)
+
+
 def _tiny_config() -> Phi4MMAudioConfig:
     return Phi4MMAudioConfig(
         num_mel_bins=80, hidden_size=32, num_heads=4, intermediate_size=48, num_layers=2,
