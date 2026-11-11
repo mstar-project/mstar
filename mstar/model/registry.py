@@ -3,6 +3,7 @@ from importlib import import_module
 from mstar.model.base import Model
 
 MODEL_REGISTRY: dict[str, tuple[str, str]] = {
+    "ministral3_3b": ("mstar.model.ministral3.ministral3_model", "Ministral3Model"),
     "bagel": ("mstar.model.bagel.bagel_model", "BagelModel"),
     "canary": ("mstar.model.canary.canary_model", "CanaryModel"),
     "canary_qwen": ("mstar.model.canary_qwen.canary_qwen_model", "CanaryQwenModel"),
@@ -59,6 +60,7 @@ MODEL_REGISTRY: dict[str, tuple[str, str]] = {
 }
 
 HF_MODELS: dict[str, dict] = {
+    "ministral3_3b": {"model_path_hf": "mistralai/Ministral-3-3B-Instruct-2512"},
     "bagel": {"model_path_hf": "ByteDance-Seed/BAGEL-7B-MoT"},
     # NVIDIA Canary-1B-v2: FastConformer encoder + Transformer decoder, speech
     # recognition in 25 European languages and translation to/from English.

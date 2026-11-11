@@ -11,7 +11,7 @@ import pytest
 pytest.importorskip("aiohttp")
 
 from benchmark import asr_eval, runner  # noqa: E402
-from benchmark.base import Model, Orpheus, RequestType  # noqa: E402
+from benchmark.base import Model, ModelType, Orpheus, RequestType  # noqa: E402
 from benchmark.request import (  # noqa: E402
     OursOpenAI,
     RequestInput,
@@ -33,6 +33,7 @@ class _TextModel(Model):
 
 class _Response:
     status = 200
+    content_type = "text/event-stream"
 
     def __init__(self, lines):
         self._lines = lines
@@ -157,3 +158,101 @@ def test_qwen3_asr_is_scored_without_its_language_prefix():
     session = _Session([json.dumps({"modality": "text", "data": text}).encode()])
     req = RequestInput(req_type=RequestType.A2T, prompt="")
     assert asyncio.run(asr_eval._transcribe(session, req, "http://x", 0, _TextModel())) == (0, "hi there", None)
+
+
+def test_ministral_benchmark_sends_greedy_text_output_and_length_controls():
+    model = ModelType.MINISTRAL3.inst()
+    assert model.get_supported_modalities() == {RequestType.T2T, RequestType.I2T}
+    session = _Session()
+    req = RequestInput(req_type=RequestType.T2T, prompt="hi", model_kwargs={"max_tokens": 128, "ignore_eos": True})
+    asyncio.run(OursOpenAI().send_request(session, req, "http://x", 0, model))
+    assert session.payload["model"] == "mistralai/Ministral-3-3B-Instruct-2512"
+    assert session.payload["modalities"] == ["text"]
+    assert session.payload["messages"][0] == model.get_openai_system_message()
+    assert session.payload["temperature"] == 0.0
+    assert session.payload["top_p"] == session.payload["repetition_penalty"] == 1.0
+    assert session.payload["max_tokens"] == 128 and session.payload["ignore_eos"]
+
+
+@pytest.mark.parametrize("usage", [None, 7])
+def test_openai_token_counts_distinguish_usage_from_chunks(usage):
+    chunks = [{"choices": [{"delta": {"content": "hello"}}]}]
+    if usage is not None:
+        chunks.append({"usage": {"completion_tokens": usage}, "choices": []})
+    session = _Session([b"data: " + json.dumps(chunk).encode() + b"\n\n" for chunk in chunks] + [b"data: [DONE]\n\n"])
+    req = RequestInput(req_type=RequestType.T2T, prompt="hi")
+    m = asyncio.run(OursOpenAI().send_request(session, req, "http://x", 0, _TextModel()))
+    assert m.server_completion_tokens == usage
+    assert m.output_text_tokens == (usage or 1)
+
+
+@pytest.mark.parametrize("system", list(runner.InferenceSystemType))
+def test_results_identify_the_measured_system(tmp_path, system):
+    cfg = runner.BenchmarkConfig(
+        url="http://x", model=_TextModel(), dataset=runner.DatasetType.TEXT, num_requests=1,
+        request_type=RequestType.T2T, local_cache_dir=".", inference_system=system, output_dir=str(tmp_path),
+    )
+    bench = runner.Benchmark(cfg)
+    metrics = [_metrics(0, ok=True, ttft=0.1, tokens=4)]
+    bench._write_results_json(metrics, aggregate_metrics(metrics, wall_time=2), 2)
+    result = json.loads((tmp_path / "results.json").read_text())
+    assert result["system"] == system.value
+    assert result["completed"] == 1 and result["failed"] == 0
+
+
+def test_ministral_manifest_harness_preserves_failures_and_rejects_invalid_measurements(tmp_path, monkeypatch):
+    from benchmark.ministral3.run import run
+
+    manifest = tmp_path / "requests.jsonl"
+    manifest.write_text('{"prompt": "first"}\n{"prompt": "second"}\n')
+    output = tmp_path / "cell"
+    sent = []
+
+    async def send(self, session, req_input, base_url, request_id, model, **kwargs):
+        sent.append((req_input.prompt, req_input.model_kwargs))
+        m = _metrics(request_id, ok=request_id == 0, ttft=0.1, tokens=4)
+        m.chunk_arrivals = {"text": [0.1, 0.2]}
+        return m
+
+    monkeypatch.setattr(OursOpenAI, "send_request", send)
+    monkeypatch.setattr("benchmark.base.Ministral3.get_tokenizer",
+                        lambda self: SimpleNamespace(encode=lambda *a, **k: [0] * 4))
+    args = SimpleNamespace(manifest=manifest, num_requests=None, concurrency=2, output_dir=output,
+                           engine="vllm", url="http://x", output_tokens=4, warmup=0)
+    with pytest.raises(RuntimeError, match="1 failures"):
+        asyncio.run(run(args))
+    assert [prompt for prompt, _ in sent] == ["first", "second"]
+    assert all(kwargs["max_tokens"] == 4 and kwargs["ignore_eos"] for _, kwargs in sent)
+    raw = json.loads((output / "raw-requests.json").read_text())
+    assert len(raw) == 2 and raw[1]["error"] == "HTTP 500"
+    assert raw[0]["chunk_arrivals_s"]["text"] == [0.1, 0.2]
+    result = json.loads((output / "results.json").read_text())
+    assert result["engine"] == "vllm" and result["failed"] == 1
+
+
+def test_ministral_length_check_uses_complete_text_when_usage_is_absent(tmp_path, monkeypatch):
+    from benchmark.ministral3.run import run
+
+    manifest = tmp_path / "requests.jsonl"
+    manifest.write_text('{"prompt": "formula"}\n')
+    output = tmp_path / "cell"
+
+    async def send(self, session, req_input, base_url, request_id, model, **kwargs):
+        m = _metrics(request_id, ok=True, ttft=0.1, tokens=1)
+        m._text_chunks = ["₂".encode()]
+        return m
+
+    def encode(text, **kwargs):
+        assert text == "₂"
+        return [100, 101]  # Two byte tokens delivered in a single UTF-8 chunk.
+
+    monkeypatch.setattr(OursOpenAI, "send_request", send)
+    monkeypatch.setattr("benchmark.base.Ministral3.get_tokenizer",
+                        lambda self: SimpleNamespace(encode=encode))
+    args = SimpleNamespace(manifest=manifest, num_requests=None, concurrency=1, output_dir=output,
+                           engine="mstar", url="http://x", output_tokens=2, warmup=0)
+    asyncio.run(run(args))
+    raw = json.loads((output / "raw-requests.json").read_text())[0]
+    assert raw["output_tokens"] == 1 and raw["decoded_text_tokens"] == 2
+    assert raw["output_count_source"] == "chunk_estimate"
+    assert not json.loads((output / "results.json").read_text())["token_counts_verified_by_server"]

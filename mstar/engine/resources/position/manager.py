@@ -2,6 +2,7 @@
 
 has ownership of per-(request,label) position counter"""
 
+import math
 from collections.abc import Sequence
 from dataclasses import dataclass, field, fields
 from typing import TYPE_CHECKING
@@ -101,6 +102,8 @@ class RopeManager(PositionManager):
         self._max_seq_len = max_seq_len
         self._rope_cache_key: tuple | None = None
         self._rope_cache: torch.Tensor | None = None
+        if config.yarn is not None and device.type == "xpu":
+            raise NotImplementedError("YaRN RoPE is not implemented for XPU")
         if device.type == "xpu":
             if config.llama31_params:
                 raise NotImplementedError(
@@ -134,7 +137,7 @@ class RopeManager(PositionManager):
             )
         # CUDA rotates from this table instead of in-kernel angles when set.
         self._rope_table: torch.Tensor | None = None
-        if config.rope_table_dtype is not None and device.type != "xpu":
+        if (config.rope_table_dtype is not None or config.yarn is not None) and device.type != "xpu":
             if config.llama31_params:
                 raise NotImplementedError("rope_table_dtype does not support Llama 3.1 RoPE scaling")
             rotary_dim = config.rotary_dim or head_dim
@@ -146,12 +149,17 @@ class RopeManager(PositionManager):
                 raise ValueError(
                     f"rope_table_dtype needs a rotary_dim that is a multiple of 16 on CUDA, "
                     f"not {rotary_dim}")
-            self._rope_table = self._build_rope_cache(
-                rotary_dim,
-                config.rope_scale,
-                config.rope_theta,
-                config.rope_table_dtype,
-            ).float()
+            if config.yarn is not None:
+                self._rope_table = self._build_yarn_cache(
+                    rotary_dim, config.rope_table_dtype or torch.float32,
+                ).float()
+            else:
+                self._rope_table = self._build_rope_cache(
+                    rotary_dim,
+                    config.rope_scale,
+                    config.rope_theta,
+                    config.rope_table_dtype,
+                ).float()
             self._rope_table_key = (rotary_dim, config.rope_scale, config.rope_theta)
 
         # rid -> label -> next pos of stream
@@ -176,7 +184,7 @@ class RopeManager(PositionManager):
         cfg = self._config
         plain = (
             cfg.rope_scale == 1.0 and not cfg.interleave and cfg.rope_dtype is None
-            and not cfg.llama31_params and cfg.rotary_dim in (None, head_dim)
+            and not cfg.llama31_params and cfg.yarn is None and cfg.rotary_dim in (None, head_dim)
         )
         return float(cfg.rope_theta) if plain else None
 
@@ -554,9 +562,9 @@ class RopeManager(PositionManager):
 
     @property
     def cos_sin_table(self) -> torch.Tensor | None:
-        """The ``(max_seq_len, rotary_dim)`` table ``rope_table_dtype`` builds, each row
+        """The ``(max_seq_len, rotary_dim)`` table ``rope_table_dtype`` or YaRN builds, each row
         ``rotary_dim / 2`` cosines then as many sines, for a kernel that rotates inside a
-        larger fusion; None without ``rope_table_dtype``."""
+        larger fusion; None when neither table option is configured."""
         return self._rope_table
 
     @property
@@ -587,6 +595,13 @@ class RopeManager(PositionManager):
             llama31_params.get(key) is not None
             for key in ("low_freq_factor", "high_freq_factor", "old_context_len")
         )
+        if self._config.yarn is not None and any(
+            value is not None for value in llama31_params.values()
+        ):
+            # Shared Attention passes these no-op defaults unconditionally.
+            defaults = dict(low_freq_factor=1.0, high_freq_factor=1.0, old_context_len=8192)
+            if llama31_params != defaults:
+                raise ValueError("YaRN cannot be combined with runtime Llama 3.1 scaling")
         if llama31 and rope_scale != 1.0:
             raise NotImplementedError(
                 "rope_table_dtype does not support Llama 3.1 RoPE scaling"
@@ -622,6 +637,47 @@ class RopeManager(PositionManager):
         )
         freqs = torch.outer(positions, inv_freq)
         return torch.cat((freqs.cos(), freqs.sin()), dim=-1).to(dtype)
+
+    def _build_yarn_cache(self, rotary_dim: int, dtype: torch.dtype) -> torch.Tensor:
+        """Build a static YaRN table in fp32, casting only after the sinusoid.
+
+        The correction ramp blends original and interpolated frequencies. Its
+        context length is the checkpoint's training length, never the deployment
+        capacity. Query-only position scaling (e.g. Ministral 3) is separate.
+        """
+        config = self._config.yarn
+        assert config is not None
+        theta = self._config.rope_theta
+        device = self._device
+
+        if rotary_dim <= 0 or rotary_dim % 2:
+            raise ValueError("YaRN rotary_dim must be positive and even")
+
+        def correction(rotations):
+            return rotary_dim * math.log(
+                config.original_max_position_embeddings / (rotations * 2 * math.pi)
+            ) / (2 * math.log(theta))
+
+        low, high = correction(config.beta_fast), correction(config.beta_slow)
+        if config.truncate:
+            low, high = math.floor(low), math.ceil(high)
+        low, high = max(low, 0), min(high, rotary_dim - 1)
+        if low == high:
+            high += 0.001
+        dims = torch.arange(rotary_dim // 2, dtype=torch.float32, device=device)
+        ramp = ((dims - low) / (high - low)).clamp(0, 1)
+        frequencies = theta ** (torch.arange(0, rotary_dim, 2, dtype=torch.float32, device=device) / rotary_dim)
+        extrapolation = 1 - ramp
+        inv_freq = (1 / (config.factor * frequencies)) * (1 - extrapolation) + (1 / frequencies) * extrapolation
+
+        def mscale(value):
+            return 1.0 if config.factor <= 1 else 1 + 0.1 * value * math.log(config.factor)
+
+        amplitude = config.attention_factor
+        if amplitude is None:
+            amplitude = mscale(config.mscale) / mscale(config.mscale_all_dim)
+        angles = torch.outer(torch.arange(self._max_seq_len, device=device, dtype=torch.float32), inv_freq)
+        return (torch.cat((angles.cos(), angles.sin()), dim=-1) * amplitude).to(dtype)
 
     def apply_qk(
         self,

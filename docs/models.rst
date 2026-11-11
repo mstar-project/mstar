@@ -22,6 +22,10 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
      - Zero-shot voice-cloning TTS: T3 speech-token LM (Llama-520M, or GPT-2-medium
        for Turbo) with CFG and exaggeration control, S3Gen flow-matching decoder,
        HiFT vocoder, PerTh watermark. 24 kHz. Multilingual covers 23 languages.
+   * - ``ministral3_3b`` *(Experimental)*
+     - ``mistralai/Ministral-3-3B-Instruct-2512``
+     - Native FP8 text decoder with a separate BF16 Pixtral image encoder; text output.
+       H200 serving tested; full-checkpoint logits parity remains open.
    * - ``command_a_plus`` *(Experimental)*
      - ``CohereLabs/command-a-plus-05-2026-bf16``
      - Command A+ text and image chat: a 218B-parameter MoE (25B active) with
@@ -2543,3 +2547,55 @@ own scaling follows PEFT: an ``alpha`` key in the weights, else the ``lora_alpha
 fused result — M* merges in fp32 with one rounding, PEFT fuses in bf16).
 A DoRA adapter (PEFT's ``lora_magnitude_vector`` or Kohya's ``dora_scale``) is refused,
 since its magnitudes would be dropped from the merge.
+
+
+Ministral 3 3B (``ministral3_3b``, experimental)
+----------------------------------------------
+
+Install the model extra and select the single-GPU deployment::
+
+    pip install -e '.[ministral3]'
+    mstar serve ministral3_3b --gpus 0
+
+``configs/ministral3_3b.yaml`` places ``LLM`` and ``vision_encoder`` on rank 0.
+The nodes can be placed independently; neither implements tensor parallelism.
+The example sets an 8,192-token deployment limit and 128 KV pages of 128 tokens.
+These are initial capacity settings, not measured throughput or concurrency recommendations.
+YaRN and Ministral's position-dependent query scaling remain enabled at this context length.
+
+The supported checkpoint file is ``model.safetensors``. Text projections retain
+E4M3 FP8 weights with the checkpoint's individual static activation and weight
+scales. Embeddings, norms, vision weights and projection outputs use BF16;
+matmul scales are represented losslessly in FP32. There is no BF16 weight
+fallback. FP8 execution requires NVIDIA SM89+ with PyTorch ``_scaled_mm`` support.
+The loader rejects missing, unexpected or incompatible checkpoint tensors.
+
+Both HTTP frontends expose ``/v1/chat/completions`` with text and ``image_url``
+content parts, text output, and ``stream: true`` support through the shared
+response path. Audio/video inputs, audio output, tool calling and constrained
+JSON output are refused. The checkpoint chat template handles conversation
+formatting; there is no ``enable_thinking`` control.
+
+Example streaming request after starting the server::
+
+    curl http://localhost:8000/v1/chat/completions \
+      -H 'Content-Type: application/json' \
+      -d '{"model":"ministral3_3b","messages":[{"role":"user","content":"Hello!"}],"max_tokens":32,"stream":true}'
+
+Validation covers tiny synthetic-weight text/vision parity, strict checkpoint
+loading and frontend request contracts. The original integration snapshot served
+8,640 requests across M*, vLLM and SGLang on an H200, with zero measured failures;
+M* used captured decoding and streaming. See ``benchmark/ministral3/RESULTS.rst``
+for the protocol, results and limitations. Full-checkpoint GPU logits parity,
+cancellation/cleanup and live token-limit 1/2 acceptance remain open. Server
+shutdown required SIGTERM escalation. This integration remains experimental.
+
+``test/modular/test_ministral3_fp8_lm.py`` checks the entire tiny FP8 text stack:
+prefill, cached decode, chunked prefill and reordered packed requests. It uses
+synthetic weights, CPU attention/cache and matmul substitutes, and a Transformers
+architecture with explicit scalar FP8 arithmetic. RMSNorm and rotary rounding
+are aligned explicitly for exact comparisons; negative controls expose both
+rounding differences and incorrect quantization. This is a wiring check, not
+untouched upstream FP8 execution parity: Transformers 5.22.2's finegrained-fp8 v4
+static kernel expects block scales and cannot serve as a verified scalar/static
+FP8 oracle for this checkpoint.

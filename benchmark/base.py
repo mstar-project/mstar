@@ -298,6 +298,34 @@ class Qwen3TTS(Model):
         return {RequestType.T2S}
 
 
+class Ministral3(Model):
+    """Released Ministral 3 3B: text/images in, text out, greedy benchmarking."""
+
+    def get_hf_url(self):
+        return "mistralai/Ministral-3-3B-Instruct-2512"
+
+    def get_supported_modalities(self):
+        return {RequestType.T2T, RequestType.I2T}
+
+    def get_model_kwargs(self, request_type: RequestType):
+        return {"temperature": 0.0, "top_p": 1.0, "repetition_penalty": 1.0}
+
+    def get_openai_system_message(self):
+        # HF and mistral-common have different implicit system-prompt behavior.
+        # An explicit message makes the benchmark inputs comparable.
+        return {"role": "system", "content": "You are a helpful assistant."}
+
+    def get_tokenizer(self):
+        if self._tokenizer is None:
+            from transformers import AutoTokenizer
+
+            self._tokenizer = AutoTokenizer.from_pretrained(
+                self.get_hf_url(), revision="b35d4dfe56c142746f54dbd64f579faab2744308",
+                trust_remote_code=False, fix_mistral_regex=False,
+            )
+        return self._tokenizer
+
+
 class Qwen3_5_Dense(Model):
     """Qwen3.5 dense (text, image and video in, text out) benchmark metadata."""
 
@@ -567,6 +595,7 @@ class NemotronAsr(_FastConformerAsr):
 
 
 class ModelType(Enum):
+    MINISTRAL3 = "ministral3"
     BAGEL = "bagel"
     ORPHEUS = "orpheus"
     KOKORO = "kokoro"
@@ -592,6 +621,8 @@ class ModelType(Enum):
     MUSE_GLIMMER = "muse_glimmer"
 
     def inst(self, **kwargs) -> Model:
+        if self == ModelType.MINISTRAL3:
+            return Ministral3(**kwargs)
         if self == ModelType.BAGEL:
             return Bagel(**kwargs)
         if self == ModelType.ORPHEUS:

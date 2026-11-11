@@ -1,0 +1,222 @@
+{
+  "repo": "mistralai/Ministral-3-3B-Instruct-2512",
+  "revision": "b35d4dfe56c142746f54dbd64f579faab2744308",
+  "oracle": {
+    "mistral-common": "1.13.1",
+    "transformers": "5.22.2",
+    "tokenizers": "0.23.3"
+  },
+  "sha256": {
+    "config.json": "a9c3658d7bb45ab5be77e660d483a9d3f8a3d54bda2c69a1c576bdfefbc16be6",
+    "generation_config.json": "e0923390059f84a9180b00e5501778acc45ea9856cd7f2fd68208b360927c677",
+    "tokenizer.json": "99cf274236c60277fcfad861a5a1007518687ad06ba8938760f50b55ffa0b1ef",
+    "tokenizer_config.json": "4a05af595aa11c3436d3b68a616219ae99b303426f708a12b31bc9ce32530728",
+    "chat_template.jinja": "0701cfbdc2b7d44fdbad104dff604faee4b0543e8247624568777fe465746f9b",
+    "tekken.json": "600bb27946565481ecf51ba8aee252e49b9a68507866080ac9c30185bb312843",
+    "processor_config.json": "ece2373c2ae391bce18785a1810543bc6173a1f28b6767cffab2c35dbea5f002"
+  },
+  "text_cases": [
+    {
+      "text": "Hello world!",
+      "ids": [
+        22177,
+        4304,
+        1033
+      ]
+    },
+    {
+      "text": "1234567890",
+      "ids": [
+        1049,
+        1050,
+        1051,
+        1052,
+        1053,
+        1054,
+        1055,
+        1056,
+        1057,
+        1048
+      ]
+    },
+    {
+      "text": "hello\n\nworld",
+      "ids": [
+        29706,
+        1267,
+        34049
+      ]
+    },
+    {
+      "text": "café 中文 Ελληνικά 👋🏽",
+      "ids": [
+        3173,
+        1102,
+        1337,
+        30549,
+        11449,
+        11813,
+        53660,
+        13865,
+        119685,
+        1145,
+        1139,
+        1240,
+        1159,
+        1143,
+        1189
+      ]
+    },
+    {
+      "text": "UPPER lower MixedCase 1.234",
+      "ids": [
+        1085,
+        11388,
+        2794,
+        4953,
+        64746,
+        11139,
+        1032,
+        1049,
+        1046,
+        1050,
+        1051,
+        1052
+      ]
+    },
+    {
+      "text": "a  b\t c\r\nd",
+      "ids": [
+        1097,
+        1032,
+        1289,
+        1009,
+        1272,
+        1013,
+        1010,
+        1100
+      ]
+    }
+  ],
+  "chat_cases": [
+    {
+      "messages": [
+        {
+          "role": "system",
+          "content": "Be concise."
+        },
+        {
+          "role": "user",
+          "content": "Hello"
+        }
+      ],
+      "ids": [
+        1,
+        17,
+        5934,
+        104335,
+        1046,
+        18,
+        3,
+        22177,
+        4
+      ]
+    },
+    {
+      "messages": [
+        {
+          "role": "system",
+          "content": "Reply in the user language."
+        },
+        {
+          "role": "user",
+          "content": "Bonjour!"
+        },
+        {
+          "role": "assistant",
+          "content": "Salut."
+        },
+        {
+          "role": "user",
+          "content": "中文 Ελληνικά café 👋🏽"
+        }
+      ],
+      "ids": [
+        1,
+        17,
+        53156,
+        1294,
+        1278,
+        3330,
+        7278,
+        1046,
+        18,
+        3,
+        48227,
+        47010,
+        1033,
+        4,
+        24683,
+        1341,
+        1046,
+        2,
+        3,
+        4392,
+        11449,
+        11813,
+        53660,
+        13865,
+        35858,
+        119685,
+        1145,
+        1139,
+        1240,
+        1159,
+        1143,
+        1189,
+        4
+      ]
+    },
+    {
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are helpful."
+        },
+        {
+          "role": "user",
+          "content": "One"
+        },
+        {
+          "role": "user",
+          "content": "Two\n\n1234567890"
+        }
+      ],
+      "ids": [
+        1,
+        17,
+        4568,
+        1584,
+        20351,
+        1046,
+        18,
+        3,
+        7446,
+        1267,
+        16489,
+        1267,
+        1049,
+        1050,
+        1051,
+        1052,
+        1053,
+        1054,
+        1055,
+        1056,
+        1057,
+        1048,
+        4
+      ]
+    }
+  ]
+}

@@ -659,6 +659,22 @@ def _command_a_plus(name, model_kwargs, tmp_path, monkeypatch):
     return _constructed(name, model_kwargs, checkpoint_dir=str(tmp_path), max_seq_len=64)
 
 
+def _ministral3(name, model_kwargs, tmp_path, monkeypatch):
+    from mstar.model.ministral3.components.vision import PixtralConfig
+    from mstar.model.ministral3.config import Ministral3TextConfig
+    from mstar.model.ministral3.ministral3_model import Ministral3Model
+    from mstar.model.ministral3.vision import VISION_NODE, VISION_OUTPUT
+    from mstar.model.multimodal import MediaEncoder
+    from mstar.model.multimodal_decoder import MediaIntake
+
+    metadata = ROOT / "test/modular/fixtures/ministral3"
+    return _bare(
+        Ministral3Model, config=Ministral3TextConfig.from_hf(metadata, tokenizer_eos_token_id=2),
+        vision_config=PixtralConfig(),
+        media=(MediaIntake("image", MediaEncoder("vision", VISION_NODE, ("pixel_values",), VISION_OUTPUT), 10, None),),
+    )
+
+
 def _cosyvoice3(name, model_kwargs, tmp_path, monkeypatch):
     from mstar.model.cosyvoice3.config import CosyVoice3Config
     from mstar.model.cosyvoice3.cosyvoice3_model import CosyVoice3Model
@@ -909,6 +925,7 @@ _FACTORIES = {
     "CanaryQwenModel": _canary_qwen,
     "ChatterboxModel": _chatterbox,
     "CommandAPlusModel": _command_a_plus,
+    "Ministral3Model": _ministral3,
     "Cosmos3Model": _cosmos3,
     "FishS2ProModel": _fish_s2_pro,
     "CosyVoice3Model": _cosyvoice3,

@@ -14,6 +14,7 @@ uv.lock
 !mstar/kernels/tables/*/*.json
 !mstar/model/command_a_plus/tests/fixtures/tiny_config.json
 !test/modular/fixtures/*.json
+!test/modular/fixtures/ministral3/*.json
 profiler/
 traces/
 

@@ -559,6 +559,31 @@ class Qwen3_5Adapter(OpenAIAdapter):
         )
 
 
+class Ministral3Adapter(OpenAIAdapter):
+    """Ministral 3 Instruct: text/image chat with text output and standard sampling."""
+
+    supports_chat = True
+
+    def chat_to_request(self, req: ChatCompletionRequest, upload_dir: Path) -> SubmitArgs:
+        mk = _passthrough(req)
+        _refuse_unserved_chat(req, mk)
+        if (req.modalities is not None and req.modalities != ["text"]) or req.audio is not None:
+            raise ValueError("Ministral 3 supports text output only")
+        for message in req.messages:
+            content = message.get("content") if isinstance(message, dict) else message.content
+            if isinstance(content, list) and any(
+                not isinstance(part, dict) or part.get("type") not in ("text", "image_url") for part in content
+            ):
+                raise ValueError("Ministral 3 accepts only text and image_url content parts")
+        _apply_sampling(req, mk)
+        text, paths, modalities, parts = flatten_messages(req.messages, upload_dir)
+        if any(modality not in ("text", "image") for modality in modalities):
+            media_io.remove_uploads(paths, upload_dir)
+            raise ValueError("Ministral 3 supports text and image inputs only")
+        return SubmitArgs(text=text, file_paths=paths or None, input_modalities=modalities,
+                          output_modalities=["text"], model_kwargs=mk, prompt_parts=parts)
+
+
 class OrpheusAdapter(OpenAIAdapter):
     """Orpheus: text-to-speech (audio out only). ``temperature`` / ``top_p`` /
     ``seed`` map directly; ``top_k``, ``repetition_penalty`` and
@@ -1737,6 +1762,7 @@ class OmnilingualASRAdapter(OpenAIAdapter):
 # Only models with an OpenAI-standard surface are registered. Action/world-model
 # models (pi05, vjepa2) are deliberately absent → /v1/* 404s; use /generate.
 ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
+    "ministral3_3b": Ministral3Adapter(),
     "bagel": BagelAdapter(),
     "chatterbox": ChatterboxAdapter(),
     "chatterbox_multilingual": ChatterboxAdapter(),

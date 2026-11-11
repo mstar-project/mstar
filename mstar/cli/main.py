@@ -24,6 +24,7 @@ from mstar.utils.socket_prefix import per_port_socket_prefix
 
 # Model name -> default config (relative to the repo's configs/).
 DEFAULT_CONFIGS: dict[str, str] = {
+    "ministral3_3b": "ministral3_3b.yaml",
     "bagel": "bagel_single_gpu.yaml",
     "bagel_cfg_parallel": "bagel_cfg_parallel.yaml",
     "command_a_plus": "command_a_plus_tp4.yaml",
@@ -155,6 +156,7 @@ def _next_steps(model: str, host: str, port: int, api_key_set: bool = False) -> 
     ]
     if model in (
         "bagel", "bagel_cfg_parallel", "qwen3_omni", "command_a_plus", "minicpm_o", "muse_glimmer", "ripple_65b",
+        "ministral3_3b",
     ):
         lines.append("    print(client.chat(\"Hello!\").text)")
     if model in ("bagel", "bagel_cfg_parallel"):
@@ -221,11 +223,11 @@ def _next_steps(model: str, host: str, port: int, api_key_set: bool = False) -> 
     if model in ("bagel", "qwen3_omni", "orpheus", "kokoro", "cosmos3", "cosmos3_super",
                  "whisper_large", "whisper_large_v3_turbo", "higgs_audio", "qwen3_asr", "qwen3_asr_realtime",
                  "flux2_klein", "flux2_klein_9b", "z_image_turbo", "ltx2_5", "minimax_h3",
-                 "muse_glimmer", "ripple_65b"):
+                 "muse_glimmer", "ripple_65b", "ministral3_3b"):
         lines += ["", "  OpenAI-compatible:",
                   "    from openai import OpenAI",
                   f"    oai = OpenAI(base_url=\"{base}/v1\", api_key=\"{oai_key}\")"]
-        if model in ("bagel", "qwen3_omni", "muse_glimmer", "ripple_65b"):
+        if model in ("bagel", "qwen3_omni", "muse_glimmer", "ripple_65b", "ministral3_3b"):
             lines.append(f"    oai.chat.completions.create(model=\"{model}\", "
                          "messages=[{\"role\":\"user\",\"content\":\"hi\"}])")
         if model in ("orpheus", "qwen3_omni", "kokoro"):
