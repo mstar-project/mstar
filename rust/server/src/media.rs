@@ -21,12 +21,14 @@
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use serde_json::Value;
 use ureq::unversioned::resolver::ResolvedSocketAddrs;
+use ureq::unversioned::transport::{Buffers, ConnectionDetails, Connector, NextTimeout, Transport};
 use uuid::Uuid;
 
 /// Map a MIME type (top-level or full) to a file extension for persisting.
@@ -499,6 +501,11 @@ fn save_remote_url(
     let mut url = url::Url::parse(url).map_err(|e| fetch_error("", "invalid URL", e))?;
     let mut host = String::new();
     for _ in 0..=REMOTE_MAX_REDIRECTS {
+        // ureq turns userinfo into `Authorization: Basic`, which neither the old
+        // client nor the Python frontend sends. Cleared per hop, so neither this
+        // URL nor a redirect to one hands credentials to an upstream.
+        let _ = url.set_username("");
+        let _ = url.set_password(None);
         // the same spelling the pinned resolver checks the hop's URI against
         host = normalized_host(url.host_str().unwrap_or(""));
         let allowlisted = policy.allowlisted(&host, written.as_deref());
@@ -579,6 +586,65 @@ impl ureq::unversioned::resolver::Resolver for Pinned {
         let mut out = self.empty();
         out.push(self.addr);
         Ok(out)
+    }
+}
+
+/// Sets `seen` when a read fails because the peer went away mid-stream.
+/// `BodyHandler::do_read` turns that error into a clean end of body, which for
+/// a body with no declared length would store a truncated file; the flag lets
+/// `read_hop` tell the two apart.
+///
+/// The kinds are the ones ureq itself reads as the remote closing. A plaintext
+/// peer closing cleanly raises none of them, which `a_body_that_runs_to_eof_is_fetched`
+/// holds, so this never fires on a body that really ended. `UnexpectedEof` is
+/// in the set for TLS, where a peer that vanishes without a close_notify
+/// surfaces as that rather than as a reset.
+#[derive(Debug)]
+struct WatchReset(Arc<AtomicBool>);
+
+impl Connector<Box<dyn Transport>> for WatchReset {
+    type Out = ResetSeen;
+
+    fn connect(
+        &self,
+        _details: &ConnectionDetails,
+        chained: Option<Box<dyn Transport>>,
+    ) -> Result<Option<Self::Out>, ureq::Error> {
+        Ok(chained.map(|inner| ResetSeen { inner, seen: self.0.clone() }))
+    }
+}
+
+#[derive(Debug)]
+struct ResetSeen {
+    inner: Box<dyn Transport>,
+    seen: Arc<AtomicBool>,
+}
+
+impl Transport for ResetSeen {
+    fn buffers(&mut self) -> &mut dyn Buffers {
+        self.inner.buffers()
+    }
+
+    fn transmit_output(&mut self, amount: usize, timeout: NextTimeout) -> Result<(), ureq::Error> {
+        self.inner.transmit_output(amount, timeout)
+    }
+
+    fn await_input(&mut self, timeout: NextTimeout) -> Result<bool, ureq::Error> {
+        let out = self.inner.await_input(timeout);
+        if let Err(ureq::Error::Io(e)) = &out {
+            if matches!(e.kind(), io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted | io::ErrorKind::UnexpectedEof) {
+                self.seen.store(true, Ordering::Relaxed);
+            }
+        }
+        out
+    }
+
+    fn is_open(&mut self) -> bool {
+        self.inner.is_open()
+    }
+
+    fn is_tls(&self) -> bool {
+        self.inner.is_tls()
     }
 }
 
@@ -692,9 +758,10 @@ fn fetch_hop(
         if left.is_zero() {
             return Err(fetch_error(host, "timed out", "the fetch ran out of time"));
         }
+        let reset = Arc::new(AtomicBool::new(false));
         let agent = ureq::Agent::with_parts(
             hop_config(left),
-            ureq::unversioned::transport::DefaultConnector::new(),
+            ureq::unversioned::transport::DefaultConnector::new().chain(WatchReset(reset.clone())),
             Pinned { host: host.to_string(), addr: *addr },
         );
         let call = agent
@@ -703,7 +770,7 @@ fn fetch_hop(
             .header("accept-encoding", "identity")
             .call();
         match call {
-            Ok(resp) => return read_hop(resp, url, host, upload_dir, max_bytes, deadline),
+            Ok(resp) => return read_hop(resp, url, host, upload_dir, max_bytes, deadline, &reset),
             Err(e) if addr_specific(&e) => last = Some(e),
             Err(e) => return Err(request_error(host, deadline, max_bytes, &e)),
         }
@@ -722,6 +789,7 @@ fn read_hop(
     upload_dir: &Path,
     max_bytes: u64,
     deadline: Instant,
+    reset: &AtomicBool,
 ) -> Result<Hop, String> {
     let code = resp.status().as_u16();
     match code {
@@ -759,16 +827,16 @@ fn read_hop(
             return Err(fetch_error(host, &too_large, format!("Content-Length {length}")));
         }
     }
+    let framed = resp.body().content_length();
     let mime = mime_for(resp.headers().get("content-type").and_then(|v| v.to_str().ok()), url);
     std::fs::create_dir_all(upload_dir).map_err(|e| fetch_error(host, "could not save the file", e))?;
     let path = upload_dir.join(format!("{}{}", Uuid::new_v4(), ext_for(&mime)));
-    // Two things ureq's reader is laxer about than the socket client was, both
-    // bounded by the fetch deadline and neither reaching the file: it consumes
-    // chunk trailers without counting their number or their bytes (the old
-    // reader stopped at 100 trailers and a 64 KiB line), and it reads a reset
-    // connection as the end of a body that has no declared length, where the
-    // old reader refused anything but a clean EOF. A body short of its
-    // `Content-Length` is still refused.
+    // One thing ureq's reader is laxer about than the socket client was,
+    // bounded by the fetch deadline and never reaching the file: it consumes
+    // chunk trailers without counting their number or their bytes, where the
+    // old reader stopped at 100 trailers and a 64 KiB line. A body short of
+    // its `Content-Length` is still refused, and so now is a body with no
+    // declared length that ended because the peer went away.
     let copied = std::fs::File::create(&path).map_err(BodyError::Store).and_then(|mut f| {
         // `limit` stops the read one byte past the cap, so the count below
         // always reaches `max_bytes` first and names the refusal
@@ -777,6 +845,11 @@ fn read_hop(
         let mut total = 0u64;
         loop {
             let n = match body.read(&mut buf) {
+                // a body with no declared length ends at the close, and ureq reads a
+                // reset as one of those; only a clean end of stream finishes the file
+                Ok(0) if framed.is_none() && reset.load(Ordering::Relaxed) => {
+                    return Err(BodyError::Read(io::ErrorKind::ConnectionReset.into()))
+                }
                 Ok(0) => return Ok(()),
                 Ok(n) => n,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
@@ -1115,6 +1188,8 @@ mod tests {
                 Reply::Delayed(out, Duration::from_millis(600))
             }
             "/to-localhost" => redirect("302 Found", &format!("http://localhost:{port}/a.png")),
+            "/to-creds" => redirect("302 Found", &format!("http://admin:admin@127.0.0.1:{port}/a.png")),
+            "/to-creds-relative" => redirect("302 Found", "/a.png"),
             "/to-short-form" => redirect("302 Found", &format!("//127.1:{port}/a.png")),
             "/to-backslash-authority" => redirect("302 Found", &format!("\\\\127.1:{port}/a.png")),
             "/to-tab" => redirect("302 Found", &format!("http://127.0.0.\t1:{port}/a.png")),
@@ -1621,4 +1696,49 @@ mod tests {
             assert!(!is_streamable_audio_format(fmt), "{fmt:?}");
         }
     }
+
+    /// A reset mid-body: the server leaves part of the request unread, so its
+    /// close sends an RST (Linux). The reply declares no length, so the body
+    /// ends at the close.
+    fn reset_server() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for mut s in listener.incoming().flatten() {
+                let mut byte = [0u8; 1];
+                for _ in 0..5 {
+                    let _ = s.read(&mut byte);
+                }
+                let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: image/png\r\n\r\n0123456789");
+                let _ = s.flush();
+                std::thread::sleep(Duration::from_millis(200));
+                drop(s);
+            }
+        });
+        port
+    }
+
+    #[test]
+    fn credentials_in_the_url_are_not_sent_upstream() {
+        let (port, seen) = serve();
+        assert_eq!(fetch(&format!("http://user:pass@127.0.0.1:{port}/a.png"), &local()).unwrap().1, PNG);
+        assert_eq!(fetch(&format!("http://127.0.0.1:{port}/to-creds"), &local()).unwrap().1, PNG);
+        assert_eq!(fetch(&format!("http://user:pass@127.0.0.1:{port}/to-creds-relative"), &local()).unwrap().1, PNG);
+        for head in seen.lock().unwrap().iter() {
+            assert!(!head.to_ascii_lowercase().contains("\r\nauthorization:"), "{head:?}");
+        }
+    }
+
+    #[test]
+    fn a_reset_mid_body_is_refused_rather_than_truncated() {
+        let port = reset_server();
+        let dir = std::env::temp_dir().join(format!("mstar-remote-{}", Uuid::new_v4()));
+        let url = url::Url::parse(&format!("http://127.0.0.1:{port}/a.png")).unwrap();
+        let addrs = [SocketAddr::from(([127, 0, 0, 1], port))];
+        let out = fetch_hop(&url, "127.0.0.1", &addrs, &dir, REMOTE_MAX_BYTES, Instant::now() + Duration::from_secs(5));
+        assert!(matches!(&out, Err(e) if e == "remote media fetch failed: connection failed"), "{out:?}", out = out.as_ref().err());
+        assert_eq!(std::fs::read_dir(&dir).map(|d| d.count()).unwrap_or(0), 0, "upload left behind");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
 }
