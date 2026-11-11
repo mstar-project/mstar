@@ -105,6 +105,9 @@ def test_the_engine_refuses_a_drafter_it_cant_hold():
         def observe(self, block, result):
             ...
 
+        def prefill(self, inputs):
+            ...
+
     assert isinstance(_FullDuck(), Drafter)
     assert "is not a Drafter: subclass it" in submodule_problems(decl, SimpleNamespace(drafter=_FullDuck()))[0]
 
@@ -134,3 +137,19 @@ def test_a_node_holding_a_drafter_the_model_declares_no_verify_node_for_is_refus
     monkeypatch.setattr(ToyModel, "verify_nodes", lambda self: [])
     with pytest.raises(RuntimeError, match="declares no VerifyNode"):
         engine(3)
+
+
+def test_a_hosted_drafter_must_say_what_its_prefill_keeps():
+    """A hosted drafter runs its own stack over each prompt, so prefill is abstract on it; a plain
+    drafter's defaults to nothing."""
+    from mstar.model.components.hosted_drafter import HostedDrafter
+
+    class _NoPrefill(HostedDrafter):
+        needs = NEEDS
+
+        def propose(self, inputs):
+            ...
+
+    with pytest.raises(TypeError, match="prefill"):
+        _NoPrefill()
+    assert _Proposes().prefill(None) is None

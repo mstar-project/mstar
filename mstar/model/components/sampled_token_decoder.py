@@ -14,7 +14,7 @@ and its attention key, and an MRoPE model adds its own positions.
 Given a drafter (speculative decoding), every decode step is a verify step:
 each row runs its last token and the drafter's ``k`` drafts, ``k + 1`` rows, on
 the verify attention kernel, through the engine's `draft_verify_step`; no mixed
-step is captured, and `after_prompt_rows` runs the drafter over each prompt.
+step is captured, and the drafter's ``prefill`` runs over each prompt.
 Without one, nothing of this runs.
 
 A media walk's row is the whole prompt's ids, each attachment expanded to
@@ -72,6 +72,7 @@ from mstar.engine.accelerator_graph_config import (
     decode_rows_then_prompt,
 )
 from mstar.engine.resources.attn.config import AttentionStep
+from mstar.engine.resources.draft.drafter import PrefillInputs
 from mstar.engine.resources.position.config import PositionStep
 from mstar.engine.resources.sampler.config import SamplerStep
 from mstar.engine.resources.step import ResourceStep, Segment, SubmoduleStep
@@ -745,19 +746,11 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
         last = self.last_token_hidden(engine_inputs, hidden)
         tokens = self.sample_tokens(engine_inputs, self.model.logits(last))
         if self._drafting:
-            self.after_prompt_rows(engine_inputs, input_ids, hidden, embeds, tokens, decoder_kwargs, tensors)
+            # the drafter's pass over the prompt rows, after the step samples
+            self.drafter.prefill(PrefillInputs(
+                engine_inputs.resources, input_ids, tokens, hidden, embeds, decoder_kwargs, tensors,
+            ))
         return tokens
-
-    def after_prompt_rows(
-        self, engine_inputs: ModelInputsFromEngine, input_ids: torch.Tensor, hidden: torch.Tensor,
-        embeds: torch.Tensor, tokens: torch.Tensor, decoder_kwargs: dict[str, Any],
-        tensors: Mapping[str, torch.Tensor],
-    ) -> None:
-        """A drafting node's pass over a step's prompt rows, after it samples:
-        ``input_ids`` and ``embeds`` are the stack's input, ``hidden`` its
-        output on every row, ``tokens`` what the step sampled, ``tensors``
-        `preprocess`'s other outputs. Runs only with a drafter; nothing by
-        default."""
 
     def _verify(
         self, engine_inputs: ModelInputsFromEngine, input_ids: torch.Tensor | None, **tensors: torch.Tensor,

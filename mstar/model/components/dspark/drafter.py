@@ -35,6 +35,7 @@ from mstar.engine.resources.draft.drafter import (
     DraftInputs,
     ModelGeometry,
     ObserveInputs,
+    PrefillInputs,
 )
 from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.engine.resources.step import ResourceStep
@@ -235,9 +236,9 @@ class DSparkDrafter(nn.Module, HostedDrafter):
 
     # ── the node's forward ──
 
-    def prefill(self, engine_inputs=None, input_ids=None, sampled=None) -> None:
+    def prefill(self, inputs: PrefillInputs) -> None:
         """The prompt's context K/V, from the taps the target's prefill wrote (not its ids)."""
-        del engine_inputs, input_ids, sampled
+        del inputs
         self._write_context()
 
     def propose(self, inputs: DraftInputs) -> torch.Tensor:

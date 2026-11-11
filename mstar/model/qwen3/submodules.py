@@ -38,7 +38,3 @@ class Qwen3LMSubmodule(SampledTokenDecoder):
         # the drafter's taps: the target hands it the residual stream entering its layers
         tap_key = None if self.drafter is None else self.drafter.needs.tap_key
         return {} if tap_key is None else {"taps": step_taps(engine_inputs, tap_key)}
-
-    def after_prompt_rows(self, engine_inputs, input_ids, hidden, embeds, tokens, decoder_kwargs, tensors) -> None:
-        # the drafter's K/V of the prompt, from the taps the target just wrote
-        self.drafter.prefill(engine_inputs, input_ids, tokens)

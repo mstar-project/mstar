@@ -1967,9 +1967,9 @@ The node passes ``drafter`` to ``SampledTokenDecoder.__init__``; ``k`` is the en
 (``NodeSubmodule.bind_draft``). The
 scaffold then captures and declares ``k + 1`` rows a decode step, runs no mixed capture,
 declares the verify step (``verify_layer_steps()``: ``layer_steps()`` with each attention on
-its verify kernel) and runs it through ``draft_verify_step``. What stays the node's:
-``decoder_kwargs`` (Qwen3's taps) and ``after_prompt_rows`` (the drafter's pass over each
-prompt step, after it samples), both called only with a drafter.
+its verify kernel) and runs it through ``draft_verify_step``, and after each prompt step
+samples it calls the drafter's ``prefill(PrefillInputs)``. What stays the node's:
+``decoder_kwargs`` (Qwen3's taps), called only with a drafter.
 
 **Drafter resources.** A drafter is declared from config alone (``DrafterDecl``): its
 ``needs`` and ``node_resources(nodes)``, the resources it adds to the node (DSpark's attention
