@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from mstar.utils.cpus import plan as cpu_plan
+from mstar.utils.profiler import phase_end, phase_start
 from mstar.utils.threads import ThreadPool
 
 logger = logging.getLogger(__name__)
@@ -311,7 +312,9 @@ class GrammarRows:
         while pending:
             rows, index, host, event = pending[0]
             if event is not None:
+                waited = phase_start()
                 event.synchronize()
+                phase_end("res.grammar.draw_wait", waited)
             drawn = host.tolist()
             # taken before its accepts, so no draw is accepted twice, and none is lost
             # to a raise above, which leaves this step's draws and every later one queued

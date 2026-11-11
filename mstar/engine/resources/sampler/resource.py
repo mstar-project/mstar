@@ -1001,7 +1001,10 @@ class GrammarSamplerResource(SamplerResource):
         fails them only when this rank serves alone: an error set on one rank of
         several would split the ranks' admits."""
         grammar, rids, slot = self._grammar, self._grammar_rids, self._grammar_slot
+        # MSTAR_PHASE_TIMING: accept includes draw_wait (`accept_pending`)
+        laps = PhaseLaps("res.grammar.")
         grammar.accept_pending()
+        laps.lap("accept")
         if not self._fills_masks:
             return
         try:
@@ -1011,6 +1014,7 @@ class GrammarSamplerResource(SamplerResource):
             masks = grammar.stop_masks(rids)
             if self._decides:
                 grammar.fail(rids, f"structured_outputs grammar failed to fill its mask: {exc}")
+        laps.lap("fill")
         if masks is not None:
             self._grammar_stager.copy_(self._grammar_mask, masks.numpy().reshape(-1), pad_value=-1)
             if slot is not None:
@@ -1020,6 +1024,7 @@ class GrammarSamplerResource(SamplerResource):
             # than this step's may have left a mask past this step's rows
             self._grammar_masks[slot].fill_(-1)
             self._grammar_dirty.discard(slot)
+        laps.lap("h2d")
 
     def commit(self, step: SamplerStep, ctx: StepContext):
         if self._grammar.any_of(ctx.request_ids):
