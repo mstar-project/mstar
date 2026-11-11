@@ -710,3 +710,15 @@ def test_an_update_field_change_moves_the_digest(first, second):
     def value(update):
         return Value("gdn", nodes={"LLM"}, layers={0}, entry=entry, updates={"u": update})
     assert declaration_digests([value(first)]) != declaration_digests([value(second)])
+
+
+def test_a_rebuild_leaves_a_whole_step_read_on_a_walk_that_takes_no_ids():
+    """A rebuild reruns its steps as they ran, and only a walk that reads the ids input takes the ids sampled since.
+    Bagel's image walks read their adds as a whole and take no ids."""
+    rebuild = {"LLM": RebuildPolicy(
+        walks=frozenset({"prefill", "decode"}), ids_input="text_inputs", sample_output="token", loop="loop",
+    )}
+    array = _array(reads={"p": _read(walks={"prefill"}), "d": _read(mask=Bidirectional(), walks={"decode"})})
+    assert state_declaration_problems(_StubModel(array, rebuild=rebuild)) == [], (
+        "a walk whose rebuild rows take no sampled ids was refused"
+    )

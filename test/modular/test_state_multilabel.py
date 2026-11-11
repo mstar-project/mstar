@@ -37,7 +37,15 @@ from test_state_calls import (
 from mstar.api_server.data_worker import PreprocessWorkerThread
 from mstar.conductor.conductor import Conductor
 from mstar.engine.resources.attn.config import AttentionSpec, AttentionStep
-from mstar.engine.resources.kv.config import KVReqConfig, KVSpec, PagedKVConfig, Span, refuse_undeclared_labels
+from mstar.engine.resources.kv.config import (
+    KVReqConfig,
+    KVSpec,
+    PagedKVConfig,
+    RingKVConfig,
+    RingKVLayerConfig,
+    Span,
+    refuse_undeclared_labels,
+)
 from mstar.engine.resources.kv.plan import group_by_plan_label
 from mstar.engine.resources.recurrent.config import RecurrentBlockConfig, RecurrentStateConfig, RecurrentStateSpec
 from mstar.engine.resources.step import Segment, StepContext, SubmoduleStep
@@ -532,3 +540,58 @@ def test_two_streams_of_a_request_need_the_pages_of_both(monkeypatch):
         check_kv_pools_fit(model, config, "cfg.yaml", logging.getLogger(__name__),
                            request_layouts={"t3_kv": dict.fromkeys(LABELS, stream)})
 
+
+def test_at_last_token_over_every_row_of_one_label_takes_a_row_that_pads_the_step():
+    """A padded step lists each row that pads it at span 0, and a call over every row returns what the plan selects
+    for it, which nothing reads."""
+    attn = _LastTokens()
+    h = _kv_handle(attn=attn)
+    segments = [Segment(1, "main", 3), Segment(2, "main", 0)]
+    attn.spans = [segment.span for segment in segments]
+    _begin(h, segments=segments, ctx=_ctx(rows=(1, 2)))
+    assert at_last_token(h, torch.arange(3.0)[:, None])[:, 0].tolist() == [2.0, 2.0], (
+        "the padding row would not get what the plan selects for it"
+    )
+
+
+def test_at_last_token_over_every_row_of_a_combined_plan_refuses_a_segment_with_no_token():
+    """Chatterbox's guided T3 prefill takes every (row, label)'s last token, and a span-0 one would be another's."""
+    h = _two_label_handle()
+    segments = [Segment(1, "main", 3), Segment(2, "main", 2), Segment(1, "uncond", 0), Segment(2, "uncond", 2)]
+    _begin(h, segments=segments, ctx=_ctx(rows=(1, 2)))
+    _refused(r"Array 'kv': at_last_token on row 1, label 'uncond', whose segment has span 0",
+             lambda: at_last_token(h, torch.zeros(7, 1)))
+
+
+def test_a_node_takes_the_handle_another_node_of_its_process_built():
+    array = _array(nodes={"LLM", "LLM_cfg_img"})
+    model = SimpleNamespace(declare_state=lambda: [array])
+    resources, built = {"kv": _StubKV(), "attn": _StubAttn()}, {}
+    llm, cfg = (node_handles(model, node, resources, built=built)["kv"] for node in ("LLM", "LLM_cfg_img"))
+    assert cfg is llm, "a layer both nodes run would stay on the handle of the node bound last"
+
+
+def test_a_pool_its_window_sizes_holds_any_cap():
+    """The pool check asks every spec, so a pool that requests don't size says so itself."""
+    ring = KVSpec(resource_key="ring", nodes={"t3"}, config=RingKVConfig(
+        num_layers=1, num_kv_heads=2, head_dim=8, tokens_per_frame=4,
+        layers=(RingKVLayerConfig(ring_frames=8, ring_buckets=1, pinned_dilation=1),),
+    ))
+    assert ring.capacity_problem(1000, None) is None, "a ring buffer's window sizes it, not its requests"
+
+
+def test_a_paged_pool_with_no_layout_holds_one_stream_of_its_max_len_a_request():
+    paged = KVSpec(resource_key="t3_kv", nodes={"t3"}, config=PagedKVConfig(
+        num_layers=2, num_qo_heads=2, num_kv_heads=2, head_dim=8, max_seq_len=256, page_size=64, max_num_pages=9,
+    ))
+    assert paged.capacity_problem(2, None) is None, "two streams of 4 pages and the sink page fit in 9"
+    assert paged.capacity_problem(3, None) == (
+        "3 concurrent requests (max_concurrent_requests) need 13 pages of resources.t3_kv (4 per request and the sink "
+        "page), which has 9; raise max_num_pages, or lower max_concurrent_requests or the tokens a request may hold"
+    )
+
+
+def test_a_setting_refused_on_a_shared_spec_names_the_read_it_was_set_under():
+    with pytest.raises(ValueError, match=r"Array 'kv': kernel_settings\['attn_image'\]: decode_tensor_cores must be "
+                                         r"true or false"):
+        build_specs([_per_walk()], kernel_settings={"attn_image": {"decode_tensor_cores": "false"}})

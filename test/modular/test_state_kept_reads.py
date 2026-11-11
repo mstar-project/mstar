@@ -220,6 +220,11 @@ def test_a_kept_cross_read_takes_only_decode_tensor_cores():
     assert next(spec for spec in built if spec.resource_key == "context").config.max_num_pages == 9
 
 
+def test_a_kept_cross_reads_setting_takes_the_same_checks_as_under_resources():
+    with pytest.raises(ValueError, match=r"kernel_settings\['cross'\]: decode_tensor_cores must be true or false"):
+        build_specs([_self_array(), _context_array()], kernel_settings={"cross": {"decode_tensor_cores": "false"}})
+
+
 def test_a_max_len_0_read_over_a_kept_array_plans_todays_cross_step():
     """The other form of a kept cross read: the queries come from the kept array, and the context stays per step."""
     chunk = _self_array()

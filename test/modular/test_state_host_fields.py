@@ -17,9 +17,10 @@ import torch
 
 from mstar.engine.engine import Engine
 from mstar.engine.resources.step import Segment, StepContext, SubmoduleStep
-from mstar.engine.state import Array, ArrayStep, Attend, Causal, Entry, Fork, KVEntry, Read, Value, host
+from mstar.engine.state import Array, ArrayStep, Attend, Causal, Entry, Fork, KVEntry, Read, TensorType, Value, host
 from mstar.engine.state.adapters import (
     HOST_VALUE,
+    VALUE_WITH_HOST,
     StateSetup,
     build_handle,
     build_specs,
@@ -275,3 +276,39 @@ def test_an_engine_with_no_host_fields_keeps_nothing_per_request():
 ])
 def test_a_field_takes_exactly_its_declared_type(value, kind, matches):
     assert is_host_value(value, kind) is matches
+
+
+class _StubPool:
+    """Holds one block per field and drops the writes."""
+
+    def block(self, field, i):
+        return torch.zeros(4, 3)
+
+    def scatter_(self, field, value, layer_idx, *, label):
+        pass
+
+
+def _streamed() -> Array:
+    """Chatterbox's S3Gen stream, small: its vocoder tail in a tensor field and its generator state in a host field."""
+    return Value("stream", nodes={"talker"}, layers={0}, entry=Entry(
+        {"tail": TensorType((3,), dtype=torch.float32)}, host={"chunks": int},
+    ))
+
+
+def test_a_value_with_tensor_fields_pools_only_those():
+    assert storage_of(_streamed()) is VALUE_WITH_HOST
+    (spec,) = build_specs([_streamed()])
+    assert set(spec.config.blocks) == {"tail"}, "the pool would hold a block for a host field"
+
+
+def test_a_value_with_tensor_fields_keeps_its_host_fields_beside_them():
+    array = _streamed()
+    fields = HostFields()
+    h = build_handle(array, {"stream": _StubPool()}, StateSetup(host_fields=fields))
+    fields.open(RID)
+    step = _step(h, host={(RID, "main", 0): {"chunks": 2}})
+    step.begin_calls()
+    h.write(0, tail=torch.ones(1, 3))
+    step.commit_calls()
+    step.end_calls()
+    assert host(h, RID, "main", 0)["chunks"] == 2, "the step's host write would be lost"
