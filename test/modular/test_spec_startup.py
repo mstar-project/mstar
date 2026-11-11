@@ -258,7 +258,7 @@ def test_a_kv_pool_without_the_slack_is_refused():
     deployment = lambda limit: check_deployment([decl], specs, {}, (), {}, True, max_seq_len=limit)  # noqa: E731
     assert deployment(56) == []
     problems = deployment(64)
-    assert len(problems) == 1 and "max_seq_len + 8" in problems[0]
+    assert len(problems) == 1 and "set resources.kv_cache.max_seq_len to 64" in problems[0]
     # the engine's load runs the same list (no serving limit there)
     assert node_problems(decl, decl.token_stop, specs, False, max_seq_len=64) == problems
 
@@ -540,6 +540,9 @@ def test_a_max_seq_len_override_on_a_verifying_pool_is_the_clients_limit():
         assert pool.config.max_seq_len == 56 and pool.request_limit == 48
     decl = _decl(needs=DrafterNeeds(chunk_boundary=ChunkBoundary.NONE))
     assert slack_problems([decl], [pool], max_seq_len=48) == []
+    # a serving limit past the pool's: the remedy is the override at that limit, the slack added past it
+    (problem,) = slack_problems([decl], [pool], max_seq_len=60)
+    assert "holds a request to 48 positions" in problem and "set resources.kv_cache.max_seq_len to 60" in problem
     # a plain pool takes the value as written
     plain = KVSpec("kv_cache", {NODE}, PagedKVConfig(num_layers=2, num_kv_heads=2, head_dim=8, max_seq_len=64))
     apply_yaml_overrides([plain], {"resources": {"kv_cache": {"max_seq_len": 48}}})

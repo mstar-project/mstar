@@ -258,8 +258,9 @@ def slack_problems(decls, specs, max_seq_len: int | None = None) -> list[str]:
                 )
             elif max_seq_len is not None and spec.request_limit < max_seq_len:
                 problems.append(
-                    f"node {decl.node!r}: KV {spec.resource_key!r} holds {spec.config.max_seq_len} tokens a "
-                    f"request; verifying needs max_seq_len + {slack} (DraftConfig.kv_slack)"
+                    f"node {decl.node!r}: KV {spec.resource_key!r} holds a request to {spec.request_limit} "
+                    f"positions, below the serving config's max_seq_len {max_seq_len}; set "
+                    f"resources.{spec.resource_key}.max_seq_len to {max_seq_len} (the verify slack is added past it)"
                 )
     return problems
 
