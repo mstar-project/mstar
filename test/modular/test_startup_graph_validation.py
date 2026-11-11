@@ -744,6 +744,32 @@ def _minimax_h3(name, model_kwargs, tmp_path, monkeypatch):
     return model
 
 
+def _phi4mm(name, model_kwargs, tmp_path, monkeypatch):
+    """Phi-4-mini's head and rotary geometry with two layers: the resource rules read
+    the layer and head counts and the rotary width, not the other sizes."""
+    from mstar.model.multimodal_decoder import MediaIntake
+    from mstar.model.phi4mm.audio import audio_encoder
+    from mstar.model.phi4mm.components.audio import Phi4MMAudioConfig
+    from mstar.model.phi4mm.components.vision import Phi4MMVisionConfig
+    from mstar.model.phi4mm.config import AUDIO_PAD_ID, IMAGE_PAD_ID, Phi4MMConfig
+    from mstar.model.phi4mm.phi4mm_model import Phi4MMModel
+    from mstar.model.phi4mm.vision import vision_media_encoder
+    config = Phi4MMConfig.from_hf({
+        "hidden_size": 3072, "intermediate_size": 8192, "num_hidden_layers": 2,
+        "num_attention_heads": 24, "num_key_value_heads": 8, "vocab_size": 1024,
+        "rms_norm_eps": 1e-5, "rope_theta": 10000.0, "partial_rotary_factor": 0.75,
+        "max_position_embeddings": 131072, "original_max_position_embeddings": 4096,
+        "rope_scaling": {"type": "longrope", "short_factor": [1.0] * 48, "long_factor": [1.0] * 48},
+        "tie_word_embeddings": True,
+    })
+    media = (
+        MediaIntake("image", vision_media_encoder(), IMAGE_PAD_ID, None),
+        MediaIntake("audio", audio_encoder(), AUDIO_PAD_ID, None),
+    )
+    return _bare(Phi4MMModel, config=config, vision_config=Phi4MMVisionConfig(),
+                 audio_config=Phi4MMAudioConfig(), media=media, local_dir="/nonexistent")
+
+
 def _qwen3_5(name, model_kwargs, tmp_path, monkeypatch):
     """Small text-only shapes: the resource rules read the layer and head
     counts, not their sizes."""
@@ -923,6 +949,7 @@ _FACTORIES = {
     "RippleModel": _ripple,
     "OrpheusModel": _orpheus,
     "ParakeetModel": _parakeet,
+    "Phi4MMModel": _phi4mm,
     "Qwen3_5DenseModel": _qwen3_5,
     "Qwen3OmniModel": _qwen3_omni,
     "Qwen3TTSModel": _qwen3_tts,

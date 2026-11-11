@@ -1,3 +1,4 @@
+import enum
 import functools
 import itertools
 import math
@@ -165,15 +166,30 @@ class RobotIO(NamedTuple):
     action_dim: int
 
 
+class KeepAdapter(enum.Enum):
+    """``ProcessPromptOutput.lora_adapter`` left unset."""
+    KEEP = "keep"
+
+
+# the request runs on the adapter its client named, or on the base model
+KEEP_ADAPTER = KeepAdapter.KEEP
+
+
 class ProcessPromptOutput(NamedTuple):
     """Tensors from `process_prompt`, and metadata to carry beside them.
 
     The data worker folds ``metadata`` into the request's ``model_kwargs``, so
     what a model settles while tokenizing reaches
     `get_request_resource_configs` without a field of its own on the request.
+
+    ``lora_adapter`` is the LoRA adapter the model runs this prompt on, one of
+    ``Model.prompt_lora_adapters``, or None for the base model; the data worker
+    gives the request what the API server gives a client that names it
+    (``ServedModels.model_chose``). Unset keeps the client's choice.
     """
     new_input_tensors: NameToTensorList
     metadata: dict
+    lora_adapter: str | None | KeepAdapter = KEEP_ADAPTER
 
 
 class ClientChunk(NamedTuple):
@@ -1063,6 +1079,12 @@ class Model(ABC):
         ``text_inputs``, which hold each attachment's pads in place; a model
         that splits ``text_inputs`` around its attachments adds theirs."""
         return sum(ids.numel() for ids in tensors.get("text_inputs", ()))
+
+    def prompt_lora_adapters(self) -> frozenset[str]:
+        """The LoRA adapters ``process_prompt`` may run a prompt on
+        (``ProcessPromptOutput.lora_adapter``). The API server refuses, at startup, a
+        deployment whose ``resources: lora: adapters:`` block does not serve them all."""
+        return frozenset()
 
     def max_input_files(self) -> dict[str, int]:
         """Most files of each input modality one request may attach, e.g.
