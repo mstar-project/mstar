@@ -1027,7 +1027,7 @@ def _layer_over_ranks(rank, world, store, split=None):
     """One rank of an SP placement running a Qwen3.5 attention layer through its KV handle on a
     prefill, against the same layer attending every key on one rank. With ``split`` (the shard's
     ``exchange``) the step splits over a sequence shard, whose exchange makes the handle's write and
-    attention one call, over a pool whose step slots hold NaN until the step writes them."""
+    attention one call. The pool's step slots hold NaN until the step writes them, as each case checks."""
     from mstar.engine.state.adapters import build_handle
     from mstar.engine.state.analysis import position_key
     from mstar.engine.state.contract import ArrayStep
@@ -1064,25 +1064,19 @@ def _layer_over_ranks(rank, world, store, split=None):
         layer.bind_state({KV_CACHE: _OneRank(case)})
         want = forward(hidden)
 
-        if split is None:
-            attn, placement = _cp_attention(joint, CPU, torch.float32)
-            _plan(attn, case)
-            cache = case.cache(placement)
-            pool = types.SimpleNamespace(
-                layer_view=lambda i: cache, write_kv=lambda *args, **kwargs: None, opens_label=lambda *args: True,
-            )
+        shard = None if split is None else SequenceShard(
+            ("main",), 0, None, 0, group, stripe_pool="kv" if split == "ring" else None, device=CPU,
+        )
+        built = []
+        attn, placement = _cp_attention(
+            joint, CPU, torch.float32, shard=shard, exchange=split or "auto",
+            kv_resource=lambda placement: built.append(_PlacedKV(placement, case)) or built[0],
+        )
+        (pool,) = built
+        _plan(attn, case, shard=shard)
+        if shard is None:
             scatter = gather = lambda x: x
         else:
-            shard = SequenceShard(
-                ("main",), 0, None, 0, group, stripe_pool="kv" if split == "ring" else None, device=CPU,
-            )
-            built = []
-            attn, _ = _cp_attention(
-                joint, CPU, torch.float32, shard=shard, exchange=split,
-                kv_resource=lambda placement: built.append(_PlacedKV(placement, case)) or built[0],
-            )
-            (pool,) = built
-            _plan(attn, case, shard=shard)
             assert shard.split_range("main") is not None
             scatter, gather = (functools.partial(f, "main") for f in (shard.scatter, shard.gather))
         handle = build_handle(array, {KV_CACHE: pool, ATTN: attn, position_key(array): None})
@@ -1095,7 +1089,10 @@ def _layer_over_ranks(rank, world, store, split=None):
         handle.begin_step(step)
         layer.bind_state({KV_CACHE: handle})
         torch.testing.assert_close(gather(forward(scatter(hidden))), want)
+        handle.check_step(step)
         handle.end_step(step)
+        # the step's k and v, in the slots this rank stores (SINK_PAGE takes the rest)
+        torch.testing.assert_close(pool.cache[1:], case.cache(placement)[1:], equal_nan=True)
     finally:
         group.device_group = None
         dist.destroy_process_group()
