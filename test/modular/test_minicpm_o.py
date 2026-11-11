@@ -74,7 +74,9 @@ def test_sincos_keys_match_upstream_table(hw):
     coords = slice_layout([(h, w)], VisionConfig()).grid_coords
     got = resampler.sincos(coords)
     want = torch.from_numpy(upstream_sincos_table(256, h, w)).reshape(h * w, -1)
-    assert torch.allclose(got, want, atol=1e-6, rtol=0)
+    max_angle = max(h, w) - 1 or 1  # the widest angle is the last row or column, at frequency 1
+    atol = 2 * torch.finfo(torch.float32).eps * max_angle  # one float32 ULP of the angle (3.8e-6 at 39 rad)
+    assert torch.allclose(got, want, atol=atol, rtol=0)
 
 
 @pytest.mark.parametrize("hw", [(26, 40), (32, 32), (7, 69), (70, 70), (100, 3), (1, 25), (13, 49)])
