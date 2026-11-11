@@ -313,7 +313,8 @@ def test_a_repeated_step_addresses_each_replay_as_host_plans_would(repeats):
     """Every replay of a step that repeats writes and attends where a host plan
     of that iteration would, page crossings included, with no host work between
     replays; the host's mirrors then stand where the stream does."""
-    live, ref, planner = _setup({1: 3, 2: 17, 3: 8})  # request 2 runs on LongRoPE's long table
+    # 17 is past LongRoPE's original length, so request 2 starts on the long table
+    live, ref, planner = _setup({1: 3, 2: 17, 3: 8}, longrope=True)
     rids = [1, 2, 3]
     for t in range(6):
         a = _captured_step(live, planner, rids, slot=t % 2, bs=4, repeats=repeats)
