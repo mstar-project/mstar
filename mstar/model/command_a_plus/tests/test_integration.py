@@ -15,6 +15,7 @@ from torch import nn
 from mstar.conductor.request_info import DEFAULT_PARTITION, FINAL_PREFILL, CurrentForwardPassInfo
 from mstar.distributed.communication import CommGroup
 from mstar.engine.resources import AttentionStep, SamplingReqConfig
+from mstar.engine.state.adapters import node_resources
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import MAX_OUTPUT_TOKENS
 from mstar.model.command_a_plus.command_a_plus_model import CommandAPlusModel
@@ -125,7 +126,7 @@ class ModelIntegrationTests(unittest.TestCase):
 
     def test_graph_and_resources(self):
         model = self.model
-        resources = {r.resource_key: r for r in model.get_node_resources()}
+        resources = {r.resource_key: r for r in node_resources(model)}
         self.assertEqual(resources[LOCAL_ATTN].config.sliding_window, 4)
         self.assertIsNone(resources[GLOBAL_ATTN].config.sliding_window)
         for key in (LOCAL_ATTN, GLOBAL_ATTN, ROPE):

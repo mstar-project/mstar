@@ -17,7 +17,7 @@ from mstar.model.submodule_base import END_PARTITION, HostRows
 def _submodule(slot_masters=True):
     config = HiggsAudioModelConfig()
     # as the model builds it: the audio walk, no text-only prompt
-    encoders = (audio_encoder(config.audio_in_token_idx),)
+    encoders = (audio_encoder(),)
     sub = HiggsAudioLLMSubmodule(torch.nn.Linear(1, 1), config, encoders, text_prompts=False)
     sub.node_resources = {SAMPLER: SimpleNamespace(has_slot_masters=slot_masters)}
     return sub
@@ -47,8 +47,8 @@ def test_decode_keeps_its_token_on_the_device_only_with_slot_masters():
     sub = _submodule()
     assert sub.device_loopback_signals("decode") == {"text_inputs"}
     assert sub.device_loopback_signals("prefill_audio") == frozenset()
-    assert sub.inline_client_signals("decode") == {"text_inputs": "new_token"}
-    assert sub.inline_client_signals("prefill_audio") == {}
+    assert sub.inline_signals("decode") == {"text_inputs": "new_token"}
+    assert sub.inline_signals("prefill_audio") == {}
     row = sub.prepare_inputs("decode", _info(), {}, has_loopback=True)
     assert row.input_ids is None and row.input_seq_len == 1
     assert sub.uniform_row_inputs("decode", has_loopback=True).input_seq_len == 1

@@ -8,9 +8,8 @@ sliced separately: a plain ``chunk(conv_dim, tp)`` would give rank 0 all of q
 plus half of k and still pass shape checks. ``_shard_blocks`` does this, hence
 the own loaders on the conv weight and ``in_proj_qkv``.
 
-The state pool shards to match via ``DeltaNetGeometry.to_blocks``
-(``shard_dims=(0,)``). The forward is inherited: it reads the rank-local
-``self.num_k_heads`` / ``self.key_dim`` etc.
+The state pool shards to match (``shard_dims=(0,)``). The forward is
+inherited: it reads the rank-local ``self.num_k_heads`` / ``self.key_dim`` etc.
 """
 from __future__ import annotations
 

@@ -25,6 +25,7 @@ import pytest
 import torch
 
 from mstar.worker import worker as worker_mod
+from mstar.worker.engine_manager import InlineStreams
 from mstar.worker.worker import Worker
 
 LAUNCH = "MSTAR_LAUNCH_WAIT_MS"
@@ -40,9 +41,13 @@ def _build(monkeypatch) -> Worker:
         transfer_engine=None, my_session_id="session", get_tensor=None,
     ))
     monkeypatch.setattr(worker_mod, "_make_graph_runtime", lambda **kw: SimpleNamespace(
-        set_node_metadata=lambda **metadata: None,
+        set_node_metadata=lambda **metadata: None, set_inline_streams=lambda keys: None,
     ))
-    monkeypatch.setattr(worker_mod.EngineManager, "build", lambda *a, **kw: SimpleNamespace(side_keys=()))
+    # an engine with no paged KV cache to preempt in
+    monkeypatch.setattr(worker_mod.EngineManager, "build", lambda *a, **kw: SimpleNamespace(
+        side_keys=(), inline_streams=InlineStreams(frozenset(), {}),
+        engine=SimpleNamespace(paged_kv_caches=list, host_allowance=None, node_dtype=lambda node: None),
+    ))
     monkeypatch.setattr(Worker, "_plan_step_cpus", lambda self, *a: (None, frozenset()))
     return Worker(
         worker_id="w0", worker_ids=["w0"], model=None, my_worker_graphs=[],

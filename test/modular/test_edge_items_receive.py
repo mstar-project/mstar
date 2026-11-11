@@ -174,3 +174,45 @@ def test_a_known_request_with_no_stream_buffer_is_acked_unread(failed, caplog):
     assert acked == [[1, 2], [4]]
     assert registered == {2: [6], 3: []}
     assert len(warned) == (0 if failed else 1)
+
+
+def _values_frame():
+    """The rows of ``_frame`` as inline items: their values, no descriptors."""
+    b = EdgeItemsBuilder("snac")
+    for wire_rid, values in [("r1", [7, 8]), ("later", [9]), ("removed", [10]), ("draining", [11]), ("r2", [12])]:
+        assert b.add_values(wire_rid, EDGE, NODE, None, values, ("", "w0", "LLM", 1, 0))
+    return b.build()
+
+
+def _buffered(w, handle):
+    buf = w.request_state.per_request_info[handle].stream_buffers[EDGE]
+    buf._update_buffer()
+    return list(buf._buffer)
+
+
+def test_a_value_frame_puts_its_items_in_the_buffers_with_nothing_read_or_acked():
+    """Inline items go straight into their stream buffers: no read, no ack. A
+    removed request's row and one past READS_DONE are dropped, with nothing to
+    release; one for a request not here yet is parked, as its tensors are."""
+    w = _worker()
+    w.ingest._process_edge_items(_values_frame())
+    reads, acked, _, parked = _state(w)
+    assert reads == [] and acked == []
+    assert _buffered(w, 1) == [7, 8] and _buffered(w, 2) == [12] and _buffered(w, 3) == []
+    assert list(parked) == ["later"]
+    (frame,) = parked["later"]
+    assert (frame.request_ids, frame.values) == (["later"], [9])
+
+
+def test_a_parked_value_row_reaches_its_buffer_when_the_request_arrives():
+    w = _worker()
+    w.ingest._process_edge_items(_values_frame())
+    later = 4
+    handles = {**HANDLES, "later": later}
+    w.ingest._runtime.get_rid_handle = handles.get
+    w.request_state.per_request_info[later] = SimpleNamespace(stream_buffers={
+        EDGE: StreamBuffer(later, EDGE, "LLM", FixedChunkPolicy(1)),
+    })
+    w.lifecycle.add(later, "later")
+    w.ingest._dispatch(w.lifecycle.take_parked("later"))
+    assert _buffered(w, later) == [9]
