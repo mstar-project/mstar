@@ -35,6 +35,8 @@ use crate::protocol::{
 
 mod asr;
 mod chat;
+mod glm;
+pub mod glm_reply;
 mod images;
 mod messages;
 mod speech;
@@ -42,6 +44,7 @@ mod video;
 
 pub use asr::*;
 pub use chat::*;
+pub use glm::GlmChat;
 pub use images::*;
 pub use messages::flatten_messages;
 use messages::*;
@@ -275,6 +278,34 @@ pub trait OpenAIAdapter: Send + Sync {
         Err("chat is not supported by this model".to_string())
     }
 
+    /// Its replies' tool calls are split out of the text, so the tool fields
+    /// reach [`OpenAIAdapter::chat_args`] for it to check rather than being refused.
+    fn serves_tool_calls(&self) -> bool {
+        false
+    }
+
+    /// The chat route ends its replies at a stop string, so `stop` is taken.
+    fn serves_stop_strings(&self) -> bool {
+        false
+    }
+
+    /// The strings the chat route ends the reply at (`stop`); none for an
+    /// adapter that does not serve them.
+    fn stop_strings(&self, req: &ChatCompletionRequest) -> Result<Vec<String>, String> {
+        let _ = req;
+        Ok(Vec::new())
+    }
+
+    /// A parser for a reply with structure inside its text (reasoning, tool
+    /// calls), or `None` to send the text as `content` (`make_output_parser`).
+    fn output_parser(
+        &self,
+        req: &ChatCompletionRequest,
+    ) -> Result<Option<Box<dyn crate::reply::OutputParser>>, String> {
+        let _ = req;
+        Ok(None)
+    }
+
     /// `speech_to_request` short of the `ref_audio` clip, which
     /// [`OpenAIAdapter::speech_to_request`] saves as [`OpenAIAdapter::ref_audio`] says.
     fn speech_args(&self, req: &SpeechRequest) -> Result<SubmitArgs, String> {
@@ -307,7 +338,8 @@ pub trait OpenAIAdapter: Send + Sync {
     fn chat_to_request(&self, req: &ChatCompletionRequest, upload_dir: &Path, allow_remote: bool) -> Result<SubmitArgs, String> {
         let mut req = req.clone();
         let mut extra = std::mem::take(&mut req.extra);
-        refuse_unserved_chat(&req, &mut extra)?;
+        let (tool_calls, stop_strings) = (self.serves_tool_calls(), self.serves_stop_strings());
+        refuse_unserved_chat(&req, &mut extra, tool_calls, stop_strings)?;
         req.extra = extra;
         self.chat_args(&req, upload_dir, allow_remote)
     }
@@ -352,6 +384,7 @@ pub static ADAPTERS: &[(&str, &dyn OpenAIAdapter)] = &[
     ("Qwen3TTSAdapter", &Qwen3TTS),
     ("DiffusionImageAdapter", &DiffusionImage),
     ("TextChatAdapter", &TextChat),
+    ("GlmChatAdapter", &GlmChat),
     ("KokoroAdapter", &Kokoro),
     ("ChatterboxAdapter", &Chatterbox),
     ("FishS2ProAdapter", &FishS2Pro),
@@ -441,6 +474,19 @@ pub(crate) fn py_space(c: char) -> bool {
 /// `str.strip()`.
 pub(crate) fn py_strip(s: &str) -> &str {
     s.trim_matches(py_space)
+}
+
+/// `type(value).__name__` of a JSON value as `json.loads` gives it.
+pub(crate) fn py_type_name(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "NoneType",
+        Value::Bool(_) => "bool",
+        Value::Number(n) if n.is_f64() => "float",
+        Value::Number(_) => "int",
+        Value::String(_) => "str",
+        Value::Array(_) => "list",
+        Value::Object(_) => "dict",
+    }
 }
 
 /// Python's `bool()` of a JSON value.

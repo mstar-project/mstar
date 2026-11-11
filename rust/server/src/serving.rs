@@ -12,6 +12,7 @@
 
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -74,13 +75,31 @@ struct AbortGuard {
     rid: String,
     sub: u64,
     done: bool,
+    outcome: Outcome,
 }
 
 impl Drop for AbortGuard {
     fn drop(&mut self) {
         if !self.done {
-            self.bridge.abort(&self.rid, self.sub);
+            let served = self.outcome.0.load(Ordering::Relaxed);
+            self.bridge.abort(&self.rid, self.sub, served);
         }
+    }
+}
+
+/// Set by a handler that ends a reply once the client has all of it (at a stop
+/// string): dropping the stream then stops the request as a success, not an abort.
+#[derive(Clone, Default)]
+pub struct Outcome(Arc<AtomicBool>);
+
+impl Outcome {
+    pub fn served(&self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub fn is_served(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
     }
 }
 
@@ -137,6 +156,8 @@ fn detokenize(base: OutStream, tok: Arc<Tok>) -> OutStream {
                         modality: "text".to_string(),
                         data: piece.into_bytes(),
                         metadata: c.metadata,
+                        num_tokens: c.num_tokens,
+                        prompt_tokens: c.prompt_tokens,
                     })
                 })
             }
@@ -167,6 +188,7 @@ fn detokenize(base: OutStream, tok: Arc<Tok>) -> OutStream {
                 modality: "text".to_string(),
                 data: rest.into_bytes(),
                 metadata: serde_json::Value::Null,
+                ..Default::default()
             })
         })
     })
@@ -180,14 +202,37 @@ fn raw_result_stream(
     request_id: &str,
     streaming: bool,
 ) -> Result<OutStream, (u16, String)> {
-    submitted_stream(state, args, request_id, streaming, Some(state.request_timeout)).map(|(stream, _)| stream)
+    let timeout = Some(state.request_timeout);
+    submitted_stream(state, args, request_id, streaming, timeout, Outcome::default())
+        .map(|(stream, _)| stream)
+}
+
+/// [`result_stream`] for a reply its handler may end once it is whole, with
+/// the [`Outcome`] it marks before dropping the stream.
+pub fn ended_result_stream(
+    state: &AppState,
+    args: &SubmitArgs,
+    request_id: &str,
+    streaming: bool,
+) -> (OutStream, Outcome) {
+    let outcome = Outcome::default();
+    let timeout = Some(state.request_timeout);
+    let submitted = submitted_stream(state, args, request_id, streaming, timeout, outcome.clone());
+    let stream = match submitted {
+        Ok((stream, _)) => stream,
+        Err((status, message)) => {
+            let refused = Out::Error { status, message, refused: false };
+            Box::pin(futures::stream::once(async move { refused }))
+        }
+    };
+    (stream, outcome)
 }
 
 /// A `/generate/ws` live call's result stream and its submission's `sub`, which
 /// its appends name. It keeps no deadline of its own: the API server's stream
 /// times out from the call's last input, which an append moves.
 pub fn live_result_stream(state: &AppState, args: &SubmitArgs, request_id: &str) -> Result<(OutStream, Option<u64>), (u16, String)> {
-    submitted_stream(state, args, request_id, true, None)
+    submitted_stream(state, args, request_id, true, None, Outcome::default())
 }
 
 fn submitted_stream(
@@ -196,6 +241,7 @@ fn submitted_stream(
     request_id: &str,
     streaming: bool,
     timeout: Option<Duration>,
+    outcome: Outcome,
 ) -> Result<(OutStream, Option<u64>), (u16, String)> {
     let mut submission = None;
     let stream: OutStream = match &state.bridge {
@@ -209,6 +255,7 @@ fn submitted_stream(
                 rid: request_id.to_string(),
                 sub,
                 done: false,
+                outcome,
             };
             // no deadline of its own: ten years on
             let deadline = Instant::now() + timeout.unwrap_or(Duration::from_secs(10 * 365 * 86_400));
@@ -289,17 +336,20 @@ fn mock_chunks(args: &SubmitArgs, sample_rate: u32) -> Vec<ResultChunk> {
                 modality: "text".to_string(),
                 data: format!("[mock] {prompt}").into_bytes(),
                 metadata: serde_json::Value::Null,
+                ..Default::default()
             }),
             "audio" => out.push(ResultChunk {
                 modality: "audio".to_string(),
                 // 0.1 s of silence as 16-bit PCM at the model rate.
                 data: vec![0u8; (sample_rate as usize / 10) * 2],
                 metadata: serde_json::Value::Null,
+                ..Default::default()
             }),
             "image" => out.push(ResultChunk {
                 modality: "image".to_string(),
                 data: ONE_PX_PNG.to_vec(),
                 metadata: serde_json::Value::Null,
+                ..Default::default()
             }),
             _ => {}
         }
@@ -339,6 +389,7 @@ mod tests {
             modality: "token".to_string(),
             data: id.to_le_bytes().to_vec(),
             metadata: serde_json::Value::Null,
+            ..Default::default()
         })
     }
 

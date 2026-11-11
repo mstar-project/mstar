@@ -16,15 +16,17 @@
 //!       input_modalities, output_modalities, model_kwargs, prompt_parts,
 //!       streaming, accepts_chunks, report_usage}, `prompt_parts` present for a
 //!       chat only, `report_usage` only when set
-//!                        | {t:"abort", rid, sub}
+//!                        | {t:"abort", rid, sub, outcome?}
 //!                        | {t:"ping", rid, sub}
 //!                        | {t:"metrics", rid, sub, refusals:{route, status, count}}
 //!                        | {t:"check_ref_audio", rid, sub, path, decoder, bare}
 //!                        | {t:"voices", rid, sub}
 //!                        | {t:"windows", rid, sub, op, plan, ...}
 //!                        | {t:"live", rid, sub, op, call, ...}
-//!   conductor -> frontend: {t:"chunk", rid, sub, modality, data(bin), metadata}
-//!                        | {t:"chunks", subs, modalities, payloads(bin), metadatas}
+//!   conductor -> frontend: {t:"chunk", rid, sub, modality, data(bin), metadata,
+//!                           num_tokens, prompt_tokens}
+//!                        | {t:"chunks", subs, modalities, payloads(bin), metadatas,
+//!                           token_counts, prompt_counts}
 //!                        | {t:"done",  rid, sub}
 //!                        | {t:"pong",  rid, sub}
 //!                        | {t:"metrics", rid, sub, data(bin), metadata}
@@ -45,7 +47,9 @@
 //!
 //! A submission with `report_usage` ends with a `chunk` of modality `usage`
 //! before its `done`: `metadata` holds `prompt_tokens`, `completion_tokens`
-//! and `finish_reason`.
+//! and `finish_reason`. Each chunk also carries its own token count and, on a
+//! text chunk, the prompt's, for a reply that ends before that `usage` chunk;
+//! its abort then says `outcome: "success"`.
 //!
 //! `sub` names one submission and is never reused; `rid` is the client's id,
 //! which a client may reuse as soon as it drops a stream (that stream's `done`
@@ -69,11 +73,16 @@ use crate::adapters::{Part, SubmitArgs};
 use crate::refusals::Snapshot;
 
 /// One chunk of generated output, matching mstar's `ResultChunk`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ResultChunk {
     pub modality: String,
     pub data: Vec<u8>,
     pub metadata: Value,
+    /// A text chunk's token count, and the prompt's (`ResultChunk.num_tokens`
+    /// and `prompt_tokens`): a reply ended before the closing `usage` chunk
+    /// counts its usage from them.
+    pub num_tokens: u64,
+    pub prompt_tokens: Option<u64>,
 }
 
 /// A result chunk, a backend error, or end-of-stream, delivered to a
@@ -190,6 +199,16 @@ struct Inbound {
     // t == "served": the API server's served LoRA adapters, after a change
     #[serde(default)]
     adapters: Option<Vec<String>>,
+    // t == "chunk": a text chunk's token counts; t == "chunks": one entry per
+    // chunk, or none from a backend that sends no counts
+    #[serde(default)]
+    num_tokens: u64,
+    #[serde(default)]
+    prompt_tokens: Option<u64>,
+    #[serde(default)]
+    token_counts: Vec<u64>,
+    #[serde(default)]
+    prompt_counts: Vec<Option<u64>>,
 }
 
 struct Route {
@@ -571,9 +590,14 @@ impl Bridge {
 
     /// Abort submission `sub` of `request_id` (client disconnected or timed
     /// out): tell the backend to release its state (a finished submission is
-    /// a no-op there) and drop the local route.
-    pub fn abort(&self, request_id: &str, sub: u64) {
-        let msg = serde_json::json!({"t": "abort", "rid": request_id, "sub": sub});
+    /// a no-op there) and drop the local route. `served`: its handler ended a
+    /// reply the client has whole (at a stop string), which the backend stops
+    /// alike and counts as a success (`abort_submission`'s `outcome`).
+    pub fn abort(&self, request_id: &str, sub: u64, served: bool) {
+        let mut msg = serde_json::json!({"t": "abort", "rid": request_id, "sub": sub});
+        if served {
+            msg["outcome"] = serde_json::Value::from("success");
+        }
         // Sent before the rid is freed, so a retry's submit (which needs the
         // rid free) goes out after it and the backend never refuses the
         // retry. Not under the routes lock: a send can block, and the demux
@@ -614,6 +638,8 @@ fn deliver(routes: &Routes, msg: Inbound) {
                 modality: msg.modality,
                 data: msg.data.into_vec(),
                 metadata: msg.metadata,
+                num_tokens: msg.num_tokens,
+                prompt_tokens: msg.prompt_tokens,
             })),
             false,
         ),
@@ -635,6 +661,7 @@ fn deliver(routes: &Routes, msg: Inbound) {
                 modality: msg.t,
                 data: msg.data.into_vec(),
                 metadata: msg.metadata,
+                ..Default::default()
             })),
             true,
         ),
@@ -660,11 +687,15 @@ fn deliver_batch(routes: &Routes, msg: Inbound) {
         eprintln!("mstar-server bridge: dropping a chunks message with ragged lists");
         return;
     }
+    let counted = msg.token_counts.len() == n && msg.prompt_counts.len() == n;
+    let (mut tokens, mut prompts) = (msg.token_counts.into_iter(), msg.prompt_counts.into_iter());
     let table = routes.lock().expect("routes lock");
     let items = msg.subs.into_iter().zip(msg.modalities).zip(msg.payloads).zip(msg.metadatas);
     for (((sub, modality), data), metadata) in items {
+        let (num_tokens, prompt_tokens) =
+            if counted { (tokens.next().unwrap_or(0), prompts.next().flatten()) } else { (0, None) };
         if let Some(route) = table.routes.get(&sub) {
-            let chunk = ResultChunk { modality, data: data.into_vec(), metadata };
+            let chunk = ResultChunk { modality, data: data.into_vec(), metadata, num_tokens, prompt_tokens };
             let _ = route.tx.send(StreamItem::Chunk(chunk));
         }
     }

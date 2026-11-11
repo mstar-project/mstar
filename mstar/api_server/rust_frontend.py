@@ -10,7 +10,7 @@ protocol are untouched):
     frontend -> bridge:  {t:"submit", rid, sub, text, file_paths,
                           input_modalities, output_modalities, model_kwargs,
                           prompt_parts, streaming, accepts_chunks, report_usage}
-                       | {t:"abort", rid, sub}
+                       | {t:"abort", rid, sub, outcome?}
                        | {t:"ping", rid, sub}
                        | {t:"metrics", rid, sub, refusals:{route, status, count}}
                        | {t:"check_ref_audio", rid, sub, path, decoder, bare}
@@ -19,8 +19,8 @@ protocol are untouched):
                        | {t:"live", rid, sub, op, call, ..., stream?, audio?(bin)}
                        | {t:"end_of_turn", rid, sub, audio(bin)}
                        | {t:"lora", rid, sub, op, lora_name, lora_path?}
-    bridge -> frontend:  {t:"chunk", rid, sub, modality, data(bin), metadata}
-                       | {t:"chunks", subs, modalities, payloads(bin), metadatas}
+    bridge -> frontend:  {t:"chunk", rid, sub, modality, data(bin), metadata, num_tokens, prompt_tokens}
+                       | {t:"chunks", subs, modalities, payloads(bin), metadatas, token_counts, prompt_counts}
                        | {t:"err", rid, sub, msg} | {t:"done", rid, sub}
                        | {t:"pong", rid, sub}
                        | {t:"metrics", rid, sub, data(bin), metadata}
@@ -62,7 +62,10 @@ end, always goes out as ``chunk``.
 
 A submit that sets ``report_usage`` (a chat) gets a last ``chunk`` of
 modality ``usage`` before ``done``: its token counts and finish reason in
-``metadata`` (``APIServer.submit_request``'s ``report_usage``).
+``metadata`` (``APIServer.submit_request``'s ``report_usage``). Every chunk also
+carries ``ResultChunk.num_tokens`` and ``prompt_tokens``, so a reply the
+frontend ends before that chunk (at a stop string) still has its usage; that
+abort carries ``outcome: "success"``, as the reply was whole.
 
 ``sub`` names one submission and is never reused. A client may resubmit its
 ``rid`` as soon as it drops a stream, and that stream's ``done`` or late
@@ -215,6 +218,8 @@ WS_MAX_BYTES_ENV = "MSTAR_WS_MAX_BYTES"
 CLIENT_STREAMS_ENV = "MSTAR_CLIENT_STREAMS"
 #: What ``/v1/realtime`` runs with, as JSON (``realtime_facts``).
 REALTIME_ENV = "MSTAR_REALTIME"
+#: What a chat adapter's port needs of the model's chat template, as JSON (``chat_template_facts``).
+CHAT_TEMPLATE_ENV = "MSTAR_CHAT_TEMPLATE"
 
 
 class WindowOp(StrEnum):
@@ -345,6 +350,19 @@ def conversation_facts(server) -> dict | None:
     return facts
 
 
+def chat_template_facts(adapter) -> dict | None:
+    """``CHAT_TEMPLATE_ENV``'s value for an adapter whose port renders the chat
+    template's switches (``GlmChatAdapter``): whether the model always reasons
+    and the ``chat_template_kwargs`` keys its template reads. ``None`` for any
+    other adapter."""
+    from mstar.api_server.openai.adapters import GlmChatAdapter
+    from mstar.model.multimodal import GLM_TEMPLATE_KWARGS
+
+    if not isinstance(adapter, GlmChatAdapter):
+        return None
+    return {"always_thinks": adapter.always_thinks, "template_kwargs": list(GLM_TEMPLATE_KWARGS)}
+
+
 def realtime_facts(server, adapter, directory: str) -> dict | None:
     """``REALTIME_ENV``'s value for a model with a ``/v1/realtime`` surface.
     ``conversation`` is ``conversation_facts``'. For a realtime transcription
@@ -386,7 +404,7 @@ def launch_rust_server(binary: str, model_name: str, port: int,
                        sample_rate: int | None = None, served_models=None,
                        transcription: dict | None = None, openpi: dict | None = None,
                        ws_max_bytes: int | None = None, client_streams=(),
-                       realtime: dict | None = None) -> subprocess.Popen:
+                       realtime: dict | None = None, chat_template: dict | None = None) -> subprocess.Popen:
     """``timeout_s`` is ``--timeout`` and ``sample_rate`` the model's audio output rate
     (``get_output_sample_rate``); ``None`` leaves the frontend's own default.
     ``served_models`` is the API server's ``ServedModels``, whose LoRA adapters a
@@ -394,7 +412,8 @@ def launch_rust_server(binary: str, model_name: str, port: int,
     ``transcription`` is ``transcription_facts``' for the served model, ``openpi``
     ``openpi_facts``' for its policy, ``ws_max_bytes`` the config's WebSocket
     message limit, ``client_streams`` the model's (``APIServer.client_streams``), and
-    ``realtime`` ``realtime_facts``' for its realtime surface."""
+    ``realtime`` ``realtime_facts``' for its realtime surface, and
+    ``chat_template`` ``chat_template_facts``' for its chat adapter."""
     # The key goes through the environment, not argv, which any local user
     # can read from the process list. ``api_key`` is the resolved setting, so
     # an inherited MSTAR_API_KEY must not override it.
@@ -424,6 +443,9 @@ def launch_rust_server(binary: str, model_name: str, port: int,
     env.pop(REALTIME_ENV, None)
     if realtime is not None:
         env[REALTIME_ENV] = json.dumps(realtime)
+    env.pop(CHAT_TEMPLATE_ENV, None)
+    if chat_template is not None:
+        env[CHAT_TEMPLATE_ENV] = json.dumps(chat_template)
     env.pop(LIBSNDFILE_ENV, None)
     if (libsndfile := soundfile_library()) is not None:
         env[LIBSNDFILE_ENV] = libsndfile
@@ -522,6 +544,8 @@ class RustFrontendBridge:
             "modalities": [c.modality for c in chunks],
             "payloads": [bytes(c.data) for c in chunks],
             "metadatas": [c.metadata for c in chunks],
+            "token_counts": [c.num_tokens for c in chunks],
+            "prompt_counts": [c.prompt_tokens for c in chunks],
         })
 
     # -- request lifecycle ---------------------------------------------------
@@ -588,6 +612,7 @@ class RustFrontendBridge:
                 self._send({
                     "t": "chunk", "rid": rid, "sub": sub, "modality": chunk.modality,
                     "data": bytes(chunk.data), "metadata": chunk.metadata,
+                    "num_tokens": chunk.num_tokens, "prompt_tokens": chunk.prompt_tokens,
                 })
             self._send({"t": "done", "rid": rid, "sub": sub})
         except Exception as e:  # noqa: BLE001 — includes the per-request timeout
@@ -605,10 +630,14 @@ class RustFrontendBridge:
 
     def _abort(self, msg: dict) -> None:
         """The frontend dropped submission ``sub``; a newer one under its rid
-        (the client's retry) may already be running and is left alone."""
+        (the client's retry) may already be running and is left alone. With
+        ``outcome: "success"`` the frontend ended a reply the client has whole
+        (at a stop string), which the metrics count as served."""
         sub = msg.get("sub")
         if sub is None:
             self.server.abort_request(msg["rid"])
+        elif msg.get("outcome") == "success":
+            self.server.abort_submission(self._keys.pop(sub, None), outcome="success")
         else:
             self.server.abort_submission(self._keys.pop(sub, None))
 

@@ -34,6 +34,7 @@ mod media;
 mod protocol;
 mod realtime;
 mod refusals;
+mod reply;
 mod served_models;
 mod lora_admin;
 mod serving;
@@ -686,6 +687,47 @@ async fn audio_voices(State(st): State<AppState>) -> Response {
 
 // ---- POST /v1/chat/completions -------------------------------------------
 
+/// A chat its adapter translated for submission, with the LoRA adapter its
+/// `model` names selected, and what its reply is read with.
+struct ChatSubmission {
+    req: ChatCompletionRequest,
+    args: SubmitArgs,
+    /// The model the reply names: the LoRA adapter that serves it, as vLLM's does.
+    model: String,
+    parser: Option<Box<dyn reply::OutputParser>>,
+    stops: Vec<String>,
+}
+
+/// `req` translated by `adapter`; a refusal is the 400's text, with any
+/// upload it saved removed.
+async fn chat_submission(
+    st: &AppState,
+    adapter: &'static dyn OpenAIAdapter,
+    req: ChatCompletionRequest,
+) -> Result<ChatSubmission, String> {
+    let (dir, remote) = (st.upload_dir.clone(), st.allow_remote);
+    let (req, translated) = blocking(move || {
+        let args = adapter.chat_to_request(&req, &dir, remote);
+        (req, args)
+    })
+    .await;
+    let mut args = translated?;
+    // resolved before it is submitted: the response names the adapter that serves it
+    let read = st.served.select(req.model.as_deref(), &mut args.model_kwargs).and_then(|served| {
+        Ok((served, adapter.output_parser(&req)?, adapter.stop_strings(&req)?))
+    });
+    match read {
+        Ok((served, parser, stops)) => {
+            let model = served.unwrap_or_else(|| st.model_name.clone());
+            Ok(ChatSubmission { req, args, model, parser, stops })
+        }
+        Err(e) => {
+            remove_uploads(&st.upload_dir, &args.file_paths);
+            Err(e)
+        }
+    }
+}
+
 async fn chat_completions(
     State(st): State<AppState>,
     payload: Result<Json<ChatCompletionRequest>, JsonRejection>,
@@ -702,24 +744,29 @@ async fn chat_completions(
         Ok(fmt) => fmt,
         Err(e) => return error(400, &e, "invalid_request_error"),
     };
-    let (dir, remote) = (st.upload_dir.clone(), st.allow_remote);
-    let (req, translated) = blocking(move || {
-        let args = adapter.chat_to_request(&req, &dir, remote);
-        (req, args)
-    })
-    .await;
-    let mut args = match translated {
-        Ok(a) => a,
+    let ChatSubmission {
+        req,
+        mut args,
+        model: model_name,
+        parser,
+        stops,
+    } = match chat_submission(&st, adapter, req).await {
+        Ok(sub) => sub,
         Err(e) => return error(400, &e, "invalid_request_error"),
     };
-    // Resolved before it is submitted: the response names the adapter that served it.
-    let model_name = match select_lora(&st, req.model.as_deref(), &mut args) {
-        Ok(served) => served.unwrap_or_else(|| st.model_name.clone()),
-        Err(r) => {
-            remove_uploads(&st.upload_dir, &args.file_paths);
-            return r;
-        }
-    };
+    let include_usage = req
+        .stream_options
+        .as_ref()
+        .and_then(|o| o.include_usage)
+        .unwrap_or(false);
+    // A reply with structure in its text (reasoning, tool calls), or one that
+    // ends at a stop string, is read as reply events.
+    if parser.is_some() || !stops.is_empty() {
+        let request_id = rid("chatcmpl");
+        let format = reply::chat::ChatReply::new(request_id.clone(), model_name, include_usage);
+        let stream = req.stream.unwrap_or(false);
+        return reply::serve(&st, args, &request_id, stream, parser, stops, format).await;
+    }
     // Frontend-tokenizes fast path: flagged adapters with a loaded tokenizer
     // submit token ids and detokenize the reply in Rust, off the GIL.
     if adapter.frontend_tokenizes() {
@@ -736,7 +783,6 @@ async fn chat_completions(
             Ok(base) => base,
             Err((status, msg)) => return error(status, &msg, error_type(status)),
         };
-        let include_usage = req.stream_options.as_ref().and_then(|o| o.include_usage).unwrap_or(false);
         return chat_sse(base, request_id, model_name, include_usage).into_response();
     }
     match collect(result_stream(&st, &args, &request_id, false)).await {
@@ -1467,6 +1513,7 @@ fn video_ndjson(base: OutStream) -> impl futures::Stream<Item = Result<Bytes, In
                         modality: "error".to_string(),
                         data: message.into_bytes(),
                         metadata: json!({"status": status}),
+                        ..Default::default()
                     })
                 }
             };
@@ -1987,6 +2034,7 @@ async fn generate_finish(
                     modality: "error".to_string(),
                     data: message.into_bytes(),
                     metadata: json!({"status": status}),
+                    ..Default::default()
                 },
             };
             let pieces = if binary {
@@ -2602,7 +2650,7 @@ mod tests {
         };
         assert_eq!((compressed("MP3"), compressed("opus")), (Ok("mp3"), Ok("opus")));
         let pcm = vec![1u8, 0, 2, 0];
-        let chunks = vec![ResultChunk { modality: "audio".into(), data: pcm.clone(), metadata: Value::Null }];
+        let chunks = vec![ResultChunk { modality: "audio".into(), data: pcm.clone(), metadata: Value::Null, ..Default::default() }];
         let resp = build_chat_response("m", "r", chunks, 24000, "pcm").unwrap();
         assert_eq!(resp["choices"][0]["message"]["audio"]["data"], media::b64(&pcm));
     }
@@ -2651,7 +2699,7 @@ mod tests {
         let data = "中文 😀".as_bytes();
         [&data[..1], &data[1..4], &data[4..8], &data[8..]]
             .iter()
-            .map(|p| ResultChunk { modality: "text".to_string(), data: p.to_vec(), metadata: Value::Null })
+            .map(|p| ResultChunk { modality: "text".to_string(), data: p.to_vec(), metadata: Value::Null, ..Default::default() })
             .collect()
     }
 
@@ -2695,7 +2743,7 @@ mod tests {
     fn chat_stream_sends_no_empty_deltas() {
         // the first piece completes no character, and an end token decodes to nothing
         let mut chunks = split_text_chunks();
-        chunks.push(ResultChunk { modality: "text".to_string(), data: Vec::new(), metadata: Value::Null });
+        chunks.push(ResultChunk { modality: "text".to_string(), data: Vec::new(), metadata: Value::Null, ..Default::default() });
         let (content, events) = streamed_content(chunks.into_iter().map(Out::Chunk).collect());
         assert_eq!(content, "中文 😀");
         let deltas: Vec<&Value> = events.iter().map(|e| &e["choices"][0]["delta"]).collect();
@@ -2874,6 +2922,7 @@ mod tests {
             modality: "usage".to_string(),
             data: Vec::new(),
             metadata: json!({"prompt_tokens": 7, "completion_tokens": 4, "finish_reason": finish}),
+            ..Default::default()
         }
     }
 

@@ -3282,6 +3282,7 @@ def main(argv: list[str] | None = None):
             from mstar.api_server.openai.adapters import get_adapter
             from mstar.api_server.rust_frontend import (
                 RustFrontendBridge,
+                chat_template_facts,
                 launch_rust_server,
                 openpi_facts,
                 realtime_facts,
@@ -3303,7 +3304,8 @@ def main(argv: list[str] | None = None):
                 openpi=openpi_facts(api_server.openpi_policy),
                 ws_max_bytes=_ws_max_size(config),
                 client_streams=api_server.client_streams,
-                realtime=realtime_facts(api_server, get_adapter(model_name), bridge_dir))
+                realtime=realtime_facts(api_server, get_adapter(model_name), bridge_dir),
+                chat_template=chat_template_facts(get_adapter(model_name)))
             logger.info("Starting mstar API server (mstar-server) on port %s",
                         args.port)
             bridge = RustFrontendBridge(api_server, bridge_dir)

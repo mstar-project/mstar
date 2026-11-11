@@ -592,6 +592,29 @@ def test_a_reply_its_handler_ends_whole_counts_as_a_success(served, stream):
     assert served.data_worker.aborted == [served.key()], "the request still stops in the engine"
 
 
+@pytest.mark.parametrize("outcome", ["success", None])
+def test_a_reply_mstar_server_ends_whole_counts_as_a_success(served, outcome):
+    """mstar-server ends a reply at a stop string by aborting its submission,
+    saying it was whole: the request stops in the engine and counts as a
+    success, timed like one. A plain abort counts as one."""
+    from mstar.api_server.rust_frontend import RustFrontendBridge
+
+    bridge = object.__new__(RustFrontendBridge)  # what _abort reads
+    bridge.server, bridge._keys = served.server, {}
+    served.server.submit_request(text="x", request_id="r", **TEXT)
+    bridge._keys[7] = served.server.submission_key("r")
+    served.data_worker.chunks.put(ResultChunk(request_id=served.key(), modality="text", data=b"done STOP"))
+    bridge._abort({"t": "abort", "rid": "r", "sub": 7, **({"outcome": outcome} if outcome else {})})
+
+    samples = served.scrape()
+    counted = {o: _count(samples, o) for o in metrics_module.OUTCOMES if _count(samples, o)}
+    assert counted == {outcome or "abort": 1}
+    latencies = samples.get(("mstar_e2e_request_latency_seconds_count", _labels(output_modalities="text")), 0)
+    assert latencies == (1 if outcome else 0)
+    assert samples[("mstar_requests_in_flight", _labels())] == 0
+    assert served.data_worker.aborted == [served.key()], "the request stops in the engine"
+
+
 def test_every_outcome_is_exported_at_zero_once_its_modalities_are_seen(served):
     """A series that first appears at 1 loses that increment to rate() and
     increase(), so the first error must find its series already at 0."""

@@ -78,6 +78,29 @@ def test_the_websocket_facts_are_the_launchers_and_never_inherited(launched, mon
     assert json.loads(env["MSTAR_REALTIME"]) == realtime
 
 
+def test_the_chat_template_facts_are_the_launchers_and_never_inherited(launched, monkeypatch):
+    import json
+
+    monkeypatch.setenv("MSTAR_CHAT_TEMPLATE", '{"always_thinks": true}')
+    rust_frontend.launch_rust_server("bin", "kokoro", 8000, "/b", "/u")
+    assert "MSTAR_CHAT_TEMPLATE" not in launched["env"]
+    facts = {"always_thinks": False, "template_kwargs": ["enable_thinking"]}
+    rust_frontend.launch_rust_server("bin", "glm52", 8000, "/b", "/u", chat_template=facts)
+    assert json.loads(launched["env"]["MSTAR_CHAT_TEMPLATE"]) == facts
+
+
+def test_the_chat_template_facts_are_the_glm_adapters():
+    from mstar.api_server.openai.adapters import get_adapter
+    from mstar.model.multimodal import GLM_TEMPLATE_KWARGS
+
+    keys = list(GLM_TEMPLATE_KWARGS)
+    facts = rust_frontend.chat_template_facts
+    assert facts(get_adapter("glm52")) == {"always_thinks": False, "template_kwargs": keys}
+    assert facts(get_adapter("glm5_next")) == {"always_thinks": True, "template_kwargs": keys}
+    assert facts(get_adapter("ripple_65b")) is None
+    assert facts(None) is None
+
+
 def test_mstar_server_gets_the_libsndfile_soundfile_loaded(launched, monkeypatch):
     monkeypatch.setenv("MSTAR_LIBSNDFILE", "/stale/libsndfile.so")
     monkeypatch.setattr(rust_frontend, "soundfile_library", lambda: None)
