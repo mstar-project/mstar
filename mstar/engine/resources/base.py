@@ -121,7 +121,8 @@ class CachedPrefix(NamedTuple):
 @dataclass(slots=True)
 class CachedLease:
     """Rank 0's lease of a resource's cached prefix, which a TP follower takes as given. Each resource that
-    leases subclasses it with what its followers need."""
+    leases subclasses it with what its followers need, as an ``@dataclass(slots=True)`` with a tag in
+    ``wire_types._TYPES``, so the wire carries it by that tag."""
 
 
 class Residency(IntEnum):
