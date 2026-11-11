@@ -19,13 +19,19 @@ sys.path.insert(0, ".")
 
 from mstar.engine.resources import resident as resident_mod  # noqa: E402
 from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec  # noqa: E402
-from mstar.engine.resources.base import CGSlotKey, Residency, Resource  # noqa: E402
+from mstar.engine.resources.base import CGSlotKey, MoveKind, Residency, Resource  # noqa: E402
 from mstar.engine.resources.kv import manager as manager_mod  # noqa: E402
 from mstar.engine.resources.kv.config import KVLayout, KVReqConfig, KVSpec, KVStep, PagedKVConfig  # noqa: E402
 from mstar.engine.resources.kv.manager import KVManager  # noqa: E402
 from mstar.engine.resources.kv.plan import SINK_PAGE  # noqa: E402
-from mstar.engine.resources.position.config import PositionConfig, PositionStep, PosScheme  # noqa: E402
-from mstar.engine.resources.position.manager import RopeManager  # noqa: E402
+from mstar.engine.resources.position.config import (  # noqa: E402
+    LongRoPE,
+    PositionConfig,
+    PositionReqConfig,
+    PositionStep,
+    PosScheme,
+)
+from mstar.engine.resources.position.manager import LongRopeManager, RopeManager  # noqa: E402
 from mstar.engine.resources.recurrent.config import (  # noqa: E402
     RecurrentBlockConfig,
     RecurrentStateConfig,
@@ -46,11 +52,28 @@ from mstar.testing_utils.resource import StubResource
 from mstar.testing_utils.worker import make_worker
 from mstar.utils import knobs  # noqa: E402
 from mstar.utils.ipc_format import OffloadDelta  # noqa: E402
+from mstar.worker.rebuild import Rebuilds  # noqa: E402
 from mstar.worker.scheduled_batch import ScheduledBatch  # noqa: E402
 
 PAGE = 4
 WALK = "decode"
 CPU = torch.device("cpu")
+MAX_SEQ_LEN = 512
+# a request whose prompt reaches past 16 positions rotates with the long half
+LONGROPE = LongRoPE((1.0,) * 4, (2.0,) * 4, original_max_position_embeddings=16, max_position_embeddings=1024)
+
+# Every test here also runs on LongRoPE (`_all_on_longrope`), where each ingest of a
+# handle flips its table, so a recycled or displaced row changes halves.
+_ON_LONGROPE = {"on": False}
+_INGESTS: dict[tuple[int, int], int] = {}
+
+
+@pytest.fixture(autouse=True, params=[False, True], ids=["rope", "longrope"])
+def _all_on_longrope(request):
+    _ON_LONGROPE["on"] = request.param
+    _INGESTS.clear()
+    yield
+    _ON_LONGROPE["on"] = False
 
 
 class _StubTransfer:
@@ -72,10 +95,14 @@ def _stub_transfer(monkeypatch):
     monkeypatch.setattr(manager_mod, "KVTransferManager", _StubTransfer)
 
 
-def _resources(cpu_offload_pages: int = 0, max_num_pages: int = 64, pool_slots: int = 9):
+def _resources(
+    cpu_offload_pages: int = 0, max_num_pages: int = 64, pool_slots: int = 9, longrope: bool | None = None,
+):
+    if longrope is None:
+        longrope = _ON_LONGROPE["on"]
     kv = KVManager(
         cfg=PagedKVConfig(
-            num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=512,
+            num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=MAX_SEQ_LEN,
             max_num_pages=max_num_pages, page_size=PAGE, cpu_offload_pages=cpu_offload_pages,
         ),
         name="kv", joint_comm_group=None, transfer_engine_info=None, device=CPU, dtype=torch.float32,
@@ -84,16 +111,26 @@ def _resources(cpu_offload_pages: int = 0, max_num_pages: int = 64, pool_slots: 
     pool = RecurrentStatePool(device=CPU, config=RecurrentStateConfig(
         num_layers=1, max_slots=pool_slots, blocks={"state": RecurrentBlockConfig(shape=(2,), dtype=torch.float32)},
     ))
-    rope = RopeManager(PositionConfig(kv_cache="kv"), CPU, max_seq_len=512, head_dim=8)
+    if longrope:
+        rope = LongRopeManager(
+            PositionConfig(kv_cache="kv", longrope=LONGROPE), CPU, max_seq_len=MAX_SEQ_LEN, head_dim=8,
+        )
+    else:
+        rope = RopeManager(PositionConfig(kv_cache="kv"), CPU, max_seq_len=MAX_SEQ_LEN, head_dim=8)
     # page-locked memory needs a GPU, and nothing here copies out of it asynchronously
     rope._pinned_pos_ids_buffer = lambda key, n: torch.empty(n, dtype=torch.long)
     return {"kv": kv, "pool": pool, "rope": rope}
 
 
-def _ingest(res: dict[str, Resource], rid: int) -> None:
+def _ingest(res: dict[str, Resource], rid: int, max_position: int | None = None) -> None:
+    if max_position is None and isinstance(res["rope"], LongRopeManager):
+        # a handle's tables alternate from one ingest to the next, from its id on
+        n = _INGESTS.get((id(res["rope"]), rid), 0)
+        _INGESTS[(id(res["rope"]), rid)] = n + 1
+        max_position = 20 if (rid + n) % 2 else 3
     res["kv"].ingest_request(rid, KVReqConfig())
     res["pool"].ingest_request(rid, None)
-    res["rope"].ingest_request(rid, None)
+    res["rope"].ingest_request(rid, None if max_position is None else PositionReqConfig(max_position=max_position))
 
 
 def _host_step(res, rids, spans, walk="prefill", advance=None):
@@ -171,7 +208,13 @@ def _replay(res, planner, s, promote=True):
     ck = CGSlotKey(bucket=bucket, slot=lease.slot, label="main")
     s.pages = state.token_to_page[: bucket.bs].tolist()
     s.offsets = state.token_to_cache[: bucket.bs].tolist()
-    s.positions = res["rope"]._static_pos_ids[ck][: bucket.bs].tolist()
+    rope = res["rope"]
+    if isinstance(rope, LongRopeManager):
+        # its positions and table ids, the two rows of one buffer
+        both = rope._static_pos_ids[CGSlotKey(bucket=bucket, slot=lease.slot, label="main#longrope")]
+        s.positions, s.table_ids = both.view(2, bucket.num_tokens)[:, : bucket.bs].tolist()
+    else:
+        s.positions = rope._static_pos_ids[ck][: bucket.bs].tolist()
     s.pool_slots = res["pool"]._cg_addressing[ck].slot_indices[: bucket.bs].tolist()
     if planner is not None:
         planner.commit_in_graph(s.captured)
@@ -183,14 +226,19 @@ def _replay(res, planner, s, promote=True):
     return s
 
 
-def _setup(prompts: dict[int, int], cpu_offload_pages: int = 0, max_num_pages: int = 64, pool_slots: int = 9):
-    """The same requests prefilled on resident resources and on a host-planned reference."""
-    live = _resources(cpu_offload_pages, max_num_pages, pool_slots)
-    ref = _resources(cpu_offload_pages, max_num_pages, pool_slots)
+def _setup(
+    prompts: dict[int, int], cpu_offload_pages: int = 0, max_num_pages: int = 64, pool_slots: int = 9,
+    longrope: bool | None = None,
+):
+    """The same requests prefilled on resident resources and on a host-planned
+    reference. With ``longrope``, each request's prompt length picks its table;
+    left None, the module's LongRoPE pass alternates each handle's table."""
+    live = _resources(cpu_offload_pages, max_num_pages, pool_slots, longrope)
+    ref = _resources(cpu_offload_pages, max_num_pages, pool_slots, longrope)
     planner = ResidentPlanner("n", {WALK}, {k: live[k] for k in ("kv", "pool", "rope")}, CPU, max_bs=4)
     for res in (live, ref):
         for rid, n in prompts.items():
-            _ingest(res, rid)
+            _ingest(res, rid, n if longrope else None)
             _host_step(res, [rid], [n])
     return live, ref, planner
 
@@ -200,6 +248,8 @@ def _same(a, b, real: int):
     assert a.offsets[:real] == b.offsets[:real]
     assert a.positions[:real] == b.positions[:real]
     assert a.pool_slots[:real] == b.pool_slots[:real]
+    if hasattr(b, "table_ids"):
+        assert a.table_ids[:real] == b.table_ids[:real]
 
 
 def _row(planner: ResidentPlanner, live, rid: int):
@@ -361,6 +411,29 @@ def test_a_position_offset_carries_through_a_row():
     b = _captured_step(ref, None, [1], slot=0, bs=1)
     _same(a, b, 1)
     assert a.positions[0] == 6
+
+
+def test_longrope_rows_read_their_own_half_of_the_table():
+    """Short and long requests side by side, each row's table id on its own half:
+    through page crossings, a row joining, and rows trading places, so a slot's
+    neighbour reads the other half."""
+    prompts = {1: 3, 2: 17, 3: 8, 4: 20}
+    long = {rid for rid, n in prompts.items() if LONGROPE.is_long(n)}
+    assert long == {2, 4}
+    live, ref, planner = _setup({rid: prompts[rid] for rid in (1, 2, 3)}, longrope=True)
+    batches = [[1, 2, 3]] * 6 + [[2, 1, 4, 3]] * 6 + [[4, 3, 2, 1]] * 6
+    for t, rids in enumerate(batches):
+        if t == 6:
+            for res in (live, ref):
+                _ingest(res, 4, prompts[4])
+                _host_step(res, [4], [prompts[4]])
+        a = _captured_step(live, planner, rids, slot=t % 2, bs=4)
+        b = _captured_step(ref, None, rids, slot=t % 2, bs=4)
+        _same(a, b, len(rids))
+        half = [MAX_SEQ_LEN if rid in long else 0 for rid in rids]
+        assert a.table_ids[: len(rids)] == [p + h for p, h in zip(a.positions[: len(rids)], half, strict=True)]
+        # a padding row reads the trash row, in range of the table
+        assert all(0 <= i < 2 * MAX_SEQ_LEN for i in a.table_ids)
 
 
 def test_a_chunked_prefill_row_is_whole_at_its_first_decode_step():
@@ -730,6 +803,9 @@ def _assert_step_read_its_streams(live, s, rids) -> None:
         assert s.offsets[i] == wrote % PAGE
         assert s.positions[i] == live["rope"].position(rid, "main") - 1
         assert s.pool_slots[i] == live["pool"]._slots[rid]["main"].index
+        rope = live["rope"]
+        if isinstance(rope, LongRopeManager):
+            assert s.table_ids[i] == s.positions[i] + (MAX_SEQ_LEN if rid in rope._long_rids else 0)
 
 
 def _assert_held_rows(planner, live) -> None:
@@ -1063,11 +1139,12 @@ def _preplan_batch(planner, rids, bs):
 
 
 @pytest.mark.parametrize("raiser", ["resident", "runner"])
-def test_a_raise_in_the_preplan_leaves_the_reservation_for_exec(monkeypatch, raiser):
+def test_a_raise_in_the_preplan_gives_its_reservation_back(monkeypatch, raiser):
     """`pre_admit` reserved a crossing page and something raises before the stage
-    is done. The plan thread's wrapper resets the pre-plan: the page stays with the
-    stream, the in-flight mark goes, and exec's admit finds the page and takes no
-    other. The same for a raise from the planner and from the runner's own pre-plan."""
+    is done. The plan thread's wrapper unwinds the pre-plan as it does one thrown
+    away: the page goes back, so rank 0 holds no page a TP follower that never
+    planned the step lacks, the in-flight mark goes, and exec's admit takes the page
+    again. The same for a raise from the planner and from the runner's own pre-plan."""
     res = _resources()
     planner = ResidentPlanner("n", {WALK}, {k: res[k] for k in ("kv", "pool", "rope")}, CPU, max_bs=4)
     _ingest(res, 1)
@@ -1097,14 +1174,14 @@ def test_a_raise_in_the_preplan_leaves_the_reservation_for_exec(monkeypatch, rai
     assert engine._pre_plan_done["n"].recorded
     assert engine._runner._pre_admitted is None and not engine._runner.staged
     assert not stream.step_in_flight
-    assert len(stream.page_indices) == 2
-    pages, free = list(stream.page_indices), kv._arena.num_free
+    assert len(stream.page_indices) == 1
+    free = kv._arena.num_free
     kv.assert_pages_conserved()
 
-    # exec re-drives it: the page it finds is the one pre_admit took
+    # exec re-drives it and takes the crossing page itself
     s = _captured_step(res, planner, [1], slot=1, bs=1)
-    assert stream.page_indices == pages and kv._arena.num_free == free
-    assert s.pages[0] == pages[1]
+    assert len(stream.page_indices) == 2 and kv._arena.num_free == free - 1
+    assert s.pages[0] == stream.page_indices[1]
     _assert_step_read_its_streams(res, s, [1])
     _assert_row(planner, res, 1)
     kv.assert_pages_conserved()
@@ -1174,8 +1251,11 @@ def _offload_engine(resources, planner):
 
     engine = make_engine(
         _resources=resources,
+        _resource_nodes={key: frozenset({"n"}) for key in resources},
         _submodules={"n": make_mgmt(resources=resources, resident=planner)},
         _graph_runtime=SimpleNamespace(get_rid_string=str, get_rid_handle=int),
+        # these requests were taken in by their resources alone, so no admission queue holds them
+        _runner=SimpleNamespace(readmit=lambda rid, node: None),
     )
     return engine
 
@@ -1314,6 +1394,8 @@ def test_an_offload_another_node_causes_gives_the_slot_up():
         },
         _graph_runtime=SimpleNamespace(get_rid_string=str, get_rid_handle=int),
         _resource_planners=dict.fromkeys(owned, planner),
+        # these requests were taken in by their resources alone, so no admission queue holds them
+        _runner=SimpleNamespace(readmit=lambda rid, node: None),
     )
 
     # a step of m's over n's two short rows, crossing a page: the pool refuses
@@ -1365,8 +1447,8 @@ def test_a_follower_replaying_an_offload_gives_the_slot_up_too():
     engine = _offload_engine({k: live[k] for k in ("kv", "pool", "rope")}, planner)
     engine._tp_follower_nodes = {"n"}
     delta = OffloadDelta.new()
-    delta.add_offloaded("1")
-    assert engine.apply_resident_delta("n", delta)
+    delta.add(MoveKind.OFFLOAD, "1", node="n")
+    assert engine.apply_resident_delta(delta, Rebuilds({}, {}))
     assert planner.slot_of(1) is None
 
 
@@ -2024,8 +2106,6 @@ def test_qwen35_decode_builds_its_rope_in_the_graph_on_every_config(monkeypatch,
 @pytest.mark.parametrize("rows", ["loopback", "own_ids"])
 def test_qwen35_captured_decode_preprocess_reads_nothing_the_tables_fill(rows):
     """The graph fills positions and write locations, after `preprocess`."""
-    from mstar.model.keys import SAMPLER
-
     _, llm = _qwen35_llm()
     token = torch.tensor([5, 6])
     inputs = [
@@ -2035,8 +2115,10 @@ def test_qwen35_captured_decode_preprocess_reads_nothing_the_tables_fill(rows):
     ]
     node = llm(None, SimpleNamespace(stop_token_ids=(1,)))
     node._position_ids_3d = lambda inputs: pytest.fail("read positions")
-    sampler = SimpleNamespace(loopback_tokens=lambda rids: token)
-    engine_inputs = SimpleNamespace(captured=True, request_ids=[1, 2], resources={SAMPLER: sampler})
+    node.sampler = SimpleNamespace(
+        _open=True, resource=SimpleNamespace(loopback_tokens=lambda rids: token), rows=(1, 2),
+    )
+    engine_inputs = SimpleNamespace(captured=True, request_ids=[1, 2])
     out = node.preprocess("decode", engine_inputs, inputs)
     assert set(out) == {"input_ids"}
 

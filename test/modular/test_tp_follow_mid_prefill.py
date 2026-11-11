@@ -12,6 +12,7 @@ import pytest
 sys.path.insert(0, ".")
 
 from mstar.engine.chunking import ChunkRange
+from mstar.engine.resources import Residency
 from mstar.graph.runtime.base import ColumnarEdgeSpecs, SpeculationPrepOutput
 from mstar.testing_utils.worker import make_scheduler, make_worker
 from mstar.utils.ipc_format import ScheduleTPNode
@@ -21,6 +22,7 @@ from mstar.worker.speculation import Speculator
 from mstar.worker.stream_buffers import StreamBufferManager
 
 NODE, MIXED = "LLM", "mixed"
+_ENGINE = SimpleNamespace(residency=lambda node, rid: Residency.RESIDENT)
 
 
 def _follower(head: ScheduleTPNode) -> Speculator:
@@ -28,7 +30,7 @@ def _follower(head: ScheduleTPNode) -> Speculator:
     assembling the step."""
     capped = []
     scheduler = make_scheduler(
-        engine_manager=SimpleNamespace(get_engine=lambda node: None), parallel_leader_nodes=set(),
+        engine_manager=SimpleNamespace(get_engine=lambda node: _ENGINE), parallel_leader_nodes=set(),
         chunk_loops=ChunkLoops([(NODE, "prefill_text")]),
         graph_runtime=SimpleNamespace(
             get_rid_handle=lambda wire_rid: wire_rid,

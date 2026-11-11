@@ -19,10 +19,12 @@ KV_CACHE = keys.KV_CACHE
 ATTN = "attn"
 GDN_STATE = "gdn_state"
 LINEAR_ATTN = "linear_attn"
-ROPE = keys.ROPE
 SAMPLER = keys.SAMPLER
-# the ViT tower's cacheless attention, on the `vision_encoder` node
+# the ViT tower's tokens and its cacheless attention over them, on the `vision_encoder` node
+VISION_TOKENS = "vision_tokens"
 VISION_ATTN = keys.VISION_ATTN
+# the GDN state's conv update, with no spec of its own: the `LinearAttnSpec` under `LINEAR_ATTN` runs both kernels
+CONV = "gdn_conv"
 
 
 # The ViT tower's config is the shared Qwen one (read off ``config.json``'s
@@ -116,16 +118,3 @@ class Qwen3_5Config:
     def rotary_dim(self) -> int:
         """Only part of each head is rotated; mrope_section covers half of it."""
         return int(self.head_dim * self.partial_rotary_factor)
-
-    def resource_layer_index(self, layer_idx: int) -> int:
-        """Where a stack layer sits among *its own* resource's layers.
-
-        The KV cache holds only full-attention layers and the recurrent pool
-        only linear ones; a stack index would read another layer's state.
-        """
-        same = (
-            self.linear_layer_indices
-            if self.layer_types[layer_idx] == LINEAR_ATTENTION
-            else self.full_layer_indices
-        )
-        return same.index(layer_idx)

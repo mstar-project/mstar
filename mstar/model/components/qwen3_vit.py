@@ -324,7 +324,10 @@ class VisionAttention(nn.Module):
     shards, via the loader's stacked-param rules).
     """
 
-    def __init__(self, config: ViTBlockConfig, attn_key: str, label: str | None = None):
+    def __init__(
+        self, config: ViTBlockConfig, attn_key: str, label: str | None = None,
+        array: str | None = None, layer: int | None = None,
+    ):
         super().__init__()
         hidden = config.hidden_size
         self.num_heads = config.num_heads
@@ -336,6 +339,9 @@ class VisionAttention(nn.Module):
         self.attn_key = attn_key
         self.label = label
         self.ragged_attn = None
+        self.array = array
+        self.layer = layer
+        self.state = None
 
     def bind_resources(self, resources: dict) -> None:
         """See ``NodeSubmodule.bind_node_resources``. A node without the resource
@@ -343,13 +349,17 @@ class VisionAttention(nn.Module):
         a deployment that never builds the vision node)."""
         self.ragged_attn = resources.get(self.attn_key, self.ragged_attn)
 
+    def bind_state(self, handles: dict) -> None:
+        """See ``Attention.bind_state``."""
+        self.state = handles.get(self.array)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
     ) -> torch.Tensor:
-        if self.ragged_attn is None:
+        if self.ragged_attn is None and self.state is None:
             raise ValueError(
                 "the vision tower has no ragged attention resource; declare a "
                 f"RaggedAttentionSpec under {self.attn_key!r} for its node"
@@ -369,7 +379,11 @@ class VisionAttention(nn.Module):
         q = ((qf * c) + (_rotate_half(qf) * s)).to(dtype)
         k = ((kf * c) + (_rotate_half(kf) * s)).to(dtype)
 
-        out = self.ragged_attn.run(q, k, v, label=self.label)
+        if self.state is not None:
+            self.state.add(self.layer, k=k, v=v)
+            out = self.state.read(self.layer, q)
+        else:
+            out = self.ragged_attn.run(q, k, v, label=self.label)
         return self.proj(out.reshape(seq_len, -1).contiguous())
 
 
@@ -380,14 +394,15 @@ class VisionBlock(nn.Module):
     attends within (windows or frames, for a windowed tower)."""
 
     def __init__(
-        self, config: ViTBlockConfig, attn_key: str, label: str | None = None, eps: float = 1e-6, *,
+        self, config: ViTBlockConfig, attn_key: str, label: str | None = None, eps: float = 1e-6,
+        array: str | None = None, layer: int | None = None, *,
         norm: Callable[[int], nn.Module] | None = None, mlp: nn.Module | None = None,
     ):
         super().__init__()
         norm = norm or functools.partial(nn.LayerNorm, eps=eps)
         self.norm1 = norm(config.hidden_size)
         self.norm2 = norm(config.hidden_size)
-        self.attn = VisionAttention(config, attn_key, label)
+        self.attn = VisionAttention(config, attn_key, label, array, layer)
         self.mlp = mlp if mlp is not None else VisionMLP(config)
 
     def forward(

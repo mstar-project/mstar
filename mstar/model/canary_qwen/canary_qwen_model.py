@@ -67,7 +67,14 @@ from mstar.model.components.request_kwargs import (
     sampling_config,
     sampling_defaults,
 )
-from mstar.model.multimodal import MEDIA_LAYOUT, MediaEncoder, expand_media_pads, media_layout, media_walk_name
+from mstar.model.multimodal import (
+    MEDIA_LAYOUT,
+    MediaEncoder,
+    MediaRun,
+    expand_media_pads,
+    media_layout,
+    media_walk_name,
+)
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.utils import TextOutput, base_language, check_kv_pools_fit, kv_pages
 from mstar.utils.hf_snapshot import resolve_snapshot_dir
@@ -101,14 +108,14 @@ def merge_lora(
         raise KeyError(f"incomplete LoRA weights for {sorted(pending)[:3]}")
 
 
-def audio_encoder(pad_id: int) -> MediaEncoder:
+def audio_encoder() -> MediaEncoder:
     """The ``audio_encoder`` node: a clip's samples in, one LLM-space row per
     audio placeholder out, on the ``prefill`` walk (configs and metrics read walk names)."""
-    return MediaEncoder("audio", "audio_encoder", ("audio",), "encoder_states", (pad_id,), walk="prefill")
+    return MediaEncoder("audio", "audio_encoder", ("audio",), "encoder_states", walk="prefill")
 
 
 # the media walk the LLM node knows its prompts by, named from the encoder
-PREFILL_WALK = media_walk_name([audio_encoder(0)])
+PREFILL_WALK = media_walk_name([audio_encoder()])
 
 
 class CanaryQwenModel(Model):
@@ -158,7 +165,7 @@ class CanaryQwenModel(Model):
         self.config.stop_token_ids = frozenset(
             self.tokenizer.convert_tokens_to_ids(t) for t in ("<|im_end|>", "<|endoftext|>")
         )
-        self.audio_encoder = audio_encoder(self.audio_token_id)
+        self.audio_encoder = audio_encoder()
         self._detokenizer = ByteLevelDetokenizer(self.tokenizer)
         self._submodule_cache: dict[str, NodeSubmodule | None] = {}
 
@@ -305,7 +312,8 @@ class CanaryQwenModel(Model):
             raise ValueError(f"Canary-Qwen transcribes English only; got language {kw['language']!r}")
         frames = self.config.encoder.output_lengths(samples.shape[0] // HOP_LENGTH)
         pads = expand_media_pads(
-            self.prompt_ids(instruction.strip() or DEFAULT_INSTRUCTION), {self.audio_token_id: [frames]},
+            self.prompt_ids(instruction.strip() or DEFAULT_INSTRUCTION),
+            {self.audio_token_id: [MediaRun(frames, self.audio_encoder.output)]},
         )
         length = int(pads.ids.numel())
         # rows, not ids: the audio placeholders are the same for every clip of a length
@@ -313,7 +321,7 @@ class CanaryQwenModel(Model):
             spans=(Span("rows", PREFILL_WALK, length, length, "text_inputs"),),
             growth=((DECODE_LOOP, 1),),
         )}}
-        layout = media_layout(pads, {self.audio_token_id: self.audio_encoder.output})
+        layout = media_layout(pads)
         return ProcessPromptOutput(
             {"audio": [samples], "text_inputs": [pads.ids]}, {MEDIA_LAYOUT: layout, "kv_layout": kv_layout},
         )
@@ -325,7 +333,7 @@ class CanaryQwenModel(Model):
         return {"audio": 1}
 
     def text_output(self) -> TextOutput:
-        return TextOutput(self._detokenizer)
+        return TextOutput(self._detokenizer, self.config.stop_token_ids)
 
     # -------------------------------------------------------------------
     # submodules

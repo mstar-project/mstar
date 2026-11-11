@@ -7,10 +7,8 @@ row-parallel ``o`` target. Other LoRA test modules import the helpers defined he
 
 from __future__ import annotations
 
-import gc
 import threading
 import time
-import weakref
 
 import pytest
 import torch
@@ -22,6 +20,8 @@ from safetensors.torch import save_file  # noqa: E402
 from mstar.distributed.base import PARALLEL_AXES  # noqa: E402
 from mstar.engine.resources.base import EngineResourceInfo, Residency, Resource  # noqa: E402
 from mstar.engine.resources.lora import LoraModuleRef, LoraReqConfig, LoraSpec, LoraTarget  # noqa: E402
+from mstar.engine.resources.lora.checkpoint import read_lora_file  # noqa: E402
+from mstar.engine.resources.lora.identity import adapter_digest  # noqa: E402
 from mstar.engine.resources.lora.pool import ZERO_SLOT, LoraAdapterPool  # noqa: E402
 from mstar.engine.resources.lora.store import LoraAdapterStore  # noqa: E402
 from mstar.engine.resources.runner import StepRunner  # noqa: E402
@@ -260,7 +260,7 @@ def test_a_request_selected_on_other_weights_than_the_pool_serves_is_refused(ada
     first's pages."""
     _, paths = adapters
     pool = make_pool({"a1": paths["a1"]})
-    digest = LoraAdapterStore(make_spec({}), pin=False).read("a1", paths["a1"]).digest
+    digest = adapter_digest(read_lora_file(paths["a1"]))
     pool.ingest_request("same", LoraReqConfig("a1", digest))
     with pytest.raises(ValueError, match="other weights"):
         pool.ingest_request("stale", LoraReqConfig("a1", b"\x00" * 32))
@@ -349,9 +349,10 @@ def test_capture_and_padding_rows_take_nothing_and_buffers_are_per_slot_key(adap
 def test_store_shards_for_its_rank_and_keeps_an_lru(adapters):
     _, paths = adapters
     spec = make_spec(paths)
-    whole = LoraAdapterStore(spec).load("a1", paths["a1"])
+    digests = spec.adapter_digests
+    whole = LoraAdapterStore(spec).load("a1", paths["a1"], digests["a1"])
     for rank in range(2):
-        part = LoraAdapterStore(spec, rank=rank, world_size=2).load("a1", paths["a1"])
+        part = LoraAdapterStore(spec, rank=rank, world_size=2).load("a1", paths["a1"], digests["a1"])
         # qkv: B rows split per slice, A whole; o: A columns split, B whole
         torch.testing.assert_close(part.b["qkv"][:, :8], whole.b["qkv"][:, rank * 8:(rank + 1) * 8])
         torch.testing.assert_close(part.b["qkv"][:, 8:12], whole.b["qkv"][:, 16 + rank * 4:16 + (rank + 1) * 4])
@@ -361,33 +362,32 @@ def test_store_shards_for_its_rank_and_keeps_an_lru(adapters):
         assert part.digest == whole.digest
     store = LoraAdapterStore(make_spec(paths, cpu_capacity=2))
     for name in ("a1", "a2"):
-        store.load(name, paths[name])
+        store.load(name, paths[name], digests[name])
     assert not store.hold("a1")  # a1 now most recent
-    store.load("a3", paths["a3"])
+    store.load("a3", paths["a3"], digests["a3"])
     assert "a1" in store and "a3" in store and "a2" not in store
     assert store.get("a3").digest != whole.digest == store.get("a1").digest
 
 
-def test_a_runtime_load_keeps_no_copy_until_a_request_names_it(adapters):
-    """Loads past ``cpu_capacity`` pin nothing outside the host tier's bound: a load's read
-    checks the file and is dropped, and the first request on the adapter reads it again."""
+def test_a_runtime_load_stages_no_copy_until_a_request_names_it(adapters):
+    """Loads past ``cpu_capacity`` pin nothing outside the host tier's bound: a load checks
+    the file and stages no copy (an experts target's is GBs, pinned), and the first request
+    on the adapter reads it in."""
     _, paths = adapters
     pool = make_pool({}, cpu_capacity=1)
-    copies, read = [], pool.store.read
+    reads, read = [], pool.store.read
 
-    def tracked(*args):
-        adapter = read(*args)
-        copies.append(weakref.ref(adapter))
-        return adapter
-    digests = {n: LoraAdapterStore(pool.spec, pin=False).read(n, paths[n]).digest for n in ("a1", "a2", "a3")}
+    def tracked(name, path, digest):
+        reads.append(name)
+        return read(name, path, digest)
+    digests = {n: adapter_digest(read_lora_file(paths[n])) for n in ("a1", "a2", "a3")}
     pool.store.read = tracked
     for name in ("a1", "a2", "a3"):
         pool.load_adapter(name, paths[name], digests[name])
-    gc.collect()
-    assert len(copies) == 3 and not any(ref() for ref in copies)
+    assert reads == [] and all(pool.serves(n) for n in ("a1", "a2", "a3"))
     ingest(pool, "r", "a2")
     settle_reads(pool)
-    assert "a2" in pool.store and len(copies) == 4
+    assert "a2" in pool.store and reads == ["a2"]
 
 
 # --- numerics and compile ------------------------------------------------------------------------
@@ -747,8 +747,8 @@ def test_a_request_on_a_resident_adapter_waits_for_its_host_copy(adapters):
     runner.remove_request("h")
     ingest(pool, "x", "a2")  # drops a1 from the tier
     settle_reads(pool)
-    gate, read = threading.Event(), pool.store._read
-    pool.store._read = lambda name, path: gate.wait(10) and read(name, path)
+    gate, read = threading.Event(), pool.store.read
+    pool.store.read = lambda name, path, digest: gate.wait(10) and read(name, path, digest)
     ingest(pool, "r", "a1")
     assert pool.resident_slot("a1") is not None and "a1" not in pool.store
     assert runner.admit_retrieve("r", "LLM", "decode").queued
@@ -763,14 +763,14 @@ def test_a_request_whose_read_fails_fails_without_waiting_for_a_slot(adapters):
     _, paths = adapters
     pool = make_pool(paths, max_slots=1, cpu_capacity=1)
     runner = lora_runner(pool)
-    gate, read = threading.Event(), pool.store._read
+    gate, read = threading.Event(), pool.store.read
 
-    def unreadable(name, path):
+    def unreadable(name, path, digest):
         if name == "a2":
             gate.wait(10)
             raise OSError("a2 is unreadable")
-        return read(name, path)
-    pool.store._read = unreadable
+        return read(name, path, digest)
+    pool.store.read = unreadable
     for rid, name in [("r1", "a1"), ("r2", "a2")]:
         ingest(pool, rid, name)
     assert admitted(runner, "r1") and run_step(pool, ["r1"]).ok
@@ -788,14 +788,14 @@ def test_a_request_let_through_on_a_failed_read_takes_no_slot_a_counted_one_need
     _, paths = adapters
     pool = make_pool(paths, max_slots=2, cpu_capacity=1)
     runner = lora_runner(pool)
-    gate, read = threading.Event(), pool.store._read
+    gate, read = threading.Event(), pool.store.read
 
-    def unreadable(name, path):
+    def unreadable(name, path, digest):
         if name == "a2":
             gate.wait(10)
             raise OSError("a2 is unreadable")
-        return read(name, path)
-    pool.store._read = unreadable
+        return read(name, path, digest)
+    pool.store.read = unreadable
     for rid, name in [("r1", "a1"), ("rB", "a3")]:
         ingest(pool, rid, name)
     settle_reads(pool)
@@ -822,13 +822,13 @@ def test_a_request_on_a_resident_adapter_whose_read_failed_still_counts_a_slot(a
     runner.remove_request("h")
     ingest(pool, "x", "a2")  # drops a1 from the tier
     settle_reads(pool)
-    read = pool.store._read
+    read = pool.store.read
 
-    def unreadable(name, path):
+    def unreadable(name, path, digest):
         if name == "a1":
             raise OSError("a1 is unreadable")
-        return read(name, path)
-    pool.store._read = unreadable
+        return read(name, path, digest)
+    pool.store.read = unreadable
     for rid, name in [("r", "a1"), ("y", "a3")]:
         ingest(pool, rid, name)
     settle_reads(pool)
@@ -900,3 +900,12 @@ def test_a_request_waiting_for_a_slot_holds_no_kv(adapters):
     runner.remove_request("r1")
     assert runner.admit_waiting(_nothing_published) == [("LLM", "r2"), ("LLM", "base")]
     assert kv.held == {"base", "r2"} and run_step(pool, ["r2", "base"]).ok
+
+
+def test_a_pool_does_not_hold_its_node_off_resident_planning(adapters):
+    """Its addressing comes from the step's segments and its own slots, so a
+    resident step plans it on the host like any other step."""
+    from mstar.engine.resources.resident import build_planner
+
+    planner, why = build_planner("LLM", ("decode",), {"lora": make_pool(adapters[1])}, {}, torch.device("cpu"), 4)
+    assert planner is not None and why == ""

@@ -7,7 +7,7 @@ The plan has four parts, in this order of priority. Size the hardware for the la
 3. **Correctness against the reference** for anything that changes what a model outputs (SKILL.md step 1). Media that metrics can't judge goes to a human.
 4. **Regression suites** for what the touched paths can break, from the table below.
 
-Every served check uses a real checkpoint. Where both a Python and a Rust implementation exist, the check runs on both; otherwise it runs on the default Rust runtime.
+Every served check uses a real checkpoint. Checks run on the Rust runtime, through both frontends where the API server is touched.
 
 ## Risk probes by layer
 
@@ -34,7 +34,7 @@ Probes that found bugs our earlier runs missed, from human reviews of the same P
 | `mstar/worker/`, `mstar/engine/engine.py`, `mstar/engine/accelerator_graph_runner.py`, `mstar/graph/`, `mstar/conductor/` | **worker A/B set** below |
 | `mstar/engine/resources/<kind>` | the worker A/B rows whose models declare that resource (grep `get_node_resources` for the class), plus the PR's own model |
 | `mstar/distributed/`, `mstar/model/components/distributed/`, anything TP/SP | the TP rows of the worker A/B set |
-| `mstar/communication/`, `rust/`, `mstar/graph/` runtime | worker A/B set. Every functional and risk check runs on both the Rust and the Python runtime (`MSTAR_RUST_ZMQ=0 MSTAR_RUST_GRAPH=0`), plus a functional smoke over `--tensor-comm-protocol TCP` (untimed) (AGENTS.md invariant 5) |
+| `mstar/communication/`, `rust/`, `mstar/graph/` runtime | worker A/B set, plus a functional smoke over `--tensor-comm-protocol TCP` (untimed). There is one runtime, in `rust/` (AGENTS.md invariant 5); a `rust/` change also runs `test/rust` |
 | `mstar/api_server/` | functional suite for each modality family it routes (text, image, speech, video), including streaming and the OpenAI routes the change touches, on both the Python and the Rust frontend (`--rust-frontend`); the CPU-overhead row if it sits on the request path |
 | `docs/`, `test/` or comments only | no served run unless the PR claims a number; read CPU test results from CI, run changed tests only if they need a GPU or weights, then say so and stop |
 | `benchmark/` | run the changed script end to end, with a real checkpoint, on the hardware it's meant for |
@@ -86,9 +86,11 @@ Save outputs for every functional check that produces them, so they can be revie
 - Name files so the PR/main pair sits side by side: `<suite>/<prompt-id>.<arm>.<ext>`, with the prompt text in `<suite>/prompts.txt`.
 - For a PR that changes a numerical path, put the reference, PR and main outputs for the same prompt and seed next to each other. Include a main-vs-main pair from two server processes as the noise floor (benchmarking skill: "Output-equivalence checks need a same-code control").
 - When the metrics can't tell whether a media output is right, the row says "needs human review". List the files and what to listen or look for in `media/README.md`.
+- **Streaming and duplex:** record what a person would hear and see. For a duplex conversation, one stereo file with the input on the left channel and the model's output on the right, on one timeline from the session's start, so overlaps, barge-ins and gaps are audible; add the timed transcript of both sides as `<name>.txt`. For streamed audio or video, save the stream as received (chunk boundaries and all), not a re-synthesis.
+- **Keep it small enough to publish:** a few representative files per suite and arm, at most about 100 MB per run. Video as H.264 MP4 at 480p or less (`ffmpeg -vf scale=-2:480 -c:v libx264 -crf 28 -c:a aac`), audio as MP3 or Opus unless the check is about bit-exactness (then keep the WAV and say so). Link files from `report.md` by their path under `media/`, relative, so they resolve wherever the directory is published.
 
 ## Hardware sizing
 
 - GPU count = the largest `ranks` + 1 among the configs in the plan (respecting `rank_devices`). Most models fit on one 80 GB GPU, so 80 GB-class Hopper is the floor; ask for more VRAM only when a config needs it (e.g. `cosmos3_super` at TP2).
-- Hopper or newer only: H100 (PCIe/SXM/NVL), H200, GH200, B200, B300.
+- Hopper or newer only: H100 (PCIe/SXM/NVL), H200, GH200, B200, B300; for AMD (ROCm) paths, MI300X or newer (MI300X, MI325X, MI350X, MI355X). ROCm's torch honours `CUDA_VISIBLE_DEVICES` as well as `HIP_VISIBLE_DEVICES`.
 - When GPU count is driven by one optional row (say the 4-GPU Cosmos TP2+SP2), check whether the 2-GPU `_tp2` and `_sp2` configs cover the PR's risk. If they do, take the cheaper box and say in the report which row you substituted.
