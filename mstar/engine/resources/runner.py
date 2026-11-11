@@ -535,10 +535,9 @@ class StepRunner:
 
     def _settle_repeats(self, step: SubmoduleStep) -> None:
         """Narrow the step's replays to what its resources allow, before any
-        of them reserves for it. Every resource the step declares answers."""
+        of them reserves for it. Every resource the step declares answers.
+        Called only for a step that asks for more than one."""
         ctx = step.ctx
-        if ctx.repeats == 1:
-            return
         if ctx.resident is None:
             ctx.repeats = 1
             return
@@ -572,7 +571,7 @@ class StepRunner:
             ready = pre[1]
             # this admit owns the stage's reservations now, so a refusal below unwinds them once
             self._pre_admitted = None
-        else:
+        elif step.ctx.repeats != 1:
             self._settle_repeats(step)
         admitted: list[str] = []
         for key in self._keys_for(step):
@@ -648,7 +647,8 @@ class StepRunner:
 
         Unwound on refusal exactly as ``admit`` is.
         """
-        self._settle_repeats(step)
+        if step.ctx.repeats != 1:
+            self._settle_repeats(step)
         ready = True
         admitted: list[str] = []
         for key in self._preplan_keys_for(step):

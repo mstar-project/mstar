@@ -73,8 +73,12 @@ class KVResidentTables:
 
     def refresh_len(self, stored_len: int, slot: int, writes: ResidentWrites) -> None:
         """A row a host-planned step advanced; its columns stay until `stage_step`.
-        Written once, ahead of the replays: `cells` replay with the graph."""
-        writes.run(slot, self.kv_len.col, [stored_len])
+        A cell, which rides the graph's scatter; a step that repeats writes it
+        once, ahead of the replays, since `cells` replay with the graph."""
+        if writes.repeats == 1:
+            writes.put(self.kv_len.cell(slot), stored_len)
+        else:
+            writes.run(slot, self.kv_len.col, [stored_len])
         self.host_len[slot] = stored_len
 
     def stage_step(self, plan: ResidentPlan, stream_len, stream_pages, rewrite) -> None:
@@ -97,7 +101,9 @@ class KVResidentTables:
             return
         slots = plan.slots
         cols = self.host_cols[slots]
-        need = (self.host_len[slots] + plan.repeats - 1) // self.page_size + 1
+        # a step that repeats needs the page of its last replay's token
+        last = self.host_len[slots] if plan.repeats == 1 else self.host_len[slots] + (plan.repeats - 1)
+        need = last // self.page_size + 1
         rows = np.flatnonzero(need > cols)
         if not rows.size:
             return

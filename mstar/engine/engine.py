@@ -233,6 +233,9 @@ class SubmoduleManagement:
     fp32_precision: Fp32Precision | None = None
     # the node's request slots and device tables, where it runs on them
     resident: ResidentPlanner | None = None
+    # a deployment asks a walk of this node to repeat (`Engine.enable_repeats`):
+    # only then does a step take the repeat path; every other node runs main's
+    may_repeat: bool = False
     # the serving config's prefill_token_buckets for the node: capture walk -> ladder,
     # and piecewise region label -> ladder
     token_ladders: Mapping[str, Any] = field(default_factory=dict)
@@ -2368,7 +2371,7 @@ class Engine:
                 plan_done_event=batch.preplan_event,
                 launch_started_event=release_event,
             )
-            return cg_runner.repeat(lease, out, ctx.repeats)
+            return cg_runner.repeat(lease, out, ctx.repeats) if submodule_mgmt.may_repeat else out
         if release_event is not None:
             release_event.set()
         if running_batched:
@@ -2978,6 +2981,7 @@ class Engine:
         """Before capture: the deployment asks these walks of the node to repeat,
         which turns on what the node says they need (``enable_repeats``)."""
         mgmt = self._submodules[node_name]
+        mgmt.may_repeat = True
         mgmt.submodule.enable_repeats(walks)
         if (loopback := getattr(mgmt.submodule, "device_loopback", None)) is not None:
             mgmt.resources[loopback.sampler].enable_device_loopback_reader()

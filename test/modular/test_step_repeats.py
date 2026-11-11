@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 from mstar.model.submodule_base import (
     ARNodeSubmodule,
+    BatchedModelOutput,
     DeviceLoopback,
     TokenStop,
 )
@@ -48,3 +49,34 @@ def test_a_plain_ar_node_is_refused_until_it_declares_what_a_repeat_reads():
         loop="decode_loop", buffer="new_token", stop_ids=frozenset({2}), sampler="sampler", withhold=("frame",),
     )
     assert declared.get_stop_policies(WALK) is None
+
+
+def test_a_node_no_deployment_asked_to_repeat_replays_as_main():
+    """With ``step_repeats`` unset a decode step's forward is main's: the replay
+    alone, nothing of the repeat path around it (Qwen3.5 at c64 spent ~30 us a
+    step there)."""
+    replayed = BatchedModelOutput()
+
+    class Runner:
+        def __init__(self):
+            self.calls = []
+
+        def run_forward(self, lease, preprocessed, **kwargs):
+            self.calls.append("run_forward")
+            return replayed
+
+        def __getattr__(self, name):
+            self.calls.append(name)
+            return lambda *args: None
+
+    ctx = SimpleNamespace(graph_walk=WALK, resident=None, repeats=1, continues=None)
+    batch = SimpleNamespace(step_context=ctx, preplan_event=None)
+    inputs = SimpleNamespace(per_request_info={})
+    runner = Runner()
+    make_engine()._forward(batch, make_mgmt(), runner, inputs, {}, object(), True, [1])
+    assert runner.calls == ["run_forward"]
+
+    # a node a deployment asked to repeat takes its iterations from the repeat path
+    runner = Runner()
+    make_engine()._forward(batch, make_mgmt(may_repeat=True), runner, inputs, {}, object(), True, [1])
+    assert "repeat" in runner.calls

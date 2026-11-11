@@ -409,7 +409,7 @@ class RopeManager(PositionManager):
         )
 
     def commit(self, step: PositionStep, ctx: StepContext):
-        all_counters = self._counters
+        all_counters, repeats = self._counters, ctx.repeats
         for segment, advance in zip(
             step.segments, self._advances(step), strict=True
         ):
@@ -417,7 +417,7 @@ class RopeManager(PositionManager):
                 counters = all_counters.get(segment.request_id)
                 if counters is None:
                     counters = all_counters[segment.request_id] = {}
-                counters[segment.label] = counters.get(segment.label, 0) + advance * ctx.repeats
+                counters[segment.label] = counters.get(segment.label, 0) + advance * repeats
 
         # post-forks copy the source after this step advanced it, matching
         # where KV applies them
