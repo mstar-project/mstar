@@ -177,8 +177,10 @@ def sse_response(api, request_id: str, body) -> ReleasingStreamingResponse:
                                       media_type="text/event-stream", headers={"Cache-Control": "no-cache"})
 
 
-def finish_reason(parser, usage: Usage, stop_string: str | None = None) -> str:
-    if parser is not None and parser.finish_reason == "tool_calls":
+def finish_reason(parser, usage: Usage, stop_string: str | None, called: bool) -> str:
+    """``tool_calls`` needs a call that went out (``called``): a stop string
+    can end the reply before a call the parser read."""
+    if called and parser is not None and parser.finish_reason == "tool_calls":
         return "tool_calls"
     return "stop" if stop_string is not None else usage.finish_reason
 
@@ -213,6 +215,15 @@ async def _events(batches, served, parser, stops, usage):
     # a byte-level BPE token's bytes can end inside a character: hold them
     text = Utf8Stream()
     failed = False
+    called = False
+
+    def passed(deltas: list[dict], out: list) -> str | None:
+        nonlocal called
+        start = len(out)
+        stop = _passed(deltas, matcher, out)
+        called = called or any("id" in c for d in out[start:] for c in d.get("tool_calls", ()))
+        return stop
+
     try:
         async for batch in batches:
             events: list = []
@@ -227,7 +238,7 @@ async def _events(batches, served, parser, stops, usage):
                     if not piece:
                         continue
                     deltas = [{"content": piece}] if parser is None else parser.feed(piece)
-                    if (stop := _passed(deltas, matcher, events)) is not None:
+                    if (stop := passed(deltas, events)) is not None:
                         break
                     if parser is not None and parser.done:
                         break
@@ -246,7 +257,7 @@ async def _events(batches, served, parser, stops, usage):
                     yield [Media(c.modality, c.data)]
             if stop is not None or parser is not None and parser.done:
                 served()  # before the close below, which would count an abort
-                yield [*events, Finish(finish_reason(parser, usage, stop), usage, stop)]
+                yield [*events, Finish(finish_reason(parser, usage, stop, called), usage, stop)]
                 return
             if events:
                 yield events
@@ -265,10 +276,10 @@ async def _events(batches, served, parser, stops, usage):
     else:
         deltas = parser.feed(tail) + parser.finish()
     events = []
-    stop = _passed(deltas, matcher, events)
+    stop = passed(deltas, events)
     if stop is None and matcher is not None and (held := matcher.flush()):
         events.append({"content": held})
-    events.append(Finish(finish_reason(parser, usage, stop), usage, stop))
+    events.append(Finish(finish_reason(parser, usage, stop, called), usage, stop))
     yield events
 
 
