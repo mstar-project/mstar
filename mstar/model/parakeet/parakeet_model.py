@@ -45,7 +45,7 @@ from mstar.engine.resources import NodeResourceSpec
 from mstar.engine.resources.recurrent import RecurrentStateConfig, RecurrentStateSpec
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import Model, ProcessPromptOutput, WalkStep
+from mstar.model.base import Model, ProcessPromptOutput, WalkStep, serving_resources
 from mstar.model.components.audio_features import HOP_LENGTH, SAMPLE_RATE, clip_samples
 from mstar.model.parakeet.config import (
     AUDIO_IN,
@@ -206,7 +206,6 @@ class ParakeetModel(Model):
     def _check_stream_pools(self, config: dict, config_path: str, cap: int) -> None:
         """A live call holds a slot in each stream pool as long as it is open, so
         ``cap`` calls must fit every one of them, not only the transducer's."""
-        from mstar.model.base import serving_resources
         from mstar.model.components.fastconformer_stream import slot_pool_requests
 
         try:

@@ -276,13 +276,17 @@ def test_startup_refuses_more_requests_than_slots(tmp_path):
         model.validate_config_yaml({"resources": {TRANSDUCER_STATE: {"max_slots": 1}}}, "a.yaml")
 
 
-def test_live_startup_refuses_more_requests_than_stream_slots(tmp_path):
+@pytest.mark.parametrize("default", [STREAM_KV, STREAM_CONV, STREAM_FRONT])
+def test_live_startup_refuses_more_requests_than_stream_slots(tmp_path, default):
     model = ParakeetModel(str(_snapshot(tmp_path, nemotron=True)), live_lookahead=3)
-    config = {"max_concurrent_requests": 200, "resources": {TRANSDUCER_STATE: {"max_slots": 201}}}
-    # the stream pools keep their 128-request default, so the 129th live call would stall
-    with pytest.raises(ValueError, match=r"resources\.stream_\w+, which holds 128"):
+    pools = (STREAM_KV, STREAM_CONV, STREAM_FRONT)
+    config = {"max_concurrent_requests": 200, "resources": {
+        TRANSDUCER_STATE: {"max_slots": 201}, **{k: {"max_slots": 201} for k in pools if k != default},
+    }}
+    # the pool left at its 128-request default would stall the 129th live call
+    with pytest.raises(ValueError, match=rf"resources\.{default}, which holds 128"):
         model.validate_config_yaml(config, "a.yaml")
-    config["resources"].update({k: {"max_slots": 201} for k in (STREAM_KV, STREAM_CONV, STREAM_FRONT)})
+    config["resources"][default] = {"max_slots": 201}
     model.validate_config_yaml(config, "a.yaml")
 
 

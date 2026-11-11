@@ -319,15 +319,13 @@ class NemotronDuplexModel(Model):
             return  # a `resources:` block the validation's resource checks report
         for spec in specs:
             held, knob = slot_pool_requests(spec), "max_slots"
-            if held is not None:
-                pass
-            elif spec.resource_key in (TALKER_KV, NANO_KV):
+            if held is None:
+                if spec.resource_key not in (TALKER_KV, NANO_KV):
+                    continue
                 kv = spec.config
                 pages = self.talker_kv_pages if spec.resource_key == TALKER_KV else self.nano_kv_pages
                 per_session = pages(kv.tokens_per_page, sessions=1) - 1
                 held, knob = (kv.max_num_pages - 1) // per_session, "max_num_pages"
-            else:
-                continue
             if held < cap:
                 raise ValueError(
                     f"{config_path}: {cap} concurrent sessions (max_concurrent_requests) need as "

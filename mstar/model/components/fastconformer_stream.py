@@ -127,12 +127,9 @@ def encoder_kv_config(config: FastConformerConfig, max_slots: int) -> BoundedKVC
     )
 
 
-def slot_pool_requests(spec) -> int | None:
+def slot_pool_requests(spec: NodeResourceSpec) -> int | None:
     """How many requests a slot pool spec holds at once (its sink slot not
     counted), or ``None`` for a spec that is not a per-request slot pool."""
-    from mstar.engine.resources.kv.bounded import BoundedKVSpec
-    from mstar.engine.resources.recurrent import RecurrentStateSpec
-
     if isinstance(spec, RecurrentStateSpec):
         return spec.config.usable_slots
     if isinstance(spec, BoundedKVSpec):
