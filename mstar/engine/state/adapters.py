@@ -44,7 +44,7 @@ from mstar.engine.resources.recurrent.config import (
 from mstar.engine.resources.sampler.config import SamplerSpec, SamplerStep, SamplingReqConfig
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
 from mstar.engine.resources.step import Segment, SubmoduleStep
-from mstar.engine.state.analysis import position_key, reads_differ_by_walk, written_by_step
+from mstar.engine.state.analysis import combined_walks, position_key, reads_differ_by_walk, written_by_step
 from mstar.engine.state.calls import ArrayHandle, SamplerHandle
 from mstar.engine.state.contract import (
     EMPTY,
@@ -780,12 +780,11 @@ class ConvOnLinearAttn(OpBinding):
 
 class PagedArrayHandle(ArrayHandle):
     """Adds and reads through the KV pages of an array that keeps entries. Each read runs on the resource
-    ``resource_of`` gives it, and ``walk_reads``, on an array whose reads differ by walk, gives the read each walk runs.
-    """
+    ``resource_of`` gives it."""
 
     def __init__(
         self, array: Array, resources: Mapping[str, Any], positions_key: str | None, bindings: tuple[BoundOp, ...], *,
-        resource_of: Mapping[str, str] = EMPTY, walk_reads: "WalkReads | None" = None,
+        resource_of: Mapping[str, str] = EMPTY,
     ):
         super().__init__(array, resources, positions_key)
         self._bindings = bindings
@@ -798,20 +797,10 @@ class PagedArrayHandle(ArrayHandle):
         }
         self._kv = resources[array.name]
         self._views = {layer: self._kv.layer_view(i) for layer, i in self._pool_layer.items()}
-        # Each walk's ops and their resources, built once since `state_steps` runs on every step, replays too, under
-        # None for a walk no read names, or for every walk when the reads don't name walks.
-        self.walk_reads = walk_reads
-        by_key = {bound.key: bound for bound in bindings}
-        self._ops = {None: [(resource[bound.key], bound) for bound in bindings]} if walk_reads is None else {
-            walk: [(resource, by_key[key]) for resource, key in reads.items()]
-            for walk, reads in walk_reads.reads.items()
-        }
-        # `_grows` says whether `check_step` needs an add, for a step that lists a row on the pages at span above 0.
-        # `_covered` holds the layers some read covers on the step's walk `_walk`, on an array whose reads differ by
-        # walk.
+        # each op with its resource, built once since `state_steps` runs on every step, replays too
+        self._ops = [(resource[bound.key], bound) for bound in bindings]
+        # whether `check_step` needs an add, for a step that lists a row on the pages at span above 0
         self._grows = False
-        self._walk: str | None = None
-        self._covered: frozenset[int] | None = None
 
     def begin_step(self, step) -> None:
         super().begin_step(step)
@@ -819,9 +808,6 @@ class PagedArrayHandle(ArrayHandle):
         combined = getattr(step.steps.get(self.name), "combined_labels", None)
         if combined:
             self.label = next(iter(combined.values()))
-        if self.walk_reads is not None and not step.ctx.replays:
-            self._walk = step.ctx.graph_walk
-            self._covered = self.walk_reads.covers.get(self._walk, self.walk_reads.covers[None])
 
     def check_step(self, step) -> None:
         super().check_step(step)
@@ -885,8 +871,6 @@ class PagedArrayHandle(ArrayHandle):
             raise self._no_layout(f"mask arguments {sorted(mask_args)}, which no mask defines")
         layer = self._layer_id(layer)
         self._record_read(layer)
-        if self._covered is not None and layer not in self._covered:
-            raise self._refusal(f"a read on layer {layer}, which no read covers on walk {self._walk!r}")
         return self._run(layer, q)
 
     def _check_add_read(self, call: str) -> None:
@@ -915,20 +899,60 @@ class PagedArrayHandle(ArrayHandle):
             if empty is not None:
                 raise self._refusal(f"at_last_token on row {empty.request_id}, label {empty.label!r}, whose segment "
                                     "has span 0 and so no token in this step")
-        read = self.first_read
-        if self.walk_reads is not None:
-            # a walk plans only the resources of its own reads
-            reads = self.walk_reads.reads.get(self._walk, self.walk_reads.reads[None])
-            if not reads:
-                raise self._refusal(f"at_last_token on walk {self._walk!r}, which runs no read of this array")
-            read = self.reads[next(iter(reads.values()))]
-        last = read.select_last_hidden(x, label=self.label)
+        last = self._last_token_read().select_last_hidden(x, label=self.label)
         return last if label is None else last[first:end]
+
+    def _last_token_read(self) -> Any:
+        """The resource whose plan selects each segment's last token."""
+        return self.first_read
+
+    def _step_ops(self, walk: str | None) -> Sequence[tuple[str, BoundOp]]:
+        return self._ops
+
+    def _kernel_setting(self, read: str, field: str) -> Any:
+        return getattr(self.reads[read], field)
+
+
+class PagedByWalkHandle(PagedArrayHandle):
+    """A paged array whose reads differ by walk: a step plans, reads through and selects by the reads of its walk,
+    which ``walk_reads`` gives."""
+
+    def __init__(
+        self, array: Array, resources: Mapping[str, Any], positions_key: str | None, bindings: tuple[BoundOp, ...], *,
+        resource_of: Mapping[str, str], walk_reads: "WalkReads",
+    ):
+        super().__init__(array, resources, positions_key, bindings, resource_of=resource_of)
+        self.walk_reads = walk_reads
+        by_key = {bound.key: bound for bound in bindings}
+        # each walk's ops with their resources, under None for a walk no read names
+        self._walk_ops = {
+            walk: [(resource, by_key[key]) for resource, key in reads.items()]
+            for walk, reads in walk_reads.reads.items()
+        }
+        # the layers some read covers on the step's walk `_walk`
+        self._walk: str | None = None
+        self._covered = walk_reads.covers[None]
+
+    def begin_step(self, step) -> None:
+        super().begin_step(step)
+        if not step.ctx.replays:
+            self._walk = step.ctx.graph_walk
+            self._covered = self.walk_reads.covers.get(self._walk, self.walk_reads.covers[None])
+
+    def _run(self, layer: int, q: torch.Tensor) -> torch.Tensor:
+        if layer not in self._covered:
+            raise self._refusal(f"a read on layer {layer}, which no read covers on walk {self._walk!r}")
+        return super()._run(layer, q)
+
+    def _last_token_read(self) -> Any:
+        # a walk plans only the resources of its own reads
+        reads = self.walk_reads.reads.get(self._walk, self.walk_reads.reads[None])
+        if not reads:
+            raise self._refusal(f"at_last_token on walk {self._walk!r}, which runs no read of this array")
+        return self.reads[next(iter(reads.values()))]
 
     def _check_capture(self, walks: Collection[str]) -> None:
         """FlashInfer fixes the mask when it plans, so every replay would run the capture walk's."""
-        if self.walk_reads is None:
-            return
         reads = self.walk_reads.reads
         for resource in {resource for by_resource in reads.values() for resource in by_resource}:
             keys = {reads.get(walk, reads[None]).get(resource) for walk in walks} - {None}
@@ -937,14 +961,9 @@ class PagedArrayHandle(ArrayHandle):
                                       f"{resource!r} with different masks, and a capture plans one")
 
     def _step_ops(self, walk: str | None) -> Sequence[tuple[str, BoundOp]]:
-        if self.walk_reads is None:
-            return self._ops[None]
         if walk is None:
             raise self._no_layout("a step with no walk, on an array whose reads differ by walk")
-        return self._ops.get(walk, self._ops[None])
-
-    def _kernel_setting(self, read: str, field: str) -> Any:
-        return getattr(self.reads[read], field)
+        return self._walk_ops.get(walk, self._walk_ops[None])
 
 
 class PagedCrossHandle(PagedArrayHandle):
@@ -1374,17 +1393,11 @@ class PagedStorage(Storage):
     kernel_settings = frozenset({"max_num_pages"})
 
     def resolve(self, arrays: Sequence[Array], declared: Sequence[Array], setup: "StateSetup") -> Resolved:
-        resolved = Resolved({}, {}, {}, {})
+        resolved = Resolved({}, {}, {})
         for array in arrays:
             reads, resource_of = self._read_specs(array, _bindings(self, array, setup.by_read))
             resolved.specs[array.name] = [self._pool(array, setup.walks), *reads]
             resolved.resource_of.update(resource_of)
-            if reads_differ_by_walk(array):
-                combined = {
-                    walk: members for node in sorted(array.nodes)
-                    for walk, members in setup.walks.combined.get(node, EMPTY).items()
-                }
-                resolved.walk_reads[array.name] = _walk_reads(array, resource_of, combined)
         return resolved
 
     def handle(
@@ -1393,7 +1406,7 @@ class PagedStorage(Storage):
     ) -> ArrayHandle:
         return self.handle_class(
             array, resources, _positions_key(array), _bindings(self, array, setup.by_read),
-            resource_of=resolved.resource_of, walk_reads=resolved.walk_reads.get(array.name),
+            resource_of=resolved.resource_of,
         )
 
     def _pool(self, array: Array, walks: "Walks") -> KVSpec:
@@ -1491,6 +1504,29 @@ def _walk_reads(array: Array, resource_of: Mapping[str, str], combined: Mapping[
         }
         covers[walk] = frozenset.intersection(*(covers.get(member, covers[None]) for member in members))
     return WalkReads(reads, covers)
+
+
+class PagedByWalkStorage(PagedStorage):
+    """An append-only array that keeps entries, whose reads differ by walk. Each walk runs its own reads, a combined
+    walk those of the walks it batches."""
+
+    handle_class = PagedByWalkHandle
+
+    def resolve(self, arrays: Sequence[Array], declared: Sequence[Array], setup: "StateSetup") -> Resolved:
+        resolved = super().resolve(arrays, declared, setup)
+        return resolved._replace(walk_reads={
+            array.name: _walk_reads(array, resolved.resource_of, combined_walks(array, setup.walks.combined))
+            for array in arrays
+        })
+
+    def handle(
+        self, array: Array, resources: Mapping[str, Any], setup: "StateSetup", resolved: Resolved,
+        sp_group: CommGroup | None,
+    ) -> ArrayHandle:
+        return PagedByWalkHandle(
+            array, resources, _positions_key(array), _bindings(self, array, setup.by_read),
+            resource_of=resolved.resource_of, walk_reads=resolved.walk_reads[array.name],
+        )
 
 
 class PagedCrossStorage(PagedStorage):
@@ -1660,6 +1696,7 @@ class WithinStepStorage(Storage):
 
 
 PAGED = PagedStorage()
+PAGED_BY_WALK = PagedByWalkStorage()
 PAGED_CROSS = PagedCrossStorage()
 VALUE = ValueStorage()
 VALUE_WITH_HOST = ValueWithHostStorage()
@@ -1677,13 +1714,16 @@ def storage_of(array: Array) -> Storage:
         raise _no_layout(array, "a rewritable array has no spec unless it is a Value, of max_len 1")
     if not array.max_len:
         return WITHIN_STEP
-    return PAGED_CROSS if any(read.queries is not None for read in array.reads.values()) else PAGED
+    if any(read.queries is not None for read in array.reads.values()):
+        return PAGED_CROSS
+    return PAGED_BY_WALK if reads_differ_by_walk(array) else PAGED
 
 
 # `Attend` is an `AttentionSpec` on a paged array, a `CrossAttentionSpec` on one read with another array's queries and a
 # `RaggedAttentionSpec` within a step, so a binding is per storage and op type.
 BINDINGS: dict[tuple[Storage, type[Op]], OpBinding] = {
     (PAGED, Attend): PagedAttend(),
+    (PAGED_BY_WALK, Attend): PagedAttend(),
     (PAGED_CROSS, Attend): PagedCrossAttend(),
     (WITHIN_STEP, Attend): RaggedAttend(),
     (VALUE, GatedDeltaNet): GDN(),

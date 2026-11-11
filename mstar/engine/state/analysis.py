@@ -37,9 +37,7 @@ def state_declaration_problems(model: "Model") -> list[str]:
             for node in sorted(array.nodes - set(nodes))
         ]
         problems += _read_problems(array, walks, combined)
-        problems += _combined_walk_problems(array, {
-            walk: members for node in sorted(array.nodes) for walk, members in combined_by_node.get(node, {}).items()
-        })
+        problems += _combined_walk_problems(array, combined_walks(array, combined_by_node))
         problems += _array_problems(array)
     problems += _kv_label_problems(model.kv_labels(), arrays)
     problems += _cross_read_problems(arrays)
@@ -57,6 +55,11 @@ def position_key(array: Array) -> str:
 
 def reads_differ_by_walk(array: Array) -> bool:
     return any(read.walks is not None for read in array.reads.values())
+
+
+def combined_walks(array: Array, by_node: Mapping[str, Mapping[str, Collection[str]]]) -> dict[str, Collection[str]]:
+    """The combined walks of ``array``'s nodes, with the walks each batches, from each node's in ``by_node``."""
+    return {walk: members for node in sorted(array.nodes) for walk, members in by_node.get(node, EMPTY).items()}
 
 
 def written_by_step(array: Array) -> frozenset[str]:
