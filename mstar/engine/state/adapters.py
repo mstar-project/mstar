@@ -742,17 +742,6 @@ class PagedArrayHandle(ArrayHandle):
         # whether `check_step` needs an add, for a step that lists a row on the pages at span above 0
         self._grows = False
 
-    def begin_step(self, step) -> None:
-        super().begin_step(step)
-        if step.ctx.replays:
-            return
-        declared: ArrayStep = step.state[self.name]
-        segments = declared.segments or step.segments or ()
-        # a capture opens the handles once around `preprocess`, where `eager_add` adds run, and again around the forward
-        self._grows = not (declared.eager_add and step.ctx.capture) and any(
-            segment.span and (segment.request_id, segment.label) not in declared.placeholders for segment in segments
-        )
-
     def check_step(self, step) -> None:
         super().check_step(step)
         if self._grows and not self._kept and self._keep and not step.ctx.replays:
@@ -760,11 +749,16 @@ class PagedArrayHandle(ArrayHandle):
                                 "would keep entries no add wrote; list those rows at span 0")
 
     def _check_storage(self, declared: ArrayStep, segments, ctx) -> None:
+        # a capture opens the handles once around `preprocess`, where `eager_add` adds run, and again around the forward
+        self._grows = not (declared.eager_add and ctx.capture) and any(
+            segment.span and (segment.request_id, segment.label) not in declared.placeholders for segment in segments
+        )
         # A capture's dummy rows open only the default label.
         if ctx.capture:
             return
+        opens_label = self._kv.opens_label
         for segment in segments:
-            if (segment.request_id, segment.label) not in declared.placeholders and not self._kv.opens_label(
+            if (segment.request_id, segment.label) not in declared.placeholders and not opens_label(
                 segment.request_id, segment.label,
             ):
                 raise self._refusal(f"a step touches label {segment.label!r} of request {segment.request_id}, "
