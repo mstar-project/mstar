@@ -322,7 +322,7 @@ def test_a_row_a_host_step_moved_does_not_rewind_on_each_replay(repeats):
         b = _captured_step(ref, None, [1], slot=(1 + i) % 2, bs=1)
         assert (replay.offsets[:1], replay.positions[:1]) == (b.offsets[:1], b.positions[:1])
     if repeats == 1:
-        assert not a.ctx.resident_plan.writes.rows, "a one-iteration step flushed a run the graph's scatter writes as a cell"
+        assert not a.ctx.resident_plan.writes.rows, "a one-iteration step flushed a run the scatter writes as a cell"
 
 
 def test_a_steady_batch_keeps_its_row():
