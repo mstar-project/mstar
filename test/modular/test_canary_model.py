@@ -379,8 +379,9 @@ def test_decoder_node_caps_captures_and_names(snapshot):
     """What the shared decoder gives Canary's node, as before the scaffold:
     prefill batches capped, only decode captured on its ladder, the sampled
     token fed back, the walk, loop and sampler names of Canary's graph, and
-    positions advanced on the resource the model declares, under its key."""
-    from mstar.model.canary.config import POS, SAMPLER
+    positions advanced on the array the model declares, under its key."""
+    from mstar.engine.state.adapters import node_resources
+    from mstar.model.canary.config import KV_CACHE, SAMPLER
     from mstar.model.submodule_base import ARNodeInputs
 
     node = _tiny_node()
@@ -395,4 +396,4 @@ def test_decoder_node_caps_captures_and_names(snapshot):
     assert walks[node.DECODE_WALK].name == node.DECODE_LOOP and node.SAMPLER == SAMPLER
     step = node.declare_step("decode", ["a"], [ARNodeInputs(input_ids=torch.tensor([5]), input_seq_len=1)])
     # the resource key YAML overrides name
-    assert POS == "positions" and POS in step.steps and POS in {s.resource_key for s in model.get_node_resources()}
+    assert KV_CACHE in step.state and "rope" in {s.resource_key for s in node_resources(model)}

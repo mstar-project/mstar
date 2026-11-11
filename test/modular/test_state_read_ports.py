@@ -38,9 +38,10 @@ from mstar.engine.resources.attn.config import (
 )
 from mstar.engine.resources.kv.config import KVSpec, KVStep, PagedKVConfig, Span
 from mstar.engine.resources.position.config import PositionConfig, PositionSpec, PositionStep
-from mstar.engine.resources.sampler.config import SamplerSpec, SamplerStep, SamplingReqConfig
+from mstar.engine.resources.sampler.config import SamplerSpec, SamplerStep
 from mstar.engine.resources.spec import apply_yaml_overrides
 from mstar.engine.resources.step import Segment, StepContext, SubmoduleStep
+from mstar.engine.state import ArrayStep
 from mstar.engine.state.adapters import (
     build_handle,
     kv_layouts,
@@ -64,11 +65,12 @@ from mstar.model.canary.config import (
 from mstar.model.canary.decoder import CanaryDecoderModel
 from mstar.model.canary.submodules import CanaryDecoderSubmodule
 from mstar.model.components.fastconformer import FastConformerConfig
+from mstar.model.components.request_kwargs import sampler_capabilities, sampling_config
 from mstar.model.pi05.components.action_expert import Pi05ActionExpert
 from mstar.model.pi05.components.paligemma import Pi05PaliGemmaExpert
-from mstar.model.pi05.config import LLM_ATTN, LLM_KV, Pi05Config
+from mstar.model.pi05.config import CHUNK_WALK, LLM_ATTN, LLM_KV, LLM_NODES, Pi05Config
 from mstar.model.pi05.pi05_model import Pi05Model
-from mstar.model.pi05.submodules import Pi05LLMSubmodule
+from mstar.model.pi05.submodules import Pi05ActionSubmodule, Pi05LLMSubmodule
 from mstar.model.submodule_base import ARNodeInputs
 from mstar.model.utils import kv_pages
 from mstar.model.vjepa2.components.ac_predictor import VisionTransformerPredictorAC
@@ -104,7 +106,7 @@ def _canary() -> CanaryModel:
 def _pi05_reference(config: Pi05Config) -> list:
     return [
         KVSpec(
-            resource_key=LLM_KV, nodes={"LLM"},
+            resource_key=LLM_KV, nodes=set(LLM_NODES),
             config=PagedKVConfig(
                 num_layers=config.num_layers,
                 num_kv_heads=config.num_kv_heads,
@@ -113,11 +115,11 @@ def _pi05_reference(config: Pi05Config) -> list:
                 num_qo_heads=config.num_qo_heads,
             ),
         ),
-        AttentionSpec(resource_key=LLM_ATTN, nodes={"LLM"}, config=AttentionConfig(kv_cache=LLM_KV)),
+        AttentionSpec(resource_key=LLM_ATTN, nodes=set(LLM_NODES), config=AttentionConfig(kv_cache=LLM_KV)),
         # The model wrote only kv_cache. The three factors are what its layer passed on every call, which picks the
         # Llama 3.1 kernel, and on the contract a layer passes nothing per call.
         PositionSpec(
-            resource_key=ROPE, nodes={"LLM"},
+            resource_key=ROPE, nodes=set(LLM_NODES),
             config=PositionConfig(kv_cache=LLM_KV, low_freq_factor=1.0, high_freq_factor=1.0, old_context_len=8192),
         ),
     ]
@@ -161,7 +163,8 @@ def _canary_reference(model: CanaryModel) -> list:
         # Keyed `positions` by the model. `position_key` names an array's counter, and gives `rope` to this one.
         PositionSpec(resource_key=ROPE, nodes={"decoder"}, config=PositionConfig(kv_cache=KV_CACHE)),
         SamplerSpec(
-            resource_key=SAMPLER, nodes={"decoder"}, vocab_size=config.vocab_size, enable_repetion_penalty=False,
+            resource_key=SAMPLER, nodes={"decoder"}, vocab_size=config.vocab_size,
+            **sampler_capabilities(model.sampling_defaults),
         ),
     ]
 
@@ -254,18 +257,18 @@ def _segments(spans) -> list[Segment]:
     return [Segment(request_id=rid, label="main", span=span) for rid, span in zip("abcd", spans, strict=False)]
 
 
-def _pi05_node(config: Pi05Config) -> Pi05LLMSubmodule:
-    return Pi05LLMSubmodule(None, None, None, None, None, None, config, device="cpu")
-
-
-@pytest.mark.parametrize("walk, spans, keep, advance", [
-    ("prefill", (910, 654), True, None),
-    ("action_gen", (50, 50), False, (0, 0)),
+@pytest.mark.parametrize("node, spans, keep, advance", [
+    ("LLM", (910, 654), True, None),
+    ("action_expert", (50, 50), False, (0, 0)),
 ])
-def test_pi05_steps_equal_the_hand_written_ones(walk, spans, keep, advance):
+def test_pi05_steps_equal_the_hand_written_ones(node, spans, keep, advance):
     model = _pi05()
+    submodule = (
+        Pi05LLMSubmodule(None, None, model.config) if node == "LLM"
+        else Pi05ActionSubmodule(None, None, None, None, model.config)
+    )
     inputs = [ARNodeInputs(input_seq_len=span) for span in spans]
-    step = state_steps(_pi05_node(model.config).declare_step(walk, ["a", "b"], inputs), _handles(model, "LLM"))
+    step = state_steps(submodule.declare_step(CHUNK_WALK, ["a", "b"], inputs), _handles(model, node))
     _assert_steps_equal(step, SubmoduleStep(segments=_segments(spans), steps={
         LLM_KV: KVStep(commit=keep),
         LLM_ATTN: AttentionStep(causal=False),
@@ -327,12 +330,13 @@ def test_canary_steps_equal_the_hand_written_ones(walk, span, clips):
     context = tuple(
         Segment(request_id=rid, label=CONTEXT_LABEL, span=clip) for rid, clip in zip("ab", clips, strict=True)
     )
+    prompts = {rid: inp.input_ids for rid, inp in zip("ab", inputs, strict=True)} if walk == "prefill" else {}
     _assert_steps_equal(step, SubmoduleStep(segments=_segments((span, span)), steps={
         KV_CACHE: KVStep(),
         ATTN: AttentionStep(causal=True),
         CROSS_KV_CACHE: KVStep(segments=context),
         CROSS_ATTN: AttentionStep(segments=context, causal=False),
-        SAMPLER: SamplerStep(apply_penalty=False),
+        SAMPLER: SamplerStep(apply_penalty=True, prefill_tracked_tokens=prompts),
         ROPE: PositionStep(),
     }))
 
@@ -346,7 +350,7 @@ def test_pi05_layout_converts_to_the_hand_written_one(cameras, horizon):
     )
     rows = cameras * 256
     assert kv_layouts(model.declare_state(), out.metadata["state_layout"], {}) == {LLM_KV: {"main": LabelLayout(
-        spans=(Span("rows", "prefill", rows, rows, "img_emb"), Span("ids", "prefill", 3, 3, "text_inputs")),
+        spans=(Span("rows", CHUNK_WALK, rows, rows, "img_emb"), Span("ids", CHUNK_WALK, 3, 3, "text_inputs")),
         scratch=horizon,
     )}}
 
@@ -387,28 +391,12 @@ def test_canary_layout_converts_to_the_hand_written_one():
     }
 
 
-@pytest.mark.parametrize("kwargs, expected", [
-    ({}, SamplingReqConfig(temperature=0.0, top_p=1.0, ignore_eos=False)),
-    (
-        {"temperature": 0.5, "top_p": 0.9, "ignore_eos": True},
-        SamplingReqConfig(temperature=0.5, top_p=0.9, ignore_eos=True),
-    ),
-])
-def test_canarys_sample_settings_convert_to_the_hand_written_ones(kwargs, expected):
+@pytest.mark.parametrize("kwargs", [{}, {"temperature": 0.5, "top_p": 0.9, "ignore_eos": True}])
+def test_canarys_sample_settings_convert_to_the_hand_written_ones(kwargs):
     model = _canary()
-    settings = model.get_request_resource_configs({}, kwargs)
+    settings = model.get_request_resource_configs([], [], kwargs)
+    expected = sampling_config(model.sampling_defaults, kwargs)
     assert sampling_configs(settings, model.declare_state())[SAMPLER] == expected
-
-
-def test_pi05_makes_its_scratch_at_load_for_the_largest_capture():
-    """Scratch made at load, which no step reads before writing, is all a model may keep between steps beyond a memo."""
-    node = Pi05LLMSubmodule(nn.Embedding(2, 4), None, None, None, None, None, Pi05Config(), device="cpu")
-    assert node._time_emb_buffer.shape == (4, 1024) and node._time_emb_buffer.dtype == torch.float32
-    assert node._fraction is None, "a memo of the config is made when first used"
-    actions = {"noisy_actions": torch.zeros(50, 32), "ts": torch.zeros(1).long()}
-    preprocessed = node._preprocess_action_gen([ARNodeInputs(input_seq_len=50, tensor_inputs=actions)] * 2)
-    assert preprocessed["time_emb_buffer"].shape == (2, 1024), "a row of scratch per request"
-    assert preprocessed["fraction"] is node._fraction and node._fraction.dtype == torch.float64
 
 
 def test_the_rollout_node_opts_out_of_torch_compile():
@@ -477,8 +465,11 @@ def _pi05_expert(expert_class, num_layers: int = TINY_PI05.num_layers):
 
 
 def _pi05_call(expert) -> tuple:
-    tokens = torch.randn(3, TINY_PI05.hidden_size if isinstance(expert, Pi05PaliGemmaExpert) else 16)
-    return (tokens,) if isinstance(expert, Pi05PaliGemmaExpert) else (tokens, torch.randn(1, 16))
+    if isinstance(expert, Pi05PaliGemmaExpert):
+        return (torch.randn(3, TINY_PI05.hidden_size),)
+    # the norms are identities, so a modulation's values go unread
+    h = TINY_PI05.action_hidden_size
+    return torch.randn(3, h), [torch.zeros(2, 3 * h)] * len(expert.layers), torch.zeros(1, 3 * h)
 
 
 def _canary_stack(num_layers: int = 2):
@@ -506,7 +497,7 @@ def _canary_stack(num_layers: int = 2):
     return decoder, kv, context
 
 
-def _compiled_run(module, args, *handles) -> tuple[int, list[str]]:
+def _compiled_run(module, args, *handles, **kwargs) -> tuple[int, list[str]]:
     """Run ``module`` compiled as a capture is, then again under the capture's stance, which raises on any new compile.
     Returns how many frames it compiled and its failed guards."""
     torch._dynamo.reset()
@@ -518,11 +509,11 @@ def _compiled_run(module, args, *handles) -> tuple[int, list[str]]:
 
     optimize = torch._dynamo.optimize(backend, dynamic=False, guard_fail_fn=lambda f: guards.append(str(f.reason)))
     compiled = optimize(module)
-    compiled(*args)
+    compiled(*args, **kwargs)
     first_call = len(frames)
     _next_step(*handles)
     with torch.compiler.set_stance("fail_on_recompile"):
-        compiled(*args)
+        compiled(*args, **kwargs)
     assert len(frames) == first_call, "a capture's stance raises on any new compile"
     return first_call, guards
 
@@ -546,11 +537,24 @@ def test_a_longer_pi05_expert_compiles_no_more_frames(expert_class):
 
 
 @torch.no_grad()
+def test_pi05s_action_expert_runs_two_euler_steps_in_one_step():
+    """The action step runs every Euler step, so each layer adds its scratch tokens again after its last read."""
+    expert, handle = _pi05_expert(Pi05ActionExpert)
+    step = SubmoduleStep(segments=[Segment(1, "main", 3)], state={LLM_KV: ArrayStep(keep=False)})
+    step.set_ctx(StepContext((1,), CHUNK_WALK, 0, False))
+    handle.end_step(step)
+    handle.begin_step(step)
+    for _ in range(2):
+        expert(*_pi05_call(expert))
+    handle.check_step(step)
+
+
+@torch.no_grad()
 def test_canarys_decoder_compiled_as_a_capture_compiles_no_frame_per_layer():
     """`disable_torch_compile` stops only the eager forward's compile, so the decode capture does compile."""
     decoder, kv, context = _canary_stack()
     embeds = torch.randn(3, 32)
-    _, guards = _compiled_run(decoder, (embeds,), kv, context)
+    _, guards = _compiled_run(decoder, (embeds,), kv, context, label="main", position_ids=torch.arange(3))
     assert not [guard for guard in guards if "layer" in guard], "one frame should serve every layer"
 
 
@@ -559,7 +563,8 @@ def test_a_longer_canary_decoder_compiles_no_more_frames():
     frames = []
     for num_layers in (2, 4):
         decoder, kv, context = _canary_stack(num_layers)
-        frames.append(_compiled_run(decoder, (torch.randn(3, 32),), kv, context)[0])
+        run = _compiled_run(decoder, (torch.randn(3, 32),), kv, context, label="main", position_ids=torch.arange(3))
+        frames.append(run[0])
     assert frames[0] == frames[1] > 1
 
 
@@ -581,7 +586,7 @@ def test_each_canary_layer_names_itself_on_both_arrays():
     seen = []
     kv._record_read = lambda layer: seen.append(("self", layer))
     context._record_read = lambda layer: seen.append(("cross", layer))
-    decoder(torch.randn(3, 32))
+    decoder(torch.randn(3, 32), label="main", position_ids=torch.arange(3))
     assert seen == [(array, layer) for layer in range(2) for array in ("self", "cross")]
 
 
@@ -666,8 +671,8 @@ def test_canarys_prefill_adds_the_context_before_any_layer_reads_it():
     ]
     assert _canary_step(node, handles, "prefill", inputs).shape == (2,)
     assert log == [
-        ("write", CROSS_KV_CACHE, 0, CONTEXT_LABEL, 20), ("write", CROSS_KV_CACHE, 1, CONTEXT_LABEL, 20),
         ("positions", "main"),
+        ("write", CROSS_KV_CACHE, 0, CONTEXT_LABEL, 20), ("write", CROSS_KV_CACHE, 1, CONTEXT_LABEL, 20),
         *_canary_layers(),
         ("last_token", ATTN, "main"),
         ("sample", ("a", "b")),

@@ -286,7 +286,7 @@ def test_pi05_deployments_pin_flashinfer_fa2(config_name):
     from mstar.engine.resources import AttentionSpec
     from mstar.engine.resources.spec import apply_yaml_overrides
 
-    specs = _make_model().get_node_resources()
+    specs = node_resources(_make_model())
     attn = next(spec for spec in specs if isinstance(spec, AttentionSpec))
     assert attn.config.flashinfer_backend == "auto"
     apply_yaml_overrides(specs, yaml.safe_load((Path(CONFIG_PATH).parent / config_name).read_text()))
@@ -961,7 +961,7 @@ class _PassThroughExpert(torch.nn.Module):
                 torch.nn.init.normal_(module.dense.bias, std=0.1)
         self.read: list[dict[Pi05AdaRMSNorm, torch.Tensor]] = []
 
-    def forward(self, query_sequence, layer_modulations, final_modulation, *, label):
+    def forward(self, query_sequence, layer_modulations, final_modulation):
         rows = {self.norm: final_modulation[self.norm.slot]}
         for layer, block in zip(self.layers, layer_modulations, strict=True):
             for norm in (layer.input_layernorm, layer.post_attention_layernorm):

@@ -13,6 +13,7 @@ from test_canary_qwen_model import _model_with_word_tokenizer
 from test_qwen3_asr_model import _make_model as _qwen3_asr
 
 from mstar.conductor.conductor import Conductor
+from mstar.engine.state.adapters import node_resources, sampling_configs
 from mstar.model.canary.canary_model import CanaryModel
 from mstar.model.canary.config import CanaryModelConfig
 from mstar.model.canary_qwen.canary_qwen_model import CanaryQwenModel
@@ -49,11 +50,12 @@ READS = {
 
 
 def _sampler(model, **kw):
-    return model.get_request_resource_configs([], [], kw)[SAMPLER]
+    # Canary's settings are its declared sampler's, which convert to the resource's config
+    return sampling_configs(model.get_request_resource_configs([], [], kw), model.declare_state())[SAMPLER]
 
 
 def _spec(model):
-    return next(s for s in model.get_node_resources() if s.resource_key == SAMPLER)
+    return next(s for s in node_resources(model) if s.resource_key == SAMPLER)
 
 
 def _loop_conductor(model) -> Conductor:
