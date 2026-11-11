@@ -165,6 +165,7 @@ class Read:
     walks: frozenset[str] | None = None     # None: all walks
     queries: str | None = None              # the array whose segments lay out the queries; None: this array
     packed: bool = True                     # queries may come as (tokens, heads, head_dim); False: only as rows
+    segmented: bool = False                 # a request's segments lie end to end in one row
 
     def __post_init__(self):
         if not isinstance(self.mask, Mask):
@@ -174,6 +175,10 @@ class Read:
         if self.op is not None and (self.op.writes or self.op.adds):
             raise ValueError(f"Read.op: a read changes no field, and {type(self.op).__name__} writes "
                              f"{list(self.op.writes)} and adds {list(self.op.adds)}")
+        if self.segmented and (self.packed or self.queries is not None or not isinstance(self.mask, Block)):
+            raise ValueError(f"Read.segmented lays a request's segments end to end in one row, which takes Block(), "
+                             f"packed=False and no queries, and got mask={self.mask!r}, packed={self.packed}, "
+                             f"queries={self.queries!r}")
         for name in ("layers", "walks"):
             if getattr(self, name) is not None:
                 object.__setattr__(self, name, frozenset(getattr(self, name)))
@@ -224,7 +229,9 @@ class Array:
     rewritable: bool = False
     labels: frozenset[str] = frozenset({"main"})
     positions: Positions | None = None
-    seq_sharded: bool = False    # under sequence parallelism, each rank's calls carry its share of every segment
+    # under sequence parallelism, each rank's calls carry its share of every segment, or of each request's row for a
+    # segmented read
+    seq_sharded: bool = False
 
     def __post_init__(self):
         object.__setattr__(self, "nodes", frozenset(self.nodes))
@@ -304,6 +311,11 @@ class Array:
 
 def is_value(array: Array) -> bool:
     return array.rewritable and array.max_len == 1
+
+
+def read_layers(array: Array, read: Read) -> frozenset[int]:
+    """The layers ``read`` reads of ``array``: its own, or all of the array's."""
+    return read.layers or array.layers
 
 
 def Value(name, *, nodes, layers, entry, updates=EMPTY) -> Array:

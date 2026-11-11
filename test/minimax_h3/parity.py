@@ -136,7 +136,8 @@ def _inexact(entry, key: str = "") -> list[str]:
 def run(args, report: dict, failures: list[str]) -> None:
 
     import mstar
-    from mstar.model.components.diffusion.attention import sdpa_attention
+    from mstar.engine.resources.step import StepContext
+    from mstar.engine.state.adapters import node_handles, state_setup
     from mstar.model.minimax_h3 import weight_loader
     from mstar.model.minimax_h3.components.layout import (
         modality_tags,
@@ -145,7 +146,7 @@ def run(args, report: dict, failures: list[str]) -> None:
         unpatchify_video,
     )
     from mstar.model.minimax_h3.components.transformer import H3Inputs
-    from mstar.model.minimax_h3.config import KEYFRAME_NOISE_AUG
+    from mstar.model.minimax_h3.config import DIT_ATTN, DIT_NODE, KEYFRAME_NOISE_AUG, REFINER_ATTN, TEXT_ENCODER_NODE
     from mstar.model.minimax_h3.keyframes import ANCHORS, vision_spans
     from mstar.model.minimax_h3.minimax_h3_model import H3Model
     from mstar.model.minimax_h3.schedule import h3_schedule, h3_step
@@ -158,6 +159,7 @@ def run(args, report: dict, failures: list[str]) -> None:
         H3VaeEncoderSubmodule,
         H3VideoDecoderSubmodule,
     )
+    from mstar.model.submodule_base import NodeInputs, engine_step
 
     print("mstar from", mstar.__file__, flush=True)
     torch.backends.cuda.matmul.allow_tf32 = False
@@ -165,8 +167,12 @@ def run(args, report: dict, failures: list[str]) -> None:
     oracle = torch.load(args.oracle, weights_only=False)
     a = oracle["args"]
     stages = set(args.stages.split(","))
-    model = H3Model(model_path_hf=str(args.snapshot), attention_backend="sdpa")
+    model = H3Model(model_path_hf=str(args.snapshot))
     config = model.config
+    # every attention through its declared read, bound as `backend: sdpa` on its resource binds it
+    on_sdpa, problems = state_setup({"resources": {key: {"backend": "sdpa"} for key in (DIT_ATTN, REFINER_ATTN)}},
+                                    model.declare_state())
+    assert not problems, problems
     kwargs = {"num_frames": int(a["num_frames"]), "num_inference_steps": int(a["steps"])}
     if a.get("height") not in (None, "None"):
         kwargs.update(height=int(a["height"]), width=int(a["width"]))
@@ -236,7 +242,7 @@ def run(args, report: dict, failures: list[str]) -> None:
         stub = H3DenoiseSubmodule.__new__(H3DenoiseSubmodule)
         stub.config = config
         gen = torch.Generator("cpu").manual_seed(int(a["seed"]))
-        seeds = H3DenoiseSubmodule.seed_loop_back(stub, None, layout, gen)
+        seeds = H3DenoiseSubmodule.seed_loop_back(stub, layout, gen)
         n = layout.num_condition_rows
         rows = seeds["latents"]
         if n:
@@ -263,6 +269,10 @@ def run(args, report: dict, failures: list[str]) -> None:
         t0 = time.time()
         encoder = weight_loader.build_text_encoder(config, args.snapshot, dev)
         conditioner = weight_loader.build_text_conditioner(config, args.snapshot, dev)
+        prompt_handles = node_handles(model, TEXT_ENCODER_NODE, {}, setup=on_sdpa)
+        for module in conditioner.modules():
+            if hasattr(module, "bind_state"):
+                module.bind_state(prompt_handles)
         with torch.no_grad():
             if images:
                 text_node = H3TextEncoderSubmodule(
@@ -272,9 +282,9 @@ def run(args, report: dict, failures: list[str]) -> None:
             else:
                 hidden = encoder(ids[None].to(dev), torch.ones_like(ids[None]).to(dev))
             report["qwen_layer50"] = stats(hidden, oracle["prompt_embeds"])
-            refined_from_ref = conditioner(oracle["prompt_embeds"].to(dev), sdpa_attention)
+            refined_from_ref = conditioner(oracle["prompt_embeds"].to(dev))
             report["conditioner_teacher_forced"] = stats(refined_from_ref, text_rows)
-            refined = conditioner(hidden, sdpa_attention)
+            refined = conditioner(hidden)
             report["conditioner"] = stats(refined, text_rows)
         report["text_seconds"] = time.time() - t0
         del encoder, conditioner
@@ -285,7 +295,8 @@ def run(args, report: dict, failures: list[str]) -> None:
     loops = {}
     if stages & {"dit", "loop"}:
         dit = weight_loader.build_transformer(config, args.snapshot, dev)
-        sub = H3DenoiseSubmodule(dit, config, loop_name="denoise_loop", attn_resource_key=None)
+        sub = H3DenoiseSubmodule(dit, config, loop_name="denoise_loop")
+        sub.bind_node_state(node_handles(model, DIT_NODE, {}, setup=on_sdpa))
         step_layout = sub.build_layout(layout, dev)
         sched = h3_schedule(request["num_inference_steps"], request["video_shift"], request["audio_shift"])
         text = text_rows.to(dev)
@@ -305,9 +316,13 @@ def run(args, report: dict, failures: list[str]) -> None:
             else:
                 t = torch.stack([sched.timesteps[k], sched.audio_timesteps[k], sched.cond_timesteps[k]])[None].to(dev)
                 row_class = None
+            step = engine_step(sub, "gen", [0], [NodeInputs(resource_step_info=layout)])
+            step.set_ctx(StepContext(request_ids=[0], graph_walk="gen", slot=0, capture=False))
+            step.begin_calls()
             with torch.no_grad():
-                return dit(H3Inputs(video=video, audio=audio, text=text, timesteps=t), step_layout, sdpa_attention,
-                           row_class=row_class)
+                out = dit(H3Inputs(video=video, audio=audio, text=text, timesteps=t), step_layout, row_class=row_class)
+            step.end_calls()
+            return out
 
         if "dit" in stages:
             for mode, exact in (("serving", False), ("reference_shapes", True)):

@@ -7,8 +7,8 @@ leaves the model-specific parts to a handful of hooks:
   engine contract (base)                          model hooks (subclass)
   ───────────────────────────────────────────     ──────────────────────────────────────
   step index from the engine's loop counter       bucket_key_for(fwd_info)      -> hashable
-  memoized schedule + seeded initial noise,       schedule_for(walk, num_steps, key) -> FlowMatchSchedule
-    drawn at ingest under PREFETCH_SEEDS
+  memoized schedule + seeded initial noise,       schedule_settings(fwd_info)   -> hashable
+    drawn at ingest under PREFETCH_SEEDS          schedule_for(walk, settings, key) -> FlowMatchSchedule
   equal-key request batching (can_batch)          seed_latents(key, generator)  -> [L, C]
   stacked preprocess / per-row outputs            request_inputs(fwd_info, inputs, key) -> {name: [..]}
   per-key CUDA-graph buckets (Euler inside)       num_tokens(key)               -> int
@@ -202,9 +202,14 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         """What has to match for two rows to share a forward (and a captured graph)."""
         raise NotImplementedError
 
-    def schedule_for(self, walk: str, num_steps: int | None, bucket_key: Hashable) -> FlowMatchSchedule:
-        """The schedule of ``walk`` at ``bucket_key``, ``num_steps`` steps long where the request sets its length (else
-        None). A pure function of the three, since the base memoizes it across requests."""
+    def schedule_settings(self, fwd_info: CurrentForwardPassInfo) -> Hashable:
+        """What the request sets of its schedule beyond the bucket key: by default its step count, None where the walk
+        fixes it."""
+        return fwd_info.step_metadata.get(NUM_STEPS)
+
+    def schedule_for(self, walk: str, settings: Hashable, bucket_key: Hashable) -> FlowMatchSchedule:
+        """The schedule of ``walk`` at ``bucket_key`` under the request's ``settings`` (`schedule_settings`). A pure
+        function of the three, since the base memoizes it across requests."""
         raise NotImplementedError
 
     def seed_latents(self, bucket_key: Hashable, generator: torch.Generator) -> torch.Tensor:
@@ -377,15 +382,15 @@ class DenoiseLoopSubmodule(NodeSubmodule):
             resource_step_info=self.step_key(fwd_info, bucket_key),
         )
 
-    def _schedule_key(self, fwd_info: CurrentForwardPassInfo, bucket_key: Hashable) -> tuple[str, int | None, Hashable]:
-        return fwd_info.graph_walk, fwd_info.step_metadata.get(NUM_STEPS), bucket_key
+    def _schedule_key(self, fwd_info: CurrentForwardPassInfo, bucket_key: Hashable) -> tuple[str, Hashable, Hashable]:
+        return fwd_info.graph_walk, self.schedule_settings(fwd_info), bucket_key
 
     def schedule_of(self, fwd_info: CurrentForwardPassInfo, bucket_key: Hashable) -> FlowMatchSchedule:
         """The memoized schedule of the walk ``fwd_info`` is on, at its ``bucket_key``."""
         return self._schedules(*self._schedule_key(fwd_info, bucket_key))
 
-    def _stage_schedule(self, walk: str, num_steps: int | None, bucket_key: Hashable) -> dict[str, torch.Tensor]:
-        return self._step_scalar_sources(self._schedules(walk, num_steps, bucket_key), self.get_device())
+    def _stage_schedule(self, walk: str, settings: Hashable, bucket_key: Hashable) -> dict[str, torch.Tensor]:
+        return self._step_scalar_sources(self._schedules(walk, settings, bucket_key), self.get_device())
 
     def _step_scalar_sources(
         self, schedule: FlowMatchSchedule, device: torch.device,

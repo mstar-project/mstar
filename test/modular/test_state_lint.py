@@ -18,8 +18,8 @@ import pytest
 
 PORTED = (
     "mstar/model/qwen3_5", "mstar/model/command_a_plus", "mstar/model/wan22", "mstar/model/flux2_klein",
-    "mstar/model/z_image", "mstar/model/ltx2_5", "mstar/model/qwen3_omni", "mstar/model/canary_qwen",
-    "mstar/model/qwen3_asr", "mstar/model/parakeet", "mstar/model/fish_s2_pro",
+    "mstar/model/z_image", "mstar/model/ltx2_5", "mstar/model/qwen3_omni", "mstar/model/minimax_h3",
+    "mstar/model/canary_qwen", "mstar/model/qwen3_asr", "mstar/model/parakeet", "mstar/model/fish_s2_pro",
     "mstar/model/qwen3_tts",
 )
 FORBIDDEN_ATTRIBUTES = {
