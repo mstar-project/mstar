@@ -3163,14 +3163,6 @@ def main(argv: list[str] | None = None):
     with open(args.config) as f:
         config = yaml.safe_load(f)
 
-    lora_block = (config.get("resources") or {}).get("lora") if lora_enabled(config) else None
-    if args.rust_frontend and isinstance(lora_block, dict) and lora_block.get("runtime_updates"):
-        # mstar-server reads the served adapters once at launch and has no
-        # /v1/load_lora_adapter or /v1/unload_lora_adapter
-        raise SystemExit(
-            "LoRA runtime updates (`runtime_updates: true` in the serving config's `lora:` block) "
-            "are served by the Python frontend only; drop --rust-frontend or the setting"
-        )
     try:
         _ws_max_size(config)  # here, not at the bind after the workers' compile
     except ValueError as e:
