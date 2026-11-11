@@ -850,7 +850,12 @@ class KVSpec(NodeResourceSpec):
 
     def apply_yaml_overrides(self, **kwargs):
         """Forwarded to the config: which keys are legal is a property of the
-        storage strategy, so the config answers for them."""
+        storage strategy, so the config answers for them. A ``max_seq_len``
+        override is the client's limit, as the model's own is, so a verifying
+        pool still holds its draft slack past it. Overrides set rather than add,
+        so applying them twice (validation, then the worker) gives the same pool."""
+        if kwargs.get("max_seq_len") is not None and self.draft_slack:
+            kwargs = {**kwargs, "max_seq_len": kwargs["max_seq_len"] + self.draft_slack}
         self.config.apply_yaml_overrides(**kwargs)
 
     def keeps_prefix_cache(self, world_size: int, checkpoint_named: bool) -> bool:
