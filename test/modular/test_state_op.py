@@ -33,7 +33,7 @@ from mstar.engine.state import (
     Value,
     state_op,
 )
-from mstar.engine.state.adapters import build_handle
+from mstar.engine.state.adapters import Resolved, StateSetup, _resolve, build_handle
 from mstar.engine.state.calls import ArrayHandle
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.testing_utils.model import make_model
@@ -109,7 +109,7 @@ def _kv_array(**fields) -> Array:
 def _handle(kv=None, attn=None, array=None) -> ArrayHandle:
     kv = kv or _StubKV()
     array = array or _kv_array()
-    return build_handle(array, {array.name: kv, "attn": attn or _StubAttn()})
+    return build_handle(array, {array.name: kv, "attn": attn or _StubAttn()}, _resolve([array], StateSetup()))
 
 
 def _open(handle) -> SubmoduleStep:
@@ -266,7 +266,8 @@ def test_a_call_in_a_step_that_doesnt_list_the_array_is_refused():
 
 def test_a_state_op_that_adds_to_a_rewritable_array_is_refused():
     value = Value("kv", nodes={"llm"}, layers={0, 1}, entry=Entry({"x": TensorType((2,), dtype=None)}))
-    h = build_handle(value, {"kv": SimpleNamespace(block=lambda field, layer: None)})
+    # a Value with no update, which resolves to no op
+    h = build_handle(value, {"kv": SimpleNamespace(block=lambda field, layer: None)}, Resolved({}, {}, {}))
     _open(h)
     with pytest.raises(ValueError, match="Array 'kv': state op 'write_q' adds to kv, and the array is rewritable"):
         _fused_op()(h, 0, *_tensors())
@@ -287,7 +288,9 @@ def test_a_state_op_that_writes_an_append_only_array_is_refused():
 
 
 def test_a_state_op_on_a_seq_sharded_array_is_refused():
-    h = _handle(array=_kv_array(seq_sharded=True))
+    array = _kv_array(seq_sharded=True)
+    # resolve refuses a seq_sharded paged array, so the read's resource is given here
+    h = build_handle(array, {array.name: _StubKV(), "attn": _StubAttn()}, Resolved({}, {"attn": "attn"}, {}))
     _open(h)
     with pytest.raises(ValueError, match="no layout yet: state op 'write_q' on a seq_sharded array"):
         _fused_op()(h, 0, *_tensors())

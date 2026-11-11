@@ -30,7 +30,15 @@ from mstar.engine.resources.attn.ragged.config import (
 from mstar.engine.resources.spec import apply_yaml_overrides
 from mstar.engine.resources.step import ResourceStep, Segment, StepContext, SubmoduleStep
 from mstar.engine.state import Array, ArrayStep, Attend, Block, Read
-from mstar.engine.state.adapters import StateSetup, build_handle, node_handles, node_resources, state_setup, state_steps
+from mstar.engine.state.adapters import (
+    StateSetup,
+    _resolve,
+    build_handle,
+    node_handles,
+    node_resources,
+    state_setup,
+    state_steps,
+)
 from mstar.engine.state.analysis import deployment_problems, state_declaration_problems
 from mstar.model.base import serving_resources
 from mstar.model.components.diffusion.attention import dit_entry
@@ -419,7 +427,7 @@ def test_a_read_that_breaks_the_graph_recompiles_no_frame_per_layer(attention):
         entry=dit_entry(2, 4), labels={"main"}, max_len=0,
         reads={"attn": Read(mask=Block(), op=Attend(q_heads=2))},
     )
-    handle = build_handle(array, {"attn": _BreakingRead()})
+    handle = build_handle(array, {"attn": _BreakingRead()}, _resolve([array], StateSetup()))
     built = [attention(layer) for layer in (0, 1)]
     for module, _ in built:
         module.bind_state({array.name: handle})
@@ -668,7 +676,7 @@ def test_h3s_split_guards_on_no_layer_and_no_layout():
     )
     setup, problems = state_setup({"resources": {"attn": {"backend": "sdpa"}}}, [array])
     assert not problems, problems
-    handle = build_handle(array, {}, setup)
+    handle = build_handle(array, {}, _resolve([array], setup), setup)
     built = [_h3_attention(layer)[0] for layer in (0, 1)]
     for module in built:
         module.bind_state({array.name: handle})

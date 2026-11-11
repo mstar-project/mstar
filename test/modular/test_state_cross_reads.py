@@ -35,6 +35,7 @@ from mstar.engine.state.adapters import (
     StateSetup,
     WithinStepHandle,
     _bindings,
+    _resolve,
     build_specs,
     node_handles,
     state_setup,
@@ -103,8 +104,11 @@ class _StubGroup:
         self.world_size, self.rank = world_size, rank
 
 
-def _within(array, ragged, **within) -> WithinStepHandle:
-    return WithinStepHandle(array, {next(iter(array.reads)): ragged}, _bindings(WITHIN_STEP, array), **within)
+def _within(array, ragged, queried=None, sp_group=None) -> WithinStepHandle:
+    resolved = _resolve([array] if queried is None else [array, queried], StateSetup())
+    return WithinStepHandle(
+        array, {next(iter(array.reads)): ragged}, _bindings(WITHIN_STEP, array), resolved, sp_group=sp_group,
+    )
 
 
 def _on_sdpa(*reads) -> StateSetup:
@@ -319,7 +323,7 @@ def test_a_cross_read_whose_query_array_lists_an_empty_tuple_is_refused_naming_i
 def test_a_binding_no_paged_array_holds_is_refused_when_it_attaches():
     with pytest.raises(ValueError, match="Array 'a': no layout yet: 'a_read' binds through RaggedAttend, which no "
                                          "paged array holds"):
-        RaggedAttend().attach(SimpleNamespace(reads={}), _array("a"), "a_read", {})
+        RaggedAttend().attach(SimpleNamespace(array=_array("a"), reads={}), "a_read", None)
 
 
 def test_a_cross_read_over_other_requests_is_refused_when_it_opens():
