@@ -1921,8 +1921,8 @@ the deployment left ``knobs: resident_planning`` at ``auto``; the worker log say
 otherwise. A resource the node shares with other nodes is fine while they plan on the host (a
 sharer's host step marks the rows it moved, and an offload it causes frees the slot on
 every planner bound to the resource); it is refused if another sharer names resident
-walks too, or runs in lockstep. A GDN layer on a node whose steps can split refuses it (a replay
-would read the last split prefill's rows); a sequence shard itself doesn't. Steps of other walks,
+walks too, or runs in lockstep. A GDN layer on a node whose steps can split refuses it (resident
+decode beside split prefills is untested); a sequence shard itself doesn't. Steps of other walks,
 and eager steps, keep the host plan and leave the row
 stale, so the first resident step after them writes it. The sampler takes part on its
 own: its per-request scalars (temperature, top-k, top-p, seed, penalties) become cells

@@ -32,6 +32,7 @@ from mstar.engine import engine as engine_mod
 from mstar.engine.accelerator_graph_config import BatchedAcceleratorGraphConfig
 from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner
 from mstar.engine.engine import Engine
+from mstar.engine.resources.attn import base as attn_base
 from mstar.engine.resources.attn import flashinfer as fi_mod
 from mstar.engine.resources.attn.base import AttentionManager
 from mstar.engine.resources.attn.config import (
@@ -68,7 +69,7 @@ from mstar.engine.resources.sampler.config import SamplingReqConfig
 from mstar.engine.resources.sequence_shard import SeqShardSpec, SequenceShard
 from mstar.engine.resources.spec import NodeResourceSpec, apply_yaml_overrides, resolve_spec_dependencies
 from mstar.engine.resources.step import BucketKey, ResourceStep, Segment, SlotLease, StepContext
-from mstar.model.base import declared_resources
+from mstar.model.base import declared_resources, serving_resources
 from mstar.model.qwen3_5.config import GDN_STATE, KV_CACHE, LLM_SHARD
 from mstar.model.submodule_base import NodeInputs, engine_step, with_segment_steps
 from mstar.testing_utils.engine import make_engine, make_mgmt
@@ -1094,6 +1095,39 @@ def test_the_startup_fit_check_pages_a_placed_pools_window_as_the_worker_does():
                 check_kv_pools_fit(model, config, "cfg.yaml", log)
 
 
+def test_the_conductor_counts_a_placed_pools_window_pages_as_the_worker_does():
+    """The conductor admits a request against its own copy of the specs, so it pages a placed
+    pool's window group (half the tokens a page, over 2 SP ranks) as the worker's `place` does."""
+    from mstar.conductor.conductor import Conductor
+    from mstar.graph.base import GraphNode
+
+    def resources():
+        return [
+            KVSpec(resource_key="kv", nodes={NODE}, config=PagedKVConfig(
+                num_layers=2, num_kv_heads=1, head_dim=8, max_seq_len=64, max_num_pages=20, page_size=8,
+                context_parallel=True,
+            )),
+            AttentionSpec(resource_key="full", nodes={NODE}, config=AttentionConfig(kv_cache="kv")),
+            AttentionSpec(resource_key="window", nodes={NODE}, config=AttentionConfig(
+                kv_cache="kv", sliding_window=8, layers=(1,),
+            )),
+        ]
+
+    model = types.SimpleNamespace(get_node_resources=resources)
+    conductor = Conductor.__new__(Conductor)
+    conductor.model, conductor.model_config = model, {}
+    section = GraphNode(name=NODE, input_names=[], outputs=[])
+    conductor._per_worker_graphs = {"w": [types.SimpleNamespace(section=section, tp_size=1, sp_size=P)]}
+
+    [specs] = conductor._resource_specs()
+    counted = specs["kv"]
+    joint = JointGroups(tp_group=_group(0, 1), sp_group=_group(0, P), instance=_group(0, P))
+    worker = serving_resources(model, {})[0].config
+    worker.place(joint, "kv")
+    assert counted.config.groups == worker.groups
+    assert counted.config.groups[1].page_size == 4
+
+
 # a step that isn't causal (BAGEL's image generation, say) attends every token of its rows
 STEPS = pytest.mark.parametrize("rows, causal", [
     (PREFILL_ROWS, True), (PREFILL_ROWS, False), (DECODE_ROWS, True),
@@ -1587,6 +1621,7 @@ def test_fa2_over_an_sp_placed_pool(monkeypatch, caplog, over_sp, capability, ba
     monkeypatch.setenv("MSTAR_WORKSPACE_BUFFER_MB", "1")
     platform = types.SimpleNamespace(cuda_capability=lambda device=None: capability)
     monkeypatch.setattr(fi_mod, "current_platform", platform)
+    monkeypatch.setattr(attn_base, "current_platform", platform)
     if over_sp:
         joint = JointGroups(tp_group=CommGroup.trivial(), sp_group=_group(0, P), instance=_group(0, P))
     else:
@@ -1610,6 +1645,7 @@ def test_fa2_over_an_sp_placed_pool_holds_for_a_windows_layers(
     monkeypatch.setenv("MSTAR_WORKSPACE_BUFFER_MB", "1")
     platform = types.SimpleNamespace(cuda_capability=lambda device=None: capability)
     monkeypatch.setattr(fi_mod, "current_platform", platform)
+    monkeypatch.setattr(attn_base, "current_platform", platform)
     if over_sp:
         joint = JointGroups(tp_group=CommGroup.trivial(), sp_group=_group(0, P), instance=_group(0, P))
     else:

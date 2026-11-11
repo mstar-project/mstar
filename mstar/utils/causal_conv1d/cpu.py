@@ -28,7 +28,7 @@ def causal_conv1d_fn(
     on ``pad_slot_id`` or ``null_block_id`` is skipped. The kernel writes its output into
     ``empty_like`` memory, so tokens no sequence covers come back ``inf`` here rather than as
     found."""
-    assert not unused.get("block_idx_first_scheduled_token") and not unused.get("initial_state_idx"), (
+    assert unused.get("block_idx_first_scheduled_token") is None and unused.get("initial_state_idx") is None, (
         "the CPU conv takes no prefix-cache block pointers"
     )
     if isinstance(activation, bool):

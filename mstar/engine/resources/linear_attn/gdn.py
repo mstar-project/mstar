@@ -167,15 +167,15 @@ class GDNManager(LinearAttnManager):
             )
 
     def resident_refusal(self) -> str | None:
-        # decode addresses the pool by slot alone, which the pool's table holds. A replayed resident
-        # step reuses the last host plan (`plan`), whose split rows, on a node whose steps split, are
-        # the last split prefill's. From the shard's bind (the group's size and the spec), so every
+        # decode addresses the pool by slot alone, which the pool's table holds. Resident decode on a
+        # node whose steps split is not tested (a replay runs no split code, but nothing has replayed
+        # beside split prefills). From the shard's bind (the group's size and the spec), so every
         # rank of the node decides alike
         if self._shard is None:
             return None
         return (
-            f"its steps split over {self._shard.group.world_size} SP ranks, and a resident decode would "
-            "replay the last split prefill's rows"
+            f"its steps split over {self._shard.group.world_size} SP ranks, and "
+            "resident decode there is untested"
         )
 
     def bind_dependencies(self, resources: Mapping[str, Resource]) -> None:

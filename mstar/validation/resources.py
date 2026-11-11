@@ -164,7 +164,8 @@ def _unskippable_resources(
         ):
             continue
         # a dependency that plans from the step a hit trimmed (a sequence shard) holds nothing to restore
-        held = {dep for dep in spec.depends_on() if not by_key[dep].resource_class.prefix_skip_safe}
+        # (an undeclared one is reported apart, by `spec_dependency_problems`)
+        held = {dep for dep in spec.depends_on() if dep in by_key and not by_key[dep].resource_class.prefix_skip_safe}
         if held and held <= pools and spec.writes_prefix_snapshots:
             continue
         yield (

@@ -4,6 +4,7 @@ Kept free of the manager and its kernels so a submodule can declare a step
 without pulling FlashInfer in behind it.
 """
 
+import copy
 import math
 from abc import ABC, abstractmethod
 from collections.abc import Collection, Iterable, Mapping, Sequence
@@ -252,6 +253,16 @@ class PagedKVConfig(KVConfig):
         tp = joint.tp_group
         first = tp.rank // size * size
         return TPPlacement(size=size, index=tp.rank % size, group=tp, partners=tuple(range(first, first + size)))
+
+    def paged_for(self, pool: str, tp: int, sp: int) -> "PagedKVConfig":
+        """This config as a rank of a node of ``tp`` x ``sp`` ranks pages it (`place`): a copy with
+        the groups placed when ``context_parallel`` is on, else this config. What the conductor
+        counts a request's pages with, so its count is the worker's."""
+        if not self.context_parallel:
+            return self
+        placed = copy.copy(self)
+        placed.groups = self.placed_groups(pool, self.context_parallel_size(pool, tp, sp))
+        return placed
 
     def placed_groups(self, pool: str, size: int) -> "tuple[KVGroup, ...]":
         """The pool's groups (`keep_window`) with its positions placed over ``size`` partners: the

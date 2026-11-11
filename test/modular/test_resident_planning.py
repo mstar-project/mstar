@@ -1842,7 +1842,7 @@ def test_a_sequence_shard_leaves_the_node_resident():
 
 
 def test_gdn_on_a_node_whose_steps_split_refuses():
-    """A resident replay reuses GDN's last host plan, whose split rows are the last split prefill's."""
+    """Resident decode beside split prefills is untested, so a GDN node whose steps split plans on the host."""
     from mstar.engine.resources.linear_attn.gdn import GDNManager
 
     manager = GDNManager.__new__(GDNManager)

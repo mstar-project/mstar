@@ -29,6 +29,7 @@ def chunk_gated_delta_rule(
     ``initial_state`` row. Returns the output ``[T, HV, V]`` (in ``q``'s dtype) and the final states
     ``[N, HV, V, K]`` fp32. Refuses a zero-length sequence, on which the kernel deadlocks."""
     assert not checkpoints, "the CPU GDN prefill keeps no state checkpoints"
+    assert not use_qk_l2norm_in_kernel, "FlashInfer's chunk kernel ignores use_qk_l2norm_in_kernel"
     bounds = cu_seqlens.tolist()
     assert all(b > a for a, b in zip(bounds[:-1], bounds[1:], strict=True)), (
         f"a zero-length sequence in {bounds}, on which the chunked kernel deadlocks"
@@ -36,8 +37,6 @@ def chunk_gated_delta_rule(
     heads, dim_k = v.shape[1], q.shape[-1]
     scale = dim_k ** -0.5 if scale is None else scale
     qf, kf = (_at_value_heads(t.float(), heads) for t in (q, k))
-    if use_qk_l2norm_in_kernel:
-        qf, kf = F.normalize(qf, dim=-1), F.normalize(kf, dim=-1)
     vf, gf, bf = v.float(), g.float(), beta.float()
     out = torch.zeros(v.shape, dtype=torch.float32)
     finals = []

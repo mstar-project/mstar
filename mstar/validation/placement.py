@@ -606,8 +606,7 @@ def _sequence_parallel(
         for spec in placed_pools:
             if spec.nodes & nodes:
                 try:
-                    size = spec.config.context_parallel_size(spec.resource_key, tp, sp)
-                    spec.config.placed_groups(spec.resource_key, size)
+                    spec.config.paged_for(spec.resource_key, tp, sp)
                 except ValueError as e:
                     yield f"node_groups[{i}]: {e}"
         # node -> whether it places its KV positions over its SP ranks (heads over TP alone)

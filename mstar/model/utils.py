@@ -767,8 +767,7 @@ def _placed_groups(spec, node_groups) -> list:
         if not spec.nodes & set(group.get("node_names", ())):
             continue
         try:
-            size = kv.context_parallel_size(spec.resource_key, group.get("tp_size", 1), group.get("sp_size", 1))
-            placed.append(kv.placed_groups(spec.resource_key, size))
+            placed.append(kv.paged_for(spec.resource_key, group.get("tp_size", 1), group.get("sp_size", 1)).groups)
         except ValueError:
             pass
     return placed
