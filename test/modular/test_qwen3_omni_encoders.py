@@ -32,6 +32,8 @@ from mstar.engine.resources.base import EngineResourceInfo, build_resource  # no
 from mstar.engine.resources.step import StepContext  # noqa: E402
 from mstar.engine.state import Array, Attend, Block, KVEntry, Read  # noqa: E402
 from mstar.engine.state.adapters import (  # noqa: E402
+    StateSetup,
+    _resolve,
     build_handle,
     node_resources,
     state_steps,
@@ -95,7 +97,7 @@ def _bind(sub, name, read, ragged, heads, head_dim, layers) -> None:
     array = Array(name, nodes={"encoder"}, layers=frozenset(range(layers)), max_len=0,
                   entry=KVEntry(heads=heads, head_dim=head_dim),
                   reads={read: Read(mask=Block(), op=Attend(q_heads=heads))})
-    sub.bind_node_state({name: build_handle(array, {read: ragged})})
+    sub.bind_node_state({name: build_handle(array, {read: ragged}, _resolve([array], StateSetup()))})
 
 
 @contextmanager

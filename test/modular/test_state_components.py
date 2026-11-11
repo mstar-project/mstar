@@ -37,7 +37,7 @@ from mstar.engine.state import (
     TensorType,
     Value,
 )
-from mstar.engine.state.adapters import build_handle, state_steps
+from mstar.engine.state.adapters import StateSetup, _resolve, build_handle, state_steps
 from mstar.engine.state.calls import ArrayHandle
 from mstar.model.components import Attention
 from mstar.model.components.decoder_layer import DecoderLayer, eager_frame, no_cursor, run_layers
@@ -92,14 +92,18 @@ def _begin(*handles) -> None:
         handle.begin_step(step)
 
 
-def _kv_handle(positions=None) -> ArrayHandle:
-    array = Array(
+def _kv_array(positions=None) -> Array:
+    return Array(
         "kv", nodes={"LLM"}, layers={0, 1, 2, 3}, entry=KVEntry(heads=HEADS, head_dim=DIM), max_len=8,
         reads={"attn": Read(mask=Causal(), op=Attend(q_heads=HEADS))},
         positions=positions,
     )
+
+
+def _kv_handle(positions=None) -> ArrayHandle:
+    array = _kv_array(positions)
     resources = {"kv": _StubKV(), "attn": _StubAttn(), "rope": _StubPositions()}
-    return build_handle(array, resources)
+    return build_handle(array, resources, _resolve([array], StateSetup()))
 
 
 def _attention(pos_key="rope", cls=Attention, **kwargs):
@@ -191,7 +195,8 @@ def _gdn_handle() -> ArrayHandle:
     })
     array = Value("gdn", nodes={"LLM"}, layers={1, 2}, entry=entry,
                   updates={"conv": CausalConv(), "linear": GatedDeltaNet()})
-    return build_handle(array, {"gdn": _StubPool(), "conv": None, "linear": _StubLinear()})
+    resolved = _resolve([_kv_array(), array], StateSetup())
+    return build_handle(array, {"gdn": _StubPool(), "linear": _StubLinear()}, resolved)
 
 
 def test_a_delta_net_with_a_handle_runs_both_updates_under_its_own_id():
@@ -227,7 +232,7 @@ class _StubRagged:
 def _vision_handle() -> ArrayHandle:
     array = Array("tokens", nodes={"vit"}, layers={0, 1}, entry=KVEntry(heads=2, head_dim=8), max_len=0,
                   reads={"vision": Read(mask=Block(), op=Attend(q_heads=2))})
-    return build_handle(array, {"vision": _StubRagged()})
+    return build_handle(array, {"vision": _StubRagged()}, _resolve([array], StateSetup()))
 
 
 def _vision_inputs():
