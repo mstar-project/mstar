@@ -237,7 +237,7 @@ class Drafter(Protocol):
         (`DrafterNeeds.carry`). Nothing by default."""
         return None
 
-    def prefill(self, inputs: PrefillInputs) -> None:
+    def prefill(self, inputs: PrefillInputs) -> torch.Tensor | None:
         """After a prompt step samples: the drafter's pass over the step's prompt
         rows, returning the rows' first carry for a drafter that declares one
         (`DrafterNeeds.carry`), which the scaffold stores. Nothing by default."""
