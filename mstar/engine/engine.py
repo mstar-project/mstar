@@ -238,7 +238,8 @@ class SubmoduleManagement:
     # walk -> the stop policy its device runs read ``ignore_eos`` through
     run_policies: dict[str, StopPolicy] = field(default_factory=dict)
     # a deployment asks a walk of this node to repeat (`Engine.enable_repeats`):
-    # only then does a step take the repeat path; every other node runs main's
+    # only then does a step take the repeat path; every other node replays its
+    # captured graph and nothing more
     may_repeat: bool = False
     # the serving config's prefill_token_buckets for the node: capture walk -> ladder,
     # and piecewise region label -> ladder
@@ -2380,7 +2381,7 @@ class Engine:
             ctx = batch.step_context
             if ctx.resident is not None:
                 ctx.resident.flush(ctx.resident_plan)
-            if submodule_mgmt.may_repeat:
+            if submodule_mgmt.may_repeat or ctx.repeats != 1:
                 return self._replay_repeating(
                     batch, submodule_mgmt, cg_runner, engine_inputs, preprocessed, lease, request_ids, release_event,
                 )

@@ -102,8 +102,8 @@ class KVResidentTables:
         slots = plan.slots
         cols = self.host_cols[slots]
         # a step that repeats needs the page of its last replay's token
-        last = self.host_len[slots] if plan.repeats == 1 else self.host_len[slots] + (plan.repeats - 1)
-        need = last // self.page_size + 1
+        tail = self.host_len[slots] if plan.repeats == 1 else self.host_len[slots] + (plan.repeats - 1)
+        need = tail // self.page_size + 1
         rows = np.flatnonzero(need > cols)
         if not rows.size:
             return
