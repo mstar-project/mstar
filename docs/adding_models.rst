@@ -1863,7 +1863,8 @@ What the model writes, and nothing more:
   loop-back masters, which only the in-graph scatter keeps fixed, so a carrying drafter is
   refused where it is off (``MSTAR_SAMPLER_INGRAPH_SCATTER=0``, or above one rank).
 - A drafter whose ``observe`` reads the target's hidden states declares
-  ``DrafterNeeds(target_hidden=True)``; ``target`` then returns ``(logits, hidden)``.
+  ``DrafterNeeds(target_hidden=True)``; ``target`` returns a ``TargetOutput(logits, hidden)``,
+  its hidden states set only then.
 - A node that prefills prompts in chunks needs a drafter that declares its rule at a chunk
   boundary (``DrafterNeeds.chunk_boundary``): ``NONE`` when its state at a row depends on that
   row alone (DSpark).

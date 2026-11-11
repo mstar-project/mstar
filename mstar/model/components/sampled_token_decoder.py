@@ -72,7 +72,7 @@ from mstar.engine.accelerator_graph_config import (
     decode_rows_then_prompt,
 )
 from mstar.engine.resources.attn.config import AttentionStep
-from mstar.engine.resources.draft.drafter import Drafter, PrefillInputs
+from mstar.engine.resources.draft.drafter import Drafter, PrefillInputs, TargetOutput
 from mstar.engine.resources.position.config import PositionStep
 from mstar.engine.resources.sampler.config import SamplerStep
 from mstar.engine.resources.step import ResourceStep, Segment, SubmoduleStep
@@ -743,10 +743,11 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
             input_ids = self.loopback_tokens(engine_inputs)
         n = input_ids.shape[0]
         decoder_kwargs = self.decoder_kwargs(self.DECODE_WALK, engine_inputs, n * self._block, **tensors)
-        model = self.model
+        model, wants_hidden = self.model, self.drafter.needs.target_hidden
 
-        def target(block: torch.Tensor) -> torch.Tensor:
-            return model.logits(model(model.embed(block), label="main", **decoder_kwargs))
+        def target(block: torch.Tensor) -> TargetOutput:
+            hidden = model(model.embed(block), label="main", **decoder_kwargs)
+            return TargetOutput(model.logits(hidden), hidden if wants_hidden else None)
 
         result = self.draft_verify_step(engine_inputs, input_ids.view(n), target)
         return self.verify_output(result)

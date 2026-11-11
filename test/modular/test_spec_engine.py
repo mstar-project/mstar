@@ -797,9 +797,11 @@ def test_the_engine_stores_the_carry_through_prompt_and_verify_steps_that_declar
 
 
 def test_a_drafter_that_reads_the_targets_hidden_states_observes_what_the_target_returned():
-    """``DrafterNeeds.target_hidden``: a verify step's target returns ``(logits, hidden)``, and ``observe`` gets that
-    hidden."""
+    """``DrafterNeeds.target_hidden``: a verify step's target returns its hidden states in its
+    `TargetOutput`, and ``observe`` gets them."""
     from spec_toy import _CarryDrafter
+
+    from mstar.engine.resources.draft.drafter import TargetOutput
 
     class ReadsHidden(_CarryDrafter):
         def __init__(self, k):
@@ -821,7 +823,7 @@ def test_a_drafter_that_reads_the_targets_hidden_states_observes_what_the_target
         if engine_inputs.step.ctx.graph_walk != "decode":
             return logits
         returned.append(logits.clone())
-        return logits, returned[-1]
+        return TargetOutput(logits, returned[-1])
 
     sub._target = with_hidden
     out, _ = _decode_with_accepted(eng, k)

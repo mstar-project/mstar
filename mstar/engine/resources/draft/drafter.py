@@ -187,6 +187,13 @@ def carry_writes(needs: DrafterNeeds | None) -> frozenset[str]:
     return frozenset({DRAFT_CARRY}) if needs is not None and needs.carry is not None else frozenset()
 
 
+class TargetOutput(NamedTuple):
+    """What a verify step's ``target`` returns for the block: its logits, and the target's last
+    hidden states for a drafter that declares ``DrafterNeeds.target_hidden`` (None otherwise)."""
+    logits: torch.Tensor
+    hidden: torch.Tensor | None = None
+
+
 class ObserveInputs(NamedTuple):
     """What a drafter's ``observe`` reads, once the step is verified."""
     # [n, k + 1]: each row's last emitted token and its drafts
@@ -246,15 +253,15 @@ def draft_verify_step(
     sampler,
     request_ids: Sequence[int],
     input_ids: torch.Tensor,
-    target: Callable[[torch.Tensor], torch.Tensor],
+    target: Callable[[torch.Tensor], TargetOutput],
     drafter: Drafter,
     resources: dict[str, Any],
     resident: CapturedResidentStep | None = None,
     settle_keys: Sequence[str] = (),
 ) -> VerifyResult:
     """One verify step, in the engine's order. ``target`` maps the block's ids
-    ``[n * (k + 1)]`` to logits ``[n * (k + 1), V]``, or with the drafter's
-    ``needs.target_hidden`` to ``(logits, hidden)``; ``sampler`` is the node's
+    ``[n * (k + 1)]`` to a `TargetOutput`: logits ``[n * (k + 1), V]``, and with
+    the drafter's ``needs.target_hidden`` the hidden states; ``sampler`` is the node's
     verifying `SamplerResource`, which also keeps a carrying drafter's
     `DRAFT_CARRY`; ``settle_keys`` the resources that correct the block's state
     (`DrafterShare.settle_keys`). Capturable: nothing here reads the device on the host."""
@@ -268,11 +275,10 @@ def draft_verify_step(
     # every rank writes KV for rank 0's drafts
     drafts = sampler.agree(drafts.long())
     block = torch.cat([input_ids.reshape(n, 1).long(), drafts], dim=1)
-    hidden = None
-    if needs.target_hidden:
-        logits, hidden = target(block.reshape(-1))
-    else:
-        logits = target(block.reshape(-1))
+    logits, hidden = target(block.reshape(-1))
+    if needs.target_hidden and hidden is None:
+        raise RuntimeError("the drafter reads the target's hidden states (DrafterNeeds.target_hidden), and the "
+                           "target returned none")
     result = sampler.verify(request_ids, logits.view(n, k + 1, -1), drafts)
     for key in settle_keys:
         # a resource whose state the block wrote in place (GDN's) corrects it here, in the graph
