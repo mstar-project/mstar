@@ -1563,9 +1563,8 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             # Cross-request batch: one combined plan over every request's
             # guidance branches (a single branch when guidance is off). The
             # image and sound batched forwards run both branches whenever the
-            # branch exists. The action one runs the conditional branch alone
-            # when no row is inside its guidance interval, as a single request
-            # does (rows outside it in a guided batch drop the other branch).
+            # branch exists. An action batch's rows agree on guidance this step
+            # (`can_batch`), so it runs both branches or the conditional one alone.
             cfg = infos[0].cfg and (graph_walk not in ACTION_WALKS or any(info.cfg_active for info in infos))
             labels = (COND_LABEL, UNCOND_LABEL) if cfg else (COND_LABEL,)
             return self._gen_step(
@@ -2206,9 +2205,9 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         forward. Mirrors the image batched path: build each request's static gen
         inputs (clamping a request that has run one step past its denoise count),
         run one batched transformer pass, then per request combine the guidance
-        branches (when present) and apply its own joint scheduler step. When no
-        row is inside its guidance interval the batch runs the conditional
-        branch alone, as ``declare_step`` planned it."""
+        branches (when present) and apply its own joint scheduler step. The rows
+        agree on guidance this step (``can_batch``), so the batch runs both
+        branches or the conditional one alone, as ``declare_step`` planned it."""
         states = self._states(engine_inputs)
         attn = self._gen_attn(engine_inputs)
         rids = engine_inputs.request_ids
@@ -2255,8 +2254,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         out = {}
         for (rid, st, lat, act, k), branches in zip(meta, results, strict=True):
             video_v, action_v = branches[0]
-            # The batch runs both branches, but a step outside the request's
-            # guidance_interval keeps the conditional one, as the single path does.
+            # The rows agree on guidance (`can_batch`); the per-row check is defensive.
             if with_cfg and self._cfg_active(st, k):
                 uncond_video, uncond_action = branches[1]
                 video_v = _guided(video_v, uncond_video, st["gs"], lat.dtype)
