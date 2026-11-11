@@ -1164,6 +1164,31 @@ def test_a_stop_string_does_not_cut_a_tool_call(client_and_stub):
 
 
 @pytest.mark.parametrize("stream", [False, True])
+def test_a_call_a_stop_string_cut_off_is_no_tool_calls_finish(client_and_stub, stream):
+    """A stop string ahead of a call in the same chunk ends the reply before
+    the call goes out, so the reply did not end in a call."""
+    client, stub = client_and_stub
+    stub.model_name = "glm52"
+    stub.next_chunks = [_Chunk("text", b"doneEND<tool_call>get_weather<arg_key>city</arg_key>"
+                                       b"<arg_value>Paris</arg_value></tool_call>")]
+    r = client.post("/v1/chat/completions", json={
+        "model": "glm52", "messages": [{"role": "user", "content": "weather?"}], "tools": _GLM_TOOLS,
+        "stop": ["END"], "enable_thinking": False, "stream": stream,
+    })
+    if stream:
+        events = _glm_events(r.text)
+        deltas = [e["choices"][0]["delta"] for e in events]
+        finish = events[-1]["choices"][0]["finish_reason"]
+        content = "".join(d.get("content") or "" for d in deltas)
+        calls = [d for d in deltas if "tool_calls" in d]
+    else:
+        choice = r.json()["choices"][0]
+        finish, content, calls = choice["finish_reason"], choice["message"]["content"], choice["message"].get(
+            "tool_calls", [])
+    assert (finish, content, calls) == ("stop", "done", [])
+
+
+@pytest.mark.parametrize("stream", [False, True])
 def test_glm_chat_without_parallel_calls_ends_at_the_first(client_and_stub, stream):
     client, stub = client_and_stub
     stub.model_name = "glm52"

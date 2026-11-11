@@ -1802,7 +1802,9 @@ class GlmChatAdapter(TextChatAdapter):
         return args
 
     def make_output_parser(self, req: ChatCompletionRequest):
-        mk = _passthrough(req)
+        # normalized as chat_to_request's are, so the parser and the prompt agree
+        # (a flat null switch is unset in both)
+        mk = normalize_generation_kwargs(_passthrough(req))
         single_call = mk.get("parallel_tool_calls") is False
         tools, template_kwargs, forced = self._options(mk)
         # truthiness, as the GLM-5.2 template reads it
