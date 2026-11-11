@@ -1114,17 +1114,10 @@ class _OneEntryPerRow(Reached):
         return torch.arange(rows.shape[0] + 1, dtype=torch.int32, device=rows.device)
 
 
-class HostValueHandle(ArrayHandle):
-    """The calls on a Value of host fields only, which ``host_fields`` holds rather than a resource."""
+class _HostCalls:
+    """The calls on a Value's host fields, which ``host_fields`` holds rather than a resource."""
 
-    def __init__(self, array: Array, host_fields: HostFields):
-        super().__init__(array, EMPTY, None)
-        self._bindings: tuple[BoundOp, ...] = ()
-        self.host_fields = host_fields
-        host_fields.declare(array)
-
-    def _check_storage(self, declared: ArrayStep, segments, ctx) -> None:
-        super()._check_storage(declared, segments, ctx)
+    host_fields: HostFields
 
     def _check_host_writes(self, declared: ArrayStep, ctx) -> None:
         if not declared.keep:
@@ -1153,6 +1146,31 @@ class HostValueHandle(ArrayHandle):
         if fields is None:
             raise self._refusal(f"no host fields for request {request}, label {label!r}, layer {layer}")
         return fields
+
+
+class HostValueHandle(_HostCalls, ArrayHandle):
+    """The calls on a Value of host fields only."""
+
+    def __init__(self, array: Array, host_fields: HostFields):
+        super().__init__(array, EMPTY, None)
+        self._bindings: tuple[BoundOp, ...] = ()
+        self.host_fields = host_fields
+        host_fields.declare(array)
+
+    def _check_storage(self, declared: ArrayStep, segments, ctx) -> None:
+        super()._check_storage(declared, segments, ctx)
+
+
+class ValueWithHostHandle(_HostCalls, ValueHandle):
+    """The calls on a Value with host fields beside its tensor fields."""
+
+    def __init__(
+        self, array: Array, resources: Mapping[str, Any], positions_key: str | None, bindings: tuple[BoundOp, ...],
+        host_fields: HostFields,
+    ):
+        super().__init__(array, resources, positions_key, bindings)
+        self.host_fields = host_fields
+        host_fields.declare(array)
 
 
 class WithinStepHandle(ArrayHandle):
@@ -1518,9 +1536,6 @@ class ValueStorage(Storage):
             raise _no_layout(array, "reads must be empty, since RecurrentStateConfig has no read")
         if array.seq_sharded:
             raise _no_layout(array, "seq_sharded takes max_len 0, and a Value's entries stay whole on each rank")
-        if array.entry.host:
-            raise _no_layout(array, f"entry has host fields {sorted(array.entry.host)}, and RecurrentStateConfig has "
-                                    "no block for one")
         bound = _bindings(self, array)
         kv_cache = None
         if bound:
@@ -1551,6 +1566,21 @@ class ValueStorage(Storage):
     def steps(self, handle: ArrayHandle, declared: ArrayStep, step: SubmoduleStep, steps: dict[str, Any]) -> None:
         pre, post, rows = _forks(handle.array, declared)
         steps[handle.name] = RecurrentStep(segments=declared.segments, pre_forks=pre, post_forks=post, fork_rids=rows)
+
+
+class ValueWithHostStorage(ValueStorage):
+    """A Value with host fields beside its tensor fields: the tensors in a recurrent state pool, which has no block
+    for a host field, and the host fields where the engine holds them."""
+
+    handle_class = ValueWithHostHandle
+
+    def handle(
+        self, array: Array, resources: Mapping[str, Any], setup: "StateSetup", resolved: Resolved,
+        sp_group: CommGroup | None,
+    ) -> ArrayHandle:
+        return ValueWithHostHandle(
+            array, resources, _positions_key(array), _bindings(self, array, setup.by_read), setup.host_fields,
+        )
 
 
 class HostValueStorage(Storage):
@@ -1623,6 +1653,7 @@ class WithinStepStorage(Storage):
 PAGED = PagedStorage()
 PAGED_CROSS = PagedCrossStorage()
 VALUE = ValueStorage()
+VALUE_WITH_HOST = ValueWithHostStorage()
 HOST_VALUE = HostValueStorage()
 WITHIN_STEP = WithinStepStorage()
 
@@ -1630,7 +1661,9 @@ WITHIN_STEP = WithinStepStorage()
 def storage_of(array: Array) -> Storage:
     """The storage today's resources keep ``array`` in."""
     if is_value(array):
-        return VALUE if array.entry.tensors else HOST_VALUE
+        if not array.entry.tensors:
+            return HOST_VALUE
+        return VALUE_WITH_HOST if array.entry.host else VALUE
     if array.rewritable:
         raise _no_layout(array, "a rewritable array has no spec unless it is a Value, of max_len 1")
     if not array.max_len:
@@ -1699,6 +1732,8 @@ def _bindings(
 
 def _no_binding(storage: Storage, array: Array, where: str) -> ValueError:
     kinds = " or ".join(sorted(kind.__name__ for held, kind in BINDINGS if held is storage))
+    if not kinds:
+        return _no_layout(array, f"{where}, and today's resources run no op on this array")
     return _no_layout(array, f"{where} must be {kinds}, the ops today's resources run on this array")
 
 
