@@ -191,11 +191,16 @@ class Qwen3DenseLM(nn.Module):
             )
         return loaded
 
+    @property
+    def embed_dtype(self) -> torch.dtype:
+        return self.embed_tokens.weight.dtype
+
     def embed(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
-    def forward(self, input_embeds: torch.Tensor) -> torch.Tensor:
-        """``(tokens, hidden)`` -> ``(tokens, hidden)`` after the final norm."""
+    def forward(self, input_embeds: torch.Tensor, *, label: str) -> torch.Tensor:
+        """``(tokens, hidden)`` -> ``(tokens, hidden)`` after the final norm. ``label`` is the scaffold's to pass and
+        goes unread, since each row's label comes from the step's segments."""
         return run_layers(self.layers, input_embeds, self.norm, no_cursor)
 
     def logits(self, hidden_states: torch.Tensor) -> torch.Tensor:

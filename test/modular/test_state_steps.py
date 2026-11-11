@@ -278,7 +278,7 @@ def test_an_array_with_no_segments_anywhere_is_refused():
 class _StubSubmodule:
     """What the engine reads off a submodule for a step."""
 
-    lora_keys = ()
+    segment_keys = ()
 
     def __init__(self, handles):
         self.state_handles = handles
@@ -311,12 +311,13 @@ def _drive(step, forward, committed: list) -> None:
     engine._order_after_pre_plans = lambda: None
     engine._runner = SimpleNamespace(plan=lambda step, phase: None, commit=committed.append)
     engine._forward = lambda *args: forward()
+    engine._foreign_planners = {}
     mgmt = SimpleNamespace(
         accelerator_graph_runner=None, resident=None, resources={}, piecewise_runners={}, fp32_precision=None,
         submodule=SimpleNamespace(preprocess=lambda *args, **kwargs: {}),
     )
     batch = SimpleNamespace(
-        preplan_event=None, per_request_input_metadata=None, launch_started_event=None, committed=None,
+        node_name="LLM", preplan_event=None, per_request_input_metadata=None, launch_started_event=None, committed=None,
     )
     engine._drive_step(batch, mgmt, [1], [], {}, step.ctx, step.ctx.slot_lease, False, step, False)
 
@@ -508,7 +509,7 @@ def test_two_arrays_with_positions_each_get_their_own_key():
 def test_a_sampler_becomes_a_sampler_spec():
     sampler = Sampler("s", nodes={"LLM"}, vocab_size=8, penalty=False, min_p=True, eos_ids=(1, 2), draws=3)
     assert build_specs([sampler]) == [SamplerSpec(
-        resource_key="s", nodes={"LLM"}, vocab_size=8, enable_repetion_penalty=False, enable_min_p=True,
+        resource_key="s", nodes={"LLM"}, vocab_size=8, enable_repetition_penalty=False, enable_min_p=True,
         min_tokens_stop_ids=(1, 2),
     )]
 
@@ -743,10 +744,10 @@ class _EngineNode(NodeSubmodule):
 
 def _load_engine(monkeypatch, node, model):
     monkeypatch.setattr(engine_module, "node_handles", lambda model, name, resources, **kwargs: {"kv": name})
-    joint = SimpleNamespace(world_size=1, tp_group=SimpleNamespace(barrier=lambda: None))
+    joint = SimpleNamespace(world_size=1, tp_group=SimpleNamespace(barrier=lambda: None), sp_group=None)
     groups = SimpleNamespace(
         get_joint_group_for_node=lambda name: joint, get_instance_world_size_for_node=lambda name: 1,
-        get_instance_rank_for_node=lambda name: 0, get_sp_config_for_node=lambda name: None,
+        get_instance_rank_for_node=lambda name: 0,
     )
     engine = Engine(None, autocast_dtype=None)
     engine.load_model(

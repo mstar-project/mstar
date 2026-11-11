@@ -57,11 +57,12 @@ from mstar.engine.resources import StepContext, StepRunner, apply_yaml_overrides
 from mstar.engine.resources.base import EngineResourceInfo, build_resource
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.state.adapters import node_handles, node_resources, sampling_configs
-from mstar.model.qwen3_tts.config import LANGUAGE_ID_KEY, PROMPT_LAYOUT_KEY, SPEAKER_ID_KEY, TALKER_TEXT
+from mstar.model.qwen3_tts.config import LANGUAGE_ID_KEY, PROMPT_LAYOUT_KEY, SPEAKER_ID_KEY
 from mstar.model.qwen3_tts.qwen3_tts_model import Qwen3TTSModel
+from mstar.model.qwen3_tts.submodules import text_stream_start
 from mstar.model.submodule_base import InputMetadata, ModelInputsFromEngine, engine_step
 
-GREEDY_KWARGS = {"do_sample": False, "subtalker_dosample": False}
+GREEDY_KWARGS = {"temperature": 0.0, "code_predictor_temperature": 0.0}
 
 
 # ---------------------------------------------------------------------------
@@ -218,7 +219,7 @@ class MStarTalkerDriver:
             config = getattr(spec, "config", None)   # sampler specs carry none
             if config is not None and hasattr(config, "max_num_pages"):
                 spec.apply_yaml_overrides(max_num_pages=max_num_pages)
-        groups = JointGroups(tp_group=CommGroup.trivial(), sp_group=CommGroup.trivial())
+        groups = JointGroups(tp_group=CommGroup.trivial(), sp_group=CommGroup.trivial(), instance=CommGroup.trivial())
         transfer = TransferEngineInfo("h", "h", LocalTransferEngine("h"))
         self.resources = {
             spec.resource_key: build_resource(
@@ -237,13 +238,14 @@ class MStarTalkerDriver:
         talker.bind_node_state(node_handles(model, "Talker", self.resources))
         self.runner = StepRunner(self.resources)
         self.fwd_index = 0
-        # what the graph holds for a request between its steps: the prefill's text edge and the loop counter
-        self.text: torch.Tensor | None = None
+        # per request: its ``text_in`` items, and how many chunks the decode popped
+        self.text_in: dict[str, tuple[list[torch.Tensor], list[int]]] = {}
+        # the decode loop's counter, which the graph holds for a request between its steps
         self.iteration = 0
 
     def open_request(self, rid: str, model_kwargs: dict[str, Any], prompt: dict[str, Any]) -> CurrentForwardPassInfo:
         """``prompt`` is ``process_prompt``'s metadata, which the prefill reads as step metadata."""
-        settings = self.model.get_request_resource_configs({}, model_kwargs)
+        settings = self.model.get_request_resource_configs([], [], model_kwargs)
         configs = sampling_configs(settings, self.model.declare_state())
         self.iteration = 0
         for config in configs.values():
@@ -252,12 +254,21 @@ class MStarTalkerDriver:
         return CurrentForwardPassInfo(
             request_id=rid, graph_walk="talker_prefill", fwd_index=0, random_seed=1234,
             max_tokens=8192, resource_configs=configs,
-            step_metadata={"is_prefill": True, **prompt},
+            step_metadata=dict(prompt),
         )
 
     def close_request(self, rid: str) -> None:
         self.runner.remove_request(rid)
         self.talker.cleanup_request(rid)
+        self.text_in.pop(rid, None)
+
+    def _text_chunk(self, rid: str) -> list[torch.Tensor]:
+        """The decode's next ``text_in`` chunk, as a one-shot stream pops it:
+        one item each, then empty chunks."""
+        items, popped = self.text_in[rid]
+        index = popped[0]
+        popped[0] += 1
+        return [t.to(self.device) for t in items[index:index + 1]]
 
     def step(self, walk: str, fwd: CurrentForwardPassInfo, inputs: dict, forward):
         """One step; ``forward(engine_inputs, **preprocessed)`` runs the compute."""
@@ -266,13 +277,13 @@ class MStarTalkerDriver:
             walk = "talker_prefill_clone"
         fwd.graph_walk = walk
         if walk == "talker_decode":
-            inputs = {**inputs, TALKER_TEXT: [self.text]}
+            inputs = {**inputs, "text_in": self._text_chunk(rid)}
+        else:
+            self.text_in[rid] = (list(inputs.get("text_in", [])), [0])
         metadata = InputMetadata(dynamic_loop_iter_counts={"talker_decode_loop": self.iteration})
         prepared = self.talker.prepare_inputs(walk, fwd, inputs, input_metadata=metadata)
         if walk == "talker_decode":
             self.iteration += 1
-        else:
-            self.text = prepared.kwargs[TALKER_TEXT]
         step = engine_step(self.talker, walk, [rid], [prepared])
         step.set_ctx(StepContext(request_ids=(rid,), graph_walk=walk, slot=0, capture=False))
         outcome = self.runner.admit(step)
@@ -286,6 +297,8 @@ class MStarTalkerDriver:
         out = forward(engine_inputs, **preprocessed)
         step.end_calls()
         self.runner.commit(step)
+        # the step ran: marks TTS EOS fed when this step fed it
+        self.talker.postprocess(rid, fwd, {}, inputs=prepared)
         return out
 
 
@@ -298,16 +311,16 @@ def mstar_teacher_forced(driver: MStarTalkerDriver, tensors: dict, prompt: dict,
     fwd = driver.open_request(rid, greedy_kwargs, prompt)
     logits, hiddens = [], []
 
-    def backbone(engine_inputs, input_embeds, last_token_indices, suppress_eos):
+    def backbone(engine_inputs, input_embeds, last_token_indices, suppress_eos, text_ids=None):
         del engine_inputs, suppress_eos
-        hidden = talker.model(input_embeds)
+        hidden = talker._main_hidden(input_embeds, text_ids)
         last = hidden.index_select(0, last_token_indices)
         hiddens.append(last[0])
         logits.append(talker.model.codec_head(last)[0])
 
     driver.step("talker_prefill", fwd, tensors, backbone)
     for t in range(frame_embeds.shape[0] - 1):
-        # prepare_inputs adds the text condition for this step itself.
+        # the driver feeds this step's text token
         driver.step("talker_decode", fwd, {"talker_input_embeds": [frame_embeds[t:t + 1]]}, backbone)
     driver.close_request(rid)
     return torch.stack(logits), torch.stack(hiddens)
@@ -602,7 +615,20 @@ def main(argv: list[str] | None = None) -> None:
         speaker_embed=tensors.get("speaker_embed", [None])[0],
         ref_codes=tensors.get("ref_codes", [None])[0],
     )
-    backbone_logits, _ = reference_teacher_forced(ref, prefill, frame_embeds, text[:-1], text[-1])
+    # the decode's text conditions: the streamed tokens, TTS EOS unless the prefill took it, then TTS PAD
+    config = talker.config
+    streamed = [int(t) for t in tensors.get("text_in", [])]
+    if text_stream_start(prompt[PROMPT_LAYOUT_KEY]) is not None:
+        streamed.append(config.tts_eos_token_id)
+
+    def project(ids: list[int]) -> torch.Tensor:
+        return talker._project_text(talker._device_ids(tuple(ids))).to(prefill.dtype)[0]
+
+    trailing = project(streamed) if streamed else prefill.new_empty(0, prefill.shape[-1])
+    backbone_logits, _ = reference_teacher_forced(
+        ref, prefill, frame_embeds, trailing, project([config.tts_pad_token_id])[0],
+    )
+    talker.cleanup_request("layout-probe")
     backbone_report = compare_logits("backbone_only_on_mstar_prefill", ours_logits, backbone_logits)
     cp_ours = mstar_code_predictor_logits(talker, ref_hidden, ref_codes)
     cp_theirs = reference_code_predictor_logits(ref, ref_hidden, ref_codes)

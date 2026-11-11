@@ -38,6 +38,7 @@ from mstar.engine.resources.linear_attn.config import (
     LinearAttnStep,
     LinearAttnVariant,
 )
+from mstar.engine.resources.lora.config import LORA_RESOURCE_KEY
 from mstar.engine.resources.position.config import PositionConfig, PositionSpec, PositionStep
 from mstar.engine.resources.recurrent.config import (
     DeltaNetGeometry,
@@ -47,12 +48,13 @@ from mstar.engine.resources.recurrent.config import (
 )
 from mstar.engine.resources.sampler.config import SamplerSpec, SamplerStep, SamplingReqConfig
 from mstar.engine.resources.spec import CombinedSplit, apply_yaml_overrides
-from mstar.engine.resources.step import Segment, StepContext, SubmoduleStep
+from mstar.engine.resources.step import ResourceStep, Segment, StepContext, SubmoduleStep
 from mstar.engine.state import Array, ArrayStep, Layout, Span
 from mstar.engine.state.adapters import (
     PAGED,
     VALUE,
     WITHIN_STEP,
+    StateSetup,
     build_handle,
     kv_layouts,
     node_handles,
@@ -62,13 +64,21 @@ from mstar.engine.state.adapters import (
 )
 from mstar.engine.state.analysis import state_declaration_problems
 from mstar.engine.state.calls import causal_conv
-from mstar.model.base import LabelLayout, parse_autocast_dtype, serving_resources
+from mstar.model.base import (
+    LabelLayout,
+    ProcessPromptOutput,
+    enabled_resources,
+    parse_autocast_dtype,
+    serving_resources,
+)
 from mstar.model.command_a_plus import config as command_a_plus_config
 from mstar.model.command_a_plus.command_a_plus_model import CommandAPlusModel
 from mstar.model.command_a_plus.submodules import CommandAPlusLLMSubmodule
 from mstar.model.components.block_loop_encoder import VISION_BLOCK_LOOP
+from mstar.model.components.request_kwargs import sampler_capabilities
 from mstar.model.keys import MIXED, ROPE
 from mstar.model.multimodal import vision_encoder
+from mstar.model.multimodal_decoder import MultimodalDecoderModel
 from mstar.model.qwen3_5.components.language_model import Qwen3_5ForCausalLM, Qwen3_5LanguageModel
 from mstar.model.qwen3_5.config import (
     ATTN,
@@ -134,6 +144,8 @@ def _qwen3_5_state_dtype(config) -> torch.dtype:
     return torch.bfloat16 if dtype is torch.bfloat16 and head_dims_ok else torch.float32
 
 
+# Less the opt-in LoRA spec, which `enabled_resources` builds only when a deployment names it. It holds callables, so
+# a second build wouldn't equal it.
 def _qwen3_5_reference(config) -> list:
     return [
         KVSpec(
@@ -172,7 +184,7 @@ def _qwen3_5_reference(config) -> list:
             ),
         ),
         SamplerSpec(
-            resource_key=SAMPLER, nodes={"LLM"}, vocab_size=config.vocab_size, enable_repetion_penalty=True,
+            resource_key=SAMPLER, nodes={"LLM"}, vocab_size=config.vocab_size, enable_repetition_penalty=True,
         ),
     ]
 
@@ -243,7 +255,7 @@ def test_the_published_configs_are_found():
 @pytest.mark.parametrize("size", QWEN3_5)
 def test_qwen3_5_specs_equal_the_hand_written_ones(size):
     model = _qwen3_5(**QWEN3_5[size])
-    _assert_equal_per_key(node_resources(model), _qwen3_5_reference(model.config))
+    _assert_equal_per_key(enabled_resources(model, {}, StateSetup()), _qwen3_5_reference(model.config))
 
 
 # The `resources:` blocks of configs/qwen3_5_9b.yaml, with its commented-out state_dtype on.
@@ -283,7 +295,7 @@ def test_qwen3_5_stored_dtype_equals_the_hand_written_rule(ssm_dtype, head_k_dim
         **QWEN3_5["9B"], "mamba_ssm_dtype": ssm_dtype, "linear_key_head_dim": head_k_dim,
         "linear_value_head_dim": head_v_dim,
     })
-    _assert_equal_per_key(node_resources(model), _qwen3_5_reference(model.config))
+    _assert_equal_per_key(enabled_resources(model, {}, StateSetup()), _qwen3_5_reference(model.config))
 
 
 def test_qwen3_5_conv_follows_the_engine_dtype_and_its_state_does_not():
@@ -303,7 +315,7 @@ _ALL_FULL_SHAPES = pytest.mark.parametrize(
 @_ALL_FULL_SHAPES
 def test_qwen3_5_all_full_specs_equal_the_hand_written_ones(overrides):
     model = _qwen3_5(**{**_ALL_FULL, **overrides})
-    specs = node_resources(model)
+    specs = enabled_resources(model, {}, StateSetup())
     _assert_equal_per_key(specs, _qwen3_5_reference(model.config))
     assert {spec.resource_key: spec for spec in specs}[GDN_STATE].config.num_layers == 0, "not the all-full shape"
 
@@ -327,8 +339,9 @@ def test_qwen3_5_refuses_a_shape_that_cant_run(overrides, where):
         _qwen3_5(**{**QWEN3_5["9B"], **overrides}).declare_state()
 
 
-def test_qwen3_5_writes_no_spec_by_hand():
-    assert _qwen3_5(**QWEN3_5["9B"]).get_node_resources() == []
+def test_qwen3_5_writes_only_lora_by_hand():
+    model = _qwen3_5(**QWEN3_5["9B"])
+    assert {spec.resource_key for spec in model.get_node_resources()} == {LORA_RESOURCE_KEY}
 
 
 # The tower of Qwen/Qwen3.5-9B's `config.json`
@@ -341,7 +354,7 @@ _VISION = dict(
 def _qwen3_5_vision(monkeypatch) -> Qwen3_5DenseModel:
     model = _qwen3_5(**QWEN3_5["9B"])
     model.vision_config = Qwen3_5VisionConfig(**_VISION)
-    model.media = (SimpleNamespace(encoder=vision_encoder((9,))),)
+    model.media = (SimpleNamespace(encoder=vision_encoder()),)
     # the image processor's numbers, which `Qwen3_5DenseModel.image_processor` reads off the checkpoint
     processor = SimpleNamespace(size={"shortest_edge": 65536}, patch_size=16)
     monkeypatch.setattr(Qwen3_5DenseModel, "image_processor", processor)
@@ -358,7 +371,6 @@ def _qwen3_5_vision_reference(model) -> RaggedAttentionSpec:
             num_kv_heads=vision.num_heads,
             head_dim=vision.head_dim,
             max_segments_per_step=VisionEncoderSubmodule.BLOCK_LOOP_PATCH_BUCKETS[-1] // min_patches,
-            compile_op=True,
         ),
     )
 
@@ -366,7 +378,7 @@ def _qwen3_5_vision_reference(model) -> RaggedAttentionSpec:
 def test_qwen3_5_vision_spec_equals_the_hand_written_one(monkeypatch):
     model = _qwen3_5_vision(monkeypatch)
     reference = [*_qwen3_5_reference(model.config), _qwen3_5_vision_reference(model)]
-    _assert_equal_per_key(node_resources(model), reference)
+    _assert_equal_per_key(enabled_resources(model, {}, StateSetup()), reference)
     assert state_declaration_problems(model) == []
 
 
@@ -468,7 +480,7 @@ def test_qwen3_5_all_full_layout_converts_to_the_hand_written_one(overrides):
 
 
 def test_qwen3_5_prefill_vision_step_equals_the_hand_written_one():
-    llm = _qwen3_5_llm(_qwen3_5(**QWEN3_5["9B"]), encoders=(vision_encoder((9,)),))
+    llm = _qwen3_5_llm(_qwen3_5(**QWEN3_5["9B"]), encoders=(vision_encoder(),))
     rids = [1]
     tokens = torch.arange(4)
     inputs = [ARNodeInputs(input_seq_len=4, input_ids=tokens, resource_step_info=6)]
@@ -503,11 +515,24 @@ def test_qwen3_5_leased_vision_step_declares_none_as_it_did(monkeypatch):
     assert step is None
 
 
+def test_qwen3_5_leased_vision_step_beside_a_lora_pool_declares_its_spans_and_no_attention(monkeypatch):
+    """The replayed block loop's region declares the attention, and the patch embed and merger outside it still need
+    the spans planned for a resource whose step is the segments (a LoRA pool), as `main` declares them."""
+    encoder = _qwen3_5_encoder(monkeypatch)
+    encoder.bind_node_resources({"lora": SimpleNamespace(steps_from_segments=True)})
+    inputs = [SimpleNamespace(resource_step_info={"main": (4, 4)})]
+    leases = {VISION_BLOCK_LOOP: object()}
+    step = engine_step(encoder, graph_walk="prefill_vision", request_ids=[1], inputs=inputs, piecewise_leases=leases)
+    segments = [Segment(1, "main", 4), Segment(1, "main", 4)]
+    assert not step.state, "a leased step's attention is its region's, which would plan it twice"
+    assert step.segments == segments and step.steps == {"lora": ResourceStep(segments=tuple(segments))}
+
+
 def test_qwen3_5_vision_region_steps_equal_the_hand_written_ones(monkeypatch):
     encoder = _qwen3_5_encoder(monkeypatch)
     config = encoder.get_piecewise_accelerator_graph_configs(torch.device("cpu"), torch.bfloat16)[VISION_BLOCK_LOOP]
     runner = object.__new__(PiecewiseAcceleratorGraphRunner)
-    runner._config, runner._lora_keys, runner._state_handles = config, (), encoder.state_handles
+    runner._config, runner._segment_keys, runner._state_handles = config, (), encoder.state_handles
     step = runner._region_step([7], [3, 5])
     reference = PiecewisePackedConfig(
         capture_fn=config.capture_fn, make_static_inputs=config.make_static_inputs, attn_key=VISION_ATTN,
@@ -561,10 +586,28 @@ def test_qwen3_5_vision_layout_converts_to_the_hand_written_one_with_no_keyed_sp
     assert converted.row() == reference.row(), "the one-walk check runs in row(), and the conductor reads what it gives"
 
 
+def test_qwen3_5_hands_on_the_scaffolds_keyed_spans(monkeypatch):
+    """The scaffold keys no span of a media prompt, whose leading text the data worker would refuse to key on its
+    `prefill_vision` walk. The state layout holds no count, so it rides beside it."""
+    spans = (
+        Span("ids", "prefill_vision", 3, 3, "text_inputs"), Span("rows", "prefill_vision", 8, 6, "text_inputs"),
+        Span("ids", "prefill_vision", 2, 2, "text_inputs"),
+    )
+    scaffold = LabelLayout(spans=spans, growth=(("decode_loop", 1),), keyed_spans=0)
+    monkeypatch.setattr(
+        MultimodalDecoderModel, "process_prompt",
+        lambda *args, **kwargs: ProcessPromptOutput({}, {"kv_layout": {KV_CACHE: {"main": scaffold}}}),
+    )
+    model = _qwen3_5(**QWEN3_5["9B"])
+    metadata = model.process_prompt("hello", ["text", "image"], ["text"]).metadata
+    converted = kv_layouts(model.declare_state(), metadata["state_layout"], metadata.get("keyed_spans", {}))
+    assert converted == {KV_CACHE: {"main": scaffold}}, "the leading text span would be keyed"
+
+
 def test_qwen3_5_request_settings_equal_the_hand_written_config():
     model = _qwen3_5(**QWEN3_5["9B"])
     kwargs = {"temperature": 0.0, "top_p": 0.5, "top_k": 3, "repetition_penalty": 1.3, "ignore_eos": True, "seed": 9}
-    configs = sampling_configs(model.get_request_resource_configs({}, kwargs), model.declare_state())
+    configs = sampling_configs(model.get_request_resource_configs([], [], kwargs), model.declare_state())
     reference = SamplingReqConfig(temperature=0.0, top_p=0.5, top_k=3, repetition_penalty=1.3, ignore_eos=True)
     assert configs == {SAMPLER: reference}
 
@@ -809,7 +852,7 @@ def _command_a_plus_reference(model: CommandAPlusModel) -> list:
             rope_theta=config.rope_theta,
         )),
         SamplerSpec(resource_key=SAMPLER, nodes={"LLM"}, vocab_size=config.vocab_size,
-                    enable_repetion_penalty=True),
+                    **sampler_capabilities(model.sampling_defaults)),
     ]
 
 
@@ -905,7 +948,7 @@ def _command_a_plus_reference_step(walk, rids, inputs) -> SubmoduleStep:
                 apply_penalty=True,
                 prefill_tracked_tokens={
                     rid: inp.input_ids for rid, inp in zip(rids, inputs, strict=True)
-                } if walk in command_a_plus_config.PREFILL_WALKS else {},
+                } if walk != "decode" else {},
             ),
         },
     )
@@ -916,7 +959,7 @@ def _command_a_plus_reference_step(walk, rids, inputs) -> SubmoduleStep:
 ])
 def test_command_a_plus_steps_equal_the_hand_written_ones(tmp_path, walk, lengths):
     model = _command_a_plus(tmp_path)
-    node = _bind(CommandAPlusLLMSubmodule(torch.nn.Module(), model.config, 0), model)
+    node = _bind(CommandAPlusLLMSubmodule(torch.nn.Module(), model.config, (model.image_encoder,)), model)
     rids = list(range(len(lengths)))
     inputs = [ARNodeInputs(input_ids=torch.arange(n), input_seq_len=n) for n in lengths]
     step = engine_step(node, graph_walk=walk, request_ids=rids, inputs=inputs)

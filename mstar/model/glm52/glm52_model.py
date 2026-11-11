@@ -2,13 +2,15 @@
 
 import json
 import logging
+from collections.abc import Mapping
 from pathlib import Path
+from types import MappingProxyType
 
 import torch
 from jinja2 import TemplateError
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import CurrentForwardConductorMetadata
+from mstar.conductor.request_info import FINAL_PREFILL
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
@@ -26,7 +28,12 @@ from mstar.engine.resources import (
 )
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span
+from mstar.model.base import KVLabel, LabelLayout, Model, ProcessPromptOutput, Span, WalkStep
+from mstar.model.components.request_kwargs import (
+    SAMPLING_KEYS,
+    generation_config_dir,
+    sampling_defaults,
+)
 from mstar.model.glm52.config import (
     ATTN_RESOURCE,
     DSA_RESOURCE,
@@ -38,7 +45,13 @@ from mstar.model.glm52.config import (
 )
 from mstar.model.multimodal import TEXT, PromptPart, chat_turns
 from mstar.model.submodule_base import NodeSubmodule
-from mstar.model.utils import capture_ladder, load_snapshot_tokenizer, read_fp8_block_quant_config, resolve_checkpoint
+from mstar.model.utils import (
+    ByteLevelTextOutput,
+    capture_ladder,
+    load_snapshot_tokenizer,
+    read_fp8_block_quant_config,
+    resolve_checkpoint,
+)
 from mstar.utils.generation_kwargs import normalize_generation_kwargs
 
 logger = logging.getLogger(__name__)
@@ -51,19 +64,29 @@ _RETIRED_KWARGS = (
     "moe_quant_kernel", "moe_decode_kernel", "moe_router_kernel", "moe_prefill_kernel",
     "moe_fused_allreduce", "dense_fp8", "mla_fused_prep", "fused_add_rmsnorm",
     "prefill_last_layer_rows")
+# The quantized checkpoint formats GLM-5.2's loader reads itself: fp8 block-scale
+# (weight_loader.py dequantizes the dense weights and keeps the routed experts fp8).
+QUANT_METHODS = ("fp8",)
+
+# what zai-org/GLM-5.2's generation_config.json declares, for a checkpoint whose file is not at hand
+DEFAULT_SAMPLING = MappingProxyType({"temperature": 1.0, "top_p": 0.95})
 
 
-class Glm52Model(Model):
+class Glm52Model(ByteLevelTextOutput, Model):
     """GLM-5.2: 753B MoE causal LM (MLA + DSA), text in / text out."""
+
+    DECODE_LOOP = "decode_loop"
 
     # the conductor builds the fused-MoE align op before spawning the workers
     prebuild_fused_moe = True
+    # the checkpoint's sampling defaults, under whatever a request sets (set by
+    # `__init__`; a model built without it takes the published recipe)
+    sampling_defaults: Mapping[str, object] = DEFAULT_SAMPLING
 
     def __init__(
         self,
         model_path_hf: str,
         cache_dir: str | None = None,
-        prefill_token_buckets: list[int] | None = None,
         **kwargs,
     ):
         self.cache_dir = cache_dir
@@ -106,13 +129,9 @@ class Glm52Model(Model):
             if not isinstance(kwargs["graph_compile"], bool):
                 raise ValueError(f"graph_compile must be true or false, got {kwargs['graph_compile']!r}")
             self.config.graph_compile = kwargs["graph_compile"]
-        if prefill_token_buckets is not None:
-            # as given: the submodule checks it as Qwen3.5's, and int() would read 64.5 as 64
-            # and "64" as [6, 4]
-            self.config.prefill_token_buckets = prefill_token_buckets
-        for key in ("prefill_batched_token_buckets", "prefill_capture_batch_sizes"):
-            if key in kwargs:
-                setattr(self.config, key, capture_ladder(key, kwargs[key]))
+        if "prefill_capture_batch_sizes" in kwargs:
+            self.config.prefill_capture_batch_sizes = capture_ladder(
+                "prefill_capture_batch_sizes", kwargs["prefill_capture_batch_sizes"])
         if "mtp_num_draft_tokens" in kwargs:
             k = kwargs["mtp_num_draft_tokens"]
             if isinstance(k, bool) or not isinstance(k, int) or k < 0:
@@ -123,8 +142,9 @@ class Glm52Model(Model):
         # "byte" maps UTF-8 bytes to token ids for reduced serve (no HF IO).
         self._tokenizer_mode = kwargs.get("tokenizer_mode", "hf")
         self._tokenizer = None
-        self._detokenizer = None
         self._submodule_cache: dict[str, NodeSubmodule | None] = {}
+        self.sampling_defaults = sampling_defaults(
+            generation_config_dir(self.model_path_hf, cache_dir), DEFAULT_SAMPLING)
 
     def _check_mtp(self, kwargs: dict) -> None:
         if self.config.dsa_long_context:
@@ -230,9 +250,12 @@ class Glm52Model(Model):
                 resource_key=POS_RESOURCE, nodes=nodes,
                 config=self.config.position_config(),
             ),
+            # min-p only where the checkpoint defaults it; elsewhere a request's
+            # min_p > 0 is refused at admission
             SamplerSpec(
                 resource_key=SAMPLER_RESOURCE, nodes=nodes,
                 vocab_size=self.config.vocab_size,
+                enable_min_p=bool(self.sampling_defaults.get("min_p")),
             ),
         ]
         if self.config.dsa_long_context:
@@ -283,11 +306,8 @@ class Glm52Model(Model):
                     ),
                 ],
             ),
-            # Runaway guard only: the per-request budget is the loop cap
-            # (get_loop_caps), set from the request's max_tokens. Sized to the most
-            # decode steps any prompt can take before the context guard, not
-            # to the default budget: at the default, every request asking for
-            # more was cut short at 1025 tokens with no error.
+            # The window every request's loop cap (get_loop_caps) must fit: the
+            # most decode steps a one-token prompt can take before the context guard.
             max_iters=self.max_decode_steps(),
             outputs=[],
         )
@@ -295,73 +315,21 @@ class Glm52Model(Model):
         return dict(prefill=prefill, decode=decode)
 
     # -------------------------------------------------------------------
-    # Model ABC: conductor state machine (prefill -> decode -> done)
+    # Model ABC: walk plan
 
-    def get_initial_forward_pass_args(
+    def walk_plan(
         self,
         partition_name: str,
         input_modalities: list[str],
         output_modalities: list[str],
         input_signals: dict[str, list[TensorPointerInfo]],
-        model_kwargs: dict | None = None,
-    ) -> ForwardPassArgs:
-        full_metadata = CurrentForwardConductorMetadata(
-            input_modalities=input_modalities,
-            output_modalities=output_modalities,
-            graph_walk="prefill",
-            is_prefill=True,
-        )
-
-        graph_edge = GraphEdge(next_node="LLM", name="text_inputs")
-        graph_edge.tensor_info = input_signals.get("text_inputs", [])
-        inputs = [graph_edge]
-        unpersist_tensors = sum([inp.tensor_info for inp in inputs], start=[])
-
-        return ForwardPassArgs(
-            full_metadata=full_metadata,
-            inputs=inputs,
-            unpersist_tensors=unpersist_tensors,
-            step_metadata={"is_prefill": True},
-        )
-
-    def get_partition_forward_pass_args(
-        self,
-        partition_name: str,
-        partition_metadata: CurrentForwardConductorMetadata,
-        persist_signals: dict[str, list[TensorPointerInfo]],
-        incoming_connections=None,
-    ) -> ForwardPassArgs:
-        metadata = partition_metadata
-        request_done = False
-
-        if metadata.is_prefill:
-            metadata.is_prefill = False
-            metadata.graph_walk = "decode"
-        elif metadata.graph_walk == "decode":
-            # The decode Loop ran to EOS (submodule check_stop) or to
-            # max_iters; either way the request is finished.
-            request_done = True
-            metadata.kwargs["decode_finished"] = True
-
-        if request_done:
-            return ForwardPassArgs(
-                full_metadata=metadata,
-                inputs=[],
-                unpersist_tensors=[],
-                request_done=True,
-            )
-
-        graph_edge = GraphEdge(next_node="LLM", name="text_inputs")
-        graph_edge.tensor_info = persist_signals.get("new_token", [])
-        unpersist_tensors = list(graph_edge.tensor_info)
-        inputs = [graph_edge]
-
-        return ForwardPassArgs(
-            full_metadata=metadata,
-            inputs=inputs,
-            unpersist_tensors=unpersist_tensors,
-            step_metadata={"is_prefill": metadata.is_prefill},
-        )
+        model_kwargs: dict,
+    ) -> list[WalkStep]:
+        # one prefill over the prompt, then decode until the stop check ends it
+        return [
+            WalkStep("prefill", step_metadata={FINAL_PREFILL: True}),
+            WalkStep("decode", bind={"text_inputs": "new_token"}),
+        ]
 
     # -------------------------------------------------------------------
     # Model ABC: prompt processing
@@ -378,9 +346,10 @@ class Glm52Model(Model):
     ) -> NameToTensorList | ProcessPromptOutput:
         if prompt is None:
             return {}
+        # read here, in the data worker: a bad knob is the client's 400 before any work
+        sampling = self.get_request_resource_configs([], [], kwargs)[SAMPLER_RESOURCE]
         if self.config.mtp_num_draft_tokens > 0:
             # refused here as a 400; prepare_inputs would refuse it as a 500
-            sampling = self.get_request_resource_configs({}, kwargs)[SAMPLER_RESOURCE]
             if sampling.temperature != 0 or sampling.repetition_penalty != 1:
                 raise ValueError(
                     f"MTP drafting is greedy only (temperature={sampling.temperature}, "
@@ -433,25 +402,22 @@ class Glm52Model(Model):
         return input_ids[0]
 
     def get_request_resource_configs(
-        self, partition_fwd_args: dict[str, ForwardPassArgs],
-        model_kwargs: dict | None = None,
+        self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
     ) -> dict[str, ResourceReqConfig]:
-        del partition_fwd_args
+        del input_modalities, output_modalities
         model_kwargs = normalize_generation_kwargs(model_kwargs)
-        keys = ["temperature", "top_p", "repetition_penalty", "ignore_eos"]
         params = {
-            k: model_kwargs.get(k, getattr(self.config, k))
-            for k in keys
+            **self.sampling_defaults,
+            **{k: model_kwargs[k] for k in SAMPLING_KEYS if k in model_kwargs},
         }
-        # the sampler's own knobs with no config default; dropped, a request got none of them
-        for k, cast in (("top_k", int), ("min_p", float), ("penalize_prompt", bool)):
-            if model_kwargs.get(k) is not None:
-                params[k] = cast(model_kwargs[k])
         if self.config.mtp_num_draft_tokens > 0 and "temperature" not in model_kwargs:
             # greedy by default under MTP, so a request that names no temperature serves
             # rather than being refused; an explicit temperature > 0 still is
             params["temperature"] = 0.0
         return {SAMPLER_RESOURCE: SamplingReqConfig(**params)}
+
+    def request_kwargs(self) -> frozenset[str]:
+        return frozenset({"max_output_tokens", *SAMPLING_KEYS})
 
     def context_limit(self) -> int:
         """The bound the submodule's preprocess holds every context to:
@@ -470,11 +436,6 @@ class Glm52Model(Model):
             "max_output_tokens", self.config.max_output_tokens)
         return self.context_limit() if budget is None else budget
 
-    def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
-        # the prefill emits the first of max_output_tokens, so the loop runs one fewer: the
-        # whole window is max_iters, and the conductor refuses a cap past it
-        return {"decode_loop": max(1, self.get_max_output_tokens(**model_kwargs) - 1)}
-
     # -------------------------------------------------------------------
     # Model ABC: postprocess
     # -------------------------------------------------------------------
@@ -486,19 +447,7 @@ class Glm52Model(Model):
         **kwargs,
     ) -> bytes:
         if modality == "text":
-            token_ids = output.flatten().tolist()
-            if self._tokenizer_mode == "byte":
-                # Synthetic reduced models emit arbitrary byte ids; return raw
-                # bytes without ever touching the HF tokenizer.
-                return bytes((t & 0xFF) for t in token_ids)
-            # The tokens' raw bytes (byte-level BPE): a character split across
-            # tokens reaches the client whole, where decoding each token alone
-            # gives U+FFFD. Special tokens drop, as with skip_special_tokens.
-            if self._detokenizer is None:
-                from mstar.model.utils import ByteLevelDetokenizer
-
-                self._detokenizer = ByteLevelDetokenizer(self.tokenizer)
-            return self._detokenizer.to_bytes(token_ids)
+            return super().postprocess(output, modality, **kwargs)
         raise ValueError(f"Unsupported modality for GLM-5.2: {modality!r}")
 
     # -------------------------------------------------------------------
@@ -568,7 +517,7 @@ class Glm52Model(Model):
             )
 
         logger.info("Successfully loaded GLM-5.2 submodule for %s", node_name)
-        submodule = Glm52LLMSubmodule(language_model=language_model, config=self.config)
+        submodule = Glm52LLMSubmodule(language_model, self.config)
         return submodule
 
     def _load_checkpoint(self, language_model, source: str, device, tp_group) -> None:
@@ -579,7 +528,7 @@ class Glm52Model(Model):
 
         index_file = Path(source) / "model.safetensors.index.json"
         if not index_file.is_file():
-            load_weights(language_model, source, device=device)
+            load_weights(language_model, source, device=device, quant_methods=QUANT_METHODS)
             return
 
         with open(index_file) as f:
@@ -595,7 +544,7 @@ class Glm52Model(Model):
             len(keys), len(checkpoint_keys), len(specs), tp_rank, tp_size,
         )
         weights = iter_safetensors_shards(
-            source, device=device, keys=keys, slice_spec=specs.get,
+            source, device=device, keys=keys, slice_spec=specs.get, quant_methods=QUANT_METHODS,
         )
         language_model.load_weights(weights)
 

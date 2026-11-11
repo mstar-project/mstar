@@ -7,7 +7,7 @@ is described in [`docs/metrics.rst`](../../docs/metrics.rst).
 ## Run it
 
 1. Start M\* on the host with metrics on (it needs the `metrics` extra,
-   `pip install 'mstar[metrics]'`), and check that it answers:
+   `pip install 'mstar-ai[metrics]'`), and check that it answers:
 
    ```bash
    mstar serve kokoro --enable-metrics        # or: mstar-serve --config ... --enable-metrics

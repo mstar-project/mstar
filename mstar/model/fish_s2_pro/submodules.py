@@ -410,23 +410,24 @@ class CodecSubmodule(ARNodeSubmodule):
         inputs: NameToTensorList,
         input_metadata: InputMetadata = EMPTY_INPUT_METADATA,
         **kwargs: Any,
-    ) -> ARNodeInputs:
+    ) -> ARNodeInputs | None:
         """The chunk's ``[frames, 10]`` codes and its bucket. Every item is a
         frame: the AR withholds its ``<|im_end|>`` frame (``TokenStop.withhold``)."""
-        del graph_walk, fwd_info, input_metadata, kwargs
-        received = inputs.get("codec_tokens")
-        if received:
-            codes = received[0].to(device=self.get_device(), dtype=torch.long)
-        else:
-            # A frameless chunk only ends the stream: the producer-done flush of a drained stream.
-            codes = torch.zeros(0, self.config.num_codebooks, dtype=torch.long, device=self.get_device())
+        del graph_walk, fwd_info, kwargs
+        chunk = self._codec_chunk(input_metadata)
+        if chunk is not None and chunk.is_final and chunk.num_items <= chunk.context_items:
+            # a frameless final chunk (the producer-done flush of a drained
+            # stream, or one whose first frame was <|im_end|>): nothing to
+            # decode, and declined it still ends the stream
+            return None
+        codes = inputs["codec_tokens"][0].to(device=self.get_device(), dtype=torch.long)
         codes = codes.reshape(-1, self.config.num_codebooks)
         frames = codes.shape[0]
         return ARNodeInputs(tensor_inputs={"codec_tokens": codes}, kwargs={"frames": frames})
 
     @staticmethod
     def _row_bucket_frames(item: ARNodeInputs) -> int:
-        return max(item.tensor_inputs["codec_tokens"].shape[0], 1)
+        return item.tensor_inputs["codec_tokens"].shape[0]
 
     def declare_step(
         self,

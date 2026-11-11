@@ -1,5 +1,6 @@
-"""The LLM node of Canary-Qwen: dense Qwen3 with the encoder's audio
-embeddings spliced into the prompt at prefill. The encoder node is the shared
+"""The LLM node of Canary-Qwen: dense Qwen3 on the shared `SampledTokenDecoder`,
+the whole prompt prefilled as one row with the encoder's audio frames spliced
+in at its placeholders. The encoder node is the shared
 ``FastConformerEncoderSubmodule`` with the projection into the LLM's width."""
 from __future__ import annotations
 
@@ -8,141 +9,43 @@ from typing import Any
 
 import torch
 
-from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.state import ArrayStep, SampleStep, Segment, SlotLease, SubmoduleStep, at_last_token, sample
-from mstar.model.canary_qwen.config import DECODE_LOOP, DECODE_WALK, KV_CACHE, SAMPLER
-from mstar.model.components.qwen3_lm import Qwen3DenseLM
-from mstar.model.components.token_step import TokenStepNode
-from mstar.model.multimodal import splice_media
-from mstar.model.submodule_base import (
-    ARNodeInputs,
-    ARNodeSubmodule,
-    BatchedModelOutput,
-    ModelInputsFromEngine,
-    TokenStop,
-)
-from mstar.utils.h2d import to_device_nonblocking
+from mstar.engine.state import ArrayStep, SampleStep, Segment, SubmoduleStep, at_last_token, position, sample
+from mstar.model.canary_qwen.config import KV_CACHE, SAMPLER
+from mstar.model.components.sampled_token_decoder import SampledTokenDecoder
+from mstar.model.submodule_base import ModelInputsFromEngine
 
 
-class CanaryQwenLLMSubmodule(TokenStepNode, ARNodeSubmodule):
-    """Dispatches on graph_walk:
-      - prefill: embed the chat prompt, put the audio embeddings over its
-        placeholder tokens, fill the KV cache, sample the first token.
-      - decode: embed the previous token, single-step decode.
-
-    Decode is captured per batch size; prefill runs eager (its length
-    follows the clip).
-    """
-
-    DECODE_WALK = DECODE_WALK
-    DECODE_LOOP = DECODE_LOOP
-    SAMPLER = SAMPLER
-    # Prefill isn't captured; this bounds its batch, so one prefill's
-    # reservation stays well inside the cache.
-    MAX_PREFILL_BATCH_SIZE = 16
+class CanaryQwenLLMSubmodule(SampledTokenDecoder):
     # off: with torch.compile, Canary-Qwen's throughput was 7-15% lower at c=1-64 (H100 A/B)
     disable_torch_compile = True
-
-    def __init__(self, llm: Qwen3DenseLM, audio_token_id: int, stop_token_ids: set[int]):
-        super().__init__()
-        self.model = llm
-        self.audio_token_id = audio_token_id
-        self.token_stop = TokenStop(
-            loop=self.DECODE_LOOP, buffer="new_token", stop_ids=frozenset(stop_token_ids),
-            sampler=self.SAMPLER, prefill_walks=frozenset({self.PREFILL_WALK}),
-        )
+    # the ladder it captured before moving onto the scaffold
+    DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]
+    # decode only, as before the scaffold: a prefill's length follows its clip
+    CAPTURE_PREFILL = False
+    # Prefill isn't captured; this caps its batch, so one prefill's
+    # reservation stays well inside the cache.
+    PREFILL_MEDIA_CAPTURE_BATCH_SIZES = [16]
+    # decode reads its ids back from the routed token and emits a tensor a
+    # request, as before the scaffold; the device path is a measured change
+    device_loopback = None
 
     def bind_state(self, handles: Mapping[str, Any]) -> None:
         self.kv = handles[KV_CACHE]
         self.sampler = handles[SAMPLER]
 
-    def splice_audio(self, input_ids: torch.Tensor, audio_embeds: torch.Tensor) -> torch.Tensor:
-        """Prompt embeddings with the k-th audio frame over the k-th
-        placeholder token (``process_prompt`` writes one per frame). No host
-        reads: this runs on the GPU thread, ahead of the step in flight."""
-        slots = input_ids == self.audio_token_id
-        # the placeholder id is past the trained vocabulary; embed 0 there
-        embeds = self.model.embed(torch.where(slots, torch.zeros_like(input_ids), input_ids))
-        return splice_media(embeds, slots, audio_embeds)
-
-    def prepare_inputs(
-        self,
-        graph_walk: str,
-        fwd_info: CurrentForwardPassInfo,
-        inputs: NameToTensorList,
-        **kwargs,
-    ) -> ARNodeInputs:
-        device = self.get_device()
-        token_ids = to_device_nonblocking(inputs["text_inputs"][0], device).reshape(-1)
-        if graph_walk == DECODE_WALK:
-            return ARNodeInputs(input_seq_len=1, input_ids=token_ids)
-        audio_embeds = inputs["encoder_states"][0].to(device)
-        return ARNodeInputs(
-            input_seq_len=token_ids.shape[0],
-            input_ids=token_ids,
-            input_embeds=self.splice_audio(token_ids, audio_embeds),
-        )
-
-    def declare_step(
-        self,
-        graph_walk: str,
-        request_ids: list[str],
-        inputs: list[ARNodeInputs],
-        slot_lease: SlotLease | None = None,
-        piecewise_leases: Mapping[str, SlotLease] | None = None,
-        **kwargs,
+    def node_step(
+        self, segments: list[Segment], prefill_tokens: Mapping[int, torch.Tensor], advance: tuple[int, ...] | None,
     ) -> SubmoduleStep:
         return SubmoduleStep(
-            segments=[
-                Segment(request_id=rid, label="main", span=inp.input_seq_len)
-                for rid, inp in zip(request_ids, inputs, strict=True)
-            ],
-            state={KV_CACHE: ArrayStep(), SAMPLER: SampleStep(apply_penalty=False)},
+            segments=segments,
+            state={KV_CACHE: ArrayStep(advance=advance), SAMPLER: SampleStep(prompt_tokens=prefill_tokens)},
         )
 
-    def preprocess(
-        self,
-        graph_walk: str,
-        engine_inputs: ModelInputsFromEngine,
-        inputs: list[ARNodeInputs],
-    ) -> dict[str, torch.Tensor | Any]:
-        if graph_walk == DECODE_WALK:
-            return {"input_ids": torch.cat([inp.input_ids for inp in inputs])}
-        return {"input_embeds": torch.cat([inp.input_embeds for inp in inputs], dim=0)}
+    def next_position(self, rid_handle: int) -> int:
+        return position(self.kv, rid_handle, "main")
 
-    def _forward(
-        self,
-        graph_walk: str,
-        input_ids: torch.Tensor | None,
-        input_embeds: torch.Tensor | None,
-    ) -> torch.Tensor:
-        if input_embeds is None:
-            input_embeds = self.model.embed(input_ids)
-        hidden = self.model(input_embeds)
-        if graph_walk != DECODE_WALK:
-            hidden = at_last_token(self.kv, hidden)
-        return sample(self.sampler, self.model.logits(hidden))
+    def last_token_hidden(self, engine_inputs: ModelInputsFromEngine, hidden: torch.Tensor) -> torch.Tensor:
+        return at_last_token(self.kv, hidden)
 
-    def forward(
-        self,
-        graph_walk: str,
-        engine_inputs: ModelInputsFromEngine,
-        input_ids: torch.Tensor | None = None,
-        input_embeds: torch.Tensor | None = None,
-        **kwargs,
-    ) -> NameToTensorList:
-        return {"new_token": [self._forward(graph_walk, input_ids, input_embeds)]}
-
-    def forward_batched(
-        self,
-        graph_walk: str,
-        engine_inputs: ModelInputsFromEngine,
-        input_ids: torch.Tensor | None = None,
-        input_embeds: torch.Tensor | None = None,
-        **kwargs,
-    ) -> BatchedModelOutput:
-        new_tokens = self._forward(graph_walk, input_ids, input_embeds)
-        # row i is request i: one clone and one D2H copy per step, not per request
-        return BatchedModelOutput(row_outputs={"new_token": new_tokens}, check_stop_buffers={"new_token": new_tokens})
-
+    def sample_tokens(self, engine_inputs: ModelInputsFromEngine, logits: torch.Tensor) -> torch.Tensor:
+        return sample(self.sampler, logits)

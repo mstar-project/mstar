@@ -204,7 +204,8 @@ class CodecDriver:
 def run_streams(submodule: CodecSubmodule, frames: dict[str, torch.Tensor], captured: bool = False):
     """Stream each request's frames through its own buffer; every step batches the
     requests that have a chunk ready, as the scheduler batches the codec.
-    Returns, per request, ``(chunk_info, audio)`` per step and the step count."""
+    Returns, per request, ``(chunk_info, audio)`` per step (a declined chunk
+    emits no audio) and the count of steps that ran a forward."""
     cfg = submodule.codec
     driver = CodecDriver(submodule)
     buffers = {}
@@ -225,21 +226,36 @@ def run_streams(submodule: CodecSubmodule, frames: dict[str, torch.Tensor], capt
     while rids := [rid for rid, buffer in buffers.items() if buffer.has_chunk_ready()]:
         chunks = {rid: buffers[rid].pop_chunk() for rid in rids}
         meta = {rid: InputMetadata(stream_chunks={"codec_tokens": chunk.info}) for rid, chunk in chunks.items()}
-        items = {
+        # an empty chunk reaches the node as an edge with no tensors
+        prepared = {
             rid: submodule.prepare_inputs(
-                "codec_chunk", infos[rid], {"codec_tokens": [chunks[rid].data["data"]]}, input_metadata=meta[rid]
+                "codec_chunk", infos[rid],
+                {"codec_tokens": [] if chunks[rid].data["data"] is None else [chunks[rid].data["data"]]},
+                input_metadata=meta[rid],
             )
             for rid in rids
         }
+        # as the engine does: a declined chunk runs no forward
+        for rid in rids:
+            if prepared[rid] is None:
+                assert chunks[rid].is_final
+                steps[rid].append((chunks[rid].info, torch.empty(0, dtype=torch.int16)))
+        items = {rid: item for rid, item in prepared.items() if item is not None}
+        if not items:
+            continue
         assert submodule.can_batch(None, list(items.values()))
         # the capture key, known before prepare_inputs, is the bucket preprocess pads to
         assert submodule.cg_key_info("codec_chunk", meta, meta) == submodule._bucket(
-            max(max(item.kwargs["frames"], 1) for item in items.values()))
+            max(item.kwargs["frames"] for item in items.values()))
         outputs = driver.step(items, captured=captured)
         count += 1
-        for rid in rids:
+        for rid in items:
             steps[rid].append((chunks[rid].info, outputs[rid]["audio_chunk"][0]))
     return steps, count
+
+
+def _no_device():
+    raise AssertionError("the codec built a device tensor")
 
 
 def streamed(steps) -> torch.Tensor:
@@ -388,19 +404,34 @@ def test_streams_batched_at_different_offsets_each_stitch_into_their_own_decode(
         assert_same_audio(streamed(steps[rid]), whole_decode(decoder, request_codes))
 
 
-def test_frameless_terminal_flush_emits_nothing(config, decoder):
+def test_frameless_terminal_flush_is_declined(config, decoder, monkeypatch):
     """A stream that ends after its consumer drained it gets a final chunk with
-    no frames: it decodes at the smallest bucket and emits nothing."""
+    no frames: the codec declines it before building any tensor, so it runs no
+    forward and emits nothing (declined, it still ends the stream)."""
     submodule = CodecSubmodule(decoder, config)
+    monkeypatch.setattr(submodule, "get_device", _no_device)
     item = submodule.prepare_inputs(
         "codec_chunk",
         SimpleNamespace(request_id="r", rid_handle="r"),
         {},
-        input_metadata=InputMetadata(stream_chunks={"codec_tokens": StreamChunkInfo(10, 0, 0, is_final=True)}),
+        input_metadata=InputMetadata(
+            stream_chunks={"codec_tokens": StreamChunkInfo(10, 0, 0, is_final=True)}
+        ),
     )
-    assert item.kwargs["frames"] == 0
-    out = CodecDriver(submodule).step({"r": item})
-    assert out["r"]["audio_chunk"][0].numel() == 0
+    assert item is None
+
+
+def test_a_stream_of_only_im_end_ends_with_a_declined_chunk(config, decoder, monkeypatch):
+    """The AR's first frame was <|im_end|>: the stream gets no item, and the
+    codec declines its final chunk, which reaches it with no tensor: it decodes
+    nothing and emits no audio."""
+    submodule = CodecSubmodule(decoder, config)
+    monkeypatch.setattr(submodule, "get_device", _no_device)
+    steps, decodes = run_streams(submodule, {"r": stream_codes(0)})
+
+    ((info, audio),) = steps["r"]
+    assert info == StreamChunkInfo(0, 0, 0, True)
+    assert audio.numel() == 0 and decodes == 0
 
 
 def test_codec_buckets_are_the_chunk_widths(config, decoder):

@@ -228,7 +228,7 @@ def _position_spec(array: Array) -> PositionSpec:
 def _sampler_spec(sampler: Sampler) -> SamplerSpec:
     return SamplerSpec(
         resource_key=sampler.name, nodes=sampler.nodes, vocab_size=sampler.vocab_size,
-        enable_repetion_penalty=sampler.penalty, enable_min_p=sampler.min_p, min_tokens_stop_ids=sampler.eos_ids,
+        enable_repetition_penalty=sampler.penalty, enable_min_p=sampler.min_p, min_tokens_stop_ids=sampler.eos_ids,
     )
 
 
@@ -376,6 +376,8 @@ class WithinStepSteps(StepBuilder):
     def __init__(self):
         self._labels: dict[str, dict[str, Sequence[Segment]]] = {}
         self._pairs: dict[str, list[tuple[str, str]]] = {}
+        # a resource's layout is fixed only if every read on it declares it so
+        self._fixed: dict[str, bool] = {}
 
     def add(self, handle: "WithinStepHandle", declared: ArrayStep, step: SubmoduleStep) -> None:
         """Plan ``handle``'s read over the segments its kernel sees. A Ulysses read runs over whole segments after the
@@ -383,6 +385,7 @@ class WithinStepSteps(StepBuilder):
         if not handle._plans:
             return
         key, name, segments = handle.resource_key, handle.name, declared.segments or step.segments
+        self._fixed[key] = self._fixed.get(key, True) and declared.fixed_layout
         if handle.queried is None:
             self._label(key, name, segments)
             return
@@ -408,7 +411,7 @@ class WithinStepSteps(StepBuilder):
             if key in self._pairs:
                 steps[key] = RaggedCrossAttentionStep(segments=tuple(segments), pairs=tuple(self._pairs[key]))
             else:
-                steps[key] = AttentionStep(segments=segments, causal=False)
+                steps[key] = AttentionStep(segments=segments, causal=False, fixed_layout=self._fixed[key])
         return steps
 
 

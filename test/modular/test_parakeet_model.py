@@ -13,6 +13,7 @@ from mstar.engine.resources.recurrent import RecurrentStateSpec
 from mstar.engine.state.adapters import node_resources
 from mstar.graph.base import GraphNode, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
+from mstar.model.base import WalkStep
 from mstar.model.parakeet.config import (
     DECODE_LOOP,
     NUM_FRAMES,
@@ -125,7 +126,8 @@ def test_adapter(detects_language):
     # greedy decoding: a retry at a higher temperature would repeat the text
     assert adapter.compression_ratio_threshold is None
     args = adapter.transcription_to_request(TranscriptionRequest(model="parakeet", language="en", prompt="x"), "a")
-    assert args.model_kwargs == {"language": "en", "temperature": 0.0}
+    # an unsent temperature stays out: this greedy model would log it as ignored
+    assert args.model_kwargs == {"language": "en"}
     with pytest.raises(ValueError):
         adapter.transcription_to_request(TranscriptionRequest(model="parakeet", timestamp_granularities=["word"]), "")
     # Whisper's task: a translation would come back as a same-language transcript
@@ -158,8 +160,8 @@ def _pointer(uuid: int) -> TensorPointerInfo:
 def test_one_walk_the_encoder_then_a_decode_loop(tmp_path, nemotron):
     """One walk: the encoder, then a loop over the transducer that re-injects
     the encoder output every iteration. No loop-back edge, so the worker
-    speculates a request's first iteration but no next one; then the request
-    is done."""
+    speculates a request's first iteration but no next one; the request runs
+    it once."""
     model = ParakeetModel(str(_snapshot(tmp_path, nemotron)))
     walks = model.get_graph_walk_graphs()
     assert walks.keys() == {WALK}
@@ -181,16 +183,11 @@ def test_one_walk_the_encoder_then_a_decode_loop(tmp_path, nemotron):
         model.config.encoder.output_lengths(610 * 16_000 // 160))
     assert model.get_loop_caps(**{NUM_FRAMES: 7}) == {DECODE_LOOP: model.config.transducer.decode_iterations(7)}
 
-    audio = _pointer(1)
+    # the decode steps read the clip's frames (the capture's bucket) and Nemotron's prompt off the host
     kwargs = {NUM_FRAMES: 7, PROMPT_ID: 3} if nemotron else {NUM_FRAMES: 7}
-    first = model.get_initial_forward_pass_args("default", ["audio"], ["text"], {"audio": [audio]}, model_kwargs=kwargs)
-    assert first.full_metadata.graph_walk == WALK
-    [edge] = first.inputs
-    assert (edge.name, edge.next_node, edge.tensor_info) == ("audio", "audio_encoder", [audio])
-    assert first.unpersist_tensors == [audio]
-    assert first.step_metadata == {NUM_FRAMES: 7, PROMPT_ID: 3 if nemotron else None}
-    done = model.get_partition_forward_pass_args("default", first.full_metadata, {})
-    assert done.request_done and done.inputs == []
+    assert model.walk_plan("default", ["audio"], ["text"], {"audio": [_pointer(1)]}, kwargs) == [
+        WalkStep(WALK, step_metadata={NUM_FRAMES: 7, PROMPT_ID: 3 if nemotron else None}),
+    ]
 
 
 def test_startup_refuses_more_requests_than_slots(tmp_path):
@@ -210,3 +207,18 @@ def test_startup_refuses_more_requests_than_slots(tmp_path):
     # slot 0 is the sink, so one slot leaves none to admit into, with or without a cap
     with pytest.raises(ValueError, match="max_slots must be an int >= 2"):
         model.validate_config_yaml({"resources": {TRANSDUCER_STATE: {"max_slots": 1}}}, "a.yaml")
+
+
+@pytest.mark.parametrize("nemotron", [False, True])
+def test_request_kwargs_are_the_keys_the_model_reads(tmp_path, nemotron):
+    model = ParakeetModel(str(_snapshot(tmp_path, nemotron)))
+    assert model.request_kwargs() == {"language"}
+    # decoding is greedy: a sent temperature is not read, so the server logs it as ignored;
+    # an unsent one is not forwarded at all
+    adapter = TransducerAdapter(detects_language=not nemotron)
+    mk = adapter.transcription_to_request(TranscriptionRequest(model="parakeet", language="en"), "a").model_kwargs
+    assert set(mk) == model.request_kwargs()
+    mk = adapter.transcription_to_request(
+        TranscriptionRequest(model="parakeet", language="en", temperature=0.2), "a"
+    ).model_kwargs
+    assert set(mk) - model.request_kwargs() == {"temperature"}

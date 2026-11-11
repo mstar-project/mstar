@@ -49,7 +49,6 @@ class Wan22Config:
     text_max_seq_len: int = 512
 
     # Wan2.2-VAE (vae/config.json)
-    vae_z_dim: int = 48
     vae_scale_factor_spatial: int = 16  # pixels per latent cell (H and W)
     vae_scale_factor_temporal: int = 4  # frames per latent frame
 
@@ -69,7 +68,7 @@ class Wan22Config:
     default_negative_prompt: str = ""
     video_fps: int = 24
 
-    # Ceiling on the denoise loop; the per-request step count is clamped to it.
+    # The denoise loop's max_iters; the conductor refuses a num_inference_steps past it.
     max_denoise_steps: int = 100
 
     # Ceiling on a request's height x width x num_frames (about 3.6x the default

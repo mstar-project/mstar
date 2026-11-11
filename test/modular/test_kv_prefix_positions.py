@@ -22,7 +22,6 @@ import torch
 from mstar.engine.resources import (
     PagedKVConfig,
     PositionConfig,
-    Resource,
     StepContext,
     StepRunner,
 )
@@ -37,6 +36,7 @@ from mstar.engine.resources.step import Segment, SubmoduleStep
 from mstar.graph.base import GraphNode, Loop
 from mstar.model.base import KVLabel, PrefixKeys
 from mstar.testing_utils.model import StubModel
+from mstar.testing_utils.resource import StubResource
 from mstar.validation.resources import (
     _uncacheable_positions,
     _unknown_prefix_walks,
@@ -278,12 +278,8 @@ def test_only_the_cache_that_was_declared_is_checked():
 # ── what else the node carries ──────────────────────────────────────────
 
 
-class _Unskippable(Resource):
+class _Unskippable(StubResource):
     """A resource that keeps state of its own and never learned the hooks."""
-
-    @classmethod
-    def build(cls, spec, info):
-        raise NotImplementedError
 
 
 @dataclass

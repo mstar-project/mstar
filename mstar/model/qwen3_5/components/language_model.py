@@ -31,6 +31,7 @@ from mstar.model.qwen3_5.components.rope import (
     apply_partial_mrope,
     compute_3d_cos_sin,
     compute_inv_freq,
+    compute_text_cos_sin,
 )
 from mstar.model.qwen3_5.config import (
     ATTN,
@@ -237,6 +238,12 @@ class Qwen3_5LanguageModel(nn.Module):
             target_dtype=dtype,
         )
 
+    def build_text_cos_sin(
+        self, positions: torch.Tensor, dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """cos/sin for text rows' ``[tokens]`` 1D positions (`compute_text_cos_sin`)."""
+        return compute_text_cos_sin(positions, self.inv_freq, target_dtype=dtype)
+
     @eager_frame
     def forward(
         self, query_sequence: torch.Tensor, *,
@@ -263,7 +270,16 @@ class Qwen3_5ForCausalLM(nn.Module):
             gather_output=True,
         )
         if config.tie_word_embeddings:
+            # PEFT adapts the head and the embedding apart even when they share a weight
             self.lm_head.weight = self.model.embed_tokens.weight
+
+    def checkpoint_rules(self):
+        """How the checkpoint's text tower lands here (the MTP head and the vision tower
+        dropped), for its weight loader and for LoRA adapters."""
+        from mstar.model.loader import CheckpointRules
+        from mstar.model.qwen3_5.weight_loader import _STACKED_PARAMS, qwen3_5_name_remapper
+
+        return CheckpointRules(stacked_params=tuple(_STACKED_PARAMS), remap=qwen3_5_name_remapper)
 
     # The decoder contract `SampledTokenDecoder` drives (as `Qwen3DenseLM`).
 

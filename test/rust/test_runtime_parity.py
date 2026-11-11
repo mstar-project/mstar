@@ -321,7 +321,10 @@ def decode():
     return rt, book
 
 
-def _run_pass(rt, book, rid, uuids, on_decode=None) -> list[str]:
+def _run_pass(rt, book, rid, uuids, on_decode=None, declined_decode=None) -> list[str]:
+    """One pass of the walk. ``declined_decode`` (1-based) is the ar_decode
+    iteration the row declines on its stream's final chunk: the worker stops
+    the loop and completes the node with no outputs."""
     def fresh():
         u = next(uuids)
         book.put_tensor(u, _info(u))
@@ -342,13 +345,19 @@ def _run_pass(rt, book, rid, uuids, on_decode=None) -> list[str]:
         if node == "ar_decode" and on_decode is not None:
             on_decode()
         signals = rt.get_output_signals(node, WALK)
+        declined = node == "ar_decode" and log.count(node) == declined_decode
+        if declined:
+            rt.stop_loops_batched(
+                partition="default", graph_walk=WALK, last_node_run=node,
+                loop_names=ParallelList([rid], [["ar_loop"]]),
+            )
         rt.complete_and_route_batch(
             RouteInput(
                 partition="default", graph_walk=WALK, node_name=node,
                 output_signals=signals,
                 wg_ids=ParallelList([rid], [WG_ID]),
-                tensors=[fresh() for _ in signals],
-                num_tensors=[1] * len(signals),
+                tensors=[] if declined else [fresh() for _ in signals],
+                num_tensors=[0 if declined else 1] * len(signals),
             ),
         )
     return log
@@ -366,6 +375,18 @@ def test_a_capped_loop_ends_at_its_cap_on_every_pass(decode):
 
     assert first.count("ar_decode") == second.count("ar_decode") == 2
     assert other.count("ar_decode") == 4, "the cap leaked to the next request"
+
+
+def test_a_loop_ends_on_an_iteration_that_ran_no_forward(decode):
+    rt, book = decode
+    uuids = iter(range(1, 500))
+    rid = _admit(rt)
+
+    first = _run_pass(rt, book, rid, uuids, declined_decode=2)
+    second = _run_pass(rt, book, rid, uuids)
+
+    assert first == ["prefill", "ar_decode", "ar_decode"]
+    assert second.count("ar_decode") == 4, "the walk did not complete"
 
 
 def test_speculation_stops_at_the_cap(decode):
@@ -1537,6 +1558,43 @@ def test_a_sibling_graph_chunk_is_held_once_not_twice(streams_to_sibling):
     assert book.can_gc(1), "still held after its only reader released"
 
 
+def test_a_local_streams_inline_items_go_to_its_buffer_by_value(streams_to_sibling):
+    """A step that kept its rows on the device routes no tensor; its streamed
+    signal's inline values reach this worker's buffer by value, one per row,
+    with nothing staged. A row that also stored a tensor keeps the tensor
+    path locally, which is what the consumer would read anyway."""
+    rt, book, store = streams_to_sibling
+    rt.set_inline_streams(frozenset({("LLM", "new_token")}))
+    rids = [
+        rt.add_request(
+            request_id=f"r{i}", partition="default", graph_walk=WALK,
+            partition_worker_graph_ids=[0, 1],
+            worker_graph_to_workers=ParallelList([0, 1], [[WORKER], [WORKER]]),
+            loop_caps={},
+        )
+        for i in (1, 2)
+    ]
+    rt.ingest_inputs_batch(_ingest_block(rids, [_spec("text_inputs", "LLM")] * 2))
+    rt.pop_rids("LLM", WALK, rids)
+    book.put_tensor(1, _info(1))
+    book.increment_ref(1, 1)
+
+    out = rt.complete_and_route_batch(
+        RouteInput(
+            partition="default", graph_walk=WALK, node_name="LLM",
+            output_signals=["new_token"],
+            wg_ids=ParallelList(rids, [0, 0]),
+            tensors=[1], num_tensors=[1, 0],
+            inline_signal="new_token", inline_values=[5, 6],
+        ),
+    )
+    assert out.local_streaming_by_signal["new_token"].keys == [rids[0]]
+    assert out.local_streaming_by_signal["new_token"].values == [1]
+    assert out.local_stream_values_by_signal["new_token"].keys == [rids[1]]
+    assert out.local_stream_values_by_signal["new_token"].values == [6]
+    assert out.register_uuids == []
+
+
 def test_a_row_with_no_tensor_on_a_stream_sends_it_no_item(streams_to_sibling):
     """A row may route zero tensors on a streaming signal (its producer
     withheld that step's item): it gets no chunk, the rest of the batch
@@ -1568,6 +1626,34 @@ def test_a_row_with_no_tensor_on_a_stream_sends_it_no_item(streams_to_sibling):
     assert out.local_streaming_by_signal["new_token"].keys == [rids[0]]
     assert out.local_streaming_by_signal["new_token"].values == [1]
     assert out.register_uuids == []
+
+
+@pytest.mark.parametrize("producer_runs", [True, False], ids=["consumer-unused", "both-unused"])
+def test_a_partition_the_request_does_not_use_takes_the_empty_walk(streams_to_sibling, producer_runs):
+    """A partition whose walk plan is empty (a TTS request with no audio out)
+    arrives on walk "" with no inputs: both runtimes admit it under the
+    request's one handle, with no live worker graph and nothing ready, and
+    the other partition runs as usual."""
+    rt, _book, _store = streams_to_sibling
+
+    def admit(partition, walk, wg_id):
+        return rt.add_request(
+            request_id="r1", partition=partition, graph_walk=walk,
+            partition_worker_graph_ids=[wg_id],
+            worker_graph_to_workers=ParallelList([0, 1], [[WORKER], [WORKER]]),
+            loop_caps={},
+        )
+
+    rid = admit("default", WALK if producer_runs else "", 0)
+    assert admit("SNAC", "", 1) == rid
+    assert rt.is_partition_idle(rid, "SNAC")
+    assert _ready(rt) == []
+    if producer_runs:
+        rt.ingest_inputs_batch(_ingest_block([rid], [_spec("text_inputs", "LLM")]))
+        assert _ready(rt) == [("LLM", WALK, [rid])]
+        assert rt.is_partition_idle(rid, "SNAC")
+    rt.remove_request(rid)
+    assert rt.get_rid_handle("r1") is None
 
 
 def test_the_speculation_target_reports_its_output_signals(pair):

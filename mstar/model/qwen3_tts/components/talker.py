@@ -100,6 +100,10 @@ class Qwen3TTSTalkerLanguageModel(nn.Module):
         return run_layers(self.layers, input_embeds, self.norm, no_cursor)
 
 
+def _not_code_predictor(name: str) -> str | None:
+    return None if name.startswith("code_predictor.") else name
+
+
 class Qwen3TTSTalkerModel(nn.Module):
     """Talker backbone, text projection, and codec-group-0 output head."""
 
@@ -118,6 +122,16 @@ class Qwen3TTSTalkerModel(nn.Module):
         )
         self.codec_head = nn.Linear(
             talker.hidden_size, talker.vocab_size, bias=False
+        )
+
+    def checkpoint_rules(self):
+        """How the checkpoint's ``talker.*`` tensors land here (the CodePredictor's,
+        under ``talker.code_predictor.``, load into their own module), and where LoRA
+        adapters land."""
+        from mstar.model.loader import LLAMA_STACKED_PARAMS, CheckpointRules
+
+        return CheckpointRules(
+            stacked_params=tuple(LLAMA_STACKED_PARAMS), remap=_not_code_predictor, prefix="talker.",
         )
 
     def forward(self, input_embeds: torch.Tensor) -> torch.Tensor:

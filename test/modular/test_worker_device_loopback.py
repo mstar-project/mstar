@@ -4,7 +4,7 @@ nothing and routes zero tensors per (request, signal)."""
 from types import SimpleNamespace
 
 from mstar.communication.tensors import StoredOutputs
-from mstar.worker.worker import Worker
+from mstar.testing_utils.worker import make_worker
 
 
 class _Engine:
@@ -17,30 +17,40 @@ class _Engine:
         return self.on_device.get((node, walk), frozenset())
 
 
-def _worker(inline_emit=True):
-    w = Worker.__new__(Worker)
-    w._device_loopback = {}
-    w._graph_runtime = SimpleNamespace(supports_inline_emit=inline_emit)
-    return w
+def _body(inline_emit=True):
+    return make_worker(graph_runtime=SimpleNamespace(supports_inline_emit=inline_emit)).executor._body
 
 
 def test_all_on_device_is_per_step_signals_and_cached_per_node_and_walk():
     engine = _Engine({("LLM", "decode"): frozenset({"text_inputs"})})
-    w = _worker()
-    assert w._all_on_device(engine, "LLM", "decode", ["text_inputs"])
-    assert w._all_on_device(engine, "LLM", "decode", ["text_inputs"])
+    body = _body()
+    assert body.all_on_device(engine, "LLM", "decode", ["text_inputs"])
+    assert body.all_on_device(engine, "LLM", "decode", ["text_inputs"])
     assert engine.calls == 1, "the node's answer is cached per (node, walk)"
     # a step that also routes a signal the node does not keep stays on tensors
-    assert not w._all_on_device(engine, "LLM", "decode", ["text_inputs", "kv"])
-    assert not w._all_on_device(engine, "LLM", "prefill_text", ["new_token"])
-    assert not w._all_on_device(engine, "LLM", "decode", [])
+    assert not body.all_on_device(engine, "LLM", "decode", ["text_inputs", "kv"])
+    assert not body.all_on_device(engine, "LLM", "prefill_text", ["new_token"])
+    assert not body.all_on_device(engine, "LLM", "decode", [])
     assert engine.calls == 2
+
+
+def test_a_signal_that_also_streams_as_a_tensor_is_not_kept_on_the_device():
+    """A stream that keeps its tensors (not by value, or a lockstep node's)
+    needs the step to store them, so its signal does not make the step
+    rows-only, whatever the node keeps on the device."""
+    engine = _Engine({("TTS", "tts_decode"): frozenset({"tts_code"})})
+    streamed = make_worker(
+        graph_runtime=SimpleNamespace(supports_inline_emit=True),
+        tensor_streams={("TTS", "tts_decode"): frozenset({"tts_code"})},
+    ).executor._body
+    assert not streamed.all_on_device(engine, "TTS", "tts_decode", ["tts_code"])
+    assert _body().all_on_device(engine, "TTS", "tts_decode", ["tts_code"])
 
 
 def test_no_rows_only_step_on_a_runtime_without_inline_emit():
     """Rows-only steps send the client's tokens inline; without it they were dropped."""
     engine = _Engine({("LLM", "decode"): frozenset({"text_inputs"})})
-    assert not _worker(inline_emit=False)._all_on_device(engine, "LLM", "decode", ["text_inputs"])
+    assert not _body(inline_emit=False).all_on_device(engine, "LLM", "decode", ["text_inputs"])
 
 
 def test_the_zero_tensor_store_shape_matches_the_route_layout():
