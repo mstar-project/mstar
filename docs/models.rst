@@ -511,11 +511,11 @@ FastConformer ASR (``canary``, ``canary_qwen``, ``parakeet``, ``nemotron_asr``) 
   checkpoint's streaming output. A live call opens with no audio (``end_input: false``) and
   appends it; an opening clip is refused. ``live_lookahead`` sets a live call's latency, 320 ms
   at 3 and 1.12 s at 13; clips keep ``lookahead``, the widest unless set. A live call's state is
-  bounded however long it runs; the live path took about 1.15 GB of GPU memory beside the
-  whole-clip path's 4.6 GB, measured at 13 (each stream's bounded state and the live captures;
-  both paths share one copy of the weights). With it on, whole clips ran 3-8% slower at 1 and 32
-  at once on an H200 (cause not traced), so a whole-clip deployment leaves it off and runs
-  exactly the clip graph.
+  bounded however long it runs; the live path took about 0.9 GB of GPU memory beside the
+  whole-clip path's 4.6 GB at lookahead 3, 1.15 GB at 13 (each stream's bounded state and the
+  live captures; both paths share one copy of the weights). With it on, whole clips ran up to
+  8% slower at 32 at once on an H200, partly because they prepare one at a time, so a
+  whole-clip deployment leaves it off and runs exactly the clip graph.
 - All four run the FastConformer encoder ``nemotron_duplex`` streams
   (``mstar/model/components/fastconformer.py``), over the whole clip. Canary, Parakeet and
   Nemotron ASR read its dimensions from the HF ``encoder_config``; Canary-Qwen from NeMo's
