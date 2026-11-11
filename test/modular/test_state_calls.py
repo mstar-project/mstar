@@ -236,7 +236,7 @@ def test_a_read_sees_this_layers_add_through_the_layers_own_pages():
     q, k, v = _tensors()
     h.add(2, k=k, v=v)
     out = h.read(2, q)
-    assert kv.writes == [(2, "main")] and attn.runs == [(2, "main", False)]
+    assert kv.writes == [(2, "main")] and attn.runs == [(2, "main", True)]
     assert torch.equal(out, q + k), "the read should see the k this layer just added"
     assert kv.pages[0].abs().sum() == 0 and kv.pages[3].abs().sum() == 0, "the add should touch only its own layer"
 
@@ -248,7 +248,7 @@ def test_a_layer_id_is_the_models_and_the_pool_counts_among_the_arrays_layers():
     q, k, v = _tensors()
     h.add(7, k=k, v=v)
     h.read(7, q)
-    assert kv.writes == [(1, "main")] and attn.runs == [(1, "main", False)]
+    assert kv.writes == [(1, "main")] and attn.runs == [(1, "main", True)]
 
 
 def test_a_label_comes_from_the_steps_segments():
@@ -258,7 +258,7 @@ def test_a_label_comes_from_the_steps_segments():
     q, k, v = _tensors()
     h.add(0, k=k, v=v)
     h.read(0, q)
-    assert kv.writes == [(0, "cfg")] and attn.runs == [(0, "cfg", False)]
+    assert kv.writes == [(0, "cfg")] and attn.runs == [(0, "cfg", True)]
 
 
 def test_an_array_steps_own_segments_win_over_the_steps():
