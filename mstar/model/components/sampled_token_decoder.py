@@ -730,7 +730,10 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
             carry = self.drafter.prefill(PrefillInputs(
                 engine_inputs.resources, input_ids, tokens, hidden, embeds, decoder_kwargs, tensors,
             ))
-            if carry is not None:
+            if self.drafter.needs.carry is not None:
+                if carry is None:
+                    # as draft_verify_step refuses an observe that returns none; checked while traced
+                    raise RuntimeError("a drafter that declares a carry returned none from prefill")
                 self.store_draft_carry(engine_inputs, carry)
         return tokens
 
