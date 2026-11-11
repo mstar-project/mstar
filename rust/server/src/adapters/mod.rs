@@ -382,8 +382,8 @@ fn set_seed(mk: &mut Map<String, Value>, seed: Option<i64>) {
 }
 
 /// Python's `repr` of a JSON value as `json.loads` gives it, for a refusal
-/// that quotes it as the Python frontend's does. An object's keys come in
-/// serde_json's (sorted) order, not the client's.
+/// that quotes it as the Python frontend's does. A nested object's keys come
+/// in the client's order (serde_json's `preserve_order`), as in a dict.
 pub(crate) fn py_value_repr(v: &Value) -> String {
     match v {
         Value::Null => "None".to_string(),
