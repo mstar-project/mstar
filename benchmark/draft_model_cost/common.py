@@ -21,33 +21,32 @@ from pathlib import Path
 import torch
 from torch import nn
 
+from mstar.model.components.hosted_drafter import HostedDrafter, HostedDrafterDecl
+
 REPO = Path(__file__).resolve().parents[2]
 TARGET = "Qwen/Qwen3-8B"
 DRAFT = "Qwen/Qwen3-0.6B"
 
 
-class _NullDrafter(nn.Module):
+class _NullDrafter(nn.Module, HostedDrafter):
     """Drafts each row's anchor ``k`` times; no state, no resources, no weights."""
 
-    kv_layers_unbound = False
-
-    def __init__(self, needs, k: int):
+    def __init__(self, needs):
         super().__init__()
-        self.needs, self.k = needs, k
+        self.needs = needs
 
     def propose(self, inputs) -> torch.Tensor:
         return inputs.input_ids.reshape(-1, 1).long().expand(-1, inputs.num_draft_tokens).contiguous()
 
-    def prefill(self, engine_inputs=None, input_ids=None, sampled=None) -> None:
-        pass
+    def prefill(self, inputs) -> None:
+        return None
 
 
 @dataclass(frozen=True)
-class NullDrafterDecl:
+class NullDrafterDecl(HostedDrafterDecl):
     """A drafter declaration with nothing to declare: the node verifies, and the step is the target's."""
 
     num_draft_tokens: int
-    tap_key: str = "null_taps"
     needs: object = field(default=None)
 
     def __post_init__(self):
@@ -65,7 +64,7 @@ class NullDrafterDecl:
         return {}
 
     def build(self, *, device, comm_group=None, dtype=None, target=None):
-        return _NullDrafter(self.needs, self.num_draft_tokens).to(device)
+        return _NullDrafter(self.needs).to(device)
 
 
 def qwen3_model(path: str, k: int | None, prefill_buckets: list[int] | None = None, mode: str = "synchronous"):
