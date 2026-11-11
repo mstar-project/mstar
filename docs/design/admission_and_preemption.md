@@ -363,7 +363,8 @@ class OffloadDelta:
 A request on a node that verifies drafts carries verify results not yet applied, which change its lengths only. A
 move to the host applies none of them: rank 0 marks the request returning when it moves it, and a follower marks it
 when it replays that OFFLOAD, in every branch, so each rank applies them at the request's first admit back, at the
-same step. The mark needs no move kind of its own.
+same step. The mark needs no move kind of its own. It is the only mechanism that keeps the request's stored lengths
+equal across the ranks through a move to the host, and no check compares stored lengths across ranks.
 
 With speculation on, rank 0 decides only where pages already move today, after the admit fence or after a refused step, so a speculative step never carries a move made after it was sent.
 
@@ -382,10 +383,11 @@ Always on:
 - A victim is preemptible, or guaranteed and not yet started, and is never older than the request whose grant failed. A breach raises, and so does a forced drop of a guaranteed request.
 - A grant that a reservation covers and that can't take its pages raises.
 - Counters per node: preemptions, drops, tokens rebuilt, and requests dropped more than once.
-
-- On a node that verifies drafts, rank 0 picks no victim while a request holds a verify step postprocess hasn't
-  recorded. Such a step never reaches that pass, and a victim with one would leave nothing on the host that knows its
-  length.
+- On a node that verifies drafts, a victim with a verify step postprocess hasn't recorded would leave nothing on the
+  host that knows its length. Rank 0 checks that no request holds one at a refused step's allocation failure, ahead
+  of `preempt` and `relieve`; such a step never reaches that pass. The victims `make_room` picks are checked only
+  under `MSTAR_KV_DEBUG_ASSERTS` (below). Without it, `VerifyLedger.take_due` still raises on every rank at such a
+  victim's first admit back.
 
 Under `MSTAR_KV_DEBUG_ASSERTS`:
 
