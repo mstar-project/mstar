@@ -23,6 +23,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
+from mstar.model.components.diffusion.denoise_loop import MAIN_SPAN
 from mstar.model.components.distributed.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
@@ -33,10 +34,6 @@ from mstar.model.minimax_h3.config import NUM_MODALITIES, H3TransformerConfig
 
 # (q, k, v) -> out over [B, S, H, D]
 Attend = Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]
-
-# the label a denoise step declares the packed rows under (``DenoiseLoopSubmodule.MAIN_SPAN``),
-# which the node's sequence shard splits
-TOKENS = "main"
 
 
 class RopeTable(NamedTuple):
@@ -363,9 +360,9 @@ class H3DiT(nn.Module):
         reference's distinct values. ``attend`` attends within ``layout.segments``, so no
         request row sees a padding row. ``shard``: the node's sequence shard (``SequenceShard``),
         which on a step it splits gives this rank a contiguous range of the packed rows (label
-        ``TOKENS``): only those are built and run, and ``attend``'s resource exchanges them."""
+        ``MAIN_SPAN``): only those are built and run, and ``attend``'s resource exchanges them."""
         cond, pad = layout.num_condition_rows, layout.num_pad_rows
-        split = None if shard is None else shard.split_range(TOKENS)
+        split = None if shard is None else shard.split_range(MAIN_SPAN)
         start, count = (0, layout.num_rows) if split is None else (split.start, split.count)
         x = self.packed_rows(inputs, layout, start, count)
         rope, row_index = layout.rope, layout.row_index
@@ -378,7 +375,7 @@ class H3DiT(nn.Module):
             row_class = layout.row_class
         if split is not None:
             rope = rope.rows(start, count)
-            row_index, row_class = shard.scatter(TOKENS, row_index, row_class, dim=0)
+            row_index, row_class = shard.scatter(MAIN_SPAN, row_index, row_class, dim=0)
         temb = self.time_embedding(inputs.timesteps)
         for block in self.blocks:
             x = block(x, temb, row_index, rope, attend)
@@ -386,7 +383,7 @@ class H3DiT(nn.Module):
         # both heads over this rank's rows, then the rows gathered: [B, S, patch_dim + audio_dim]
         out = torch.cat([self.final_layer.video_out(h), self.final_layer.audio_out(h)], dim=-1)
         if split is not None:
-            out = shard.gather(TOKENS, out, dim=1)
+            out = shard.gather(MAIN_SPAN, out, dim=1)
         text, audio_rows, end = layout.text_len, layout.num_audio_rows, layout.num_rows - pad
         patch_dim = self.cfg.patch_dim
         video_v = torch.cat(
