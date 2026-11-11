@@ -50,7 +50,10 @@ def position_key(array: Array) -> str:
 
 
 def written_by_step(array: Array) -> frozenset[str]:
-    """The fields of a Value's entry that its step writes itself, the ones no update op writes in place."""
+    """The fields of a Value's entry that its step writes itself, the ones no update op writes in place, and none for
+    any other array."""
+    if not is_value(array):
+        return frozenset()
     return frozenset(array.entry.tensors.keys() - {field for op in array.updates.values() for field in op.writes})
 
 
@@ -151,7 +154,7 @@ def _cross_read_problems(arrays: Sequence[Array]) -> list[str]:
 def _value_problems(arrays: Sequence[Array], kv_labels: Mapping[str, Mapping[str, object]]) -> list[str]:
     """What a Value's entry can't hold yet. A prefix hit restores a Value's snapshot, and a snapshot carries neither its
     host fields nor a field its step writes itself, which no kernel writes mid-prefill."""
-    plain = [array for array in arrays if is_value(array) and written_by_step(array)]
+    plain = [array for array in arrays if written_by_step(array)]
     if not plain and not any(array.entry.host for array in arrays):
         return []
     keyed = {
