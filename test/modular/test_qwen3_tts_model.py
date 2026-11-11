@@ -22,7 +22,7 @@ from mstar.engine.resources.attn.wrappers import (
 from mstar.engine.resources.kv.config import KVSpec
 from mstar.engine.resources.position.config import PositionConfig
 from mstar.engine.resources.sampler.config import SamplerSpec
-from mstar.engine.state.adapters import StateSetup, build_handle, node_resources, sampling_configs
+from mstar.engine.state.adapters import StateSetup, _resolve, build_handle, node_resources, sampling_configs
 from mstar.engine.state.host_fields import HostFields
 from mstar.model.base import ClientChunk
 from mstar.model.components.code_predictor_kernels import ResidualCodePredictor
@@ -843,7 +843,8 @@ def test_qwen3_tts_decode_feeds_its_text_stream_then_eos_then_pad(layout, first_
     submodule = TalkerSubmodule(Qwen3TTSTalkerModel(config), _code_predictor(config), config)
     text = next(declared for declared in _make_model().declare_state() if declared.name == TALKER_TEXT)
     fields = HostFields()
-    submodule.text = build_handle(text, {}, StateSetup(host_fields=fields))
+    setup = StateSetup(host_fields=fields)
+    submodule.text = build_handle(text, {}, _resolve([text], setup), setup)
     fields.open(1)
     info = SimpleNamespace(
         request_id="r", rid_handle=1, graph_walk="talker_decode", step_metadata={PROMPT_LAYOUT_KEY: layout},
@@ -1776,7 +1777,8 @@ class _CodecDriver:
         (spec,) = build_specs([array], kernel_settings={CODEC_STATE: {"max_slots": max_slots}})
         self.pool = RecurrentStatePool.build(spec, EngineResourceInfo(device=torch.device("cpu")))
         self.runner = StepRunner({CODEC_STATE: self.pool})
-        self.node.bind_node_state({CODEC_STATE: build_handle(array, {CODEC_STATE: self.pool})})
+        resolved = _resolve([array], StateSetup())
+        self.node.bind_node_state({CODEC_STATE: build_handle(array, {CODEC_STATE: self.pool}, resolved)})
         self.streams: set[str] = set()
 
     def remove(self, rid: str) -> None:

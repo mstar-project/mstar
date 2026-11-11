@@ -29,7 +29,7 @@ from mstar.engine.state import (  # noqa: E402
     Read,
     Rope,
 )
-from mstar.engine.state.adapters import build_handle  # noqa: E402
+from mstar.engine.state.adapters import StateSetup, _resolve, build_handle  # noqa: E402
 from mstar.engine.state.analysis import position_key  # noqa: E402
 from mstar.engine.state.calls import ArrayHandle  # noqa: E402
 from mstar.engine.state.state_op import STATE_OPS  # noqa: E402
@@ -355,7 +355,7 @@ def _on_state(rope: Rope | None = None, num_layers: int = TINY["num_hidden_layer
     ours.load_weights([(k.removeprefix("model."), v) for k, v in hf.state_dict().items()])
     pages, pos = _FakePages(), _FakePositions()
     array = _declared(rope, num_layers)
-    handle = build_handle(array, {KV: pages, ATTN: pages, position_key(array): pos})
+    handle = build_handle(array, {KV: pages, ATTN: pages, position_key(array): pos}, _resolve([array], StateSetup()))
     for module in ours.modules():
         if hasattr(module, "bind_state"):
             module.bind_state({KV: handle})

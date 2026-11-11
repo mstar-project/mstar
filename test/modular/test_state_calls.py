@@ -994,7 +994,7 @@ def _plain_value() -> tuple[ArrayHandle, RecurrentStatePool]:
     pool = RecurrentStatePool(torch.device("cpu"), spec.config)
     for rid in (1, 2):
         pool.ingest_request(rid)
-    return build_handle(array, {"state": pool}), pool
+    return build_handle(array, {"state": pool}, _resolve([array], StateSetup())), pool
 
 
 def _plan(pool, segments, capture=False):
@@ -1086,7 +1086,7 @@ def _gdn_over_a_pool(array: Array) -> tuple[RecurrentStatePool, ArrayHandle]:
     specs = {spec.resource_key: spec for spec in build_specs([_array(), array])}
     pool = RecurrentStatePool(torch.device("cpu"), specs["gdn"].config, kv_dtype=torch.float32)
     pool.ingest_request(1)
-    return pool, build_handle(array, {"gdn": pool, "d": _StubLinear()})
+    return pool, build_handle(array, {"gdn": pool, "d": _StubLinear()}, _resolve([_array(), array], StateSetup()))
 
 
 def test_a_gated_delta_nets_state_reads_declared_and_stores_k_last():
@@ -1164,7 +1164,8 @@ def test_a_read_outside_a_step_is_refused():
 
 def test_a_read_on_a_value_with_only_host_fields_is_refused():
     array = Value("host", nodes={"LLM"}, layers={0}, entry=Entry({}, host={"n": int}))
-    h = build_handle(array, {}, StateSetup(host_fields=HostFields()))
+    setup = StateSetup(host_fields=HostFields())
+    h = build_handle(array, {}, _resolve([array], setup), setup)
     _refused(r"Array 'host': no layout yet: read on a HostValueHandle", lambda: h.read(0))
 
 
