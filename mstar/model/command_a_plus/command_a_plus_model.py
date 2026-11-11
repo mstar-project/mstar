@@ -10,14 +10,11 @@ import torch
 from mstar.conductor.request_info import FINAL_PREFILL
 from mstar.distributed.base import ShardingConfig
 from mstar.engine.resources import (
-    AttentionConfig,
-    AttentionSpec,
-    KVSpec,
-    PagedKVConfig,
     PositionConfig,
     PositionSpec,
     SamplerSpec,
 )
+from mstar.engine.state import Array, Attend, Causal, KVEntry, Read, Window
 from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import KVLabel, LabelLayout, Model, ProcessPromptOutput, Span, WalkStep
@@ -40,6 +37,7 @@ from mstar.model.multimodal import (
     MEDIA_LAYOUT,
     MediaEncoder,
     MediaPads,
+    MediaRun,
     expand_media_pads,
     media_layout,
     media_walk_name,
@@ -69,9 +67,7 @@ class CommandAPlusModel(Model):
         self.vision_config = config.vision_config
         # the image tower, whose output fills the image pads in prompt order;
         # it names the image walk, `prefill_image`
-        self.image_encoder = MediaEncoder(
-            "image", "vision_encoder", ("pixel_values",), "image_embeds", (self.vision_config.image_token_id,),
-        )
+        self.image_encoder = MediaEncoder("image", "vision_encoder", ("pixel_values",), "image_embeds")
         self.image_walk = media_walk_name((self.image_encoder,))
         self.max_seq_len = min(8192, self.config.max_position_embeddings) if max_seq_len is None else max_seq_len
         if type(self.max_seq_len) is not int or not 0 < self.max_seq_len <= self.config.max_position_embeddings:
@@ -124,21 +120,26 @@ class CommandAPlusModel(Model):
         # one prefill over the prompt, then decode until the stop check ends it
         return [prefill, WalkStep("decode", bind={"text_inputs": "new_token"})]
 
+    def declare_state(self) -> list[Array]:
+        config = self.config
+        every = frozenset(range(config.num_hidden_layers))
+        local = frozenset(i for i, kind in enumerate(config.layer_types) if kind == "sliding_attention")
+        attend = Attend(q_heads=config.num_attention_heads)
+        return [
+            Array(
+                KV_CACHE, nodes={"LLM"}, layers=every,
+                entry=KVEntry(heads=config.num_key_value_heads, head_dim=config.head_dim),
+                max_len=self.max_seq_len,
+                reads={
+                    LOCAL_ATTN: Read(mask=Window(config.sliding_window), op=attend, layers=local),
+                    GLOBAL_ATTN: Read(mask=Causal(), op=attend, layers=every - local),
+                },
+            ),
+        ]
+
     def get_node_resources(self):
         config = self.config
-        local = tuple(i for i, kind in enumerate(config.layer_types) if kind == "sliding_attention")
         return [
-            KVSpec(resource_key=KV_CACHE, nodes={"LLM"}, config=PagedKVConfig(
-                num_layers=config.num_hidden_layers, num_qo_heads=config.num_attention_heads,
-                num_kv_heads=config.num_key_value_heads, head_dim=config.head_dim,
-                max_seq_len=self.max_seq_len,
-            )),
-            AttentionSpec(resource_key=LOCAL_ATTN, nodes={"LLM"}, config=AttentionConfig(
-                kv_cache=KV_CACHE, sliding_window=config.sliding_window, layers=local,
-            )),
-            AttentionSpec(resource_key=GLOBAL_ATTN, nodes={"LLM"}, config=AttentionConfig(
-                kv_cache=KV_CACHE,
-            )),
             PositionSpec(resource_key=ROPE, nodes={"LLM"}, config=PositionConfig(
                 kv_cache=KV_CACHE, rotary_dim=config.head_dim, interleave=True,
                 rope_theta=config.rope_theta,
@@ -264,7 +265,7 @@ class CommandAPlusModel(Model):
                     ids.numel(), ids.numel(), "text_inputs")
         layout = LabelLayout(spans=(span,), growth=(("decode_loop", 1),))
         # always set, so a layout the client sent never reaches the LLM
-        media = media_layout(pads, {self.image_encoder.pad_ids[0]: self.image_encoder.output})
+        media = media_layout(pads)
         return ProcessPromptOutput(result, {MEDIA_LAYOUT: media, "kv_layout": {KV_CACHE: {"main": layout}}})
 
     @staticmethod
@@ -292,7 +293,7 @@ class CommandAPlusModel(Model):
         """Tile each image and write its one ``<|IMG_PATCH|>`` placeholder out as
         the processor lays it out: the image's start, each tile's pads ending
         in a line break, the image's end. Each tile is one run of pads."""
-        pad = self.image_encoder.pad_ids[0]
+        pad = self.vision_config.image_token_id
         positions = (ids == pad).nonzero().flatten().tolist()
         if len(positions) != len(images):
             raise ValueError(f"The prompt has {len(positions)} image placeholders for {len(images)} images")
@@ -318,7 +319,7 @@ class CommandAPlusModel(Model):
             pixel_values.append(tiles.to(torch.bfloat16))
             start = position + 1
         pieces.append(ids[start:])
-        runs = [tokens] * sum(len(tiles) for tiles in pixel_values)
+        runs = [MediaRun(tokens, self.image_encoder.output)] * sum(len(tiles) for tiles in pixel_values)
         return expand_media_pads(torch.cat(pieces), {pad: runs}), pixel_values
 
     def postprocess(self, output, modality, request_kwargs=None):

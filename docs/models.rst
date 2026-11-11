@@ -102,6 +102,8 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
        openpi's DROID normalization: raw joint state in, joint velocities out. It also
        serves openpi's policy WebSocket, so openpi's DROID client connects unchanged
        (see :doc:`clients`).
+       ``LLM`` and ``action_expert`` share a KV cache, so ``node_groups`` must list them in
+       one entry; the server refuses to start otherwise.
    * - ``qwen3_5_{0.8,2,4,9,27}b``
      - ``Qwen/Qwen3.5-4B``
      - Hybrid-attention VLM (text + image in, text out): gated DeltaNet linear
@@ -111,8 +113,9 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
      - Qwen3.8-27B on the Qwen3.5 code above (same architecture); ships a TP4 config.
    * - ``minicpm_o`` *(Beta)*
      - ``openbmb/MiniCPM-o-4_5``
-     - Omni-modal chat (text/image/audio in, text out): Qwen3-8B over a navit SigLIP +
-       resampler and a Whisper-medium encoder. Half-duplex only.
+     - Omni-modal chat (text/image/audio in, text and speech out): Qwen3-8B over a navit
+       SigLIP + resampler and a Whisper-medium encoder; a Llama TTS and a streaming
+       flow-matching vocoder for speech. Half-duplex only.
    * - ``omnivoice``
      - ``k2-fsa/OmniVoice``
      - Massively multilingual zero-shot TTS: masked-diffusion canvas over a Qwen3-0.6B
@@ -211,7 +214,10 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
        chunk by chunk (Wan2.1-layout causal DiT, rolling KV cache, 4 distilled steps).
        A request carries the whole camera trajectory as JSON in ``model_kwargs``, which the API
        server caps at 1 MiB: about 3,900 frames of ``[4, 4]`` float32 poses; send ``[F, 3, 4]``
-       rows for up to the 4,077-frame maximum. One rollout per GPU. The DiT's attention runs
+       rows for up to the 4,077-frame maximum. One rollout at a time: the model refuses any
+       other ``max_concurrent_requests`` until each rollout's text K/V and VAE caches, which
+       are outside the rolling K/V pool (``resources: dit_kv: pool_tokens``), are engine
+       resources. The DiT's attention runs
        through the engine's ragged attention resource, its blocks are compiled (Inductor's
        deterministic mode), the condition encode runs channels-last, and the VAE decode is
        channels-last, compiled and bf16 where cuDNN >= 9.16 (frames 51 dB from the fp32 decode).
@@ -315,12 +321,18 @@ merge's.
        checkpoint's ``audio_decoder_proj.text_lm_head``)
      - No embedding target.
    * - Qwen3-Omni (``Thinker``), *not validated*
-     - ``qkv_proj``, ``o_proj``, dense-layer ``gate_up_proj`` / ``down_proj``, ``lm_head``
-     - Attention only on MoE layers: an adapter on the routed experts or the router is
-       refused. Talker, code predictor and encoders take none. Not validated: this MoE
-       model's bf16 noise is about 10x a dense model's (its router flips experts on
-       near-ties), so even base rows, run in a larger batch than the reference's, miss
-       the check against merged weights.
+     - ``qkv_proj``, ``o_proj``, dense-layer ``gate_up_proj`` / ``down_proj``, ``lm_head``;
+       the routed experts' ``experts_gate_up_proj`` / ``experts_down_proj`` when the YAML's
+       ``targets:`` names them
+     - Expert targets are opt-in: each slot holds every expert's A and B (about 1.7 GB per
+       slot at rank 16, and as much pinned on the host per adapter held there), and with
+       128 experts a pool serves at most 7 slots. Under TP only: an ``ep_config`` with
+       ``parallel: ep`` over several ranks refuses them at startup. Per-expert adapters
+       only (``experts.<N>.<proj>``), not PEFT's fused 3-D form. The router takes none.
+       Talker, code predictor and encoders take none. Not validated: this MoE model's
+       bf16 noise is about 10x a dense model's (its router flips experts on near-ties),
+       so even base rows, run in a larger batch than the reference's, miss the check
+       against merged weights.
    * - Qwen3-TTS (``Talker``), *not validated*
      - ``qkv_proj``, ``o_proj``, ``gate_up_proj``, ``down_proj``, ``codec_head``
      - Not the text projection (runs before the step) or the CodePredictor. Not
@@ -393,7 +405,7 @@ Higgs Audio notes
 - The model drops or repeats text on long audio, so ``/v1/audio/transcriptions``
   cuts an upload longer than 30 s into windows of at most 30 s run in parallel.
 - One prefill step per request: the ChatML text around the audio and the audio
-  embeddings go into the KV cache as one span.
+  embeddings go into the KV cache as three spans.
 - Decode keeps each request's last token in the sampler's slot master and
   sends the client's copy inline (``MSTAR_DEVICE_LOOPBACK``, on by default),
   as Qwen3.5 does: a decode step stores and routes no tensors.
@@ -890,6 +902,37 @@ refused and the MTP head is skipped. The chat template's new
 ``reasoning_effort`` and ``preserve_thinking`` are not forwarded: every
 request gets the template's defaults (``xhigh`` and preserved), whatever the
 client sends, and a request that sends one is logged as ignoring it.
+
+MiniCPM-o 4.5 (``minicpm_o``)
+------------------------------
+
+Text, image and audio in; text, or text and 24 kHz speech, out, as upstream's half-duplex
+``chat()``: the LLM (Qwen3-8B) writes the reply, a TTS reads it into speech codes, and a
+streaming flow-matching vocoder (Step-Audio2's token2wav) turns them into audio. Ask for
+speech with ``output_modalities`` including ``"audio"``; the bundled ``default`` voice is the
+only one. A spoken reply's system message is upstream's voice-clip prompt, so a spoken
+request with a system prompt of its own is refused (400) unless it sets ``voice_prompt:
+false``, which uses the request's ``system_prompt`` instead, as vllm-omni does.
+``streaming_generate``, video input and full duplex are not supported.
+
+``configs/minicpm_o.yaml`` runs three workers on one GPU (LLM and encoders, TTS, vocoder);
+it sets ``mps: true``, so their kernels overlap (see *Several workers on one GPU* in :doc:`serving`). Each spoken
+reply holds a slot of each ``t2w_*`` resource (~0.4 GiB in all) while it speaks, so their
+``max_slots`` cap the replies being voiced at once. ``t2w_state`` has one more than each of the
+three ``t2w_*_kv`` (its sink); startup refuses counts that disagree. The slots don't hold
+back the TTS, which keeps a spoken reply's ``tts_kv`` pages (up to 32) until its last code,
+so ``max_concurrent_requests`` caps the requests in flight and startup refuses a ``tts_kv``
+that can't hold that many full replies: overfilled, the TTS would stall. A reply's LLM
+pages have no such bound, so ``llm_kv`` has host pages (``cpu_offload_pages``): a full
+pool moves a request to the host until those fill. At the cap of 32, with 2048 tokens
+out on an H200 (one run per size), a burst of prompts around 3.7k tokens or longer still
+waits, 2.5k does not (follow-up: reserve a request's whole layout).
+
+The vocoder's DiT runs its GEMMs, convolutions and attention, and keeps its caches, in
+float16; its residual stream, its norms' arithmetic, the Euler solver, the token encoder
+and HiFT stay float32. Its mel is within about 0.1% of a float32 DiT's, and the served
+speech's Whisper WER is unchanged. HiFT up to its spectrum is compiled (``compile_regions``),
+and the TTS's decode capture runs cuBLAS GEMMs (``compile_mode="default"``).
 
 Command A+ (``command_a_plus``)
 -------------------------------

@@ -14,6 +14,7 @@ import torch
 import torch.nn.functional as F
 
 from mstar.distributed.communication import CommGroup
+from mstar.engine.state.adapters import node_resources
 from mstar.model.command_a_plus.components.language_model import (
     CommandAPlusAttention,
     CommandAPlusLanguageModel,
@@ -240,7 +241,7 @@ class BackboneTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             shutil.copyfile(FIXTURE, Path(directory) / "config.json")
-            specs = CommandAPlusModel(directory).get_node_resources()
+            specs = node_resources(CommandAPlusModel(directory))
         # 6-token full pages, so 2-token pages of the 3 local layers, a window's in 2 pages
         apply_yaml_overrides(specs, {"resources": {KV_CACHE: {"page_size": 6, "max_num_pages": 32}}})
         cfg = next(spec.config for spec in specs if spec.resource_key == KV_CACHE)

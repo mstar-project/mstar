@@ -55,11 +55,11 @@ DEFAULT_SAMPLING = GREEDY_SAMPLING
 MAX_OUTPUT_TOKENS = 1024
 
 
-def audio_encoder(pad_id: int) -> MediaEncoder:
+def audio_encoder() -> MediaEncoder:
     """The ``audio_encoder`` node: a clip's mel chunks in, one LLM-space
     row per audio pad out. Each chunk's mel frame count rides the walk's
     ``MEDIA_LAYOUT`` as the clip's grid, so the node reads it on the host."""
-    return MediaEncoder("audio", "audio_encoder", ("audio_features",), "audio_embeds", (pad_id,))
+    return MediaEncoder("audio", "audio_encoder", ("audio_features",), "audio_embeds")
 
 
 class HiggsAudioModel(MultimodalDecoderModel):
@@ -96,7 +96,7 @@ class HiggsAudioModel(MultimodalDecoderModel):
         )
         self._detokenizer = ByteLevelDetokenizer(self.tokenizer)
         pad = self.config.audio_in_token_idx
-        self.media = (MediaIntake("audio", audio_encoder(pad), pad, self._audio_intake),)
+        self.media = (MediaIntake("audio", audio_encoder(), pad, self._audio_intake),)
 
     # -------------------------------------------------------------------
     # Resources

@@ -83,7 +83,7 @@ class MuseGlimmerModel(MultimodalDecoderModel):
             self.config.eot_token_id = eot
         # the vision tower, whose output fills the images' pads in prompt order
         self.media = (MediaIntake(
-            "image", vision_encoder((self._image_pad_id,)), self._image_pad_id, self._image_intake,
+            "image", vision_encoder(), self._image_pad_id, self._image_intake,
             sentinels=(self._image_start_id, self._image_end_id),
         ),)
         if self._image_pad_id != self.config.image_token_id:
