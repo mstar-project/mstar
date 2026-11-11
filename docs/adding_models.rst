@@ -3381,8 +3381,10 @@ across heads followed by the interleaved-pair RoPE, q and k in one launch. Both 
 with eager to bf16 rounding rather than bitwise. Wan2.2 is the first user;
 ``test/modular/test_diffusion_dit_kernels.py`` holds them to the eager form.
 ``qwen/dit_kernels.py`` is a third, bit-exact one for the Qwen-Image DiTs, exposed as the ops
-``mstar::dit_qk_norm_rope``, ``dit_modulate``, ``dit_gated_add``, ``dit_norm_modulate`` and
-``dit_gated_norm_modulate`` (the same test file holds them to the eager ops bit for bit).
+``mstar::dit_qk_norm_rope``, ``dit_qk_pair_norm_rope``, ``dit_joint_qk_pair_norm_rope``, ``dit_modulate``,
+``dit_gated_add``, ``dit_norm_modulate`` and ``dit_gated_norm_modulate``. Unlike the two above these run in the
+eager forward too (on CUDA, bf16, after a one-time self-check against the eager ops), and the same test file holds
+them to the eager ops bit for bit.
 
 On the API side ``DiffusionImageAdapter`` (``mstar/api_server/openai/adapters.py``) serves
 ``/v1/images/generations`` and ``/v1/images/edits`` for any such model (``size`` becomes
