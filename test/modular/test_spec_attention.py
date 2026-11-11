@@ -182,9 +182,9 @@ def test_fa3_paged_attention_matches_a_dense_reference(causal, hide, dim):
     (8, 2, 16, [37, 130, 5], 8, 128, 1),
     # DSpark on Qwen3-8B: 32 query and 8 KV heads of 128, pages of 128, k = 7
     (32, 8, 128, [37, 300, 5, 1021], 8, 128, 1),
-    # Qwen3.5-9B's verify (and MTP) attention: 16 query and 4 KV heads of 256, causal, k = 3
+    # a causal verify of 16 query and 4 KV heads of 256 (Qwen3.5-9B's full-attention shape), k = 3
     (16, 4, 16, [37, 300, 5, 1021], 4, 256, 0),
-], ids=["toy", "qwen3_8b_dspark", "qwen3_5_9b_mtp"])
+], ids=["toy", "qwen3_8b_dspark", "head_dim_256_causal"])
 def test_fa3_and_flashinfer_agree_on_the_hidden_last_row(heads, kv_heads, page, lengths, span, dim, hide):
     """Each verify mask on FA3 (asynchronous) and FlashInfer (synchronous)."""
     reason = fa3_paged_unavailable_reason(torch.device("cuda"), dim, torch.bfloat16)
