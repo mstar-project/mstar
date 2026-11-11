@@ -1,4 +1,5 @@
-"""Kernels that write state themselves, in one launch with the math before it, in place of a layer's `add`.
+"""Kernels that write state themselves, in one launch with the math before it, in place of a layer's `add`, or of
+its `add` and `read`.
 
 An op is a plain call behind a graph break, as `add` is. It names a fused kernel, the formats that kernel can address,
 and a reference over the contract's calls that any other format runs, so an unlisted format loses speed and still boots.
