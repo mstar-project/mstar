@@ -684,10 +684,16 @@ class RopeManager(PositionManager):
         split = self._current_split_pos_ids.get(label) if self._can_split else None
         if pos_ids is None:
             pos_ids = self._current_pos_ids[label] if split is None else split.flatten()
-        elif split is not None and pos_ids.shape[0] != q.shape[0]:
-            raise ValueError(
-                f"apply_qk on label {label!r}, which this step splits over SP ranks, got {pos_ids.shape[0]} "
-                f"positions for {q.shape[0]} tokens: pass this rank's range's positions"
+        elif split is not None:
+            # refused on what every rank shares: the counts differ by rank, so a refusal on them could
+            # stop some ranks before the exchange's collectives and hang the others
+            if pos_ids.shape[0] == self._current_pos_ids[label].shape[0]:
+                raise ValueError(
+                    f"apply_qk on label {label!r}, which this step splits over SP ranks, got the whole label's "
+                    f"{pos_ids.shape[0]} positions: pass this rank's range's positions"
+                )
+            assert pos_ids.shape[0] == q.shape[0], (
+                f"apply_qk got {pos_ids.shape[0]} positions for {q.shape[0]} tokens this rank holds of label {label!r}"
             )
         config = self._config
         alone = k is None
