@@ -751,6 +751,12 @@ window.runMermaid = runMermaid;</script>
 </ul>
 </details></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.model.parakeet.html">mstar.model.parakeet</a></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../../../../../_autosummary/mstar.model.phi4mm.html">mstar.model.phi4mm</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.phi4mm.components.html">mstar.model.phi4mm.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.phi4mm.config.html">mstar.model.phi4mm.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.phi4mm.tests.html">mstar.model.phi4mm.tests</a></li>
+</ul>
+</details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../../../_autosummary/mstar.model.pi05.html">mstar.model.pi05</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.pi05.components.html">mstar.model.pi05.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.pi05.config.html">mstar.model.pi05.config</a></li>
@@ -1084,6 +1090,19 @@ window.runMermaid = runMermaid;</script>
         <span class="n">payload</span> <span class="o">=</span> <span class="n">field</span> <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">field</span><span class="p">,</span> <span class="nb">bytes</span><span class="p">)</span> <span class="k">else</span> <span class="nb">str</span><span class="p">(</span><span class="n">field</span><span class="p">)</span><span class="o">.</span><span class="n">encode</span><span class="p">()</span>
         <span class="n">hasher</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">_field</span><span class="p">(</span><span class="n">payload</span><span class="p">))</span>
     <span class="k">return</span> <span class="n">hasher</span><span class="o">.</span><span class="n">digest</span><span class="p">()</span></div>
+
+
+
+<span class="c1"># folded into every variant's root, so no variant can coincide with an adapter's root</span>
+<span class="n">_VARIANT_NAMESPACE</span> <span class="o">=</span> <span class="s2">"prefix-variant"</span>
+
+
+<div class="viewcode-block" id="variant_root">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.keys.html#mstar.engine.resources.kv.keys.variant_root">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">variant_root</span><span class="p">(</span><span class="n">root</span><span class="p">:</span> <span class="nb">bytes</span><span class="p">,</span> <span class="n">resource_key</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">variant</span><span class="p">:</span> <span class="nb">bytes</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bytes</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""``root`` (an adapter's, or the base model's empty one) with the variant a resource</span>
+<span class="sd">    names for a request folded in (``NodeResourceSpec.prefix_variant``)."""</span>
+    <span class="k">return</span> <span class="n">fingerprint</span><span class="p">(</span><span class="n">_VARIANT_NAMESPACE</span><span class="p">,</span> <span class="n">root</span><span class="p">,</span> <span class="n">resource_key</span><span class="p">,</span> <span class="n">variant</span><span class="p">)</span></div>
 
 
 

@@ -18,6 +18,7 @@ mstar.engine.resources.kv.keys
       fingerprint
       page_items
       page_key
+      variant_root
    
    
 

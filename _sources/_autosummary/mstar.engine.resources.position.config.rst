@@ -17,9 +17,11 @@ mstar.engine.resources.position.config
 
    .. autosummary::
    
+      LongRoPE
       PosBackend
       PosScheme
       PositionConfig
+      PositionReqConfig
       PositionSpec
       PositionStep
    

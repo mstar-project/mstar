@@ -57,6 +57,7 @@
    omnivoice
    orpheus
    parakeet
+   phi4mm
    pi05
    qwen3_5
    qwen3_asr

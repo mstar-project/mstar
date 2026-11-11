@@ -397,6 +397,12 @@
 </ul>
 </details></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.model.parakeet.html">mstar.model.parakeet</a></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.phi4mm.html">mstar.model.phi4mm</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.phi4mm.components.html">mstar.model.phi4mm.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.phi4mm.config.html">mstar.model.phi4mm.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.phi4mm.tests.html">mstar.model.phi4mm.tests</a></li>
+</ul>
+</details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.pi05.html">mstar.model.pi05</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.pi05.components.html">mstar.model.pi05.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.pi05.config.html">mstar.model.pi05.config</a></li>
@@ -1404,6 +1410,24 @@ the empty root, so its keys are what they were before LoRA. Only a registered ad
 can be selected, so every request on one has its root; one that arrives without is not
 cached.
 Nothing on the model side is needed for this.</p>
+<p>A model that picks a request’s adapter itself (Phi-4-multimodal runs an image prompt on
+its <code class="docutils literal notranslate"><span class="pre">vision</span></code> adapter and an audio prompt on <code class="docutils literal notranslate"><span class="pre">speech</span></code>) names the adapters it may pick
+in <code class="docutils literal notranslate"><span class="pre">Model.prompt_lora_adapters</span></code> and returns its pick as <code class="docutils literal notranslate"><span class="pre">ProcessPromptOutput.lora_adapter</span></code>
+(<code class="docutils literal notranslate"><span class="pre">None</span></code> for the base model; left at <code class="docutils literal notranslate"><span class="pre">KEEP_ADAPTER</span></code>, the client’s choice stands). The
+API server refuses at startup a deployment whose <code class="docutils literal notranslate"><span class="pre">resources:</span> <span class="pre">lora:</span> <span class="pre">adapters:</span></code> block does
+not serve them all. The data worker then gives the request what <code class="docutils literal notranslate"><span class="pre">ServedModels.select</span></code>
+gives a client that names the adapter: its digest and its root, from the API server’s
+<code class="docutils literal notranslate"><span class="pre">ServedModels</span></code>, so runtime loads and unloads apply. An adapter unloaded since startup,
+or one other than the adapter the client named (<code class="docutils literal notranslate"><span class="pre">None</span></code> included), refuses the request
+with a 400; a pick outside <code class="docutils literal notranslate"><span class="pre">prompt_lora_adapters</span></code> is a 500.</p>
+<p>A resource whose KV differs per request for the same tokens (a LongRoPE table picked by
+prompt length) says so in <code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.prefix_variant(model_kwargs)</span></code>: opaque
+bytes, from the same kwargs its <code class="docutils literal notranslate"><span class="pre">request_config</span></code> reads, or None. The data worker folds
+every declared spec’s variant into the root after any adapter’s, in declaration order and
+under the spec’s key (<code class="docutils literal notranslate"><span class="pre">variant_root</span></code> in <code class="docutils literal notranslate"><span class="pre">mstar/engine/resources/kv/keys.py</span></code>), keys the
+prompt and sends that root on, so generated pages are keyed under it too. Requests share
+pages only under the same variants, and a request whose resources name none keys under the
+root it had.</p>
 </section>
 </section>
 <section id="step-2a-declare-your-state">
@@ -1730,7 +1754,19 @@ a cos/sin table built once (GLM-5.2 uses float32); <code class="docutils literal
 kernel that rotates inside a larger fusion, and <code class="docutils literal notranslate"><span class="pre">interleave</span></code> says which pairs that
 kernel must turn. A model with learned position
 embeddings also declares this spec, because it needs the position counter. Such a
-model never applies RoPE.</p></td>
+model never applies RoPE.
+<code class="docutils literal notranslate"><span class="pre">longrope=LongRoPE.from_hf(config)</span></code> (Phi-3, Phi-4-mini) builds a short and a long
+table, each with its per-dimension factors and attention scale (<code class="docutils literal notranslate"><span class="pre">LongRopeManager</span></code>).
+A request whose <code class="docutils literal notranslate"><span class="pre">MAX_POSITION_KWARG</span></code> (set by <code class="docutils literal notranslate"><span class="pre">process_prompt</span></code>; the data worker
+drops a client’s value) passes
+<code class="docutils literal notranslate"><span class="pre">original_max_position_embeddings</span></code> rotates with the long one for its whole life,
+others with the short one. Set it to the length the model’s reference picks its table
+by: the prompt’s for Phi-3 and Phi-4, not prompt plus <code class="docutils literal notranslate"><span class="pre">max_tokens</span></code>. The spec builds the request’s config from that kwarg and
+names the long table in its prefix keys (<code class="docutils literal notranslate"><span class="pre">PositionSpec.prefix_variant</span></code>), so the two
+cannot disagree. Explicit <code class="docutils literal notranslate"><span class="pre">pos_ids</span></code> are refused under it. On resident tables a
+row keeps its table id’s offset beside its position’s, both fixed between host
+steps. A cos/sin table on CUDA needs a <code class="docutils literal notranslate"><span class="pre">rotary_dim</span></code> that is a multiple of 32 with NeoX
+pairing, of 16 with GPT-J pairing (<code class="docutils literal notranslate"><span class="pre">interleave</span></code>).</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">SamplerSpec(vocab_size=...,</span> <span class="pre">enable_repetition_penalty=...)</span></code></p></td>
 <td><p>A sampler with its own per-request parameter buffers, philox stream, and optional
@@ -2333,7 +2369,8 @@ with the list, so every process builds the same pools; an adapter it cannot read
 the deployment.</p></li>
 <li><p><strong>Requests.</strong> Nothing per model. <code class="docutils literal notranslate"><span class="pre">LoraSpec.request_config</span></code> opens a request that
 names an adapter in the <code class="docutils literal notranslate"><span class="pre">lora_adapter</span></code> kwarg, which the OpenAI <code class="docutils literal notranslate"><span class="pre">model</span></code> field maps
-onto, with a <code class="docutils literal notranslate"><span class="pre">LoraReqConfig</span></code>, which each node’s pool takes; a base-model request
+onto (or which the model’s <code class="docutils literal notranslate"><span class="pre">process_prompt</span></code> sets; see <strong>Cross-request prefix
+reuse</strong>), with a <code class="docutils literal notranslate"><span class="pre">LoraReqConfig</span></code>, which each node’s pool takes; a base-model request
 carries none. The API server refuses, with a 400, an adapter it does not serve
 (<code class="docutils literal notranslate"><span class="pre">ServedModels</span></code>), and the conductor, with a 409, one a runtime load or unload is in
 flight for; an adapter is checked when it is registered (rank within

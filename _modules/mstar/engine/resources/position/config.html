@@ -751,6 +751,12 @@ window.runMermaid = runMermaid;</script>
 </ul>
 </details></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.model.parakeet.html">mstar.model.parakeet</a></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../../../../../_autosummary/mstar.model.phi4mm.html">mstar.model.phi4mm</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.phi4mm.components.html">mstar.model.phi4mm.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.phi4mm.config.html">mstar.model.phi4mm.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.phi4mm.tests.html">mstar.model.phi4mm.tests</a></li>
+</ul>
+</details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../../../_autosummary/mstar.model.pi05.html">mstar.model.pi05</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.pi05.components.html">mstar.model.pi05.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.pi05.config.html">mstar.model.pi05.config</a></li>
@@ -1030,13 +1036,15 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">without pulling FlashInfer in behind it.</span>
 <span class="sd">"""</span>
 
+<span class="kn">import</span><span class="w"> </span><span class="nn">math</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Mapping</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">enum</span><span class="w"> </span><span class="kn">import</span> <span class="n">Enum</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">TYPE_CHECKING</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">TYPE_CHECKING</span><span class="p">,</span> <span class="n">Any</span>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
 
-<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.spec</span><span class="w"> </span><span class="kn">import</span> <span class="n">NodeResourceSpec</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.spec</span><span class="w"> </span><span class="kn">import</span> <span class="n">NodeResourceSpec</span><span class="p">,</span> <span class="n">ResourceReqConfig</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.step</span><span class="w"> </span><span class="kn">import</span> <span class="n">ResourceStep</span>
 
 <span class="k">if</span> <span class="n">TYPE_CHECKING</span><span class="p">:</span>
@@ -1055,6 +1063,97 @@ window.runMermaid = runMermaid;</script>
 <span class="k">class</span><span class="w"> </span><span class="nc">PosScheme</span><span class="p">(</span><span class="n">Enum</span><span class="p">):</span>
     <span class="n">SEQUENTIAL</span> <span class="o">=</span> <span class="s2">"sequential"</span>
     <span class="n">BLOCK</span> <span class="o">=</span> <span class="s2">"block"</span></div>
+
+
+
+<div class="viewcode-block" id="LongRoPE">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.position.config.html#mstar.engine.resources.LongRoPE">[docs]</a>
+<span class="nd">@dataclass</span><span class="p">(</span><span class="n">frozen</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">LongRoPE</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""LongRoPE scaling (Phi-3, Phi-4-mini): every rotary frequency divided by a</span>
+<span class="sd">    per-dimension factor, from a short set or a long set, and cos/sin scaled by</span>
+<span class="sd">    ``sqrt(1 + ln(max / original) / ln(original))``.</span>
+
+<span class="sd">    A request rotates under one set for its whole life, chosen from the length</span>
+<span class="sd">    the model passes (``PositionReqConfig.max_position``): the long set past</span>
+<span class="sd">    ``original_max_position_embeddings``. Pass the length the model's reference</span>
+<span class="sd">    chooses by: for Phi-3 and Phi-4 that is the prompt's, since the reference</span>
+<span class="sd">    picks by the positions in its forward. Prompt plus ``max_tokens`` would put</span>
+<span class="sd">    prompts the reference runs short on the long set. The reference switches</span>
+<span class="sd">    mid-request, once its output crosses the threshold, and recomputes its cache;</span>
+<span class="sd">    holding one set keeps a request's KV consistent without that.</span>
+<span class="sd">    """</span>
+
+    <span class="n">short_factor</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">float</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span>
+    <span class="n">long_factor</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">float</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span>
+    <span class="n">original_max_position_embeddings</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">max_position_embeddings</span><span class="p">:</span> <span class="nb">int</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">__post_init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">short_factor</span><span class="p">)</span> <span class="o">!=</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">long_factor</span><span class="p">):</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">"LongRoPE short and long factors differ in length: "</span>
+                <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">short_factor</span><span class="p">)</span><span class="si">}</span><span class="s2"> vs </span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">long_factor</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span>
+            <span class="p">)</span>
+
+<div class="viewcode-block" id="LongRoPE.from_hf">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.position.config.html#mstar.engine.resources.LongRoPE.from_hf">[docs]</a>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">from_hf</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="s2">"LongRoPE"</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""From a Hugging Face config with ``rope_scaling.type == "longrope"``."""</span>
+        <span class="n">scaling</span> <span class="o">=</span> <span class="n">config</span><span class="p">[</span><span class="s2">"rope_scaling"</span><span class="p">]</span>
+        <span class="k">if</span> <span class="n">scaling</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"type"</span><span class="p">,</span> <span class="n">scaling</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"rope_type"</span><span class="p">))</span> <span class="o">!=</span> <span class="s2">"longrope"</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"not a LongRoPE config: rope_scaling=</span><span class="si">{</span><span class="n">scaling</span><span class="si">!r}</span><span class="s2">"</span><span class="p">)</span>
+        <span class="k">return</span> <span class="bp">cls</span><span class="p">(</span>
+            <span class="n">short_factor</span><span class="o">=</span><span class="nb">tuple</span><span class="p">(</span><span class="nb">float</span><span class="p">(</span><span class="n">f</span><span class="p">)</span> <span class="k">for</span> <span class="n">f</span> <span class="ow">in</span> <span class="n">scaling</span><span class="p">[</span><span class="s2">"short_factor"</span><span class="p">]),</span>
+            <span class="n">long_factor</span><span class="o">=</span><span class="nb">tuple</span><span class="p">(</span><span class="nb">float</span><span class="p">(</span><span class="n">f</span><span class="p">)</span> <span class="k">for</span> <span class="n">f</span> <span class="ow">in</span> <span class="n">scaling</span><span class="p">[</span><span class="s2">"long_factor"</span><span class="p">]),</span>
+            <span class="n">original_max_position_embeddings</span><span class="o">=</span><span class="nb">int</span><span class="p">(</span><span class="n">config</span><span class="p">[</span><span class="s2">"original_max_position_embeddings"</span><span class="p">]),</span>
+            <span class="n">max_position_embeddings</span><span class="o">=</span><span class="nb">int</span><span class="p">(</span><span class="n">config</span><span class="p">[</span><span class="s2">"max_position_embeddings"</span><span class="p">]),</span>
+        <span class="p">)</span></div>
+
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">attention_scale</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">float</span><span class="p">:</span>
+        <span class="n">scale</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_position_embeddings</span> <span class="o">/</span> <span class="bp">self</span><span class="o">.</span><span class="n">original_max_position_embeddings</span>
+        <span class="k">if</span> <span class="n">scale</span> <span class="o">&lt;=</span> <span class="mf">1.0</span><span class="p">:</span>
+            <span class="k">return</span> <span class="mf">1.0</span>
+        <span class="k">return</span> <span class="n">math</span><span class="o">.</span><span class="n">sqrt</span><span class="p">(</span><span class="mi">1</span> <span class="o">+</span> <span class="n">math</span><span class="o">.</span><span class="n">log</span><span class="p">(</span><span class="n">scale</span><span class="p">)</span> <span class="o">/</span> <span class="n">math</span><span class="o">.</span><span class="n">log</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">original_max_position_embeddings</span><span class="p">))</span>
+
+<div class="viewcode-block" id="LongRoPE.is_long">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.position.config.html#mstar.engine.resources.LongRoPE.is_long">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">is_long</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">max_position</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Whether a request whose table is chosen by ``max_position`` rotates with</span>
+<span class="sd">        the long factors."""</span>
+        <span class="k">return</span> <span class="n">max_position</span> <span class="o">&gt;</span> <span class="bp">self</span><span class="o">.</span><span class="n">original_max_position_embeddings</span></div>
+</div>
+
+
+
+<span class="c1"># the length LongRoPE picks a request's table by, as `process_prompt` sets it</span>
+<span class="n">MAX_POSITION_KWARG</span> <span class="o">=</span> <span class="s2">"max_position"</span>
+
+
+<div class="viewcode-block" id="PositionReqConfig">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.position.config.html#mstar.engine.resources.PositionReqConfig">[docs]</a>
+<span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">PositionReqConfig</span><span class="p">(</span><span class="n">ResourceReqConfig</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""The length a resource that picks its rotary table per request</span>
+<span class="sd">    (``PositionConfig.longrope``) chooses by: the one the model's reference</span>
+<span class="sd">    chooses by, which for Phi-3 and Phi-4 is the prompt's (`LongRoPE`)."""</span>
+
+    <span class="n">max_position</span><span class="p">:</span> <span class="nb">int</span>
+
+<div class="viewcode-block" id="PositionReqConfig.validate">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.position.config.html#mstar.engine.resources.PositionReqConfig.validate">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">validate</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">spec</span><span class="p">:</span> <span class="s2">"NodeResourceSpec | None"</span> <span class="o">=</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">max_position</span><span class="p">,</span> <span class="nb">bool</span><span class="p">)</span> <span class="ow">or</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">max_position</span><span class="p">,</span> <span class="nb">int</span><span class="p">)</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_position</span> <span class="o">&lt;</span> <span class="mi">1</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"max_position must be a positive int; got </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">max_position</span><span class="si">!r}</span><span class="s2">"</span><span class="p">)</span>
+        <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">spec</span><span class="p">,</span> <span class="n">PositionSpec</span><span class="p">)</span> <span class="ow">and</span> <span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">longrope</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">"position resource </span><span class="si">{</span><span class="n">spec</span><span class="o">.</span><span class="n">resource_key</span><span class="si">!r}</span><span class="s2"> has one rotary table; "</span>
+                <span class="s2">"a per-request max_position needs PositionConfig.longrope"</span>
+            <span class="p">)</span></div>
+</div>
 
 
 
@@ -1079,13 +1178,19 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># for checkpoints trained with a low-precision table (Fish S2-Pro:</span>
     <span class="c1"># bfloat16). None computes the angles in the kernel with its fast sin/cos,</span>
     <span class="c1"># about a bf16 ulp from a float32 table. CUDA needs a rotary_dim that is a</span>
-    <span class="c1"># multiple of 16 for a table. XPU rotates from a table in rope_dtype or the</span>
+    <span class="c1"># multiple of 32 for a table with NeoX pairing, of 16 with GPT-J pairing</span>
+    <span class="c1"># (`check_table_rotary_dim`). XPU rotates from a table in rope_dtype or the</span>
     <span class="c1"># KV dtype and refuses any other value.</span>
     <span class="n">rope_table_dtype</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">dtype</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
 
     <span class="n">low_freq_factor</span><span class="p">:</span> <span class="nb">float</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="n">high_freq_factor</span><span class="p">:</span> <span class="nb">float</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="n">old_context_len</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+
+    <span class="c1"># Per-request short/long rotary tables (`LongRoPE`). CUDA rotates from a</span>
+    <span class="c1"># table, rounded to ``rope_table_dtype`` when that is set; a request picks</span>
+    <span class="c1"># the long one with ``MAX_POSITION_KWARG`` (`PositionSpec.request_config`).</span>
+    <span class="n">longrope</span><span class="p">:</span> <span class="n">LongRoPE</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
 
     <span class="nd">@property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">llama31_params</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">float</span><span class="p">]:</span>
@@ -1110,6 +1215,30 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.position.config.html#mstar.engine.resources.PositionSpec.depends_on">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">depends_on</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">set</span><span class="p">[</span><span class="nb">str</span><span class="p">]:</span>
         <span class="k">return</span> <span class="p">{</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">kv_cache</span><span class="p">}</span></div>
+
+
+<div class="viewcode-block" id="PositionSpec.request_config">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.position.config.html#mstar.engine.resources.PositionSpec.request_config">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">request_config</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">model_kwargs</span><span class="p">:</span> <span class="nb">dict</span> <span class="o">|</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">"PositionReqConfig | None"</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Under LongRoPE, the length the request's table is chosen by, from</span>
+<span class="sd">        ``MAX_POSITION_KWARG``, which a model sets in ``process_prompt`` (the data worker</span>
+<span class="sd">        drops a client's); without it, the short table."""</span>
+        <span class="n">length</span> <span class="o">=</span> <span class="p">(</span><span class="n">model_kwargs</span> <span class="ow">or</span> <span class="p">{})</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">MAX_POSITION_KWARG</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">length</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">longrope</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">return</span> <span class="kc">None</span>
+        <span class="k">return</span> <span class="n">PositionReqConfig</span><span class="p">(</span><span class="n">max_position</span><span class="o">=</span><span class="n">length</span><span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="PositionSpec.prefix_variant">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.position.config.html#mstar.engine.resources.PositionSpec.prefix_variant">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">prefix_variant</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">model_kwargs</span><span class="p">:</span> <span class="nb">dict</span> <span class="o">|</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bytes</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""The long table gives other KV than the short one for the same tokens, so a</span>
+<span class="sd">        request on it keys its prefix apart; derived from the same kwarg as its config,</span>
+<span class="sd">        so the two cannot disagree."""</span>
+        <span class="n">config</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">request_config</span><span class="p">(</span><span class="n">model_kwargs</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">config</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">longrope</span><span class="o">.</span><span class="n">is_long</span><span class="p">(</span><span class="n">config</span><span class="o">.</span><span class="n">max_position</span><span class="p">):</span>
+            <span class="k">return</span> <span class="kc">None</span>
+        <span class="k">return</span> <span class="sa">b</span><span class="s2">"longrope-long"</span></div>
 
 
     <span class="nd">@property</span>

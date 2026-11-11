@@ -398,6 +398,12 @@
 </ul>
 </details></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.model.parakeet.html">mstar.model.parakeet</a></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.phi4mm.html">mstar.model.phi4mm</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.phi4mm.components.html">mstar.model.phi4mm.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.phi4mm.config.html">mstar.model.phi4mm.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.phi4mm.tests.html">mstar.model.phi4mm.tests</a></li>
+</ul>
+</details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.pi05.html">mstar.model.pi05</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.pi05.components.html">mstar.model.pi05.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.pi05.config.html">mstar.model.pi05.config</a></li>
@@ -745,6 +751,7 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.keys.fingerprint"><code class="docutils literal notranslate"><span class="pre">fingerprint()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.keys.page_items"><code class="docutils literal notranslate"><span class="pre">page_items()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.keys.page_key"><code class="docutils literal notranslate"><span class="pre">page_key()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.keys.variant_root"><code class="docutils literal notranslate"><span class="pre">variant_root()</span></code></a></li>
 </ul>
             </nav>
         </div>
@@ -783,6 +790,9 @@ variable-length field so that no two different spans encode alike.</p>
 </tr>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.keys.page_key" title="mstar.engine.resources.kv.keys.page_key"><code class="xref py py-obj docutils literal notranslate"><span class="pre">page_key</span></code></a>(prev, tokens[, items])</p></td>
 <td><p>Hash a page's parent key, its token ids and its items into the page's key.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.keys.variant_root" title="mstar.engine.resources.kv.keys.variant_root"><code class="xref py py-obj docutils literal notranslate"><span class="pre">variant_root</span></code></a>(root, resource_key, variant)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">root</span></code> (an adapter's, or the base model's empty one) with the variant a resource names for a request folded in (<code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.prefix_variant</span></code>).</p></td>
 </tr>
 </tbody>
 </table>
@@ -933,6 +943,25 @@ an item is not causal and a page’s KV depends on the item’s later slots too.
 </dl>
 </dd></dl>
 
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.keys.variant_root">
+<span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.kv.keys.</span></span><span class="sig-name descname"><span class="pre">variant_root</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">root</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">resource_key</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">variant</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/keys.html#variant_root"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.keys.variant_root" title="Link to this definition">#</a></dt>
+<dd><p><code class="docutils literal notranslate"><span class="pre">root</span></code> (an adapter’s, or the base model’s empty one) with the variant a resource
+names for a request folded in (<code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.prefix_variant</span></code>).</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>root</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#bytes" title="(in Python v3.12)"><em>bytes</em></a>)</p></li>
+<li><p><strong>resource_key</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>variant</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#bytes" title="(in Python v3.12)"><em>bytes</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#bytes" title="(in Python v3.12)">bytes</a></p>
+</dd>
+</dl>
+</dd></dl>
+
 </section>
 
 
@@ -994,6 +1023,7 @@ an item is not causal and a page’s KV depends on the item’s later slots too.
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.keys.fingerprint"><code class="docutils literal notranslate"><span class="pre">fingerprint()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.keys.page_items"><code class="docutils literal notranslate"><span class="pre">page_items()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.keys.page_key"><code class="docutils literal notranslate"><span class="pre">page_key()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.keys.variant_root"><code class="docutils literal notranslate"><span class="pre">variant_root()</span></code></a></li>
 </ul>
   </nav></div>
 

@@ -751,6 +751,12 @@ window.runMermaid = runMermaid;</script>
 </ul>
 </details></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.model.parakeet.html">mstar.model.parakeet</a></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../../../../_autosummary/mstar.model.phi4mm.html">mstar.model.phi4mm</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.phi4mm.components.html">mstar.model.phi4mm.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.phi4mm.config.html">mstar.model.phi4mm.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.phi4mm.tests.html">mstar.model.phi4mm.tests</a></li>
+</ul>
+</details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../../_autosummary/mstar.model.pi05.html">mstar.model.pi05</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.pi05.components.html">mstar.model.pi05.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.pi05.config.html">mstar.model.pi05.config</a></li>
@@ -1247,6 +1253,17 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        None. The conductor adds it to the model's own (``get_request_resource_configs``),</span>
 <span class="sd">        so a resource the deployment declares needs no model code to take request</span>
 <span class="sd">        settings."""</span>
+        <span class="k">return</span> <span class="kc">None</span></div>
+
+
+<div class="viewcode-block" id="NodeResourceSpec.prefix_variant">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.spec.html#mstar.engine.resources.NodeResourceSpec.prefix_variant">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">prefix_variant</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">model_kwargs</span><span class="p">:</span> <span class="nb">dict</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bytes</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""What sets a request's KV on this resource apart from another's for the same</span>
+<span class="sd">        tokens (a LongRoPE table picked per request), from the kwargs ``request_config``</span>
+<span class="sd">        reads; None (the default) for nothing. The API server's data worker folds it into</span>
+<span class="sd">        the request's prefix-cache root, so the two never share pages. Called per request</span>
+<span class="sd">        on the data worker's threads, so it reads only ``model_kwargs`` and the spec."""</span>
         <span class="k">return</span> <span class="kc">None</span></div>
 
 
