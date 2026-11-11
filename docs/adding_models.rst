@@ -2390,8 +2390,7 @@ row whose last step did not keep its value on the device (its first decode step,
 the prefill) still brings it routed, and that read puts it over the slot's.
 ``SampledTokenDecoder`` declares it for Qwen3.5, Muse Glimmer, Higgs Audio, Qwen3-ASR and the Cosmos3 reasoner,
 and a node on it that reads the routed token sets ``device_loopback = None``; Whisper and
-Qwen3-Omni's Thinker declare their own. Qwen3.5 and Qwen3-ASR read the tokens with ``last_sampled``,
-and the scaffold puts a row's routed token over its slot's with ``splice_loopback_ids``.
+Qwen3-Omni's Thinker declare their own. Qwen3.5 and Qwen3-ASR read the tokens with ``last_sampled``.
 
 A token that also streams to another node can go down the stream by value, when the
 stream's ``Connection`` sets ``by_value=True``: its consumer then takes a window of the

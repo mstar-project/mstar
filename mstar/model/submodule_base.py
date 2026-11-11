@@ -1566,32 +1566,6 @@ def engine_step(submodule, *args, **kwargs) -> SubmoduleStep | None:
     return state_steps(step, getattr(submodule, "state_handles", {}))
 
 
-def splice_loopback_ids(ids: torch.Tensor, inputs: list[ARNodeInputs], decode: bool) -> torch.Tensor:
-    """``ids`` (one loop-back token per row) with each row that brought
-    its own ids taking them instead, in row order: a mixed step's prompt
-    rows, or a decode row whose last step ran elsewhere. Runs of loop-back
-    rows go in as one slice each, and the splice is device ops only: an
-    index built from a host list would be a synchronous copy behind the
-    step in flight. A decode step keeps the slot's padding rows past
-    ``inputs``, so its length stays the captured one."""
-    pieces: list[torch.Tensor] = []
-    run = None
-    for i, inp in enumerate(inputs):
-        if inp.input_ids is None or (decode and not inp.input_seq_len):
-            if run is None:
-                run = i
-            continue
-        if run is not None:
-            pieces.append(ids[run:i])
-            run = None
-        pieces.append(inp.input_ids.to(ids.dtype))
-    if run is not None:
-        pieces.append(ids[run:len(inputs)])
-    if decode and ids.shape[0] > len(inputs):
-        pieces.append(ids[len(inputs):])
-    return torch.cat(pieces) if len(pieces) > 1 else pieces[0]
-
-
 class ARNodeSubmodule(NodeSubmodule):
     # Set True on a submodule whose `split_inputs` cuts its own ``tensor_inputs``.
     # The engine probes the prefix cache for a walk that carries them only then.
