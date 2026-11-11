@@ -548,19 +548,28 @@ def test_a_resource_over_nodes_that_split_heads_differently_is_refused(tmp_path)
                          r"\['b'\] keep KV by head over them, .* share resources \['shared'\]")
 
 
-@pytest.mark.parametrize("tp, shard", [(4, None), (2, {"exchange": "all_gather"})], ids=["copied", "split"])
-def test_qwen3_5_on_sp_ranks_runs_with_its_kv_positions_placed_over_them(tp, shard, tmp_path, monkeypatch):
+@pytest.mark.parametrize("tp, placed, shard", [
+    (4, True, None), (2, True, {"exchange": "all_gather"}), (1, False, None), (1, False, {"exchange": "ulysses"}),
+], ids=["copied", "split", "by_head", "by_head_ulysses"])
+def test_qwen3_5_on_sp_ranks_runs_with_its_kv_positions_placed_over_them(tp, placed, shard, tmp_path, monkeypatch):
     """As placed, its steps run copied (DCP); with its shard's exchange set they split, and its
-    recurrent layers follow by Ulysses (at a TP size leaving their heads two SP ranks' worth)."""
+    recurrent layers follow by Ulysses (at a TP size leaving their heads two SP ranks' worth).
+    Over KV stored by head it splits only where the deployment opts into Ulysses, which no GPU
+    has run: refused by default."""
     config = yaml.safe_load((ROOT / "configs/qwen3_5_27b_tp4.yaml").read_text())
     llm, = (group for group in config["node_groups"] if group["node_names"] == ["LLM"])
     llm.update(ranks=list(range(2 * tp)), tp_size=tp, sp_size=2)
-    config["resources"]["kv_cache"] = {"context_parallel": True}
+    if placed:
+        config["resources"]["kv_cache"] = {"context_parallel": True}
     if shard is not None:
         config["resources"]["llm_shard"] = shard
     path = tmp_path / "cfg.yaml"
     path.write_text(yaml.safe_dump(config))
-    assert _validate(_qwen3_5(config["model"], {}, tmp_path, monkeypatch), str(path)).worker_graphs
+    model = _qwen3_5(config["model"], {}, tmp_path, monkeypatch)
+    if not placed and shard is None:
+        _refused(model, str(path), r"node 'LLM' runs on 2 SP ranks, and its steps never split")
+        return
+    assert _validate(model, str(path)).worker_graphs
 
 
 class _CfgModel(_Model):

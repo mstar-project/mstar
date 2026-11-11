@@ -22,12 +22,13 @@ from mstar.engine.resources.sequence_shard import SeqShardSpec
 from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.model.base import TensorAndMetadata
 from mstar.model.components.mrope import image_position_advance
-from mstar.model.keys import MIXED
+from mstar.model.keys import MIXED, PREFILL_TEXT
 from mstar.model.media_limits import read_image
 from mstar.model.multimodal import (
     VIDEO,
     PromptPart,
     as_uint8_chw,
+    media_walk_names,
     messages_from_parts,
     vision_encoder,
 )
@@ -45,7 +46,6 @@ from mstar.model.qwen3_5.config import (
     LINEAR_ATTN,
     LLM_SHARD,
     ROPE,
-    SPLIT_WALKS,
     VISION_ATTN,
     Qwen3_5Config,
     Qwen3_5VisionConfig,
@@ -183,10 +183,16 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
                 ),
             ),
             self._sampler_spec(self.config.vocab_size),
-            # a step split over the LLM's SP ranks; one SP rank, or KV stored by position under the
-            # shard's default exchange (auto), runs every step copied. Decode never splits, so its
-            # compiled frame traces the bracket straight through
-            SeqShardSpec(LLM_SHARD, {"LLM"}, labels=("main",), axis=0, walks=SPLIT_WALKS),
+            # a step split over the LLM's SP ranks, where the deployment sets the shard's exchange:
+            # all_gather over KV stored by position, ulysses over KV stored by head. "none" by default,
+            # so one SP rank, or KV stored by position, runs every step copied, and the LLM on SP
+            # ranks over KV stored by head is refused until a deployment opts into Ulysses, which
+            # has run on CPU only. Its prefill walks may split, never decode, so decode's compiled
+            # frame traces the bracket straight through
+            SeqShardSpec(
+                LLM_SHARD, {"LLM"}, labels=("main",), axis=0,
+                walks=(PREFILL_TEXT, *media_walk_names(self.encoders), MIXED), exchange="none",
+            ),
             *self._vision_resources(),
             qwen3_5_lora_spec(self.config, self.vision_config),
         ]

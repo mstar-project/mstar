@@ -21,9 +21,8 @@ GDN_STATE = "gdn_state"
 LINEAR_ATTN = "linear_attn"
 ROPE = keys.ROPE
 SAMPLER = keys.SAMPLER
-# whether a step's tokens split over the LLM's SP ranks, and the walks that may (decode never does)
+# whether a step's tokens split over the LLM's SP ranks
 LLM_SHARD = "llm_shard"
-SPLIT_WALKS = (keys.PREFILL_TEXT, "prefill_vision", keys.MIXED)
 # the ViT tower's cacheless attention, on the `vision_encoder` node
 VISION_ATTN = keys.VISION_ATTN
 

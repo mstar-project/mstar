@@ -711,9 +711,11 @@ and startup time.
 On ``sp_size`` above 1 the LLM declares a sequence shard (``llm_shard``, its
 prefill and mixed walks; decode never splits, and its compiled frame keeps the
 bracket out). With its KV pool stored by position (``kv_cache:
-{context_parallel: true}``) and the shard's default ``exchange``, every step
+{context_parallel: true}``) and the shard's default ``exchange`` (``none``), every step
 runs copied, each rank attending its share of the stored context (more KV
-capacity, no faster prefill). With ``llm_shard: {exchange: all_gather}`` a
+capacity, no faster prefill). Over KV stored by head the LLM on SP ranks is
+refused unless the deployment sets ``llm_shard: {exchange: ulysses}``, which
+has run on CPU only. With ``llm_shard: {exchange: all_gather}`` a
 step of at least ``llm_shard.min_tokens`` tokens splits over
 the SP ranks: each runs the layers on its part of the prompt, attention gathers
 the step's queries, keys and values, and the gated DeltaNet layers trade tokens

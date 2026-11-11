@@ -97,13 +97,10 @@ class EngineResourceInfo:
     # the prefix caches this engine opens (`opening_prefix_caches`), decided
     # before any resource is built, for one that sizes itself by its own
     prefix_caches: frozenset[str] = frozenset()
-    # whether the resource's nodes run replicated over their SP ranks, because their pools place
-    # positions over them (``PagedKVConfig.context_parallel``), rather than splitting their steps
-    # over them (``SeqShardSpec``)
+    # whether every SP rank holds this resource's heads whole, so they split over TP alone: its
+    # nodes' pools place positions over the SP ranks (``PagedKVConfig.context_parallel``), or it is
+    # a pool stored ``copied`` or a resource over such pools alone (``NodeResourceSpec.storage``)
     replicated_over_sp: bool = False
-    # whether every SP rank holds this resource's state whole: a pool stored ``copied``, or a
-    # resource over such pools alone (``NodeResourceSpec.storage``), so its heads split over TP alone
-    copied_over_sp: bool = False
     # what each step may still copy to the host once its outputs are sent, or on a pass that runs no step
     host_allowance: StepAllowance | None = None
 
@@ -113,7 +110,7 @@ class EngineResourceInfo:
         counts by (`head_shards`). A ragged resource splits over TP only, unless it declares
         ``RaggedAttentionSpec.sp_exchange`` on a node whose steps split: over TP x SP then, even
         where the node's pools place positions."""
-        return head_shards(self.joint_comm_group, self.replicated_over_sp or self.copied_over_sp)
+        return head_shards(self.joint_comm_group, self.replicated_over_sp)
 
     def dependency(self, key: str) -> NodeResourceSpec:
         spec = self.dependencies.get(key)

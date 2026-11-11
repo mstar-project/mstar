@@ -156,9 +156,7 @@ def test_forward_in_graph_rope_reads_planned_positions_at_capture():
     """A capture hands the forward the slot's static input_ids and rotary
     tables. The ids are always the static ones; the forward builds the tables
     from the planned positions instead."""
-    from mstar.distributed.communication import CommGroup
-    from mstar.engine.resources.sequence_shard import SequenceShard
-    from mstar.model.qwen3_5.config import ATTN, LLM_SHARD, ROPE
+    from mstar.model.qwen3_5.config import ATTN, ROPE
 
     calls = {}
 
@@ -189,14 +187,11 @@ def test_forward_in_graph_rope_reads_planned_positions_at_capture():
     sub.node_resources[ROPE] = SimpleNamespace(pos_ids=lambda label: torch.tensor([10, 20]))
     sub.model = _Decoder()
     static_ids, static_cos = torch.tensor([9, 9]), torch.full((3, 2), 7.0)
-    # one SP rank: the bracket passes the stack's inputs through
-    shard = SequenceShard(("main",), 0, None, 0, CommGroup.trivial())
 
     def run(captured):
         calls.clear()
         engine_inputs = SimpleNamespace(
-            resources={SAMPLER: sampler, ATTN: object(), LLM_SHARD: shard}, request_ids=["r1", "r2"],
-            captured=captured,
+            resources={SAMPLER: sampler, ATTN: object()}, request_ids=["r1", "r2"], captured=captured,
         )
         out = LLMSubmodule._forward(
             sub, "decode", engine_inputs, cos_3d=static_cos, sin_3d=static_cos, input_ids=static_ids,
