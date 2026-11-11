@@ -514,7 +514,7 @@ FastConformer ASR (``canary``, ``canary_qwen``, ``parakeet``, ``nemotron_asr``) 
   bounded however long it runs; the live path took about 0.9 GB of GPU memory beside the
   whole-clip path's 4.6 GB at lookahead 3, 1.15 GB at 13 (each stream's bounded state and the
   live captures; both paths share one copy of the weights). With it on, whole clips ran up to
-  8% slower at 32 at once on an H200, partly because they prepare one at a time, so a
+  8% slower at 32 at once on an H200 (the cause is not traced), so a
   whole-clip deployment leaves it off and runs exactly the clip graph.
 - All four run the FastConformer encoder ``nemotron_duplex`` streams
   (``mstar/model/components/fastconformer.py``), over the whole clip. Canary, Parakeet and
