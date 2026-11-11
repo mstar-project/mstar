@@ -120,8 +120,8 @@ class Qwen3Model(MultimodalDecoderModel):
         except ValueError as exc:
             raise ValueError(f"draft model {draft.model!r}: {exc}") from None
         taps = config.taps or default_taps(self.config.num_hidden_layers)
-        # the weights' dtype from one level, the top's if it names one (as Qwen3.5 reads text_config): merged, a
-        # top-level torch_dtype and an inner dtype that disagree would be refused though each level agrees with itself
+        # the weights' dtype from one level, the top's if it names one: merged, a top-level torch_dtype and an inner
+        # dtype that disagree would be refused though each level agrees with itself
         level = hf if "dtype" in hf or "torch_dtype" in hf else hf.get("transformer_layer_config", {})
         # its query heads, KV geometry, RoPE base and the width it reads are checked at startup (`geometry_problems`)
         return Eagle3(

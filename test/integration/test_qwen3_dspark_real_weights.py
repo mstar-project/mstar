@@ -108,7 +108,8 @@ def _sibling(name: str):
 
 
 fp32_screen = _sibling("fp32_screen")
-# the Qwen3.5 module's gates; the deficit tripwire is uncalibrated for Qwen3-8B, so the rank tripwire alone
+# the gates as calibrated on a served Qwen3.5 MTP run (#1323); the deficit tripwire is uncalibrated for Qwen3-8B,
+# so the rank tripwire alone
 GATES = fp32_screen.Gates(p_fail=1e-3, trip_rank=5, trip_deficit=None, burst=(3, 16))
 spec_served = _sibling("spec_served")
 _snapshot, _server_module, _totals, _counters, _tau = (
