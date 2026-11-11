@@ -766,10 +766,11 @@ reply: chat ``response_format`` (``json_object``, or ``json_schema`` with its ``
 JSON schema), ``json_object``, ``regex``, ``choice`` (a list of strings) or ``grammar`` (EBNF),
 as vLLM takes it. ``"after": "</think>"`` starts the constraint once the reply holds that text,
 so a reasoning model thinks freely first; a model that declares the text that ends its
-reasoning (Qwen3.5's ``</think>``, Muse Glimmer's ``to=user<|message|>``, the end of its
-answer's header) sets it on any turn whose prompt leaves the reasoning open. An unsupported
-schema is a 400, and so is a request on a deployment without ``enable_grammar`` or a grammar
-and ``after`` over 131072 characters, or one that also sends ``min_tokens`` or ``ignore_eos``.
+reasoning (Qwen3.5's and MiniCPM-o's ``</think>``, Muse Glimmer's ``to=user<|message|>``, the
+end of its answer's header) sets it on any turn whose prompt leaves the reasoning open. An
+unsupported schema is a 400, and so is a request on a deployment without ``enable_grammar`` or a
+grammar and ``after`` over 131072 characters, or one that also sends ``min_tokens`` or
+``ignore_eos``.
 The grammar compiles in the background, on every rank, while its request waits and the requests
 behind it start. The captured sampler then applies a bitmask on every step but a greedy one
 without a constrained row (the lean twin). A step holding a constrained row launches its

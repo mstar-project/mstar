@@ -12,6 +12,8 @@ import torch
 
 xgrammar = pytest.importorskip("xgrammar")
 
+from test_byte_level_text_chunks import fast_tokenizer  # noqa: E402, F401
+
 from mstar.api_server.openai.adapters import _refuse_unserved_chat  # noqa: E402
 from mstar.conductor.conductor import Conductor  # noqa: E402
 from mstar.engine.accelerator_graph_backend import SplitGraph  # noqa: E402
@@ -21,6 +23,7 @@ from mstar.engine.resources.sampler.config import SamplerSpec, SamplerStep, Samp
 from mstar.engine.resources.sampler.grammar import MAX_GRAMMAR_CHARS, GrammarRequest, grammar_request  # noqa: E402
 from mstar.engine.resources.sampler.resource import GrammarSamplerResource  # noqa: E402
 from mstar.engine.resources.step import ASKS, SlotLease, StepContext  # noqa: E402
+from mstar.model.utils import TextChunkDetokenizer  # noqa: E402
 from mstar.testing_utils.resource import StubResource  # noqa: E402
 
 VOCAB = [b"{", b"}", b'"', b":", b",", b"a", b"b", b"1", b"2", b" ", b"true", b"x", b"<think>", b"</think>", b""]
@@ -369,6 +372,27 @@ def test_after_starts_the_grammar_once_the_reply_holds_its_text():
         drawn.append(res.sample([0], logits).item())
         res.commit(step, ctx)
     assert drawn[:3] == [x, think, x] and _text(drawn[3:5]) == "ab" and drawn[5] == EOS
+
+
+def test_after_reasoning_ignores_trailing_special_tokens(fast_tokenizer):  # noqa: F811
+    """MiniCPM-o's audio prompt closes the think block, then adds ``<|tts_bos|>``
+    (kept in its detokenizer's bytes): the reasoning is closed, as for a text prompt.
+    An end that itself contains a special token still reads as closed."""
+    tok = fast_tokenizer
+    detok = TextChunkDetokenizer(tok)
+    ask = {"json_object": True}
+    ids = {t: tok.convert_tokens_to_ids(t) for t in ("<think>", "</think>", "<|im_end|>")}
+    nl, nl2, hi = (tok.encode(t) for t in ("\n", "\n\n", "hi"))
+    think, close, special = ids["<think>"], ids["</think>"], ids["<|im_end|>"]
+
+    def after(end, *seq):
+        out = SimpleNamespace(detokenizer=detok, reasoning_end=end)
+        return grammar.after_reasoning(ask, out, torch.tensor([*hi, *seq])).get("after")
+
+    assert after("</think>", think, *nl) == "</think>"
+    assert after("</think>", close, *nl2, special) is None
+    assert after("</think>", close, *hi, special) == "</think>"
+    assert after("</think><|im_end|>", close, special) is None
 
 
 @pytest.mark.parametrize("value, error", [

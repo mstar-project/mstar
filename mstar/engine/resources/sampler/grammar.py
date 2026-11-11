@@ -150,14 +150,23 @@ def grammar_request(value: Any) -> GrammarRequest | None:
 def after_reasoning(structured: Any, text_output: TextOutput | None, prompt_ids: torch.Tensor) -> Any:
     """``structured`` with ``after`` the model's ``reasoning_end`` when the prompt
     leaves the reasoning open, so a thinking turn reasons freely and then answers
-    in its grammar; as it came on a turn whose prompt ends past the reasoning."""
+    in its grammar; as it came on a turn whose prompt ends past the reasoning.
+    The check reads the last 8 ids and the whitespace before the end does not
+    count. If they do not end in ``reasoning_end``, it drops one trailing special
+    token and reads again, so a template may add special tokens after the end
+    (MiniCPM-o's ``<|tts_bos|>``) and an end made of special tokens still matches."""
     end = None if text_output is None else text_output.reasoning_end
     if end is None or not isinstance(structured, dict) or "after" in structured:
         return structured
-    tail = b"".join(text_output.detokenizer.token_bytes(int(i)) for i in prompt_ids[-8:])
-    if tail.decode("utf-8", errors="replace").rstrip().endswith(end):
-        return structured
-    return {**structured, "after": end}
+    detokenizer = text_output.detokenizer
+    ids = prompt_ids[-32:].tolist()
+    while True:
+        tail = b"".join(map(detokenizer.token_bytes, ids[-8:]))
+        if tail.decode("utf-8", errors="replace").rstrip().endswith(end):
+            return structured
+        if not ids or ids[-1] not in detokenizer.kept_special_ids:
+            return {**structured, "after": end}
+        ids.pop()
 
 
 def response_format_request(response_format: Any) -> dict | None:
