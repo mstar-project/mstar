@@ -31,13 +31,20 @@ an add into one fused multiply-add, which drops the rounding the eager ops make 
 
 from __future__ import annotations
 
+import logging
+
 import torch
+import torch.nn.functional as F
+
+from mstar.platforms import current_platform
 
 try:
     import triton
     import triton.language as tl
 except ImportError:  # pragma: no cover - CPU-only installs
     triton = None
+
+logger = logging.getLogger(__name__)
 
 _BLOCK = 1024
 
@@ -204,9 +211,78 @@ if triton is not None:
             tl.store(o_ptr + base + col, (m.to(tl.float32) + shift).to(tl.bfloat16), mask=mask)
 
 
+_VERIFIED: dict[tuple[torch.device, torch.dtype], bool] = {}
+
+
 def fits(*tensors: torch.Tensor) -> bool:
-    """Whether the fused kernels take these tensors: CUDA bf16 with Triton available."""
-    return triton is not None and all(t.is_cuda and t.dtype == torch.bfloat16 for t in tensors)
+    """Whether the fused kernels take these tensors: CUDA (mstar's platform, not a ROCm or XPU torch that reports a
+    ``cuda`` device) bf16 with Triton available, on a device where the kernels reproduce the eager ops."""
+    return (
+        triton is not None and current_platform.is_cuda()
+        and all(t.is_cuda and t.dtype == torch.bfloat16 for t in tensors)
+        and all(_reproduces_eager(device, dtype) for device, dtype in {(t.device, t.dtype) for t in tensors})
+    )
+
+
+def _reproduces_eager(device: torch.device, dtype: torch.dtype) -> bool:
+    """Whether every kernel gives the eager ops' bits on ``device``, checked once on small inputs; if one does
+    not (a torch whose reduction order or complex multiply changed), the eager ops run from then on, with one
+    warning. The first call is a warm-up forward, before any capture; a call that lands under capture or in a
+    compiled trace before that takes the eager ops (the same result) rather than reading the check back to the
+    host, and the check runs on the next eager call."""
+    known = _VERIFIED.get((device, dtype))
+    if known is not None:
+        return known
+    if torch.compiler.is_compiling() or torch.cuda.is_current_stream_capturing():
+        return False
+    failed = _kernels_off_eager(device, dtype)
+    ok = _VERIFIED[(device, dtype)] = not failed
+    if failed:
+        logger.warning("dit_kernels: %s differ from torch %s's eager ops on %s; using the eager ops",
+                       ", ".join(failed), torch.__version__, device)
+    return ok
+
+
+def _kernels_off_eager(device: torch.device, dtype: torch.dtype) -> list[str]:
+    """The kernels whose output is not ``torch.equal`` to the eager ops' on a small input (the served head count
+    and width, so the Triton compiles are the ones serving needs)."""
+    gen = torch.Generator(device=device).manual_seed(0)
+    rows, length, split, heads, dim = 2, 8, 3, 24, 3072
+
+    def rand(*shape, scale=1.0, shift=0.0):
+        return (torch.randn(*shape, generator=gen, device=device) * scale + shift).to(dtype)
+
+    def per_token(p):  # [2 * rows, D] -> [rows, length, D]: set 0 before ``split``, set 1 from it
+        return torch.cat([p[:rows, None].expand(-1, split, -1), p[rows:, None].expand(-1, length - split, -1)], 1)
+
+    weight = rand(128)
+    freqs = torch.polar(torch.ones(length, 64, device=device), torch.randn(length, 64, generator=gen, device=device))
+    q = rand(rows, length, heads, 128)
+    h = q.float()
+    normed = weight * (h * torch.rsqrt(h.pow(2).mean(-1, keepdim=True) + 1e-6)).to(dtype)
+    pairs = torch.view_as_complex(normed.float().reshape(*normed.shape[:-1], -1, 2))
+    rotated = torch.view_as_real(pairs * freqs.unsqueeze(-2)).flatten(-2).type_as(normed)
+
+    x, y = rand(rows, length, dim, scale=4, shift=30), rand(rows, length, dim)
+    gate, shift, scale1p = rand(2 * rows, dim), rand(2 * rows, dim), 1 + rand(2 * rows, dim)
+    residual = x + per_token(gate) * y
+
+    def modulated(t):
+        return t * per_token(scale1p) + per_token(shift)
+
+    def ln(t):
+        return F.layer_norm(t, (dim,), eps=1e-6)
+
+    got_residual, got_gated = gated_norm_modulate(x, gate, y, scale1p, shift, split, 1e-6)
+    checks = {
+        "qk_norm_rope": (qk_norm_rope(q, weight, freqs, 1e-6), rotated),
+        "modulate": (modulate(x, scale1p, shift, split), modulated(x)),
+        "gated_add": (gated_add(x, gate, y, split), residual),
+        "norm_modulate": (norm_modulate(x, scale1p, shift, split, 1e-6), modulated(ln(x))),
+        "gated_norm_modulate": (torch.stack([got_residual, got_gated]),
+                                torch.stack([residual, modulated(ln(residual))])),
+    }
+    return [name for name, (got, want) in checks.items() if not torch.equal(got, want)]
 
 
 def _norm_rope_into(x: torch.Tensor, weight: torch.Tensor, freqs: torch.Tensor, eps: float, out: torch.Tensor,
@@ -330,7 +406,7 @@ def _(x, gate, y, split):
 def norm_fits(x: torch.Tensor) -> bool:
     """Whether :func:`norm_modulate` / :func:`gated_norm_modulate` take ``x``: a contiguous ``[R, L, D]`` with
     ``D % 512 == 0`` (torch's vectorized LayerNorm then gives every thread the same number of values)."""
-    return x.dim() == 3 and x.is_contiguous() and x.shape[-1] % 512 == 0
+    return fits(x) and x.dim() == 3 and x.is_contiguous() and x.shape[-1] % 512 == 0
 
 
 # rows per program and warps of the LayerNorm kernels (ln_micro's sweep on an H200, [2, 8192, 3072])
