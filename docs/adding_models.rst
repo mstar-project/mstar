@@ -443,8 +443,8 @@ A prompt on a walk the keys don't name sets 0, because the data worker refuses a
 from any other walk. This key is temporary, with ``kv_labels``.
 A name either key doesn't declare fails the request.
 
-The footprint adds the spans, the growth at each loop's iterations and the
-scratch, and rounds up to whole pages per label. A span's own scratch counts only with the spans before
+The footprint adds the spans, the growth at each loop's iterations (up to a ``LabelLayout``'s
+``max_growth``) and the scratch, and rounds up to whole pages per label. A span's own scratch counts only with the spans before
 it, so a window's denoise steps and its commit count once. Under a ``RetentionPolicy`` it
 takes the window's peak instead. ``KVReqConfig.validate`` refuses a request whose footprint
 is bigger than its pool with a 400 at intake, and ``KVReqConfig.loop_room`` cuts the default
@@ -487,8 +487,9 @@ media item's rows, the walk asserts the two agree: BAGEL's ViT walk against
 ``vit_patches``, Qwen3-Omni's vision encoder against the processor's grid.
 
 A model that hasn't moved to declarations returns today's ``LabelLayout`` under
-``kv_layout``, which adds the ``RetentionPolicy`` its committing steps declare. Loading
-fails in three cases, and a request fails in two:
+``kv_layout``, which adds the ``RetentionPolicy`` its committing steps declare, and
+``max_growth``: the most slots ``growth`` writes in all, for loops that end before their
+caps, as Nemotron's do. Loading fails in three cases, and a request fails in two:
 
 - A paged pool has no labels. The message is ``<Model> declares no labels for its paged
   pool '<key>'; add them to `kv_labels`, and return each request's layout for them from
@@ -849,6 +850,12 @@ The spec types are:
        reserved or released per step. ``attend`` takes an optional per-distance score
        term (``rel_bias``) for relative-position attention. Float32 by default (Triton
        kernels). See `Bounded (sink + window) caches`_.
+   * - ``RollingKVSpec(config=RollingKVConfig(...))``
+     - Per-request sink + window K/V kept compacted in stream order, in regions of a pool
+       reserved at startup (``pool_tokens``), with no attention of its own: a step writes its
+       tokens with ``write`` and hands ``window`` (one contiguous range) to whatever attention
+       the model runs, a ragged one say. For long chunks where that kernel's speed matters (a
+       causal video DiT). See `Rolling (compacted) caches`_.
    * - ``AttentionSpec(config=AttentionConfig(kv_cache=...))``
      - Self-attention planned over the named cache. ``backend`` selects
        ``AttnBackend.AUTO`` (the default, which lets the engine pick the platform's
@@ -1415,6 +1422,41 @@ compute in it. The streaming FastConformer (``encoder_kv_config`` in
 ``mstar/model/components/fastconformer_stream.py``, Nemotron VoiceChat's ``ENCODER_KV``) is
 the per-query example.
 
+Rolling (compacted) caches
+^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+A causal video DiT that denoises chunk after chunk against a sink and a sliding window of
+earlier chunks (Self-Forcing's rolling cache; LingBot-World's ``DIT_KV``) declares a
+``RollingKVSpec``. Its chunks are thousands of queries over tens of thousands of keys, so
+the attention kernel dominates the step, and bounded KV's Triton kernel (built for short
+streaming steps) is several times slower there than the ragged FlashInfer one. The rolling
+store therefore runs no attention: it keeps the stream's first ``sink`` tokens and its last
+``window`` (the step's included) in stream order, shifting the window left behind the sink
+when a step would overflow, so a step's keys are always one contiguous slice.
+
+Each step declares its rows' ``RollingPosition(written, sink, window)`` in tokens
+(``RollingKVStep``), so the retention can follow a request's own geometry. ``plan`` applies
+the shift, once per step even when planned twice; the model then calls ``write(layer, k, v)``
+(as often as its denoise loop rewrites the chunk; the last write stays) and attends
+``window(layer)`` with its own kernel.
+
+The K/V live in one pool reserved at startup, ``pool_tokens`` a layer. The model declares
+each request's size by returning ``RollingKVReqConfig(tokens=sink + window)`` from
+``get_request_resource_configs``; a request it declares nothing for fails at its first step.
+A request waits in the engine's admission queue, in arrival order, until the pool has its
+room, which is then set aside for it, and one larger than the whole pool is a 400 at the
+conductor. Its first step takes a contiguous region of exactly that size (first fit), given
+back when the request ends, so requests of different sizes share the pool instead of each
+holding the largest. When no free gap holds a new request but the free tokens do, the
+resident regions slide left to join the gaps, a copy of what they hold, between steps; one
+that slides across a short gap is copied through a staging block of 512 tokens a layer,
+reserved with the pool (90 MiB at LingBot-World's geometry), rather than in many small
+copies. How many requests run at once is the deployment's ``max_concurrent_requests``, not
+the store's: the pool counts tokens, so it admits many small requests, and any state a
+model keeps per request outside the store is bounded only by that limit (LingBot-World
+requires it to be 1 for this reason). A step that declares this store runs eager (no
+capture yet), and it does not shard across ranks yet.
+
 Per-request LoRA adapters
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -1466,7 +1508,15 @@ placed exactly as weights are.
   subclasses of either that keep their base's forward are swapped alike, and are whole
   on every rank. An unbound module keeps its class, so a deployment without a ``lora:``
   block runs, traces and guards exactly as before (tests hold the aten ops, the dynamo
-  graph and its guards). Anything else holding weight matrices (MoE experts, a router, a
+  graph and its guards). An MoE layer's ``FusedExperts`` is a target per parameter
+  (``LoraCapable.lora_targets``): ``gate_up_proj`` and ``down_proj``, each with an A and B
+  per expert, named ``experts_gate_up_proj`` / ``experts_down_proj`` and placed per expert
+  by the loader's ``"gate:N"`` / ``"up:N"`` / ``"down:N"`` shard ids; its twin adds the
+  deltas inside the dispatch (``FusedExperts._dispatch``), after each grouped GEMM
+  (before the activation, and before the top-k sum and the all-reduce), so a subclass
+  with a ``_dispatch`` of its own is refused as one with its own forward is; so is an
+  adapter of PEFT's fused 3-D form (one A and B on the experts container), read per
+  expert only. Anything else holding weight matrices (a router, a
   depthwise conv, ``nn.Embedding``, a forward overridden on an instance or hooked) takes
   none: the walk records why, and an adapter touching it is refused with that reason. So
   does a child its parent runs through the weight itself rather than its forward (folded at
@@ -1536,7 +1586,17 @@ placed exactly as weights are.
   (Qwen3.5's delta-net ``in_proj_qkv``: one A for the three, B cut by their widths), and
   a base linear that pads a slice per rank for alignment says so in ``slice_align``.
   ``parallel="none"`` is a target whole on every rank, its delta added to an output that
-  is already whole.
+  is already whole. ``experts=E`` is one stacked parameter of an MoE layer's routed
+  experts: each (token, top-k) row runs its token's slot's A and B for the expert the
+  router picked, addressed by one combined id ``(slot - 1) * E + expert`` (the zero
+  adapter's are not stored), on the fused-MoE grouped GEMM (``LoraBackend.apply_experts_``;
+  one align per layer over the combined ids, then a shrink and an accumulating expand per
+  slice). Experts targets are opt-in, since every slot holds a copy of each expert's
+  factors: ``module_lora_spec`` declares them in ``LoraSpec.dropped_targets``, and the
+  YAML's ``targets:`` serves them by naming them. The align op groups fewer than 1024 ids
+  once padded to its warp of 32, so a spec serves at most ``992 // E`` slots (7 at 128
+  experts) and refuses more where the YAML sizes it. Experts split by expert parallelism
+  are refused at deployment validation and at bind (``expert_split``); serve them under TP.
 - **Target kinds and rows.** ``kind="embedding"`` is a token embedding: ``in_features``
   is the vocabulary, the layer passes token ids as ``x``, and the shrink is a gather of
   A's column per token (``mstar::lora_gather_shrink``), PEFT's ``lora_embedding_A`` /
@@ -1544,12 +1604,13 @@ placed exactly as weights are.
   ``per_segment`` is one row per segment and ``token_fold=k`` one row per ``k``
   consecutive tokens of a segment. The pool plans an addressing per grouping its targets
   use; the call checks the rows it gets.
-- **Checkpoint layouts.** Adapters are validated from the safetensors header: modules
-  map to targets, shapes fit them (an adapter for another model size is a 400, not an
-  admit failure), and a conv adapter whose kernel is its stride flattens to the linear
-  over the patch. DoRA (PEFT's ``lora_magnitude_vector``, Kohya's ``dora_scale``), ``modules_to_save``, trainable
-  tokens and bias LoRA are refused by name. A YAML ``targets: [...]`` keeps a subset of
-  the model's targets (dropping vocabulary-sized ones saves their slots); an adapter
+- **Checkpoint layouts.** Adapters are validated from the same read that pins their
+  digest: modules map to targets, shapes fit them (an adapter for another model size
+  is a 400, not an admit failure), and a conv adapter whose kernel is its stride
+  flattens to the linear over the patch. DoRA (PEFT's ``lora_magnitude_vector``,
+  Kohya's ``dora_scale``), ``modules_to_save``, trainable tokens and bias LoRA are
+  refused by name. A YAML ``targets: [...]`` keeps a subset of the model's targets
+  (dropping vocabulary-sized ones saves their slots); an adapter
   touching a dropped target is refused, and its modules stay unbound. Without the list,
   a deployment with ``runtime_updates`` off keeps the targets its configured adapters
   touch (a node left with none gets no pool): the API server reads them once at startup
@@ -1570,7 +1631,8 @@ placed exactly as weights are.
   zero adapter; a replay's plan writes each row's slot into the buffers that capture
   recorded, so a captured graph serves any mix of adapters without recapture. The
   kernels are the custom ops ``mstar::lora_shrink`` and ``mstar::lora_expand_`` (the
-  latter declares the ``y`` it writes), so ``torch.compile`` takes them as single nodes
+  latter declares the ``y`` it writes), and an experts target's grouped GEMMs are one
+  more, ``mstar::lora_experts_apply_``, so ``torch.compile`` takes them as single nodes
   without a graph break. Under Triton the launch grid depends on the token count and
   the slot count alone. The pool is a lean resource (``Resource.lean_capture``; see
   **Lean captures** under the resources table), so the engine captures every bucket whose
@@ -2315,6 +2377,19 @@ the prefill) still brings it routed, and that read puts it over the slot's.
 and a node on it that reads the routed token sets ``device_loopback = None``; Whisper and
 Qwen3-Omni's Thinker declare their own. Qwen3.5 reads the tokens with ``last_sampled``.
 
+A token that also streams to another node can go down the stream by value, when the
+stream's ``Connection`` sets ``by_value=True``: its consumer then takes a window of the
+stream as one CPU int64 tensor of its items' values. A step whose node names the signal
+in ``inline_signals(walk)`` sends each row's value in the step's ``EDGE_ITEMS`` frame
+instead of a tensor, with nothing to stage, read or acknowledge. A step carries one
+inline signal, the first of those it outputs, so a client token and a different stream
+token cannot both ride inline. The step keeps its rows on the device only if every
+output is one of ``device_loopback_signals``, so the streamed signal must also be the
+loop-back signal: MiniCPM-o's TTS decode loops its code back on the device and streams
+the same code to the vocoder by value. A lockstep node's streams keep their tensors,
+and a ``by_value`` connection cannot join its items, drive its consumer's walk or come
+from the client.
+
 On such a node a captured step writes each row's token and RNG offset back to the request's
 row inside the graph (``knobs: sampler_ingraph_scatter``, on by default). Those rows are
 allocated once, ``knobs: sampler_slots`` of them, so a request takes its row when the runner
@@ -2543,7 +2618,8 @@ Both types share the base ``CudaGraphConfig`` fields:
 - ``capture_graph_walk`` is the walk to capture.
 - ``replay_graph_walks`` lists the walks that may replay this capture. One capture can
   therefore serve several walks, for example ``prefill_audio`` reusing ``prefill_text``.
-- ``capture_batch_sizes`` lists the batch sizes to record.
+- ``capture_batch_sizes`` lists the batch sizes to record. ``None`` uses the runner
+  default; ``[]`` records none.
 - ``additional_key_info`` is an extra hashable component of the capture bucket key. Use it
   when one walk must be captured more than once because the batch shape alone does not
   identify the capture. Its value must equal both the value returned by the submodule's
@@ -2718,7 +2794,12 @@ Both types share the base ``PiecewiseCudaGraphConfig`` fields:
   none, since its replay would address every request's tokens to the first request's
   adapter.
 - ``capture_batch_sizes`` lists the batch sizes to record. ``None`` uses the runner
-  default.
+  default; ``[]`` records none, for an eager-only region (below).
+- ``eager_fallback`` runs a shape with no graph eagerly through ``run`` instead of
+  raising: the runner declares, plans and commits the region's step over the real rows
+  (as a replay declares it, without padding), so the caller has one path for captured
+  and uncaptured shapes. Off, the caller checks ``can_run`` first. MiniCPM-o's vocoder
+  uses it, with eager-only regions for the shapes it never captures.
 - ``compile`` runs ``torch.compile`` on ``capture_fn`` before capture. The default is
   ``False``.
 - ``compile_mode`` is that ``torch.compile``'s mode, as on ``AcceleratorGraphConfig``.
@@ -2912,6 +2993,8 @@ that a misspelled setting is never silently ignored:
      - ``num_sessions``
    * - ``BoundedKVSpec``
      - ``max_slots``
+   * - ``RollingKVSpec``
+     - ``pool_tokens``
    * - ``SamplerSpec``
      - ``enable_logprobs``, ``enable_processed_logprobs`` (see ``SamplingReqConfig``),
        ``greedy_capture`` (``true`` / ``false``; by default a sampler past the one-kernel
@@ -2942,8 +3025,10 @@ that a misspelled setting is never silently ignored:
        (adapters held in pinned host memory), ``adapters`` (adapter name to safetensors
        path: the names requests can ask for), ``targets`` (the subset of the model's
        targets to allocate; by default, with ``runtime_updates`` off, the targets the
-       configured adapters touch, and every target with it on; a node left with none
-       gets no pool, while a YAML list keeping none at all is an error), ``runtime_updates`` (default false: serve
+       configured adapters touch, and every target with it on, except experts targets,
+       which are allocated only when the list names them; a list chooses among all the
+       declared targets, so a later one may name a target an earlier one left out; a node
+       left with none gets no pool, while a YAML list keeping none at all is an error), ``runtime_updates`` (default false: serve
        ``/v1/load_lora_adapter`` and ``/v1/unload_lora_adapter``),
        ``runtime_update_timeout_s`` (default 120: how long the conductor waits for every
        worker to answer one before giving up on it). The one ``lora:`` block sizes the
@@ -3041,10 +3126,15 @@ in arrival order. A deployment sets the pool at the top level of its config; 1 t
    preprocess_workers: 2
 
 The pool only helps work that releases the GIL, so measure each stage first. Qwen3-Omni,
-V-JEPA2 and Cosmos3 declare it (``configs/vjepa2.yaml`` and ``configs/vjepa2_ac.yaml`` set 8
+V-JEPA2, Cosmos3, Parakeet, Nemotron ASR and Omnilingual ASR declare it (``configs/vjepa2.yaml`` and ``configs/vjepa2_ac.yaml`` set 8
 and 4, the sizes measured for their video decode; Cosmos3's DROID policy configs set 1, since
 a robot sends one request at a time). A model with client streams always prepares inline,
 since an append has to follow its request.
+
+A model that takes several images per request and whose ``load_image`` is mostly a decode can
+also set ``PREPROCESS_PARALLEL_IMAGES = True``, which decodes one request's images at once on a
+second pool the size of the prepare pool, unless ``preprocess_workers`` is 1. Pi0.5 declares it
+for its camera frames.
 
 A pool that small is slow for a large copy, and a 121-frame 832x480 video is 145 MB. A
 video decoder should therefore emit its clip in the layout the encoder takes, transposed
@@ -3668,14 +3758,17 @@ Glimmer and Ripple-65B return ``{}`` until a drop has run through a sliding-wind
 and Qwen3-ASR until one has run through its captured prefill. A model without text prompts
 (``TEXT_PROMPTS = False``) is rebuilt on its media walks alone. ``media`` holds a
 ``MediaIntake`` per attachment modality: its ``MediaEncoder`` (modalities may share one),
-its placeholder ``pad`` id, the sentinels a template leaves to its processor, how many
-placeholders an attachment fills (``runs``, one by default; a Qwen3.5 video fills one per
-temporal group), and ``prepare``, which turns an attachment into the encoder's input
+its placeholder ``pad`` id (intakes may share one: the nth placeholder of a pad goes to the
+nth attachment of that pad in the order of the prompt's parts, which is where ``_prompt_ids``
+renders each), the sentinels a template leaves to its processor, how many
+placeholders an attachment fills (``runs(attachment, metadata)``, one by default; a Qwen3.5 video fills one
+per temporal group), and ``prepare``, which turns an attachment into the encoder's input
 tensors and each placeholder's tokens (a ``PreparedMedia``). ``_prompt_ids`` renders and
 tokenizes the whole prompt once. ``intake`` then refuses a prompt whose placeholders don't
 match its attachments, prepares each attachment in prompt order, expands each placeholder
-to one pad per token with ``expand_media_pads``, and ``process_prompt`` returns the pads'
-layout as ``MEDIA_LAYOUT`` metadata and ``"kv_layout": self.kv_layout(layout, length)``.
+to its run (a ``MediaRun``) with ``expand_media_pads`` (one pad per token, read from the run's encoder output,
+with its grid), and ``process_prompt`` returns the pads' layout as ``MEDIA_LAYOUT``
+metadata and ``"kv_layout": self.kv_layout(layout, length)``.
 The layout's runs say which encoders the prompt runs (``media_encoders``), for the prefill
 schedule's walk and the KV layout's alike. ``kv_layout`` lays a media prompt's text out as
 ``ids`` spans and each run of pads as a ``rows`` span, which moves the position counter by
@@ -3693,13 +3786,15 @@ The ``LLM`` node subclasses ``SampledTokenDecoder``
 (decode, packed text prefill, mixed, and one packed capture every media walk replays,
 which also caps their batches), device loop-back of the sampled token, the splice of
 the encoders' outputs into the prompt's embeddings inside the forward
-(``where(pad, media[cumsum(pad) - 1], embed(ids))``), the step declaration around the
+(``where(mask, media[cumsum(mask) - 1], embed(ids))``, the media in prompt order and the mask
+of their tokens laid out from ``MEDIA_LAYOUT``, not found by pad id, so media may share a
+placeholder token), the step declaration around the
 sampler and the position resource, the forward through the sampler, and the stop: a
 ``TokenStop`` over the prefill walks and decode. A stop id on a decode row ends the
 loop; a stop id on the prefill row (the step the walk plan marks ``FINAL_PREFILL``), or
 a one-token budget, ends the partition before decode runs. The loop's cap,
-``max(1, max_output_tokens - 1)``, is the only budget. A media row's tensor holds exactly the pads in its
-ids, checked against the layout in ``prepare_inputs``. A prompt's ids, pads and
+``max(1, max_output_tokens - 1)``, is the only budget. Each encoder's rows match the tokens of
+its runs in the layout, checked in ``prepare_inputs``. A prompt's ids, pads and
 sentinels included, feed the repetition penalty, as in transformers and vLLM. A model
 writes:
 
@@ -3921,8 +4016,8 @@ streams (audio and video, say): each has its own buffer and its own end.
   and a final chunk, and a loop fed by the stream ends as any stream-terminated loop does.
   Over ``/generate/ws`` a client that opens with ``end_input: false`` appends and ends
   input explicitly (see :doc:`clients`), and a ``/v1/realtime`` conversation keeps it open
-  for the call's life; every other request ends the input as soon as it is submitted. ``/generate/ws``
-  and ``/v1/realtime`` are on the Python frontend only, not ``--rust-frontend``.
+  for the call's life; every other request ends the input as soon as it is submitted. Both
+  frontends serve ``/generate/ws`` and ``/v1/realtime``.
 - The API server's data worker is the stream's producer. The conductor tells it the
   consuming node and its ranks once per call, when it dispatches the request, and the data
   worker sends each append's items to every one of those ranks itself, and then the

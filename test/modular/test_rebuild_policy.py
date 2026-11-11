@@ -865,29 +865,15 @@ def test_a_sample_of_more_than_one_id_is_refused(host):
             rebuilds.keep_samples(_batch((R,)), {R: {"new_token": [codes[0]]}}, None)
 
 
-def test_a_request_that_samples_a_pad_id_is_never_dropped():
-    """A rebuild row's sampled ids run in the packed media step, where the nth pad reads the nth encoder row. A
-    sampled pad took the row of the next pad in the step, and every row after it read the wrong encoder rows."""
+def test_the_vlm_scaffold_keeps_a_request_that_samples_a_pad_id_droppable():
+    """The scaffold places a prompt's encoder rows by its layout, not by pad id, so a pad sampled into a rebuild
+    row's tail takes no encoder row (`test_qwen3_5_video`), and no sample needs to make the request undroppable."""
     model = Qwen3_5DenseModel.__new__(Qwen3_5DenseModel)
     vars(model).update(
         config=SimpleNamespace(max_position_embeddings=4096, hidden_size=2),
-        media=(SimpleNamespace(encoder=vision_encoder((90, 91))),),
+        media=(SimpleNamespace(encoder=vision_encoder()),),
     )
-    pads = model.rebuild_policies()[NODE].pad_ids
-    pool = HostPool(1 << 10, torch.device("cpu"))
-    rebuilds = Rebuilds({NODE: replace(MEDIA, pad_ids=pads)}, _graphs(), pool, StepAllowance(), DTYPES)
-    for rid in (R, A):
-        _ingest(rebuilds, rid, IMAGE_CHAT)
-    rebuilds.record(_ran(VISION, {
-        rid: {"text_inputs": [torch.arange(11)], "embeds": [torch.zeros(6, 2)]} for rid in (R, A)
-    }))
-
-    rebuilds.keep_samples(_batch((R, A)), {}, HostRows((R, A), {"new_token": torch.tensor([91, 5])}))
-
-    assert "keeps no log" in rebuilds.refusal(R, NODE, DECODE, {"decode_loop": 0}, None), (
-        "a rebuild row would carry the sampled pad, and the rows after it would read the wrong encoder rows"
-    )
-    assert list(rebuilds._kept[NODE][A].sampled) == [5], "a request that sampled text would stop being droppable"
+    assert not model.rebuild_policies()[NODE].pad_ids
 
 
 @pytest.mark.parametrize("last, forgotten", [(VISION, True), (PREFILL, False)])

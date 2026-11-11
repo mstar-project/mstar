@@ -633,12 +633,15 @@ def touched_files(diff_text):
 
 
 def last_live_test(comments):
-    """The bot's last live-test comment among `comments` ({"user": login, "body": text}), {"sha", "verdict",
-    "body"}, or None. Only its first line, the marker, is read: the report below it is the box's text."""
+    """The bot's last conclusive live-test comment among `comments` ({"user": login, "body": text}), {"sha",
+    "verdict", "body"}, or None: any but an `unavailable` one (no GPUs, or a box that couldn't start the
+    session), which says nothing, so a failure before it still stands. A verdict outside pass, partial and fail
+    (`none`: the session wrote no valid one) is conclusive too, and counts as a failure (gpu_review.carry). Only
+    its first line, the marker, is read: the report below it is the box's text."""
     last = None
     for c in comments:
         m = LIVE_TEST.fullmatch((c["body"] or "").split("\n")[0])
-        if m and c["user"] in BOT_USERS:
+        if m and c["user"] in BOT_USERS and m[2] != "unavailable":
             last = {"sha": m[1], "verdict": m[2], "body": c["body"]}
     return last
 
@@ -843,13 +846,14 @@ def job_token_forms(token):
     return (token, base64.b64encode(token.encode()).decode().rstrip("=")) if token else ()
 
 
-def post(out, repo, pr, runner_temp, head_sha, mode, salvaged, detail="", max_gpus="4", job_token=""):
+def post(out, repo, pr, runner_temp, head_sha, mode, salvaged, detail="", max_gpus="4", job_token="", team=""):
     """Post the review's inline comments and the summary, rendered from the review's fields by render_summary and
     redacted, and with the job's token removed however it is spelled (`job_token`): model output from untrusted
     input. Read the PR's threads after posting the inline comments, so the
     status line counts them along with earlier ones still open. Each run posts its own summary comment, so a
     re-review doesn't overwrite the last one. A "didn't complete" comment an earlier run left is then rewritten to
-    point here, and loses its marker so a later failure starts a fresh one."""
+    point here, and loses its marker so a later failure starts a fresh one. `team`: the run had the team's turn
+    cap, under which a skipped file means the review didn't finish (render_summary.render)."""
     exact = job_token_forms(job_token)
     try:
         review = render_summary.over_gpu_cap(finished_review(runner_temp), max_gpus)
@@ -861,7 +865,7 @@ def post(out, repo, pr, runner_temp, head_sha, mode, salvaged, detail="", max_gp
         review = redact_fields({**render_summary.carried(review, earlier, answered, pages),
                                 "untouched": untouched(earlier)}, exact)
         text = render_summary.render(review, pages, head_sha, mode, render_summary.stacked_above("stacked-above.json"),
-                                     salvaged == "true")
+                                     salvaged == "true", team == "true")
     except Exception as e:
         text = ""
         print(f"::warning::The review's summary didn't render: {type(e).__name__}: {log_value(str(e))}")

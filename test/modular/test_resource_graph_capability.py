@@ -91,3 +91,37 @@ def test_resource_capability_filters_recipes_and_preserves_strict_mode(
         monkeypatch.setenv("MSTAR_REQUIRE_ACCELERATOR_GRAPHS", "1")
         with pytest.raises(RuntimeError, match="accelerator graphs are required"):
             fail_if_graphs_required([str(bucket) for bucket in missing])
+
+
+@pytest.mark.parametrize("piecewise", [False, True])
+def test_empty_capture_batch_sizes_capture_nothing(piecewise):
+    """``capture_batch_sizes=[]`` means no capture in both runners (``None`` is the
+    runner's defaults)."""
+    resource = SimpleNamespace(can_capture=lambda: True, force_double_buffer=False, lean_capture=False)
+    declare = Mock(return_value=SimpleNamespace(steps={"attention": object()}))
+    if piecewise:
+        runner = PiecewiseAcceleratorGraphRunner(
+            label="blocks", config=PiecewiseBatchedConfig(
+                seq_len=4, capture_batch_sizes=[], declare_step=declare,
+                capture_fn=lambda **kwargs: None, make_static_inputs=lambda shape: {},
+            ),
+            resources={"attention": resource}, step_runner=Mock(), device=torch.device("cpu"),
+            autocast_dtype=None, num_slots=2,
+        )
+    else:
+        config = BatchedAcceleratorGraphConfig(
+            capture_graph_walk="decode", capture_batch_sizes=[],
+            single_request_inputs=NodeInputs(tensor_inputs={}, input_seq_len=1),
+        )
+        runner = AcceleratorGraphRunner(
+            submodule_name="llm",
+            submodule=SimpleNamespace(
+                get_accelerator_graph_configs=lambda *args: [config], declare_step=declare,
+                compiled_entries_per_shape=1,
+            ),
+            resources={"attention": resource}, step_runner=Mock(), device=torch.device("cpu"),
+            autocast_dtype=None, joint_comm_group=SimpleNamespace(world_size=1), num_slots=2,
+        )
+        assert runner.max_batch_size_for("decode") is None and runner.max_capture_bs({"decode"}) == 0
+    assert not runner.prepare_for_capture()
+    declare.assert_not_called()

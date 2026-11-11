@@ -227,7 +227,7 @@ jobs:
       main_sha: ${{ steps.base.outputs.commit }}
       # The summary's fields as `post` rendered them, with what it carried over and this run's inline findings.
       result: ${{ steps.post.outputs.result }}
-      # Built on an earlier review: the live test's `targeted`, or its `none` on runtime code, needs a live test before it.
+      # Built on an earlier review: one naming something untestable isn't made full (gpu_review.py, carry).
       rereview: ${{ steps.diff.outputs.rereview }}
       # stacked-above.json, for the approval rule's count of findings fixed above.
       above: ${{ steps.diff.outputs.above }}
@@ -328,6 +328,11 @@ jobs:
         # timeout) never turns the PR's check red; the last step reports it.
         continue-on-error: true
         timeout-minutes: ${{ fromJSON(steps.pr.outputs.timeout || '25') }}
+        # Subagents (the slices of a big PR) run in the foreground, so the review waits for each one's report.
+        # By default Claude Code starts them in the background, and a review then returned while its slices
+        # were still running, with their files in `skipped`.
+        env:
+          CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: "1"
         uses: anthropics/claude-code-action@374f254f5efaf968abfe15d399fd90972e8138b9 # v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
@@ -430,6 +435,8 @@ jobs:
           SALVAGED: ${{ steps.review.outcome != 'success' }}
           DETAIL: ${{ steps.salvage.outputs.detail }}
           MAX_GPUS: ${{ vars.REVIEW_GPU_MAX_GPUS }}
+          # The team's turn cap, which reviews every file: a skipped file then means the review didn't finish.
+          TEAM: ${{ needs.preflight.outputs.non_write_user == '' }}
         run: python3 .github/review/bot.py post
 
       # Hide the earlier summaries as outdated, so the PR shows only the latest
@@ -555,9 +562,10 @@ jobs:
 
       # Nothing runs while the review left an open P0–P2 finding (by the review's own judgement, as
       # the status line counts them) or a skipped file (`gated`): the comment says what to fix first. Otherwise the review's
-      # call stands unless the PR's last live test didn't pass on an ancestor of this head, or a
-      # re-review's `targeted`, or its `none` on runtime code, has no live test before it: then the live
-      # test runs in full, every kind of check, so a failure is never hidden (gpu_review.py, carry); a
+      # call stands unless the PR's last conclusive live test failed, was partial or left no valid verdict
+      # (an unavailable run leaves the call alone unless the last conclusive one before it failed, was
+      # partial or left no valid verdict): then the live test runs in full, every kind of check, so a
+      # failure is never hidden (gpu_review.py, carry); a
       # re-review with `untestable` set is exempt, since that PR can't be approved. A
       # `none` that stands runs nothing (verdict `skipped`), which the approval never counts as a pass.
       # It posts no live-test marker: it isn't a live test, so the next run still checks against the
@@ -692,6 +700,7 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: python3 .github/review/gpu_review.py post
 
+      # These paths are gpu_review.py's UPLOADED: the redact step leaves only regular files there.
       - name: Keep the report
         if: always() && steps.wait.outcome == 'success' && steps.redact.outcome == 'success'
         continue-on-error: true
@@ -701,6 +710,7 @@ jobs:
           path: |
             ${{ runner.temp }}/lt/results/report.md
             ${{ runner.temp }}/lt/results/result.json
+            ${{ runner.temp }}/lt/results/progress.log
           retention-days: 30
           if-no-files-found: ignore
 

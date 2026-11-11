@@ -354,7 +354,7 @@ _VISION = dict(
 def _qwen3_5_vision(monkeypatch) -> Qwen3_5DenseModel:
     model = _qwen3_5(**QWEN3_5["9B"])
     model.vision_config = Qwen3_5VisionConfig(**_VISION)
-    model.media = (SimpleNamespace(encoder=vision_encoder((9,))),)
+    model.media = (SimpleNamespace(encoder=vision_encoder()),)
     # the image processor's numbers, which `Qwen3_5DenseModel.image_processor` reads off the checkpoint
     processor = SimpleNamespace(size={"shortest_edge": 65536}, patch_size=16)
     monkeypatch.setattr(Qwen3_5DenseModel, "image_processor", processor)
@@ -480,7 +480,7 @@ def test_qwen3_5_all_full_layout_converts_to_the_hand_written_one(overrides):
 
 
 def test_qwen3_5_prefill_vision_step_equals_the_hand_written_one():
-    llm = _qwen3_5_llm(_qwen3_5(**QWEN3_5["9B"]), encoders=(vision_encoder((9,)),))
+    llm = _qwen3_5_llm(_qwen3_5(**QWEN3_5["9B"]), encoders=(vision_encoder(),))
     rids = [1]
     tokens = torch.arange(4)
     inputs = [ARNodeInputs(input_seq_len=4, input_ids=tokens, resource_step_info=6)]

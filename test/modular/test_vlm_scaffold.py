@@ -11,10 +11,12 @@ import torch
 
 from mstar.conductor.request_info import FINAL_PREFILL, WalkStep
 from mstar.graph.base import Parallel
+from mstar.model.components.sampled_token_decoder import MEDIA_EMBEDS, MEDIA_MASK
 from mstar.model.keys import KV_CACHE, MIXED, ROPE, SAMPLER
 from mstar.model.multimodal import (
     MEDIA_LAYOUT,
     MediaEncoder,
+    MediaRun,
     expand_media_pads,
     media_layout,
     media_prefill_step,
@@ -24,8 +26,8 @@ from mstar.model.multimodal import (
 )
 
 IMAGE_PAD, VIDEO_PAD, AUDIO_PAD = 90, 91, 80
-VISION = vision_encoder((IMAGE_PAD, VIDEO_PAD))
-AUDIO = MediaEncoder("audio", "audio_encoder", ("audio_values",), "audio_embeds", (AUDIO_PAD,))
+VISION = vision_encoder()
+AUDIO = MediaEncoder("audio", "audio_encoder", ("audio_values",), "audio_embeds")
 
 
 # ---------------------------------------------------------------------------
@@ -35,18 +37,13 @@ AUDIO = MediaEncoder("audio", "audio_encoder", ("audio_values",), "audio_embeds"
 
 def test_each_pad_expands_to_its_tokens_in_prompt_order():
     ids = torch.tensor([1, IMAGE_PAD, 2, AUDIO_PAD, IMAGE_PAD])
-    pads = expand_media_pads(
-        ids, {IMAGE_PAD: [2, 1], AUDIO_PAD: [3]}, sentinels={AUDIO_PAD: (70, 71)},
-    )
+    pads = expand_media_pads(ids, {
+        IMAGE_PAD: [MediaRun(2, "vision_embeds", torch.tensor([1, 4, 4])),
+                    MediaRun(1, "vision_embeds", torch.tensor([1, 2, 2]))],
+        AUDIO_PAD: [MediaRun(3, "audio_embeds")],
+    }, sentinels={AUDIO_PAD: (70, 71)})
     assert pads.ids.tolist() == [1, 90, 90, 2, 70, 80, 80, 80, 71, 90]
-    assert (pads.pad, pads.index, pads.offset, pads.tokens) == (
-        [IMAGE_PAD, AUDIO_PAD, IMAGE_PAD], [0, 0, 1], [1, 5, 9], [2, 3, 1],
-    )
-    layout = media_layout(
-        pads, {IMAGE_PAD: "vision_embeds", AUDIO_PAD: "audio_embeds"},
-        {IMAGE_PAD: [torch.tensor([1, 4, 4]), torch.tensor([1, 2, 2])]},
-    )
-    assert layout == {
+    assert media_layout(pads) == {
         "offset": [1, 5, 9], "tokens": [2, 3, 1],
         "output": ["vision_embeds", "audio_embeds", "vision_embeds"],
         "grid": [[1, 4, 4], [], [1, 2, 2]],
@@ -57,7 +54,7 @@ def test_each_pad_expands_to_its_tokens_in_prompt_order():
 def test_a_pad_without_a_count_or_a_count_without_a_pad_is_refused(ids):
     # user text that spells a placeholder; an attachment the prompt never placed
     with pytest.raises(ValueError, match="placeholder"):
-        expand_media_pads(torch.tensor(ids, dtype=torch.long), {IMAGE_PAD: [1]})
+        expand_media_pads(torch.tensor(ids, dtype=torch.long), {IMAGE_PAD: [MediaRun(1, "vision_embeds")]})
 
 
 # ---------------------------------------------------------------------------
@@ -202,6 +199,30 @@ def test_a_padded_media_step_moves_no_position_for_its_padding_rows():
     assert step.state[KV_CACHE].advance == (6, 4, 5, 0)
 
 
+def test_a_media_row_pads_with_the_captures_rows_on_the_device():
+    """A replay pads a real media row (its mask built on the host from the
+    layout) with the capture's own rows, built for the accelerator: the step's
+    mask still concatenates, then goes to the device in one copy."""
+    from mstar.model.components.sampled_token_decoder import SampledTokenDecoder
+
+    device = torch.device("meta")  # a device other than the host, as an accelerator is
+    llm = _qwen_llm()
+    llm.prompt_positions = lambda start, layout, n: (None, None)
+    llm.next_position = lambda rid_handle: 0
+    (config,) = [
+        c for c in llm.get_accelerator_graph_configs(device) if c.capture_graph_walk == "prefill_vision"
+    ]
+    layout = {"offset": [1], "tokens": [2], "output": ["vision_embeds"], "grid": [[]]}
+    fwd_info = SimpleNamespace(request_id="r", rid_handle=0, step_metadata={MEDIA_LAYOUT: layout})
+    row = llm.prepare_inputs("prefill_vision", fwd_info, {
+        "text_inputs": [torch.zeros(4, dtype=torch.long, device=device)],
+        "vision_embeds": [torch.zeros(2, 8, dtype=torch.bfloat16, device=device)],
+    })
+    engine_inputs = SimpleNamespace(resources={}, request_ids=[0, 1])
+    out = SampledTokenDecoder.preprocess(llm, "prefill_vision", engine_inputs, [row, config.make_node_input(0)])
+    assert out[MEDIA_MASK].device == device and out[MEDIA_MASK].shape == (4,)
+
+
 def test_a_media_row_with_the_wrong_row_count_fails_its_request():
     """Checked on host values: the media tensor's shape against the layout."""
     llm = _qwen_llm((AUDIO,))
@@ -213,13 +234,66 @@ def test_a_media_row_with_the_wrong_row_count_fails_its_request():
     layout = {"offset": [1], "tokens": [2], "output": ["audio_embeds"], "grid": [[]]}
     fwd_info = SimpleNamespace(request_id="r", rid_handle=7, step_metadata={MEDIA_LAYOUT: layout})
     row = llm.prepare_inputs("prefill_audio", fwd_info, {"text_inputs": [ids], "audio_embeds": [torch.zeros(2, 8)]})
-    assert row.input_ids is ids and row.tensor_inputs["audio_embeds"].shape == (2, 8)
+    assert row.input_ids is ids and row.tensor_inputs[MEDIA_EMBEDS].shape == (2, 8)
     assert starts == [5]
     with pytest.raises(ValueError, match="1 rows for the prompt's 2 pads"):
         llm.prepare_inputs("prefill_audio", fwd_info, {"text_inputs": [ids], "audio_embeds": [torch.zeros(1, 8)]})
     # no output at all: a replay would splice in the previous step's rows
     with pytest.raises(ValueError, match="0 rows for the prompt's 2 pads"):
         llm.prepare_inputs("prefill_audio", fwd_info, {"text_inputs": [ids]})
+
+
+@pytest.mark.parametrize("tile", [{"tile_embeds": [torch.zeros(0, 1)]}, {}], ids=["empty", "absent"])
+def test_encoders_sharing_a_placeholder_take_their_rows_from_the_layout(tile):
+    """The layout, not the pad id, says whose row each token takes, so two
+    media may share one placeholder (MiniCPM-o's ``<unk>``). A run of no
+    tokens takes no rows, whether its encoder sent an empty output or none."""
+    from mstar.model.multimodal import splice_media
+
+    tiles = MediaEncoder("tile", "tile_encoder", ("tile_values",), "tile_embeds")
+    llm = _qwen_llm((VISION, AUDIO, tiles))
+    llm.prompt_positions = lambda start, layout, n: (None, None)
+    llm.next_position = lambda rid_handle: 0
+    unk = 0
+    ids = torch.tensor([1, unk, unk, 2, unk, 3, unk])
+    layout = {"offset": [1, 4, 5, 6], "tokens": [2, 1, 0, 1],
+              "output": ["vision_embeds", "audio_embeds", "tile_embeds", "vision_embeds"], "grid": [[], [], [], []]}
+    fwd_info = SimpleNamespace(request_id="r", rid_handle=0, step_metadata={MEDIA_LAYOUT: layout})
+    vision, audio = torch.tensor([[10.0], [11.0], [12.0]]), torch.tensor([[20.0]])
+    row = llm.prepare_inputs(
+        "prefill_vision_audio_tile", fwd_info,
+        {"text_inputs": [ids], "vision_embeds": [vision], "audio_embeds": [audio], **tile},
+    )
+    spliced = splice_media(ids.float()[:, None], row.tensor_inputs[MEDIA_MASK], row.tensor_inputs[MEDIA_EMBEDS])
+    assert spliced[:, 0].tolist() == [1, 10, 11, 2, 20, 3, 12]
+
+
+def test_two_intakes_may_share_a_placeholder():
+    """Each placeholder goes to the attachment the prompt renders there, and
+    the layout names that attachment's encoder."""
+    from mstar.model.multimodal_decoder import MediaIntake, MultimodalDecoderModel, PreparedMedia
+
+    unk = 0
+
+    class Model(MultimodalDecoderModel):
+        NAME = "shared"
+
+        def _prompt_ids(self, parts, raw, **kwargs):
+            return torch.tensor([1, unk, 2, unk, 3])
+
+        def get_node_resources(self):
+            return []
+
+    model = object.__new__(Model)
+    model.media = tuple(
+        MediaIntake(m, encoder, unk, lambda attachment, metadata, n=n: PreparedMedia({}, [n]))
+        for m, encoder, n in (("image", VISION, 2), ("audio", AUDIO, 3))
+    )
+    attachments = {"image_inputs": [torch.zeros(1)], "audio_inputs": [torch.zeros(1)]}
+    prompt = model.intake(None, ["audio", "image"], attachments)
+    layout = model.prompt_layout(prompt)
+    assert prompt.pads.ids.tolist() == [1, unk, unk, unk, 2, unk, unk, 3]
+    assert (layout["offset"], layout["tokens"], layout["output"]) == ([1, 5], [3, 2], ["audio_embeds", "vision_embeds"])
 
 
 def test_every_media_walk_replays_one_capture_that_caps_it():
@@ -231,7 +305,7 @@ def test_every_media_walk_replays_one_capture_that_caps_it():
     for walk in ("prefill_vision", "prefill_audio", "prefill_vision_audio"):
         (config,) = [c for c in configs if walk in c.replay_graph_walks]
         assert config.caps_eager_batch_size
-        assert config.input_seq_dims == {"vision_embeds": 0, "audio_embeds": 0}
+        assert config.input_seq_dims == {MEDIA_EMBEDS: 0, MEDIA_MASK: 0}
         assert llm.max_batch_size(walk) == max(config.capture_batch_sizes)
     assert llm.max_batch_size("decode") is None
 
@@ -303,8 +377,8 @@ def test_qwen_media_capture_stages_every_media_buffer():
         rows = [config.make_node_input(n)]
         engine_inputs = SimpleNamespace(resources={}, request_ids=[0], captured=True)
         out = type(llm).preprocess(llm, "prefill_vision", engine_inputs, rows)
-        assert list(out) == ["input_ids", "vision_embeds", "cos_3d", "sin_3d"]
-        assert out["vision_embeds"].shape == (n, 8) and out["vision_embeds"].dtype == torch.bfloat16
+        assert list(out) == ["input_ids", MEDIA_EMBEDS, MEDIA_MASK, "cos_3d", "sin_3d"]
+        assert out[MEDIA_EMBEDS].shape == (n, 8) and out[MEDIA_EMBEDS].dtype == torch.bfloat16
         assert seen["pos"] == (3, n)
 
 

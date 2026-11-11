@@ -32,7 +32,7 @@ from mstar.model.components.distributed.linear import (
     MergedColumnParallelLinear,
     RowParallelLinear,
 )
-from mstar.model.components.mlp import _resolve_activation
+from mstar.model.components.mlp import _resolve_activation, silu_and_mul  # noqa: F401 (registers the op)
 
 # Public shard IDs for gate / up projections.
 GATE_SHARD_ID = 0
@@ -48,6 +48,9 @@ class ParallelGatedMLP(nn.Module):
         intermediate_size: SwiGLU intermediate dim (full).
         activation: HF activation name (``silu``, ``gelu``, ``gelu_tanh``).
         bias: whether the linears have a bias term.
+        fused_silu: on CUDA in half precision, ``silu(gate) * up`` as one
+            FlashInfer kernel, which rounds once rather than after the SiLU
+            too. Opt-in, since it moves a model's numerics by that rounding.
     """
 
     def __init__(
@@ -58,6 +61,7 @@ class ParallelGatedMLP(nn.Module):
         activation: str | Callable = "silu",
         bias: bool = False,
         reduce_results: bool = True,
+        fused_silu: bool = False,
     ):
         """``reduce_results=False`` returns this rank's partial down_proj output, for a
         caller that adds it to another partial and reduces once."""
@@ -67,6 +71,9 @@ class ParallelGatedMLP(nn.Module):
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
         self.act = _resolve_activation(activation)
+        if fused_silu and activation != "silu":
+            raise ValueError(f"fused_silu needs the silu activation, not {activation!r}")
+        self.fused_silu = fused_silu
 
         self.gate_up_proj = MergedColumnParallelLinear(
             comm_group=comm_group,
@@ -90,6 +97,8 @@ class ParallelGatedMLP(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate_up = self.gate_up_proj(x)
+        if self.fused_silu:
+            return self.down_proj(torch.ops.mstar.silu_and_mul(gate_up))
         gate, up = gate_up.split(self.intermediate_size_per_partition, dim=-1)
         return self.down_proj(self.act(gate) * up)
 

@@ -343,7 +343,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     serve.add_argument(
         "--enable-metrics", action="store_true",
-        help="serve Prometheus metrics at /metrics (needs mstar[metrics])",
+        help="serve Prometheus metrics at /metrics (needs mstar-ai[metrics])",
     )
     serve.add_argument(
         "--rust-frontend", action="store_true",

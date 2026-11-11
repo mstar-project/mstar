@@ -347,6 +347,7 @@ def inline_findings(pages):
 
 
 EDITED = "edited after the bot posted it; a person decides"
+UNFINISHED = "the review didn't finish: it left files unreviewed"
 
 
 def open_findings(review, pages, stacked):
@@ -461,10 +462,14 @@ def checklist(review, pages, stacked, extra=()):
     return f"{text}\n\nApprove if you're OK with these."
 
 
-def render(review, pages, head, mode, stacked, salvaged=False):
+def render(review, pages, head, mode, stacked, salvaged=False, team=False):
     """The summary comment. `stacked`: the PRs stacked above whose diffs the review was given (stacked_above).
-    `salvaged`: the review went past its turn limit, so the action failed it and no live test follows."""
+    `salvaged`: the review went past its turn limit, so the action failed it and no live test follows. `team`: the
+    run had the team's turn cap, which reviews every file, so files it skipped mean it didn't finish."""
     parts = ["### Automated review", status(review, pages, head, mode, stacked)]
+    if team and review["skipped"]:
+        parts.append(f"⚠️ **Incomplete review**: {UNFINISHED}, which is the bot's to finish, not the author's. "
+                     "Comment `/review` again.")
     raw = judged(review, stacked)  # the saved state and the checklist; what's shown goes through `inert`
     review = inert(raw)
     if review["since_last"].strip(" \t\r\n\"'"):  # a model sometimes returns a pair of quotes for "nothing"

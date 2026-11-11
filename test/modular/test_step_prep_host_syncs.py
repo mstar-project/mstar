@@ -697,3 +697,81 @@ def test_qwen3_omni_audio_encoder_prep_reads_no_tensor():
             })
         assert reads.reads == []
         assert row.input_seq_len == int(_get_feat_extract_output_lengths(torch.tensor(frames)))
+
+
+class _ScalarWrites(TorchFunctionMode):
+    """Records every index write of a Python scalar into a tensor: on a CUDA
+    tensor it copies the scalar from the host, which waits for queued work."""
+
+    def __init__(self):
+        super().__init__()
+        self.writes: list[str] = []
+
+    def __torch_function__(self, func, types, args=(), kwargs=None):
+        if func is _T.__setitem__ and not torch.is_tensor(args[2]):
+            self.writes.append(repr(args[1]))
+        return func(*args, **(kwargs or {}))
+
+
+def _qwen3_omni_thinker(device: torch.device):
+    from mstar.model.qwen3_omni.config import THINKER_POS, Qwen3OmniModelConfig
+    from mstar.model.qwen3_omni.submodules import ThinkerSubmodule
+
+    config = Qwen3OmniModelConfig()
+    thinker = ThinkerSubmodule.__new__(ThinkerSubmodule)
+    nn.Module.__init__(thinker)
+    thinker.config = config
+    ids = (config.thinker.audio_start_token_id, config.thinker.audio_end_token_id,
+           config.thinker.audio_token_id, config.thinker.vision_start_token_id,
+           config.thinker.vision_end_token_id, config.im_start_token_id, config.assistant_token_id)
+    embed = nn.Embedding(max(config.thinker_text.vocab_size, *ids) + 1, 8, device=device)
+    thinker.model = SimpleNamespace(model=SimpleNamespace(embed_tokens=embed))
+    thinker._vision_bos_embed = thinker._vision_eos_embed = None
+    thinker.__dict__["_cached_device"] = device
+    thinker.node_resources = {THINKER_POS: SimpleNamespace(position=lambda rid, label: 5)}
+    return thinker
+
+
+def _qwen3_omni_prefill_rows(device: torch.device):
+    """An audio and an image row, each between a text span before it and one after it."""
+    texts = [torch.tensor([9, 10, 11], device=device), torch.tensor([12, 13], device=device)]
+    grid = torch.tensor([1, 4, 6], device=device)
+    return [
+        ("prefill_audio", {"audio_embeds": [torch.zeros(7, 8, device=device)], "text_inputs": texts}),
+        ("prefill_vision", {"vision_embeds": [torch.zeros(6, 8, device=device)],
+                            "deepstack": [torch.zeros(6, 8, device=device)] * 2, "image_grid_thw": [grid],
+                            "text_inputs": texts}),
+    ]
+
+
+def _qwen3_omni_fwd(walk: str):
+    from mstar.model.qwen3_omni.qwen3_omni_model import TEXT_BEFORE
+
+    return _fwd(0, walk, step_metadata={TEXT_BEFORE: 1})
+
+
+def test_qwen3_omni_thinker_prefill_prep_writes_no_scalar():
+    """The Thinker's audio and image rows set their sentinel slots with
+    device fills, not index writes of Python scalars."""
+    thinker = _qwen3_omni_thinker(torch.device("cpu"))
+    for walk, inputs in _qwen3_omni_prefill_rows(torch.device("cpu")):
+        with _ScalarWrites() as writes:
+            thinker.prepare_inputs(walk, _qwen3_omni_fwd(walk), inputs)
+        assert writes.writes == [], f"{walk} wrote scalars by index: {writes.writes}"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="sync-debug mode needs a GPU")
+def test_qwen3_omni_thinker_audio_prep_takes_no_host_sync():
+    """An audio row prepares with no host sync after a warm call. An image row
+    reads its grid on the host, so only the CPU test above covers it."""
+    device = torch.device("cuda")
+    thinker = _qwen3_omni_thinker(device)
+    walk, inputs = _qwen3_omni_prefill_rows(device)[0]
+    thinker.prepare_inputs(walk, _qwen3_omni_fwd(walk), inputs)
+    torch.cuda.synchronize()
+    previous = torch.cuda.get_sync_debug_mode()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        thinker.prepare_inputs(walk, _qwen3_omni_fwd(walk), inputs)
+    finally:
+        torch.cuda.set_sync_debug_mode(previous)
