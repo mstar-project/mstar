@@ -252,6 +252,9 @@ def _python(server, frames, until, linger):
         with TestClient(entrypoint.app).websocket_connect("/v1/realtime") as ws:
             events.append(json.loads(ws.receive_text()))
             for f in frames:
+                if isinstance(f, float):
+                    time.sleep(f)
+                    continue
                 if callable(f):
                     while not f(events):
                         events.append(json.loads(ws.receive_text()))
@@ -272,6 +275,9 @@ def _rust_session(port, frames, until, linger):
                                             max_size=None) as ws:
             events.append(json.loads(ws.recv(timeout=30)))
             for f in frames:
+                if isinstance(f, float):
+                    time.sleep(f)
+                    continue
                 if callable(f):
                     while not f(events):
                         events.append(json.loads(ws.recv(timeout=30)))
@@ -287,12 +293,12 @@ def _rust_session(port, frames, until, linger):
 
 def _both(stacks, monkeypatch, kind, events, *, script=(), end=True, refuse=0, until=None, linger=0.0):
     """Each frontend's (events, close code) and what its call got. ``events``
-    may hold functions of the events read so far (see ``_wait``): the session reads
-    until one is true before sending on; ``until`` stops reading (the socket
+    may hold floats, seconds to wait, or functions of the events read so far (see
+    ``_wait``): the session reads until one is true before sending on; ``until`` stops reading (the socket
     left open), else the session reads until the server closes it."""
     server, port = stacks(kind)
     monkeypatch.setattr(entrypoint, "api_server", server)
-    frames = [e if isinstance(e, (str, bytes)) or callable(e) else json.dumps(e) for e in events]
+    frames = [e if isinstance(e, (str, bytes, float)) or callable(e) else json.dumps(e) for e in events]
     out = []
     for run in (lambda: _python(server, frames, until, linger), lambda: _rust_session(port, frames, until, linger)):
         server.reset(script, end, refuse)
@@ -541,13 +547,13 @@ def _session(**session) -> dict:
 
 
 COMMIT = {"type": "input_audio_buffer.commit"}
-DELTA = "conversation.item.input_audio_transcription.delta"
+PARTIAL = "mstar.transcription.partial"
 LIVE = {
     # the knobs and prompt a live model can't apply, and a language change mid-item, refused;
     # two items, each a call, the second opened in the language set between them
     "completed": ([_text(0, b" hello"), _text(1, " wö".encode()[:3]), _text(2, " wö".encode()[3:] + b"rld")], [
         _session(mstar={"chunk_seconds": 1.0}), _session(input_audio_transcription={"prompt": "names"}),
-        _append(_tone(16000, 0.3).tobytes()), _wait(DELTA), _session(input_audio_transcription={"language": "de"}),
+        _append(_tone(16000, 0.3).tobytes()), _wait(PARTIAL, 3), _session(input_audio_transcription={"language": "de"}),
         _append(_tone(16000, 0.1).tobytes()), COMMIT,
         _session(input_audio_transcription={"language": "de", "prompt": ""}),
         _append(_tone(16000, 0.2).tobytes()), COMMIT, END]),
@@ -561,11 +567,11 @@ LIVE = {
     # a commit whose end fails inside the server aborts the item's call rather than waiting it out;
     # the item fails and the next one goes on
     "end-fails": ([_text(0, b" hello")], [
-        _append(_tone(16000, 0.2).tobytes()), _append(np.array([-16384], "<i2").tobytes()), _wait(DELTA), COMMIT,
+        _append(_tone(16000, 0.2).tobytes()), _append(np.array([-16384], "<i2").tobytes()), _wait(PARTIAL), COMMIT,
         _append(_tone(16000, 0.1).tobytes()), COMMIT, END]),
     # a clear aborts the item's call; the next append opens another
     "cleared": ([_text(0, b" hello")], [
-        _append(_tone(16000, 0.2).tobytes()), _wait(DELTA), {"type": "input_audio_buffer.clear"},
+        _append(_tone(16000, 0.2).tobytes()), _wait(PARTIAL), {"type": "input_audio_buffer.clear"},
         _append(_tone(16000, 0.1).tobytes()), COMMIT, END]),
 }
 

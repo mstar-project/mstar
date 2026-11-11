@@ -176,7 +176,7 @@ class ParakeetModel(Model):
         request holds its slot from its first decode iteration until it is torn down;
         past the pool, a decode step's admit waits for a slot while the
         request's frames sit on the GPU, where the conductor would have
-        queued the request."""
+        queued the request. A live deployment's stream pools hold a slot each too."""
         slots = ((config.get("resources") or {}).get(TRANSDUCER_STATE) or {}).get(
             "max_slots", self.MAX_CONCURRENT_REQUESTS + 1,
         )
@@ -221,7 +221,7 @@ class ParakeetModel(Model):
                 raise ValueError(
                     f"{config_path}: {cap} concurrent requests (max_concurrent_requests) need as many "
                     f"slots in resources.{spec.resource_key}, which holds {held}; raise its max_slots "
-                    "or lower max_concurrent_requests"
+                    "(a sink slot is not usable) or lower max_concurrent_requests"
                 )
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:

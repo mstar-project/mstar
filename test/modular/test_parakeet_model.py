@@ -277,7 +277,7 @@ def test_startup_refuses_more_live_calls_than_stream_slots(tmp_path):
     model = ParakeetModel(str(_snapshot(tmp_path, nemotron=True)), live_lookahead=3)
     model.validate_config_yaml({"max_concurrent_requests": 128}, "a.yaml")
     # the transducer pool is raised, the encoder's stream pools are not
-    with pytest.raises(ValueError, match="resources.stream_kv"):
+    with pytest.raises(ValueError, match="resources.stream_"):
         model.validate_config_yaml(
             {"max_concurrent_requests": 200, "resources": {TRANSDUCER_STATE: {"max_slots": 201}}}, "a.yaml",
         )
