@@ -1087,6 +1087,28 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="n">text</span><span class="p">,</span> <span class="n">error_id</span>
     <span class="k">return</span> <span class="sa">f</span><span class="s2">"internal error (error id </span><span class="si">{</span><span class="n">error_id</span><span class="si">}</span><span class="s2">)"</span><span class="p">,</span> <span class="n">error_id</span></div>
 
+
+
+<div class="viewcode-block" id="exception_status_text">
+<a class="viewcode-back" href="../../../_autosummary/mstar.utils.client_errors.html#mstar.utils.client_errors.exception_status_text">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">exception_status_text</span><span class="p">(</span><span class="n">exc</span><span class="p">:</span> <span class="ne">BaseException</span><span class="p">,</span> <span class="n">what</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="o">*</span><span class="p">,</span> <span class="n">log</span><span class="p">:</span> <span class="n">logging</span><span class="o">.</span><span class="n">Logger</span> <span class="o">=</span> <span class="n">logger</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">str</span><span class="p">]:</span>
+<span class="w">    </span><span class="sd">"""``(status, text)`` an OpenAI route answers ``exc`` with: an exception that</span>
+<span class="sd">    carries its own ``status_code`` and ``detail`` (an ``HTTPException``) keeps</span>
+<span class="sd">    both; a ``ValueError`` is a refusal, a 400 (or its own status) with server</span>
+<span class="sd">    paths cut to base names, logged as one INFO line; anything else goes through</span>
+<span class="sd">    :func:`client_error_text` (a ``TypeError`` a 400 that keeps its traceback,</span>
+<span class="sd">    any other a 500 showing only an error id). ``what`` names the route."""</span>
+    <span class="n">status</span><span class="p">,</span> <span class="n">detail</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">exc</span><span class="p">,</span> <span class="s2">"status_code"</span><span class="p">,</span> <span class="kc">None</span><span class="p">),</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">exc</span><span class="p">,</span> <span class="s2">"detail"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+    <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">status</span><span class="p">,</span> <span class="nb">int</span><span class="p">)</span> <span class="ow">and</span> <span class="n">detail</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">status</span><span class="p">,</span> <span class="nb">str</span><span class="p">(</span><span class="n">detail</span><span class="p">)</span>
+    <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">exc</span><span class="p">,</span> <span class="ne">ValueError</span><span class="p">):</span>
+        <span class="n">log</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="s2">"</span><span class="si">%s</span><span class="s2"> request refused: </span><span class="si">%s</span><span class="s2">"</span><span class="p">,</span> <span class="n">what</span><span class="p">,</span> <span class="n">exc</span><span class="p">)</span>
+        <span class="k">return</span> <span class="p">(</span><span class="n">status</span> <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">status</span><span class="p">,</span> <span class="nb">int</span><span class="p">)</span> <span class="k">else</span> <span class="mi">400</span><span class="p">),</span> <span class="n">scrub_paths</span><span class="p">(</span><span class="nb">str</span><span class="p">(</span><span class="n">exc</span><span class="p">))</span>
+    <span class="n">text</span><span class="p">,</span> <span class="n">_</span> <span class="o">=</span> <span class="n">client_error_text</span><span class="p">(</span><span class="n">exc</span><span class="p">,</span> <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">what</span><span class="si">}</span><span class="s2"> request failed"</span><span class="p">,</span> <span class="n">log</span><span class="o">=</span><span class="n">log</span><span class="p">,</span> <span class="n">type_name</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">status</span><span class="p">,</span> <span class="nb">int</span><span class="p">):</span>
+        <span class="n">status</span> <span class="o">=</span> <span class="mi">400</span> <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">exc</span><span class="p">,</span> <span class="ne">TypeError</span><span class="p">)</span> <span class="k">else</span> <span class="mi">500</span>
+    <span class="k">return</span> <span class="n">status</span><span class="p">,</span> <span class="n">text</span></div>
+
 </pre></div>
 
                 </article>

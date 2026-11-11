@@ -736,10 +736,7 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#communication">Communication</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#models">Models</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#serving-python-frontend">Serving (Python frontend)</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#serving-rust-frontend">Serving (Rust frontend)</a><ul class="pst-show_toc_level nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#rust-frontend-limitations">Rust frontend limitations</a></li>
-</ul>
-</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#serving-rust-frontend">Serving (Rust frontend)</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#request-media">Request media</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#worker-scheduling">Worker scheduling</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#compilation">Compilation</a></li>
@@ -1203,9 +1200,10 @@ LGPL.</p></td>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_SERVED_MODELS</span></code></p></td>
 <td><p>unset</p></td>
 <td><p>The names a Rust-frontend request’s <code class="docutils literal notranslate"><span class="pre">model</span></code> may carry, as JSON: the
-base model’s names and the served LoRA adapters
-(<code class="docutils literal notranslate"><span class="pre">api_server/served_models.py</span></code>, <code class="docutils literal notranslate"><span class="pre">rust/server/src/served_models.rs</span></code>).
-Unset serves the base model alone. Not for deployments to set:
+base model’s names and the LoRA adapters served at launch
+(<code class="docutils literal notranslate"><span class="pre">api_server/served_models.py</span></code>, <code class="docutils literal notranslate"><span class="pre">rust/server/src/served_models.rs</span></code>);
+the API server pushes each later change over the bridge. Unset serves
+the base model alone. Not for deployments to set:
 <code class="docutils literal notranslate"><span class="pre">launch_rust_server</span></code> sets it from the API server’s <code class="docutils literal notranslate"><span class="pre">ServedModels</span></code>.</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_TRANSCRIPTION</span></code></p></td>
@@ -1316,13 +1314,6 @@ ingest.</p></td>
 </tbody>
 </table>
 </div>
-<section id="rust-frontend-limitations">
-<h3>Rust frontend limitations<a class="headerlink" href="#rust-frontend-limitations" title="Link to this heading">#</a></h3>
-<p>The Rust frontend serves every route the Python frontend serves but LoRA’s
-runtime updates (<code class="docutils literal notranslate"><span class="pre">/v1/load_lora_adapter</span></code> and <code class="docutils literal notranslate"><span class="pre">/v1/unload_lora_adapter</span></code>, see
-<a class="reference internal" href="models.html"><span class="doc">Supported Models</span></a>): <code class="docutils literal notranslate"><span class="pre">mstar</span> <span class="pre">serve</span></code> refuses <code class="docutils literal notranslate"><span class="pre">--rust-frontend</span></code> with
-<code class="docutils literal notranslate"><span class="pre">runtime_updates:</span> <span class="pre">true</span></code>.</p>
-</section>
 </section>
 <section id="request-media">
 <h2>Request media<a class="headerlink" href="#request-media" title="Link to this heading">#</a></h2>
@@ -1849,10 +1840,7 @@ lands depends on whether Inductor compiled first.</p></td>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#communication">Communication</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#models">Models</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#serving-python-frontend">Serving (Python frontend)</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#serving-rust-frontend">Serving (Rust frontend)</a><ul class="pst-show_toc_level nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#rust-frontend-limitations">Rust frontend limitations</a></li>
-</ul>
-</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#serving-rust-frontend">Serving (Rust frontend)</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#request-media">Request media</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#worker-scheduling">Worker scheduling</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#compilation">Compilation</a></li>

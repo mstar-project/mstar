@@ -734,6 +734,7 @@
             <nav aria-label="Page">
                 <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.client_errors.client_error_text"><code class="docutils literal notranslate"><span class="pre">client_error_text()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.client_errors.exception_status_text"><code class="docutils literal notranslate"><span class="pre">exception_status_text()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.client_errors.scrub_paths"><code class="docutils literal notranslate"><span class="pre">scrub_paths()</span></code></a></li>
 </ul>
             </nav>
@@ -755,7 +756,10 @@
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.client_errors.client_error_text" title="mstar.utils.client_errors.client_error_text"><code class="xref py py-obj docutils literal notranslate"><span class="pre">client_error_text</span></code></a>(exc, what, *[, log, ...])</p></td>
 <td><p>Return <code class="docutils literal notranslate"><span class="pre">(text,</span> <span class="pre">error_id)</span></code>: what a client may see for <code class="docutils literal notranslate"><span class="pre">exc</span></code>.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.client_errors.scrub_paths" title="mstar.utils.client_errors.scrub_paths"><code class="xref py py-obj docutils literal notranslate"><span class="pre">scrub_paths</span></code></a>(text)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.client_errors.exception_status_text" title="mstar.utils.client_errors.exception_status_text"><code class="xref py py-obj docutils literal notranslate"><span class="pre">exception_status_text</span></code></a>(exc, what, *[, log])</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">(status,</span> <span class="pre">text)</span></code> an OpenAI route answers <code class="docutils literal notranslate"><span class="pre">exc</span></code> with: an exception that carries its own <code class="docutils literal notranslate"><span class="pre">status_code</span></code> and <code class="docutils literal notranslate"><span class="pre">detail</span></code> (an <code class="docutils literal notranslate"><span class="pre">HTTPException</span></code>) keeps both; a <code class="docutils literal notranslate"><span class="pre">ValueError</span></code> is a refusal, a 400 (or its own status) with server paths cut to base names, logged as one INFO line; anything else goes through <a class="reference internal" href="#mstar.utils.client_errors.client_error_text" title="mstar.utils.client_errors.client_error_text"><code class="xref py py-func docutils literal notranslate"><span class="pre">client_error_text()</span></code></a> (a <code class="docutils literal notranslate"><span class="pre">TypeError</span></code> a 400 that keeps its traceback, any other a 500 showing only an error id).</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.client_errors.scrub_paths" title="mstar.utils.client_errors.scrub_paths"><code class="xref py py-obj docutils literal notranslate"><span class="pre">scrub_paths</span></code></a>(text)</p></td>
 <td><p>Replace each absolute file path in <code class="docutils literal notranslate"><span class="pre">text</span></code> with its base name, and a directory path (one ending in &quot;/&quot;) with <code class="docutils literal notranslate"><span class="pre">&lt;path&gt;</span></code>.</p></td>
 </tr>
 </tbody>
@@ -786,6 +790,29 @@ the request was refused.</p>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
 <dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)">tuple</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a>, <a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a>]</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.utils.client_errors.exception_status_text">
+<span class="sig-prename descclassname"><span class="pre">mstar.utils.client_errors.</span></span><span class="sig-name descname"><span class="pre">exception_status_text</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">exc</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">what</span></span></em>, <em class="sig-param"><span class="keyword-only-separator o"><abbr title="Keyword-only parameters separator (PEP 3102)"><span class="pre">*</span></abbr></span></em>, <em class="sig-param"><span class="n"><span class="pre">log</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">logger</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/client_errors.html#exception_status_text"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.client_errors.exception_status_text" title="Link to this definition">#</a></dt>
+<dd><p><code class="docutils literal notranslate"><span class="pre">(status,</span> <span class="pre">text)</span></code> an OpenAI route answers <code class="docutils literal notranslate"><span class="pre">exc</span></code> with: an exception that
+carries its own <code class="docutils literal notranslate"><span class="pre">status_code</span></code> and <code class="docutils literal notranslate"><span class="pre">detail</span></code> (an <code class="docutils literal notranslate"><span class="pre">HTTPException</span></code>) keeps
+both; a <code class="docutils literal notranslate"><span class="pre">ValueError</span></code> is a refusal, a 400 (or its own status) with server
+paths cut to base names, logged as one INFO line; anything else goes through
+<a class="reference internal" href="#mstar.utils.client_errors.client_error_text" title="mstar.utils.client_errors.client_error_text"><code class="xref py py-func docutils literal notranslate"><span class="pre">client_error_text()</span></code></a> (a <code class="docutils literal notranslate"><span class="pre">TypeError</span></code> a 400 that keeps its traceback,
+any other a 500 showing only an error id). <code class="docutils literal notranslate"><span class="pre">what</span></code> names the route.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>exc</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/exceptions.html#BaseException" title="(in Python v3.12)"><em>BaseException</em></a>)</p></li>
+<li><p><strong>what</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>log</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/logging.html#logging.Logger" title="(in Python v3.12)"><em>Logger</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)">tuple</a>[<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a>, <a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a>]</p>
 </dd>
 </dl>
 </dd></dl>
@@ -855,6 +882,7 @@ directory path (one ending in “/”) with <code class="docutils literal notran
   <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.client_errors.client_error_text"><code class="docutils literal notranslate"><span class="pre">client_error_text()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.client_errors.exception_status_text"><code class="docutils literal notranslate"><span class="pre">exception_status_text()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.client_errors.scrub_paths"><code class="docutils literal notranslate"><span class="pre">scrub_paths()</span></code></a></li>
 </ul>
   </nav></div>

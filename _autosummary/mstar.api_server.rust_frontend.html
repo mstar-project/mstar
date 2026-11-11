@@ -809,6 +809,7 @@ prompt_parts, streaming, accepts_chunks, report_usage}</p>
 <div class="line">{t:”windows”, rid, sub, op, plan, …}</div>
 <div class="line">{t:”live”, rid, sub, op, call, …, stream?, audio?(bin)}</div>
 <div class="line">{t:”end_of_turn”, rid, sub, audio(bin)}</div>
+<div class="line">{t:”lora”, rid, sub, op, lora_name, lora_path?}</div>
 </div>
 </dd>
 <dt>bridge -&gt; frontend:  {t:”chunk”, rid, sub, modality, data(bin), metadata}</dt><dd><div class="line-block">
@@ -821,6 +822,8 @@ prompt_parts, streaming, accepts_chunks, report_usage}</p>
 <div class="line">{t:”windows”, rid, sub, metadata:{duration, single, windows} | {error}}</div>
 <div class="line">{t:”live”, rid, sub, metadata:{taking | accepted | rejected | error, status, error_id?}}</div>
 <div class="line">{t:”end_of_turn”, rid, sub, metadata:{p} | {error}}</div>
+<div class="line">{t:”lora”, rid, sub, metadata:{text} | {error:{status, message}}}</div>
+<div class="line">{t:”served”, adapters}   (unsolicited, on every change)</div>
 </div>
 </dd>
 </dl>

@@ -1696,9 +1696,9 @@ at TP4, and the DeltaNet <code class="docutils literal notranslate"><span class=
 on one GPU in every shipped config.</p>
 <p>Both frontends serve LoRA: a request’s <code class="docutils literal notranslate"><span class="pre">model</span></code> names the adapter it runs under
 (<code class="docutils literal notranslate"><span class="pre">ServedModels</span></code>), and <code class="docutils literal notranslate"><span class="pre">/v1/models</span></code> lists the adapters beside the base model.
-Runtime updates (below) are the Python frontend’s only for now: <code class="docutils literal notranslate"><span class="pre">mstar-server</span></code>
-reads the served adapters once at launch and has neither route, so <code class="docutils literal notranslate"><span class="pre">mstar</span> <span class="pre">serve</span></code>
-refuses <code class="docutils literal notranslate"><span class="pre">--rust-frontend</span></code> with <code class="docutils literal notranslate"><span class="pre">runtime_updates:</span> <span class="pre">true</span></code>.</p>
+Both serve runtime updates (below) too: <code class="docutils literal notranslate"><span class="pre">mstar-server</span></code> selects the adapter itself,
+and the API server pushes it the served set after every change, so a request pays no
+extra round trip for it.</p>
 <p>Adapters can also be loaded and unloaded while the server runs, with vLLM’s
 endpoints and bodies. They make the server read paths a client names, so they are off
 unless the <code class="docutils literal notranslate"><span class="pre">lora</span></code> block opts in, and answer 404 otherwise (as vLLM’s do without

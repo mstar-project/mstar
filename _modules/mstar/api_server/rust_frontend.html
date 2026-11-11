@@ -1044,6 +1044,7 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">                       | {t:"windows", rid, sub, op, plan, ...}</span>
 <span class="sd">                       | {t:"live", rid, sub, op, call, ..., stream?, audio?(bin)}</span>
 <span class="sd">                       | {t:"end_of_turn", rid, sub, audio(bin)}</span>
+<span class="sd">                       | {t:"lora", rid, sub, op, lora_name, lora_path?}</span>
 <span class="sd">    bridge -&gt; frontend:  {t:"chunk", rid, sub, modality, data(bin), metadata}</span>
 <span class="sd">                       | {t:"chunks", subs, modalities, payloads(bin), metadatas}</span>
 <span class="sd">                       | {t:"err", rid, sub, msg} | {t:"done", rid, sub}</span>
@@ -1054,6 +1055,8 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">                       | {t:"windows", rid, sub, metadata:{duration, single, windows} | {error}}</span>
 <span class="sd">                       | {t:"live", rid, sub, metadata:{taking | accepted | rejected | error, status, error_id?}}</span>
 <span class="sd">                       | {t:"end_of_turn", rid, sub, metadata:{p} | {error}}</span>
+<span class="sd">                       | {t:"lora", rid, sub, metadata:{text} | {error:{status, message}}}</span>
+<span class="sd">                       | {t:"served", adapters}   (unsolicited, on every change)</span>
 
 <span class="sd">A ``live`` request is one operation on a ``/generate/ws`` live call, the</span>
 <span class="sd">submission ``call`` names: ``taking`` (``taking_input``), ``append``</span>
@@ -1128,7 +1131,7 @@ window.runMermaid = runMermaid;</script>
 <span class="p">)</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.graph.runtime.utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">CHECKOUT_RUST</span><span class="p">,</span> <span class="n">is_mstar_rust_crate</span><span class="p">,</span> <span class="n">require_rust_extension</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.multimodal</span><span class="w"> </span><span class="kn">import</span> <span class="n">PromptPart</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.utils.client_errors</span><span class="w"> </span><span class="kn">import</span> <span class="n">client_error_text</span><span class="p">,</span> <span class="n">scrub_paths</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.utils.client_errors</span><span class="w"> </span><span class="kn">import</span> <span class="n">client_error_text</span><span class="p">,</span> <span class="n">exception_status_text</span><span class="p">,</span> <span class="n">scrub_paths</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.utils.threads</span><span class="w"> </span><span class="kn">import</span> <span class="n">ThreadPool</span>
 
 <span class="n">logger</span> <span class="o">=</span> <span class="n">logging</span><span class="o">.</span><span class="n">getLogger</span><span class="p">(</span><span class="vm">__name__</span><span class="p">)</span>
@@ -1539,11 +1542,30 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="o">.</span><span class="n">loop</span><span class="p">:</span> <span class="n">asyncio</span><span class="o">.</span><span class="n">AbstractEventLoop</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="c1"># a transcription upload's WindowPlanner, by the frontend's plan id, until it closes</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_planners</span><span class="p">:</span> <span class="nb">dict</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="c1"># mstar-server selects LoRA adapters itself, with no round trip per request:</span>
+        <span class="c1"># every change to the served set (a runtime load or unload, a conductor's</span>
+        <span class="c1"># answer that came after its request timed out) is pushed to it</span>
+        <span class="n">served</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">server</span><span class="p">,</span> <span class="s2">"served_models"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">served</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">served</span><span class="o">.</span><span class="n">subscribe</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_push_served</span><span class="p">)</span>
 
     <span class="c1"># -- outbound ----------------------------------------------------------</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_send</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">msg</span><span class="p">:</span> <span class="nb">dict</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">comm</span><span class="o">.</span><span class="n">send</span><span class="p">(</span><span class="s2">"frontend"</span><span class="p">,</span> <span class="n">msg</span><span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_push_served</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">adapters</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="o">...</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""``ServedModels``' listener: the served adapters, from whichever thread</span>
+<span class="sd">        changed them (the conductor's answers arrive on the message thread)."""</span>
+        <span class="n">msg</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"t"</span><span class="p">:</span> <span class="s2">"served"</span><span class="p">,</span> <span class="s2">"rid"</span><span class="p">:</span> <span class="s2">""</span><span class="p">,</span> <span class="s2">"sub"</span><span class="p">:</span> <span class="kc">None</span><span class="p">,</span> <span class="s2">"adapters"</span><span class="p">:</span> <span class="nb">list</span><span class="p">(</span><span class="n">adapters</span><span class="p">)}</span>
+        <span class="n">loop</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">loop</span>
+        <span class="k">if</span> <span class="n">loop</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_send</span><span class="p">(</span><span class="n">msg</span><span class="p">)</span>   <span class="c1"># not serving yet: nothing else sends</span>
+            <span class="k">return</span>
+        <span class="k">try</span><span class="p">:</span>
+            <span class="n">loop</span><span class="o">.</span><span class="n">call_soon_threadsafe</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_send</span><span class="p">,</span> <span class="n">msg</span><span class="p">)</span>
+        <span class="k">except</span> <span class="ne">RuntimeError</span><span class="p">:</span>
+            <span class="k">pass</span>  <span class="c1"># the loop has closed, and the frontend with it</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_err</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">sub</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span> <span class="n">detail</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_send</span><span class="p">({</span><span class="s2">"t"</span><span class="p">:</span> <span class="s2">"err"</span><span class="p">,</span> <span class="s2">"rid"</span><span class="p">:</span> <span class="n">rid</span><span class="p">,</span> <span class="s2">"sub"</span><span class="p">:</span> <span class="n">sub</span><span class="p">,</span> <span class="s2">"msg"</span><span class="p">:</span> <span class="n">detail</span><span class="p">})</span>
@@ -1770,6 +1792,33 @@ window.runMermaid = runMermaid;</script>
         <span class="n">reply</span><span class="p">[</span><span class="s2">"metadata"</span><span class="p">]</span> <span class="o">=</span> <span class="n">meta</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_send</span><span class="p">(</span><span class="n">reply</span><span class="p">)</span>
 
+    <span class="k">def</span><span class="w"> </span><span class="nf">_lora</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">msg</span><span class="p">:</span> <span class="nb">dict</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""``/v1/load_lora_adapter`` or ``/v1/unload_lora_adapter``: the API server's</span>
+<span class="sd">        ``LoraAdmin`` call, answered with its text or with the error the Python</span>
+<span class="sd">        route answers (``exception_status_text``). The served set it changes</span>
+<span class="sd">        reaches mstar-server by ``_push_served``."""</span>
+        <span class="n">reply</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"t"</span><span class="p">:</span> <span class="s2">"lora"</span><span class="p">,</span> <span class="s2">"rid"</span><span class="p">:</span> <span class="n">msg</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"rid"</span><span class="p">),</span> <span class="s2">"sub"</span><span class="p">:</span> <span class="n">msg</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"sub"</span><span class="p">),</span> <span class="s2">"data"</span><span class="p">:</span> <span class="sa">b</span><span class="s2">""</span><span class="p">,</span> <span class="s2">"metadata"</span><span class="p">:</span> <span class="p">{}}</span>
+        <span class="n">route</span> <span class="o">=</span> <span class="s2">"/v1/load_lora_adapter"</span> <span class="k">if</span> <span class="n">msg</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"op"</span><span class="p">)</span> <span class="o">==</span> <span class="s2">"load"</span> <span class="k">else</span> <span class="s2">"/v1/unload_lora_adapter"</span>
+
+        <span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">run</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">try</span><span class="p">:</span>
+                <span class="n">admin</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">server</span><span class="p">,</span> <span class="s2">"lora_admin"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+                <span class="k">if</span> <span class="n">admin</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                    <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span><span class="s2">"this API server has no LoRA admin"</span><span class="p">)</span>
+                <span class="k">if</span> <span class="n">msg</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"op"</span><span class="p">)</span> <span class="o">==</span> <span class="s2">"load"</span><span class="p">:</span>
+                    <span class="n">text</span> <span class="o">=</span> <span class="k">await</span> <span class="n">admin</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">msg</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"lora_name"</span><span class="p">),</span> <span class="n">msg</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"lora_path"</span><span class="p">))</span>
+                <span class="k">elif</span> <span class="n">msg</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"op"</span><span class="p">)</span> <span class="o">==</span> <span class="s2">"unload"</span><span class="p">:</span>
+                    <span class="n">text</span> <span class="o">=</span> <span class="k">await</span> <span class="n">admin</span><span class="o">.</span><span class="n">unload</span><span class="p">(</span><span class="n">msg</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"lora_name"</span><span class="p">))</span>
+                <span class="k">else</span><span class="p">:</span>
+                    <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"unknown lora operation </span><span class="si">{</span><span class="n">msg</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">'op'</span><span class="p">)</span><span class="si">!r}</span><span class="s2">"</span><span class="p">)</span>
+                <span class="n">reply</span><span class="p">[</span><span class="s2">"metadata"</span><span class="p">]</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"text"</span><span class="p">:</span> <span class="n">text</span><span class="p">}</span>
+            <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">exc</span><span class="p">:</span>  <span class="c1"># noqa: BLE001 — the call fails, the bridge goes on</span>
+                <span class="n">status</span><span class="p">,</span> <span class="n">text</span> <span class="o">=</span> <span class="n">exception_status_text</span><span class="p">(</span><span class="n">exc</span><span class="p">,</span> <span class="n">route</span><span class="p">,</span> <span class="n">log</span><span class="o">=</span><span class="n">logger</span><span class="p">)</span>
+                <span class="n">reply</span><span class="p">[</span><span class="s2">"metadata"</span><span class="p">]</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"error"</span><span class="p">:</span> <span class="p">{</span><span class="s2">"status"</span><span class="p">:</span> <span class="n">status</span><span class="p">,</span> <span class="s2">"message"</span><span class="p">:</span> <span class="n">text</span><span class="p">}}</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_send</span><span class="p">(</span><span class="n">reply</span><span class="p">)</span>
+
+        <span class="bp">self</span><span class="o">.</span><span class="n">loop</span><span class="o">.</span><span class="n">create_task</span><span class="p">(</span><span class="n">run</span><span class="p">())</span>
+
     <span class="k">def</span><span class="w"> </span><span class="nf">_end_of_turn</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">msg</span><span class="p">:</span> <span class="nb">dict</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""``semantic_vad``'s end-of-turn probability of a turn's last audio</span>
 <span class="sd">        (float32), by this side's Smart Turn: its int8 model moves by tenths</span>
@@ -1913,6 +1962,8 @@ window.runMermaid = runMermaid;</script>
             <span class="bp">self</span><span class="o">.</span><span class="n">_windows</span><span class="p">(</span><span class="n">msg</span><span class="p">)</span>
         <span class="k">elif</span> <span class="n">t</span> <span class="o">==</span> <span class="s2">"live"</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_live</span><span class="p">(</span><span class="n">msg</span><span class="p">)</span>
+        <span class="k">elif</span> <span class="n">t</span> <span class="o">==</span> <span class="s2">"lora"</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_lora</span><span class="p">(</span><span class="n">msg</span><span class="p">)</span>
         <span class="k">elif</span> <span class="n">t</span> <span class="o">==</span> <span class="s2">"end_of_turn"</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_end_of_turn</span><span class="p">(</span><span class="n">msg</span><span class="p">)</span>
         <span class="k">else</span><span class="p">:</span>

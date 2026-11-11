@@ -14,6 +14,7 @@ mstar.utils.client\_errors
    .. autosummary::
    
       client_error_text
+      exception_status_text
       scrub_paths
    
    
