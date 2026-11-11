@@ -376,8 +376,9 @@ class Allotment:
     request on the host covers its reload, and ``returning`` is set while the request returns from the host: the
     pages it may take beyond its reload. ``passed`` is set for a request admitted past a head that doesn't fit,
     and its allotment then covers its growth too. ``kept`` is the count of `KVManager._kept` the last reservation
-    took, ``grown`` is the shortage `reserve` last granted an allotment its request waited holding, and
-    ``grown_from`` the allotment's pages before. `unreserve` puts back the first and the last. ``taken_back`` counts
+    took, ``grown`` is the shortage `reserve` last granted an allotment its request waited holding,
+    ``grown_from`` the allotment's pages before and ``grown_took`` the pages of the shortage it took back from what it
+    lent. `unreserve` puts back ``kept``, ``grown_from`` and ``grown_took``. ``taken_back`` counts
     the pages of ``remaining`` a guaranteed request took back from borrowers, which it writes first and lends no
     more, and ``lends`` is its share of `KVManager._borrowable`: the rest of ``remaining`` for a guaranteed
     request in a pool whose requests the worker moves (`KVManager.moves`), and none otherwise. `KVManager._count`
@@ -390,6 +391,7 @@ class Allotment:
     kept: int = 0
     grown: int = 0
     grown_from: int = 0
+    grown_took: int = 0
     taken_back: int = 0
     lends: int = 0
 
@@ -4588,7 +4590,7 @@ class KVManager(AttentionResource):
             allotment = self._allotments[rid]
             allotment.kept = kept
             allotment.grown, allotment.grown_from = pages, allotment.pages
-            self._allot(rid, pages)
+            allotment.grown_took = self._allot(rid, pages)
             self._made = None
         else:
             returning = self._return_pages(rid) if self._on_host(rid) else None
@@ -4614,11 +4616,12 @@ class KVManager(AttentionResource):
             if allotment.kept and self._keeper not in self._asks:
                 self._keeper = rid
             if allotment.grown:
-                # it waits holding its allotment again, for the same shortage
+                # it waits holding its allotment again, for the same shortage, and lends again what it took back
                 allotment.pages = allotment.grown_from
                 self._asks[rid], allotment.grown, allotment.kept = allotment.grown, 0, 0
                 self._stalled.add(rid)
-                self._recount(rid)
+                remaining = max(0, allotment.pages - self._held(rid))
+                self._count(rid, allotment, remaining, allotment.taken_back - allotment.grown_took)
             else:
                 self._unreserve(rid)
             if self.journal is not None:
@@ -5165,13 +5168,15 @@ class KVManager(AttentionResource):
         self._settle(rid, self._spare() - room, allotment)
         self._forget_earmark(rid)
 
-    def _allot(self, rid: str, pages: int) -> None:
+    def _allot(self, rid: str, pages: int) -> int:
+        """Grow ``rid``'s allotment by ``pages`` and return how many of them it took back from what it lends."""
         # A request past its allotment holds more than ``allotment.pages``, so ``pages`` add to what it holds. A
         # guaranteed request takes back what it lends first.
         allotment = self._allotments[rid]
         taken = min(pages, allotment.lends)
         allotment.pages = max(allotment.pages, self._held(rid)) + pages - taken
         self._recount(rid, took_back=taken)
+        return taken
 
     def replay(self, kind: MoveKind, rid: str, count: int, victims: list[str]) -> None:
         """Make rank 0's ``kind`` move on ``rid`` in this rank's counts, or raise if the move doesn't fit them."""

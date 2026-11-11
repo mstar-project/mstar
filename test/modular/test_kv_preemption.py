@@ -1396,6 +1396,28 @@ def test_a_refused_step_leaves_a_guaranteed_request_holding_back_what_it_took_ba
     assert kv._allotments["g"].taken_back == taken_back and kv._spare() == 0, "o can borrow a page g took back"
 
 
+def test_a_guaranteed_request_another_resource_holds_back_lends_again_what_its_grant_took_back():
+    """g waits holding its allotment for what o borrowed, and once o finishes the runner grants g that shortage, which
+    takes back what g lent. Another resource then holds g back and the grant is undone. g still counted those pages as
+    taken back, so it lent them no more, and its next grant grew its allotment past its footprint by them."""
+    kv = _pool()
+    _running(kv, "o", 3, arrival=0)
+    _running(kv, "g", 1, arrival=1, guaranteed=True)
+    assert _step(kv, "o", 3 * PAGE_SIZE).ok
+    short = _step(kv, "g", 4 * PAGE_SIZE).reason.pages_short
+    assert _preempt(kv, "g", short, droppable=lambda rid: False).waits
+    _runner(kv).readmit("g", NODE)
+    _remove(kv, "o")
+    allotment = kv._allotments["g"]
+    counts = allotment.pages, allotment.remaining, allotment.taken_back, kv._borrowable
+    assert _admitted(kv, "g") and allotment.taken_back
+
+    kv.unreserve("g")
+
+    assert (allotment.pages, allotment.remaining, allotment.taken_back, kv._borrowable) == counts
+    assert _admitted(kv, "g") and allotment.pages == counts[0], "g's allotment grew past its footprint"
+
+
 @pytest.mark.parametrize("moves", ["is dropped", "moves to the host"])
 def test_a_guaranteed_request_takes_back_what_it_lent_from_an_older_borrower(moves):
     """o arrived before g and borrowed what g hasn't written. A request that runs short moves only newer ones, so g
