@@ -46,7 +46,6 @@ from mstar.distributed.utils import divide
 from mstar.model.components.diffusion.ffn import addmm_gelu_tanh
 from mstar.model.components.diffusion.qwen import dit_kernels as kernels
 from mstar.model.components.distributed.linear import ColumnParallelLinear, RowParallelLinear
-from mstar.model.components.lora.capable import LoraBound
 from mstar.model.components.norm import QwenRMSNorm
 
 # The rotary tables' extent in the reference (``QwenEmbedRope``'s 4096 positions per sign).
@@ -197,8 +196,8 @@ class _GeluProj(nn.Module):
         self.proj = ColumnParallelLinear(comm_group, dim, inner, bias=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # a LoRA-bound projection adds its delta in its forward, before the GELU
-        if x.is_cuda and not isinstance(self.proj, LoraBound):
+        # a LoRA-bound projection adds its delta in its forward, before the GELU: only a plain one takes the GEMM
+        if x.is_cuda and _plain(self.proj, ColumnParallelLinear):
             return addmm_gelu_tanh(x, self.proj.weight, self.proj.bias)
         return F.gelu(self.proj(x), approximate="tanh")
 

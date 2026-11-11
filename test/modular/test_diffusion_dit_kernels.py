@@ -18,7 +18,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from mstar.model.components.diffusion import modulation, qk_norm_rope
-from mstar.model.components.diffusion.ffn import gelu_tanh_ffn
+from mstar.model.components.diffusion.ffn import addmm_gelu_tanh, gelu_tanh_ffn
 from mstar.model.components.diffusion.qwen import dit_kernels
 from mstar.model.components.mlp import MLP
 from mstar.model.components.norm import QwenRMSNorm
@@ -188,6 +188,15 @@ def test_eager_ffn_is_the_module_bitwise():
     mlp = _ffn("cpu")
     with torch.no_grad():
         assert torch.equal(gelu_tanh_ffn(x, mlp), mlp(x))
+
+
+def test_addmm_gelu_tanh_off_cuda_is_the_tanh_gelu_of_the_linear():
+    """``_addmm_activation`` applies the erf GELU on CPU; the helper must still mean tanh."""
+    x, *_ = _stream("cpu")
+    mlp = _ffn("cpu")
+    lin = mlp.linear_in
+    with torch.no_grad():
+        assert torch.equal(addmm_gelu_tanh(x, lin.weight, lin.bias), F.gelu(lin(x), approximate="tanh"))
 
 
 @pytest.mark.skipif(not CUDA, reason="needs CUDA")

@@ -20,6 +20,7 @@ bit-exact with it.
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 
 from mstar.model.components.lora.capable import LoraBound
 from mstar.model.components.mlp import MLP
@@ -28,7 +29,10 @@ from mstar.model.components.mlp import MLP
 def addmm_gelu_tanh(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
     """``gelu(x @ weight.T + bias, approximate="tanh")`` in one GEMM, ``x [..., K]`` with ``weight [N, K]``.
 
-    CUDA only: the CPU kernel of ``_addmm_activation`` applies the erf GELU."""
+    On CUDA only: the CPU kernel of ``_addmm_activation`` applies the erf GELU, so elsewhere this is
+    ``F.gelu(F.linear(...), approximate="tanh")``."""
+    if not x.is_cuda:
+        return F.gelu(F.linear(x, weight, bias), approximate="tanh")
     out = torch._addmm_activation(bias, x.flatten(0, -2), weight.t(), use_gelu=True)
     return out.unflatten(0, x.shape[:-1])
 
