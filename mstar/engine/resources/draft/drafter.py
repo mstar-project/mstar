@@ -244,9 +244,9 @@ class Drafter(Protocol):
 
 
 @torch.compiler.disable
-def _read_carry(sampler, request_ids: Sequence[int], n: int, name: str = DRAFT_CARRY) -> torch.Tensor:
+def _read_carry(sampler, request_ids: Sequence[int], n: int) -> torch.Tensor:
     # the sampler's loop-back reads stay out of the compiled forward, as `sample` does
-    return sampler.loopback_state(name, request_ids)[:n]
+    return sampler.loopback_state(DRAFT_CARRY, request_ids)[:n]
 
 
 def draft_verify_step(

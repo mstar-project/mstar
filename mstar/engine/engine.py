@@ -1020,7 +1020,7 @@ class Engine:
         )
         submodule.bind_draft(DrafterShare(
             decl.walk, stop.sampler, decl.config.num_draft_tokens, stop.prefill_walks,
-            carry_writes(decl.needs), carry_writes(decl.needs), decl.prefill_steps, decl.verify_steps,
+            carry_writes(decl.needs), decl.prefill_steps, decl.verify_steps,
             settle_keys,
         ))
         return draft
