@@ -446,7 +446,7 @@ each verify step after the one before it was post-processed. ``fa3-fwd``, which
 ``.[cosmos3]`` and ``.[all]`` install, is built without paged KV, so it can't serve them.
 
 PyTorch's index hosts the official wheel, one per CUDA build, built against torch's stable
-ABI. Install the one matching your torch's CUDA (the command below is ``cu129``'s):
+ABI. Install the one matching your torch's CUDA (the speculative decoding gates ran 3.0.1, ``cu129``, torch 2.12.1):
 
 .. code-block:: bash
 

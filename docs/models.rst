@@ -106,7 +106,8 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
        one entry; the server refuses to start otherwise.
    * - ``qwen3_8b``
      - ``Qwen/Qwen3-8B``
-     - Dense Qwen3 text chat; see the notes below.
+     - Dense Qwen3 text chat, optionally with a DSpark drafter for speculative
+       decoding (``configs/qwen3_8b_dspark.yaml``); see the notes below.
    * - ``qwen3_5_{0.8,2,4,9,27}b``
      - ``Qwen/Qwen3.5-4B``
      - Hybrid-attention VLM (text + image in, text out): gated DeltaNet linear
@@ -647,6 +648,27 @@ context: one that asks no length decodes at most 2048 tokens (the server's defau
 cap), fewer where its prompt leaves less room, and a prompt past the context is a 400.
 Rope scaling, sliding windows and attention biases are refused at startup rather than
 ignored.
+
+**Speculative decoding.** ``configs/qwen3_8b_dspark.yaml`` (and its TP2
+variant) adds DeepSeek's DSpark drafter for Qwen3-8B
+(``deepseek-ai/dspark_qwen3_8b_block7``) under ``model_kwargs.draft``: every
+decode step drafts ``num_draft_tokens`` tokens and the target verifies them in
+the same forward, so a greedy reply is the plain one (up to the rounding of the
+different attention kernels on a near-tie) and a sampled reply is distributed
+as the plain one. The drafter's five layers are extra layers of
+the target's KV pool (36 + 5), so ``resources.kv_cache.max_num_pages`` sizes both
+and a cached prompt prefix carries the drafter's context too. The model declares the
+drafter on the state contract, a ``Draft`` beside its KV array (see *Speculative
+decoding* in :doc:`adding_models`). The pool holds
+``2(k + 1)`` tokens a request past the checkpoint's context, which still bounds
+prompt plus reply.
+While drafting, a request's ``repetition_penalty`` other than 1 is refused with
+a 400, log-probs are not reported, and the node runs no mixed prefill/decode
+steps and rebuilds no dropped request. Startup refuses a drafter whose KV heads, head size, hidden size,
+vocabulary or dtype differ from the target's, or that reads a layer the target
+lacks. ``mode: auto`` runs asynchronously where FA3's paged kernel serves the
+verify step (Hopper) and synchronously elsewhere; the startup log names the mode
+and why. :doc:`serving` covers the ``draft`` block for operators.
 
 Qwen3.5 / Qwen3.8 (``qwen3_5_*``, ``qwen3_8_27b``)
 --------------------------------------------------

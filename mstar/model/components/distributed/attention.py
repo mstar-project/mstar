@@ -152,7 +152,7 @@ class ParallelAttention(nn.Module):
 
     def bind_state(self, handles: dict) -> None:
         """See ``Attention.bind_state``."""
-        self.state = handles.get(self._kv_key)
+        self.state = None if self._kv_layer_set is not None else handles.get(self._kv_key)
 
     def _rotate_state(self, q: torch.Tensor, k: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         # see Attention._attend_state

@@ -166,8 +166,9 @@ class Attention(nn.Module):
 
     def bind_state(self, handles: dict) -> None:
         """Take the handle on this layer's array, where the model declares it, whose calls then replace the
-        resources'. See ``NodeSubmodule.bind_node_state``."""
-        self.state = handles.get(self._kv_key)
+        resources'. See ``NodeSubmodule.bind_node_state``. A layer that joins its pool as a layer set (a drafter's)
+        reads the pool through the resources, so it takes no handle, though its KV key names the target's array."""
+        self.state = None if self._kv_layer_set is not None else handles.get(self._kv_key)
 
     def _attend_state(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
         # The declared `Rope` picks the kernel here, so this layer's ``rope_*`` arguments have no effect on this path.

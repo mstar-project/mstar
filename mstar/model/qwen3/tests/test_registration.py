@@ -1,5 +1,6 @@
 """Dense Qwen3-8B is registered, takes the OpenAI chat route, and the CLI serves
-it from a shipped config."""
+it from a shipped config: the RFC's accuracy and acceptance gates go through
+/v1/chat/completions."""
 from __future__ import annotations
 
 from pathlib import Path

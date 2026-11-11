@@ -248,7 +248,7 @@ If `flash-attn-4` isn't importable or torch is older than 2.11, the server logs 
 
 A node that drafts and verifies tokens runs its verify steps in asynchronous mode only on FlashAttention-3's paged kernel, which reads each request's KV length on the device. Without it (or off SM90) the node runs in synchronous mode on FlashInfer, which is correct and plans each verify step after the one before it was post-processed. `fa3-fwd`, which `.[cosmos3]` and `.[all]` install, is built without paged KV, so it can't serve them.
 
-PyTorch's index hosts the official wheel, one per CUDA build, built against torch's stable ABI. Install the one matching your torch's CUDA (the command below is `cu129`'s):
+PyTorch's index hosts the official wheel, one per CUDA build, built against torch's stable ABI. Install the one matching your torch's CUDA (the speculative decoding gates ran 3.0.1, `cu129`, torch 2.12.1):
 
 ```bash
 uv pip install --no-deps flash_attn_3==3.0.1 --index-url https://download.pytorch.org/whl/cu129
