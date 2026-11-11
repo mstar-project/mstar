@@ -72,7 +72,7 @@ def test_write_kv_writes_what_forward_writes(cls):
     assert torch.equal(k_fwd, k_w) and torch.equal(v_fwd, v_w)
 
 
-def test_a_stacks_write_kv_moves_each_layers_cursor_to_its_own_index():
+def test_a_stacks_write_kv_moves_each_layers_cursor_to_its_own_index_under_its_label():
     from mstar.model.components.qwen3_lm import Qwen3DenseLM, Qwen3LMConfig
 
     config = Qwen3LMConfig(vocab_size=16, hidden_size=32, intermediate_size=48, num_hidden_layers=3,
@@ -81,10 +81,11 @@ def test_a_stacks_write_kv_moves_each_layers_cursor_to_its_own_index():
     lm = Qwen3DenseLM(config, attn_key="attn", kv_key="kv", pos_key="rope")
     seen = []
     kv = _KV()
-    kv.set_default_layer_idx = seen.append
+    kv.set_default_label = kv.set_default_layer_idx = seen.append
     for layer in lm.layers:
         layer.self_attn.bind_resources({"attn": _Attn(), "kv": kv, "rope": SimpleNamespace(
             apply_qk=_Pos().apply_qk, fusable_rope_theta=lambda head_dim: None)})
     with torch.no_grad():
-        lm.write_kv(torch.randn(4, 32), label="main")
-    assert seen == [0, 1, 2] and len(kv.written) == 3
+        lm.write_kv(torch.randn(4, 32), label="other")
+    # the label is bound before the first layer writes, though another was bound last
+    assert seen == ["other", 0, 1, 2] and len(kv.written) == 3
