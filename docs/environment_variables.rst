@@ -218,7 +218,7 @@ model, so they are named for it.
        the token buckets (see :doc:`serving`).
    * - ``MSTAR_VIT_ACCELERATOR_GRAPH_BATCH_SIZES``
      - ``1,2,4``
-     - Comma-separated batch sizes to capture. Read only when
+     - Comma-separated batch sizes to capture; empty captures none. Read only when
        ``MSTAR_VIT_BATCHING=1``; otherwise only batch size 1 is captured.
    * - ``COSMOS3_DISABLE_ACCELERATOR_GRAPH``
      - unset
