@@ -505,6 +505,10 @@ class OpBinding:
         """What a handle calls to run the op."""
         return resources[key]
 
+    def attach(self, handle: "PagedArrayHandle", array: Array, key: str, resources: Mapping[str, Any]) -> None:
+        """Give a paged ``handle`` what it calls for the op under ``key``."""
+        raise _no_layout(array, f"{key!r} binds through {type(self).__name__}, which no paged array holds")
+
 
 class PagedAttend(OpBinding):
     """`Attend` on a paged array: an `AttentionSpec` over the array's pool."""
@@ -533,6 +537,9 @@ class PagedAttend(OpBinding):
     def steps(self, key: str, declared: ArrayStep, segments, steps: dict[str, Any]) -> None:
         steps[key] = AttentionStep(segments=segments, causal=True)
 
+    def attach(self, handle: "PagedArrayHandle", array: Array, key: str, resources: Mapping[str, Any]) -> None:
+        handle.reads[key] = self.bind(array, key, resources)
+
 
 class PositionsBinding(OpBinding):
     """An array's `Positions`, which a position resource keeps per request under `position_key`, with the `Rope` its
@@ -546,10 +553,10 @@ class PositionsBinding(OpBinding):
         advance = declared.advance if declared.keep else (0,) * len(segments)
         steps[key] = PositionStep(segments=segments, advance=advance, pos_ids=declared.position_ids)
 
-    def bind(self, array: Array, key: str, resources: Mapping[str, Any]) -> tuple[Any, torch.dtype | None]:
-        """The position resource, and the dtype the declared `Rope` rotates in, None for the query's."""
+    def attach(self, handle: "PagedArrayHandle", array: Array, key: str, resources: Mapping[str, Any]) -> None:
+        """Set the handle's position resource, and the dtype the declared `Rope` rotates in, None for the query's."""
         rope = array.positions.rope
-        return resources[key], None if rope is None else rope.dtype
+        handle.positions, handle.rope_dtype = self.bind(array, key, resources), None if rope is None else rope.dtype
 
 
 class WithinStepAttend(OpBinding, ABC):
@@ -682,13 +689,9 @@ class PagedArrayHandle(ArrayHandle):
     ):
         super().__init__(array, resources)
         self._bindings = bindings
-        self.reads = {
-            bound.key: bound.binding.bind(array, bound.key, resources)
-            for bound in bindings if isinstance(bound.declared, Read)
-        }
+        self.reads = {}
         for bound in bindings:
-            if isinstance(bound.declared, Positions):
-                self.positions, self.rope_dtype = bound.binding.bind(array, bound.key, resources)
+            bound.binding.attach(self, array, bound.key, resources)
         self.first_read = next(iter(self.reads.values()))
         self._attn = {
             layer: self.reads[key]

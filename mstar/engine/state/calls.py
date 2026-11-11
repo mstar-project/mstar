@@ -137,8 +137,8 @@ class ArrayHandle(StepHandle):
         if forked - declared_labels:
             raise self._refusal(f"a fork names labels {sorted(forked - declared_labels)}, and the array declares "
                                 f"{sorted(declared_labels)}")
-        if self.positions is None and (declared.advance is not None or declared.position_ids is not None):
-            raise self._refusal("a step sets advance or position_ids, and the array declares no positions")
+        if declared.advance is not None or declared.position_ids is not None:
+            _positions(self, "a step sets advance or position_ids, and the array declares no positions")
         self._check_storage(declared, segments, ctx)
 
     @abstractmethod
@@ -293,9 +293,9 @@ def host(h: ArrayHandle, request: int, label: str, layer: int | torch.Tensor) ->
     return h._host(request, label, h._layer_id(layer))
 
 
-def _positions(h: ArrayHandle) -> Any:
+def _positions(h: ArrayHandle, cause: str = "the array declares no positions") -> Any:
     if h.positions is None:
-        raise h._refusal("the array declares no positions")
+        raise h._refusal(cause)
     return h.positions
 
 
