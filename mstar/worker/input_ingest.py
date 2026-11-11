@@ -9,7 +9,7 @@ import logging
 from collections.abc import Callable, Collection
 from typing import TYPE_CHECKING
 
-from mstar.communication.edge_items import frame_dtypes, row_infos, row_input_signals
+from mstar.communication.edge_items import frame_dtypes, row_infos, row_input_signals, row_values_frame
 from mstar.communication.edge_items import rows as stream_rows
 from mstar.communication.event import EventWakeup
 from mstar.engine.resources.kv.config import without_layouts
@@ -407,6 +407,9 @@ class InputIngest:
         """A step's streamed tensors from one producer (EDGE_ITEMS): each
         row is what one INPUT_SIGNALS of a single streamed edge did, and the
         frame's reads start in one call."""
+        if frame.values:
+            self._process_edge_values(frame)
+            return
         reads: list[tuple[int, list[GraphEdge]]] = []
         dtypes = frame_dtypes(frame)
         per_request_info = self._request_state.per_request_info
@@ -443,6 +446,26 @@ class InputIngest:
                 self._fail_intake([rid for rid, _ in reads], err, "streamed input read failed")
                 return
             self._wakeup_event.register_futures(futures)
+
+    def _process_edge_values(self, frame: EdgeItems) -> None:
+        """A frame of inline items: each row's values go straight into its
+        stream buffer, with nothing to read or acknowledge. A row for a request
+        not here yet is parked as a frame of its own, as its tensors would be."""
+        per_request_info = self._request_state.per_request_info
+        values = frame.values
+        for row in stream_rows(frame):
+            rid = self._runtime.get_rid_handle(row.request_id)
+            if rid is None or rid not in per_request_info:
+                # a removed request's row holds nothing to release
+                self._lifecycle.park(WorkerMessage(
+                    message_type=WorkerMessageType.EDGE_ITEMS, body=row_values_frame(frame, row),
+                ))
+                continue
+            if not self._lifecycle.takes_input(row.request_id) or rid in self._lifecycle.pending_removes:
+                continue
+            stream_buf = per_request_info[rid].stream_buffers.get(row.signal)
+            if stream_buf is not None:
+                stream_buf.put_values(values[row.start:row.start + row.count])
 
     def _fail_intake(self, rids: list[int], err: Exception, what: str) -> None:
         """Fail ``rids`` for an error taking in their inputs (a CUDA OOM in

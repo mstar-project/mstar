@@ -163,6 +163,7 @@ class Runtime:
         from mstar.engine.resources.kv.transfer import TransferEngineInfo
         from mstar.engine.resources.runner import StepRunner
         from mstar.engine.resources.spec import apply_yaml_overrides
+        from mstar.engine.state.adapters import node_resources
         from mstar.model.command_a_plus.config import KV_CACHE
 
         self.model = CommandAPlusModel(str(args.checkpoint), max_seq_len=args.context)
@@ -175,7 +176,7 @@ class Runtime:
         # Every rank runs its own encoder here, instead of receiving rank 0's output.
         self.vision = self.model.get_submodule("vision_encoder", device=torch.device("cuda", group.rank),
                                                autocast_dtype=torch.bfloat16) if args.images else None
-        specs = {spec.resource_key: spec for spec in self.model.get_node_resources()}
+        specs = {spec.resource_key: spec for spec in node_resources(self.model)}
         # as a server resolves them, so the pool keeps the local layers' window
         apply_yaml_overrides(list(specs.values()), {"resources": {KV_CACHE: {"max_num_pages": 256}}})
         transfer = TransferEngineInfo(f"validation_{group.rank}", "validation", LocalTransferEngine("localhost"))

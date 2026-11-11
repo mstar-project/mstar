@@ -1069,7 +1069,8 @@ class Engine:
                         pw_runner.warmup_and_capture(
                             None if planned is None else {bucket for region, bucket in planned if region == label}
                         )
-                    if pw_runner.any_graphs:
+                    # an eager-fallback region serves calls without graphs, so it is kept
+                    if pw_runner.any_graphs or pw_runner.eager_fallback:
                         captured[label] = pw_runner
             submodule_mgmt.piecewise_runners = captured
         if plan is not None:
@@ -1503,14 +1504,15 @@ class Engine:
             for rid in rids:
                 steps.pop(rid, None)
 
-    def inline_client_signals(
+    def inline_signals(
         self, node_name: str, graph_walk: str,
     ) -> dict[str, str]:
-        """The node's client signals that can ride inline this walk."""
+        """The node's signals that can ride inline this walk
+        (``NodeSubmodule.inline_signals``)."""
         mgmt = self._submodules.get(node_name)
         if mgmt is None:
             return {}
-        return mgmt.submodule.inline_client_signals(graph_walk)
+        return mgmt.submodule.inline_signals(graph_walk)
 
     def _prepare_chunk(
         self, batch: ExecutingBatch, rid: int, walk: str, chunk: ChunkRange,

@@ -55,6 +55,7 @@ impl OpenAIAdapter for Qwen3Omni {
             output_modalities: out_mods.into_iter().map(str::to_string).collect(),
             model_kwargs: mk,
             parts,
+            ..SubmitArgs::default()
         })
     }
     fn speech_args(&self, req: &SpeechRequest) -> Result<SubmitArgs, String> {
