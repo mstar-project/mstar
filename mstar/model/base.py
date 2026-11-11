@@ -5,7 +5,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from fractions import Fraction
-from typing import TYPE_CHECKING, NamedTuple, Type
+from typing import TYPE_CHECKING, Any, NamedTuple, Type
 
 import torch
 import yaml
@@ -25,7 +25,7 @@ from mstar.distributed.base import (
     node_group_axis_sizes,
 )
 from mstar.engine.resources import NodeResourceSpec, ResourceReqConfig
-from mstar.engine.resources.kv.config import RetentionPolicy, SpanKind
+from mstar.engine.resources.kv.config import RetentionPolicy, Span, SpanKind
 from mstar.engine.resources.lora.config import LORA_ADAPTER_KWARG, LORA_DIGEST_KWARG
 from mstar.engine.resources.sampler.utils import SamplingConfig
 from mstar.graph.base import (
@@ -142,6 +142,7 @@ if TYPE_CHECKING:
     from mstar.model.components.moe_parallel import MoeParallelConfig
 
 if TYPE_CHECKING:
+    from mstar.engine.state import Array, Sampler, SampleSettings
     from mstar.streaming.topology import Connection
     from mstar.worker.scheduling_policy import WalkPriority
 
@@ -187,32 +188,6 @@ class ClientChunk(NamedTuple):
     # this append's model_kwargs, and the opening message's
     model_kwargs: dict
     request_kwargs: dict
-
-
-class Span(NamedTuple):
-    """One write to a KV stream. A layout lists them in the order the walks write.
-
-    Each span is one step's row, unless a span sets ``opens_step`` False: the step of
-    the span before it then writes it too, in the same row, as text around an attachment is.
-    That span is of the same walk, since a step runs one.
-
-    ``length`` is how many KV slots the write fills, and ``advance`` is how far
-    it moves the position counter, which is the length for text. ``source`` is
-    the tensor whose next entry an ids span keys, or the file of a digest span
-    as ``(modality, index)``. ``params`` are the preprocessing arguments that
-    change the tensors made from the file. A ``rows`` span writes KV made from
-    anything else, such as another node's outputs, and is never keyed.
-    ``scratch`` is the most a non-committing step writes before the span
-    commits into those slots, as a denoised window does.
-    """
-    kind: SpanKind
-    walk: str
-    length: int
-    advance: int
-    source: str | tuple[str, int]
-    params: tuple = ()
-    scratch: int = 0
-    opens_step: bool = True
 
 
 class LabelLayout(NamedTuple):
@@ -561,10 +536,17 @@ def streamed_inputs(model: "Model", graph_walk: str, graph: GraphSection) -> set
 def enabled_resources(model: "Model", model_config: dict) -> list[NodeResourceSpec]:
     """The resource specs a deployment's YAML turns on, before its ``resources:``
     overrides: the model's declaration, less the opt-in specs (``NodeResourceSpec.opt_in``)
-    its ``resources:`` block does not name."""
+    its ``resources:`` block does not name. Raises the first problem with the declaration,
+    for callers that skip ``validate_deployment``, which reports them all."""
+    from mstar.engine.state.adapters import node_resources
+    from mstar.engine.state.analysis import state_declaration_problems
+
+    problems = state_declaration_problems(model)
+    if problems:
+        raise ValueError(problems[0])
     named = (model_config.get("resources") or {}).keys()
     return [
-        spec for spec in model.get_node_resources() or []
+        spec for spec in node_resources(model)
         if not spec.opt_in or spec.resource_key in named
     ]
 
@@ -780,17 +762,28 @@ class Model(ABC):
             for node in graph.get_nodes()
         })
 
-    @abstractmethod
     def get_node_resources(self) -> list[NodeResourceSpec]:
         """Declare the resources the engine builds, and which nodes share each.
 
-        The whole declaration: a KV cache's shape, the attention backend over
-        it, positions, samplers. The engine builds one resource per spec and
-        hands each node the subset naming it. An opt-in spec (per-request LoRA
-        adapters) is declared here too, and built only for a deployment whose
-        ``resources:`` block names it.
+        The whole declaration, apart from what `declare_state` declares: a KV
+        cache's shape, the attention backend over it, positions, samplers. The
+        engine builds one resource per spec and hands each node the subset naming it.
+        An opt-in spec (per-request LoRA adapters) is declared here too, and built
+        only for a deployment whose ``resources:`` block names it.
         """
-        pass
+        return []
+
+    def declare_state(self) -> "list[Array | Sampler]":
+        """The state the model keeps between steps, from which the engine builds the specs for it.
+
+        A pure function of the model's config and the deployment's settings, since each process calls it.
+        """
+        return []
+
+    def kernel_settings(self) -> dict[str, dict[str, Any]]:
+        """``splits``, ``decode_fmha`` and a within-step read's ``max_segments_per_step`` and ``compile_op``, by read or
+        update key, until the engine picks kernels itself."""
+        return {}
 
     def checkpoint_path(self) -> str | None:
         """Where this model's weights and config sit on disk.
@@ -862,7 +855,7 @@ class Model(ABC):
         """The paged KV labels the model's walks write, by resource and label.
 
         `process_prompt` returns a `LabelLayout` for each under ``kv_layout``, as
-        ``{resource: {label: LabelLayout}}``. A label with keys opts its node into
+        ``{resource: {label: LabelLayout}}``, or a `Layout` under ``state_layout``. A label with keys opts its node into
         cross-request prefix reuse: the preprocess worker keys its layout's keyed
         spans and the KV resource matches what it already holds. With no keyed
         label the model is uncached whatever the deployment asks for.
@@ -874,7 +867,7 @@ class Model(ABC):
         input_modalities: list[str],
         output_modalities: list[str],
         model_kwargs: dict,
-    ) -> dict[str, ResourceReqConfig]:
+    ) -> "dict[str, ResourceReqConfig | SampleSettings]":
         """Per-resource config a new request is opened with, by resource label.
 
         Where a request's knobs live now: sampling params, whether it needs
@@ -1049,7 +1042,8 @@ class Model(ABC):
     def prompt_tokens(self, tensors: NameToTensorList, kv_layout: dict[str, dict[str, LabelLayout]]) -> int:
         """A response's ``usage.prompt_tokens``: the positions the prompt fills,
         attachments included, as OpenAI and vLLM count them. ``tensors`` and
-        ``kv_layout`` are what `process_prompt` returned. By default the ids in
+        ``kv_layout`` are what `process_prompt` returned, with a ``state_layout``
+        converted to a ``kv_layout``. By default the ids in
         ``text_inputs``, which hold each attachment's pads in place; a model
         that splits ``text_inputs`` around its attachments adds theirs."""
         return sum(ids.numel() for ids in tensors.get("text_inputs", ()))

@@ -59,8 +59,8 @@ Core design principles
   ``prefill``, ``decode``, ``image_gen``) via ``get_graph_walk_graphs()``.
 - **Disaggregated.** Logical computation nodes map to physical workers via the YAML
   config's ``node_groups`` (node names → GPU ranks).
-- **Models declare, the engine executes.** A model declares its resources in
-  ``get_node_resources()``, and declares what each step does to them in
+- **Models declare, the engine executes.** A model declares its state in
+  ``declare_state()`` and any other resources in ``get_node_resources()``, and declares what each step does to them in
   ``NodeSubmodule.declare_step()``. The engine performs admission, planning, capture and
   commit. A step that cannot be admitted therefore becomes backpressure that the scheduler
   can resolve by eviction, instead of an error inside a forward pass.
