@@ -976,11 +976,11 @@ class WithinStepHandle(ArrayHandle):
 
     def query_share(self, segments: Sequence[Segment]) -> tuple[Segment, ...]:
         """The query layout this read's plan sees of ``segments``, the query array's in this step."""
-        return self._share(segments) if self._queries_sharded and not self._keys_sharded else tuple(segments)
+        return self._share(segments) if self._queries_sharded and not self._ulysses else tuple(segments)
 
     def key_share(self, segments: Sequence[Segment]) -> tuple[Segment, ...]:
         """The key layout this read's plan sees of ``segments``, this array's in this step."""
-        return self._share(segments) if self._keys_sharded and not self._queries_sharded else tuple(segments)
+        return self._share(segments) if self._keys_sharded and not self._ulysses else tuple(segments)
 
     def _share(self, segments: Sequence[Segment]) -> tuple[Segment, ...]:
         world_size, rank = self._sp.world_size, self._sp.rank
