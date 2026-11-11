@@ -571,7 +571,7 @@ class StepRunner:
         ledger hands a result out once."""
         if ledger is None:
             return
-        # nested in engine.admit or engine.pre_admit, whichever reached the step first
+        # nested in engine.admit and engine.pre_admit: the second of the two finds nothing due
         t0 = phase_start()
         try:
             takes = ledger.take_due(ledger.next_step, frozenset(step.ctx.request_ids))
