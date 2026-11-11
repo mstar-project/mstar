@@ -1095,13 +1095,14 @@ Qwen3-Omni notes
   shorter prefills run copied on both ranks, each attending its half of the
   stored context, and the two partials are merged. A captured prefill decides on its bucket's size.
   ``min_tokens`` is 16384: on 8 H100s all-gather prefilled faster than
-  the copied path from 16K-token prompts and slower at 4K to 8K, and the config serves
-  prompts to 131072 tokens (``thinker_kv``'s ``max_seq_len``, past the model's own 65536). Chunked prefill is off on SP ranks, so a prompt prefills in one step.
+  the copied path from 16K-token prompts and slower at 4K to 8K. The config serves prompts up to the
+  model's own 65536 positions (greedy outputs were checked to 60K; the 64K and 128K rows measured time and
+  memory only). Chunked prefill is off on SP ranks, so a prompt prefills in one step.
 - Numerics: the Thinker's q/k RMSNorm and multimodal RoPE run in one kernel
   with the KV write, in fp32 throughout and rounded once, where the unfused ops
   (and Hugging Face) round to bf16 after the norm and after each step of the
   rotation: no less accurate, but not bit-exact. (A Thinker step that splits
-  over SP ranks runs unfused, through the exchange; a copied step keeps the fused kernel.) The code predictor (shared
+  over SP ranks runs unfused, through the exchange, and so does a copied prefill; a decode step keeps the fused kernel.) The code predictor (shared
   with Qwen3-TTS, see its notes) runs each projection with its RMSNorm folded
   in and its residual add in the same Triton kernel (``cp_linear``), and its
   attention as another (``cp_attend``), neither bit-exact with the unfused
