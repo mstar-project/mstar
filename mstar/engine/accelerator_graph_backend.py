@@ -46,6 +46,17 @@ class SplitGraph:
         return self.graphs[0].pool()
 
 
+def replay_graph(graph: CapturedGraph | SplitGraph, before_last_launch: Callable[[], None] | None = None) -> None:
+    """Replay ``graph``, running ``before_last_launch`` just before its last launch: before
+    the only one of a plain graph, before the second of a split one."""
+    if isinstance(graph, SplitGraph):
+        graph.replay(before_last_launch)
+        return
+    if before_last_launch is not None:
+        before_last_launch()
+    graph.replay()
+
+
 @dataclass
 class GraphCapture:
     """A capture running on this thread (`AcceleratorGraphBackend.capture`): the graphs it

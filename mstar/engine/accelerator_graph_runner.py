@@ -17,6 +17,7 @@ from mstar.engine.accelerator_graph_backend import (
     AcceleratorGraphPool,
     CapturedGraph,
     SplitGraph,
+    replay_graph,
 )
 from mstar.engine.accelerator_graph_config import (
     DEFAULT_CAPTURE_BATCH_SIZES,
@@ -1702,12 +1703,7 @@ class AcceleratorGraphRunner:
         # enqueue cost only. GPU-side duration comes from --cuda-graph-trace.
         if self._enable_nvtx:
             profiler.range_push(f"cg.replay.slot[{lease.slot}]")
-        if isinstance(slot.graph, SplitGraph):
-            slot.graph.replay(launching)
-        else:
-            if launching is not None:
-                launching()
-            slot.graph.replay()
+        replay_graph(slot.graph, launching)
         if self._enable_nvtx:
             profiler.range_pop()
         return slot.static_outputs
