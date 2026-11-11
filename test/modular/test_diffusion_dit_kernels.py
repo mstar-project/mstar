@@ -18,8 +18,8 @@ import torch.nn.functional as F
 from torch import nn
 
 from mstar.model.components.diffusion import modulation, qk_norm_rope
-from mstar.model.components.diffusion.qwen import dit_kernels
 from mstar.model.components.diffusion.ffn import gelu_tanh_ffn
+from mstar.model.components.diffusion.qwen import dit_kernels
 from mstar.model.components.mlp import MLP
 from mstar.model.components.norm import QwenRMSNorm
 from mstar.model.wan22.components.dit import Wan22RoPE3D
