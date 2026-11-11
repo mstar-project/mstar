@@ -292,6 +292,50 @@ def test_the_node_stores_the_carry_its_hosted_drafters_prefill_returns(tmp_path,
     assert torch.equal(stored[:2].to(carry.dtype), carry)
 
 
+def test_a_prompt_steps_carry_is_the_heads_output_at_each_prompts_last_row(tmp_path, monkeypatch):
+    """Over a packed step of prompts of different lengths, each row reads the next prompt token and each
+    prompt's last row the token the step sampled from it; the carry is the head's output at that last row.
+    The reference runs the head over every row with those tokens, in the same step, and takes the last rows
+    by the prompts' lengths."""
+    import qwen3_cpu
+
+    from mstar.model.components.eagle3 import CARRY_DTYPE, Eagle3Drafter
+
+    qwen3_cpu.patch_cpu(monkeypatch)
+    prompts = {1: [5, 9, 2, 7, 11, 3], 2: [17, 4, 8], 3: [6, 1, 14, 2, 10]}
+    ends = torch.tensor([len(p) for p in prompts.values()]).cumsum(0) - 1
+    seen = {}
+    real_prefill, real_head = Eagle3Drafter.prefill, Eagle3Drafter._head
+
+    def head(self, hidden, next_ids, keep=None):
+        seen.setdefault("following", next_ids.clone())
+        return real_head(self, hidden, next_ids, keep)
+
+    def prefill(self, inputs):
+        carry = real_prefill(self, inputs)
+        sampled = inputs.sampled.reshape(-1).tolist()
+        following = torch.tensor(sum((p[1:] + [s] for p, s in zip(prompts.values(), sampled, strict=True)), []))
+        seen.update(sampled=sampled, want_following=following,
+                    want=real_head(self, self._fused_taps(), following).index_select(0, ends).to(CARRY_DTYPE),
+                    carry=carry.clone())
+        return carry
+
+    monkeypatch.setattr(Eagle3Drafter, "_head", head)
+    monkeypatch.setattr(Eagle3Drafter, "prefill", prefill)
+    target, _ = qwen3_cpu.write_checkpoints(tmp_path)
+    model = qwen3_cpu.make_model(target, _cpu_eagle3(tmp_path), max_seq_len=512)
+    driver = qwen3_cpu.Driver(qwen3_cpu.engine(model), model)
+    for rid, prompt in prompts.items():
+        driver.add(rid, prompt, 8)
+    driver.prefill(list(prompts), prompts)
+
+    # the tokens the drafter read as sampled are the step's
+    assert seen["sampled"] == [driver.out[rid][0] for rid in prompts]
+    assert seen["following"].tolist() == seen["want_following"].tolist()
+    assert seen["carry"].shape == (len(prompts), model.drafter_decl.config.hidden_size)
+    torch.testing.assert_close(seen["carry"], seen["want"], rtol=1e-5, atol=1e-6)
+
+
 def test_a_carrying_drafter_whose_prefill_returns_none_is_refused(tmp_path, monkeypatch):
     """EAGLE-3 declares a carry, so a prefill that forgets to return it is refused while the step is
     traced, as an observe that returns none is."""
