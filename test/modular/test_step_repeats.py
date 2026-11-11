@@ -408,3 +408,32 @@ def test_a_device_run_ends_once_every_row_stopped_and_the_next_step_of_its_rows_
     first.replay()
     torch.cuda.synchronize()
     assert first.state.index.item() == 8
+def test_a_node_no_deployment_asked_to_repeat_replays_as_main():
+    """With ``step_repeats`` unset a decode step's forward is main's: the replay
+    alone, nothing of the repeat path around it (Qwen3.5 at c64 spent ~30 us a
+    step there)."""
+    replayed = BatchedModelOutput()
+
+    class Runner:
+        def __init__(self):
+            self.calls = []
+
+        def run_forward(self, lease, preprocessed, **kwargs):
+            self.calls.append("run_forward")
+            return replayed
+
+        def __getattr__(self, name):
+            self.calls.append(name)
+            return lambda *args: None
+
+    ctx = SimpleNamespace(graph_walk=WALK, resident=None, repeats=1, continues=None)
+    batch = SimpleNamespace(step_context=ctx, preplan_event=None)
+    inputs = SimpleNamespace(per_request_info={})
+    runner = Runner()
+    make_engine()._forward(batch, make_mgmt(), runner, inputs, {}, object(), True, [1])
+    assert runner.calls == ["run_forward"]
+
+    # a node a deployment asked to repeat takes its iterations from the repeat path
+    runner = Runner()
+    make_engine()._forward(batch, make_mgmt(may_repeat=True), runner, inputs, {}, object(), True, [1])
+    assert "repeat" in runner.calls
