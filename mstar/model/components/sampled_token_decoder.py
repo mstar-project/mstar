@@ -300,7 +300,8 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
         return engine_inputs.resources[SAMPLER].loopback_tokens(engine_inputs.request_ids)
 
     def last_token_hidden(self, engine_inputs: ModelInputsFromEngine, hidden: torch.Tensor) -> torch.Tensor:
-        """``hidden`` at each row's last token, picked by the plan of the attention resource under ``ATTN_KEY``."""
+        """``hidden`` (hidden states or token ids) at each row's last token, picked by the plan of the
+        attention resource under ``ATTN_KEY``."""
         return engine_inputs.resources[self.ATTN_KEY].select_last_hidden(hidden)
 
     def sample_tokens(self, engine_inputs: ModelInputsFromEngine, logits: torch.Tensor) -> torch.Tensor:
