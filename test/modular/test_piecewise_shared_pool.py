@@ -86,7 +86,7 @@ def test_run_without_a_graph_runs_the_region_eagerly_through_its_step():
 
     def declare(request_ids, seq_lens):
         seen["declared"] = (list(request_ids), list(seq_lens))
-        return mock.Mock()
+        return mock.Mock(state=None)
 
     step_runner = mock.Mock()
     step_runner.admit.return_value = ADMIT_OK
@@ -160,7 +160,7 @@ def test_run_without_a_graph_declares_each_labeled_layout():
 
     def declare(request_ids, seq_lens, label_seq_lens=None):
         seen["labels"] = label_seq_lens
-        return mock.Mock()
+        return mock.Mock(state=None)
 
     step_runner = mock.Mock()
     step_runner.admit.return_value = ADMIT_OK

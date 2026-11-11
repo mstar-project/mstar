@@ -907,6 +907,8 @@ class NodeSubmodule(torch.nn.Module, ABC):
         # embedder, scratch caches), bound once at load. Empty until then
         # and on engines that build none.
         self.node_resources: dict[str, Any] = {}
+        # This node's handles on its declared state (`mstar.engine.state`), bound once at load.
+        self.state_handles: Mapping[str, Any] = {}
 
     def bind_node_resources(self, resources: dict[str, Any]) -> None:
         """Receive the engine-built resources for this submodule's node, and
@@ -930,6 +932,15 @@ class NodeSubmodule(torch.nn.Module, ABC):
         from mstar.model.components.lora.modules import bind_module_lora
 
         bind_module_lora(self, resources)
+
+    def bind_node_state(self, handles: Mapping[str, Any]) -> None:
+        """Receive this node's state handles, by declared name, and pass them to each module with a ``bind_state``:
+        the layers that call them and the submodule itself."""
+        self.state_handles = handles
+        for module in self.modules():
+            bind = getattr(module, "bind_state", None)
+            if bind is not None:
+                bind(handles)
 
     def cg_key_info(
         self, graph_walk: str,
@@ -1546,9 +1557,14 @@ def with_segment_steps(step: SubmoduleStep | None, keys: Sequence[str]) -> Submo
 def engine_step(submodule, *args, **kwargs) -> SubmoduleStep | None:
     """What the engine calls for a node's step: its ``declare_step``, with a step of its
     segments under each resource that takes them as they are (``with_segment_steps``),
-    so a model declares nothing for such a resource (a LoRA pool)."""
+    so a model declares nothing for such a resource (a LoRA pool), and what it declares
+    about its state expanded (``state_steps``)."""
     # the engine drives duck-typed submodules too
-    return with_segment_steps(submodule.declare_step(*args, **kwargs), getattr(submodule, "segment_keys", ()))
+    step = with_segment_steps(submodule.declare_step(*args, **kwargs), getattr(submodule, "segment_keys", ()))
+    # Imported here because the adapters load the resources' Triton kernels, which importing mstar.model must not need.
+    from mstar.engine.state.adapters import state_steps
+
+    return state_steps(step, getattr(submodule, "state_handles", {}))
 
 
 class ARNodeSubmodule(NodeSubmodule):
@@ -1563,6 +1579,14 @@ class ARNodeSubmodule(NodeSubmodule):
     # Set by a submodule whose decode walk reads its last sampled token back on
     # the device; the loop-back hooks below follow from it.
     device_loopback: DeviceLoopback | None = None
+
+    def bind_node_state(self, handles: Mapping[str, Any]) -> None:
+        super().bind_node_state(handles)
+        loopback = self.device_loopback
+        sampler = None if loopback is None else handles.get(loopback.sampler)
+        if sampler is not None and sampler.sampler.draws > 1:
+            raise ValueError(f"Sampler {loopback.sampler!r}: a device loop-back reads one token per step, and draws "
+                             f"is {sampler.sampler.draws}")
 
     def _loops_back(self, graph_walk: str) -> bool:
         """Whether this walk's token loops back on the device."""

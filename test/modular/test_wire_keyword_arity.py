@@ -48,7 +48,7 @@ def test_no_call_passes_a_keyword_its_dataclass_does_not_have():
         path: ast.parse(path.read_text(), filename=str(path))
         for path in ROOT.rglob("*.py") if "/tests/" not in path.as_posix()
     }
-    # A name two classes share resolves to neither: the state contract's Window repeats another, for example.
+    # A name two classes share resolves to neither, as the state contract's Sampler and Window do.
     defined = Counter(
         node.name for tree in trees.values() for node in ast.walk(tree) if isinstance(node, ast.ClassDef)
     )

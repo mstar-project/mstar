@@ -28,6 +28,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from mstar.engine.resources.convenience import AttentionCallable
+from mstar.engine.state import rope
 from mstar.model.components.norm import RMSNorm
 
 
@@ -52,6 +53,7 @@ class Attention(nn.Module):
         attn_key: str = "attn",
         kv_key: str = "kv",
         pos_key: str | None = "rope",
+        layer: int | None = None,
     ):
         super().__init__()
         # Resource labels this layer calls, as the model declared them in
@@ -64,6 +66,10 @@ class Attention(nn.Module):
         self.attn = None
         self.kv = None
         self.pos = None
+        # the model's id for this layer, a plain attribute that `.to(device)` leaves on the CPU, and its handle where
+        # the model declares the array
+        self.layer = None if layer is None else torch.tensor(layer, device="cpu")
+        self.state = None
 
         self.hidden_size = hidden_size
         self.num_heads = num_heads
@@ -154,6 +160,18 @@ class Attention(nn.Module):
         # into a traced function, so nothing specializes on its identity.
         self.attend = AttentionCallable(kv=self.kv, attn=self.attn)
 
+    def bind_state(self, handles: dict) -> None:
+        """Take the handle on this layer's array, where the model declares it, whose calls then replace the
+        resources'. See ``NodeSubmodule.bind_node_state``."""
+        self.state = handles.get(self._kv_key)
+
+    def _attend_state(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        # The declared `Rope` picks the kernel here, so this layer's ``rope_*`` arguments have no effect on this path.
+        if self._pos_key is not None:
+            q, k = rope(self.state, q, k)
+        self.state.add(self.layer, k=k, v=v)
+        return self.state.read(self.layer, q)
+
     def _apply_rope(
         self,
         q: torch.Tensor, k: torch.Tensor, label: str,
@@ -184,8 +202,11 @@ class Attention(nn.Module):
         num_tokens = hidden_states.shape[0]
         q, k, v = self._project_qkv(hidden_states)
         q, k = self._apply_qk_norm(q, k)
-        q, k = self._apply_rope(q, k, self.attend.label)
-        attn_output = self.attend(q, k, v)
+        if self.state is not None:
+            attn_output = self._attend_state(q, k, v)
+        else:
+            q, k = self._apply_rope(q, k, self.attend.label)
+            attn_output = self.attend(q, k, v)
         attn_output = attn_output.reshape(num_tokens, self.num_heads * self.head_dim)
         return self.o_proj(attn_output)
 
