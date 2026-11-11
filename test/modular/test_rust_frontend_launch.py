@@ -78,6 +78,29 @@ def test_the_websocket_facts_are_the_launchers_and_never_inherited(launched, mon
     assert json.loads(env["MSTAR_REALTIME"]) == realtime
 
 
+def test_the_chat_template_facts_are_the_launchers_and_never_inherited(launched, monkeypatch):
+    import json
+
+    monkeypatch.setenv("MSTAR_CHAT_TEMPLATE", '{"always_thinks": true}')
+    rust_frontend.launch_rust_server("bin", "kokoro", 8000, "/b", "/u")
+    assert "MSTAR_CHAT_TEMPLATE" not in launched["env"]
+    facts = {"always_thinks": False, "template_kwargs": ["enable_thinking"]}
+    rust_frontend.launch_rust_server("bin", "glm52", 8000, "/b", "/u", chat_template=facts)
+    assert json.loads(launched["env"]["MSTAR_CHAT_TEMPLATE"]) == facts
+
+
+def test_the_chat_template_facts_are_the_glm_adapters():
+    from mstar.api_server.openai.adapters import get_adapter
+    from mstar.model.multimodal import GLM_TEMPLATE_KWARGS
+
+    keys = list(GLM_TEMPLATE_KWARGS)
+    facts = rust_frontend.chat_template_facts
+    assert facts(get_adapter("glm52")) == {"always_thinks": False, "template_kwargs": keys}
+    assert facts(get_adapter("glm5_next")) == {"always_thinks": True, "template_kwargs": keys}
+    assert facts(get_adapter("ripple_65b")) is None
+    assert facts(None) is None
+
+
 def test_mstar_server_gets_the_libsndfile_soundfile_loaded(launched, monkeypatch):
     monkeypatch.setenv("MSTAR_LIBSNDFILE", "/stale/libsndfile.so")
     monkeypatch.setattr(rust_frontend, "soundfile_library", lambda: None)
@@ -128,3 +151,34 @@ def test_realtime_facts_carry_what_a_conversation_reads_off_the_model(tmp_path):
     assert rust_frontend.realtime_facts(server, None, str(tmp_path)) == {
         "conversation": {"streams": 1, "turn_tokens": False, "channels": 1}}
     assert rust_frontend.realtime_facts(SimpleNamespace(model=_Duplex(), client_audio=[]), None, str(tmp_path)) is None
+
+
+@pytest.mark.parametrize("signame", ["SIGINT", "SIGTERM"])
+def test_the_bridge_stops_on_a_signal_even_with_sigint_ignored(tmp_path, signame):
+    """As uvicorn stops on either: a server started as a background job inherits
+    SIGINT ignored, where asyncio.run would leave the bridge's loop running."""
+    import signal
+    import subprocess
+    import sys
+    import time
+
+    pytest.importorskip("mstar_rust")
+    script = (
+        "import signal, sys, types\n"
+        # what a background job inherits; the bridge is built after, as it is in a launched server
+        "signal.signal(signal.SIGINT, signal.SIG_IGN)\n"
+        "from mstar.api_server.rust_frontend import RustFrontendBridge\n"
+        f"bridge = RustFrontendBridge(types.SimpleNamespace(), {str(tmp_path)!r})\n"
+        "print('serving', flush=True)\n"
+        "bridge.run()\n"
+        "print('stopped', flush=True)\n"
+    )
+    proc = subprocess.Popen([sys.executable, "-c", script], stdout=subprocess.PIPE, text=True)
+    try:
+        assert proc.stdout.readline().strip() == "serving"
+        time.sleep(0.5)  # the loop is running
+        proc.send_signal(getattr(signal, signame))
+        out, _ = proc.communicate(timeout=10)
+    finally:
+        proc.kill()
+    assert "stopped" in out and proc.returncode == 0

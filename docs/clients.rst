@@ -485,13 +485,14 @@ Endpoints and model coverage:
      - Text chat (streaming + non-streaming). Qwen3-Omni can also emit speech, in
        ``audio.format`` ``wav`` (default), ``pcm16``, or ``mp3`` / ``flac`` / ``opus`` with
        the ``audio`` extra; streamed audio is ``pcm16``. The GLMs take ``tools`` and return
-       ``reasoning_content`` and ``tool_calls`` (not on ``--rust-frontend``). ``n`` or
-       ``best_of`` above 1, ``stop`` (the GLMs serve it, see :ref:`coding-agents`), ``stop_token_ids``, ``logprobs``,
-       ``top_logprobs``, ``logit_bias``, ``presence_penalty`` / ``frequency_penalty`` and a
-       ``response_format`` other than text are refused. ``user``, ``store``, ``metadata`` and
-       ``service_tier`` are accepted and have no effect, and so is ``parallel_tool_calls``
-       except on the GLMs, where ``false`` ends the reply at its first call; a stream ends
-       with a usage chunk when ``stream_options`` sets ``include_usage``.
+       ``reasoning_content`` and ``tool_calls`` (the deprecated ``functions`` and
+       ``function_call`` are a 400). ``n`` or ``best_of`` above 1, ``stop`` (the GLMs serve it,
+       strings of at most 256 characters; see :ref:`coding-agents`), ``stop_token_ids``,
+       ``logprobs``, ``top_logprobs``, ``logit_bias``, ``presence_penalty`` /
+       ``frequency_penalty`` and a ``response_format`` other than text are refused. ``user``,
+       ``store``, ``metadata`` and ``service_tier`` are accepted and have no effect, and so is
+       ``parallel_tool_calls`` except on the GLMs, where ``false`` ends the reply at its first
+       call; a stream ends with a usage chunk when ``stream_options`` sets ``include_usage``.
    * - ``POST /v1/messages``, ``POST /v1/messages/count_tokens``
      - ``glm52``, ``glm5_next``
      - Anthropic's Messages API, for Claude Code: streamed or whole, tools, thinking blocks
@@ -763,9 +764,11 @@ and tool calls split out, streamed or whole. Any ``model`` name gets the loaded 
 stateless.
 
 - **Stop strings.** ``stop`` (chat completions, at most 4) and ``stop_sequences`` (Messages,
-  at most 16 of at most 256 characters) match the answer only, not the reasoning or a call's arguments. The first to appear ends
-  the reply before it (``finish_reason: "stop"``, ``stop_reason: "stop_sequence"``) and stops
-  the request in the engine.
+  at most 16), each of at most 256 characters, match the answer only, not the reasoning or a
+  call's arguments. The first to appear ends the reply before it (``finish_reason: "stop"``,
+  ``stop_reason: "stop_sequence"``) and stops the request in the engine.
+- **Tools.** ``tools`` and ``tool_choice``; the deprecated ``functions`` and
+  ``function_call`` are a ``400``.
 - **Forced calls.** ``tool_choice`` ``"required"`` or a named function (Messages: ``any`` or
   ``tool``) ends the prompt with the opening of the call, so the reply is that call, without
   reasoning: asking for thinking as well is a ``400``. With several tools, ``"required"``

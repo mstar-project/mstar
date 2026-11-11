@@ -265,12 +265,19 @@ const CHAT_ENVELOPE_FIELDS: [&str; 6] =
 /// call. The rules are `_refuse_unserved_chat` in
 /// `api_server/openai/adapters.py`. `mk` is the request's passthrough; an off
 /// value of one of these fields (`logprobs: false`, `tools: []`) is dropped
-/// from it, before any `chat_template_kwargs` key is merged in.
-pub(super) fn refuse_unserved_chat(req: &ChatCompletionRequest, mk: &mut BTreeMap<String, Value>) -> Result<(), String> {
+/// from it, before any `chat_template_kwargs` key is merged in. An adapter
+/// that serves tool calls keeps the tool fields and `parallel_tool_calls` and
+/// checks them itself; one that serves stop strings takes `stop`.
+pub(super) fn refuse_unserved_chat(
+    req: &ChatCompletionRequest,
+    mk: &mut BTreeMap<String, Value>,
+    serves_tool_calls: bool,
+    serves_stop_strings: bool,
+) -> Result<(), String> {
     if let Some(n) = req.n.filter(|&n| n != 1) {
         return Err(format!("n={n}: this model returns one choice"));
     }
-    if req.stop.as_ref().is_some_and(truthy) {
+    if !serves_stop_strings && req.stop.as_ref().is_some_and(truthy) {
         return Err(
             "stop sequences are not supported; the reply ends at a stop token or max_tokens".to_string(),
         );
@@ -307,16 +314,23 @@ pub(super) fn refuse_unserved_chat(req: &ChatCompletionRequest, mk: &mut BTreeMa
         Some(Value::String(c)) => c != "none" && c != "auto",
         Some(_) => true,
     };
-    if (listed("tools") && !says_none("tool_choice"))
-        || (listed("functions") && !says_none("function_call"))
-        || choice
-        || function_call
+    if !serves_tool_calls
+        && ((listed("tools") && !says_none("tool_choice"))
+            || (listed("functions") && !says_none("function_call"))
+            || choice
+            || function_call)
     {
         return Err("tool calling is not supported for this model".to_string());
     }
-    let off = ["best_of", "response_format", "tools", "tool_choice", "functions", "function_call"];
-    for name in UNSERVED_CHAT_FIELDS.iter().chain(&off).chain(&CHAT_ENVELOPE_FIELDS) {
+    let tool_fields: &[&str] =
+        if serves_tool_calls { &[] } else { &["tools", "tool_choice", "functions", "function_call"] };
+    for name in UNSERVED_CHAT_FIELDS.iter().chain(&["best_of", "response_format"]).chain(tool_fields) {
         mk.remove(*name);
+    }
+    for name in CHAT_ENVELOPE_FIELDS {
+        if !(serves_tool_calls && name == "parallel_tool_calls") {
+            mk.remove(name);
+        }
     }
     Ok(())
 }

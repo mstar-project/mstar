@@ -353,6 +353,8 @@ def test_quality_is_scored_after_the_sessions_unless_stress_replaced_the_cases(t
     monkeypatch.setattr(arm, "job", job)
     monkeypatch.setattr(arm, "out", tmp_path)
     monkeypatch.setattr(arm, "build_rust", lambda a: None)
+    monkeypatch.setattr(arm.shutil, "which", lambda name: f"/usr/bin/{name}")   # every arm builds mstar-server
+    monkeypatch.setattr(arm, "build_rust_server", lambda a: None)
     monkeypatch.setattr(arm, "requirements_problem", lambda a: "")
     monkeypatch.setattr(arm, "run_arm", lambda name, s: {"healthy": True, "mstar_from_arm_src": True})
     monkeypatch.setattr(arm, "score_quality", lambda: calls.append("quality"))

@@ -176,6 +176,8 @@ def _passthrough(req) -> dict:
 # model_kwargs, so a client that sends it on every call (LiveKit's
 # ``stream_options``) is not logged as ignoring it. Dynamo's bridge strips the same.
 CHAT_ENVELOPE_KEYS = ("stream_options", "parallel_tool_calls", "user", "store", "metadata", "service_tier")
+# the longest stop string a chat takes, in characters (mstar-server's ``MAX_STOP_CHARS``)
+MAX_STOP_CHARS = 256
 
 
 def _refuse_tool_calls(mk: dict) -> None:
@@ -1736,7 +1738,8 @@ class TextChatAdapter(OpenAIAdapter):
 
     def stop_strings(self, req: ChatCompletionRequest) -> list[str]:
         """``stop``, as OpenAI takes it: a string or up to 4. The serving layer
-        matches them on the decoded answer and ends the request at the first."""
+        matches them on the decoded answer and ends the request at the first;
+        their length is capped, as every token is matched against each."""
         if not self.serves_stop_strings:
             return []
         stops = [req.stop] if isinstance(req.stop, str) else list(req.stop or [])
@@ -1744,6 +1747,8 @@ class TextChatAdapter(OpenAIAdapter):
             raise ValueError(f"stop takes at most 4 strings, got {len(stops)}")
         if "" in stops:
             raise ValueError("a stop string cannot be empty")
+        if any(len(s) > MAX_STOP_CHARS for s in stops):
+            raise ValueError(f"a stop string takes at most {MAX_STOP_CHARS} characters")
         return stops
 
 
@@ -1824,6 +1829,10 @@ class GlmChatAdapter(TextChatAdapter):
         the function's name, or ``""`` for the model to name one."""
         if "reply_prefix" in mk:
             raise ValueError("reply_prefix is not a request field; tool_choice sets it")
+        # the deprecated names of tools and tool_choice: an off value drops
+        functions, function_call = mk.pop("functions", None), mk.pop("function_call", None)
+        if functions not in (None, []) or function_call not in (None, "none", "auto"):
+            raise ValueError("functions and function_call are not served; send tools and tool_choice")
         # false ends the reply at its first call (the parser's single_call); read, not sent on
         parallel = mk.pop("parallel_tool_calls", None)
         if parallel is not None and not isinstance(parallel, bool):
