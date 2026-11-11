@@ -101,18 +101,23 @@ def test_qwen3_5_stack_with_adapters_compiles_and_matches_eager(qwen_adapters):
     plain, _, plain_rows = _llm(qwen_adapters, with_pool=False)
     plain_rows.lengths = rows.lengths
 
-    def breaks(model):
+    tables = Q.no_rope(llm.model.model, x.shape[0])
+
+    def breaks(model, model_rows):
         torch._dynamo.reset()
-        return torch._dynamo.explain(lambda x: model.model.model(x, label="main"))(x).graph_break_count
+        with Q.step_over(model, model_rows):
+            return torch._dynamo.explain(lambda x: model.model.model(x, cos_sin=tables))(x).graph_break_count
 
     def fwd(x):
-        return llm.model.model(x, label="main")
+        return llm.model.model(x, cos_sin=tables)
 
     with torch.no_grad():
-        assert breaks(llm) == breaks(plain)
-        eager = fwd(x)
+        assert breaks(llm, rows) == breaks(plain, plain_rows)
+        with Q.step_over(llm, rows):
+            eager = fwd(x)
         torch._dynamo.reset()
-        compiled = torch.compile(fwd, backend="inductor")(x)
+        with Q.step_over(llm, rows):
+            compiled = torch.compile(fwd, backend="inductor")(x)
     # the stack without LoRA differs between eager and Inductor by ~1e-6 on its own
     torch.testing.assert_close(compiled, eager, rtol=1e-5, atol=1e-5)
 

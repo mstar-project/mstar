@@ -3,7 +3,9 @@
 
 usage: gpu_health.py [--seconds 60]      (runs on the box; needs any python with torch)
 
-Only the GPUs this process can see are loaded and judged, numbered as torch numbers them.
+Only the GPUs this process can see are loaded and judged, numbered as torch numbers them. It reads
+NVIDIA's throttle reasons, so on ROCm it checks nothing and says so: give every perf cell on that box
+the caveat.
 
 A TP/SP instance runs at the pace of its slowest rank, so one badly cooled GPU slows every
 engine on the box, by a different amount for each, and invalidates absolute and relative
@@ -39,6 +41,12 @@ def visible_uuids() -> list[str]:
     return [str(torch.cuda.get_device_properties(i).uuid) for i in range(torch.cuda.device_count())]
 
 
+def on_rocm() -> bool:
+    import torch
+
+    return bool(torch.version.hip)
+
+
 def sample(uuids: list[str]) -> list[tuple[int, int, int, int]]:
     """(torch index, temperature, SM clock, throttle reasons) of each GPU the burn loaded."""
     out = subprocess.run(
@@ -62,6 +70,10 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--seconds", type=int, default=60)
     args = ap.parse_args()
+    if on_rocm():
+        print("unchecked: gpu_health.py reads NVIDIA's throttle reasons, and this is a ROCm box. Every perf cell "
+              "here carries that caveat.")
+        return 0
     stop = threading.Event()
     uuids = visible_uuids()
     sample(uuids)  # a GPU nvidia-smi can't match exits here, before anything is loaded

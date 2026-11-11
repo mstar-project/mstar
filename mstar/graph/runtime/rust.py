@@ -302,6 +302,9 @@ class RustGraphRuntime(GraphRuntime):
 
     supports_inline_emit = True
 
+    def set_inline_streams(self, keys: frozenset[tuple[str, str]]) -> None:
+        self._rust.set_inline_streams(sorted(keys))
+
     # --------- Bookkeeping ----------
 
     def set_node_metadata(
@@ -680,6 +683,15 @@ class RustGraphRuntime(GraphRuntime):
                     out.local_streaming_signals,
                     out.local_streaming_rids,
                     out.local_streaming_uuids,
+                    strict=True,
+                )
+            },
+            local_stream_values_by_signal={
+                name: ParallelList(rids, values)
+                for name, rids, values in zip(
+                    out.local_stream_value_signals,
+                    out.local_stream_value_rids,
+                    out.local_stream_values,
                     strict=True,
                 )
             },
