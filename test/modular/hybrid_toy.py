@@ -32,6 +32,7 @@ from mstar.engine.resources.draft.drafter import (
     Drafter,
     DrafterDecl,
     DrafterNeeds,
+    TargetOutput,
     VerifyNode,
     drafter_resources,
 )
@@ -350,7 +351,7 @@ class HybridLM(ARNodeSubmodule):
         if not self.verifies:
             tokens = self._draw(engine_inputs, self.net(ids.view(n)))
             return BatchedModelOutput(row_outputs={"new_token": tokens}, check_stop_buffers={"new_token": tokens})
-        result = self.draft_verify_step(engine_inputs, ids.view(n), self.net)
+        result = self.draft_verify_step(engine_inputs, ids.view(n), lambda block: TargetOutput(self.net(block)))
         return self.verify_output(result)
 
     @torch.compiler.disable
