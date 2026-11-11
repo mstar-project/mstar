@@ -43,6 +43,9 @@ class Usage:
     completion: int = 0
     # ``length`` once the closing chunk says the reply used its whole budget
     finish_reason: str = "stop"
+    # of ``completion``, the tokens of the chunks that began inside the
+    # reasoning (the one that closes it too; under MTP a chunk can straddle)
+    reasoning: int = 0
 
     def close(self, reported: dict) -> None:
         """Takes the closing ``usage`` chunk's metadata."""
@@ -218,6 +221,8 @@ async def _events(batches, served, parser, stops, usage):
                     usage.completion += c.num_tokens
                     if c.prompt_tokens is not None:
                         usage.prompt = c.prompt_tokens
+                    if parser is not None and parser.reasoning:
+                        usage.reasoning += c.num_tokens
                     piece = text.feed(c.data)
                     if not piece:
                         continue
