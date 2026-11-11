@@ -103,14 +103,14 @@ def node_resources(model: "Model", *, setup: "StateSetup | None" = None) -> list
 
 
 def _with_walks(model: "Model", declarations: Sequence[Array | Sampler], setup: "StateSetup") -> "StateSetup":
-    """``setup`` with ``model``'s `Walks`, each built only where an array needs it, since building the walk graphs can
-    read checkpoints: the nodes each walk runs for an array on several nodes, and the combined walks for an array whose
-    reads differ by walk."""
-    arrays = [declared for declared in declarations if isinstance(declared, Array)]
+    """``setup`` with ``model``'s `Walks`. Building the walk graphs can read checkpoints, so each field is built only
+    when an array's storage takes it: the nodes each walk runs, for a pool on several nodes, and the combined walks, for
+    an array whose reads differ by walk."""
+    held = [(storage_of(declared), declared) for declared in declarations if isinstance(declared, Array)]
     nodes = EMPTY
-    if any(len(array.nodes) > 1 for array in arrays):
+    if any(storage.takes_leader and len(array.nodes) > 1 for storage, array in held):
         nodes = {walk: frozenset(graph.get_nodes()) for walk, graph in model.get_graph_walk_graphs().items()}
-    combined = model.get_combined_graph_walks() if any(reads_differ_by_walk(array) for array in arrays) else EMPTY
+    combined = model.get_combined_graph_walks() if any(storage.takes_combined_walks for storage, _ in held) else EMPTY
     return replace(setup, walks=Walks(nodes, combined))
 
 
@@ -1555,6 +1555,10 @@ class Storage(ABC):
     kernel_settings: ClassVar[frozenset[str]] = frozenset()
     # whether an array here may be seq_sharded, so its calls carry a rank's share of a step's tokens
     takes_seq_sharded: ClassVar[bool] = False
+    # whether a pool here on several nodes takes its leader from the nodes each walk runs
+    takes_leader: ClassVar[bool] = False
+    # whether an array here reads by walk, so a combined walk takes its reads from the walks it batches
+    takes_combined_walks: ClassVar[bool] = False
 
     def __init__(self):
         # `state_steps` reaches a handle's storage, for its step builder, through the handle's class
@@ -1600,6 +1604,7 @@ class PagedStorage(Storage):
 
     handle_class = PagedArrayHandle
     kernel_settings = frozenset({"max_num_pages"})
+    takes_leader = True
 
     def resolve(self, arrays: Sequence[Array], declared: Sequence[Array], setup: "StateSetup") -> Resolved:
         resolved = Resolved({}, {}, {}, {})
@@ -1712,6 +1717,7 @@ class PagedByWalkStorage(PagedStorage):
     walk those of the walks it batches."""
 
     handle_class = PagedByWalkHandle
+    takes_combined_walks = True
 
     def resolve(self, arrays: Sequence[Array], declared: Sequence[Array], setup: "StateSetup") -> Resolved:
         resolved = super().resolve(arrays, declared, setup)
@@ -1909,8 +1915,7 @@ SDPA: dict[tuple[Storage, type[Op]], OpBinding] = {(WITHIN_STEP, Attend): SdpaAt
 
 class Walks(NamedTuple):
     """The model's walks, where a storage needs them: the nodes each walk runs, from which a pool on several nodes takes
-    its leader, and each node's combined walks with the walks each batches, through which a read that differs by walk
-    finds the read of a combined walk."""
+    its leader, and each node's combined walks, with the walks each batches, which give a combined walk its reads."""
 
     nodes: Mapping[str, frozenset[str]] = EMPTY
     combined: Mapping[str, Mapping[str, Collection[str]]] = EMPTY
