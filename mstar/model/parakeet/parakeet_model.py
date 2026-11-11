@@ -42,10 +42,11 @@ import torch
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import DEFAULT_PARTITION, PartitionDefinition
 from mstar.engine.resources import NodeResourceSpec
+from mstar.engine.resources.kv.bounded import BoundedKVSpec
 from mstar.engine.resources.recurrent import RecurrentStateConfig, RecurrentStateSpec
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import Model, ProcessPromptOutput, WalkStep
+from mstar.model.base import Model, ProcessPromptOutput, WalkStep, serving_resources
 from mstar.model.components.audio_features import HOP_LENGTH, SAMPLE_RATE, clip_samples
 from mstar.model.parakeet.config import (
     AUDIO_IN,
@@ -200,6 +201,28 @@ class ParakeetModel(Model):
                 f"{cap + 1} slots of resources.{TRANSDUCER_STATE} (one each and the sink), which has "
                 f"{slots}; raise max_slots or lower max_concurrent_requests"
             )
+        if not self.live:
+            return
+        # a live call also holds a slot in each stream pool of the encoder
+        try:
+            specs = serving_resources(self, config)
+        except ValueError:
+            return  # a `resources:` block the validation's resource checks report
+        for spec in specs:
+            if spec.resource_key == TRANSDUCER_STATE:
+                continue
+            if isinstance(spec, RecurrentStateSpec):
+                held = spec.config.usable_slots
+            elif isinstance(spec, BoundedKVSpec):
+                held = spec.config.max_slots
+            else:
+                continue
+            if held < cap:
+                raise ValueError(
+                    f"{config_path}: {cap} concurrent requests (max_concurrent_requests) need as many "
+                    f"slots in resources.{spec.resource_key}, which holds {held}; raise its max_slots "
+                    "or lower max_concurrent_requests"
+                )
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         decode = Loop(
