@@ -187,8 +187,10 @@ def _qwen3_5_reference(config, encoders=()) -> list:
         SamplerSpec(
             resource_key=SAMPLER, nodes={"LLM"}, vocab_size=config.vocab_size, enable_repetition_penalty=True,
         ),
-        SeqShardSpec(LLM_SHARD, {"LLM"}, labels=("main",), axis=0, walks=(PREFILL_TEXT, *media_walk_names(encoders), MIXED),
-                     exchange="none"),
+        SeqShardSpec(
+            LLM_SHARD, {"LLM"}, labels=("main",), axis=0, walks=(PREFILL_TEXT, *media_walk_names(encoders), MIXED),
+            exchange="none",
+        ),
     ]
 
 
