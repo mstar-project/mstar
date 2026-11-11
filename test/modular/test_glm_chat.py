@@ -260,6 +260,16 @@ def _chat(**body):
     return ChatCompletionRequest(model="glm52", **body)
 
 
+def test_a_null_switch_is_unset_for_the_reply_too(tmp_path):
+    """A flat ``enable_thinking: null`` reaches the template as unset, so GLM-5.2
+    reasons, and the reply is split as one that reasons."""
+    adapter = adapters.get_adapter("glm52")
+    req = _chat(enable_thinking=None)
+    assert "enable_thinking" not in adapter.chat_to_request(req, tmp_path).model_kwargs["chat_template_kwargs"]
+    message = _message(adapter.make_output_parser(req), "Two plus two.</think>\n\nIt is 4.")
+    assert (message["reasoning_content"], message["content"]) == ("Two plus two.", "It is 4.")
+
+
 def test_adapter_sends_messages_tools_and_template_switches(tmp_path):
     adapter = adapters.get_adapter("glm52")
     req = _chat(tools=[WEATHER], tool_choice="auto", enable_thinking=False,
