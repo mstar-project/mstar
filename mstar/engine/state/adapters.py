@@ -786,20 +786,24 @@ class HostValueHandle(ArrayHandle):
         if not declared.keep:
             raise self._refusal("a host write on a step that keeps nothing, which has no commit to apply it at")
         for (row, label, layer), written in declared.host.items():
-            where = f"a host write on row {row}, label {label!r}, layer {layer}"
             if not ctx.is_real_row(row):
-                raise self._refusal(f"{where}, and that row isn't one of the step's requests")
+                raise self._write_refusal(row, label, layer, ", and that row isn't one of the step's requests")
             if label not in self.array.labels or layer not in self.array.layers:
-                raise self._refusal(f"{where}, and the array declares labels {sorted(self.array.labels)} and layers "
-                                    f"{sorted(self.array.layers)}")
+                raise self._write_refusal(row, label, layer, f", and the array declares labels "
+                                          f"{sorted(self.array.labels)} and layers {sorted(self.array.layers)}")
             if not self.host_fields.is_open(row):
-                raise self._refusal(f"{where}, and that request has no open fields")
+                raise self._write_refusal(row, label, layer, ", and that request has no open fields")
             for field, value in written.items():
                 kind = self.array.entry.host.get(field)
                 if kind is None:
-                    raise self._refusal(f"{where}: field {field!r} isn't declared, of {sorted(self.array.entry.host)}")
+                    raise self._write_refusal(row, label, layer, f": field {field!r} isn't declared, of "
+                                              f"{sorted(self.array.entry.host)}")
                 if not is_host_value(value, kind):
-                    raise self._refusal(f"{where}: field {field!r} takes {kind}, and got {value!r}")
+                    raise self._write_refusal(row, label, layer, f": field {field!r} takes {kind}, and got {value!r}")
+
+    def _write_refusal(self, row: int, label: str, layer: int, cause: str) -> ValueError:
+        # built only on a refusal: every row of every step passes the checks above
+        return self._refusal(f"a host write on row {row}, label {label!r}, layer {layer}{cause}")
 
     def commit_step(self, step) -> None:
         self.host_fields.commit(self.array, step.state[self.name], step.ctx.request_ids)
