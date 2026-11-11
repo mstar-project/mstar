@@ -2061,7 +2061,14 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             # policy -- or all two-branch), so one plan covers the batch. Modes
             # and embodiment domains may differ: each request's masks, scheduler
             # and domain-aware action projection are applied per request.
-            return len({st["uncond"] is not None for st in sts}) == 1
+            # Rows must also agree on whether this step guides: a batch runs
+            # both branches for every row once any row is inside its
+            # guidance_interval, which doubles the work of the rows outside it.
+            infos = [self._gen_step_info(inp) for inp in model_inputs]
+            return (
+                len({st["uncond"] is not None for st in sts}) == 1
+                and len({info.cfg_active for info in infos}) == 1
+            )
         return False
 
     def max_batch_size(self, graph_walk: str):
