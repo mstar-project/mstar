@@ -230,3 +230,17 @@ def test_the_kv_write_op_passes_opcheck():
         torch.zeros(3, device="cuda", dtype=torch.int32), torch.arange(3, device="cuda", dtype=torch.int32),
         3, 1e-6, 1e-6, THETA,
     ))
+
+
+def test_fused_norm_helpers_refuse_a_gemma_norm():
+    """The fused kernels scale by ``weight``; a Gemma-style norm scales by ``1 + weight``."""
+    from types import SimpleNamespace
+
+    from mstar.engine.resources.convenience import AttentionCallable
+    from mstar.model.components.norm import RMSNorm
+
+    attend = AttentionCallable(SimpleNamespace(), SimpleNamespace(requires_kv_write=False))
+    q, k, v = torch.zeros(1, HQ, D), torch.zeros(1, HKV, D), torch.zeros(1, HKV, D)
+    norm = RMSNorm(D, gemma_mode=True)
+    with pytest.raises(ValueError, match="gemma_mode"):
+        attend.norm_rope_attend(q, k, v, norm, norm, torch.zeros(1, dtype=torch.long), THETA)
