@@ -263,7 +263,7 @@ def test_a_kv_pool_without_the_slack_is_refused():
     assert node_problems(decl, decl.token_stop, specs, False, max_seq_len=64) == problems
 
 
-def _fit(needs=None, target=None, tap_size=16, more_taps=False, **drafter):
+def _fit(needs=None, target=None, tap_size=16, more_taps=False, tap_nodes=None, **drafter):
     """A verifying node that declares a drafter, its specs: a fit unless a test says otherwise."""
     from mstar.engine.resources.draft.drafter import ModelGeometry
     from mstar.engine.resources.kv.config import KVLayerSet
@@ -276,7 +276,7 @@ def _fit(needs=None, target=None, tap_size=16, more_taps=False, **drafter):
     specs = _specs(
         kv_cache=KVSpec("kv_cache", {NODE}, pool, draft_slack=8),
         rope=PositionSpec("rope", {NODE}, PositionConfig(kv_cache="kv_cache", rope_theta=1e4)),
-        taps=TapSpec("taps", {NODE}, layers=(1,), hidden_size=tap_size),
+        taps=TapSpec("taps", tap_nodes or {NODE}, layers=(1,), hidden_size=tap_size),
         **({"extra": TapSpec("extra", {NODE}, layers=(0,), hidden_size=tap_size)} if more_taps else {}),
     )
     kw = dict(taps=(1,), tap_key="taps", kv=KVLayerSet("kv_cache", "drafter", 1, 2, 8), geometry=geometry)
@@ -292,6 +292,8 @@ def _fit(needs=None, target=None, tap_size=16, more_taps=False, **drafter):
     # the drafter's TapSpec is found by its key, not by being the node's only one
     (dict(needs=dict(tap_key="other")), "from TapSpec 'other' (DrafterNeeds.tap_key), which the node doesn't declare"),
     (dict(needs=dict(tap_key=None)), "from TapSpec None"),
+    # declared, but on another node: the verifying node's steps would find no tap resource
+    (dict(tap_nodes={"elsewhere"}), "from TapSpec 'taps' (DrafterNeeds.tap_key), which the node doesn't declare"),
     (dict(more_taps=True), "declares TapSpecs ['extra'] besides the drafter's; run_layers writes one"),
     (dict(needs=dict(taps=())), "declares taps its drafter doesn't read"),
     (dict(target=None), "no target geometry"),
