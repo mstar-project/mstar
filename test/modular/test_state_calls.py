@@ -800,7 +800,7 @@ def _added_and_read(h, q, k, v):
     (_added, 0, None, True, {}, "an add on layer 0 after its kept add"),
     # both calls would refuse, and the add's check runs first
     (_added, 0, None, False, {}, "an add on layer 0 after its kept add"),
-    (_added_and_read, 0, False, True, {}, "an add on layer 0 after a read in the same layer"),
+    (_added_and_read, 0, None, True, {}, "a kept add on layer 0 after a read in the same layer"),
     (None, 0, None, False, {}, "no layout yet: a read with no op"),
     (None, 0, None, True, {"top_k": 3}, r"no layout yet: mask arguments \['top_k'\]"),
 ])
