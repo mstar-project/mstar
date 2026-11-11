@@ -788,7 +788,9 @@ one of the model's stop tokens; when the reply finishes first (a stop or its len
 always without async scheduling), it ends normally with the refused token in it. The stops here
 are the ones the model's ``text_output()`` declares, else, for a Hugging Face tokenizer, the
 stops xgrammar finds for it (its EOS); a model with neither gets none, and its row is left
-unmasked, so a model whose loop stops on tokens of its own should declare them there. Not served
+unmasked, so a model whose loop stops on tokens of its own should declare them there (a loop that stops
+through a ``TokenStop`` on the grammar sampler must list those ids in ``text_output()``, or the
+deployment is refused at startup; a loop that stops in its own ``check_stop`` is not checked). Not served
 with it yet: speculative decoding (no model that declares ``text_output()`` drafts outside its
 sampler), resident planning, a declared ``Sampler`` with ``draws`` above 1 (its capture would
 split twice), and a text sampler whose walks run on different ranks (a prefill/decode split);

@@ -23,6 +23,7 @@ from mstar.engine.resources.sampler.config import SamplerSpec, SamplerStep, Samp
 from mstar.engine.resources.sampler.grammar import MAX_GRAMMAR_CHARS, GrammarRequest, grammar_request  # noqa: E402
 from mstar.engine.resources.sampler.resource import GrammarSamplerResource  # noqa: E402
 from mstar.engine.resources.step import ASKS, SlotLease, StepContext  # noqa: E402
+from mstar.model.submodule_base import TokenStop  # noqa: E402
 from mstar.model.utils import TextChunkDetokenizer  # noqa: E402
 from mstar.testing_utils.resource import StubResource  # noqa: E402
 
@@ -455,3 +456,32 @@ def test_enable_grammar_on_a_sampler_narrower_than_the_text_vocabulary_is_refuse
             vocab_size=V, enable_repetition_penalty=False, device=torch.device("cpu"),
             text_output=text_output, grammar_cache_mb=16,
         )
+
+
+def test_a_loop_stop_the_model_does_not_declare_is_refused_for_a_grammar_deployment():
+    from mstar.worker.engine_manager import _refuse_unlisted_grammar_stops
+
+    def deployment(text_stops, enable_grammar=True):
+        stop = TokenStop(loop="loop", buffer="token", stop_ids=frozenset({EOS, EOS + 1}), sampler="s")
+        model = SimpleNamespace(
+            text_output=lambda: SimpleNamespace(stop_token_ids=text_stops, detokenizer=SimpleNamespace(tokenizer=None))
+        )
+        spec = SamplerSpec(resource_key="s", nodes={"Talker"}, vocab_size=V, enable_grammar=enable_grammar)
+        other = TokenStop(loop="tts_loop", buffer="code", stop_ids=frozenset({999}), sampler="tts")
+        submodules = {"Talker": SimpleNamespace(token_stop=stop), "Tts": SimpleNamespace(token_stop=other)}
+        return submodules, [spec], model
+
+    _refuse_unlisted_grammar_stops(*deployment(frozenset({EOS, EOS + 1})))
+    _refuse_unlisted_grammar_stops(*deployment(frozenset(), enable_grammar=False))
+    with pytest.raises(ValueError, match=rf"\[{EOS + 1}\].*does not list"):
+        _refuse_unlisted_grammar_stops(*deployment(frozenset({EOS})))
+
+    # grammar on a sampler narrower than the text vocabulary, or on a model without text_output(): the
+    # sampler's own refusal speaks
+    submodules, specs, model = deployment(frozenset({EOS}))
+    model.text_output = lambda: SimpleNamespace(
+        stop_token_ids=frozenset(), detokenizer=SimpleNamespace(tokenizer=[b""] * (V + 1))
+    )
+    _refuse_unlisted_grammar_stops(submodules, specs, model)
+    model.text_output = lambda: None
+    _refuse_unlisted_grammar_stops(submodules, specs, model)
