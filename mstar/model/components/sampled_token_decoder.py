@@ -79,7 +79,6 @@ from mstar.model.submodule_base import (
     InputSeqLenInfo,
     ModelInputsFromEngine,
     TokenStop,
-    splice_loopback_ids,
 )
 from mstar.utils.h2d import to_device_nonblocking
 from mstar.utils.profiler import PHASE_PERIOD, PhaseLaps, phase_record
@@ -483,6 +482,34 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
         loop-back decode row."""
         return any(inp.input_ids is None for inp in inputs)
 
+    @staticmethod
+    def _splice_row_ids(
+        ids: torch.Tensor, inputs: list[ARNodeInputs], decode: bool,
+    ) -> torch.Tensor:
+        """``ids`` (one loop-back token per row) with each row that brought
+        its own ids taking them instead, in row order: a mixed step's prompt
+        rows, or a decode row whose last step ran elsewhere. Runs of loop-back
+        rows go in as one slice each, and the splice is device ops only: an
+        index built from a host list would be a synchronous copy behind the
+        step in flight. A decode step keeps the slot's padding rows past
+        ``inputs``, so its length stays the captured one."""
+        pieces: list[torch.Tensor] = []
+        run = None
+        for i, inp in enumerate(inputs):
+            if inp.input_ids is None or (decode and not inp.input_seq_len):
+                if run is None:
+                    run = i
+                continue
+            if run is not None:
+                pieces.append(ids[run:i])
+                run = None
+            pieces.append(inp.input_ids.to(ids.dtype))
+        if run is not None:
+            pieces.append(ids[run:len(inputs)])
+        if decode and ids.shape[0] > len(inputs):
+            pieces.append(ids[len(inputs):])
+        return torch.cat(pieces) if len(pieces) > 1 else pieces[0]
+
     def preprocess(
         self,
         graph_walk: str,
@@ -498,7 +525,7 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
             laps.lap("tokens")
             decode = graph_walk == self.DECODE_WALK
             if not decode or any(inp.input_ids is not None and inp.input_seq_len for inp in inputs):
-                ids = splice_loopback_ids(ids, inputs, decode)
+                ids = self._splice_row_ids(ids, inputs, decode)
             laps.lap("splice")
             if PHASE_PERIOD:
                 phase_record("engine.preprocess.loopback", perf_counter() - t0)

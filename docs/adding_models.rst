@@ -2357,13 +2357,12 @@ signal, sampler, buffer)`` instead reads each row's last sampled token off the s
 the device (``MSTAR_DEVICE_LOOPBACK``): the base class's ``device_loopback_signals`` names
 the signal, so the worker routes it without a tensor and sends the client's copy inline,
 ``prepare_inputs`` returns ``self.uniform_row_inputs(...)`` for such a row, and
-``preprocess`` reads the tokens with ``last_sampled``. A row whose last step did not keep its
-value on the device (its first decode step, after the prefill) still brings it routed, and
-``splice_loopback_ids(ids, inputs, decode=True)`` puts it over the slot's. A model that hasn't
-moved reads both with ``self.loopback_inputs(engine_inputs, inputs)``.
+``preprocess`` reads the tokens with ``self.loopback_inputs(engine_inputs, inputs)``. A
+row whose last step did not keep its value on the device (its first decode step, after
+the prefill) still brings it routed, and that read puts it over the slot's.
 ``SampledTokenDecoder`` declares it for Qwen3.5, Muse Glimmer, Higgs Audio, Qwen3-ASR and the Cosmos3 reasoner,
 and a node on it that reads the routed token sets ``device_loopback = None``; Whisper and
-Qwen3-Omni's Thinker declare their own.
+Qwen3-Omni's Thinker declare their own. Qwen3.5 reads the tokens with ``last_sampled``.
 
 A token that also streams to another node can go down the stream by value, when the
 stream's ``Connection`` sets ``by_value=True``: its consumer then takes a window of the

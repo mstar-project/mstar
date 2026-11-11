@@ -9,7 +9,8 @@ import itertools
 import pytest
 import torch
 
-from mstar.model.submodule_base import ARNodeInputs, splice_loopback_ids
+from mstar.model.qwen3_5.submodules import LLMSubmodule
+from mstar.model.submodule_base import ARNodeInputs
 
 
 def _mixed_reference(ids, inputs):
@@ -53,7 +54,7 @@ PATTERNS = ["d", "p", "ddd", "ppp", "pdd", "ddp", "dpd", "pdp", "dpdpd", "ppddpp
 def test_mixed_splice_matches_one_piece_per_row(pattern, padding):
     inputs = _inputs(pattern, decode=False)
     ids = torch.arange(len(inputs) + padding, dtype=torch.long) + 7
-    got = splice_loopback_ids(ids, inputs, decode=False)
+    got = LLMSubmodule._splice_row_ids(ids, inputs, decode=False)
     want = _mixed_reference(ids, inputs)
     assert got.dtype == want.dtype == ids.dtype
     assert torch.equal(got, want)
@@ -64,7 +65,7 @@ def test_mixed_splice_matches_one_piece_per_row(pattern, padding):
 def test_decode_splice_matches_index_copy(pattern, padding):
     inputs = _inputs(pattern, decode=True)
     ids = torch.arange(len(inputs) + padding, dtype=torch.long) + 7
-    got = splice_loopback_ids(ids, inputs, decode=True)
+    got = LLMSubmodule._splice_row_ids(ids, inputs, decode=True)
     want = _decode_reference(ids, inputs)
     assert got.shape == ids.shape  # the captured input's length
     assert torch.equal(got, want)

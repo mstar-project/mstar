@@ -102,8 +102,7 @@ class DeviceLoopback(NamedTuple):
     Declared as ``ARNodeSubmodule.device_loopback``; the loop-back hooks
     (``uniform_row_inputs``, ``device_loopback_signals``,
     ``inline_signals``) and the read in ``preprocess``
-    (``last_sampled``, or ``loopback_inputs`` on a model that hasn't moved)
-    follow from it. The sampler keeps the masters only
+    (``loopback_inputs``) follow from it. The sampler keeps the masters only
     for a node that declares this: their eager step write is a small
     synchronous host-to-device copy per step, which a node that reads its
     tokens on the host would pay for nothing.
@@ -1568,32 +1567,6 @@ def engine_step(submodule, *args, **kwargs) -> SubmoduleStep | None:
     from mstar.engine.state.adapters import state_steps
 
     return state_steps(step, getattr(submodule, "state_handles", {}))
-
-
-def splice_loopback_ids(ids: torch.Tensor, inputs: list[ARNodeInputs], decode: bool) -> torch.Tensor:
-    """``ids`` (one loop-back token per row) with each row that brought
-    its own ids taking them instead, in row order: a mixed step's prompt
-    rows, or a decode row whose last step ran elsewhere. Runs of loop-back
-    rows go in as one slice each, and the splice is device ops only: an
-    index built from a host list would be a synchronous copy behind the
-    step in flight. A decode step keeps the slot's padding rows past
-    ``inputs``, so its length stays the captured one."""
-    pieces: list[torch.Tensor] = []
-    run = None
-    for i, inp in enumerate(inputs):
-        if inp.input_ids is None or (decode and not inp.input_seq_len):
-            if run is None:
-                run = i
-            continue
-        if run is not None:
-            pieces.append(ids[run:i])
-            run = None
-        pieces.append(inp.input_ids.to(ids.dtype))
-    if run is not None:
-        pieces.append(ids[run:len(inputs)])
-    if decode and ids.shape[0] > len(inputs):
-        pieces.append(ids[len(inputs):])
-    return torch.cat(pieces) if len(pieces) > 1 else pieces[0]
 
 
 class ARNodeSubmodule(NodeSubmodule):
