@@ -58,6 +58,7 @@ from mstar.engine.state.contract import (
     TensorType,
     Window,
     is_value,
+    read_layers,
 )
 from mstar.engine.state.host_fields import HostFields, is_host_value
 from mstar.model.components.diffusion.attention import FrameSDPA, joint_attention, sdpa_attention
@@ -528,7 +529,7 @@ class PagedAttend(OpBinding):
             config=AttentionConfig(
                 kv_cache=array.name,
                 sliding_window=read.mask.size if windowed else None,
-                layers=tuple(kv_layer[layer] for layer in sorted(read.layers or array.layers)) if windowed else None,
+                layers=tuple(kv_layer[layer] for layer in sorted(read_layers(array, read))) if windowed else None,
             ),
         )]
 
@@ -669,7 +670,7 @@ class PagedArrayHandle(ArrayHandle):
         self.first_read = next(iter(self.reads.values()))
         self._attn = {
             layer: self.reads[key]
-            for key, read in array.reads.items() for layer in read.layers or array.layers
+            for key, read in array.reads.items() for layer in read_layers(array, read)
         }
         self._kv = resources[array.name]
         self._views = {layer: self._kv.layer_view(i) for layer, i in self._pool_layer.items()}

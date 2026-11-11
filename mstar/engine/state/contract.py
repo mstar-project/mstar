@@ -313,6 +313,11 @@ def is_value(array: Array) -> bool:
     return array.rewritable and array.max_len == 1
 
 
+def read_layers(array: Array, read: Read) -> frozenset[int]:
+    """The layers ``read`` reads of ``array``: its own, or all of the array's."""
+    return read.layers or array.layers
+
+
 def Value(name, *, nodes, layers, entry, updates=EMPTY) -> Array:
     """A rewritable array of one entry."""
     return Array(name, nodes=nodes, layers=layers, entry=entry, updates=updates, max_len=1, rewritable=True)

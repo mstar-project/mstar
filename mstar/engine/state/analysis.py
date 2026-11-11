@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, get_origin
 
 import torch
 
-from mstar.engine.state.contract import EMPTY, Array, Block, Sampler
+from mstar.engine.state.contract import EMPTY, Array, Block, Sampler, read_layers
 
 if TYPE_CHECKING:
     from mstar.model.base import Model
@@ -173,7 +173,7 @@ def _read_problems(array: Array, walks: Mapping[str, set[str]], combined: set[st
                 problems.append(f"{where}.walks: {walk!r} is not a walk of the model, which has {sorted(walks)}")
             elif walk not in array_walks:
                 problems.append(f"{where}.walks: {walk!r} runs none of the array's nodes {sorted(array.nodes)}")
-        for layer, walk in product(sorted(read.layers or array.layers), sorted(read.walks or array_walks)):
+        for layer, walk in product(sorted(read_layers(array, read)), sorted(read.walks or array_walks)):
             other = reader.setdefault((layer, walk), key)
             if other != key and (other, key) not in clashes:
                 clashes.add((other, key))
