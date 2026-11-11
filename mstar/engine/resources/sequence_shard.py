@@ -30,8 +30,8 @@ own ``run``:
   position).
 
 A recurrent layer's resource takes its conv's left context from the earlier ranks (``conv_halo``),
-and its prompt rows through ``ulysses`` (its ``sp_exchange``'s default) or ``state_passing``, the
-state a row enters a rank with.
+and its prompt rows through ``ulysses`` where its heads split over the SP ranks or else
+``state_passing``, the state a row enters a rank with (the spec picks from its head counts).
 
 ``sequence_parallel_refusals`` is what a node on SP ranks may not declare; the engine and
 ``validate_deployment`` both run it.
@@ -85,7 +85,7 @@ class SeqShardSpec(NodeResourceSpec):
 
     Where the node splits, a resource over state every rank stores whole takes its own exchange
     whatever this one is: a window attention gathers the step's keys (``kv_gather``), a recurrent
-    layer its ``sp_exchange``. So does a ragged attention, by its model's ``sp_exchange``; a shard
+    layer the one its head counts allow. So does a ragged attention, by its model's ``sp_exchange``; a shard
     that never splits stops them all splitting.
 
     ``exchanges=False`` declares that no op on the node mixes a listed label's units (a video
@@ -387,7 +387,8 @@ class SequenceShard(Resource):
         On an eager node (``SeqShardSpec.eager``) it also sets the floors: no captured step
         splits. Every rank sees the same configs, so the floors agree."""
         # the config module reaches back here through the submodule base
-        from mstar.engine.accelerator_graph_config import DEFAULT_CAPTURE_BATCH_SIZES, AcceleratorGraphConfigType
+        from mstar.engine.accelerator_graph_config import AcceleratorGraphConfigType
+        from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner
 
         if not self.can_split:
             return
@@ -405,7 +406,7 @@ class SequenceShard(Resource):
                 )
             if self.eager:
                 largest = max(
-                    (n for bs in config.capture_batch_sizes or DEFAULT_CAPTURE_BATCH_SIZES
+                    (n for bs in config.capture_batch_sizes or AcceleratorGraphRunner.CAPTURE_BATCH_SIZES
                      for n in config.get_total_tokens(bs)),
                     default=0,
                 )
