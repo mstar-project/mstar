@@ -1304,11 +1304,12 @@ class Model(ABC):
         comes: the model's one ``ClientAudio`` stream when it declares no
         ``turn_tokens`` and sends the client no audio, so its text is a
         transcript rather than replies (such as Nemotron ASR with
-        ``live_lookahead``). None otherwise."""
+        ``live_lookahead``) and takes 16 kHz audio, the rate the session
+        hands it. None otherwise."""
         if self.turn_tokens is not None:
             return None
         audio = [conn for conn in self.get_partition_topology().client_connections() if conn.audio is not None]
-        if len(audio) != 1:
+        if len(audio) != 1 or audio[0].audio.sample_rate != 16000:
             return None
         walks = self.get_graph_walk_graphs().values()
         edges = [edge for walk in walks for node in walk.get_nodes().values() for edge in node.outputs]

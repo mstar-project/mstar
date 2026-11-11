@@ -418,6 +418,16 @@ def test_a_client_stream_that_declares_audio_needs_looped_output():
             return {"listen": ear}
 
     assert _UnmarkedSpeaker().live_transcription_stream is None
+
+    class _At24k(_Unmarked):
+        def get_partition_topology(self):
+            topology = super().get_partition_topology()
+            topology.connections[0].audio = ClientAudio(24000, 1920)
+            return topology
+
+    # the live session hands its stream 16 kHz audio and does not resample
+    assert _Unmarked().live_transcription_stream is not None
+    assert _At24k().live_transcription_stream is None
     assert _refused(_UnmarkedSpeaker(), "['ear'] emit outside one")
     assert check_client_streams(_Unmarked(), {}) == check_client_streams(_Marked(), {}) == []
 
