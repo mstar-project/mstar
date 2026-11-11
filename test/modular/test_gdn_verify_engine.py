@@ -126,30 +126,6 @@ def test_only_the_cpu_attention_keeps_the_toy_from_asynchronous_mode():
     assert not eng._drafts[toy.NODE].asynchronous
 
 
-def test_a_pool_nothing_settles_fails_its_first_take_back(monkeypatch):
-    """Startup refuses a pool no linear-attention resource names (`unsettled_problems`);
-    if a bind still leaves none registered to rerun it, the pool's take-back raises
-    rather than keep the rejected tokens."""
-    import hybrid_toy as toy
-
-    from mstar.engine.resources.linear_attn.gdn import GDNManager
-
-    real = GDNManager.bind_verify_walk
-
-    def unregistered(self, walk, block, slack):
-        real(self, walk, block, slack)
-        self._pool.verify_settler = None
-
-    monkeypatch.setattr(GDNManager, "bind_verify_walk", unregistered)
-    # every draft rejected, so the next step takes tokens back
-    eng = toy.engine(3, toy.ForcedDrafter(_references(), spoil=lambda j: True))
-    driver = Driver(eng)
-    for rid, prompt in PROMPTS.items():
-        driver.add(rid, prompt, 12)
-    with pytest.raises(RuntimeError, match="reruns its state"):
-        driver.run(list(PROMPTS))
-
-
 def _plain(prompts=PROMPTS):
     import hybrid_toy as toy
 

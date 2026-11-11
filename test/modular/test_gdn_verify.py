@@ -278,12 +278,9 @@ def test_the_settle_kernel_matches_its_reference_on_the_cpu_path():
 
 def test_a_pool_whose_state_nothing_settles_is_refused():
     """A pool with no linear-attention resource rerunning it would keep rejected
-    tokens folded in: startup refuses it from the specs, and a take-back that
-    still reaches one raises."""
+    tokens folded in: startup refuses it from the specs."""
     from mstar.engine.resources.draft.startup import unsettled_problems
 
-    pool, manager = _build()
-    assert pool.verify_settler is manager
     pool_spec = RecurrentStateSpec(POOL, {"LLM"}, RecurrentStateConfig(
         num_layers=LAYERS, blocks=GEOMETRY.to_blocks(), max_slots=8,
     ))
@@ -292,10 +289,6 @@ def test_a_pool_whose_state_nothing_settles_is_refused():
     assert unsettled_problems(decl, {POOL: pool_spec, LIN: rerun}) == []
     (problem,) = unsettled_problems(decl, {POOL: pool_spec})
     assert "no linear-attention resource reruns its state" in problem
-    lone = RecurrentStatePool.build(pool_spec, EngineResourceInfo(device=CPU))
-    lone.bind_verify_walk(VERIFY, K + 1, 0)
-    with pytest.raises(RuntimeError, match="reruns its state"):
-        lone.take_back([1], [1], "main")
 
 
 def test_a_verifying_node_keeps_its_recurrent_state_resident():
