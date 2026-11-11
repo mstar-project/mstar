@@ -721,12 +721,12 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
         # `prefill_tokens` from the inputs
         return graph_walk in self._decode_walks
 
-    def inline_client_signals(self, graph_walk: str) -> dict[str, str]:
+    def inline_signals(self, graph_walk: str) -> dict[str, str]:
         # every decode walk's client token rides inline, off the stop check's host copy
         loopback = self.device_loopback
         if loopback is not None and graph_walk in self._decode_walks:
             return {loopback.signal: loopback.buffer}
-        return super().inline_client_signals(graph_walk)
+        return super().inline_signals(graph_walk)
 
     def batch_postprocess(
         self,

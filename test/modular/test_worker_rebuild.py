@@ -33,6 +33,7 @@ from mstar.testing_utils.engine import make_engine
 from mstar.testing_utils.model import make_model
 from mstar.testing_utils.worker import make_worker, preempting
 from mstar.worker import worker as worker_mod
+from mstar.worker.engine_manager import InlineStreams
 from mstar.worker.executing_batch import build_executing_batch
 from mstar.worker.host_pool import HostPool
 from mstar.worker.micro_scheduler import CHAIN_LANE, SIDE_LANE, ScheduledBatch
@@ -708,13 +709,16 @@ def test_a_follower_worker_takes_room_past_twice_the_rebuild_pool(monkeypatch):
     monkeypatch.setattr(worker_mod, "create_tensor_communication_manager", lambda **kw: SimpleNamespace(
         transfer_engine=None, my_session_id="s", get_tensor=None))
     monkeypatch.setattr(worker_mod, "_make_graph_runtime", lambda **kw: SimpleNamespace(
-        set_node_metadata=lambda *a, **kw: None))
+        set_node_metadata=lambda *a, **kw: None, set_inline_streams=lambda keys: None))
     engine = SimpleNamespace(
         get_stop_policies=lambda node, walk: None, paged_kv_caches=list, host_allowance=StepAllowance(),
         node_dtype=lambda node: torch.float32,
     )
     monkeypatch.setattr(worker_mod, "EngineManager", SimpleNamespace(
-        build=lambda *a, **kw: SimpleNamespace(engine=engine, get_engine=lambda node: engine, side_keys=())))
+        build=lambda *a, **kw: SimpleNamespace(
+            engine=engine, get_engine=lambda node: engine, side_keys=(),
+            inline_streams=InlineStreams(frozenset(), {}),
+        )))
     # the worker runs with no model, so its rebuilds come from one that declares ``NODE``'s policy
     model, make = make_model(rebuild_policies=lambda: {NODE: POLICY}, get_graph_walk_graphs=_graphs), _make_rebuilds
     monkeypatch.setattr(

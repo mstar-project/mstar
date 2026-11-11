@@ -209,7 +209,7 @@ def test_a_text_replys_decode_steps_loop_back(tmp_path, speech):
     llm.node_resources = {SAMPLER: SimpleNamespace(has_slot_masters=True)}
     # the worker's test for a rows-only step (``Worker._all_on_device``)
     assert (signals <= llm.device_loopback_signals(walk)) == (not speech)
-    assert llm.inline_client_signals(walk) == {"text_inputs": "new_token"}
+    assert llm.inline_signals(walk) == {"text_inputs": "new_token"}
 
 
 def test_a_spoken_reply_plans_the_tts_after_its_text_and_streams_to_the_vocoder(tmp_path):
@@ -291,6 +291,25 @@ def test_the_spoken_decode_hands_the_tts_each_rows_id_and_hidden(tmp_path):
     # each row its own copy, apart from the batch clone and from its step-mates
     ptrs = {h.untyped_storage().data_ptr() for h in (*spoken, rows[ROW_HIDDEN])}
     assert len(ptrs) == 3 and spoken[0].untyped_storage().nbytes() == spoken[0].nbytes
+
+def test_a_tts_decode_step_keeps_its_code_on_the_device_and_streams_it_inline():
+    """The TTS decode reads its last code off the sampler's slot masters and
+    sends the same code to the vocoder by value, so every output of the step is
+    a loop-back signal and the worker runs it rows-only. The prefill's code goes
+    by value too, so no window mixes in a stored item."""
+    from mstar.model.minicpm_o.components.tts import TTSConfig
+    from mstar.model.minicpm_o.config import TTS_DECODE, TTS_PREFILL, TTS_SAMPLER, TTSSampling
+    from mstar.model.minicpm_o.submodules import TTSSubmodule
+
+    model = a_bare_model(max_seq_len=4096)
+    tts = TTSSubmodule(SimpleNamespace(config=TTSConfig()), a_config(), TTSSampling())
+    tts.node_resources = {TTS_SAMPLER: SimpleNamespace(has_slot_masters=True)}
+    decode = {edge.name for edge in model.get_graph_walk_graphs()[TTS_DECODE].section.outputs}
+    assert decode == {"tts_code"} and decode <= tts.device_loopback_signals(TTS_DECODE)
+    for walk in (TTS_PREFILL, TTS_DECODE):
+        assert tts.inline_signals(walk) == {"tts_code": "tts_code"}
+    [conn] = [c for c in model.get_partition_topology().connections if c.edge_name == "tts_code"]
+    assert conn.by_value
 
 
 def test_tts_code_budget_is_its_loop_cap():

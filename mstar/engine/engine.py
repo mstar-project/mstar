@@ -1504,14 +1504,15 @@ class Engine:
             for rid in rids:
                 steps.pop(rid, None)
 
-    def inline_client_signals(
+    def inline_signals(
         self, node_name: str, graph_walk: str,
     ) -> dict[str, str]:
-        """The node's client signals that can ride inline this walk."""
+        """The node's signals that can ride inline this walk
+        (``NodeSubmodule.inline_signals``)."""
         mgmt = self._submodules.get(node_name)
         if mgmt is None:
             return {}
-        return mgmt.submodule.inline_client_signals(graph_walk)
+        return mgmt.submodule.inline_signals(graph_walk)
 
     def _prepare_chunk(
         self, batch: ExecutingBatch, rid: int, walk: str, chunk: ChunkRange,

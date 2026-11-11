@@ -86,6 +86,7 @@ from mstar.model.submodule_base import (
     ARNodeInputs,
     ARNodeSubmodule,
     BatchedModelOutput,
+    DeviceLoopback,
     InputMetadata,
     ModelInputsFromEngine,
     NodeInputs,
@@ -402,9 +403,16 @@ class TTSSubmodule(ARNodeSubmodule):
             loop=TTS_DECODE_LOOP, buffer="tts_code", stop_ids=frozenset({model.config.eos_code}),
             sampler=TTS_SAMPLER, walk=TTS_DECODE, runtime_check=True,
         )
+        # A decode step reads its last code off the sampler's slot masters, and
+        # the code streams to the vocoder inline, so the step runs rows-only.
+        self.device_loopback = DeviceLoopback(
+            walk=TTS_DECODE, signal="tts_code", sampler=TTS_SAMPLER, buffer="tts_code",
+        )
 
-    def inline_client_signals(self, graph_walk: str) -> dict[str, str]:
-        return {}  # the codes go to the vocoder, not the client
+    def inline_signals(self, graph_walk: str) -> dict[str, str]:
+        # The prefill's code too, not only the loop-back's: then every item of a
+        # reply's stream goes by value, and no window mixes in a stored one.
+        return {"tts_code": "tts_code"}
 
     def get_accelerator_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,
@@ -445,8 +453,12 @@ class TTSSubmodule(ARNodeSubmodule):
         graph_walk: str,
         fwd_info: CurrentForwardPassInfo,
         inputs: NameToTensorList,
+        has_loopback: bool = False,
         **kwargs: Any,
     ) -> ARNodeInputs:
+        if (row := self.uniform_row_inputs(graph_walk, has_loopback)) is not None:
+            # one code, read off the sampler's slot master in ``preprocess``
+            return row
         device = self.get_device()
         if graph_walk == TTS_PREFILL:
             ids = torch.cat([t.reshape(-1) for t in inputs[ROW_IDS]]).to(device)
@@ -461,6 +473,10 @@ class TTSSubmodule(ARNodeSubmodule):
         engine_inputs: ModelInputsFromEngine,
         inputs: list[ARNodeInputs],
     ) -> dict[str, Any]:
+        if graph_walk == TTS_DECODE and any(inp.input_ids is None for inp in inputs):
+            # a row that looped back on the device brings no code: read by slot,
+            # beside the rows that bring theirs (a first decode step)
+            return {"input_embeds": self.model.emb_code(self.loopback_inputs(engine_inputs, inputs)["input_ids"])}
         if inputs[0].input_ids is not None:
             return {"input_embeds": self.model.emb_code(torch.cat([inp.input_ids for inp in inputs]))}
         return {"input_embeds": torch.cat([inp.input_embeds for inp in inputs])}
@@ -616,10 +632,12 @@ class Token2WavSubmodule(NodeSubmodule):
             # stream's one chunk is final and empty. It still runs, voicing nothing,
             # as the empty step below does.
             return NodeInputs(tensor_inputs={"codes": torch.zeros(1, 0, dtype=torch.int32)}, kwargs={"last": True})
-        # A host sync, which serializes this node's async pipeline. It is needed either
-        # way: a window's length decides its capture and its cache writes. Filtering
-        # the stop code on the device would need check_stop to filter outputs (an
-        # engine change), and would still leave the length on the device.
+        # A window whose codes all came inline is already a CPU tensor, so this copies
+        # nothing. A window holding a stored item (a row that ran no forward on its
+        # step) is on the device, and this is a host sync. The codes are needed on the
+        # host either way: a window's length decides its capture and its cache writes.
+        # Filtering the stop code on the device would need check_stop to filter outputs
+        # (an engine change), and would still leave the length on the device.
         codes = inputs["tts_code"][0].reshape(-1).to("cpu", torch.int32)
         # The TTS's stop code is streamed before its stop is seen. It is not speech, and
         # it ends the speech: the window holding it is the last, as upstream's stream
