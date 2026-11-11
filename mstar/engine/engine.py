@@ -834,12 +834,8 @@ class Engine:
             submodule.bind_node_resources(resources)
             handles = {} if model is None else node_handles(
                 model, node_name, resources, sp_group=parallel_groups.get_joint_group_for_node(node_name).sp_group,
-                setup=self._state_setup,
+                setup=self._state_setup, built=shared,
             )
-            # Nodes in one engine can share layers, as BAGEL's LLM nodes share one language model, and a second
-            # node's bind would point those layers at a handle the first node's steps never open. A within-step handle
-            # keeps the sequence-parallel group of the first node that builds it.
-            handles = {name: shared.setdefault(name, handle) for name, handle in handles.items()}
             if handles:
                 bind_state_ops(handles)
                 submodule.bind_node_state(handles)

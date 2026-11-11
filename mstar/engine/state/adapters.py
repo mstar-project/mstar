@@ -288,19 +288,27 @@ def _apply_kernel_settings(
 
 def node_handles(
     model: "Model", node: str, resources: Mapping[str, Any], *, sp_group: CommGroup | None = None,
-    setup: "StateSetup | None" = None,
+    setup: "StateSetup | None" = None, built: dict[str, ArrayHandle | SamplerHandle] | None = None,
 ) -> dict[str, ArrayHandle | SamplerHandle]:
-    """``node``'s handles, by declared name, over its built ``resources``, each read bound as ``setup`` binds it."""
+    """``node``'s handles, by declared name, over its built ``resources``, each read bound as ``setup`` binds it.
+
+    ``built`` maps declared names to the handles this process's other nodes built, and this call adds the ones it
+    builds. A node shares the handle of an array or sampler another node built: nodes can share layers, as BAGEL's LLM
+    nodes share one language model, and a handle per node would leave the shared layers on the handle of the node
+    bound last, which the other nodes' steps never open. A shared within-step handle keeps the sequence-parallel group
+    of the node that built it.
+    """
     setup = setup or StateSetup()
+    built = {} if built is None else built
     declarations = model.declare_state()
     arrays = [declared for declared in declarations if isinstance(declared, Array)]
     if any(read.walks is not None for array in arrays for read in array.reads.values()):
         setup = replace(setup, walks=Walks(combined=model.get_combined_graph_walks()))
     resolved = _resolve(arrays, setup)
-    return {
-        declared.name: build_handle(declared, resources, setup, resolved, sp_group)
-        for declared in declarations if node in declared.nodes
-    }
+    for declared in declarations:
+        if node in declared.nodes and declared.name not in built:
+            built[declared.name] = build_handle(declared, resources, setup, resolved, sp_group)
+    return {declared.name: built[declared.name] for declared in declarations if node in declared.nodes}
 
 
 def build_handle(

@@ -765,7 +765,7 @@ def test_the_engine_binds_a_nodes_handles_when_it_loads_a_model(monkeypatch):
 def test_nodes_in_one_process_share_their_handles(monkeypatch):
     nodes = {name: _EngineNode() for name in ("LLM_cfg_text", "LLM_cfg_img")}
     _load_engine(monkeypatch, nodes, make_model(checkpoint_path=lambda: None),
-                 handles=lambda model, name, resources, **kwargs: {"kv": object()})
+                 handles=lambda model, name, resources, built, **kwargs: {"kv": built.setdefault("kv", object())})
     text, image = (node.declared_handles for node in nodes.values())
     assert text["kv"] is image["kv"], (
         "BAGEL's LLM nodes share one language model, so a handle per node would leave the shared layers on the handle "
