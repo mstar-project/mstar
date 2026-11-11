@@ -19,6 +19,8 @@ from huggingface_hub.errors import EntryNotFoundError
 import mstar.model.bagel.bagel_model as bagel_mod
 from mstar.conductor.conductor import Conductor
 from mstar.engine.resources.sampler.config import SamplerSpec, SamplingReqConfig
+from mstar.engine.state import Sampler
+from mstar.engine.state.adapters import node_resources, sampling_configs
 from mstar.model.bagel.bagel_model import BagelModel, check_request_kwargs
 from mstar.model.base import MAX_OUTPUT_TOKENS, Model
 from mstar.model.components.diffusion.image_io import OUTPUT_FORMAT_KWARGS
@@ -376,7 +378,9 @@ def _qwen3_5_model(defaults=None) -> Qwen3_5DenseModel:
 
 
 def _qwen3_5_sampler(model, **kw) -> SamplingReqConfig:
-    return model.get_request_resource_configs([], [], kw)[QWEN3_5_SAMPLER]
+    """The request's sampler config, as the conductor converts Qwen3.5's settings."""
+    sampler = Sampler(QWEN3_5_SAMPLER, nodes={"LLM"}, vocab_size=model.config.vocab_size)
+    return sampling_configs(model.get_request_resource_configs([], [], kw), [sampler])[QWEN3_5_SAMPLER]
 
 
 def test_qwen3_5_request_kwargs_are_the_keys_it_reads():
@@ -428,7 +432,7 @@ def test_qwen3_5_enable_thinking_must_be_a_bool(bad):
 def test_qwen3_5_real_0_8b_has_no_generation_config_and_no_min_p_capability():
     model = Qwen3_5DenseModel(str(next(CACHED_0_8B.iterdir())))
     assert model.sampling_defaults == {}
-    spec = next(s for s in model.get_node_resources() if s.resource_key == QWEN3_5_SAMPLER)
+    spec = next(s for s in node_resources(model) if s.resource_key == QWEN3_5_SAMPLER)
     assert spec.enable_repetition_penalty and not spec.enable_min_p
 
 
