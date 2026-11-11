@@ -749,8 +749,9 @@ schema is a 400, and so is a request on a deployment without ``enable_grammar`` 
 and ``after`` over 131072 characters, or one that also sends ``min_tokens`` or ``ignore_eos``.
 The grammar compiles in the background, on every rank, while its request waits and the requests
 behind it start. The captured sampler then applies a bitmask on every step but a greedy one
-without a constrained row (the lean twin), and a step holding a constrained row waits for its
-rows' last draws to reach the host before it launches. A grammar that fails to compile fails
+without a constrained row (the lean twin). A step holding a constrained row launches its
+forward, then waits for its rows' last draws to reach the host and fills their masks while the
+forward runs, before it launches the draw (its capture is split there). A grammar that fails to compile fails
 its request with an error. A drawn token the grammar refuses (only a mask that failed to cover
 the draw lets one through) fails its request at the step after the next, and meanwhile the reply
 may only draw one of the model's stop tokens (any token, for a model that declares none); when the

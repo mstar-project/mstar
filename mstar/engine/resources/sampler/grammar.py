@@ -3,12 +3,13 @@ may draw next, advanced by the tokens it drew (JSON schema, JSON object, regex,
 choice list, EBNF; xgrammar underneath).
 
 The sampler resource owns it, beside its other per-request draw state. A step
-that holds a constrained row stages each row's bitmask before it launches, from
+that holds a constrained row fills each row's bitmask as its draw begins, from
 the tokens the rows drew in their last step: the sampler copies those to the
-host at commit, and the next step's plan waits for that copy alone (step N's
-draw, not the worker's postprocess), accepts them and fills the masks. The draw
-then applies the mask before either sampling path, so a captured step bakes the
-apply over the slot's static mask buffer.
+host at commit, and the next step waits for that copy alone (step N's draw, not
+the worker's postprocess), accepts them and fills the masks. A captured step
+splits there (`split_capture`), so its forward is launched first and the masks
+are filled while it runs. The draw then applies the mask before either sampling
+path, so a captured step bakes the apply over the slot's static mask buffer.
 """
 
 from __future__ import annotations
@@ -274,7 +275,7 @@ class GrammarRows:
 
     def note_draws(self, rids, tokens: torch.Tensor, kept) -> None:
         """Queue the copy of this step's drawn tokens for its constrained rows
-        (``kept`` None keeps every row); the next ``stage`` accepts them."""
+        (``kept`` None keeps every row); the next `accept_pending` accepts them."""
         index = [i for i, rid in enumerate(rids) if rid in self._rows and (kept is None or rid in kept)]
         if not index:
             return
@@ -291,22 +292,27 @@ class GrammarRows:
         event.record()
         self._pending.append((rows, index, host, event))
 
-    def _accept_pending(self) -> None:
-        for rows, index, host, event in self._pending:
+    def accept_pending(self) -> None:
+        """Advance each row by the draws `note_draws` queued, once they reach the host."""
+        # taken first, so a step whose accept raises never accepts a draw twice
+        pending, self._pending = self._pending, []
+        for rows, index, host, event in pending:
             if event is not None:
                 event.synchronize()
             drawn = host.tolist()
             for row, i in zip(rows, index, strict=True):
                 row.accept(drawn[i])
-        self._pending.clear()
 
-    def fill(self, rids) -> torch.Tensor:
-        """The host bitmask for a step's rows, after accepting every draw so far:
-        all ones for a free row, and only the stop ids for a failed one."""
-        self._accept_pending()
-        if len(set(rids)) != len(rids):
-            raise ValueError("a constrained request has two rows in one step (speculative decoding is not served)")
+    def fill(self, rids, failed: bool = False) -> torch.Tensor:
+        """The host bitmask for a step's rows: all ones for a free row, and only
+        the stop ids for a failed one, or with ``failed``, for every grammar row."""
         mask = torch.full((len(rids), self.words), -1, dtype=torch.int32)
+        if failed:
+            if self._stops is not None:
+                for i, rid in enumerate(rids):
+                    if rid in self._rows:
+                        mask[i] = self._stops
+            return mask
         matchers, index = [], []
         for i, rid in enumerate(rids):
             row = self._rows.get(rid)

@@ -156,7 +156,7 @@ def test_a_request_whose_grammar_compiles_holds_back_no_other(ranks):
     """A compile is readiness, not capacity: the requests behind it start
     meanwhile, and it waits out of every step on any number of ranks (the one
     step that waited for it would stall every row on the worker)."""
-    res = _resource(graph=False, comm_group=SimpleNamespace(world_size=ranks))
+    res = _resource(graph=False, comm_group=SimpleNamespace(world_size=ranks, rank=0))
     compiled = Future()
     res._grammar._compile_pool = SimpleNamespace(submit=lambda fn, *args: compiled)
     request = grammar_request({"choice": ["ab"]})
@@ -173,7 +173,7 @@ def test_a_request_whose_grammar_compiles_holds_back_no_other(ranks):
 @pytest.mark.parametrize("failure", ["compile", "refused draw"])
 def test_a_grammar_that_can_no_longer_hold_fails_its_request(failure):
     """A grammar that fails to compile is the request's error at its next admit;
-    a draw it refuses, at the admit after the plan that accepts it, and past it
+    a draw it refuses, at the admit after the step that accepts it, and past it
     the row may only stop. A pre-admit gives the same answer as a full admit, as
     a pre-admitted step skips its full admit on one TP rank and not another."""
     res = _resource(graph=True)
