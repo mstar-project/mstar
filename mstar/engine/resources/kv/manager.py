@@ -4741,7 +4741,7 @@ class KVManager(AttentionResource):
         request that asks to be admitted counts what moving every preemptible request would free, since it can take
         that back."""
         if not guaranteed:
-            room = self._room() + (0 if self._taking_back() else self._borrowable)
+            room = self._room() + (self._borrowable if self._borrowable and not self._taking_back() else 0)
         elif self._moves and reclaim:
             # Under the lock even from `grew_since`, since the GPU thread opens a label in `_streams` during an admit.
             # The room is read under it too, so a page freed between the two reads isn't counted in both.

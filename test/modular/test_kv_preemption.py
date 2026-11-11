@@ -1327,6 +1327,18 @@ def test_moves_for_a_guaranteed_request_that_runs_past_its_footprint_take_nothin
     assert victims.to_drop == ["v"] and not victims.takes_back, "moves for a grant past g's footprint took back"
 
 
+def test_a_preemptible_grant_past_its_allotment_reads_no_waiting_request_while_nothing_is_lent():
+    """Nothing is guaranteed, so nothing is lent, but each grant past an allotment still read every waiting request
+    to see whether one was taking pages back."""
+    kv = _pool()
+    _running(kv, "r", 3, arrival=0, decodes=8 * PAGE_SIZE)
+    read = []
+    kv._taking_back = lambda: read.append(True) or False
+
+    assert _step(kv, "r", 4 * PAGE_SIZE).ok
+    assert not read, "a grant past r's allotment read the waiting requests with nothing lent"
+
+
 def test_a_guaranteed_request_takes_back_what_it_lent_by_moving_the_newest_preemptible_request(monkeypatch):
     """o borrowed what g hasn't written. g's grant then moves v, the newest, and keeps every page v frees, so o can't
     borrow them again before g writes them."""
