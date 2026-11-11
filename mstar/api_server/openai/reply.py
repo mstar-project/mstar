@@ -32,8 +32,12 @@ _DISCONNECT_POLL_S = 0.05
 
 @dataclass
 class Usage:
-    """A reply's token counts and why the engine ended it, from the ``usage``
-    chunk that closes it (``APIServer.submit_request``'s ``report_usage``)."""
+    """A reply's token counts and why the engine ended it. The text chunks add
+    up ``completion`` as they are read and carry ``prompt`` (``ResultChunk``'s
+    ``num_tokens`` and ``prompt_tokens``), so a reply its handler ends early
+    has both. The ``usage`` chunk that closes a reply which ran to its end
+    (``APIServer.submit_request``'s ``report_usage``) restates them and gives
+    its ``finish_reason``."""
 
     prompt: int = 0
     completion: int = 0
@@ -60,11 +64,12 @@ class Failure:
 
 @dataclass
 class Finish:
-    """``reason`` is ``stop`` (a stop token), ``length`` (the token budget)
-    or ``tool_calls`` (the reply made calls)."""
+    """``reason`` is ``stop`` (a stop token or ``stop_string``), ``length``
+    (the token budget) or ``tool_calls`` (the reply made calls)."""
 
     reason: str
     usage: Usage
+    stop_string: str | None = None
 
 
 @dataclass
@@ -75,6 +80,65 @@ class Run:
     kind: str
     text: str = ""
     call: dict = field(default_factory=dict)
+
+
+class StopMatcher:
+    """Ends a text at the first of ``stops`` to appear in it. ``feed`` holds
+    back the end that may be the start of a stop (at most the longest stop
+    less one character) and returns the text that may go out, with the stop
+    once one has appeared; the text from the stop on never goes out."""
+
+    def __init__(self, stops: list[str]):
+        self._stops = stops
+        self._held = ""
+
+    def feed(self, text: str) -> tuple[str, str | None]:
+        text = self._held + text
+        # the stop that completes first ends the text; of two that end
+        # together, the longer started first
+        hits = [(i + len(s), -len(s), s) for s in self._stops if (i := text.find(s)) >= 0]
+        if hits:
+            end, neg_len, stop = min(hits)
+            self._held = ""
+            return text[:end + neg_len], stop
+        keep = max(_started(text, s) for s in self._stops)
+        self._held = text[len(text) - keep:]
+        return text[:len(text) - keep], None
+
+    def flush(self) -> str:
+        held, self._held = self._held, ""
+        return held
+
+
+def _started(text: str, stop: str) -> int:
+    """Length of the longest end of ``text`` that begins ``stop``, short of all of it."""
+    for k in range(min(len(stop) - 1, len(text)), 0, -1):
+        if text.endswith(stop[:k]):
+            return k
+    return 0
+
+
+def _passed(deltas: list[dict], matcher: StopMatcher | None, out: list) -> str | None:
+    """Appends to ``out`` the deltas that may go out; returns the stop string
+    that ended the reply, if one did. Stops match the answer (``content``)
+    only: reasoning and tool calls go out whole. Held content goes out before
+    a delta of another kind, so a stop matches within one stretch of content."""
+    if matcher is None:
+        out.extend(deltas)
+        return None
+    for d in deltas:
+        content = d.get("content")
+        if content is None:
+            if held := matcher.flush():
+                out.append({"content": held})
+            out.append(d)
+            continue
+        text, stop = matcher.feed(content)
+        if text:
+            out.append({"content": text})
+        if stop is not None:
+            return stop
+    return None
 
 
 def submit(api, request_id: str, model_name: str, req, args) -> str:
@@ -96,11 +160,11 @@ def submit(api, request_id: str, model_name: str, req, args) -> str:
     return (model_kwargs or {}).get(LORA_ADAPTER_KWARG) or model_name
 
 
-async def stream_events(api, request_id: str, raw_request, parser=None):
+async def stream_events(api, request_id: str, raw_request, parser=None, stops=None):
     """``reply_events`` of a streamed request once its results start: a
     request the engine refuses raises its status here rather than inside a 200."""
     batches = await api.open_result_stream(request_id, raw_request, batches=True)
-    return reply_events(api, request_id, parser, batches=batches)
+    return reply_events(api, request_id, parser, stops, batches=batches)
 
 
 def sse_response(api, request_id: str, body) -> ReleasingStreamingResponse:
@@ -108,25 +172,32 @@ def sse_response(api, request_id: str, body) -> ReleasingStreamingResponse:
                                       media_type="text/event-stream", headers={"Cache-Control": "no-cache"})
 
 
-def finish_reason(parser, usage: Usage) -> str:
+def finish_reason(parser, usage: Usage, stop_string: str | None = None) -> str:
     if parser is not None and parser.finish_reason == "tool_calls":
         return "tool_calls"
-    return usage.finish_reason
+    return "stop" if stop_string is not None else usage.finish_reason
 
 
-def reply_events(api, request_id: str, parser=None, batches=None):
+def reply_events(api, request_id: str, parser=None, stops: list[str] | None = None, batches=None):
     """The events of a request's reply, one list per batch of result chunks.
     Bound to the submission when called, as Starlette iterates a stream's body
-    later. Closing the iterator early, as a client that leaves does, aborts
-    the request. ``batches`` are the chunk batches already opened
-    (``api.open_result_stream``).
+    later.
+
+    A stop string ends the reply where it starts: the request stops in the
+    engine, as closing the iterator early does. Usage counts every
+    token read until then, the stop's own included, as vLLM counts them, and
+    can count a few past it: the rest of the stop's chunk (up to k under MTP),
+    and what was read while the parser held the stop's end back.
+    ``batches`` are the chunk batches already opened (``api.open_result_stream``).
     """
     if batches is None:
         batches = api.iter_result_chunk_batches(request_id)
-    return _events(batches, parser, Usage())
+    return _events(batches, parser, stops, Usage())
 
 
-async def _events(batches, parser, usage):
+async def _events(batches, parser, stops, usage):
+    matcher = StopMatcher(stops) if stops else None
+    stop: str | None = None
     # a byte-level BPE token's bytes can end inside a character: hold them
     text = Utf8Stream()
     failed = False
@@ -135,9 +206,15 @@ async def _events(batches, parser, usage):
             events: list = []
             for c in batch:
                 if c.modality == "text":
+                    usage.completion += c.num_tokens
+                    if c.prompt_tokens is not None:
+                        usage.prompt = c.prompt_tokens
                     piece = text.feed(c.data)
-                    if piece:
-                        events.extend([{"content": piece}] if parser is None else parser.feed(piece))
+                    if not piece:
+                        continue
+                    deltas = [{"content": piece}] if parser is None else parser.feed(piece)
+                    if (stop := _passed(deltas, matcher, events)) is not None:
+                        break
                 elif c.modality == USAGE:
                     usage.close(c.metadata)
                 elif c.modality == "error":
@@ -151,6 +228,9 @@ async def _events(batches, parser, usage):
                         yield events
                         events = []
                     yield [Media(c.modality, c.data)]
+            if stop is not None:
+                yield [*events, Finish(finish_reason(parser, usage, stop), usage, stop)]
+                return
             if events:
                 yield events
     except HTTPException as exc:
@@ -158,7 +238,7 @@ async def _events(batches, parser, usage):
         yield [Failure(str(exc.detail), exc.status_code)]
         return
     finally:
-        # a reply that ended early (a client gone) stops the request
+        # a reply that ended early (a stop string, a client gone) stops the request
         await batches.aclose()
     if failed:
         return
@@ -167,7 +247,12 @@ async def _events(batches, parser, usage):
         deltas = [{"content": tail}] if tail else []
     else:
         deltas = parser.feed(tail) + parser.finish()
-    yield [*deltas, Finish(finish_reason(parser, usage), usage)]
+    events = []
+    stop = _passed(deltas, matcher, events)
+    if stop is None and matcher is not None and (held := matcher.flush()):
+        events.append({"content": held})
+    events.append(Finish(finish_reason(parser, usage, stop), usage, stop))
+    yield events
 
 
 async def collect(events, raw_request=None) -> list:

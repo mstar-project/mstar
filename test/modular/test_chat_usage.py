@@ -454,6 +454,7 @@ def _chat(chunks, tmp_path, **fields):
     adapter = SimpleNamespace(
         chat_to_request=lambda req, upload_dir: SubmitArgs(text="hi", input_modalities=["text"]),
         make_output_parser=lambda req: None,
+        stop_strings=lambda req: None,
     )
     req = ChatCompletionRequest(messages=[{"role": "user", "content": "hi"}], **fields)
 

@@ -7,7 +7,8 @@ then maps the resulting modality chunks back to OpenAI shapes: text into
 ``usage`` and ``finish_reason``. An adapter's output parser splits a text
 reply into ``content``, ``reasoning_content`` and ``tool_calls``.
 
-A streamed reply, and a whole one that is parsed, is read as ``reply`` events.
+A streamed reply, and a whole one that is parsed or has stop strings, is read
+as ``reply`` events.
 """
 
 from __future__ import annotations
@@ -28,17 +29,18 @@ async def create_chat_completion(api, model_name, adapter, req, raw_request=None
     # off the loop: media parts may be decoded, written or fetched (MSTAR_ALLOW_REMOTE)
     args = await asyncio.to_thread(adapter.chat_to_request, req, api.upload_dir)
     parser = adapter.make_output_parser(req)
+    stops = adapter.stop_strings(req)
     request_id = rid("chatcmpl")
 
     try:
         model_name = reply.submit(api, request_id, model_name, req, args)
         if req.stream:
-            events = await reply.stream_events(api, request_id, raw_request, parser)
+            events = await reply.stream_events(api, request_id, raw_request, parser, stops)
             include_usage = bool(req.stream_options and req.stream_options.include_usage)
             return reply.sse_response(api, request_id, _stream_events(events, model_name, request_id, include_usage))
-        if parser is not None:
-            # read chunk by chunk, so a client that leaves stops the request
-            events = await reply.collect(reply.reply_events(api, request_id, parser), raw_request)
+        if parser is not None or stops:
+            # read chunk by chunk, so a stop string ends the request as it appears
+            events = await reply.collect(reply.reply_events(api, request_id, parser, stops), raw_request)
             return _text_response(model_name, request_id, events)
         chunks = await api.collect_results(request_id, raw_request)
     finally:
@@ -90,7 +92,7 @@ def _audio_format(req, sample_rate: int) -> str:
 
 
 def _build_response(model_name, request_id, chunks, sample_rate, audio_format="wav") -> dict:
-    """A whole reply with no output parser: text, audio and images."""
+    """A whole reply with no output parser and no stop strings: text, audio and images."""
     text_parts: list[bytes] = []
     audio_pcm: list[bytes] = []
     images: list[bytes] = []

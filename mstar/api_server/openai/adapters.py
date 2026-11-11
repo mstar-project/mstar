@@ -199,7 +199,8 @@ def _refuse_tool_calls(mk: dict) -> None:
         raise ValueError("tool calling is not supported for this model")
 
 
-def _refuse_unserved_chat(req, mk: dict, serves_tool_calls: bool = False) -> None:
+def _refuse_unserved_chat(req, mk: dict, serves_tool_calls: bool = False,
+                          serves_stop_strings: bool = False) -> None:
     """Refuse a chat that asks for more than one plain reply: more choices, stop
     sequences, log probs, sampling penalties, a response format, or a tool call.
     ``mk`` is the request's :func:`_passthrough`; an off value of one of these
@@ -211,10 +212,12 @@ def _refuse_unserved_chat(req, mk: dict, serves_tool_calls: bool = False) -> Non
     different request with a 200. An adapter whose output parser splits tool
     calls out of the reply (``serves_tool_calls``) keeps the tool fields in
     ``mk`` and checks them itself; the others go through :func:`_refuse_tool_calls`.
+    One whose replies the chat handler ends at a stop string
+    (``serves_stop_strings``) takes ``stop``.
     """
     if req.n not in (None, 1):
         raise ValueError(f"n={req.n}: this model returns one choice")
-    if req.stop:
+    if req.stop and not serves_stop_strings:
         raise ValueError("stop sequences are not supported; the reply ends at a stop token or max_tokens")
     for name in ("logprobs", "top_logprobs", "logit_bias", "presence_penalty", "frequency_penalty",
                  "stop_token_ids"):
@@ -361,6 +364,11 @@ class OpenAIAdapter:
         """A parser for a chat reply with structure inside its text (reasoning,
         tool calls), or None to return the text as ``content``."""
         return None
+
+    def stop_strings(self, req: ChatCompletionRequest) -> list[str]:  # noqa: ARG002
+        """The strings the chat handler ends the reply at (``stop``). An adapter
+        that does not serve them returns none."""
+        return []
 
     def speech_to_request(self, req: SpeechRequest, upload_dir: Path) -> SubmitArgs:  # noqa: ARG002
         raise NotImplementedError("audio/speech is not supported by this model")
@@ -1684,10 +1692,14 @@ class TextChatAdapter(OpenAIAdapter):
     supports_chat = True
     # set by a subclass whose output parser splits tool calls out of the reply
     serves_tool_calls = False
+    # set by a subclass whose replies the chat handler ends at a stop string
+    serves_stop_strings = False
 
     def chat_to_request(self, req: ChatCompletionRequest, upload_dir: Path) -> SubmitArgs:
         mk = _passthrough(req)
-        _refuse_unserved_chat(req, mk, serves_tool_calls=self.serves_tool_calls)
+        _refuse_unserved_chat(req, mk, serves_tool_calls=self.serves_tool_calls,
+                              serves_stop_strings=self.serves_stop_strings)
+        self.stop_strings(req)
         text, file_paths, modalities, parts = flatten_messages(req.messages, upload_dir, allow_remote=False)
         # an image or audio part was decoded to disk and then dropped: the model
         # answered as if it had seen it
@@ -1714,6 +1726,18 @@ class TextChatAdapter(OpenAIAdapter):
             prompt_parts=parts,
         )
 
+    def stop_strings(self, req: ChatCompletionRequest) -> list[str]:
+        """``stop``, as OpenAI takes it: a string or up to 4. The serving layer
+        matches them on the decoded answer and ends the request at the first."""
+        if not self.serves_stop_strings:
+            return []
+        stops = [req.stop] if isinstance(req.stop, str) else list(req.stop or [])
+        if len(stops) > 4:
+            raise ValueError(f"stop takes at most 4 strings, got {len(stops)}")
+        if "" in stops:
+            raise ValueError("a stop string cannot be empty")
+        return stops
+
 
 class GlmChatAdapter(TextChatAdapter):
     """GLM-5.2 / GLM-5.3: the messages with their roles, and ``tools``, go to
@@ -1730,6 +1754,7 @@ class GlmChatAdapter(TextChatAdapter):
     """
 
     serves_tool_calls = True
+    serves_stop_strings = True
 
     def __init__(self, *, always_thinks: bool):
         self.always_thinks = always_thinks

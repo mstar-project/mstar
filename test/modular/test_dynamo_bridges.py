@@ -550,6 +550,16 @@ def test_a_chat_that_asks_for_an_unserved_field_is_a_400_with_the_adapters_messa
     assert not server.submitted, "the chat reached the model, which ignores the field"
 
 
+def test_a_chat_with_a_stop_string_is_a_400(tmp_path):
+    """The bridge streams the model's text as it comes and applies no stop string, so it
+    refuses a chat that sends one."""
+    server = _FakeRealtimeServer([_chunk("text", b"hi")], tmp_path)
+    with pytest.raises(ValueError) as refused:
+        _chat_through_bridge(server, {"stop": ["\n"]}, ADAPTER_REGISTRY["glm52"])
+    assert (refused.value.code, refused.value.message) == (400, "stop is not supported on this endpoint")
+    assert not server.submitted
+
+
 def test_the_chat_fields_clients_send_by_default_reach_the_model(tmp_path):
     server = _FakeRealtimeServer([_chunk("text", b"hi")], tmp_path)
     _chat_through_bridge(server, {"tools": [], "tool_choice": "auto", "presence_penalty": 0, "logprobs": False,

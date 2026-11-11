@@ -23,6 +23,7 @@ import pytest
 
 pytest.importorskip("mstar_rust")
 
+from mstar.api_server.request_types import ResultChunk
 from mstar.api_server.rust_frontend import (
     OPENAI_ADAPTER_ENV,
     RustFrontendBridge,
@@ -40,11 +41,11 @@ pytestmark = pytest.mark.skipif(
     BINARY is None, reason="mstar-server binary not built")
 
 
-class _Chunk:
-    def __init__(self, modality, data, metadata=None):
-        self.modality = modality
-        self.data = data
-        self.metadata = metadata or {}
+class _Chunk(ResultChunk):
+    """A result chunk, its request's id left out."""
+
+    def __init__(self, modality, data, metadata=None, **fields):
+        super().__init__(request_id="r", modality=modality, data=data, metadata=metadata or {}, **fields)
 
 
 # what the data plane ends a ``report_usage`` submission with
