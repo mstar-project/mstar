@@ -851,7 +851,7 @@ class RecurrentStatePool(Resource):
         """The blocks' shapes and dtypes. The state's dtype changes what the
         recurrent layers output, and so every KV page written after them."""
         return fingerprint(sorted(
-            (name, block.shape, str(block.dtype)) for name, block in self.config.blocks.items()
+            (name, block.shape, str(self._blocks[name].dtype)) for name, block in self.config.blocks.items()
         ))
 
     def resolve_cached_prefix(
