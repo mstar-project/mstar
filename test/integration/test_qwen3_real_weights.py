@@ -13,10 +13,13 @@ positions under its own 0.98 quantile: a bf16 port errs from fp32 as transformer
 does. Trimmed, because one served greedy flip in a reply of ~100 positions moves a plain
 mean by most of the margin (Alice: 1.8 with it, 1.1 without). The real model needs
 R <= R_MAX on every set; the control (``CONTROLS``, a checkpoint edited the way a port bug
-would read it) must fail the same gate on the long set. Calibrated on an H100 (Qwen3-8B,
-three long prompts): the real model at most 1.10 per prompt and 0.93 pooled, rope_theta
-x1.1 at least 1.95 and 2.42. rms_norm_eps 1e-5 isn't a control: its served log-probs match
-the real model's at every length. The plain-mean and p90 ratios, the greedy-flip counts
+would read it) must fail the same gate on the long set. Measured on an H100 (Qwen3-8B, the
+committed prompts): the real model 0.911 short and 0.962 long, rope_theta x1.1 1.038 short
+and 2.374 long. Only the long set separates the control: the short replies are too short
+for a position error to build up. Per prompt the two overlap (the real model up to 1.65 on
+one short prompt, the control down to 1.42 on one long one), which is why R is pooled per
+set. rms_norm_eps 1e-5 isn't a control: its served log-probs match the real model's at
+every length. The plain-mean and p90 ratios, the greedy-flip counts
 and the deficit (fp32's margin given up at a flip) are printed only.
 
 Qwen3-0.6B ties its head to the embedding (its file also ships the head, equal to
@@ -76,7 +79,7 @@ SETS = {"short": PROMPTS, "long": LONG_PROMPTS}
 # every prompt, in the order the server and the reference run them, with its set
 ALL_PROMPTS = [(name, prompt) for name, prompts in SETS.items() for prompt in prompts]
 TOKENS = 128
-# the real model at 0.93 and the control at 2.42 pooled over the long set: about 1.6x each side
+# the real model at 0.962 and the control at 2.374 over the long set: about 1.6x each side
 R_MAX = 1.5
 # each error's positions past this quantile are left out of its mean
 TRIM = 0.98
