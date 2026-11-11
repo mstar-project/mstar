@@ -55,6 +55,7 @@ from mstar.engine.state.adapters import (
     VALUE,
     WITHIN_STEP,
     StateSetup,
+    _resolve,
     build_handle,
     kv_layouts,
     node_handles,
@@ -688,8 +689,9 @@ def _qwen3_5_stack(blocks: int = 2):
     stack.config, stack.vision_config = config, None
     declared = {d.name: d for d in stack.declare_state()}
     kv_array, gdn_array = declared[KV_CACHE], declared[GDN_STATE]
-    kv = build_handle(kv_array, {KV_CACHE: _QwenKV(kv_array), ATTN: _QwenAttn(), ROPE: None})
-    gdn = build_handle(gdn_array, {GDN_STATE: _QwenPool(gdn_array), CONV: None, LINEAR_ATTN: _QwenLinear()})
+    resolved = _resolve([kv_array, gdn_array], StateSetup())
+    kv = build_handle(kv_array, {KV_CACHE: _QwenKV(kv_array), ATTN: _QwenAttn(), ROPE: None}, resolved)
+    gdn = build_handle(gdn_array, {GDN_STATE: _QwenPool(gdn_array), LINEAR_ATTN: _QwenLinear()}, resolved)
     for module in model.modules():
         if hasattr(module, "bind_state"):
             module.bind_state({KV_CACHE: kv, GDN_STATE: gdn})

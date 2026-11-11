@@ -26,6 +26,8 @@ def _zero(kind: type) -> object:
     return () if get_origin(kind) is tuple else kind()
 
 
+# The stored key. Lookups pass a plain tuple in this field order, which hashes and compares equal and skips building
+# the NamedTuple on every decode step, so this has to stay a tuple.
 class EntryKey(NamedTuple):
     array: str
     label: str
@@ -65,14 +67,14 @@ class HostFields:
 
     def fields(self, request: int, array: str, label: str, layer: int) -> Mapping[str, object] | None:
         """One entry's fields, or None for an entry that doesn't exist."""
-        return self._fields.get(request, {}).get(EntryKey(array, label, layer))
+        return self._fields.get(request, {}).get((array, label, layer))
 
     def commit(self, array: Array, declared: ArrayStep, rows: Collection[int]) -> None:
         """Apply what a kept step declares of ``array``: a fork at its start copies before the step's writes, and a fork
         at its end after them."""
         self._fork(array, declared, "start", rows)
         for (row, label, layer), written in declared.host.items():
-            entries, key = self._fields[row], EntryKey(array.name, label, layer)
+            entries, key = self._fields[row], (array.name, label, layer)
             entries[key] = FrozenMap({**entries[key], **written})
         self._fork(array, declared, "end", rows)
 
@@ -82,5 +84,5 @@ class HostFields:
                 for row in rows if fork.rows is None else fork.rows:
                     entries = self._fields[row]
                     for layer in array.layers:
-                        src, dst = EntryKey(array.name, fork.src, layer), EntryKey(array.name, fork.dst, layer)
+                        src, dst = (array.name, fork.src, layer), (array.name, fork.dst, layer)
                         entries[dst] = entries[src]

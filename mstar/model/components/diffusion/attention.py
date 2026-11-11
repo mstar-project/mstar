@@ -76,6 +76,22 @@ def sdpa_attention(
     return out.to(q.dtype).transpose(1, 2), torch.logsumexp(scores, dim=-1).transpose(1, 2)
 
 
+class FrameSDPA:
+    """SDPA within each segment of ``lengths``, set before each call. It stands in for a ragged resource's ``run``
+    where none is declared (a model's SDPA mode, the reference's own kernel)."""
+
+    def __init__(self, lengths=()):
+        self.lengths = list(lengths)
+
+    def run(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, label: str | None = None) -> torch.Tensor:
+        # [1, heads, segment, head_dim] per segment, the call transformers makes (and so its kernel)
+        out = [
+            F.scaled_dot_product_attention(*(t.transpose(0, 1)[None] for t in segment))[0].transpose(0, 1)
+            for segment in zip(q.split(self.lengths), k.split(self.lengths), v.split(self.lengths), strict=True)
+        ]
+        return torch.cat(out)
+
+
 def joint_attention(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, ragged: RaggedAttentionFn | None = None,
     return_lse: bool = False,
