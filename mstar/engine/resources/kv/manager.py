@@ -1046,7 +1046,11 @@ class KVManager(AttentionResource):
                 if rid in self._dropped:
                     self.rebuild_pages[node_name] = self.rebuild_pages.get(node_name, 0) + len(matched[0])
                 if held:
-                    starts = self._start_pages(chain, held, matched)
+                    # the allotment doesn't count them (`_retain_window_match`), so they come out of the room left
+                    room = self._allowance(rid) if self._decides else None
+                    starts = self._start_pages(chain, held, matched, room=room)
+                    if self._world_size == 1:
+                        self._index.touch(starts)
                     self._share(starts)
                     self._arena.retain(starts)
                     stream.lease = Lease(held, matched, image_page, copy_page, starts)
@@ -1133,20 +1137,36 @@ class KVManager(AttentionResource):
             end = lower
         return 0, [[] for _ in self._groups]
 
-    def _start_pages(self, chain: PrefixChain, end: int, groups: list[list[int]]) -> list[int]:
-        """The window pages past ``groups`` that the index keeps at each walk start under ``end``. A lease holds them
-        too: a later walk the lease doesn't serve (`_drop_layout`, a declined hit) cuts it to the walks it did, which
-        must outlive eviction, and above one rank a cut re-matches among the lease's own pages only (`_recut`)."""
+    def _window_at(self, rooted: list[bytes], at: int, among: Collection[int] | None = None) -> list[int] | None:
+        """Every window group's pages a stream holds once it has written ``at`` tokens, when ``at`` is a hit boundary
+        and the index holds them all (with ``among``, all among it too), else None. A lease whose first group reaches
+        past ``at`` serves a cut there only then."""
+        if at % self._hit_unit:
+            return None
+        pages = [page for g, _ in self._windows for page in self._indexed(rooted, g, self._held_at(g, at))]
+        if None in pages or (among is not None and not all(page in among for page in pages)):
+            return None
+        return pages
+
+    def _start_pages(
+        self, chain: PrefixChain, end: int, groups: list[list[int]],
+        among: Collection[int] | None = None, room: int | None = None,
+    ) -> list[int]:
+        """The window pages past ``groups`` kept at each walk start under ``end`` the index holds the window at
+        (`_window_at`, with ``among``). With ``room``, only the starts whose new pages fit in it, in order. A lease
+        holds them too: a later walk the lease doesn't serve (`_drop_layout`, a declined hit) cuts it to the walks
+        it did, which must outlive eviction, and above one rank a cut re-matches among the lease's own pages only
+        (`_recut`). A walk ending at a start skipped here is cut there (`cap_cached_prefix`)."""
         if not self._windows:
             return []
         pages, leased, at = [], {page for group in groups for page in group}, 0
         for span in chain.spans:
-            # The first group's pages under ``end`` are the lease's, so the index serves a walk start on a hit
-            # boundary when it holds every window page kept there.
-            if span.opens_step and 0 < at < end and not at % self._hit_unit:
-                held = [page for g, _ in self._windows for page in self._indexed(chain.rooted, g, self._held_at(g, at))]
-                if None not in held:
-                    pages += [page for page in held if page not in leased and page not in pages]
+            window = self._window_at(chain.rooted, at, among) if span.opens_step and 0 < at < end else None
+            if window is not None:
+                new = [page for page in dict.fromkeys(window) if page not in leased and page not in pages]
+                if room is None or len(new) <= room:
+                    pages += new
+                    room = None if room is None else room - len(new)
             at += span.length
         return pages
 
@@ -1189,9 +1209,10 @@ class KVManager(AttentionResource):
         """Cut the stream's lease to the longest boundary at or under ``held`` the cache serves, matched again
         there, and return it. A window keeps other pages at a shorter boundary than at the lease's end, which
         the index may still hold. Above one rank only the lease's own pages count: every rank holds the same
-        lease, but this rank's index may be ahead of rank 0's. The lease also holds the window at each walk start
-        under its end (`_start_pages`), and a walk is served whole only up to one (`cap_cached_prefix`), so a cut
-        falls at worst to the walk start below it. Raises if that boundary is under ``least``."""
+        lease, but this rank's index may be ahead of rank 0's. The lease also holds the window at walk starts under
+        its end (`_start_pages`), and a walk is served whole only up to one (`cap_cached_prefix`), so a cut falls at
+        worst to the walk start below it, unless the walks served end where no cut can keep them. Raises if that
+        boundary is under ``least``."""
         lease = stream.lease
         among = None if self._world_size == 1 else set(lease.pages())
         end, groups = self._match(stream.chain.rooted, held // self.config.tokens_per_page, among)
@@ -1207,7 +1228,7 @@ class KVManager(AttentionResource):
         self._arena.retain(taken)
         if self._world_size == 1:
             self._index.touch(taken)
-        starts = [page for page in lease.starts if page not in kept] if end else []
+        starts = self._start_pages(stream.chain, end, groups, set(lease.pages())) if end else []
         stream.lease = Lease(end, groups, starts=starts) if end else None
         kept.update(starts)
         windows = [page for group in lease.groups[1:] for page in group] + lease.starts
@@ -1225,7 +1246,7 @@ class KVManager(AttentionResource):
         window pool's lease holds a window's pages only at its own end and its walk starts. A walk the lease serves
         whole is left alone when it ends where the lease holds the window, or inside a page (which `_drop_layout`
         refuses to cut), since the walks after it use the rest. On another page boundary a later cut could not keep
-        the walk, so the lease is cut at or under it now."""
+        the walk, so the lease is cut at or under it now, unless no cut keeps the walks served before it either."""
         if not self._windows:
             # every page boundary under the lease is served, so `apply_cached_prefix` cuts it
             return prefix
@@ -1239,9 +1260,10 @@ class KVManager(AttentionResource):
             held, page = cursor.consumed + prefix.tokens, self.config.tokens_per_page
             if held >= stream.lease.end:
                 return prefix
+            among, rooted = set(stream.lease.pages()), stream.chain.rooted
             if prefix.tokens == sum(span.length for span in step) and (
-                held % page
-                or self._match(stream.chain.rooted, held // page, set(stream.lease.pages()))[0] == held
+                held % page or self._window_at(rooted, held, among) is not None
+                or (cursor.consumed and self._window_at(rooted, cursor.consumed, among) is None)
             ):
                 return prefix
             end = self._recut(rid, stream, held, cursor.consumed)

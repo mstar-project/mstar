@@ -886,6 +886,32 @@ def test_a_window_page_another_request_holds_is_no_room_once_the_first_rolls_it_
     kv.assert_pages_conserved()
 
 
+def test_a_lease_takes_the_window_at_its_walk_starts_only_while_the_room_lasts():
+    """A lease also holds the window at each walk start under its end, which its allotment doesn't count. Taken
+    past the room, they would leave the pool short of what admitted requests were allotted."""
+    kv = _window_manager()
+    shared = list(range(160))
+    # five walks of 32 slots, each its own step, so the cache keeps the window at each one's start
+    layout = {"main": StreamLayout(spans=tuple(PrefixSpan(32, 32, WALK) for _ in range(5)), keyed_spans=5)}
+    kv.ingest_request("seed", KVReqConfig(prefix_keys={"main": _keys(shared)}, kv_layout=layout))
+    for _ in range(5):
+        _probe(kv, "seed", 32)
+        _grow(kv, "seed", 32)
+    _remove(kv, "seed")
+    kv.ingest_request("a", KVReqConfig(prefix_keys={"main": _keys(shared)}, kv_layout=layout))
+    assert _ready(kv, "a")
+    # a second request is allotted what room is left
+    for slots in range(kv._room(), 0, -1):
+        _laid_out(kv, "c", list(range(5000, 5000 + 8 * slots)))
+        if _ready(kv, "c"):
+            break
+        _remove(kv, "c")
+
+    assert _probe(kv, "a", 32).tokens == 32
+    assert kv._room() >= 0, f"a's lease took {len(kv._streams['a']['main'].lease.starts)} walk-start pages past it"
+    kv.assert_pages_conserved()
+
+
 def test_a_request_one_pool_holds_back_keeps_no_allotment_in_another_on_its_node():
     # Whisper's decoder asks a self-attention pool and a cross-attention pool in one readiness check
     self_kv, cross_kv = _manager(max_num_pages=4), _manager(max_num_pages=3)
