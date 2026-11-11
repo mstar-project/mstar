@@ -48,6 +48,7 @@ from mstar.engine.resources.step import Segment, SubmoduleStep
 from mstar.engine.state import Array, Span
 from mstar.engine.state.adapters import (
     StateSetup,
+    _resolve,
     build_handle,
     kv_layouts,
     node_handles,
@@ -511,10 +512,12 @@ class _Positions:
 
 
 def _bound(stack: nn.Module, declared: list, resources: dict):
+    arrays = [array for array in declared if isinstance(array, Array)]
+    resolved = _resolve(arrays, StateSetup())
     handles = {}
-    for array in declared:
-        if isinstance(array, Array) and array.max_len:
-            handles[array.name] = build_handle(array, resources)
+    for array in arrays:
+        if array.max_len:
+            handles[array.name] = build_handle(array, resources, resolved)
     for module in stack.modules():
         if hasattr(module, "bind_state"):
             module.bind_state(handles)
