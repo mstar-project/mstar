@@ -76,7 +76,7 @@ def test_video_capture_buckets_and_keys(monkeypatch) -> None:
     assert sub.cg_key_info(C.VIDEO_GEN_AR_WALK, info("ch", "kv")) is None  # mixed batch
     assert sub.cg_key_info(C.VIDEO_GEN_AR_WALK, info("ch", "ch")) == video_key
     assert sub.cg_key_info(C.PREFILL_WALK, info("vid")) == "cfg"
-    assert sub.cg_key_info(C.PREFILL_WALK, info("nocfg")) == "cond"  # keyed apart; no such bucket here
+    assert sub.cg_key_info(C.PREFILL_WALK, info("nocfg")) == "cond"  # keyed apart from the cfg graph
     assert sub.cg_key_info(C.PREFILL_WALK, info("vid", "nocfg")) is None  # mixed regimes
 
 
@@ -255,20 +255,38 @@ def test_masked_capture_matches_eager_layout() -> None:
         assert not torch.all(g[:, :, 0] == 0)  # the graph predicts it too; postprocess masks it away
 
 
+def _prefill_configs(monkeypatch, distilled=False, **config):
+    monkeypatch.setenv("COSMOS3_GEN_CAPTURE_RES", "64x64")
+    monkeypatch.delenv("COSMOS3_DISABLE_PREFILL_ACCELERATOR_GRAPH", raising=False)
+    monkeypatch.delenv("COSMOS3_DISABLE_ACCELERATOR_GRAPH", raising=False)
+    cfg = Cosmos3Config(compile_denoise=False, **config)
+    if distilled:
+        cfg.distilled_sigmas = (1.0, 0.5)
+    sub = Cosmos3DiTSubmodule(transformer=_fake_transformer(cfg), config=cfg, scheduler=None)
+    return sub, [c for c in sub.get_accelerator_graph_configs("cpu") if c.capture_graph_walk == C.PREFILL_WALK]
+
+
 def test_prefill_capture_inputs_follow_the_regime(monkeypatch) -> None:
-    """The captured prefill's rows declare the labels of their regime, so the
+    """Each captured prefill's rows declare the labels of its regime, so the
     capture's own `declare_step` plans exactly those."""
-    for scale, labels in ((6.0, {"main", "uncond"}), (1.0, {"main"})):
-        monkeypatch.setenv("COSMOS3_GEN_CAPTURE_RES", "64x64")
-        monkeypatch.delenv("COSMOS3_DISABLE_PREFILL_ACCELERATOR_GRAPH", raising=False)
-        monkeypatch.delenv("COSMOS3_DISABLE_ACCELERATOR_GRAPH", raising=False)
-        cfg = Cosmos3Config(compile_denoise=False, guidance_scale=scale)
-        sub = Cosmos3DiTSubmodule(transformer=_fake_transformer(cfg), config=cfg, scheduler=None)
-        prefill = next(c for c in sub.get_accelerator_graph_configs("cpu") if c.capture_graph_walk == C.PREFILL_WALK)
-        assert prefill.additional_key_info == ("cfg" if len(labels) == 2 else "cond")
-        (row,) = prefill.get_node_inputs(1, 63)
-        assert row.kwargs["cfg"] == (len(labels) == 2) and set(row.kwargs["seq_lens"]) == labels
-        assert sum(row.kwargs["seq_lens"].values()) == 63
-        step = sub.declare_step(C.PREFILL_WALK, ["r"], [row])
-        assert {seg.label for seg in step.segments} == labels
-        assert step.cg_key_info == prefill.additional_key_info
+    labels = {"cfg": {"main", "uncond"}, "cond": {"main"}}
+    for scale in (6.0, 1.0):
+        sub, prefills = _prefill_configs(monkeypatch, guidance_scale=scale)
+        for prefill in prefills:
+            want = labels[prefill.additional_key_info]
+            (row,) = prefill.get_node_inputs(1, 63)
+            assert row.kwargs["cfg"] == (len(want) == 2) and set(row.kwargs["seq_lens"]) == want
+            assert sum(row.kwargs["seq_lens"].values()) == 63
+            step = sub.declare_step(C.PREFILL_WALK, ["r"], [row])
+            assert {seg.label for seg in step.segments} == want
+            assert step.cg_key_info == prefill.additional_key_info
+
+
+def test_guided_checkpoints_capture_the_prefill_in_both_regimes(monkeypatch) -> None:
+    """A guided checkpoint also serves guidance-scale-1 requests, so its
+    conditional-only prefill is captured too; a distilled one runs only that."""
+    for scale in (6.0, 1.0):
+        _, prefills = _prefill_configs(monkeypatch, guidance_scale=scale)
+        assert [c.additional_key_info for c in prefills] == ["cfg", "cond"]
+    _, prefills = _prefill_configs(monkeypatch, distilled=True, guidance_scale=1.0)
+    assert [c.additional_key_info for c in prefills] == ["cond"]

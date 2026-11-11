@@ -551,8 +551,9 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         — so every condition the old gate checked lives here:
 
         * a request's guidance regime (``_regime``: both branches, or the
-          conditional one alone) is part of every key, and only the regime the
-          deployment's default guidance runs is captured (``_capture_regime``);
+          conditional one alone) is part of every key; the denoise step is
+          captured only in the regime the deployment's default guidance runs
+          (``_capture_regime``), the prefill in both (``_prefill_capture_regimes``);
         * of the denoise walks only ``image_gen`` and the plain and chained
           video walks, and only at a latent shape a graph was captured for
           (``_capture_keys``);
@@ -2320,10 +2321,12 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
     def get_accelerator_graph_configs(self, device, tp_world_size: int = 1):
         """Declare one fixed-shape capture of the image denoise step per
         resolution, in the guidance regime the deployment's default guidance
-        runs (``_capture_regime``). Requests at other resolutions, or in the
-        other regime, fall back to the eager path. The per-resolution token layout is prompt-independent,
-        so bake it once here and key it by latent shape; the per-prompt rotary
-        tables, the latents and the timestep flow in as static-buffer inputs.
+        runs (``_capture_regime``), and the text prefill in every regime a
+        request can run (``_prefill_capture_regimes``). Denoise steps at other
+        resolutions, or in the other regime, fall back to the eager path. The
+        per-resolution token layout is prompt-independent, so bake it once here
+        and key it by latent shape; the per-prompt rotary tables, the latents
+        and the timestep flow in as static-buffer inputs.
 
         Set ``COSMOS3_DISABLE_CUDA_GRAPH=1`` to skip capture and run the denoise
         loop eagerly (escape hatch for a misbehaving driver, and an A/B switch).
@@ -2397,8 +2400,16 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                 walk, replay_walks, regime,
             ))
 
-        configs.extend(self._prefill_capture_configs(device, regime))
+        configs.extend(self._prefill_capture_configs(device, self._prefill_capture_regimes()))
         return configs
+
+    def _prefill_capture_regimes(self) -> tuple[GuidanceRegime, ...]:
+        """The prefill is captured in every regime a request can run, since
+        each regime keys its own graph (`cg_key_info`) and an uncaptured one
+        runs eager and host-bound. A guided checkpoint serves both, whatever
+        its default (action requests, forward and inverse dynamics and client
+        overrides change the scale); a distilled one refuses any scale but 1."""
+        return (COND_REGIME,) if self.config.distilled_sigmas else (CFG_REGIME, COND_REGIME)
 
     def _capture_regime(self) -> GuidanceRegime:
         """The guidance regime the captures are built for: the one a request
@@ -2477,9 +2488,9 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             total_tokens_multiplier=regime.tokens_multiplier,
         )
 
-    def _prefill_capture_configs(self, device, regime: str) -> list:
+    def _prefill_capture_configs(self, device, regimes: tuple[GuidanceRegime, ...]) -> list:
         configs = []
-        # Understanding-tower text prefill in the captured regime: cond+uncond
+        # Understanding-tower text prefill, one config per regime: cond+uncond
         # packed into one combined sequence (batched CFG), or the conditional
         # prompt alone. The dummy zeros are placeholders — the real
         # input_ids / mrope ids are copied into the static buffers at replay.
@@ -2491,23 +2502,24 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             )
             mrope_dtype = torch.float32 if self.config.enable_fps_modulation else torch.long
 
-            configs.append(PackedAcceleratorGraphConfig(
+            configs.extend(PackedAcceleratorGraphConfig(
                 capture_graph_walk=PREFILL_WALK,
                 replay_graph_walks=list(PREFILL_WALKS),
                 capture_token_lengths=list(self.prefill_capture_token_buckets),
-                make_node_input=lambda n: self._prefill_capture_input(
+                make_node_input=lambda n, regime=regime: self._prefill_capture_input(
                     n, device, mrope_dtype, regime,
                 ),
-                # A prefill in the other regime declares a different set of
-                # labels, so it keys elsewhere (`cg_key_info`) and runs eager.
+                # Each regime declares its own set of labels, so it keys its
+                # own graph (`cg_key_info`).
                 additional_key_info=regime.name,
                 compile=self.config.compile_prefill,
                 compile_mode=(
                     None if self.config.denoise_compile_mode == "level" else self.config.denoise_compile_mode
                 ),
-                capture_batch_sizes=prefill_bs,
+                # a regime that never batches never fills a wider bucket
+                capture_batch_sizes=prefill_bs if regime.batches else [1],
                 caps_eager_batch_size=False,
-            ))
+            ) for regime in regimes)
         return configs
 
     def _prefill_capture_input(

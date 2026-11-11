@@ -1918,10 +1918,13 @@ which already fills the GPU's GEMM and attention throughput, so a batch of N
 costs about N single steps: batching keeps requests in step rather than adding
 throughput.
 
-Captures (the text prefill and the denoise steps) are built for the guidance
-regime the deployment's default ``guidance_scale`` runs: both branches when it
-is not 1, the conditional branch alone when it is 1, which the distilled 4-step
-Super checkpoints force. A request in the other regime runs eager.
+The denoise-step captures are built for the guidance regime the deployment's
+default ``guidance_scale`` runs: both branches when it is not 1, the
+conditional branch alone when it is 1, which the distilled 4-step Super
+checkpoints force. A denoise step in the other regime runs eager. The text
+prefill is captured in both regimes, since a guided checkpoint also serves
+guidance-scale-1 requests (the Edge configs' action requests, forward and
+inverse dynamics); a distilled checkpoint captures only its own.
 ``gen_capture_image`` lists the (height, width) image tiers to capture
 (default 192x320, 480x832 and 720x1280, each still bounded by
 ``graph_max_latent_area``); the Super T2I config captures its 1024x1024
