@@ -94,7 +94,7 @@ class Phi4MMModel(MultimodalDecoderModel):
         # audio rows take the `vision` projection
         self.media = (
             MediaIntake("image", vision_media_encoder(), IMAGE_PAD_ID, self._image_intake),
-            MediaIntake("audio", audio_encoder(AUDIO_PAD_ID), AUDIO_PAD_ID, self._audio_intake),
+            MediaIntake("audio", audio_encoder(), AUDIO_PAD_ID, self._audio_intake),
         )
 
     def load_audio(self, filepath: str, device: str) -> TensorAndMetadata:

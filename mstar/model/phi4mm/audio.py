@@ -29,7 +29,6 @@ from mstar.model.phi4mm.components.audio import (
     Phi4MMAudioTower,
     audio_batch,
 )
-from mstar.model.phi4mm.config import AUDIO_PAD_ID
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
 
 if TYPE_CHECKING:
@@ -48,10 +47,10 @@ NARROWBAND_RATE = 8_000
 PREEMPHASIS = 0.97
 
 
-def audio_encoder(pad_id: int = AUDIO_PAD_ID) -> MediaEncoder:
+def audio_encoder() -> MediaEncoder:
     """The ``audio_encoder`` node: a clip's log-mel frames in, one LLM row
-    per audio pad out."""
-    return MediaEncoder("audio", "audio_encoder", (AUDIO_FEATURES,), AUDIO_EMBEDS, (pad_id,))
+    per token of its ``MEDIA_LAYOUT`` runs out."""
+    return MediaEncoder("audio", "audio_encoder", (AUDIO_FEATURES,), AUDIO_EMBEDS)
 
 
 @cache

@@ -40,7 +40,6 @@ from mstar.model.keys import VISION_ATTN
 from mstar.model.multimodal import MediaEncoder, as_uint8_chw
 from mstar.model.multimodal_decoder import PreparedMedia
 from mstar.model.phi4mm.components.vision import Phi4MMVisionConfig, Phi4MMVisionModel
-from mstar.model.phi4mm.config import IMAGE_PAD_ID
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs
 from mstar.utils.h2d import to_device_nonblocking
 
@@ -57,7 +56,7 @@ MASKED, SUB_GN, GLB_GN = -1, -2, -3
 
 def vision_media_encoder() -> MediaEncoder:
     """The ``vision_encoder`` node as the VLM scaffold's walks see it."""
-    return MediaEncoder("vision", VISION_NODE, (PIXEL_VALUES, GLOBAL_PIXEL_VALUES), VISION_OUTPUT, (IMAGE_PAD_ID,))
+    return MediaEncoder("vision", VISION_NODE, (PIXEL_VALUES, GLOBAL_PIXEL_VALUES), VISION_OUTPUT)
 
 
 # ---------------------------------------------------------------------------
