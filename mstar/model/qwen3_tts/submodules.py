@@ -812,11 +812,11 @@ class TalkerSubmodule(ARNodeSubmodule):
         inputs: ARNodeInputs | None = None,
         **kwargs: Any,
     ) -> None:
-        """Route what a prefill made for the decode steps, and expose the stop token, without a GPU sync.
+        """Lead an in-context clone's codec stream with its reference frames, and expose the stop token, without a GPU
+        sync.
 
-        A prefill's text goes on the persisted edge. An in-context clone's prefill leads the codec stream with its
-        reference frames, one ``[1, groups]`` item per frame, the shape of a row of the batched outputs, so one stream's
-        items always stack; the codec trims their audio. Whole-graph replay and eager execution normally retain
+        The reference frames go one ``[1, groups]`` item per frame, the shape of a row of the batched outputs, so one
+        stream's items always stack; the codec trims their audio. Whole-graph replay and eager execution normally retain
         ``layer0_codes``. ``codec_tokens`` is the routed output, though, so use its first codebook as a fallback. This
         keeps EOS detection correct even if an execution path filters the sampler-only output before slow-path
         ``check_stop``.
