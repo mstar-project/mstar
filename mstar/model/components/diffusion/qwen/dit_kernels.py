@@ -323,7 +323,7 @@ def norm_fits(x: torch.Tensor) -> bool:
 
 
 # rows per program and warps of the LayerNorm kernels (ln_micro's sweep on an H200, [2, 8192, 3072])
-_LN_ROWS, _LN_WARPS = 1, 4
+_LN_ROWS, _LN_WARPS = 8, 8
 
 
 def _norm_modulate_launch(x, gate, y, residual, scale1p, shift, out, split, eps, gated: bool):
