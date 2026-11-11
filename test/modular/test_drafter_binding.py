@@ -100,6 +100,14 @@ def test_the_engine_refuses_a_drafter_it_cant_hold():
 
     assert "is not a Drafter: subclass it" in submodule_problems(decl, SimpleNamespace(drafter=_Duck()))[0]
 
+    class _FullDuck(_Duck):
+        # every member the protocol has, observe with its old signature: still not a Drafter
+        def observe(self, block, result):
+            ...
+
+    assert isinstance(_FullDuck(), Drafter)
+    assert "is not a Drafter: subclass it" in submodule_problems(decl, SimpleNamespace(drafter=_FullDuck()))[0]
+
     class _Binds(Drafter):
         needs = NEEDS
 

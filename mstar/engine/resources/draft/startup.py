@@ -70,7 +70,9 @@ def submodule_problems(decl: VerifyNode, submodule) -> list[str]:
     if drafter is None:
         return [f"{where}: a verifying node's submodule must set `drafter`"]
     problems = []
-    if not isinstance(drafter, Drafter):
+    # by class, not structure: a drafter with the protocol's names but not its signatures (an old observe)
+    # would pass a runtime_checkable isinstance and fail at its first verify trace
+    if Drafter not in type(drafter).__mro__:
         problems.append(f"{where}: its drafter, a {type(drafter).__name__}, is not a Drafter: subclass it")
     if hasattr(drafter, "bind_resources") and not isinstance(drafter, nn.Module):
         problems.append(

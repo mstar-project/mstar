@@ -488,6 +488,9 @@ class FlashInferManager(PlacedAttention):
             # not on a pre-plan: the step in flight may still read its own
             self._step_qo.clear()
         laps = PhaseLaps(f"{ctx.plan_phase}.attn.")
+        if step.verify and self._verify_fa3 and len(plan_outputs) > 1:
+            # one FA3 wrapper per (bucket, slot), whichever label: a second label's plan would overwrite the first's
+            raise RuntimeError(f"a verify step plans one KV label on FA3, not {sorted(plan_outputs)}")
         for label, kv_out in plan_outputs.items():
             indptrs = kv_out.cpu_indptrs
             r = None if shard_plan is None else shard_plan.ranges.get(label)
