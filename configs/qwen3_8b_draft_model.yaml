@@ -4,7 +4,8 @@ model: "qwen3_8b"
 # verifies them in the same forward. Greedy replies are the target's; temperature > 0 verifies by
 # speculative sampling. A request's repetition_penalty (other than 1) is refused. Off: drop `draft`.
 # Docs: docs/serving.rst (the `draft` block), docs/models.rst (Qwen3).
-# required by the serving config, read by nothing; the checkpoint's context bounds a request,
+# required by the serving config; a verifying deployment is refused at startup if its KV pool holds a
+# request to less than this. The checkpoint's context bounds a request,
 # and the KV pool holds two verify steps' worth more
 max_seq_len: 40960
 model_kwargs:
