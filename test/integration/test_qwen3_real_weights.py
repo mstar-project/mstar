@@ -8,12 +8,15 @@ log-probs:
 
     e_srv(t) = |served(s_t) - f[t, s_t]|      e_bf(t) = |b[t, s_t] - f[t, s_t]|
 
-The gate is the ratio of pooled means over all positions, R = mean(e_srv) / mean(e_bf):
-a bf16 port matches transformers' own bf16 error, so the real model needs R <= R_MAX,
-and each control (``CONTROLS``, a checkpoint edited the way a port bug would read it)
-needs R >= R_CONTROL_MIN. Both are placeholders until a GPU calibration run sets them.
-The deficit (fp32's margin given up at a greedy flip) and the bf16 spread are printed
-only: they see a bug only where it flips a near-tie.
+The gate is, per prompt set, the ratio of the means over its positions,
+R = mean(e_srv) / mean(e_bf): a bf16 port errs from fp32 as transformers' own bf16 does.
+The real model needs R <= R_MAX on every set; the control (``CONTROLS``, a checkpoint
+edited the way a port bug would read it) must fail the same gate on the long set.
+Measured on an H100 (Qwen3-8B): the real model 0.91 short and 0.92 long, rope_theta x1.1
+1.07 short and 2.58 long. Sets aren't pooled: the short replies would dilute the control
+to about 1.6. rms_norm_eps 1e-5 isn't a control: its served log-probs match the real
+model's at every length (R 0.93 against 0.92). The deficit (fp32's margin given up at a
+greedy flip) and the bf16 spread are printed only.
 
 Qwen3-0.6B ties its head to the embedding (its file also ships the head, equal to
 the embedding); it is not a registered size, so the loader's tie path is checked
@@ -52,10 +55,19 @@ PROMPTS = [
     "Summarize the plot of Romeo and Juliet in one paragraph.",
     "What is 17 * 23? Answer with the computation.",
 ]
+# 3.4k prompt tokens (rendered) of fixed public-domain prose, committed so it never moves: Lewis Carroll,
+# Alice's Adventures in Wonderland (1865), chapter I into chapter II (transcribed, not a given edition)
+LONG_PROMPTS = [
+    (Path(__file__).parent / "data" / "alice_chapters_1_2.txt").read_text()
+    + "\n\nIn the passage above, what did Alice find on the glass table, and what happened to her after she "
+    "drank from the bottle and ate the cake? Answer in a few sentences.",
+]
+SETS = {"short": PROMPTS, "long": LONG_PROMPTS}
+# every prompt, in the order the server and the reference run them, with its set
+ALL_PROMPTS = [(name, prompt) for name, prompts in SETS.items() for prompt in prompts]
 TOKENS = 128
-# placeholders, to be set from the GPU calibration run (real model and both controls)
-R_MAX = 2.0
-R_CONTROL_MIN = 4.0
+# the real model at 0.91-0.92, the control at 2.58 on the long set: a 1.6x and a 1.7x margin
+R_MAX = 1.5
 # the positions where a log-prob error isn't compressed by p near 1, reported apart
 MID = (0.05, 0.95)
 
@@ -67,12 +79,7 @@ def _scale_rope_theta(config: dict) -> None:
             holder["rope_theta"] *= 1.1
 
 
-def _llama_norm_eps(config: dict) -> None:
-    # Llama's RMSNorm eps (1e-5) in place of Qwen3's (1e-6): a default carried over from another port
-    config["rms_norm_eps"] = 1e-5
-
-
-CONTROLS = [("rope_theta x1.1", _scale_rope_theta), ("rms_norm_eps 1e-5", _llama_norm_eps)]
+CONTROLS = [("rope_theta x1.1", _scale_rope_theta)]
 
 
 def _snapshot(repo: str) -> Path | None:
@@ -141,10 +148,10 @@ class _Reference:
         self.prompts = [
             model.process_prompt(p, ["text"], ["text"], enable_thinking=False)
             .new_input_tensors["text_inputs"][0].tolist()
-            for p in PROMPTS
+            for _, p in ALL_PROMPTS
         ]
         # encode_ids over the rendered text gives the ids apply_chat_template's own tokenize does
-        for p, ids in zip(PROMPTS, self.prompts, strict=True):
+        for (_, p), ids in zip(ALL_PROMPTS, self.prompts, strict=True):
             want = model.tokenizer.apply_chat_template(
                 [{"role": "user", "content": p}], add_generation_prompt=True, tokenize=True,
                 return_dict=False, enable_thinking=False,
@@ -207,7 +214,7 @@ def _errors(ref: _Reference, served: list[_Served]) -> list[_Errors]:
 
 
 def _ratio(errors: list[_Errors], mid: bool = False) -> float:
-    """R: the pooled mean served error over the pooled mean bf16 error."""
+    """R over ``errors``' positions: the mean served error over the mean bf16 error."""
     pick = (lambda e: e.mid) if mid else (lambda e: torch.ones_like(e.mid))
     srv = torch.cat([e.served[pick(e)] for e in errors])
     bf = torch.cat([e.bf16[pick(e)] for e in errors])
@@ -215,20 +222,24 @@ def _ratio(errors: list[_Errors], mid: bool = False) -> float:
     return float(srv.mean() / bf.mean())
 
 
-def _report(label: str, errors: list[_Errors]) -> float:
-    """Print what the calibration reads (the PR quotes it) and return R."""
+def _report(label: str, errors: list[_Errors]) -> dict[str, float]:
+    """Print what the calibration reads (the PR quotes it) and return each set's R."""
     def stats(x: torch.Tensor) -> str:
         return f"mean {float(x.mean()):.4f} p90 {float(x.quantile(0.9)):.4f}" if x.numel() else "none"
 
-    for i, e in enumerate(errors):
-        print(f"{label}: prompt {i} ({len(e.served)} tokens, {int(e.mid.sum())} mid) e_srv {stats(e.served)} "
+    for i, ((name, _), e) in enumerate(zip(ALL_PROMPTS, errors, strict=True)):
+        print(f"{label}: {name} prompt {i} ({len(e.served)} tokens, {int(e.mid.sum())} mid) e_srv {stats(e.served)} "
               f"e_bf {stats(e.bf16)} deficit {e.deficit:.4f} spread {e.spread:.4f}")
-    srv, bf = torch.cat([e.served for e in errors]), torch.cat([e.bf16 for e in errors])
-    ratio = _ratio(errors)
-    mid = _ratio(errors, mid=True) if any(e.mid.any() for e in errors) else float("nan")
-    print(f"{label}: pooled e_srv {stats(srv)} e_bf {stats(bf)}; R {ratio:.3f}, R on p in {MID} {mid:.3f}; "
-          f"largest deficit {max(e.deficit for e in errors):.4f}, spread {max(e.spread for e in errors):.4f}")
-    return ratio
+    ratios = {}
+    for name in SETS:
+        group = [e for (n, _), e in zip(ALL_PROMPTS, errors, strict=True) if n == name]
+        srv, bf = torch.cat([e.served for e in group]), torch.cat([e.bf16 for e in group])
+        ratios[name] = _ratio(group)
+        mid = _ratio(group, mid=True) if any(e.mid.any() for e in group) else float("nan")
+        print(f"{label}: {name} set e_srv {stats(srv)} e_bf {stats(bf)}; R {ratios[name]:.3f}, "
+              f"R on p in {MID} {mid:.3f}; largest deficit {max(e.deficit for e in group):.4f}, "
+              f"spread {max(e.spread for e in group):.4f}")
+    return ratios
 
 
 CASES = [("qwen3_8b", "Qwen/Qwen3-8B")]
@@ -252,7 +263,7 @@ def _served_ids(tmp_path, name: str, model_path: Path | None = None) -> list[_Se
         "--upload-dir", str(tmp_path / "upload"), "--tensor-comm-protocol", "SHM",
     ]
     with server.Server(REPO, path, tmp_path / "server.log", command=command, env={"HF_HUB_OFFLINE": "1"}) as url:
-        return [_ids(url, p) for p in PROMPTS]
+        return [_ids(url, p) for _, p in ALL_PROMPTS]
 
 
 def _snapshot_or_skip(repo: str) -> Path:
@@ -284,17 +295,18 @@ def reference():
 
 @pytest.mark.parametrize("name, repo", CASES, ids=[c[0] for c in CASES])
 def test_served_log_probs_err_from_fp32_as_transformers_bf16_does(tmp_path, name, repo, reference):
-    ratio = _report(name, _errors(reference, _served_ids(tmp_path, name)))
-    assert ratio <= R_MAX, f"{name}: served log-probs err {ratio:.3f}x transformers' bf16 from fp32, past {R_MAX}"
+    ratios = _report(name, _errors(reference, _served_ids(tmp_path, name)))
+    past = {k: round(r, 3) for k, r in ratios.items() if r > R_MAX}
+    assert not past, f"{name}: served log-probs err from fp32 past {R_MAX}x transformers' bf16 on {past}"
 
 
 @pytest.mark.parametrize("control, edit", CONTROLS, ids=[c[0] for c in CONTROLS])
 def test_a_port_bug_fails_the_check(tmp_path, control, edit, reference):
-    """The negative controls: each must err at least ``R_CONTROL_MIN`` times transformers' bf16."""
+    """The negative control: the real model's gate fails it on the long set."""
     name, repo = CASES[0]
     served = _served_ids(tmp_path, name, model_path=_edited(tmp_path, _snapshot_or_skip(repo), edit))
-    ratio = _report(f"{name} ({control})", _errors(reference, served))
-    assert ratio >= R_CONTROL_MIN, f"{control} is not caught: R {ratio:.3f}, below {R_CONTROL_MIN}"
+    ratios = _report(f"{name} ({control})", _errors(reference, served))
+    assert ratios["long"] > R_MAX, f"{control} passes the gate: R {ratios['long']:.3f} on the long set"
 
 
 def test_a_tied_head_checkpoint_loads_its_head_from_the_embedding():
