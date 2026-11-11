@@ -23,6 +23,11 @@ class ChatMessage(BaseModel):
     content: str | list[dict[str, Any]] | None = None
 
 
+class StreamOptions(BaseModel):
+    # a bool as pydantic reads one ("false" is False), like the Rust frontend's flex::opt_bool
+    include_usage: bool | None = None
+
+
 class ChatCompletionRequest(BaseModel):
     model_config = _CFG
 
@@ -36,6 +41,8 @@ class ChatCompletionRequest(BaseModel):
     seed: int | None = None
     stop: str | list[str] | None = None
     stream: bool | None = False
+    # {"include_usage": true} ends a stream with a chunk that carries ``usage``
+    stream_options: StreamOptions | None = None
 
     # Multimodal output (OpenAI chat-completions ``modalities`` and ``audio``)
     modalities: list[str] | None = None
@@ -148,3 +155,12 @@ class ModelCard(BaseModel):
 class ModelList(BaseModel):
     object: str = "list"
     data: list[ModelCard] = Field(default_factory=list)
+
+
+class LoadLoraAdapterRequest(BaseModel):
+    lora_name: str
+    lora_path: str
+
+
+class UnloadLoraAdapterRequest(BaseModel):
+    lora_name: str

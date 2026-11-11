@@ -1,8 +1,11 @@
-"""The consumer side of streaming edges on one worker.
+"""Streaming edges on one worker, both sides.
 
-Each request's ``StreamBuffer``s live on its per-request info; this object
+On the consumer side, each request's ``StreamBuffer``s live on its per-request info; this object
 creates them, turns their ready chunks into graph edges, takes back the
-chunks a step did not keep, and settles which streams a step ends.
+chunks a step did not keep, and settles which streams a step ends. On the
+producer side, ``assign_consumer_walks`` stamps each walk-driven send with the
+consumer walk it drives, from tables that also cover connections consumed on
+other workers.
 """
 from __future__ import annotations
 
@@ -14,8 +17,8 @@ import torch
 from mstar.communication.tensors import NameToTensorList, TensorCommunicationManager
 from mstar.graph.base import GraphEdge, GraphSection
 from mstar.graph.runtime.base import ColumnarEdgeSpecs, EdgeSpec, InputTensors
-from mstar.streaming.stream_buffer import StreamBuffer, StreamChunkInfo, StreamingEdge, collate
-from mstar.streaming.topology import Connection
+from mstar.streaming.stream_buffer import InlineValue, StreamBuffer, StreamChunkInfo, StreamingEdge, collate
+from mstar.streaming.topology import Connection, PartitionTopology, ProducerWalkCtx
 from mstar.worker.node_manager_utils import RequestStateManager
 
 
@@ -41,7 +44,8 @@ def consumer_nodes(
 
 class StreamBufferManager:
     """The stream buffers of this worker's requests, for the connections whose
-    consumer runs here."""
+    consumer runs here, and the walk-driver tables this worker stamps its sends
+    with as a producer."""
 
     def __init__(
         self,
@@ -51,13 +55,27 @@ class StreamBufferManager:
         walks: dict[str, GraphSection] | None = None,
         *,
         graph_runtime=None,
-        walk_driven_edges: dict[str, str] | None = None,
+        topology: PartitionTopology | None = None,
     ):
         self._request_state = request_state
         self._tensor_manager = tensor_manager
         self._graph_runtime = graph_runtime
-        # walk-driven edge here -> the producer-triggered partition it feeds
-        self._walk_driven_edges = walk_driven_edges or {}
+        # producer-triggered partition -> the connection that decides its walk
+        self._walk_drivers: dict[str, Connection] = topology.walk_drivers() if topology else {}
+        # consumer side: walk-driven edge here -> its consumer partition
+        self.walk_driven_edges = {
+            conn.edge_name: conn.to_partition for conn in connections
+            if conn.to_partition in self._walk_drivers
+        }
+        # producer side: streamed signal -> its consumer partition, and
+        # (node, walk) -> the walk drivers it emits for
+        self._signal_consumer = {
+            conn.edge_name: conn.to_partition
+            for conn in (topology.connections if topology else [])
+        }
+        self._emitted_walk_drivers: dict[tuple[str, str], list[Connection]] = {}
+        # refilled for every walk-hook call rather than built per request per step
+        self._walk_ctx = ProducerWalkCtx()
         self.connections = connections
         # edge name -> the node that consumes it
         self.consumer_node: dict[str, str] = (
@@ -123,6 +141,49 @@ class StreamBufferManager:
     def remove_request(self, request_id: int) -> None:
         self._rids.discard(request_id)
 
+    def assign_consumer_walks(self, batch_N) -> None:
+        """Decide the consumer walk of this pass's streamed items, per rid and
+        producer-triggered consumer partition, and stamp it on the fwd_info
+        that rides with the remote sends. Asked per real walk: a mixed step's
+        combined label is no walk of the graph's. Runs on every emitting step,
+        so it allocates nothing per row."""
+        if not self._walk_drivers:
+            return
+        ctx = None
+        input_metadata = batch_N.node_batch.per_request_input_metadata
+        for walk, walk_rids in batch_N.batch.rids_by_walk().items():
+            key = (batch_N.node_name, walk)
+            drivers = self._emitted_walk_drivers.get(key)
+            if drivers is None:
+                consumers = {
+                    self._signal_consumer[signal]
+                    for signal in self._graph_runtime.get_output_signals(*key)
+                    if signal in self._signal_consumer
+                }
+                drivers = [
+                    self._walk_drivers[partition] for partition in consumers
+                    if partition in self._walk_drivers
+                ]
+                self._emitted_walk_drivers[key] = drivers
+            if not drivers:
+                continue
+            ctx = self._walk_ctx
+            ctx.producer_walk = walk
+            ctx.node = batch_N.node_name
+            for rid in walk_rids:
+                req_info = self._request_state.per_request_info.get(rid)
+                if req_info is None:
+                    continue
+                fwd_info = req_info.per_partition_info[batch_N.partition].current_fwd_info
+                meta = input_metadata.get(rid)
+                ctx.loop_iters = meta.dynamic_loop_iter_counts if meta else {}
+                ctx.fwd_info = fwd_info
+                for conn in drivers:
+                    fwd_info.stream_consumer_walks[conn.to_partition] = conn.consumer_walk(ctx)
+        if ctx is not None:
+            ctx.fwd_info = None
+            ctx.loop_iters = {}
+
     # -- items in, chunks out -------------------------------------------------
 
     def route_tensor(self, request_id: int, edge: GraphEdge) -> None:
@@ -150,7 +211,7 @@ class StreamBufferManager:
         walk = sbuf.peek_walk()
         if walk is None:
             return True
-        partition = self._walk_driven_edges[edge_name]
+        partition = self.walk_driven_edges[edge_name]
         if walk == self._partition_walk(request_id, partition):
             return True
         if not allow_walk_change or not self._graph_runtime.is_partition_idle(
@@ -174,7 +235,7 @@ class StreamBufferManager:
         waiting = sbuf.pop_waiting_edge()
         if waiting is not None:
             return waiting
-        partition = self._walk_driven_edges.get(edge_name)
+        partition = self.walk_driven_edges.get(edge_name)
         consumer_walk = (
             self._partition_walk(request_id, partition) if partition else None
         )
@@ -190,16 +251,46 @@ class StreamBufferManager:
         # The chunk's items as the buffer holds them: their uuids, or none for
         # an empty chunk (producer done, nothing left). The edge carries every
         # item; ``input_tensors`` stacks them when the consuming batch is built.
-        uuids = list(chunk.data.get("data") or [])
+        items = list(chunk.data.get("data") or [])
         tm = self._tensor_manager
-        if uuids:
-            # the edge's own reference, dropped once its node consumes it
-            tm.increment_ref_batch_uniform(uuids)
-        if chunk.released:
+        if any(type(item) is InlineValue for item in items):
+            # items that came inline: the window as one stored tensor, holding
+            # the edge's reference
+            uuids = [self._pack_window(request_id, edge_name, items)]
+        else:
+            uuids = items
+            if uuids:
+                # the edge's own reference, dropped once its node consumes it
+                tm.increment_ref_batch_uniform(uuids)
+        released = [item for item in chunk.released if type(item) is not InlineValue]
+        if released:
             # the buffer's references to the items it advanced past; after
             # the increment, so an item in both stays alive
-            tm.dereference_batch_uniform(list(chunk.released))
+            tm.dereference_batch_uniform(released)
         return StreamingEdge(edge_name, consumer_node, uuids, chunk.info)
+
+    def _pack_window(self, request_id: int, edge_name: str, items: list) -> int:
+        """A window that holds inline items, as one stored CPU int64 tensor ``[n]``
+        (what stacking ``n`` scalar items gives), with one reference: the edge's.
+        A window that also holds stored items (a step that could not send its
+        values inline) copies theirs to the host."""
+        if all(type(item) is InlineValue for item in items):
+            window = torch.tensor(items, dtype=torch.int64)
+        else:
+            stored = iter(self._tensor_manager.get_tensors(
+                [item for item in items if type(item) is not InlineValue]
+            ))
+            window = torch.cat([
+                torch.tensor([item], dtype=torch.int64) if type(item) is InlineValue
+                else next(stored).reshape(-1).to("cpu", torch.int64)
+                for item in items
+            ])
+        tm = self._tensor_manager
+        (info,) = tm.store_and_return_tensor_info(
+            request_id, {edge_name: [window]}, skip_cuda_sync=True,
+        )[edge_name]
+        tm.increment_ref(info.uuid)
+        return info.uuid
 
     def poll(self) -> list[tuple[int, StreamingEdge]]:
         """Every request's ready chunks, popped. A buffer nothing has touched
@@ -345,28 +436,3 @@ class StreamBufferManager:
             if all(self._partition.get(e) != partition for e in live):
                 partition_done.add(rid)
         return node_done, partition_done
-
-    def consumption(self, request_id: int) -> dict[str, int]:
-        """Items consumed so far per stream, as the producer is told."""
-        req_info = self._request_state.per_request_info.get(request_id)
-        if req_info is None:
-            return {}
-        return {
-            edge_name: sbuf._consumed
-            for edge_name, sbuf in req_info.stream_buffers.items()
-        }
-
-    def consumption_batch(self, rids: list[int]) -> list[tuple[int, dict[str, int]]]:
-        """``consumption`` for the rids that have stream buffers at all; the
-        rest would report an empty dict."""
-        infos = self._request_state.per_request_info
-        out: list[tuple[int, dict[str, int]]] = []
-        for rid in rids:
-            req_info = infos.get(rid)
-            if req_info is None or not req_info.stream_buffers:
-                continue
-            out.append((rid, {
-                edge_name: sbuf._consumed
-                for edge_name, sbuf in req_info.stream_buffers.items()
-            }))
-        return out

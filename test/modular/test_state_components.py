@@ -269,7 +269,7 @@ def test_a_region_on_an_array_declares_the_step_its_attn_key_did():
     on_array = state_steps(_region(array="tokens").region_step([1, 2], [3, 5]), {"tokens": h})
     on_key = _region(attn_key="vision").region_step([1, 2], [3, 5])
     assert on_array.steps == on_key.steps
-    assert on_array.segments == on_key.segments, "lora_rows reads the step's segments"
+    assert on_array.segments == on_key.segments, "with_segment_steps reads the step's segments"
     assert on_array.steps["vision"] == AttentionStep(segments=on_key.segments, causal=False)
 
 

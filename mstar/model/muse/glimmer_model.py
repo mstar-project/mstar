@@ -68,11 +68,8 @@ class MuseGlimmerModel(MultimodalDecoderModel):
         "tokenizer_config.json", "tokenizer.json", "chat_template.jinja",
     )
 
-    def __init__(
-        self, model_path_hf: str, cache_dir: str | None = None,
-        prefill_token_buckets: list[int] | None = None, **kwargs: Any,
-    ):
-        super().__init__(model_path_hf, cache_dir, prefill_token_buckets)
+    def __init__(self, model_path_hf: str, cache_dir: str | None = None, **kwargs: Any):
+        super().__init__(model_path_hf, cache_dir)
         self.config = MuseGlimmerConfig.from_hf(self.local_dir)
         self.vision_config = MuseGlimmerVisionConfig.from_hf(self.local_dir)
         self.tokenizer = load_tokenizer(self.local_dir)
@@ -86,7 +83,7 @@ class MuseGlimmerModel(MultimodalDecoderModel):
             self.config.eot_token_id = eot
         # the vision tower, whose output fills the images' pads in prompt order
         self.media = (MediaIntake(
-            "image", vision_encoder((self._image_pad_id,)), self._image_pad_id, self._image_intake,
+            "image", vision_encoder(), self._image_pad_id, self._image_intake,
             sentinels=(self._image_start_id, self._image_end_id),
         ),)
         if self._image_pad_id != self.config.image_token_id:
@@ -199,10 +196,18 @@ class MuseGlimmerModel(MultimodalDecoderModel):
             ids = ids[1:]
         return torch.tensor(ids, dtype=torch.long)
 
+    def request_kwargs(self) -> frozenset[str]:
+        return super().request_kwargs() | {"reasoning_strength", "reasoning_effort", "current_date"}
+
     def render_prompt(self, parts: list[PromptPart], **kwargs) -> str:
         template_kwargs = {}
+        enable_thinking = kwargs.get("enable_thinking")
+        if enable_thinking is not None and not isinstance(enable_thinking, bool):
+            raise ValueError(f"enable_thinking must be a boolean; got {enable_thinking!r}")
+        if kwargs.get("current_date") is not None and not isinstance(kwargs["current_date"], str):
+            raise ValueError(f"current_date must be a string; got {kwargs['current_date']!r}")
         strength = kwargs.get("reasoning_strength") or kwargs.get("reasoning_effort")
-        if strength is None and kwargs.get("enable_thinking") is False:
+        if strength is None and enable_thinking is False:
             # the chat adapters' switch: the template has no off, only "low"
             strength = "low"
         if strength is not None:
@@ -272,4 +277,4 @@ class MuseGlimmerModel(MultimodalDecoderModel):
         weight_loader.load_text_weights(model, weights_dir, device=device)
         model.requires_grad_(False).eval()
         logger.info("Loaded Muse Glimmer LLM onto %s", device)
-        return LLMSubmodule(model, self.config, self.encoders, self.prefill_token_buckets)
+        return LLMSubmodule(model, self.config, self.encoders)

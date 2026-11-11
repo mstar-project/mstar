@@ -14,19 +14,14 @@ from dataclasses import dataclass, field
 
 import torch
 
+from mstar.engine.resources.base import StepAllowance
 from mstar.engine.resources.kv.cpu_page_pool import CPUPagePool, PageCopies
 from mstar.engine.resources.kv.prefix_index import PrefixIndex
 
 logger = logging.getLogger(__name__)
 
-# What a step may queue for the host. The device has one device-to-host copy engine, which runs copies
-# in the order they were queued whatever their stream or priority, and the writes queue behind the
-# step's own output copy.
-# `_WRITE_BYTES_PER_STEP` bounds how long the writes hold the copy engine before the next step's output
-# copy can run (about 1 ms on an H100).
-# `_WRITE_PAGES_PER_STEP` bounds the copies launched from the host, one per page at most (about 0.1 ms of host
-# time at 16).
-_WRITE_BYTES_PER_STEP = 32 << 20
+# `_WRITE_PAGES_PER_STEP` bounds the copies a step launches from the host for cached pages, one per page at most (about
+# 0.1 ms of host time at 16).
 _WRITE_PAGES_PER_STEP = 16
 
 
@@ -49,10 +44,11 @@ class HostWrite:
 
 
 class HostWrites:
-    def __init__(self, pool: CPUPagePool, index: PrefixIndex, page_bytes: int):
+    def __init__(self, pool: CPUPagePool, index: PrefixIndex, page_bytes: int, allowance: StepAllowance):
         self._pool = pool
         self._index = index
-        self._per_step = min(_WRITE_PAGES_PER_STEP, max(1, _WRITE_BYTES_PER_STEP // page_bytes))
+        self._page_bytes = page_bytes
+        self._allowance = allowance
         # Keys waiting for their copy, in release order, each with the commit count when it was queued. A
         # key queued again keeps its place and its count, since its page is sealed and never written again.
         self.queued: OrderedDict[bytes, int] = OrderedDict()
@@ -86,17 +82,19 @@ class HostWrites:
                 write.cancelled.add(key)
 
     def take(self, done: int) -> HostWrite | None:
-        """Up to a step's share of queued pages to copy, among those queued by commit ``done`` or earlier.
-        Each page comes after its ancestors that have no copy on the host and none on the way."""
+        """Queued pages to copy, as many as the step's allowance has room for, among those queued by commit ``done``
+        or earlier. Each page comes after its ancestors that have no copy on the host and none on the way."""
+        left = self._allowance.left
+        per_step = min(_WRITE_PAGES_PER_STEP, max(1, left // self._page_bytes)) if left else 0
         keys: list[bytes] = []
         taken: set[bytes] = set()
         anchors: set[int] = set()
-        while self.queued and len(keys) < self._per_step:
+        while self.queued and len(keys) < per_step:
             key, commits = next(iter(self.queued.items()))
             if commits > done:
                 break
             chain, anchor = self._unwritten_chain(key, taken)
-            room = self._per_step - len(keys)
+            room = per_step - len(keys)
             if len(chain) > room:
                 # the ancestors that fit go now, and the key waits for a later step
                 chain = chain[:room]
@@ -116,6 +114,7 @@ class HostWrites:
             self._pool.arena.release(held)
             return None
         del keys[len(host):]
+        self._allowance.spend(len(keys) * self._page_bytes)
         pages = [self._index.page_for(key) for key in keys]
         write = HostWrite(
             keys=keys, pages=pages, host_pages=host, parents=[self._index.parent_key(page) for page in pages],

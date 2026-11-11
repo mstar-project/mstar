@@ -7,210 +7,67 @@ from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.accelerator_graph_config import (
-    AcceleratorGraphConfig,
-    BatchedAcceleratorGraphConfig,
-    PackedAcceleratorGraphConfig,
-)
+from mstar.engine.accelerator_graph_config import AcceleratorGraphConfig, BatchedAcceleratorGraphConfig
 from mstar.engine.engine import ExecutingBatch
-from mstar.engine.state import ArrayStep, SampleStep, Segment, SlotLease, SubmoduleStep, at_last_token, sample
+from mstar.engine.state import ArrayStep, SampleStep, Segment, SubmoduleStep, at_last_token, sample
+from mstar.model.components.sampled_token_decoder import SampledTokenDecoder
 from mstar.model.orpheus.config import KV_CACHE, SAMPLER, SNAC_LEFT_REACH_FRAMES, OrpheusModelConfig
 from mstar.model.submodule_base import (
     EMPTY_INPUT_METADATA,
     ARNodeInputs,
-    ARNodeSubmodule,
-    BatchedModelOutput,
     InputMetadata,
-    InputSeqLenInfo,
     ModelInputsFromEngine,
-    NodeInputs,
     NodeSubmodule,
-    TokenStop,
 )
 from mstar.streaming.stream_buffer import StreamChunkInfo
 
 logger = logging.getLogger(__name__)
 
 
-def token_stop(stop_token_id: int) -> TokenStop:
-    """The decode loop's stop id, checked by the graph runtime on every walk;
-    the loop's cap is the token budget."""
-    return TokenStop(
-        loop="decode_loop", buffer="new_token", stop_ids=frozenset({stop_token_id}), sampler=SAMPLER,
-        runtime_check=True,
-    )
+class OrpheusLLMSubmodule(SampledTokenDecoder):
+    """Llama 3.2 3B for Orpheus TTS: samples the audio tokens the SNAC node decodes."""
 
+    PREFILL_WALK = "prefill"
+    # The decode step also streams its token to SNAC, as a stored tensor (its
+    # connection is not ``by_value``), so its outputs never all stay on the
+    # device, which the loop-back needs: the sampler keeps no slot masters for it.
+    device_loopback = None
+    # A prompt is a voice and its text, so the ladder stops at 1024: a longer
+    # step runs eagerly rather than every capture being sized for 8192.
+    PREFILL_TOKEN_BUCKETS = [32, 64, 128, 256, 512, 1024]
+    # the batch ladders orpheus captured before moving onto the scaffold
+    # (decode the runner's default; prompt and mixed steps up to 64 rows)
+    DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]
+    PREFILL_CAPTURE_BATCH_SIZES = [1, 4, 16, 64]
+    MIXED_CAPTURE_BATCH_SIZES = [4, 16, 64]
+    # No split kernel and no recurrent state to size for prompt rows, so a
+    # mixed step takes any number of them.
+    MIXED_MAX_PREFILL_ROWS = None
+    # tokens a step runs, a prompt's chunk and any decode rows beside it
+    MAX_BATCH_TOKENS = 512
 
-class OrpheusLLMSubmodule(ARNodeSubmodule):
-    """Llama 3.2 3B wrapper for Orpheus TTS.
-
-    Dispatches on graph_walk:
-      - prefill: embed text tokens, fill KV cache
-      - decode: embed previous token, generate next audio token
-      - mixed: prefill and decode rows in one batch
-    """
-
-    def __init__(
-        self,
-        language_model: nn.Module,
-        config: OrpheusModelConfig,
-    ):
-        super().__init__()
-        self.language_model = language_model
-        self.embed_tokens = language_model.model.embed_tokens
-        self.lm_head = language_model.lm_head
-        self.config = config
-        self.token_stop = token_stop(config.stop_token_id)
-        # The LM head computes the custom-token rows alone and reads -inf for
-        # the text rows (``output_start``), so the stop token must be one of them.
-        if config.stop_token_id < config.custom_token_base_id:
-            raise ValueError("Orpheus's stop token must be a custom token")
+    def capture_compile_mode(self, graph_walk: str) -> str | None:
+        # max-autotune until the default compile level (mstar serve -O) is measured on this model
+        return "max-autotune-no-cudagraphs"
 
     def bind_state(self, handles: Mapping[str, Any]) -> None:
         self.kv = handles[KV_CACHE]
         self.sampler = handles[SAMPLER]
 
-    PREFILL_TOKEN_BUCKETS = [32, 64, 128, 256, 512, 1024]
-    PREFILL_CAPTURE_BATCH_SIZES = [1, 4, 16, 64]
-    MAX_BATCH_TOKENS = 512
-
-    def get_accelerator_graph_configs(
-        self, device: torch.device, tp_world_size: int = 1,
-    ) -> list[AcceleratorGraphConfig]:
-        return [
-            BatchedAcceleratorGraphConfig(
-                # max-autotune until the default compile level (mstar serve -O) is measured on this model
-                compile_mode="max-autotune-no-cudagraphs",
-                capture_graph_walk="decode",
-                single_request_inputs=ARNodeInputs(
-                    input_ids=torch.zeros(1, dtype=torch.long, device=device),
-                    input_seq_len=1
-                ),
-            ),
-            PackedAcceleratorGraphConfig(
-                # max-autotune until the default compile level (mstar serve -O) is measured on this model
-                compile_mode="max-autotune-no-cudagraphs",
-                capture_graph_walk="prefill",
-                # a mixed batch is packed rows too, decode rows one token long
-                replay_graph_walks=["prefill", "mixed"],
-                capture_token_lengths=self.PREFILL_TOKEN_BUCKETS,
-                make_node_input=lambda n: ARNodeInputs(
-                    input_ids=torch.zeros(
-                        (n,), dtype=torch.long, device=device,
-                    ), input_seq_len=n
-                ),
-                capture_batch_sizes=self.PREFILL_CAPTURE_BATCH_SIZES
-            )
-        ]
-
-    def prepare_inputs(
-        self,
-        graph_walk: str,
-        fwd_info: CurrentForwardPassInfo,
-        inputs: NameToTensorList,
-        **kwargs,
-    ) -> ARNodeInputs:
-        return ARNodeInputs(
-            input_ids=inputs["text_inputs"][0],
-            input_seq_len=inputs["text_inputs"][0].shape[0]
-        )
-
-    def get_input_sequence_len(
-        self, graph_walk: str, fwd_info: CurrentForwardPassInfo,
-        inputs: NameToTensorList, **kwargs,
-    ) -> InputSeqLenInfo | None:
-        if "text_inputs" not in inputs:
-            return None
-        return InputSeqLenInfo(inputs["text_inputs"][0].shape[0])
-
-    def speculative_input_seq_len(self, graph_walk, fwd_info, prev_seq_len):
-        if graph_walk == "decode":
-            return 1
-        return super().speculative_input_seq_len(graph_walk, fwd_info, prev_seq_len)
-
-    def declare_step(
-        self, graph_walk: str,
-        request_ids: list[str],
-        inputs: list[ARNodeInputs],
-        slot_lease: SlotLease | None = None,
-        piecewise_leases: Mapping[str, SlotLease] | None = None,
-        **kwargs,
-    ):
-        prefill_tokens = {
-            rid: inp.input_ids for rid, inp in zip(request_ids, inputs, strict=True)
-            if (inp.graph_walk or graph_walk) == "prefill"
-        }
+    def node_step(
+        self, segments: list[Segment], prefill_tokens: Mapping[int, torch.Tensor], advance: tuple[int, ...] | None,
+    ) -> SubmoduleStep:
         return SubmoduleStep(
-            segments=[
-                Segment(
-                    request_id=rid,
-                    label="main",
-                    span=inp.input_seq_len,
-                ) for rid, inp in zip(request_ids, inputs, strict=True)
-            ],
-            state={KV_CACHE: ArrayStep(), SAMPLER: SampleStep(prompt_tokens=prefill_tokens)},
+            segments=segments,
+            state={KV_CACHE: ArrayStep(advance=advance), SAMPLER: SampleStep(prompt_tokens=prefill_tokens)},
         )
 
-    def preprocess(
-        self,
-        graph_walk: str,
-        engine_inputs: ModelInputsFromEngine,
-        inputs: list[ARNodeInputs],
-    ) -> dict[str, torch.Tensor | Any]:
-        return {
-            "text_inputs": torch.cat([inp.input_ids for inp in inputs]),
-        }
+    def last_token_hidden(self, engine_inputs: ModelInputsFromEngine, hidden: torch.Tensor) -> torch.Tensor:
+        return at_last_token(self.kv, hidden)
 
-    def _forward(self, graph_walk: str, text_inputs: torch.Tensor) -> torch.Tensor:
-        hidden = self.language_model(self.embed_tokens(text_inputs))
-        if graph_walk != "decode":
-            hidden = at_last_token(self.kv, hidden)
-        return sample(self.sampler, self.lm_head(hidden))
+    def sample_tokens(self, engine_inputs: ModelInputsFromEngine, logits: torch.Tensor) -> torch.Tensor:
+        return sample(self.sampler, logits)
 
-    def forward(
-        self,
-        graph_walk: str,
-        engine_inputs: ModelInputsFromEngine,
-        text_inputs: torch.Tensor,
-        **kwargs
-    ) -> NameToTensorList:
-        return {
-            "new_token": self._forward(graph_walk=graph_walk, text_inputs=text_inputs)
-        }
-
-    def can_batch(
-        self, batch: ExecutingBatch,
-        model_inputs: list[NodeInputs]
-    ) -> bool:
-        return True
-
-    def forward_batched(
-        self,
-        graph_walk: str,
-        engine_inputs: ModelInputsFromEngine,
-        text_inputs: torch.Tensor,
-        **kwargs
-    ) -> BatchedModelOutput:
-        new_tokens = self._forward(graph_walk=graph_walk, text_inputs=text_inputs)
-        # Row i is request i; a per-rid dict here would guard the compiled frame
-        # on the ids. As the stop buffers too, the stop check reads one host
-        # copy of the rows, and the declared stop policies run in the runtime.
-        return BatchedModelOutput(
-            row_outputs={"new_token": new_tokens},
-            check_stop_buffers={"new_token": new_tokens},
-        )
-
-    def postprocess(
-        self, request_id: str,
-        request_info: CurrentForwardPassInfo,
-        outputs: dict[str, list[torch.Tensor]],
-        **kwargs
-    ):
-        # Metadata-only: rebind output name for graph routing. EOS check
-        # moved to check_stop so the GPU thread doesn't sync on .item() here.
-        if "new_token" not in outputs:
-            return
-        outputs["text_inputs"] = outputs["new_token"]
 
 class SNACDecoderSubmodule(NodeSubmodule):
     """SNAC 24kHz streaming decoder submodule.
@@ -293,22 +150,27 @@ class SNACDecoderSubmodule(NodeSubmodule):
         input_metadata: InputMetadata = EMPTY_INPUT_METADATA,
         is_final_stream_chunk: bool = False,
         **kwargs
-    ) -> ARNodeInputs:
+    ) -> ARNodeInputs | None:
         """One window's tokens -> ``(frames, 7)`` codes plus the frames to emit.
 
         A trailing partial frame (the EOS token the LLM streams last) is not
         audio and is dropped. Without stream chunk info the window is treated
         as a whole utterance.
         """
+        chunk = self._stream_chunk(input_metadata)
+        received = inputs.get("new_token")
+        if not received:
+            # an empty final chunk (a no-context stream cut at a chunk boundary
+            # without EOS): nothing to decode, and declined it still ends the walk
+            assert is_final_stream_chunk or (chunk is not None and chunk.is_final), (
+                "an empty chunk before the end of the stream"
+            )
+            return None
+        final = is_final_stream_chunk or chunk is None or chunk.is_final
         tpf = self.config.tokens_per_frame
         right = self.config.snac_right_context_frames
-        # an empty final chunk (a no-context stream cut at a chunk boundary
-        # without EOS) arrives as no tensor at all
-        received = inputs.get("new_token") or [self.idx_14.new_empty(0)]
         tokens = received[0].flatten()
-        chunk = self._stream_chunk(input_metadata)
         frames = tokens.numel() // tpf
-        final = is_final_stream_chunk or chunk is None or chunk.is_final
         start = max((chunk.context_items if chunk is not None else 0) // tpf - right, 0)
         end = max(frames if final else frames - right, start)
         codes = (tokens[: frames * tpf].view(frames, tpf) - self.config.custom_token_base_id - 10) % 4096

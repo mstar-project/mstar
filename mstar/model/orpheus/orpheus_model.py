@@ -20,6 +20,7 @@ windows of frames with left and right context (``OrpheusModelConfig.snac_*``);
 the SNAC decoder emits the audio of each window's own frames.
 """
 
+import dataclasses
 import logging
 from pathlib import Path
 
@@ -27,7 +28,8 @@ import torch
 from transformers import AutoTokenizer
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import CurrentForwardConductorMetadata, PartitionDefinition, StreamingConnectionState
+from mstar.conductor.request_info import FINAL_PREFILL, PartitionDefinition
+from mstar.engine.resources.lora import LoraSpec
 from mstar.engine.state import (
     Array,
     Attend,
@@ -43,13 +45,45 @@ from mstar.engine.state import (
 )
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.base import ForwardPassArgs, KVLabel, Model, PrefixKeys, ProcessPromptOutput
+from mstar.model.base import KVLabel, Model, PrefixKeys, ProcessPromptOutput, WalkStep
+from mstar.model.keys import MIXED
 from mstar.model.orpheus.config import ATTN, KV_CACHE, SAMPLER, OrpheusModelConfig
 from mstar.model.rebuild import RebuildPolicy
 from mstar.model.submodule_base import ChunkingPolicy, NodeSubmodule
+from mstar.model.utils import load_generation_defaults
 from mstar.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
 
 logger = logging.getLogger(__name__)
+
+# model_kwargs forwarded to the engine sampler; an unset one takes the config's value
+SAMPLING_KEYS = (
+    "temperature", "top_p", "top_k", "min_p",
+    "repetition_penalty", "penalize_prompt", "ignore_eos",
+)
+
+
+def _checkpoint_sampling_defaults(model_path_hf: str, cache_dir: str | None) -> dict:
+    """Greedy when the checkpoint's generation_config.json sets ``do_sample: false``;
+    {} when it is unreachable (the repo is gated).
+
+    The file is Llama-3.2-3B's chat preset (top_p 0.9), not Orpheus's recipe, so
+    its knob values are not read and the config's apply on every host.
+    """
+    if not model_path_hf:
+        return {}
+    if Path(model_path_hf).is_dir():
+        checkpoint_dir = model_path_hf
+    else:
+        from huggingface_hub import hf_hub_download
+
+        try:
+            checkpoint_dir = Path(hf_hub_download(
+                model_path_hf, "generation_config.json", cache_dir=cache_dir,
+            )).parent
+        except Exception as e:
+            logger.warning("No generation_config.json for %s (%s); using config defaults", model_path_hf, e)
+            return {}
+    return load_generation_defaults(checkpoint_dir, switch_only=True)
 
 
 # What the LLM checkpoint is loaded from (configs, tokenizer, safetensors shards).
@@ -79,6 +113,8 @@ def _resolve_local_hf_snapshot(
 class OrpheusModel(Model):
     """Orpheus TTS model: Llama 3.2 3B + SNAC 24kHz decoder."""
 
+    DECODE_LOOP = "decode_loop"
+
     def __init__(
         self,
         model_path_hf: str,
@@ -97,8 +133,9 @@ class OrpheusModel(Model):
             "snac_left_context_frames": snac_left_context_frames,
             "snac_right_context_frames": snac_right_context_frames,
         }
-        self.config = OrpheusModelConfig(
-            **{k: v for k, v in snac_overrides.items() if v is not None}
+        self.config = dataclasses.replace(
+            OrpheusModelConfig(**{k: v for k, v in snac_overrides.items() if v is not None}),
+            **_checkpoint_sampling_defaults(model_path_hf, cache_dir),
         )
 
         tokenizer_source = _resolve_local_hf_snapshot(
@@ -119,20 +156,20 @@ class OrpheusModel(Model):
     # -------------------------------------------------------------------
 
     def get_combined_graph_walks(self) -> dict[str, dict[str, set[str]]]:
-        return {"LLM": {"mixed": {"prefill", "decode"}}}
+        return {"LLM": {MIXED: {"prefill", "decode"}}}
 
     def get_chunking_policies(self) -> dict[str, tuple[ChunkingPolicy, ...]]:
         from mstar.model.orpheus.submodules import OrpheusLLMSubmodule
 
         budget = OrpheusLLMSubmodule.MAX_BATCH_TOKENS
         return {"LLM": (
-            ChunkingPolicy(walks=("prefill",), chunkable=True, max_batch_tokens=budget),
+            ChunkingPolicy(walks=(OrpheusLLMSubmodule.PREFILL_WALK,), chunkable=True, max_batch_tokens=budget),
             # carries the budget for the steps that mix a chunk with decode rows
-            ChunkingPolicy(walks=("mixed",), max_batch_tokens=budget),
+            ChunkingPolicy(walks=(MIXED,), max_batch_tokens=budget),
         )}
 
     def rebuild_policies(self) -> dict[str, RebuildPolicy]:
-        return {"LLM": RebuildPolicy(walk="prefill", ids_input="text_inputs", sample_output="new_token",
+        return {"LLM": RebuildPolicy(walks=frozenset({"prefill"}), ids_input="text_inputs", sample_output="new_token",
                                      loop="decode_loop")}
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
@@ -215,94 +252,30 @@ class OrpheusModel(Model):
             PartitionDefinition(
                 name="LLM",
                 graph_walks={"prefill", "decode"},
-                initial_walk="prefill",
-                producer_partitions=[],
             ),
             PartitionDefinition(
                 name="SNAC",
                 graph_walks={"snac_chunk"},
-                initial_walk=None,
-                producer_partitions=["LLM"],
             ),
         ]
 
-    def get_partition_forward_pass_args(
+    def walk_plan(
         self,
         partition_name: str,
-        partition_metadata: CurrentForwardConductorMetadata,
-        persist_signals: dict[str, list[TensorPointerInfo]],
-        incoming_connections: list[StreamingConnectionState] | None = None,
-    ) -> ForwardPassArgs:
+        input_modalities: list[str],
+        output_modalities: list[str],
+        input_signals: dict[str, list[TensorPointerInfo]],
+        model_kwargs: dict,
+    ) -> list[WalkStep]:
         if partition_name == "LLM":
-            return self._get_llm_partition_forward(
-                partition_metadata, persist_signals,
-            )
-        elif partition_name == "SNAC":
-            # Extract streaming state from the incoming connection
-            conn = incoming_connections[0] if incoming_connections else None
-            token_buffer_count = conn.token_count if conn else 0
-            producer_done = conn.producer_done if conn else False
-            consumed = conn.consumed_count if conn else 0
-            return self._get_snac_partition_forward(
-                partition_metadata, token_buffer_count, producer_done, consumed,
-            )
+            return [
+                WalkStep("prefill", step_metadata={FINAL_PREFILL: True}),
+                WalkStep("decode", bind={"text_inputs": "new_token"}),
+            ]
+        if partition_name == "SNAC":
+            # runs on each window of the LLM's tokens until the worker reports the last
+            return [WalkStep("snac_chunk")]
         raise ValueError(f"Unknown partition: {partition_name!r}")
-
-    def _get_llm_partition_forward(
-        self,
-        metadata: CurrentForwardConductorMetadata,
-        persist_signals: dict[str, list[TensorPointerInfo]],
-    ) -> ForwardPassArgs:
-        """LLM partition: prefill -> decode loop until EOS."""
-        request_done = False
-
-        if metadata.is_prefill:
-            metadata.is_prefill = False
-            metadata.graph_walk = "decode"
-        elif metadata.graph_walk == "decode":
-            request_done = True
-            metadata.kwargs["decode_finished"] = True
-
-        if request_done:
-            return ForwardPassArgs(
-                full_metadata=metadata,
-                inputs=[],
-                unpersist_tensors=[],
-                request_done=True,
-            )
-
-        graph_edge = GraphEdge(next_node="LLM", name="text_inputs")
-        graph_edge.tensor_info = persist_signals.get("new_token", [])
-        inputs = [graph_edge]
-        unpersist_tensors = sum([inp.tensor_info for inp in inputs], start=[])
-        step_metadata = {
-            "is_prefill": metadata.is_prefill,
-        }
-
-        return ForwardPassArgs(
-            full_metadata=metadata,
-            inputs=inputs,
-            unpersist_tensors=unpersist_tensors,
-            step_metadata=step_metadata,
-        )
-
-    def _get_snac_partition_forward(
-        self,
-        metadata: CurrentForwardConductorMetadata,
-        token_buffer_count: int,
-        producer_done: bool,
-        consumed: int = 0,
-    ) -> ForwardPassArgs:
-        """SNAC partition: the streaming decode loop is self-triggered,
-        so this function is basically a no-op.
-        """
-        metadata.graph_walk = "snac_chunk"
-
-        return ForwardPassArgs(
-            full_metadata=metadata,
-            inputs=[],
-            unpersist_tensors=[],
-        )
 
     # -------------------------------------------------------------------
     # Model ABC: prompt processing
@@ -323,18 +296,18 @@ class OrpheusModel(Model):
         if prompt is None or not prompt.strip():
             raise ValueError("Orpheus requires a non-empty text prompt")
 
-        # An explicit empty/None voice keeps the unprefixed prompt.
         voice = kwargs.get("voice", self.config.default_voice)
-        if voice:
-            voice = str(voice).lower()
-            if voice not in self.config.available_voices:
-                supported = ", ".join(self.config.available_voices)
-                raise ValueError(
-                    f"Unsupported Orpheus voice {voice!r}; supported: {supported}"
-                )
+        if not isinstance(voice, str) or not voice:
+            raise ValueError(f"voice must be a non-empty name; got {voice!r}")
+        voice = voice.lower()
+        if voice not in self.config.available_voices:
+            supported = ", ".join(self.config.available_voices)
+            raise ValueError(
+                f"Unsupported Orpheus voice {voice!r}; supported: {supported}"
+            )
 
         # Format: "{voice}: {text}"
-        adapted_prompt = f"{voice}: {prompt}" if voice else prompt
+        adapted_prompt = f"{voice}: {prompt}"
         prompt_tokens = self.tokenizer(adapted_prompt, return_tensors="pt")
 
         # Wrap with special tokens: [128259, ...tokens..., 128009, 128260, 128261, 128257]
@@ -349,62 +322,8 @@ class OrpheusModel(Model):
         return ProcessPromptOutput({"text_inputs": [all_input_ids]}, {"state_layout": {KV_CACHE: {"main": layout}}})
 
     # -------------------------------------------------------------------
-    # Model ABC: forward pass args
-    # -------------------------------------------------------------------
-
-    def get_initial_forward_pass_args(
-        self,
-        partition_name: str,
-        input_modalities: list[str],
-        output_modalities: list[str],
-        input_signals: dict[str, list[TensorPointerInfo]],
-        model_kwargs: dict | None = None,
-    ) -> ForwardPassArgs:
-        if partition_name == "LLM":
-            full_metadata = CurrentForwardConductorMetadata(
-                input_modalities=input_modalities,
-                output_modalities=output_modalities,
-                graph_walk="prefill",
-                is_prefill=True,
-            )
-
-            graph_edge = GraphEdge(next_node="LLM", name="text_inputs")
-            graph_edge.tensor_info = input_signals.get("text_inputs", [])
-            inputs = [graph_edge]
-
-            unpersist_tensors = sum([inp.tensor_info for inp in inputs], start=[])
-
-            return ForwardPassArgs(
-                full_metadata=full_metadata,
-                inputs=inputs,
-                unpersist_tensors=unpersist_tensors,
-                step_metadata={
-                    "is_prefill": True,
-                },
-            )
-        elif partition_name == "SNAC":
-            # SNAC starts with snac_chunk walk but no inputs —
-            # it will self-trigger via StreamBuffer when tokens arrive.
-            full_metadata = CurrentForwardConductorMetadata(
-                input_modalities=input_modalities,
-                output_modalities=output_modalities,
-                graph_walk="snac_chunk",
-                is_prefill=False,
-            )
-            return ForwardPassArgs(
-                full_metadata=full_metadata,
-                inputs=[],
-                unpersist_tensors=[],
-            )
-        raise ValueError(f"Unknown partition: {partition_name!r}")
-
-    # -------------------------------------------------------------------
     # Model ABC: resources
     # -------------------------------------------------------------------
-
-    def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
-        # the prefill samples the first of max_output_tokens, so the loop runs one fewer
-        return {"decode_loop": max(1, self.get_max_output_tokens(**model_kwargs) - 1)}
 
     def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
         """The LLM's prompt is its token ids. Its generated audio codes never
@@ -419,6 +338,24 @@ class OrpheusModel(Model):
             self.model_path_hf, cache_dir=self.cache_dir, allow_patterns=LLM_FILES,
         )
 
+    def _lora_spec(self) -> LoraSpec:
+        """Per-request adapters on the LLM (opt-in): every linear of the Llama stack, the
+        LM head (one row per request: the last token's) and the token embedding, placed as
+        the weight loader places the checkpoint's own tensors. Adapters saved on the bare
+        ``LlamaModel`` (``layers.*``) are read under ``model.``."""
+        from mstar.model.components.lora.modules import PER_SEGMENT, module_lora_spec
+        from mstar.model.orpheus.components.language_model import OrpheusForCausalLM
+        return module_lora_spec(
+            lambda group: OrpheusForCausalLM(self.config, comm_group=group),
+            nodes={"LLM"}, root_path="model",
+            adapter_roots=[("", "model.")],
+            rows={"lm_head": PER_SEGMENT},
+            embeddings=True,
+        )
+
+    def get_node_resources(self):
+        return [self._lora_spec()]
+
     def declare_state(self) -> list[Array | Sampler]:
         c, scaling = self.config, self.config.rope_scaling
         return [
@@ -432,28 +369,27 @@ class OrpheusModel(Model):
                 )),
                 reads={ATTN: Read(mask=Causal(), op=Attend(q_heads=c.num_attention_heads))},
             ),
-            Sampler(SAMPLER, nodes={"LLM"}, vocab_size=c.vocab_size, penalty=True),
+            # min_p on only when the recipe sets it (the checkpoint's file can't: it is read
+            # switch_only); otherwise a request min_p > 0 is refused
+            Sampler(SAMPLER, nodes={"LLM"}, vocab_size=c.vocab_size, penalty=True, min_p=c.min_p > 0),
         ]
 
     def get_request_resource_configs(
-        self, partition_fwd_args: dict[str, ForwardPassArgs],
-        model_kwargs: dict | None = None,
+        self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
     ) -> dict[str, SampleSettings]:
-        del partition_fwd_args
+        del input_modalities, output_modalities
         model_kwargs = model_kwargs or {}
-        keys = [
-            "temperature", "top_p", "repetition_penalty",
-            "ignore_eos"
-        ]
         return {
             SAMPLER: SampleSettings(
                 **{
                     k: model_kwargs.get(k, getattr(self.config, k))
-                    for k in keys
+                    for k in SAMPLING_KEYS
                 }
             )
         }
 
+    def request_kwargs(self) -> frozenset[str]:
+        return frozenset({"voice", "max_output_tokens", *SAMPLING_KEYS})
 
     def get_output_sample_rate(self, modality: str = "audio") -> int:
         return self.config.sample_rate
@@ -467,18 +403,6 @@ class OrpheusModel(Model):
     # -------------------------------------------------------------------
     # Model ABC: postprocess
     # -------------------------------------------------------------------
-
-    def postprocess(
-        self,
-        output: torch.Tensor,
-        modality: str,
-        **kwargs
-    ) -> bytes:
-        if modality == "audio":
-            if output.numel() == 0:
-                return b""
-            return output.cpu().numpy().tobytes()
-        raise ValueError(f"Unsupported modality for Orpheus: {modality!r}")
 
     # -------------------------------------------------------------------
     # Model ABC: sharding
@@ -543,10 +467,7 @@ class OrpheusModel(Model):
         load_weights(language_model, local_dir, device=device)
         language_model.eval()
 
-        return OrpheusLLMSubmodule(
-            language_model=language_model,
-            config=self.config,
-        )
+        return OrpheusLLMSubmodule(language_model, self.config)
 
     def _create_snac_submodule(self, device: str) -> NodeSubmodule:
         from mstar.model.orpheus.components.snac import SNAC

@@ -8,7 +8,7 @@ backends; the per-model OpenAI adapters translate them onto the same
 submission path the native surfaces use. Replication for throughput means
 more M* instances — the Dynamo router balances across them.
 
-Requires the ``dynamo`` extra (``pip install mstar[dynamo]``). Launch::
+Requires the ``dynamo`` extra (``pip install mstar-ai[dynamo]``). Launch::
 
     python -m mstar.integrations.dynamo --config configs/<model>.yaml \\
         --model-path <hf snapshot dir> [--namespace mstar ...]

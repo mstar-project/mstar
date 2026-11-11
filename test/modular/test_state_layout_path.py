@@ -118,7 +118,7 @@ class _Settings:
     def __init__(self, configs):
         self.configs = configs
 
-    def get_request_resource_configs(self, partition_fwd_args, model_kwargs):
+    def get_request_resource_configs(self, input_modalities, output_modalities, model_kwargs):
         return self.configs
 
     def declare_state(self):
@@ -130,7 +130,7 @@ def _configs(*args):
     conductor.model = _Settings(*args)
     conductor._kv_labels = {}
     conductor._node_resources_cache = []
-    return conductor._get_resource_configs({}, {})
+    return conductor._get_resource_configs([], [], {})
 
 
 def test_the_conductor_hands_on_settings_as_todays_config():

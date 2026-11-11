@@ -76,43 +76,12 @@ def _loop_step(fwd_info: CurrentForwardPassInfo, step_index: torch.Tensor) -> in
     return int(step_index.reshape(-1)[0].item())
 
 
-class _SingleRequestMixin:
-    """Serve one request per step through the engine's batched entry point.
-
-    The engine always dispatches to ``forward_batched``; a submodule that only
-    defines ``forward`` never runs.  The codec nodes do not batch — each
-    request's waveform has its own length and the codec is small enough that
-    padding would cost more than it saves — so they cap at one and hand the row
-    to ``forward``, rather than claiming a batching they do not implement.
-    """
-
-    def max_batch_size(self, graph_walk: str):
-        return 1
-
-    def forward_batched(
-        self,
-        graph_walk: str,
-        engine_inputs: ModelInputsFromEngine,
-        **kwargs,
-    ) -> dict[str, NameToTensorList]:
-        request_ids = engine_inputs.request_ids
-        assert len(request_ids) == 1, (
-            f"{type(self).__name__} does not batch; got {len(request_ids)} "
-            "requests in one step (max_batch_size should have capped it at 1)"
-        )
-        return {
-            request_ids[0]: self.forward(
-                graph_walk, engine_inputs=engine_inputs, **kwargs
-            )
-        }
-
-
 # ---------------------------------------------------------------------------
 # ref_encoder
 # ---------------------------------------------------------------------------
 
 
-class OmniVoiceRefEncoderSubmodule(_SingleRequestMixin, NodeSubmodule):
+class OmniVoiceRefEncoderSubmodule(NodeSubmodule):
     """Higgs-Audio-v2 encode of the cloning reference.
 
     Consumes ``ref_audio_inputs`` — one mono waveform already resampled to the
@@ -131,6 +100,10 @@ class OmniVoiceRefEncoderSubmodule(_SingleRequestMixin, NodeSubmodule):
         super().__init__()
         self.codec = codec
         self.config = config
+
+    def max_batch_size(self, graph_walk: str):
+        # never batched: each waveform has its own length
+        return 1
 
     def prepare_inputs(
         self,
@@ -186,6 +159,16 @@ class OmniVoiceBackboneSubmodule(NodeSubmodule):
     #   Mismatched Tensor on argument #1 ... expected dtype=float32
     # So numerics here are governed by the load dtype, not by the engine.
     disable_autocast = True
+    # Packed tokens per step (both CFG documents of every request); a step
+    # above the largest bucket runs eagerly. Eager steps stay launch-bound well
+    # past 4096 tokens: at 16 requests (~5-9k tokens) the eager layer loop took
+    # ~12 ms of host time for ~10 ms of GPU work on an H100. 8192 covers 16
+    # requests of up to ~10 s of speech each. A deployment sets its own with
+    # the serving config's `prefill_token_buckets: {backbone: {backbone_layers: [...]}}`.
+    BACKBONE_TOKEN_BUCKETS = [
+        256, 512, 768, 1024, 1536, 2048, 2560, 3072, 3584, 4096,
+        4608, 5120, 5632, 6144, 6656, 7168, 7680, 8192,
+    ]
 
     def __init__(self, backbone: OmniVoiceBackbone, config: OmniVoiceConfig):
         super().__init__()
@@ -245,16 +228,6 @@ class OmniVoiceBackboneSubmodule(NodeSubmodule):
         else:
             step_index = inputs["step_index"][0]
             k = _loop_step(fwd_info, step_index)
-            num_step = int(meta["num_step"])
-            if k >= num_step:
-                # Async scheduling dispatched an iteration past this request's
-                # stop. Veto it — None makes the engine skip the forward.
-                logger.info(
-                    "OmniVoice backbone: skipping async-overshoot iteration %d "
-                    "(request %s runs %d steps)",
-                    k, fwd_info.request_id, num_step,
-                )
-                return None
             tokens = inputs["audio_tokens"][0].to(device)
             target_len = tokens.shape[-1]
 
@@ -326,7 +299,7 @@ class OmniVoiceBackboneSubmodule(NodeSubmodule):
                 make_static_inputs=partial(self._layer_static_inputs, device=device),
                 declare_step=self._attention_step,
                 lease_before_step=True,
-                total_tokens=list(self.config.backbone_token_buckets),
+                total_tokens=list(self.BACKBONE_TOKEN_BUCKETS),
                 capture_batch_sizes=list(self.config.backbone_capture_batch_sizes),
             )
         }
@@ -504,33 +477,13 @@ class OmniVoiceBackboneSubmodule(NodeSubmodule):
         rid = engine_inputs.request_ids[0]
         return self.forward_batched(graph_walk, engine_inputs, **kwargs)[rid]
 
-    # -- stop -------------------------------------------------------------
-
-    def check_stop(
-        self,
-        request_id: str,
-        request_info: CurrentForwardPassInfo,
-        outputs: dict[str, list[torch.Tensor]],
-    ) -> set[str]:
-        """End the loop after exactly this request's ``num_step`` iterations.
-
-        While iteration k is being postprocessed the counter still reads k, so
-        for N steps the stop must fire at ``k == N - 1``.  ``>=`` keeps it
-        firing if async scheduling has already advanced the deferred count.
-        """
-        iter_idx = request_info.dynamic_loop_iter_counts.get(UNMASK_LOOP_NAME, 0)
-        requested = int(request_info.step_metadata.get("num_step", 0) or 0)
-        if requested > 0 and iter_idx + 1 >= requested:
-            return {UNMASK_LOOP_NAME}
-        return set()
-
 
 # ---------------------------------------------------------------------------
 # code2wav
 # ---------------------------------------------------------------------------
 
 
-class OmniVoiceCode2WavSubmodule(_SingleRequestMixin, NodeSubmodule):
+class OmniVoiceCode2WavSubmodule(NodeSubmodule):
     """Decode the finished canvas to the codec's float waveform.
 
     Emits ``audio_output``, 1-D float32 at the codec's sample rate, and nothing
@@ -554,6 +507,10 @@ class OmniVoiceCode2WavSubmodule(_SingleRequestMixin, NodeSubmodule):
         super().__init__()
         self.codec = codec
         self.config = config
+
+    def max_batch_size(self, graph_walk: str):
+        # never batched: each waveform has its own length
+        return 1
 
     def compile_regions(self) -> dict[str, list[tuple]]:
         """The codec's acoustic decoder, compiled for dynamic canvas lengths:

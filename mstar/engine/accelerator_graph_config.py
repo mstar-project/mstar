@@ -1,4 +1,6 @@
+import logging
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable
@@ -8,6 +10,9 @@ import torch
 from mstar.engine.resources import AttentionStep, Segment, SubmoduleStep
 from mstar.engine.state.contract import ArrayStep
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs
+from mstar.model.utils import capture_ladder
+
+logger = logging.getLogger(__name__)
 
 # A compile mode of the engine's own rather than torch.compile's: Inductor's
 # defaults in its deterministic mode, which picks each kernel's config by rule
@@ -15,6 +20,9 @@ from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs
 # same kernels and one input gives one output from any server. See
 # ``accelerator_graph_runner.compile_kwargs``.
 DETERMINISTIC_COMPILE_MODE = "deterministic"
+
+# The batch sizes a capture takes when its config names none.
+DEFAULT_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]
 
 
 def check_compile_mode(mode: str | None) -> str | None:
@@ -42,6 +50,23 @@ def check_compile_mode(mode: str | None) -> str | None:
     return mode
 
 
+def check_inductor_options(options: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    """A capture config's ``inductor_options``, refused at build: each must name
+    an Inductor config entry, and none may turn on Inductor's CUDA graphs."""
+    if not options:
+        return None
+    import torch._inductor.config as inductor_config
+
+    known = inductor_config.get_config_copy()
+    unknown = sorted(name for name in options if name not in known)
+    if unknown:
+        raise ValueError(f"inductor_options names no Inductor config entry: {unknown}")
+    if options.get("triton.cudagraphs"):
+        # Inductor's own graphs inside the runner's capture fail it
+        raise ValueError("inductor_options turns on Inductor's CUDA graphs inside the runner's capture")
+    return dict(options)
+
+
 class AcceleratorGraphConfigType(Enum):
     BASIC_BATCHED = "basic_batched"
     FLASH_INFER_PACKED = "flash_infer_packed"
@@ -60,8 +85,13 @@ class AcceleratorGraphConfig(ABC):
         # torch.compile mode for the captured forward; None takes the deployment's
         # compile level (mstar serve -O), a mode opts the config out of it
         compile_mode: str | None = None,
+        # Inductor config entries the compile runs under, over the mode's (or
+        # the compile level's) own: e.g. which GEMM backends max-autotune may
+        # pick, ``{"max_autotune_gemm_backends": "ATEN"}``
+        inductor_options: Mapping[str, Any] | None = None,
 
-        # Per-config override for the set of batch sizes to capture
+        # Per-config override for the set of batch sizes to capture (None: the
+        # runner's defaults; []: none)
         capture_batch_sizes: list[int] | None = None,
         # Method on the submodule to capture
         capture_forward_method: str = "forward_batched",
@@ -81,6 +111,7 @@ class AcceleratorGraphConfig(ABC):
         self.additional_key_info = additional_key_info
         self.compile = compile
         self.compile_mode = check_compile_mode(compile_mode)
+        self.inductor_options = check_inductor_options(inductor_options)
         self.capture_batch_sizes = capture_batch_sizes
         self.capture_forward_method = capture_forward_method
         self.caps_eager_batch_size = caps_eager_batch_size
@@ -119,6 +150,7 @@ class BatchedAcceleratorGraphConfig(AcceleratorGraphConfig):
         total_tokens_multiplier: int = 1,
         compile_mode: str | None = None,
         input_seq_dims: dict[str, int] | None = None,
+        inductor_options: Mapping[str, Any] | None = None,
     ):
         super().__init__(
             capture_graph_walk=capture_graph_walk,
@@ -130,6 +162,7 @@ class BatchedAcceleratorGraphConfig(AcceleratorGraphConfig):
             capture_forward_method=capture_forward_method,
             caps_eager_batch_size=caps_eager_batch_size,
             input_seq_dims=input_seq_dims,
+            inductor_options=inductor_options,
         )
         self.single_request_inputs = single_request_inputs
         # ``single_request_inputs.input_seq_len`` is also read per-label by the
@@ -188,7 +221,10 @@ class PackedAcceleratorGraphConfig(AcceleratorGraphConfig):
     def __init__(
         self,
         capture_graph_walk: str,
-        capture_token_lengths: list[int],
+        # a ladder, or ``{min batch size: ladder}``: a batch size takes the
+        # ladder of the largest key at or below it, and none if every key is above
+        # (a plain ladder is kept as ``{1: ladder}``)
+        capture_token_lengths: list[int] | Mapping[int, list[int]],
         # seq len -> NodeInputs
         make_node_input: Callable[[int], NodeInputs],
         replay_graph_walks: list[str] | None = None,
@@ -204,6 +240,7 @@ class PackedAcceleratorGraphConfig(AcceleratorGraphConfig):
         total_tokens_multiplier: int = 1,
         compile_mode: str | None = None,
         input_seq_dims: dict[str, int] | None = None,
+        inductor_options: Mapping[str, Any] | None = None,
         # (input tokens, bs) -> each capture row's span; `distribute_tokens`
         # by default. A walk whose kernels split rows by span (a mixed step's
         # one-token rows beside a prompt) captures a layout it will replay.
@@ -219,11 +256,12 @@ class PackedAcceleratorGraphConfig(AcceleratorGraphConfig):
             capture_forward_method=capture_forward_method,
             caps_eager_batch_size=caps_eager_batch_size,
             input_seq_dims=input_seq_dims,
+            inductor_options=inductor_options,
         )
         if total_tokens_multiplier < 1:
             raise ValueError("total_tokens_multiplier must be at least 1")
         self.make_node_input = make_node_input
-        self.capture_token_lengths = capture_token_lengths
+        self.capture_token_lengths = ladders_by_batch_size(capture_token_lengths)
         self.total_tokens_multiplier = total_tokens_multiplier
         self.token_layout = token_layout or distribute_tokens
 
@@ -231,12 +269,10 @@ class PackedAcceleratorGraphConfig(AcceleratorGraphConfig):
         return AcceleratorGraphConfigType.FLASH_INFER_PACKED
 
     def get_total_tokens(self, bs: int) -> list[int]:
+        ladder = max(((k, v) for k, v in self.capture_token_lengths.items() if k <= bs), default=(0, []))[1]
         # every real row carries a token, so a bucket with fewer tokens than
         # rows could never serve a step; capturing it would give rows of none
-        return [
-            n * self.total_tokens_multiplier for n in self.capture_token_lengths
-            if n >= bs
-        ]
+        return [n * self.total_tokens_multiplier for n in ladder if n >= bs]
 
     def get_node_inputs(self, bs: int, num_tokens: int):
         # ``num_tokens`` is the bucket's plan tokens; the rows get input tokens
@@ -244,6 +280,161 @@ class PackedAcceleratorGraphConfig(AcceleratorGraphConfig):
         return [
             self.make_node_input(n) for n in seq_lens
         ]
+
+
+def ladders_by_batch_size(ladder: Any) -> dict[int, Any]:
+    """A ``capture_token_lengths`` or ``prefill_token_buckets`` value as
+    ``{min batch size: ladder}``: a plain ladder serves every batch size."""
+    return dict(ladder) if isinstance(ladder, Mapping) else {1: ladder}
+
+
+def check_token_ladder(where: str, ladder: Any) -> None:
+    """Refuse a ``prefill_token_buckets`` value that is not a ladder (a
+    non-empty list of distinct positive ints) or ``{min batch size: ladder}``
+    whose top rungs rise with the batch size: a capture's static buffers are
+    sized by its first, largest-batch bucket, so a smaller batch's ladder must
+    not reach past it."""
+    by_bs = ladders_by_batch_size(ladder)
+    if not by_bs or not all(isinstance(k, int) and not isinstance(k, bool) and k > 0 for k in by_bs):
+        raise ValueError(
+            f"prefill_token_buckets for {where} maps a min batch size (a positive int) to a "
+            f"ladder, got {ladder!r}"
+        )
+    tops = [max(capture_ladder(f"prefill_token_buckets for {where}", by_bs[k])) for k in sorted(by_bs)]
+    if tops != sorted(tops):
+        raise ValueError(
+            f"prefill_token_buckets for {where}: a larger batch size's ladder must reach at least as "
+            f"far as a smaller one's, got {ladder!r}"
+        )
+
+
+def _trim(ladder: list[int], tokens: int | None, at_least: int = 0) -> list[int]:
+    """``ladder`` up to its first rung that holds ``tokens`` and ``at_least``."""
+    rungs = sorted(ladder)
+    if tokens is None:
+        return rungs
+    bound = max(tokens, at_least)
+    held = next((i for i, n in enumerate(rungs) if n >= bound), len(rungs) - 1)
+    return rungs[:held + 1]
+
+
+def apply_token_ladders(
+    node: str, configs: list[AcceleratorGraphConfig], ladders: Mapping[str, Any],
+    step_tokens: Callable[[str, int], int | None],
+    batch_sizes: Callable[[AcceleratorGraphConfig], list[int]],
+) -> None:
+    """Take a serving config's ``prefill_token_buckets`` for ``node`` (capture
+    walk -> ladder or ``{min batch size: ladder}``, which `EngineManager`
+    checked) as the ``capture_token_lengths`` of the node's packed captures of
+    that walk.
+
+    A ladder runs to the first rung that holds the most tokens the scheduler
+    gives a step its capture replays (``step_tokens`` of each replay walk and
+    the capture's widest batch, of the ``batch_sizes`` the runner captures it
+    at: its token budget, or a little past it beside
+    decode rows; none where any walk's steps have no bound): a rung beyond
+    would never replay. A larger batch size's ladder also runs at least as far
+    as a smaller one's, which share its static buffers.
+
+    A walk whose steps only replay another walk's capture is refused, naming
+    that walk, as is one the node captures by batch size alone. A walk the
+    node captures nothing for here, as a model that turns
+    its captures off at runtime does, is logged and skipped: its steps run
+    eagerly whatever the ladder.
+    """
+    packed = [c for c in configs if isinstance(c, PackedAcceleratorGraphConfig)]
+    for walk, ladder in ladders.items():
+        targets = [c for c in packed if c.capture_graph_walk == walk]
+        if not targets:
+            replayed_on = sorted({c.capture_graph_walk for c in packed if walk in c.replay_graph_walks})
+            if replayed_on:
+                raise ValueError(
+                    f"prefill_token_buckets names walk {walk!r} of {node}, whose steps replay the "
+                    f"captures of {replayed_on}; name that walk"
+                )
+            if any(walk == c.capture_graph_walk or walk in c.replay_graph_walks for c in configs):
+                raise ValueError(
+                    f"prefill_token_buckets names walk {walk!r} of {node}, whose capture captures by "
+                    "batch size, not tokens"
+                )
+            logger.warning(
+                "%s: no packed capture of walk %r at this deployment, so prefill_token_buckets "
+                "for it does nothing", node, walk,
+            )
+            continue
+        for config in targets:
+            rows = max(batch_sizes(config))
+            bounds = [step_tokens(w, rows) for w in config.replay_graph_walks]
+            bound = None if None in bounds else max(bounds)
+            trimmed, top, dropped = {}, 0, []
+            for k, rungs in sorted(ladders_by_batch_size(ladder).items()):
+                trimmed[k] = _trim(rungs, bound, top)
+                top = trimmed[k][-1]
+                dropped += sorted(set(rungs) - set(trimmed[k]))
+            if dropped:
+                logger.info(
+                    "%s/%s: drops prefill_token_buckets %s, past the first that holds the "
+                    "%d tokens its steps run at most", node, walk, dropped, bound,
+                )
+            config.capture_token_lengths = trimmed
+
+
+def _overrides(cls: type, hook: str) -> bool:
+    """Whether a submodule class declares its own ``hook``, which the base leaves empty."""
+    from mstar.model.submodule_base import NodeSubmodule
+
+    return getattr(cls, hook) is not getattr(NodeSubmodule, hook)
+
+
+def apply_region_ladders(
+    node: str, configs: Mapping[str, "PiecewiseAcceleratorGraphConfig"],
+    ladders: Mapping[str, list[int]], walk_ladders: Mapping[str, Any], submodule_cls: type,
+) -> None:
+    """Take a serving config's ``prefill_token_buckets`` for ``node`` that name
+    no walk of it (`EngineManager` split them off) as the ``total_tokens`` of
+    its piecewise packed regions, by label.
+
+    A name that is neither a walk nor a region of the node is refused, as is a
+    region the config also names as a walk, or one captured by batch size
+    alone. A node whose ``submodule_cls`` declares regions (overrides
+    `NodeSubmodule.get_piecewise_accelerator_graph_configs`) but returned none
+    at this deployment logs and skips. The node's ``walk_ladders`` are refused
+    here, naming its regions, where its class captures no walk at all (doesn't
+    override `NodeSubmodule.get_accelerator_graph_configs`);
+    `apply_token_ladders` takes them otherwise.
+    """
+    if walk_ladders and not _overrides(submodule_cls, "get_accelerator_graph_configs"):
+        regions = f"; its piecewise regions are {sorted(configs)}" if configs else ""
+        raise ValueError(
+            f"prefill_token_buckets names walks {sorted(walk_ladders)} of {node}, which captures no "
+            f"walk{regions}"
+        )
+    both = sorted(set(configs) & set(walk_ladders))
+    if both:
+        raise ValueError(
+            f"prefill_token_buckets names {both} for {node}, each both a walk and a piecewise "
+            "region of it"
+        )
+    for label, ladder in ladders.items():
+        config = configs.get(label)
+        if config is None and not configs and _overrides(submodule_cls, "get_piecewise_accelerator_graph_configs"):
+            logger.warning(
+                "%s: no piecewise region at this deployment, so prefill_token_buckets for %r "
+                "does nothing", node, label,
+            )
+        elif config is None:
+            raise ValueError(
+                f"prefill_token_buckets names {label!r} for {node}, neither one of its walks nor "
+                f"one of its piecewise regions {sorted(configs)}"
+            )
+        elif not isinstance(config, PiecewisePackedConfig):
+            raise ValueError(
+                f"prefill_token_buckets names piecewise region {label!r} of {node}, which "
+                "captures by batch size, not tokens"
+            )
+        else:
+            config.total_tokens = sorted(ladder)
+
 
 class PiecewiseConfigType(Enum):
     BATCHED = "batched"
@@ -330,14 +521,22 @@ class PiecewiseAcceleratorGraphConfig(ABC):
     one_row_per_step: bool = False
     # static kwargs threaded into capture_fn (e.g. cond_tokens, is_causal)
     forward_kwargs: dict[str, Any] = field(default_factory=dict)
-    # None => defer to the runner's default batch-size buckets
+    # None => defer to the runner's default batch-size buckets; [] captures nothing
     capture_batch_sizes: list[int] | None = None
+    # A shape with no captured graph runs the region eagerly through ``run``, its
+    # step declared, planned and committed over the real rows, rather than raising;
+    # the caller then has one path for both. Off: the caller checks ``can_run``.
+    eager_fallback: bool = False
     # Whether to torch.compile capture_fn before capture. Default off; the
     # block loop already benefits from graph capture alone.
     compile: bool = False
     # torch.compile mode for the region; None takes the deployment's compile
     # level (mstar serve -O), a mode opts the config out of it
     compile_mode: str | None = None
+    # Every shape is captured or the worker refuses to start: for a region with no
+    # eager path, whose state lives only where its captures read and write it, a shape
+    # left out (for memory, or failed) would fail its requests at serving time instead.
+    required: bool = False
 
     def __post_init__(self):
         check_compile_mode(self.compile_mode)
@@ -419,7 +618,12 @@ class PiecewisePackedConfig(PiecewiseAcceleratorGraphConfig):
     requests for the capture-time plan; real per-request lengths arrive at
     replay.
     """
-    total_tokens: list[int]  # token-count buckets to capture
+    # The token-count buckets to capture. Before capture the engine replaces
+    # it, on this same config object, with the serving config's
+    # ``prefill_token_buckets`` for the region's label where one is named
+    # (`apply_region_ladders`), so a submodule that keeps the config it
+    # returned may read back the ladder its region was captured on.
+    total_tokens: list[int]
     # The attention resource of a region whose rows each attend within
     # themselves. Set with `declare_step` left None, the region declares one
     # non-causal "main" segment per row on it; a `one_row_per_step` region's

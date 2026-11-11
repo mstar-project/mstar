@@ -26,20 +26,18 @@ from test_startup_graph_validation import (
 
 from mstar.conductor.conductor import Conductor
 from mstar.distributed.base import ShardingConfig, ShardingGroup
-from mstar.engine.resources.base import Resource
 from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
 from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.graph.base import GraphEdge, GraphNode, Sequential
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import KVLabel, PrefixKeys, WorkerGraph
+from mstar.testing_utils.resource import StubResource
 from mstar.validation import DeploymentError
 from mstar.validation.placement import MAX_NODE_INPUTS, _sharding_groups
 
 
-class _Stub(Resource):
-    @classmethod
-    def build(cls, spec, info):
-        raise NotImplementedError
+class _Stub(StubResource):
+    pass
 
 
 @dataclass
@@ -128,6 +126,22 @@ def test_missing_max_seq_len_is_refused(tmp_path):
 
 def test_mps_that_is_not_a_bool_is_refused(tmp_path):
     _refused(_Model(), _cfg(tmp_path, mps="yes"), r"mps must be true or false, got 'yes'")
+
+
+def test_unpausable_outputs_that_are_not_a_list_are_refused(tmp_path):
+    _refused(
+        _Model(), _cfg(tmp_path, unpausable_outputs="audio"),
+        r"unpausable_outputs must be a list of output modalities from \[.*\], got 'audio'",
+    )
+
+
+@pytest.mark.parametrize("outputs", [["Audio"], ["speech"]])
+def test_unpausable_outputs_that_name_no_output_modality_are_refused(tmp_path, outputs):
+    """A misspelled modality matched no request's outputs, so every voice stream was preemptible."""
+    _refused(
+        _Model(), _cfg(tmp_path, unpausable_outputs=outputs),
+        rf"unpausable_outputs must be a list of output modalities from \[.*\], got \['{outputs[0]}'\]",
+    )
 
 
 def test_missing_node_groups_is_refused(tmp_path):
@@ -260,13 +274,64 @@ def test_config_that_is_not_a_mapping_is_refused(tmp_path):
 def test_ranks_not_divisible_by_the_instance_size_are_refused(tmp_path):
     cfg = _cfg(tmp_path, [{"node_names": ["llm"], "ranks": [0, 1, 2], "tp_size": 2}])
     _refused(_Model(tp_enabled_nodes=["llm"]), cfg,
-             r"node_groups\[0\] \(nodes \['llm'\]\) has 3 ranks; not divisible by tp_size\*sp_size \(2\*1=2\)")
+             r"node_groups\[0\] \(nodes \['llm'\]\) has 3 ranks; not divisible by its instance size")
 
 
-@pytest.mark.parametrize("axis", ["tp", "sp"])
+@pytest.mark.parametrize("axis", ["tp", "sp", "cfg"])
 def test_parallel_node_group_over_a_node_without_support_is_refused(axis, tmp_path):
     cfg = _cfg(tmp_path, [{"node_names": ["llm"], "ranks": [0, 1], f"{axis}_size": 2}])
     _refused(_Model(), cfg, rf"node_groups\[0\] has {axis}_size 2 and contains nodes not in {axis}_enabled_nodes")
+
+
+class _CfgModel(_Model):
+    """A model whose ``llm`` splits two guidance branches over ``cfg_size``."""
+
+    def get_default_sharding_config(self):
+        return ShardingConfig(groups=[], tp_enabled_nodes=set(), shard_dim={}, cfg_enabled_nodes={"llm": 2})
+
+
+def test_cfg_size_that_does_not_divide_the_branches_is_refused(tmp_path):
+    cfg = _cfg(tmp_path, [{"node_names": ["llm"], "ranks": [0, 1, 2, 3], "cfg_size": 4}])
+    _refused(_CfgModel(), cfg, r"cfg_size 4, which does not divide the 2 guidance branches 'llm' runs")
+
+
+def test_a_cfg_instance_is_one_lockstep_group(tmp_path):
+    """Its ranks route as one instance, not as cfg_size data-parallel replicas
+    (which would leave each rank's gather waiting for a peer that never runs)."""
+    cfg = _cfg(tmp_path, [{"node_names": ["llm"], "ranks": [0, 1], "cfg_size": 2}])
+    _validate(_CfgModel(), cfg)
+    (group,) = _CfgModel().get_sharding_config(cfg).groups
+    assert (group.nodes, group.tp_size) == ({"llm"}, 2)
+
+
+def test_a_paged_kv_cache_on_a_cfg_parallel_node_is_refused(tmp_path):
+    """Its rank math takes every instance rank for a head shard, and a CFG rank
+    runs another branch on every head. Refused before any worker loads weights."""
+    kv = KVSpec(resource_key="kv", nodes={"llm"}, config=PagedKVConfig(
+        num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=64, max_num_pages=4, page_size=16,
+    ))
+    model = _CfgModel(specs=[kv], kv_labels={"kv": {"main": KVLabel()}})
+    cfg = _cfg(tmp_path, [{"node_names": ["llm"], "ranks": [0, 1], "cfg_size": 2}])
+    _refused(model, cfg, r"KV kv: a node with cfg_size > 1 can't hold a paged KV cache")
+
+
+class _WideModel(_Model):
+    """A model whose ``llm`` takes TP beside SP or CFG."""
+
+    def get_default_sharding_config(self):
+        return ShardingConfig(
+            groups=[], tp_enabled_nodes={"llm"}, shard_dim={},
+            sp_enabled_nodes={"llm"}, cfg_enabled_nodes={"llm": 2},
+        )
+
+
+@pytest.mark.parametrize("axis", ["sp", "cfg"])
+def test_a_sharded_signal_into_an_instance_wider_than_tp_is_refused(axis, tmp_path):
+    """The fanout splits a shard_dim signal over every instance rank, while
+    only the TP ranks split the weights."""
+    cfg = _cfg(tmp_path, [{"node_names": ["llm"], "ranks": [0, 1, 2, 3], "tp_size": 2, f"{axis}_size": 2}],
+               sharding_config={"shard_dim": {"x": 1}})
+    _refused(_WideModel(), cfg, r"node 'llm' takes or emits \['x'\], which have a shard_dim")
 
 
 def test_model_yaml_hook_refusal_is_reported(tmp_path):
@@ -346,7 +411,7 @@ def test_worker_graph_claimed_by_two_sharding_groups_is_refused():
 def test_worker_graph_and_sharding_group_tp_mismatch_is_refused():
     groups = [ShardingGroup(nodes={"a"}, tp_size=4)]
     assert list(_sharding_groups([_wg(["a"])], ShardingConfig(groups, set(), {}))) == [
-        "the worker graph of ['w'] with nodes ['a'] on ranks [0, 1] has tp_size 2, but its "
+        "the worker graph of ['w'] with nodes ['a'] on ranks [0, 1] has instance size 2, but its "
         "sharding group has tp_size 4. node_groups and sharding_config disagree."
     ]
 
@@ -394,10 +459,9 @@ class _TrailSpec(_Spec):
     (_TrailSpec("kv", {"a", "b"}), {}),
 ], ids=["kv_offload_off", "page_trail_only"])
 def test_lockstep_nodes_sharing_a_journaled_resource_are_refused(spec, resources, tmp_path):
-    """Rank 0's decisions on a resource (page moves, prefix leases, page
-    trails) reach the followers per node, riding on one node's next step, so
-    two lockstep nodes over one resource could admit out of step. Refused until
-    rank 0 journals a shared resource in one stream."""
+    """Rank 0's prefix leases and page trails on a resource reach the followers
+    per node, riding on one node's next step, so two lockstep nodes over one
+    resource could admit out of step."""
     labels = {"kv": {"main": KVLabel()}} if isinstance(spec, KVSpec) else None
     model = _Model(_a_then_b, specs=[spec], kv_labels=labels, tp_enabled_nodes=["a", "b"])
     cfg = _cfg(tmp_path, [{"node_names": ["a", "b"], **_TP2}], resources=resources)
@@ -406,10 +470,9 @@ def test_lockstep_nodes_sharing_a_journaled_resource_are_refused(spec, resources
 
 
 @pytest.mark.parametrize("b, placed", [
-    ({"ranks": [1, 0], "tp_size": 2}, "TP ranks [1, 0]"),  # the same ranks, led by the other one
     ({"ranks": [0, 1, 2, 3], "tp_size": 4}, "TP ranks [0, 1, 2, 3]"),
     ({"ranks": [0, 1], "sp_size": 2}, "SP ranks [0, 1]"),  # the same ranks, the other axis
-], ids=["other_leader", "other_size", "other_axis"])
+], ids=["other_size", "other_axis"])
 def test_lockstep_nodes_in_different_instances_on_one_worker_are_refused(b, placed, tmp_path):
     """Two instances on a worker are two leaders' step streams with no order
     between them."""
@@ -426,7 +489,20 @@ def test_parallel_ranks_off_their_position_are_refused(tmp_path):
     worker_2 and rank 2 off the end."""
     cfg = _cfg(tmp_path, [{"node_names": ["llm"], "ranks": [1, 2], "tp_size": 2}])
     _refused(_Model(tp_enabled_nodes=["llm"]), cfg,
-             r"the deployment uses ranks \[1, 2\]; ranks \[1, 2\] are in tensor- or sequence-parallel groups")
+             r"the deployment uses ranks \[1, 2\]; ranks \[1, 2\] are in parallel groups")
+
+
+@pytest.mark.parametrize(("ranks", "refused"), [([1, 0], True), ([2, 3, 0, 1], False)])
+def test_parallel_ranks_out_of_order_are_refused(tmp_path, ranks, refused):
+    """torch orders a group by global rank and the mesh by the config's list,
+    so a gather would come back in a different order than the ranks split by.
+    Only each instance's own ranks need the order: [2, 3, 0, 1] is two
+    ascending replicas."""
+    cfg = _cfg(tmp_path, [{"node_names": ["llm"], "ranks": ranks, "tp_size": 2}])
+    if refused:
+        _refused(_Model(tp_enabled_nodes=["llm"]), cfg, r"out of order")
+    else:
+        _validate(_Model(tp_enabled_nodes=["llm"]), cfg)
 
 
 def test_an_unused_rank_above_the_parallel_ones_is_accepted(tmp_path, monkeypatch):
@@ -444,7 +520,7 @@ def test_node_in_two_parallel_groups_on_one_worker_is_refused(tmp_path):
         {"node_names": ["llm"], "ranks": [0, 1], "tp_size": 2, "graph_walks": ["prefill"]},
         {"node_names": ["llm"], "ranks": [0, 2], "tp_size": 2, "graph_walks": ["decode"]},
     ])
-    _refused(_Model(tp_enabled_nodes=["llm"]), cfg, r"Node llm already has a comm group assigned for worker 0")
+    _refused(_Model(tp_enabled_nodes=["llm"]), cfg, r"Node llm already has a tp comm group assigned for worker 0")
 
 
 def test_resource_over_nodes_of_different_parallel_shapes_is_refused(tmp_path):
@@ -454,7 +530,7 @@ def test_resource_over_nodes_of_different_parallel_shapes_is_refused(tmp_path):
         {"node_names": ["b"], "ranks": [2]},
     ])
     model = _Model(_a_then_b, specs=[_Spec("kv", {"a", "b"})], tp_enabled_nodes=["a"])
-    _refused(model, cfg, r"Resource spec kv nodes \['a', 'b'\] must use the same TP x SP shape across replicas")
+    _refused(model, cfg, r"Resource spec kv nodes \['a', 'b'\] must use the same parallel shape across replicas")
 
 
 def test_resource_over_local_nodes_in_different_parallel_groups_is_refused(tmp_path):
@@ -464,7 +540,7 @@ def test_resource_over_local_nodes_in_different_parallel_groups_is_refused(tmp_p
     ])
     model = _Model(_a_then_b, specs=[_Spec("kv", {"a", "b"})], tp_enabled_nodes=["a", "b"])
     assert (
-        "Resource spec kv local nodes ['a', 'b'] on worker_0 must all be in the same parallel (tp x sp) group"
+        "Resource spec kv local nodes ['a', 'b'] on worker_0 must all be in the same parallel group"
         in _problems(model, cfg)
     )
 
@@ -548,49 +624,37 @@ def test_prefix_stream_laying_out_an_undeclared_resource_is_refused(tmp_path):
 # -- LoRA ---------------------------------------------------------------------
 
 
-def _lora_spec(key="lora", nodes=("llm",)):
-    from test_lora_pool import make_spec  # skips the test without safetensors
+def _lora_spec():
+    """One LoRA spec over a (its qkv target) and b (its o target)."""
+    from test_lora_pool import QKV, O, make_spec  # skips the test without safetensors
 
-    return dataclasses.replace(make_spec({}), resource_key=key, nodes=set(nodes))
+    targets = {"qkv": dataclasses.replace(QKV, node="a"), "o": dataclasses.replace(O, node="b")}
+    return dataclasses.replace(make_spec({}), nodes={"a", "b"}, targets=targets)
 
 
-class _LoraModel(_Model):
-    def __init__(self, lora, *args, **kw):
-        super().__init__(*args, **kw)
-        self._lora = lora
-
-    def get_lora_specs(self):
-        return list(self._lora)
+# a tensor-parallel LLM (a) and its vision tower (b), in different lockstep instances
+_A_TP_THEN_B = [{"node_names": ["a"], "ranks": [0, 1], "tp_size": 2}, {"node_names": ["b"], "ranks": [2]}]
 
 
 def test_a_lora_deployment_passes(tmp_path):
-    """The pass checks the specs the YAML turns on, as the workers build them: the
-    model's declaration alone has no `lora` resource for the block to override."""
-    _validate(_LoraModel([_lora_spec()]), _cfg(tmp_path, resources={"lora": {"max_slots": 2}}))
+    """The pass checks the specs the YAML turns on, as the workers build them: the opt-in
+    LoRA spec, for the `lora:` block to override, split into a pool per node."""
+    cfg = _cfg(tmp_path, _A_TP_THEN_B, resources={"lora": {"max_slots": 2}})
+    _validate(_Model(_a_then_b, specs=[_lora_spec()], tp_enabled_nodes=["a"]), cfg)
 
 
-@pytest.mark.parametrize("serves_lora, block, refusal", [
-    (True, {"max_slots": 0}, "resources.lora: max_slots must be an integer >= 1; got 0"),
-    # reported once, not again as an unknown resource
-    (False, {"max_slots": 0}, "declaring the LoRA specs failed: ValueError: the serving config "
-                              "has a `resources: lora:` block, but _LoraModel serves no LoRA adapters"),
-    (True, None, "declaring the LoRA specs failed: ValueError: `resources: lora:` must be a mapping; got None"),
-], ids=["bad_value", "no_lora_specs", "not_a_mapping"])
-def test_a_bad_lora_value_is_reported_with_the_other_problems(tmp_path, serves_lora, block, refusal):
-    """The `lora:` block sizes every LoRA spec; a bad value there is one problem, and the
-    other resources' checks still run."""
-    cfg = _cfg(tmp_path, [
-        {"node_names": ["a"], "ranks": [0, 1], "tp_size": 2},
-        {"node_names": ["b"], "ranks": [2]},
-    ], resources={"lora": block})
-    model = _LoraModel(
-        [_lora_spec(nodes={"a"}), _lora_spec("lora_b", nodes={"b"})] if serves_lora else [],
-        _a_then_b, specs=[_Spec("kv", {"a", "b"})], tp_enabled_nodes=["a"],
-    )
-    assert _problems(model, cfg) == [
-        refusal,
-        "Resource spec kv nodes ['a', 'b'] must use the same TP x SP shape across replicas",
-    ]
+@pytest.mark.parametrize("block, refusal", [
+    ({"max_slots": 0}, r"resources\.lora: max_slots must be an integer >= 1; got 0"),
+    (["sql"], r"resources\.lora: .*argument after \*\* must be a mapping, not list"),
+], ids=["bad_value", "not_a_mapping"])
+def test_a_bad_lora_value_is_reported_once_with_the_other_problems(tmp_path, block, refusal):
+    """A refused `lora:` block leaves the spec as declared, so splitting it per node
+    reports nothing again, and the other resources' placement checks still run."""
+    cfg = _cfg(tmp_path, _A_TP_THEN_B, resources={"lora": block})
+    model = _Model(_a_then_b, specs=[_lora_spec(), _Spec("kv", {"a", "b"})], tp_enabled_nodes=["a"])
+    problems = _problems(model, cfg)
+    assert len(problems) == 2 and re.fullmatch(refusal, problems[0]), problems
+    assert problems[1] == "Resource spec kv nodes ['a', 'b'] must use the same parallel shape across replicas"
 
 
 # -- every problem at once ----------------------------------------------------
@@ -659,5 +723,5 @@ def test_worker_graph_problems_are_reported_together(tmp_path):
     assert problems[0] == "serving config overrides unknown resource(s) ['vk']; this model declares ['kv']"
     assert problems[1].startswith("graph walk 'w': node 'step' of Loop 'loop' sends 'y' to 'post'")
     assert problems[2] == (
-        "Resource spec kv nodes ['llm', 'post'] must use the same TP x SP shape across replicas"
+        "Resource spec kv nodes ['llm', 'post'] must use the same parallel shape across replicas"
     )

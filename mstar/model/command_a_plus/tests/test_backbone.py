@@ -126,7 +126,7 @@ class TorchPositions:
 
 def bind_test_state(model, config, resources, labels=("main",)):
     """Bind ``model``'s attention layers to a handle over ``resources``, as the engine does at load."""
-    model_stub = SimpleNamespace(config=config, max_seq_len=config.max_position_embeddings)
+    model_stub = SimpleNamespace(config=config, max_seq_len=config.max_position_embeddings, sampling_defaults={})
     array = replace(CommandAPlusModel.declare_state(model_stub)[0], labels=labels)
     handles = node_handles(SimpleNamespace(declare_state=lambda: [array]), "LLM", resources)
     for module in model.modules():

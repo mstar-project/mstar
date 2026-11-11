@@ -27,10 +27,9 @@ from typing import Any
 import torch
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import CurrentForwardConductorMetadata, StreamingConnectionState
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import ForwardPassArgs, Model, ProcessPromptOutput
+from mstar.model.base import Model, ProcessPromptOutput, WalkStep
 from mstar.model.kokoro.config import (
     AUDIO_CHUNK,
     BOUNDARY_TOKEN_ID,
@@ -57,6 +56,18 @@ SERVING_OVERRIDES = {
     "text_buckets", "frame_buckets", "capture_batch_sizes", "max_batch_frames", "frame_grouping", "decoder_dtype",
     "compile_decoder",
 }
+# The model_kwargs a request may carry; ``language`` is an alias of ``lang_code``.
+REQUEST_KWARGS = frozenset({"voice", "speed", "lang_code", "language", "phonemes"})
+
+
+def _optional_str(kwargs: dict[str, Any], key: str, what: str = "string") -> str | None:
+    """``kwargs[key]`` if given, which must then be a non-empty string; None when absent."""
+    value = kwargs.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{key} must be a non-empty {what}; got {value!r}")
+    return value
 
 
 def _resolve_snapshot(repo_id: str, cache_dir: str | None, allow_patterns: list[str] | None) -> str:
@@ -143,16 +154,22 @@ class KokoroModel(Model):
         if any(m != "text" for m in input_modalities):
             raise ValueError("Kokoro takes text input only")
 
-        voice = str(kwargs.get("voice") or self.config.default_voice)
+        voice = _optional_str(kwargs, "voice", "name") or self.config.default_voice
         self.voices.resolve(voice)  # reject unknown voices before anything language-specific runs
-        speed = float(kwargs.get("speed") or self.config.default_speed)
+        speed = kwargs.get("speed")
+        if speed is None:
+            speed = self.config.default_speed
+        elif isinstance(speed, bool) or not isinstance(speed, (int, float)):
+            raise ValueError(f"speed must be a number; got {speed!r}")
         if not self.config.min_speed <= speed <= self.config.max_speed:
             raise ValueError(f"speed must be within [{self.config.min_speed}, {self.config.max_speed}], got {speed}")
-        lang = kwargs.get("lang_code") or kwargs.get("language") or self.default_lang or self.voices.language_of(voice)
+        lang_code = _optional_str(kwargs, "lang_code")
+        language = _optional_str(kwargs, "language")
+        lang = lang_code or language or self.default_lang or self.voices.language_of(voice)
 
-        phonemes = kwargs.get("phonemes")
-        if phonemes:
-            chunks = self.g2p.chunk_phonemes(str(phonemes))
+        phonemes = _optional_str(kwargs, "phonemes")
+        if phonemes is not None:
+            chunks = self.g2p.chunk_phonemes(phonemes)
         else:
             if not prompt or not prompt.strip():
                 raise ValueError("Kokoro requires a non-empty text prompt")
@@ -161,8 +178,9 @@ class KokoroModel(Model):
             except ImportError as exc:
                 # a bundled voice whose G2P extra is not installed here: the client's
                 # request is fine, this server just cannot serve it -> 400 with the fix
+                name = LANG_NAMES[normalize_lang_code(lang)]
                 raise ValueError(
-                    f"Voice {voice!r} needs {LANG_NAMES[lang]} G2P, which this server does not have ({exc}); "
+                    f"Voice {voice!r} needs {name} G2P, which this server does not have ({exc}); "
                     "GET /v1/audio/voices lists the voices it can serve"
                 ) from exc
         if not chunks:
@@ -172,7 +190,7 @@ class KokoroModel(Model):
         # past the PL-BERT window the embedding gather asserts on the device, killing the worker's CUDA context
         longest = max(len(c.phonemes) for c in chunks)
         if longest > self.config.max_phonemes:
-            raise RuntimeError(f"G2P produced a {longest}-phoneme chunk; the window is {self.config.max_phonemes}")
+            raise ValueError(f"G2P produced a {longest}-phoneme chunk; the window is {self.config.max_phonemes}")
 
         ids = [torch.tensor(self.tokenize(c.phonemes), dtype=torch.long) for c in chunks]
         lengths = [len(x) for x in ids]
@@ -185,51 +203,27 @@ class KokoroModel(Model):
             {CHUNK_LENGTHS: lengths},
         )
 
-    # -- conductor state machine -------------------------------------------
+    # -- walk plan ---------------------------------------------------------
 
-    def get_initial_forward_pass_args(
+    def walk_plan(
         self,
         partition_name: str,
         input_modalities: list[str],
         output_modalities: list[str],
         input_signals: dict[str, list[TensorPointerInfo]],
-        model_kwargs: dict | None = None,
-    ) -> ForwardPassArgs:
-        del partition_name
-        metadata = CurrentForwardConductorMetadata(
-            input_modalities=input_modalities,
-            output_modalities=output_modalities,
-            graph_walk=SYNTH_WALK,
-            is_prefill=True,
-        )
-        inputs = []
-        for name in (PHONEME_IDS, REF_STYLE, SPEED):
-            edge = GraphEdge(next_node=SYNTH_NODE, name=name)
-            edge.tensor_info = input_signals.get(name, [])
-            inputs.append(edge)
-        return ForwardPassArgs(
-            full_metadata=metadata,
-            inputs=inputs,
-            unpersist_tensors=sum([edge.tensor_info for edge in inputs], start=[]),
-            request_done="audio" not in output_modalities,
-            step_metadata={CHUNK_LENGTHS: model_kwargs[CHUNK_LENGTHS]},
-        )
-
-    def get_partition_forward_pass_args(
-        self,
-        partition_name: str,
-        partition_metadata: CurrentForwardConductorMetadata,
-        persist_signals: dict[str, list[TensorPointerInfo]],
-        incoming_connections: list[StreamingConnectionState] | None = None,
-    ) -> ForwardPassArgs:
-        """The single walk synthesizes every chunk; when it returns, the request is done."""
-        del partition_name, persist_signals, incoming_connections
-        return ForwardPassArgs(full_metadata=partition_metadata, inputs=[], unpersist_tensors=[], request_done=True)
+        model_kwargs: dict,
+    ) -> list[WalkStep]:
+        """The single walk synthesizes every chunk (``process_prompt`` refuses a
+        request that asks for no audio)."""
+        return [WalkStep(SYNTH_WALK, step_metadata={CHUNK_LENGTHS: model_kwargs[CHUNK_LENGTHS]})]
 
     # -- output ------------------------------------------------------------
 
     def get_output_sample_rate(self, modality: str = "audio") -> int:
         return self.config.sample_rate
+
+    def request_kwargs(self) -> frozenset[str]:
+        return REQUEST_KWARGS
 
     def get_voices(self) -> list[str]:
         """The bundled voices this server can phonemize for; blends of them are accepted too (see ``VoiceRegistry``)."""
@@ -240,18 +234,6 @@ class KokoroModel(Model):
 
     def get_autocast_dtype(self):
         return torch.float32
-
-    def postprocess(self, output: torch.Tensor, modality: str, request_kwargs: dict | None = None) -> bytes:
-        """Emitted PCM16 tensor -> little-endian bytes."""
-        del request_kwargs
-        if modality != "audio":
-            raise ValueError(f"Unsupported Kokoro output modality: {modality!r}")
-        if output.numel() == 0:
-            return b""
-        pcm = output.detach().cpu()
-        if pcm.is_floating_point():
-            pcm = (pcm.clamp(-1, 1) * 32767).to(torch.int16)
-        return pcm.contiguous().numpy().tobytes()
 
     # -- worker-side construction ------------------------------------------
 

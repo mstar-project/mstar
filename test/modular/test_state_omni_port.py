@@ -18,9 +18,11 @@ import pytest
 import torch
 from test_state_ports import _assert_steps_equal
 
+from mstar.conductor.request_info import FINAL_PREFILL
 from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec, AttentionStep
 from mstar.engine.resources.attn.ragged.config import RaggedAttentionConfig, RaggedAttentionSpec
 from mstar.engine.resources.kv.config import KVSpec, KVStep, PagedKVConfig
+from mstar.engine.resources.lora.config import LORA_RESOURCE_KEY
 from mstar.engine.resources.position.config import PositionConfig, PositionSpec, PositionStep
 from mstar.engine.resources.sampler.config import SamplerSpec, SamplerStep, SamplingReqConfig
 from mstar.engine.resources.spec import apply_yaml_overrides
@@ -29,6 +31,7 @@ from mstar.engine.state import host
 from mstar.engine.state.adapters import StateSetup, node_handles, node_resources, sampling_configs, state_steps
 from mstar.engine.state.analysis import state_declaration_problems
 from mstar.engine.state.host_fields import HostFields
+from mstar.model.base import enabled_resources
 from mstar.model.components.aut_encoder import AuTEncoderConfig
 from mstar.model.components.aut_submodule import AuTEncoderSubmodule
 from mstar.model.components.code_predictor_kernels import DepthKV
@@ -101,19 +104,19 @@ def _reference(c: Qwen3OmniModelConfig) -> list:
             old_context_len=8192,
         )),
         SamplerSpec(resource_key=THINKER_SAMPLER, nodes={"Thinker"}, vocab_size=tt.vocab_size,
-                    enable_repetion_penalty=True),
+                    enable_repetition_penalty=True),
         SamplerSpec(resource_key=TALKER_SAMPLER, nodes={"Talker"}, vocab_size=kt.vocab_size,
-                    enable_repetion_penalty=True),
+                    enable_repetition_penalty=True),
         SamplerSpec(resource_key=CODE_PRED_SAMPLER, nodes={"Talker"}, vocab_size=c.code_predictor.vocab_size,
-                    enable_repetion_penalty=False),
+                    enable_repetition_penalty=False),
         RaggedAttentionSpec(resource_key=AUDIO_ATTN, nodes={"audio_encoder"}, config=RaggedAttentionConfig(
             num_qo_heads=c.audio_encoder.encoder_attention_heads, num_kv_heads=c.audio_encoder.encoder_attention_heads,
             head_dim=c.audio_encoder.head_dim,
-            max_segments_per_request=AuTEncoderSubmodule.max_windows_per_replay(c.audio_encoder),
+            max_segments_per_request=AuTEncoderSubmodule.max_windows_per_replay(c.audio_encoder), workspace_mb=256,
         )),
         RaggedAttentionSpec(resource_key=VISION_ATTN, nodes={"vision_encoder"}, config=RaggedAttentionConfig(
             num_qo_heads=c.vision.num_heads, num_kv_heads=c.vision.num_heads, head_dim=c.vision.head_dim,
-            max_segments_per_step=VisionEncoderSubmodule.BLOCK_LOOP_PATCH_BUCKETS[-1] // 256,
+            max_segments_per_step=VisionEncoderSubmodule.BLOCK_LOOP_PATCH_BUCKETS[-1] // 256, workspace_mb=128,
         )),
     ]
 
@@ -124,7 +127,7 @@ def _assert_specs_equal(specs, reference) -> None:
 
 def test_specs_equal_the_hand_written_ones():
     model = _model()
-    _assert_specs_equal(node_resources(model), _reference(model.config))
+    _assert_specs_equal(enabled_resources(model, {}, StateSetup()), _reference(model.config))
 
 
 def test_specs_equal_the_hand_written_ones_after_yaml_overrides():
@@ -133,14 +136,14 @@ def test_specs_equal_the_hand_written_ones_after_yaml_overrides():
         THINKER_KV: {"max_seq_len": 1024}, VISION_ATTN: {"max_segments_per_step": 9},
         THINKER_SAMPLER: {"enable_logprobs": True},
     }}
-    specs, reference = node_resources(model), _reference(model.config)
+    specs, reference = enabled_resources(model, {}, StateSetup()), _reference(model.config)
     apply_yaml_overrides(specs, overrides)
     apply_yaml_overrides(reference, overrides)
     _assert_specs_equal(specs, reference)
 
 
-def test_the_port_writes_no_spec_by_hand():
-    assert _model().get_node_resources() == []
+def test_the_port_writes_only_lora_by_hand():
+    assert {spec.resource_key for spec in _model().get_node_resources()} == {LORA_RESOURCE_KEY}
 
 
 def test_the_value_of_host_fields_is_on_a_node_with_no_prefix_keys():
@@ -160,7 +163,7 @@ def test_the_code_predictor_declares_its_fifteen_draws():
 ])
 def test_request_settings_equal_the_hand_written_ones(kwargs, thinker):
     model = _model()
-    settings = sampling_configs(model.get_request_resource_configs({}, kwargs), model.declare_state())
+    settings = sampling_configs(model.get_request_resource_configs([], [], kwargs), model.declare_state())
     assert settings == {
         THINKER_SAMPLER: SamplingReqConfig(**thinker),
         TALKER_SAMPLER: SamplingReqConfig(temperature=0.9, top_k=50, top_p=1.0, repetition_penalty=1.05),
@@ -208,6 +211,19 @@ def _thinker_reference(rids, spans, *, tokens=None, kept=None, advance=None) -> 
     )
 
 
+
+def test_the_audio_encoder_batches_by_the_window_ceiling_its_read_holds():
+    """Qwen3-Omni's AuT names no resource, so it reads how many windows a replay's plan holds per row off its array:
+    looking for the resource raised on every multi-clip batch."""
+    model = _model()
+    window = model.config.audio_encoder.window_tokens
+    encoder = AudioEncoderSubmodule(SimpleNamespace(config=model.config.audio_encoder), model.config)
+    encoder.bind_node_state(_handles(model, "audio_encoder"))
+    encoder.state_handles[AUDIO_TOKENS].reads[AUDIO_ATTN].max_segments_per_request = 2
+    clips = [SimpleNamespace(input_seq_len=2 * window)] * 2
+    assert encoder.can_batch(None, clips)
+    assert not encoder.can_batch(None, [SimpleNamespace(input_seq_len=3 * window)] * 2), "a YAML override should hold"
+
 def test_a_thinker_decode_step_equals_the_hand_written_one():
     sub = _thinker()
     rows = [ARNodeInputs(input_seq_len=1), ARNodeInputs(input_seq_len=1)]
@@ -219,7 +235,7 @@ def test_a_text_prefill_step_equals_the_hand_written_one():
     sub = _thinker()
     ids = torch.arange(4)
     rows = [ARNodeInputs(input_seq_len=4, input_ids=ids)]
-    info = {1: SimpleNamespace(step_metadata={"is_last_prefill": True})}
+    info = {1: SimpleNamespace(step_metadata={FINAL_PREFILL: True})}
     declared = sub.declare_step("prefill_text", [1], rows, per_request_info=info)
     step = state_steps(declared, sub.state_handles)
     _assert_steps_equal(step, _thinker_reference([1], [4], tokens={1: ids}, kept=frozenset({1})))

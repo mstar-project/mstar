@@ -22,7 +22,7 @@ V, H, LO = 96, 16, 60
 
 
 def _config() -> OrpheusModelConfig:
-    return OrpheusModelConfig(vocab_size=V, custom_token_base_id=LO, stop_token_id=LO + 2)
+    return OrpheusModelConfig(vocab_size=V, custom_token_base_id=LO, stop_token_ids=frozenset({LO + 2}))
 
 
 class _Group:
@@ -38,16 +38,23 @@ def _head(weight: torch.Tensor, rank: int = 0, tp_size: int = 1) -> ColumnParall
 
 
 class _FakeLM(nn.Module):
+    """The decoder contract `SampledTokenDecoder` drives, with Orpheus's head."""
+
     def __init__(self, rank: int = 0, tp_size: int = 1):
         super().__init__()
         torch.manual_seed(3)
-        self.model = nn.Module()
-        self.model.embed_tokens = nn.Embedding(V, H)
+        self.embed_tokens = nn.Embedding(V, H)
         self.full_head = nn.Linear(H, V, bias=False)
         self.lm_head = _head(self.full_head.weight.data, rank, tp_size)
 
-    def forward(self, emb):
+    def embed(self, ids):
+        return self.embed_tokens(ids)
+
+    def forward(self, emb, *, label):
         return emb
+
+    def logits(self, hidden):
+        return self.lm_head(hidden)
 
 
 class _GreedySampler:
@@ -67,14 +74,14 @@ def _forward(rank: int = 0, tp_size: int = 1):
     sub.sampler.begin_step(SimpleNamespace(ctx=SimpleNamespace(padded_request_ids=list("abcd"))))
     engine_inputs = SimpleNamespace(request_ids=list("abcd"))
     with torch.no_grad():
-        out = sub.forward("decode", engine_inputs, text_inputs=IDS)["new_token"]
-        full = lm.full_head(lm.model.embed_tokens(IDS))
+        out = sub.forward("decode", engine_inputs, input_ids=IDS)["new_token"]
+        full = lm.full_head(lm.embed_tokens(IDS))
     return sampler.logits, out, full
 
 
 def test_real_config_ids_fall_in_the_custom_rows():
     cfg = OrpheusModelConfig()
-    assert cfg.stop_token_id >= cfg.custom_token_base_id
+    assert min(cfg.stop_token_ids) >= cfg.custom_token_base_id
     # every SNAC code position (7 per frame, 4096 codes each) after the 10 markers
     assert cfg.custom_token_base_id + 10 + cfg.tokens_per_frame * 4096 <= cfg.vocab_size
 

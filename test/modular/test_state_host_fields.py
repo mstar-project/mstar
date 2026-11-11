@@ -118,7 +118,7 @@ def test_a_step_declared_twice_applies_only_the_declaration_that_runs():
 def _engine_run(h, step, forward):
     """``Engine._forward_and_commit`` over ``step``, with its forward and its resources stubbed."""
     engine = Engine.__new__(Engine)
-    engine._enable_nvtx, engine._enable_profile = False, False
+    engine._enable_nvtx, engine._enable_profile, engine._foreign_planners = False, False, {}
     order = []
     engine._runner = SimpleNamespace(commit=lambda _: order.append(host(h, RID, "main", 0)["sent"]))
     engine._forward = forward
@@ -128,7 +128,7 @@ def _engine_run(h, step, forward):
     )
     batch = SimpleNamespace(
         per_request_input_metadata=None, launch_started_event=None, committed=None, preplan_event=None,
-        exec_timings=SimpleNamespace(fwd_start=0.0),
+        exec_timings=SimpleNamespace(fwd_start=0.0), node_name="Talker",
     )
     engine._forward_and_commit(batch, mgmt, [RID], [], {}, step.ctx, None, False, step, False)
     return order
