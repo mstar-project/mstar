@@ -933,12 +933,20 @@ _QWEN3_REPOS = {
         "rms_norm_eps": 1e-6, "rope_theta": 1000000, "max_position_embeddings": 40960,
         "tie_word_embeddings": False, "eos_token_id": 151645, "torch_dtype": "bfloat16",
     },
+    "deepseek-ai/dspark_qwen3_8b_block7": {
+        "model_type": "qwen3", "block_size": 7, "markov_rank": 256, "mask_token_id": 151669,
+        "target_layer_ids": [1, 9, 17, 25, 33], "hidden_size": 4096, "num_hidden_layers": 5,
+        "num_attention_heads": 32, "num_key_value_heads": 8, "head_dim": 128, "intermediate_size": 12288,
+        "vocab_size": 151936, "rms_norm_eps": 1e-6, "rope_parameters": {"rope_theta": 1000000, "rope_type": "default"},
+        "max_position_embeddings": 40960, "tie_word_embeddings": False, "dtype": "bfloat16",
+    },
 }
 
 
 def _qwen3(name, model_kwargs, tmp_path, monkeypatch):
     # through the model's own __init__ with the config's model_kwargs, as serving builds it
-    # (entrypoint), from a config-only snapshot of each repo it names: no Hub on CI
+    # (entrypoint), from a config-only snapshot of each repo it names: no Hub on CI. The
+    # target's comes through the scaffold's download, a drafter's through `resolve_snapshot_dir`.
     import huggingface_hub
 
     def snapshot(repo_id, cache_dir=None, allow_patterns=None, **kwargs):

@@ -1,0 +1,26 @@
+model: "qwen3_8b"
+# Qwen3-8B with DeepSeek's DSpark drafter (deepseek-ai/dspark_qwen3_8b_block7: 5 Qwen3 layers
+# reading the streams entering target layers 2, 10, 18, 26 and 34, a block of 7, a Markov head).
+# The drafter runs inside the LLM node: each decode step drafts 7 tokens and the target verifies
+# them in the same forward. Greedy replies are the target's; temperature > 0 verifies by
+# speculative sampling. A request's repetition_penalty (other than 1) is refused. Off: drop
+# `draft`. Docs: docs/serving.rst (the `draft` block), docs/models.rst (Qwen3).
+# required by the serving config, read by nothing; the checkpoint's context bounds a request,
+# and the KV pool holds two verify steps' worth more
+max_seq_len: 40960
+model_kwargs:
+  draft:
+    method: dspark
+    model: deepseek-ai/dspark_qwen3_8b_block7
+    num_draft_tokens: 7
+    # asynchronous where every resource corrects itself on the device (FA3 on Hopper),
+    # else synchronous; the startup log says which and why
+    mode: auto
+resources:
+  kv_cache:
+    # target and drafter KV in one pool: 36 + 5 layers x 8 KV heads x 128 dims x K and V x bf16
+    # = 164 KiB a token
+    max_num_pages: 1024
+node_groups:
+  - node_names: [LLM]
+    ranks: [0]
