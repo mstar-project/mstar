@@ -143,7 +143,6 @@ class DraftModelDrafter(nn.Module, HostedDrafter):
         super().__init__()
         self.decl = decl
         self.needs = decl.needs
-        self.k = decl.num_draft_tokens
         self.lm = Qwen3DenseLM(
             decl.config, attn_key=decl.attn_key, kv_key=decl.kv_key, pos_key=decl.pos_key, comm_group=comm_group,
             # its layers in the target's pool, placed there by the pool's layer set
@@ -177,7 +176,9 @@ class DraftModelDrafter(nn.Module, HostedDrafter):
     # ── verify step ──
 
     def propose(self, inputs: DraftInputs) -> torch.Tensor:
-        n, k = inputs.input_ids.shape[0], self.k
+        # k is the engine's, as for every drafter; the passes are the declaration's lag, built from the same
+        # k, and startup refuses a lag that doesn't split the verify block (`draft_lag`)
+        n, k = inputs.input_ids.shape[0], inputs.num_draft_tokens
         prev, bonus = inputs.carry.view(n).long(), inputs.input_ids.view(n).long()
         self._select(0)
         hidden = self._run(torch.stack([prev, bonus], dim=1).view(-1))

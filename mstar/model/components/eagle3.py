@@ -204,7 +204,6 @@ class Eagle3Drafter(nn.Module, HostedDrafter):
         cfg = decl.config
         self.decl = decl
         self.needs = decl.needs
-        self.k = decl.num_draft_tokens
         hidden = cfg.hidden_size
         # sharded by vocabulary as the target's is, so one borrowed from the target is this rank's shard of it
         self.embed_tokens = VocabParallelEmbedding(
@@ -311,7 +310,7 @@ class Eagle3Drafter(nn.Module, HostedDrafter):
     # ── verify step ──
 
     def propose(self, inputs: DraftInputs) -> torch.Tensor:
-        return chain_drafts(inputs.carry.to(self.fc.weight.dtype), self.k, self._head, self._draft)
+        return chain_drafts(inputs.carry.to(self.fc.weight.dtype), inputs.num_draft_tokens, self._head, self._draft)
 
     def observe(self, inputs: ObserveInputs) -> torch.Tensor:
         """The layer's K/V over the block from the target's taps there, and the new carry: its output at each row's
