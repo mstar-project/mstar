@@ -65,6 +65,38 @@ class AttentionCallable:
             self.kv.write_kv(k, v)
         return self.attn.run(q, kv_cache_layer=self.kv.layer_view(), k=k, v=v)
 
+    @torch.compiler.disable
+    def norm_rope_attend(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, q_norm: torch.nn.Module, k_norm: torch.nn.Module,
+        pos_ids: torch.Tensor, rope_theta: float,
+    ) -> torch.Tensor:
+        """Per-head q/k RMSNorm (``q_norm``, ``k_norm``), plain RoPE at
+        ``pos_ids`` and ``rope_theta``, and attention, on CUDA (a layer off it
+        rotates through its position resource instead). For a backend that
+        reads K/V from the paged cache, the step's KV write rides in the
+        norm/RoPE kernel (``qk_norm_rope_kv_write``) rather than a launch of its
+        own; a backend that takes fresh K/V gets them normed and rotated."""
+        from mstar.utils.attention import qk_norm_rope_inplace, qk_norm_rope_kv_write
+
+        eps = _norm_eps(q_norm, k_norm)
+        if not self.attn.requires_kv_write:
+            qk_norm_rope_inplace(q, k, q_norm.weight, k_norm.weight, pos_ids, *eps, rope_theta)
+            return self(q, k, v)
+        layer, page_idx, slot_idx, n = self.kv.write_target()
+        qk_norm_rope_kv_write(
+            q, k, v, q_norm.weight, k_norm.weight, pos_ids, layer, page_idx, slot_idx, min(n, q.shape[0]),
+            *eps, rope_theta,
+        )
+        return self.attn.run(q, kv_cache_layer=self.kv.layer_view())
+
+
+def _norm_eps(q_norm: torch.nn.Module, k_norm: torch.nn.Module) -> tuple[float, float]:
+    """The q and k norms' epsilons. The fused kernels scale by ``weight``, so a
+    Gemma-style norm (scale ``1 + weight``) is refused rather than mis-scaled."""
+    if getattr(q_norm, "gemma_mode", False) or getattr(k_norm, "gemma_mode", False):
+        raise ValueError("the fused q/k norm kernels scale by weight; a gemma_mode RMSNorm needs its own path")
+    return float(q_norm.variance_epsilon), float(k_norm.variance_epsilon)
+
 
 class _KDALayerBlocks(NamedTuple):
     conv: torch.Tensor

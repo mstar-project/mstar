@@ -132,6 +132,8 @@ class RecurrentAddressing:
     # kernels by them must not read the device copies back
     host_slot_indices: Sequence[int] | None = None
     host_has_state: Sequence[bool] | None = None
+    # whether every row has saved state, so `gather` has no start to select
+    every_row_has_state: bool = False
     # The prefill states to save into snapshot slots, and the checkpoint
     # interval they sit on: a page or a multiple of one, or 0 while the pool
     # keeps no snapshots.
@@ -325,6 +327,11 @@ class RecurrentStatePool(Resource):
             self._need_sink("gather")
         rows = self.addressing(label)
         out = self.block(name, layer_idx).index_select(0, rows.slot_indices[: rows.num_rows])
+        # Every row reads its own slot, so the select would change nothing. A
+        # capture addresses every row to the sink, so its graph keeps the
+        # select a replay's fresh rows need.
+        if rows.every_row_has_state:
+            return out
         fresh = ~rows.has_state[: rows.num_rows].view(-1, *(1,) * (out.dim() - 1))
         return torch.where(fresh, 0 if start is None else start, out)
 
@@ -1194,6 +1201,7 @@ class RecurrentStatePool(Resource):
             # a later step with the same addressing hands out the same ones
             host_slot_indices=indices,
             host_has_state=has_state,
+            every_row_has_state=all(has_state),
             snapshots=snapshots,
             snapshot_every=(
                 self._checkpoint_every(segments, ctx) if snapshots

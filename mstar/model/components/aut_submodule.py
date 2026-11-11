@@ -22,7 +22,7 @@ from mstar.engine.accelerator_graph_config import (
 )
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import Segment, SlotLease, SubmoduleStep
-from mstar.engine.state import ArrayStep
+from mstar.engine.state import ArrayStep, kernel_setting
 from mstar.model.components.aut_encoder import AuTEncoder, AuTEncoderConfig
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
 
@@ -146,8 +146,10 @@ class AuTEncoderSubmodule(NodeSubmodule):
         return {AUT_ENCODE: self._encode_region}
 
     def max_segments_per_request(self) -> int:
-        """The ceiling on windows per row of the attention resource under ``attn_key``."""
-        return self.node_resources[self.attn_key].max_segments_per_request
+        """The ceiling on windows per row of the array's read."""
+        handle = self.state_handles[self.array]
+        (read,) = handle.array.reads
+        return kernel_setting(handle, read, "max_segments_per_request")
 
     def _fits_replay(self, inputs: list[NodeInputs]) -> bool:
         """Whether a step's windows fit a replay's attention plan: the resource

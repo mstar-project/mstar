@@ -43,12 +43,12 @@ from transformers import AutoTokenizer
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import PartitionDefinition
-from mstar.engine.resources import NodeResourceSpec
 from mstar.engine.resources.lora import LoraSpec
 from mstar.engine.state import (
     Array,
     Attend,
     Causal,
+    Entry,
     KVEntry,
     Layout,
     Positions,
@@ -90,6 +90,7 @@ from mstar.model.qwen3_tts.config import (
     TALKER_KV,
     TALKER_MIXED,
     TALKER_SAMPLER,
+    TALKER_TEXT,
     Qwen3TTSModelConfig,
 )
 from mstar.model.submodule_base import NodeSubmodule
@@ -515,7 +516,8 @@ class Qwen3TTSModel(Model):
     # -----------------------------------------------------------------------
 
     def declare_state(self) -> list[Array | Sampler]:
-        """Talker paged KV with its read and positions, its two samplers, and the Codec's per-stream decoder state.
+        """Talker paged KV with its read and positions, whether TTS EOS was fed, its two samplers, and the Codec's
+        per-stream decoder state.
 
         The CodePredictor's frame-local KV scratch is its ``DepthKV``'s (overwritten every step)."""
         from mstar.model.qwen3_tts.components.incremental_codec import codec_state_entry
@@ -540,6 +542,7 @@ class Qwen3TTSModel(Model):
                 min_p=bool(defaults.get("code_predictor_min_p")),
                 draws=self.config.num_code_groups - 1,
             ),
+            Value(TALKER_TEXT, nodes={"Talker"}, layers=frozenset({0}), entry=Entry({}, host={"eos_fed": bool})),
             Value(
                 CODEC_STATE, nodes={"Codec"}, layers=frozenset({0}),
                 entry=codec_state_entry(self.config.codec, self.codec_dtype),
@@ -561,7 +564,7 @@ class Qwen3TTSModel(Model):
             exclude={"text_projection": "the prefill projects it in prepare_inputs, outside the planned step"},
         )
 
-    def get_node_resources(self) -> list[NodeResourceSpec]:
+    def get_node_resources(self):
         return [self._lora_spec()]
 
     def kernel_settings(self) -> dict[str, dict[str, Any]]:

@@ -8,6 +8,9 @@ over the replay addressing and replays it for different batches.
 
 from __future__ import annotations
 
+from dataclasses import replace
+from unittest.mock import Mock
+
 import pytest
 import torch
 
@@ -200,6 +203,33 @@ def test_padding_rows_read_and_write_only_the_sink():
     assert all(bool((h[s] == 0).all()) for s in others)
     pool.commit(step, ctx)
     assert pool.num_free_slots == MAX_SLOTS - 2, "only a holds a slot"
+
+
+def test_a_step_whose_rows_all_have_state_reads_them_with_no_select(monkeypatch):
+    """The select of a fresh row's start is three ops per field, and a step whose rows all have saved state skips it:
+    it reads the rows the select would, and a step with a fresh row still reads its start."""
+    pool = build_pool()
+    step, ctx = eager(["a", "b"])
+    plan(pool, step, ctx)
+    pool.scatter_("h", rows_of(2, 1.0), layer_idx=1)
+    pool.commit(step, ctx)
+    start = torch.full(SHAPE, 9.0)
+
+    step, ctx = eager(["b", "a"])
+    rows = plan(pool, step, ctx)
+    with monkeypatch.context() as patched:
+        patched.setattr(torch, "where", Mock(side_effect=AssertionError("the read ran the select")))
+        skipped = pool.gather("h", layer_idx=1, start=start)
+    pool._current["main"] = replace(rows, every_row_has_state=False)
+    assert torch.equal(skipped, pool.gather("h", layer_idx=1, start=start)), "the skip reads other rows than the select"
+    torch.testing.assert_close(skipped, rows_of(2, 1.0)[[1, 0]])
+    pool.commit(step, ctx)
+
+    step, ctx = eager(["c", "a"])
+    plan(pool, step, ctx)
+    read = pool.gather("h", layer_idx=1, start=start)
+    assert torch.equal(read[0], start), "a fresh row reads its start"
+    torch.testing.assert_close(read[1], rows_of(2, 1.0)[0])
 
 
 def test_a_freed_slot_reads_as_zeros():

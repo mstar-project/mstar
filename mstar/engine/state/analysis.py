@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, get_origin
 
 import torch
 
-from mstar.engine.state.contract import EMPTY, Array, Bidirectional, Block, GatedDeltaNet, Sampler, is_value
+from mstar.engine.state.contract import EMPTY, Array, Bidirectional, Block, Sampler, is_value
 
 if TYPE_CHECKING:
     from mstar.model.base import Model
@@ -53,6 +53,11 @@ def state_declaration_problems(model: "Model") -> list[str]:
 def position_key(array: Array) -> str:
     """The resource key of ``array``'s positions: ``thinker_pos`` for ``thinker_kv``, ``rope`` for any other name."""
     return f"{array.name.removesuffix('_kv')}_pos" if array.name.endswith("_kv") else "rope"
+
+
+def written_by_step(array: Array) -> frozenset[str]:
+    """The fields of a Value's entry that its step writes itself, the ones no update op writes in place."""
+    return frozenset(array.entry.tensors.keys() - {field for op in array.updates.values() for field in op.writes})
 
 
 def _name_problems(arrays: Sequence[Array], samplers: Sequence[Sampler]) -> list[str]:
@@ -165,8 +170,8 @@ def _reads_input(graphs: Mapping[str, object], walk: str, node: str, tensor: str
 
 def _value_problems(arrays: Sequence[Array], kv_labels: Mapping[str, Mapping[str, object]]) -> list[str]:
     """What a Value's entry can't hold yet. A prefix hit restores a Value's snapshot, and a snapshot carries neither its
-    host fields nor a plain field, which has no kernel to write mid-prefill snapshots."""
-    plain = [array for array in arrays if is_value(array) and array.entry.tensors and not array.updates]
+    host fields nor a field its step writes itself, which no kernel writes mid-prefill."""
+    plain = [array for array in arrays if is_value(array) and written_by_step(array)]
     if not plain and not any(array.entry.host for array in arrays):
         return []
     keyed = {
@@ -174,8 +179,7 @@ def _value_problems(arrays: Sequence[Array], kv_labels: Mapping[str, Mapping[str
         for node in array.nodes
     }
     problems = [
-        f"Array {array.name!r}.layers is empty, and a Value with tensor fields and no update is read and written per "
-        "layer"
+        f"Array {array.name!r}.layers is empty, and the fields its step writes itself are read and written per layer"
         for array in plain if not array.layers
     ]
     problems += [
@@ -264,10 +268,10 @@ def deployment_problems(
         and resources.get(declared.name, {}).get("enable_logprobs")
     ]
     for array in arrays.values():
-        gated = any(isinstance(update, GatedDeltaNet) for update in array.updates.values())
-        if is_value(array) and not gated and "state_dtype" in resources.get(array.name, {}):
-            problems.append(f"Array {array.name!r}: resources.{array.name}.state_dtype, and only a Value with a "
-                            "GatedDeltaNet picks a stored dtype")
+        # a pool with no state block refuses state_dtype itself
+        if "state_dtype" in resources.get(array.name, {}) and "state" in written_by_step(array):
+            problems.append(f"Array {array.name!r}: resources.{array.name}.state_dtype, and its step writes state "
+                            "itself, where only a field an update op writes takes a stored dtype")
         for key, read in array.reads.items():
             shards = max((head_shards.get(node, 1) for node in array.nodes), default=1)
             if array.seq_sharded and arrays.get(read.queries, array).seq_sharded and read.op.q_heads % shards:

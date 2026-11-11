@@ -1042,6 +1042,8 @@ def _tower_with_ladder(tower: str, ladder: list[int], walk: str | None = None):
     config's ``ladder`` (or, with ``walk``, the ladder named for that walk instead)
     and its attention resource sized from the class's own top bucket, as the models
     declare it: the node and its region's runner."""
+    from mstar.engine.state import Array, Attend, Block, KVEntry, Read
+    from mstar.engine.state.adapters import build_handle
     from mstar.model.components.aut_encoder import AuTEncoderConfig
     from mstar.model.components.aut_submodule import AuTEncoderSubmodule
     from mstar.model.components.block_loop_encoder import VISION_BLOCK_LOOP, PackedBlockLoopEncoder
@@ -1056,9 +1058,15 @@ def _tower_with_ladder(tower: str, ladder: list[int], walk: str | None = None):
     else:
         config = AuTEncoderConfig()
         node = type("Encoder", (AuTEncoderSubmodule,), {"prepare_inputs": None})(
-            SimpleNamespace(config=config), "audio_attn")
-        node.node_resources = {"audio_attn": SimpleNamespace(
-            max_segments_per_request=AuTEncoderSubmodule.max_windows_per_replay(config))}
+            SimpleNamespace(config=config), "audio_tokens")
+        read = Read(mask=Block(), op=Attend(q_heads=1))
+        tokens = Array("audio_tokens", nodes={"node"}, layers=frozenset({0}), max_len=0,
+                       entry=KVEntry(heads=1, head_dim=4), reads={"audio_attn": read})
+        # the ragged resource as the node's lease check sees it: its windows per row
+        ragged = SimpleNamespace(
+            max_segments_per_request=AuTEncoderSubmodule.max_windows_per_replay(config), run=lambda q, k, v, label: q,
+        )
+        node.bind_node_state({"audio_tokens": build_handle(tokens, {"audio_attn": ragged})})
         label = "aut_encode"
     named = {"token_ladders": {walk: ladder}} if walk else {"region_ladders": {label: ladder}}
     mgmt = make_mgmt(node, joint_comm_group=SimpleNamespace(world_size=1), **named)
@@ -1077,7 +1085,7 @@ def test_an_audio_clip_past_the_window_ceiling_runs_eagerly_however_long_the_lad
     with more than a replay's plan holds takes no lease, so its stack runs eagerly
     rather than overflowing the plan."""
     node, runner = _tower_with_ladder("audio", [64, 16384])
-    windows = node.node_resources["audio_attn"].max_segments_per_request
+    windows = node.max_segments_per_request()
     rows = [SimpleNamespace(input_seq_len=104 * n) for n in (windows, windows + 1)]
     assert runner.can_lease(rows[:1], ["a"])
     assert not runner.can_lease(rows[1:], ["b"])

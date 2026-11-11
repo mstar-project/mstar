@@ -1218,7 +1218,7 @@ def test_a_write_is_visible_to_the_next_steps_read():
     _commit_written(h, pool)
     _commit_written(h, pool, x=5.0, n=10)
     step, _, _ = _value_step(h, pool, [Segment(2, "main", 1)])
-    assert h.read(0).fields["n"].tolist() == [10], "the write set the entry at the step's commit"
+    assert h.read(0).fields["n"].tolist() == [10], "a committed step's write is the entry the next step reads"
     h.end_step(step)
 
 
@@ -1362,6 +1362,62 @@ def test_a_step_over_a_fresh_row_and_a_written_row_counts_only_its_own_write():
     h.end_step(step)
 
 
+def _gdn_entry() -> Entry:
+    return Entry({
+        "state": TensorType((HEADS, DIM, DIM), dtype=torch.float32, shard=0),
+        "conv": TensorType((3 * HEADS * DIM, 3), dtype=None, shard=0),
+    })
+
+
+@pytest.mark.parametrize("updates, unwritten", [
+    ({"c": CausalConv(), "d": GatedDeltaNet()}, None),
+    ({"d": GatedDeltaNet()}, r"\['conv'\]"),
+], ids=["both updates", "no causal conv"])
+def test_a_kept_step_writes_exactly_the_fields_no_update_op_writes(updates, unwritten):
+    """The fields a step writes itself are the entry's minus those its update ops write, whatever kind of Value it
+    is. A GatedDeltaNet and its CausalConv write state and conv in place. A GatedDeltaNet alone leaves conv to the
+    step, which would otherwise keep zeros."""
+    pool, h = _gdn_over_a_pool(Value("gdn", nodes={"LLM"}, layers={0}, entry=_gdn_entry(), updates=updates))
+    step, _, _ = _value_step(h, pool, [Segment(1, "main", 1)])
+    if unwritten is None:
+        h.check_step(step)
+    else:
+        _refused(rf"Array 'gdn': layer 0's fields {unwritten} are unwritten in a kept step for rows \[1\], and no "
+                 "update op writes them", lambda: h.check_step(step))
+    h.end_step(step)
+
+
+def test_nothing_but_gdn_turns_the_state_k_last(monkeypatch):
+    """GDN holds the K-last layout and both of its conversions. With them as the identity, a written state lands in
+    the pool as declared and reads back unchanged, so nothing else transposes it."""
+    monkeypatch.setattr(GDN, "stored", lambda self, value: value)
+    monkeypatch.setattr(GDN, "from_stored", lambda self, stored: stored)
+    updates = {"c": CausalConv(), "d": GatedDeltaNet()}
+    pool, h = _gdn_over_a_pool(Value("gdn", nodes={"LLM"}, layers={0}, entry=_gdn_entry(), updates=updates))
+    state = torch.randn(1, HEADS, DIM, DIM)
+    step, plan, ctx = _value_step(h, pool, [Segment(1, "main", 1)])
+    h.write(0, state=state)
+    slot = pool.addressing("main").host_slot_indices[0]
+    assert torch.equal(pool.block("state", 0)[slot], state[0]), "the write transposed the state outside GDN"
+    pool.commit(plan, ctx)
+    h.end_step(step)
+    step, _, _ = _value_step(h, pool, [Segment(1, "main", 1)])
+    assert torch.equal(h.read(0).fields["state"], state), "the read transposed the state outside GDN"
+    h.end_step(step)
+
+
+def test_a_value_read_that_never_asks_for_row_offsets_builds_none(monkeypatch):
+    """No model reads a Value's row offsets, so building them would cost every eager read a launch and every captured
+    read a recorded kernel."""
+    h, pool = _plain_value()
+    step, _, _ = _value_step(h, pool, [Segment(1, "main", 1), Segment(2, "main", 1)])
+    with monkeypatch.context() as patched:
+        patched.setattr(torch, "arange", Mock(side_effect=AssertionError("the read built row_offsets")))
+        reached = h.read(0)
+    assert reached.row_offsets.tolist() == [0, 1, 2], "asked for, they still count one entry per row"
+    h.end_step(step)
+
+
 def test_a_step_with_every_row_at_span_zero_needs_no_write():
     h, pool = _plain_value()
     step, _, _ = _value_step(h, pool, [Segment(1, "main", 0)])
@@ -1411,7 +1467,7 @@ def test_no_arguments_from_the_sampler_means_the_model_samples():
     assert fused_draw_args(s) is None, "an eager step or a penalty draws through `sample`"
 
 
-@pytest.mark.parametrize("vocab_size, fused", [(2048, True), (2049, False), (4096, False)])
+@pytest.mark.parametrize("vocab_size, fused", [(2048, True), (2049, False), (3072, False), (4096, False)])
 def test_fused_draws_stop_where_fused_sample_leaves_the_layout_draw_row_assumes(vocab_size, fused, monkeypatch):
     launched = {}
     monkeypatch.setattr(sampler_utils, "_fused_sample_kernel", {(1,): lambda *args, **kw: launched.update(kw)})
@@ -1496,6 +1552,17 @@ def test_arguments_from_one_step_dont_carry_to_the_next():
 def test_fused_draw_args_in_a_step_that_doesnt_list_the_sampler_is_refused():
     _refused(r"Sampler 'draws': fused_draw_args in a step that doesn't list the sampler",
              lambda: fused_draw_args(_drawing()))
+
+
+def test_the_sampler_imports_nothing_from_the_state_contract():
+    """A resource's launch settings and types live in the resource, and the contract imports them, never the other
+    way round."""
+    script = (
+        "import sys, mstar.engine.resources.sampler.resource; "
+        "sys.exit(any(name.startswith('mstar.engine.state') for name in sys.modules))"
+    )
+    imported = subprocess.run([sys.executable, "-c", script], check=False).returncode
+    assert imported == 0, "the sampler imports the contract"
 
 
 def test_importing_the_contract_leaves_gluon_unimported():

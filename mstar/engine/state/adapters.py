@@ -44,7 +44,7 @@ from mstar.engine.resources.recurrent.config import (
 from mstar.engine.resources.sampler.config import SamplerSpec, SamplerStep, SamplingReqConfig
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
 from mstar.engine.resources.step import Segment, SubmoduleStep
-from mstar.engine.state.analysis import position_key
+from mstar.engine.state.analysis import position_key, written_by_step
 from mstar.engine.state.calls import ArrayHandle, SamplerHandle, step_labels
 from mstar.engine.state.contract import (
     EMPTY,
@@ -259,50 +259,31 @@ def _apply_kernel_settings(
 ) -> None:
     """Set the kernel choices, capture sizes and default pool sizes the contract leaves to the engine, and refuse any
     other, so this hook can't carry other physical choices until the engine picks kernels and sizes its pools itself."""
-    owners = {array.name: (array, None) for array in arrays} | {
+    owners = {array.name: (array, storage_of(array)) for array in arrays} | {
         bound.key: (array, bound.binding)
         for array in arrays for bound in _bindings(storage_of(array), array) if bound.binding.kernel_settings
     }
     by_key = {spec.resource_key: spec for spec in specs}
-    # (spec, field) -> the read or update that set it and its value
+    # (spec, field) -> the key of `kernel_settings` that set it and its value
     set_by: dict[tuple[str, str], tuple[str, Any]] = {}
     for key, settings in kernel_settings.items():
         if key not in owners:
             raise ValueError(f"kernel_settings[{key!r}] names no read or update of the declarations that takes kernel "
                              f"settings, and no array, of {sorted(owners)}")
-        array, binding = owners[key]
-        # an update's settings go on its own spec, and a read on SDPA has no spec to set
-        spec = by_key.get(resource_of.get(key, key))
-        if binding is not None:
-            allowed = binding.kernel_settings
-        elif isinstance(spec, KVSpec):
-            allowed = {"max_num_pages"}
-        elif isinstance(spec, RecurrentStateSpec):
-            allowed = {"max_slots"}
-        else:
-            allowed = set()    # a host-only Value or an array with max_len 0 has no pool
-        refused = settings.keys() - allowed
+        array, owner = owners[key]
+        refused = settings.keys() - owner.kernel_settings
         if refused:
             raise ValueError(f"Array {array.name!r}: kernel_settings[{key!r}] sets {sorted(refused)}; "
-                             f"it may set only {sorted(allowed)}")
-        if spec is None:
-            continue
-        if binding is not None:
-            for field, value in settings.items():
-                other, earlier = set_by.setdefault((spec.resource_key, field), (key, value))
-                if earlier != value:
-                    raise ValueError(f"Array {array.name!r}: kernel_settings[{other!r}] and kernel_settings[{key!r}] "
-                                     f"set {field} to {earlier!r} and {value!r}, and both reads run on "
-                                     f"{spec.resource_key!r}")
-        # an array's sizes and a read's decode keys go through the spec's YAML path and its checks
-        yaml_keys = settings.keys() if binding is None else settings.keys() & {"decode_tensor_cores", "decode_fmha"}
-        for field in settings.keys() - yaml_keys:
-            setattr(spec.config, field, settings[field])
-        if yaml_keys:
-            try:
-                spec.apply_yaml_overrides(**{field: settings[field] for field in yaml_keys})
-            except ValueError as e:
-                raise ValueError(f"Array {array.name!r}: kernel_settings[{key!r}]: {e}") from e
+                             f"it may set only {sorted(owner.kernel_settings)}")
+        # A read's settings go on the spec of the resource it runs on, which SDPA has none of. An update's or an
+        # array's go on its own spec.
+        spec = by_key.get(resource_of.get(key, key))
+        for field, value in settings.items() if spec is not None else ():
+            other, earlier = set_by.setdefault((spec.resource_key, field), (key, value))
+            if earlier != value:
+                raise ValueError(f"Array {array.name!r}: kernel_settings[{other!r}] and kernel_settings[{key!r}] set "
+                                 f"{field} to {earlier!r} and {value!r}, and both reads run on {spec.resource_key!r}")
+        owner.set_kernel_settings(array, spec, settings)
 
 
 def node_handles(
@@ -581,9 +562,19 @@ class OpBinding:
         """``value`` in the layout `block` gives its field in the pool."""
         return value
 
+    def from_stored(self, stored: torch.Tensor) -> torch.Tensor:
+        """``stored``, read from the pool, in the layout the op declares its field in."""
+        return stored
+
     def bind(self, array: Array, key: str, resources: Mapping[str, Any]) -> Any:
         """What a handle calls to run the op."""
         return resources[key]
+
+    def set_kernel_settings(self, array: Array, spec: NodeResourceSpec | None, settings: Mapping[str, Any]) -> None:
+        """Set ``settings`` on the op's ``spec``, which is None for a read on SDPA."""
+        if spec is not None:
+            for field, value in settings.items():
+                setattr(spec.config, field, value)
 
 
 class PagedAttend(OpBinding):
@@ -612,8 +603,18 @@ class PagedAttend(OpBinding):
     def steps(self, key: str, read: Read, segments, steps: dict[str, Any]) -> None:
         steps[key] = AttentionStep(segments=segments, causal=not isinstance(read.mask, Bidirectional))
 
+    def set_kernel_settings(self, array: Array, spec: NodeResourceSpec | None, settings: Mapping[str, Any]) -> None:
+        """The decode keys go through the spec's own YAML path and its checks, as they do under `resources:`."""
+        decode = {field: settings[field] for field in settings.keys() & {"decode_tensor_cores", "decode_fmha"}}
+        super().set_kernel_settings(array, spec, {field: settings[field] for field in settings.keys() - decode.keys()})
+        if decode:
+            try:
+                spec.apply_yaml_overrides(**decode)
+            except ValueError as e:
+                raise ValueError(f"Array {array.name!r}: kernel_settings[{spec.resource_key!r}]: {e}") from e
 
-class PagedCrossAttend(OpBinding):
+
+class PagedCrossAttend(PagedAttend):
     """`Attend` with ``queries`` on a paged array: a `CrossAttentionSpec` over the array's pool, planned by the queried
     array's segments."""
 
@@ -729,8 +730,11 @@ class GDN(LinearAttnBinding):
         return _block(TensorType((h_v, d_v, d_k), dtype=dtype, shard=shard))
 
     def stored(self, value: torch.Tensor) -> torch.Tensor:
-        """The swap of the last two axes, which is its own inverse."""
+        """The swap of the last two axes, which `from_stored` swaps back."""
         return value.transpose(-1, -2)
+
+    def from_stored(self, stored: torch.Tensor) -> torch.Tensor:
+        return stored.transpose(-1, -2)
 
 
 class ConvOnLinearAttn(OpBinding):
@@ -983,8 +987,9 @@ class ValueHandle(ArrayHandle):
         }
         self._runners = {type(bound.declared): bound.binding.bind(array, bound.key, resources) for bound in bindings}
         self._layouts = _field_layouts(bindings)
-        # `_written` holds the fields each layer's write set this step.
+        # `_step_written` holds the fields a kept step writes itself, and `_written` those each layer's write set.
         # `_start` holds each layer's start state from `set_start`, in the pool's layout, fixed from the first step on.
+        self._step_written = written_by_step(array)
         self._written: dict[int, set[str]] = {}
         self._start: dict[int, dict[str, torch.Tensor]] = {}
         self._stepped = False
@@ -996,7 +1001,7 @@ class ValueHandle(ArrayHandle):
 
     def check_step(self, step) -> None:
         super().check_step(step)
-        if not step.ctx.replays and not self.array.updates:
+        if self._step_written and not step.ctx.replays:
             self._check_written(step.state[self.name].segments or step.segments or ())
 
     def _check_written(self, segments) -> None:
@@ -1004,10 +1009,10 @@ class ValueHandle(ArrayHandle):
         if not rows:
             return
         for layer in sorted(self.array.layers):
-            unwritten = sorted(self.array.entry.tensors.keys() - self._written.get(layer, set()))
+            unwritten = sorted(self._step_written - self._written.get(layer, set()))
             if unwritten:
                 raise self._refusal(f"layer {layer}'s fields {unwritten} are unwritten in a kept step for rows {rows}, "
-                                    "and a Value with no update is written whole by the step's own write")
+                                    "and no update op writes them")
 
     def _check_storage(self, declared: ArrayStep, segments, ctx) -> None:
         if not declared.keep:
@@ -1037,8 +1042,7 @@ class ValueHandle(ArrayHandle):
         for field in self.array.entry.tensors:
             read = self._pool.gather(field, self._pool_layer[layer], label=self.label, start=start.get(field))
             fields[field] = self._declared(field, read)
-        rows = next(iter(fields.values()))
-        return Reached(fields, row_offsets=torch.arange(rows.shape[0] + 1, dtype=torch.int32, device=rows.device))
+        return _OneEntryPerRow(fields)
 
     def set_start(self, start: Mapping[str, torch.Tensor]) -> None:
         if self._stepped:
@@ -1052,32 +1056,28 @@ class ValueHandle(ArrayHandle):
             for layer in self.array.layers
         }
 
-    def _k_last(self, field: str) -> bool:
-        """Whether ``field`` is the state a declared `GatedDeltaNet` reads, stored K-last as `GDN.block` lays it."""
-        return field == "state" and GatedDeltaNet in self._runners
-
     def _stored(self, field: str, layer: int, value: torch.Tensor, shape: torch.Size, what: str) -> torch.Tensor:
         """``value``, whose entries are of ``shape``, in the layout and dtype the pool stores ``field`` in."""
         block = self.block(field, layer)
-        expected = (*block.shape[1:-2], block.shape[-1], block.shape[-2]) if self._k_last(field) else block.shape[1:]
+        layout = self._layouts.get(field)
+        expected = block.shape[1:] if layout is None else layout.from_stored(block).shape[1:]
         dtype = self.array.entry.tensors[field].dtype or block.dtype
         if tuple(shape) != tuple(expected) or value.dtype != dtype:
             raise self._refusal(f"{what} of field {field!r} on layer {layer} is {tuple(shape)} of {value.dtype}, and "
                                 f"the field is {tuple(expected)} of {dtype} on this rank")
-        return (value.transpose(-1, -2) if self._k_last(field) else value).to(block.dtype)
+        return (value if layout is None else layout.stored(value)).to(block.dtype)
 
     def _declared(self, field: str, stored: torch.Tensor) -> torch.Tensor:
         """``stored``, read from the pool, in ``field``'s declared layout and dtype."""
-        value = stored.transpose(-1, -2) if self._k_last(field) else stored
+        layout = self._layouts.get(field)
+        value = stored if layout is None else layout.from_stored(stored)
         return value.to(self.array.entry.tensors[field].dtype or value.dtype)
 
     @torch.compiler.disable
     def write(self, layer: int | torch.Tensor, *, at: torch.Tensor | None = None, **fields: torch.Tensor) -> None:
-        """Set the step's rows' entries on a Value for later steps, at the step's commit.
-
-        The rule is per row: with no update, each row at span 1 or more gets every field from the step's own write,
-        and a row at span 0 or that pads the step writes nowhere.
-        """
+        """Write each row's ``fields`` into its slot in place. The scatter changes the slots where the forward runs
+        it, in an eager step or a replay, so a step refused after a field's write keeps it in the slots its rows
+        already held."""
         if at is not None:
             raise self._no_layout("write at positions, on anything but a Value")
         layer = self._layer_id(layer)
@@ -1099,6 +1099,19 @@ class ValueHandle(ArrayHandle):
         view = self.block(field, layer)
         self._record_update(field, layer)
         return runner, view
+
+
+class _OneEntryPerRow(Reached):
+    """A Value read's `Reached`. Its ``row_offsets`` is built only when asked for, so a read that doesn't ask launches
+    no kernel for it, and a captured read records none."""
+
+    def __init__(self, fields: Mapping[str, torch.Tensor]):
+        object.__setattr__(self, "fields", fields)
+
+    @functools.cached_property
+    def row_offsets(self) -> torch.Tensor:
+        rows = next(iter(self.fields.values()))
+        return torch.arange(rows.shape[0] + 1, dtype=torch.int32, device=rows.device)
 
 
 class HostValueHandle(ArrayHandle):
@@ -1282,6 +1295,8 @@ class Storage(ABC):
     """How today's resources hold one kind of array: its specs, its own step, its layouts and its handle."""
 
     handle_class: ClassVar[type[ArrayHandle]]
+    # the pool sizes `kernel_settings` may set under the array's name, until the engine sizes its pools itself
+    kernel_settings: ClassVar[frozenset[str]] = frozenset()
 
     def __init__(self):
         # `state_steps` reaches a handle's storage, for its step builder, through the handle's class
@@ -1313,6 +1328,15 @@ class Storage(ABC):
         """Today's `LabelLayout` per label, or None where the array's pool takes no layout."""
         return None
 
+    def set_kernel_settings(self, array: Array, spec: NodeResourceSpec | None, settings: Mapping[str, Any]) -> None:
+        """Size the array's pool ``spec`` through its own YAML path, so a value here means what the same key under
+        `resources:` means."""
+        if settings:
+            try:
+                spec.apply_yaml_overrides(**settings)
+            except ValueError as e:
+                raise ValueError(f"Array {array.name!r}: kernel_settings[{array.name!r}]: {e}") from e
+
 
 class PagedStorage(Storage):
     """An append-only array that keeps entries, in a pool of KV pages. Its reads of one config share the spec of the
@@ -1320,6 +1344,7 @@ class PagedStorage(Storage):
     plans them as one combined plan."""
 
     handle_class = PagedArrayHandle
+    kernel_settings = frozenset({"max_num_pages"})
 
     def resolve(self, arrays: Sequence[Array], declared: Sequence[Array], setup: "StateSetup") -> Resolved:
         resolved = Resolved({}, {}, {}, {})
@@ -1483,6 +1508,7 @@ class ValueStorage(Storage):
     """A rewritable array of one entry, in a recurrent state pool."""
 
     handle_class = ValueHandle
+    kernel_settings = frozenset({"max_slots"})
 
     def resolve(self, arrays: Sequence[Array], declared: Sequence[Array], setup: "StateSetup") -> Resolved:
         return Resolved({array.name: self._specs(array, declared) for array in arrays}, {}, {})

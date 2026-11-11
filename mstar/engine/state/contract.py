@@ -420,22 +420,6 @@ class PagedNHD:
                 object.__setattr__(self, name, frozenset(getattr(self, name)))
 
 
-# The widest row `draw_row` draws as `sample` does: `fused_sample` launches 4 warps up to here, and 8 past it.
-FUSED_DRAW_MAX_VOCAB = 2048
-
-
-class FusedDrawArgs(NamedTuple):
-    """Not frozen yet, like the rest of the fused draw. Each row's sampling parameters, for a kernel in the forward
-    that draws its own tokens. Row r's i-th draw is ``draw_row(..., seed[r], offset[r] + i, ...)``, which consumes one
-    draw from the row's random stream, exactly as one `sample` call does."""
-
-    temperature: torch.Tensor    # [rows] float32
-    top_k: torch.Tensor          # [rows] int32, 0 is off
-    top_p: torch.Tensor          # [rows] float32
-    seed: torch.Tensor           # [rows] int64
-    offset: torch.Tensor         # [rows] int64, this kernel's first draw
-
-
 class PagedNHDTarget(NamedTuple):
     """Where a state op writes this step's entries on one layer of a `PagedNHD` array."""
 

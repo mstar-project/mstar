@@ -22,7 +22,8 @@ from mstar.engine.resources.attn.wrappers import (
 from mstar.engine.resources.kv.config import KVSpec
 from mstar.engine.resources.position.config import PositionConfig
 from mstar.engine.resources.sampler.config import SamplerSpec
-from mstar.engine.state.adapters import node_resources, sampling_configs
+from mstar.engine.state.adapters import StateSetup, build_handle, node_resources, sampling_configs
+from mstar.engine.state.host_fields import HostFields
 from mstar.model.base import ClientChunk
 from mstar.model.components.code_predictor_kernels import ResidualCodePredictor
 from mstar.model.qwen3_tts import qwen3_tts_model
@@ -37,6 +38,7 @@ from mstar.model.qwen3_tts.config import (
     TALKER_ATTN,
     TALKER_MIXED,
     TALKER_SAMPLER,
+    TALKER_TEXT,
     Qwen3TTSCodecConfig,
     Qwen3TTSCodePredictorConfig,
     Qwen3TTSModelConfig,
@@ -835,12 +837,16 @@ def test_qwen3_tts_talker_builds_official_non_streaming_prefill():
 def test_qwen3_tts_decode_feeds_its_text_stream_then_eos_then_pad(layout, first_empty):
     """Each decode frame adds one text token: the stream's next one, then TTS
     EOS once past its end (unless the prefill took it), then TTS PAD. TTS EOS
-    counts as fed only once its step has run, so a step prepared twice (an
+    counts as fed only once its step commits, so a step prepared twice (an
     admit retry) adds the same token both times."""
     config = _tiny_model_config()
     submodule = TalkerSubmodule(Qwen3TTSTalkerModel(config), _code_predictor(config), config)
+    text = next(declared for declared in _make_model().declare_state() if declared.name == TALKER_TEXT)
+    fields = HostFields()
+    submodule.text = build_handle(text, {}, StateSetup(host_fields=fields))
+    fields.open(1)
     info = SimpleNamespace(
-        request_id="r", rid_handle="r", graph_walk="talker_decode", step_metadata={PROMPT_LAYOUT_KEY: layout},
+        request_id="r", rid_handle=1, graph_walk="talker_decode", step_metadata={PROMPT_LAYOUT_KEY: layout},
     )
     loop_back = {"talker_input_embeds": [torch.zeros(1, 16)]}
 
@@ -848,7 +854,9 @@ def test_qwen3_tts_decode_feeds_its_text_stream_then_eos_then_pad(layout, first_
         return submodule.prepare_inputs("talker_decode", info, {**loop_back, "text_in": list(fed)})
 
     def ran(prepared):
-        submodule.postprocess("r", info, {}, inputs=prepared)
+        declared = submodule.declare_step("talker_decode", [1], [prepared])
+        if TALKER_TEXT in declared.state:
+            fields.commit(text, declared.state[TALKER_TEXT], [1])
 
     tokens = {"eos": config.tts_eos_token_id, "pad": config.tts_pad_token_id}
     # two tokens streamed, then the stream's empty chunks
@@ -1319,7 +1327,7 @@ def test_qwen3_tts_talker_preprocess_packs_the_tensors_the_per_row_device_copies
 
     seen = []
 
-    def main_input(input_embeds, label):
+    def main_input(input_embeds):
         seen.append(input_embeds)
         raise RuntimeError("the main Talker ran")
 
@@ -1663,16 +1671,17 @@ def test_qwen3_tts_checkpoint_min_p_turns_the_capability_on():
         **model._generation_defaults(), "min_p": 0.05, "code_predictor_min_p": 0.1,
     }
     specs = {
-        spec.resource_key: spec for spec in model.get_node_resources()
+        spec.resource_key: spec for spec in node_resources(model)
         if isinstance(spec, SamplerSpec)
     }
     assert specs[TALKER_SAMPLER].enable_min_p and specs[CODE_PRED_SAMPLER].enable_min_p
     # a plain request takes those defaults and is not refused
-    for key, config in model.get_request_resource_configs([], [], {}).items():
+    configs = sampling_configs(model.get_request_resource_configs([], [], {}), model.declare_state())
+    for key, config in configs.items():
         config.validate(specs[key])
     # without them the capability stays off
     plain = {
-        spec.resource_key: spec for spec in _make_model().get_node_resources()
+        spec.resource_key: spec for spec in node_resources(_make_model())
         if isinstance(spec, SamplerSpec)
     }
     assert not plain[TALKER_SAMPLER].enable_min_p and not plain[CODE_PRED_SAMPLER].enable_min_p

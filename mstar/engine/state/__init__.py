@@ -1,6 +1,7 @@
 """The model-facing state contract. ``__all__`` is its whole surface, and after release the surface only grows."""
 
 from mstar.engine.resources.kv.config import Span
+from mstar.engine.resources.sampler.utils import FusedDrawArgs  # noqa: F401
 from mstar.engine.resources.step import (
     Segment,
     SlotLease,
@@ -31,7 +32,6 @@ from mstar.engine.state.contract import (
     CausalConv,
     Entry,
     Fork,
-    FusedDrawArgs,  # noqa: F401
     GatedDeltaNet,
     KVEntry,
     Layout,

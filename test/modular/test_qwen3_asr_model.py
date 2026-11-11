@@ -20,7 +20,7 @@ sys.path.insert(0, ".")
 from mstar.conductor.request_info import FINAL_PREFILL  # noqa: E402
 from mstar.engine.resources import KVSpec, RaggedAttentionSpec, SlotLease  # noqa: E402
 from mstar.engine.state import ArrayStep  # noqa: E402
-from mstar.engine.state.adapters import node_resources  # noqa: E402
+from mstar.engine.state.adapters import node_handles, node_resources  # noqa: E402
 from mstar.model.base import WalkStep  # noqa: E402
 from mstar.model.components.audio_features import LogMelSpectrogram  # noqa: E402
 from mstar.model.components.aut_encoder import AuTEncoder, AuTEncoderConfig  # noqa: E402
@@ -236,7 +236,7 @@ def test_process_prompt_builds_features_and_prompt():
         ]
         pre = ids.index(AUDIO_PAD)
         assert [span.length for span in spans] == [pre, n_tokens, len(ids) - pre - n_tokens]
-        assert set(out.metadata) == {MEDIA_LAYOUT, "state_layout"}
+        assert set(out.metadata) == {MEDIA_LAYOUT, "state_layout", "keyed_spans"}
     assert torch.equal(out.new_input_tensors["audio"][0], wave)  # samples as they are; the encoder makes the mel
 
     # the request's layout and any other attachment are ignored, as they always were
@@ -420,8 +420,11 @@ def test_encoder_packs_a_step_only_up_to_its_largest_capture():
     model = _make_model()
     sub = _encoder_submodule(model.config)
     # the windows a row holds, as the model sizes its resource (a step's windows gate it too)
-    (ragged,) = (s for s in model.get_node_resources() if isinstance(s, RaggedAttentionSpec))
-    sub.node_resources = {AUT_ATTN: ragged.config}
+    (ragged,) = (s for s in node_resources(model) if isinstance(s, RaggedAttentionSpec))
+    resource = SimpleNamespace(
+        max_segments_per_request=ragged.config.max_segments_per_request, run=lambda q, k, v, label: q,
+    )
+    sub.bind_node_state(node_handles(model, "audio_encoder", {AUT_ATTN: resource}))
     top = sub.ENCODE_TOKEN_BUCKETS[-1]
 
     def rows(*lens):

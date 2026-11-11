@@ -32,7 +32,7 @@ TALKER_SAMPLER = "talker_sampler"
 CODE_PRED_SAMPLER = "code_predictor"
 # Codec node: each stream's incremental decoder state
 CODEC_STATE = "codec_state"
-# the text each decode step adds, then TTS PAD
+# Talker node: whether a request's decode has added TTS EOS
 TALKER_TEXT = "talker_text"
 # combined walk of the Talker's prefills and decode: a new prompt rides a
 # decode step (Model.get_combined_graph_walks)

@@ -606,7 +606,7 @@ def test_qwen3_tts_lays_out_the_rows_its_prefill_builds(variant, text, kwargs):
     [span] = layout[TALKER_KV]["main"].spans
     assert span.walk == ("talker_prefill_clone" if clone else "talker_prefill")
     frames = metadata[PROMPT_LAYOUT_KEY][4]
-    prefill, _, _ = _tiny_qwen3_tts_talker()._build_prefill(
+    prefill, _ = _tiny_qwen3_tts_talker()._build_prefill(
         torch.zeros_like(output.new_input_tensors["text_inputs"][0]), metadata[PROMPT_LAYOUT_KEY],
         speaker_id=40 if metadata[SPEAKER_ID_KEY] >= 0 else -1,
         language_id=41 if metadata[LANGUAGE_ID_KEY] >= 0 else -1,

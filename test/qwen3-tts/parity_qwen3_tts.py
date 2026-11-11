@@ -56,7 +56,8 @@ from mstar.distributed.communication import CommGroup, JointGroups
 from mstar.engine.resources import StepContext, StepRunner, apply_yaml_overrides, resolve_spec_dependencies
 from mstar.engine.resources.base import EngineResourceInfo, build_resource
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
-from mstar.engine.state.adapters import node_handles, node_resources, sampling_configs
+from mstar.engine.state.adapters import StateSetup, node_handles, node_resources, sampling_configs
+from mstar.engine.state.host_fields import HostFields
 from mstar.model.qwen3_tts.config import LANGUAGE_ID_KEY, PROMPT_LAYOUT_KEY, SPEAKER_ID_KEY
 from mstar.model.qwen3_tts.qwen3_tts_model import Qwen3TTSModel
 from mstar.model.qwen3_tts.submodules import text_stream_start
@@ -235,7 +236,9 @@ class MStarTalkerDriver:
             for spec in specs
         }
         talker.bind_node_resources(self.resources)
-        talker.bind_node_state(node_handles(model, "Talker", self.resources))
+        # the request handles' host fields, which the engine opens when it mints a handle
+        self.fields = HostFields()
+        talker.bind_node_state(node_handles(model, "Talker", self.resources, setup=StateSetup(host_fields=self.fields)))
         self.runner = StepRunner(self.resources)
         self.fwd_index = 0
         # per request: its ``text_in`` items, and how many chunks the decode popped
@@ -251,14 +254,16 @@ class MStarTalkerDriver:
         for config in configs.values():
             config.apply_conductor_config(seed=1234)
         self.runner.ingest_request(rid, configs)
+        self.fields.open(rid)
         return CurrentForwardPassInfo(
-            request_id=rid, graph_walk="talker_prefill", fwd_index=0, random_seed=1234,
+            request_id=rid, rid_handle=rid, graph_walk="talker_prefill", fwd_index=0, random_seed=1234,
             max_tokens=8192, resource_configs=configs,
             step_metadata=dict(prompt),
         )
 
     def close_request(self, rid: str) -> None:
         self.runner.remove_request(rid)
+        self.fields.remove_request(rid)
         self.talker.cleanup_request(rid)
         self.text_in.pop(rid, None)
 
@@ -296,9 +301,10 @@ class MStarTalkerDriver:
         step.begin_calls()
         out = forward(engine_inputs, **preprocessed)
         step.end_calls()
+        step.check_calls()
         self.runner.commit(step)
-        # the step ran: marks TTS EOS fed when this step fed it
-        self.talker.postprocess(rid, fwd, {}, inputs=prepared)
+        # the step ran: a step that fed TTS EOS marks it fed
+        step.commit_calls()
         return out
 
 
@@ -609,7 +615,7 @@ def main(argv: list[str] | None = None) -> None:
         "rel_diff": float((ours_hidden.float() - ref_hidden.float()).norm() / ref_hidden.float().norm()),
     }
     # Diagnostic: the reference backbone over M*'s own prefill embeddings.
-    prefill, text, _ = talker._build_prefill(
+    prefill, _ = talker._build_prefill(
         tensors["text_inputs"][0], prompt[PROMPT_LAYOUT_KEY],
         prompt[SPEAKER_ID_KEY], prompt[LANGUAGE_ID_KEY],
         speaker_embed=tensors.get("speaker_embed", [None])[0],
