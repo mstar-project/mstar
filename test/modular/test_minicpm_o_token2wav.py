@@ -142,9 +142,10 @@ def stream(model: Token2Wav, state: Token2WavState, voice: Token2WavVoice, token
 class _CacheSteps:
     """Token2wav's resources (its state pool and its three attention caches) for requests
     in the voices of ``bank``, driven through admit / plan / commit one window at a time,
-    as the engine does."""
+    as the engine does. ``dit_dtype``: the DiT caches' dtype, which it computes in (the
+    bank's must match)."""
 
-    def __init__(self, bank, slots: int, device):
+    def __init__(self, bank, slots: int, device, dit_dtype: torch.dtype | None = None):
         from mstar.engine.resources.kv.bounded.config import BoundedKVConfig
         from mstar.engine.resources.kv.bounded.manager import BoundedKVManager
         from mstar.engine.resources.recurrent.config import RecurrentBlockConfig, RecurrentStateConfig
@@ -159,13 +160,14 @@ class _CacheSteps:
                 num_layers=f.num_layers, num_heads=f.num_heads, head_dim=f.head_dim, rows_per_request=f.rows,
                 max_source_len=f.rate * p, retention=f.retention, max_slots=slots,
                 reverse_step_order=f.reverse_step_order,
+                dtype=dit_dtype if name == "dit" and dit_dtype else torch.float32,
             ), device)
             for name, f in CACHE_FAMILIES.items()
         }
         self.pool = RecurrentStatePool(device, RecurrentStateConfig(
             num_layers=1, max_slots=slots + 1,
             blocks={n: RecurrentBlockConfig(shape=b.shape, dtype=b.dtype)
-                    for n, b in slot_layout(CacheCapacity(p)).items()},
+                    for n, b in slot_layout(CacheCapacity(p), dit_dtype=dit_dtype).items()},
         ))
         self.written: dict[str, int] = {}
         self.voice: dict[str, int] = {}
@@ -469,6 +471,20 @@ def test_batched_windows_on_pool(random_token2wav, device):
         mels.append(mel)
         noises.append(nz)
 
+    if device == "cuda":
+        # as served: the DiT computes in DIT_COMPUTE_DTYPE (its caches' dtype) on its
+        # fused kernels; its mel tracks the fp32 run above
+        from mstar.model.minicpm_o.components.token2wav import DIT_COMPUTE_DTYPE
+
+        bank16 = VoiceBank.build({"v": voice}, dit_dtype=DIT_COMPUTE_DTYPE)
+        kv16 = _CacheSteps(bank16, 3, device, dit_dtype=DIT_COMPUTE_DTYPE)
+        for (win, last), want in zip(wins[0], mels, strict=True):
+            state, kv, ids, commit = kv16.window(["r0"], len(win), last)
+            got = model.window_flow(state, bank16, ids, torch.tensor([win], dtype=torch.int32, device=device), kv, last)
+            commit()
+            rel = ((got.float() - want).norm() / want.norm()).item()
+            assert rel < 1e-3, rel  # 1.4e-4 measured; a broken kernel is far past it
+
     # The same utterance in two rows two windows apart, their full windows' flow in one
     # batch: rows at different positions (a first window beside a later one, then
     # rows on either side of the caches' bound) each match the one-row run.
@@ -504,6 +520,42 @@ def test_assets_load_completely():
     state = new_state(model, voice)
     wav = stream(model, state, voice, [4218] * 3 + [100] * 25, last=False)
     assert wav.shape == (1, 50 * 480) and torch.isfinite(wav).all()
+
+
+@needs_ckpt
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_the_served_float16_dit_tracks_float32_on_the_checkpoint():
+    """The DiT as served, in DIT_COMPUTE_DTYPE on its fused kernels, against the fp32 DiT
+    over an utterance's windows in three rows, on the real weights: the mel stays within
+    0.2% of fp32's (0.05-0.12% measured here, 0.07-0.14% at batch 24; a 0.1% random
+    perturbation of the fp32 mel gives 0.1%)."""
+    import soundfile as sf
+
+    from mstar.model.minicpm_o.components.token2wav import DIT_COMPUTE_DTYPE, load_token2wav
+
+    torch.backends.cuda.matmul.allow_tf32 = True
+    model = load_token2wav(f"{CKPT}/assets/token2wav", "cuda").requires_grad_(False)
+    wav, _ = sf.read(f"{CKPT}/assets/HT_ref_audio.wav", dtype="float32")
+    voice = model.prepare_voice(model.voice_encoder(torch.from_numpy(wav)))
+    torch.manual_seed(0)
+    codes = torch.randint(0, 6561, (3, 215)).tolist()
+    wins = [reference_windows(c) for c in codes]
+    rids = ["a", "b", "c"]
+    mels = {}
+    with torch.inference_mode():
+        for dtype in (None, DIT_COMPUTE_DTYPE):
+            bank = VoiceBank.build({"v": voice}, dit_dtype=dtype)
+            kv_steps = _CacheSteps(bank, 3, "cuda", dit_dtype=dtype)
+            mels[dtype] = []
+            for w in range(len(wins[0])):
+                last = wins[0][w][1]
+                tokens = torch.tensor([ws[w][0] for ws in wins], dtype=torch.int32, device="cuda")
+                state, kv, ids, commit = kv_steps.window(rids, tokens.shape[1], last)
+                mels[dtype].append(model.window_flow(state, bank, ids, tokens, kv, last).float())
+                commit()
+    for w, (want, got) in enumerate(zip(mels[None], mels[DIT_COMPUTE_DTYPE], strict=True)):
+        rel = ((got - want).norm(dim=(1, 2)) / want.norm(dim=(1, 2))).max().item()
+        assert rel < 2e-3, (w, rel)
 
 
 @pytest.mark.parametrize(("n", "stop"), [

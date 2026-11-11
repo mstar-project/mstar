@@ -66,7 +66,7 @@ from mstar.engine.resources.recurrent.config import (
 )
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.base import KVLabel, LabelLayout, ProcessPromptOutput, Span, WalkStep
+from mstar.model.base import KVLabel, LabelLayout, Model, ProcessPromptOutput, Span, WalkStep
 from mstar.model.components.audio_features import HOP_LENGTH, LogMelSpectrogram
 from mstar.model.components.sampled_token_decoder import ROW_HIDDEN, ROW_IDS
 from mstar.model.keys import KV_CACHE, ROPE, VISION_ATTN
@@ -412,9 +412,7 @@ class MiniCPMOModel(MultimodalDecoderModel):
             AttentionSpec(resource_key=TTS_ATTN, nodes={TTS}, config=AttentionConfig(kv_cache=TTS_KV)),
             PositionSpec(
                 resource_key=TTS_POS, nodes={TTS},
-                # a TTS step is a few small kernels a layer: fused RoPE saved 5-10% of its
-                # GPU time per step (4e880c21d1: 1 x H100, TTS alone), not re-measured since
-                config=PositionConfig(kv_cache=TTS_KV, rope_theta=tts.rope_theta, fused=True),
+                config=PositionConfig(kv_cache=TTS_KV, rope_theta=tts.rope_theta),
             ),
             # upstream's TTS sampling (see TTSSubmodule)
             SamplerSpec(
@@ -711,12 +709,8 @@ class MiniCPMOModel(MultimodalDecoderModel):
         return cached
 
     def postprocess(self, output: torch.Tensor, modality: str, request_kwargs: dict | None = None) -> bytes:
-        if modality == TEXT:
-            return super().postprocess(output, modality, request_kwargs)
-        if modality == "audio":
-            pcm = (output.reshape(-1).float().clamp(-1.0, 1.0) * 32767.0).to(torch.int16)
-            return pcm.cpu().numpy().tobytes()
-        raise ValueError(f"Unsupported modality for MiniCPM-o: {modality!r}")
+        # the scaffold's refuses audio; Model's encodes it as it does text (#1134)
+        return Model.postprocess(self, output, modality, request_kwargs)
 
     # ------------------------------------------------------------------
     # Walks

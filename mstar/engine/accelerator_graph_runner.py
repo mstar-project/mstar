@@ -2345,6 +2345,7 @@ class PiecewiseAcceleratorGraphRunner:
         seq_lens: list[int] | None,
         real_bs: int,
         real_total_tokens: int | None,
+        label_seq_lens: dict[str, list[int]] | None = None,
     ) -> PiecewiseOutput:
         """The region's callable run eagerly, through the same step a replay
         declares (``_declare``), so its resources hold a plan for exactly these rows."""
@@ -2355,7 +2356,7 @@ class PiecewiseAcceleratorGraphRunner:
                 raise ValueError(f"piecewise {self._label!r}: an eager run of a packed region needs seq_lens")
             step = self._declare(
                 list(request_ids), list(seq_lens) if seq_lens is not None else [self._config.seq_len] * real_bs,
-                None, capture=False, slot=self._current_slot,
+                None, capture=False, slot=self._current_slot, label_seq_lens=label_seq_lens,
             )
         if step is not None:
             outcome = self._step_runner.admit(step)
@@ -2530,7 +2531,7 @@ class PiecewiseAcceleratorGraphRunner:
                     f"piecewise {self._label!r}: no captured graph for bs={real_bs}, "
                     f"total_tokens={real_total_tokens}"
                 )
-            return self._run_eager(static_inputs, request_ids, seq_lens, real_bs, real_total_tokens)
+            return self._run_eager(static_inputs, request_ids, seq_lens, real_bs, real_total_tokens, label_seq_lens)
 
         for name, value in static_inputs.items():
             buffer = data.static_inputs.get(name)
