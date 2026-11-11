@@ -14,8 +14,9 @@ pytest.importorskip("xgrammar")
 
 from mstar.api_server.openai.adapters import _refuse_unserved_chat  # noqa: E402
 from mstar.conductor.conductor import Conductor  # noqa: E402
+from mstar.engine.accelerator_graph_backend import SplitGraph  # noqa: E402
 from mstar.engine.resources import StepRunner  # noqa: E402
-from mstar.engine.resources.sampler import utils  # noqa: E402
+from mstar.engine.resources.sampler import grammar, utils  # noqa: E402
 from mstar.engine.resources.sampler.config import SamplerSpec, SamplerStep, SamplingReqConfig  # noqa: E402
 from mstar.engine.resources.sampler.grammar import MAX_GRAMMAR_CHARS, GrammarRequest, grammar_request  # noqa: E402
 from mstar.engine.resources.sampler.resource import GrammarSamplerResource  # noqa: E402
@@ -170,18 +171,21 @@ def test_a_request_whose_grammar_compiles_holds_back_no_other(ranks):
     assert runner.admit_retrieve("a", "LLM", "w").ready
 
 
-@pytest.mark.parametrize("failure", ["compile", "refused draw"])
+@pytest.mark.parametrize("failure", ["compile", "refused draw", "two rows"])
 def test_a_grammar_that_can_no_longer_hold_fails_its_request(failure):
     """A grammar that fails to compile is the request's error at its next admit;
     a draw it refuses, at the admit after the step that accepts it, and past it
-    the row may only stop. A pre-admit gives the same answer as a full admit, as
-    a pre-admitted step skips its full admit on one TP rank and not another."""
+    the row may only stop; two rows of one step (a draft's), at that step's admit.
+    A pre-admit gives the same answer as a full admit, as a pre-admitted step
+    skips its full admit on one TP rank and not another."""
     res = _resource(graph=True)
     lease = SlotLease(slot=0, bucket=SimpleNamespace(bs=4))
     step = SamplerStep(apply_penalty=False)
     if failure == "compile":
         # past the tokenizer-free check, as a grammar xgrammar compiles differently would be
         res.ingest_request(0, SamplingReqConfig(grammar=GrammarRequest("grammar", "root ::= undefined_rule")))
+    elif failure == "two rows":
+        res.ingest_request(0, SamplingReqConfig(grammar=grammar_request({"choice": ["ab"]})))
     else:
         res.ingest_request(0, SamplingReqConfig(grammar=grammar_request({"choice": ["ab"]})))
         ctx = StepContext(request_ids=(0,), graph_walk="w", slot=0, capture=False, slot_lease=lease)
@@ -196,9 +200,59 @@ def test_a_grammar_that_can_no_longer_hold_fails_its_request(failure):
         logits = torch.zeros(4, V)
         logits[:, VOCAB.index(b"x")] = 1.0
         assert res.sample([0], logits)[0].item() == EOS, "the reply went on past its grammar"
-    ctx = StepContext(request_ids=(0, 1), graph_walk="w", slot=0, capture=False, slot_lease=lease)
+    rows = (0, 1, 0) if failure == "two rows" else (0, 1)
+    ctx = StepContext(request_ids=rows, graph_walk="w", slot=0, capture=False, slot_lease=lease)
     outcome = res.admit(step, ctx)
     assert not outcome.ok and outcome.reason.terminal and outcome.reason.request_ids == {0}
+
+
+def test_a_fill_that_raises_still_draws_and_fails_no_row(monkeypatch):
+    """A replay fills the masks between its forward and its draw, and a raise
+    there would skip the draw's graph and its collectives on one rank alone: the
+    draw goes on, the row may only stop, and no row fails, as other ranks may
+    not have raised."""
+    res = _resource(graph=True)
+    res.ingest_request(0, SamplingReqConfig(grammar=grammar_request({"choice": ["ab"]})))
+    lease = SlotLease(slot=0, bucket=SimpleNamespace(bs=4))
+    step = SamplerStep(apply_penalty=False)
+    ctx = StepContext(request_ids=(0,), graph_walk="w", slot=0, capture=False, slot_lease=lease)
+    res.plan(step, ctx)
+    replayed = []
+    parts = [SimpleNamespace(replay=lambda part=part: replayed.append(part)) for part in ("forward", "draw")]
+    graph = SplitGraph(parts, res._fill_grammar)
+    with monkeypatch.context() as patch:
+        patch.setattr(grammar._Row, "matcher", property(lambda row: 1 / 0))
+        graph.replay()
+    assert replayed == ["forward", "draw"]
+    logits = torch.zeros(4, V)
+    logits[:, VOCAB.index(b"a")] = 1.0
+    res._grammar.apply(logits, res._grammar_mask)
+    assert logits[0].argmax().item() == EOS, "a row whose fill raised drew past its grammar"
+    assert res.admit(step, ctx).ok
+
+
+def test_only_rank_0_fills_masks_and_every_rank_fails_a_refused_draw_alike():
+    """Rank 0's draw is every rank's, so only it fills masks; every rank accepts
+    the draws, so a refused one fails its request at the same admit on each."""
+    lease = SlotLease(slot=0, bucket=SimpleNamespace(bs=4))
+    step = SamplerStep(apply_penalty=False)
+    ctx = StepContext(request_ids=(0,), graph_walk="w", slot=0, capture=False, slot_lease=lease)
+    filled, outcomes = [], []
+    for rank in (0, 1):
+        res = _resource(graph=True, comm_group=SimpleNamespace(world_size=2, rank=rank))
+        res.ingest_request(0, SamplingReqConfig(grammar=grammar_request({"choice": ["ab"]})))
+        res.plan(step, ctx)
+        res._fill_grammar()
+        filled.append(bool((res._grammar_mask[0] != -1).any()))
+        # a draw the mask did not cover
+        res._cg_sampler.last_token_buf.fill_(VOCAB.index(b"x"))
+        res.commit(step, ctx)
+        res.plan(step, ctx)
+        res._fill_grammar()
+        outcome = res.admit(step, ctx)
+        outcomes.append((outcome.ok, outcome.reason and outcome.reason.request_ids))
+    assert filled == [True, False]
+    assert outcomes == [(False, {0}), (False, {0})]
 
 
 def test_after_starts_the_grammar_once_the_reply_holds_its_text():
