@@ -18,6 +18,7 @@ use std::collections::VecDeque;
 pub enum ArenaError {
     OutOfRange(i64),
     NoOwner(i32),
+    NotSoleOwner(i32),
     NoStream(usize),
 }
 
@@ -26,6 +27,7 @@ impl std::fmt::Display for ArenaError {
         match self {
             ArenaError::OutOfRange(page) => write!(f, "page {page} is outside the pool"),
             ArenaError::NoOwner(page) => write!(f, "page {page} released with no owner"),
+            ArenaError::NotSoleOwner(page) => write!(f, "page {page} given back while it has other owners or none"),
             ArenaError::NoStream(sid) => write!(f, "stream {sid} is not in the arena"),
         }
     }
@@ -128,6 +130,23 @@ impl ArenaCore {
         self.free.extend(pages);
     }
 
+    /// Undo the acquire that handed out `pages`, which nothing else holds:
+    /// they go back to the front of the free list in their order, so the next
+    /// acquire hands them out again.
+    pub fn give_back(&mut self, pages: &[i64]) -> Result<(), ArenaError> {
+        for &page in pages {
+            if self.owners[self.slot(page)?] != 1 {
+                return Err(ArenaError::NotSoleOwner(page as i32));
+            }
+        }
+        for &page in pages.iter().rev() {
+            self.owners[page as usize] = 0;
+            self.sealed[page as usize] = false;
+            self.free.push_front(page as i32);
+        }
+        Ok(())
+    }
+
     pub fn seal(&mut self, page: i64) -> Result<(), ArenaError> {
         let i = self.slot(page)?;
         self.sealed[i] = true;
@@ -220,7 +239,7 @@ mod py {
     impl From<ArenaError> for PyErr {
         fn from(e: ArenaError) -> PyErr {
             match e {
-                ArenaError::NoOwner(_) => PyAssertionError::new_err(e.to_string()),
+                ArenaError::NoOwner(_) | ArenaError::NotSoleOwner(_) => PyAssertionError::new_err(e.to_string()),
                 _ => PyIndexError::new_err(e.to_string()),
             }
         }
@@ -442,6 +461,11 @@ mod py {
             }
             self.core().free(&freed);
             Ok(())
+        }
+
+        fn give_back(&self, pages: &Bound<'_, PyAny>) -> PyResult<()> {
+            let pages = pages_of(pages)?;
+            Ok(self.core().give_back(&pages)?)
         }
 
         fn seal(&self, pages: &Bound<'_, PyAny>) -> PyResult<()> {
@@ -847,6 +871,20 @@ mod tests {
         assert_eq!(a.free_pages(), vec![2, 3, 0]);
         assert_eq!(a.acquire(3), Some(vec![2, 3, 0]));
         assert_eq!(a.num_free(), 0);
+    }
+
+    #[test]
+    fn pages_given_back_go_out_again_first_and_in_their_order() {
+        let mut a = ArenaCore::new(5);
+        a.acquire(1);
+        let taken: Vec<i64> = a.acquire(2).unwrap().into_iter().map(i64::from).collect();
+        assert_eq!(a.release(0), Ok(Released::Freed));
+        a.free(&[0]);
+        a.give_back(&taken).unwrap();
+        assert_eq!(a.free_pages(), vec![1, 2, 3, 4, 0]);
+        let held = a.acquire(1).unwrap()[0] as i64;
+        a.retain(held).unwrap();
+        assert_eq!(a.give_back(&[held]), Err(ArenaError::NotSoleOwner(held as i32)));
     }
 
     #[test]

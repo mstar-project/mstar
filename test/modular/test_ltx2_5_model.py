@@ -16,7 +16,7 @@ import pytest
 import torch
 
 from mstar.engine.resources import RaggedCrossAttentionSpec
-from mstar.engine.state.adapters import node_resources
+from mstar.engine.state.adapters import node_resources, state_setup
 from mstar.graph.base import GraphNode, Loop, Parallel, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.ltx2_5.components.transformer import (
@@ -184,8 +184,10 @@ def test_resources_follow_the_attention_backend():
     assert all(s.nodes == {"dit"} for s in specs.values())
     assert (specs[VIDEO_SELF].config.num_qo_heads, specs[VIDEO_SELF].config.head_dim) == (32, 128)
     assert (specs[AUDIO_SELF].config.num_qo_heads, specs[AUDIO_SELF].config.head_dim) == (32, 64)
-    assert node_resources(_make_model(), sdpa_nodes={"dit"}) == []
-    with pytest.raises(ValueError, match="attention_backend is a node group's setting"):
+    model = _make_model()
+    setup, _ = state_setup({"resources": {key: {"backend": "sdpa"} for key in specs}}, model.declare_state())
+    assert node_resources(model, setup=setup) == []
+    with pytest.raises(ValueError, match="attention_backend is a resource's setting"):
         _make_model(attention_backend="sdpa")
 
 
@@ -236,28 +238,25 @@ def test_process_prompt_rejects_missing_prompt_or_modality():
         model.process_prompt("a dog", ["text", "image"], ["video"])
 
 
-@pytest.mark.parametrize(
-    "outputs,walk",
-    [(["video", "audio"], GENERATE_AV_WALK), (["video"], GENERATE_VIDEO_WALK), (["audio"], GENERATE_AUDIO_WALK)],
-)
-def test_schedule_encode_text_then_generate_then_done(outputs, walk):
-    model = _make_model()
-    args = model.get_initial_forward_pass_args(
+_FULL = {"height": 1088, "width": 1920, "num_frames": 121, "fps": 24.0}
+_HALF = {**_FULL, "height": 544, "width": 960}
+
+
+@pytest.mark.parametrize("outputs, recipe, walks", [
+    (["video", "audio"], "single", [(ENCODE_TEXT_WALK, _FULL), (GENERATE_AV_WALK, _FULL)]),
+    (["video"], "single", [(ENCODE_TEXT_WALK, _FULL), (GENERATE_VIDEO_WALK, _FULL)]),
+    (["audio"], "single", [(ENCODE_TEXT_WALK, _FULL), (GENERATE_AUDIO_WALK, _FULL)]),
+    # stage 1 runs at half the size, the refine walk at the request's
+    (["video", "audio"], "two_stage", [(ENCODE_TEXT_WALK, _FULL), (STAGE1_WALK, _HALF), (REFINE_AV_WALK, _FULL)]),
+    (["video"], "two_stage", [(ENCODE_TEXT_WALK, _FULL), (STAGE1_WALK, _HALF), (REFINE_VIDEO_WALK, _FULL)]),
+], ids=["av", "video", "audio", "two-stage-av", "two-stage-video"])
+def test_plan_walks_and_their_geometry(outputs, recipe, walks):
+    plan = _make_model().walk_plan(
         "default", ["text"], outputs, {"text_inputs": [_info("t", [36])]},
-        model_kwargs={"height": 544, "width": 960, "num_frames": 121, "fps": 24},
+        {"recipe": recipe, "height": 1088, "width": 1920, "num_frames": 121, "fps": 24},
     )
-    md = args.full_metadata
-    assert md.graph_walk == ENCODE_TEXT_WALK and md.kwargs["walk_schedule"] == [ENCODE_TEXT_WALK, walk]
-    assert args.step_metadata == {"is_prefill": True, "height": 544, "width": 960, "num_frames": 121, "fps": 24.0}
-    assert md.kwargs["request"]["recipe"] == "single"
-    persist = {"text_video": [_info("v", [1024, 4096])], "text_audio": [_info("a", [1024, 2048])]}
-    nxt = model.get_partition_forward_pass_args("default", md, persist)
-    assert nxt.full_metadata.graph_walk == walk and not nxt.request_done
-    by_name = {e.name: e for e in nxt.inputs}
-    assert set(by_name) == {"text_video", "text_audio", "latents", "audio_latents"}
-    assert by_name["latents"].tensor_info == [] and by_name["audio_latents"].tensor_info == []
-    done = model.get_partition_forward_pass_args("default", nxt.full_metadata, {})
-    assert done.request_done and done.inputs == []
+    assert [(step.walk, dict(step.step_metadata)) for step in plan] == walks
+    assert not any(step.bind for step in plan)
 
 
 def test_stage1_walk_upsamples_and_persists_the_refine_inputs():
@@ -279,33 +278,6 @@ def test_refine_walk_reads_the_upsampled_latents_for_three_steps():
     assert loop.section.input_names == {
         "text_video", "text_audio", "latents", "audio_latents", "refine_latents", "refine_audio",
     }
-
-
-def test_two_stage_schedule_keeps_text_until_the_refine_walk():
-    model = _make_model()
-    args = model.get_initial_forward_pass_args(
-        "default", ["text"], ["video", "audio"], {"text_inputs": [_info("t", [36])]},
-        model_kwargs={"recipe": "two_stage", "height": 1088, "width": 1920, "num_frames": 121},
-    )
-    md = args.full_metadata
-    assert md.kwargs["walk_schedule"] == [ENCODE_TEXT_WALK, STAGE1_WALK, REFINE_AV_WALK]
-    text = {"text_video": [_info("v", [1024, 4096])], "text_audio": [_info("a", [1024, 2048])]}
-    md.kwargs.update(args.step_metadata)  # what the conductor does after every pass
-    s1 = model.get_partition_forward_pass_args("default", md, text)
-    assert s1.full_metadata.graph_walk == STAGE1_WALK
-    s1.full_metadata.kwargs.update(s1.step_metadata)
-    # stage 1 runs at half the size, and the text embeddings stay persisted for stage 2
-    assert (s1.step_metadata["height"], s1.step_metadata["width"]) == (544, 960)
-    assert s1.unpersist_tensors == []
-    refine_inputs = {**text, "refine_latents": [_info("rl", [32640, 128])], "refine_audio": [_info("ra", [126, 128])]}
-    s2 = model.get_partition_forward_pass_args("default", s1.full_metadata, refine_inputs)
-    assert s2.full_metadata.graph_walk == REFINE_AV_WALK
-    assert (s2.step_metadata["height"], s2.step_metadata["width"]) == (1088, 1920)
-    assert {e.name for e in s2.inputs} == {
-        "text_video", "text_audio", "refine_latents", "refine_audio", "latents", "audio_latents",
-    }
-    assert {i.uuid for i in s2.unpersist_tensors} == {"uuid-v", "uuid-a", "uuid-rl", "uuid-ra"}
-    assert model.get_partition_forward_pass_args("default", s2.full_metadata, {}).request_done
 
 
 def test_two_stage_sizes_must_halve_onto_the_vae_grid():

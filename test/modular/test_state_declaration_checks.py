@@ -252,13 +252,6 @@ def test_a_good_rope_has_no_problem(positions):
     assert state_declaration_problems(_StubModel(_array(positions=positions))) == []
 
 
-def test_an_array_may_not_carry_two_updates_of_one_type():
-    value = Value("gdn", nodes={"LLM"}, layers={0}, entry=_gdn_entry(),
-                  updates={"a": CausalConv(), "b": CausalConv(activation=None)})
-    problem = _one_problem(value)
-    assert problem.startswith("Array 'gdn'.updates") and "2 updates of type CausalConv" in problem
-
-
 def test_kv_labels_may_name_only_declared_labels():
     problem = _one_problem(_array(), kv_labels={"kv": {"main": KVLabel(), "cfg": KVLabel()}})
     assert problem.startswith("kv_labels()['kv']['cfg']") and "Array 'kv'.labels" in problem
@@ -367,7 +360,9 @@ def test_a_chunked_walk_outside_a_reads_walks_is_free():
     assert state_declaration_problems(_chunked(array)) == []
 
 
-_REBUILD = {"LLM": RebuildPolicy(walk="prefill", ids_input="text_inputs", sample_output="token", loop="loop")}
+_REBUILD = {
+    "LLM": RebuildPolicy(walks=frozenset({"prefill"}), ids_input="text_inputs", sample_output="token", loop="loop"),
+}
 
 
 def _keyed(growth=False) -> dict:
@@ -377,7 +372,7 @@ def _keyed(growth=False) -> dict:
 
 @pytest.mark.parametrize("kwargs, cause", [
     ({"kv_labels": _keyed()}, "kv_labels()['kv']['main'] keys for prefix reuse"),
-    ({"rebuild": _REBUILD}, "LLM's rebuild policy runs again in one step"),
+    ({"rebuild": _REBUILD}, "LLM's rebuild policy runs it again with the ids sampled after the prompt"),
 ], ids=["prefix_keys", "rebuild"])
 def test_a_walk_a_prefix_hit_or_a_rebuild_regroups_cant_read_this_steps_adds_as_a_whole(kwargs, cause):
     """A hit can end inside one step's adds, and a rebuild runs the prompt again beside the ids sampled after it."""

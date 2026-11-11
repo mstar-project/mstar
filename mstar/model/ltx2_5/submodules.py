@@ -199,7 +199,7 @@ class LTXDenoiseSubmodule(DenoiseLoopSubmodule):
     Every attention in the DiT reads a declared array (``LTX25Model.declare_state``):
     three spans per request, ``video``, ``audio`` and ``text``; two self-attentions
     and four cross-attentions between them, on four resources (self / cross x the
-    two head geometries). With ``attention_backend: sdpa`` every attention runs SDPA,
+    two head geometries). With ``backend: sdpa`` on all four every attention runs SDPA,
     which is what the reference pipeline runs.
     """
 
@@ -452,7 +452,7 @@ class LTXVideoDecoderSubmodule(_ShapeBatchedBase, BatchedRows, NodeSubmodule):
         # shapes cover 1088x1920 (dynamo would unroll the tile loop of ``vae.decode`` into one
         # enormous graph).
         if compile_decode:
-            # before the warm-up: dynamo guards on requires_grad (see KleinVaeDecoderSubmodule)
+            # before the warm-up: dynamo guards on requires_grad (see decode_utils.WarmedDecode)
             vae.requires_grad_(False)
             vae.decoder = _WarmedDecoder(vae.decoder)
             self.warmup(warmup_shapes)

@@ -26,6 +26,7 @@ def test_null_is_unset():
 @pytest.mark.parametrize("kwargs", [
     {"temperature": 0}, {"temperature": 1e6}, {"top_p": 1}, {"top_p": 1e-6},
     {"min_p": 0}, {"min_p": 1}, {"repetition_penalty": 0.5}, {"top_k": 0},
+    {"max_output_tokens": 1}, {"seed": -(2**63)}, {"ignore_eos": False}, {"do_sample": False},
     {"max_output_tokens": 1}, {"seed": -(2**63)}, {"ignore_eos": False}, {"return_token_ids": True},
     {"talker_temperature": 0.9}, {"code_predictor_top_k": 50},
     {"class_temperature": 0}, {"cfg_weight": "anything: not a knob"},
@@ -55,7 +56,17 @@ def test_in_contract_values_pass(kwargs):
     ({"seed": 2**64}, "seed"),
     ({"seed": 1e20}, "seed"),
     ({"ignore_eos": "false"}, "ignore_eos"),
+    ({"do_sample": "false"}, "do_sample"),
+    ({"num_inference_steps": 0}, "num_inference_steps"),
+    ({"num_inference_steps": 7.9}, "num_inference_steps"),
+    ({"height": True}, "height"),
+    ({"width": "512.5"}, "width"),
+    ({"num_frames": -1}, "num_frames"),
+    ({"fps": 0}, "fps"),
+    ({"video_fps": "-24"}, "video_fps"),
+    ({"guidance_scale": "inf"}, "guidance_scale"),
     ({"return_token_ids": 1}, "return_token_ids"),
+    ({"enable_thinking": "false"}, "enable_thinking"),  # a chat template thinks on "false"
     ({"talker_top_p": 0}, "talker_top_p"),
     ({"thinker_temperature": -0.1}, "thinker_temperature"),
 ])
@@ -77,6 +88,8 @@ def test_out_of_contract_values_raise(kwargs, name):
     ({"seed": "7"}, {"seed": 7}),
     ({"seed": 42.0}, {"seed": 42}),
     ({"seed": "9007199254740993.0"}, {"seed": 9007199254740993}),
+    ({"num_inference_steps": "8", "height": 1024.0}, {"num_inference_steps": 8, "height": 1024}),
+    ({"fps": "24", "guidance_scale": "-2"}, {"fps": 24.0, "guidance_scale": -2.0}),
 ])
 def test_values_that_denote_the_knobs_type_are_coerced(kwargs, expected):
     out = normalize_generation_kwargs(kwargs)
@@ -187,8 +200,8 @@ def test_an_unread_key_warns_on_every_request(caplog):
         for _ in range(3):
             server._report_ignored_params({"initial_prompt": "x"})
         server._report_ignored_params(
-            {"seed": 1, "prefix_cache": True, "lora_adapter": "a", "max_output_tokens": 4,
-             "return_token_ids": True},
+            {"seed": 1, "prefix_cache": True, "lora_adapter": "a", "lora_digest": "d", "max_output_tokens": 4,
+             "return_token_ids": True, "return_logprobs": True},
         )
     levels = [r.levelname for r in caplog.records if "does not read" in r.getMessage()]
     # keys the conductor reads are never reported
@@ -246,7 +259,7 @@ def test_rust_bridge_carries_a_refusal_as_a_400_chunk():
     )
     bridge._submit({"rid": "r1", "model_kwargs": {"seed": 2**64}})
     [frame] = sent
-    assert (frame["t"], frame["modality"], frame["metadata"]) == ("chunk", "error", {"status": 400})
+    assert (frame["t"], frame["modality"], frame["metadata"]) == ("chunk", "error", {"status": 400, "refused": True})
 
 
 def test_rust_bridge_passes_extras_to_the_coercing_check():
@@ -339,3 +352,4 @@ def test_a_client_still_waiting_keeps_its_stream():
         return [c async for c in chunks], client.receives
 
     assert asyncio.run(asyncio.wait_for(run(), timeout=5)) == ([ok], 1)
+

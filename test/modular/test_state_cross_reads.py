@@ -16,20 +16,34 @@ sys.path.insert(0, ".")
 import pytest
 import torch
 
+from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine.resources.attn.config import AttentionStep
 from mstar.engine.resources.attn.ragged.config import (
     RaggedAttentionSpec,
     RaggedCrossAttentionSpec,
     RaggedCrossAttentionStep,
 )
+from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.step import Segment, StepContext, SubmoduleStep
-from mstar.engine.state import Array, ArrayStep, Attend, Block, Causal, KVEntry, Read, TensorType, Value
-from mstar.engine.state.adapters import build_specs, node_handles, state_steps
-from mstar.engine.state.analysis import deployment_problems, sdpa_nodes
+from mstar.engine.state import Array, ArrayStep, Attend, Block, Causal, KVEntry, Read, TensorType, Value, adapters
+from mstar.engine.state.adapters import (
+    SDPA,
+    WITHIN_STEP,
+    StateSetup,
+    WithinStepHandle,
+    _bindings,
+    build_specs,
+    node_handles,
+    state_setup,
+    state_steps,
+)
+from mstar.engine.state.analysis import deployment_problems
 from mstar.engine.state.calls import kernel_setting
 from mstar.engine.state.contract import Entry
-from mstar.engine.state.within_step import WithinStepHandle
 from mstar.model.components.diffusion.attention import sdpa_attention
+from mstar.testing_utils.model import StubModel
+from mstar.worker import engine_manager
+from mstar.worker.engine_manager import EngineManager
 
 HEADS, DIM = 4, 8
 
@@ -40,12 +54,12 @@ def _entry(heads=HEADS, dtype=None) -> Entry:
 
 
 def _array(
-    name, read=None, *, queries=None, sharded=False, label=None, heads=HEADS, nodes=("dit",), dtype=None,
+    name, read=None, *, queries=None, sharded=False, label=None, heads=HEADS, nodes=("dit",), dtype=None, packed=False,
 ) -> Array:
     return Array(
         name, nodes=set(nodes), layers={0, 1}, entry=_entry(heads, dtype), max_len=0, seq_sharded=sharded,
         labels={label or name},
-        reads={read or f"{name}_read": Read(mask=Block(), op=Attend(q_heads=heads), queries=queries)},
+        reads={read or f"{name}_read": Read(mask=Block(), op=Attend(q_heads=heads), queries=queries, packed=packed)},
     )
 
 
@@ -86,10 +100,22 @@ class _StubGroup:
         self.world_size, self.rank = world_size, rank
 
 
-def _handles(arrays, *, group=None, sdpa=False) -> dict[str, WithinStepHandle]:
+def _within(array, ragged, **within) -> WithinStepHandle:
+    return WithinStepHandle(array, {next(iter(array.reads)): ragged}, None, _bindings(WITHIN_STEP, array), **within)
+
+
+def _on_sdpa(*reads) -> StateSetup:
+    return StateSetup(dict.fromkeys(reads, SDPA[WITHIN_STEP, Attend]))
+
+
+def _sdpa_config(*keys) -> dict:
+    return {"resources": {key: {"backend": "sdpa"} for key in keys}}
+
+
+def _handles(arrays, *, group=None, setup=None) -> dict[str, WithinStepHandle]:
     specs = build_specs(arrays)
     return node_handles(
-        _Model(*arrays), "dit", {spec.resource_key: _StubRagged() for spec in specs}, sp_group=group, sdpa=sdpa,
+        _Model(*arrays), "dit", {spec.resource_key: _StubRagged() for spec in specs}, sp_group=group, setup=setup,
     )
 
 
@@ -188,6 +214,22 @@ def test_a_seq_sharded_value_is_refused_by_name():
                     seq_sharded=True)
     with pytest.raises(ValueError, match="Array 'v': no layout yet"):
         build_specs([sharded])
+
+
+def test_each_side_resolves_the_arrays_sharing_a_resource_once(monkeypatch):
+    read, reads = adapters._within_step_read, []
+
+    def counted(array, *rest):
+        reads.append(array.name)
+        return read(array, *rest)
+
+    monkeypatch.setattr(adapters, "_within_step_read", counted)
+    arrays = _av()
+    resources = {spec.resource_key: _StubRagged() for spec in build_specs(arrays)}
+    assert sorted(reads) == sorted(array.name for array in arrays), "the specs resolved an array once per array"
+    reads.clear()
+    node_handles(_Model(*arrays), "dit", resources)
+    assert sorted(reads) == sorted(array.name for array in arrays), "the handles resolved the arrays again per array"
 
 
 # The steps, per rank
@@ -304,7 +346,7 @@ def _opened(handle, segments):
 def test_a_read_with_no_exchange_packs_rows_and_unpacks_them_as_main_does():
     ragged = _StubRagged()
     array = _array("a", label="main")
-    h = WithinStepHandle(array, {"a_read": ragged}, None)
+    h = _within(array, ragged)
     _opened(h, [Segment(1, "main", 4)])
     h.add(0, k=_q(), v=_q())
     assert h.read(0, _q()).shape == (1, 4, HEADS, DIM)
@@ -313,7 +355,7 @@ def test_a_read_with_no_exchange_packs_rows_and_unpacks_them_as_main_does():
 
 def test_a_read_of_packed_tokens_goes_straight_to_the_kernel():
     ragged = _StubRagged()
-    h = WithinStepHandle(_array("a", label="main"), {"a_read": ragged}, None)
+    h = _within(_array("a", label="main", packed=True), ragged)
     _opened(h, [Segment(1, "main", 4)])
     h.add(0, k=_q()[0], v=_q()[0])
     assert h.read(0, _q()[0]).shape == (4, HEADS, DIM)
@@ -322,7 +364,7 @@ def test_a_read_of_packed_tokens_goes_straight_to_the_kernel():
 def test_a_cross_read_runs_under_the_label_of_both_sides():
     ragged = _StubRagged()
     array = _array("b", queries="a", label="text")
-    h = WithinStepHandle(array, {"b_read": ragged}, None, queried=_array("a", label="video"))
+    h = _within(array, ragged, queried=_array("a", label="video"))
     step = SubmoduleStep(state={
         "a": ArrayStep(segments=(Segment(1, "video", 4),)), "b": ArrayStep(segments=(Segment(1, "text", 2),)),
     })
@@ -337,14 +379,12 @@ def test_a_cross_read_runs_under_the_label_of_both_sides():
     (True, True, "ulysses"), (True, False, "merge"), (False, True, "plain"), (False, False, "plain"),
 ])
 def test_the_two_flags_pick_the_exchange(monkeypatch, sharded, queried_sharded, exchange):
-    from mstar.engine.state import within_step
-
     calls = []
-    monkeypatch.setattr(within_step, "ulysses_attention", lambda *a, **k: calls.append(("ulysses", a[1], k)))
-    monkeypatch.setattr(within_step, "attention_over_sharded_keys", lambda *a, **k: calls.append(("merge", a[1], k)))
+    monkeypatch.setattr(adapters, "ulysses_attention", lambda *a, **k: calls.append(("ulysses", a[1], k)))
+    monkeypatch.setattr(adapters, "attention_over_sharded_keys", lambda *a, **k: calls.append(("merge", a[1], k)))
     queried = _array("a", sharded=queried_sharded)
     array = _array("b", queries="a", sharded=sharded)
-    h = WithinStepHandle(array, {"b_read": _StubRagged()}, None, queried=queried, sp_group=_StubGroup())
+    h = _within(array, _StubRagged(), queried=queried, sp_group=_StubGroup())
     step = SubmoduleStep(state={
         "a": ArrayStep(segments=(Segment(1, "a", 9),)), "b": ArrayStep(segments=(Segment(1, "b", 9),)),
     })
@@ -359,25 +399,21 @@ def test_the_two_flags_pick_the_exchange(monkeypatch, sharded, queried_sharded, 
 
 
 def test_no_flag_exchanges_at_sp1(monkeypatch):
-    from mstar.engine.state import within_step
-
     def fail(*args, **kwargs):
         raise AssertionError("attention_over_sharded_keys breaks the graph, so it must not run at SP1")
 
-    monkeypatch.setattr(within_step, "ulysses_attention", fail)
-    monkeypatch.setattr(within_step, "attention_over_sharded_keys", fail)
-    h = WithinStepHandle(_array("a", sharded=True), {"a_read": _StubRagged()}, None, sp_group=_StubGroup(world_size=1))
+    monkeypatch.setattr(adapters, "ulysses_attention", fail)
+    monkeypatch.setattr(adapters, "attention_over_sharded_keys", fail)
+    h = _within(_array("a", sharded=True), _StubRagged(), sp_group=_StubGroup(world_size=1))
     _opened(h, [Segment(1, "a", 4)])
     h.add(0, k=_q(), v=_q())
     h.read(0, _q())
 
 
 def test_ulysses_gets_one_callable_per_array_never_one_per_layer(monkeypatch):
-    from mstar.engine.state import within_step
-
     callables = []
-    monkeypatch.setattr(within_step, "ulysses_attention", lambda group, q, k, v, run, *a, **kw: callables.append(run))
-    h = WithinStepHandle(_array("a", sharded=True), {"a_read": _StubRagged()}, None, sp_group=_StubGroup())
+    monkeypatch.setattr(adapters, "ulysses_attention", lambda group, q, k, v, run, *a, **kw: callables.append(run))
+    h = _within(_array("a", sharded=True), _StubRagged(), sp_group=_StubGroup())
     _opened(h, [Segment(1, "a", 8)])
     for layer in (0, 1):
         h.add(layer, k=_q(), v=_q())
@@ -385,71 +421,115 @@ def test_ulysses_gets_one_callable_per_array_never_one_per_layer(monkeypatch):
     assert callables[0] is callables[1], "Dynamo would retrace ulysses_attention's frame once per layer"
 
 
-# attention_backend: sdpa
+def test_a_step_none_of_whose_builders_has_anything_to_do_is_skipped():
+    step = SubmoduleStep(state={"a": ArrayStep(segments=(Segment(1, "a", 4),))})
+    for group, skipped in ((None, True), (_StubGroup(), False)):
+        handles = _handles([_array("a", sharded=True)], group=group, setup=_on_sdpa("a_read"))
+        builder = WITHIN_STEP.step_builder()
+        builder.add(handles["a"], step.state["a"], step)
+        assert builder.steps() == {}, "a read on SDPA plans nothing"
+        assert (state_steps(step, handles) is None) is skipped, "only a Ulysses exchange needs the step's segments"
 
 
-def test_a_node_on_sdpa_builds_no_spec():
-    assert build_specs([_array("a")], sdpa_nodes={"dit"}) == []
+def test_a_read_declared_packed_false_refuses_packed_queries():
+    h = _within(_array("a", label="main"), _StubRagged())
+    _opened(h, [Segment(1, "main", 4)])
+    h.add(0, k=_q()[0], v=_q()[0])
+    with pytest.raises(ValueError, match="Array 'a': packed queries on a read declared packed=False"):
+        h.read(0, _q()[0])
 
 
-def test_kernel_settings_on_a_node_on_sdpa_set_nothing_and_still_refuse_a_bad_field():
-    assert build_specs([_array("a")], sdpa_nodes={"dit"}, kernel_settings={"a_read": {"workspace_mb": 1}}) == []
+# backend: sdpa
+
+
+def test_a_worker_gives_its_specs_and_its_engine_one_choice_object(monkeypatch):
+    seen = []
+    serving = engine_manager.serving_resources
+    monkeypatch.setattr(engine_manager, "serving_resources",
+                        lambda model, config, setup: seen.append(setup) or serving(model, config, setup))
+    manager = EngineManager.build(
+        node_names=set(), device=torch.device("cpu"), model_config={"node_groups": []},
+        parallel_groups=WorkerParallelGroups(num_workers=1, global_rank=0),
+        transfer_engine_info=TransferEngineInfo(my_entity_id="test", my_session_id="test", transfer_engine=None),
+        model=StubModel(), graph_runtime=SimpleNamespace(),
+    )
+    assert seen == [manager.engine._state_setup] and seen[0] is manager.engine._state_setup, (
+        "the specs and the handles would bind by two choices, and the engine would open requests in another store"
+    )
+
+
+def test_a_resource_on_sdpa_builds_no_spec():
+    assert build_specs([_array("a")], setup=_on_sdpa("a_read")) == []
+
+
+def test_kernel_settings_on_a_resource_on_sdpa_set_nothing_and_still_refuse_a_bad_field():
+    assert build_specs([_array("a")], setup=_on_sdpa("a_read"), kernel_settings={"a_read": {"workspace_mb": 1}}) == []
     with pytest.raises(ValueError, match="it may set only"):
-        build_specs([_array("a")], sdpa_nodes={"dit"}, kernel_settings={"a_read": {"backend": "dense"}})
+        build_specs([_array("a")], setup=_on_sdpa("a_read"), kernel_settings={"a_read": {"backend": "dense"}})
 
 
-def test_a_node_on_sdpa_needs_an_array_with_a_read():
-    assert deployment_problems(_Model(_array("a")), {}, sdpa={"dit"}) == []
-    (problem,) = deployment_problems(_Model(_array("a")), {}, sdpa={"dit", "vae"})
-    assert problem.startswith("node 'vae': attention_backend sdpa, and it holds no array")
+def test_sdpa_on_a_resource_no_read_runs_on_is_refused_and_left_out():
+    setup, problems = state_setup(_sdpa_config("a_read", "vae"), [_array("a")])
+    assert problems == ["resources.vae: backend sdpa, and no read runs on it, of the resources ['a_read']"]
+    assert setup.by_read == {"a_read": SDPA[WITHIN_STEP, Attend]}, "the rest of the config should still bind"
+
+
+def test_sdpa_on_a_read_that_shares_another_reads_resource_names_that_resource():
+    arrays = [_array("a"), _array("b", label="b")]
+    (problem,) = state_setup(_sdpa_config("b_read"), arrays)[1]
+    assert problem.startswith("resources.b_read: backend sdpa, and the read 'b_read' runs on 'a_read'"), problem
 
 
 def test_a_kernel_setting_of_a_read_on_sdpa_is_refused_by_name():
-    handle = node_handles(_Model(_array("a")), "dit", {}, sdpa=True)["a"]
-    with pytest.raises(ValueError, match="Array 'a': no max_segments_per_request for read 'a_read', which runs SDPA"):
+    handle = node_handles(_Model(_array("a")), "dit", {}, setup=_on_sdpa("a_read"))["a"]
+    with pytest.raises(ValueError, match="Array 'a': no max_segments_per_request for read 'a_read', whose binding "
+                                         "SdpaAttend takes no kernel settings"):
         kernel_setting(handle, "a_read", "max_segments_per_request")
 
 
 def test_a_step_of_reads_on_sdpa_is_no_step_at_all():
-    handles = node_handles(_Model(_array("a")), "dit", {}, sdpa=True)
+    handles = node_handles(_Model(_array("a")), "dit", {}, setup=_on_sdpa("a_read"))
     step = SubmoduleStep(state={"a": ArrayStep(segments=(Segment(1, "a", 4),))})
-    assert state_steps(step, handles) is None, "a node on sdpa declares no step, and its forward still runs"
+    assert state_steps(step, handles) is None, "a step on sdpa declares no step, and its forward still runs"
 
 
 def test_a_read_on_sdpa_equals_sdpa_with_no_step_open():
     q, k, v = (torch.randn(2, 4, HEADS, DIM) for _ in range(3))
-    h = node_handles(_Model(_array("a")), "dit", {}, sdpa=True)["a"]
+    h = node_handles(_Model(_array("a")), "dit", {}, setup=_on_sdpa("a_read"))["a"]
     h.add(0, k=k, v=v)
     assert torch.equal(h.read(0, q), sdpa_attention(q, k, v))
 
 
 def test_a_read_on_sdpa_refuses_packed_tokens():
-    h = node_handles(_Model(_array("a")), "dit", {}, sdpa=True)["a"]
-    h.add(0, k=_q()[0], v=_q()[0])
-    with pytest.raises(ValueError, match="Array 'a': no layout yet: SDPA over packed tokens"):
-        h.read(0, _q()[0])
+    with pytest.raises(ValueError, match="Array 'a': no layout yet: reads\\['a_read'\\] runs SDPA, which can't tell"):
+        node_handles(_Model(_array("a", packed=True)), "dit", {}, setup=_on_sdpa("a_read"))
 
 
-def test_the_setting_is_read_per_node_from_its_groups():
-    assert sdpa_nodes([{"node_names": ["dit", "vae"], "attention_backend": "sdpa"}, {"node_names": ["te"]}]) == {
-        "dit", "vae",
-    }
+def test_the_setting_is_read_per_resource_and_binds_every_read_on_it():
+    arrays = [_array("a"), _array("b", label="b"), _array("c", nodes=("x",))]
+    config = {"resources": {"a_read": {"backend": "sdpa"}, "c_read": {"backend": "dense"}, "kv": {"page_size": 8}}}
+    setup, problems = state_setup(config, arrays)
+    assert problems == [] and setup.by_read.keys() == {"a_read", "b_read"}, "b's read shares a's resource"
 
 
-@pytest.mark.parametrize("groups, cause", [
-    ([{"node_names": ["dit"], "attention_backend": "dense"}], "takes flashinfer or sdpa, not 'dense'"),
-    ([{"node_names": ["dit"], "attention_backend": "sdpa"}, {"node_names": ["dit"]}], "node 'dit' gets different"),
+@pytest.mark.parametrize("config, cause", [
+    ({"node_groups": [{"node_names": ["dit"], "attention_backend": "sdpa"}]},
+     "node_groups[0].attention_backend: the backend is a resource's setting"),
+    ({"resources": {"a_read": {"backend": "sdpa", "max_segments_per_step": 2}}},
+     "resources.a_read: backend sdpa builds no resource, so it takes no other setting"),
 ])
-def test_a_bad_setting_is_refused_naming_the_cause(groups, cause):
-    with pytest.raises(ValueError, match=cause):
-        sdpa_nodes(groups)
+def test_a_bad_setting_is_refused_naming_the_cause(config, cause):
+    (problem,) = state_setup(config, [_array("a")])[1]
+    assert problem.startswith(cause), problem
 
 
-def test_sdpa_on_a_node_that_keeps_entries_is_refused_at_load():
+def test_sdpa_on_a_read_that_keeps_entries_is_refused_at_load():
     array = Array("kv", nodes={"llm"}, layers={0}, entry=KVEntry(heads=HEADS, head_dim=DIM), max_len=8,
                   reads={"r": Read(mask=Causal(), op=Attend(q_heads=HEADS))})
-    (problem,) = deployment_problems(_Model(array), {}, sdpa={"llm"})
-    assert problem.startswith("Array 'kv': attention_backend sdpa on nodes ['llm']")
+    setup, problems = state_setup(_sdpa_config("r"), [array])
+    assert problems == [
+        "resources.r: backend sdpa runs only an Attend read within a step, and Array 'kv'.reads['r'] isn't one",
+    ] and setup.by_read == {}, "a paged read takes no SDPA"
 
 
 def test_a_read_sharded_on_both_sides_needs_heads_that_divide_by_tp_times_sp():

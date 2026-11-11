@@ -15,7 +15,9 @@ sys.path.insert(0, ".")
 
 import pytest
 import torch
+import yaml
 
+from mstar.distributed.base import node_group_axis_sizes
 from mstar.distributed.communication import CommGroup
 from mstar.engine.resources.attn.config import AttentionStep
 from mstar.engine.resources.attn.ragged.config import (
@@ -24,13 +26,12 @@ from mstar.engine.resources.attn.ragged.config import (
     RaggedCrossAttentionSpec,
     RaggedCrossAttentionStep,
 )
-from mstar.engine.resources.lora.config import LoraStep
 from mstar.engine.resources.spec import apply_yaml_overrides
-from mstar.engine.resources.step import Segment, StepContext, SubmoduleStep
+from mstar.engine.resources.step import ResourceStep, Segment, StepContext, SubmoduleStep
 from mstar.engine.state import Array, ArrayStep, Attend, Block, Read
-from mstar.engine.state.adapters import node_handles, node_resources, state_steps
-from mstar.engine.state.analysis import state_declaration_problems
-from mstar.engine.state.within_step import WithinStepHandle
+from mstar.engine.state.adapters import StateSetup, build_handle, node_handles, node_resources, state_setup, state_steps
+from mstar.engine.state.analysis import deployment_problems, state_declaration_problems
+from mstar.model.base import serving_resources
 from mstar.model.components.diffusion.attention import dit_entry
 from mstar.model.flux2_klein.components.transformer import Flux2JointAttention
 from mstar.model.flux2_klein.config import DENOISE_LOOP, JOINT_TOKENS, Flux2KleinConfig
@@ -49,9 +50,9 @@ from mstar.model.ltx2_5.config import (
 )
 from mstar.model.ltx2_5.ltx2_5_model import LTX25Model
 from mstar.model.ltx2_5.submodules import LTXDenoiseSubmodule, LTXShape
-from mstar.model.submodule_base import NodeInputs, engine_step, lora_rows
+from mstar.model.submodule_base import NodeInputs, engine_step, with_segment_steps
 from mstar.model.wan22.components.dit import Wan22DiTAttention
-from mstar.model.wan22.config import SELF_ATTN, Wan22Config
+from mstar.model.wan22.config import DIT_TOKENS, SELF_ATTN, Wan22Config
 from mstar.model.wan22.submodules import Wan22DitSubmodule, WanStepKey
 from mstar.model.wan22.wan22_model import Wan22Model
 from mstar.model.z_image.components.transformer import ZImageAttention
@@ -87,6 +88,14 @@ def _ltx(**kwargs) -> LTX25Model:
     model = LTX25Model(skip_weight_loading=True, **kwargs)
     model.set_config(LTX25Config())
     return model
+
+
+def _on_sdpa(model) -> StateSetup:
+    """SDPA on every resource ``model`` declares, which on a DiT is each attention's."""
+    on_sdpa = {spec.resource_key: {"backend": "sdpa"} for spec in node_resources(model)}
+    setup, problems = state_setup({"resources": on_sdpa}, model.declare_state())
+    assert not problems, problems
+    return setup
 
 
 def _wan_reference() -> RaggedAttentionSpec:
@@ -143,7 +152,8 @@ def test_specs_equal_the_hand_written_one_after_yaml_overrides(name):
 
 @pytest.mark.parametrize("name", MODELS)
 def test_sdpa_builds_no_spec_as_the_hand_written_model_did(name):
-    assert node_resources(MODELS[name][0](), sdpa_nodes={"dit"}) == []
+    model = MODELS[name][0]()
+    assert node_resources(model, setup=_on_sdpa(model)) == []
 
 
 @pytest.mark.parametrize("name", MODELS)
@@ -163,12 +173,12 @@ def test_declarations_have_no_problems(name):
 
 @pytest.mark.parametrize("build", [_klein, _z])
 def test_the_old_knob_is_refused(build):
-    with pytest.raises(ValueError, match="attention_backend is a node group's setting"):
+    with pytest.raises(ValueError, match="attention_backend is a resource's setting"):
         build(attention_backend="sdpa")
 
 
 def test_the_old_knob_is_refused_on_wan22():
-    with pytest.raises(ValueError, match="attention_backend is a node group's setting"):
+    with pytest.raises(ValueError, match="attention_backend is a resource's setting"):
         Wan22Model("test/wan22", attention_backend="sdpa")
 
 
@@ -203,6 +213,7 @@ def _assert_plans_equal(step: SubmoduleStep, reference: SubmoduleStep, key: str)
     assert step.steps.keys() == reference.steps.keys() and step.cg_key_info == reference.cg_key_info
     assert step.segments == reference.segments, "a LoRA pool's rows are the step's segments"
     assert isinstance(step.steps[key], AttentionStep) and step.steps[key].causal is False
+    assert step.steps[key].fixed_layout == reference.steps[key].fixed_layout, "a captured bucket replays its layout"
     assert _by_label(step.steps[key]) == _by_label(reference.steps[key])
 
 
@@ -217,7 +228,9 @@ def test_klein_steps_equal_the_hand_written_one(rids):
     key = _klein_key()
     sub = KleinDenoiseSubmodule(None, model.config, loop_name=DENOISE_LOOP, compile_transformer=False)
     segments = [Segment(request_id=rid, label="main", span=key.total_tokens) for rid in rids]
-    reference = SubmoduleStep(segments=segments, steps={KLEIN_ATTN: AttentionStep(causal=False)}, cg_key_info=key)
+    reference = SubmoduleStep(
+        segments=segments, steps={KLEIN_ATTN: AttentionStep(causal=False, fixed_layout=True)}, cg_key_info=key,
+    )
     _assert_plans_equal(_expanded(model, sub, [key] * len(rids), rids), reference, KLEIN_ATTN)
 
 
@@ -230,7 +243,9 @@ def test_z_image_steps_equal_the_hand_written_one(rids):
         Segment(request_id=rid, label=label, span=span) for rid in rids
         for label, span in (("image", key.image_tokens_padded), ("caption", 32), ("main", key.total_tokens))
     ]
-    reference = SubmoduleStep(segments=segments, steps={Z_ATTN: AttentionStep(causal=False)}, cg_key_info=key)
+    reference = SubmoduleStep(
+        segments=segments, steps={Z_ATTN: AttentionStep(causal=False, fixed_layout=True)}, cg_key_info=key,
+    )
     _assert_plans_equal(_expanded(model, sub, [key] * len(rids), rids), reference, Z_ATTN)
 
 
@@ -241,14 +256,63 @@ def test_wan22_steps_equal_the_hand_written_one(guidance, branches):
     sub = Wan22DitSubmodule(None, model.config)
     tokens = sub.num_tokens(key)
     segments = [Segment(request_id=0, label="main", span=tokens)] * branches
-    reference = SubmoduleStep(segments=segments, steps={SELF_ATTN: AttentionStep(causal=False)}, cg_key_info=key)
+    reference = SubmoduleStep(
+        segments=segments, steps={SELF_ATTN: AttentionStep(causal=False, fixed_layout=True)}, cg_key_info=key,
+    )
     _assert_plans_equal(_expanded(model, sub, [key], [0]), reference, SELF_ATTN)
 
+
+
+# Wan2.2's parallel configs, whose ranks main's model code split
+
+
+WAN_PARALLEL_CONFIGS = ["configs/wan22_cfg_parallel_2gpu.yaml", "configs/wan22_cfg2_sp2_4gpu.yaml"]
+
+
+def _serving(path: str) -> tuple[dict, dict[str, int]]:
+    """The serving config at ``path``, and the size of its dit's node group on each mesh axis."""
+    with open(path) as f:
+        config = yaml.safe_load(f)
+    (group,) = [group for group in config["node_groups"] if "dit" in group["node_names"]]
+    return config, node_group_axis_sizes(group)
+
+
+@pytest.mark.parametrize("path", WAN_PARALLEL_CONFIGS)
+def test_wan22_parallel_configs_serve_the_hand_written_spec(path):
+    config, axes = _serving(path)
+    model = _wan()
+    assert serving_resources(model, config) == [_wan_reference()]
+    head_shards = {"dit": axes["tp"] * axes["sp"]}
+    assert deployment_problems(model, config.get("resources") or {}, head_shards=head_shards) == []
+
+
+@pytest.mark.parametrize("guidance", [5.0, 1.0])
+@pytest.mark.parametrize("path", WAN_PARALLEL_CONFIGS)
+def test_wan22_parallel_configs_plan_each_ranks_step_as_main_did(path, guidance):
+    """A CFG rank plans the guidance branches it forwards, and an SP rank the whole sequence, which its read
+    exchanges."""
+    _, axes = _serving(path)
+    model = _wan()
+    key = WanStepKey(frames=3, height=8, width=8, guidance=guidance, i2v=False)
+    branches = 2 // axes["cfg"] if guidance > 1.0 else 1
+    for cfg_rank in range(axes["cfg"]):
+        sub = Wan22DitSubmodule(None, model.config, cfg_group=SimpleNamespace(world_size=axes["cfg"], rank=cfg_rank))
+        segments = [Segment(request_id=0, label="main", span=sub.num_tokens(key))] * branches
+        reference = SubmoduleStep(
+            segments=segments, steps={SELF_ATTN: AttentionStep(causal=False, fixed_layout=True)}, cg_key_info=key,
+        )
+        for sp_rank in range(axes["sp"]):
+            sp_group = SimpleNamespace(world_size=axes["sp"], rank=sp_rank)
+            handles = node_handles(model, "dit", {SELF_ATTN: _StubRagged()}, sp_group=sp_group)
+            step = state_steps(sub.declare_step("gen", [0], [_inputs(key)]), handles)
+            _assert_plans_equal(step, reference, SELF_ATTN)
+            exchanges = (handles[DIT_TOKENS]._keys_sharded, handles[DIT_TOKENS]._queries_sharded)
+            assert exchanges == (axes["sp"] > 1,) * 2, "a sharded sequence needs the Ulysses exchange"
 
 def test_a_step_on_sdpa_is_none_as_the_hand_written_model_returned():
     model = _klein()
     sub = KleinDenoiseSubmodule(None, model.config, loop_name=DENOISE_LOOP, compile_transformer=False)
-    handles = node_handles(model, "dit", {}, sdpa=True)
+    handles = node_handles(model, "dit", {}, setup=_on_sdpa(model))
     assert state_steps(sub.declare_step("gen", [0], [_inputs(_klein_key())]), handles) is None
 
 
@@ -256,21 +320,21 @@ def test_a_lora_pool_gets_its_rows_from_the_steps_segments_as_before():
     model = _klein()
     sub = KleinDenoiseSubmodule(None, model.config, loop_name=DENOISE_LOOP, compile_transformer=False)
     key = _klein_key()
-    declared = lora_rows(sub.declare_step("gen", [0, 1], [_inputs(key)] * 2), ("lora",))
-    assert isinstance(declared.steps["lora"], LoraStep)
-    assert list(declared.steps["lora"].segments) == [Segment(rid, "main", key.total_tokens) for rid in (0, 1)]
+    declared = with_segment_steps(sub.declare_step("gen", [0, 1], [_inputs(key)] * 2), ("lora",))
+    segments = tuple(Segment(rid, "main", key.total_tokens) for rid in (0, 1))
+    assert declared.steps["lora"] == ResourceStep(segments=segments)
 
 
-def test_engine_step_runs_the_expansion_after_the_lora_rows():
+def test_engine_step_runs_the_expansion_after_the_lora_pools_step():
     model = _klein()
     sub = SimpleNamespace(
         declare_step=KleinDenoiseSubmodule(None, model.config, loop_name=DENOISE_LOOP, compile_transformer=False)
         .declare_step,
-        lora_keys=("lora",),
+        segment_keys=("lora",),
         state_handles=node_handles(model, "dit", {KLEIN_ATTN: _StubRagged()}),
     )
     step = engine_step(sub, "gen", [0], [_inputs(_klein_key())])
-    assert isinstance(step.steps["lora"], LoraStep) and isinstance(step.steps[KLEIN_ATTN], AttentionStep)
+    assert type(step.steps["lora"]) is ResourceStep and isinstance(step.steps[KLEIN_ATTN], AttentionStep)
 
 
 # One compiled frame per attention, not one per layer
@@ -318,7 +382,7 @@ def test_a_read_that_breaks_the_graph_recompiles_no_frame_per_layer(attention):
         entry=dit_entry(2, 4), labels={"main"}, max_len=0,
         reads={"attn": Read(mask=Block(), op=Attend(q_heads=2))},
     )
-    handle = WithinStepHandle(array, {"attn": _BreakingRead()}, None)
+    handle = build_handle(array, {"attn": _BreakingRead()})
     built = [attention(layer) for layer in (0, 1)]
     for module, _ in built:
         module.bind_state({array.name: handle})
@@ -373,7 +437,7 @@ def test_ltx_specs_equal_the_hand_written_four_after_yaml_overrides():
 
 
 def test_ltx_on_sdpa_builds_no_spec_and_its_declarations_have_no_problems():
-    assert node_resources(_ltx(), sdpa_nodes={"dit"}) == []
+    assert node_resources(_ltx(), setup=_on_sdpa(_ltx())) == []
     assert state_declaration_problems(_ltx()) == []
 
 
@@ -384,8 +448,8 @@ def _ltx_reference_step(rids, shape: LTXShape, shard: int) -> dict:
     audio = tuple(Segment(rid, "audio", shape.audio_frames) for rid in rids)
     text = tuple(Segment(rid, "text", shape.text_len) for rid in rids)
     return {
-        "dit_attn_video": AttentionStep(segments=video, causal=False),
-        "dit_attn_audio": AttentionStep(segments=audio, causal=False),
+        "dit_attn_video": AttentionStep(segments=video, causal=False, fixed_layout=True),
+        "dit_attn_audio": AttentionStep(segments=audio, causal=False, fixed_layout=True),
         "dit_xattn_video": RaggedCrossAttentionStep(segments=video_shard + text, pairs=(("video", "text"),)),
         "dit_xattn_audio": RaggedCrossAttentionStep(
             segments=video_shard + audio + text, pairs=(("audio", "text"), ("video", "audio"), ("audio", "video")),
@@ -413,7 +477,7 @@ def test_ltx_steps_equal_the_hand_written_ones_per_rank(rids, world_size, rank, 
         if isinstance(expected, RaggedCrossAttentionStep):
             assert step.steps[key].pairs == expected.pairs, "plans run in the order of the hand-written pairs"
         else:
-            assert step.steps[key].causal is False
+            assert step.steps[key].causal is False and step.steps[key].fixed_layout, key
 
 
 @pytest.mark.parametrize("array, keys, queries, label", [
@@ -443,5 +507,5 @@ def test_ltx_on_sdpa_at_sp1_declares_no_step_as_main_did():
     model = _ltx()
     sub = LTXDenoiseSubmodule(None, model.config, loop_name=DENOISE_LOOP)
     shape = LTXShape(frames=1, height=5, width=5, audio_frames=5, fps=24.0, text_len=16)
-    handles = node_handles(model, "dit", {}, sdpa=True)
+    handles = node_handles(model, "dit", {}, setup=_on_sdpa(model))
     assert state_steps(sub.declare_step("generate_av", [0], [_inputs(shape)]), handles) is None

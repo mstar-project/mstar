@@ -1,26 +1,92 @@
 import logging
-from collections.abc import Collection
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass, field
+from typing import NamedTuple
 
 import torch
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.base import ShardingConfig, ShardingGroup
 from mstar.distributed.communication import WorkerParallelGroups
+from mstar.engine.accelerator_graph_config import check_token_ladder
 from mstar.engine.chunking import DEFAULT_MIN_CHUNK_TOKENS
 from mstar.engine.engine import Engine
 from mstar.engine.node_dtype import resolve_model_dtype, resolve_node_dtype
 from mstar.engine.resources import ResourceReqConfig
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
-from mstar.engine.state.analysis import sdpa_nodes
 from mstar.graph.base import GraphNode
 from mstar.graph.runtime.base import GraphRuntime
-from mstar.model.base import Model, node_moe_parallel_configs, parse_autocast_dtype, serving_resources
+from mstar.model.base import (
+    Model,
+    deployment_setup,
+    node_moe_parallel_configs,
+    parse_autocast_dtype,
+    serving_resources,
+)
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.utils.device import DeviceCapability
 from mstar.utils.streams import reset_device_scheduling
 
 logger = logging.getLogger(__name__)
+
+
+def _prefill_token_buckets(model_config: dict) -> Mapping:
+    """The serving config's ``prefill_token_buckets``: node -> capture walk or
+    piecewise region -> ladder (`_split_token_ladders`)."""
+    # the model_kwargs ladders this key replaced; a model now drops them in **kwargs unread
+    moved = sorted(
+        {"prefill_token_buckets", "prefill_batched_token_buckets", "backbone_token_buckets", "lm_prefill_token_buckets"}
+        & set(model_config.get("model_kwargs") or {})
+    )
+    if moved:
+        raise ValueError(
+            f"model_kwargs {moved} moved to the top level of the serving config, per node and "
+            "capture walk or region: prefill_token_buckets: {<node>: {<walk or region>: [...]}}"
+        )
+    ladders = model_config.get("prefill_token_buckets")
+    if ladders is None:
+        return {}
+    if not isinstance(ladders, Mapping) or not all(isinstance(v, Mapping) for v in ladders.values()):
+        raise ValueError(
+            f"prefill_token_buckets takes node -> capture walk -> ladder, got {ladders!r}"
+        )
+    return ladders
+
+
+def _split_token_ladders(
+    ladders: Mapping[str, Mapping], model: Model,
+) -> tuple[dict[str, dict], dict[str, dict]]:
+    """Each node's ladders by walk (a walk the node is in, or a combined walk
+    of it), which its packed captures take (`apply_token_ladders`), and by
+    any other name, which can only be a piecewise region's label
+    (`Engine._build_piecewise_runners` checks that, once the node declares
+    its regions). Refuses, from the config and the model's graph alone, a
+    ladder that is not one, a region's that is not a list, and a walk of the
+    model that does not run the node."""
+    graphs = model.get_graph_walk_graphs()
+    combined = model.get_combined_graph_walks()
+    every_walk = set(graphs) | {name for walks in combined.values() for name in walks}
+    by_walk: dict[str, dict] = {}
+    by_region: dict[str, dict] = {}
+    for node, named in ladders.items():
+        walks = {walk for walk, graph in graphs.items() if node in graph.get_nodes()} | set(combined.get(node, {}))
+        for name, ladder in named.items():
+            check_token_ladder(f"{node}/{name}", ladder)
+            if name in walks:
+                by_walk.setdefault(node, {})[name] = ladder
+            elif name in every_walk:
+                raise ValueError(
+                    f"prefill_token_buckets names walk {name!r} for {node}, which it does not run; "
+                    f"its walks are {sorted(walks)}"
+                )
+            elif isinstance(ladder, Mapping):
+                raise ValueError(
+                    f"prefill_token_buckets names {name!r} for {node}, not one of its walks {sorted(walks)}, "
+                    f"so a piecewise region, which takes one ladder for every batch size, got {ladder!r}"
+                )
+            else:
+                by_region.setdefault(node, {})[name] = ladder
+    return by_walk, by_region
 
 
 def _unchunkable_nodes(
@@ -45,7 +111,7 @@ def _unchunkable_nodes(
                 f"{type(model).__name__}: {node!r} chunks {walk!r} but does not "
                 "report get_input_sequence_len"
             )
-        if parallel_groups.get_sp_config_for_node(node).world_size > 1:
+        if parallel_groups.get_joint_group_for_node(node).sp_group.world_size > 1:
             off.add(node)
     if off:
         logger.warning(
@@ -123,6 +189,46 @@ def _refuse_unroutable_withholds(submodules: dict, model: Model) -> None:
                     )
 
 
+class InlineStreams(NamedTuple):
+    """Which streamed signals go as values (``_inline_streams``)."""
+    # (node, signal) pairs whose streamed items the route sends as values
+    keys: frozenset[tuple[str, str]]
+    # (node, walk) -> its streamed signals that go as tensors there: a step keeps
+    # such a signal's rows on the device only if nothing streams it
+    tensor_streams: dict[tuple[str, str], frozenset[str]]
+
+
+def _inline_streams(
+    submodules: dict, model: Model, parallel_groups: WorkerParallelGroups | None = None,
+) -> InlineStreams:
+    """The streams whose items the route sends as values: a ``by_value``
+    connection's, for the graph runtime. On a walk, such a stream goes by value
+    only when its signal is the step's one inline signal, the first of the
+    node's ``inline_signals`` it outputs; every other stream, and a lockstep
+    node's (whose replicated stream's consumer counts items from every rank,
+    which a value cannot say), keeps its tensors."""
+    topology = model.get_partition_topology()
+    by_value = {c.edge_name for c in (topology.connections if topology else []) if c.by_value}
+    keys = set()
+    tensor_streams: dict[tuple[str, str], set[str]] = {}
+    for walk, section in model.get_graph_walk_graphs().items():
+        for name, node in section.get_nodes().items():
+            submodule = submodules.get(name)
+            lockstep = parallel_groups is not None and parallel_groups.get_instance_world_size_for_node(name) > 1
+            outputs = {edge.name for edge in node.outputs}
+            inline = submodule.inline_signals(walk) if submodule is not None else {}
+            sent_inline = next((signal for signal in inline if signal in outputs), None)
+            for edge in node.outputs:
+                if not edge.is_streaming:
+                    continue
+                if edge.name in by_value and not lockstep:
+                    keys.add((name, edge.name))
+                    if edge.name == sent_inline:
+                        continue
+                tensor_streams.setdefault((name, walk), set()).add(edge.name)
+    return InlineStreams(frozenset(keys), {k: frozenset(v) for k, v in tensor_streams.items()})
+
+
 def side_stream_nodes(node_groups: list[dict]) -> frozenset[str]:
     """The nodes whose node groups set ``side_stream: true``. A node listed by
     several groups, one per graph walk, must get the same answer from each."""
@@ -142,7 +248,7 @@ def _side_lane_keys(
     parallel_groups: WorkerParallelGroups, accelerator: bool,
 ) -> tuple[tuple[str, str], ...]:
     """The (node, walk) keys this worker runs beside its chain
-    (``mstar.worker.side_steps``): the ``side_stream_walks`` of the node whose
+    (``StepPipeline._launch_side``): the ``side_stream_walks`` of the node whose
     group sets ``side_stream: true``, or a ``ValueError`` naming why the lane
     can't take it. Only nodes that ask are checked.
 
@@ -164,8 +270,8 @@ def _side_lane_keys(
         if not side:
             raise refuse("its submodule declares no side_stream_walks")
         if parallel_groups.get_instance_world_size_for_node(name) > 1:
-            raise refuse("it runs tensor or sequence parallel: when a side step lands is per rank, "
-                         "and every rank of a lockstep instance has to agree on it")
+            raise refuse("it runs in a lockstep instance (TP, SP or CFG): when a side step lands "
+                         "is per rank, and every rank of the instance has to agree on it")
         if set(node_names) <= {name}:
             raise refuse("it is the only node on its worker, so there is no chain to run beside")
         if not accelerator:
@@ -248,6 +354,8 @@ class EngineManager:
     # (node, walk) keys that run beside the chain, as ``build`` decided from
     # the config's ``side_stream`` (see ``_side_lane_keys``)
     side_keys: tuple[tuple[str, str], ...] = ()
+    # which streamed signals go as values (``_inline_streams``)
+    inline_streams: InlineStreams = InlineStreams(frozenset(), {})
 
     @classmethod
     def build(
@@ -270,7 +378,21 @@ class EngineManager:
         shape rides on those, so there is no separate cache config. The conductor's
         ``validate_deployment`` has already checked the specs and overrides.
         """
-        specs = serving_resources(model, model_config)
+        # the per-node settings read only the config: refuse a bad one before any weights load
+        budgets = model_config.get("max_batch_tokens") or {}
+        override_mixed = model_config.get("can_override_mixed_max_tokens") or {}
+        ladders = _prefill_token_buckets(model_config)
+        known = {n for group in model_config.get("node_groups", []) for n in group.get("node_names", [])}
+        for key, setting in (
+            ("max_batch_tokens", budgets), ("can_override_mixed_max_tokens", override_mixed),
+            ("prefill_token_buckets", ladders),
+        ):
+            unknown = sorted(set(setting) - known)
+            if unknown:
+                raise ValueError(f"{key} names nodes {unknown} that no node group serves")
+        walk_ladders, region_ladders = _split_token_ladders(ladders, model)
+        setup = deployment_setup(model, model_config)
+        specs = serving_resources(model, model_config, setup)
 
         # YAML autocast_dtype over the model's own, but never re-enabling
         # autocast for a model that pinned its numerics (see node_dtype)
@@ -285,19 +407,20 @@ class EngineManager:
         # Checked by the conductor's get_sharding_config before spawn.
         moe_parallel = node_moe_parallel_configs(model_config["node_groups"])
         for name in sorted(node_names):
-            # Sequence parallelism is opt-in per node; only forward the SP
-            # group when this node actually participates in one, so models
-            # that don't support SP keep their existing get_submodule call.
-            # Likewise ``moe_parallel``, only for a node group's ``ep_config``.
+            # Sequence and CFG parallelism are opt-in per node; only forward
+            # their groups when this node actually participates in one, so
+            # models that support neither keep their existing get_submodule
+            # call. Likewise ``moe_parallel``, only for a node group's
+            # ``ep_config``.
             extra = {}
-            node_sp_group = parallel_groups.get_sp_config_for_node(name)
-            if node_sp_group.world_size > 1:
-                extra["sp_group"] = node_sp_group
+            joint = parallel_groups.get_joint_group_for_node(name)
+            for key, group in (("sp_group", joint.sp_group), ("cfg_group", joint.cfg_group)):
+                if group.world_size > 1:
+                    extra[key] = group
             if name in moe_parallel:
                 extra["moe_parallel"] = moe_parallel[name]
             submodule = model.get_submodule(
-                name, device,
-                tp_group=parallel_groups.get_tp_config_for_node(name),
+                name, device, tp_group=joint.tp_group,
                 autocast_dtype=autocast_dtype, **extra,
             )
             if submodule is None:
@@ -309,6 +432,7 @@ class EngineManager:
         _refuse_split_combined_walks(submodules, model)
         _refuse_speculated_spans(submodules, model)
         _refuse_unroutable_withholds(submodules, model)
+        inline_streams = _inline_streams(submodules, model, parallel_groups)
         side_keys = _side_lane_keys(
             submodules, specs, model, node_names, side_stream_nodes(model_config["node_groups"]),
             parallel_groups, (device_capability or DeviceCapability.of(device)).is_accelerator,
@@ -323,7 +447,7 @@ class EngineManager:
             gpu_memory_fraction=model_config.get("gpu_memory_fraction"),
             device_capability=device_capability,
             side_stream_nodes={name for name, _ in side_keys},
-            sdpa_nodes=sdpa_nodes(model_config["node_groups"]),
+            state_setup=setup,
         )
         engine.load_model(
             submodules,
@@ -333,14 +457,9 @@ class EngineManager:
             transfer_engine_info=transfer_engine_info,
             kv_cache_type=autocast_dtype,
             model=model,
+            token_ladders=walk_ladders,
+            region_ladders=region_ladders,
         )
-        budgets = model_config.get("max_batch_tokens") or {}
-        override_mixed = model_config.get("can_override_mixed_max_tokens") or {}
-        known = {n for group in model_config.get("node_groups", []) for n in group.get("node_names", [])}
-        for key, setting in (("max_batch_tokens", budgets), ("can_override_mixed_max_tokens", override_mixed)):
-            unknown = sorted(set(setting) - known)
-            if unknown:
-                raise ValueError(f"{key} names nodes {unknown} that no node group serves")
         if not all(isinstance(flag, bool) for flag in override_mixed.values()):
             raise ValueError(f"can_override_mixed_max_tokens takes node -> true/false, not {override_mixed!r}")
         engine.set_chunking_policies(model.chunking_policy_of())
@@ -353,7 +472,10 @@ class EngineManager:
         )
         logger.info("Engine loaded on device %s for nodes %s", device, sorted(node_names))
 
-        return cls(engine=engine, node_names=set(node_names), side_keys=side_keys)
+        return cls(
+            engine=engine, node_names=set(node_names), side_keys=side_keys,
+            inline_streams=inline_streams,
+        )
 
     def warmup_all(self) -> None:
         """CUDA graph capture, for the whole forward and any piecewise region."""

@@ -42,7 +42,8 @@ import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from mstar.api_server.openai.adapters import OpenAIAdapter, SubmitArgs
+from mstar.api_server.openai._util import check_inline_result
+from mstar.api_server.openai.adapters import CHAT_ENVELOPE_KEYS, OpenAIAdapter, SubmitArgs
 from mstar.api_server.openai.protocol import (
     ChatCompletionRequest,
     ImageGenerationRequest,
@@ -50,6 +51,13 @@ from mstar.api_server.openai.protocol import (
     VideoGenerationRequest,
 )
 from mstar.api_server.openai.serving_images import image_count
+from mstar.api_server.openai.serving_realtime import (
+    content_event,
+    decode_base64,
+    error_event,
+    response_object,
+    server_event,
+)
 from mstar.utils.generation_kwargs import offset_seed
 from mstar.utils.utf8_stream import Utf8Stream
 
@@ -65,21 +73,21 @@ logger = logging.getLogger(__name__)
 # ignore_eos) reach a model. Two tiers:
 #   - Dynamo router/frontend envelope fields: never model input.
 #   - OpenAI-standard fields with no M* mapping: stripped so they don't
-#     pollute model_kwargs. When a model starts consuming one of these
-#     from model_kwargs, delete it here and it flows through.
+#     pollute model_kwargs. When a model starts consuming min_tokens or
+#     eos_token_ids, delete it here and it flows through. The rest are
+#     ``adapters.CHAT_ENVELOPE_KEYS``, which every chat adapter drops as
+#     well; this strips them from every body, image and video too.
 _STRIP_KEYS = {
     # Dynamo envelope / bookkeeping
     "routing", "output_options", "sampling_options", "stop_conditions",
     "token_ids", "batch_token_ids", "bootstrap_info", "multi_modal_data",
-    "guided_decoding", "chat_template_kwargs", "chat_template_args",
+    "guided_decoding",
     "nvext", "extra_args", "annotations", "trace", "disaggregated_params",
     "backend_instance_id",
-    # OpenAI-standard, no M* mapping today
-    "min_tokens", "eos_token_ids",
-    "stream_options", "frequency_penalty", "presence_penalty", "logit_bias",
-    # not tools or tool_choice: the adapter refuses a chat that asks for a tool call
-    "logprobs", "top_logprobs", "parallel_tool_calls",
-    "response_format", "user", "store", "metadata", "service_tier",
+    # OpenAI-standard, no M* mapping today. Not tools, tool_choice, the
+    # penalties, logit_bias, logprobs, top_logprobs or response_format: the chat
+    # adapter refuses a chat that sets one of them on.
+    "min_tokens", "eos_token_ids", *CHAT_ENVELOPE_KEYS,
 }
 
 # Image-request fields that ride nvext (mirrors Dynamo's NvCreateImageRequest);
@@ -99,11 +107,19 @@ def _clean(request: dict) -> dict:
     return {k: v for k, v in request.items() if k not in _STRIP_KEYS}
 
 
+def _inline_result(response_format, n=1) -> None:
+    """``check_inline_result``, refused as a client error."""
+    try:
+        check_inline_result(response_format, n)
+    except ValueError as exc:
+        raise _BadRequestError(str(exc)) from exc
+
+
 def _image_body(request: dict) -> dict:
     """NvCreateImageRequest -> body for the native image request model."""
-    if request.get("response_format") == "url":
-        raise ValueError("response_format 'url' needs a media store; use 'b64_json'")
+    _inline_result(request.get("response_format"))  # n is served, as on the native route
     body = _clean(request)
+    body.pop("response_format", None)  # checked above; null would fail the request model
     for key in _IMAGE_NVEXT_KEYS:
         value = (request.get("nvext") or {}).get(key)
         if value is not None:
@@ -113,11 +129,11 @@ def _image_body(request: dict) -> dict:
 
 def _video_body(request: dict) -> dict:
     """NvCreateVideoRequest -> body for the native video request model."""
-    if request.get("response_format") == "url":
-        raise ValueError("response_format 'url' needs a media store; use 'b64_json'")
+    _inline_result(request.get("response_format"))
     if request.get("output_format") not in (None, "mp4"):
         raise ValueError(f"unsupported output_format {request['output_format']!r}; only 'mp4'")
     body = _clean(request)
+    body.pop("response_format", None)  # checked above; null would fail the request model
     for key in _VIDEO_NVEXT_KEYS:
         value = (request.get("nvext") or {}).get(key)
         if value is not None:
@@ -139,8 +155,7 @@ def _speech_body(request: dict) -> dict:
     """NvCreateAudioSpeechRequest -> body for the native speech request model."""
     if request.get("data_source") == "url":
         raise ValueError("data_source 'url' needs a media store; use 'b64_json'")
-    # For speech, response_format is the audio codec (wav/mp3/...), not the
-    # chat-style field _clean strips — reattach it after cleaning.
+    # For speech, response_format is the audio codec (wav/mp3/...); null is the default.
     fmt = (request.get("response_format") or "wav").lower()
     body = _clean(request)
     body.pop("data_source", None)
@@ -193,6 +208,10 @@ class RequestBridge:
 
     async def _chat(self, request: dict, context):
         body = _clean(request)
+        # Dynamo reads a client's chat_template_kwargs into chat_template_args and
+        # forwards it under that name; Qwen3.5 and Cosmos3-Edge read enable_thinking from it
+        if "chat_template_args" in body:
+            body.setdefault("chat_template_kwargs", body.pop("chat_template_args"))
         modalities = body.get("modalities")
         if modalities and set(modalities) != {"text"}:
             # Dynamo's chat stream delta carries no audio/image fields, so
@@ -259,13 +278,14 @@ class RequestBridge:
         reference = body.get("input_reference")
         if reference:
             from mstar.api_server import media_io
+            # one engine request, as on the native route, which refuses an n it would drop
+            _inline_result(None, req.n)
             _, path = media_io.resolve_media_ref(reference, self.server.upload_dir)
             extra = dict(req.model_extra or {})
             extra.pop("input_reference", None)
             # seed is a declared field, so model_extra never carries it; the
             # edit adapter expects it in extra_kwargs (the native multipart
-            # route feeds it from a form field). Edits are single-submit on
-            # the native path too, so n does not apply here.
+            # route feeds it from a form field).
             if req.seed is not None:
                 extra.setdefault("seed", req.seed)
             submits = [self.adapter.image_edit_to_request(req.prompt, path, extra)]
@@ -326,7 +346,7 @@ class RequestBridge:
         # refuse a codec we cannot produce before the request costs GPU time
         fmt = media_io.check_audio_format(body["response_format"], sample_rate=sample_rate)
         req = SpeechRequest.model_validate(body)
-        args = self.adapter.speech_to_request(req, self.server.upload_dir)
+        args = self.adapter.speech_request(req, self.server.upload_dir)
 
         rid = self._submit(args, prefix="speech")
         pcm = bytearray()
@@ -368,6 +388,7 @@ class RequestBridge:
         started = time.monotonic()
         body = _video_body(request)
         req = VideoGenerationRequest.model_validate(body)
+        _inline_result(req.response_format, req.n)  # one engine request, one video
         args = self.adapter.video_to_request(req, self.server.upload_dir)
 
         rid = self._submit(args, prefix="vid")
@@ -398,7 +419,9 @@ class RequestBridge:
                 from mstar.api_server import media_io
                 audio = audios[i]
                 try:
-                    video = media_io.mux_mp4_with_pcm16(
+                    # ffprobe + ffmpeg, up to minutes: off the event loop every request shares
+                    video = await asyncio.to_thread(
+                        media_io.mux_mp4_with_pcm16,
                         video,
                         audio.data,
                         sample_rate=int((audio.metadata or {}).get("sample_rate", 48000)),
@@ -506,26 +529,6 @@ async def _stream_chunks(server: APIServer, rid: str, context):
 # realtime
 # ----------------------------------------------------------------------
 
-def _event_id() -> str:
-    return f"event_{uuid.uuid4().hex}"
-
-
-def _decode_pcm16_b64(audio_b64) -> bytes | None:
-    """Base64 PCM16 append payload -> raw bytes; None when malformed.
-
-    The length may be odd: a sample split across two appends is joined in
-    the session's byte buffer, and a commit takes whole samples only.
-    """
-    if not isinstance(audio_b64, str):
-        return None
-    try:
-        # whitespace is allowed (base64.encodebytes wraps lines), as on the API
-        # server; translate stays linear where split() would build a list
-        return base64.b64decode(audio_b64.encode("ascii").translate(None, b" \t\n\r\v\f"), validate=True)
-    except Exception:  # noqa: BLE001 — refuse the malformed chunk, keep the session
-        return None
-
-
 def _drain(queue: asyncio.Queue) -> None:
     while not queue.empty():
         try:
@@ -581,61 +584,11 @@ class RealtimeBridge:
 
     @staticmethod
     def _session_updated(session) -> dict:
-        return {"type": "session.updated", "event_id": _event_id(), "session": session}
+        return server_event("session.updated", session=session)
 
     @staticmethod
     def _committed(turn: _RealtimeTurn) -> dict:
-        return {
-            "type": "input_audio_buffer.committed",
-            "event_id": _event_id(),
-            "previous_item_id": None,
-            "item_id": turn.item_id,
-        }
-
-    @staticmethod
-    def _error(message: str, *, etype: str = "server_error", code: str | None = None) -> dict:
-        return {
-            "type": "error",
-            "event_id": _event_id(),
-            "error": {"type": etype, "code": code, "message": message},
-        }
-
-    @staticmethod
-    def _response(turn: _RealtimeTurn, status: str, modalities: list[str],
-                  status_details: dict | None = None) -> dict:
-        response: dict = {
-            "id": turn.response_id,
-            "object": "realtime.response",
-            "max_output_tokens": "inf",
-            "output": [],
-            "output_modalities": modalities,
-            "status": status,
-        }
-        if status_details is not None:
-            response["status_details"] = status_details
-        return response
-
-    def _response_created(self, turn: _RealtimeTurn, modalities: list[str]) -> dict:
-        return {"type": "response.created", "event_id": _event_id(),
-                "response": self._response(turn, "in_progress", modalities)}
-
-    def _response_done(self, turn: _RealtimeTurn, modalities: list[str],
-                       status: str = "completed",
-                       status_details: dict | None = None) -> dict:
-        return {"type": "response.done", "event_id": _event_id(),
-                "response": self._response(turn, status, modalities, status_details)}
-
-    @staticmethod
-    def _content_event(etype: str, turn: _RealtimeTurn, **fields) -> dict:
-        return {
-            "type": etype,
-            "event_id": _event_id(),
-            "response_id": turn.response_id,
-            "item_id": turn.item_id,
-            "output_index": 0,
-            "content_index": 0,
-            **fields,
-        }
+        return server_event("input_audio_buffer.committed", previous_item_id=None, item_id=turn.item_id)
 
     # -- utterance -> engine -------------------------------------------
 
@@ -692,7 +645,8 @@ class RealtimeBridge:
         want_audio = "audio" in args.output_modalities
         modalities = ["audio"] if want_audio else ["text"]
         try:
-            await events.put(self._response_created(turn, modalities))
+            await events.put(server_event("response.created", response=response_object(
+                turn.response_id, "in_progress", modalities)))
             rid = _submit(self.server, args, prefix="rt")
             sent_audio = False
             stopped = False
@@ -712,11 +666,11 @@ class RealtimeBridge:
                         if not delta:
                             continue
                         text_parts.append(delta)
-                        await events.put(self._content_event(etype, turn, delta=delta))
+                        await events.put(content_event(etype, turn.response_id, turn.item_id, delta=delta))
                     elif chunk.modality == "audio":
                         sent_audio = True
-                        await events.put(self._content_event(
-                            "response.output_audio.delta", turn,
+                        await events.put(content_event(
+                            "response.output_audio.delta", turn.response_id, turn.item_id,
                             delta=base64.b64encode(chunk.data).decode("ascii")))
                     elif chunk.modality == "error":
                         raise RuntimeError(chunk.data.decode("utf-8", "replace"))
@@ -728,24 +682,25 @@ class RealtimeBridge:
                 return
             if tail := text.flush():
                 text_parts.append(tail)
-                await events.put(self._content_event(etype, turn, delta=tail))
+                await events.put(content_event(etype, turn.response_id, turn.item_id, delta=tail))
             if sent_audio:
-                await events.put(self._content_event("response.output_audio.done", turn))
+                await events.put(content_event("response.output_audio.done", turn.response_id, turn.item_id))
             if not want_audio:
-                await events.put(self._content_event(
-                    "response.output_text.done", turn, text="".join(text_parts)))
-            await events.put(self._response_done(turn, modalities))
+                await events.put(content_event("response.output_text.done", turn.response_id, turn.item_id,
+                                               text="".join(text_parts)))
+            await events.put(server_event("response.done", response=response_object(
+                turn.response_id, "completed", modalities)))
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 — engine failures travel in-band
             logger.exception("realtime turn %s failed", turn.response_id)
-            await events.put(self._error(str(exc), code="generation_error"))
-            await events.put(self._response_done(
-                turn, modalities, status="failed",
+            await events.put(error_event(str(exc), kind="server_error", code="generation_error"))
+            await events.put(server_event("response.done", response=response_object(
+                turn.response_id, "failed", modalities,
                 status_details={
                     "type": "failed",
                     "error": {"code": "generation_error", "type": "server_error"},
-                }))
+                })))
         finally:
             await events.put(None)
 
@@ -799,47 +754,48 @@ class RealtimeBridge:
                             refused = f"unsupported input audio rate {fmt.get('rate')!r}; only 24000 is supported"
                         if refused:
                             # keep reading the audio as before, and echo that
-                            out_stream.put_nowait(self._error(
-                                refused, etype="invalid_request_error", code="unsupported_audio_format"))
+                            out_stream.put_nowait(error_event(
+                                refused, kind="invalid_request_error", code="unsupported_audio_format"))
                             kept = served_in.get("format") if isinstance(served_in, dict) else None
                             audio_in = {**audio_in, "format": kept or {"type": "audio/pcm", "rate": 24000}}
                             session = {**session, "audio": {**session["audio"], "input": audio_in}}
                         if isinstance(audio_in, dict) and audio_in.get("turn_detection") is not None:
                             # no server turn detection: say so, and echo the
                             # session as served rather than as asked
-                            out_stream.put_nowait(self._error(
+                            out_stream.put_nowait(error_event(
                                 "server turn detection is not supported; set audio.input.turn_detection "
                                 "to null and end each turn with input_audio_buffer.commit",
-                                etype="invalid_request_error",
+                                kind="invalid_request_error",
                                 code="unsupported_turn_detection"))
                             session = {**session, "audio": {**session["audio"],
                                                             "input": {**audio_in, "turn_detection": None}}}
                         out_stream.put_nowait(self._session_updated(session))
                     elif etype == "input_audio_buffer.append":
-                        raw = _decode_pcm16_b64(event.get("audio", ""))
-                        if raw is None:
-                            out_stream.put_nowait(self._error(
+                        try:
+                            # the length may be odd: a sample split across two appends is
+                            # joined in pcm, and a commit takes whole samples only
+                            pcm.extend(decode_base64(event.get("audio", "")))
+                        except Exception:  # noqa: BLE001 — refuse the malformed chunk, keep the session
+                            out_stream.put_nowait(error_event(
                                 "audio is not base64",
-                                etype="invalid_request_error",
+                                kind="invalid_request_error",
                                 code="invalid_audio"))
-                        else:
-                            pcm.extend(raw)
                     elif etype == "input_audio_buffer.commit":
                         # whole samples only: an odd trailing byte waits for
                         # the rest of its sample in the next append
                         whole = len(pcm) - len(pcm) % 2
                         if not whole:
-                            out_stream.put_nowait(self._error(
+                            out_stream.put_nowait(error_event(
                                 "input audio buffer is empty",
-                                etype="invalid_request_error",
+                                kind="invalid_request_error",
                                 code="input_audio_buffer_commit_empty"))
                             continue
                         try:
                             args = self._utterance_args(session, bytes(pcm[:whole]))
                         except Exception as exc:  # noqa: BLE001 — keep the session usable
                             logger.exception("realtime: building the utterance request failed")
-                            out_stream.put_nowait(self._error(
-                                str(exc), etype="invalid_request_error"))
+                            out_stream.put_nowait(error_event(
+                                str(exc), kind="invalid_request_error"))
                             pcm = pcm[whole:]
                             continue
                         pcm = pcm[whole:]

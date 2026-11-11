@@ -48,12 +48,12 @@ from torch import nn
 sys.path.insert(0, ".")
 
 from mstar.engine.state import KVEntry
-from mstar.model.components import AdaRMSNorm as Pi05AdaRMSNorm
 from mstar.model.components.decoder_layer import _gated_residual
 from mstar.model.components.distributed.attention import ParallelAttention
 from mstar.model.pi05.components.action_expert import (
     Pi05ActionExpert,
     Pi05ActionExpertLayer,
+    Pi05AdaRMSNorm,
     Pi05TimeMLP,
 )
 from mstar.model.pi05.components.flow_matching import sincos_timestep_embedding
@@ -424,17 +424,17 @@ def test_adarms_norm_matches_reference_with_shared_weights():
     # (FlashInfer's dispatch requirement). Comparison is at bf16 tolerance.
     ref_norm = RefAdaRMSNorm(hidden_size=32, cond_dim=32).to(DEVICE, dtype=torch.float32)
     _randomize_adarms(ref_norm)
-    ours = Pi05AdaRMSNorm(hidden_size=32, cond_dim=32).to(DEVICE, dtype=MSTAR_DTYPE)
+    ours = Pi05AdaRMSNorm(hidden_size=32, cond_dim=32, eps=1e-6, slot=1).to(DEVICE, dtype=MSTAR_DTYPE)
     _copy_adarms(ours, ref_norm)
 
     x = torch.randn(4, 32, device=DEVICE, dtype=torch.float32)
     cond = torch.randn(32, device=DEVICE, dtype=torch.float32)
 
-    # mstar's AdaRMSNorm takes cond batched as [BS, cond_dim] (it slices
-    # modulation as [:, :H]); the reference keeps its single-request 1-D form.
-    ours_out, ours_gate = ours(
-        x.to(MSTAR_DTYPE), cond.unsqueeze(0).to(MSTAR_DTYPE)
-    )
+    # The norm takes its precomputed modulation: row ``slot`` of the block its
+    # layer passes, shared by every row of x.
+    own = ours.dense(cond.unsqueeze(0).to(MSTAR_DTYPE))
+    modulations = torch.cat([torch.zeros_like(own), own])
+    ours_out, ours_gate = ours(x.to(MSTAR_DTYPE), modulations)
     ref_out, ref_gate = ref_norm(x, cond)
 
     ours_out_f32 = ours_out.to(torch.float32)
@@ -482,10 +482,10 @@ def test_action_expert_layer_matches_reference_single_request():
 
     handle = MockKVAttention(scale=config.head_dim ** -0.5)
     _bind_mock_handle(ours, handle)
-    ours_out = ours(
-        hidden_states=x.to(MSTAR_DTYPE),
-        adarms_cond=cond.unsqueeze(0).to(MSTAR_DTYPE),
-    ).to(torch.float32)
+    # The layer's norms take their modulations, precomputed from the condition.
+    c = cond.unsqueeze(0).to(MSTAR_DTYPE)
+    modulations = torch.cat([ours.input_layernorm.dense(c), ours.post_attention_layernorm.dense(c)])
+    ours_out = ours(hidden_states=x.to(MSTAR_DTYPE), modulation=modulations).to(torch.float32)
 
     ref_out, _, _ = ref_layer(x, cond=cond)
     assert ours_out.shape == ref_out.shape
@@ -549,9 +549,11 @@ def test_action_expert_full_stack_matches_reference_against_prefix_kv_cache():
 
     suffix = torch.randn(config.action_horizon, config.hidden_size, device=DEVICE, dtype=torch.float32)
     cond = torch.randn(config.hidden_size, device=DEVICE, dtype=torch.float32)
+    layer_mods, final_mod = ours.modulations(cond.unsqueeze(0).to(MSTAR_DTYPE))
     ours_out = ours(
         query_sequence=suffix.to(MSTAR_DTYPE),
-        adarms_cond=cond.unsqueeze(0).to(MSTAR_DTYPE),
+        layer_modulations=[mod[0] for mod in layer_mods],
+        final_modulation=final_mod[0],
     ).to(torch.float32)
 
     # Reference stack on the same suffix using the same prefix KV cache.
@@ -848,8 +850,11 @@ def test_pi05_siglip_encoder_matches_hf_reference():
 
 
 def _ref_resize_with_pad(images: torch.Tensor, target_h: int, target_w: int) -> torch.Tensor:
-    """Reference port of ``image_tools.resize_with_pad_torch`` (channels-first
-    float32 path). Used to verify ``Pi05ViTEncoderSubmodule._prepare_one``.
+    """Reference port of openpi's ``image_tools.resize_with_pad``, which its
+    data pipeline applies (``transforms.ResizeImages``), channels-first float32.
+    Its ``jax.image.resize`` linear resize antialiases when downscaling, as
+    torch's ``antialias=True`` does. Used to verify
+    ``Pi05ViTEncoderSubmodule._prepare_one``.
     """
     assert images.dim() == 4 and images.dtype == torch.float32
     _, _, cur_h, cur_w = images.shape
@@ -857,7 +862,7 @@ def _ref_resize_with_pad(images: torch.Tensor, target_h: int, target_w: int) -> 
     resized_h = int(cur_h / ratio)
     resized_w = int(cur_w / ratio)
     resized = torch.nn.functional.interpolate(
-        images, size=(resized_h, resized_w), mode="bilinear", align_corners=False
+        images, size=(resized_h, resized_w), mode="bilinear", align_corners=False, antialias=True,
     ).clamp(-1.0, 1.0)
     pad_h0, rem_h = divmod(target_h - resized_h, 2)
     pad_h1 = pad_h0 + rem_h
@@ -869,7 +874,7 @@ def _ref_resize_with_pad(images: torch.Tensor, target_h: int, target_w: int) -> 
 
 
 def test_pi05_image_preprocessing_matches_resize_with_pad_letterbox():
-    """``Pi05ViTEncoderSubmodule._prepare_one`` vs openpi's resize_with_pad_torch.
+    """``Pi05ViTEncoderSubmodule._prepare_one`` vs openpi's resize_with_pad.
 
     Tests three cases that exercise the letterbox path:
       * already-target square (no resize / no pad — identity-ish)
