@@ -290,11 +290,12 @@ class ChatterboxModel(Model):
         past the stop included. CFG keeps a conditional and an unconditional one.
         """
         t3 = self.config.t3
-        limit = self.config.max_new_tokens_limit or t3.max_speech_tokens
-        bos = 2 if t3.duplicate_bos_in_prefill else 1
-        tokens = t3.cond_len + self.config.max_text_tokens + bos + limit
-        streams = 1 if self.config.is_turbo else 2
-        check_kv_pools_fit(self, config, config_path, logger, request_tokens={T3_KV: (tokens,) * streams})
+        layout = self._t3_layout("prefill", t3.cond_len, self.config.max_text_tokens)
+        labels = (COND_LABEL,) if self.config.is_turbo else (COND_LABEL, UNCOND_LABEL)
+        check_kv_pools_fit(
+            self, config, config_path, logger, request_layouts={T3_KV: dict.fromkeys(labels, layout)},
+            loop_caps={self.DECODE_LOOP: self.config.max_new_tokens_limit or t3.max_speech_tokens},
+        )
 
     def _lora_spec(self) -> LoraSpec | None:
         """Per-request adapters on T3: every linear of its Llama backbone and the speech
@@ -681,13 +682,13 @@ class ChatterboxModel(Model):
             wav = self._prepare_reference(wav)
             out[REF_AUDIO] = [wav]
             out[VOICE_KEY] = [voice_key_for(wav)]
-        layout = self._t3_layout(text_ids, wav)
+        layout = self._t3_layout(*self._t3_prompt(wav), text_ids.numel())
         guided = knobs["cfg_weight"] > 0
         labels = (COND_LABEL, UNCOND_LABEL) if guided else (COND_LABEL,)
         return ProcessPromptOutput(out, {"state_layout": {T3_KV: dict.fromkeys(labels, layout)}})
 
-    def _t3_layout(self, text_ids: torch.Tensor, reference: torch.Tensor | None) -> Layout:
-        """What T3 writes on each label the request opens: ``[cond | text | BOS]``, then a row per decode step."""
+    def _t3_prompt(self, reference: torch.Tensor | None) -> tuple[str, int]:
+        """The walk that prefills T3 for ``reference``, and the conditioning rows it writes."""
         from mstar.model.chatterbox.submodules import reference_tokens
 
         t3 = self.config.t3
@@ -700,7 +701,11 @@ class ChatterboxModel(Model):
                 else reference_tokens(reference.numel(), self.config)
             )
             cond += prompt - t3.speech_cond_prompt_len
-        text = text_ids.numel()
+        return walk, cond
+
+    def _t3_layout(self, walk: str, cond: int, text: int) -> Layout:
+        """What T3 writes on each label the request opens: ``[cond | text | BOS]``, then a row per decode step."""
+        t3 = self.config.t3
         bos = 2 if t3.duplicate_bos_in_prefill else 1
         return Layout(
             spans=(

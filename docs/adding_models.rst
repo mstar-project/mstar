@@ -3646,9 +3646,9 @@ Sizing the caches is only half of it: ``configs/whisper_large.yaml`` also sets
 worker offloading decoding requests to admit them. ``WhisperModel.validate_config_yaml``
 refuses at startup a cap that either cache cannot hold after the YAML's ``resources:``
 overrides, through ``mstar.model.utils.check_kv_pools_fit``, which any model with KV caches
-can call the same way. A model whose request holds several streams on one pool passes the
-tokens of each, ``request_tokens={pool: (tokens, ...)}``, as Chatterbox does for a guided
-request's two.
+can call the same way. A model on the contract can size a pool by the request it is sized for,
+``request_layouts={array: {label: Layout}}`` with its ``loop_caps``, as Chatterbox passes its
+T3 layout on both labels of a guided request with the decode loop at its limit.
 
 The decoder node's ``declare_step`` shows how a write-once context is expressed with spans.
 Canary's comes from ``EncoderDecoderNode`` (``mstar/model/components/encoder_decoder.py``),

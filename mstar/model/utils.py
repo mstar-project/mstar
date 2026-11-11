@@ -3,13 +3,16 @@ import json
 import logging
 import os
 import re
-from collections.abc import Container, Mapping, Sequence
+from collections.abc import Container, Mapping
 from dataclasses import dataclass, field
 from functools import cached_property
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import torch
+
+if TYPE_CHECKING:
+    from mstar.engine.state.contract import Layout
 
 # safetensors is imported where it is used: mstar.model.base imports this
 # module, and safetensors is not a core dependency.
@@ -711,7 +714,7 @@ def kv_pages(tokens: int, page_size: int, requests: int) -> int:
 
 def check_kv_pools_fit(
     model, config: dict, config_path: str, log: logging.Logger,
-    request_tokens: Mapping[str, Sequence[int]] | None = None,
+    request_layouts: "Mapping[str, Mapping[str, Layout]] | None" = None, loop_caps: Mapping[str, int] | None = None,
 ) -> None:
     """Refuse a ``max_concurrent_requests`` the model's KV caches or recurrent pools cannot hold.
 
@@ -720,14 +723,16 @@ def check_kv_pools_fit(
     (``cpu_offload_pages``), the worker offloads decoding requests to admit it,
     which costs far more than queueing would. So the cap's requests
     at full length must fit each cache next to its sink page; the conductor
-    queues the rest. Warnings go to the model's ``log``. ``request_tokens``
-    gives a pool the tokens each of a request's streams holds at full length,
-    by default one stream of the pool's ``max_seq_len``. A recurrent pool must
+    queues the rest. Warnings go to the model's ``log``. ``request_layouts``
+    gives the `Layout` per array and label of the request the deployment is
+    sized for, with its loops at ``loop_caps``, and a pool it doesn't name
+    holds one stream of its ``max_seq_len``. A recurrent pool must
     hold a slot for each label of each of the cap's requests, since a request
     keeps them until it is torn down, and offloading frees none.
     """
-    from mstar.engine.resources import KVSpec, PagedKVConfig
+    from mstar.engine.resources import KVReqConfig, KVSpec, PagedKVConfig
     from mstar.engine.resources.recurrent.config import RecurrentStateSpec
+    from mstar.engine.state.adapters import kv_layouts
     from mstar.model.base import serving_resources
 
     cap = config.get("max_concurrent_requests")
@@ -745,6 +750,16 @@ def check_kv_pools_fit(
         specs = serving_resources(model, config)
     except ValueError:
         return  # a `resources:` block the validation's resource checks report
+    # each pool's config as the conductor opens the request, from the rows the data worker sends
+    requests: dict[str, KVReqConfig] = {}
+    for key, by_label in (kv_layouts(model.declare_state(), request_layouts, {}) if request_layouts else {}).items():
+        uncapped = {loop for layout in by_label.values() for loop, _ in layout.growth} - (loop_caps or {}).keys()
+        if uncapped:
+            raise ValueError(f"{config_path}: request_layouts[{key!r}] grows loops {sorted(uncapped)}, which loop_caps "
+                             "doesn't cap")
+        rows = {label: layout.row() for label, layout in by_label.items()}
+        requests[key] = KVReqConfig(needed_labels=list(rows))
+        requests[key].apply_conductor_config(kv_layout=rows, loop_caps=loop_caps)
     for spec in specs:
         if isinstance(spec, RecurrentStateSpec):
             state = spec.config
@@ -760,11 +775,11 @@ def check_kv_pools_fit(
         if not isinstance(spec, KVSpec) or not isinstance(spec.config, PagedKVConfig):
             continue
         kv = spec.config
-        # in arena pages: a request at full length holds every token of every group, a window's
-        # too, since a one-step prefill keeps its whole prompt until it commits
-        per_request = sum(
-            -(-tokens // group.page_size)
-            for tokens in (request_tokens or {}).get(spec.resource_key, (kv.max_seq_len,)) for group in kv.groups
+        request = requests.get(spec.resource_key)
+        # In arena pages. A stream of max_seq_len holds every token of every group, a window's too, since a one-step
+        # prefill keeps its whole prompt until it commits.
+        per_request = request.pages(spec.nodes, request.loop_caps or {}, kv) if request is not None else sum(
+            -(-kv.max_seq_len // group.page_size) for group in kv.groups
         )
         need = 1 + cap * per_request
         if need > kv.num_units:

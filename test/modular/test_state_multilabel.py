@@ -48,6 +48,7 @@ from mstar.engine.state import (
     Bidirectional,
     Causal,
     KVEntry,
+    Layout,
     Read,
     Window,
     at_last_token,
@@ -516,8 +517,18 @@ def test_two_streams_of_a_request_need_the_pages_of_both(monkeypatch):
                          page_size=64, max_num_pages=1 + 2 * 4)
     monkeypatch.setattr("mstar.model.base.serving_resources",
                         lambda model, config: [KVSpec(resource_key="t3_kv", nodes={"t3"}, config=pool)])
+    array = Array("t3_kv", nodes={"t3"}, layers=frozenset({0, 1}), entry=KVEntry(heads=2, head_dim=8), max_len=256,
+                  labels=frozenset(LABELS), reads={"attn": Read(mask=Causal(), op=Attend(q_heads=2))})
+    model = SimpleNamespace(declare_state=lambda: [array])
+    stream = Layout(spans=(Span("ids", "prefill", 192, 192, "text_inputs"),), growth=(("decode_loop", 1),))
     config = {"max_concurrent_requests": 2}
-    check_kv_pools_fit(None, config, "cfg.yaml", logging.getLogger(__name__))
+    check_kv_pools_fit(model, config, "cfg.yaml", logging.getLogger(__name__))
     with pytest.raises(ValueError, match=r"2 concurrent requests \(max_concurrent_requests\) need 17 pages of "
                                          r"resources.t3_kv \(8 per request and the sink page\), which has 9"):
-        check_kv_pools_fit(None, config, "cfg.yaml", logging.getLogger(__name__), request_tokens={"t3_kv": (256, 256)})
+        check_kv_pools_fit(model, config, "cfg.yaml", logging.getLogger(__name__),
+                           request_layouts={"t3_kv": dict.fromkeys(LABELS, stream)}, loop_caps={"decode_loop": 64})
+    with pytest.raises(ValueError, match=r"request_layouts\['t3_kv'\] grows loops \['decode_loop'\], which loop_caps "
+                                         r"doesn't cap"):
+        check_kv_pools_fit(model, config, "cfg.yaml", logging.getLogger(__name__),
+                           request_layouts={"t3_kv": dict.fromkeys(LABELS, stream)})
+
