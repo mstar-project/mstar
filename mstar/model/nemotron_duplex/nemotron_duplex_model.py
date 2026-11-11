@@ -66,7 +66,6 @@ from mstar.engine.resources import (
     SamplerSpec,
     SamplingReqConfig,
 )
-from mstar.engine.resources.kv.bounded import BoundedKVSpec
 from mstar.engine.resources.kv.config import DEFAULT_PAGE_SIZE
 from mstar.engine.resources.linear_attn.config import LinearAttnConfig, LinearAttnSpec, LinearAttnVariant
 from mstar.engine.resources.recurrent import Mamba2Geometry, RecurrentStateConfig, RecurrentStateSpec
@@ -82,7 +81,7 @@ from mstar.model.base import (
     serving_resources,
 )
 from mstar.model.components.audio_features import NemoLogMel
-from mstar.model.components.fastconformer_stream import stream_node_resources
+from mstar.model.components.fastconformer_stream import slot_pool_requests, stream_node_resources
 from mstar.model.multimodal import PromptPart
 from mstar.model.nemotron_duplex.components.audio_codec import codec_state_blocks
 from mstar.model.nemotron_duplex.config import (
@@ -319,10 +318,9 @@ class NemotronDuplexModel(Model):
         except ValueError:
             return  # a `resources:` block the validation's resource checks report
         for spec in specs:
-            if isinstance(spec, RecurrentStateSpec):
-                held, knob = spec.config.usable_slots, "max_slots"
-            elif isinstance(spec, BoundedKVSpec):
-                held, knob = spec.config.max_slots, "max_slots"
+            held, knob = slot_pool_requests(spec), "max_slots"
+            if held is not None:
+                pass
             elif spec.resource_key in (TALKER_KV, NANO_KV):
                 kv = spec.config
                 pages = self.talker_kv_pages if spec.resource_key == TALKER_KV else self.nano_kv_pages

@@ -200,6 +200,27 @@ class ParakeetModel(Model):
                 f"{cap + 1} slots of resources.{TRANSDUCER_STATE} (one each and the sink), which has "
                 f"{slots}; raise max_slots or lower max_concurrent_requests"
             )
+        if self.live:
+            self._check_stream_pools(config, config_path, cap)
+
+    def _check_stream_pools(self, config: dict, config_path: str, cap: int) -> None:
+        """A live call holds a slot in each stream pool as long as it is open, so
+        ``cap`` calls must fit every one of them, not only the transducer's."""
+        from mstar.model.base import serving_resources
+        from mstar.model.components.fastconformer_stream import slot_pool_requests
+
+        try:
+            specs = serving_resources(self, config)
+        except ValueError:
+            return  # a `resources:` block the validation's resource checks report
+        for spec in specs:
+            held = slot_pool_requests(spec)
+            if held is not None and held < cap:
+                raise ValueError(
+                    f"{config_path}: {cap} concurrent requests (max_concurrent_requests) need as "
+                    f"many in resources.{spec.resource_key}, which holds {held}; raise its "
+                    "max_slots or lower max_concurrent_requests"
+                )
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         decode = Loop(

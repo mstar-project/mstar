@@ -19,6 +19,9 @@ from mstar.model.parakeet.config import (
     LIVE_ENCODE_WALK,
     NUM_FRAMES,
     PROMPT_ID,
+    STREAM_CONV,
+    STREAM_FRONT,
+    STREAM_KV,
     TRANSDUCER_STATE,
     WALK,
     ParakeetModelConfig,
@@ -271,6 +274,16 @@ def test_startup_refuses_more_requests_than_slots(tmp_path):
     # slot 0 is the sink, so one slot leaves none to admit into, with or without a cap
     with pytest.raises(ValueError, match="max_slots must be an int >= 2"):
         model.validate_config_yaml({"resources": {TRANSDUCER_STATE: {"max_slots": 1}}}, "a.yaml")
+
+
+def test_live_startup_refuses_more_requests_than_stream_slots(tmp_path):
+    model = ParakeetModel(str(_snapshot(tmp_path, nemotron=True)), live_lookahead=3)
+    config = {"max_concurrent_requests": 200, "resources": {TRANSDUCER_STATE: {"max_slots": 201}}}
+    # the stream pools keep their 128-request default, so the 129th live call would stall
+    with pytest.raises(ValueError, match=r"resources\.stream_\w+, which holds 128"):
+        model.validate_config_yaml(config, "a.yaml")
+    config["resources"].update({k: {"max_slots": 201} for k in (STREAM_KV, STREAM_CONV, STREAM_FRONT)})
+    model.validate_config_yaml(config, "a.yaml")
 
 
 @pytest.mark.parametrize("nemotron", [False, True])
