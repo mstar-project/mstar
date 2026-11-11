@@ -541,7 +541,6 @@ def test_flashinfers_resident_gather_fills_a_real_fa3_paged_wrapper_off_the_tabl
     assert wrapper._seqused.tolist() == (kv_len + SPAN - hide_last).clamp(min=1).tolist()
 
 
-
 def test_a_lagged_fa3_binding_plans_each_pass_and_its_gather_fills_them_off_the_tables():
     """A lagged binding on FA3 (`AttentionStep.lag`): `_plan_lagged` builds a wrapper a pass over the
     verify block's KV plan (``plan_span`` the block, ``kv_extent`` the pass's), and the replay's gather
@@ -620,6 +619,46 @@ def test_a_lagged_fa3_pass_attends_past_its_queries_never_past_the_plans_rows():
     assert wrapper(4).kv_extent == 4
     with pytest.raises(ValueError, match="kv_extent 5 outside a plan span of 4"):
         wrapper(5)
+
+
+def test_a_lagged_flashinfer_binding_keeps_its_host_plans():
+    """On FlashInfer a lagged binding's passes have no wrapper that reads the tables
+    (`_plan_lagged` collects only FA3's), so a replay's gather keeps the host plans rather than
+    reading tables nothing fills from."""
+    from mstar.engine.resources.attn.flashinfer import FlashInferManager
+
+    bs = 2
+    node = _Node({1: 5, 2: 9}, max_bs=bs, lag=1)
+    res, planner, layout = node.res, node.planner, node.layout
+    bucket = BucketKey(graph_walk=WALK, bs=bs, num_tokens=bs * SPAN)
+    manager = FlashInferManager.__new__(FlashInferManager)
+    # what `_plan_lagged` stores for a FlashInfer verify binding
+    manager._kv_cache_name, manager._cg_plan_states, manager._lagged_cg = "kv", {}, {(bucket, 0): []}
+
+    rids = (1, 2)
+    lease = SlotLease(slot=0, bucket=bucket)
+    segments = tuple(Segment(r, "main", SPAN) for r in rids)
+    kv, rope = KVStep(segments=segments, lag=node.lag), PositionStep(segments=segments, lag=layout)
+    step = SubmoduleStep(steps={"kv": kv}, segments=list(segments))
+    ctx = StepContext(request_ids=rids, graph_walk=WALK, slot=0, capture=False, slot_lease=lease)
+    ctx.set_padded_rids(rids)
+    assert res["kv"].admit(kv, ctx).ok
+    first = StepContext(request_ids=rids, graph_walk=WALK, slot=0, capture=True, slot_lease=lease)
+    first.plan_results["kv"] = res["kv"].plan(kv, first)
+    res["rope"].plan(rope, first)
+    captured = planner.capture_step(bucket, 0, step)
+    ctx.resident = planner
+    planner.plan(step, ctx)
+    ctx.plan_results["kv"] = res["kv"].plan(kv, ctx)
+    res["rope"].plan(rope, ctx)
+    planner.flush(ctx.resident_plan)
+    planner.gather(captured)
+    assert not captured.streams["kv"].reads
+
+    manager.resident_gather(captured)
+
+    assert captured.host_planned and not captured.reads_tables
+
 
 def test_a_lagged_set_writes_one_position_behind_the_device_length():
     """A draft model's layer set lagged one row in passes (`KVStep.lag`, `PositionStep.lag`): under
