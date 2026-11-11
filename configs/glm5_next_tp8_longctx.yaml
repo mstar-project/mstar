@@ -6,9 +6,9 @@ max_seq_len: 1048576
 # need cpu_offload_pages: 0): when live contexts outgrow it, decode holds requests until
 # pages free up or they time out.
 max_concurrent_requests: 64
-# NVLS multicast for the small decode all-reduces; stays on NCCL, with a
-# warning, where NVLink multicast is unavailable.
-tp_allreduce: "symm_multimem"
+# FlashInfer's one-kernel all-reduce, as glm5_next_tp8.yaml: 3.2-3.5% faster decode steps
+# than symm_multimem on 4x H200
+tp_allreduce: "flashinfer"
 tp_allreduce_max_kb: 32768
 tp_async_sched: true
 model_kwargs:
