@@ -58,15 +58,18 @@ def test_a_node_the_config_names_with_no_walk_that_can_repeat_stops_the_worker()
         repeats.settle(lambda node, walk: "resource 'attn' allows one iteration a step")
 
 
-@pytest.mark.parametrize(("ready_waits", "repeats", "owed", "want"), [
-    (True, 1, False, True),   # the run the waiting rows are owed
-    (True, 1, True, False),   # once: a step narrowed to 1 can't keep them out
-    (True, 8, False, False),  # it just ran long
-    (False, 1, False, False),  # the policy is off: today's behaviour
+@pytest.mark.parametrize(("ready_waits", "walk", "repeats", "owed", "want"), [
+    (True, WALK, 1, False, True),   # the run the waiting rows are owed
+    (True, WALK, 1, True, False),   # once: a step narrowed to 1 can't keep them out
+    (True, WALK, 8, False, False),  # it just ran long
+    (True, "prefill", 1, False, False),  # a prompt step of the node can never repeat
+    (False, WALK, 1, False, False),  # the policy is off: today's behaviour
 ])
-def test_ready_rows_wait_only_for_the_one_run_owed(ready_waits, repeats, owed, want):
+def test_ready_rows_wait_only_for_the_one_run_owed(ready_waits, walk, repeats, owed, want):
     config = RepeatConfig(max=8, ready_waits=ready_waits)
-    assert StepRepeats({NODE: config}, {}).owes_run(NODE, repeats, owed) is want
+    steps = StepRepeats({NODE: config}, {})
+    steps._walks.add((NODE, WALK))
+    assert steps.owes_run(NODE, walk, repeats, owed) is want
 
 
 def test_a_plain_ar_node_is_refused_until_it_declares_what_a_repeat_reads():
@@ -104,3 +107,13 @@ def test_a_plain_ar_node_is_refused_until_it_declares_what_a_repeat_reads():
         loop="decode_loop", buffer="new_token", stop_ids=frozenset({2}), sampler="sampler", withhold=("frame",),
     )
     assert declared.get_stop_policies(WALK) is None
+
+
+def test_the_spec_cap_counts_steps_not_the_iterations_a_step_asked_for():
+    from mstar.worker.speculation import Speculator
+
+    speculator = Speculator.__new__(Speculator)
+    speculator._consecutive = 0
+    launched = SimpleNamespace(is_yield_away=False, node_batch=SimpleNamespace(step_context=SimpleNamespace(repeats=8)))
+    speculator.note_launched(launched)
+    assert speculator._consecutive == 1
