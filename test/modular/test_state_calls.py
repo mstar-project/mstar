@@ -644,6 +644,18 @@ def test_each_replay_starts_clean_for_an_add_that_runs_outside_the_graph():
         h.end_step(step)
 
 
+def test_adds_outside_the_graph_write_every_layer_before_a_read_attends_the_pages():
+    kv, attn = _StubKV(), _StubAttn()
+    h = _kv_handle(kv=kv, attn=attn)
+    _begin(h, kv=ArrayStep(eager_add=True))
+    q, k, v = _tensors()
+    for layer in range(LAYERS):
+        h.add(layer, k=k + layer, v=v)
+    out = h.read(0, q)
+    assert kv.writes == [(layer, "main") for layer in range(LAYERS)]
+    assert attn.runs == [(0, "main", False)] and torch.equal(out, q + k)
+
+
 @pytest.mark.parametrize("make, declared, cause", [
     (_kv_handle, ArrayStep(advance=(1,)), "advance or position_ids"),
     (_kv_handle, ArrayStep(position_ids=torch.zeros(1)), "advance or position_ids"),
