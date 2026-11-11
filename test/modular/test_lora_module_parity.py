@@ -24,7 +24,17 @@ def _talker(config, weights):
     return TalkerSubmodule(H._loaded(Qwen3TTSTalkerModel(config).to(H.DTYPE), weights), predictor.to(H.DTYPE), config)
 
 
-@pytest.mark.parametrize("model, stack, build", [("qwen3_tts", "qwen3_tts_talker", _talker)])
+def _thinker(config, weights):
+    """The Thinker node as the model builds it for the benchmark: weights loaded, no handles bound."""
+    from mstar.model.qwen3_omni.components.thinker import Qwen3OmniThinkerModel
+    from mstar.model.qwen3_omni.submodules import ThinkerSubmodule
+
+    return ThinkerSubmodule(H._loaded(Qwen3OmniThinkerModel(config).to(H.DTYPE), weights), config)
+
+
+@pytest.mark.parametrize("model, stack, build", [
+    ("qwen3_tts", "qwen3_tts_talker", _talker), ("qwen3_omni", "qwen3_omni_thinker", _thinker),
+])
 def test_a_contract_nodes_entry_declares_and_runs_its_step(model, stack, build):
     entry, harness = getattr(module_parity, f"_{model}")(), H.STACKS[stack]()
     config = harness.config()
@@ -34,6 +44,6 @@ def test_a_contract_nodes_entry_declares_and_runs_its_step(model, stack, build):
     module_parity._set_positions(LENGTHS)
     with torch.no_grad():
         plain = entry.run(sub, torch.cat(ids), list(LENGTHS))
-        rotated = entry.run(sub, torch.cat(ids), list(LENGTHS), rope=lambda q, k: (q, k))
+        rotated = entry.run(sub, torch.cat(ids), list(LENGTHS), rope=lambda q, k: (-q, k))
     assert plain.shape[0] == len(LENGTHS)
-    assert not torch.equal(plain, rotated), "with a rope, each row's tokens rotate by their positions"
+    assert not torch.equal(plain, rotated), "the stack rotates its queries and keys when given a rope"
