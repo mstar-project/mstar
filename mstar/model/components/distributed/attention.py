@@ -55,6 +55,7 @@ class ParallelAttention(nn.Module):
         rope_high_freq_factor: float = 1.0,
         rope_old_context_len: int = 8192,
         input_hidden_size: int | None = None,
+        output_hidden_size: int | None = None,
         attn_key: str = "attn",
         kv_key: str = "kv",
         pos_key: str | None = "rope",
@@ -79,6 +80,8 @@ class ParallelAttention(nn.Module):
         self.comm_group = comm_group
         self.hidden_size = hidden_size
         self.input_hidden_size = input_hidden_size or hidden_size
+        # what o_proj writes back: the input's width unless a layer reads a wider one (EAGLE-3's 2H)
+        self.output_hidden_size = output_hidden_size or self.input_hidden_size
         self.head_dim = head_dim
         self.total_num_heads = num_heads
         self.total_num_kv_heads = num_kv_heads
@@ -97,7 +100,7 @@ class ParallelAttention(nn.Module):
         self.o_proj = RowParallelLinear(
             comm_group=comm_group,
             input_size=num_heads * head_dim,
-            output_size=self.input_hidden_size,
+            output_size=self.output_hidden_size,
             bias=o_bias,
             input_is_parallel=True,
             reduce_results=True,

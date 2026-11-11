@@ -1,14 +1,28 @@
 """The engine binds a verifying node's graph reads on its sampler (`Engine._set_up_draft`, `verify_writes`): a leased
 step of the verify walk stages the drafter's loop-back state off the masters, and the forward reads the staged rows.
-Built through the real engine load, for a carrying toy with no lag."""
+Built through the real engine load, for a lagged drafter (a Qwen3 draft model on the CPU harness: its carry and its
+keep flag) and for a carrying toy with no lag."""
 from __future__ import annotations
+
+import json
 
 import pytest
 import torch
+from qwen3_cpu import engine as qwen3_engine
+from qwen3_cpu import make_model, patch_cpu, write_checkpoints
 
-from mstar.engine.resources.draft.drafter import DRAFT_CARRY
+from mstar.engine.resources.draft.drafter import DRAFT_CARRY, DRAFT_KEEP_FIRST
 from mstar.engine.resources.sampler.config import SamplerStep
 from mstar.engine.resources.step import BucketKey, SlotLease, StepContext
+from mstar.model.keys import PREFILL_TEXT as PREFILL_WALK
+
+# the decoder scaffold's decode walk, which Qwen3 verifies on
+DECODE_WALK = "decode"
+
+DRAFT = dict(architectures=["Qwen3ForCausalLM"], model_type="qwen3", hidden_size=32, num_hidden_layers=2,
+             num_attention_heads=4, num_key_value_heads=2, head_dim=16, intermediate_size=48, vocab_size=97,
+             rms_norm_eps=1e-6, rope_theta=10_000.0, max_position_embeddings=512, tie_word_embeddings=True,
+             torch_dtype="float32", use_sliding_window=False)
 
 
 @pytest.fixture
@@ -32,6 +46,16 @@ def _leased(rids, walk: str, bs: int = 4, slot: int = 0) -> StepContext:
     return ctx
 
 
+def _draft_model_engine(tmp_path, monkeypatch):
+    patch_cpu(monkeypatch)
+    target, _ = write_checkpoints(tmp_path)
+    draft = tmp_path / "draft"
+    draft.mkdir()
+    (draft / "config.json").write_text(json.dumps(DRAFT))
+    model = make_model(target, {"method": "draft_model", "model": str(draft), "num_draft_tokens": 3})
+    return qwen3_engine(model)
+
+
 def _check_staged(sampler, walk: str, names: frozenset[str]) -> None:
     for rid in (1, 2):
         sampler.ingest_request(rid)
@@ -46,6 +70,16 @@ def _check_staged(sampler, walk: str, names: frozenset[str]) -> None:
         staged = sampler._cg_buffers.loopback[name].read_view(0, 4)
         assert rows.data_ptr() == staged.data_ptr(), f"{name} is not read from its staged rows"
         assert rows[:2, 0].tolist() == [2, 1]
+
+
+def test_a_draft_models_verify_walk_stages_its_carry_and_keep_flag(tmp_path, monkeypatch):
+    eng = _draft_model_engine(tmp_path, monkeypatch)
+    sampler = eng._resources["sampler"]
+    assert sampler._graph_reads == {DECODE_WALK: frozenset({DRAFT_CARRY, DRAFT_KEEP_FIRST})}
+    _check_staged(sampler, DECODE_WALK, frozenset({DRAFT_CARRY, DRAFT_KEEP_FIRST}))
+    # a prompt step stages nothing: it stores the first carry, it reads none
+    sampler.plan(SamplerStep(), _leased([2, 1], PREFILL_WALK))
+    assert sampler._staged == frozenset()
 
 
 def test_a_carrying_drafter_with_no_lag_stages_only_its_carry(toy_engine):

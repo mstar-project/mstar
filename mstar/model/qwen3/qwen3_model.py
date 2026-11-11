@@ -1,9 +1,10 @@
 """Dense Qwen3 (Qwen3-8B and its siblings): text in, text out on one ``LLM``
 node of the shared decoder scaffold, on the shared Qwen3 decoder.
 
-``model_kwargs.draft`` turns on speculative decoding with a DSpark drafter
-(`mstar.model.components.dspark`): the drafter's layers join the target's KV
-pool, and every decode step drafts and verifies ``num_draft_tokens`` tokens.
+``model_kwargs.draft`` turns on speculative decoding with a DSpark, EAGLE-3 or
+draft-model drafter (`mstar.model.components`): the drafter's layers join the
+target's KV pool, and every decode step drafts and verifies ``num_draft_tokens``
+tokens.
 Without the block the model is plain Qwen3.
 """
 from __future__ import annotations
@@ -46,7 +47,8 @@ class Qwen3Model(MultimodalDecoderModel):
         self, model_path_hf: str, cache_dir: str | None = None, draft: dict | None = None,
         accelerator_graph: bool = True,
     ):
-        """``draft``: the speculative-decoding block (``method: dspark``).
+        """``draft``: the speculative-decoding block (``method``: ``dspark``,
+        ``eagle3`` or ``draft_model``).
         ``accelerator_graph: false`` runs the LLM node uncaptured (no resident
         planning, so a draft block verifies synchronously)."""
         super().__init__(model_path_hf, cache_dir)
@@ -61,11 +63,15 @@ class Qwen3Model(MultimodalDecoderModel):
         """The drafter's declaration, from its checkpoint's config alone."""
         from mstar.model.components.dspark import DSpark, DSparkConfig
 
-        if draft.method != "dspark":
-            raise ValueError(f"Qwen3 drafts with method dspark, not {draft.method!r}")
+        if draft.method not in ("dspark", "draft_model", "eagle3"):
+            raise ValueError(f"Qwen3 drafts with method dspark, eagle3 or draft_model, not {draft.method!r}")
         directory = self._drafter_dir = resolve_snapshot_dir(
             draft.model, cache_dir=self.cache_dir, allow_patterns=["*.json"],
         )
+        if draft.method == "draft_model":
+            return self._draft_model(draft, directory)
+        if draft.method == "eagle3":
+            return self._eagle3(draft, directory)
         dspark = DSparkConfig.from_hf(json.loads((directory / "config.json").read_text()))
         if max(dspark.taps) >= self.config.num_hidden_layers:
             # its checkpoint names the last layer's output, HF's hidden_states[L], which is after
@@ -85,6 +91,40 @@ class Qwen3Model(MultimodalDecoderModel):
         from transformers import AutoTokenizer
 
         return AutoTokenizer.from_pretrained(self.local_dir)
+
+    def _draft_model(self, draft: DraftConfig, directory):
+        """A separate draft model of the target's family and tokenizer (`DraftModel`)."""
+        from mstar.model.components.draft_model import DraftModel, draft_model_refusals
+
+        hf = json.loads((directory / "config.json").read_text())
+        problems = draft_model_refusals(hf, self.config.vocab_size)
+        mine, theirs = directory / "tokenizer.json", Path(self.local_dir) / "tokenizer.json"
+        if mine.is_file() and theirs.is_file() and \
+                json.loads(mine.read_text()).get("model") != json.loads(theirs.read_text()).get("model"):
+            problems.append("a draft model with another tokenizer is not supported")
+        if problems:
+            raise ValueError(f"draft model {draft.model!r}: " + "; ".join(problems))
+        # its query heads, KV geometry and RoPE base are checked at startup (`geometry_problems`)
+        return DraftModel(
+            qwen3_lm_config(hf), draft.num_draft_tokens, dtype=hf_weight_dtype(hf), kv_key=KV_CACHE, pos_key=ROPE,
+            checkpoint=draft.model, cache_dir=self.cache_dir,
+        )
+
+    def _eagle3(self, draft: DraftConfig, directory):
+        """EAGLE-3 over this target's taps (`Eagle3`)."""
+        from mstar.model.components.eagle3 import Eagle3, Eagle3Config, default_taps
+
+        hf = json.loads((directory / "config.json").read_text())
+        try:
+            config = Eagle3Config.from_hf(hf)
+        except ValueError as exc:
+            raise ValueError(f"draft model {draft.model!r}: {exc}") from None
+        taps = config.taps or default_taps(self.config.num_hidden_layers)
+        # its query heads, KV geometry, RoPE base and the width it reads are checked at startup (`geometry_problems`)
+        return Eagle3(
+            config, draft.num_draft_tokens, dtype=hf_weight_dtype({**hf.get("transformer_layer_config", {}), **hf}),
+            taps=taps, kv_key=KV_CACHE, pos_key=ROPE, attn_key=ATTN, checkpoint=draft.model, cache_dir=self.cache_dir,
+        )
 
     def _stop_token_ids(self, hf: dict) -> frozenset[int]:
         """Every EOS the configs name, and the tokenizer's: a chat turn ends on
