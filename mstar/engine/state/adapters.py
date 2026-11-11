@@ -37,7 +37,7 @@ from mstar.engine.resources.sampler.config import SamplerSpec, SamplerStep, Samp
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
 from mstar.engine.resources.step import Segment, SubmoduleStep
 from mstar.engine.state.analysis import both_sharded, position_key
-from mstar.engine.state.calls import ArrayHandle, SamplerHandle, pool_layers
+from mstar.engine.state.calls import ArrayHandle, SamplerHandle, pool_layers, segments_of
 from mstar.engine.state.contract import (
     EMPTY,
     Array,
@@ -362,7 +362,7 @@ class ArraySteps(StepBuilder):
             bound.binding.steps(bound.key, segments, self._steps)
         if handle.array.positions is not None:
             # a step that keeps nothing doesn't advance the counter
-            advance = declared.advance if declared.keep else (0,) * len(segments or step.segments)
+            advance = declared.advance if declared.keep else (0,) * len(segments_of(declared, step))
             self._steps[handle.positions_key] = PositionStep(
                 segments=segments, advance=advance, pos_ids=declared.position_ids,
             )
@@ -386,7 +386,7 @@ class WithinStepSteps(StepBuilder):
         exchange, and any other over this rank's share of a sharded side."""
         if not handle._plans:
             return
-        key, name, segments = handle.resource_key, handle.name, declared.segments or step.segments
+        key, name, segments = handle.resource_key, handle.name, segments_of(declared, step)
         self._fixed[key] = self._fixed.get(key, True) and declared.fixed_layout
         if handle.queried is None:
             self._label(key, name, segments)
@@ -395,10 +395,12 @@ class WithinStepSteps(StepBuilder):
         if queries is None:
             raise ValueError(f"Array {name!r}: a step lists it without {handle.queried.name!r}, whose segments lay out "
                              "its queries")
-        q_label = self._label(key, name, handle.query_share(queries.segments or step.segments))
+        q_label = self._label(key, name, handle.query_share(segments_of(queries, step)))
         self._pairs.setdefault(key, []).append((q_label, self._label(key, name, handle.key_share(segments))))
 
     def _label(self, key: str, name: str, segments: Sequence[Segment]) -> str:
+        if not segments:
+            raise ValueError(f"Array {name!r}: a step lists it with no segments, its own or the step's")
         label = segments[0].label
         if tuple(self._labels.setdefault(key, {}).setdefault(label, segments)) != tuple(segments):
             raise ValueError(f"Array {name!r}: label {label!r} on its resource already holds other segments")
@@ -934,9 +936,9 @@ class WithinStepHandle(ArrayHandle):
         super().begin_step(step)
         if step.ctx.replays:
             return
-        segments = step.state[self.name].segments or step.segments or ()
+        segments = segments_of(step.state[self.name], step) or ()
         if self.queried is not None:
-            queries = step.state[self.queried.name].segments or step.segments
+            queries = segments_of(step.state[self.queried.name], step)
             if [s.request_id for s in queries] != [s.request_id for s in segments]:
                 raise self._refusal(f"its segments and those of {self.queried.name!r}, which lay out its queries, must "
                                     "name the same requests in the same order, with one segment to one")

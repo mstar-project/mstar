@@ -5,13 +5,18 @@ on a replay, and its checks live in it.
 """
 
 from abc import abstractmethod
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 import torch
 
-from mstar.engine.resources.step import StepHandle
+from mstar.engine.resources.step import Segment, StepHandle
 from mstar.engine.state.contract import Array, ArrayStep, CausalConv, GatedDeltaNet, Op, Sampler
+
+
+def segments_of(declared: ArrayStep, step) -> Sequence[Segment]:
+    """The segments ``declared`` lays out in ``step``: its own, or the step's where it lists None."""
+    return step.segments if declared.segments is None else declared.segments
 
 
 def pool_layers(array: Array) -> dict[int, int]:
@@ -82,7 +87,7 @@ class ArrayHandle(StepHandle):
             raise self._refusal("a step began while another is open")
         self._open = True
         declared: ArrayStep = step.state[self.name]
-        segments = declared.segments or step.segments
+        segments = segments_of(declared, step)
         if segments:
             self.label = segments[0].label
         # on a replay too, whose `eager_add` adds still run
