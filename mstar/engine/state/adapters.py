@@ -4,10 +4,12 @@ storage and op type, and a handle per storage. It builds the specs, steps and la
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, replace
+from functools import partial
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
 
 import torch
 
+from mstar.engine.resources.attn.base import AttentionManager
 from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec, AttentionStep
 from mstar.engine.resources.attn.ragged.config import RaggedAttentionConfig, RaggedAttentionSpec
 from mstar.engine.resources.kv.config import KVSpec, KVStep, PagedKVConfig
@@ -430,6 +432,12 @@ class ConvOnLinearAttn(OpBinding):
 # Handles
 
 
+def _exchanges(attn: Any) -> bool:
+    """Whether a call on ``attn`` goes through its exchange (`AttentionManager.splits`); a stand-in attention, which
+    is no `AttentionManager`, keeps the direct call."""
+    return isinstance(attn, AttentionManager) and attn.splits
+
+
 class PagedArrayHandle(ArrayHandle):
     """Adds and reads through the KV pages of an array that keeps entries."""
 
@@ -465,9 +473,9 @@ class PagedArrayHandle(ArrayHandle):
         attn = self._attn.get(layer)
         if attn is not None:
             # held for the read, which passes them on as a layer calls attention (`requires_kv_write`): a kernel may
-            # attend the step's own k and v rather than the pages (`reads_step_kv`)
+            # attend the step's own k and v rather than the pages (`reads_step_kv`), and an exchange writes them
             self._held, self._held_layer = (fields["k"], fields["v"]), layer
-        if attn is None or attn.requires_kv_write:
+        if attn is None or attn.requires_kv_write and not _exchanges(attn):
             self._kv.write_kv(fields["k"], fields["v"], layer_idx=self._pool_layer[layer], label=self.label)
 
     @torch.compiler.disable
@@ -479,11 +487,24 @@ class PagedArrayHandle(ArrayHandle):
         layer = self._layer_id(layer)
         self._record_read(layer)
         attn = self._attn[layer]
+        if _exchanges(attn):
+            # the add's write and the attention as one call, on the tokens and heads this rank stores
+            return attn.exchange(partial(self._attend, layer), q, *self._take_hold(layer), label=self.label)
         # a read with no add before it attends the pages alone, which a kernel that takes no writes can't
         k, v = self._take_hold(layer) if self._held is not None or not attn.requires_kv_write else (None, None)
         return attn.run(
             q, label=self.label, kv_cache_layer=self._views[layer], k=k, v=v, layer_idx=self._pool_layer[layer],
         )
+
+    def _attend(self, layer: int, q: torch.Tensor | None, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor | None:
+        """An exchange's ``run``: this layer's write where the kernel reads the pages, then its attention (``q``
+        None: the write alone), as `AttentionCallable` makes the call."""
+        attn, i = self._attn[layer], self._pool_layer[layer]
+        if attn.requires_kv_write:
+            self._kv.write_kv(k, v, layer_idx=i, label=self.label)
+        if q is None:
+            return None
+        return attn.run(q, label=self.label, kv_cache_layer=self._views[layer], k=k, v=v, layer_idx=i)
 
     def at_last_token(self, x: torch.Tensor) -> torch.Tensor:
         self._check_open("at_last_token")
