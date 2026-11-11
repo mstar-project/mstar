@@ -90,7 +90,7 @@ ROUNDS = 4
 # shared, short replies done early), so 192 was never short for a k = 3 drafter
 PRESSURE_PAGES = 128
 # the drafters whose pressure rounds also run on TP2
-TP2_PRESSURE = ("dspark",)
+TP2_PRESSURE = ("dspark", "eagle3")
 # requests preempted for pages, and those of them dropped (main's `Preemption` counts)
 PREEMPTION_COUNTERS = ("mstar_kv_preemptions_total", "mstar_kv_drops_total")
 
