@@ -458,12 +458,17 @@ class PagedArrayHandle(ArrayHandle):
                 raise self._refusal(f"a step touches label {segment.label!r} of request {segment.request_id}, "
                                     "which it didn't open")
 
+    def begin_step(self, step) -> None:
+        super().begin_step(step)
+        # adds that run before the reads, outside the captured graph, which the reads find in the pages
+        self._eager = step.state[self.name].eager_add
+
     @torch.compiler.disable
     def add(self, layer: int | torch.Tensor, *, keep: bool | None = None, **fields: torch.Tensor) -> None:
         layer = self._layer_id(layer)
         self._record_add(layer, keep)
         attn = self._attn.get(layer)
-        if attn is not None:
+        if attn is not None and not self._eager:
             # held for the read, which passes them on as a layer calls attention (`requires_kv_write`): a kernel may
             # attend the step's own k and v rather than the pages (`reads_step_kv`)
             self._held, self._held_layer = (fields["k"], fields["v"]), layer
