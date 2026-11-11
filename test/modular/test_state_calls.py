@@ -843,15 +843,6 @@ def test_add_read_refuses_an_array_with_max_len_0_whose_read_stays_in_the_graph(
     _refused(r"Array 'kv': add_read with max_len 0", lambda: add_read(h, 0, q, k=k, v=v))
 
 
-def test_add_read_refuses_an_entry_with_a_field_named_q():
-    t = TensorType((HEADS, DIM), dtype=None, shard=0)
-    h = _kv_handle(_array(entry=Entry({"k": t, "v": t, "q": t})))
-    _begin(h)
-    q, k, v = _tensors()
-    _refused(r"Array 'kv': add_read takes q for the read, and the entry declares a field named q",
-             lambda: add_read(h, 0, q, k=k, v=v))
-
-
 def _resume_frames(fn, *args) -> list[str]:
     """Counted from Dynamo's resume frames, since a frame with no graph doesn't show in ``graph_break_count``."""
     torch._dynamo.reset()

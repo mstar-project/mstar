@@ -192,9 +192,6 @@ class ArrayHandle(StepHandle):
     ) -> torch.Tensor:
         self._check_add_read("add_read")
         fields = self.array.entry.tensors
-        # A keyword a read defines can't share a field's name, since it would go to `add`.
-        if "q" in fields:
-            raise self._refusal("add_read takes q for the read, and the entry declares a field named q")
         self.add(layer, keep=keep, **{name: keywords.pop(name) for name in fields if name in keywords})
         return self.read(layer, q, **keywords)
 
