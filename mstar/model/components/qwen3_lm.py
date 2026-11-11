@@ -180,5 +180,13 @@ class Qwen3DenseLM(nn.Module):
         self.layers[0].self_attn.attend.bind_step(label)
         return run_layers(self.layers, input_embeds, self.norm, taps=taps)
 
+    def write_kv(self, hidden_states: torch.Tensor, *, label: str) -> None:
+        """Every layer's K/V of the same ``hidden_states``, under ``label``, without
+        running the stack (`ParallelAttention.write_kv`, the unfused path)."""
+        self.layers[0].self_attn.attend.bind_step(label)
+        for i, layer in enumerate(self.layers):
+            layer.self_attn.attend.set_layer_idx(i)
+            layer.self_attn.write_kv(hidden_states)
+
     def logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.lm_head(hidden_states)
