@@ -218,7 +218,7 @@ class ParakeetModel(Model):
                 raise ValueError(
                     f"{config_path}: {cap} concurrent requests (max_concurrent_requests) need as "
                     f"many in resources.{spec.resource_key}, which holds {held}; raise its "
-                    "max_slots or lower max_concurrent_requests"
+                    "max_slots (a recurrent pool's sink slot holds no request) or lower max_concurrent_requests"
                 )
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
