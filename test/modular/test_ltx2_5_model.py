@@ -15,7 +15,7 @@ sys.path.insert(0, ".")
 import pytest
 import torch
 
-from mstar.engine.resources import AttentionStep, RaggedCrossAttentionSpec, RaggedCrossAttentionStep, SeqShardStep
+from mstar.engine.resources import AttentionStep, RaggedCrossAttentionSpec, RaggedCrossAttentionStep
 from mstar.engine.resources.sequence_shard import sequence_parallel_refusals
 from mstar.graph.base import GraphNode, Loop, Parallel, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
@@ -349,10 +349,9 @@ def test_declare_step_spans_and_pairs():
     shape = LTXShape(frames=2, height=3, width=4, audio_frames=5, fps=24.0, text_len=16)
     inputs = [NodeInputs(resource_step_info=shape) for _ in range(2)]
     step = _dit(cfg).declare_step("generate_av", [11, 12], inputs)
-    # every span whole, the sequence shard's step over the video: on SP ranks the resources cut
-    # the video spans to each rank's share themselves
-    assert isinstance(step.steps[VIDEO_SHARD], SeqShardStep)
-    assert [(s.request_id, s.label, s.span) for s in step.steps[VIDEO_SHARD].segments] == [
+    # every span whole, the step's segments the video's (the sequence shard's): on SP ranks the
+    # resources cut the video spans to each rank's share themselves
+    assert [(s.request_id, s.label, s.span) for s in step.segments] == [
         (11, "video", 24), (12, "video", 24),
     ]
     video, audio = step.steps[VIDEO_ATTN], step.steps[AUDIO_ATTN]

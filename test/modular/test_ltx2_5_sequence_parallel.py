@@ -27,7 +27,7 @@ from mstar.model.ltx2_5.components.transformer import LTX2DiT  # noqa: E402
 from mstar.model.ltx2_5.config import DENOISE_LOOP, LTX25Config  # noqa: E402
 from mstar.model.ltx2_5.ltx2_5_model import LTX25Model  # noqa: E402
 from mstar.model.ltx2_5.submodules import VIDEO_SHARD, LTXDenoiseSubmodule, LTXShape  # noqa: E402
-from mstar.model.submodule_base import NodeInputs  # noqa: E402
+from mstar.model.submodule_base import NodeInputs, engine_step  # noqa: E402
 
 WORLD = 2
 CPU = torch.device("cpu")
@@ -94,7 +94,7 @@ def _denoise(rank, frames, height, width):
     sp = _group(rank)
     split.bind_node_resources(_resources(cfg, JointGroups(tp_group=CommGroup.trivial(), sp_group=sp, instance=sp)))
     rids = ["r0", "r1"]
-    step = split.declare_step("generate_av", rids, [NodeInputs(resource_step_info=shape)] * len(rids))
+    step = engine_step(split, "generate_av", rids, [NodeInputs(resource_step_info=shape)] * len(rids))
     step.set_ctx(StepContext(request_ids=rids, graph_walk="generate_av", slot=0, capture=False))
     StepRunner(split.node_resources).plan(step)
     tokens = frames * height * width

@@ -45,12 +45,6 @@ if TYPE_CHECKING:
 # --- declaration ------------------------------------------------------------------------------
 
 
-@dataclass(frozen=True)
-class SeqShardStep(ResourceStep):
-    """The step's segments and ``combined_labels`` (``SubmoduleStep`` fills both, unless the step
-    sets its own segments), so a combined plan label gets a range over its sources too."""
-
-
 @dataclass
 class SeqShardSpec(NodeResourceSpec):
     """A node's steps split over its SP ranks, or copied.
@@ -67,8 +61,9 @@ class SeqShardSpec(NodeResourceSpec):
     rank may get an empty range (fewer units than ranks still splits; ``gather`` takes it).
 
     The attention and position resources on the node take this as a dependency in their own
-    ``derive``, so every ``declare_step`` branch of the node declares a ``SeqShardStep``; at one
-    SP rank it plans copied at no cost."""
+    ``derive``. A model declares no step for it: its step is the node's segments and
+    ``combined_labels`` (``Resource.steps_from_segments``), so a combined plan label gets a range
+    over its sources too; at one SP rank it plans copied at no cost."""
 
     labels: tuple[str, ...]
     axis: int
@@ -78,6 +73,9 @@ class SeqShardSpec(NodeResourceSpec):
 
     def __post_init__(self):
         super().__post_init__()
+        # a string would split into characters, which match no label: every step would plan copied
+        if isinstance(self.labels, str) or isinstance(self.walks, str):
+            raise ValueError(f"sequence shard {self.resource_key!r}: labels and walks are collections, not strings")
         self.labels = tuple(self.labels)
         if not self.labels:
             raise ValueError(f"sequence shard {self.resource_key!r} lists no labels")
@@ -174,6 +172,8 @@ class SequenceShard(Resource):
 
     prefix_skip_safe = True
     supports_split_steps = True
+    # its step is the node's segments and combined labels
+    steps_from_segments = True
     # holds no per-request state, so a dropped request leaves nothing behind
     supports_drop = True
 
@@ -248,7 +248,7 @@ class SequenceShard(Resource):
                     "total_tokens_multiplier"
                 )
 
-    def plan(self, step: SeqShardStep, ctx: StepContext) -> SeqShardPlan:
+    def plan(self, step: ResourceStep, ctx: StepContext) -> SeqShardPlan:
         assert not (self._preplanned and ctx.is_preplan), (
             "sequence shard preplan is already pending; clear_preplan before planning a different step ahead"
         )
@@ -264,7 +264,7 @@ class SequenceShard(Resource):
             self._scattered.clear()
         return result
 
-    def commit(self, step: SeqShardStep, ctx: StepContext) -> None:
+    def commit(self, step: ResourceStep, ctx: StepContext) -> None:
         # the plan ends with its step: a bracket outside one (a warmup compile) is the identity
         self._current = None
         self._scattered.clear()
@@ -276,7 +276,7 @@ class SequenceShard(Resource):
         self._current = None
         self._scattered.clear()
 
-    def _decide(self, step: SeqShardStep, ctx: StepContext) -> SeqShardPlan:
+    def _decide(self, step: ResourceStep, ctx: StepContext) -> SeqShardPlan:
         """Split or copied, from inputs every rank of the instance shares: the declared step, the
         walk and the lease."""
         lease = ctx.slot_lease
@@ -410,12 +410,12 @@ class SequenceShard(Resource):
 
 
 def check_shard_plan(owner: str, shard_key: str, ctx: StepContext) -> SeqShardPlan:
-    """The shard plan a dependent of ``shard_key`` reads; raises if the step doesn't declare it."""
+    """The shard plan a dependent of ``shard_key`` reads; raises if the step has none (it declares no segments)."""
     plan = ctx.plan_results.get(shard_key)
     if plan is None:
         raise ValueError(
-            f"{owner} depends on sequence shard {shard_key!r}, which this step doesn't declare: "
-            "every declare_step branch of its node declares a SeqShardStep"
+            f"{owner} depends on sequence shard {shard_key!r}, which this step doesn't plan: "
+            "its step is made of the node's segments, and this one declares none (nor a step of its own)"
         )
     return plan
 
@@ -515,7 +515,8 @@ def sequence_parallel_refusals(
             return []
         return [
             f"node {node!r} runs on {sp} SP ranks but neither splits tokens (a SeqShardSpec) nor stores "
-            "KV by position (context_parallel on its paged KV pools)"
+            "KV by position (context_parallel on its paged KV pools); an attention run outside the "
+            "engine's resources (attention_backend: sdpa) declares neither"
         ]
     refusals = []
     attends = any(spec.attends_split_steps for spec in specs)

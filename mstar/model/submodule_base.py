@@ -881,7 +881,7 @@ class NodeSubmodule(torch.nn.Module, ABC):
     capture_cudnn_benchmark: bool = False
 
     # The keys of this node's resources whose step is its segments
-    # (``Resource.steps_from_segments``: the LoRA pools); set by `bind_node_resources`. The
+    # (``Resource.steps_from_segments``: the LoRA pools, the sequence shard); set by `bind_node_resources`. The
     # engine adds a step of the segments under each to the node's step (``engine_step``),
     # and to each piecewise region's from the region's own: in order, the rows the node's
     # computation sees, each a request's span of tokens (a request may have several, as
@@ -1521,12 +1521,15 @@ class NodeSubmodule(torch.nn.Module, ABC):
 def with_segment_steps(step: SubmoduleStep | None, keys: Sequence[str]) -> SubmoduleStep | None:
     """``step`` with a ``ResourceStep`` of its segments under each of ``keys`` (the
     resources whose step is the segments, ``Resource.steps_from_segments``) that it does
-    not declare itself, as a new step (a declaration reused across calls keeps its own). A
-    step without segments gets none: a resource that needs one refuses for want of a plan
-    (``LoraLayerDelta``)."""
+    not declare itself, as a new step carrying its ``combined_labels`` (a declaration reused
+    across calls keeps its own). A step without segments gets none: a resource that needs one
+    refuses for want of a plan (``LoraLayerDelta``, the sequence shard's dependents)."""
     if keys and step is not None and step.segments is not None:
         segments = tuple(step.segments)
-        added = {key: ResourceStep(segments=segments) for key in keys if key not in step.steps}
+        added = {
+            key: ResourceStep(segments=segments, combined_labels=step.combined_labels)
+            for key in keys if key not in step.steps
+        }
         if added:
             step = replace(step, steps={**step.steps, **added})
     return step

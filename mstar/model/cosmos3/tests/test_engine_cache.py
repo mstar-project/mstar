@@ -32,7 +32,7 @@ from mstar.engine.resources.base import AttentionResource
 from mstar.engine.resources.kv.plan import group_by_plan_label
 from mstar.engine.resources.sequence_shard import SequenceShard
 from mstar.model.cosmos3.submodules import ATTN, COND_LABEL, KV_CACHE, LATENT_DTYPE, SEQ_SHARD, UNCOND_LABEL
-from mstar.model.submodule_base import ModelInputsFromEngine
+from mstar.model.submodule_base import ModelInputsFromEngine, engine_step
 
 PROMPT = "A red cube resting on a polished wooden table, soft daylight."
 # Parity checks here are resolution-independent; 256x256 keeps them quick. The
@@ -300,7 +300,7 @@ def _forward_step(
         step_fwds = cg_runner.step_metadata(lease, real_ids, step_fwds)
         step_ids = cg_runner.step_ids(lease, real_ids)
 
-    step = dit.declare_step(walk, step_ids, inputs, slot_lease=lease)
+    step = engine_step(dit, walk, step_ids, inputs, slot_lease=lease)
     if step is not None:
         step.set_ctx(StepContext(
             request_ids=tuple(step_ids), graph_walk=walk,

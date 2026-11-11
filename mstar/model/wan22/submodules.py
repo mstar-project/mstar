@@ -324,7 +324,6 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
         super().__init__(
             loop_name=DENOISE_LOOP_NAME, max_batch_size=config.dit_max_batch_size,
             attn_resource_key=self.SELF_ATTN if config.attention_backend == "flashinfer" else None,
-            shard_resource_key=self.SEQ_SHARD if config.attention_backend == "flashinfer" else None,
         )
         self.transformer = transformer
         self.config = config

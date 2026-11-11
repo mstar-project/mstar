@@ -24,7 +24,7 @@ from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.resources import AttentionStep, Segment, SeqShardStep, SubmoduleStep
+from mstar.engine.resources import AttentionStep, Segment, SubmoduleStep
 from mstar.model.components.batched_rows import BatchedRows
 from mstar.model.components.diffusion.attention import joint_attention, sdpa_attention
 from mstar.model.components.diffusion.compile_utils import compile_blocks as compile_blocks_
@@ -264,10 +264,10 @@ class H3DenoiseSubmodule(DenoiseLoopSubmodule):
             raise ValueError(f"the MiniMax-H3 dit runs one request per step; got max_batch_size={max_batch_size}")
         if int(row_bucket) < 1:
             raise ValueError(f"row_bucket must be a positive int; got {row_bucket!r}")
-        super().__init__(
-            loop_name=loop_name, max_batch_size=1, attn_resource_key=attn_resource_key,
-            shard_resource_key=shard_resource_key,
-        )
+        super().__init__(loop_name=loop_name, max_batch_size=1, attn_resource_key=attn_resource_key)
+        # the node's sequence shard: its step is the node's segments, and the DiT brackets its
+        # layer stack with its scatter / gather
+        self.shard_resource_key = shard_resource_key
         self.transformer = transformer
         self.config = config
         self.compiled = bool(compile_blocks)
@@ -495,7 +495,7 @@ class H3VideoDecoderSubmodule(_LayoutBatched, BatchedRows, NodeSubmodule):
             Segment(rid, self.CLIPS, self.vae.walk.num_clips(inp.resource_step_info.latent_frames))
             for rid, inp in zip(request_ids, inputs, strict=True)
         ]
-        return SubmoduleStep(segments=segments, steps={self.shard_resource_key: SeqShardStep()})
+        return SubmoduleStep(steps={}, segments=segments)
 
     def run_batch(self, latents: torch.Tensor, layout: H3Layout, **kwargs):
         # SDPA within each fixed-size tile, as the reference: dense, one segment, no capture,
