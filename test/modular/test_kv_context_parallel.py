@@ -1083,7 +1083,7 @@ def test_the_startup_fit_check_pages_a_placed_pools_window_as_the_worker_does():
             )),
         ]
 
-    model = types.SimpleNamespace(get_node_resources=resources)
+    model = make_model(get_node_resources=resources)
     log = logging.getLogger(__name__)
     for sp, fits in ((1, True), (P, False)):
         config = {"max_concurrent_requests": 2,
@@ -1113,7 +1113,7 @@ def test_the_conductor_counts_a_placed_pools_window_pages_as_the_worker_does():
             )),
         ]
 
-    model = types.SimpleNamespace(get_node_resources=resources)
+    model = make_model(get_node_resources=resources)
     conductor = Conductor.__new__(Conductor)
     conductor.model, conductor.model_config = model, {}
     section = GraphNode(name=NODE, input_names=[], outputs=[])
