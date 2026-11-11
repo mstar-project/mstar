@@ -192,6 +192,34 @@ def test_a_layout_reaches_its_streams_as_footprints(tmp_path, monkeypatch, prefi
     assert kv._ensure_label("r", "uncond").footprint == -(-(10 + 2 * 40 + 7) // PS)
 
 
+class _Verifying(_Model):
+    """A pool that verifies drafts: it holds a slack of 8 past its client limit, and its one label
+    declares no scratch, which the conductor floors at the slack."""
+
+    def __init__(self):
+        super().__init__(layout={"kv": {"main": LAYOUT["kv"]["main"]}})
+
+    def get_node_resources(self):
+        (spec,) = super().get_node_resources()
+        spec.bind_draft_slack(8)
+        return [spec]
+
+    def kv_labels(self):
+        return {"kv": {"main": super().kv_labels()["kv"]["main"]}}
+
+    def get_request_resource_configs(self, input_modalities, output_modalities, model_kwargs):
+        return {"kv": KVReqConfig(needed_labels=["main"])}
+
+
+def test_the_conductor_floors_a_verifying_pools_scratch_at_its_slack(tmp_path, monkeypatch):
+    """The conductor's own `apply_spec` is the only place a verifying request's layout gets the
+    slack it reserves: without it the worker refuses every request."""
+    model = _Verifying()
+    kwargs = _preprocess(model, {"max_output_tokens": 30})
+    cfg = _ingest(model, kwargs, tmp_path, monkeypatch).request_info.resource_configs["kv"]
+    assert cfg.kv_layout["main"].scratch == 8
+
+
 class _NamesNoCheckpoint(_Model):
     checkpoint_path = Model.checkpoint_path
 
