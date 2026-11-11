@@ -169,6 +169,12 @@ def test_an_append_only_array_on_other_nodes_does_not_stop_the_link():
     assert _by_key(other, _kv(), _gdn())["gdn"].config.kv_cache == "kv", "only an array on the value's nodes can link"
 
 
+def test_a_cross_read_array_on_the_value_nodes_does_not_stop_the_link():
+    context = Array("context", nodes={"llm"}, layers={2, 5}, entry=KVEntry(heads=4, head_dim=16), max_len=64,
+                    reads={"cross": _read(mask=Bidirectional(), queries="kv")})
+    assert _by_key(_kv(), context, _gdn())["gdn"].config.kv_cache == "kv", "a context holds no row's own entries"
+
+
 def test_a_value_specs_sit_on_the_value_nodes_not_the_pool_nodes():
     specs = _by_key(_kv(nodes={"llm", "audio"}), _gdn())
     assert specs["gdn"].nodes == specs["delta"].nodes == {"llm"}, "the state would be built where the value isn't"

@@ -281,6 +281,7 @@ def _apply_kernel_settings(
 ) -> None:
     """Set the kernel choices, capture sizes and default pool sizes the contract leaves to the engine, and refuse any
     other, so this hook can't carry other physical choices until the engine picks kernels and sizes its pools itself."""
+    # each key's owner and the resource its settings go on: an array's pool is under its name
     owners = {array.name: (array, storage_of(array), array.name) for array in arrays} | {
         bound.key: (array, bound.binding, resolved.resource_of[bound.key])
         for array in arrays for bound in resolved.bound[array.name] if bound.binding.kernel_settings

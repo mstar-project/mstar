@@ -2314,7 +2314,8 @@ The rest are free functions in ``mstar.engine.state``:
 
 A layer with nothing traced between its ``add`` and its ``read`` calls ``add_read``, since two breaks
 compile a frame for the gap on every shape. It runs both calls' checks in their order, and refuses an
-array with ``max_len=0``, whose calls a compiled block traces.
+array with ``max_len=0``, whose calls a compiled block traces. Call it from the frame the layer
+compiles: a break inside a method that frame calls compiles that method as a frame of its own.
 
 On an array that keeps entries, every call that touches state breaks the compiled graph and runs
 eagerly, so model code adds no ``torch.compiler.disable`` of its own. A layer stack calls
