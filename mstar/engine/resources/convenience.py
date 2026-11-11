@@ -101,7 +101,7 @@ class AttentionCallable:
         own; a step that attends the fresh K/V (``reads_step_kv``) gets them
         normed and rotated. Where ``__call__`` goes through the attention's exchange (a split
         step, or a node that splits over KV stored by head), so do the write and the attention (the
-        unfused branch); a copied step over KV stored by position keeps the fused write."""
+        unfused branch); a copied decode step over KV stored by position keeps the fused write."""
         from mstar.utils.attention import qk_norm_rope_inplace, qk_norm_rope_kv_write
 
         eps = _norm_eps(q_norm, k_norm)
