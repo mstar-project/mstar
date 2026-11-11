@@ -52,6 +52,7 @@ from mstar.engine.state.contract import (
     KVEntry,
     Layout,
     Op,
+    Positions,
     Read,
     Sampler,
     SampleSettings,
@@ -84,8 +85,7 @@ def build_specs(
     setup: "StateSetup | None" = None,
 ) -> list[NodeResourceSpec]:
     """Each array's specs, from its storage and its ops' bindings, under the names the declarations give, then a
-    `PositionSpec` for each array that declares positions and a `SamplerSpec` per sampler. A read that ``setup`` binds
-    takes that binding.
+    `SamplerSpec` per sampler. A read that ``setup`` binds takes that binding.
 
     Raises ``ValueError`` on an array today's specs can't hold, naming what they lack. That includes a second update of
     one type on an array, a temporary limit: an update call finds its op by type, which today's resources need and the
@@ -96,8 +96,6 @@ def build_specs(
     specs: list[NodeResourceSpec] = []
     for array in arrays:
         specs += resolved.specs[array.name]
-        if array.positions is not None:
-            specs.append(_position_spec(array))
     specs += [_sampler_spec(declared) for declared in declarations if isinstance(declared, Sampler)]
     _apply_kernel_settings(specs, arrays, resolved.resource_of, kernel_settings)
     return specs
@@ -357,16 +355,10 @@ class ArraySteps(StepBuilder):
         self._steps: dict[str, Any] = {}
 
     def add(self, handle: ArrayHandle, declared: ArrayStep, step: SubmoduleStep) -> None:
-        segments = declared.segments
+        segments = segments_of(declared, step)
         self._storage.steps(handle, declared, self._steps)
         for bound in handle._bindings:
-            bound.binding.steps(bound.key, segments, self._steps)
-        if handle.array.positions is not None:
-            # a step that keeps nothing doesn't advance the counter
-            advance = declared.advance if declared.keep else (0,) * len(segments_of(declared, step))
-            self._steps[handle.positions_key] = PositionStep(
-                segments=segments, advance=advance, pos_ids=declared.position_ids,
-            )
+            bound.binding.steps(bound.key, declared, segments, self._steps)
 
     def steps(self) -> dict[str, Any]:
         return self._steps
@@ -475,10 +467,10 @@ def sampling_configs(
 
 
 class BoundOp(NamedTuple):
-    """One of an array's reads or updates, under its key, with the binding that runs it."""
+    """One of an array's reads or updates, or its positions, under its key, with the binding that runs it."""
 
     key: str
-    declared: Read | Op
+    declared: Read | Op | Positions
     binding: "OpBinding"
 
 
@@ -490,15 +482,15 @@ class OpBinding:
     # those of them whose value in effect the bound runner reports, which `kernel_setting` reads back
     read_back: ClassVar[frozenset[str]] = frozenset()
 
-    def check(self, array: Array, key: str, declared: Read | Op) -> None:
+    def check(self, array: Array, key: str, declared: Read | Op | Positions) -> None:
         """Raise ``ValueError`` on what today's resources can't run, naming ``array``."""
         return
 
-    def specs(self, array: Array, key: str, declared: Read | Op) -> list[NodeResourceSpec]:
+    def specs(self, array: Array, key: str, declared: Read | Op | Positions) -> list[NodeResourceSpec]:
         return []
 
-    def steps(self, key: str, segments, steps: dict[str, Any]) -> None:
-        """Add the step of the op's resource under ``key``, over ``segments``."""
+    def steps(self, key: str, declared: ArrayStep, segments, steps: dict[str, Any]) -> None:
+        """Add the step of the op's resource under ``key``, for the array's ``declared`` step over ``segments``."""
         return
 
     def block(self, tensor: TensorType) -> RecurrentBlockConfig:
@@ -538,8 +530,26 @@ class PagedAttend(OpBinding):
             ),
         )]
 
-    def steps(self, key: str, segments, steps: dict[str, Any]) -> None:
+    def steps(self, key: str, declared: ArrayStep, segments, steps: dict[str, Any]) -> None:
         steps[key] = AttentionStep(segments=segments, causal=True)
+
+
+class PositionsBinding(OpBinding):
+    """An array's `Positions`, which a position resource keeps per request under `position_key`, with the `Rope` its
+    calls rotate by."""
+
+    def specs(self, array: Array, key: str, declared: Positions) -> list[NodeResourceSpec]:
+        return [_position_spec(array)]
+
+    def steps(self, key: str, declared: ArrayStep, segments, steps: dict[str, Any]) -> None:
+        # a step that keeps nothing doesn't advance the counter
+        advance = declared.advance if declared.keep else (0,) * len(segments)
+        steps[key] = PositionStep(segments=segments, advance=advance, pos_ids=declared.position_ids)
+
+    def bind(self, array: Array, key: str, resources: Mapping[str, Any]) -> tuple[Any, torch.dtype | None]:
+        """The position resource, and the dtype the declared `Rope` rotates in, None for the query's."""
+        rope = array.positions.rope
+        return resources[key], None if rope is None else rope.dtype
 
 
 class WithinStepAttend(OpBinding, ABC):
@@ -594,7 +604,7 @@ class LinearAttnBinding(OpBinding):
 
     kernel_settings = frozenset({"splits"})
 
-    def steps(self, key: str, segments, steps: dict[str, Any]) -> None:
+    def steps(self, key: str, declared: ArrayStep, segments, steps: dict[str, Any]) -> None:
         steps[key] = LinearAttnStep(segments=segments)
 
     @staticmethod
@@ -668,11 +678,17 @@ class PagedArrayHandle(ArrayHandle):
     """Adds and reads through the KV pages of an array that keeps entries."""
 
     def __init__(
-        self, array: Array, resources: Mapping[str, Any], positions_key: str | None, bindings: tuple[BoundOp, ...],
+        self, array: Array, resources: Mapping[str, Any], bindings: tuple[BoundOp, ...],
     ):
-        super().__init__(array, resources, positions_key)
+        super().__init__(array, resources)
         self._bindings = bindings
-        self.reads = {bound.key: bound.binding.bind(array, bound.key, resources) for bound in bindings}
+        self.reads = {
+            bound.key: bound.binding.bind(array, bound.key, resources)
+            for bound in bindings if isinstance(bound.declared, Read)
+        }
+        for bound in bindings:
+            if isinstance(bound.declared, Positions):
+                self.positions, self.rope_dtype = bound.binding.bind(array, bound.key, resources)
         self.first_read = next(iter(self.reads.values()))
         self._attn = {
             layer: self.reads[key]
@@ -728,9 +744,9 @@ class ValueHandle(ArrayHandle):
     """The calls on a Value: its updates, which run in place on one layer's block, and writes of whole fields."""
 
     def __init__(
-        self, array: Array, resources: Mapping[str, Any], positions_key: str | None, bindings: tuple[BoundOp, ...],
+        self, array: Array, resources: Mapping[str, Any], bindings: tuple[BoundOp, ...],
     ):
-        super().__init__(array, resources, positions_key)
+        super().__init__(array, resources)
         self._bindings = bindings
         self._pool = resources[array.name]
         self._blocks = {
@@ -776,7 +792,7 @@ class HostValueHandle(ArrayHandle):
     """The calls on a Value of host fields only, which ``host_fields`` holds rather than a resource."""
 
     def __init__(self, array: Array, host_fields: HostFields):
-        super().__init__(array, EMPTY, None)
+        super().__init__(array, EMPTY)
         self._bindings: tuple[BoundOp, ...] = ()
         self.host_fields = host_fields
         host_fields.declare(array)
@@ -903,10 +919,10 @@ class WithinStepHandle(ArrayHandle):
     """
 
     def __init__(
-        self, array: Array, resources: Mapping[str, Any], positions_key: str | None, bindings: tuple[BoundOp, ...], *,
+        self, array: Array, resources: Mapping[str, Any], bindings: tuple[BoundOp, ...], *,
         resource_key: str | None = None, queried: Array | None = None, sp_group: CommGroup | None = None,
     ):
-        super().__init__(array, resources, positions_key)
+        super().__init__(array, resources)
         self._bindings = bindings
         ((key, read, self._binding),) = bindings
         self.resource_key = resource_key or key
@@ -1030,8 +1046,7 @@ class Storage(ABC):
         sp_group: CommGroup | None,
     ) -> ArrayHandle:
         """``array``'s handle over a node's built ``resources``."""
-        key = None if array.positions is None else position_key(array)
-        return self.handle_class(array, resources, key, _bindings(self, array, setup.by_read))
+        return self.handle_class(array, resources, _bindings(self, array, setup.by_read))
 
     def steps(self, handle: ArrayHandle, declared: ArrayStep, steps: dict[str, Any]) -> None:
         """Add the step of the array's own resource, under its name."""
@@ -1195,7 +1210,7 @@ class WithinStepStorage(Storage):
     ) -> ArrayHandle:
         (key,) = array.reads
         return WithinStepHandle(
-            array, resources, None, _bindings(self, array, setup.by_read),
+            array, resources, _bindings(self, array, setup.by_read),
             resource_key=resolved.resource_of.get(key, key), queried=resolved.queried.get(key), sp_group=sp_group,
         )
 
@@ -1217,8 +1232,9 @@ def storage_of(array: Array) -> Storage:
 
 # `Attend` is an `AttentionSpec` on a paged array and a `RaggedAttentionSpec` within a step, so a binding is per storage
 # and op type.
-BINDINGS: dict[tuple[Storage, type[Op]], OpBinding] = {
+BINDINGS: dict[tuple[Storage, type[Op | Positions]], OpBinding] = {
     (PAGED, Attend): PagedAttend(),
+    (PAGED, Positions): PositionsBinding(),
     (WITHIN_STEP, Attend): RaggedAttend(),
     (VALUE, GatedDeltaNet): GDN(),
     (VALUE, CausalConv): ConvOnLinearAttn(),
@@ -1239,9 +1255,9 @@ class StateSetup:
 def _bindings(
     storage: Storage, array: Array, chosen: Mapping[str, OpBinding] = EMPTY,
 ) -> tuple[BoundOp, ...]:
-    """``array``'s reads, then its updates, each with the binding that runs it on ``storage``: ``chosen``'s for a read
-    it names, and `BINDINGS`' for the rest. Each binding checks its op. Refuses a pair `BINDINGS` has no entry for, and
-    a second update of one type."""
+    """``array``'s reads, then its updates, then its positions, each with the binding that runs it on ``storage``:
+    ``chosen``'s for a read it names, and `BINDINGS`' for the rest. Each binding checks its op. Refuses a pair
+    `BINDINGS` has no entry for, and a second update of one type."""
     bound = []
     for key, read in array.reads.items():
         binding = BINDINGS.get((storage, type(read.op)))
@@ -1258,13 +1274,18 @@ def _bindings(
             raise _no_layout(array, f"updates[{other!r}] and updates[{key!r}] are both {type(op).__name__}, and an "
                                     "update call finds its op by type")
         bound.append(BoundOp(key, op, BINDINGS[storage, type(op)]))
+    if array.positions is not None:
+        binding = BINDINGS.get((storage, Positions))
+        if binding is None:
+            raise _no_layout(array, "positions, which only an append-only array that keeps entries holds")
+        bound.append(BoundOp(position_key(array), array.positions, binding))
     for each in bound:
         each.binding.check(array, each.key, each.declared)
     return tuple(bound)
 
 
 def _no_binding(storage: Storage, array: Array, where: str) -> ValueError:
-    kinds = " or ".join(sorted(kind.__name__ for held, kind in BINDINGS if held is storage))
+    kinds = " or ".join(sorted(kind.__name__ for held, kind in BINDINGS if held is storage and kind is not Positions))
     return _no_layout(array, f"{where} must be {kinds}, the ops today's resources run on this array")
 
 

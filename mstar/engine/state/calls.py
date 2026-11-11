@@ -39,17 +39,16 @@ class ArrayHandle(StepHandle):
     # each read's runner, and the ops bound with their keys, where the storage binds them
     reads: Mapping[str, Any] = EMPTY
     _bindings: tuple = ()
+    # the position resource and the dtype its `Rope` rotates in, where the array declares positions
+    positions: Any = None
+    rope_dtype: torch.dtype | None = None
 
-    def __init__(self, array: Array, resources: Mapping[str, Any], positions_key: str | None):
+    def __init__(self, array: Array, resources: Mapping[str, Any]):
         self.array = array
         # the state ops whose fused kernel can write this array's pages (`bind_state_ops`)
         self.fused_ops: frozenset[str] = frozenset()
         self.name = array.name
         self.label = "main"
-        self.positions_key = positions_key
-        self.positions = None if positions_key is None else resources[positions_key]
-        rope = None if array.positions is None else array.positions.rope
-        self.rope_dtype = None if rope is None else rope.dtype
 
         self._pool_layer = pool_layers(array)
 
@@ -294,22 +293,28 @@ def host(h: ArrayHandle, request: int, label: str, layer: int | torch.Tensor) ->
     return h._host(request, label, h._layer_id(layer))
 
 
+def _positions(h: ArrayHandle) -> Any:
+    if h.positions is None:
+        raise h._refusal("the array declares no positions")
+    return h.positions
+
+
 def position(h: ArrayHandle, rid_handle: int, label: str) -> int:
     """The next position on ``label`` of the request at worker handle ``rid_handle``, on the host."""
-    return h.positions.position(rid_handle, label)
+    return _positions(h).position(rid_handle, label)
 
 
 def positions(h: ArrayHandle) -> torch.Tensor:
     """This step's position ids in segment order, on the device. Under a graph lease the buffer runs to the bucket's
     length, past the step's tokens."""
     h._check_open("positions")
-    return h.positions.pos_ids(h.label)
+    return _positions(h).pos_ids(h.label)
 
 
 def rope(h: ArrayHandle, q: torch.Tensor, k: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """``q`` and ``k`` rotated at this step's positions with the declared `Rope`."""
     h._check_open("rope")
-    return h.positions.apply_qk(q, k, label=h.label, rope_dtype=h.rope_dtype or q.dtype)
+    return _positions(h).apply_qk(q, k, label=h.label, rope_dtype=h.rope_dtype or q.dtype)
 
 
 @torch.compiler.disable

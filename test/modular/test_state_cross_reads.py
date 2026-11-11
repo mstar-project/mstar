@@ -103,7 +103,7 @@ class _StubGroup:
 
 
 def _within(array, ragged, **within) -> WithinStepHandle:
-    return WithinStepHandle(array, {next(iter(array.reads)): ragged}, None, _bindings(WITHIN_STEP, array), **within)
+    return WithinStepHandle(array, {next(iter(array.reads)): ragged}, _bindings(WITHIN_STEP, array), **within)
 
 
 def _on_sdpa(*reads) -> StateSetup:
