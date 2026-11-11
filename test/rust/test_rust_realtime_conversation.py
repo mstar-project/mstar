@@ -29,9 +29,6 @@ pytest.importorskip("fastapi")
 pytest.importorskip("websockets")
 np = pytest.importorskip("numpy")
 
-# the event waits read a socket with no timeout of their own: a dropped event must fail a named test
-pytestmark = pytest.mark.timeout(120)
-
 import websockets.exceptions
 import websockets.sync.client
 from fastapi import HTTPException
@@ -50,7 +47,8 @@ from mstar.api_server.rust_frontend import (
 )
 from mstar.streaming.topology import CLIENT, ClientAudio, Connection
 
-pytestmark = pytest.mark.skipif(BINARY is None, reason="mstar-server binary not built")
+# the event waits read a socket with no timeout of their own, so a dropped event must fail a named test
+pytestmark = [pytest.mark.skipif(BINARY is None, reason="mstar-server binary not built"), pytest.mark.timeout(120)]
 
 FRAME = 1280   # the stream's frame: 80 ms at 16 kHz
 BUDGET = 4 * 16000 * 4   # float32 bytes of input a call takes: 4 s
@@ -258,7 +256,7 @@ def _python(server, frames, until, linger):
                 if isinstance(f, float):
                     time.sleep(f)
                     continue
-                if callable(f):   # a wait on the session's own events
+                if callable(f):
                     while not f(events):
                         events.append(json.loads(ws.receive_text()))
                     continue
@@ -281,7 +279,7 @@ def _rust_session(port, frames, until, linger):
                 if isinstance(f, float):
                     time.sleep(f)
                     continue
-                if callable(f):   # a wait on the session's own events
+                if callable(f):
                     while not f(events):
                         events.append(json.loads(ws.recv(timeout=30)))
                     continue
@@ -296,8 +294,8 @@ def _rust_session(port, frames, until, linger):
 
 def _both(stacks, monkeypatch, kind, events, *, script=(), end=True, refuse=0, until=None, linger=0.0):
     """Each frontend's (events, close code) and what its call got. ``events``
-    may hold floats, seconds to wait, and ``_seen`` waits, which read events
-    until the session has sent them; ``until`` stops reading (the socket
+    may hold floats, seconds to wait, or functions of the events read so far (see
+    ``_wait``): the session reads until one is true before sending on; ``until`` stops reading (the socket
     left open), else the session reads until the server closes it."""
     server, port = stacks(kind)
     monkeypatch.setattr(entrypoint, "api_server", server)
@@ -332,6 +330,12 @@ def _tone(rate, seconds, amp=8000):
 QUIET = _append(b"\0\0" * 480)
 # answered with an error after every event before it: reading up to it reads everything they caused
 END = {"type": "mstar.end"}
+
+
+def _wait(kind: str, n: int = 1):
+    """A frame that holds the client until ``n`` events of ``kind`` have arrived, so
+    the order of the calls' output and the client's next event is the events', not the clock's."""
+    return lambda events: sum(e["type"] == kind for e in events) >= n
 
 
 def _is_end(e: dict) -> bool:
@@ -544,39 +548,31 @@ def _session(**session) -> dict:
 
 
 COMMIT = {"type": "input_audio_buffer.commit"}
-
-
-def _seen(suffix: str, count: int = 1):
-    """A wait for the session to have sent ``count`` events whose type ends in
-    ``suffix``: the order comes from its events, not the clock."""
-    return lambda evs: sum(e["type"].endswith(suffix) for e in evs) >= count
-
-
-DELTA, ERROR = _seen(".delta"), _seen("error")
+PARTIAL = "mstar.transcription.partial"
 LIVE = {
     # the knobs and prompt a live model can't apply, and a language change mid-item, refused;
     # two items, each a call, the second opened in the language set between them
     "completed": ([_text(0, b" hello"), _text(1, " wö".encode()[:3]), _text(2, " wö".encode()[3:] + b"rld")], [
         _session(mstar={"chunk_seconds": 1.0}), _session(input_audio_transcription={"prompt": "names"}),
-        _append(_tone(16000, 0.3).tobytes()), DELTA, _session(input_audio_transcription={"language": "de"}),
+        _append(_tone(16000, 0.3).tobytes()), _wait(PARTIAL, 3), _session(input_audio_transcription={"language": "de"}),
         _append(_tone(16000, 0.1).tobytes()), COMMIT,
         _session(input_audio_transcription={"language": "de", "prompt": ""}),
         _append(_tone(16000, 0.2).tobytes()), COMMIT, END]),
     # each item's call fails after its first append: the rest of the item is dropped, its commit reports it
     "failed": ([_text(0, b" hello"), _Chunk("error", b"boom reading /srv/ckpt/model.safetensors", {"status": 500})], [
-        _append(_tone(16000, 0.2).tobytes()), ERROR, _append(_tone(16000, 0.2).tobytes()), COMMIT,
-        _append(_tone(16000, 0.1).tobytes()), _seen("error", 2), COMMIT, END]),
+        _append(_tone(16000, 0.2).tobytes()), _wait("error"), _append(_tone(16000, 0.2).tobytes()), COMMIT,
+        _append(_tone(16000, 0.1).tobytes()), _wait("error", 2), COMMIT, END]),
     # an append that fails inside the server is an error event; the item's call goes on
     "append-fails": ([_text(0, b" hello")], [
         _append(np.array([16384], "<i2").tobytes()), _append(_tone(16000, 0.2).tobytes()), COMMIT, END]),
     # a commit whose end fails inside the server aborts the item's call rather than waiting it out;
     # the item fails and the next one goes on
     "end-fails": ([_text(0, b" hello")], [
-        _append(_tone(16000, 0.2).tobytes()), _append(np.array([-16384], "<i2").tobytes()), DELTA, COMMIT,
+        _append(_tone(16000, 0.2).tobytes()), _append(np.array([-16384], "<i2").tobytes()), _wait(PARTIAL), COMMIT,
         _append(_tone(16000, 0.1).tobytes()), COMMIT, END]),
     # a clear aborts the item's call; the next append opens another
     "cleared": ([_text(0, b" hello")], [
-        _append(_tone(16000, 0.2).tobytes()), DELTA, {"type": "input_audio_buffer.clear"},
+        _append(_tone(16000, 0.2).tobytes()), _wait(PARTIAL), {"type": "input_audio_buffer.clear"},
         _append(_tone(16000, 0.1).tobytes()), COMMIT, END]),
 }
 
