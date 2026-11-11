@@ -452,8 +452,8 @@ class WhisperDecoderSubmodule(TokenStepNode, ARNodeSubmodule):
         language = row[meta["language_slot"]] if meta["language"] is None else meta["language"]
         ids = row[meta["transcript_start"]:]
         # An end-of-text from a decode step stopped the loop, and a speculative
-        # step may have written past it. One from the prompt walk stops
-        # nothing, and under ``ignore_eos`` none does.
+        # step may have written past it. One from the prompt walk ended the
+        # request before this step, and under ``ignore_eos`` none stops it.
         if not meta["ignore_eos"] and eos in ids[1:]:
             ids = ids[: ids.index(eos, 1)]
         # the 4 prompt tokens and end-of-text stay inside the position table
