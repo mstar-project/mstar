@@ -33,6 +33,7 @@ from mstar.engine.state.adapters import StateSetup, build_handle, node_handles, 
 from mstar.engine.state.analysis import deployment_problems, state_declaration_problems
 from mstar.model.base import serving_resources
 from mstar.model.components.diffusion.attention import dit_entry
+from mstar.model.components.distributed.sequence_parallel import sp_seq_split
 from mstar.model.flux2_klein.components.transformer import Flux2JointAttention
 from mstar.model.flux2_klein.config import DENOISE_LOOP, JOINT_TOKENS, Flux2KleinConfig
 from mstar.model.flux2_klein.config import DIT_ATTN as KLEIN_ATTN
@@ -308,6 +309,19 @@ def test_wan22_parallel_configs_plan_each_ranks_step_as_main_did(path, guidance)
             _assert_plans_equal(step, reference, SELF_ATTN)
             exchanges = (handles[DIT_TOKENS]._keys_sharded, handles[DIT_TOKENS]._queries_sharded)
             assert exchanges == (axes["sp"] > 1,) * 2, "a sharded sequence needs the Ulysses exchange"
+
+
+@pytest.mark.parametrize("rids", [[0], [0, 1]])
+def test_wan22_guided_rows_split_one_rows_tokens_over_sp2(rids):
+    """Each guidance branch is a row of its own, so the exchange splits one row's tokens however many rows there are."""
+    model = _wan()
+    key = WanStepKey(frames=3, height=8, width=8, guidance=5.0, i2v=False)
+    sub = Wan22DitSubmodule(None, model.config)
+    handles = node_handles(model, "dit", {SELF_ATTN: _StubRagged()}, sp_group=SimpleNamespace(world_size=2, rank=0))
+    step = state_steps(sub.declare_step("gen", rids, [_inputs(key)] * len(rids)), handles)
+    step.set_ctx(StepContext(request_ids=rids, graph_walk="gen", slot=0, capture=False))
+    step.begin_calls()
+    assert handles[DIT_TOKENS]._seq_sizes == sp_seq_split(sub.num_tokens(key), 2), "a rank's share of one row"
 
 def test_a_step_on_sdpa_is_none_as_the_hand_written_model_returned():
     model = _klein()

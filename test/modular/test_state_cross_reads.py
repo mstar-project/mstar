@@ -3,7 +3,9 @@
 LTX-2.5 wrote each attention's plan and exchange in model code, one case per attention, so a port that gets a case wrong
 attends the wrong tokens with no error. The three cases follow from two flags: both sides sharded runs Ulysses over
 whole segments, only the queries sharded runs on the rank's share, and only the keys sharded merges the ranks' partial
-attentions. A DiT compares its output bytes exactly, so a break or a plan that moves is a regression.
+attentions. A DiT compares its output bytes exactly, so a break or a plan that moves is a regression. A segmented read
+lays a request's segments end to end in one row, as MiniMax-H3 pads its rows, and SDPA attends within each segment as
+H3's own split did.
 """
 
 from __future__ import annotations
@@ -40,7 +42,7 @@ from mstar.engine.state.adapters import (
 from mstar.engine.state.analysis import deployment_problems
 from mstar.engine.state.calls import kernel_setting
 from mstar.engine.state.contract import Entry
-from mstar.model.components.diffusion.attention import sdpa_attention
+from mstar.model.components.diffusion.attention import FrameSDPA, joint_attention, sdpa_attention
 from mstar.testing_utils.model import StubModel
 from mstar.worker import engine_manager
 from mstar.worker.engine_manager import EngineManager
@@ -398,6 +400,17 @@ def test_the_two_flags_pick_the_exchange(monkeypatch, sharded, queried_sharded, 
         assert calls[0][2] == {"seq_dim": 1, "head_dim": 2}
 
 
+@pytest.mark.parametrize("sharded, queried_sharded", [(True, True), (True, False), (False, True)])
+def test_the_exchange_its_step_and_the_narrowed_heads_follow_one_predicate(sharded, queried_sharded):
+    """A Ulysses exchange needs a step for its sizes and a kernel built for the rank's share of the heads. A read that
+    exchanged without both would run over sizes nobody took, or over heads its kernel wasn't built for."""
+    arrays = [_array("a", "a_self", sharded=queried_sharded), _array("b", "b_cross", queries="a", sharded=sharded)]
+    (spec,) = [spec for spec in build_specs(arrays) if spec.resource_key == "b_cross"]
+    handle = _handles(arrays, group=_StubGroup(), setup=_on_sdpa("a_self", "b_cross"))["b"]
+    ulysses = sharded and queried_sharded
+    assert (handle._ulysses, handle.needs_step, spec.config.shard_over_sp) == (ulysses,) * 3
+
+
 def test_no_flag_exchanges_at_sp1(monkeypatch):
     def fail(*args, **kwargs):
         raise AssertionError("attention_over_sharded_keys breaks the graph, so it must not run at SP1")
@@ -537,3 +550,59 @@ def test_a_read_sharded_on_both_sides_needs_heads_that_divide_by_tp_times_sp():
     assert problem.startswith("Array 'a'.reads['a_read']: q_heads 4 doesn't divide by 3")
     assert deployment_problems(_Model(_array("a", sharded=True)), {}, head_shards={"dit": 4}) == []
     assert deployment_problems(_Model(_array("a")), {}, head_shards={"dit": 3}) == [], "only both sides narrow"
+
+
+# A segmented read
+
+
+def _segmented_on_sdpa() -> WithinStepHandle:
+    """A request's rows and their padding in one row, as MiniMax-H3's DiT lays them out, on SDPA."""
+    array = Array("a", nodes={"dit"}, layers={0, 1}, entry=_entry(), max_len=0,
+                  reads={"a_read": Read(mask=Block(), op=Attend(q_heads=HEADS), packed=False, segmented=True)})
+    return node_handles(_Model(array), "dit", {}, setup=_on_sdpa("a_read"))["a"]
+
+
+@pytest.mark.parametrize("field", [{"packed": True}, {"queries": "b"}, {"mask": Causal()}])
+def test_a_segmented_read_takes_block_rows_and_no_queries(field):
+    read = {"mask": Block(), "op": Attend(q_heads=HEADS), "packed": False, "segmented": True}
+    Read(**read)
+    with pytest.raises(ValueError, match=r"Read.segmented lays a request's segments end to end in one row, which takes "
+                                         r"Block\(\), packed=False and no queries"):
+        Read(**{**read, **field})
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_a_segmented_read_on_sdpa_attends_within_each_segment_as_h3_did(dtype):
+    """H3 ran padded rows through `joint_attention` over `FrameSDPA`, and unpadded ones through `sdpa_attention`."""
+    q, k, v = (torch.randn(1, 16, HEADS, DIM, dtype=dtype) for _ in range(3))
+    h = _segmented_on_sdpa()
+    for spans, want in (((13, 3), joint_attention(q, k, v, ragged=FrameSDPA((13, 3)).run)),
+                        ((16,), sdpa_attention(q, k, v))):
+        step = _opened(h, [Segment(1, "main", span) for span in spans])
+        h.add(0, k=k, v=v)
+        got = h.read(0, q)
+        step.end_calls()
+        assert torch.equal(got, want), f"segments {spans} would attend across the padding or round apart from main"
+
+
+def test_a_segmented_read_on_sdpa_opens_its_step_with_no_exchange():
+    step = SubmoduleStep(state={"a": ArrayStep(segments=(Segment(1, "main", 13), Segment(1, "main", 3)))})
+    assert state_steps(step, {"a": _segmented_on_sdpa()}) is not None, "its split needs the step's spans"
+
+
+def test_a_segmented_read_outside_a_step_is_refused():
+    h = _segmented_on_sdpa()
+    for opened in (False, True):
+        if opened:
+            _opened(h, [Segment(1, "main", 4)]).end_calls()
+        h.add(0, k=_q(), v=_q())
+        with pytest.raises(ValueError, match="Array 'a': read in a step that doesn't list the array"):
+            h.read(0, _q())
+
+
+def test_a_segmented_read_over_two_requests_is_refused_when_it_opens():
+    step = SubmoduleStep(segments=[Segment(1, "main", 4), Segment(2, "main", 4)], state={"a": ArrayStep()})
+    step.set_ctx(_ctx(rows=(1, 2)))
+    step.set_state_handles((_segmented_on_sdpa(),))
+    with pytest.raises(ValueError, match="Array 'a': no layout yet: a segmented read in a step of several requests"):
+        step.begin_calls()
