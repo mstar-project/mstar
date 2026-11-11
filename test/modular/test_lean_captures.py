@@ -213,7 +213,7 @@ def _capture_runner(resources, steps=None, blocked=()):
 
     def declare_step(graph_walk, **kwargs):
         keys = resources.keys() if steps is None else steps[graph_walk]
-        return SimpleNamespace(steps=dict.fromkeys(keys, object()), segments=None)
+        return SimpleNamespace(steps=dict.fromkeys(keys, object()), segments=None, state={})
 
     for key in blocked:
         resources[key].can_capture = lambda: False
