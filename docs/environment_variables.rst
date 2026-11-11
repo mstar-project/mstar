@@ -218,7 +218,7 @@ model, so they are named for it.
        the token buckets (see :doc:`serving`).
    * - ``MSTAR_VIT_ACCELERATOR_GRAPH_BATCH_SIZES``
      - ``1,2,4``
-     - Comma-separated batch sizes to capture. Read only when
+     - Comma-separated batch sizes to capture; empty captures none. Read only when
        ``MSTAR_VIT_BATCHING=1``; otherwise only batch size 1 is captured.
    * - ``COSMOS3_DISABLE_ACCELERATOR_GRAPH``
      - unset
@@ -383,6 +383,38 @@ Read by the ``mstar-server`` binary and its bridge
        (``api_server/served_models.py``, ``rust/server/src/served_models.rs``).
        Unset serves the base model alone. Not for deployments to set:
        ``launch_rust_server`` sets it from the API server's ``ServedModels``.
+   * - ``MSTAR_TRANSCRIPTION``
+     - unset
+     - What the Rust frontend's ``/v1/audio/transcriptions`` needs from the
+       served model, as JSON: the kwargs it declares, the deployment's
+       ``max_concurrent_requests``, the adapter's language tables, and the
+       pydantic version its error text cites. Not for deployments to set:
+       ``launch_rust_server`` sets it from ``transcription_facts`` for a model
+       with a transcription surface, and drops an inherited value.
+   * - ``MSTAR_OPENPI``
+     - unset
+     - The deployment's openpi policy (its ``openpi:`` block as the API server
+       checked it, the metadata frame packed), as JSON; unset serves no socket
+       at ``/``. Not for deployments to set: ``launch_rust_server`` sets it from
+       ``openpi_facts``.
+   * - ``MSTAR_WS_MAX_BYTES``
+     - the body limit
+     - The largest WebSocket message the Rust frontend reads, in bytes: the
+       config's ``ws_max_message_mb``. Not for deployments to set:
+       ``launch_rust_server`` sets it.
+   * - ``MSTAR_CLIENT_STREAMS``
+     - ``[]``
+     - The model's client streams, as JSON: on ``/generate/ws`` a request to a
+       model with any is a live call. Not for deployments to set:
+       ``launch_rust_server`` sets it from ``APIServer.client_streams``.
+   * - ``MSTAR_REALTIME``
+     - unset
+     - What the Rust frontend's ``/v1/realtime`` runs with, as JSON: for a
+       model with an audio client stream, what a conversation needs from it
+       (``conversation_facts``); for realtime transcription, the ONNX Runtime
+       library ``onnxruntime`` loads, Silero's weights, why Smart Turn did not
+       load (if it didn't), and the model's tokenizer. Not for deployments to
+       set: ``launch_rust_server`` sets it from ``realtime_facts``.
    * - ``MSTAR_ALLOW_REMOTE``
      - ``0``
      - Allow ``http(s)`` media URLs in requests, fetched server-side by both
@@ -447,9 +479,10 @@ Read by the ``mstar-server`` binary and its bridge
 Rust frontend limitations
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-The Rust frontend serves no ``/generate/ws``, so a model's live client input
-(appends to a running request, see :doc:`clients`) needs the Python frontend;
-over ``/generate`` such a model's input ends when the request is submitted.
+The Rust frontend serves every route the Python frontend serves but LoRA's
+runtime updates (``/v1/load_lora_adapter`` and ``/v1/unload_lora_adapter``, see
+:doc:`models`): ``mstar serve`` refuses ``--rust-frontend`` with
+``runtime_updates: true``.
 
 Request media
 -------------

@@ -259,7 +259,7 @@ def test_rust_bridge_carries_a_refusal_as_a_400_chunk():
     )
     bridge._submit({"rid": "r1", "model_kwargs": {"seed": 2**64}})
     [frame] = sent
-    assert (frame["t"], frame["modality"], frame["metadata"]) == ("chunk", "error", {"status": 400})
+    assert (frame["t"], frame["modality"], frame["metadata"]) == ("chunk", "error", {"status": 400, "refused": True})
 
 
 def test_rust_bridge_passes_extras_to_the_coercing_check():
