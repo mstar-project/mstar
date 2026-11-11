@@ -25,8 +25,8 @@ PHONEME_IDS = "phoneme_ids"
 REF_STYLE = "ref_style"
 SPEED = "speed"
 AUDIO_CHUNK = "audio_chunk"
-# Each chunk's length as host ints in ``step_metadata``, which the conductor merges into the partition's kwargs, hence
-# the model-prefixed name.
+# Each chunk's length as host ints, from the request's kwargs to the synth walk's ``step_metadata``. The kwargs share a
+# namespace with the client's, hence the model-prefixed name.
 CHUNK_LENGTHS = "kokoro_chunk_lengths"
 
 # Token id used for both the <bos> and the <eos> the model expects around a
