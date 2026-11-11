@@ -807,16 +807,14 @@ class PagedArrayHandle(ArrayHandle):
             for walk, reads in walk_reads.reads.items()
         }
         # `_grows` says whether `check_step` needs an add, for a step that lists a row on the pages at span above 0.
-        # `_segments` are the step's, and `_covered` the layers some read covers on its walk `_walk`, on an array whose
-        # reads differ by walk.
+        # `_covered` holds the layers some read covers on the step's walk `_walk`, on an array whose reads differ by
+        # walk.
         self._grows = False
-        self._segments: Sequence[Segment] = ()
         self._walk: str | None = None
         self._covered: frozenset[int] | None = None
 
     def begin_step(self, step) -> None:
         super().begin_step(step)
-        self._segments = step.state[self.name].segments or step.segments or ()
         # the one plan `PagedStorage.steps` names for a step over several labels
         combined = getattr(step.steps.get(self.name), "combined_labels", None)
         if combined:
@@ -969,7 +967,7 @@ class PagedCrossHandle(PagedArrayHandle):
         if len(labels) > 1:
             raise self._no_layout(f"a step over labels {sorted(labels)} on {self.queried.name!r}, whose segments lay "
                                   "out this read's queries")
-        queries = _query_segments(self, step, step.state[self.name].segments or step.segments or ())
+        queries = _query_segments(self, step, self._segments)
         if queries:
             self._query_label = queries[0].label
 
@@ -1017,7 +1015,7 @@ class ValueHandle(ArrayHandle):
     def check_step(self, step) -> None:
         super().check_step(step)
         if self._step_written and not step.ctx.replays:
-            self._check_written(step.state[self.name].segments or step.segments or ())
+            self._check_written(self._segments)
 
     def _check_written(self, segments) -> None:
         rows = [segment.request_id for segment in segments if segment.span >= 1]
@@ -1229,11 +1227,10 @@ class WithinStepHandle(ArrayHandle):
         super().begin_step(step)
         if step.ctx.replays:
             return
-        segments = step.state[self.name].segments or step.segments or ()
         if self.queried is not None:
-            _query_segments(self, step, segments)
+            _query_segments(self, step, self._segments)
         if self._keys_sharded and self._queries_sharded:
-            spans = {s.span for s in segments}
+            spans = {s.span for s in self._segments}
             if len(spans) > 1:
                 raise self._no_layout(f"a Ulysses exchange over spans {sorted(spans)}, and mixed lengths need a "
                                       "permutation in the unpack")

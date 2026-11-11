@@ -5,13 +5,13 @@ on a replay, and its checks live in it.
 """
 
 from abc import abstractmethod
-from collections.abc import Collection, Iterable, Mapping
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from typing import Any
 
 import torch
 
 from mstar.engine.resources.sampler.utils import FUSED_DRAW_MAX_VOCAB, FusedDrawArgs
-from mstar.engine.resources.step import StepHandle
+from mstar.engine.resources.step import Segment, StepHandle
 from mstar.engine.state.contract import Array, ArrayStep, CausalConv, GatedDeltaNet, Op, Sampler
 
 
@@ -41,10 +41,11 @@ class ArrayHandle(StepHandle):
 
         self._pool_layer = {layer: i for i, layer in enumerate(sorted(array.layers))}
 
-        # This step's calls, checked in eager steps and at capture.
+        # This step's segments, and its calls, checked in eager steps and at capture.
         # `_held` is the k and v an add left for `_held_layer`'s read, on a kernel that takes them there.
         # `_kept` holds the layers whose kept add has run, `_scratch` those with a scratch add, `_read` those read,
         # and `_updated` the update calls run.
+        self._segments: Sequence[Segment] = ()
         self._open = False
         self._keep = True
         self._capturing = False
@@ -78,9 +79,9 @@ class ArrayHandle(StepHandle):
             raise self._refusal("a step began while another is open")
         self._open = True
         declared: ArrayStep = step.state[self.name]
-        segments = declared.segments or step.segments
-        if segments:
-            self.label = segments[0].label
+        self._segments = declared.segments or step.segments or ()
+        if self._segments:
+            self.label = self._segments[0].label
         # on a replay too, whose `eager_add` adds still run
         self._keep = declared.keep
         self._capturing = step.ctx.capture
@@ -91,7 +92,7 @@ class ArrayHandle(StepHandle):
             self._check_host_writes(declared, step.ctx)
         if step.ctx.replays:
             return
-        self._check_step(declared, segments or (), step.ctx)
+        self._check_step(declared, self._segments, step.ctx)
 
     def check_step(self, step) -> None:
         if step.ctx.replays or not self._keep:
