@@ -19,6 +19,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from mstar.engine.resources.attn.base import AttentionManager
 from mstar.engine.resources.sampler import utils as sampler_utils
 from mstar.engine.resources.sampler.config import SamplerStep
 from mstar.engine.resources.sampler.resource import SamplerResource
@@ -69,7 +70,7 @@ class _StubKV:
     def layer_view(self, i):
         return self.pages[i]
 
-    def write_kv(self, k, v, layer_idx=None, label=None):
+    def write_kv(self, k, v, layer_idx=None, label=None, tokens=None):
         self.writes.append((layer_idx, label))
         self.pages[layer_idx, :k.shape[0], 0] = k
         self.pages[layer_idx, :k.shape[0], 1] = v
@@ -99,6 +100,21 @@ class _StubDense(_StubAttn):
     """Takes k and v at the read, as the dense backend does."""
 
     requires_kv_write = False
+
+
+class _StubExchange(_StubAttn, AttentionManager):
+    """Attention whose every call goes through its exchange, which hands its run the step whole."""
+
+    def __init__(self):
+        super().__init__()
+        self.exchanges = []
+
+    def step_exchanges(self, label=None):
+        return True
+
+    def exchange(self, run, q, k, v, label=None):
+        self.exchanges.append("attend" if q is not None else "write")
+        return run(q, k, v)
 
 
 class _StubRagged:
@@ -642,6 +658,34 @@ def test_each_replay_starts_clean_for_an_add_that_runs_outside_the_graph():
         step = _begin(h, ctx=_ctx(leased=True), kv=ArrayStep(eager_add=True))
         _add(h, 1)
         h.end_step(step)
+
+
+def test_adds_outside_the_graph_write_every_layer_before_a_read_attends_the_pages():
+    kv, attn = _StubKV(), _StubAttn()
+    h = _kv_handle(kv=kv, attn=attn)
+    _begin(h, kv=ArrayStep(eager_add=True))
+    q, k, v = _tensors()
+    for layer in range(LAYERS):
+        h.add(layer, k=k + layer, v=v)
+    out = h.read(0, q)
+    assert kv.writes == [(layer, "main") for layer in range(LAYERS)]
+    assert attn.runs == [(0, "main", False)] and torch.equal(out, q + k)
+
+
+@pytest.mark.parametrize("eager", [False, True], ids=["one-read", "outside-the-graph"])
+def test_an_exchanging_step_writes_each_add_once_through_the_exchange(eager):
+    # an add waits for its read's exchange, so one its layer never reads is written at the next add or the check
+    kv, attn = _StubKV(), _StubExchange()
+    h = _kv_handle(kv=kv, attn=attn)
+    step = _begin(h, kv=ArrayStep(eager_add=eager))
+    q, k, v = _tensors()
+    for layer in range(LAYERS):
+        h.add(layer, k=k, v=v)
+        if layer == 1 and not eager:
+            h.read(1, q)
+    h.check_step(step)
+    assert kv.writes == [(layer, "main") for layer in range(LAYERS)]
+    assert attn.exchanges == (["write"] * LAYERS if eager else ["write", "attend", "write", "write"])
 
 
 @pytest.mark.parametrize("make, declared, cause", [
