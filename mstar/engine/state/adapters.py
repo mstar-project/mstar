@@ -1423,8 +1423,8 @@ class PagedStorage(Storage):
             raise _no_layout(array, "reads is empty, and PagedKVConfig needs num_qo_heads from an Attend read")
         joined = sorted(label for label in array.labels if "+" in label)
         if joined:
-            raise ValueError(f"Array {array.name!r}.labels: {joined} hold a '+', which joins the labels of a step over "
-                             "several labels into the name of its plan")
+            raise _no_layout(array, f"labels {joined} hold a '+', which joins the labels of a step over several labels "
+                                    "into the name of its plan")
         q_heads = {read.op.q_heads for read in array.reads.values()}
         if len(q_heads) > 1:
             raise _no_layout(array, f"reads have q_heads {sorted(q_heads)}, and PagedKVConfig has one num_qo_heads")

@@ -172,7 +172,7 @@ def test_a_step_over_two_labels_on_a_value_has_no_layout_yet():
 def test_a_declared_label_with_a_plus_is_refused_at_load():
     """The plan of a step over several labels takes their names joined by '+', and a label of that name would replace
     that plan's rows with its own."""
-    with pytest.raises(ValueError, match=r"Array 'kv'.labels: \['main\+uncond'\] hold a '\+'"):
+    with pytest.raises(ValueError, match=r"Array 'kv': no layout yet: labels \['main\+uncond'\] hold a '\+'"):
         build_specs([_array(labels={"main", "uncond", "main+uncond"})])
 
 
