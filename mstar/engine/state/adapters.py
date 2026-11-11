@@ -1231,15 +1231,13 @@ class ValueStorage(Storage):
         return resolved
 
     def _specs(self, array: Array, arrays: Sequence[Array]) -> tuple[list[NodeResourceSpec], tuple[BoundOp, ...]]:
-        if array.reads:
-            raise _no_layout(array, "reads must be empty, since RecurrentStateConfig has no read")
+        bound = _bindings(self, array)
         if array.entry.host:
             raise _no_layout(array, f"entry has host fields {sorted(array.entry.host)}, and RecurrentStateConfig has "
                                     "no block for one")
         if not array.updates:
             raise _no_layout(array, f"updates is empty, and today's resources hold a Value only for a linear attention "
                                     f"update ({LinearAttnBinding.kinds()})")
-        bound = _bindings(self, array)
         holders = [other for other in arrays if storage_of(other) is PAGED and other.nodes & array.nodes]
         if len(holders) != 1 or not array.nodes <= holders[0].nodes:
             raise _no_layout(array, f"its nodes must hold one append-only array, the one RecurrentStateConfig.kv_cache "
@@ -1266,10 +1264,9 @@ class HostValueStorage(Storage):
     handle_class = HostValueHandle
 
     def resolve(self, arrays: Sequence[Array], declared: Sequence[Array], setup: "StateSetup") -> Resolved:
-        for array in arrays:
-            if array.reads or array.updates:
-                raise _no_layout(array, "a Value of host fields only takes no read or update")
-        return Resolved({array.name: [] for array in arrays}, {array.name: () for array in arrays}, {}, {})
+        return Resolved(
+            {array.name: [] for array in arrays}, {array.name: _bindings(self, array) for array in arrays}, {}, {},
+        )
 
     def handle(
         self, array: Array, resources: Mapping[str, Any], setup: "StateSetup", resolved: Resolved,
@@ -1365,11 +1362,11 @@ def _bindings(
     for key, read in array.reads.items():
         binding = BINDINGS.get((storage, type(read.op)))
         if binding is None:
-            raise _no_binding(storage, array, f"reads[{key!r}].op")
+            raise _no_binding(storage, array, f"reads[{key!r}].op", update=False)
         bound.append(BoundOp(key, read, chosen.get(key, binding)))
     unbound = sorted(key for key, op in array.updates.items() if (storage, type(op)) not in BINDINGS)
     if unbound:
-        raise _no_binding(storage, array, f"updates {unbound}")
+        raise _no_binding(storage, array, f"updates {unbound}", update=True)
     by_type: dict[type[Op], str] = {}
     for key, op in array.updates.items():
         other = by_type.setdefault(type(op), key)
@@ -1387,9 +1384,17 @@ def _bindings(
     return tuple(bound)
 
 
-def _no_binding(storage: Storage, array: Array, where: str) -> ValueError:
-    kinds = " or ".join(sorted(kind.__name__ for held, kind in BINDINGS if held is storage and kind is not Positions))
-    return _no_layout(array, f"{where} must be {kinds}, the ops today's resources run on this array")
+def _no_binding(storage: Storage, array: Array, where: str, *, update: bool) -> ValueError:
+    """The refusal of ``where``, a read's op or an update ``storage`` has no binding for, naming the ops of that kind it
+    binds: a read's op changes no field, and an update writes one."""
+    kinds = sorted(
+        kind.__name__ for held, kind in BINDINGS
+        if held is storage and kind is not Positions and bool(kind.writes) == update
+    )
+    side = "update" if update else "read"
+    if not kinds:
+        return _no_layout(array, f"{where}: today's resources run no {side} on this array")
+    return _no_layout(array, f"{where} must be {' or '.join(kinds)}, the {side}s today's resources run on this array")
 
 
 def _resources_of(array: Array, bound: Sequence[BoundOp]) -> dict[str, str]:

@@ -294,7 +294,7 @@ NO_LAYOUT = {
     "a read on a value": ("gdn", lambda: [_kv(), Array(
         "gdn", nodes={"llm"}, layers={0}, entry=_gdn_entry(), max_len=1, rewritable=True,
         reads={"r": Read(mask=Causal())},
-    )], "reads must be empty"),
+    )], "today's resources run no read on this array"),
     "a value of one tensor": (
         "gdn",
         lambda: [_kv(), _gdn(entry=Entry({"state": TensorType((8, 128, 64), dtype=None)}),
