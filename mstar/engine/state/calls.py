@@ -187,6 +187,22 @@ class ArrayHandle(StepHandle):
         latest add, at the positions its mask reaches."""
         raise self._unsupported("read")
 
+    def _add_read(
+        self, layer: int | torch.Tensor, q: torch.Tensor | None, *, keep: bool | None, **keywords: Any,
+    ) -> torch.Tensor:
+        self._check_add_read("add_read")
+        fields = self.array.entry.tensors
+        # A keyword a read defines can't share a field's name, since it would go to `add`.
+        if "q" in fields:
+            raise self._refusal("add_read takes q for the read, and the entry declares a field named q")
+        self.add(layer, keep=keep, **{name: keywords.pop(name) for name in fields if name in keywords})
+        return self.read(layer, q, **keywords)
+
+    def _check_add_read(self, call: str) -> None:
+        """Raise unless this storage's add and read can share one graph break. ``call`` names the caller in the
+        refusal."""
+        raise self._unsupported(call)
+
     def write(self, layer: int | torch.Tensor, *, at: torch.Tensor | None = None, **fields: torch.Tensor) -> None:
         """Overwrite entries in place, on a rewritable array. ``at`` gives each token's log position, and is omitted
         for a Value."""
@@ -253,17 +269,9 @@ def add_read(
     h: ArrayHandle, layer: int | torch.Tensor, q: torch.Tensor | None = None, *, keep: bool | None = None,
     **keywords: Any,
 ) -> torch.Tensor:
-    """``add`` then ``read`` on ``layer`` behind one graph break, for a layer with nothing traced between them, so it
-    compiles no frame for the gap. A keyword that names an entry field goes to ``add``, and any other to ``read``."""
-    if not h.array.max_len:
-        raise h._refusal("add_read with max_len 0, whose add and read a compiled block traces: a break here takes the "
-                         "read out of that graph")
-    fields = h.array.entry.tensors
-    # A keyword a read defines can't share a field's name, since it would go to `add`.
-    if "q" in fields:
-        raise h._refusal("add_read takes q for the read, and the entry declares a field named q")
-    h.add(layer, keep=keep, **{name: keywords.pop(name) for name in fields if name in keywords})
-    return h.read(layer, q, **keywords)
+    """`add` then `read` on ``layer`` behind one graph break, for a layer with nothing traced between them, so it
+    compiles no frame for the gap. A keyword that names an entry field goes to `add`, and any other to `read`."""
+    return h._add_read(layer, q, keep=keep, **keywords)
 
 
 @torch.compiler.disable

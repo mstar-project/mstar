@@ -135,9 +135,8 @@ def _check_call(op: StateOp, args: Sequence[Any]) -> None:
             raise handle._refusal(f"state op {op.name!r} adds to {name}, and the array is rewritable")
         if name in op.writes and not handle.array.rewritable:
             raise handle._refusal(f"state op {op.name!r} writes {name}, and the array is append-only")
-        if name in op.reads and not handle.array.max_len:
-            raise handle._refusal(f"state op {op.name!r} reads {name} with max_len 0, whose read a compiled block "
-                                  "traces: a break here takes the read out of that graph")
+        if name in op.reads:
+            handle._check_add_read(f"state op {op.name!r} reads {name}")
 
 
 def _call(op: StateOp, args: Sequence[Any]) -> Any:

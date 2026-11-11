@@ -47,7 +47,6 @@ from torch import nn
 
 sys.path.insert(0, ".")
 
-from mstar.engine.state import KVEntry
 from mstar.model.components.decoder_layer import _gated_residual
 from mstar.model.components.distributed.attention import ParallelAttention
 from mstar.model.pi05.components.action_expert import (
@@ -262,7 +261,6 @@ class MockKVAttention:
 
     label = "main"
     rope_dtype = None
-    array = SimpleNamespace(max_len=1, entry=KVEntry(heads=1, head_dim=1))
 
     def __init__(self, scale: float):
         self.scale = scale
@@ -278,7 +276,14 @@ class MockKVAttention:
         """Pre-populate a layer's cache, standing in for a prefill pass."""
         self._store[layer_idx] = (k, v)
 
-    def add(self, layer: torch.Tensor, *, keep: bool | None = None, k: torch.Tensor, v: torch.Tensor) -> None:
+    def _add_read(
+        self, layer: torch.Tensor, q: torch.Tensor, *, keep: bool | None, k: torch.Tensor, v: torch.Tensor,
+    ) -> torch.Tensor:
+        assert keep is None, "this fake keeps every add"
+        self.add(layer, k=k, v=v)
+        return self.read(layer, q)
+
+    def add(self, layer: torch.Tensor, *, k: torch.Tensor, v: torch.Tensor) -> None:
         self._pending = (k, v)
 
     def read(self, layer: torch.Tensor, q: torch.Tensor) -> torch.Tensor:

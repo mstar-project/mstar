@@ -791,6 +791,9 @@ class PagedArrayHandle(ArrayHandle):
         self._record_read(layer)
         return self._run(layer, q)
 
+    def _check_add_read(self, call: str) -> None:
+        """Nothing: a paged add and read run outside the graph already."""
+
     def _run(self, layer: int, q: torch.Tensor) -> torch.Tensor:
         k, v = self._take_hold(layer) if self._holds(layer) else (None, None)
         return self._attn[layer].run(
@@ -1030,6 +1033,10 @@ class WithinStepHandle(ArrayHandle):
         if self._keys_sharded:
             return attention_over_sharded_keys(self._sp, q, k, v, self._attend)
         return self._attend(q, k, v)
+
+    def _check_add_read(self, call: str) -> None:
+        raise self._refusal(f"{call} with max_len 0, whose read a compiled block traces: a break here takes the read "
+                            "out of that graph")
 
     def _kernel_setting(self, read: str, field: str) -> Any:
         if not self._binding.kernel_settings:

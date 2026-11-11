@@ -12,7 +12,6 @@ import torch
 
 from mstar.api_server.openai.adapters import CanaryAdapter
 from mstar.api_server.openai.protocol import TranscriptionRequest
-from mstar.engine.state import KVEntry
 from mstar.model.canary.canary_model import CanaryModel
 from mstar.model.canary.config import LANGUAGES, MEL_SETTINGS, PROMPT_LENGTH, CanaryModelConfig, check_task
 from mstar.model.canary.decoder import CanaryDecoderModel, sinusoid_positions
@@ -196,8 +195,6 @@ class _FakeSelfAttention:
 
     label = "main"
 
-    array = SimpleNamespace(max_len=1, entry=KVEntry(heads=1, head_dim=1))
-
     def __init__(self):
         self._kv: dict[int, tuple[list, list]] = {}
         self._pending = None
@@ -211,7 +208,12 @@ class _FakeSelfAttention:
         self.seen = hidden
         return hidden[-1:]
 
-    def add(self, layer, *, keep=None, k, v):
+    def _add_read(self, layer, q, *, keep, k, v):
+        assert keep is None, "this fake keeps every add"
+        self.add(layer, k=k, v=v)
+        return self.read(layer, q)
+
+    def add(self, layer, *, k, v):
         self._pending = (k, v)
 
     def read(self, layer, q):

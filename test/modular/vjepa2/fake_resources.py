@@ -8,12 +8,9 @@ mask since the array's read is ``Bidirectional``.
 
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 import torch
 import torch.nn.functional as F
 
-from mstar.engine.state import KVEntry
 from mstar.model.vjepa2.config import KV_CACHE
 
 
@@ -25,8 +22,6 @@ class FakeKVAttention:
     ``plan`` mirrors what preprocess does in production: it says how to split
     the flattened ``[sum(seq_lens), H, D]`` batch back into per-request slices.
     """
-
-    array = SimpleNamespace(max_len=1, entry=KVEntry(heads=1, head_dim=1))
 
     def __init__(self):
         self._seq_lens: list[int] = []
@@ -45,9 +40,16 @@ class FakeKVAttention:
             if len(req_kvs) != n_req:
                 self._kv[layer] = [([], []) for _ in range(n_req)]
 
-    # --- the calls `add_read` makes
+    # --- what a block's `add_read` runs
 
-    def add(self, layer: torch.Tensor, *, keep: bool | None = None, k: torch.Tensor, v: torch.Tensor) -> None:
+    def _add_read(
+        self, layer: torch.Tensor, q: torch.Tensor, *, keep: bool | None, k: torch.Tensor, v: torch.Tensor,
+    ) -> torch.Tensor:
+        assert keep is None, "this fake keeps every add"
+        self.add(layer, k=k, v=v)
+        return self.read(layer, q)
+
+    def add(self, layer: torch.Tensor, *, k: torch.Tensor, v: torch.Tensor) -> None:
         self._pending = (k, v)
 
     def read(self, layer: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
