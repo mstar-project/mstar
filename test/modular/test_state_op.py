@@ -32,6 +32,7 @@ from mstar.engine.state import (
     Read,
     TensorType,
     Value,
+    Window,
     state_op,
 )
 from mstar.engine.state.adapters import PAGED, Resolved, StateSetup, _bindings, _resolve, build_handle
@@ -298,11 +299,12 @@ def test_a_state_op_that_writes_never_takes_the_paged_fused_path():
 
 
 def test_no_fused_op_runs_on_an_array_where_one_layers_read_takes_k_and_v_at_its_kernel():
-    """A fused op writes the pages, and that read takes its k and v from the add, so the layer's read finds no add."""
+    """A fused op writes the pages, and that read takes its k and v from the add, so the layer's read finds no add. The
+    read's window gives it a spec of its own, since reads of one config share one."""
     _fused_op()
     array = Array("kv", nodes={"llm"}, layers={0, 1}, entry=KVEntry(heads=HEADS, head_dim=DIM), max_len=16, reads={
         "attn": Read(mask=Causal(), op=Attend(q_heads=HEADS), layers={0}),
-        "held": Read(mask=Causal(), op=Attend(q_heads=HEADS), layers={1}),
+        "held": Read(mask=Window(8), op=Attend(q_heads=HEADS), layers={1}),
     })
     resources = {"kv": _StubKV(), "attn": _StubAttn(), "held": _StubAttn(requires_kv_write=False)}
     h = build_handle(array, resources, _resolve([array], StateSetup()))
