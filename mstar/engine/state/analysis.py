@@ -135,6 +135,10 @@ def _cross_read_problems(arrays: Sequence[Array]) -> list[str]:
 def _regrouping_problems(model: "Model", arrays: Sequence[Array], graphs: Mapping[str, object]) -> list[str]:
     # A keyed walk whose node reads another tensor than the keyed one is checked per request instead, before the data
     # worker keys its spans (`PreprocessWorkerThread._check_whole_steps`).
+    whole = [
+        (array, key, read) for array in arrays for key, read in array.reads.items()
+        if isinstance(read.mask, Block | Bidirectional)
+    ]
     regrouped = [
         *((node, walk, "a chunking policy splits across steps", "leave it out of the policy")
           for node, policies in model.get_chunking_policies().items() for policy in policies if policy.chunkable
@@ -149,16 +153,17 @@ def _regrouping_problems(model: "Model", arrays: Sequence[Array], graphs: Mappin
           )),
         *((node, walk, f"{node}'s rebuild policy runs it again with the ids sampled after the prompt",
            "drop the rebuild policy")
-          for node, policy in model.rebuild_policies().items() for walk in policy.walks),
+          # A rebuild reruns its steps as they ran, and only a walk that reads the ids input takes the ids sampled
+          # since.
+          for node, policy in model.rebuild_policies().items() if any(node in array.nodes for array, _, _ in whole)
+          for walk in policy.ids_walks(node, graphs)),
     ]
     # once per array, which several of its nodes may report
     return list(dict.fromkeys(
         f"Array {array.name!r}.reads[{key!r}]: {type(read.mask).__name__} on walk {walk!r}, which {cause}. A Block or "
         f"Bidirectional read sees each step's adds as a whole, so {fix}"
         for node, walk, cause, fix in regrouped
-        for array in arrays if node in array.nodes
-        for key, read in array.reads.items()
-        if isinstance(read.mask, Block | Bidirectional) and (read.walks is None or walk in read.walks)
+        for array, key, read in whole if node in array.nodes and (read.walks is None or walk in read.walks)
     ))
 
 
