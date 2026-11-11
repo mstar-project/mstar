@@ -779,7 +779,7 @@ def test_a_capture_combining_labels_over_a_placed_pool_is_refused_at_load_if_it_
     kv = types.SimpleNamespace(can_capture=lambda: True, lean_capture=False, placement=PagedKVConfig(
         num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=64, page_size=8, context_parallel=True,
     ).place(joint, "kv"))
-    step = types.SimpleNamespace(steps={"kv": KVStep(combined_labels={("cond", "uncond"): "cfg"})})
+    step = types.SimpleNamespace(steps={"kv": KVStep(combined_labels={("cond", "uncond"): "cfg"})}, state={})
     runner = AcceleratorGraphRunner(
         submodule_name="t3", resources={"kv": kv}, step_runner=mock.Mock(), device=CPU, autocast_dtype=None,
         submodule=types.SimpleNamespace(get_accelerator_graph_configs=lambda *args: [config],
