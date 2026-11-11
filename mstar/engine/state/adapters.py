@@ -799,7 +799,6 @@ class HostValueHandle(ArrayHandle):
 
     def __init__(self, array: Array, host_fields: HostFields):
         super().__init__(array, EMPTY)
-        self._bindings: tuple[BoundOp, ...] = ()
         self.host_fields = host_fields
         host_fields.declare(array)
 
