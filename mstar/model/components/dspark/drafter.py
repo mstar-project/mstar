@@ -265,16 +265,8 @@ class DSparkDrafter(nn.Module, HostedDrafter):
     def _write_context(self) -> None:
         taps = self.taps.read()
         context = self.hidden_norm(self.fc(taps.reshape(taps.shape[0], -1).to(self.fc.weight.dtype)))
-        layers = self.backbone.layers
-        layers[0].self_attn.attend.bind_step(LABEL)
-        for i, layer in enumerate(layers):
-            attn = layer.self_attn
-            attn.attend.set_layer_idx(i)
-            # the query half of the projection is unused; a K/V-only projection would save it
-            q, k, v = attn._project_qkv(context)
-            q, k = attn._apply_qk_norm(q, k)
-            _, k = attn._apply_rope(q, k, attn.attend.label)
-            attn.kv.write_kv(k, v)
+        # the query half of each layer's projection goes unused; a K/V-only projection would save it
+        self.backbone.write_kv(context, label=LABEL)
 
 
 class _MarkovHead(nn.Module):
