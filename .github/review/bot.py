@@ -47,8 +47,23 @@ REFUSED = "<!-- claude-review-continue-refused -->"
 # What Claude Code wrote of the run: the action's execution file, and the session transcripts.
 EXECUTION = "claude-execution-output.json"
 TYPES = render_summary.TYPES
-# The first line of the bot's live-test comment (gpu_review.py), the only line of it the bot reads.
-LIVE_TEST = re.compile(r"<!-- claude-live-test sha=([0-9a-f]{40}) verdict=([a-z]+) -->")
+# The first line of the bot's live-test comment (gpu_review.py), the only line of it the bot reads: the commit,
+# the verdict and the GPU vendors it ran on (a comment from before vendors were written ran on NVIDIA alone).
+LIVE_TEST = re.compile(r"<!-- claude-live-test sha=([0-9a-f]{40}) verdict=([a-z]+)(?: vendors=([a-z,]+))? -->")
+# Hardware other than NVIDIA's, as a word in a PR can name it (untestable): the backstop for the review's own
+# `untestable` field. Lookarounds rather than \b, so `rocm_env`, `is_amd`, `amdsmi` and `isAMD` count, and
+# `amd64`, `AuthenticAMD` (a CPU), `hipster` and `bare_metal` don't. Not `mps`: here that is usually NVIDIA's
+# Multi-Process Service. `TPU` in capitals only: `tpu` is also an ordinary local variable. The AMD box runs only for
+# the AMD words it can cover (covered AMD words, covered_by_amd), which stop counting once it passed there.
+AMD_MODEL = r"mi\d{3}[ax]?"
+AMD = rf"(?:is)?amd(?!64|ahl)[a-z0-9]*|rocm|hip(?:cc)?|{AMD_MODEL}"  # not Amdahl's law
+UNTESTABLE_HARDWARE = re.compile(rf"(?<![a-z0-9])(?:{AMD}|xpu|gaudi|hpu|(?-i:TPU)|(?<!bare[- _])metal"
+                                 r"|apple[ _-]?silicon)(?![a-z0-9])", re.IGNORECASE)
+AMD_HARDWARE = re.compile(AMD, re.IGNORECASE)
+AMD_RENTED = re.compile(r"\bMI3[0-5]\d?X\b", re.IGNORECASE)  # the AMD GPUs an AMD box can be (gpu.py SUPPORTED)
+# The GPU vendors a live test runs on, in the order their boxes start and their reports show: NVIDIA always, AMD
+# for a PR that names covered AMD words.
+VENDORS = {"nvidia": "NVIDIA", "amd": "AMD"}
 # A branch name safe for the API path and the command line.
 BRANCH = re.compile(r"[A-Za-z0-9._/][A-Za-z0-9._/-]*")
 THREADS = """query($owner: String!, $name: String!, $pr: Int!, $endCursor: String) {
@@ -542,7 +557,7 @@ def collect(out, repo, pr, head_sha, mode, prev=""):
     if not prev:
         rereview_inputs(out, repo, pull, head_sha, diff, conversation)
     if mode == "full":
-        since_live_test(repo, head_sha, conversation)
+        since_live_test(repo, pull, head_sha, conversation)
     write_stacked_above(out, repo, pull, head_sha)
     write_open_issues(repo, mode)
     out["lines"] = diff.count("\n")
@@ -634,15 +649,15 @@ def touched_files(diff_text):
 
 def last_live_test(comments):
     """The bot's last conclusive live-test comment among `comments` ({"user": login, "body": text}), {"sha",
-    "verdict", "body"}, or None: any but an `unavailable` one (no GPUs, or a box that couldn't start the
-    session), which says nothing, so a failure before it still stands. A verdict outside pass, partial and fail
-    (`none`: the session wrote no valid one) is conclusive too, and counts as a failure (gpu_review.carry). Only
-    its first line, the marker, is read: the report below it is the box's text."""
+    "verdict", "vendors", "body"}, or None: any but an `unavailable` one (no GPUs, or a box that couldn't start
+    the session), which says nothing, so a failure before it still stands. A verdict outside pass, partial and
+    fail (`none`: a session wrote no valid one) is conclusive too, and counts as a failure (gpu_review.carry).
+    Only its first line, the marker, is read: the report below it is the box's text."""
     last = None
     for c in comments:
         m = LIVE_TEST.fullmatch((c["body"] or "").split("\n")[0])
         if m and c["user"] in BOT_USERS and m[2] != "unavailable":
-            last = {"sha": m[1], "verdict": m[2], "body": c["body"]}
+            last = {"sha": m[1], "verdict": m[2], "vendors": (m[3] or "nvidia").split(","), "body": c["body"]}
     return last
 
 
@@ -655,13 +670,63 @@ def passed_on_ancestor(repo, live, head_sha):
     return status in ("ahead", "identical")
 
 
-def since_live_test(repo, head_sha, conversation):
+def changed_files(repo, base, sha):
+    """GitHub's entries for the files changed from `base` (a commit or branch) to SHA, or None when its list is too
+    long to check (300 max)."""
+    files = api(f"repos/{repo}/compare/{base}...{sha}").get("files")
+    return None if files is None or len(files) >= 300 else files
+
+
+def file_names(files):
+    """The names in changed_files' entries, a rename's old name too."""
+    return [name for f in files for name in (f["filename"], f.get("previous_filename")) if name]
+
+
+def hardware_named(pull, changes):
+    """The words of UNTESTABLE_HARDWARE in the PR's title, file names and changed lines (`changes`, changed_files'
+    entries), lowercased."""
+    text = [pull["title"], *file_names(changes)]
+    for f in changes:
+        text += [line[1:] for line in (f.get("patch") or "").splitlines() if line[:1] in ("+", "-")]
+    return sorted({m.lower() for line in text for m in UNTESTABLE_HARDWARE.findall(line)})
+
+
+def covered_by_amd(word):
+    """Whether a pass on an AMD box covers this hardware word: an AMD word that names no GPU model (`rocm`,
+    `is_amd`), or one of the MI3xxX models gpu.py rents, or their series (`MI300`; an MI300A or MI250 stays
+    untestable). The box is the cheapest of those models, so an MI355X change can pass on an MI300X, as a B200
+    change can pass on an H200."""
+    if not AMD_HARDWARE.fullmatch(word):
+        return False
+    series = re.fullmatch(r"mi\d{3}", word, re.IGNORECASE)  # no letter: the series of the X model
+    return not re.fullmatch(AMD_MODEL, word, re.IGNORECASE) \
+        or bool(AMD_RENTED.search(word + "x" if series else word))
+
+
+def vendors_of(words):
+    """The vendors whose GPUs the live test runs on, given the hardware words the PR names (hardware_named): AMD
+    only when a word is one its box covers (a PR naming just an MI300A can't pass there, so no box is rented)."""
+    return [v for v in VENDORS if v == "nvidia" or any(covered_by_amd(w) for w in words)]
+
+
+def vendors_for(repo, pull, sha):
+    """The vendors whose GPUs the live test of `pull` at `sha` runs on (vendors_of), by the hardware it names
+    against the default branch, as the approval reads it. The live test decides with it (gpu_review.carry), and so
+    does the review's since-live-test diff (since_live_test)."""
+    return vendors_of(hardware_named(pull, changed_files(repo, pull["base"]["repo"]["default_branch"], sha) or []))
+
+
+def since_live_test(repo, pull, head_sha, conversation):
     """Full mode: since-live-test.diff and since-live-test-commits.txt, the diff and commits since the PR's
-    last live test, when it passed on an ancestor of the head (last_live_test, passed_on_ancestor), for the
-    review's live-test call (review-prompt.md, Re-review step 4). Without both files (GitHub refused
-    either) the review judges the whole PR."""
+    last live test, when it passed on an ancestor of the head (last_live_test, passed_on_ancestor) on every GPU
+    vendor this PR's live test needs (vendors_for, as the live-test job decides), for the review's
+    live-test call (review-prompt.md, Re-review step 4). Without both files (GitHub refused either, or the vendors
+    couldn't be read) the review judges the whole PR."""
     live = last_live_test(conversation)
     if not passed_on_ancestor(repo, live, head_sha):
+        return
+    vendors = read(vendors_for, repo, pull, head_sha)
+    if vendors is None or not set(vendors) <= set(live["vendors"]):  # unknown, or a vendor that pass didn't run on
         return
     tested = f"repos/{repo}/compare/{live['sha']}...{head_sha}"
     try:
@@ -846,13 +911,14 @@ def job_token_forms(token):
     return (token, base64.b64encode(token.encode()).decode().rstrip("=")) if token else ()
 
 
-def post(out, repo, pr, runner_temp, head_sha, mode, salvaged, detail="", max_gpus="4", job_token=""):
+def post(out, repo, pr, runner_temp, head_sha, mode, salvaged, detail="", max_gpus="4", job_token="", team=""):
     """Post the review's inline comments and the summary, rendered from the review's fields by render_summary and
     redacted, and with the job's token removed however it is spelled (`job_token`): model output from untrusted
     input. Read the PR's threads after posting the inline comments, so the
     status line counts them along with earlier ones still open. Each run posts its own summary comment, so a
     re-review doesn't overwrite the last one. A "didn't complete" comment an earlier run left is then rewritten to
-    point here, and loses its marker so a later failure starts a fresh one."""
+    point here, and loses its marker so a later failure starts a fresh one. `team`: the run had the team's turn
+    cap, under which a skipped file means the review didn't finish (render_summary.render)."""
     exact = job_token_forms(job_token)
     try:
         review = render_summary.over_gpu_cap(finished_review(runner_temp), max_gpus)
@@ -864,7 +930,7 @@ def post(out, repo, pr, runner_temp, head_sha, mode, salvaged, detail="", max_gp
         review = redact_fields({**render_summary.carried(review, earlier, answered, pages),
                                 "untouched": untouched(earlier)}, exact)
         text = render_summary.render(review, pages, head_sha, mode, render_summary.stacked_above("stacked-above.json"),
-                                     salvaged == "true")
+                                     salvaged == "true", team == "true")
     except Exception as e:
         text = ""
         print(f"::warning::The review's summary didn't render: {type(e).__name__}: {log_value(str(e))}")

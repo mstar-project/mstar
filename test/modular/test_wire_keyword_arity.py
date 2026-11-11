@@ -10,6 +10,7 @@ import ast
 import dataclasses
 import pathlib
 import sys
+from collections import Counter
 
 sys.path.insert(0, ".")
 
@@ -40,14 +41,19 @@ def _known_dataclasses() -> dict[str, set[str]]:
 
 def test_no_call_passes_a_keyword_its_dataclass_does_not_have():
     known = _known_dataclasses()
+    # In-tree model test dirs are not part of this suite and some are
+    # already stale (mstar/model/cosmos3/tests/* still pass
+    # sampling_config= to CurrentForwardPassInfo, dropped in #228).
+    trees = {
+        path: ast.parse(path.read_text(), filename=str(path))
+        for path in ROOT.rglob("*.py") if "/tests/" not in path.as_posix()
+    }
+    # A name two classes share resolves to neither, as the state contract's Sampler and Window do.
+    defined = Counter(
+        node.name for tree in trees.values() for node in ast.walk(tree) if isinstance(node, ast.ClassDef)
+    )
     bad = []
-    for path in ROOT.rglob("*.py"):
-        if "/tests/" in path.as_posix():
-            # In-tree model test dirs are not part of this suite and some are
-            # already stale (mstar/model/cosmos3/tests/* still pass
-            # sampling_config= to CurrentForwardPassInfo, dropped in #228).
-            continue
-        tree = ast.parse(path.read_text(), filename=str(path))
+    for path, tree in trees.items():
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
@@ -56,7 +62,7 @@ def test_no_call_passes_a_keyword_its_dataclass_does_not_have():
                 func, "id", None
             )
             allowed = known.get(name)
-            if allowed is None:
+            if allowed is None or defined[name] > 1:
                 continue  # not a dataclass we can resolve by name
             if any(kw.arg is None for kw in node.keywords):
                 continue  # **kwargs splat; nothing to check statically

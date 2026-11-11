@@ -32,6 +32,8 @@ from mstar.engine.node_dtype import node_scope
 from mstar.engine.resources import BucketKey, CGSlotSpec, KVStep, Resource, SlotLease, StepContext, StepRunner
 from mstar.engine.resources.resident import ResidentPlanner
 from mstar.engine.resources.step import PIECEWISE_WALK, lean_subsets
+from mstar.engine.state.adapters import state_steps
+from mstar.engine.state.contract import EMPTY
 from mstar.model.submodule_base import (
     BatchedModelOutput,
     ModelInputsFromEngine,
@@ -828,7 +830,7 @@ class AcceleratorGraphRunner:
         self._declare_inputs: dict[BucketKey, list[NodeInputs]] = {}
 
         self.max_bs = max(
-            (max(self._batch_sizes(config)) for config in self._capture_configs),
+            (max(self._batch_sizes(config), default=1) for config in self._capture_configs),
             default=1,
         )
         self.recompile_limit = self._recompile_limit()
@@ -838,7 +840,8 @@ class AcceleratorGraphRunner:
         return bool(self._buckets)
 
     def _batch_sizes(self, config: AcceleratorGraphConfig) -> list[int]:
-        return config.capture_batch_sizes or self.CAPTURE_BATCH_SIZES
+        # None defers to the defaults; [] captures nothing, as in the piecewise runner
+        return self.CAPTURE_BATCH_SIZES if config.capture_batch_sizes is None else config.capture_batch_sizes
 
     def _recompile_limit(self) -> int | None:
         """The dynamo recompile limit this node's compiled calls run under, None where the
@@ -856,7 +859,8 @@ class AcceleratorGraphRunner:
     def max_capture_bs(self, walks: Collection[str]) -> int:
         """The widest capture of any of ``walks``, 0 when none of them has one."""
         return max(
-            (max(self._batch_sizes(config)) for config in self._capture_configs if config.capture_graph_walk in walks),
+            (max(self._batch_sizes(config), default=0)
+             for config in self._capture_configs if config.capture_graph_walk in walks),
             default=0,
         )
 
@@ -1272,7 +1276,7 @@ class AcceleratorGraphRunner:
             slot_lease=lease, per_request_info=engine_inputs.per_request_info,
         )
         if step is not None:
-            step = replace(step, _ctx=StepContext(
+            step.set_ctx(StepContext(
                 request_ids=tuple(dummy_rids),
                 graph_walk=walk,
                 slot=spec.slot,
@@ -1293,11 +1297,17 @@ class AcceleratorGraphRunner:
                         f"capture admit failed for {spec.bucket}: {outcome.reason}"
                     )
                 self._step_runner.plan(step)
-            return self._submodule.preprocess(
-                graph_walk=walk,
-                engine_inputs=engine_inputs,
-                inputs=dummy_inputs,
-            )
+            try:
+                if step is not None:
+                    step.begin_calls()
+                return self._submodule.preprocess(
+                    graph_walk=walk,
+                    engine_inputs=engine_inputs,
+                    inputs=dummy_inputs,
+                )
+            finally:
+                if step is not None:
+                    step.end_calls()
 
         try:
             static_inputs = prepare()
@@ -1328,11 +1338,19 @@ class AcceleratorGraphRunner:
             def run_forward():
                 if resident is not None:
                     planner.gather(resident)
-                out = forward(
-                    graph_walk=walk,
-                    engine_inputs=engine_inputs,
-                    **static_inputs,
-                )
+                try:
+                    if step is not None:
+                        step.begin_calls()
+                    out = forward(
+                        graph_walk=walk,
+                        engine_inputs=engine_inputs,
+                        **static_inputs,
+                    )
+                    if step is not None:
+                        step.check_calls()
+                finally:
+                    if step is not None:
+                        step.end_calls()
                 if resident is not None:
                     planner.commit_in_graph(resident)
                 return out
@@ -1549,7 +1567,7 @@ class AcceleratorGraphRunner:
         capped = [
             max(self._batch_sizes(config)) for config in self._capture_configs
             if graph_walk in config.replay_graph_walks
-            and config.caps_eager_batch_size
+            and config.caps_eager_batch_size and self._batch_sizes(config)
         ]
         return max(capped) if capped else None
 
@@ -1885,12 +1903,14 @@ class PiecewiseAcceleratorGraphRunner:
         device_capability: DeviceCapability | None = None,
         capture_stream: Any = None,
         segment_keys: tuple[str, ...] = (),
+        state_handles: Mapping[str, Any] = EMPTY,
     ):
         self._label = label
         self._capture_stream = capture_stream
         self._config = config
         # the node's resources whose step is its segments (`_region_step`)
         self._segment_keys = segment_keys
+        self._state_handles = state_handles
         self._resources = resources
         # A `one_row_per_step` region replays every row as its first request's, so it
         # runs the node's lean resources lean (`_bucket`) and leases only a step whose
@@ -1911,8 +1931,10 @@ class PiecewiseAcceleratorGraphRunner:
         self._node_name = node_name
         self._prepared_shapes: list | None = None
 
+        # [] captures nothing: an eager-only region, which ``run`` still drives
+        # through its step
         self._capture_batch_sizes = sorted(
-            config.capture_batch_sizes or self.CAPTURE_BATCH_SIZES
+            self.CAPTURE_BATCH_SIZES if config.capture_batch_sizes is None else config.capture_batch_sizes
         )
 
         self._graphs: dict[PiecewiseGraphKey, PiecewiseGraphData] = {}
@@ -1966,6 +1988,10 @@ class PiecewiseAcceleratorGraphRunner:
     @property
     def any_graphs(self) -> bool:
         return bool(self._graphs)
+
+    @property
+    def eager_fallback(self) -> bool:
+        return self._config.eager_fallback
 
     def _dummy_key(self, shape: PiecewiseCaptureShape, slot: int) -> str:
         """Padding rows are per slot, as in ``CudaGraphRunner``: a slot's plan
@@ -2244,7 +2270,16 @@ class PiecewiseAcceleratorGraphRunner:
             )
 
         def run_fn():
-            return self._normalize_output(fn(call))
+            try:
+                if step is not None:
+                    step.begin_calls()
+                out = self._normalize_output(fn(call))
+                if step is not None:
+                    step.check_calls()
+            finally:
+                if step is not None:
+                    step.end_calls()
+            return out
 
         try:
             self._plan(step, shape)
@@ -2300,11 +2335,12 @@ class PiecewiseAcceleratorGraphRunner:
 
     def _declare(
         self, request_ids: list[int], seq_lens: list[int],
-        bucket: BucketKey, capture: bool, slot: int,
+        bucket: BucketKey | None, capture: bool, slot: int,
         real_bs: int | None = None,
         label_seq_lens: dict[str, list[int]] | None = None,
     ):
-        """The region's step over the padded batch, addressed at its slot.
+        """The region's step over the padded batch, addressed at its slot; with
+        no ``bucket``, over the real rows of an eager run.
 
         The declaration covers every row, but the context reports only the real
         head as ``request_ids`` and the padding tail on `set_padded_rids`, as
@@ -2321,7 +2357,7 @@ class PiecewiseAcceleratorGraphRunner:
             graph_walk=PIECEWISE_WALK,
             slot=slot,
             capture=capture,
-            slot_lease=SlotLease(slot=slot, bucket=bucket),
+            slot_lease=None if bucket is None else SlotLease(slot=slot, bucket=bucket),
             force_prefill=self._config.get_config_type() == PiecewiseConfigType.PACKED,
             lean=self._lean,
         )
@@ -2334,11 +2370,13 @@ class PiecewiseAcceleratorGraphRunner:
         label_seq_lens: dict[str, list[int]] | None = None,
     ):
         """The config's step for the region, with a step of its own segments under each of
-        the node's resources that takes them (``with_segment_steps``)."""
-        return with_segment_steps(
+        the node's resources that takes them (``with_segment_steps``), and what it declares
+        about its state expanded (``state_steps``)."""
+        step = with_segment_steps(
             self._config.region_step(list(request_ids), list(seq_lens), label_seq_lens),
             self._segment_keys,
         )
+        return state_steps(step, self._state_handles)
 
     def _plan(self, step, shape: PiecewiseCaptureShape) -> None:
         if step is None:
@@ -2350,6 +2388,44 @@ class PiecewiseAcceleratorGraphRunner:
                 f"total_tokens={shape.total_tokens}: {outcome.reason}"
             )
         self._step_runner.plan(step)
+
+    def _run_eager(
+        self,
+        static_inputs: dict[str, torch.Tensor],
+        request_ids: list[int] | None,
+        seq_lens: list[int] | None,
+        real_bs: int,
+        real_total_tokens: int | None,
+        label_seq_lens: dict[str, list[int]] | None = None,
+    ) -> PiecewiseOutput:
+        """The region's callable run eagerly, through the same step a replay
+        declares (``_declare``), so its resources hold a plan for exactly these rows."""
+        is_packed = self._config.get_config_type() == PiecewiseConfigType.PACKED
+        step = None
+        if request_ids is not None:
+            if seq_lens is None and is_packed:
+                raise ValueError(f"piecewise {self._label!r}: an eager run of a packed region needs seq_lens")
+            step = self._declare(
+                list(request_ids), list(seq_lens) if seq_lens is not None else [self._config.seq_len] * real_bs,
+                None, capture=False, slot=self._current_slot, label_seq_lens=label_seq_lens,
+            )
+        if step is not None:
+            outcome = self._step_runner.admit(step)
+            if not outcome.ok:
+                raise RuntimeError(f"piecewise {self._label!r} eager admit failed: {outcome.reason}")
+            self._step_runner.plan(step)
+        ids = list(request_ids) if request_ids is not None else []
+        out = self._normalize_output(self._config.capture_fn(PiecewiseCallInputs(
+            static_inputs=static_inputs,
+            engine_inputs=ModelInputsFromEngine(
+                request_ids=ids, per_request_info=dummy_metadata(ids, PIECEWISE_WALK),
+                resources=dict(self._resources),
+            ),
+            kwargs=self._config.forward_kwargs,
+        )))
+        if step is not None:
+            self._step_runner.commit(step)
+        return PiecewiseOutput(out, real_total_tokens if is_packed else real_bs)
 
     @staticmethod
     def _normalize_output(out) -> dict[str, torch.Tensor]:
@@ -2455,6 +2531,11 @@ class PiecewiseAcceleratorGraphRunner:
         ran once, at capture, so whatever it read off ``PiecewiseCallInputs``
         is baked into the graph.
 
+        With no captured graph for the shape and ``config.eager_fallback``, the
+        region runs eagerly on ``static_inputs`` as given, its step declared,
+        planned and committed over the real rows alone: the caller's path is the
+        same either way.
+
         A ``one_row_per_step`` region replays the step as one row named by its
         first request, however many requests or segments it is passed, with its lean
         resources lean (``can_lease``): every row must let them.
@@ -2496,10 +2577,12 @@ class PiecewiseAcceleratorGraphRunner:
         real_total_tokens = sum(seq_lens) if seq_lens is not None else None
         data = self._resolve(real_bs, real_total_tokens if is_packed else None)
         if data is None:
-            raise RuntimeError(
-                f"piecewise {self._label!r}: no captured graph for bs={real_bs}, "
-                f"total_tokens={real_total_tokens}"
-            )
+            if not self._config.eager_fallback:
+                raise RuntimeError(
+                    f"piecewise {self._label!r}: no captured graph for bs={real_bs}, "
+                    f"total_tokens={real_total_tokens}"
+                )
+            return self._run_eager(static_inputs, request_ids, seq_lens, real_bs, real_total_tokens, label_seq_lens)
 
         for name, value in static_inputs.items():
             buffer = data.static_inputs.get(name)

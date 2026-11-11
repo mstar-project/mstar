@@ -44,10 +44,12 @@ case "$job" in
         python -m pip install maturin
         # pyyaml: runtime tests import mstar.model.base.
         python -m pip install pytest==9.2.0 msgpack numpy pyyaml
-        # The tensor-transport stack imports torch and Triton. Preserve this
-        # job's existing unpinned versions and minimal mstar installation.
-        python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
-        python -m pip install triton
+        # The tensor-transport stack imports torch and Triton, and the
+        # transcription parity cases resample with torchaudio: the versions
+        # rust-transport pins, and a minimal mstar installation.
+        python -m pip install torch==2.10.0 torchaudio==2.10.0 \
+            --index-url https://download.pytorch.org/whl/cpu
+        python -m pip install triton==3.6.0
         python -m pip install --no-deps -e .
         ;;
 esac
