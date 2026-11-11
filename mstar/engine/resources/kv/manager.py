@@ -3111,8 +3111,9 @@ class KVManager(AttentionResource):
             sink = step.sink
             rows = () if ctx.capture else step.segments
             repeats = ctx.repeats
-            # a repeated step's stored spans are `repeats` of what it declared (see `_run_lag`)
-            self._run_lag = max(self._run_lag, 2 * (repeats - 1))
+            if repeats != 1:
+                # a repeated step's stored spans are `repeats` of what it declared (see `_run_lag`)
+                self._run_lag = max(self._run_lag, 2 * (repeats - 1))
             if rows and repeats == 1 and self._index is None and not retention and not windows and not _DEBUG_ASSERTS:
                 # nothing to index, adopt, retain or check: the arena moves
                 # every row's counts in one call, and hands back the ones it can't

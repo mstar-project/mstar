@@ -722,7 +722,7 @@ class RecurrentStatePool(Resource):
             if self._admit_restores or self._admit_snaps:
                 self._forget_prefix_admit(lambda key: ctx.is_real_row(key[0]))
             page = self._kv.config.tokens_per_page if self._kv is not None else 0
-            slots, is_pad = self._slots, ctx.is_padding_row
+            slots, is_pad, repeats = self._slots, ctx.is_padding_row, ctx.repeats
             for segment in step.segments or ():
                 if segment.span <= 0 or is_pad(segment.request_id):
                     continue
@@ -734,7 +734,7 @@ class RecurrentStatePool(Resource):
                         slot.has_state = True
                         self._version += 1
                     # a step that repeats ran its span once a replay
-                    slot.tokens += segment.span * ctx.repeats
+                    slot.tokens += segment.span * repeats
                     # a row too short to checkpoint that ends on a page (a decode step) is saved here, after its forward
                     if page and segment.span < page and not slot.tokens % page:
                         self._save_decode(segment.request_id, segment.label, slot)

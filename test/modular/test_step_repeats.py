@@ -10,6 +10,7 @@ from mstar.graph.base import GraphEdge, GraphNode, Loop
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.submodule_base import (
     ARNodeSubmodule,
+    BatchedModelOutput,
     DeviceLoopback,
     TokenStop,
 )
@@ -118,3 +119,34 @@ def test_the_spec_cap_counts_steps_not_the_iterations_a_step_asked_for():
     launched = SimpleNamespace(is_yield_away=False, node_batch=SimpleNamespace(step_context=SimpleNamespace(repeats=8)))
     speculator.note_launched(launched)
     assert speculator._consecutive == 1
+
+
+def test_a_node_no_deployment_asked_to_repeat_replays_as_main():
+    """With ``step_repeats`` unset a decode step's forward is main's: the replay
+    alone, nothing of the repeat path around it (Qwen3.5 at c64 spent ~30 us a
+    step there)."""
+    replayed = BatchedModelOutput()
+
+    class Runner:
+        def __init__(self):
+            self.calls = []
+
+        def run_forward(self, lease, preprocessed, **kwargs):
+            self.calls.append("run_forward")
+            return replayed
+
+        def __getattr__(self, name):
+            self.calls.append(name)
+            return lambda *args: None
+
+    ctx = SimpleNamespace(graph_walk=WALK, resident=None, repeats=1, continues=None)
+    batch = SimpleNamespace(step_context=ctx, preplan_event=None)
+    inputs = SimpleNamespace(per_request_info={})
+    runner = Runner()
+    make_engine()._forward(batch, make_mgmt(), runner, inputs, {}, object(), True, [1])
+    assert runner.calls == ["run_forward"]
+
+    # a node a deployment asked to repeat takes its iterations from the repeat path
+    runner = Runner()
+    make_engine()._forward(batch, make_mgmt(may_repeat=True), runner, inputs, {}, object(), True, [1])
+    assert "repeat" in runner.calls

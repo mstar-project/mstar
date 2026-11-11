@@ -327,19 +327,23 @@ def test_a_step_repeats_only_when_its_rows_all_continue(in_chain, fresh, same_no
     assert repeats.ceiling(speculation, in_chain, lambda: room) == want
 
 
-def test_a_row_a_host_step_moved_does_not_rewind_on_each_replay():
+@pytest.mark.parametrize("repeats", [1, 3], ids=lambda n: f"{n}_replays")
+def test_a_row_a_host_step_moved_does_not_rewind_on_each_replay(repeats):
     """A one-token host step leaves a row's length to be refreshed. A run after
-    it refreshes it once, not at the head of every replay."""
+    it refreshes it once, not at the head of every replay; a one-iteration step
+    refreshes it as main does, a cell on the graph's scatter, with nothing to flush."""
     live, ref, planner = _setup({1: 5})
     _captured_step(live, planner, [1], slot=0, bs=1)
     _captured_step(ref, None, [1], slot=0, bs=1)
     step, ctx = _host_step(live, [1], [1], walk=WALK)
     planner.commit(step, ctx)
     _host_step(ref, [1], [1], walk=WALK)
-    a = _captured_step(live, planner, [1], slot=1, bs=1, repeats=3)
+    a = _captured_step(live, planner, [1], slot=1, bs=1, repeats=repeats)
     for i, replay in enumerate(a.replays):
         b = _captured_step(ref, None, [1], slot=(1 + i) % 2, bs=1)
         assert (replay.offsets[:1], replay.positions[:1]) == (b.offsets[:1], b.positions[:1])
+    if repeats == 1:
+        assert not a.ctx.resident_plan.writes.rows, "a one-iteration step flushed a run main writes as a cell"
 
 
 def test_a_steady_batch_keeps_its_row():
