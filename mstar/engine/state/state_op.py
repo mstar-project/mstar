@@ -14,7 +14,6 @@ from typing import Any
 
 import torch
 
-from mstar.engine.resources.kv.config import KVLayout
 from mstar.engine.state.calls import ArrayHandle
 from mstar.engine.state.contract import PagedNHD, PagedNHDTarget
 
@@ -103,22 +102,10 @@ def _state_op(fused, adds, writes, reads, mutates, formats, reference) -> StateO
 
 
 def bind_state_ops(handles: Mapping[str, Any]) -> None:
-    """Cache on each array handle which ops run their fused kernel on its format, so a call reads a constant."""
-    # imported here, since the layer imports the model's components, and they import this package
-    from mstar.engine.state.adapters import PagedArrayHandle
-
+    """Cache on each array handle which ops run their fused kernel on it, so a call reads a constant."""
     for handle in handles.values():
-        if isinstance(handle, PagedArrayHandle):
-            handle.fused_ops = frozenset(name for name, op in STATE_OPS.items() if _addresses(op, handle))
-
-
-def _addresses(op: StateOp, handle: ArrayHandle) -> bool:
-    """Whether ``op``'s kernel can write ``handle``'s pages. A backend that takes K/V at its read never sees them."""
-    cache = handle._kv.kv_cache
-    return cache.layout is KVLayout.NHD and handle.first_read.requires_kv_write and any(
-        (fmt.dtypes is None or cache.dtype in fmt.dtypes) and (fmt.devices is None or cache.device.type in fmt.devices)
-        for fmt in op.formats
-    )
+        if isinstance(handle, ArrayHandle):
+            handle.fused_ops = frozenset(name for name, op in STATE_OPS.items() if handle.takes_fused(op))
 
 
 def _check_call(op: StateOp, args: Sequence[Any]) -> None:
@@ -139,8 +126,7 @@ def _call(op: StateOp, args: Sequence[Any]) -> Any:
     if op.name not in handle.fused_ops:
         return op.reference(*args)
     layer = handle._layer_id(args[op.layer_at])
-    handle._record_add(layer, None)
-    target = PagedNHDTarget(*handle._kv.write_target(layer_idx=handle._pool_layer[layer], label=handle.label))
+    target = handle.fused_target(layer)
     # A capture records its launches, so the check's host sync can't run in one.
     if not _DEBUG_ASSERTS or handle._capturing:
         return op.fused(*args, target=target)
@@ -166,6 +152,8 @@ def conformance_problems(call: Callable[..., Any], args: Sequence[Any], toleranc
     array unchanged, and every tensor argument it doesn't list as mutated unchanged."""
     op: StateOp = call.op
     handle: ArrayHandle = args[op.target_at]
+    if not handle.takes_fused(op):
+        return [f"the handle takes no fused kernel of {op.name!r}, so a call runs the reference either way"]
     layer = handle._pool_layer[handle._layer_id(args[op.layer_at])]
     names = list(inspect.signature(op.reference).parameters)
     mutated = [names.index(name) for name in op.mutates]

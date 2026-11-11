@@ -6,12 +6,15 @@ on a replay, and its checks live in it.
 
 from abc import abstractmethod
 from collections.abc import Mapping, Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 
 from mstar.engine.resources.step import Segment, StepHandle
 from mstar.engine.state.contract import EMPTY, Array, ArrayStep, CausalConv, GatedDeltaNet, Op, Sampler
+
+if TYPE_CHECKING:
+    from mstar.engine.state.state_op import StateOp
 
 
 def segments_of(declared: ArrayStep, step) -> Sequence[Segment]:
@@ -211,6 +214,10 @@ class ArrayHandle(StepHandle):
 
     def at_last_token(self, x: torch.Tensor) -> torch.Tensor:
         raise self._unsupported("at_last_token")
+
+    def takes_fused(self, op: "StateOp") -> bool:
+        """Whether ``op``'s fused kernel writes this array itself, in place of its reference running the calls."""
+        return False
 
     def _kernel_setting(self, read: str, field: str) -> Any:
         if read not in self.reads:

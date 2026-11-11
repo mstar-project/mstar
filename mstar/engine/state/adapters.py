@@ -19,7 +19,7 @@ from mstar.engine.resources.attn.ragged.config import (
     RaggedCrossAttentionStep,
     cross_label,
 )
-from mstar.engine.resources.kv.config import KVSpec, KVStep, PagedKVConfig
+from mstar.engine.resources.kv.config import KVLayout, KVSpec, KVStep, PagedKVConfig
 from mstar.engine.resources.linear_attn.config import (
     LinearAttnConfig,
     LinearAttnSpec,
@@ -52,6 +52,7 @@ from mstar.engine.state.contract import (
     KVEntry,
     Layout,
     Op,
+    PagedNHDTarget,
     Positions,
     Read,
     Sampler,
@@ -71,6 +72,7 @@ from mstar.model.components.distributed.sequence_parallel import (
 )
 
 if TYPE_CHECKING:
+    from mstar.engine.state.state_op import StateOp
     from mstar.model.base import LabelLayout, Model
 
 
@@ -764,6 +766,21 @@ class PagedArrayHandle(ArrayHandle):
     def at_last_token(self, x: torch.Tensor) -> torch.Tensor:
         self._check_open("at_last_token")
         return self.first_read.select_last_hidden(x, label=self.label)
+
+    def takes_fused(self, op: "StateOp") -> bool:
+        """On a pool in one of ``op``'s formats, while no layer's read takes k and v at its kernel, which would never
+        see the pages the op writes."""
+        cache = self._kv.kv_cache
+        dtype, device = cache.dtype, cache.device.type
+        return cache.layout is KVLayout.NHD and not any(map(self._holds, self.array.layers)) and any(
+            (fmt.dtypes is None or dtype in fmt.dtypes) and (fmt.devices is None or device in fmt.devices)
+            for fmt in op.formats
+        )
+
+    def fused_target(self, layer: int) -> PagedNHDTarget:
+        """Record ``layer``'s add, which a fused op makes, and give where it writes the step's entries."""
+        self._record_add(layer, None)
+        return PagedNHDTarget(*self._kv.write_target(layer_idx=self._pool_layer[layer], label=self.label))
 
 
 class ValueHandle(ArrayHandle):
