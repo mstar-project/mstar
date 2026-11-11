@@ -1228,7 +1228,7 @@ class CodecSubmodule(ARNodeSubmodule):
         for request_id in per_request_info:
             chunk = self._codec_chunk(per_request_input_metadata.get(request_id))
             if chunk is not None:
-                buckets.add(self._bucket(max(chunk.num_items, 1)))
+                buckets.add(self._bucket(chunk.num_items))
         return max(buckets) if buckets else None
 
     def get_accelerator_graph_configs(
