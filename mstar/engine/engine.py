@@ -241,8 +241,9 @@ def _layer_set_problem(submodule, resources: Mapping[str, Resource], joined) -> 
     """Why the drafter's KV layer set (``joined``, a `KVLayerSet`) is not bound
     by exactly its layers once `bind_node_resources` has run: as many attention
     layers declaring the set (``kv_layer_set``) as it holds. A stack that forgot
-    it would write the target's first layers instead of its own. Which index each
-    layer sets is not checked."""
+    it would write the target's first layers instead of its own. Layers are counted
+    by their `AttentionCallable`, so a layer-set stack gives each layer its own
+    ``attend``. Which index each layer sets is not checked."""
     if joined is None:
         return None
     from mstar.engine.resources.convenience import AttentionCallable
@@ -257,7 +258,7 @@ def _layer_set_problem(submodule, resources: Mapping[str, Resource], joined) -> 
     if bound != slot.num_layers:
         return (
             f"layer set {joined.name!r} of KV {joined.kv_cache!r} holds {slot.num_layers} layers, and {bound} "
-            "attention layers declare it (kv_layer_set)"
+            "attention layers declare it (kv_layer_set; each layer of the set needs its own attend)"
         )
     return None
 

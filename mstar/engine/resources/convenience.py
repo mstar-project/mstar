@@ -18,7 +18,9 @@ class AttentionCallable:
     attention resource's exchange (`AttentionManager.exchange`), which hands the
     write and the attention the tokens and heads its pool's storage needs. One
     instance can drive a whole stack, so the label is one cursor for it; a
-    model that varies its label per layer threads it explicitly instead.
+    model that varies its label per layer threads it explicitly instead. A
+    drafter's KV layer set is the exception to sharing one: the engine counts
+    its layers by their callables, so each layer of the set holds its own.
 
     A cacheless (ragged) attention needs no callable: call the resource's
     ``run(q, k, v, label=...)`` with the span's label bound.
