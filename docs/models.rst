@@ -1930,7 +1930,8 @@ Super checkpoints force. A request in the other regime runs eager.
 ``gen_capture_image`` lists the (height, width) image tiers to capture
 (default 192x320, 480x832 and 720x1280, each still bounded by
 ``graph_max_latent_area``); the Super T2I config captures its 1024x1024
-default.
+default. ``compile_prefill`` (default off) compiles the captured text prefill
+in ``denoise_compile_mode``; the Super T2I config turns it on.
 
 The action policy (``cosmos3_edge_droid``, or ``cosmos3_edge`` with an action
 ``domain_name``) predicts a chunk of robot actions from the current observation:
