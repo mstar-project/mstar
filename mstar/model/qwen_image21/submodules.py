@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+from functools import cache
 from typing import NamedTuple
 
 import torch
@@ -131,6 +132,32 @@ def _decode(vae: nn.Module, z: torch.Tensor) -> torch.Tensor:
     return vae.decoder(vae.post_quant_conv(z), None, None, True).clamp(-1.0, 1.0)
 
 
+@cache
+def _padded_conv_class() -> type:
+    """diffusers' ``QwenImage21CausalConv3d`` with its zero padding inside the convolution."""
+    from diffusers.models.autoencoders.autoencoder_kl_qwenimage21 import QwenImage21CausalConv3d
+
+    class PaddedCausalConv(QwenImage21CausalConv3d):
+        def forward(self, x, cache_x=None):
+            if cache_x is not None:
+                raise ValueError("the one-frame VAE takes no feature cache")
+            return nn.Conv2d.forward(self, x.squeeze(2)).unsqueeze(2)
+
+    return PaddedCausalConv
+
+
+def _pad_inside_convs(vae: nn.Module) -> None:
+    """Under ``compile``: each causal conv pads inside its convolution, not through an ``F.pad`` copy first
+    (zero padding either way). Compiled, that copy is one full-resolution kernel before every conv, and the
+    one before the decoder's head is stored with uncoalesced writes: a 1024^2 decode 73 -> 49 ms."""
+    padded = _padded_conv_class()
+    for module in vae.modules():
+        if isinstance(module, padded.__base__) and not isinstance(module, padded):
+            pad_w, _, pad_h, _ = module._padding  # (w, w, h, h): symmetric
+            module.padding, module._padding = (pad_h, pad_w), (0, 0, 0, 0)
+            module.__class__ = padded
+
+
 class QwenImage21VaeEncoderSubmodule(NodeSubmodule):
     """RGBA uint8 ``[4, H, W]`` references -> their normalized latents (the posterior's mode) as
     rows ``[h * w, C]``, every reference end to end. Images differ in size: one encode each."""
@@ -142,6 +169,8 @@ class QwenImage21VaeEncoderSubmodule(NodeSubmodule):
         super().__init__()
         self.vae = vae
         self._compile = compile
+        if compile:
+            _pad_inside_convs(vae)
 
     def compile_regions(self) -> dict[str, list[tuple]]:
         if not self._compile:
@@ -177,6 +206,8 @@ class QwenImage21VaeDecoderSubmodule(NodeSubmodule):
         super().__init__()
         self.vae = vae
         self._compile = compile
+        if compile:
+            _pad_inside_convs(vae)
 
     def compile_regions(self) -> dict[str, list[tuple]]:
         if not self._compile:

@@ -181,9 +181,10 @@ def test_vae_pixels_are_the_image_processors_to_the_bit_and_layout():
 
 def test_the_cache_free_vae_calls_are_diffusers_encode_and_decode_to_the_bit():
     """The nodes call the VAE's encoder and decoder without the one-frame feature cache diffusers passes
-    (written, never read, for one frame); a diffusers change that reads it would break parity here."""
+    (written, never read, for one frame); a diffusers change that reads it would break parity here, as one
+    to the causal conv's padding would break the padded convs `compile` swaps in."""
     vae_module = pytest.importorskip("diffusers.models.autoencoders.autoencoder_kl_qwenimage21")
-    from mstar.model.qwen_image21.submodules import _decode, _encode_mode
+    from mstar.model.qwen_image21.submodules import QwenImage21VaeDecoderSubmodule, _decode, _encode_mode
 
     torch.manual_seed(0)
     vae = vae_module.AutoencoderKLQwenImage21(
@@ -193,8 +194,13 @@ def test_the_cache_free_vae_calls_are_diffusers_encode_and_decode_to_the_bit():
     pixels = torch.rand(1, 4, 1, 48, 32) * 2 - 1
     with torch.no_grad():
         mode = vae.encode(pixels).latent_dist.mode()
+        decoded = vae.decode(mode, return_dict=False)[0]
         assert torch.equal(_encode_mode(vae, pixels), mode)
-        assert torch.equal(_decode(vae, mode), vae.decode(mode, return_dict=False)[0])
+        assert torch.equal(_decode(vae, mode), decoded)
+        # under `compile` the convs pad inside the convolution: the same function
+        QwenImage21VaeDecoderSubmodule(vae, compile=True)
+        torch.testing.assert_close(_encode_mode(vae, pixels), mode)
+        torch.testing.assert_close(_decode(vae, mode), decoded)
 
 
 def test_the_compiled_vae_regions_serve_other_sizes_without_recompiling():
