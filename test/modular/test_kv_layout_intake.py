@@ -65,15 +65,16 @@ class _ScriptDoneError(Exception):
 
 
 class _Model(StubModel):
-    def __init__(self, layout=LAYOUT, max_seq_len=4096):
-        self._layout, self._max_seq_len = layout, max_seq_len
+    def __init__(self, layout=LAYOUT, max_seq_len=4096, max_num_pages=64):
+        self._layout, self._max_seq_len, self._max_num_pages = layout, max_seq_len, max_num_pages
 
     def checkpoint_path(self):
         return "/a/checkpoint"
 
     def get_node_resources(self):
         return [KVSpec(resource_key="kv", nodes={"llm"}, config=PagedKVConfig(
-            num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=self._max_seq_len, max_num_pages=64, page_size=PS,
+            num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=self._max_seq_len,
+            max_num_pages=self._max_num_pages, page_size=PS,
         ))]
 
     def kv_labels(self):
@@ -196,8 +197,8 @@ class _Verifying(_Model):
     """A pool that verifies drafts: it holds a slack of 8 past its client limit, and its one label
     declares no scratch, which the conductor floors at the slack."""
 
-    def __init__(self):
-        super().__init__(layout={"kv": {"main": LAYOUT["kv"]["main"]}})
+    def __init__(self, max_num_pages=64):
+        super().__init__(layout={"kv": {"main": LAYOUT["kv"]["main"]}}, max_num_pages=max_num_pages)
 
     def get_node_resources(self):
         (spec,) = super().get_node_resources()
@@ -218,6 +219,28 @@ def test_the_conductor_floors_a_verifying_pools_scratch_at_its_slack(tmp_path, m
     kwargs = _preprocess(model, {"max_output_tokens": 30})
     cfg = _ingest(model, kwargs, tmp_path, monkeypatch).request_info.resource_configs["kv"]
     assert cfg.kv_layout["main"].scratch == 8
+
+
+def test_a_verifying_request_is_checked_against_the_pool_with_its_slack(tmp_path, monkeypatch):
+    """The pool holds 9 request pages (144 tokens). The prompt and 40 tokens fit in them, and the
+    8-token slack does not, so the slack has to be applied before the request is checked."""
+    model = _Verifying(max_num_pages=10)
+
+    sent = _conduct(model, _preprocess(model, {"max_output_tokens": 40}), tmp_path, monkeypatch).sent
+
+    failed = [msg.body for msg in sent if getattr(msg, "message_type", None) == "request_failed"]
+    assert [body.status for body in failed] == [400], "a request whose slack overflows the pool was served"
+    assert not any(getattr(msg.message_type, "name", "") == "NEW_REQUEST" for msg in sent)
+
+
+def test_a_verifying_requests_fitted_length_leaves_room_for_its_slack(tmp_path, monkeypatch):
+    """With no length asked, the loops are fitted to the pool: 144 tokens less the prompt and the
+    8-token slack leave 36."""
+    model = _Verifying(max_num_pages=10)
+
+    new_request = _ingest(model, _preprocess(model, {}), tmp_path, monkeypatch)
+
+    assert new_request.loop_caps["decode_loop"] == 144 - PROMPT - 8
 
 
 class _NamesNoCheckpoint(_Model):
