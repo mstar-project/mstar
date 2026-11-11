@@ -172,10 +172,7 @@ class _GeluProj(nn.Module):
         self.proj = ColumnParallelLinear(comm_group, dim, inner, bias=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = self.proj(x)
-        if kernels.fits(y) and y.is_contiguous():
-            return kernels.gelu_tanh(y)
-        return F.gelu(y, approximate="tanh")
+        return F.gelu(self.proj(x), approximate="tanh")
 
 
 class _FeedForward(nn.Module):
