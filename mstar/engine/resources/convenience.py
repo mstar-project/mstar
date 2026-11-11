@@ -130,67 +130,6 @@ def _rotate_half_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> 
     return x * cos + torch.cat((-x[..., half:], x[..., :half]), dim=-1) * sin
 
 
-class LinearAttnCallable:
-    """A recurrent state pool plus the resource running kernels against it,
-    mirroring :class:`AttentionCallable`.
-
-    The layer calls ``conv`` then the instance; this hands the pool's per-layer
-    blocks over as plain tensors, so neither the layer nor the manager holds
-    the pool.
-    """
-
-    def __init__(self, pool: RecurrentStatePool, attn: LinearAttnManager | None = None):
-        self.pool = pool
-        self.attn = attn
-        self._layer_idx = 0
-
-    @torch.compiler.disable
-    def bind_step(self, label: str, attn: LinearAttnManager | None = None) -> None:
-        if attn is not None:
-            self.attn = attn
-        assert self.attn is not None, (
-            "no linear attention resource: pass `attn` here or at construction"
-        )
-        self.attn.set_default_label(label)
-
-    @property
-    def label(self) -> str:
-        return self.attn.default_label
-
-    @torch.compiler.disable
-    def set_layer_idx(self, layer_idx: int) -> None:
-        """The layer's index among the *recurrent* layers, not the stack's."""
-        self._layer_idx = layer_idx
-        self.attn.set_default_layer_idx(layer_idx)
-
-    @torch.compiler.disable
-    def conv(
-        self, x: torch.Tensor, weight: torch.Tensor,
-        bias: torch.Tensor | None = None, activation: str | None = "silu",
-    ) -> torch.Tensor:
-        return self.attn.run_conv(
-            x,
-            conv_layer=self.pool.block("conv", self._layer_idx),
-            weight=weight,
-            bias=bias,
-            activation=activation,
-        )
-
-    @torch.compiler.disable
-    def __call__(
-        self,
-        q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
-        a: torch.Tensor, b: torch.Tensor,
-        a_log: torch.Tensor, dt_bias: torch.Tensor,
-    ) -> torch.Tensor:
-        return self.attn.run(
-            q, k, v, a, b,
-            state_layer=self.pool.block("state", self._layer_idx),
-            a_log=a_log,
-            dt_bias=dt_bias,
-        )
-
-
 class _KDALayerBlocks(NamedTuple):
     conv: torch.Tensor
     state: torch.Tensor
@@ -198,7 +137,7 @@ class _KDALayerBlocks(NamedTuple):
 
 
 class KDACallable:
-    """:class:`LinearAttnCallable` for Kimi delta attention. The layer passes its
+    """A recurrent state pool plus the resource running Kimi delta attention against it. The layer passes its
     projections and ``KDAParams``; this resolves the layer's conv, state and, for a
     verify step, speculative blocks, so neither the layer nor the manager holds the
     pool. The same cursor protocol, counting KDA layers only; a ``layer_idx``
@@ -275,7 +214,7 @@ class KDACallable:
         prefix_len.index_copy_(0, slots, count)
         side.index_copy_(0, slots, 1 - side.index_select(0, slots))
 class Mamba2Callable:
-    """``LinearAttnCallable`` for a Mamba-2 layer: the conv, then the SSD
+    """A recurrent state pool plus the resource running a Mamba-2 layer's kernels against it: the conv, then the SSD
     recurrence, each handed this layer's block of the pool as a plain tensor.
 
     Same cursor protocol (``bind_step`` once per stack, ``set_layer_idx`` per
