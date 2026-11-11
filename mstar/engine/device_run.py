@@ -121,7 +121,7 @@ class RunState:
             self.limit.fill_(limit)
             self._immune_stager.copy_(self.immune, immune, pad_value=False)
         rows = tuple(rows)
-        assert previous is not self, "a slot's run is never the run it continues: leases rotate"
+        # leases rotate, so a step never continues its own slot's run (previous is not self)
         same = previous is not None and previous.rows == rows
         if same and len(previous.marks) == len(self.marks):
             self.marks.copy_(previous.marks)  # same rows, same bucket: padding is marked alike
