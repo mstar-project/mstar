@@ -339,6 +339,31 @@ def test_adapter_refuses_what_it_cannot_honour(body, tmp_path):
         adapters.get_adapter("glm52").chat_to_request(_chat(**body), tmp_path)
 
 
+@pytest.mark.parametrize("body", [
+    {"functions": [{"name": "get_weather", "parameters": {}}]},
+    {"function_call": {"name": "get_weather"}},
+    {"tools": [WEATHER], "function_call": "auto", "functions": [WEATHER["function"]]},
+])
+def test_the_legacy_function_fields_are_refused(body, tmp_path):
+    """Their tools would be dropped and the reply read as plain text."""
+    with pytest.raises(ValueError, match="functions and function_call are not served; send tools and tool_choice"):
+        adapters.get_adapter("glm52").chat_to_request(_chat(**body), tmp_path)
+
+
+def test_the_legacy_function_fields_off_drop(tmp_path):
+    mk = adapters.get_adapter("glm52").chat_to_request(_chat(functions=[], function_call="none"), tmp_path).model_kwargs
+    assert "functions" not in mk and "function_call" not in mk
+
+
+def test_stop_strings_are_capped(tmp_path):
+    adapter = adapters.get_adapter("glm52")
+    assert adapter.stop_strings(_chat(stop=["END", "x" * adapters.MAX_STOP_CHARS])) == ["END", "x" * 256]
+    with pytest.raises(ValueError, match="a stop string takes at most 256 characters"):
+        adapter.chat_to_request(_chat(stop="é" * 257), tmp_path)
+    with pytest.raises(ValueError, match="stop takes at most 4 strings, got 5"):
+        adapter.chat_to_request(_chat(stop=list("abcde")), tmp_path)
+
+
 @pytest.mark.parametrize("model", ["glm52", "glm5_next"])
 def test_a_refused_image_leaves_no_upload(model, tmp_path):
     """The chat route cleans up only what it submits; a text model refuses an image after

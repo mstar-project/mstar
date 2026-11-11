@@ -51,7 +51,7 @@ ROUTES = {
     "transcriptions": ("/v1/audio/transcriptions", {"model": "m"}),
 }
 # Surfaces the Python adapter serves and mstar-server does not yet (#742).
-NOT_PORTED: set[tuple[str, str]] = {("GlmChatAdapter", "chat")}
+NOT_PORTED: set[tuple[str, str]] = set()
 
 
 def _classes() -> dict[str, object]:
@@ -192,14 +192,15 @@ def _chat_classes() -> list[str]:
                   if a.supports_chat and (c, "chat") not in NOT_PORTED)
 
 
-# Text-only chat refuses the multimodal CHAT body; its own table is below.
-TEXT_ONLY_CHAT = {"TextChatAdapter"}
+# Text-only chat refuses the multimodal CHAT body; its own table is below, and
+# GlmChatAdapter's in test_rust_glm_chat.py.
+TEXT_ONLY_CHAT = {"TextChatAdapter", "GlmChatAdapter"}
 CHAT_CLASSES = [c for c in _chat_classes() if c not in TEXT_ONLY_CHAT]
 
 
 def test_the_chat_classes_are_the_ones_this_pr_ports():
     assert _chat_classes() == [
-        "BagelAdapter", "Cosmos3EdgeAdapter", "Qwen3OmniAdapter", "Qwen3_5Adapter", "TextChatAdapter",
+        "BagelAdapter", "Cosmos3EdgeAdapter", "GlmChatAdapter", "Qwen3OmniAdapter", "Qwen3_5Adapter", "TextChatAdapter",
     ]
 
 

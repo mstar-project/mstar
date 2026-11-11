@@ -266,7 +266,7 @@ fn a_chat_that_asks_for_a_tool_call_is_refused() {
         r#""functions":[{"name":"get_weather"}]"#,
         r#""function_call":{"name":"get_weather"}"#,
     ] {
-        for (name, adapter) in ADAPTERS.iter().filter(|(_, a)| a.supports_chat()) {
+        for (name, adapter) in ADAPTERS.iter().filter(|(_, a)| a.supports_chat() && !a.serves_tool_calls()) {
             let err = adapter.chat_to_request(&chat_with(fields), Path::new("/unused"), false).unwrap_err();
             assert_eq!(err, "tool calling is not supported for this model", "{fields} reached {name}");
         }
@@ -284,7 +284,8 @@ fn a_chat_asking_for_more_than_one_plain_reply_is_refused() {
         (r#""best_of":3"#, "best_of is not supported"),
         (r#""response_format":{"type":"json_object"}"#, "response_format needs constrained decoding"),
     ] {
-        for (name, adapter) in ADAPTERS.iter().filter(|(_, a)| a.supports_chat()) {
+        let stop = fields.starts_with(r#""stop""#);
+        for (name, adapter) in ADAPTERS.iter().filter(|(_, a)| a.supports_chat() && !(stop && a.serves_stop_strings())) {
             let got = adapter.chat_to_request(&chat_with(fields), Path::new("/unused"), false).unwrap_err();
             assert!(got.starts_with(err), "{fields} on {name}: {got}");
         }
@@ -316,7 +317,9 @@ fn the_tool_fields_clients_send_by_default_pass() {
         r#""response_format":{"type":"text"}"#,
         r#""stream_options":{"include_usage":true},"user":"u1","store":false,"metadata":{"k":"v"},"service_tier":"auto","parallel_tool_calls":true"#,
     ] {
-        for (name, adapter) in ADAPTERS.iter().filter(|(_, a)| a.supports_chat()) {
+        // an adapter that serves tool calls refuses listed legacy functions: send tools
+        let functions = fields.contains(r#""functions":[{"#);
+        for (name, adapter) in ADAPTERS.iter().filter(|(_, a)| a.supports_chat() && !(functions && a.serves_tool_calls())) {
             let args = adapter.chat_to_request(&chat_with(fields), Path::new("/unused"), false);
             assert!(args.is_ok(), "{fields} refused a plain chat on {name}: {args:?}");
             let mk = args.unwrap().model_kwargs;

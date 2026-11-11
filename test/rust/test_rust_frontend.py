@@ -596,6 +596,8 @@ def test_api_key_guards_every_route_but_health(monkeypatch):
             "Access-Control-Request-Method": "POST",
             "Access-Control-Request-Headers": "authorization,content-type"})
         assert status == 200 and "access-control-allow-origin" in resp_headers
+        # echoed, as Starlette does: a browser won't let a literal "*" cover Authorization
+        assert resp_headers.get("access-control-allow-headers") == "authorization,content-type"
 
 
 def test_no_api_key_ignores_an_inherited_env_key(monkeypatch):
@@ -725,6 +727,13 @@ class _ImageStubAPIServer(_StubAPIServer):
 @contextlib.contextmanager
 def _model_stack(model, stub, env=None):
     """Launch the real mstar-server for `model` wired to `stub`."""
+    with _bridged_stack(model, stub, env) as (port, upload_dir, _bridge):
+        yield port, upload_dir
+
+
+@contextlib.contextmanager
+def _bridged_stack(model, stub, env=None):
+    """``_model_stack``, also yielding the ``RustFrontendBridge``."""
     import os
     import subprocess
 
@@ -739,7 +748,7 @@ def _model_stack(model, stub, env=None):
     thread.start()
     try:
         assert _wait_healthy(port)
-        yield port, upload_dir
+        yield port, upload_dir, bridge
     finally:
         bridge.stop()
         proc.terminate()
@@ -1539,3 +1548,84 @@ def test_both_frontends_route_under_a_root_path_alike(root, tmp_path, monkeypatc
             except urllib.error.HTTPError as e:
                 got.append(e.code)
     assert got == want, list(zip(paths, got, want, strict=True))
+
+
+def _bare_server_cmd(port) -> list[str]:
+    """mstar-server alone, with no bridge behind it."""
+    return [BINARY, "qwen3_omni", str(port), tempfile.mkdtemp(prefix="mstar_rf_bare_"),
+            tempfile.mkdtemp(prefix="mstar_rf_bareup_")]
+
+
+def _listening(port) -> bool:
+    with socket.socket() as s:
+        return s.connect_ex(("127.0.0.1", port)) == 0
+
+
+def test_a_taken_port_exits_3_and_says_so():
+    """``mstar serve`` exits when mstar-server does, and ``test/e2e/server.py``
+    tells a lost port race by this message."""
+    import os
+    import subprocess
+
+    env = dict(os.environ, MSTAR_SERVER_HOST="127.0.0.1", **{OPENAI_ADAPTER_ENV: openai_adapter_class("qwen3_omni")})
+    with socket.socket() as taken:
+        taken.bind(("127.0.0.1", 0))
+        taken.listen()
+        proc = subprocess.Popen(_bare_server_cmd(taken.getsockname()[1]), env=env, stderr=subprocess.PIPE, text=True)
+        _, err = proc.communicate(timeout=60)
+    assert proc.returncode == 3, err
+    assert "address already in use" in err.lower()
+
+
+def test_mstar_server_exits_when_its_launcher_is_killed():
+    """A SIGKILL of ``mstar serve`` runs no cleanup: mstar-server notices its
+    launcher is gone and lets the port go."""
+    import os
+    import subprocess
+    import sys
+
+    port = _free_port()
+    env = dict(os.environ, MSTAR_SERVER_HOST="127.0.0.1", **{OPENAI_ADAPTER_ENV: openai_adapter_class("qwen3_omni")})
+    launcher = subprocess.Popen(
+        [sys.executable, "-c", "import subprocess, sys, time\n"
+         f"print(subprocess.Popen({_bare_server_cmd(port)!r}).pid, flush=True)\n"
+         "time.sleep(600)"],
+        env=env, stdout=subprocess.PIPE, text=True)
+    pid = int(launcher.stdout.readline())
+    try:
+        # listening (/health needs a bridge, and none runs here)
+        deadline = time.time() + 30
+        while not _listening(port) and time.time() < deadline:
+            time.sleep(0.1)
+        assert time.time() < deadline, "mstar-server never listened"
+    finally:
+        launcher.kill()
+        launcher.wait()
+
+    def gone() -> bool:
+        try:
+            with open(f"/proc/{pid}/stat") as f:
+                return f.read().rsplit(")", 1)[1].split()[0] == "Z"  # exited, not yet reaped
+        except FileNotFoundError:
+            return True
+
+    deadline = time.time() + 15
+    while not gone() and time.time() < deadline:
+        time.sleep(0.1)
+    if not gone():
+        os.kill(pid, 9)
+        pytest.fail("mstar-server outlived its launcher")
+    # the port is free again, to a server binding it as mstar-server does (mio
+    # sets SO_REUSEADDR): a zombie's other threads may still hold its sockets
+    # for a moment after its leader exits, so retry briefly
+    deadline = time.time() + 10
+    while True:
+        with socket.socket() as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                s.bind(("127.0.0.1", port))
+                break
+            except OSError:
+                if time.time() > deadline:
+                    raise
+        time.sleep(0.1)
