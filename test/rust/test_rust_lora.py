@@ -65,6 +65,9 @@ class _Python:
     def release_request(self, request_id):
         pass
 
+    def submission_key(self, request_id):
+        return request_id
+
 
 def _post(port, path, body):
     req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", data=json.dumps(body).encode(),

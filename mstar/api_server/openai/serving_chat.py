@@ -6,6 +6,9 @@ then maps the resulting modality chunks back to OpenAI shapes: text into
 ``image_url`` data-URL content parts, and the closing ``usage`` chunk into
 ``usage`` and ``finish_reason``. An adapter's output parser splits a text
 reply into ``content``, ``reasoning_content`` and ``tool_calls``.
+
+A streamed reply, and a whole one that is parsed or has stop strings, is read
+as ``reply`` events.
 """
 
 from __future__ import annotations
@@ -13,14 +16,10 @@ from __future__ import annotations
 import asyncio
 import base64
 
-from fastapi import HTTPException
-
 from mstar.api_server import media_io
+from mstar.api_server.openai import reply
 from mstar.api_server.openai._util import SSE_DONE, error_type, now, rid, sse
 from mstar.api_server.request_types import USAGE
-from mstar.api_server.streaming_response import ReleasingStreamingResponse
-from mstar.engine.resources.lora.config import LORA_ADAPTER_KWARG
-from mstar.utils.utf8_stream import Utf8Stream
 
 
 async def create_chat_completion(api, model_name, adapter, req, raw_request=None):
@@ -30,40 +29,58 @@ async def create_chat_completion(api, model_name, adapter, req, raw_request=None
     # off the loop: media parts may be decoded, written or fetched (MSTAR_ALLOW_REMOTE)
     args = await asyncio.to_thread(adapter.chat_to_request, req, api.upload_dir)
     parser = adapter.make_output_parser(req)
+    stops = adapter.stop_strings(req)
     request_id = rid("chatcmpl")
 
     try:
-        # resolved once, before it is submitted: the response names the adapter that
-        # served it, as vLLM's does, whether the model field or the lora_adapter kwarg
-        # picked it
-        model_kwargs = api.lora_kwargs(req.model, args.model_kwargs).model_kwargs
-        served = (model_kwargs or {}).get(LORA_ADAPTER_KWARG)
-        if served is not None:
-            model_name = served
-        api.submit_request(
-            text=args.text,
-            file_paths=args.file_paths,
-            input_modalities=args.input_modalities,
-            output_modalities=args.output_modalities,
-            model_kwargs=model_kwargs,
-            prompt_parts=args.prompt_parts,
-            streaming=bool(req.stream),
-            request_id=request_id,
-            report_usage=True,
-        )
+        model_name = reply.submit(api, request_id, model_name, req, args)
         if req.stream:
-            # a request the engine refuses gets its status, not a 200
-            batches = await api.open_result_stream(request_id, raw_request, batches=True)
+            events = await reply.stream_events(api, request_id, raw_request, parser, stops)
             include_usage = bool(req.stream_options and req.stream_options.include_usage)
-            return ReleasingStreamingResponse(
-                _stream_events(batches, model_name, request_id, sample_rate, parser, include_usage),
-                release=lambda: api.release_request(request_id),
-                media_type="text/event-stream", headers={"Cache-Control": "no-cache"},
-            )
+            return reply.sse_response(api, request_id, _stream_events(events, model_name, request_id, include_usage))
+        if parser is not None or stops:
+            # read chunk by chunk, so a stop string ends the request as it appears
+            events = await reply.collect(reply.reply_events(api, request_id, parser, stops), raw_request)
+            return _text_response(model_name, request_id, events)
         chunks = await api.collect_results(request_id, raw_request)
     finally:
         media_io.schedule_upload_cleanup(args.file_paths, api.upload_dir)
-    return _build_response(model_name, request_id, chunks, sample_rate, audio_format, parser)
+    return _build_response(model_name, request_id, chunks, sample_rate, audio_format)
+
+
+def _usage(usage: reply.Usage) -> dict:
+    out = {"prompt_tokens": usage.prompt, "completion_tokens": usage.completion,
+           "total_tokens": usage.prompt + usage.completion}
+    if usage.reasoning:
+        # OpenAI's field for a reasoning model's share; a reply parser counts it
+        out["completion_tokens_details"] = {"reasoning_tokens": usage.reasoning}
+    return out
+
+
+def _text_response(model_name, request_id, events) -> dict:
+    finish = events[-1]
+    content, reasoning, calls = "", "", []
+    for run in reply.runs(events):
+        if run.kind == "call":
+            calls.append({"id": run.call["id"], "type": "function",
+                          "function": {"name": run.call["name"], "arguments": run.call["arguments"]}})
+        elif run.kind == "reasoning":
+            reasoning += run.text
+        else:
+            content += run.text
+    message: dict = {"role": "assistant", "content": content or (None if calls else "")}
+    if reasoning:
+        message["reasoning_content"] = reasoning
+    if calls:
+        message["tool_calls"] = calls
+    return {
+        "id": request_id,
+        "object": "chat.completion",
+        "created": now(),
+        "model": model_name,
+        "choices": [{"index": 0, "message": message, "finish_reason": finish.reason}],
+        "usage": _usage(finish.usage),
+    }
 
 
 def _audio_format(req, sample_rate: int) -> str:
@@ -78,25 +95,12 @@ def _audio_format(req, sample_rate: int) -> str:
     return "pcm" if fmt == "pcm16" else fmt
 
 
-def _usage(reported: dict | None) -> dict:
-    """OpenAI ``usage`` from a ``usage`` chunk's metadata; zeros without one."""
-    prompt = (reported or {}).get("prompt_tokens", 0)
-    completion = (reported or {}).get("completion_tokens", 0)
-    return {"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": prompt + completion}
-
-
-def _finish_reason(reported: dict | None, parser=None) -> str:
-    """``tool_calls`` when the reply's parser read whole calls, else the ``usage`` chunk's."""
-    if parser is not None and parser.finish_reason == "tool_calls":
-        return "tool_calls"
-    return (reported or {}).get("finish_reason", "stop")
-
-
-def _build_response(model_name, request_id, chunks, sample_rate, audio_format="wav", parser=None) -> dict:
+def _build_response(model_name, request_id, chunks, sample_rate, audio_format="wav") -> dict:
+    """A whole reply with no output parser and no stop strings: text, audio and images."""
     text_parts: list[bytes] = []
     audio_pcm: list[bytes] = []
     images: list[bytes] = []
-    usage = None
+    usage = reply.Usage()
     for c in chunks:
         if c.modality == "text":
             text_parts.append(c.data)
@@ -105,13 +109,11 @@ def _build_response(model_name, request_id, chunks, sample_rate, audio_format="w
         elif c.modality == "image":
             images.append(c.data)
         elif c.modality == USAGE:
-            usage = c.metadata
+            usage.close(c.metadata)
 
     # a byte-level BPE token's bytes can end inside a character
     text = b"".join(text_parts).decode("utf-8", "replace")
     message: dict = {"role": "assistant", "content": text}
-    if parser is not None:
-        message = parser.message(text)
 
     if audio_pcm:
         audio, _ = media_io.pcm16_to_container(b"".join(audio_pcm), sample_rate, audio_format)
@@ -134,12 +136,13 @@ def _build_response(model_name, request_id, chunks, sample_rate, audio_format="w
         "object": "chat.completion",
         "created": now(),
         "model": model_name,
-        "choices": [{"index": 0, "message": message, "finish_reason": _finish_reason(usage, parser)}],
+        "choices": [{"index": 0, "message": message, "finish_reason": usage.finish_reason}],
         "usage": _usage(usage),
     }
 
 
-async def _stream_events(batches, model_name, request_id, sample_rate, parser=None, include_usage=False):
+async def _stream_events(batches, model_name, request_id, include_usage=False):
+    """The chat.completion.chunk encoder of a reply's events."""
     created = now()
 
     def chunk(delta, finish=None) -> str:
@@ -151,82 +154,40 @@ async def _stream_events(batches, model_name, request_id, sample_rate, parser=No
             "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
         })
 
-    def error(message: str, status: int) -> str:
-        return sse({"error": {"message": message, "type": error_type(status), "code": status}})
-
     # The role rides on the first delta: clients time the first token from the
     # first chunk, so nothing may go out before the model has produced one.
     role = {"role": "assistant"}
-    failed = False
     usage = None
-    # a byte-level BPE token's bytes can end inside a character: hold them
-    text = Utf8Stream()
-    try:
-        # One yield per batch of text chunks: the tokens a request had waiting
-        # when its handler ran go out as one body frame (one write), which is
-        # what keeps the delivery loop ahead at high token rates. A batch of
-        # one is the common case when the loop keeps up.
-        async for batch in batches:
-            text_events: list[str] = []
-            for c in batch:
-                if c.modality == "text":
-                    content = text.feed(c.data)
-                    if not content:
-                        continue
-                    deltas = [{"content": content}] if parser is None else parser.feed(content)
-                    for delta in deltas:
-                        text_events.append(chunk({**role, **delta}))
-                        role = {}
-                    continue
-                if c.modality == USAGE:
-                    usage = c.metadata
-                    continue
-                if text_events:
-                    yield "".join(text_events)
-                    text_events = []
-                if c.modality == "audio":
-                    # Streaming audio deltas are base64 16-bit PCM at the model rate.
-                    audio = {"id": rid("audio"), "data": base64.b64encode(c.data).decode("ascii")}
-                    yield chunk({**role, "audio": audio})
-                    role = {}
-                elif c.modality == "image":
-                    yield chunk({**role, "content": media_io.png_to_data_url(c.data)})
-                    role = {}
-                elif c.modality == "error":
-                    # The request failed after the stream opened (an engine error
-                    # mid generation, a preprocess error); the HTTP status is
-                    # committed, so the failure travels in-band the way the
-                    # non-streaming path's error body does, not as a normal
-                    # ``stop`` a client would take for a complete answer. The error
-                    # is the iterator's last chunk, so the loop ends on its own;
-                    # returning here instead would trip the iterator's abort on a
-                    # request that is already gone.
-                    failed = True
-                    yield error(c.data.decode("utf-8", "replace"), int(c.metadata.get("status", 500)))
-            if text_events:
-                yield "".join(text_events)
-    except HTTPException as exc:
-        # The delivery timeout raises out of the iterator (which aborts the
-        # request on its way out); report it the same way.
-        failed = True
-        yield error(str(exc.detail), exc.status_code)
-    if not failed:
-        tail = text.flush()
-        if parser is None:
-            yield chunk({**role, "content": tail} if tail else role, finish=_finish_reason(usage))
-        else:
-            deltas = parser.feed(tail) + parser.finish()
-            for delta in deltas[:-1]:
-                yield chunk({**role, **delta})
-                role = {}
-            yield chunk({**role, **(deltas[-1] if deltas else {})}, finish=_finish_reason(usage, parser))
-        if include_usage:
-            yield sse({
-                "id": request_id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": model_name,
-                "choices": [],
-                "usage": _usage(usage),
-            })
+    # One yield per list of events: the tokens a request had waiting when its
+    # handler ran go out as one body frame (one write), which is what keeps the
+    # delivery loop ahead at high token rates. A list of one is the common
+    # case when the loop keeps up.
+    async for events in batches:
+        out: list[str] = []
+        for i, e in enumerate(events):
+            if isinstance(e, dict):
+                if i + 1 < len(events) and isinstance(events[i + 1], reply.Finish):
+                    continue  # rides on the finish chunk
+                out.append(chunk({**role, **e}))
+            elif isinstance(e, reply.Finish):
+                last = events[i - 1] if i and isinstance(events[i - 1], dict) else {}
+                out.append(chunk({**role, **last}, finish=e.reason))
+                usage = e.usage
+            elif isinstance(e, reply.Failure):
+                # The HTTP status is committed, so the failure travels in-band the
+                # way the non-streaming path's error body does, not as a normal
+                # ``stop`` a client would take for a complete answer.
+                out.append(sse({"error": {"message": e.message, "type": error_type(e.status), "code": e.status}}))
+            elif e.modality == "audio":
+                # Streaming audio deltas are base64 16-bit PCM at the model rate.
+                audio = {"id": rid("audio"), "data": base64.b64encode(e.data).decode("ascii")}
+                out.append(chunk({**role, "audio": audio}))
+            else:
+                out.append(chunk({**role, "content": media_io.png_to_data_url(e.data)}))
+            role = {}
+        yield "".join(out)
+    if include_usage and usage is not None:
+        # OpenAI's stream_options.include_usage: one last chunk, no choices
+        yield sse({"id": request_id, "object": "chat.completion.chunk", "created": created,
+                   "model": model_name, "choices": [], "usage": _usage(usage)})
     yield SSE_DONE

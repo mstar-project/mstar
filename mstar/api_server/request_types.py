@@ -32,6 +32,10 @@ class ResultChunk:
     num_tokens: int = 0
     # Its last token is one of the model's stop ids, so it ended the reply.
     stopped: bool = False
+    # On a chunk that carries text tokens: the prompt's count (``Model.prompt_tokens``),
+    # for a handler that reports it before the request's ``usage`` chunk (a stream
+    # that opens with it, a reply the handler ends at a stop string).
+    prompt_tokens: int | None = None
 
 
 # The modality of the chunk that ends a request submitted with

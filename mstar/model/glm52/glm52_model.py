@@ -84,7 +84,7 @@ class Glm52Model(ByteLevelTextOutput, Model):
     prebuild_fused_moe = True
     # read only by process_prompt's template, and kept off the conductor's wire,
     # which cannot carry every number a tool schema may hold (2**64)
-    PREPROCESS_ONLY_KWARGS = ("messages", "tools", "chat_template_kwargs")
+    PREPROCESS_ONLY_KWARGS = ("messages", "tools", "chat_template_kwargs", "reply_prefix")
     # the checkpoint's sampling defaults, under whatever a request sets (set by
     # `__init__`; a model built without it takes the published recipe)
     sampling_defaults: Mapping[str, object] = DEFAULT_SAMPLING
@@ -366,14 +366,13 @@ class Glm52Model(ByteLevelTextOutput, Model):
                     f"repetition_penalty={sampling.repetition_penalty}); serve with mtp_num_draft_tokens: 0"
                 )
         if self._tokenizer_mode == "byte":
-            # Reduced serve maps UTF-8 bytes directly to token ids, avoiding HF IO.
+            # Reduced serve maps UTF-8 bytes directly to token ids, avoiding HF IO;
+            # the reply prefix (a forced tool call) follows the prompt
             vocab = self.config.vocab_size
-            byte_ids = [min(b, vocab - 1) for b in prompt.encode("utf-8")] or [0]
-            input_ids = torch.tensor(byte_ids, dtype=torch.long)
-        elif getattr(self.tokenizer, "chat_template", None):
-            input_ids = render_chat_template(self.tokenizer, prompt, prompt_parts, kwargs, GLM_TEMPLATE_KWARGS)
+            text = (prompt.encode("utf-8") or b"\0") + (kwargs.get("reply_prefix") or "").encode("utf-8")
+            input_ids = torch.tensor([min(b, vocab - 1) for b in text], dtype=torch.long)
         else:
-            input_ids = self.tokenizer(prompt, return_tensors="pt").input_ids[0]
+            input_ids = render_chat_template(self.tokenizer, prompt, prompt_parts, kwargs, GLM_TEMPLATE_KWARGS)
 
         # here, in the data worker, a ValueError reaches the client as a 400
         if input_ids.numel() > self.config.max_prompt_tokens:
