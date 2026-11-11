@@ -31,6 +31,7 @@ from mstar.distributed.base import ShardingConfig
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
+    AttnBackend,
     KVReqConfig,
     KVSpec,
     NodeResourceSpec,
@@ -54,6 +55,7 @@ from mstar.model.media_limits import PILLOW_IMAGE_FORMATS, check_image_size, dec
 from mstar.model.qwen_image21.components.transformer import ROPE_POSITIVE
 from mstar.model.qwen_image21.config import (
     ATTN,
+    ATTN_GEN,
     DEFAULT_OUTPUT_RESOLUTION,
     DENOISE_LOOP,
     DIT_NODE,
@@ -208,17 +210,23 @@ class QwenImage21Model(Model):
 
     # ------------------------------------------------------------ structure
     def get_node_resources(self) -> list[NodeResourceSpec]:
-        """The dit's paged KV (the prefix, then each denoise step's scratch target) and its attention.
+        """The dit's paged KV (the prefix, then each denoise step's scratch target) and its attention: paged for
+        the prefix walks, which write the cache; dense for eager denoise steps, which attend the frozen prefix
+        and their own K/V and write nothing a later step reads (a captured step stays paged).
         No position resource: the K/V are cached after the model's own 3-axis rope."""
         cfg = self.config.transformer
         heads = cfg.num_attention_heads
-        return [
+        specs = [
             KVSpec(resource_key=KV, nodes={DIT_NODE}, config=PagedKVConfig(
                 num_layers=cfg.num_layers, num_kv_heads=heads, head_dim=cfg.attention_head_dim, num_qo_heads=heads,
                 max_seq_len=self.max_seq_len, max_num_pages=self.max_num_pages,
             )),
             AttentionSpec(resource_key=ATTN, nodes={DIT_NODE}, config=AttentionConfig(kv_cache=KV)),
         ]
+        if not self.accelerator_graph:
+            specs.append(AttentionSpec(resource_key=ATTN_GEN, nodes={DIT_NODE},
+                                       config=AttentionConfig(kv_cache=KV, backend=AttnBackend.DENSE)))
+        return specs
 
     def kv_labels(self):
         return {KV: {MAIN: KVLabel(keys=PrefixKeys(PREFIX_IDS, (PREFIX_TEXT_WALK, PREFIX_IMAGE_WALK))),

@@ -34,6 +34,7 @@ from mstar.model.qwen_image21.components.transformer import (
 )
 from mstar.model.qwen_image21.config import (
     ATTN,
+    ATTN_GEN,
     KV,
     MAIN,
     PREFIX_IMAGE_WALK,
@@ -355,16 +356,24 @@ class QwenImage21DenoiseSubmodule(DenoiseLoopSubmodule):
             transformer.compile_target_blocks()
         self.qi_config = config
         self.prefix_pass = PrefixPass(self)
-        self._attend: AttentionCallable | None = None
+        self._attends: dict[str, AttentionCallable] = {}
 
     def bind_node_resources(self, resources) -> None:
         super().bind_node_resources(resources)
-        self._attend = None
+        self._attends = {}
 
-    def attend(self):
-        if self._attend is None:
-            self._attend = AttentionCallable(kv=self.node_resources[KV], attn=self.node_resources[ATTN])
-        return self._attend
+    def attend(self, attn_key: str = ATTN) -> AttentionCallable:
+        """The K/V write and attention through ``attn_key`` (the prefix walks' paged one by default)."""
+        attend = self._attends.get(attn_key)
+        if attend is None:
+            attend = self._attends[attn_key] = AttentionCallable(
+                kv=self.node_resources[KV], attn=self.node_resources[attn_key],
+            )
+        return attend
+
+    def target_attn_key(self) -> str:
+        """The denoise steps' attention: the dense one when the model declared it (eager steps), else paged."""
+        return ATTN_GEN if ATTN_GEN in self.node_resources else ATTN
 
     # ------------------------------------------------------------ prefix walks
     def prepare_inputs(self, graph_walk, fwd_info, inputs, **kwargs):
@@ -408,7 +417,7 @@ class QwenImage21DenoiseSubmodule(DenoiseLoopSubmodule):
         return SubmoduleStep(cg_key_info=self._uniform_key(keys), steps={
             KV: KVStep(segments=segments, commit=False,
                        combined_labels={labels: CFG_LABEL} if len(labels) > 1 else {}),
-            ATTN: AttentionStep(segments=segments, causal=False),
+            self.target_attn_key(): AttentionStep(segments=segments, causal=False),
         })
 
     def cg_key_info(self, graph_walk, per_request_info, per_request_input_metadata=None, **kwargs):
@@ -477,7 +486,7 @@ class QwenImage21DenoiseSubmodule(DenoiseLoopSubmodule):
         positions = torch.cat(
             [label_major(frame)[:, None, :].expand(-1, tokens, 1), hw[None].expand(rows, -1, -1)], dim=-1,
         )
-        attend = self.attend()
+        attend = self.attend(self.target_attn_key())
         attend.bind_step(CFG_LABEL if local > 1 else BRANCH_LABELS[key.branches[0]])
         velocity = self.transformer.target(label_major(latents), label_major(timestep), positions, attend)
         return velocity if local == 1 else velocity.unflatten(0, (local, -1)).transpose(0, 1).flatten(0, 1)

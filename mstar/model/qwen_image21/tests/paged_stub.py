@@ -134,7 +134,7 @@ def dit_node(transformer, dtype: torch.dtype):
     plan = model.walk_plan("default", ["text", "image"], ["image"], {}, kwargs)
     sub = QwenImage21DenoiseSubmodule(transformer, DIT_CONFIG, loop_name="denoise_loop")
     attend = PagedAttendStub()
-    sub.attend = lambda: attend
+    sub.attend = lambda *_: attend
     return sub, attend, plan, torch.cat([pos_vl, neg_vl]), torch.cat(refs)
 
 
