@@ -1,5 +1,5 @@
 model: "qwen3_omni"
-max_seq_len: 32768
+max_seq_len: 131072
 # The Thinker on 8 GPUs, 4 TP ranks x 2 SP ranks, for long prompts. Its KV pool is
 # stored by position over each SP pair (context_parallel), and a prefill of at least
 # min_tokens tokens splits over the pair: each rank runs the layers on its half of the
@@ -13,13 +13,14 @@ max_seq_len: 32768
 resources:
   thinker_kv:
     context_parallel: true
+    # the rows ran prompts of 60K to 128K tokens, past the model's own 65536
+    max_seq_len: 131072
     # rank 0 decides each prefix hit for the 8 ranks; without it the cache is off
     prefix_cache_tp: true
   thinker_shard:
-    # placeholder: on 8 H100s all-gather prefilled faster than the copied path from 16K
-    # tokens and slower at 4K to 8K, not yet tuned to. A captured prefill splits on its
-    # bucket's size, not its prompt's.
-    min_tokens: 8192
+    # on 8 H100s all-gather prefilled faster than the copied path from 16K tokens and
+    # slower at 4K to 8K. A captured prefill splits on its bucket's size, not its prompt's.
+    min_tokens: 16384
     exchange: all_gather
 node_groups:
   # TP groups {0..3} and {4..7}; SP pairs {0,4}, {1,5}, {2,6}, {3,7}
