@@ -769,7 +769,7 @@ against the real tokenizer over the benchmark prompts.</p>
 <td><p>Indices where <code class="docutils literal notranslate"><span class="pre">text</span></code> may be cut: each is a space that starts a whitespace run, at or after the next chunk target.</p></td>
 </tr>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.fast_tokenize.encode_ids" title="mstar.utils.fast_tokenize.encode_ids"><code class="xref py py-obj docutils literal notranslate"><span class="pre">encode_ids</span></code></a>(tokenizer, text[, chunk_chars, ...])</p></td>
-<td><p>Token ids of <code class="docutils literal notranslate"><span class="pre">text</span></code> with the tokenizer's defaults for special tokens: a long text goes through the Rust backend as a batch of chunks, a short one (or a tokenizer without a Rust backend) through <code class="docutils literal notranslate"><span class="pre">tokenizer</span></code> itself.</p></td>
+<td><p>Token ids of <code class="docutils literal notranslate"><span class="pre">text</span></code> as written: special tokens only where the text spells them, never the post-processor's (a rendered chat template already opens with its BOS), as <code class="docutils literal notranslate"><span class="pre">apply_chat_template(tokenize=True)</span></code> encodes.</p></td>
 </tr>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.fast_tokenize.split_at" title="mstar.utils.fast_tokenize.split_at"><code class="xref py py-obj docutils literal notranslate"><span class="pre">split_at</span></code></a>(text, cuts)</p></td>
 <td><p></p></td>
@@ -800,10 +800,12 @@ short or no safe cut exists.</p>
 <dl class="py function">
 <dt class="sig sig-object py" id="mstar.utils.fast_tokenize.encode_ids">
 <span class="sig-prename descclassname"><span class="pre">mstar.utils.fast_tokenize.</span></span><span class="sig-name descname"><span class="pre">encode_ids</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">tokenizer</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">text</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">chunk_chars</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">DEFAULT_CHUNK_CHARS</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">max_chunks</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">DEFAULT_MAX_CHUNKS</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/fast_tokenize.html#encode_ids"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.fast_tokenize.encode_ids" title="Link to this definition">#</a></dt>
-<dd><p>Token ids of <code class="docutils literal notranslate"><span class="pre">text</span></code> with the tokenizer’s defaults for special
-tokens: a long text goes through the Rust backend as a batch of chunks,
-a short one (or a tokenizer without a Rust backend) through <code class="docutils literal notranslate"><span class="pre">tokenizer</span></code>
-itself.</p>
+<dd><p>Token ids of <code class="docutils literal notranslate"><span class="pre">text</span></code> as written: special tokens only where the text
+spells them, never the post-processor’s (a rendered chat template already
+opens with its BOS), as <code class="docutils literal notranslate"><span class="pre">apply_chat_template(tokenize=True)</span></code> encodes.
+A long text goes through the Rust backend as a batch of chunks, a short
+one (or a tokenizer without a Rust backend) through <code class="docutils literal notranslate"><span class="pre">tokenizer</span></code> itself;
+both give the same ids.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
