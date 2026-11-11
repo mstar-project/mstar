@@ -112,7 +112,8 @@ def test_a_device_run_that_ended_short_settles_its_width_before_anything_reads_i
 def test_a_device_run_leaves_a_resources_host_row_whole():
     """A one-iteration run with a log-prob row: that row is one value a row, not a column."""
     rows = HostRows(
-        (1, 2), {"new_token": torch.tensor([[5], [6]]), "sampled_logprob": torch.tensor([-0.5, -0.7])}, torch.tensor([1]),
+        (1, 2), {"new_token": torch.tensor([[5], [6]]), "sampled_logprob": torch.tensor([-0.5, -0.7])},
+        torch.tensor([1]),
     )
     ctx = SimpleNamespace(repeats=1)
     batch_n = SimpleNamespace(node_batch=SimpleNamespace(step_context=ctx), graph_walk=WALK)
@@ -128,7 +129,9 @@ def test_a_capture_another_walk_replays_is_refused_at_load_for_a_device_run():
 
     runner = AcceleratorGraphRunner.__new__(AcceleratorGraphRunner)
     runner._run_asks, runner._run_failures = {WALK: object()}, {}
-    spec = SimpleNamespace(bucket=SimpleNamespace(graph_walk=WALK), config=SimpleNamespace(replay_graph_walks=[WALK, "alias"]))
+    spec = SimpleNamespace(
+        bucket=SimpleNamespace(graph_walk=WALK), config=SimpleNamespace(replay_graph_walks=[WALK, "alias"]),
+    )
 
     assert runner._capture_run(spec, None) is None
     assert "alias" in runner.device_run_refusal(WALK)
@@ -209,3 +212,4 @@ def test_the_spec_cap_counts_steps_not_the_iterations_a_step_asked_for():
     launched = SimpleNamespace(is_yield_away=False, node_batch=SimpleNamespace(step_context=SimpleNamespace(repeats=8)))
     speculator.note_launched(launched)
     assert speculator._consecutive == 1
+
