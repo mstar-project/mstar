@@ -483,6 +483,11 @@ class PagedArrayHandle(ArrayHandle):
         self._write_unread()
         k, v = fields["k"], fields["v"]
         attn = self._attn.get(layer)
+        if self._eager and attn is not None and self._needs_step_kv(attn):
+            raise self._refusal(
+                f"an eager_add step adds layer {layer} outside the graph and keeps nothing for its read, and that read "
+                "needs the step's own k and v (an exchange, a context-parallel pool on a multi-token step, or the "
+                "dense backend)")
         if attn is None or self._eager:
             self._write(layer, k, v)
             return
@@ -507,6 +512,11 @@ class PagedArrayHandle(ArrayHandle):
         layer = self._held_layer
         if layer is not None and _exchanges(self._attn[layer], self.label):
             self._write(layer, *self._take_hold(layer))
+
+    def _needs_step_kv(self, attn: Any) -> bool:
+        """Whether a read through ``attn`` attends the step's own k and v rather than only the pages, or goes through
+        its exchange."""
+        return _exchanges(attn) or attn.reads_step_kv(self.label)
 
     @torch.compiler.disable
     def read(self, layer: int | torch.Tensor, q: torch.Tensor | None = None, **mask_args: Any) -> torch.Tensor:
