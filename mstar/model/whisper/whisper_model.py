@@ -584,7 +584,7 @@ class WhisperModel(Model):
         return super().postprocess(output, modality, **kwargs)
 
     def text_output(self) -> TextOutput:
-        return TextOutput(self._detokenizer)
+        return TextOutput(self._detokenizer, frozenset({self.config.eos_token_id}))
 
     def warmup_preprocess(self) -> None:
         # postprocess runs the word timestamps' DTW in this process
