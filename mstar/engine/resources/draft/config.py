@@ -37,8 +37,7 @@ class DraftMethod:
 # The drafters the engine knows. A model may serve others (a test's scripted
 # drafter, say) by passing its own table to `DraftConfig.parse`.
 DSPARK = DraftMethod("dspark", needs_model=True)
-MTP = DraftMethod("mtp", needs_model=False)
-DRAFT_METHODS: Mapping[str, DraftMethod] = {m.name: m for m in (DSPARK, MTP)}
+DRAFT_METHODS: Mapping[str, DraftMethod] = {m.name: m for m in (DSPARK,)}
 
 _KEYS = ("method", "model", "num_draft_tokens", "mode")
 
