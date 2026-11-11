@@ -8,15 +8,16 @@ log-probs:
 
     e_srv(t) = |served(s_t) - f[t, s_t]|      e_bf(t) = |b[t, s_t] - f[t, s_t]|
 
-The gate is, per prompt set, the ratio of the means over its positions,
-R = mean(e_srv) / mean(e_bf): a bf16 port errs from fp32 as transformers' own bf16 does.
-The real model needs R <= R_MAX on every set; the control (``CONTROLS``, a checkpoint
-edited the way a port bug would read it) must fail the same gate on the long set.
-Measured on an H100 (Qwen3-8B): the real model 0.91 short and 0.92 long, rope_theta x1.1
-1.07 short and 2.58 long. Sets aren't pooled: the short replies would dilute the control
-to about 1.6. rms_norm_eps 1e-5 isn't a control: its served log-probs match the real
-model's at every length (R 0.93 against 0.92). The deficit (fp32's margin given up at a
-greedy flip) and the bf16 spread are printed only.
+The gate is, per prompt set, R = trim(e_srv).mean() / trim(e_bf).mean(), each error's
+positions under its own 0.98 quantile: a bf16 port errs from fp32 as transformers' bf16
+does. Trimmed, because one served greedy flip in a reply of ~100 positions moves a plain
+mean by most of the margin (Alice: 1.8 with it, 1.1 without). The real model needs
+R <= R_MAX on every set; the control (``CONTROLS``, a checkpoint edited the way a port bug
+would read it) must fail the same gate on the long set. Calibrated on an H100 (Qwen3-8B,
+three long prompts): the real model at most 1.10 per prompt and 0.93 pooled, rope_theta
+x1.1 at least 1.95 and 2.42. rms_norm_eps 1e-5 isn't a control: its served log-probs match
+the real model's at every length. The plain-mean and p90 ratios, the greedy-flip counts
+and the deficit (fp32's margin given up at a flip) are printed only.
 
 Qwen3-0.6B ties its head to the embedding (its file also ships the head, equal to
 the embedding); it is not a registered size, so the loader's tie path is checked
@@ -55,21 +56,30 @@ PROMPTS = [
     "Summarize the plot of Romeo and Juliet in one paragraph.",
     "What is 17 * 23? Answer with the computation.",
 ]
-# 3.4k prompt tokens (rendered) of fixed public-domain prose, committed so it never moves: Lewis Carroll,
-# Alice's Adventures in Wonderland (1865), chapter I into chapter II (transcribed, not a given edition)
+DATA = Path(__file__).parent / "data"
+# Fixed public-domain prose, committed so it never moves (transcribed, not a given edition), and
+# questions that ask for a full reply: Lewis Carroll's Alice's Adventures in Wonderland (1865), chapter I
+# into II, 3.4k rendered tokens; Poe's The Cask of Amontillado (1846), 3.2k; Austen's Pride and Prejudice
+# (1813), chapter I into II, 1.3k.
 LONG_PROMPTS = [
-    (Path(__file__).parent / "data" / "alice_chapters_1_2.txt").read_text()
-    + "\n\nIn the passage above, what did Alice find on the glass table, and what happened to her after she "
-    "drank from the bottle and ate the cake? Answer in a few sentences.",
+    (DATA / "alice_chapters_1_2.txt").read_text()
+    + "\n\nRetell, in order and in detail, everything that happens to Alice in the passage above, from the "
+    "riverbank to the end of the passage.",
+    (DATA / "poe_cask_of_amontillado.txt").read_text()
+    + "\n\nRetell the story above in order and in detail: why Montresor wants revenge, how he lures Fortunato "
+    "into the vaults, and how it ends.",
+    (DATA / "austen_pride_and_prejudice_1_2.txt").read_text()
+    + "\n\nDescribe in detail the conversations in the passage above: what Mrs. Bennet wants, how Mr. Bennet "
+    "answers her, and what the narrator says of each of their characters.",
 ]
 SETS = {"short": PROMPTS, "long": LONG_PROMPTS}
 # every prompt, in the order the server and the reference run them, with its set
 ALL_PROMPTS = [(name, prompt) for name, prompts in SETS.items() for prompt in prompts]
 TOKENS = 128
-# the real model at 0.91-0.92, the control at 2.58 on the long set: a 1.6x and a 1.7x margin
+# the real model at 0.93 and the control at 2.42 pooled over the long set: about 1.6x each side
 R_MAX = 1.5
-# the positions where a log-prob error isn't compressed by p near 1, reported apart
-MID = (0.05, 0.95)
+# each error's positions past this quantile are left out of its mean
+TRIM = 0.98
 
 
 def _scale_rope_theta(config: dict) -> None:
@@ -185,9 +195,9 @@ class _Errors(NamedTuple):
     """One prompt's per-position errors against fp32, at the served tokens."""
     served: torch.Tensor  # e_srv
     bf16: torch.Tensor  # e_bf
-    mid: torch.Tensor  # fp32 p(s_t) in MID
-    deficit: float  # fp32's margin given up at a greedy flip, the largest
-    spread: float  # bf16's largest error on the top-2 (or top and served) logit difference
+    served_flips: int  # served token != fp32's argmax
+    bf16_flips: int  # bf16's argmax != fp32's
+    deficit: float  # fp32's margin given up at a served flip, the largest
 
 
 def _errors(ref: _Reference, served: list[_Served]) -> list[_Errors]:
@@ -197,48 +207,53 @@ def _errors(ref: _Reference, served: list[_Served]) -> list[_Errors]:
     out = []
     for f, b, s in zip(fp32, bf16, served, strict=True):
         rows, tokens = torch.arange(len(s.ids)), torch.tensor(s.ids, dtype=torch.long)
-        f_s = f[rows, tokens]
-        top2 = f.topk(2, dim=-1).indices
-        top = top2[:, 0]
-        other = torch.where(tokens == top, top2[:, 1], tokens)
-        spread = (b[rows, top] - b[rows, other]) - (f[rows, top] - f[rows, other])
-        p = f_s.exp()
+        f_s, top = f[rows, tokens], f.argmax(-1)
         out.append(_Errors(
             served=(torch.tensor(s.logprobs, dtype=torch.float32) - f_s).abs(),
             bf16=(b[rows, tokens] - f_s).abs(),
-            mid=(p >= MID[0]) & (p <= MID[1]),
+            served_flips=int((tokens != top).sum()),
+            bf16_flips=int((b.argmax(-1) != top).sum()),
             deficit=float((f[rows, top] - f_s).max()) if len(s.ids) else 0.0,
-            spread=float(spread.abs().max()) if len(s.ids) else 0.0,
         ))
     return out
 
 
-def _ratio(errors: list[_Errors], mid: bool = False) -> float:
-    """R over ``errors``' positions: the mean served error over the mean bf16 error."""
-    pick = (lambda e: e.mid) if mid else (lambda e: torch.ones_like(e.mid))
-    srv = torch.cat([e.served[pick(e)] for e in errors])
-    bf = torch.cat([e.bf16[pick(e)] for e in errors])
+def _trimmed_mean(x: torch.Tensor) -> float:
+    return float(x[x <= x.quantile(TRIM)].mean())
+
+
+class _Ratios(NamedTuple):
+    trimmed: float  # R, the gate's
+    mean: float
+    p90: float
+
+
+def _ratios(errors: list[_Errors]) -> _Ratios:
+    srv, bf = torch.cat([e.served for e in errors]), torch.cat([e.bf16 for e in errors])
     assert bf.numel() and float(bf.mean()) > 0, "no positions to compare"
-    return float(srv.mean() / bf.mean())
+    return _Ratios(
+        _trimmed_mean(srv) / _trimmed_mean(bf), float(srv.mean() / bf.mean()),
+        float(srv.quantile(0.9) / bf.quantile(0.9)),
+    )
 
 
 def _report(label: str, errors: list[_Errors]) -> dict[str, float]:
     """Print what the calibration reads (the PR quotes it) and return each set's R."""
-    def stats(x: torch.Tensor) -> str:
-        return f"mean {float(x.mean()):.4f} p90 {float(x.quantile(0.9)):.4f}" if x.numel() else "none"
+    def line(group: list[_Errors]) -> str:
+        r = _ratios(group)
+        srv, bf = torch.cat([e.served for e in group]), torch.cat([e.bf16 for e in group])
+        return (f"R {r.trimmed:.3f} (mean ratio {r.mean:.3f}, p90 ratio {r.p90:.3f}); e_srv mean "
+                f"{float(srv.mean()):.4f} e_bf mean {float(bf.mean()):.4f}; greedy flips served "
+                f"{sum(e.served_flips for e in group)} bf16 {sum(e.bf16_flips for e in group)}; "
+                f"largest deficit {max(e.deficit for e in group):.4f}")
 
     for i, ((name, _), e) in enumerate(zip(ALL_PROMPTS, errors, strict=True)):
-        print(f"{label}: {name} prompt {i} ({len(e.served)} tokens, {int(e.mid.sum())} mid) e_srv {stats(e.served)} "
-              f"e_bf {stats(e.bf16)} deficit {e.deficit:.4f} spread {e.spread:.4f}")
+        print(f"{label}: {name} prompt {i} ({len(e.served)} tokens): {line([e])}")
     ratios = {}
     for name in SETS:
         group = [e for (n, _), e in zip(ALL_PROMPTS, errors, strict=True) if n == name]
-        srv, bf = torch.cat([e.served for e in group]), torch.cat([e.bf16 for e in group])
-        ratios[name] = _ratio(group)
-        mid = _ratio(group, mid=True) if any(e.mid.any() for e in group) else float("nan")
-        print(f"{label}: {name} set e_srv {stats(srv)} e_bf {stats(bf)}; R {ratios[name]:.3f}, "
-              f"R on p in {MID} {mid:.3f}; largest deficit {max(e.deficit for e in group):.4f}, "
-              f"spread {max(e.spread for e in group):.4f}")
+        ratios[name] = _ratios(group).trimmed
+        print(f"{label}: {name} set: {line(group)}")
     return ratios
 
 
