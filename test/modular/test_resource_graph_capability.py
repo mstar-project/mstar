@@ -120,7 +120,7 @@ def test_empty_capture_batch_sizes_capture_nothing(piecewise):
                 compiled_entries_per_shape=1,
             ),
             resources={"attention": resource}, step_runner=Mock(), device=torch.device("cpu"),
-            autocast_dtype=None, joint_comm_group=SimpleNamespace(world_size=1), num_slots=2,
+            autocast_dtype=None, joint_comm_group=SimpleNamespace(world_size=1), num_slots=2, head_shards=1,
         )
         assert runner.max_batch_size_for("decode") is None and runner.max_capture_bs({"decode"}) == 0
     assert not runner.prepare_for_capture()
