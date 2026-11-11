@@ -63,6 +63,7 @@ from mstar.engine.state import (
     SubmoduleStep,
     drew,
     fused_draw_args,
+    host,
     sample,
 )
 from mstar.model.components.audio_features import MatchaLogMel
@@ -84,6 +85,7 @@ from mstar.model.qwen3_tts.config import (
     TALKER_KV,
     TALKER_MIXED,
     TALKER_SAMPLER,
+    TALKER_TEXT,
     Qwen3TTSModelConfig,
 )
 from mstar.model.submodule_base import (
@@ -105,8 +107,6 @@ if TYPE_CHECKING:
 
 # the CodePredictor depth loop, as a piecewise capture region
 DEPTH_LOOP_REGION = "code_predictor_loop"
-# Talker request state: TTS EOS has conditioned one decode step (PAD from then on)
-TTS_EOS_FED = "tts_eos_fed"
 
 
 def prefill_rows(prompt_layout: Sequence[int], language_id: int, speaker: bool) -> int:
@@ -226,6 +226,7 @@ class TalkerSubmodule(ARNodeSubmodule):
     def bind_state(self, handles: Mapping[str, Any]) -> None:
         self.sampler = handles[TALKER_SAMPLER]
         self.cp_sampler = handles[CODE_PRED_SAMPLER]
+        self.text = handles[TALKER_TEXT]
 
     def _get_suppress_mask(self) -> torch.Tensor:
         """Cache the checkpoint's static invalid-token mask on the worker GPU."""
@@ -509,12 +510,12 @@ class TalkerSubmodule(ARNodeSubmodule):
         """The ``(1,)`` text token a decode frame adds: the stream's next one,
         then TTS EOS once past its end (unless the prefill took it), then TTS
         PAD. Read, never set, here: a refused admit prepares the step again,
-        and ``postprocess`` marks TTS EOS fed once its step has run."""
+        and the step that adds TTS EOS marks it fed when it commits."""
         fed = inputs.get("text_in")
         if fed:
             return fed[0].reshape(1)
         streams = text_stream_start(fwd_info.step_metadata[PROMPT_LAYOUT_KEY]) is not None
-        eos = streams and not self.request_state(fwd_info.rid_handle).get(TTS_EOS_FED, False)
+        eos = streams and not host(self.text, fwd_info.rid_handle, "main", 0)["eos_fed"]
         return self._special_id(self.config.tts_eos_token_id if eos else self.config.tts_pad_token_id)
 
     def _special_id(self, token: int) -> torch.Tensor:
@@ -616,6 +617,14 @@ class TalkerSubmodule(ARNodeSubmodule):
         state = {TALKER_KV: ArrayStep(), TALKER_SAMPLER: SampleStep(apply_penalty=True)}
         if not (piecewise_leases or {}).get(DEPTH_LOOP_REGION):
             state[CODE_PRED_SAMPLER] = SampleStep(apply_penalty=False)
+        # the rows that add TTS EOS, so their next steps add TTS PAD
+        eos = self._special_id(self.config.tts_eos_token_id)
+        fed = {
+            (rid, "main", 0): {"eos_fed": True} for rid, inp in zip(request_ids, inputs, strict=True)
+            if inp.kwargs.get("text_id") is eos
+        }
+        if fed:
+            state[TALKER_TEXT] = ArrayStep(host=fed)
         return SubmoduleStep(
             segments=[
                 Segment(request_id=rid, label="main", span=inp.input_seq_len)
@@ -812,10 +821,8 @@ class TalkerSubmodule(ARNodeSubmodule):
         keeps EOS detection correct even if an execution path filters the sampler-only output before slow-path
         ``check_stop``.
         """
-        del request_info, kwargs
+        del request_id, request_info, kwargs
         row = {} if inputs is None else inputs.kwargs
-        if row.get("text_id") is self._special_id(self.config.tts_eos_token_id):
-            self.request_state(request_id).add(TTS_EOS_FED, True)
         lead = row.get("lead_frames")
         if lead is not None and "codec_tokens" in outputs:
             outputs["codec_tokens"] = [*lead.split(1), outputs["codec_tokens"][-1]]

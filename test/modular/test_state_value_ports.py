@@ -508,7 +508,10 @@ def _talker_steps() -> dict:
 
 
 def _talker(model: Qwen3TTSModel) -> TalkerSubmodule:
-    return _bind(_node(TalkerSubmodule), model, "Talker")
+    # what `declare_step` reads to tell a row that adds TTS EOS
+    node = _node(TalkerSubmodule, config=model.config, _fixed_embeds={}, _prefill_ids={})
+    node.get_device = lambda: torch.device("cpu")
+    return _bind(node, model, "Talker")
 
 
 @pytest.mark.parametrize("walk, spans", [
@@ -528,6 +531,19 @@ def test_qwen3_tts_talker_leaves_the_depth_sampler_to_a_leased_region(walk, span
     node = _talker(_tts())
     step = engine_step(node, walk, [1, 2], _rows(*spans), piecewise_leases={DEPTH_LOOP_REGION: object()})
     _assert_steps_equal(step, _reference_step(_talker_steps(), [1, 2], spans))
+
+
+def test_qwen3_tts_a_step_adding_tts_eos_marks_it_fed_and_holds_no_resource_step_for_it():
+    node = _talker(_tts())
+    node.state_handles["talker_text"].host_fields.open(1)
+    eos = node._special_id(node.config.tts_eos_token_id)
+    # a capture's template row brings a zero id of its own
+    rows = [ARNodeInputs(input_seq_len=1, kwargs={"text_id": eos}),
+            ARNodeInputs(input_seq_len=1, kwargs={"text_id": torch.zeros(1, dtype=torch.long)})]
+    declared = node.declare_step("talker_decode", [1, 2], rows)
+    assert declared.state["talker_text"].host == {(1, "main", 0): {"eos_fed": True}}
+    step = state_steps(declared, node.state_handles)
+    assert "talker_text" in step.state and "talker_text" not in step.steps
 
 
 def test_qwen3_tts_depth_regions_step_declares_the_sampler_through_state():
