@@ -29,6 +29,9 @@ pytest.importorskip("fastapi")
 pytest.importorskip("websockets")
 np = pytest.importorskip("numpy")
 
+# the event waits read a socket with no timeout of their own: a dropped event must fail a named test
+pytestmark = pytest.mark.timeout(120)
+
 import websockets.exceptions
 import websockets.sync.client
 from fastapi import HTTPException
