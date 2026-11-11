@@ -297,6 +297,30 @@ def test_the_vae_nodes_match_the_pipelines_math():
     assert torch.equal(image_out, want_out)
 
 
+def test_the_compiled_vae_regions_serve_other_sizes_without_recompiling():
+    """Each region warmed on its ``compile_regions`` examples (the engine compiles it with dynamic=True) must take a
+    live request's input as it comes, any size and decode batch: a recompile there stalls that request for minutes."""
+    _, wan = _vaes()
+    encoder, decoder = QwenImageVaeEncoderSubmodule(wan, compile=True), QwenImageVaeDecoderSubmodule(
+        wan, QwenImageConfig(), compile=True)
+    for sub in (encoder, decoder):
+        sub.get_device = lambda: torch.device("cpu")
+        for path, examples in sub.compile_regions().items():
+            module = sub.get_submodule(path)
+            module.forward = torch.compile(module.forward, dynamic=True, backend="eager")
+            with torch.no_grad():
+                for args in examples:
+                    module.forward(*args)
+    try:  # sizes above the warm-up's: on CPU (not CUDA) the conv backend switches below a size, a guard of its own
+        with torch._dynamo.config.patch(error_on_recompile=True), torch.no_grad():
+            for (h, w), batch in (((464, 336), 1), ((480, 480), 3)):
+                encoder.forward(IMAGE_INPUTS, None, image_0=torch.zeros(3, h, w, dtype=torch.uint8))
+                grid = (h // 16, w // 16)
+                decoder.run_batch(torch.randn(batch, grid[0] * grid[1], 64), grid)
+    finally:
+        torch._dynamo.reset()
+
+
 class _FakeProcessor:
     """The checkpoint processor's outputs, sized from the request: one pad per merged image token."""
 

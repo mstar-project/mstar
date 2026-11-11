@@ -136,9 +136,10 @@ class QwenImageTextEncoderSubmodule(NodeSubmodule):
 # vae_encoder
 # ---------------------------------------------------------------------------
 
-# the latent grid the compiled encoder and decoder are warmed on (1024 x 768 pixels): not square, so the dynamic
-# graph keeps height and width apart and serves every size
-_WARM_GRID = (128, 96)
+# the image size (pixels) the compiled encoder and decoder are warmed on. Dynamo gives equal sizes one symbol (duck
+# sizing), and a symbol tied to a fixed size is fixed: height == width would tie the two, and a side equal to a
+# channel count would pin it, so every other size would recompile on a live request
+_WARM_PIXELS = (448, 320)
 
 
 def _encode_mode(vae: nn.Module, pixels: torch.Tensor) -> torch.Tensor:
@@ -168,9 +169,9 @@ class QwenImageVaeEncoderSubmodule(NodeSubmodule):
     def compile_regions(self) -> dict[str, list[tuple]]:
         if not self._compile:
             return {}
-        h, w = (n * self.vae.spatial_compression_ratio for n in _WARM_GRID)
-        pixels = torch.zeros(1, 3, 1, h, w, device=self.get_device(), dtype=self.vae.dtype)
-        return {"vae.encoder": [(pixels,)]}
+        # laid out as forward's input (vae_pixels' NHWC strides): Dynamo guards on strides
+        image = torch.zeros(3, *_WARM_PIXELS, dtype=torch.uint8)
+        return {"vae.encoder": [(vae_pixels(image).to(device=self.get_device(), dtype=self.vae.dtype),)]}
 
     def max_batch_size(self, graph_walk: str):
         return 1
@@ -342,8 +343,11 @@ class QwenImageVaeDecoderSubmodule(BatchedRows, NodeSubmodule):
     def compile_regions(self) -> dict[str, list[tuple]]:
         if not self._compile:
             return {}
-        z = torch.zeros(1, self.vae.config.z_dim, 1, *_WARM_GRID, device=self.get_device(), dtype=self.vae.dtype)
-        return {"vae.decoder": [(z,)]}
+        # built as run_batch builds it, at batch 1 and 2: Dynamo specializes a size of 1, so the batched decodes
+        # (2 up to max_batch_size) need their own warm-up
+        grid = self.config.latent_grid(*_WARM_PIXELS)
+        tokens = torch.zeros(2, grid[0] * grid[1], 4 * self.vae.config.z_dim)
+        return {"vae.decoder": [(self._vae_latents(tokens[:1], grid),), (self._vae_latents(tokens, grid),)]}
 
     def prepare_inputs(self, graph_walk, fwd_info, inputs: NameToTensorList, **kwargs) -> NodeInputs:
         grid = self.config.latent_grid(int(fwd_info.step_metadata["height"]), int(fwd_info.step_metadata["width"]))
@@ -359,9 +363,12 @@ class QwenImageVaeDecoderSubmodule(BatchedRows, NodeSubmodule):
         latents = torch.stack([inp.tensor_inputs[LATENTS] for inp in inputs])
         return {LATENTS: latents, "grid": inputs[0].resource_step_info}
 
-    def run_batch(self, latents: torch.Tensor, grid: tuple[int, int], **kwargs):
+    def _vae_latents(self, latents: torch.Tensor, grid: tuple[int, int]) -> torch.Tensor:
+        """Packed tokens ``[B, h*w, 64]`` -> the decoder's input ``[B, C, 1, H, W]``: unpacked, ``z / (1 / std) + mean``."""
         device, dtype = self.get_device(), self.vae.dtype
         mean, inv_std = latent_affine(self.vae, dtype, device)
-        z = unpack(latents.to(device=device, dtype=dtype), grid)[:, :, None] / inv_std + mean
-        image = _decode(self.vae, z)[:, :, 0]
+        return unpack(latents.to(device=device, dtype=dtype), grid)[:, :, None] / inv_std + mean
+
+    def run_batch(self, latents: torch.Tensor, grid: tuple[int, int], **kwargs):
+        image = _decode(self.vae, self._vae_latents(latents, grid))[:, :, 0]
         return {IMAGE_OUTPUT: pixels_to_uint8(image)}
