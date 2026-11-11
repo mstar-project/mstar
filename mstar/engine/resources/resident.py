@@ -20,12 +20,19 @@ The host stays the source of truth. A row is written whole the first time a
 step reads it and whenever something other than a resident commit changed it
 (a host-planned step, a fork); see `mark_stale`. An offload gives the slot up,
 so a reload starts over as a new request does.
+
+The exception is a verify step of speculative decoding, which appends ``k + 1``
+tokens a row and keeps ``accepted + 1`` of them: the graph advances the KV
+length cell by that device count, so until the host applies the step's result
+(`pending`) the device holds the row's true length, and no host write touches
+that cell.
 """
 from __future__ import annotations
 
 import logging
+import os
 import threading
-from collections.abc import Collection, Iterable, Mapping
+from collections.abc import Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass, field
 from itertools import chain
 
@@ -38,6 +45,9 @@ from mstar.engine.resources.base import Resource
 from mstar.engine.resources.step import BucketKey, SubmoduleStep
 from mstar.utils.h2d import PinnedStager
 from mstar.utils.profiler import PhaseLaps
+
+# the KV pool's bookkeeping checks' switch (MSTAR_KV_DEBUG_ASSERTS): `ResidentPlanner.flush` reads its rows back
+_DEBUG_ASSERTS = os.environ.get("MSTAR_KV_DEBUG_ASSERTS", "0") == "1"
 
 logger = logging.getLogger(__name__)
 
@@ -57,21 +67,29 @@ def _scatter_cells_kernel(cells_ptr, values_ptr, store_ptr):
 
 @triton.jit
 def _gather_column_kernel(
-    slots_ptr, store_ptr, out_ptr, plus_ptr, STRIDE: tl.constexpr, COL: tl.constexpr, PLUS: tl.constexpr,
+    slots_ptr, store_ptr, out_ptr, plus_ptr,
+    STRIDE: tl.constexpr, COL: tl.constexpr, PLUS: tl.constexpr, SPAN: tl.constexpr,
 ):
-    i = tl.program_id(0)
-    value = tl.load(store_ptr + tl.load(slots_ptr + i) * STRIDE + COL)
+    t = tl.program_id(0)
+    i = t // SPAN
+    value = tl.load(store_ptr + tl.load(slots_ptr + i) * STRIDE + COL) + t % SPAN
     if PLUS:
         value += tl.load(plus_ptr + i)
-    tl.store(out_ptr + i, value.to(out_ptr.dtype.element_ty))
+    tl.store(out_ptr + t, value.to(out_ptr.dtype.element_ty))
 
 
 @triton.jit
-def _advance_column_kernel(slots_ptr, store_ptr, STRIDE: tl.constexpr, COL: tl.constexpr, TRASH: tl.constexpr):
+def _advance_column_kernel(
+    slots_ptr, store_ptr, by_ptr, STRIDE: tl.constexpr, COL: tl.constexpr, TRASH: tl.constexpr, BY: tl.constexpr,
+):
     i = tl.program_id(0)
     slot = tl.load(slots_ptr + i)
     cell = slot * STRIDE + COL
-    tl.store(store_ptr + cell, tl.load(store_ptr + cell) + tl.where(slot != TRASH, 1, 0))
+    if BY:
+        by = tl.load(by_ptr + i)
+    else:
+        by = 1
+    tl.store(store_ptr + cell, tl.load(store_ptr + cell) + tl.where(slot != TRASH, by, 0))
 
 
 def scatter_cells(store: torch.Tensor, cells: torch.Tensor) -> None:
@@ -84,27 +102,39 @@ def scatter_cells(store: torch.Tensor, cells: torch.Tensor) -> None:
 
 def gather_column(
     store: torch.Tensor, slots: torch.Tensor, stride: int, col: int, out: torch.Tensor,
-    plus: torch.Tensor | None = None,
+    plus: torch.Tensor | None = None, span: int = 1,
 ) -> None:
-    """``out[i] = store[slots[i], col]``, plus ``plus[i]``."""
+    """``out[i * span + j] = store[slots[i], col] + plus[i] + j`` for ``j < span``:
+    a row's value, and with ``span`` above 1 the run of its next ``span`` tokens."""
     n = slots.numel()
     if store.is_cuda:
-        _gather_column_kernel[(n,)](
+        _gather_column_kernel[(n * span,)](
             slots, store, out, plus if plus is not None else slots,
-            STRIDE=stride, COL=col, PLUS=plus is not None, num_warps=1,
+            STRIDE=stride, COL=col, PLUS=plus is not None, SPAN=span, num_warps=1,
         )
         return
     value = store.index_select(0, slots * stride + col)
-    out[:n].copy_(value if plus is None else value + plus)
+    if plus is not None:
+        value = value + plus
+    if span == 1:
+        out[:n].copy_(value)
+        return
+    out[: n * span].view(n, span).copy_(value[:, None] + torch.arange(span, device=value.device))
 
 
-def advance_column(store: torch.Tensor, slots: torch.Tensor, stride: int, col: int) -> None:
-    """``store[slots[i], col] += 1`` for every row but the trash row's."""
+def advance_column(
+    store: torch.Tensor, slots: torch.Tensor, stride: int, col: int, by: torch.Tensor | None = None,
+) -> None:
+    """``store[slots[i], col] += by[i]`` (1 without ``by``) for every row but the trash row's."""
     if store.is_cuda:
-        _advance_column_kernel[(slots.numel(),)](slots, store, STRIDE=stride, COL=col, TRASH=TRASH_SLOT, num_warps=1)
+        _advance_column_kernel[(slots.numel(),)](
+            slots, store, by if by is not None else slots,
+            STRIDE=stride, COL=col, TRASH=TRASH_SLOT, BY=by is not None, num_warps=1,
+        )
     else:
         cells = slots * stride + col
-        store.index_copy_(0, cells, store.index_select(0, cells) + (slots != TRASH_SLOT))
+        live = slots != TRASH_SLOT
+        store.index_copy_(0, cells, store.index_select(0, cells) + (live if by is None else torch.where(live, by, 0)))
 
 
 class ResidentTable:
@@ -127,12 +157,14 @@ class ResidentTable:
 class ResidentStream:
     """One resource's stream on a resident bucket's steps, fixed by its capture."""
 
-    __slots__ = ("label", "reads")
+    __slots__ = ("label", "reads", "span")
 
-    def __init__(self, label: str, reads: bool):
+    def __init__(self, label: str, reads: bool, span: int = 1):
         self.label = label
         # declared at span 0: the step reads the stream and appends nothing
         self.reads = reads
+        # tokens a row appends: 1, or a verify step's k + 1
+        self.span = span
 
 
 class ResidentWrites:
@@ -141,7 +173,7 @@ class ResidentWrites:
     ride the graph's own scatter. ``streams`` is each resource's stream, by
     resource key."""
 
-    __slots__ = ("streams", "rows", "cells", "values", "kv_len", "repeats")
+    __slots__ = ("streams", "rows", "cells", "values", "kv_len", "repeats", "kept")
 
     def __init__(self, streams: Mapping[str, ResidentStream], repeats: int = 1):
         self.repeats = repeats
@@ -151,6 +183,8 @@ class ResidentWrites:
         self.values: list[int] = []
         # each KV pool's stored length of the row being rewritten, for the owners after it
         self.kv_len: dict[str, int] = {}
+        # narrow columns of the row being rewritten that its rewrite leaves as they are
+        self.kept: list[int] = []
 
     def put(self, cell: int, value: int) -> None:
         self.cells.append(cell)
@@ -180,6 +214,9 @@ class ResidentBuffers:
     # each KV pool's stored lengths of the rows this step, by resource key: the
     # graph writes them, for what reads them after
     kv_len: dict[str, torch.Tensor]
+    # On a verify step, what each row's KV length advances by (accepted + 1),
+    # written in the graph by the verify; None on a step of one token a row.
+    advance: torch.Tensor | None = None
     # the host row ``slots`` holds: a steady batch keeps one array, so no H2D and no compare
     staged: np.ndarray | None = None
     dirty: bool = False
@@ -244,11 +281,21 @@ class ResidentPlanner:
 
     def __init__(
         self, node: str, walks: Collection[str], resources: Mapping[str, Resource],
-        device: torch.device, max_bs: int,
+        device: torch.device, max_bs: int, max_span: int = 1,
     ):
         self.node = node
         self.walks = frozenset(walks)
         self.device = device
+        # the widest span a resident step appends a row: k + 1 on a node that verifies drafts
+        self.max_span = max_span
+        # Set by the engine on a node that verifies drafts. ``pending``: a request
+        # has verify results the host has not applied, so a rewrite of its row
+        # keeps the device's length cell, and it can't take a new slot.
+        # ``unrecorded``: one is not even recorded, so only the device knows its
+        # length and the row keeps its slot; a recorded one can be displaced, its
+        # results applied before it next runs.
+        self.pending: Callable[[int], bool] | None = None
+        self.unrecorded: Callable[[int], bool] | None = None
         # request rows plus the trash row
         self.max_slots = 2 * max_bs + 1
         self._keys = tuple(resources)
@@ -256,6 +303,8 @@ class ResidentPlanner:
         self._tables: list[ResidentTable] = []
         # the KV pools whose stored lengths a capture gathers, as they bind
         self._length_keys: list[str] = []
+        # new block table columns a row of a step may need, at most, per KV pool
+        self._new_cols = 1
         self._store: torch.Tensor | None = None
         # columns of the one-cell tables, which a rewritten row always covers
         self.narrow_cols = 0
@@ -266,6 +315,10 @@ class ResidentPlanner:
         self.host_plan_free: set[BucketKey] = set()
         # walk -> the step its captures declare, for the load-time repeat check
         self.captured_steps: dict[str, SubmoduleStep] = {}
+        # the resource keys whose gather host-planned a bucket, over every
+        # capture of it, for buckets any did: the engine refuses an
+        # asynchronous verify walk with one captured
+        self.host_planned_by: dict[BucketKey, frozenset[str]] = {}
         # (bucket, pool) whose attention reads its pages off the tables: the
         # pool's KV plan hands it host lengths and no page indices
         self.lengths_only: set[tuple[BucketKey, str]] = set()
@@ -306,10 +359,13 @@ class ResidentPlanner:
         self._tables.append(table)
         return table
 
-    def length_table(self, key: str) -> ResidentTable:
+    def length_table(self, key: str, new_cols: int = 1) -> ResidentTable:
         """KV pool ``key``'s table of stored lengths, which each capture
-        gathers into a buffer of its own (`ResidentBuffers.kv_len`)."""
+        gathers into a buffer of its own (`ResidentBuffers.kv_len`).
+        ``new_cols`` is how many block table columns a row of one step may
+        gain at most."""
         self._length_keys.append(key)
+        self._new_cols = max(self._new_cols, new_cols)
         return self.table()
 
     def _seal(self) -> None:
@@ -372,7 +428,12 @@ class ResidentPlanner:
         row is host state and one H2D, and no collective sees it."""
         held = self._slot_of
         reads = self._last_read[np.fromiter(held.values(), dtype=np.int64, count=len(held))]
-        open_rows = np.flatnonzero(reads <= settled)
+        open_mask = reads <= settled
+        if self.unrecorded is not None:
+            # its device length is the only true one until its results are recorded
+            unrecorded = self.unrecorded
+            open_mask &= np.fromiter((not unrecorded(rid) for rid in held), dtype=bool, count=len(held))
+        open_rows = np.flatnonzero(open_mask)
         if open_rows.size < n:
             raise RuntimeError(
                 f"resident planning on {self.node}: {n} rows found no slot among {self.max_slots - 1}, "
@@ -417,9 +478,9 @@ class ResidentPlanner:
     # The step
 
     def _cells_width(self, bs: int) -> int:
-        """Single-cell writes a step of ``bs`` rows can queue: a length and a
-        new column a row per KV pool."""
-        return 2 * bs * max(1, len(self._length_keys))
+        """Single-cell writes a step of ``bs`` rows can queue: a length and its
+        new columns a row per KV pool."""
+        return (1 + self._new_cols) * bs * max(1, len(self._length_keys))
 
     def buffers(self, bucket: BucketKey, slot: int) -> ResidentBuffers:
         """The per-step rows of one capture, every slot at the trash row until staged."""
@@ -488,6 +549,15 @@ class ResidentPlanner:
                     # stamped first: a row of this step is no one's victim
                     self._last_read[[slot for slot in row if slot is not None]] = seq
                     new = [i for i, slot in enumerate(row) if slot is None]
+                    if self.pending is not None:
+                        # a row's results are applied at its step's admit, before this plan,
+                        # unless it ran the step before, and then it holds its slot
+                        lost = [rids[i] for i in new if self.pending(rids[i])]
+                        if lost:
+                            raise RuntimeError(
+                                f"resident planning on {self.node}: requests {lost} have unapplied verify "
+                                "results but no slot, so their device KV lengths are lost"
+                            )
                     for i, slot in zip(new, self._take_slots(len(new), seq), strict=True):
                         row[i] = self._slot_of[rids[i]] = slot
                         self._stale.add(rids[i])
@@ -531,10 +601,21 @@ class ResidentPlanner:
         """Queue ``rid``'s row whole: the narrow columns as one run, which the
         owners fill, and each wide table's used cells as a run its owner adds."""
         row = [0] * self.narrow_cols
+        first = len(writes.rows)
         if row:
             writes.run(slot, 0, row)
         for resource in self._owners:
             resource.resident_row(rid, slot, row, writes)
+        if writes.kept:
+            # cut the cells an owner keeps out of the row's first run
+            _, col, cells = writes.rows[first]
+            runs, begin = [], 0
+            for kept in sorted(writes.kept):
+                runs.append((begin, kept))
+                begin = kept + 1
+            runs.append((begin, len(cells)))
+            writes.rows[first: first + 1] = [(slot, col + a, cells[a:b]) for a, b in runs if b > a]
+            writes.kept.clear()
 
     def _stage_cells(self, plan: ResidentPlan, buffers: ResidentBuffers) -> None:
         """One copy, on the plan stream: the graph scatters these first thing."""
@@ -557,6 +638,13 @@ class ResidentPlanner:
         stride, store = self._stride, self._store
         dsts = [store[slot * stride + col: slot * stride + col + len(cells)] for slot, col, cells in rows]
         self._stager.copy_runs_(dsts, np.fromiter(chain.from_iterable(c for _, _, c in rows), dtype=np.int64))
+        if _DEBUG_ASSERTS:
+            # a rewritten row (KV length, position offset, recurrent slot, ...) holds the host's values
+            if store.is_cuda:
+                torch.cuda.current_stream(store.device).synchronize()
+            for dst, (slot, col, cells) in zip(dsts, rows, strict=True):
+                held = dst.tolist()
+                assert held == list(cells), f"resident row {slot} at column {col}: {held} on device, {list(cells)} host"
 
     def commit(self, step: SubmoduleStep, ctx) -> None:
         """After the resources' commit, before the step's commit event: the
@@ -604,6 +692,12 @@ class ResidentPlanner:
             raise ValueError(f"resident walk {bucket.graph_walk!r} on {self.node} declares no step")
         # once per bucket: each of its captures, and every step it replays, reads these
         streams = self._streams.get(bucket) or self._declared_streams(bucket, step)
+        span = max(stream.span for stream in streams.values()) if streams else 1
+        if span > self.max_span:
+            raise ValueError(
+                f"resident walk {bucket.graph_walk!r} on {self.node} appends {span} tokens a row; "
+                f"the planner was sized for {self.max_span}"
+            )
         for key, resource_step in step.steps.items():
             refusal = next(
                 (
@@ -621,27 +715,31 @@ class ResidentPlanner:
         self._streams[bucket] = streams
         buffers = self.buffers(bucket, slot)
         self.captured_steps[bucket.graph_walk] = step
-        return CapturedResidentStep(
-            bucket, slot, buffers.slots, buffers, self._store, streams,
-        )
+        if span > 1 and buffers.advance is None:
+            # zero until a verify writes it, so a forward that never does leaves lengths visibly stuck
+            buffers.advance = torch.zeros(bucket.bs, dtype=torch.long, device=self.device)
+        return CapturedResidentStep(bucket, slot, buffers.slots, buffers, self._store, streams)
 
     def _declared_streams(self, bucket: BucketKey, step: SubmoduleStep) -> dict[str, ResidentStream]:
         """Each resource's stream on ``bucket``'s steps: the label of its own
         segments, or of the step's when it names none, and whether it appends
-        one token a row (span 1) or only reads (span 0)."""
+        the same number of tokens to every row (span 1, or a verify step's
+        k + 1) or only reads (span 0)."""
         streams = {}
         for key in self._keys:
             resource_step = step.steps.get(key)
             segments = (resource_step.segments if resource_step is not None else None) or step.segments or ()
             labels = {seg.label for seg in segments}
             spans = {seg.span for seg in segments}
-            if len(labels) != 1 or spans not in ({1}, {0}):
+            if len(labels) != 1 or len(spans) != 1 or not 0 <= next(iter(spans)) <= self.max_span:
                 raise ValueError(
                     f"resident walk {bucket.graph_walk!r} on {self.node}: resource {key!r} declares "
                     f"{len(segments)} segments over labels {sorted(labels)} and spans {sorted(spans)}; "
-                    "a resident step is one token per row in one stream a resource, or a stream it only reads"
+                    f"a resident step is one span (at most {self.max_span}) per row in one stream a "
+                    "resource, or a stream it only reads"
                 )
-            streams[key] = ResidentStream(labels.pop(), reads=spans == {0})
+            span = spans.pop()
+            streams[key] = ResidentStream(labels.pop(), reads=span == 0, span=max(span, 1))
         return streams
 
     def gather(self, step: CapturedResidentStep) -> None:
@@ -649,9 +747,18 @@ class ResidentPlanner:
             # before the owners' reads: a row that crossed writes into its new
             # page. Only a KV pool queues single cells.
             scatter_cells(self._store, step.buffers.cells)
-        for resource in self._owners:
+        planned_by = []
+        for key, resource in zip(self._keys, self._owners, strict=True):
+            planned, step.host_planned = step.host_planned, False
             resource.resident_gather(step)
-        if step.reads_tables and not step.host_planned:
+            if step.host_planned:
+                planned_by.append(key)
+            step.host_planned |= planned
+        if planned_by:
+            self.host_planned_by[step.bucket] = self.host_planned_by.get(step.bucket, frozenset()) | set(planned_by)
+            # one capture of the bucket needs its host plan, so every replay of it does
+            self.host_plan_free.discard(step.bucket)
+        elif step.reads_tables and not step.host_planned and step.bucket not in self.host_planned_by:
             self.host_plan_free.add(step.bucket)
         self.lengths_only.update((step.bucket, pool) for pool in step.lengths_only)
 
@@ -664,6 +771,7 @@ def build_planner(
     node: str, walks: Iterable[str], resources: Mapping[str, Resource],
     resource_nodes: Mapping[str, Collection[str]], device: torch.device, max_bs: int,
     resident_nodes: Collection[str] = (), sharded_nodes: Collection[str] = (),
+    max_span: int = 1,
 ) -> tuple[ResidentPlanner | None, str]:
     """A planner for ``node``, or None and why not. Every resource of the node
     must be able to, since a capture is one graph: a resource that reads
@@ -695,4 +803,4 @@ def build_planner(
         refusal = resource.resident_refusal()
         if refusal is not None:
             return None, f"resource {key!r}: {refusal}"
-    return ResidentPlanner(node, walks, resources, device, max_bs), ""
+    return ResidentPlanner(node, walks, resources, device, max_bs, max_span), ""

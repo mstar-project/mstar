@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
+from mstar.engine.resources.spec import NodeResourceSpec, ResourceCapabilities, ResourceReqConfig
 from mstar.engine.resources.step import ResourceStep
 
 if TYPE_CHECKING:
@@ -110,6 +110,18 @@ class SamplerSpec(NodeResourceSpec):
     # always. The twins cost capture memory and time, so a deployment that never
     # samples greedily turns them off in its ``resources:`` block.
     greedy_capture: bool | None = None
+    # The node verifies drafts (speculative decoding): set by `drafter_resources` when the
+    # deployment's ``model_kwargs.draft`` is on, so ingest refuses what verify can't honour.
+    verifies: bool = False
+
+    def resource_capabilities(self, ctx) -> ResourceCapabilities:
+        # what a request asks for is refused at ingest (`SamplingReqConfig.validate`)
+        verify = None
+        if self.max_repetition_window > 0:
+            verify = "a windowed repetition penalty keeps a history the take-back does not restore"
+        elif self.enable_logprobs:
+            verify = "log-probs of a verify step's emitted tokens are not reported"
+        return ResourceCapabilities(verify_refusal=verify, async_verify_refusal=None)
 
     def apply_yaml_overrides(
         self, enable_logprobs: bool | None = None, enable_processed_logprobs: bool | None = None,
@@ -179,6 +191,13 @@ class SamplingReqConfig(ResourceReqConfig):
     def seed(self):
         return self._seed
 
+    def _refuse_for_verify(self) -> None:
+        problem = _verify_problem(self)
+        if problem is not None:
+            raise ValueError(
+                f"this deployment drafts and verifies tokens (speculative decoding), so {problem} is not supported"
+            )
+
     def validate(self, spec: "SamplerSpec | None" = None) -> None:
         """Raise ``ValueError`` on a value outside the contract, or one ``spec``'s
         node cannot honour. None means the sampler's default."""
@@ -202,12 +221,30 @@ class SamplingReqConfig(ResourceReqConfig):
             raise ValueError("this deployment does not report logprobs; leave return_logprobs unset")
         if self.return_logprobs and self.logprobs_mode == "processed" and not spec.enable_processed_logprobs:
             raise ValueError("this deployment does not report processed logprobs; use logprobs_mode 'raw'")
+        if spec.verifies:
+            self._refuse_for_verify()
         # a windowed penalty counts the generation history, not the seen-token mask
         windowed = self.repetition_window > 0 and spec.max_repetition_window > 0
         if self.repetition_penalty not in (None, 1) and not (spec.enable_repetition_penalty or windowed):
             raise ValueError(
                 "this model does not support repetition_penalty; send 1 or leave it unset"
             )
+
+
+def _verify_problem(cfg: "SamplingReqConfig") -> str | None:
+    """What a request asks that verifying drafts can't honour: each depends
+    on a history the take-back does not restore, or on one token a step."""
+    if cfg.repetition_penalty not in (None, 1):
+        return "repetition_penalty other than 1"
+    if cfg.repetition_window:
+        return "repetition_window"
+    if cfg.min_tokens:
+        return "min_tokens"
+    if cfg.return_logprobs:
+        return "return_logprobs"
+    if cfg.penalize_prompt is False:
+        return "penalize_prompt false"
+    return None
 
 
 def derive_seed(seed: int, stream: str) -> int:

@@ -1,5 +1,6 @@
 """Paged attention through FlashInfer's prefill/decode wrappers."""
 
+import functools
 import logging
 from collections.abc import Mapping
 from typing import TYPE_CHECKING
@@ -15,7 +16,7 @@ from mstar.engine.resources.attn.base import (
     one_token_rows,
     own_queries,
 )
-from mstar.engine.resources.attn.config import AttentionStep, refuse_context_only
+from mstar.engine.resources.attn.config import AttentionStep, VerifyBackend, refuse_context_only
 from mstar.engine.resources.attn.workspace import Workspace
 from mstar.engine.resources.attn.wrappers import (
     FlashInferDecodeWrapper,
@@ -29,7 +30,7 @@ from mstar.engine.resources.base import CGSlotKey
 from mstar.engine.resources.context_parallel import KeyRows, OwnTokensKernel, RingAttentionWrapper, SPPlacement
 from mstar.engine.resources.kv.config import PagedKVConfig
 from mstar.engine.resources.kv.keys import fingerprint
-from mstar.engine.resources.kv.plan import KVPlanOutputs
+from mstar.engine.resources.kv.plan import KVPlanOutputs, build_paged_indptrs, hide_tail_views
 from mstar.engine.resources.resident_hooks import ANY_REPEATS
 from mstar.engine.resources.spec import CombinedSplit
 from mstar.engine.resources.step import SlotLease, StepContext
@@ -62,6 +63,7 @@ class FlashInferManager(PlacedAttention):
         decode_fmha: bool = False,
         layers: tuple[int, ...] | None = None,
         sm_scale: float | None = None,
+        verify_backend: "VerifyBackend | str" = "auto",
     ):
         super().__init__(kv_cache, device, dtype, kv_config)
         self._splits = {split.combined_walk: split for split in splits}
@@ -107,6 +109,13 @@ class FlashInferManager(PlacedAttention):
         self._step_qo: dict[str, torch.Tensor] = {}
         # walk -> whether its captured decode kernels see a row's length per replay
         self._repeat_walks: dict[str, bool] = {}
+
+        # a verify step (speculative decoding) on FA3's paged kernel, which reads
+        # lengths on the device, or on FlashInfer's prefill wrappers; chosen in
+        # `bind_verify_walk`, so a node that never verifies never loads flash_attn_3
+        self._verify_backend = VerifyBackend.parse(verify_backend)
+        self._verify_fa3 = False
+        self._verify_wrappers: dict = {}
 
     def bind_dependencies(self, resources) -> None:
         # the pool, built, has paged its groups for its placement (`PagedKVConfig.placed_groups`)
@@ -179,6 +188,37 @@ class FlashInferManager(PlacedAttention):
             allowed = self._repeat_walks[walk] = bool(wrappers) and all(w.supports_repeats for w in wrappers)
         return ANY_REPEATS if allowed else 1
 
+    @functools.cached_property
+    def _fa3_reason(self) -> str | None:
+        """Why FA3's paged kernel can't run this pool's verify steps here, or None. Memoized; changes nothing."""
+        from mstar.engine.resources.attn.fa3_paged import fa3_paged_unavailable_reason
+
+        reason = fa3_paged_unavailable_reason(self._device, self._kv_config.head_dim, self._dtype)
+        if reason is None and self._sm_scale is not None:
+            # the FA3 wrapper runs the kernel's default scale
+            reason = f"a custom sm_scale ({self._sm_scale})"
+        return reason
+
+    def capabilities(self):
+        """Without FA3 here, a pinned ``verify_backend: fa3`` can't verify, and ``auto``
+        plans its verify steps on the host, which asynchronous mode can't. The flashinfer
+        pin is a config fact, which `AttentionSpec.resource_capabilities` reports."""
+        from mstar.engine.resources.spec import ResourceCapabilities
+
+        if self._verify_backend is VerifyBackend.FLASHINFER or self._fa3_reason is None:
+            return ResourceCapabilities.granting_all()
+        if self._verify_backend is VerifyBackend.FA3:
+            return ResourceCapabilities(
+                verify_refusal=f"verify_backend fa3: {self._fa3_reason}", async_verify_refusal=None,
+            )
+        return ResourceCapabilities(
+            verify_refusal=None, async_verify_refusal=f"verify attention plans on the host ({self._fa3_reason})",
+        )
+
+    def bind_verify_walk(self, walk: str, block: int, slack: int) -> None:
+        del walk, block, slack
+        self._verify_fa3 = self._verify_backend is not VerifyBackend.FLASHINFER and self._fa3_reason is None
+
     def resident_refusal(self) -> str | None:
         if self._window_left >= 0:
             return "a sliding window reads pages a resident row no longer holds"
@@ -220,6 +260,24 @@ class FlashInferManager(PlacedAttention):
             return super().fingerprint()
         # the window and scale shape every later layer's K/V
         return fingerprint(type(self).__name__, self._window_left, self._sm_scale)
+
+    def _verify_wrapper(self, step: AttentionStep, num_rows: int, num_tokens: int, lease: SlotLease | None):
+        """FA3's paged wrapper for a verify step of ``num_rows`` blocks, persistent per
+        (bucket, slot) under a lease and per (rows, block) eager. The step's mask in the
+        wrapper's terms: ``kv_extent = span - hide_last`` keys past each row's stored length."""
+        span = num_tokens // num_rows
+        key = (None if lease is None else (lease.bucket, lease.slot), num_rows, span, step.hide_last, step.causal)
+        wrapper = self._verify_wrappers.get(key)
+        if wrapper is None:
+            from mstar.engine.resources.attn.fa3_paged import FA3PagedWrapper
+
+            page_size = self._group.page_size
+            wrapper = self._verify_wrappers[key] = FA3PagedWrapper(
+                page_size=page_size, table_width=self._kv_config.block_table_width(page_size), device=self._device,
+                span=span, kv_extent=span - step.hide_last, causal=step.causal, batch_size=num_rows,
+                accelerator_graph=lease is not None, dtype=self._dtype,
+            )
+        return wrapper
 
     def _cg_wrapper(
         self, lease: SlotLease, label: str, num_rows: int, force_prefill: bool,
@@ -450,6 +508,20 @@ class FlashInferManager(PlacedAttention):
                 wrapper.plan(kv_out, r.counts, causal=step.causal)
                 plan_states[label] = wrapper
                 continue
+            if step.verify and self._verify_fa3:
+                num_rows = indptrs.qo_indptr.shape[0] - 1
+                wrapper = self._verify_wrapper(step, num_rows, int(indptrs.qo_indptr[-1]), lease)
+                if lease is not None:
+                    # the resident gather finds it under the step's label
+                    self._cg_plan_states[CGSlotKey(bucket=lease.bucket, slot=lease.slot, label=label)] = wrapper
+                wrapper.plan(dtype=self._dtype, window_left=self._window_left, **indptrs.to_kwargs_dict())
+                plan_states[label] = wrapper
+                continue
+            if step.hide_last:
+                # the block's last rows out of the keys, on FlashInfer's host plan
+                indptrs = build_paged_indptrs(
+                    hide_tail_views(kv_out.views, step.hide_last, self._group.page_size), self._group.page_size,
+                )
             if lease is not None:
                 num_rows = indptrs.qo_indptr.shape[0] - 1
                 wrapper = self._cg_wrapper(lease, label, num_rows, ctx.force_prefill)
