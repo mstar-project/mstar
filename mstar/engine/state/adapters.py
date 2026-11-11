@@ -388,12 +388,15 @@ class WithinStepSteps(StepBuilder):
         if queries is None:
             raise ValueError(f"Array {name!r}: a step lists it without {handle.queried.name!r}, whose segments lay out "
                              "its queries")
-        q_label = self._label(key, name, handle.query_share(segments_of(queries, step)))
+        query_segments = segments_of(queries, step)
+        if query_segments is None:
+            raise ValueError(f"Array {handle.queried.name!r}: a step lists it with no segments, its own or the step's")
+        q_label = self._label(key, handle.queried.name, handle.query_share(query_segments))
         self._pairs.setdefault(key, []).append((q_label, self._label(key, name, handle.key_share(segments))))
 
     def _label(self, key: str, name: str, segments: Sequence[Segment]) -> str:
         if not segments:
-            raise ValueError(f"Array {name!r}: a step lists it with no segments, its own or the step's")
+            raise ValueError(f"Array {name!r}: a step lays it out over an empty list of segments")
         label = segments[0].label
         if tuple(self._labels.setdefault(key, {}).setdefault(label, segments)) != tuple(segments):
             raise ValueError(f"Array {name!r}: label {label!r} on its resource already holds other segments")

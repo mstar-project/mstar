@@ -826,7 +826,7 @@ def test_an_array_step_that_lists_no_segments_of_its_own_is_refused_by_name():
     """An empty tuple is the array's own layout, of nothing. It doesn't fall back to the step's segments, as None
     does."""
     step = SubmoduleStep(segments=SEGMENTS, state={"vision": ArrayStep(segments=())})
-    with pytest.raises(ValueError, match="Array 'vision': a step lists it with no segments, its own or the step's"):
+    with pytest.raises(ValueError, match="Array 'vision': a step lays it out over an empty list of segments"):
         state_steps(step, _handles(_within(), node="vit"))
 
 
