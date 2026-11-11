@@ -216,7 +216,10 @@ _VERIFIED: dict[tuple[torch.device, torch.dtype], bool] = {}
 
 def fits(*tensors: torch.Tensor) -> bool:
     """Whether the fused kernels take these tensors: CUDA (mstar's platform, not a ROCm or XPU torch that reports a
-    ``cuda`` device) bf16 with Triton available, on a device where the kernels reproduce the eager ops."""
+    ``cuda`` device) bf16 with Triton available, on a device where the kernels reproduce the eager ops.
+
+    The first call on a device runs the self-check, so the eager forward calls it once before any compiled region:
+    a trace that reaches it first takes the eager ops and recompiles once the check has run."""
     return (
         triton is not None and current_platform.is_cuda()
         and all(t.is_cuda and t.dtype == torch.bfloat16 for t in tensors)
@@ -235,19 +238,26 @@ def _reproduces_eager(device: torch.device, dtype: torch.dtype) -> bool:
         return known
     if torch.compiler.is_compiling() or torch.cuda.is_current_stream_capturing():
         return False
-    failed = _kernels_off_eager(device, dtype)
+    try:
+        failed = _kernels_off_eager(device, dtype)
+    except Exception as e:  # a Triton kernel that does not compile or launch here: the eager ops, never a crash
+        failed = [f"(raised {type(e).__name__}: {e})"]
     ok = _VERIFIED[(device, dtype)] = not failed
     if failed:
-        logger.warning("dit_kernels: %s differ from torch %s's eager ops on %s; using the eager ops",
+        logger.warning("dit_kernels: %s failed the check against torch %s's eager ops on %s; using the eager ops",
                        ", ".join(failed), torch.__version__, device)
     return ok
 
 
+@torch.autocast("cuda", enabled=False)
 def _kernels_off_eager(device: torch.device, dtype: torch.dtype) -> list[str]:
-    """The kernels whose output is not ``torch.equal`` to the eager ops' on a small input (the served head count
-    and width, so the Triton compiles are the ones serving needs)."""
+    """The kernels whose output is not ``torch.equal`` to the eager ops' on a small input, through the entry points
+    serving runs: the pair kernels (distinct q and k, as the block calls them), the modulations and the LayerNorms.
+    The head count is the served 24 and the width 3072 (the input's are not known to ``fits``), so these are the
+    Triton compiles serving needs; autocast is off so the eager side is the plain ops."""
     gen = torch.Generator(device=device).manual_seed(0)
     rows, length, split, heads, dim = 2, 8, 3, 24, 3072
+    n_txt = 3
 
     def rand(*shape, scale=1.0, shift=0.0):
         return (torch.randn(*shape, generator=gen, device=device) * scale + shift).to(dtype)
@@ -255,13 +265,22 @@ def _kernels_off_eager(device: torch.device, dtype: torch.dtype) -> list[str]:
     def per_token(p):  # [2 * rows, D] -> [rows, length, D]: set 0 before ``split``, set 1 from it
         return torch.cat([p[:rows, None].expand(-1, split, -1), p[rows:, None].expand(-1, length - split, -1)], 1)
 
-    weight = rand(128)
-    freqs = torch.polar(torch.ones(length, 64, device=device), torch.randn(length, 64, generator=gen, device=device))
-    q = rand(rows, length, heads, 128)
-    h = q.float()
-    normed = weight * (h * torch.rsqrt(h.pow(2).mean(-1, keepdim=True) + 1e-6)).to(dtype)
-    pairs = torch.view_as_complex(normed.float().reshape(*normed.shape[:-1], -1, 2))
-    rotated = torch.view_as_real(pairs * freqs.unsqueeze(-2)).flatten(-2).type_as(normed)
+    def freqs(n):
+        return torch.polar(torch.ones(n, 64, device=device), torch.randn(n, 64, generator=gen, device=device))
+
+    def norm_rope(t, weight, f):
+        h = t.float()
+        normed = weight * (h * torch.rsqrt(h.pow(2).mean(-1, keepdim=True) + 1e-6)).to(dtype)
+        pairs = torch.view_as_complex(normed.float().reshape(*normed.shape[:-1], -1, 2))
+        return torch.view_as_real(pairs * f.unsqueeze(-2)).flatten(-2).type_as(normed)
+
+    qw, kw, qw_img, kw_img = rand(128), rand(128), rand(128), rand(128)
+    f_txt, f_img = freqs(n_txt), freqs(length - n_txt)
+    q, k = rand(rows, length, heads, 128), rand(rows, length, heads, 128)
+    f = torch.cat([f_txt, f_img])
+    got_q, got_k = qk_pair_norm_rope(q[0], k[0], qw, kw, f, 1e-6)
+    joint_q, joint_k = joint_qk_pair_norm_rope(
+        q[:, :n_txt], q[:, n_txt:], k[:, :n_txt], k[:, n_txt:], qw, qw_img, kw, kw_img, f_txt, f_img, 1e-6)
 
     x, y = rand(rows, length, dim, scale=4, shift=30), rand(rows, length, dim)
     gate, shift, scale1p = rand(2 * rows, dim), rand(2 * rows, dim), 1 + rand(2 * rows, dim)
@@ -275,7 +294,12 @@ def _kernels_off_eager(device: torch.device, dtype: torch.dtype) -> list[str]:
 
     got_residual, got_gated = gated_norm_modulate(x, gate, y, scale1p, shift, split, 1e-6)
     checks = {
-        "qk_norm_rope": (qk_norm_rope(q, weight, freqs, 1e-6), rotated),
+        "qk_pair_norm_rope": (torch.stack([got_q, got_k]),
+                              torch.stack([norm_rope(q[0], qw, f), norm_rope(k[0], kw, f)])),
+        "joint_qk_pair_norm_rope": (
+            torch.stack([joint_q, joint_k]),
+            torch.stack([torch.cat([norm_rope(q[:, :n_txt], qw, f_txt), norm_rope(q[:, n_txt:], qw_img, f_img)], 1),
+                         torch.cat([norm_rope(k[:, :n_txt], kw, f_txt), norm_rope(k[:, n_txt:], kw_img, f_img)], 1)])),
         "modulate": (modulate(x, scale1p, shift, split), modulated(x)),
         "gated_add": (gated_add(x, gate, y, split), residual),
         "norm_modulate": (norm_modulate(x, scale1p, shift, split, 1e-6), modulated(ln(x))),
@@ -368,10 +392,24 @@ def _(q_txt, q_img, k_txt, k_img, q_txt_weight, q_img_weight, k_txt_weight, k_im
     return q, torch.empty_like(q)
 
 
+def _check_args(name: str, x: torch.Tensor, split: int, *params: torch.Tensor, others: tuple = ()) -> None:
+    """The kernels read ``x`` (and ``others``) as contiguous ``[R, L, D]`` and each parameter as ``[R, D]`` (one set,
+    ``split >= L``) or ``[2R, D]``: anything else would read the wrong memory, so it is an error."""
+    if x.dim() != 3 or not all(t.is_contiguous() for t in (x, *others)):
+        raise ValueError(f"{name}: x and y must be contiguous [R, L, D]")
+    rows, length, dim = x.shape
+    want = rows if split >= length else 2 * rows
+    for p in params:
+        if tuple(p.shape) != (want, dim):
+            raise ValueError(f"{name}: parameters {tuple(p.shape)} do not fit x {tuple(x.shape)} with split {split} "
+                             f"(want {(want, dim)})")
+
+
 @torch.library.custom_op("mstar::dit_modulate", mutates_args=())
 def modulate(x: torch.Tensor, scale1p: torch.Tensor, shift: torch.Tensor, split: int) -> torch.Tensor:
     """``x * scale1p + shift`` for ``x [R, L, D]`` contiguous and ``[sets * R, D]`` parameters: a token before
     ``split`` takes set 0's row, from it set 1's (one set: ``split = L``)."""
+    _check_args("modulate", x, split, scale1p, shift)
     rows, length, dim = x.shape
     scale1p, shift = scale1p.contiguous(), shift.contiguous()
     out = torch.empty_like(x)
@@ -389,6 +427,7 @@ def _(x, scale1p, shift, split):
 @torch.library.custom_op("mstar::dit_gated_add", mutates_args=())
 def gated_add(x: torch.Tensor, gate: torch.Tensor, y: torch.Tensor, split: int) -> torch.Tensor:
     """``x + gate * y`` (``x``, ``y`` ``[R, L, D]`` contiguous), ``gate`` by token as in :func:`modulate`."""
+    _check_args("gated_add", x, split, gate, others=(y,))
     rows, length, dim = x.shape
     gate = gate.contiguous()
     out = torch.empty_like(x)
@@ -403,10 +442,11 @@ def _(x, gate, y, split):
     return torch.empty_like(x)
 
 
-def norm_fits(x: torch.Tensor) -> bool:
-    """Whether :func:`norm_modulate` / :func:`gated_norm_modulate` take ``x``: a contiguous ``[R, L, D]`` with
-    ``D % 512 == 0`` (torch's vectorized LayerNorm then gives every thread the same number of values)."""
-    return fits(x) and x.dim() == 3 and x.is_contiguous() and x.shape[-1] % 512 == 0
+def norm_fits(x: torch.Tensor, *params: torch.Tensor) -> bool:
+    """Whether :func:`norm_modulate` / :func:`gated_norm_modulate` take ``x`` (with its ``params``, as :func:`fits`):
+    a contiguous ``[R, L, D]`` with ``D % 512 == 0`` (torch's vectorized LayerNorm then gives every thread the
+    same number of values)."""
+    return fits(x, *params) and x.dim() == 3 and x.is_contiguous() and x.shape[-1] % 512 == 0
 
 
 # rows per program and warps of the LayerNorm kernels (ln_micro's sweep on an H200, [2, 8192, 3072])
@@ -426,6 +466,7 @@ def _norm_modulate_launch(x, gate, y, residual, scale1p, shift, out, split, eps,
 def norm_modulate(x: torch.Tensor, scale1p: torch.Tensor, shift: torch.Tensor, split: int, eps: float) -> torch.Tensor:
     """``modulate(layer_norm(x, eps), scale1p, shift, split)``: no affine, ``x`` as :func:`norm_fits` takes, the
     parameters as :func:`modulate`'s."""
+    _check_args("norm_modulate", x, split, scale1p, shift)
     out = torch.empty_like(x)
     _norm_modulate_launch(x, x, x, x, scale1p.contiguous(), shift.contiguous(), out, split, eps, gated=False)
     return out
@@ -443,6 +484,7 @@ def gated_norm_modulate(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """``r = gated_add(x, gate, y, split)`` and ``norm_modulate(r, scale1p, shift, split, eps)``, returned as
     ``(r, out)``; ``y`` contiguous as ``x``."""
+    _check_args("gated_norm_modulate", x, split, gate, scale1p, shift, others=(y,))
     residual, out = torch.empty_like(x), torch.empty_like(x)
     _norm_modulate_launch(x, gate.contiguous(), y, residual, scale1p.contiguous(), shift.contiguous(), out, split, eps,
                           gated=True)

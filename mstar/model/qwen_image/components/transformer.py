@@ -197,7 +197,7 @@ class _GeluProj(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # a LoRA-bound projection adds its delta in its forward, before the GELU: only a plain one takes the GEMM
-        if x.is_cuda and _plain(self.proj, ColumnParallelLinear):
+        if _plain(self.proj, ColumnParallelLinear):
             return addmm_gelu_tanh(x, self.proj.weight, self.proj.bias)
         return F.gelu(self.proj(x), approximate="tanh")
 
@@ -347,7 +347,7 @@ def _gated_add(x: torch.Tensor, gate: torch.Tensor, y: torch.Tensor, split: int)
 
 def _norm_modulate(norm: nn.LayerNorm, x: torch.Tensor, mod: _Mod, split: int):
     """:func:`_modulate` of ``norm(x)``, in one pass where the kernel takes ``x``."""
-    if kernels.fits(x, mod.shift) and kernels.norm_fits(x):
+    if kernels.norm_fits(x, mod.shift):
         return kernels.norm_modulate(x, mod.scale1p, mod.shift, split, norm.eps), mod.gate
     return _modulate(norm(x), mod, split)
 
@@ -357,7 +357,7 @@ def _gated_norm_modulate(
 ):
     """``r = _gated_add(x, gate, y)`` and ``_modulate(norm(r), mod)``: ``(r, modulated, next gate)``, from one
     read of ``x`` and ``y`` where the kernel takes them."""
-    if kernels.fits(x, gate, y, mod.shift) and kernels.norm_fits(x) and y.is_contiguous():
+    if kernels.norm_fits(x, gate, y, mod.shift) and y.is_contiguous():
         residual, out = kernels.gated_norm_modulate(x, gate, y, mod.scale1p, mod.shift, split, norm.eps)
         return residual, out, mod.gate
     residual = _gated_add(x, gate, y, split)
@@ -416,8 +416,8 @@ class _AdaNormOut(nn.Module):
 
     def forward(self, x: torch.Tensor, temb: torch.Tensor) -> torch.Tensor:
         scale, shift = self.linear(self.silu(temb).to(x.dtype)).chunk(2, dim=1)
-        if kernels.fits(x, shift) and kernels.norm_fits(x):
-            return kernels.norm_modulate(x, (1 + scale).contiguous(), shift.contiguous(), x.shape[1], self.norm.eps)
+        if kernels.norm_fits(x, shift):
+            return kernels.norm_modulate(x, 1 + scale, shift, x.shape[1], self.norm.eps)
         return self.norm(x) * (1 + scale)[:, None, :] + shift[:, None, :]
 
 
@@ -461,6 +461,7 @@ class QwenImageTransformer(nn.Module):
             for tensor in (txt, txt_freqs):
                 torch._dynamo.mark_dynamic(tensor, 1)
         temb_act = F.silu(temb)
+        kernels.fits(img)  # the kernels' one-time self-check runs here, in eager, before any compiled block
         for block in self.transformer_blocks:
             img, txt = block(img, txt, temb_act, layout, txt_freqs, attend)
         if self.config.zero_cond_t:

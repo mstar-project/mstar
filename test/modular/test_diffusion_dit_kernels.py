@@ -224,6 +224,8 @@ def test_dit_kernels_round_as_the_eager_ops():
     sets along the tokens, and the LayerNorms with them (the statistics in torch's own order)."""
     dev, bf16 = "cuda", torch.bfloat16
     g = torch.Generator().manual_seed(1)
+    # the self-check serving runs on first use, through the same entry points
+    assert dit_kernels._kernels_off_eager(torch.device("cuda"), torch.bfloat16) == []
 
     def rand(*shape, scale=1.0, shift=0.0):
         return (torch.randn(*shape, generator=g) * scale + shift).to(dev, bf16)
@@ -250,6 +252,14 @@ def test_dit_kernels_round_as_the_eager_ops():
     x = rand(2, 40, 3, 128)
     for f in (freqs(40), freqs(2, 40)):
         assert torch.equal(dit_kernels.qk_norm_rope(x, norm.weight, f, norm.eps), rope(norm(x), f))
+    # the joint op: text and image parts of q and k written into one tensor each
+    q_txt, q_img, k_txt, k_img = rand(2, 5, 3, 128), rand(2, 40, 3, 128), rand(2, 5, 3, 128), rand(2, 40, 3, 128)
+    f_txt, f_img = freqs(2, 5), freqs(40)
+    got = dit_kernels.joint_qk_pair_norm_rope(
+        q_txt, q_img, k_txt, k_img, norm.weight, norm.weight, kn.weight, kn.weight, f_txt, f_img, norm.eps)
+    parts = ((q_txt, q_img, norm), (k_txt, k_img, kn))
+    want = [torch.cat([rope(n(t), f_txt), rope(n(i), f_img)], 1) for t, i, n in parts]
+    assert all(map(torch.equal, got, want))
 
     # the served width (3072) on rows far from zero mean (the statistics' order shows), an odd token count
     x, y = rand(2, 37, 3072, scale=4, shift=30), rand(2, 37, 3072)
@@ -264,6 +274,12 @@ def test_dit_kernels_round_as_the_eager_ops():
         return a * per_token(scale1p) + per_token(shift)
 
     assert torch.equal(dit_kernels.modulate(x, scale1p, shift, 16), modulated(x))
+    # parameters that are views of a wider tensor (a ``chunk`` of a linear's output), not contiguous
+    wide = rand(4, 2 * 3072)
+    scale1p_view, shift_view = (1 + wide[:, :3072]), wide[:, 3072:]
+    assert not shift_view.is_contiguous()
+    assert torch.equal(dit_kernels.modulate(x, scale1p_view, shift_view, 16),
+                       x * per_token(scale1p_view) + per_token(shift_view))
     residual = x + per_token(gate) * y
     assert torch.equal(dit_kernels.gated_add(x, gate, y, 16), residual)
     assert torch.equal(dit_kernels.norm_modulate(x, scale1p, shift, 16, layer_norm.eps), modulated(layer_norm(x)))
@@ -280,6 +296,16 @@ def test_dit_kernels_refuse_inputs_they_would_read_wrongly():
         dit_kernels.qk_norm_rope(strided, w, torch.ones(5, 64, dtype=torch.complex64), 1e-6)
     with pytest.raises(ValueError, match="rows 1 or 2"):
         dit_kernels.qk_norm_rope(x, w, torch.ones(3, 5, 64, dtype=torch.complex64), 1e-6)
+    # the modulations read x contiguous and the parameters one row per batch row (two sets: twice that)
+    a, p = torch.zeros(2, 6, 8), torch.zeros(2, 8)
+    with pytest.raises(ValueError, match="contiguous"):
+        dit_kernels.modulate(a.transpose(0, 1), p, p, 6)
+    with pytest.raises(ValueError, match="contiguous"):
+        dit_kernels.gated_add(a, p, a.transpose(1, 2), 6)
+    with pytest.raises(ValueError, match="do not fit"):
+        dit_kernels.modulate(a, p, p, 3)  # two sets needed: 4 rows
+    with pytest.raises(ValueError, match="do not fit"):
+        dit_kernels.modulate(a, torch.zeros(4, 8), torch.zeros(4, 8), 6)  # one set: 2 rows
 
 
 def test_dit_kernels_fall_back_to_eager_once_on_a_device_they_do_not_reproduce(monkeypatch, caplog):

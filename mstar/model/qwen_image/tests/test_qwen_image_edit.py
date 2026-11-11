@@ -242,6 +242,8 @@ def test_the_fused_kernels_round_as_the_eager_ops(zero_cond_t, monkeypatch):
             return dit(img, txt, timestep, layout, joint_attention)
 
     fused = forward()
+    # the fused kernels ran: the self-check passed on this device, so this is not eager against eager
+    assert kernels._VERIFIED[(img.device, torch.bfloat16)] is True
     monkeypatch.setattr(kernels, "fits", lambda *tensors: False)
     assert torch.equal(fused, forward())
     # the copy-free GEMMs (v written into the joint tensor, the output projections reading in place) against the
