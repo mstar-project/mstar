@@ -920,8 +920,8 @@ one target pass) turns it on with a ``draft`` block; without one it decodes as u
 
    model_kwargs:
      draft:
-       method: dspark                              # dspark | eagle3 | draft_model | mtp (Qwen3.5's own head)
-       model: deepseek-ai/dspark_qwen3_8b_block7   # its checkpoint (none for mtp)
+       method: dspark                              # dspark | eagle3 | draft_model
+       model: deepseek-ai/dspark_qwen3_8b_block7   # its checkpoint
        num_draft_tokens: 7                         # k; eagle3 and draft_model default to 3
        mode: auto                                  # auto | synchronous | asynchronous
 

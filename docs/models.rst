@@ -673,7 +673,7 @@ and why. :doc:`serving` covers the ``draft`` block for operators.
 ``configs/qwen3_8b_eagle3.yaml`` drafts with EAGLE-3
 (``RedHatAI/Qwen3-8B-speculator.eagle3``, ``k = 3``, its trained depth): one decoder layer reading
 the streams entering target layers 2, 18 and 33 (a checkpoint may name its own), chaining its
-passes like Qwen3.5's MTP head, over a 32,000-token vocabulary that its ``d2t`` table maps back to
+passes (``chain_drafts``), over a 32,000-token vocabulary that its ``d2t`` table maps back to
 the target's. Its K/V is one more layer of the pool (36 + 1).
 
 ``configs/qwen3_8b_draft_model.yaml`` drafts with Qwen3-0.6B (``k = 3``, at most 4): a separate
