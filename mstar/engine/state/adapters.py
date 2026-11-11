@@ -105,7 +105,11 @@ def _resolve(arrays: Sequence[Array], setup: "StateSetup") -> "Resolved":
     """``arrays`` resolved by their storages, all of one storage's arrays in one call."""
     by_storage: dict[Storage, list[Array]] = {}
     for array in arrays:
-        by_storage.setdefault(storage_of(array), []).append(array)
+        storage = storage_of(array)
+        if array.seq_sharded and not storage.takes_seq_sharded:
+            raise _no_layout(array, "seq_sharded takes max_len 0, and an array that keeps entries keeps them whole on "
+                                    "each rank")
+        by_storage.setdefault(storage, []).append(array)
     specs: dict[str, list[NodeResourceSpec]] = {}
     bound: dict[str, tuple[BoundOp, ...]] = {}
     resource_of: dict[str, str] = {}
@@ -1133,6 +1137,8 @@ class Storage(ABC):
     """How today's resources hold one kind of array: its specs, its own step, its layouts and its handle."""
 
     handle_class: ClassVar[type[ArrayHandle]]
+    # whether an array here may be seq_sharded, so its calls carry a rank's share of a step's tokens
+    takes_seq_sharded: ClassVar[bool] = False
 
     def __init__(self):
         # `state_steps` reaches a handle's storage, for its step builder, through the handle's class
@@ -1179,8 +1185,6 @@ class PagedStorage(Storage):
 
     def _specs(self, array: Array, setup: "StateSetup") -> tuple[list[NodeResourceSpec], tuple[BoundOp, ...]]:
         heads, head_dim = _kv_shape(array)
-        if array.seq_sharded:
-            raise _no_layout(array, "seq_sharded takes max_len 0, and a paged array's entries stay whole on each rank")
         if not array.reads:
             raise _no_layout(array, "reads is empty, and PagedKVConfig needs num_qo_heads from an Attend read")
         bound = _bindings(self, array, setup.by_read)
@@ -1229,8 +1233,6 @@ class ValueStorage(Storage):
     def _specs(self, array: Array, arrays: Sequence[Array]) -> tuple[list[NodeResourceSpec], tuple[BoundOp, ...]]:
         if array.reads:
             raise _no_layout(array, "reads must be empty, since RecurrentStateConfig has no read")
-        if array.seq_sharded:
-            raise _no_layout(array, "seq_sharded takes max_len 0, and a Value's entries stay whole on each rank")
         if array.entry.host:
             raise _no_layout(array, f"entry has host fields {sorted(array.entry.host)}, and RecurrentStateConfig has "
                                     "no block for one")
@@ -1280,6 +1282,7 @@ class WithinStepStorage(Storage):
     """An array with ``max_len`` 0, whose adds last only the step, so it has no pool."""
 
     handle_class = WithinStepHandle
+    takes_seq_sharded = True
 
     def step_builder(self) -> StepBuilder:
         return WithinStepSteps()
