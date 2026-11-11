@@ -109,7 +109,7 @@ class Glm52Model(ByteLevelTextOutput, Model):
             # serve the first N layers of a deeper checkpoint
             self.config.num_hidden_layers = int(kwargs["num_hidden_layers"])
         if long_context_kwargs(kwargs):
-            # Opt-in DSA engine path (configs/glm52_tp8_longctx.yaml). Sparse
+            # Opt-in DSA engine path (the long-context override in docs/models.rst). Sparse
             # attention reads the paged latent cache, so the naive
             # (mla_absorb=False) backend cannot host it.
             if not self.config.mla_absorb:
