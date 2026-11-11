@@ -52,7 +52,17 @@ from mstar.engine.state import (
     Window,
     at_last_token,
 )
-from mstar.engine.state.adapters import _leader, _read_specs, build_specs, check_capture, node_handles, state_steps
+from mstar.engine.state.adapters import (
+    StateSetup,
+    Walks,
+    _leader,
+    _resolve,
+    build_handle,
+    build_specs,
+    check_capture,
+    node_handles,
+    state_steps,
+)
 from mstar.engine.state.calls import ArrayHandle
 from mstar.model.base import KVLabel, LabelLayout, PrefixKeys
 from mstar.model.utils import check_kv_pools_fit
@@ -146,7 +156,7 @@ def test_a_row_with_two_segments_on_one_label_of_a_combined_step_is_refused():
 
 def test_a_step_over_two_labels_on_a_value_has_no_layout_yet():
     h = _value_handle(labels=set(LABELS))
-    _refused(r"Array 'gdn': no layout yet: a step over labels \['main', 'uncond'\] on a Value",
+    _refused(r"Array 'gdn': no layout yet: a step touches labels \['main', 'uncond'\], and a plan holds one per call",
              lambda: _begin(h, segments=_label_major(), ctx=_ctx(rows=(1, 2))))
 
 
@@ -162,7 +172,8 @@ def test_a_cross_read_refuses_queries_laid_out_over_two_labels():
     queried = _array(labels=set(LABELS))
     context = Array("ctx", nodes={"LLM"}, layers=queried.layers, entry=queried.entry, max_len=16,
                     reads={"cross": Read(mask=Bidirectional(), op=Attend(q_heads=2), queries="kv")})
-    h = ArrayHandle(context, {"ctx": _StubKV(), "cross": _StubAttn()}, None, queried=queried)
+    resolved = _resolve([queried, context], StateSetup())
+    h = build_handle(context, {"ctx": _StubKV(), "cross": _StubAttn()}, resolved=resolved)
     step = SubmoduleStep(segments=[Segment(1, "main", 0), Segment(2, "main", 0)], state={
         "ctx": ArrayStep(), "kv": ArrayStep(segments=tuple(_label_major())),
     })
@@ -218,9 +229,9 @@ def _per_walk(**reads) -> Array:
 
 def _per_walk_handle(array=None) -> ArrayHandle:
     array = array or _per_walk()
-    _, spec_of = _read_specs(array)
-    resources = {"kv": _StubKV(), **{key: _StubAttn() for key in set(spec_of.values())}}
-    return ArrayHandle(array, resources, None, read_resources=spec_of, combined=COMBINED)
+    resolved = _resolve([array], StateSetup(walks=Walks(combined={"LLM": COMBINED})))
+    resources = {"kv": _StubKV(), **{key: _StubAttn() for key in set(resolved.resource_of.values())}}
+    return build_handle(array, resources, resolved=resolved)
 
 
 def _causal(h: ArrayHandle, walk: str | None) -> dict[str, bool]:
@@ -250,7 +261,7 @@ def test_shared_reads_take_the_first_reads_key_in_declaration_order():
         attn_image=Read(mask=Bidirectional(), op=Attend(q_heads=2), walks=IMAGE),
         attn=Read(mask=Causal(), op=Attend(q_heads=2), walks=TEXT),
     )
-    assert _read_specs(image_first)[1] == {"attn_image": "attn_image", "attn": "attn_image"}
+    assert _resolve([image_first], StateSetup()).resource_of == {"attn_image": "attn_image", "attn": "attn_image"}
 
 
 def test_reads_with_two_masks_on_one_walk_keep_two_specs():
@@ -312,9 +323,9 @@ def _two_spec_handle() -> ArrayHandle:
     """Two reads that build different specs over different layers, each on its own walk, and walk ``c`` with none."""
     array = _per_walk(causal=Read(mask=Causal(), op=Attend(q_heads=2), walks={"a"}, layers={0, 1}),
                       local=Read(mask=Window(16), op=Attend(q_heads=2), walks={"b"}, layers={2, 3}))
-    _, spec_of = _read_specs(array)
-    resources = {"kv": _StubKV(), **{key: _Named(key) for key in set(spec_of.values())}}
-    return ArrayHandle(array, resources, None, read_resources=spec_of)
+    resolved = _resolve([array], StateSetup())
+    resources = {"kv": _StubKV(), **{key: _Named(key) for key in set(resolved.resource_of.values())}}
+    return build_handle(array, resources, resolved=resolved)
 
 
 def _at_last_token_on(h: ArrayHandle, walk: str):
@@ -455,32 +466,32 @@ def _pool(*nodes) -> Array:
 
 
 def test_the_leader_is_the_one_node_that_runs_every_walk_its_pool_runs():
-    assert _leader(_pool("LLM", "LLM_cfg_text", "LLM_cfg_img"), BAGEL_WALKS) == "LLM"
+    assert _leader(_pool("LLM", "LLM_cfg_text", "LLM_cfg_img"), Walks(nodes=BAGEL_WALKS)) == "LLM"
 
 
 def test_a_pool_where_no_node_runs_every_walk_has_no_leader():
     """Cosmos3's DiT and reasoner each miss the other's walks, so each admits for itself."""
-    assert _leader(_pool("dit", "reasoner"), {"generate": {"dit"}, "reason": {"reasoner"}}) is None
+    assert _leader(_pool("dit", "reasoner"), Walks(nodes={"generate": {"dit"}, "reason": {"reasoner"}})) is None
 
 
 def test_a_pool_on_one_node_has_no_leader():
-    assert _leader(_pool("LLM"), BAGEL_WALKS) is None
+    assert _leader(_pool("LLM"), Walks(nodes=BAGEL_WALKS)) is None
 
 
 def test_a_kept_arrays_handle_is_the_same_whichever_of_its_nodes_builds_it():
     array = _array(nodes={"LLM", "LLM_cfg_img"}, labels=set(LABELS), reads=_per_walk().reads)
-    _, spec_of = _read_specs(array)
     model = SimpleNamespace(declare_state=lambda: [array], get_combined_graph_walks=lambda: {"LLM": COMBINED})
-    resources = {"kv": _StubKV(), **{key: _StubAttn() for key in set(spec_of.values())}}
+    resources = {"kv": _StubKV(), **{key: _StubAttn() for key in _resolve([array], StateSetup()).resource_of.values()}}
     llm, cfg = (node_handles(model, node, resources)["kv"] for node in ("LLM", "LLM_cfg_img"))
-    assert set(COMBINED) <= set(cfg.walk_reads)
-    assert (cfg.walk_reads, cfg._covers) == (llm.walk_reads, llm._covers), (
+    assert set(COMBINED) <= set(cfg.walk_reads.reads)
+    assert cfg.walk_reads == llm.walk_reads, (
         "the engine keeps whichever node's handle it builds first, so it has to plan every node's combined walks"
     )
 
 
 def test_build_specs_puts_the_leader_on_the_pool():
-    (kv,) = [spec for spec in build_specs([_pool("LLM", "LLM_cfg_img")], walks=BAGEL_WALKS) if isinstance(spec, KVSpec)]
+    setup = StateSetup(walks=Walks(nodes=BAGEL_WALKS))
+    (kv,) = [spec for spec in build_specs([_pool("LLM", "LLM_cfg_img")], setup=setup) if isinstance(spec, KVSpec)]
     assert kv.leader == "LLM"
 
 

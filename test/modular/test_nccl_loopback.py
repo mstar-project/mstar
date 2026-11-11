@@ -118,9 +118,8 @@ def _rank(rank: int, store_port: int, backend: str, queue) -> None:
     if backend == "nccl":
         torch.cuda.set_device(rank)
         kwargs["device_id"] = torch.device("cuda", rank)
-    dist.init_process_group(
-        backend, init_method=f"tcp://127.0.0.1:{store_port}", world_size=2, rank=rank, **kwargs,
-    )
+    store = dist.TCPStore("127.0.0.1", store_port, 2, is_master=False)
+    dist.init_process_group(backend, store=store, world_size=2, rank=rank, **kwargs)
     device = "cuda" if backend == "nccl" else "cpu"
     x = torch.ones(1, device=device)
     dist.all_reduce(x)
@@ -128,17 +127,19 @@ def _rank(rank: int, store_port: int, backend: str, queue) -> None:
     cpu_group = dist.new_group(ranks=[0, 1], backend="gloo", use_local_synchronization=True)
     y = torch.ones(1)
     dist.all_reduce(y, group=cpu_group)
-    store = f":{store_port}"
-    queue.put((rank, x.item() + y.item(), [a for a in _own_listeners() if not a.endswith(store)]))
+    queue.put((rank, x.item() + y.item(), _own_listeners()))
     dist.barrier()
     dist.destroy_process_group()
 
 
 def _run_two_ranks(backend: str) -> None:
+    import torch.distributed as dist
+
     keep_bootstrap_sockets_on_loopback()
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        store_port = s.getsockname()[1]
+    # The store listens before the ranks spawn: a port probed free and closed
+    # could be taken by another test before rank 0 bound it.
+    store = dist.TCPStore("127.0.0.1", 0, 2, is_master=True, wait_for_workers=False)
+    store_port = store.port
     ctx = multiprocessing.get_context("spawn")
     queue = ctx.Queue()
     procs = [ctx.Process(target=_rank, args=(r, store_port, backend, queue)) for r in range(2)]

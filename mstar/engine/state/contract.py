@@ -164,11 +164,15 @@ class GatedDeltaNet(Op):
 
 @dataclass(frozen=True, kw_only=True)
 class Read:
+    """A view of the entries a row has kept. ``mask`` says which entries each query can still reach, so the engine
+    can free the rest and tell when two requests can share a prefix. A read leaves the entries as they were."""
+
     mask: Mask
     op: Op | None = None
     layers: frozenset[int] | None = None    # None: all of the array's layers
     walks: frozenset[str] | None = None     # None: all walks
     queries: str | None = None              # the array whose segments lay out the queries; None: this array
+    packed: bool = True                     # queries may come as (tokens, heads, head_dim); False: only as rows
 
     def __post_init__(self):
         if not isinstance(self.mask, Mask):
@@ -199,6 +203,10 @@ class Rope:
 
 @dataclass(frozen=True, kw_only=True)
 class Positions:
+    """Each row's position on the array, which the model rotates or embeds its next tokens at. It reads no entries,
+    and it lives on the host and moves when a step is planned: by the row's span, by ``ArrayStep.advance`` or by
+    ``ArrayStep.position_ids``. It forks and takes prefix hits with its array."""
+
     rope: Rope | None = None    # None: a counter only
 
 
@@ -208,6 +216,8 @@ class Array:
 
     An append-only array only grows, and a rewritable one also takes writes in place. All layers of an array have
     the same length at the end of every step. ``nodes`` lists who may touch the array, and the engine places it.
+    ``updates`` are kernels that replace a Value's entry with its next version. The version they overwrite is gone,
+    so prefix caching and undo save a copy before one runs.
     With ``max_len`` 0 an array keeps nothing between steps, so every add is scratch.
     """
 
@@ -372,6 +382,7 @@ class ArrayStep:
     forks: tuple[Fork, ...] = ()
     placeholders: frozenset[tuple[int, str]] = frozenset()    # (row, label): holds a place, reads and keeps nothing
     eager_add: bool = False                        # this step's adds run outside the captured graph
+    fixed_layout: bool = False                     # replays of its capture bucket plan the capture's layout
     advance: tuple[int, ...] | None = None         # positions per row; None: the span
     position_ids: torch.Tensor | None = None       # explicit ids, (tokens,) in segment order
     host: Mapping[tuple[int, str, int], Mapping[str, object]] = EMPTY    # (row, label, layer) -> fields, at commit

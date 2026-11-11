@@ -9,13 +9,14 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from mstar.model import keys
 from mstar.model.components.fastconformer import FastConformerConfig
 from mstar.model.utils import GRANARY_LANGUAGES, base_language
 
-# the decoder node's arrays, reads and sampler
+# the decoder node's arrays, reads and sampler; the shared decoder reads `keys`' sampler
 KV_CACHE = "kv_cache"
 ATTN = "attn"
-SAMPLER = "sampler"
+SAMPLER = keys.SAMPLER
 # the encoder output, added once at prefill, in an array of its own so the
 # self-attention resource never plans over it
 CROSS_KV_CACHE = "cross_kv_cache"
@@ -67,6 +68,10 @@ class CanaryModelConfig:
     @property
     def head_dim(self) -> int:
         return self.hidden_size // self.num_heads
+
+    @property
+    def stop_token_ids(self) -> frozenset[int]:
+        return frozenset({self.eos_token_id})
 
     @classmethod
     def from_pretrained(cls, local_dir: str | Path) -> CanaryModelConfig:

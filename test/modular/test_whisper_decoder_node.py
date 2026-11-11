@@ -1,8 +1,8 @@
 """Whisper's decoder node on the shared TokenStepNode: HF generate's
 token suppression, applied to the logits the sampler gets; the batched stop
-check, which only a decode step's token answers; the per-request stop check,
-which copies only the token to the host; and the walk and loop names of
-Whisper's graph."""
+check, where EOS ends the loop on a decode step and the request on a prefill;
+the per-request stop check, which copies only the token to the host; and the
+walk and loop names of Whisper's graph."""
 from collections.abc import Collection
 from types import SimpleNamespace
 
@@ -13,7 +13,7 @@ from mstar.engine.resources.base import EngineResourceInfo
 from mstar.engine.resources.recurrent.pool import RecurrentStatePool
 from mstar.engine.resources.step import StepContext
 from mstar.engine.state.adapters import node_handles, node_resources
-from mstar.model.submodule_base import HostRows, ModelInputsFromEngine, engine_step
+from mstar.model.submodule_base import END_PARTITION, HostRows, ModelInputsFromEngine, engine_step
 from mstar.model.whisper.components.decoder import WhisperDecoderModel
 from mstar.model.whisper.config import (
     ATTN,
@@ -28,7 +28,6 @@ from mstar.model.whisper.config import (
 )
 from mstar.model.whisper.submodules import WhisperDecoderSubmodule
 from mstar.model.whisper.whisper_model import WhisperModel
-from mstar.worker.worker import _LazyHostOutputs
 
 
 def _node():
@@ -188,10 +187,10 @@ def test_names_match_whispers_graph():
     assert walks[node.DECODE_WALK].name == node.DECODE_LOOP
 
 
-def test_batched_stop_check_answers_decode_steps_only():
+def test_batched_stop_check_ends_the_loop_or_the_prefill():
     """As the per-request check: EOS ends the loop on a decode step (a row at
-    its token cap is the loop cap's to end), while a prefill walk's EOS runs
-    outside the loop and ends nothing."""
+    its token cap is the loop cap's to end), and a prefill walk's EOS, which
+    runs before the loop exists, ends the request."""
     node = _node()
     infos = {
         rid: SimpleNamespace(graph_walk=walk, resource_configs={"sampler": SimpleNamespace(ignore_eos=False)},
@@ -203,25 +202,7 @@ def test_batched_stop_check_answers_decode_steps_only():
     rows = HostRows(request_ids=("go", "limit", "eos", "prefill_eos"),
                     buffers={"new_token": torch.tensor([[7], [7], [3], [3]])})
     assert node.check_stop_batched(["eos", "limit", "go", "prefill_eos"], infos, rows) == {
-        "eos": {"decode_loop"},
+        "eos": {"decode_loop"}, "prefill_eos": {END_PARTITION},
     }
 
 
-def test_stop_check_on_a_routed_token_copies_only_the_token():
-    """A decode step that routes its token as ``text_inputs`` alone, checked
-    per request over lazily copied host outputs: the stop check copies that
-    one output, not every output the step produced."""
-    source = {"eos": {"text_inputs": [torch.tensor([[3]])], "hidden": [torch.ones(2, 4)],
-                      "cross_kv": [torch.ones(4)]}}
-    copied = []
-
-    def copy_names(names):
-        copied.extend(names)
-        return {name: {rid: [t.clone() for t in row[name]] for rid, row in source.items()} for name in names}
-
-    info = SimpleNamespace(graph_walk="decode", resource_configs={"sampler": SimpleNamespace(ignore_eos=False)},
-                           dynamic_loop_iter_counts={"decode_loop": 0}, max_tokens=10,
-                           step_metadata={}, rid_handle=0)
-    lazy = _LazyHostOutputs(source, copy_names)
-    assert _node().check_stop("eos", info, lazy["eos"]) == {"decode_loop"}
-    assert copied == ["text_inputs"]

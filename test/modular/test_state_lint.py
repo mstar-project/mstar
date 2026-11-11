@@ -26,7 +26,8 @@ PORTED = (
 FORBIDDEN_ATTRIBUTES = {
     "node_resources", "resources", "request_state", "request_states", "per_request_states",
     # what a handle holds
-    "resource", "positions", "reads", "first_read", "_kv", "_attn", "_pool", "_linear", "_views", "_blocks",
+    "resource", "positions", "reads", "first_read", "_kv", "_attn", "_pool", "_runners", "_views", "_blocks",
+    "_bindings", "_layouts", "_update",
 }
 
 _CAPTURE = "a capture's buckets and compile mode, which the engine doesn't pick yet"
@@ -41,6 +42,7 @@ ALLOWED = {
 } | {
     ("mstar.engine.engine", "ExecutingBatch"): "the annotation of `NodeSubmodule.can_batch`, a base class's hook",
     ("mstar.engine.resources.lora.checkpoint", "LoraFile"): "a model's static LoRA merge at load, which holds no state",
+    ("mstar.engine.resources.lora", "LoraSpec"): "the opt-in LoRA spec, written by hand: the contract declares no LoRA",
 }
 # Exceptions for one file, by file, module and name, which a later port of the same kind mustn't inherit.
 ALLOWED_IN: dict[tuple[str, str, str], str] = {

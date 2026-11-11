@@ -27,8 +27,8 @@ import torch.nn.functional as F
 from mstar.engine.resources.position.config import PositionConfig
 from mstar.engine.resources.step import StepContext
 from mstar.engine.state import ArrayStep, Segment, SubmoduleStep
-from mstar.engine.state.adapters import node_handles, node_resources, state_steps
-from mstar.engine.state.host import HostFields
+from mstar.engine.state.adapters import StateSetup, node_handles, node_resources, state_steps
+from mstar.engine.state.host_fields import HostFields
 from mstar.model.chatterbox.chatterbox_model import ChatterboxModel
 from mstar.model.chatterbox.config import (
     COND_LABEL,
@@ -327,7 +327,8 @@ class FakeS3GenStream:
         self.pool = _FakeStreamPool(stream.entry.tensors)
         self.fields = HostFields()
         self.sub = sub
-        sub.bind_node_state(node_handles(model, S3GEN_NODE, {S3GEN_STREAM: self.pool}, host_fields=self.fields))
+        setup = StateSetup(host_fields=self.fields)
+        sub.bind_node_state(node_handles(model, S3GEN_NODE, {S3GEN_STREAM: self.pool}, setup=setup))
 
     def held(self, rid) -> dict:
         return dict(self.fields.fields(rid, S3GEN_STREAM, "main", 0))

@@ -24,7 +24,8 @@ rotation here reads a precomputed cos/sin table, the way the reference
   (without).
 * :class:`MiniCPMLocalTransformer` is a bidirectional stack over a short,
   fixed-length sequence per row (5 tokens for the local encoder, 11 for the
-  local DiT), attended densely with SDPA and kept out of the KV resources.
+  local DiT), attended with the shared RoPE-and-attention kernel
+  (``components/rope_attention.py``) and kept out of the KV resources.
 
 Parameter paths follow the checkpoint (``layers.N.self_attn.q_proj`` ...) once
 ``LLAMA_STACKED_PARAMS`` routes q/k/v and gate/up into the fused projections.
@@ -33,7 +34,6 @@ Parameter paths follow the checkpoint (``layers.N.self_attn.q_proj`` ...) once
 from __future__ import annotations
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
@@ -44,6 +44,7 @@ from mstar.model.components.distributed import (
     VocabParallelEmbedding,
 )
 from mstar.model.components.norm import RMSNorm
+from mstar.model.components.rope_attention import rope_attention
 from mstar.model.voxcpm2.config import MiniCPM4Config
 
 
@@ -134,12 +135,13 @@ class MiniCPMPagedAttention(ParallelAttention):
         return apply_rope(q, k, cos, sin)
 
 
-def _mlp(config: MiniCPM4Config, comm_group: CommGroup) -> ParallelGatedMLP:
+def _mlp(config: MiniCPM4Config, comm_group: CommGroup, fused_silu: bool = False) -> ParallelGatedMLP:
     return ParallelGatedMLP(
         comm_group=comm_group,
         hidden_size=config.hidden_size,
         intermediate_size=config.intermediate_size,
         activation="silu",
+        fused_silu=fused_silu,
     )
 
 
@@ -211,7 +213,7 @@ class MiniCPMLM(nn.Module):
 
 
 class MiniCPMLocalAttention(ParallelAttention):
-    """Bidirectional attention over ``[rows, seq, hidden]``, dense SDPA.
+    """Bidirectional attention over ``[rows, seq, hidden]``, each row whole.
 
     Reuses the fused QKV / output projections of ``ParallelAttention`` but no
     resource: every row is a complete, short sequence that nothing caches.
@@ -226,20 +228,10 @@ class MiniCPMLocalAttention(ParallelAttention):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         rows, seq, _ = hidden_states.shape
-        q, k, v = self._project_qkv(hidden_states.reshape(rows * seq, -1))
-        q = q.view(rows, seq, self.num_heads, self.head_dim)
-        k = k.view(rows, seq, self.num_kv_heads, self.head_dim)
-        v = v.view(rows, seq, self.num_kv_heads, self.head_dim)
-        cos = self._rope.cos[:seq].unsqueeze(1)
-        sin = self._rope.sin[:seq].unsqueeze(1)
-        q, k = apply_rope(q, k, cos, sin)
-        out = F.scaled_dot_product_attention(
-            q.transpose(1, 2),
-            k.transpose(1, 2),
-            v.transpose(1, 2),
-            enable_gqa=self.num_heads != self.num_kv_heads,
+        qkv = self.qkv_proj(hidden_states.reshape(rows * seq, -1))
+        out = rope_attention(
+            qkv, self._rope.cos, self._rope.sin, rows, seq, self.num_heads, self.num_kv_heads, self.head_dim,
         )
-        out = out.transpose(1, 2).reshape(rows * seq, self.num_heads * self.head_dim)
         return self.o_proj(out).view(rows, seq, -1)
 
 
@@ -263,7 +255,7 @@ class MiniCPMLocalTransformer(nn.Module):
                         head_dim=config.head_dim,
                         input_hidden_size=config.hidden_size,
                     ),
-                    mlp=_mlp(config, comm_group),
+                    mlp=_mlp(config, comm_group, fused_silu=True),
                     input_layernorm=RMSNorm(config.hidden_size, eps=config.rms_norm_eps),
                     post_attention_layernorm=RMSNorm(config.hidden_size, eps=config.rms_norm_eps),
                 )
@@ -276,6 +268,12 @@ class MiniCPMLocalTransformer(nn.Module):
         self.rope.materialize()
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        for layer in self.layers:
-            hidden_states = layer(hidden_states=hidden_states)
-        return self.norm(hidden_states)
+        # ``run_layers``' loop, each residual add folded into the next norm, without
+        # its attention cursor: these layers hold no resource, so nothing breaks a
+        # compiled graph between them
+        layers = self.layers
+        h, residual = layers[0].input_layernorm.forward_residual(hidden_states.clone(), None)
+        for i, layer in enumerate(layers):
+            next_norm = layers[i + 1].input_layernorm if i + 1 < len(layers) else self.norm
+            h, residual = layer.forward_mlp_residual(layer.self_attn(h), residual, next_norm)
+        return h

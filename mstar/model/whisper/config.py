@@ -232,6 +232,14 @@ class WhisperModelConfig:
         ids.extend(self.prompt_tail_ids(task=task, timestamps=timestamps))
         return ids
 
+    def decoder_prompt_len(self) -> int:
+        """Length of the plain forced prompt: ``<|sot|> <|lang|> <|task|> <|notimestamps|>``.
+
+        A count rather than ``len(decoder_prompt_ids())``: a config built without
+        the tokenizer's language and task tables (startup graph validation, the
+        CPU tests) has no ids to measure. test_whisper_model pins it to the ids."""
+        return 4
+
     def prompt_tail_ids(self, task: str = "transcribe", timestamps: bool = False) -> list[int]:
         """What follows the language token: ``<|task|> [<|notimestamps|>]``."""
         ids = [self.task_token(task)]

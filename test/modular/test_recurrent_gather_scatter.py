@@ -21,8 +21,7 @@ from mstar.engine.resources.recurrent.config import (
 from mstar.engine.resources.recurrent.pool import NO_SLOT, SINK_SLOT, RecurrentStatePool
 from mstar.engine.resources.step import BucketKey, Segment, SlotLease, StepContext, SubmoduleStep
 from mstar.engine.state import ArrayStep, Entry, TensorType, Value
-from mstar.engine.state.adapters import build_specs
-from mstar.engine.state.calls import ArrayHandle
+from mstar.engine.state.adapters import build_handle, build_specs
 
 MAX_SLOTS = 6  # 5 usable, slot 0 is the sink
 SHAPE = (2, 8)
@@ -321,7 +320,7 @@ def test_a_values_read_and_write_captured_address_the_rows_each_replay_plans():
     pool = RecurrentStatePool.build(spec, EngineResourceInfo(device=torch.device("cuda")))
     for rid in "abcd":
         pool.ingest_request(rid)
-    handle = ArrayHandle(array, {"state": pool}, None)
+    handle = build_handle(array, {"state": pool})
     handle.set_start({"h": torch.full(SHAPE, 100.0, device="cuda")})
     inc = torch.zeros(4, *SHAPE, device="cuda")
 

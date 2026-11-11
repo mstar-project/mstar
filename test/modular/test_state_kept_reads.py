@@ -44,10 +44,9 @@ from mstar.engine.state import (
     Window,
     at_last_token,
 )
-from mstar.engine.state.adapters import build_specs, node_handles, state_steps
+from mstar.engine.state.adapters import PagedCrossHandle, build_handle, build_specs, node_handles, state_steps
 from mstar.engine.state.calls import ArrayHandle
 from mstar.engine.state.contract import Entry
-from mstar.engine.state.within_step import WithinStepHandle
 from mstar.model.components.distributed.attention import ParallelCrossAttention
 
 state_op_module = sys.modules["mstar.engine.state.state_op"]
@@ -110,14 +109,14 @@ def _context_array(**overrides) -> Array:
     })
 
 
+def _handles(arrays, resources) -> dict[str, ArrayHandle]:
+    return node_handles(SimpleNamespace(declare_state=lambda: arrays), "n", resources)
+
+
 def _bound(device="cpu") -> dict[str, ArrayHandle]:
-    self_array = _self_array()
-    return {
-        "kv": ArrayHandle(self_array, {"kv": _StubKV(), "attn": _StubSelfRead(), "rope": object()}, "rope"),
-        "context": ArrayHandle(
-            _context_array(), {"context": _StubKV(device), "cross": _StubCross()}, None, queried=self_array,
-        ),
-    }
+    return _handles([_self_array(), _context_array()], {
+        "kv": _StubKV(), "attn": _StubSelfRead(), "rope": object(), "context": _StubKV(device), "cross": _StubCross(),
+    })
 
 
 def _ctx(capture=False, rows=("a", "b")) -> StepContext:
@@ -149,7 +148,7 @@ def _add_and_read(handle, layer, tokens=3) -> None:
 def test_a_kept_reads_mask_picks_the_steps_flag(mask, causal):
     array = Array("kv", nodes={"n"}, layers=LAYERS, entry=ENTRY, max_len=64,
                   reads={"attn": Read(mask=mask, op=Attend(q_heads=HEADS))})
-    handle = ArrayHandle(array, {"kv": _StubKV(), "attn": _StubSelfRead()}, None)
+    handle = build_handle(array, {"kv": _StubKV(), "attn": _StubSelfRead()})
     step = state_steps(SubmoduleStep(segments=[Segment("a", "main", 1)], state={"kv": ArrayStep()}), {"kv": handle})
     assert step.steps["attn"].causal is causal, f"{mask} plans the other flag"
 
@@ -226,10 +225,9 @@ def test_a_max_len_0_read_over_a_kept_array_plans_todays_cross_step():
     chunk = _self_array()
     text = Array("text", nodes={"n"}, layers=LAYERS, entry=ENTRY, max_len=0, labels={"text"},
                  reads={"text_attn": Read(mask=Block(), op=Attend(q_heads=HEADS), queries="kv")})
-    handles = {
-        "kv": ArrayHandle(chunk, {"kv": _StubKV(), "attn": _StubSelfRead(), "rope": object()}, "rope"),
-        "text": WithinStepHandle(text, {"text_attn": _StubCross()}, None, resource_key="text_attn", queried=chunk),
-    }
+    handles = _handles(
+        [chunk, text], {"kv": _StubKV(), "attn": _StubSelfRead(), "rope": object(), "text_attn": _StubCross()},
+    )
     queries = [Segment("a", "main", 30), Segment("b", "main", 20)]
     context = (Segment("a", "text", 512), Segment("b", "text", 512))
     step = state_steps(SubmoduleStep(
@@ -411,7 +409,7 @@ def test_at_last_token_on_a_cross_array_is_refused_by_name():
 
 def test_a_handles_queried_array_is_keyword_only():
     with pytest.raises(TypeError):
-        ArrayHandle(_context_array(), {"context": _StubKV(), "cross": _StubCross()}, None, None, _self_array())
+        PagedCrossHandle(_context_array(), {"context": _StubKV(), "cross": _StubCross()}, None, (), _self_array())
 
 
 # State ops and the pages
@@ -443,7 +441,7 @@ class _StubDense(_StubSelfRead):
 
 def test_a_backend_that_takes_k_and_v_at_its_read_is_never_addressed():
     array = _self_array()
-    handle = ArrayHandle(array, {"kv": _StubKV(), "attn": _StubDense(), "rope": object()}, "rope")
+    handle = build_handle(array, {"kv": _StubKV(), "attn": _StubDense(), "rope": object()})
     assert not state_op_module._addresses(ANY_DEVICE, handle)
 
 
@@ -534,7 +532,7 @@ def dense(monkeypatch):
                   reads={"attn": Read(mask=Bidirectional(), op=Attend(q_heads=4))})
     for rid in ("a", "b"):
         kv.ingest_request(rid)
-    return kv, attn, ArrayHandle(array, {"kv": kv, "attn": attn}, None)
+    return kv, attn, build_handle(array, {"kv": kv, "attn": attn})
 
 
 def _run_step(kv, attn, handle, spans, keep):
@@ -659,7 +657,7 @@ def test_a_bidirectional_read_on_flashinfers_kernel_matches_sdpa(monkeypatch):
     attn = FlashInferManager(kv_cache="kv", device=torch.device("cuda"), dtype=torch.bfloat16, kv_config=config)
     array = Array("kv", nodes={"n"}, layers=LAYERS, entry=KVEntry(heads=2, head_dim=64), max_len=64,
                   reads={"attn": Read(mask=Bidirectional(), op=Attend(q_heads=4))})
-    handle = ArrayHandle(array, {"kv": pool, "attn": attn}, None)
+    handle = build_handle(array, {"kv": pool, "attn": attn})
     kept: dict = {}
     for spans, keep in (({"a": 18, "b": 3}, True), ({"a": 2, "b": 4}, False)):
         step = state_steps(SubmoduleStep(
@@ -709,10 +707,9 @@ def test_a_kept_cross_read_on_flashinfers_kernel_matches_sdpa_with_a_label_of_it
     cross_array = Array("context", nodes={"n"}, layers=LAYERS, entry=KVEntry(heads=2, head_dim=64), max_len=48,
                         labels={CONTEXT},
                         reads={"cross": Read(mask=Bidirectional(), op=Attend(q_heads=4), queries="kv")})
-    handles = {
-        "kv": ArrayHandle(self_array, {"kv": self_pool, "attn": attn}, None),
-        "context": ArrayHandle(cross_array, {"context": context_pool, "cross": cross}, None, queried=self_array),
-    }
+    handles = _handles(
+        [self_array, cross_array], {"kv": self_pool, "attn": attn, "context": context_pool, "cross": cross},
+    )
     contexts: dict = {}
     for query_spans, context_spans in (((5, 3), (20, 7)), ((1, 1), (0, 0))):
         segments = (Segment("a", CONTEXT, context_spans[0]), Segment("b", CONTEXT, context_spans[1]))

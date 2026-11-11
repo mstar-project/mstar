@@ -41,7 +41,8 @@ from mstar.engine.resources.recurrent import (
 )
 from mstar.engine.resources.step import BucketKey, Segment, SlotLease, StepContext, SubmoduleStep
 from mstar.engine.state import ArrayStep, CausalConv, Entry, GatedDeltaNet, TensorType, Value
-from mstar.engine.state.calls import ArrayHandle, causal_conv, gated_delta_net
+from mstar.engine.state.adapters import build_handle
+from mstar.engine.state.calls import causal_conv, gated_delta_net
 from mstar.model.components.distributed import (
     ColumnParallelLinear,
     RowParallelLinear,
@@ -139,10 +140,10 @@ class Stack(torch.nn.Module):
             "state": TensorType((g.num_v_heads, g.head_k_dim, g.head_v_dim), dtype=torch.float32),
             "conv": TensorType((g.conv_dim, g.conv_kernel_size - 1), dtype=None),
         })
-        self.state = ArrayHandle(
+        self.state = build_handle(
             Value(GDN_STATE, nodes={"llm"}, layers=range(depth), entry=entry,
                   updates={"conv": CausalConv(), LINEAR_ATTN: GatedDeltaNet()}),
-            {GDN_STATE: pool, "conv": None, LINEAR_ATTN: manager}, None,
+            {GDN_STATE: pool, "conv": None, LINEAR_ATTN: manager},
         )
         for layer in self.layers:
             layer.bind_state({GDN_STATE: self.state})

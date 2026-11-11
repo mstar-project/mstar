@@ -4,22 +4,16 @@ Pi0.5 is a robotics VLA model. It takes camera images, a text task prompt,
 and a robot proprioceptive state vector as inputs, and produces a 50-step
 robot action trajectory through flow-matching denoising.
 
-Architecture (2 nodes):
-    vit_encoder  (enc_dec) - SigLIP So400m/14 + linear connector
-    LLM          (ar)      - PaliGemma prefix expert + action expert.
-                             A single fat node hosts both Gemma weight sets;
-                             they share KV-cache dimensions so the action
-                             expert can attend to the prefix KV cache that
-                             PaliGemma writes during prefill.
+Architecture (3 nodes):
+    vit_encoder    (enc_dec) - SigLIP So400m/14 + linear connector
+    LLM            (ar)      - PaliGemma prefix expert: writes the KV cache.
+    action_expert  (ar)      - reads that KV cache and runs the 10-step
+                               flow-matching loop in one step, with adaRMS
+                               timestep conditioning, and emits the actions.
 
-Graph walks (2):
-    prefill    - SigLIP encodes camera images, then PaliGemma prefills the
-                 prefix [image_tokens, language_tokens, state_tokens] with
-                 bidirectional attention and writes the KV cache.
-    action_gen - 10-iteration flow-matching loop. Each iteration the action
-                 expert reads the frozen prefix KV cache, predicts a velocity
-                 with adaRMS timestep conditioning, and applies one Euler
-                 step. The final iteration emits the denoised action tensor.
+One graph walk, so the action step follows the prefix on the worker with no
+round trip through the conductor. The two experts share KV-cache dimensions and
+one KV cache, so both nodes have to be in one node group.
 """
 
 import json
@@ -30,26 +24,22 @@ import torch
 from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import (
-    CurrentForwardConductorMetadata,
-    StreamingConnectionState,
-)
 from mstar.engine.state import Array, Attend, Bidirectional, KVEntry, Layout, Positions, Read, Rope, Span
 from mstar.graph.base import (
     GraphEdge,
     GraphNode,
     GraphSection,
-    Loop,
     Sequential,
     TensorPointerInfo,
 )
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import (
-    ForwardPassArgs,
     KVLabel,
     Model,
     ProcessPromptOutput,
+    RobotIO,
     TensorAndMetadata,
+    WalkStep,
 )
 from mstar.model.loader import LLAMA_STACKED_PARAMS, load_hf_weights
 from mstar.model.media_limits import read_image
@@ -60,12 +50,14 @@ from mstar.model.pi05.components.paligemma import Pi05PaliGemmaExpert
 from mstar.model.pi05.components.siglip import Pi05SiglipEncoder
 from mstar.model.pi05.components.tokenization import Pi05Tokenizer, pi05_prompt
 from mstar.model.pi05.config import (
+    CHUNK_WALK,
     LLM_ATTN,
     LLM_KV,
+    LLM_NODES,
     Pi05Config,
     load_pi05_config,
 )
-from mstar.model.pi05.submodules import Pi05LLMSubmodule, Pi05ViTEncoderSubmodule
+from mstar.model.pi05.submodules import Pi05ActionSubmodule, Pi05LLMSubmodule, Pi05ViTEncoderSubmodule
 from mstar.model.submodule_base import NodeSubmodule
 
 logger = logging.getLogger(__name__)
@@ -153,13 +145,25 @@ def _reset_non_persistent_buffers(module: nn.Module, device) -> None:
                 )
 
 
+def _flat(value):
+    """Leaves of a nested list/tuple."""
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _flat(item)
+    else:
+        yield value
+
+
 class Pi05Model(Model):
     """Pi0.5 vision-language-action model implementation."""
 
     PREPROCESS_ONLY_KWARGS = ("robot_state",)
+    # load_image and process_prompt share only the fast tokenizer, called without padding or truncation
+    PREPROCESS_PARALLEL = True
+    # load_image is a PNG decode per camera, and only that
+    PREPROCESS_PARALLEL_IMAGES = True
 
-    PREFILL_WALK = "prefill"
-    ACTION_GEN_WALK = "action_gen"
+    CHUNK_WALK = CHUNK_WALK
 
     def __init__(
         self,
@@ -425,7 +429,7 @@ class Pi05Model(Model):
         is stateless, and actions come from flow matching, so there is no sampler."""
         c = self.config
         return [Array(
-            LLM_KV, nodes={"LLM"}, layers=frozenset(range(c.num_layers)),
+            LLM_KV, nodes=set(LLM_NODES), layers=frozenset(range(c.num_layers)),
             entry=KVEntry(heads=c.num_kv_heads, head_dim=c.head_dim), max_len=c.max_position_embeddings,
             # Factors of 1 scale nothing, and setting them picks flashinfer's Llama 3.1 kernel over its plain one.
             positions=Positions(rope=Rope(
@@ -434,6 +438,17 @@ class Pi05Model(Model):
             reads={LLM_ATTN: Read(mask=Bidirectional(), op=Attend(q_heads=c.num_qo_heads))},
         )]
 
+    def validate_config_yaml(self, config: dict, config_path: str) -> None:
+        """The action step follows the prefix on the worker only inside one node group.
+        A group on other ranks would also hold its own KV cache, where the action expert
+        attends over an empty prefix and answers without error."""
+        groups = config.get("node_groups")
+        if groups and not any(set(LLM_NODES) <= set(group.get("node_names", [])) for group in groups):
+            raise ValueError(
+                f"{config_path}: node_groups must list {' and '.join(LLM_NODES)} in one entry, "
+                "so the action step follows the prefix on the worker that holds its KV cache"
+            )
+
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         # Pi0.5 encodes the robot state as a decimal-string suffix on the
         # language prompt (e.g. "Task: pick up the block, State: 12 87 ...;
@@ -441,7 +456,10 @@ class Pi05Model(Model):
         # tokenizer. So the model only ever sees a single "text_inputs"
         # stream — there are no separate state-bin tokens. This matches
         # lerobot's processor_pi05.Pi05PrepareStateTokenizerProcessorStep.
-        prefill = Sequential(
+        # One walk, so the action step follows the prefix KV write on the worker
+        # with no round trip through the conductor. ``prefix_done`` only orders
+        # the two: the action step reads the prefix through the shared KV.
+        chunk = Sequential(
             [
                 GraphNode(
                     name="vit_encoder",
@@ -451,44 +469,24 @@ class Pi05Model(Model):
                 GraphNode(
                     name="LLM",
                     input_names=["img_emb", "text_inputs"],
-                    outputs=[],
+                    outputs=[GraphEdge(next_node="action_expert", name="prefix_done")],
+                ),
+                GraphNode(
+                    name="action_expert",
+                    input_names=["prefix_done"],
+                    outputs=[
+                        GraphEdge(
+                            next_node=EMIT_TO_CLIENT,
+                            name="actions",
+                            output_modality="action",
+                        ),
+                    ],
                 ),
             ]
         )
 
-        # NOTE: The Loop's terminal ``outputs`` are matched into the section's
-        # node outputs by **name** (see Loop._replace_outputs_for_final_iter
-        # in mstar/graph/base.py): on the final iteration, any section-output
-        # edge whose name matches a terminal output's name is replaced with
-        # the terminal version. This is the same convention BAGEL's image_gen
-        # uses (section returns ``latents`` looping back to LLM, terminal
-        # output is ``name="latents" → vae_decoder``). So our terminal output
-        # MUST be named ``noisy_actions`` to match the section's loop-back
-        # edge — the name is just a graph-internal key, while the actual
-        # client-facing modality bucket is determined by ``output_modality``.
-        action_gen = Loop(
-            section=GraphNode(
-                name="LLM",
-                input_names=["noisy_actions", "timestep_index"],
-                outputs=[
-                    GraphEdge(next_node="LLM", name="noisy_actions"),
-                    GraphEdge(next_node="LLM", name="timestep_index"),
-                ],
-            ),
-            max_iters=self.config.num_flow_steps,
-            outputs=[
-                GraphEdge(
-                    next_node=EMIT_TO_CLIENT,
-                    name="noisy_actions",
-                    output_modality="action",
-                    persist=True,
-                ),
-            ],
-        )
-
         return {
-            self.PREFILL_WALK: prefill,
-            self.ACTION_GEN_WALK: action_gen,
+            self.CHUNK_WALK: chunk,
         }
 
     # ------------------------------------------------------------------
@@ -515,6 +513,7 @@ class Pi05Model(Model):
         configured, ``robot_state`` is the raw state and is normalized first,
         as openpi's policy does; without, it is binned as given.
         """
+        robot_state = self._robot_state(kwargs.get("robot_state"))
         if self.tokenizer is None:
             # Tokenizer-less fallback for dummy mode (skip_weight_loading), used by structural unit tests.
             if prompt is not None:
@@ -526,9 +525,8 @@ class Pi05Model(Model):
             return {}
 
         state_bins = None
-        robot_state = kwargs.get("robot_state")
         if robot_state is not None:
-            state = torch.as_tensor(robot_state, dtype=torch.float64).detach().cpu().reshape(-1)
+            state = robot_state
             if self.norm_stats is not None:
                 state = self.norm_stats.normalize_state(state)
             state_bins = discretize_state(state, num_bins=self.config.state_token_bins).tolist()
@@ -541,8 +539,8 @@ class Pi05Model(Model):
         image_rows = images * (cfg.vit_image_size // cfg.vit_patch_size) ** 2
         layout = Layout(
             spans=(
-                Span("rows", self.PREFILL_WALK, image_rows, image_rows, "img_emb"),
-                Span("ids", self.PREFILL_WALK, text_ids.numel(), text_ids.numel(), "text_inputs"),
+                Span("rows", self.CHUNK_WALK, image_rows, image_rows, "img_emb"),
+                Span("ids", self.CHUNK_WALK, text_ids.numel(), text_ids.numel(), "text_inputs"),
             ),
             scratch=cfg.action_horizon,
         )
@@ -552,10 +550,45 @@ class Pi05Model(Model):
         """The decoded RGB camera image, left uint8 ``(C, H, W)``: the ViT step
         normalizes uint8 on the GPU, so the API server skips a float pass per
         camera and stages a quarter of the bytes for the worker."""
-        return TensorAndMetadata(read_image(filepath, rgb=True).to(device))
+        return self.load_decoded_image(read_image(filepath, rgb=True), device)
+
+    def load_decoded_image(self, image: torch.Tensor, device: str) -> TensorAndMetadata:
+        return TensorAndMetadata(image.to(device))
+
+    def robot_io(self) -> RobotIO:
+        return RobotIO("robot_state", self.config.action_horizon, self.config.action_dim)
 
     def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
         return {LLM_KV: {"main": KVLabel()}}
+
+    def _robot_state(self, raw) -> torch.Tensor | None:
+        """The client's ``robot_state`` as a float64 vector of at most ``state_dim``
+        finite values; anything else is a ``ValueError``. A value outside [-1, 1]
+        (after ``norm_stats``, when configured) bins as openpi's (``discretize_state``)."""
+        if raw is None:
+            return None
+        limit = self.config.state_dim
+        if isinstance(raw, torch.Tensor):
+            state = raw.to(torch.float64)
+        else:
+            if isinstance(raw, (str, bytes)) or any(isinstance(v, (bool, str, bytes)) for v in _flat(raw)):
+                raise ValueError(f"robot_state must be a list of at most {limit} numbers; got {raw!r}")
+            try:
+                state = torch.tensor(raw, dtype=torch.float64)
+            except (TypeError, ValueError, RuntimeError):
+                raise ValueError(f"robot_state must be a list of at most {limit} numbers; got {raw!r}") from None
+        if state.dim() != 1 or not 1 <= state.numel() <= limit:
+            raise ValueError(
+                f"robot_state must be a list of 1 to {limit} numbers; got shape {tuple(state.shape)}"
+            )
+        if not torch.isfinite(state).all():
+            # NaN and +inf would bin as 255 and -inf as -1: an ordinary-looking state token
+            raise ValueError("robot_state must be finite; it holds NaN or inf")
+        return state
+
+    def request_kwargs(self) -> frozenset[str]:
+        # flow steps and the rest come from the deployment YAML, not the request
+        return frozenset({"robot_state"})
 
     def max_input_files(self) -> dict[str, int]:
         # one image per camera slot the SigLIP capture holds
@@ -573,71 +606,21 @@ class Pi05Model(Model):
     # Model ABC: forward pass orchestration
     # ------------------------------------------------------------------
 
-    def get_initial_forward_pass_args(
+    def walk_plan(
         self,
         partition_name: str,
         input_modalities: list[str],
         output_modalities: list[str],
         input_signals: dict[str, list[TensorPointerInfo]],
-        model_kwargs: dict | None = None,
-    ) -> ForwardPassArgs:
-        full_metadata = CurrentForwardConductorMetadata(
-            input_modalities=input_modalities,
-            output_modalities=output_modalities,
-            graph_walk=self.PREFILL_WALK,
-            is_prefill=True,
-            kwargs={},
-        )
-
-        inputs = []
-        if "image_inputs" in input_signals:
-            edge = GraphEdge(next_node="vit_encoder", name="image_inputs")
-            edge.tensor_info = input_signals["image_inputs"]
-            inputs.append(edge)
-        if "text_inputs" in input_signals:
-            edge = GraphEdge(next_node="LLM", name="text_inputs")
-            edge.tensor_info = input_signals["text_inputs"]
-            inputs.append(edge)
-
-        unpersist_tensors = sum([inp.tensor_info for inp in inputs], start=[])
-        return ForwardPassArgs(
-            full_metadata=full_metadata,
-            inputs=inputs,
-            unpersist_tensors=unpersist_tensors,
-            step_metadata={"is_prefill": True},
-        )
-
-    def get_partition_forward_pass_args(
-        self,
-        partition_name: str,
-        partition_metadata: CurrentForwardConductorMetadata,
-        persist_signals: dict[str, list[TensorPointerInfo]],
-        incoming_connections: list[StreamingConnectionState] | None = None,
-    ) -> ForwardPassArgs:
-        metadata = partition_metadata
-        request_done = False
-        inputs: list[GraphEdge] = []
-
-        if metadata.graph_walk == self.PREFILL_WALK:
-            metadata.is_prefill = False
-            metadata.graph_walk = self.ACTION_GEN_WALK
-            # Inputs for the first action_gen iteration are sampled inside the
-            # LLM submodule's preprocess (Gaussian noise + timestep_index=0).
-            inputs = [
-                GraphEdge(next_node="LLM", name="noisy_actions"),
-                GraphEdge(next_node="LLM", name="timestep_index"),
-            ]
-        elif metadata.graph_walk == self.ACTION_GEN_WALK:
-            request_done = True
-
-        unpersist_tensors = sum([inp.tensor_info for inp in inputs], start=[])
-        return ForwardPassArgs(
-            full_metadata=metadata,
-            inputs=inputs,
-            unpersist_tensors=unpersist_tensors,
-            step_metadata={"is_prefill": metadata.is_prefill},
-            request_done=request_done,
-        )
+        model_kwargs: dict,
+    ) -> list[WalkStep]:
+        """One walk: SigLIP over the camera images, the prefill over them and the
+        prompt, then the action expert's flow, whose initial noise it draws."""
+        # The prefill's LLM waits on the images' embeddings, so a request without
+        # them could never finish. process_prompt always emits the prompt's tokens.
+        if not input_signals.get("image_inputs"):
+            raise ValueError("Pi0.5 requires camera images (image_inputs)")
+        return [WalkStep(self.CHUNK_WALK)]
 
     # ------------------------------------------------------------------
     # Model ABC: submodule loading
@@ -649,10 +632,10 @@ class Pi05Model(Model):
     ) -> torch.nn.Module | None:
         # NOTE: ``autocast_dtype`` is accepted for interface parity but
         # deliberately NOT applied at param allocation. Pi0.5's submodules
-        # (Pi05ViTEncoderSubmodule / Pi05LLMSubmodule) override ``to()`` to
-        # keep precision-sensitive params in fp32 — the SigLIP vision tower
-        # entirely, and the transformer norm params — matching lerobot's
-        # ``to_bfloat16_for_selected_params``. Meta-casting to bf16 before
+        # (Pi05ViTEncoderSubmodule and the two experts) override ``to()`` to
+        # keep precision-sensitive params in fp32 — SigLIP's patch and
+        # position embeddings, the transformer norms and the time MLP — as
+        # openpi keeps them. Meta-casting to bf16 before
         # ``to_empty`` would load those weights into bf16 storage and lose
         # precision that the post-load fp32 upcast cannot recover (~0.2 abs
         # delta on final actions). So we load in fp32 and let the submodule
@@ -679,12 +662,16 @@ class Pi05Model(Model):
             return Pi05LLMSubmodule(
                 embed_tokens=self.embed_tokens,
                 paligemma=self.paligemma,
+                config=self.config,
+            )
+        if node_name == "action_expert":
+            self._init_llm_components(device)
+            return Pi05ActionSubmodule(
                 action_expert=self.action_expert,
                 action_in_proj=self.action_in_proj,
                 action_out_proj=self.action_out_proj,
                 time_mlp=self.time_mlp,
                 config=self.config,
-                device=device,
             )
         return None
 

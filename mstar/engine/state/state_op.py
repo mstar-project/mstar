@@ -1,4 +1,5 @@
-"""Kernels that write state themselves, in one launch with the math before it, in place of a layer's `add`.
+"""Kernels that write state themselves, in one launch with the math before it, in place of a layer's `add`, or of
+its `add` and `read`.
 
 An op is a plain call behind a graph break, as `add` is. It names a fused kernel, the formats that kernel can address,
 and a reference over the contract's calls that any other format runs, so an unlisted format loses speed and still boots.
@@ -108,15 +109,18 @@ def _state_op(fused, adds, writes, reads, mutates, formats, reference) -> StateO
 
 def bind_state_ops(handles: Mapping[str, Any]) -> None:
     """Cache on each array handle which ops run their fused kernel on its format, so a call reads a constant."""
+    # imported here, since the layer imports the model's components, and they import this package
+    from mstar.engine.state.adapters import PagedArrayHandle
+
     for handle in handles.values():
-        if isinstance(handle, ArrayHandle) and handle._kv is not None:
+        if isinstance(handle, PagedArrayHandle):
             handle.fused_ops = frozenset(name for name, op in STATE_OPS.items() if _addresses(op, handle))
 
 
 def _addresses(op: StateOp, handle: ArrayHandle) -> bool:
     """Whether ``op``'s kernel can write ``handle``'s pages. A backend that takes K/V at its read never sees them."""
     cache = handle._kv.kv_cache
-    return cache.layout is KVLayout.NHD and all(handle._reads_pages(layer) for layer in handle.array.layers) and any(
+    return cache.layout is KVLayout.NHD and not any(handle._holds(layer) for layer in handle.array.layers) and any(
         (fmt.dtypes is None or cache.dtype in fmt.dtypes) and (fmt.devices is None or cache.device.type in fmt.devices)
         for fmt in op.formats
     )
@@ -132,9 +136,8 @@ def _check_call(op: StateOp, args: Sequence[Any]) -> None:
             raise handle._refusal(f"state op {op.name!r} adds to {name}, and the array is rewritable")
         if name in op.writes and not handle.array.rewritable:
             raise handle._refusal(f"state op {op.name!r} writes {name}, and the array is append-only")
-        if name in op.reads and not handle.array.max_len:
-            raise handle._refusal(f"state op {op.name!r} reads {name} with max_len 0, whose read a compiled block "
-                                  "traces: a break here takes the read out of that graph")
+        if name in op.reads:
+            handle._check_add_read(f"state op {op.name!r} reads {name}")
 
 
 def _call(op: StateOp, args: Sequence[Any]) -> Any:

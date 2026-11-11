@@ -100,8 +100,9 @@ class _Mesh:
             [], [],
         )
 
-    def run(self, rid, uuids, **send_kwargs):
-        """Ingest, pop, complete and send. Returns the frames each peer got."""
+    def run(self, rid, uuids, route=None, **send_kwargs):
+        """Ingest, pop, complete and send. Returns the frames each peer got.
+        ``route``: more of the route's input (an inline signal and its values)."""
         self.rt.ingest_inputs_batch(_one_signal(rid, "prompt", "only"))
         self.rt.pop_rids("only", WALK, [rid])
         signals = self.rt.get_output_signals("only", WALK)
@@ -112,10 +113,10 @@ class _Mesh:
             "num_tensors": [
                 len(uuids) if s == signals[0] else 0 for s in signals
             ],
+            **(route or {}),
         })
         args = dict(
-            request_infos=[(rid, None)], new_token_counts=[],
-            stream_tokens_consumed=[], profiling=[],
+            request_infos=[(rid, None)], new_token_counts=[], profiling=[],
         )
         args.update(send_kwargs)
         _send(self.rt, out.completion_id, **args)
@@ -135,15 +136,12 @@ def _send(rt, completion_id, **aos):
 
     info_rids, infos = split("request_infos")
     ntc_rids, ntc = split("new_token_counts")
-    con_rids, con = split("stream_tokens_consumed")
     prof_rids, prof = split("profiling")
     publish_rids, publications = split("publications")
     rt.send_outputs(
         completion_id=completion_id,
         info_rids=info_rids, request_infos=infos,
         ntc_rids=ntc_rids, new_token_counts=[dict(c) for c in ntc],
-        consumed_rids=con_rids,
-        stream_tokens_consumed=[dict(c) for c in con],
         prof_rids=prof_rids, profiling=prof,
         publish_rids=publish_rids, publications=publications,
         skip_rids=aos.get("skip_rids", []),
@@ -1086,7 +1084,7 @@ def test_one_route_reports_each_row_in_its_own_walks_graph(tmp_path):
         "walks": ["prefill", "decode"], "rid_walk_idx": [0, 1],
     })
     _send(rt, out.completion_id, request_infos=[(rid, None) for rid in rids],
-          new_token_counts=[], stream_tokens_consumed=[], profiling=[])
+          new_token_counts=[], profiling=[])
 
     done = {
         m.body.request_id: (m.body.worker_graph_ids, m.body.graph_walk)
@@ -1115,6 +1113,37 @@ def test_a_streamed_edge_goes_as_the_edge_items_python_builds(tmp_path):
     assert frame == _sent(WorkerMessage(
         message_type=WorkerMessageType.EDGE_ITEMS, body=builder.build(),
     ))
+
+
+@pytest.mark.parametrize("with_tensor", [False, True], ids=["rows_only", "stored"])
+def test_a_streamed_value_goes_as_the_value_frame_python_builds(tmp_path, with_tensor):
+    """A streamed edge whose signal rides inline goes to a peer as a value row
+    of EDGE_ITEMS: no descriptor, whether or not the step stored a tensor, and
+    the frame decodes to the one EdgeItemsBuilder.add_values makes. It counts
+    as one item sent, as a descriptor would."""
+    mesh = _stream_mesh(tmp_path)
+    mesh.rt.set_inline_streams([("only", "out")])
+    rid = mesh.admit(wgs=(WG_ID, 1), workers=(ME, PEER))
+    if with_tensor:
+        _put(mesh, 1, _source_node_name="only", _source_graph_walk=WALK)
+    got = mesh.run(rid, uuids=[1] if with_tensor else [], route={"inline_signal": "out", "inline_values": [7]})
+    (frame,) = got[PEER]
+    builder = EdgeItemsBuilder("default")
+    assert builder.add_values("r1", "out", "remote", None, [7], ("", ME, "only", 1, 0))
+    assert frame == _sent(WorkerMessage(message_type=WorkerMessageType.EDGE_ITEMS, body=builder.build()))
+    assert got["conductor"][0].body.stream_items_sent == {"out": {PEER: 1}}
+
+
+def test_a_signal_inline_to_the_client_keeps_its_streams_tensors(tmp_path):
+    """A signal the route carries inline goes down a stream as a value only for
+    a node that streams it inline; for any other (one that rides inline to the
+    client, say) its stream keeps the tensor's descriptor."""
+    mesh = _stream_mesh(tmp_path)
+    rid = mesh.admit(wgs=(WG_ID, 1), workers=(ME, PEER))
+    _put(mesh, 1, _source_node_name="only", _source_graph_walk=WALK)
+    (frame,) = mesh.run(rid, uuids=[1], route={"inline_signal": "out", "inline_values": [7]})[PEER]
+    assert frame.message_type == WorkerMessageType.EDGE_ITEMS
+    assert frame.body.values == [] and frame.body.uuids == [1]
 
 
 def test_a_streamed_row_unlike_the_frame_goes_as_input_signals(tmp_path):

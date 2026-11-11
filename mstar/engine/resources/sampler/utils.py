@@ -618,10 +618,11 @@ def _count_ge(x_bits, t):
 @triton.jit
 def _kth_largest_bits(x_bits, k):
     """The largest threshold ``t`` (float bits) with at least ``k`` entries >= t:
-    the k-th largest value's bits. Non-negative floats order like their bits."""
+    the k-th largest value's bits, for values in [0, 1]: those order like their
+    bits, which are at most 1.0's, so 30 halvings cover them."""
     lo = 0
-    hi = 0x7F800000
-    for _ in range(31):
+    hi = 0x3F800000
+    for _ in range(30):
         mid = lo + (hi - lo + 1) // 2
         ok = _count_ge(x_bits, mid) >= k
         lo = tl.where(ok, mid, lo)
@@ -643,7 +644,7 @@ def _fused_filter_kernel(
     offs = tl.arange(0, BLOCK)
     valid = offs < V
     p = tl.load(probs_ptr + row * stride_in + offs, mask=valid, other=0.0)
-    p = tl.maximum(p, 0.0)
+    p = tl.minimum(tl.maximum(p, 0.0), 1.0)
     bits = p.to(tl.int32, bitcast=True)
     k = tl.load(top_k_ptr + row)
     first_k = tl.load(first_k_ptr + row)
@@ -657,11 +658,11 @@ def _fused_filter_kernel(
     mass_first = tl.sum(tl.where(in_first, p, 0.0), axis=0)
     # top-p keeps token i iff the mass strictly above it is < p * mass. That mass
     # falls as i's value rises, so the kept tokens are those >= the smallest
-    # threshold t with mass(> t) < p * mass: search for it on the bits
+    # threshold t with mass(> t) < p * mass: search for it on the bits, at most 1.0's
     target = top_p * mass_first
     lo = 0
-    hi = 0x7F800000
-    for _ in range(31):
+    hi = 0x3F800000
+    for _ in range(30):
         mid = lo + (hi - lo) // 2
         above = tl.sum(tl.where(in_first & (bits > mid), p, 0.0), axis=0)
         ok = above < target
@@ -683,23 +684,10 @@ def _fused_filter_kernel(
 
 
 @triton.jit
-def _kth_largest_key(key, k, HI: tl.constexpr, ITERS: tl.constexpr):
-    """The largest ``t`` in ``[0, HI]`` with at least ``k`` entries of ``key`` >= t."""
-    lo = 0
-    hi = HI
-    for _ in range(ITERS):
-        mid = lo + (hi - lo + 1) // 2
-        ok = tl.sum((key >= mid).to(tl.int32), axis=0) >= k
-        lo = tl.where(ok, mid, lo)
-        hi = tl.where(ok, hi, mid - 1)
-    return lo
-
-
-@triton.jit
 def _fused_sample_kernel(
     logits_ptr, temperature_ptr, top_k_ptr, top_p_ptr, seed_ptr, offset_ptr,
     penalty_ptr, seen_ptr, out_ptr,
-    V, stride_l, seen_stride_b, seen_stride_v,
+    V, stride_b, stride_v, seen_stride_b, seen_stride_v,
     APPLY_PENALTY: tl.constexpr, BLOCK: tl.constexpr,
 ):
     """One row's token, from its logits, in registers: the repetition penalty,
@@ -708,13 +696,12 @@ def _fused_sample_kernel(
     own (seed, offset), so a request draws the same token at any batch
     position. Temperature 0 takes the argmax.
 
-    The cuts rank tokens by their probability's top 16 bits (bf16
-    precision, truncated): a search over 2^14 keys instead of 2^31, so
-    tokens within one bf16 step of the k-th probability are kept with it."""
+    The cuts compare the probabilities' full float32 bits, so a token just
+    below the k-th one is cut however close it is."""
     row = tl.program_id(0)
     offs = tl.arange(0, BLOCK)
     valid = offs < V
-    x = tl.load(logits_ptr + row * stride_l + offs, mask=valid, other=-float("inf")).to(tl.float32)
+    x = tl.load(logits_ptr + row * stride_b + offs * stride_v, mask=valid, other=-float("inf")).to(tl.float32)
     if APPLY_PENALTY:
         seen = tl.load(
             seen_ptr + row * seen_stride_b + offs * seen_stride_v, mask=valid, other=0,
@@ -724,14 +711,15 @@ def _fused_sample_kernel(
     greedy = temp == 0
     x_max, arg = tl.max(x, axis=0, return_indices=True)
     inv_temp = tl.where(greedy, 1.0, 1.0 / tl.maximum(temp, 1e-30))
-    # unnormalised: the largest is 1, so every key is at most 1.0's, 0x3F80
-    e = tl.where(valid, tl.exp((x - x_max) * inv_temp), 0.0)
-    key = e.to(tl.int32, bitcast=True) >> 16
+    # unnormalised: the largest is 1, so every key is at most 1.0's bits (the
+    # minimum holds that against an approximate exp just below 0)
+    e = tl.where(valid, tl.minimum(tl.exp((x - x_max) * inv_temp), 1.0), 0.0)
+    key = e.to(tl.int32, bitcast=True)
     k = tl.load(top_k_ptr + row)
     t = 0
     if k > 0:
         if k < V:  # a branch, not tl.where: skip the search when nothing is cut
-            t = _kth_largest_key(key, k, 0x3F80, 14)
+            t = _kth_largest_bits(key, k)
     top_p = tl.load(top_p_ptr + row)
     if top_p < 1.0:
         # top-p keeps token i iff the mass strictly above it is < p * mass. That
@@ -739,8 +727,8 @@ def _fused_sample_kernel(
         # mass(> t') < p * mass
         target = top_p * tl.sum(tl.where(key >= t, e, 0.0), axis=0)
         lo = t
-        hi = 0x3F80
-        for _ in range(14):
+        hi = 0x3F800000
+        for _ in range(30):
             mid = lo + (hi - lo) // 2
             ok = tl.sum(tl.where(key > mid, e, 0.0), axis=0) < target
             hi = tl.where(ok, mid, hi)
@@ -776,11 +764,31 @@ def fused_sample(
     _fused_sample_kernel[(B,)](
         logits, temperature, top_k, top_p, seed, offset,
         rep_penalty if penalty else temperature, seen_tokens if penalty else logits, out,
-        V, logits.stride(0),
+        V, logits.stride(0), logits.stride(1),
         seen_tokens.stride(0) if penalty else 0, seen_tokens.stride(1) if penalty else 0,
         APPLY_PENALTY=penalty, BLOCK=triton.next_power_of_2(V), num_warps=4 if V <= FUSED_DRAW_MAX_VOCAB else 8,
     )
     return out
+
+
+def _fused_draw(
+    logits: torch.Tensor, temperature: torch.Tensor, top_k: torch.Tensor, top_p: torch.Tensor,
+    seed: torch.Tensor | None, offset: torch.Tensor | None,
+    rep_penalty: torch.Tensor | None, seen_tokens: torch.Tensor | None,
+    min_p: torch.Tensor | None, history: HistoryRows | None, order: FilterOrder | None,
+    return_probs: bool, fused_draw: bool,
+) -> torch.Tensor | None:
+    """``fused_sample``'s draw when ``fused_draw`` and it covers the step, else None
+    (FlashInfer draws). A node's eager and captured samplers pass the same
+    ``fused_draw``, which ``SamplerResource`` decides from the node's spec (none of
+    the processors ``fused_sample`` lacks), so a request's eager and captured
+    steps draw through the same kernel whatever its batch asks for."""
+    if (
+        not fused_draw or logits.shape[1] > FUSED_SAMPLE_MAX_VOCAB or seed is None or offset is None
+        or min_p is not None or history is not None or order is not None or return_probs
+    ):
+        return None
+    return fused_sample(logits, temperature, top_k, top_p, seed, offset, rep_penalty, seen_tokens)
 
 
 def filter_top_k_top_p(
@@ -1071,6 +1079,82 @@ class GenerationHistory:
 GREEDY_TEMPERATURE = 1e-5
 
 
+@triton.jit
+def _argmax_partials_kernel(logits_ptr, max_ptr, arg_ptr, V, CHUNK, stride_b, NSPLIT, BLOCK: tl.constexpr):
+    """Each (row, chunk)'s max and its first index. Every lane keeps its own
+    first maximum (a strict ``>`` over rising offsets), so the lowest index
+    of the lanes at the chunk's max is the chunk's first."""
+    row = tl.program_id(0)
+    split = tl.program_id(1)
+    lo = split * CHUNK
+    hi = tl.minimum(lo + CHUNK, V)
+    lanes = tl.arange(0, BLOCK)
+    best = tl.full([BLOCK], -float("inf"), tl.float32)
+    arg = lo + lanes
+    for start in range(lo, hi, BLOCK):
+        offs = start + lanes
+        vals = tl.load(logits_ptr + row * stride_b + offs, mask=offs < hi, other=-float("inf")).to(tl.float32)
+        up = vals > best
+        best = tl.where(up, vals, best)
+        arg = tl.where(up, offs, arg)
+    top = tl.max(best, axis=0)
+    tl.store(max_ptr + row * NSPLIT + split, top)
+    tl.store(arg_ptr + row * NSPLIT + split, tl.min(tl.where(best == top, arg, 2147483647), axis=0))
+
+
+@triton.jit
+def _argmax_combine_kernel(max_ptr, arg_ptr, out_ptr, NSPLIT, BLOCK_N: tl.constexpr):
+    """A row's first index at its max, from its chunks'."""
+    row = tl.program_id(0)
+    offs = tl.arange(0, BLOCK_N)
+    mask = offs < NSPLIT
+    cmax = tl.load(max_ptr + row * NSPLIT + offs, mask=mask, other=-float("inf"))
+    carg = tl.load(arg_ptr + row * NSPLIT + offs, mask=mask, other=2147483647)
+    top = tl.max(cmax, axis=0)
+    tl.store(out_ptr + row, tl.min(tl.where(cmax == top, carg, 2147483647), axis=0).to(tl.int64))
+
+
+def greedy_tokens(logits: torch.Tensor) -> torch.Tensor:
+    """``[B]`` int64: each row's argmax, the lowest index among equal maxima,
+    which is the token the full sampler's one-hot puts a greedy row on. On
+    CUDA a split over the vocab in two launches; at B300 248k-vocab rows it
+    took 5 / 9 / 13 us for 16 / 64 / 128 rows against torch's 16 / 29 / 43."""
+    if logits.device.type != "cuda" or logits.stride(-1) != 1:
+        return torch.argmax(logits, dim=-1)
+    batch, vocab = logits.shape
+    # about a thousand blocks at decode widths: a narrow batch needs finer chunks to fill the GPU
+    chunk = 4096 if batch <= 16 else 8192
+    nsplit = triton.cdiv(vocab, chunk)
+    cmax = torch.empty((batch, nsplit), device=logits.device, dtype=torch.float32)
+    carg = torch.empty((batch, nsplit), device=logits.device, dtype=torch.int32)
+    out = torch.empty(batch, device=logits.device, dtype=torch.int64)
+    with torch.cuda.device(logits.device):
+        _argmax_partials_kernel[(batch, nsplit)](
+            logits, cmax, carg, vocab, chunk, logits.stride(0), nsplit, BLOCK=1024, num_warps=4,
+        )
+        _argmax_combine_kernel[(batch,)](
+            cmax, carg, out, nsplit, BLOCK_N=triton.next_power_of_2(nsplit), num_warps=1,
+        )
+    return out
+
+
+def samples_greedy(cfg: "SamplingConfig") -> bool:
+    """Whether the full sampler's token for ``cfg`` is always its row's argmax.
+
+    Greedy is temperature 0 as ``canonical_sampling_values`` reads it (below
+    ``GREEDY_TEMPERATURE``), not top-k 1, which breaks exact ties by the seed.
+    Its filters are then written off: the argmax is the first token any
+    top-k, top-p or min-p filter keeps, so a greedy row with top_p < 1 draws
+    the same token. What does move it is a penalty (the seen-token mask or the
+    window) or the min-tokens floor, both applied to the logits first, and a
+    row asking for log-probs needs the full sampler's scoring.
+    """
+    temperature = canonical_sampling_values(cfg.temperature, cfg.top_k, cfg.top_p, cfg.min_p)[0]
+    return (
+        temperature == 0 and cfg.repetition_penalty == 1 and cfg.min_tokens == 0 and not cfg.return_logprobs
+    )
+
+
 def canonical_sampling_values(
     temperature, top_k, top_p, min_p,
 ) -> tuple[float, int, float, float]:
@@ -1206,7 +1290,7 @@ class BaseSampler(ABC):
         tp_group = getattr(self, "tp_group", None)
         if tp_group is None or tp_group.world_size == 1:
             return tokens
-        return tp_group.broadcast(tokens, src=0)
+        return tp_group.broadcast(tokens)
 
     @abstractmethod
     def sample(
@@ -1260,6 +1344,9 @@ class Sampler(BaseSampler):
     history: GenerationHistory | None = None
     stop_ids: torch.Tensor | None = None
     enable_top_p_first: bool = False
+    # Whether the node draws through ``fused_sample`` where it covers the step
+    # (``SamplerResource.fused_draw``), as its captured sampler does.
+    fused_draw: bool = True
     # The last ``sample``'s sampled-token log-probs, NaN in a row that did not
     # ask; None when no row asked.
     logprobs: torch.Tensor | None = None
@@ -1314,7 +1401,7 @@ class Sampler(BaseSampler):
         self, request_ids: list[str], logits: torch.Tensor,
         apply_penalty: bool = True, apply_filters: bool = True,
         kept_rids: "frozenset | None" = None,
-        rand_offset: torch.Tensor | None = None, **kwargs
+        rand_offset: torch.Tensor | None = None, greedy: bool = False, **kwargs
     ) -> torch.Tensor:
         """Return the sampled tokens as a single [B] int tensor.
 
@@ -1329,9 +1416,22 @@ class Sampler(BaseSampler):
 
         ``rand_offset`` ([B], on the device) draws at the caller's offsets
         instead of ``_step_offset``, and leaves advancing them to the caller.
+
+        ``greedy``: every row samples greedily (``samples_greedy``), so each
+        takes its row's argmax, as the captured sampler's lean step does. The
+        offsets and history move as on a full step.
         """
         configs = [self._sampling_config[rid] for rid in request_ids]
         history, rows = self._gather_history(request_ids, configs)
+        if greedy:
+            tokens = self._broadcast_tokens(greedy_tokens(logits))
+            # no row of a greedy step asked for one
+            self.logprobs = None
+            if history is not None:
+                self._write_history(history, rows, tokens, request_ids, kept_rids)
+            if rand_offset is None:
+                self._advance_offsets(request_ids, kept_rids, logits)
+            return tokens
         order = self._gather_filter(configs)
         temperature = torch.tensor([c.temperature for c in configs], device=logits.device)
         top_k = torch.tensor([c.top_k if apply_filters else 0 for c in configs],
@@ -1388,6 +1488,7 @@ class Sampler(BaseSampler):
             history=history,
             order=order,
             return_probs=any(processed),
+            fused_draw=self.fused_draw,
         )
         tokens, probs = tokens if any(processed) else (tokens, None)
 
@@ -1416,23 +1517,29 @@ class Sampler(BaseSampler):
             self.logprobs = torch.where(torch.tensor(want, device=logits.device), chosen, torch.nan)
 
         if history is not None:
-            advance_history(history, tokens)
-            new_tokens, count = history.tokens, history.count
-            if kept_rids is not None:
-                # only the kept rows' draws count
-                sel = torch.tensor([i for i, rid in enumerate(request_ids) if rid in kept_rids],
-                                   dtype=torch.long, device=rows.device)
-                rows, count = rows.index_select(0, sel), count.index_select(0, sel)
-                new_tokens = None if new_tokens is None else new_tokens.index_select(0, sel)
-            self.history.write(rows, new_tokens, count)
+            self._write_history(history, rows, tokens, request_ids, kept_rids)
 
         if any_rep_pen:
             for i, rid in enumerate(request_ids):
                 if kept_rids is None or rid in kept_rids:
                     self._seen_token_mask[rid].add_tokens(tokens[i:i+1])
 
-        if not own_offsets:
-            return tokens
+        if own_offsets:
+            self._advance_offsets(request_ids, kept_rids, logits)
+        return tokens
+
+    def _write_history(self, history, rows, tokens, request_ids, kept_rids) -> None:
+        advance_history(history, tokens)
+        new_tokens, count = history.tokens, history.count
+        if kept_rids is not None:
+            # only the kept rows' draws count
+            sel = torch.tensor([i for i, rid in enumerate(request_ids) if rid in kept_rids],
+                               dtype=torch.long, device=rows.device)
+            rows, count = rows.index_select(0, sel), count.index_select(0, sel)
+            new_tokens = None if new_tokens is None else new_tokens.index_select(0, sel)
+        self.history.write(rows, new_tokens, count)
+
+    def _advance_offsets(self, request_ids, kept_rids, logits: torch.Tensor) -> None:
         # FlashInfer consumes one offset unit per sampled row. The XPU kernel
         # consumes one Philox region per logit in its row, so advancing by one
         # would make consecutive decode steps reuse overlapping RNG regions.
@@ -1445,8 +1552,6 @@ class Sampler(BaseSampler):
             self._step_offset[rid] = (
                 self._step_offset.get(rid, 0) + offset_stride
             )
-
-        return tokens
 
     def _stage(self, rows: list[list[float]]) -> torch.Tensor:
         """Per-request settings ``[len(rows), B]`` on the device in one pinned H2D
@@ -1510,9 +1615,11 @@ def _sample_cuda(
     history: HistoryRows | None = None,
     order: FilterOrder | None = None,
     return_probs: bool = False,
+    fused_draw: bool = True,
 ) -> torch.Tensor | Draw:
-    """Sample normalized CUDA inputs with FlashInfer; with ``return_probs``,
-    also the distribution the filters ran on."""
+    """Sample normalized CUDA inputs with ``fused_sample`` where it covers the
+    step (``_fused_draw``), else FlashInfer; with ``return_probs``, also the distribution the
+    filters ran on."""
     import flashinfer
 
     # Pin the Triton prep kernel (writes probs) and the FlashInfer sampler
@@ -1521,13 +1628,20 @@ def _sample_cuda(
     # worker's current-device stream while probs lives off-device (e.g. BAGEL
     # LLM on rank 1) — a cross-stream race that yields garbage.
     with torch.cuda.device(logits.device):
+        penalty = repetition_penalty if seen_token_mask is not None else None
+        drawn = _fused_draw(
+            logits, temperature, top_k, top_p, seed, rand_offset, penalty, seen_token_mask,
+            min_p, history, order, return_probs, fused_draw,
+        )
+        if drawn is not None:
+            return drawn
         # One Triton kernel fuses (optional rep-penalty, and the history's
         # windowed penalty) + (temperature-scaled softmax) + (argmax → one-hot
         # for greedy rows). FlashInfer's sample-from-probs then deterministically
         # picks argmax on one-hot rows, matching greedy semantics.
         probs = fused_temperature_softmax(
             logits, temperature,
-            penalty=repetition_penalty if seen_token_mask is not None else None,
+            penalty=penalty,
             seen_mask=seen_token_mask,
             include_greedy=run_greedy,
             history=history,
@@ -1679,6 +1793,7 @@ def sample_tokens(
     history: HistoryRows | None = None,
     order: FilterOrder | None = None,
     return_probs: bool = False,
+    fused_draw: bool = True,
 ) -> torch.Tensor | Draw:
     """Sample tokens from logits with temperature, top-k, top-p, and repetition penalty.
 
@@ -1709,6 +1824,8 @@ def sample_tokens(
         order: Optional ``FilterOrder`` (CUDA only): HF's top-p-first order.
         return_probs: (CUDA only) also return the distribution the filters
             ran on, for ``processed_logprobs``.
+        fused_draw: (CUDA only) False draws through FlashInfer even where
+            ``fused_sample`` covers the step (``_fused_draw``).
 
     Returns:
         tokens: [batch_size] sampled token IDs.
@@ -1743,6 +1860,7 @@ def sample_tokens(
             history=history,
             order=order,
             return_probs=return_probs,
+            fused_draw=fused_draw,
         )
     elif logits.device.type == "xpu":
         if history is not None or order is not None:
@@ -1805,16 +1923,14 @@ def sample_accelerator_graphable_gpu(
     history: HistoryRows | None = None,
     order: FilterOrder | None = None,
     return_probs: bool = False,
+    fused_draw: bool = True,
 ) -> torch.Tensor | Draw:
     """Deterministic per-batch top-k/top-p sampling for graph-captured code.
 
-    On CUDA, a vocabulary of at most ``FUSED_SAMPLE_MAX_VOCAB`` without
+    On CUDA with ``fused_draw``, a vocabulary of at most ``FUSED_SAMPLE_MAX_VOCAB`` without
     ``min_p``, ``history``, ``order`` or ``return_probs`` draws in one
-    ``fused_sample`` launch:
-    per-row seeds, so batch-invariant, but its cuts rank on bf16-truncated
-    keys (see ``_fused_sample_kernel``), and the eager ``Sampler`` path
-    (``_sample_cuda``) keeps FlashInfer, so for those vocabularies an eager
-    and a captured step draw differently for the same seed.
+    ``fused_sample`` launch (``_fused_draw``, which the eager ``Sampler``
+    path shares): per-row seeds, so batch-invariant.
 
     Otherwise it routes through the fused Triton prep kernel
     (``fused_temperature_softmax``) so the CUDA-graph path can apply the same
@@ -1848,6 +1964,7 @@ def sample_accelerator_graphable_gpu(
             caller advances ``history`` with the sampled tokens.
         return_probs: (CUDA only) also return the distribution the filters
             ran on, for ``processed_logprobs``.
+        fused_draw: as in ``sample_tokens``.
 
     Returns:
         ``[batch_size]`` int64 sampled token IDs. FlashInfer's default
@@ -1872,14 +1989,13 @@ def sample_accelerator_graphable_gpu(
         import flashinfer
 
         with torch.cuda.device(logits.device):
-            if (
-                logits.shape[1] <= FUSED_SAMPLE_MAX_VOCAB and min_p is None
-                and history is None and order is None and not return_probs
-            ):
-                return fused_sample(
-                    logits, temperature, top_k, top_p, seed, offset,
-                    rep_penalty if apply_penalty else None, seen_tokens if apply_penalty else None,
-                )
+            drawn = _fused_draw(
+                logits, temperature, top_k, top_p, seed, offset,
+                rep_penalty if apply_penalty else None, seen_tokens if apply_penalty else None,
+                min_p, history, order, return_probs, fused_draw,
+            )
+            if drawn is not None:
+                return drawn
             probs = fused_temperature_softmax(
                 logits, temperature,
                 penalty=rep_penalty if apply_penalty else None,
@@ -1953,6 +2069,9 @@ class AcceleratorGraphableSampler(BaseSampler):
     slot_idx_view: torch.Tensor | None = None
     scatter_idx_view: torch.Tensor | None = None
     ingraph_scatter: bool = False
+    # Whether the node draws through ``fused_sample`` where it covers the step
+    # (``SamplerResource.fused_draw``), as its eager sampler does.
+    fused_draw: bool = True
 
     # Set during graph capture, and used by the cuda graph runner to determine
     # whether requests' seen token buffers should be synced post-replay
@@ -1994,7 +2113,14 @@ class AcceleratorGraphableSampler(BaseSampler):
         self, request_ids: list[str], logits: torch.Tensor,
         apply_penalty: bool = False,
         apply_filters: bool = True,
+        greedy: bool = False,
     ):
+        """``greedy``: every row samples greedily (``samples_greedy``), so the
+        draw is each row's argmax. The offsets, history and masters move as
+        on a full step; the seen-token rows don't, as no row of the step
+        reads its mask."""
+        if greedy:
+            return self._sample_greedy(logits)
         top_k, top_p = self.top_k_buf, self.top_p_buf
         if not apply_filters:
             # top-k 0 is "off"; captured, these are constant fills
@@ -2013,6 +2139,7 @@ class AcceleratorGraphableSampler(BaseSampler):
             history=self.history,
             order=self.order,
             return_probs=processed,
+            fused_draw=self.fused_draw,
         )
         codes, probs = codes if processed else (codes, None)
         self.offset_buf.add_(_rng_offset_stride(logits.device.type, logits.shape[-1]))
@@ -2041,6 +2168,22 @@ class AcceleratorGraphableSampler(BaseSampler):
             # (``buf[rows, codes] = True``) is not — it trips "operation not
             # permitted when stream is capturing".
             self.seen_tokens_buf.scatter_(1, codes.unsqueeze(1), True)
+        return codes
+
+    def _sample_greedy(self, logits: torch.Tensor) -> torch.Tensor:
+        if self.ingraph_scatter:
+            self.gather_in_graph()
+        codes = self._broadcast_tokens(greedy_tokens(logits))
+        self.offset_buf.add_(_rng_offset_stride(logits.device.type, logits.shape[-1]))
+        if self.logprob_buf is not None:
+            # no row of a greedy step asked for one
+            self.logprob_buf.fill_(torch.nan)
+        if self.history is not None:
+            advance_history(self.history, codes)
+        if self.last_token_buf is not None:
+            self.last_token_buf.copy_(codes)
+        if self.ingraph_scatter:
+            self.scatter_in_graph(codes)
         return codes
 
     @torch.compiler.disable
@@ -2410,6 +2553,7 @@ class SamplerBuffers:
     # Request rows of the device masters; lags ``_master_capacity`` until the gpu thread grows them.
     _device_capacity: int = field(default=0, repr=False)
     ingraph_scatter: bool = False
+    fused_draw: bool = True  # the samplers' ``fused_draw``
     # With ``ingraph_scatter``: request rows of the offset and last-token masters, which
     # the captured graphs index and so never grow; the other masters grow up to it.
     _ingraph_capacity: int = field(default=0, repr=False)
@@ -2507,6 +2651,7 @@ class SamplerBuffers:
         loopback_state: "Mapping[str, LoopbackState] | None" = None,
         enable_logprobs: bool = False,
         enable_processed_logprobs: bool = False,
+        fused_draw: bool = True,
     ) -> "SamplerBuffers":
         """Allocate sampling buffers for ``max_batch_size``.
 
@@ -2575,6 +2720,7 @@ class SamplerBuffers:
             _master_capacity=cap,
             _device_capacity=cap,
             ingraph_scatter=ingraph_scatter,
+            fused_draw=fused_draw,
             _ingraph_capacity=ingraph_cap,
             cg_slots=cg_slots,
             _slot_idx_cpu=torch.zeros(cg_slots, idx_cols, dtype=torch.long, pin_memory=pinned),
@@ -2643,6 +2789,7 @@ class SamplerBuffers:
             "slot_idx_view": index[:bs],
             "scatter_idx_view": index[bs:2 * bs] if self.ingraph_scatter else None,
             "ingraph_scatter": self.ingraph_scatter,
+            "fused_draw": self.fused_draw,
         }
 
     def _history_rows(self, bs: int, scalar) -> HistoryRows:

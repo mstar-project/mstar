@@ -16,7 +16,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from mstar.model.qwen3_tts.config import PROMPT_LAYOUT_KEY, SPEAKER_ID_KEY, TALKER_TEXT
+from mstar.model.qwen3_tts.config import PROMPT_LAYOUT_KEY, SPEAKER_ID_KEY
 from mstar.model.qwen3_tts.qwen3_tts_model import Qwen3TTSModel
 
 VARIANTS = {
@@ -126,7 +126,8 @@ def test_prefill_layout_matches_variant(loaded):
     # [speaker], pad.
     tags = 3 + 1 + (1 if variant == "custom_voice" else 0) + 1
     assert prepared.input_seq_len == instruct_len + 3 + tags + (text_len + 1) + 1
-    assert prepared.kwargs[TALKER_TEXT].shape == (1, model.config.talker.hidden_size), "every decode step adds TTS PAD"
+    # the prefill took the whole text and TTS EOS: nothing streams
+    assert result.new_input_tensors["text_in"] == []
 
 
 def test_depth_loop_runs_through_projection(loaded):

@@ -15,7 +15,6 @@ from torch.overrides import TorchFunctionMode
 
 pytest.importorskip("flashinfer")
 
-from mstar.conductor.request_info import CurrentForwardConductorMetadata  # noqa: E402
 from mstar.engine.resources.sampler.resource import SamplerResource  # noqa: E402
 from mstar.graph.base import Loop  # noqa: E402
 from mstar.graph.special_destinations import EMIT_TO_CLIENT  # noqa: E402
@@ -102,8 +101,8 @@ def thinker():
     ))
     sub.bind_node_resources({THINKER_SAMPLER: SimpleNamespace(has_slot_masters=True)})
     sub.kv = SimpleNamespace(
-        _check_open=lambda call: None, label="main", positions=None, queried=None, _segments=(), walk_reads={},
-        first_read=SimpleNamespace(select_last_hidden=lambda h, label: h[-2:]),
+        _check_open=lambda call: None, label="main", positions=None,
+        at_last_token=lambda h, label=None: h[-2:],
     )
     sub.sampler = _SamplerHandle()
     sub.get_device = lambda: torch.device("cpu")
@@ -121,13 +120,6 @@ def _model():
     model = object.__new__(Qwen3OmniModel)
     model.config = SimpleNamespace(thinker_text=SimpleNamespace(max_position_embeddings=64))
     return model
-
-
-def _metadata(audio_output: bool, walk="prefill_text") -> CurrentForwardConductorMetadata:
-    return CurrentForwardConductorMetadata(
-        input_modalities=["text"], output_modalities=["text"], graph_walk=walk, is_prefill=True,
-        kwargs={"prefill_schedule": [("prefill_text", {})], "prefill_step": 0, "audio_output": audio_output},
-    )
 
 
 def _engine_inputs(request_ids, tokens, captured=False):
@@ -165,7 +157,7 @@ def test_the_thinker_declares_its_loop_back_and_its_stop(thinker):
     assert stop.walk == frozenset(DECODE_WALKS), "both decode walks end the loop, and no prefill"
     assert not stop.prefill_walks, "a stop at prefill ending the partition isn't this model's behaviour"
     for hook in (
-        "uniform_row_inputs", "device_loopback_signals", "inline_client_signals",
+        "uniform_row_inputs", "device_loopback_signals", "inline_signals",
         "check_stop", "check_stop_batched", "loopback_inputs",
     ):
         assert hook not in vars(ThinkerSubmodule), f"{hook} follows from the declarations"
@@ -184,19 +176,16 @@ def test_every_config_that_splits_the_thinker_by_walk_places_the_text_walk():
 
 @pytest.mark.parametrize(("audio_output", "walk"), [(False, THINKER_TEXT_DECODE), (True, "thinker_decode")])
 def test_prefill_hands_over_to_the_requests_decode_walk(audio_output, walk):
-    metadata = _metadata(audio_output)
-    args = _model()._get_thinker_forward(metadata, {"new_token": []})
-    assert metadata.graph_walk == walk and not metadata.is_prefill
-    assert args.inputs[0].name == "text_inputs"
-    done = _model()._get_thinker_forward(metadata, {})
-    assert done.request_done
+    outputs = ["text", "audio"] if audio_output else ["text"]
+    *_, decode = _model().walk_plan("Thinker", ["text"], outputs, {}, {})
+    assert decode.walk == walk and dict(decode.bind) == {"text_inputs": "new_token"}
 
 
 def test_only_the_text_walk_keeps_its_token_on_the_device(thinker):
     assert thinker.device_loopback_signals(THINKER_TEXT_DECODE) == frozenset({"text_inputs"})
     assert thinker.device_loopback_signals("thinker_decode") == frozenset()
-    assert thinker.inline_client_signals(THINKER_TEXT_DECODE) == {"text_inputs": "new_token"}
-    assert thinker.inline_client_signals("thinker_decode") == {}
+    assert thinker.inline_signals(THINKER_TEXT_DECODE) == {"text_inputs": "new_token"}
+    assert thinker.inline_signals("thinker_decode") == {}
     assert thinker.uniform_row_inputs(THINKER_TEXT_DECODE, has_loopback=True).input_seq_len == 1
     assert thinker.uniform_row_inputs(THINKER_TEXT_DECODE, has_loopback=False) is None
     assert thinker.uniform_row_inputs("thinker_decode", has_loopback=True) is None
@@ -208,7 +197,7 @@ def test_the_tensor_path_stays_with_loop_back_off(thinker, monkeypatch):
     assert thinker.uniform_row_inputs(THINKER_TEXT_DECODE, has_loopback=True) is None
     row = thinker.prepare_inputs(THINKER_TEXT_DECODE, None, {"text_inputs": [torch.tensor([5])]}, has_loopback=True)
     assert row.input_ids.tolist() == [5], "a row brings its token when nothing keeps it"
-    assert thinker.inline_client_signals(THINKER_TEXT_DECODE) == {"text_inputs": "new_token"}
+    assert thinker.inline_signals(THINKER_TEXT_DECODE) == {"text_inputs": "new_token"}
 
 
 def test_an_eager_only_sampler_keeps_the_tensor_path(thinker):

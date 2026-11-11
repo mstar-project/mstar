@@ -84,7 +84,7 @@ class _PromptPackedConfig(PackedAcceleratorGraphConfig):
 # Walks that run the encoder and hand the decoder its output.
 ENCODER_WALKS = (PREFILL_WALK, DETECT_LANGUAGE_WALK)
 # Walks whose sampled token is the first transcript token, subject to the
-# begin-suppression rules.
+# begin-suppression rules; a stop id there ends the request.
 FIRST_TOKEN_WALKS = (PREFILL_WALK, PREFILL_PROMPT_WALK)
 
 
@@ -284,10 +284,11 @@ class WhisperDecoderSubmodule(TokenStepNode, ARNodeSubmodule):
         super().__init__()
         self.decoder = decoder
         self.config = config
-        # a prompt walk's token never stops the loop
+        # a stop on the first transcript token ends the partition (`_token_stops`)
         self.token_stop = TokenStop(
             loop=self.DECODE_LOOP, buffer="new_token",
-            stop_ids=frozenset({config.eos_token_id}), sampler=self.SAMPLER, walk=DECODE_WALK,
+            stop_ids=frozenset({config.eos_token_id}), sampler=self.SAMPLER,
+            prefill_walks=frozenset(FIRST_TOKEN_WALKS),
         )
         # The decode walk reads its last token off the sampler's slot masters.
         self.device_loopback = DeviceLoopback(
@@ -483,6 +484,11 @@ class WhisperDecoderSubmodule(TokenStepNode, ARNodeSubmodule):
         encoder_states = inp.tensor_inputs.get("encoder_states")
         return 0 if encoder_states is None else encoder_states.shape[0]
 
+    def resident_walks(self) -> frozenset[str]:
+        # one token a row in the main stream; the context is read, not written,
+        # and `preprocess` reads no planned position or KV location
+        return frozenset({DECODE_WALK})
+
     def declare_step(
         self,
         graph_walk: str,
@@ -668,3 +674,16 @@ class WhisperDecoderSubmodule(TokenStepNode, ARNodeSubmodule):
         signal = "text_inputs" if graph_walk == DECODE_WALK else "new_token"
         return BatchedModelOutput(row_outputs={signal: new_tokens}, check_stop_buffers={"new_token": new_tokens})
 
+    def _token_stops(self, request_id: str, token: int, info: CurrentForwardPassInfo) -> bool:
+        """A stop id on a decode row's token, or on the first transcript token,
+        where it ends the request (an empty transcript has no words to align).
+        No budget check at the prompt walk: the loop cap ends decode, and the
+        walk plan skips decode for a one-token budget, so a word-timestamp
+        request still aligns that token."""
+        walk = info.graph_walk
+        if walk != DECODE_WALK:
+            return (
+                walk in FIRST_TOKEN_WALKS and token in self.token_stop.stop_ids
+                and not info.resource_configs[SAMPLER].ignore_eos
+            )
+        return super()._token_stops(request_id, token, info)

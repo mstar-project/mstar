@@ -13,8 +13,6 @@ conv3d kernels run in, so no conv pays a layout conversion on the way in or out.
 
 from __future__ import annotations
 
-import os
-
 import torch
 import torch.nn.functional as F
 from diffusers.models.autoencoders.autoencoder_kl_wan import WanCausalConv3d, WanUpsample, unpatchify
@@ -197,7 +195,7 @@ def compile_decode(fn, deterministic: bool = False):
     output by up to 2 uint8 levels, at the same speed.
 
     ``deterministic`` adds the engine's deterministic compile option
-    (``accelerator_graph_runner.deterministic_inductor_options``); see
+    (``mstar.platforms.compile.deterministic_inductor_options``); see
     ``DecoderStep``.
     """
     import torch._inductor.config as inductor_config
@@ -206,7 +204,7 @@ def compile_decode(fn, deterministic: bool = False):
     if hasattr(inductor_config, "comprehensive_padding"):
         options["comprehensive_padding"] = False
     if deterministic:
-        from mstar.engine.accelerator_graph_runner import deterministic_inductor_options
+        from mstar.platforms.compile import deterministic_inductor_options
 
         options.update(deterministic_inductor_options())
     return torch.compile(fn, fullgraph=False, dynamic=False, options=options or None)
@@ -303,20 +301,6 @@ def decode_causal(
     if vae.config.patch_size is not None:
         out = unpatchify(out, patch_size=vae.config.patch_size)
     return torch.clamp(out, min=-1.0, max=1.0)
-
-
-def decode_dtype(fp32_env: str | None = None) -> torch.dtype:
-    """The decode dtype a Wan VAE decoder node runs in, read from the live cuDNN.
-
-    cuDNN ships fast Hopper bf16 conv3d for this decode only from 9.16; before
-    that bf16 is 2-10x slower than fp32/TF32 (measured via a single-variable
-    cuDNN swap), so an upgrade flips the choice on its own. ``fp32_env`` names
-    the model's override variable, if it has one: set, it forces fp32, or bf16
-    when it is 0/false/no/off."""
-    override = os.environ.get(fp32_env) if fp32_env else None
-    if override is not None:
-        return torch.bfloat16 if override.lower() in ("0", "false", "no", "off") else torch.float32
-    return torch.bfloat16 if (torch.backends.cudnn.version() or 0) >= 91600 else torch.float32
 
 
 class FastDecoder:

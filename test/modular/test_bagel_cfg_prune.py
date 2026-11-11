@@ -293,7 +293,7 @@ def _pointer(uuid):
 
 def _image_request_intake(kwargs, cfg_parallel=True):
     """A text-to-image request through BAGEL's intake: the model, the request's
-    `CFGWindow`, the kwargs process_prompt hands on, and its first forward."""
+    `CFGWindow`, the kwargs process_prompt hands on, and its walk plan."""
     from mstar.model.bagel.bagel_model import CFG_WINDOW, ROLE_TURNS, BagelModel
 
     model = BagelModel.__new__(BagelModel)
@@ -304,10 +304,8 @@ def _image_request_intake(kwargs, cfg_parallel=True):
     params = model._request_params(["text"], ["image"], kwargs)
     window = cfg_window(N, SHIFT, tuple(params["cfg_interval"]), params["cfg_text_scale"], params["cfg_img_scale"])
     model_kwargs = {**kwargs, CFG_WINDOW: tuple(window), ROLE_TURNS: False}
-    fwd = model.get_initial_forward_pass_args(
-        DEFAULT_PARTITION, ["text"], ["image"], {"text_inputs": [_pointer(0)]}, model_kwargs,
-    )
-    return model, window, model_kwargs, fwd
+    plan = model.walk_plan(DEFAULT_PARTITION, ["text"], ["image"], {"text_inputs.0": [_pointer(0)]}, model_kwargs)
+    return model, window, model_kwargs, plan
 
 
 @pytest.mark.parametrize("cfg_parallel", [True, False], ids=["cfg_parallel", "one_node"])
@@ -323,19 +321,24 @@ def test_conductor_walks_a_request_through_its_phases(kwargs, walks, cfg_paralle
     first fed the previous one's persisted latents and time_index on every
     node that reads them, and the request ends after the decode. On one node
     the window is a walk of its own too, so its branch count is fixed."""
+    from test_ingest_unpersist import plan_step, released_by_step
+
     if not cfg_parallel:
         walks = [walk.replace("_cfg", "_guided") for walk in walks]
-    model, window, model_kwargs, fwd = _image_request_intake(kwargs, cfg_parallel)
+    model, window, model_kwargs, plan = _image_request_intake(kwargs, cfg_parallel)
     graphs = model.get_graph_walk_graphs()
-    metadata, persist, seen, loops = fwd.full_metadata, {}, [], []
-    while not (fwd := model.get_partition_forward_pass_args(DEFAULT_PARTITION, metadata, persist)).request_done:
-        walk = metadata.graph_walk
-        fed = {(edge.next_node, edge.name): [info.uuid for info in edge.tensor_info] for edge in fwd.inputs}
-        # the conductor drops what a walk unpersists from the request's persist signals
-        unpersisted = {info.uuid for info in fwd.unpersist_tensors}
-        assert {uuid for uuids in fed.values() for uuid in uuids} <= unpersisted
-        persist = {name: [i for i in infos if i.uuid not in unpersisted] for name, infos in persist.items()}
+    # the prompt's one prefill, then the denoise walks
+    assert plan[0].walk == "prefill_text"
+    persist, seen, loops = {}, [], []
+    for k in range(1, len(plan)):
+        walk = plan[k].walk
+        fed = {(edge.next_node, edge.name): [info.uuid for info in edge.tensor_info]
+               for edge in plan_step(model, plan, k, persist).inputs}
         expected = [] if not seen else [100 * len(seen) + i for i in range(2)]
+        # what a phase is fed goes with it
+        assert {u for uuids in fed.values() for u in uuids} <= {
+            info.uuid for info in released_by_step(model, plan, k, persist)
+        }
         if walk == IMAGE_DECODE:
             assert fed == {("vae_decoder", "latents"): expected[:1]}
         else:
@@ -348,9 +351,8 @@ def test_conductor_walks_a_request_through_its_phases(kwargs, walks, cfg_paralle
             assert denoise_loop(walk) in graphs[walk].get_loops()
             loops.append(denoise_loop(walk))
         seen.append(walk)
-        # the walk's loop persists where it left off, appended as the conductor does
-        persist.setdefault("latents", []).append(_pointer(100 * len(seen)))
-        persist.setdefault("time_index", []).append(_pointer(100 * len(seen) + 1))
+        # the walk's loop persists where it left off, replacing what was held under the name
+        persist = {"latents": [_pointer(100 * len(seen))], "time_index": [_pointer(100 * len(seen) + 1)]}
     assert seen == walks
     phases = model._image_gen_phases(window)
     assert [p.walk for p in phases] == walks
@@ -376,9 +378,9 @@ def test_a_guided_request_publishes_only_the_kv_its_cfg_walk_reads(kwargs, cfg_p
     walk's branch nodes, so the main LLM exports only those, and nothing for a
     guided request whose window has no step."""
 
-    model, _, model_kwargs, fwd = _image_request_intake(kwargs, cfg_parallel)
+    model, _, model_kwargs, plan = _image_request_intake(kwargs, cfg_parallel)
     # a window with no step runs no guidance anywhere
-    assert fwd.full_metadata.kwargs["requires_cfg"] == bool(published)
-    kv = model.get_request_resource_configs({DEFAULT_PARTITION: fwd}, model_kwargs)["kv"]
+    assert all(step.step_metadata["requires_cfg"] == bool(published) for step in plan)
+    kv = model.get_request_resource_configs(["text"], ["image"], model_kwargs)["kv"]
     assert kv.publish_labels_per_node_walk == published
     assert kv.final_publish_labels_per_node_walk == final

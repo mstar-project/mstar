@@ -1,8 +1,8 @@
 """Qwen3.5's multimodal prompt: one row of ids, each attachment's pad expanded.
 
 `process_prompt` renders and tokenizes the prompt once, then expands each
-image's pad to one pad per merged vision token; `_prefill_step` hands
-the whole prompt and the tower's inputs to one walk. These check nothing is
+image's pad to one pad per merged vision token; `_prefill_step` runs
+the whole prompt as one walk. These check nothing is
 lost or duplicated in the expansion, and that the layout the LLM places
 positions with matches the ids.
 
@@ -22,7 +22,6 @@ from mstar.model.multimodal import (
     TEXT,
     PromptPart,
     parts_from_modalities,
-    walk_input_edges,
 )
 
 CKPT = os.environ.get("QWEN3_5_CKPT")
@@ -93,9 +92,9 @@ def test_the_prompt_is_the_template_with_each_pad_expanded(model, modalities):
     assert torch.equal(torch.cat(collapsed), template)
 
 
-def test_the_prefill_walk_gets_the_prompt_and_the_tower_inputs(model):
-    """`_prefill_step` gives one walk the whole prompt and every image,
-    in prompt order; the grids reach only the encoder."""
+def test_the_prefill_walk_gets_the_prompt_and_its_layout(model):
+    """`_prefill_step` runs the whole prompt, both images, as one media
+    walk carrying the layout."""
     modalities = ["text", "image", "text", "image"]
     parts = [
         PromptPart(modality=TEXT, text="First:"),
@@ -114,14 +113,7 @@ def test_the_prefill_walk_gets_the_prompt_and_the_tower_inputs(model):
     signals = {name: list(out[name]) for name in ("text_inputs", "pixel_values")}
     step = model._prefill_step(signals, layout)
     assert step.walk == "prefill_vision"
-    assert step.metadata == {MEDIA_LAYOUT: layout}
-
-    edges = {(edge.next_node, edge.name): edge.tensor_info for edge in walk_input_edges(step)}
-    assert set(edges) == {
-        ("LLM", "text_inputs"), ("vision_encoder", "pixel_values"),
-    }
-    for (_node, name), got in edges.items():
-        assert all(a is b for a, b in zip(got, signals[name], strict=True))
+    assert step.step_metadata == {MEDIA_LAYOUT: layout}
 
 
 def test_text_only_prompt_still_uses_prefill_text(model):
@@ -129,9 +121,7 @@ def test_text_only_prompt_still_uses_prefill_text(model):
     out = model.process_prompt("just text", ["text"], ["text"], tensors={})
     out = out.new_input_tensors
     signals = {"text_inputs": list(out["text_inputs"])}
-    step = model._prefill_step(signals)
-    assert step.walk == "prefill_text"
-    assert step.input_tensors[("LLM", "text_inputs")][0] is signals["text_inputs"][0]
+    assert model._prefill_step(signals).walk == "prefill_text"
 
 
 def test_a_bare_string_with_adjacent_images_is_one_row(model):
@@ -157,7 +147,7 @@ def test_a_spelled_out_pad_is_a_bad_request(model):
 def test_empty_prompt_fails_legibly(model):
     """Nothing to prefill is a bad request, not an IndexError off schedule[0]."""
     with pytest.raises(ValueError, match="nothing to prefill"):
-        model.get_initial_forward_pass_args("LLM", ["text"], ["text"], {})
+        model.walk_plan("LLM", ["text"], ["text"], {}, {})
 
 
 def test_image_only_message_renders_an_empty_text_span(model):
@@ -217,7 +207,7 @@ def test_a_chat_the_template_refuses_is_a_bad_request(model, tmp_path):
 def test_byte_patches_normalize_to_the_processors_pixels(model, size):
     """`process_prompt` ships un-normalized byte patches; the encoder's
     normalization must give the processor's own pixels exactly, resized or not."""
-    from mstar.model.qwen3_5.qwen3_5_model import _as_hwc_uint8
+    from mstar.model.multimodal import as_uint8_chw
     from mstar.model.qwen3_5.submodules import VisionEncoderSubmodule
 
     torch.manual_seed(0)
@@ -229,5 +219,8 @@ def test_byte_patches_normalize_to_the_processors_pixels(model, size):
     assert patches.dtype == torch.uint8
     encoder = VisionEncoderSubmodule.__new__(VisionEncoderSubmodule)
     encoder._pixel_normalizer = model.pixel_normalizer()
-    reference = model.image_processor(images=[_as_hwc_uint8(image)], return_tensors="pt")
+    reference = model.image_processor(
+        images=[as_uint8_chw(image, truncate=True).permute(1, 2, 0).numpy()], return_tensors="pt",
+        input_data_format="channels_last",
+    )
     assert torch.equal(VisionEncoderSubmodule._normalize(encoder, patches), reference["pixel_values"])

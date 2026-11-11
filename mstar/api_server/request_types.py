@@ -1,5 +1,6 @@
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from mstar.graph.base import GraphEdge
 from mstar.graph.loop_indices import NestedLoopIndices
@@ -7,6 +8,10 @@ from mstar.model.multimodal import PromptPart
 from mstar.observability.recorders import MetricSnapshot
 from mstar.profile.format import InputInfo, RxInfo, TxInfo
 from mstar.profile.worker import GraphTimings
+
+if TYPE_CHECKING:
+    import numpy as np
+    import torch
 
 
 @dataclass
@@ -22,6 +27,16 @@ class ResultChunk:
     # ``postprocess_inline`` call for a value sent inline)
     read_time: float | None = None
     postprocess_s: float = 0.0
+    # The text tokens it carries, as ``token_ids`` lists them (a stop token
+    # included); summed into the request's ``completion_tokens``.
+    num_tokens: int = 0
+    # Its last token is one of the model's stop ids, so it ended the reply.
+    stopped: bool = False
+
+
+# The modality of the chunk that ends a request submitted with
+# ``report_usage``: no data, its token counts and finish reason in metadata.
+USAGE = "usage"
 
 
 @dataclass
@@ -66,6 +81,11 @@ class RequestComplete:
     # When the conductor took the request in (queued or admitted), in the same
     # clock as conductor_ingest_time. Only stamped while metrics are on.
     conductor_arrival_time: float | None = None
+    # For the response's usage: the prompt's token count as the data worker
+    # sent it, and the output cap the conductor resolved for the request
+    # (the model's default, or what fits its resources, when the client set none).
+    prompt_tokens: int | None = None
+    max_output_tokens: int | None = None
 
 
 @dataclass
@@ -89,6 +109,16 @@ class ConductorStatus:
 
 
 @dataclass
+class LoraAdapterResult:
+    """The conductor's answer to a LoRA adapter load or unload, once every worker hosting
+    the pool has acknowledged it: ``error_message`` is None on success, else ``status``
+    is the HTTP status the API server answers with."""
+    op_id: str
+    error_message: str | None = None
+    status: int = 200
+
+
+@dataclass
 class WorkersReady:
     """The conductor's ``setup_done``: every worker is ready, and these are its declarations' digests by name
     (`declaration_digests`), which the API server checks its own against."""
@@ -99,7 +129,8 @@ class WorkersReady:
 # takes the first whose required fields are all present, so a body must lack a
 # required field of every branch before it.
 APIServerMessageBody = (
-    ResultTensors | ResultTokens | RequestComplete | RequestFailed | ConductorStatus | WorkersReady | None
+    ResultTensors | ResultTokens | RequestComplete | RequestFailed | ConductorStatus
+    | LoraAdapterResult | WorkersReady | None
 )
 
 
@@ -107,7 +138,7 @@ APIServerMessageBody = (
 class APIServerMessage:
     """Envelope for messages received by the API server."""
     # "result_tensors" | "result_tokens" | "request_complete" | "request_failed"
-    # | "conductor_status" | "setup_done"
+    # | "conductor_status" | "lora_adapter_result" | "setup_done"
     message_type: str
     body: APIServerMessageBody = None
 
@@ -147,8 +178,17 @@ class PreprocessInput:
     # The id the client knows the request by; ``request_id`` is the API
     # server's key for this one submission.
     client_request_id: str | None = None
+    # what the prompt's prefix-cache key chains hang from: the root of the LoRA adapter
+    # the API server selected (``ServedModels.select``), empty for the base model. Set
+    # in process, never from the client's kwargs.
+    prefix_root: bytes = b""
     # the client streams the opening ends; the others stay open for appends
     ends: frozenset[str] = frozenset()
+    streaming: bool = False
+    # Inputs the API server already holds decoded, by modality and in order,
+    # in place of that modality's files (an image is RGB uint8 ``[3, H, W]``):
+    # each goes to ``Model.load_decoded_<modality>``, with no file between.
+    raw_inputs: dict[str, list["torch.Tensor"]] | None = None
 
 
 @dataclass
@@ -165,6 +205,9 @@ class ClientAppend:
     file_streams: dict[str, list[str | None]] | None = None
     # this append's own model_kwargs; the opening's stay the request's
     model_kwargs: dict | None = None
+    # per ClientAudio stream, decoded mono float32 samples at its declared
+    # rate: a route that decodes the client's codec itself appends without a file
+    samples: "dict[str, np.ndarray] | None" = None
     # Answers the append as late, with an error naming why; called from the
     # preprocess thread when the model routes items to a stream that has
     # ended (by the client, or with its consuming partition). None: nobody

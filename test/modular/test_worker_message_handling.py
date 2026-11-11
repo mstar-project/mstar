@@ -1,18 +1,18 @@
-"""Regression tests for Worker._process_message_list out-of-order handling.
+"""Regression tests for InputIngest's out-of-order handling.
 
 A REMOVE handled while replaying a request's buffered messages must not let its
 trailing signals re-buffer onto the list being iterated (which would loop).
 
 The stub keys ``per_request_info`` by HANDLE and resolves the wire string
-through ``_rid``, because that is what the worker does. Keying it by the
-string instead is what let the guard below compare a string against a
+through ``get_rid_handle``, because that is what the worker does. Keying it
+by the string instead is what let the guard below compare a string against a
 handle-keyed dict -- always true, so every message for a LIVE request was
 parked as out-of-order and never delivered.
 """
 import threading
 import types
 
-from mstar.utils.containers import RecentSet
+from mstar.testing_utils.worker import make_worker
 from mstar.utils.ipc_format import (
     InputSignals,
     MessageSource,
@@ -20,38 +20,29 @@ from mstar.utils.ipc_format import (
     WorkerMessage,
     WorkerMessageType,
 )
-from mstar.worker.worker import Worker
 
 
 def _stub_worker(active_rids):
-    """Minimal stub exposing only what _process_message_list touches.
+    """A worker with the real ``InputIngest`` and ``RequestLifecycle``, over a
+    runtime that only resolves handles. Only the input handler is replaced, to
+    record what reaches it.
 
     ``active_rids`` are wire strings; each gets an integer handle, and state is
     keyed by the handle as on the real worker.
     """
     handles = {rid: i for i, rid in enumerate(active_rids)}
-    stub = types.SimpleNamespace()
-    stub.request_state = types.SimpleNamespace(
+    request_state = types.SimpleNamespace(
         per_request_info={h: object() for h in handles.values()}
     )
-    stub._unprocessed_messages = {}
-    stub._removed_rids = RecentSet(16)
-    stub._rid = handles.get
-    stub.delivered = []
-
-    # REMOVE drops the handle from per_request_info (mirrors _remove_request's
-    # teardown); the other handlers are no-ops we don't exercise here.
-    def _remove(body):
-        stub.request_state.per_request_info.pop(handles.get(body.request_id), None)
-
-    stub._remove_request = _remove
-    stub._add_new_request = lambda body: None
-    stub._process_new_inputs = stub.delivered.append
-    stub._handle_tensor_received = lambda body: None
-    stub._unpersist_tensors = lambda body: None
-    stub._stop_loops = lambda body: None
-    stub.scheduler = types.SimpleNamespace(register_tp_follow=lambda body: None)
-    return stub
+    worker = make_worker(
+        request_state=request_state,
+        graph_runtime=types.SimpleNamespace(get_rid_handle=handles.get),
+    )
+    for rid, handle in handles.items():
+        worker.lifecycle.add(handle, rid)
+    worker.delivered = []
+    worker.ingest._handlers[WorkerMessageType.INPUT_SIGNALS] = worker.delivered.append
+    return worker
 
 
 def _run_with_timeout(fn, timeout=5.0):
@@ -89,16 +80,13 @@ def test_replay_buffered_remove_then_signal_terminates():
             body=InputSignals(request_id="X", inputs=[], request_info=None),
         ),
     ]
-    stub._unprocessed_messages["X"] = buffered
 
-    finished, err = _run_with_timeout(
-        lambda: Worker._process_message_list(stub, stub._unprocessed_messages["X"]),
-        timeout=5.0,
-    )
+    finished, err = _run_with_timeout(lambda: stub.ingest._dispatch(buffered), timeout=5.0)
     assert err is None, f"unexpected error: {err!r}"
-    assert finished, "_process_message_list did not terminate (re-append loop)"
-    # The request was removed and not resurrected.
-    assert 0 not in stub.request_state.per_request_info
+    assert finished, "the dispatch did not terminate (re-append loop)"
+    # The remove is recorded, and the trailing signals are not parked behind it.
+    assert list(stub.lifecycle.pending_removes) == [0]
+    assert stub.lifecycle._parked == {}
 
 
 def test_out_of_order_messages_buffer_for_unknown_request():
@@ -109,10 +97,10 @@ def test_out_of_order_messages_buffer_for_unknown_request():
         body=InputSignals(request_id="Y", inputs=[], request_info=None),
     )
     finished, err = _run_with_timeout(
-        lambda: Worker._process_message_list(stub, [msg]), timeout=5.0
+        lambda: stub.ingest._dispatch([msg]), timeout=5.0
     )
     assert err is None and finished
-    assert stub._unprocessed_messages.get("Y") == [msg]
+    assert stub.lifecycle._parked.get("Y") == [msg]
 
 
 def test_signals_for_a_live_request_are_delivered_not_buffered():
@@ -130,8 +118,8 @@ def test_signals_for_a_live_request_are_delivered_not_buffered():
         body=InputSignals(request_id="X", inputs=[], request_info=None),
     )
     finished, err = _run_with_timeout(
-        lambda: Worker._process_message_list(stub, [msg]), timeout=5.0
+        lambda: stub.ingest._dispatch([msg]), timeout=5.0
     )
     assert err is None and finished
     assert stub.delivered == [msg.body], "the signals never reached the worker"
-    assert stub._unprocessed_messages == {}, "a live request must not buffer"
+    assert stub.lifecycle._parked == {}, "a live request must not buffer"

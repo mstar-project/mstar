@@ -127,8 +127,6 @@ class AuTAttention(nn.Module):
 
     def bind_state(self, handles: dict) -> None:
         self.state = handles.get(self.array)
-        if self.state is not None and self.state.runs_sdpa:
-            raise ValueError(f"Array {self.array!r}: attention_backend sdpa, and packed windows have no SDPA layout")
 
     @staticmethod
     @torch.compiler.disable

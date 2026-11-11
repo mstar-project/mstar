@@ -84,7 +84,7 @@ class _Node:
         specs = [spec for spec in node_resources(model) if NODE in spec.nodes]
         apply_yaml_overrides(specs, {"resources": {TALKER_KV: {"max_num_pages": 64, "page_size": 16}}})
         by_key = resolve_spec_dependencies(specs)
-        groups = JointGroups(tp_group=CommGroup.trivial(), sp_group=CommGroup.trivial())
+        groups = JointGroups(tp_group=CommGroup.trivial(), sp_group=CommGroup.trivial(), instance=CommGroup.trivial())
         transfer = TransferEngineInfo(
             my_entity_id="qwen3_tts_packed", my_session_id="qwen3_tts_packed",
             transfer_engine=LocalTransferEngine("localhost"),
@@ -98,7 +98,7 @@ class _Node:
         }
         self.runner = StepRunner(self.resources, node_resources={NODE: list(self.resources)})
         self.overrides = sampling_configs(
-            model.get_request_resource_configs({}, model_kwargs={"do_sample": False}), model.declare_state(),
+            model.get_request_resource_configs([], [], model_kwargs={"do_sample": False}), model.declare_state(),
         )
         self.sub = _submodule(config)
         self.sub.bind_node_resources(self.resources)

@@ -26,9 +26,11 @@ Graph walks:
                        asked for: emits the cross-attention alignment that
                        ``postprocess`` turns into word timings
 
-Request state machine (``[-> align]`` for word timestamps):
-    language given:  prefill -> decode [-> align] -> done
-    language absent: detect_language -> prefill_prompt -> decode [-> align] -> done
+Walk plan (``[-> align]`` for word timestamps):
+    language given:  prefill [-> decode] [-> align]
+    language absent: detect_language -> prefill_prompt [-> decode] [-> align]
+The prompt walk samples the first of ``max_output_tokens``, so a budget of one
+runs no decode; a stop id sampled there ends the request.
 
 The transcript is streamed token by token as Whisper's own token stream
 rendered to text: spoken words as bytes, plus the language token (``<|en|>``)
@@ -37,16 +39,13 @@ adapter lifts those into ``language`` / ``segments``.
 """
 
 import logging
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
 import torch
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import (
-    CurrentForwardConductorMetadata,
-    StreamingConnectionState,
-)
 from mstar.engine.state import (
     Array,
     Attend,
@@ -65,9 +64,16 @@ from mstar.engine.state import (
 )
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import ForwardPassArgs, KVLabel, Model, ProcessPromptOutput, TensorAndMetadata
-from mstar.model.components.audio_features import LogMelSpectrogram, load_speech_file
-from mstar.model.components.request_kwargs import checked_request_kwargs
+from mstar.model.base import KVLabel, Model, ProcessPromptOutput, WalkStep
+from mstar.model.components.audio_features import LogMelSpectrogram
+from mstar.model.components.request_kwargs import (
+    GREEDY_SAMPLING,
+    SAMPLING_KEYS,
+    checked_request_kwargs,
+    sampler_capabilities,
+    sampling_config,
+    sampling_defaults,
+)
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.utils import ByteLevelDetokenizer, TextOutput, check_kv_pools_fit, kv_pages
 from mstar.model.whisper.components import alignment
@@ -94,6 +100,9 @@ from mstar.model.whisper.config import (
 )
 
 logger = logging.getLogger(__name__)
+
+# greedy, as openai-whisper decodes; the checkpoint's generation_config.json overrides
+DEFAULT_SAMPLING = GREEDY_SAMPLING
 
 
 def _resolve_local_hf_snapshot(repo_id: str, cache_dir: str | None = None) -> str:
@@ -142,9 +151,15 @@ class WhisperDetokenizer(ByteLevelDetokenizer):
 class WhisperModel(Model):
     """Whisper ASR: native batched encoder + native AR decoder."""
 
-    # A requested length is cut to the room the prompt leaves in the position
-    # table rather than refused, as a length past the table is clamped below:
-    # long-form windows carry the transcript so far as <|startofprev|> context.
+    DECODE_LOOP = DECODE_LOOP
+
+    # the checkpoint's sampling defaults, set by __init__; a model built without it has the built-in ones
+    sampling_defaults: Mapping[str, object] = DEFAULT_SAMPLING
+
+    # A requested length that fits the table is cut to the room a longer prompt
+    # leaves rather than refused: long-form windows carry the transcript so far
+    # as <|startofprev|> context. One past the table is still refused (see
+    # get_max_output_tokens).
     LENGTH_KWARGS = ()
 
     # Requests the default decoder caches hold at once, each at full length.
@@ -171,6 +186,8 @@ class WhisperModel(Model):
 
         self.local_dir = _resolve_local_hf_snapshot(model_path_hf, cache_dir=cache_dir)
         self.config = WhisperModelConfig.from_pretrained(self.local_dir)
+        self.sampling_defaults = sampling_defaults(self.local_dir)
+        self.AUDIO_INPUT_RATE = self.config.sampling_rate
 
         from transformers import AutoTokenizer
 
@@ -205,6 +222,7 @@ class WhisperModel(Model):
         kv = KVEntry(heads=c.decoder_attention_heads, head_dim=c.head_dim)
         attend = Attend(q_heads=c.decoder_attention_heads)
         layers = frozenset(range(c.decoder_layers))
+        capabilities = sampler_capabilities(self.sampling_defaults)
         return [
             # No RoPE: the counter's planned ids drive the learned ``embed_positions`` lookup.
             Array(KV_CACHE, nodes={DECODER_NODE}, layers=layers, entry=kv, max_len=c.max_target_positions,
@@ -218,8 +236,11 @@ class WhisperModel(Model):
                 "ts_rules": TensorType((STATE_SIZE,), dtype=torch.long),
                 "transcript": TensorType((c.max_target_positions + 1,), dtype=torch.long),
             })),
-            # ASR transcription decodes greedily; no seen-token buffers.
-            Sampler(SAMPLER, nodes={DECODER_NODE}, vocab_size=c.vocab_size, penalty=False),
+            # ASR decodes greedily; without the capability a request penalty or min_p is refused at admission.
+            Sampler(
+                SAMPLER, nodes={DECODER_NODE}, vocab_size=c.vocab_size,
+                penalty=capabilities["enable_repetition_penalty"], min_p=capabilities["enable_min_p"],
+            ),
         ]
 
     def kernel_settings(self) -> dict[str, dict[str, Any]]:
@@ -237,19 +258,16 @@ class WhisperModel(Model):
         }
 
     def get_request_resource_configs(
-        self, partition_fwd_args: dict[str, ForwardPassArgs],
-        model_kwargs: dict | None = None,
+        self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
     ) -> dict[str, SampleSettings]:
-        del partition_fwd_args
-        kw = checked_request_kwargs(model_kwargs or {})
-        return {
-            SAMPLER: SampleSettings(
-                # ASR default is greedy (temperature 0 -> argmax).
-                temperature=kw.get("temperature", 0.0),
-                top_p=kw.get("top_p", 1.0),
-                ignore_eos=kw.get("ignore_eos", False),
-            )
-        }
+        del input_modalities, output_modalities
+        config = sampling_config(self.sampling_defaults, model_kwargs)
+        return {SAMPLER: SampleSettings(**{key: getattr(config, key) for key in SAMPLING_KEYS})}
+
+    def request_kwargs(self) -> frozenset[str]:
+        return frozenset({
+            "language", "task", "timestamps", "initial_prompt", "max_output_tokens", *SAMPLING_KEYS,
+        })
 
     def validate_config_yaml(self, config: dict, config_path: str) -> None:
         """Refuse a request cap the decoder caches cannot hold: a request keeps
@@ -287,10 +305,11 @@ class WhisperModel(Model):
 
     def get_max_output_tokens(self, **model_kwargs):
         # The learned position table caps prompt + generated tokens at
-        # max_target_positions (448), the shortest forced prompt takes 4.
-        # The conductor cuts a longer prompt's cap to what is left.
-        limit = self.config.max_target_positions - 4
-        return min(checked_request_kwargs(model_kwargs).get("max_output_tokens", limit), limit)
+        # max_target_positions (448), less the plain forced prompt. A larger
+        # request is refused by the conductor, not clamped; it cuts a longer
+        # prompt's cap to what is left.
+        limit = self.config.max_target_positions - self.config.decoder_prompt_len()
+        return checked_request_kwargs(model_kwargs).get("max_output_tokens", limit)
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         def emit_first_token() -> list[GraphEdge]:
@@ -340,7 +359,8 @@ class WhisperModel(Model):
                     GraphEdge(next_node=EMIT_TO_CLIENT, name="text_inputs", output_modality="text"),
                 ],
             ),
-            max_iters=self.get_max_output_tokens(),
+            # the default request's iterations: past them a request overruns the position table
+            max_iters=self.get_loop_caps()[DECODE_LOOP],
             outputs=[],
         )
 
@@ -360,171 +380,65 @@ class WhisperModel(Model):
         }
 
     # -------------------------------------------------------------------
-    # Model ABC: forward pass args
+    # Model ABC: walk plan
     # -------------------------------------------------------------------
 
-    @staticmethod
-    def _edge(node: str, name: str, tensor_info: list[TensorPointerInfo]) -> GraphEdge:
-        edge = GraphEdge(next_node=node, name=name)
-        edge.tensor_info = list(tensor_info)
-        return edge
-
-    @staticmethod
-    def _prefill_step_metadata(kwargs: dict) -> dict:
-        """What the decoder's ``prepare_inputs`` needs about the forced prompt.
-
-        ``step_metadata`` is per step, so each prefill walk restates it from
-        the conductor metadata, which carries it for the request's lifetime.
-        """
-        return {
-            "is_prefill": True,
-            "timestamps": kwargs.get("timestamps", False),
-        }
-
-    def get_initial_forward_pass_args(
+    def walk_plan(
         self,
         partition_name: str,
         input_modalities: list[str],
         output_modalities: list[str],
         input_signals: dict[str, list[TensorPointerInfo]],
-        model_kwargs: dict | None = None,
-    ) -> ForwardPassArgs:
-        # ``process_prompt`` emits ``prompt_tail`` only when the language
-        # is to be detected. It is held back for the second prefill walk.
-        prompt_tail = input_signals.get("prompt_tail", [])
-        detect = bool(prompt_tail)
-        kwargs = model_kwargs or {}
-        # The same three settings ``process_prompt`` built the forced prompt
-        # from, resolved to token ids here and carried on the metadata, rather
-        # than read back off the prompt tensor on the GPU thread (a D2H sync).
-        # Detection leaves the language token unknown by construction; the
-        # decoder state keeps the detected one instead.
-        language = kwargs.get("language")
-        if kwargs.get("timestamps") == "word" and self._decoder_tp_size > 1:
+        model_kwargs: dict,
+    ) -> list[WalkStep]:
+        """``[detect_language -> prefill_prompt | prefill] -> [decode] [-> align]``."""
+        word_timestamps = model_kwargs.get("timestamps") == "word"
+        if word_timestamps and self._decoder_tp_size > 1:
             # a 400 now, rather than a failure after the whole decode has run
             raise ValueError(
                 "word timestamps need the decoder on one GPU; this deployment shards it "
                 f"(tp_size {self._decoder_tp_size})"
             )
-        full_metadata = CurrentForwardConductorMetadata(
-            input_modalities=input_modalities,
-            output_modalities=output_modalities,
-            graph_walk=DETECT_LANGUAGE_WALK if detect else PREFILL_WALK,
-            is_prefill=True,
-            kwargs={
-                "prompt_tail": prompt_tail,
-                # for the align walk: how much of the window carries audio,
-                # where its transcript row holds the transcript and a detected
-                # language, and whether the request asked for word timestamps
-                "audio_frames": kwargs.get("audio_frames"),
-                "transcript_start": kwargs.get("transcript_start"),
-                "language_slot": kwargs.get("language_slot"),
-                "word_timestamps": kwargs.get("timestamps") == "word",
-                "language_token": (
-                    None if language is None else self.config.language_token(language)
-                ),
-                "task_token": self.config.task_token(kwargs.get("task", "transcribe")),
-                # as ``process_prompt`` reads it: any truthy value (True,
-                # "word", "segment") means the prompt omits <|notimestamps|>
-                "timestamps": bool(kwargs.get("timestamps", False)),
-            },
-        )
-        inputs = [
-            self._edge(ENCODER_NODE, "audio", input_signals.get("audio", [])),
-            self._edge(DECODER_NODE, "text_inputs", input_signals.get("text_inputs", [])),
-        ]
-        return ForwardPassArgs(
-            full_metadata=full_metadata,
-            inputs=inputs,
-            unpersist_tensors=sum([inp.tensor_info for inp in inputs], start=[]),
-            step_metadata=self._prefill_step_metadata(full_metadata.kwargs),
-        )
-
-    def get_partition_forward_pass_args(
-        self,
-        partition_name: str,
-        partition_metadata: CurrentForwardConductorMetadata,
-        persist_signals: dict[str, list[TensorPointerInfo]],
-        incoming_connections: list[StreamingConnectionState] | None = None,
-    ) -> ForwardPassArgs:
-        """Single-partition state machine:
-        ``[detect_language -> prefill_prompt | prefill] -> decode -> [align] -> done``."""
-        metadata = partition_metadata
-        new_token = persist_signals.get("new_token", [])
-        word_timestamps = bool(metadata.kwargs.get("word_timestamps"))
-
-        if metadata.is_prefill:
-            if metadata.graph_walk == DETECT_LANGUAGE_WALK:
-                # the sampled language token leads the rest of the prompt
-                metadata.graph_walk = PREFILL_PROMPT_WALK
-                inputs = [
-                    self._edge(DECODER_NODE, "text_inputs", new_token),
-                    self._edge(DECODER_NODE, "prompt_tail", metadata.kwargs.get("prompt_tail", [])),
-                ]
-                return ForwardPassArgs(
-                    full_metadata=metadata,
-                    inputs=inputs,
-                    unpersist_tensors=sum([inp.tensor_info for inp in inputs], start=[]),
-                    step_metadata=self._prefill_step_metadata(metadata.kwargs),
-                )
-            metadata.is_prefill = False
-            metadata.graph_walk = DECODE_WALK
-        elif metadata.graph_walk == DECODE_WALK and word_timestamps:
-            # The loop is done. Align the transcript (kept in the decoder
-            # state) against the persisted encoder output.
-            metadata.graph_walk = ALIGN_WALK
-            inputs = [
-                self._edge(DECODER_NODE, "encoder_states", persist_signals.get("encoder_states", [])),
+        # What the decoder needs about the forced prompt, read as ``process_prompt``
+        # reads it: any truthy ``timestamps`` (True, "word", "segment") omits
+        # <|notimestamps|>.
+        prompt = {"timestamps": bool(model_kwargs.get("timestamps", False))}
+        if input_signals.get("prompt_tail"):
+            # ``process_prompt`` holds the prompt's tail back when the language is
+            # to be detected: the detected language token leads it in the second walk
+            plan = [
+                WalkStep(DETECT_LANGUAGE_WALK, step_metadata=prompt),
+                WalkStep(PREFILL_PROMPT_WALK, bind={"text_inputs": "new_token"}, step_metadata=prompt),
             ]
-            kwargs = metadata.kwargs
-            return ForwardPassArgs(
-                full_metadata=metadata,
-                inputs=inputs,
-                unpersist_tensors=sum([inp.tensor_info for inp in inputs], start=[]),
-                step_metadata={
-                    "is_prefill": False,
-                    # the forced prompt the transcript is aligned under; a
-                    # detected language (None here) the decoder state keeps
-                    "language": kwargs.get("language_token"),
-                    "task": kwargs.get("task_token"),
-                    "audio_frames": kwargs.get("audio_frames"),
-                    "transcript_start": kwargs.get("transcript_start"),
-                    "language_slot": kwargs.get("language_slot"),
-                },
-            )
-        elif metadata.graph_walk in (DECODE_WALK, ALIGN_WALK):
-            # The decode dynamic loop returned to the conductor (EOS or max
-            # tokens), or the alignment after it ran: the request is complete.
-            return ForwardPassArgs(
-                full_metadata=metadata,
-                inputs=[],
-                unpersist_tensors=[],
-                request_done=True,
-            )
-
-        inputs = [self._edge(DECODER_NODE, "text_inputs", new_token)]
-        return ForwardPassArgs(
-            full_metadata=metadata,
-            inputs=inputs,
-            unpersist_tensors=list(new_token),
-            step_metadata={"is_prefill": False},
-        )
+        else:
+            plan = [WalkStep(PREFILL_WALK, step_metadata=prompt)]
+        # the prompt walk samples the budget's first token, so one token leaves decode
+        # nothing to do. The conductor's fit to the caches never cuts a budget to one:
+        # a request with no room for a decode step is refused.
+        if self.get_max_output_tokens(**model_kwargs) > 1:
+            plan.append(WalkStep(DECODE_WALK, bind={"text_inputs": "new_token"}))
+        if word_timestamps:
+            # The transcript the decoder state keeps, aligned against the persisted encoder
+            # output under the forced prompt. Its tokens are resolved here, not read off
+            # the prompt tensor on the GPU thread (a D2H sync); a detected language is
+            # in the decoder state too.
+            language = model_kwargs.get("language")
+            plan.append(WalkStep(ALIGN_WALK, step_metadata={
+                "language": None if language is None else self.config.language_token(language),
+                "task": self.config.task_token(model_kwargs.get("task", "transcribe")),
+                # how much of the window carries audio, and where its transcript row
+                # holds the transcript and a detected language
+                "audio_frames": model_kwargs.get("audio_frames"),
+                "transcript_start": model_kwargs.get("transcript_start"),
+                "language_slot": model_kwargs.get("language_slot"),
+            }))
+        return plan
 
     # -------------------------------------------------------------------
     # Model ABC: media loading + prompt processing
     # -------------------------------------------------------------------
 
-    def load_audio(self, filepath: str, device: str) -> TensorAndMetadata:
-        from mstar.api_server.media_io import MAX_AUDIO_SECONDS
-
-        del device  # decoded on the CPU; the mel front end runs there too
-        # the route windows long uploads; past one window process_prompt drops the rest
-        waveform = load_speech_file(filepath, self.config.sampling_rate, MAX_AUDIO_SECONDS)
-        return TensorAndMetadata(
-            data=waveform, metadata=dict(sample_rate=self.config.sampling_rate, num_channels=1),
-        )
-
-    def prompt_tokens(self, prompt: str | None) -> list[int]:
+    def _initial_prompt_ids(self, prompt: str | None) -> list[int]:
         """The ``<|startofprev|>`` context: prior transcript text, tokenized
         the way openai-whisper does (a leading space, no specials)."""
         if not prompt or not prompt.strip():
@@ -575,7 +489,7 @@ class WhisperModel(Model):
         if task not in self.config.task_to_id:
             raise ValueError(f"Whisper task must be one of {sorted(self.config.task_to_id)}, got {task!r}")
         timestamps = bool(kw.get("timestamps", False))
-        prev_tokens = self.prompt_tokens(kw.get("initial_prompt"))
+        prev_tokens = self._initial_prompt_ids(kw.get("initial_prompt"))
         prompt_ids = self.config.decoder_prompt_ids(
             language=language, task=task, timestamps=timestamps, prev_tokens=prev_tokens,
         )
@@ -614,10 +528,6 @@ class WhisperModel(Model):
             "transcript_start": transcript_start,
             "language_slot": language_slot,
         })
-
-    def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
-        # the prefill emits the first of max_output_tokens, so the loop runs one fewer
-        return {DECODE_LOOP: max(1, self.get_max_output_tokens(**model_kwargs) - 1)}
 
     def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
         return {

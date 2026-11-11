@@ -11,6 +11,7 @@ from mstar.api_server.request_types import (
     APIServerMessage,
     ConductorStatus,
     DataWorkerProfile,
+    LoraAdapterResult,
     PreprocessInput,
     PromptPart,
     RequestComplete,
@@ -25,6 +26,7 @@ from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.resources.base import PublishedInfo
 from mstar.engine.resources.kv.config import KVReqConfig
 from mstar.engine.resources.kv.manager import PublishedKVInfo
+from mstar.engine.resources.kv.rolling.config import RollingKVReqConfig
 from mstar.engine.resources.kv.transfer import (
     CudaIpcKVTransferInfo,
     KVTransferInfo,
@@ -44,6 +46,8 @@ from mstar.utils.ipc_format import (
     EnableMetrics,
     FailRequests,
     InputSignals,
+    LoadLoraAdapter,
+    LoraAdapterAck,
     MessageBody,
     NewRequest,
     NewRequestConductor,
@@ -54,6 +58,7 @@ from mstar.utils.ipc_format import (
     StopLoops,
     TensorReceived,
     TPNoSpeculation,
+    UnloadLoraAdapter,
     UnpersistTensors,
     WorkerGraphsDone,
     WorkerMessage,
@@ -89,12 +94,17 @@ _TYPES: dict[str, type] = {
     "fail_requests": FailRequests,
     "worker_status": WorkerStatus,
     "enable_metrics": EnableMetrics,
+    # runtime LoRA adapters: api server -> conductor -> workers, and the acks back
+    "load_lora_adapter": LoadLoraAdapter,
+    "unload_lora_adapter": UnloadLoraAdapter,
+    "lora_adapter_ack": LoraAdapterAck,
     # api-server bodies
     "result_tensors": ResultTensors,
     "result_tokens": ResultTokens,
     "request_complete": RequestComplete,
     "request_failed": RequestFailed,
     "conductor_status": ConductorStatus,
+    "lora_adapter_result": LoraAdapterResult,
     "workers_ready": WorkersReady,
     "result_chunk": ResultChunk,
     "preprocess_input": PreprocessInput,
@@ -110,6 +120,7 @@ _TYPES: dict[str, type] = {
     "kv_req_config": KVReqConfig,
     "sampling_req_config": SamplingReqConfig,
     "lora_req_config": LoraReqConfig,
+    "rolling_kv_req_config": RollingKVReqConfig,
 }
 
 for _tag, _cls in _TYPES.items():

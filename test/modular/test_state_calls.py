@@ -59,10 +59,9 @@ from mstar.engine.state import (
     rope,
     sample,
 )
-from mstar.engine.state.adapters import build_specs
+from mstar.engine.state.adapters import GDN, StateSetup, WithinStepHandle, build_handle, build_specs
 from mstar.engine.state.calls import ArrayHandle, SamplerHandle
-from mstar.engine.state.host import HostFields
-from mstar.engine.state.within_step import WithinStepHandle
+from mstar.engine.state.host_fields import HostFields
 
 LAYERS, SLOTS, HEADS, DIM = 4, 64, 2, 8
 TOKENS = 3
@@ -204,7 +203,7 @@ def _array(**overrides) -> Array:
 def _kv_handle(array=None, kv=None, attn=None) -> ArrayHandle:
     array = array or _array()
     resources = {"kv": kv or _StubKV(len(array.layers)), **{key: attn or _StubAttn() for key in array.reads}}
-    return ArrayHandle(array, resources, None)
+    return build_handle(array, resources)
 
 
 def _value_handle(labels=frozenset({"main"})) -> ArrayHandle:
@@ -218,18 +217,18 @@ def _value_handle(labels=frozenset({"main"})) -> ArrayHandle:
         "state": torch.zeros(2, SLOTS, HEADS, DIM + 1, DIM),
         "conv": torch.zeros(2, SLOTS, 3 * HEADS * DIM, 3),
     })
-    return ArrayHandle(array, {"gdn": pool, "c": None, "d": _StubLinear()}, None)
+    return build_handle(array, {"gdn": pool, "c": None, "d": _StubLinear()})
 
 
 def _within_handle(ragged=None) -> WithinStepHandle:
     array = _array(max_len=0, reads={"vision": Read(mask=Block(), op=Attend(q_heads=HEADS))})
-    return WithinStepHandle(array, {"vision": ragged or _StubRagged()}, None)
+    return build_handle(array, {"vision": ragged or _StubRagged()})
 
 
 def _sampler_handle(draws=1) -> SamplerHandle:
-    resource = SamplerResource(vocab_size=8, enable_repetion_penalty=True, device=torch.device("cpu"))
+    resource = SamplerResource(vocab_size=8, enable_repetition_penalty=True, device=torch.device("cpu"))
     resource.ingest_request(1, None)
-    return SamplerHandle(Sampler("sampler", nodes={"LLM"}, vocab_size=8, draws=draws), resource)
+    return build_handle(Sampler("sampler", nodes={"LLM"}, vocab_size=8, draws=draws), {"sampler": resource})
 
 
 def _tensors(n=TOKENS):
@@ -335,6 +334,29 @@ def test_write_overwrites_a_value_field_in_its_stored_layout():
     assert h._pool.scatters == [("state", 1, "main", (TOKENS, HEADS, DIM + 1, DIM))], "state is stored K-last"
 
 
+class _RowPool(_StubPool):
+    """Writes each scattered row into its layer's block, from slot 0."""
+
+    def scatter_(self, name, value, layer_idx, *, label):
+        self.blocks[name][layer_idx, :value.shape[0]] = value
+
+
+def test_a_state_written_through_its_handle_reads_back_through_gdn():
+    """GDN stores a state K-last and owns that layout both ways, so a row read back from the pool is the row written."""
+    entry = Entry({
+        "state": TensorType((HEADS, DIM, DIM + 1), dtype=torch.float32, shard=0),
+        "conv": TensorType((3 * HEADS * DIM, 3), dtype=None, shard=0),
+    })
+    array = Value("gdn", nodes={"LLM"}, layers={5}, entry=entry, updates={"d": GatedDeltaNet()})
+    stored = GDN().block(entry.tensors["state"]).shape
+    pool = _RowPool({"state": torch.zeros(1, SLOTS, *stored), "conv": torch.zeros(1, SLOTS, 3 * HEADS * DIM, 3)})
+    h = build_handle(array, {"gdn": pool, "d": _StubLinear()})
+    _begin(h)
+    state = torch.randn(1, HEADS, DIM, DIM + 1)
+    h.write(5, state=state)
+    assert torch.equal(GDN().stored(pool.blocks["state"][0, :1]), state), "a write and a read disagree on the layout"
+
+
 def test_updates_run_on_the_layers_own_field_and_write_it_in_place():
     h = _value_handle()
     _begin(h)
@@ -351,7 +373,7 @@ def test_updates_run_on_the_layers_own_field_and_write_it_in_place():
 def test_positions_read_the_resource_at_the_steps_label():
     pos = _StubPositions()
     array = _array(labels={"main", "cfg"}, positions=Positions(rope=Rope(dtype=torch.bfloat16)))
-    h = ArrayHandle(array, {"kv": _StubKV(), "attn": _StubAttn(), "rope": pos}, "rope")
+    h = build_handle(array, {"kv": _StubKV(), "attn": _StubAttn(), "rope": pos})
     _begin(h, segments=[Segment(1, "cfg", TOKENS)])
     assert position(h, 1, "cfg") == 5
     assert torch.equal(positions(h), pos.ids)
@@ -363,7 +385,7 @@ def test_positions_read_the_resource_at_the_steps_label():
 def test_rope_with_no_declared_dtype_rotates_in_qs():
     pos = _StubPositions()
     resources = {"kv": _StubKV(), "attn": _StubAttn(), "rope": pos}
-    h = ArrayHandle(_array(positions=Positions(rope=Rope())), resources, "rope")
+    h = build_handle(_array(positions=Positions(rope=Rope())), resources)
     _begin(h)
     q, k, _ = _tensors()
     rope(h, q.double(), k)
@@ -521,13 +543,25 @@ def test_an_add_after_a_kept_add_raises():
     _refused(r"Array 'kv': an add on layer 0 after its kept add", lambda: h.add(0, k=k, v=v))
 
 
-def test_an_add_after_a_read_in_the_same_layer_raises():
+def test_a_kept_add_after_a_read_in_the_same_layer_raises():
     h = _kv_handle()
     _begin(h)
     q, k, v = _tensors()
     h.add(0, keep=False, k=k, v=v)
     h.read(0, q)
-    _refused(r"Array 'kv': an add on layer 0 after a read in the same layer", lambda: h.add(0, keep=False, k=k, v=v))
+    _refused(r"Array 'kv': a kept add on layer 0 after a read in the same layer", lambda: h.add(0, k=k, v=v))
+
+
+def test_a_scratch_add_after_a_read_starts_another_pass():
+    """Pi0.5's action step runs every Euler step in one engine step: each adds the action tokens again and reads."""
+    h = _kv_handle()
+    step = _begin(h, kv=ArrayStep(keep=False))
+    q, k, v = _tensors()
+    for _ in range(2):
+        for layer in range(LAYERS):
+            h.add(layer, k=k, v=v)
+            h.read(layer, q)
+    h.check_step(step)
 
 
 def test_write_on_an_append_only_array_raises():
@@ -563,6 +597,31 @@ def test_a_second_update_of_a_field_in_a_layer_raises():
     x, weight = torch.ones(TOKENS, 6), torch.ones(6, 4)
     causal_conv(h, 1, x, weight=weight)
     _refused(r"Array 'gdn': a second update of conv on layer 1", lambda: causal_conv(h, 1, x, weight=weight))
+
+
+@pytest.mark.parametrize("call, name", [
+    (lambda h, q, k, v: h.add(1, k=k, v=v), "add"),
+    (lambda h, q, k, v: add_read(h, 1, q, k=k, v=v), "add_read"),
+    (lambda h, q, k, v: at_last_token(h, q), "at_last_token"),
+    (lambda h, q, k, v: kernel_setting(h, "d", "splits"), "kernel_setting of 'd'"),
+], ids=["add", "add_read", "at_last_token", "kernel_setting"])
+def test_a_call_a_value_does_not_run_has_no_layout_yet(call, name):
+    h = _value_handle()
+    _begin(h)
+    _refused(rf"Array 'gdn': no layout yet: {name} on a ValueHandle", lambda: call(h, *_tensors()))
+
+
+def test_an_update_the_value_does_not_declare_is_refused():
+    entry = Entry({
+        "state": TensorType((HEADS, DIM, DIM), dtype=torch.float32, shard=0),
+        "conv": TensorType((6, 3), dtype=None, shard=0),
+    })
+    array = Value("gdn", nodes={"LLM"}, layers={1}, entry=entry, updates={"d": GatedDeltaNet()})
+    pool = _StubPool({"state": torch.zeros(1, SLOTS, HEADS, DIM, DIM), "conv": torch.zeros(1, SLOTS, 6, 3)})
+    h = build_handle(array, {"gdn": pool, "d": _StubLinear()})
+    _begin(h)
+    _refused(r"Array 'gdn': an update of type CausalConv, which the array doesn't declare",
+             lambda: causal_conv(h, 1, torch.ones(TOKENS, 6), weight=torch.ones(6, 4)))
 
 
 def test_a_read_with_no_op_or_with_mask_arguments_has_no_layout_yet():
@@ -749,7 +808,7 @@ def _added_and_read(h, q, k, v):
     (_added, 0, None, True, {}, "an add on layer 0 after its kept add"),
     # both calls would refuse, and the add's check runs first
     (_added, 0, None, False, {}, "an add on layer 0 after its kept add"),
-    (_added_and_read, 0, False, True, {}, "an add on layer 0 after a read in the same layer"),
+    (_added_and_read, 0, None, True, {}, "a kept add on layer 0 after a read in the same layer"),
     (None, 0, None, False, {}, "no layout yet: a read with no op"),
     (None, 0, None, True, {"top_k": 3}, r"no layout yet: mask arguments \['top_k'\]"),
 ])
@@ -789,15 +848,6 @@ def test_add_read_refuses_an_array_with_max_len_0_whose_read_stays_in_the_graph(
     _begin(h)
     q, k, v = _tensors()
     _refused(r"Array 'kv': add_read with max_len 0", lambda: add_read(h, 0, q, k=k, v=v))
-
-
-def test_add_read_refuses_an_entry_with_a_field_named_q():
-    t = TensorType((HEADS, DIM), dtype=None, shard=0)
-    h = _kv_handle(_array(entry=Entry({"k": t, "v": t, "q": t})))
-    _begin(h)
-    q, k, v = _tensors()
-    _refused(r"Array 'kv': add_read takes q for the read, and the entry declares a field named q",
-             lambda: add_read(h, 0, q, k=k, v=v))
 
 
 def _resume_frames(fn, *args) -> list[str]:
@@ -962,10 +1012,10 @@ def test_every_call_reads_the_steps_label():
     _begin(gdn, segments=[Segment(1, "cfg", TOKENS)])
     causal_conv(gdn, 1, torch.randn(TOKENS, 3 * HEADS * DIM), weight=torch.ones(3 * HEADS * DIM, 4))
     gated_delta_net(gdn, 1, q, k, v, q, q, q, q)
-    assert gdn._linear.labels == ["cfg", "cfg"]
+    assert gdn._runners[GatedDeltaNet].labels == ["cfg", "cfg"]
     ragged = _StubRagged()
     array = _array(max_len=0, labels={"main", "cfg"}, reads={"vision": Read(mask=Block(), op=Attend(q_heads=HEADS))})
-    within = WithinStepHandle(array, {"vision": ragged}, None)
+    within = build_handle(array, {"vision": ragged})
     _begin(within, segments=[Segment(1, "cfg", TOKENS)])
     within.add(0, k=k, v=v)
     within.read(0, q)
@@ -1021,9 +1071,10 @@ def test_every_update_runs_behind_a_graph_break():
         return gated_delta_net(h, 5, x, k, v, x, x, x, x)
 
     def record(note):
-        conv, delta, scatter = h._linear.run_conv, h._linear.run, h._pool.scatter_
-        h._linear.run_conv = lambda *args, **kwargs: (note(), conv(*args, **kwargs))[1]
-        h._linear.run = lambda *args, **kwargs: (note(), delta(*args, **kwargs))[1]
+        linear = h._runners[GatedDeltaNet]
+        conv, delta, scatter = linear.run_conv, linear.run, h._pool.scatter_
+        linear.run_conv = lambda *args, **kwargs: (note(), conv(*args, **kwargs))[1]
+        linear.run = lambda *args, **kwargs: (note(), delta(*args, **kwargs))[1]
         h._pool.scatter_ = lambda *args, **kwargs: (note(), scatter(*args, **kwargs))[1]
 
     assert _compiling_at_each_kernel(updates, record) == [False, False, False]
@@ -1083,7 +1134,7 @@ def _plain_value() -> tuple[ArrayHandle, RecurrentStatePool]:
     pool = RecurrentStatePool(torch.device("cpu"), spec.config)
     for rid in (1, 2):
         pool.ingest_request(rid)
-    return ArrayHandle(array, {"state": pool}, None), pool
+    return build_handle(array, {"state": pool}), pool
 
 
 def _plan(pool, segments, capture=False):
@@ -1175,7 +1226,7 @@ def _gdn_over_a_pool(array: Array) -> tuple[RecurrentStatePool, ArrayHandle]:
     specs = {spec.resource_key: spec for spec in build_specs([_array(), array])}
     pool = RecurrentStatePool(torch.device("cpu"), specs["gdn"].config, kv_dtype=torch.float32)
     pool.ingest_request(1)
-    return pool, ArrayHandle(array, {"gdn": pool, "d": _StubLinear()}, None)
+    return pool, build_handle(array, {"gdn": pool, "d": _StubLinear()})
 
 
 def test_a_gated_delta_nets_state_reads_declared_and_stores_k_last():
@@ -1253,12 +1304,12 @@ def test_a_read_outside_a_step_is_refused():
 
 def test_a_read_on_a_value_with_only_host_fields_is_refused():
     array = Value("host", nodes={"LLM"}, layers={0}, entry=Entry({}, host={"n": int}))
-    h = ArrayHandle(array, {}, None, HostFields())
-    _refused(r"Array 'host': read on a Value with no tensor fields", lambda: h.read(0))
+    h = build_handle(array, {}, StateSetup(host_fields=HostFields()))
+    _refused(r"Array 'host': no layout yet: read on a HostValueHandle", lambda: h.read(0))
 
 
 def test_set_start_on_an_array_that_isnt_a_value_is_refused():
-    _refused(r"Array 'kv': set_start on an array that isn't a Value with tensor fields",
+    _refused(r"Array 'kv': no layout yet: set_start on a PagedArrayHandle",
              lambda: _kv_handle().set_start({"k": torch.ones(1)}))
 
 

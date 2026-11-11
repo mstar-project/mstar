@@ -9,15 +9,20 @@ leaves the model-specific parts to a handful of hooks:
   step index from the engine's loop counter       bucket_key_for(fwd_info)      -> hashable
   memoized schedule + seeded initial noise,       schedule_for(walk, num_steps, key) -> FlowMatchSchedule
     drawn at ingest under PREFETCH_SEEDS
-  overshoot veto (async scheduling)               seed_latents(key, generator)  -> [L, C]
-  equal-key request batching (can_batch)          request_inputs(fwd_info, inputs, key) -> {name: [..]}
-  stacked preprocess / per-row outputs            num_tokens(key)               -> int
-  stop after the request's own step count         denoise(engine_inputs, key, latents, timestep,
-  per-key CUDA-graph buckets (Euler inside)               sigma, sigma_next, **cond) -> [B, L, C]
+  equal-key request batching (can_batch)          seed_latents(key, generator)  -> [L, C]
+  stacked preprocess / per-row outputs            request_inputs(fwd_info, inputs, key) -> {name: [..]}
+  per-key CUDA-graph buckets (Euler inside)       num_tokens(key)               -> int
+                                                  denoise(engine_inputs, key, latents, timestep,
+                                                          sigma, sigma_next, **cond) -> [B, L, C]
   the step's arrays and their segments            capture_request_inputs(key, device) -> {name: [..]}
                                                   attention_segments(key) -> {array: ((label, span), ...)}
 
 Conventions the base fixes:
+
+* The loop ends on its iteration count: a model whose request picks its own
+  step count declares it as the loop's cap (``Model.get_loop_caps``), so the
+  loop completes after that iteration and the async worker never speculates
+  past it.
 
 * The loop-back edges are :attr:`~DenoiseLoopSubmodule.loop_back_names`
   (``latents`` plus whatever ``SOLVER_STATE`` a multi-step scheduler carries);
@@ -50,7 +55,6 @@ Conventions the base fixes:
 from __future__ import annotations
 
 import functools
-import logging
 import threading
 from collections import OrderedDict, deque
 from collections.abc import Hashable, Mapping, Sequence
@@ -78,8 +82,6 @@ from mstar.utils.threads import ThreadPool
 
 if TYPE_CHECKING:
     from mstar.model.components.quant_linear import StepDtypes
-
-logger = logging.getLogger(__name__)
 
 # Entries in each memo. A schedule is a few floats per step and a seed entry a latent, and a miss only rebuilds it.
 _MEMO_ENTRIES = 256
@@ -182,8 +184,8 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         # Under a lock, since a request's arrival adds to it on the main thread and iteration 0 takes on the GPU's.
         self._seed_draws: deque[tuple[tuple[Hashable, int], Future]] = deque(maxlen=_MEMO_ENTRIES)
         self._seed_lock = threading.Lock()
-        # Keyed by `schedule_for`'s inputs. `check_stop` reads the first on the main thread, and only `prepare_inputs`
-        # and the solver stage the second, so the main thread never touches the device.
+        # Keyed by `schedule_for`'s inputs: the schedule, and the tensors `prepare_inputs` and the solver read on the
+        # device.
         self._schedules = functools.lru_cache(_MEMO_ENTRIES)(self.schedule_for)
         self._staged_schedules = functools.lru_cache(_MEMO_ENTRIES)(self._stage_schedule)
         # The dtype each step runs (``step_key``), and the one the step in ``denoise`` runs: None without a schedule.
@@ -353,16 +355,15 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         device = self.get_device()
         # A request whose walks run this node in successive stages (a draft loop, then a
         # refinement loop) gets a fresh shape and schedule for each, through the key.
-        bucket_key, num_steps = self.bucket_key_for(fwd_info), self.num_steps_of(fwd_info)
+        bucket_key = self.bucket_key_for(fwd_info)
+        schedule_key = self._schedule_key(fwd_info, bucket_key)
+        num_steps = self._schedules(*schedule_key).num_steps
         if k >= num_steps:
-            # Async scheduling dispatched an iteration past this request's stop; None
-            # makes the engine skip the forward (the cosmos3 / wan22 veto).
-            # debug, not info: one line per vetoed step per request (1.9k lines in a
-            # 36-minute served run), and it is the expected outcome of speculation.
-            logger.debug("%s: skipping overshoot iteration %d (request %s runs %d steps)",
-                         type(self).__name__, k, fwd_info.request_id, num_steps)
-            return None
-        staged = self._staged_schedules(*self._schedule_key(fwd_info))
+            raise RuntimeError(
+                f"{type(self).__name__}: iteration {k} is past request {fwd_info.request_id}'s "
+                f"{num_steps} steps; declare the step count as the loop's cap (Model.get_loop_caps)"
+            )
+        staged = self._staged_schedules(*schedule_key)
         tensors = {
             **self._carried_inputs(fwd_info, inputs, bucket_key, k, device),
             **{
@@ -376,15 +377,12 @@ class DenoiseLoopSubmodule(NodeSubmodule):
             resource_step_info=self.step_key(fwd_info, bucket_key),
         )
 
-    def _schedule_key(self, fwd_info: CurrentForwardPassInfo) -> tuple[str, int | None, Hashable]:
-        return fwd_info.graph_walk, fwd_info.step_metadata.get(NUM_STEPS), self.bucket_key_for(fwd_info)
+    def _schedule_key(self, fwd_info: CurrentForwardPassInfo, bucket_key: Hashable) -> tuple[str, int | None, Hashable]:
+        return fwd_info.graph_walk, fwd_info.step_metadata.get(NUM_STEPS), bucket_key
 
-    def schedule_of(self, fwd_info: CurrentForwardPassInfo) -> FlowMatchSchedule:
-        """The memoized schedule of the walk ``fwd_info`` is on."""
-        return self._schedules(*self._schedule_key(fwd_info))
-
-    def num_steps_of(self, fwd_info: CurrentForwardPassInfo) -> int:
-        return self.schedule_of(fwd_info).num_steps
+    def schedule_of(self, fwd_info: CurrentForwardPassInfo, bucket_key: Hashable) -> FlowMatchSchedule:
+        """The memoized schedule of the walk ``fwd_info`` is on, at its ``bucket_key``."""
+        return self._schedules(*self._schedule_key(fwd_info, bucket_key))
 
     def _stage_schedule(self, walk: str, num_steps: int | None, bucket_key: Hashable) -> dict[str, torch.Tensor]:
         return self._step_scalar_sources(self._schedules(walk, num_steps, bucket_key), self.get_device())
@@ -482,17 +480,6 @@ class DenoiseLoopSubmodule(NodeSubmodule):
             for i, rid in enumerate(engine_inputs.request_ids)
         }
 
-    def check_stop(self, request_id: int, request_info: CurrentForwardPassInfo, outputs) -> set[str]:
-        # iteration k is being postprocessed while the counter reads k, so N steps stop at k == N - 1
-        k, num_steps = self.step_index(request_info), self.num_steps_of(request_info)
-        stop = k + 1 >= num_steps
-        # debug, not info: one line per request per step on the GPU thread -- 19.8k of
-        # the 49.7k lines in a 36-minute served run. Invaluable when debugging the loop
-        # counter, far too loud for a served default.
-        logger.debug("%s: check_stop request %s k=%d/%d -> %s", type(self).__name__,
-                     request_id, k, num_steps, "STOP" if stop else "continue")
-        return {self.loop_name} if stop else set()
-
     # ------------------------------------------------------------ resources
     def _uniform_key(self, keys) -> Hashable | None:
         keys = set(keys)
@@ -548,7 +535,7 @@ class DenoiseLoopSubmodule(NodeSubmodule):
                 name: ArrayStep(segments=tuple(
                     Segment(request_id=rid, label=label, span=span)
                     for rid, arrays in rows for label, span in arrays[name]
-                ))
+                ), fixed_layout=True)
                 for name in rows[0][1]
             },
             cg_key_info=self._uniform_key(inp.resource_step_info for inp in inputs),
@@ -637,11 +624,12 @@ class UniPCDenoiseLoopSubmodule(DenoiseLoopSubmodule):
         steps = []
         for i, rid in enumerate(engine_inputs.request_ids):
             info = engine_inputs.per_request_info[rid]
-            schedule = self.schedule_of(info)
+            schedule_key = self._schedule_key(info, bucket_key)
+            schedule = self._schedules(*schedule_key)
             steps.append(unipc_step(
                 output[i], latents[i],
                 UniPCState(model_outputs=unipc_model_outputs[i], last_sample=unipc_last_sample[i]),
-                schedule.sigmas, self._staged_schedules(*self._schedule_key(info))["sigmas"], self.step_index(info),
+                schedule.sigmas, self._staged_schedules(*schedule_key)["sigmas"], self.step_index(info),
                 schedule.num_steps,
             ))
         return {
