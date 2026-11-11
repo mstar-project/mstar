@@ -22,6 +22,7 @@ from mstar.engine.resources.kv.config import (
     PrefixSpan,
     StreamLayout,
 )
+from mstar.engine.resources.kv.cpu_page_pool import CPUPagePool, PageCopies
 from mstar.engine.resources.kv.keys import chain
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.step import Lag, Segment, StepContext
@@ -221,6 +222,49 @@ def test_an_offload_and_reload_bring_back_every_storage():
     pages = list(kv._streams["r0"]["main"].page_indices)
     for t, old in zip(kv.kv_cache.storages, expected, strict=True):
         assert torch.equal(t[:, pages], old)
+
+
+class _RecordingCopier:
+    """Records each page copy as (destination, its pages, source, its pages)."""
+
+    def __init__(self):
+        self.copies = []
+
+    def copy(self, dst, dst_pages, src, src_pages, stream):
+        del stream
+        self.copies.append((id(dst), list(dst_pages), id(src), list(src_pages)))
+
+
+class _Stream:
+    def wait_stream(self, stream):
+        del stream
+
+
+def test_each_host_copy_covers_every_storage_primary_first(monkeypatch):
+    """Offload, reload (and a prefix hit served from the host) and the prefix cache's host write each copy every
+    storage of a pool with a drafter's own, with its host storage. A smallest real pool on the CPU: its own
+    constructor pins host memory, which needs CUDA."""
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: None)
+    kv_cache = _manager(DRAFT).kv_cache
+    pool = CPUPagePool.__new__(CPUPagePool)
+    pool.cpu_storages = [torch.empty_like(t) for t in kv_cache.storages]
+    pool._copier = copier = _RecordingCopier()
+    pool._stream = pool._write_stream = _Stream()
+    pool._copied_since_write = False
+    copies = PageCopies(gpu=[3, 5], cpu=[0, 1])
+
+    pool.copy_out(kv_cache, copies)
+    pool.copy_in(kv_cache, copies)
+    pool.write(kv_cache, copies)
+
+    pairs = [(id(host), id(device)) for host, device in zip(pool.cpu_storages, kv_cache.storages, strict=True)]
+    assert len(pairs) == 2 and kv_cache.storages[0] is kv_cache.tensor
+    to_host = [(host, [0, 1], device, [3, 5]) for host, device in pairs]
+    to_device = [(device, [3, 5], host, [0, 1]) for host, device in pairs]
+    assert copier.copies == to_host + to_device + to_host
+    # a call site handing over the primary tensor alone would leave the drafter's pages behind
+    with pytest.raises(ValueError):
+        pool.copy_out(kv_cache.tensor, copies)
 
 
 def _flashinfer_reason() -> str | None:
