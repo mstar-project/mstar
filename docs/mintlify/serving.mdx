@@ -101,7 +101,7 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
 | Key | Meaning |
 |----|----|
 | `model` | Registry key of the model (see [Supported Models](/models)). |
-| `max_seq_len` | Required, but nothing reads it: it neither sizes the KV cache nor caps context. A KV cache's length limit is its own `max_seq_len`, set by the model or under `resources: <kv>:` (see the resource overrides below). On a node that verifies drafts that override is still the client's limit: the pool holds the verify slack past it. |
+| `max_seq_len` | Required. It neither sizes the KV cache nor caps context: a KV cache's length limit is its own `max_seq_len`, set by the model or under `resources: <kv>:` (see the resource overrides below). On a node that verifies drafts that override is still the client's limit (the pool holds the verify slack past it), and startup reads the top-level value only to refuse a verifying pool whose limit is below it. |
 | `node_groups` | List of placements. Each entry assigns `node_names` to `ranks`, optionally scoped to specific `graph_walks` and/or parallelized with `tp_size`, `sp_size` and `cfg_size`. An `ep_config` block picks TP or EP for the group's MoE experts. `side_stream: true` runs the group's node beside the worker's main chain of steps (see below). |
 | `resources` | *(optional)* Per-resource overrides, keyed by the model's resource names (see below). |
 | `max_concurrent_requests` | *(optional)* How many requests run at once. Requests past the cap wait in the conductor's queue, except a live call (open client input), which is refused with a 503. |
