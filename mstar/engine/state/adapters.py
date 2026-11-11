@@ -839,6 +839,7 @@ class PagedArrayHandle(ArrayHandle):
         super().begin_step(step)
         # the one plan `PagedStorage.steps` names for a step over several labels
         combined = getattr(step.steps.get(self.name), "combined_labels", None)
+        self._combined = bool(combined)
         if combined:
             self.label = next(iter(combined.values()))
 
@@ -927,7 +928,7 @@ class PagedArrayHandle(ArrayHandle):
             first, end = at[0], at[-1] + 1
         # A span-0 segment adds no token to the plan, so its row gets the previous segment's last token. A call over
         # every row of a one-label step takes that for the rows that pad it.
-        if label is not None or len(step_labels(segments)) > 1:
+        if label is not None or self._combined:
             empty = next((segment for segment in segments[first:end] if not segment.span), None)
             if empty is not None:
                 raise self._refusal(f"at_last_token on row {empty.request_id}, label {empty.label!r}, whose segment "

@@ -579,7 +579,9 @@ def test_at_last_token_over_every_row_of_a_combined_plan_refuses_a_segment_with_
     """Chatterbox's guided T3 prefill takes every (row, label)'s last token, and a span-0 one would be another's."""
     h = _two_label_handle()
     segments = [Segment(1, "main", 3), Segment(2, "main", 2), Segment(1, "uncond", 0), Segment(2, "uncond", 2)]
-    _begin(h, segments=segments, ctx=_ctx(rows=(1, 2)))
+    step = state_steps(_step(h, segments=segments), {"kv": h}, graph_walk="decode")
+    step.set_ctx(_ctx(rows=(1, 2)))
+    h.begin_step(step)
     _refused(r"Array 'kv': at_last_token on row 1, label 'uncond', whose segment has span 0",
              lambda: at_last_token(h, torch.zeros(7, 1)))
 
