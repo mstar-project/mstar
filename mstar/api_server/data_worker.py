@@ -50,6 +50,7 @@ from mstar.distributed.base import node_group_axis_sizes
 from mstar.engine.resources.kv.config import KVSpec, prefix_caches_by_rank
 from mstar.engine.resources.kv.keys import PageItem, chain, end_key, fingerprint, page_items, variant_root
 from mstar.engine.resources.lora.config import LORA_ADAPTER_KWARG, LORA_DIGEST_KWARG
+from mstar.engine.resources.position.config import MAX_POSITION_KWARG
 from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.engine.state.adapters import kv_layouts
 from mstar.model.base import (
@@ -995,12 +996,13 @@ class PreprocessWorkerThread:
         # only this worker keys a prompt: a client that sent its own could name
         # another request's pages and be served that request's KV, and a stream
         # lead past the edge's context would raise in the worker's ingest.
-        # Likewise only process_prompt sets the model's INTERNAL_KWARGS, and
-        # only this worker knows which client streams the opening leaves open.
+        # Likewise only process_prompt sets the model's INTERNAL_KWARGS and the
+        # LongRoPE ceiling (which picks the request's table and prefix variant),
+        # and only this worker knows which client streams the opening leaves open.
         internal = getattr(self.model, "INTERNAL_KWARGS", ())
         for name in (
             "prefix_keys", "prefix_tail", "prefix_decode", "kv_layout", "state_layout", "keyed_spans", "prefix_root",
-            "stream_lead_items", "open_streams", *internal,
+            "stream_lead_items", "open_streams", MAX_POSITION_KWARG, *internal,
         ):
             model_kwargs.pop(name, None)
         open_streams = self._client_edges - input.ends

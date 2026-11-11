@@ -400,3 +400,17 @@ def test_prefix_variants_key_apart(adapters):
     chosen, named = run(b"short", model_adapter="a"), run(b"short", client_adapter="a")
     assert chosen["prefix_root"] == named["prefix_root"] == adapter_root
     assert _keys(chosen) == _keys(named) != _keys(short)
+
+
+def test_a_client_cannot_set_the_longrope_ceiling(adapters):
+    """``MAX_POSITION_KWARG`` picks a request's LongRoPE table and prefix variant, so only
+    ``process_prompt`` sets it: the data worker drops a client's value for every model."""
+    from mstar.engine.resources.position.config import MAX_POSITION_KWARG
+
+    config = _deployment(None)
+    sent = _run(_worker(_Model(), config), **{MAX_POSITION_KWARG: 99_999})
+    assert MAX_POSITION_KWARG not in sent
+    model = _Model()
+    model.metadata = {MAX_POSITION_KWARG: 7}
+    sent = _run(_worker(model, config), **{MAX_POSITION_KWARG: 99_999})
+    assert sent[MAX_POSITION_KWARG] == 7
