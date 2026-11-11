@@ -55,6 +55,10 @@ def position_key(array: Array) -> str:
     return f"{array.name.removesuffix('_kv')}_pos" if array.name.endswith("_kv") else "rope"
 
 
+def reads_differ_by_walk(array: Array) -> bool:
+    return any(read.walks is not None for read in array.reads.values())
+
+
 def written_by_step(array: Array) -> frozenset[str]:
     """The fields of a Value's entry that its step writes itself, the ones no update op writes in place."""
     return frozenset(array.entry.tensors.keys() - {field for op in array.updates.values() for field in op.writes})
@@ -237,7 +241,7 @@ def _read_problems(array: Array, walks: Mapping[str, set[str]], combined: set[st
 
 def _combined_walk_problems(array: Array, combined: Mapping[str, Collection[str]]) -> list[str]:
     """A combined walk's rows read by their own walks, and a combined step plans one mask per resource."""
-    if all(read.walks is None for read in array.reads.values()):
+    if not reads_differ_by_walk(array):
         return []
     problems: list[str] = []
     for walk, members in sorted(combined.items()):

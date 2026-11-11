@@ -44,7 +44,7 @@ from mstar.engine.resources.recurrent.config import (
 from mstar.engine.resources.sampler.config import SamplerSpec, SamplerStep, SamplingReqConfig
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
 from mstar.engine.resources.step import Segment, SubmoduleStep
-from mstar.engine.state.analysis import position_key, written_by_step
+from mstar.engine.state.analysis import position_key, reads_differ_by_walk, written_by_step
 from mstar.engine.state.calls import ArrayHandle, SamplerHandle, step_labels
 from mstar.engine.state.contract import (
     EMPTY,
@@ -305,7 +305,7 @@ def node_handles(
     built = {} if built is None else built
     declarations = model.declare_state()
     arrays = [declared for declared in declarations if isinstance(declared, Array)]
-    if any(read.walks is not None for array in arrays for read in array.reads.values()):
+    if any(reads_differ_by_walk(array) for array in arrays):
         setup = replace(setup, walks=Walks(combined=model.get_combined_graph_walks()))
     resolved = _resolve(arrays, setup)
     for declared in declarations:
@@ -1377,7 +1377,7 @@ class PagedStorage(Storage):
             reads, resource_of = self._read_specs(array, _bindings(self, array, setup.by_read))
             resolved.specs[array.name] = [self._pool(array, setup.walks), *reads]
             resolved.resource_of.update(resource_of)
-            if any(read.walks is not None for read in array.reads.values()):
+            if reads_differ_by_walk(array):
                 combined = {
                     walk: members for node in sorted(array.nodes)
                     for walk, members in setup.walks.combined.get(node, EMPTY).items()
