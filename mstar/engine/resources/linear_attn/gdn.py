@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Mapping
+from types import MappingProxyType
 
 import torch
 
@@ -71,6 +72,13 @@ _PREFILL_STATE_DTYPES: dict[int, tuple[torch.dtype, ...]] = {
 class GDNManager(LinearAttnManager):
     # the state is the recurrent pool's, which a drop zeroes
     supports_drop = True
+    # Speculative decoding: walk -> its verify block (k + 1), and the block of the step planned
+    # (None for any other step). A verify step keeps, per layer, what `correct_verify_state` reruns.
+    # Immutable class defaults, rebound rather than mutated, so a node that never verifies sets none.
+    _verify_walks: Mapping[str, int] = MappingProxyType({})
+    _verify_block: int | None = None
+    _cached_verify_block: int | None = None
+    _kept: Mapping[int, VerifyRerun] = MappingProxyType({})
 
     def __init__(
         self,
@@ -128,13 +136,6 @@ class GDNManager(LinearAttnManager):
         # result.
         self._preplanned = False
         self._cached_plan_output: dict[str, GDNWrapper] | None = None
-
-        # Speculative decoding: walk -> its verify block (k + 1), and the block of the step planned
-        # (None for any other step). A verify step keeps, per layer, what `correct_verify_state` reruns.
-        self._verify_walks: dict[str, int] = {}
-        self._verify_block: int | None = None
-        self._cached_verify_block: int | None = None
-        self._kept: dict[int, VerifyRerun] = {}
 
     @staticmethod
     def _check_state_dtype(
@@ -512,7 +513,7 @@ class GDNManager(LinearAttnManager):
         known. Compiles every variant a verify step can reach before the node
         serves; what the kernel can't run, `capabilities` refused."""
         del slack
-        self._verify_walks[walk] = block
+        self._verify_walks = {**self._verify_walks, walk: block}
         if self._device.type == "cuda" and self._verify_kernel_refusal() is None:
             self._warm_verify(block)
 

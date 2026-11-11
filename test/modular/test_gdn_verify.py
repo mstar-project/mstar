@@ -352,7 +352,7 @@ def test_a_verifying_node_needs_a_float32_state():
     pool = RecurrentStatePool.build(pool_spec, EngineResourceInfo(device=CPU))
     # the bf16 pool's own decode checks need FlashInfer's bf16 backend: only the verify check runs here
     manager = GDNManager.__new__(GDNManager)
-    manager._pool, manager.state_dtype, manager._device, manager._verify_walks = pool, torch.bfloat16, CPU, {}
+    manager._pool, manager.state_dtype, manager._device = pool, torch.bfloat16, CPU
     manager._world_size = 1
     caps = manager.capabilities()
     assert "float32" in caps.verify_refusal and caps.async_verify_refusal is None
