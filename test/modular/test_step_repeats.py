@@ -84,7 +84,7 @@ def test_ready_rows_wait_only_for_the_one_run_owed(ready_waits, walks, repeats, 
 
 def test_a_device_run_starts_with_only_real_rows_live_and_keeps_a_column_an_iteration():
     state = RunState(4, 3, {2}, torch.device("cpu"))
-    state.stage(2, [False, True], limit=3)
+    state.stage((7, 8), [False, True], 3, None)
     assert state.marks.tolist() == [False, False, True, True], "padding rows start stopped"
     assert (state.continuation.item(), state.limit.item(), state.immune.tolist()) == (1, 3, [False, True, False, False])
 
@@ -95,6 +95,48 @@ def test_a_device_run_starts_with_only_real_rows_live_and_keeps_a_column_an_iter
     results = state.results(3, ("new_token",))
     assert results["new_token"][:2, :2].tolist() == [[5, 7], [6, 8]]
     assert state.index.item() == 2
+
+
+@pytest.mark.parametrize("rows, seeded", [
+    ((7, 8), [True, False]),
+    ((8, 7), [False, False]),  # moved
+    ((7,), [False]),  # one left
+    ((7, 8, 9), [False, False, False]),  # one joined
+])
+def test_a_device_run_after_a_run_of_its_rows_starts_with_that_runs_marks(rows, seeded):
+    """A step speculated past a row's stop ends once the rest stop, whatever the
+    model samples after one; rows that moved, left or joined start unmarked."""
+    before, run = (RunState(4, 3, {2}, torch.device("cpu")) for _ in range(2))
+    before.stage((7, 8), [False, False], 3, None)
+    before.marks[0] = True  # the run's kernel saw request 7 stop
+
+    run.stage(rows, [False] * len(rows), 3, before)
+    want = seeded + [True] * (4 - len(rows))
+    assert run.marks.tolist() == want, "a stopped row keeps its mark, padding rows theirs"
+    run.stage(rows, [False] * len(rows), 3, run)
+    assert run.marks.tolist() == want, "a slot after its own run keeps its marks"
+    run.stage(rows, [False] * len(rows), 3, None)
+    assert run.marks.tolist() == [False] * len(rows) + [True] * (4 - len(rows)), "no step before: unmarked"
+
+
+@pytest.mark.parametrize("ceiling", [1, 8])
+def test_only_a_step_that_repeats_continues_the_run_before_it(ceiling):
+    """A step that repeats runs every row of N one iteration on in N's Loop, so a
+    row N saw stop is one it drops; any other step, the first of a Loop that
+    starts again for the same request included, starts from no marks."""
+    from mstar.worker.speculation import Speculator
+
+    speculator = Speculator.__new__(Speculator)
+    speculator._consecutive = 1
+    speculator._step_repeats = SimpleNamespace(ceiling=lambda *args: ceiling)
+    ctx = SimpleNamespace(repeats=1, continues=None)
+    speculation = SimpleNamespace(
+        scheduled_batch=SimpleNamespace(node_name=NODE, graph_walk=WALK), node_batch=SimpleNamespace(step_context=ctx),
+    )
+    pending = SimpleNamespace(node_batch=SimpleNamespace(step_context=SimpleNamespace(repeats=8)))
+
+    speculator._stamp_repeats(speculation, pending, owes_run=False)
+    assert ctx.continues is (pending.node_batch.step_context if ceiling > 1 else None)
 
 
 def test_a_device_run_that_ended_short_settles_its_width_before_anything_reads_it():
@@ -145,7 +187,7 @@ def test_a_capture_another_walk_replays_is_refused_at_load_for_a_device_run():
 def test_a_slot_with_a_device_run_never_replays_unstaged():
     """A walk that shares the capture of an asked walk gets its WHILE graph but
     no stop policy: it must fail, not replay on the last run's device state."""
-    ctx = SimpleNamespace(graph_walk="alias", resident=None, repeats=1)
+    ctx = SimpleNamespace(graph_walk="alias", resident=None, repeats=1, continues=None)
     batch = SimpleNamespace(step_context=ctx, preplan_event=None)
     run = SimpleNamespace(stage=lambda *args: None)
     runner = SimpleNamespace(slot_run=lambda lease: run, run_forward=lambda *args, **kwargs: BatchedModelOutput())
@@ -259,7 +301,7 @@ def test_the_link_libraries_are_looked_for_next_to_nvrtc_before_the_toolkit(
 def test_the_stop_kernel_links_to_sass_and_marks_the_rows_that_sampled_a_stop_id():
     """``load_kernels`` compiles for the device's arch and links with nvJitLink, with no JIT of PTX by the driver."""
     state = RunState(3, 4, {2}, torch.device("cuda"))
-    state.stage(3, [False] * 3, limit=4)
+    state.stage((0, 1, 2), [False] * 3, 4, None)
     stream = torch.cuda.current_stream().cuda_stream
     cuda = CudaWhile()
 
@@ -270,3 +312,55 @@ def test_the_stop_kernel_links_to_sass_and_marks_the_rows_that_sampled_a_stop_id
     cuda.stop(state, torch.tensor([2, 2, 2], device="cuda"), stream)
     torch.cuda.synchronize()
     assert (state.marks.tolist(), state.index.item(), state.continuation.item()) == ([True] * 3, 2, 0)
+
+
+class _CudaRun:
+    """A captured WHILE run of ``bs`` rows whose every row samples stop id 2 once
+    ``stop_at`` iterations have run (never while it is 0), and 1 before."""
+
+    def __init__(self, bs: int, stop_at: torch.Tensor):
+        from mstar.engine.device_run import WhileGraph
+
+        cuda = CudaWhile()
+        cuda.load_kernels()
+        self.state = RunState(bs, 8, {2}, torch.device("cuda"))
+        self.counter = torch.zeros(1, dtype=torch.long, device="cuda")
+        child, side = torch.cuda.CUDAGraph(keep_graph=True), torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.graph(child, stream=side):
+            self.counter.add_(1)
+            token = torch.where(self.counter == stop_at, 2, 1).repeat(bs)
+            self.state.keep_token(token)
+            cuda.stop(self.state, token, torch.cuda.current_stream().cuda_stream)
+        self.graph = WhileGraph(cuda, child, self.state.continuation, lambda: torch.cuda.current_stream().cuda_stream)
+
+    def replay(self) -> None:
+        self.counter.zero_()
+        self.graph.replay()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="captures and launches a WHILE run")
+def test_a_device_run_ends_once_every_row_stopped_and_the_next_step_of_its_rows_after_one_iteration():
+    """A run whose rows all sample a stop at iteration k reads ``index`` k + 1. The
+    step staged straight after it (no host sync: speculated) for the same rows
+    ends after one iteration, though its model never samples a stop; one for
+    other rows runs to its limit."""
+    stop_at = torch.zeros(1, dtype=torch.long, device="cuda")
+    first, second = _CudaRun(3, stop_at), _CudaRun(3, stop_at)
+    rows, k = (7, 8), 2
+
+    stop_at.fill_(k + 1)
+    first.state.stage(rows, [False, False], 8, None)
+    first.replay()
+    stop_at.fill_(0)
+    second.state.stage(rows, [False, False], 8, first.state)
+    second.replay()
+    torch.cuda.synchronize()
+    assert first.state.index.item() == k + 1
+    assert first.state.results(k + 1, ("t",))["t"][:2].tolist() == [[1] * k + [2]] * 2
+    assert second.state.index.item() == 1
+
+    first.state.stage((8, 9), [False, False], 8, second.state)
+    first.replay()
+    torch.cuda.synchronize()
+    assert first.state.index.item() == 8

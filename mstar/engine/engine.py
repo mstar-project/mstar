@@ -2373,15 +2373,19 @@ class Engine:
         ``release_event`` is set as late as possible before the call that drops
         the GIL — the replay, or the submodule forward on the eager path."""
         graph_walk = batch.step_context.graph_walk
+        # read here, once the step this one continues has run its forward and holds its lease
+        before, batch.step_context.continues = batch.step_context.continues, None
         if lease is not None:
             ctx = batch.step_context
             if ctx.resident is not None:
                 ctx.resident.flush(ctx.resident_plan)
             run = cg_runner.slot_run(lease)
             if run is not None:
+                lease_before = None if before is None else before.slot_lease
+                previous = None if lease_before is None else cg_runner.slot_run(lease_before)
                 run.stage(
-                    len(request_ids), self._ignore_eos(submodule_mgmt, graph_walk, engine_inputs, request_ids),
-                    ctx.repeats,
+                    request_ids, self._ignore_eos(submodule_mgmt, graph_walk, engine_inputs, request_ids),
+                    ctx.repeats, previous,
                 )
             out = cg_runner.run_forward(
                 lease, preprocessed,

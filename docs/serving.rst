@@ -442,6 +442,8 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        not named keeps its own token path. A step isn't rewound for a row that stopped inside it.
        ``device_stop: true`` launches each step once, as a WHILE node that ends on the device when every
        row has stopped (needs CUDA 12.4 or later, and ``libnvJitLink`` with ``libcudadevrt.a`` from one CUDA release: torch's pip wheels, else the toolkit at ``CUDA_HOME`` or ``/usr/local/cuda``).
+       A step that repeats and keeps the last run's rows in their order starts from that run's stops,
+       so one launched past every row's stop ends after one iteration.
    * - ``batch_builder``
      - *(optional, default* ``fifo`` *)* How the worker composes a step under a token
        budget (``max_batch_tokens``). ``fifo`` serves prompts in the order they started:

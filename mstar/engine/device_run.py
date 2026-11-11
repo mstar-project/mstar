@@ -77,10 +77,12 @@ class RunAsk(NamedTuple):
 
 
 class RunState:
-    """A capture slot's run, on the device. ``marks``: a row's stop in this
-    run, padding rows set, so an earlier EOS doesn't end it. ``tokens``: one
-    column an iteration, outside the capture's memory pool, where the next
-    iteration's scratch would land on them."""
+    """A capture slot's run, on the device. ``marks``: a row's stop, padding
+    rows set. A mark is set only on a token the host stops the row's Loop on,
+    so the step that continues the run's rows in their places starts with
+    them: one speculated past every row's stop ends after one iteration.
+    ``tokens``: one column an iteration, outside the capture's memory pool,
+    where the next iteration's scratch would land on them."""
 
     def __init__(self, bs: int, limit: int, stop_ids: Collection[int], device: torch.device):
         self.index = torch.zeros(1, dtype=torch.long, device=device)
@@ -90,13 +92,20 @@ class RunState:
         self.marks = torch.zeros(bs, dtype=torch.bool, device=device)
         self.tokens = torch.empty(bs, limit, dtype=torch.long, device=device)
         self.stop_ids = torch.tensor(sorted(stop_ids), dtype=torch.long, device=device)
-        self._rows = torch.arange(bs, device=device)
+        self._positions = torch.arange(bs, device=device)
         self._immune_stager = PinnedStager(torch.bool, numel=bs)
         self._staged: tuple | None = None
+        # the request ids of the step staged last, in row order
+        self.rows: tuple = ()
 
-    def stage(self, real: int, immune: Sequence[bool], limit: int) -> None:
+    def stage(self, rows: Sequence, immune: Sequence[bool], limit: int, previous: RunState | None) -> None:
         """Before the launch, on its stream. A staged value keeps its address:
-        the graph reads it."""
+        the graph reads it. ``rows``: the step's request ids, in row order.
+        ``previous``: the run of the step this one continues
+        (``StepContext.continues``), or None. If it was staged for these rows
+        in these places, they start with its marks (a device copy, after that
+        run in stream order: no host sync), else unmarked."""
+        real = len(rows)
         self.index.zero_()
         self.continuation.fill_(1)
         key = (real, tuple(immune), limit)
@@ -104,7 +113,13 @@ class RunState:
             self._staged = key
             self.limit.fill_(limit)
             self._immune_stager.copy_(self.immune, immune, pad_value=False)
-        torch.ge(self._rows, real, out=self.marks)
+        rows = tuple(rows)
+        same = previous is not None and previous.rows == rows
+        if not (same and previous is self):
+            torch.ge(self._positions, real, out=self.marks)
+            if same:
+                self.marks[:real].copy_(previous.marks[:real])
+        self.rows = rows
 
     def keep_token(self, token: torch.Tensor) -> None:
         """Inside the body: this iteration's token column."""
