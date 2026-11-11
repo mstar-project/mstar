@@ -495,7 +495,7 @@ def test_glimmer_samples_and_loops_back_off_its_resources():
         ),
         ATTN_FULL: SimpleNamespace(select_last_hidden=lambda x: x[-1:]),
     })
-    rows, logits = llm._forward("prefill_text", engine_inputs)
+    rows, logits = llm._forward("prefill_text", engine_inputs)["new_token"]
     assert rows == ["r"] and torch.equal(logits, hidden[-1:]), "a prefill feeds the head each row's last token"
     assert llm.loopback_tokens(engine_inputs).tolist() == [9]
 
