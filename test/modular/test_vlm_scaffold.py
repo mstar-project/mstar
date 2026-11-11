@@ -12,7 +12,7 @@ import torch
 from mstar.conductor.request_info import FINAL_PREFILL, WalkStep
 from mstar.graph.base import Parallel
 from mstar.model.components.sampled_token_decoder import MEDIA_EMBEDS, MEDIA_MASK
-from mstar.model.keys import MIXED, ROPE, SAMPLER
+from mstar.model.keys import KV_CACHE, MIXED, ROPE, SAMPLER
 from mstar.model.multimodal import (
     MEDIA_LAYOUT,
     MediaEncoder,
@@ -167,11 +167,11 @@ def test_a_media_prompt_hands_its_advance_and_ids_to_the_resources():
         for n, advance in ((10, 6), (4, 4))
     ]
     step = llm.declare_step("prefill_vision", [0, 1], rows)
-    assert step.steps[ROPE].advance == (6, 4)
-    assert step.steps[SAMPLER].prefill_tracked_tokens[0] is rows[0].input_ids
+    assert step.state[KV_CACHE].advance == (6, 4)
+    assert step.state[SAMPLER].prompt_tokens[0] is rows[0].input_ids
     # a mixed step never carries media rows
     assert llm.declare_step(MIXED, [0], [ARNodeInputs(input_seq_len=1, input_ids=torch.tensor([1]))]) \
-        .steps[ROPE].advance is None
+        .state[KV_CACHE].advance is None
 
 
 def test_a_padded_media_step_moves_no_position_for_its_padding_rows():
@@ -196,7 +196,7 @@ def test_a_padded_media_step_moves_no_position_for_its_padding_rows():
     runner._buckets = {bucket: SimpleNamespace(config=config)}
     padded = runner.pad_inputs(SlotLease(slot=0, bucket=bucket), rows)
     step = llm.declare_step("prefill_vision", [0, 1, 2, 3], padded)
-    assert step.steps[ROPE].advance == (6, 4, 5, 0)
+    assert step.state[KV_CACHE].advance == (6, 4, 5, 0)
 
 
 def test_a_media_row_pads_with_the_captures_rows_on_the_device():
@@ -208,7 +208,7 @@ def test_a_media_row_pads_with_the_captures_rows_on_the_device():
     device = torch.device("meta")  # a device other than the host, as an accelerator is
     llm = _qwen_llm()
     llm.prompt_positions = lambda start, layout, n: (None, None)
-    llm.node_resources = {ROPE: SimpleNamespace(position=lambda rid, label: 0)}
+    llm.next_position = lambda rid_handle: 0
     (config,) = [
         c for c in llm.get_accelerator_graph_configs(device) if c.capture_graph_walk == "prefill_vision"
     ]
@@ -229,7 +229,7 @@ def test_a_media_row_with_the_wrong_row_count_fails_its_request():
     starts = []
     llm.prompt_positions = lambda start, layout, n: starts.append(start) or (None, None)
     # the stream's counter is keyed by the worker's handle, not the wire id
-    llm.node_resources = {ROPE: SimpleNamespace(position=lambda rid, label: {(7, "main"): 5}[rid, label])}
+    llm.kv = SimpleNamespace(positions=SimpleNamespace(position=lambda rid, label: {(7, "main"): 5}[rid, label]))
     ids = torch.tensor([1, AUDIO_PAD, AUDIO_PAD])
     layout = {"offset": [1], "tokens": [2], "output": ["audio_embeds"], "grid": [[]]}
     fwd_info = SimpleNamespace(request_id="r", rid_handle=7, step_metadata={MEDIA_LAYOUT: layout})
@@ -253,7 +253,7 @@ def test_encoders_sharing_a_placeholder_take_their_rows_from_the_layout(tile):
     tiles = MediaEncoder("tile", "tile_encoder", ("tile_values",), "tile_embeds")
     llm = _qwen_llm((VISION, AUDIO, tiles))
     llm.prompt_positions = lambda start, layout, n: (None, None)
-    llm.node_resources = {ROPE: SimpleNamespace(position=lambda rid, label: 0)}
+    llm.next_position = lambda rid_handle: 0
     unk = 0
     ids = torch.tensor([1, unk, unk, 2, unk, 3, unk])
     layout = {"offset": [1, 4, 5, 6], "tokens": [2, 1, 0, 1],
@@ -365,7 +365,10 @@ def test_qwen_media_capture_stages_every_media_buffer():
     llm = _qwen_llm(model=SimpleNamespace(
         embed_dtype=torch.bfloat16, model=SimpleNamespace(build_cos_sin=build_cos_sin),
     ))
-    llm.node_resources = {ROPE: SimpleNamespace(pos_ids=lambda label: torch.arange(8192))}
+    llm.kv = SimpleNamespace(
+        _check_open=lambda call: None, label="main",
+        positions=SimpleNamespace(pos_ids=lambda label: torch.arange(8192)),
+    )
     (config,) = [
         c for c in llm.get_accelerator_graph_configs(torch.device("cpu"))
         if c.capture_graph_walk == "prefill_vision"
@@ -389,6 +392,71 @@ def test_the_forward_reads_only_tensors_from_preprocess():
 # ---------------------------------------------------------------------------
 # Muse Glimmer on the scaffolds
 # ---------------------------------------------------------------------------
+
+
+def _glimmer_llm():
+    from mstar.model.muse.submodules import LLMSubmodule
+
+    model = SimpleNamespace(embed_dtype=torch.bfloat16)
+    return LLMSubmodule(model, SimpleNamespace(hidden_size=8, stop_token_ids=()), (VISION,))
+
+
+def test_glimmer_writes_its_steps_by_hand_on_the_scaffolds_default():
+    from mstar.engine.resources.position.config import PositionStep
+    from mstar.engine.resources.sampler.config import SamplerStep
+    from mstar.model.muse.config import ATTN_FULL
+    from mstar.model.submodule_base import ARNodeInputs
+
+    step = _glimmer_llm().declare_step(
+        "prefill_vision", [0], [ARNodeInputs(input_seq_len=4, input_ids=torch.arange(4), resource_step_info=3)],
+    )
+    assert not step.state, "Muse Glimmer has no handles to expand a declared step"
+    assert isinstance(step.steps[SAMPLER], SamplerStep) and isinstance(step.steps[ROPE], PositionStep)
+    assert step.steps[ROPE].advance == (3,) and ATTN_FULL in step.steps
+
+
+def test_glimmer_samples_and_loops_back_off_its_resources():
+    from mstar.model.muse.config import ATTN_FULL
+
+    hidden = torch.arange(6.0).reshape(3, 2)
+
+    class _Decoder:
+        def embed(self, ids):
+            return hidden
+
+        def __call__(self, embeds, label):
+            return embeds
+
+        def logits(self, x):
+            return x
+
+    llm = _glimmer_llm()
+    llm.model = _Decoder()
+    engine_inputs = SimpleNamespace(request_ids=["r"], resources={
+        SAMPLER: SimpleNamespace(
+            loopback_tokens=lambda rids: torch.tensor([9]) if rids == ["r"] else None,
+            sample=lambda rids, logits: (rids, logits),
+        ),
+        ATTN_FULL: SimpleNamespace(select_last_hidden=lambda x: x[-1:]),
+    })
+    rows, logits = llm._forward("prefill_text", engine_inputs)
+    assert rows == ["r"] and torch.equal(logits, hidden[-1:]), "a prefill feeds the head each row's last token"
+    assert llm.loopback_tokens(engine_inputs).tolist() == [9]
+
+
+def test_glimmer_reads_its_position_off_its_resource():
+    llm = _glimmer_llm()
+    llm.node_resources = {ROPE: SimpleNamespace(position=lambda rid, label: {(7, "main"): 5}[rid, label])}
+    assert llm.next_position(7) == 5
+
+
+def test_glimmer_encoder_reads_its_segment_ceiling_off_its_resource():
+    from mstar.model.keys import VISION_ATTN
+    from mstar.model.muse.submodules import VisionEncoderSubmodule
+
+    encoder = VisionEncoderSubmodule(torch.nn.Linear(1, 1), SimpleNamespace(), "vision_embeds")
+    encoder.node_resources = {VISION_ATTN: SimpleNamespace(max_segments_per_step=2)}
+    assert encoder._fits_replay(16, 2) and not encoder._fits_replay(16, 3), "a YAML override should hold"
 
 
 def test_glimmer_encoder_declares_windows_and_frames():

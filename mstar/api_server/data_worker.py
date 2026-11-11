@@ -49,6 +49,7 @@ from mstar.distributed.base import node_group_axis_sizes
 from mstar.engine.resources.kv.config import KVSpec, prefix_caches_by_rank
 from mstar.engine.resources.kv.keys import PageItem, chain, end_key, fingerprint, page_items
 from mstar.engine.resources.lora.config import LORA_ADAPTER_KWARG
+from mstar.engine.state.adapters import kv_layouts
 from mstar.model.base import (
     ClientChunk,
     Model,
@@ -973,8 +974,8 @@ class PreprocessWorkerThread:
         # only this worker knows which client streams the opening leaves open.
         internal = getattr(self.model, "INTERNAL_KWARGS", ())
         for name in (
-            "prefix_keys", "prefix_tail", "prefix_decode", "kv_layout", "prefix_root", "stream_lead_items",
-            "open_streams", *internal,
+            "prefix_keys", "prefix_tail", "prefix_decode", "kv_layout", "state_layout", "keyed_spans", "prefix_root",
+            "stream_lead_items", "open_streams", *internal,
         ):
             model_kwargs.pop(name, None)
         open_streams = self._client_edges - input.ends
@@ -995,7 +996,12 @@ class PreprocessWorkerThread:
                 prompt_tensors = prompt_tensors.new_input_tensors
             if prompt_tensors:
                 tensors.update(prompt_tensors)
-            layouts = model_kwargs.pop("kv_layout", {})
+            state_layout = model_kwargs.pop("state_layout", None)
+            keyed_spans = model_kwargs.pop("keyed_spans", {})
+            layouts = (
+                model_kwargs.pop("kv_layout", {}) if state_layout is None
+                else kv_layouts(self._declarations, state_layout, keyed_spans)
+            )
             num_prompt_tokens = self.model.prompt_tokens(tensors, layouts)
             rows = {
                 key: {label: layout.row() for label, layout in by_label.items()}
@@ -1289,6 +1295,12 @@ class PreprocessWorkerThread:
                 request_id=request_id, inputs=[], request_info=None, partition_name=partition,
                 producer_done={CLIENT}, producer_done_items=counts,
             )))
+
+    @cached_property
+    def _declarations(self) -> list:
+        """Built once, since a prompt on this thread holds up the API server's GIL, and building them on each prompt
+        took a tenth of Qwen3.5's one-token throughput."""
+        return self.model.declare_state()
 
     @cached_property
     def _item_limits(self) -> dict[str, ClientStreamLimits]:
