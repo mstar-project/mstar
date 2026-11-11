@@ -19,8 +19,8 @@ complex product itself: its rounding is the device's complex multiply (fused mul
 CUDA), which no one real-arithmetic formula reproduces on every device.
 
 On CUDA the elementwise work between the GEMMs runs as fused kernels (``kernels``) that round where
-the eager ops do: the q/k norms with the rotation, the modulation and the gated residuals. The
-output is bit-identical to the eager ops (the CPU path), in a fraction of the memory traffic.
+the eager ops do: the q/k norms with the rotation, the LayerNorms with the modulation after them (the
+attention's gated residual too) and the gated residuals. The output is bit-identical to the eager ops (the CPU path), in a fraction of the memory traffic.
 
 Linears are tensor-parallel (``comm_group``): q/k/v and the MLP's first linear split by
 column, the attention outputs and the MLP's second by row; the modulation linears stay whole.
@@ -300,6 +300,27 @@ def _gated_add(x: torch.Tensor, gate: torch.Tensor, y: torch.Tensor, split: int)
     return _by_token(lambda t, u, g: t + g * u, split, (x, y), (gate,))
 
 
+def _norm_modulate(norm: nn.LayerNorm, x: torch.Tensor, params: torch.Tensor, split: int):
+    """:func:`_modulate` of ``norm(x)``, in one pass where the kernel takes ``x``."""
+    if kernels.fits(x, params) and kernels.norm_fits(x):
+        shift, scale, gate = (p.contiguous() for p in params.chunk(3, dim=-1))
+        return kernels.norm_modulate(x, 1 + scale, shift, split, norm.eps), gate
+    return _modulate(norm(x), params, split)
+
+
+def _gated_norm_modulate(
+    x: torch.Tensor, gate: torch.Tensor, y: torch.Tensor, norm: nn.LayerNorm, params: torch.Tensor, split: int,
+):
+    """``r = _gated_add(x, gate, y)`` and ``_modulate(norm(r), params)``: ``(r, modulated, next gate)``, from one
+    read of ``x`` and ``y`` where the kernel takes them."""
+    if kernels.fits(x, gate, y, params) and kernels.norm_fits(x) and y.is_contiguous():
+        shift, scale, next_gate = (p.contiguous() for p in params.chunk(3, dim=-1))
+        residual, out = kernels.gated_norm_modulate(x, gate, y, 1 + scale, shift, split, norm.eps)
+        return residual, out, next_gate
+    residual = _gated_add(x, gate, y, split)
+    return (residual, *_modulate(norm(residual), params, split))
+
+
 class QwenImageBlock(nn.Module):
     """``QwenImageTransformerBlock``."""
 
@@ -328,15 +349,13 @@ class QwenImageBlock(nn.Module):
         txt_mod1, txt_mod2 = self.txt_mod(txt_temb).chunk(2, dim=-1)
         txt_split = txt.shape[1]
 
-        img_in, img_gate1 = _modulate(self.img_norm1(img), img_mod1, split)
-        txt_in, txt_gate1 = _modulate(self.txt_norm1(txt), txt_mod1, txt_split)
+        img_in, img_gate1 = _norm_modulate(self.img_norm1, img, img_mod1, split)
+        txt_in, txt_gate1 = _norm_modulate(self.txt_norm1, txt, txt_mod1, txt_split)
         img_attn, txt_attn = self.attn(img_in, txt_in, layout, txt_freqs, attend)
-        img = _gated_add(img, img_gate1, img_attn, split)
-        txt = _gated_add(txt, txt_gate1, txt_attn, txt_split)
 
-        img_in, img_gate2 = _modulate(self.img_norm2(img), img_mod2, split)
+        img, img_in, img_gate2 = _gated_norm_modulate(img, img_gate1, img_attn, self.img_norm2, img_mod2, split)
         img = _gated_add(img, img_gate2, self.img_mlp(img_in), split)
-        txt_in, txt_gate2 = _modulate(self.txt_norm2(txt), txt_mod2, txt_split)
+        txt, txt_in, txt_gate2 = _gated_norm_modulate(txt, txt_gate1, txt_attn, self.txt_norm2, txt_mod2, txt_split)
         txt = _gated_add(txt, txt_gate2, self.txt_mlp(txt_in), txt_split)
         return img, txt
 
@@ -352,6 +371,8 @@ class _AdaNormOut(nn.Module):
 
     def forward(self, x: torch.Tensor, temb: torch.Tensor) -> torch.Tensor:
         scale, shift = self.linear(self.silu(temb).to(x.dtype)).chunk(2, dim=1)
+        if kernels.fits(x, shift) and kernels.norm_fits(x):
+            return kernels.norm_modulate(x, (1 + scale).contiguous(), shift.contiguous(), x.shape[1], self.norm.eps)
         return self.norm(x) * (1 + scale)[:, None, :] + shift[:, None, :]
 
 

@@ -208,14 +208,17 @@ def test_rope_rounds_as_the_reference(device):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="the fused kernels run on CUDA")
 @pytest.mark.parametrize("zero_cond_t", [True, False])
 def test_the_fused_kernels_round_as_the_eager_ops(zero_cond_t, monkeypatch):
-    """On CUDA the q/k norms with the rotation, the modulation and the gated residuals run as fused kernels. They
-    round where the eager ops do, so a bf16 forward is the eager forward (and so the reference's) bit for bit."""
+    """On CUDA the q/k norms with the rotation, the LayerNorms with the modulation, and the gated residuals run as
+    fused kernels. They round where the eager ops do (the LayerNorm's statistics in torch's own order), so a bf16
+    forward is the eager forward (and so the reference's) bit for bit."""
     from mstar.model.components.diffusion.attention import joint_attention
     from mstar.model.components.diffusion.qwen import dit_kernels as kernels
     from mstar.model.qwen_image.components.transformer import QwenStepLayout, apply_rope, qwen_rope_tables
 
-    config = QwenImageTransformerConfig(**{**TINY, "attention_head_dim": 128, "axes_dims_rope": (16, 56, 56)},
-                                        zero_cond_t=zero_cond_t)
+    # four 128-wide heads: a 512-wide model, the narrowest the LayerNorm kernel takes
+    config = QwenImageTransformerConfig(
+        **{**TINY, "attention_head_dim": 128, "num_attention_heads": 4, "axes_dims_rope": (16, 56, 56)},
+        zero_cond_t=zero_cond_t)
     torch.manual_seed(0)
     dit = QwenImageTransformer(config).eval()
     with torch.no_grad():
@@ -243,6 +246,19 @@ def test_the_fused_kernels_round_as_the_eager_ops(zero_cond_t, monkeypatch):
     x = torch.randn(40, 3, 128, generator=g).to("cuda", torch.bfloat16)
     want = apply_rope(attn.norm_q(x[None]), layout.img_freqs)[0]
     assert torch.equal(kernels.qk_norm_rope(x, attn.norm_q.weight, layout.img_freqs, attn.norm_q.eps), want)
+    # the served width (3072) on rows far from zero mean (the statistics' order shows), an odd token count
+    block = dit.transformer_blocks[0]
+    x = (torch.randn(2, 37, 3072, generator=g) * 4 + 30).to("cuda", torch.bfloat16)
+    y = torch.randn(2, 37, 3072, generator=g).to("cuda", torch.bfloat16)
+    gate, params = (torch.randn(4, n, generator=g).to("cuda", torch.bfloat16) for n in (3072, 3 * 3072))
+    norm = torch.nn.LayerNorm(3072, elementwise_affine=False, eps=block.img_norm2.eps)
+    shift, scale, next_gate = (p.contiguous() for p in params.chunk(3, dim=-1))
+    residual = kernels.gated_add(x, gate, y, 16)
+    want = kernels.modulate(norm(residual), 1 + scale, shift, 16)
+    assert all(map(torch.equal, kernels.gated_norm_modulate(x, gate, y, 1 + scale, shift, 16, norm.eps),
+                   (residual, want)))
+    assert torch.equal(kernels.norm_modulate(x, 1 + scale, shift, 16, norm.eps),
+                       kernels.modulate(norm(x), 1 + scale, shift, 16))
 
 
 def _vaes():

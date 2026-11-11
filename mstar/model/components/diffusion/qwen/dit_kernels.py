@@ -15,6 +15,14 @@ the callers run the eager ops (``fits``).
 * :func:`modulate`: ``x * (1 + scale) + shift`` with two parameter sets along the tokens (``zero_cond_t``: the
   target's tokens take the step's, the references' timestep 0's), one pass instead of the per-token select.
 * :func:`gated_add`: ``x + gate * y``, the same two parameter sets.
+* :func:`norm_modulate`: ``modulate(LayerNorm(x))`` (no affine), and :func:`gated_norm_modulate`: the residual
+  ``r = x + gate * y`` and ``modulate(LayerNorm(r))`` from one read of ``x`` and ``y``. The statistics are PyTorch's
+  ``vectorized_layer_norm_kernel`` (torch 2.12.1, a bf16 row of D % 512 == 0): one row per 128 threads, thread t
+  holding the 4-wide vectors t, t + 128, ...; an online Welford over its values in order, ``mean += delta * (1/n)``
+  and ``m2 += delta * (v - mean)`` contracted to FMAs; then the warp's shuffle-down tree (16, 8, 4, 2, 1) and the
+  four warps' tree (2, 1) of ``cuWelfordCombine(own, other)``; ``var = m2 / D`` and ``rstd = rsqrt(var + eps)``;
+  ``y = rstd * (x - mean)``. Both reciprocal and divide are correctly rounded there (no fast math), so here too
+  (``tl.div_rn``). A torch that changes its LayerNorm kernel breaks the CUDA test, not the output's correctness.
 
 Every launch turns Triton's fp fusion off: with it on, the compiler folds a bf16 round trip between a multiply and
 an add into one fused multiply-add, which drops the rounding the eager ops make there.
@@ -116,6 +124,76 @@ if triton is not None:
         gate = _params(gate_ptr, rows_per_set, row, token, split, D, col, mask)
         gy = (gate * y).to(tl.bfloat16).to(tl.float32)
         tl.store(o_ptr + tok * D + col, (x + gy).to(tl.bfloat16), mask=mask)
+
+
+    @triton.jit
+    def _welford(mean, m2, v, n: tl.constexpr):
+        # cuWelfordOnlineSum: the n-th value of each lane
+        delta = v - mean
+        mean = tl.fma(delta, tl.div_rn(1.0, tl.full([], n, tl.float32)), mean)
+        return mean, tl.fma(delta, v - mean, m2)
+
+    @triton.jit
+    def _welford_halves(mean, m2, n: tl.constexpr, count: tl.constexpr):
+        # [R, 2n] -> [R, n]: cuWelfordCombine(own = [:, :n], other = [:, n:]), ``count`` values on each side
+        mo, mx = tl.split(tl.permute(tl.reshape(mean, (mean.shape[0], 2, n)), (0, 2, 1)))
+        so, sx = tl.split(tl.permute(tl.reshape(m2, (m2.shape[0], 2, n)), (0, 2, 1)))
+        c = tl.full([], count, tl.float32)
+        share = c * tl.div_rn(1.0, c + c)
+        delta = mo - mx
+        return tl.fma(share, mx, share * mo), tl.fma(delta * delta * c, share, sx + so)
+
+    @triton.jit
+    def _norm_modulate_kernel(x_ptr, gate_ptr, y_ptr, r_ptr, scale1p_ptr, shift_ptr, o_ptr, L, rows_per_set, split,
+                              eps, D: tl.constexpr, GATED: tl.constexpr):
+        tok = tl.program_id(0).to(tl.int64)          # one row of D per program, as torch's one row per block
+        row, token = tok // L, tok % L
+        base = tok * D
+        lane = 4 * tl.arange(0, 128)[:, None] + tl.arange(0, 4)[None, :]  # [128 threads, 4 values]
+        ones = lane >= 0
+        mean = tl.zeros((128,), tl.float32)
+        m2 = tl.zeros((128,), tl.float32)
+        for j in tl.static_range(D // 512):
+            col = 512 * j + lane
+            if GATED:
+                x = tl.load(x_ptr + base + col).to(tl.float32)
+                gy = (_params(gate_ptr, rows_per_set, row, token, split, D, col, ones)
+                      * tl.load(y_ptr + base + col).to(tl.float32)).to(tl.bfloat16).to(tl.float32)
+                r = (x + gy).to(tl.bfloat16)
+                tl.store(r_ptr + base + col, r)
+                v = r.to(tl.float32)
+            else:
+                v = tl.load(x_ptr + base + col).to(tl.float32)
+            e0, e1 = tl.split(tl.reshape(v, (128, 2, 2)))
+            v0, v2 = tl.split(e0)
+            v1, v3 = tl.split(e1)
+            mean, m2 = _welford(mean, m2, v0, 4 * j + 1)
+            mean, m2 = _welford(mean, m2, v1, 4 * j + 2)
+            mean, m2 = _welford(mean, m2, v2, 4 * j + 3)
+            mean, m2 = _welford(mean, m2, v3, 4 * j + 4)
+        # thread t = 32 * warp + lane: each warp's tree, then the warps'
+        per = D // 128
+        mean, m2 = tl.reshape(mean, (4, 32)), tl.reshape(m2, (4, 32))
+        mean, m2 = _welford_halves(mean, m2, 16, per)
+        mean, m2 = _welford_halves(mean, m2, 8, 2 * per)
+        mean, m2 = _welford_halves(mean, m2, 4, 4 * per)
+        mean, m2 = _welford_halves(mean, m2, 2, 8 * per)
+        mean, m2 = _welford_halves(mean, m2, 1, 16 * per)
+        mean, m2 = tl.reshape(mean, (1, 4)), tl.reshape(m2, (1, 4))
+        mean, m2 = _welford_halves(mean, m2, 2, 32 * per)
+        mean, m2 = _welford_halves(mean, m2, 1, 64 * per)
+        rstd = tl.math.rsqrt(tl.div_rn(m2, tl.full([], D, tl.float32)) + eps)
+        if GATED:
+            tl.debug_barrier()  # the residual this program stored is read back below
+        src = r_ptr if GATED else x_ptr
+        for j in tl.static_range(D // 512):
+            col = 512 * j + lane
+            v = tl.load(src + base + col).to(tl.float32)
+            normed = (rstd * (v - mean)).to(tl.bfloat16).to(tl.float32)
+            scale1p = _params(scale1p_ptr, rows_per_set, row, token, split, D, col, ones)
+            m = (normed * scale1p).to(tl.bfloat16).to(tl.float32)
+            shift = _params(shift_ptr, rows_per_set, row, token, split, D, col, ones)
+            tl.store(o_ptr + base + col, (m + shift).to(tl.bfloat16))
 
 
 def fits(*tensors: torch.Tensor) -> bool:
@@ -229,3 +307,48 @@ def gated_add(x: torch.Tensor, gate: torch.Tensor, y: torch.Tensor, split: int) 
 @gated_add.register_fake
 def _(x, gate, y, split):
     return torch.empty_like(x)
+
+
+def norm_fits(x: torch.Tensor) -> bool:
+    """Whether :func:`norm_modulate` / :func:`gated_norm_modulate` take ``x``: a contiguous ``[R, L, D]`` with
+    ``D % 512 == 0`` (torch's vectorized LayerNorm then gives every thread the same number of values)."""
+    return x.dim() == 3 and x.is_contiguous() and x.shape[-1] % 512 == 0
+
+
+def _norm_modulate_launch(x, gate, y, residual, scale1p, shift, out, split, eps, gated: bool):
+    rows, length, dim = x.shape
+    _norm_modulate_kernel[(rows * length,)](
+        x, gate, y, residual, scale1p, shift, out, length, rows, split, eps, D=dim, GATED=gated,
+        num_warps=4, enable_fp_fusion=False,
+    )
+
+
+@torch.library.custom_op("mstar::qwen_image_norm_modulate", mutates_args=())
+def norm_modulate(x: torch.Tensor, scale1p: torch.Tensor, shift: torch.Tensor, split: int, eps: float) -> torch.Tensor:
+    """``modulate(layer_norm(x, eps), scale1p, shift, split)``: no affine, ``x`` as :func:`norm_fits` takes, the
+    parameters as :func:`modulate`'s."""
+    out = torch.empty_like(x)
+    _norm_modulate_launch(x, x, x, x, scale1p, shift, out, split, eps, gated=False)
+    return out
+
+
+@norm_modulate.register_fake
+def _(x, scale1p, shift, split, eps):
+    return torch.empty_like(x)
+
+
+@torch.library.custom_op("mstar::qwen_image_gated_norm_modulate", mutates_args=())
+def gated_norm_modulate(
+    x: torch.Tensor, gate: torch.Tensor, y: torch.Tensor, scale1p: torch.Tensor, shift: torch.Tensor, split: int,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``r = gated_add(x, gate, y, split)`` and ``norm_modulate(r, scale1p, shift, split, eps)``, returned as
+    ``(r, out)``; ``y`` contiguous as ``x``."""
+    residual, out = torch.empty_like(x), torch.empty_like(x)
+    _norm_modulate_launch(x, gate, y, residual, scale1p, shift, out, split, eps, gated=True)
+    return residual, out
+
+
+@gated_norm_modulate.register_fake
+def _(x, gate, y, scale1p, shift, split, eps):
+    return torch.empty_like(x), torch.empty_like(x)
