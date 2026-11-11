@@ -1632,8 +1632,9 @@ class ARNodeSubmodule(NodeSubmodule):
     ) -> "VerifyResult":
         """A verify step of speculative decoding, in the engine's order
         (`draft_verify_step`): ``input_ids`` ``[n]`` are each row's last
-        emitted token, ``target`` maps the block's ids ``[n * (k + 1)]`` to
-        logits, and the node's drafter proposes. The sampler is the one the
+        emitted token, ``target`` maps the block's ids ``[n * (k + 1)]`` to a
+        `TargetOutput` (its logits, and its hidden states for a drafter that
+        reads them), and the node's drafter proposes. The sampler is the one the
         engine bound (`bind_draft`). Traced with the forward, so the target
         and the drafter compile with it; the sampler's ``agree`` and
         ``verify`` are out of the graph, as ``sample`` is."""

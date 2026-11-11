@@ -796,6 +796,61 @@ def test_the_engine_stores_the_carry_through_prompt_and_verify_steps_that_declar
         assert engine_step(sub, **kwargs).steps["sampler"].loopback_writes == {DRAFT_CARRY}
 
 
+def _reads_hidden():
+    from spec_toy import _CarryDrafter
+
+    class ReadsHidden(_CarryDrafter):
+        def __init__(self, k):
+            super().__init__(k)
+            self.needs = self.needs._replace(target_hidden=True)
+
+    return ReadsHidden
+
+
+def test_a_drafter_that_reads_hidden_states_refuses_a_target_that_returns_none():
+    eng = engine(3, _reads_hidden())
+    with pytest.raises(RuntimeError, match="the target returned none"):
+        _decode_with_accepted(eng, 3)
+
+
+def test_a_verify_target_that_returns_bare_logits_is_refused():
+    """A bare tensor would unpack along its rows: with one request and k = 1 its two rows become
+    logits and hidden states."""
+    from spec_toy import _CarryDrafter
+
+    eng = engine(1, _CarryDrafter)
+    sub = eng._submodules[NODE].submodule
+    target = sub._target
+
+    def bare(engine_inputs, ids):
+        out = target(engine_inputs, ids)
+        return out.logits if engine_inputs.step.ctx.graph_walk == "decode" else out
+
+    sub._target = bare
+    with pytest.raises(TypeError, match="returns a TargetOutput, not Tensor"):
+        _decode_with_accepted(eng, 1)
+
+
+def test_a_recurrent_pool_past_the_samplers_carry_rows_is_logged(monkeypatch, caplog):
+    import logging
+
+    from mstar.engine.engine import Engine
+    from mstar.engine.resources.recurrent.config import RecurrentBlockConfig, RecurrentStateConfig
+    from mstar.engine.resources.recurrent.pool import RecurrentStatePool
+    from mstar.utils import knobs
+
+    monkeypatch.setattr(knobs, "sampler_slots", lambda: 4)
+    pool = RecurrentStatePool.__new__(RecurrentStatePool)
+    pool.config = RecurrentStateConfig(
+        num_layers=1, blocks={"state": RecurrentBlockConfig((2,), torch.float32)}, max_slots=8,
+    )
+    mgmt = SimpleNamespace(resources={"gdn_state": pool})
+    decl, sampler = SimpleNamespace(node=NODE), SimpleNamespace(fixed_loopback_masters=True)
+    with caplog.at_level(logging.WARNING):
+        Engine._check_carry_rows(Engine.__new__(Engine), decl, sampler, mgmt)
+    assert any("'gdn_state' holds" in r.getMessage() and "carry rows 4" in r.getMessage() for r in caplog.records)
+
+
 def test_a_drafter_that_reads_the_targets_hidden_states_observes_what_the_target_returned():
     """``DrafterNeeds.target_hidden``: a verify step's target returns its hidden states in its
     `TargetOutput`, and ``observe`` gets them."""
@@ -819,11 +874,11 @@ def test_a_drafter_that_reads_the_targets_hidden_states_observes_what_the_target
     target, returned = sub._target, []
 
     def with_hidden(engine_inputs, ids):
-        logits = target(engine_inputs, ids)
+        out = target(engine_inputs, ids)
         if engine_inputs.step.ctx.graph_walk != "decode":
-            return logits
-        returned.append(logits.clone())
-        return TargetOutput(logits, returned[-1])
+            return out
+        returned.append(out.logits.clone())
+        return TargetOutput(out.logits, returned[-1])
 
     sub._target = with_hidden
     out, _ = _decode_with_accepted(eng, k)

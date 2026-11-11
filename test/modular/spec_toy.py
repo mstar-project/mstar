@@ -204,7 +204,7 @@ class ToyLM(ARNodeSubmodule):
             return {"ids": torch.cat([inp.input_ids.reshape(-1) for inp in inputs])}
         return {"ids": self.loopback_inputs(engine_inputs, inputs)["input_ids"]}
 
-    def _target(self, engine_inputs, ids: torch.Tensor) -> torch.Tensor:
+    def _target(self, engine_inputs, ids: torch.Tensor) -> TargetOutput:
         """Write ``ids`` to the KV cache, then each row's logits: a one-hot at
         its next token, which reads the cache up to and including itself."""
         kv, rope = engine_inputs.resources["kv"], engine_inputs.resources["rope"]
@@ -217,7 +217,7 @@ class ToyLM(ARNodeSubmodule):
             before = view.length - view.to_compute
             sums.append(seen.cumsum(0)[before:])
         token = next_token(ids, positions[: ids.numel()], torch.cat(sums))
-        return torch.nn.functional.one_hot(token, VOCAB).float() * 20.0
+        return TargetOutput(torch.nn.functional.one_hot(token, VOCAB).float() * 20.0)
 
     def forward(self, graph_walk, engine_inputs, ids, **kwargs):
         return self.forward_batched(graph_walk, engine_inputs, ids, **kwargs)
@@ -227,7 +227,7 @@ class ToyLM(ARNodeSubmodule):
         kv = engine_inputs.resources["kv"]
         kv._current_plan_outputs_for_toy = engine_inputs.step.ctx.plan_results["kv"]["main"].views
         if graph_walk == "prefill":
-            logits = self._target(engine_inputs, ids)
+            logits = self._target(engine_inputs, ids).logits
             ends = torch.tensor([v.to_compute for v in _views(kv)]).cumsum(0) - 1
             # main's sampler draws on an accelerator only; the prompt step is greedy here
             tokens = logits[ends].argmax(-1)
@@ -240,11 +240,7 @@ class ToyLM(ARNodeSubmodule):
                 per_rid_outputs={rid: {"new_token": [tokens[i: i + 1]]} for i, rid in enumerate(rids)},
             )
         n = len(rids)
-        def target(block):
-            out = self._target(engine_inputs, block)
-            return out if isinstance(out, TargetOutput) else TargetOutput(out)
-
-        result = self.draft_verify_step(engine_inputs, ids.view(n), target)
+        result = self.draft_verify_step(engine_inputs, ids.view(n), lambda block: self._target(engine_inputs, block))
         return self.verify_output(result)
 
 

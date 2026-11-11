@@ -1835,7 +1835,7 @@ What the model writes, and nothing more:
   its verify walk, the sampler that verifies, ``k`` and ``block``. The node's hooks ask
   ``is_verify_walk(graph_walk)``.
 - Its forward makes one call, ``self.draft_verify_step(engine_inputs, input_ids, target)``,
-  with ``target(ids) -> logits`` over the block's ``n * (k + 1)`` ids, and returns
+  with ``target(ids) -> TargetOutput(logits, hidden=None)`` over the block's ``n * (k + 1)`` ids, and returns
   ``self.verify_output(result)``: ``result.tokens`` per row under ``TokenStop.buffer`` plus
   ``VERIFY_TOKENS`` and ``VERIFY_ACCEPTED`` in ``check_stop_buffers``.
 - A drafter that reads the target's residual stream declares a ``TapSpec`` and names its key in
