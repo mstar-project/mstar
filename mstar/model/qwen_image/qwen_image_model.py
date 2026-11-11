@@ -96,8 +96,8 @@ class QwenImageModel(Model):
         self.skip_weight_loading = skip_weight_loading
         self.attention_backend = attention_backend
         # EXPERIMENTAL torch.compile per transformer block (static but for the text axis) and the VAE's encoder and
-        # decoder (dynamic): not bit-exact; on the perf runs it failed the fp32 yardstick on p5, served slower than
-        # the fused-kernel eager path, and recompiled the DiT on the first batched step. Off by default.
+        # decoder (dynamic): not bit-exact; on the perf runs it failed the fp32 yardstick on one prompt, served
+        # slower than the fused-kernel eager path, and recompiled the DiT on the first batched step. Off by default.
         self.compile = bool(compile)
         # the largest output a request may ask for: the attention is quadratic in it
         self.max_image_area = int(max_image_area)
