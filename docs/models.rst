@@ -669,10 +669,14 @@ In either mode its arrivals run inside its verify steps (mixed
 prompt-plus-verify steps, up to four prompts and a captured ladder of up to
 512 prompt tokens past the verify rows a step; ``max_batch_tokens`` for
 ``LLM``/``mixed`` bounds them), so an arrival holds no decode row.
-Its prompts prefill in chunks of 8192
-tokens a step (the serving config's ``max_batch_tokens`` for ``LLM`` sets
-another budget, null none), so a wave of long prompts runs as several steps
-rather than one; a plain Qwen3 node prefills each prompt whole.
+Its prompts prefill in chunks. Since its prompts run under the mixed walk, a
+step's tokens, verify blocks and prompt chunks together, stay within the mixed
+budget, 128 verify blocks plus 512 tokens (1,536 at DSpark's ``k = 7``),
+whether the step holds verify rows or not; asynchronously that budget is also
+capped at the widest captured mixed bucket (see :doc:`serving`). So a long
+prompt prefills over several steps. The ``LLM`` node's own 8192-token budget
+applies only where it runs no mixed steps (a drafter that doesn't declare
+them). A plain Qwen3 node prefills each prompt whole.
 Startup refuses a drafter whose KV heads, head size, hidden size,
 vocabulary or dtype differ from the target's, or that reads a layer the target
 lacks. ``mode: auto`` runs asynchronously where FA3's paged kernel serves the
