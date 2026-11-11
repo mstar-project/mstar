@@ -24,7 +24,8 @@ _preplan_taken, _reserved}, KDAManager._verifying and RollingKVManager.{_request
 _admit_taken, _wants, _reserved}
 (purged by remove_request), ResidentPlanner.{_slot_of, _stale, _moved} (purged by
 release), SamplerCells._cells and SamplerResource._sampled_rids (purged by the
-sampler's remove_request), and WorkerProfileInfo.
+sampler's remove_request), RopeManager._counters and LongRopeManager._long_rids (purged by their
+remove_request), and WorkerProfileInfo.
 
 Lockstep's follow count is the one deliberate exception: a
 ScheduleTPNode can arrive before the NEW_REQUEST that mints the handle, so it

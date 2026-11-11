@@ -1192,6 +1192,12 @@ class LoraAdapterPool(Resource):
         # each plan stages its addressing into a buffer a replay reads
         return True
 
+    def resident_refusal(self) -> str | None:
+        # never holds a node back: its addressing comes from the step's segments and
+        # this pool's own slots, not from a plan a resident step skips, so a resident
+        # step plans it on the host as any other (memoized for a steady batch)
+        return None
+
     # Engine lifecycle
 
     def cleanup(self):

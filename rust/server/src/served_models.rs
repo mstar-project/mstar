@@ -2,7 +2,11 @@
 //! `api_server/served_models.py`'s `ServedModels` reads them: the base model's
 //! name (or its checkpoint repo) runs the base model, and with LoRA on (a
 //! `resources: lora:` block in the serving config) an adapter's name runs that
-//! adapter. The launcher passes the lists in `MSTAR_SERVED_MODELS`.
+//! adapter. The launcher passes the lists in `MSTAR_SERVED_MODELS`; the API
+//! server pushes the adapters over the bridge after every runtime load or
+//! unload (`ServedModels.subscribe`), so selection needs no round trip.
+
+use std::sync::RwLock;
 
 use serde::Deserialize;
 use serde_json::{Map, Value};
@@ -13,28 +17,79 @@ use crate::adapters::py_value_repr;
 /// (`LORA_ADAPTER_KWARG`).
 const LORA_ADAPTER_KWARG: &str = "lora_adapter";
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Deserialize)]
+struct Launched {
+    base: Vec<String>,
+    #[serde(default)]
+    adapters: Vec<String>,
+    #[serde(default)]
+    lora: bool,
+}
+
+#[derive(Debug, Default)]
 pub struct ServedModels {
     /// Names that select the base model: the config's model name and its checkpoint repo.
-    pub base: Vec<String>,
-    /// The served adapters, in the config's order (`/v1/models` lists them so).
-    #[serde(default)]
-    pub adapters: Vec<String>,
-    #[serde(default)]
-    pub lora: bool,
+    base: Vec<String>,
+    /// The served adapters, in the order the API server holds them (`/v1/models`
+    /// lists them so): the config's, then runtime loads.
+    adapters: RwLock<Vec<String>>,
+    /// LoRA on (a `lora:` block, or adapters at launch), as `ServedModels.lora`.
+    lora: bool,
+}
+
+/// One request's view of the served adapters.
+struct Snapshot<'a> {
+    served: &'a ServedModels,
+    adapters: Vec<String>,
 }
 
 impl ServedModels {
+    pub fn new(base: Vec<String>, adapters: Vec<String>, lora: bool) -> Self {
+        let lora = lora || !adapters.is_empty();
+        ServedModels { base, adapters: RwLock::new(adapters), lora }
+    }
+
     /// `MSTAR_SERVED_MODELS`, or the base model alone (no LoRA) when unset.
     pub fn from_env(model_name: &str) -> Self {
         match std::env::var("MSTAR_SERVED_MODELS").ok().filter(|s| !s.is_empty()) {
-            Some(json) => serde_json::from_str(&json).expect("MSTAR_SERVED_MODELS is a served-models object"),
-            None => ServedModels { base: vec![model_name.to_string()], adapters: Vec::new(), lora: false },
+            Some(json) => {
+                let l: Launched = serde_json::from_str(&json).expect("MSTAR_SERVED_MODELS is a served-models object");
+                ServedModels::new(l.base, l.adapters, l.lora)
+            }
+            None => ServedModels::new(vec![model_name.to_string()], Vec::new(), false),
         }
     }
 
+    /// The API server's served adapters after a change (the bridge's `served` push).
+    pub fn set_adapters(&self, adapters: Vec<String>) {
+        *self.adapters.write().unwrap() = adapters;
+    }
+
+    fn snapshot(&self) -> Snapshot<'_> {
+        Snapshot { served: self, adapters: self.adapters.read().unwrap().clone() }
+    }
+
+    /// `select`: put the adapter the request runs under in `model_kwargs`, the one
+    /// its `model` names or its `lora_adapter` kwarg, each checked; both, naming
+    /// different adapters, is refused. Returns that adapter, `None` for the base
+    /// model. A refusal is the 400's text.
+    pub fn select(&self, requested: Option<&str>, model_kwargs: &mut Map<String, Value>) -> Result<Option<String>, String> {
+        self.snapshot().select(requested, model_kwargs)
+    }
+
+    /// `/v1/models`' cards: the base model, then each adapter naming it as its parent.
+    pub fn cards(&self, model_name: &str, created: i64) -> Value {
+        let mut data = vec![serde_json::json!({"id": model_name, "object": "model", "created": created, "owned_by": "mstar"})];
+        data.extend(self.snapshot().adapters.iter().map(|name| {
+            serde_json::json!({"id": name, "object": "model", "created": created, "owned_by": "mstar", "parent": model_name})
+        }));
+        serde_json::json!({"object": "list", "data": data})
+    }
+}
+
+impl Snapshot<'_> {
     fn lora_on(&self) -> bool {
-        self.lora || !self.adapters.is_empty()
+        self.served.lora
     }
 
     /// `adapter_for`: the adapter a request's `model` names; `None` runs the base
@@ -44,7 +99,7 @@ impl ServedModels {
         let Some(requested) = requested.filter(|r| !r.is_empty()) else {
             return Ok(None);
         };
-        if !self.lora_on() || self.base.iter().any(|b| b == requested) {
+        if !self.lora_on() || self.served.base.iter().any(|b| b == requested) {
             return Ok(None);
         }
         self.check(&Value::from(requested))?;
@@ -66,11 +121,7 @@ impl ServedModels {
         ))
     }
 
-    /// `select`: put the adapter the request runs under in `model_kwargs`, the one
-    /// its `model` names or its `lora_adapter` kwarg, each checked; both, naming
-    /// different adapters, is refused. Returns that adapter, `None` for the base
-    /// model. A refusal is the 400's text.
-    pub fn select(&self, requested: Option<&str>, model_kwargs: &mut Map<String, Value>) -> Result<Option<String>, String> {
+    fn select(&self, requested: Option<&str>, model_kwargs: &mut Map<String, Value>) -> Result<Option<String>, String> {
         let adapter = self.adapter_for(requested)?;
         let explicit = model_kwargs.get(LORA_ADAPTER_KWARG).filter(|v| !v.is_null()).cloned();
         let Some(explicit) = explicit else {
@@ -91,15 +142,6 @@ impl ServedModels {
         }
         Ok(explicit.as_str().map(str::to_string))
     }
-
-    /// `/v1/models`' cards: the base model, then each adapter naming it as its parent.
-    pub fn cards(&self, model_name: &str, created: i64) -> Value {
-        let mut data = vec![serde_json::json!({"id": model_name, "object": "model", "created": created, "owned_by": "mstar"})];
-        data.extend(self.adapters.iter().map(|name| {
-            serde_json::json!({"id": name, "object": "model", "created": created, "owned_by": "mstar", "parent": model_name})
-        }));
-        serde_json::json!({"object": "list", "data": data})
-    }
 }
 
 #[cfg(test)]
@@ -107,7 +149,7 @@ mod tests {
     use super::*;
 
     fn served() -> ServedModels {
-        ServedModels { base: vec!["qwen".into(), "Qwen/Qwen3.5-0.8B".into()], adapters: vec!["sql".into(), "chat".into()], lora: true }
+        ServedModels::new(vec!["qwen".into(), "Qwen/Qwen3.5-0.8B".into()], vec!["sql".into(), "chat".into()], true)
     }
 
     #[test]
@@ -137,6 +179,19 @@ mod tests {
         );
         // without LoRA, `model` is not read
         let mut mk = Map::new();
-        assert_eq!(ServedModels { base: vec!["qwen".into()], ..Default::default() }.select(Some("x"), &mut mk), Ok(None));
+        assert_eq!(ServedModels::new(vec!["qwen".into()], Vec::new(), false).select(Some("x"), &mut mk), Ok(None));
+    }
+
+    #[test]
+    fn a_pushed_set_is_what_requests_select_from() {
+        let served = served();
+        served.set_adapters(vec!["chat".into(), "new".into()]);
+        let mut mk = Map::new();
+        assert_eq!(served.select(Some("new"), &mut mk), Ok(Some("new".into())));
+        assert_eq!(
+            served.select(Some("sql"), &mut Map::new()),
+            Err("unknown LoRA adapter 'sql'; this deployment serves ['chat', 'new']".to_string())
+        );
+        assert_eq!(served.cards("qwen", 0)["data"].as_array().unwrap().len(), 3);
     }
 }
