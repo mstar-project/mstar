@@ -2,9 +2,10 @@
 built from config alone, and the module it builds on a worker."""
 from __future__ import annotations
 
+from abc import abstractmethod
 from typing import TYPE_CHECKING, Protocol
 
-from mstar.engine.resources.draft.drafter import Drafter, DrafterDecl
+from mstar.engine.resources.draft.drafter import Drafter, DrafterDecl, PrefillInputs
 
 if TYPE_CHECKING:
     import torch
@@ -14,8 +15,10 @@ if TYPE_CHECKING:
 
 
 class HostedDrafter(Drafter, Protocol):
-    def prefill(self, engine_inputs, input_ids: torch.Tensor, sampled: torch.Tensor | None = None) -> None:
-        """Its state over a prompt step's rows, after the target's forward wrote what it reads."""
+    @abstractmethod
+    def prefill(self, inputs: PrefillInputs) -> torch.Tensor | None:
+        """Its state over a prompt step's rows, after the target's forward wrote what it reads.
+        A hosted drafter runs its own stack over the prompt, so it has to say what it keeps."""
         ...
 
 

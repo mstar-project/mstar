@@ -21,7 +21,3 @@ class Qwen3LMSubmodule(DeclaredTokenDecoder):
         # locations are planned by the resources. An uncaptured node has no resident
         # step, so a draft block's `mode: auto` verifies synchronously.
         return frozenset({self.DECODE_WALK}) if self.accelerator_graph else frozenset()
-
-    def after_prompt_rows(self, engine_inputs, input_ids, hidden, embeds, tokens, decoder_kwargs, tensors) -> None:
-        # the drafter's K/V of the prompt, from the taps the target just wrote
-        self.drafter.prefill(engine_inputs, input_ids, tokens)

@@ -2044,13 +2044,13 @@ declares a chunking budget for the mixed step drops it itself while drafting:
 The node passes ``drafter`` to ``SampledTokenDecoder.__init__``; ``k`` is the engine's to bind
 (``NodeSubmodule.bind_draft``). The
 scaffold then captures and declares ``k + 1`` rows a decode step, runs no mixed capture,
-declares the verify step and runs it through ``draft_verify_step``. On resources the step is
+declares the verify step and runs it through ``draft_verify_step``, and after each prompt step
+samples it calls the drafter's ``prefill(PrefillInputs)``. On resources the step is
 ``verify_layer_steps()``, ``layer_steps()`` with each attention on its verify kernel; a
 ``DeclaredTokenDecoder`` declares its array and sampler (``SampleStep(apply_penalty=False)``),
 the engine marks the verify (``drafter_step``), and ``draft_verify_step`` counts the sampler's
 verify as the step's draw. The scaffold hands a drafter that reads taps its ``TapResource``
-(``decoder_kwargs``). What stays the node's: ``after_prompt_rows`` (the drafter's pass over each
-prompt step, after it samples), called only with a drafter.
+(``decoder_kwargs``), called only with a drafter.
 
 **Drafter resources.** A drafter is declared from config alone (``DrafterDecl``): its
 ``needs`` and ``node_resources(nodes)``, the resources it adds to the node (DSpark's attention
