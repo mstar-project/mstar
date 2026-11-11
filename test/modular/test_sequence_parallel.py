@@ -627,6 +627,16 @@ def test_a_shard_that_never_splits_plans_every_step_copied():
         assert ragged._kwargs["num_qo_heads"] == (1 if splits else 2)
 
 
+def test_a_rows_share_comes_back_row_major():
+    """Wan2.2's patchified stream is channel-major. Eager pointwise ops keep their first input's
+    layout, so a strided share would run every block's norms and residual adds strided."""
+    shard = _shard(labels=("main",), axis=1)
+    full = torch.randn(2, 4, 10).transpose(1, 2)  # [B, S, D], channel-major
+    _split(shard, _rows("main", 10))
+    share = shard.scatter("main", full)
+    assert share.is_contiguous() and torch.equal(share, full[:, :5])
+
+
 # --- the recurrent resources on a split step -----------------------------------------------------
 
 LINEAR_SLOTS = 12

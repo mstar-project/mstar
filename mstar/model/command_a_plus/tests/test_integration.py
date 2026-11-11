@@ -271,7 +271,8 @@ class ModelIntegrationTests(unittest.TestCase):
         self.model._tokenizer = tokenizer
         # Room for the default output cap, which counts toward max_seq_len.
         self.model.max_seq_len = MAX_OUTPUT_TOKENS + 8
-        tensors, metadata = self.model.process_prompt("hello", ["text"], ["text"])
+        prompt = self.model.process_prompt("hello", ["text"], ["text"])
+        tensors, metadata = prompt.new_input_tensors, prompt.metadata
         self.assertEqual(tensors["text_inputs"][0].tolist(), [2, 10, 11])
         layout = metadata["state_layout"]["kv_cache"]["main"]
         self.assertEqual([span.length for span in layout.spans], [3])
@@ -319,9 +320,10 @@ class ModelIntegrationTests(unittest.TestCase):
         photos = [torch.rand(3, 40, 60), torch.rand(3, 20, 20)]
         parts = [PromptPart(modality="image", index=0), PromptPart(modality="text", text="hi"),
                  PromptPart(modality="image", index=1)]
-        result, metadata = self.model.process_prompt(
+        prompt = self.model.process_prompt(
             None, ["image", "text", "image"], ["text"], tensors={"image_inputs": photos}, prompt_parts=parts,
         )
+        result, metadata = prompt.new_input_tensors, prompt.metadata
         self.assertEqual(tokenizer.apply_chat_template.call_args.args[0], [{"role": "user", "content": [
             {"type": "image", "image": ""}, {"type": "text", "text": "hi"}, {"type": "image", "image": ""},
         ]}])

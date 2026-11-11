@@ -565,9 +565,12 @@ class SequenceShard(Resource):
 
     def scatter(self, label: str, *xs: torch.Tensor | None, dim: int | None = None, walk: str | None = None):
         """This rank's share of each of ``xs`` (whole on every rank) along ``dim`` (the spec's
-        axis by default), when this step splits ``label`` (``SeqRange.local``); the inputs
-        unchanged otherwise.
-        One tensor in, one out; several in, a tuple out. None passes through.
+        axis by default), when this step splits ``label`` (``SeqRange.local``), contiguous; the inputs
+        unchanged otherwise. One tensor in, one out; several in, a tuple out. None passes through.
+
+        Contiguous because eager pointwise ops keep their first input's layout: a view of a
+        channel-major stream (Wan2.2's patchified latents) would carry that layout through every
+        block's norms and residual adds.
 
         ``walk``, the step's walk where the caller's frame is compiled per walk: a walk the shard
         never splits (outside ``walks``) traces straight through, as at one SP rank, rather than
@@ -602,7 +605,7 @@ class SequenceShard(Resource):
         dim = self.axis if dim is None else dim
         if scatter:
             self._scattered.add(label)
-            out = tuple(None if x is None else r.local(x, dim) for x in xs)
+            out = tuple(None if x is None else r.local(x, dim).contiguous() for x in xs)
         else:
             self._scattered.discard(label)
             out = tuple(None if x is None else r.whole(x, dim) for x in xs)

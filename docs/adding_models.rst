@@ -153,6 +153,40 @@ You must implement these abstract methods:
    separately. :mod:`mstar.model.multimodal` turns either into the prefill plan
    that ``process_prompt`` and the schedule builder both work from.
 
+``walk_plan(self, partition_name, input_modalities, output_modalities, input_signals, model_kwargs) -> list[WalkStep]``
+   The walks a partition runs for this request, in order, as
+   :class:`mstar.model.base.WalkStep` s; ``[]`` when the request doesn't use the
+   partition. A prefill-decode model returns
+   ``[WalkStep("prefill"), WalkStep("decode", bind={"text_inputs": "new_token"})]``.
+   The conductor derives each step's input edges from the walk's graph: every external
+   and loop-back input that no stream feeds gets the persisted signal of its own name,
+   the one ``bind`` names, or an empty edge (a denoise loop's seed, a chunk loop's tick).
+   A persisted tensor a step reads is released when the step is sent, unless a later step
+   of some partition reads it with no walk of that partition persisting the name in
+   between; anything else stays held until the request ends. ``step_metadata`` carries
+   request constants to every node of the step's walk. The step that samples the reply's
+   first token, the last prefill before decode, sets ``FINAL_PREFILL`` (from
+   ``mstar.conductor.request_info``) in its step metadata; ``media_prefill_step`` does
+   this for a ``MultimodalDecoderModel``.
+   A step whose walk a stream feeds and that runs no Loop but chunk loops runs once per
+   chunk until the worker reports the stream's final chunk, its inputs' tensors sent with
+   the first chunk only; any other step advances when its walk reports, and the partition
+   is done after its last step. A ``ValueError`` here refuses the request with a 400, and
+   so does a plan of ``[]`` for every partition (nothing would ever run). A plan the
+   conductor can't run is a model bug, refused with a 500: a step whose walk is not one of
+   its partition's, a ``bind`` key that is not an input of the step's walk, a step after
+   one that runs once per chunk (only the stream's end, which ends the partition, moves
+   past it), or a later step whose walk takes no input the conductor sends (it moves a
+   worker onto a step only by sending it inputs).
+   In a partition a stream moves (``Connection.consumer_walk``), the stream decides how
+   many passes each step runs, but the conductor moves past a step on its first report
+   when it is the last step (the partition ends) or the next step takes inputs it sends,
+   so such a step must run once (a ``Loop``, say). Such a partition's plan must list every
+   walk the stream can move it to: before the partition's last pass, a report of a walk
+   the plan doesn't run fails the request.
+   Qwen3.5 (through ``MultimodalDecoderModel``), Z-Image, Orpheus and Chatterbox are
+   references.
+
 ``get_submodule(self, node_name, device="cpu", tp_group=None, autocast_dtype=None, moe_parallel=None, cfg_group=None) -> NodeSubmodule | None``
    Build and return the ``NodeSubmodule`` for ``node_name``, and cache the result. Load
    weights here, on ``device``. Return ``None`` for dummy mode.
@@ -613,6 +647,26 @@ can be selected, so every request on one has its root; one that arrives without 
 cached.
 Nothing on the model side is needed for this.
 
+A model that picks a request's adapter itself (Phi-4-multimodal runs an image prompt on
+its ``vision`` adapter and an audio prompt on ``speech``) names the adapters it may pick
+in ``Model.prompt_lora_adapters`` and returns its pick as ``ProcessPromptOutput.lora_adapter``
+(``None`` for the base model; left at ``KEEP_ADAPTER``, the client's choice stands). The
+API server refuses at startup a deployment whose ``resources: lora: adapters:`` block does
+not serve them all. The data worker then gives the request what ``ServedModels.select``
+gives a client that names the adapter: its digest and its root, from the API server's
+``ServedModels``, so runtime loads and unloads apply. An adapter unloaded since startup,
+or one other than the adapter the client named (``None`` included), refuses the request
+with a 400; a pick outside ``prompt_lora_adapters`` is a 500.
+
+A resource whose KV differs per request for the same tokens (a LongRoPE table picked by
+prompt length) says so in ``NodeResourceSpec.prefix_variant(model_kwargs)``: opaque
+bytes, from the same kwargs its ``request_config`` reads, or None. The data worker folds
+every declared spec's variant into the root after any adapter's, in declaration order and
+under the spec's key (``variant_root`` in ``mstar/engine/resources/kv/keys.py``), keys the
+prompt and sends that root on, so generated pages are keyed under it too. Requests share
+pages only under the same variants, and a request whose resources name none keys under the
+root it had.
+
 .. _Step 2a — Declare your state:
 
 Step 2a — Declare your state
@@ -959,6 +1013,18 @@ The spec types are:
        kernel must turn. A model with learned position
        embeddings also declares this spec, because it needs the position counter. Such a
        model never applies RoPE.
+       ``longrope=LongRoPE.from_hf(config)`` (Phi-3, Phi-4-mini) builds a short and a long
+       table, each with its per-dimension factors and attention scale (``LongRopeManager``).
+       A request whose ``MAX_POSITION_KWARG`` (set by ``process_prompt``; the data worker
+       drops a client's value) passes
+       ``original_max_position_embeddings`` rotates with the long one for its whole life,
+       others with the short one. Set it to the length the model's reference picks its table
+       by: the prompt's for Phi-3 and Phi-4, not prompt plus ``max_tokens``. The spec builds the request's config from that kwarg and
+       names the long table in its prefix keys (``PositionSpec.prefix_variant``), so the two
+       cannot disagree. Explicit ``pos_ids`` are refused under it. On resident tables a
+       row keeps its table id's offset beside its position's, both fixed between host
+       steps. A cos/sin table on CUDA needs a ``rotary_dim`` that is a multiple of 32 with NeoX
+       pairing, of 16 with GPT-J pairing (``interleave``).
    * - ``SamplerSpec(vocab_size=..., enable_repetition_penalty=...)``
      - A sampler with its own per-request parameter buffers, philox stream, and optional
        seen-token mask. ``enable_repetition_penalty`` declares a capability, not an
@@ -1595,7 +1661,8 @@ placed exactly as weights are.
   the deployment.
 - **Requests.** Nothing per model. ``LoraSpec.request_config`` opens a request that
   names an adapter in the ``lora_adapter`` kwarg, which the OpenAI ``model`` field maps
-  onto, with a ``LoraReqConfig``, which each node's pool takes; a base-model request
+  onto (or which the model's ``process_prompt`` sets; see **Cross-request prefix
+  reuse**), with a ``LoraReqConfig``, which each node's pool takes; a base-model request
   carries none. The API server refuses, with a 400, an adapter it does not serve
   (``ServedModels``), and the conductor, with a 409, one a runtime load or unload is in
   flight for; an adapter is checked when it is registered (rank within
@@ -3096,7 +3163,9 @@ Splitting is declared in four places:
   treat this rank's share as the whole step, and on any step over KV stored by head, since it would
   pass the TP heads where the pool holds this rank's slice. ``AttentionCallable.norm_rope_attend``
   and ``norm_rope_table_attend``, which fuse the K/V write into the norm/RoPE kernel, skip the fused
-  write and go through the exchange wherever the attention ``splits``. A cacheless self-attention
+  write and go through the exchange wherever the call exchanges
+  (``AttentionManager.step_exchanges(label)``): a label the step splits, and every step over KV
+  stored by head, copied steps too (each rank's head slice). A cacheless self-attention
   that may see split tokens declares
   ``RaggedAttentionSpec(..., sp_exchange="ulysses")`` (the default is ``"none"``); it is a no-op
   on a node with no ``SeqShardSpec``, or one whose sequence shard never splits

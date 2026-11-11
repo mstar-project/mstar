@@ -379,9 +379,10 @@ Read by the ``mstar-server`` binary and its bridge
    * - ``MSTAR_SERVED_MODELS``
      - unset
      - The names a Rust-frontend request's ``model`` may carry, as JSON: the
-       base model's names and the served LoRA adapters
-       (``api_server/served_models.py``, ``rust/server/src/served_models.rs``).
-       Unset serves the base model alone. Not for deployments to set:
+       base model's names and the LoRA adapters served at launch
+       (``api_server/served_models.py``, ``rust/server/src/served_models.rs``);
+       the API server pushes each later change over the bridge. Unset serves
+       the base model alone. Not for deployments to set:
        ``launch_rust_server`` sets it from the API server's ``ServedModels``.
    * - ``MSTAR_TRANSCRIPTION``
      - unset
@@ -475,14 +476,6 @@ Read by the ``mstar-server`` binary and its bridge
        tokenization. Leave unset with the Python backend — its preprocess
        worker owns tokenization, and the bridge rejects pre-tokenized
        ingest.
-
-Rust frontend limitations
-~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-The Rust frontend serves every route the Python frontend serves but LoRA's
-runtime updates (``/v1/load_lora_adapter`` and ``/v1/unload_lora_adapter``, see
-:doc:`models`): ``mstar serve`` refuses ``--rust-frontend`` with
-``runtime_updates: true``.
 
 Request media
 -------------
