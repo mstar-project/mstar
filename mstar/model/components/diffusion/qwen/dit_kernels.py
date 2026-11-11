@@ -144,27 +144,34 @@ if triton is not None:
         return tl.fma(share, mx, share * mo), tl.fma(delta * delta * c, share, sx + so)
 
     @triton.jit
-    def _norm_modulate_kernel(x_ptr, gate_ptr, y_ptr, r_ptr, scale1p_ptr, shift_ptr, o_ptr, L, rows_per_set, split,
-                              eps, D: tl.constexpr, GATED: tl.constexpr):
-        tok = tl.program_id(0).to(tl.int64)          # one row of D per program, as torch's one row per block
+    def _set_params(p_ptr, rows_per_set, row, token, split, D: tl.constexpr, col, mask):
+        # [ROWS] tokens' parameter rows (as _params) at columns col [1, 128, 4] -> [ROWS, 128, 4] fp32
+        prow = tl.where(token < split, row, rows_per_set + row)
+        return tl.load(p_ptr + (prow * D)[:, None, None] + col, mask=mask, other=0.0).to(tl.float32)
+
+    @triton.jit
+    def _norm_modulate_kernel(x_ptr, gate_ptr, y_ptr, r_ptr, scale1p_ptr, shift_ptr, o_ptr, n_tok, L, rows_per_set,
+                              split, eps, D: tl.constexpr, GATED: tl.constexpr, ROWS: tl.constexpr):
+        # ROWS rows of D per program, each reduced as torch reduces one row per block of 128 threads
+        tok = tl.program_id(0).to(tl.int64) * ROWS + tl.arange(0, ROWS).to(tl.int64)
         row, token = tok // L, tok % L
-        base = tok * D
-        lane = 4 * tl.arange(0, 128)[:, None] + tl.arange(0, 4)[None, :]  # [128 threads, 4 values]
-        ones = lane >= 0
-        mean = tl.zeros((128,), tl.float32)
-        m2 = tl.zeros((128,), tl.float32)
+        base = (tok * D)[:, None, None]
+        lane = (4 * tl.arange(0, 128)[:, None] + tl.arange(0, 4)[None, :])[None, :, :]  # [1, 128 threads, 4]
+        mask = (tok < n_tok)[:, None, None] & (lane >= 0)
+        mean = tl.zeros((ROWS, 128), tl.float32)
+        m2 = tl.zeros((ROWS, 128), tl.float32)
         for j in tl.static_range(D // 512):
             col = 512 * j + lane
             if GATED:
-                x = tl.load(x_ptr + base + col).to(tl.float32)
-                gy = (_params(gate_ptr, rows_per_set, row, token, split, D, col, ones)
-                      * tl.load(y_ptr + base + col).to(tl.float32)).to(tl.bfloat16).to(tl.float32)
-                r = (x + gy).to(tl.bfloat16)
-                tl.store(r_ptr + base + col, r)
+                x = tl.load(x_ptr + base + col, mask=mask, other=0.0).to(tl.float32)
+                gy = (_set_params(gate_ptr, rows_per_set, row, token, split, D, col, mask)
+                      * tl.load(y_ptr + base + col, mask=mask, other=0.0).to(tl.float32)).to(tl.bfloat16)
+                r = (x + gy.to(tl.float32)).to(tl.bfloat16)
+                tl.store(r_ptr + base + col, r, mask=mask)
                 v = r.to(tl.float32)
             else:
-                v = tl.load(x_ptr + base + col).to(tl.float32)
-            e0, e1 = tl.split(tl.reshape(v, (128, 2, 2)))
+                v = tl.load(x_ptr + base + col, mask=mask, other=0.0).to(tl.float32)
+            e0, e1 = tl.split(tl.reshape(v, (ROWS, 128, 2, 2)))
             v0, v2 = tl.split(e0)
             v1, v3 = tl.split(e1)
             mean, m2 = _welford(mean, m2, v0, 4 * j + 1)
@@ -173,27 +180,27 @@ if triton is not None:
             mean, m2 = _welford(mean, m2, v3, 4 * j + 4)
         # thread t = 32 * warp + lane: each warp's tree, then the warps'
         per = D // 128
-        mean, m2 = tl.reshape(mean, (4, 32)), tl.reshape(m2, (4, 32))
+        mean, m2 = tl.reshape(mean, (ROWS * 4, 32)), tl.reshape(m2, (ROWS * 4, 32))
         mean, m2 = _welford_halves(mean, m2, 16, per)
         mean, m2 = _welford_halves(mean, m2, 8, 2 * per)
         mean, m2 = _welford_halves(mean, m2, 4, 4 * per)
         mean, m2 = _welford_halves(mean, m2, 2, 8 * per)
         mean, m2 = _welford_halves(mean, m2, 1, 16 * per)
-        mean, m2 = tl.reshape(mean, (1, 4)), tl.reshape(m2, (1, 4))
+        mean, m2 = tl.reshape(mean, (ROWS, 4)), tl.reshape(m2, (ROWS, 4))
         mean, m2 = _welford_halves(mean, m2, 2, 32 * per)
         mean, m2 = _welford_halves(mean, m2, 1, 64 * per)
-        rstd = tl.math.rsqrt(tl.div_rn(m2, tl.full([], D, tl.float32)) + eps)
+        rstd = tl.math.rsqrt(tl.div_rn(m2, tl.full([], D, tl.float32)) + eps)[:, :, None]
+        mean = mean[:, :, None]
         if GATED:
             tl.debug_barrier()  # the residual this program stored is read back below
         src = r_ptr if GATED else x_ptr
         for j in tl.static_range(D // 512):
             col = 512 * j + lane
-            v = tl.load(src + base + col).to(tl.float32)
+            v = tl.load(src + base + col, mask=mask, other=0.0).to(tl.float32)
             normed = (rstd * (v - mean)).to(tl.bfloat16).to(tl.float32)
-            scale1p = _params(scale1p_ptr, rows_per_set, row, token, split, D, col, ones)
-            m = (normed * scale1p).to(tl.bfloat16).to(tl.float32)
-            shift = _params(shift_ptr, rows_per_set, row, token, split, D, col, ones)
-            tl.store(o_ptr + base + col, (m + shift).to(tl.bfloat16))
+            m = (normed * _set_params(scale1p_ptr, rows_per_set, row, token, split, D, col, mask)).to(tl.bfloat16)
+            shift = _set_params(shift_ptr, rows_per_set, row, token, split, D, col, mask)
+            tl.store(o_ptr + base + col, (m.to(tl.float32) + shift).to(tl.bfloat16), mask=mask)
 
 
 def fits(*tensors: torch.Tensor) -> bool:
@@ -315,11 +322,16 @@ def norm_fits(x: torch.Tensor) -> bool:
     return x.dim() == 3 and x.is_contiguous() and x.shape[-1] % 512 == 0
 
 
+# rows per program and warps of the LayerNorm kernels (ln_micro's sweep on an H200, [2, 8192, 3072])
+_LN_ROWS, _LN_WARPS = 1, 4
+
+
 def _norm_modulate_launch(x, gate, y, residual, scale1p, shift, out, split, eps, gated: bool):
     rows, length, dim = x.shape
-    _norm_modulate_kernel[(rows * length,)](
-        x, gate, y, residual, scale1p, shift, out, length, rows, split, eps, D=dim, GATED=gated,
-        num_warps=4, enable_fp_fusion=False,
+    tokens = rows * length
+    _norm_modulate_kernel[(triton.cdiv(tokens, _LN_ROWS),)](
+        x, gate, y, residual, scale1p, shift, out, tokens, length, rows, split, eps, D=dim, GATED=gated,
+        ROWS=_LN_ROWS, num_warps=_LN_WARPS, enable_fp_fusion=False,
     )
 
 
