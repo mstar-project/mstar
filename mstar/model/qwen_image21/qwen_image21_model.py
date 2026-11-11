@@ -161,8 +161,8 @@ class QwenImage21Model(Model):
         self.max_num_pages = int(max_num_pages)
         self.max_batch_size = int(max_batch_size)
         self.accelerator_graph = bool(accelerator_graph)
-        # torch.compile the denoise target's blocks and the VAE's encoder and decoder (not bit-exact: gated
-        # against the fp32 pipeline)
+        # torch.compile the denoise target's blocks and the VAE's decoder (not bit-exact: gated against the fp32
+        # pipeline; the compiled encoder missed more edit cases than eager, so it stays eager)
         self.compile = bool(compile)
         self.capture_sizes = [tuple(int(v) for v in s) for s in (capture_sizes or [[1024, 1024]])]
         self.capture_batch_sizes = [int(b) for b in (capture_batch_sizes or [1, 2, 4])]
@@ -536,7 +536,7 @@ class QwenImage21Model(Model):
                 weight_loader.build_vision_tower(snapshot, device),
             )
         if node_name == VAE_ENCODER_NODE:
-            return QwenImage21VaeEncoderSubmodule(weight_loader.build_vae(snapshot, device), compile=self.compile)
+            return QwenImage21VaeEncoderSubmodule(weight_loader.build_vae(snapshot, device))
         if node_name == VAE_DECODER_NODE:
             return QwenImage21VaeDecoderSubmodule(weight_loader.build_vae(snapshot, device), compile=self.compile)
         if node_name == DIT_NODE:

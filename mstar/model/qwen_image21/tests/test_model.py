@@ -203,31 +203,25 @@ def test_the_cache_free_vae_calls_are_diffusers_encode_and_decode_to_the_bit():
         torch.testing.assert_close(_decode(vae, mode), decoded)
 
 
-def test_the_compiled_vae_regions_serve_other_sizes_without_recompiling():
-    """Each region warmed on its ``compile_regions`` example (the engine compiles it with dynamic=True) must take
-    a live request's input as it comes: a recompile there stalls that request for minutes."""
+def test_the_compiled_vae_decoder_serves_other_sizes_without_recompiling():
+    """The decoder warmed on its ``compile_regions`` example (the engine compiles it with dynamic=True) must take
+    a live request's latents as they come: a recompile there stalls that request for minutes."""
     vae_module = pytest.importorskip("diffusers.models.autoencoders.autoencoder_kl_qwenimage21")
-    from mstar.model.qwen_image21.submodules import (
-        QwenImage21VaeDecoderSubmodule,
-        QwenImage21VaeEncoderSubmodule,
-    )
+    from mstar.model.qwen_image21.submodules import QwenImage21VaeDecoderSubmodule
 
     torch.manual_seed(0)
     vae = vae_module.AutoencoderKLQwenImage21(  # the checkpoint's 64 latent channels and RGBA pixels, one level
         base_dim=4, decoder_base_dim=4, z_dim=64, in_channels=4, out_channels=4, dim_mult=[1, 1],
         temperal_downsample=[False], num_res_blocks=1, latents_mean=[0.0] * 64, latents_std=[1.0] * 64,
     ).eval()
-    r = vae.spatial_compression_ratio
-    encoder, decoder = QwenImage21VaeEncoderSubmodule(vae, compile=True), QwenImage21VaeDecoderSubmodule(vae, True)
-    for sub in (encoder, decoder):
-        for path, examples in sub.compile_regions().items():
-            module = sub.get_submodule(path)
-            module.forward = torch.compile(module.forward, dynamic=True, backend="eager")
-            with torch.no_grad():
-                module.forward(*examples[0])
+    decoder = QwenImage21VaeDecoderSubmodule(vae, True)
+    for path, examples in decoder.compile_regions().items():
+        module = decoder.get_submodule(path)
+        module.forward = torch.compile(module.forward, dynamic=True, backend="eager")
+        with torch.no_grad():
+            module.forward(*examples[0])
     with torch._dynamo.config.patch(error_on_recompile=True):
         for h, w in ((52, 78), (64, 64)):
-            encoder.forward(None, None, image_0=_image(r * w, r * h))
             decoder.forward(None, None, latents=torch.randn(h * w, 64), target=(h, w))
     torch._dynamo.reset()
 
