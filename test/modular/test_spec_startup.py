@@ -526,3 +526,21 @@ def test_a_label_with_its_own_scratch_on_a_verifying_pool_is_refused_and_a_plain
     pool.bind_draft_slack(8)
     with pytest.raises(ValueError, match="not supported yet"):
         _request(scratch=3).apply_spec(pool)
+
+
+def test_a_max_seq_len_override_on_a_verifying_pool_is_the_clients_limit():
+    """The YAML override keeps its meaning: the pool holds the slack past it, and
+    applying the overrides twice (validation, then the worker) changes nothing."""
+    from mstar.engine.resources.spec import apply_yaml_overrides
+
+    pool = KVSpec("kv_cache", {NODE}, PagedKVConfig(num_layers=2, num_kv_heads=2, head_dim=8, max_seq_len=64))
+    pool.bind_draft_slack(8)
+    for _ in range(2):
+        apply_yaml_overrides([pool], {"resources": {"kv_cache": {"max_seq_len": 48}}})
+        assert pool.config.max_seq_len == 56 and pool.request_limit == 48
+    decl = _decl(needs=DrafterNeeds(chunk_boundary=ChunkBoundary.NONE))
+    assert slack_problems([decl], [pool], max_seq_len=48) == []
+    # a plain pool takes the value as written
+    plain = KVSpec("kv_cache", {NODE}, PagedKVConfig(num_layers=2, num_kv_heads=2, head_dim=8, max_seq_len=64))
+    apply_yaml_overrides([plain], {"resources": {"kv_cache": {"max_seq_len": 48}}})
+    assert plain.config.max_seq_len == 48
