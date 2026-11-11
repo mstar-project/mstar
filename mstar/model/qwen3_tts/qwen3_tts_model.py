@@ -43,7 +43,6 @@ from transformers import AutoTokenizer
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import PartitionDefinition
-from mstar.engine.resources import NodeResourceSpec
 from mstar.engine.resources.lora import LoraSpec
 from mstar.engine.state import (
     Array,
@@ -561,7 +560,7 @@ class Qwen3TTSModel(Model):
             exclude={"text_projection": "the prefill projects it in prepare_inputs, outside the planned step"},
         )
 
-    def get_node_resources(self) -> list[NodeResourceSpec]:
+    def get_node_resources(self):
         return [self._lora_spec()]
 
     def kernel_settings(self) -> dict[str, dict[str, Any]]:
