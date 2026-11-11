@@ -803,7 +803,7 @@ def _attention_splits(model):
     return attn.config.splits
 
 
-def test_drafting_turns_off_combined_walks_rebuild_and_the_mixed_split(ckpt):
+def test_drafting_turns_off_combined_walks_and_the_mixed_split_and_the_engine_turns_off_rebuild(ckpt):
     """The model turns off combined walks and the mixed split; it keeps its
     rebuild policy, which the engine leaves out for a verifying node."""
     from mstar.engine.engine import Engine
