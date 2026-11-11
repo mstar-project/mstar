@@ -2768,16 +2768,6 @@ impl GraphRuntime {
                 !self.walk_driven_signals.contains(signal)
                     && self.inline_streams.contains(&(input.node_name.clone(), signal.to_string()))
             });
-        // A stream takes one value a step: a step that repeats has no stream to
-        // a node but its own (`loop_signals` refuses one at load), so its runs
-        // never get here. Refused before any row is routed.
-        if inline_streams && inline_values.iter().flatten().any(|run| run.values().len() != 1) {
-            return Err(PyValueError::new_err(format!(
-                "{}: a streamed {} goes one value a step, and this step ran several",
-                input.node_name,
-                input.inline_signal.as_deref().unwrap_or_default(),
-            )));
-        }
         let mut stream_inline: FxHashMap<(u32, Sym), i64> = FxHashMap::default();
         let logprobs: FxHashMap<u32, f64> = input
             .rids
@@ -3137,7 +3127,20 @@ impl GraphRuntime {
                     && matches!(e.dest, Dest::External(_))
                     && Some(e.name) == inline_sym
                     && !e.persist;
-                let stream_value = if inline_stream { one_value } else { None };
+                // A stream takes one value a step: a step that repeats has no
+                // stream to a node but its own (`loop_signals` refuses one at
+                // load), so its runs never get here.
+                let stream_value = match (inline_stream, one_value) {
+                    (false, _) => None,
+                    (true, Some(value)) => Some(value),
+                    (true, None) => {
+                        return Err(PyValueError::new_err(format!(
+                            "{}: a streamed {} goes one value a step, and this step ran several",
+                            input.node_name,
+                            self.interner.name(e.name),
+                        )))
+                    }
+                };
                 if let Some(value) = stream_value {
                     stream_inline.insert((rid, e.name), value);
                 }

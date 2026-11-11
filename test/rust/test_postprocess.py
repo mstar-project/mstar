@@ -465,3 +465,65 @@ def test_a_repeated_steps_client_tokens_match_one_iteration_a_step(tmp_path, lan
     assert sent["one_a_step"] == (
         {"r0": [(1, 0), (2, 1), (3, 2), (5, 3)], "r1": [(4, 0), (EOS, 1)]}, {"r0": 4, "r1": 2},
     )
+
+
+def test_a_walk_that_repeats_is_not_refused_by_another_walks_stream(tmp_path):
+    """A stream goes one value a step, so a step that streams a signal by value
+    can run one iteration alone. One node whose walk A streams ``SIG`` to
+    another partition and whose walk B loops on itself with ``SIG`` out to the
+    client: B's width-2 step is legal, though the node streams ``SIG`` in A."""
+    stream_walk, loop_walk = "stream", "loop"
+    streamed = WorkerGraph(
+        section=GraphNode(
+            name=NODE, input_names=[SIG],
+            outputs=[GraphEdge(next_node="consumer", name=SIG, is_streaming=True)],
+        ),
+        graph_walks={stream_walk}, ranks=[0], worker_graph_id=0,
+    )
+    consumer = WorkerGraph(
+        section=GraphNode(
+            name="consumer", input_names=[SIG], outputs=[GraphEdge(next_node=EMIT_TO_CLIENT, name="audio")],
+        ),
+        graph_walks={"consume"}, ranks=[0], worker_graph_id=1,
+    )
+    loop = Loop(
+        name=LOOP,
+        section=GraphNode(
+            name=NODE, input_names=[SIG],
+            outputs=[
+                GraphEdge(next_node=NODE, name=SIG),
+                GraphEdge(next_node=EMIT_TO_CLIENT, name=SIG, output_modality="text"),
+            ],
+        ),
+        max_iters=MAX_ITERS, outputs=[],
+    )
+    looped = WorkerGraph(section=loop, graph_walks={loop_walk}, ranks=[0], worker_graph_id=2)
+    rt = rust_runtime.RustGraphRuntime(
+        my_worker_id=ME, my_worker_graphs=[streamed, consumer, looped],
+        all_wg_ids_to_graph_walks={0: {stream_walk}, 1: {"consume"}, 2: {loop_walk}},
+        all_wg_ids_to_dyn_loops={0: set(), 1: set(), 2: {LOOP}},
+        all_wg_ids_to_nodes={0: {NODE}, 1: {"consumer"}, 2: {NODE}},
+        node_to_partition={NODE: PART, "consumer": "consumer"},
+        sharding_config=ShardingConfig(groups=[], tp_enabled_nodes=set(), shard_dim={}),
+        bookkeeping=RustTensorBookkeeping(),
+        communicator=SimpleNamespace(_inner=ZmqCommunicator(ME, str(tmp_path))),
+    )
+    rt.set_stop_policies(NODE, loop_walk, {LOOP: POLICY})
+    rt.set_inline_streams(frozenset({(NODE, SIG)}))
+    rid = rt.add_request(
+        request_id="r0", partition=PART, graph_walk=loop_walk, partition_worker_graph_ids=[2],
+        worker_graph_to_workers=ParallelList([2], [[ME]]), loop_caps={},
+    )
+    rt.register_stop_limits(rid, SimpleNamespace(max_tokens=1 << 20, resource_configs={}, partition_name=PART))
+    block = ColumnarEdgeSpecs.empty()
+    block.add(rid, SIG, [], False, next_node=NODE)
+    rt.ingest_inputs_batch(block)
+    assert rt.pop_rids(NODE, loop_walk, [rid]) is not None
+    column = torch.tensor([[1, 2]], dtype=torch.int64)
+    trace = _drive(rt, PostprocessRequest(
+        partition=PART, node_name=NODE, graph_walk=loop_walk, output_signals=[SIG],
+        wg_ids=ParallelList([rid], [2]), runtime_stops=True,
+        tokens=column, row_rids=[rid], inline=InlineColumn(SIG, column),
+        loop_strides=[2], token_width=2,
+    ), {}, model_stops={})
+    assert trace[-1][0] is PostprocessNeed.DONE
