@@ -39,6 +39,7 @@ class _Recorder(GDNManager):
         self.kinds = []
         self.config = SimpleNamespace(splits=())
         self._splits = {}
+        self._verify_walks = {}
 
     def _get_wrapper(self, label, is_decode, lease=None, split=False):
         self.kinds.append("decode" if is_decode else "prefill")
