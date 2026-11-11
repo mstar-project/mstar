@@ -8,7 +8,7 @@ served token at rank >= ``Gates.trip_rank`` or deficit >= ``Gates.trip_deficit``
 departures within ``Gates.burst[1]`` tokens of a reload, or a reply that ends on no stop token where its pair
 goes on). Where a reply first differs from plain's is reported, not gated.
 
-Shared by the served Qwen3.5 MTP and Qwen3-8B drafter modules; ``test/modular/test_fp32_screen.py`` pins its
+Shared by the served Qwen3-8B drafter module; ``test/modular/test_fp32_screen.py`` pins its
 decisions on synthetic inputs. The integration tests are no package: load it by path.
 """
 from __future__ import annotations

@@ -158,7 +158,7 @@ def test_a_captured_plan_stages_the_tables_an_eager_plan_builds(hide, dim):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 @pytest.mark.parametrize("causal,hide", [(True, 0), (False, 1)])
-# 128: Qwen3 and DSpark; 256: Qwen3.5's full-attention layers and its MTP head
+# 128: Qwen3 and DSpark; 256: Qwen3.5's full-attention layers
 @pytest.mark.parametrize("dim", [128, 256])
 def test_fa3_paged_attention_matches_a_dense_reference(causal, hide, dim):
     reason = fa3_paged_unavailable_reason(torch.device("cuda"), dim, torch.bfloat16)
