@@ -38,7 +38,7 @@ from mstar.engine.resources.sequence_shard import (
     conv_halo,
     conv_halo_plan,
 )
-from mstar.engine.resources.step import BucketKey, StepContext
+from mstar.engine.resources.step import StepContext
 from mstar.utils.h2d import to_device_nonblocking
 
 if TYPE_CHECKING:
@@ -218,11 +218,6 @@ class LinearAttnManager(AttentionResource):
             keys.add(self._shard_key)
         return keys
 
-    def captures_bucket(self, bucket: BucketKey, packed: bool) -> bool:
-        # both exchanges plan their halo and hand-off per rank on the host: a step that may split
-        # runs eagerly. No shard where the node never splits (one SP rank, say)
-        return self._shard is None or not self._shard.may_split_in(bucket, packed)
-
     def bind_dependencies(self, resources: Mapping[str, Resource]) -> None:
         if self._shard_key is None or not resources[self._shard_key].can_split:
             return
@@ -245,7 +240,7 @@ class LinearAttnManager(AttentionResource):
         r = plan.ranges.get(label) if self._shard is not None and plan.split else None
         if r is None:
             return None
-        # the node captures no bucket a step may split in (`captures_bucket`)
+        # the node never splits a captured step (`SeqShardSpec.eager`)
         assert ctx.slot_lease is None, "a leased step split for a linear attention"
         if addressing.snapshots:
             # the pool keeps snapshots at one rank only (`RecurrentStateSpec.keeps_prefix_cache`)

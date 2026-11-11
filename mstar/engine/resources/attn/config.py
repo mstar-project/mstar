@@ -114,6 +114,10 @@ class AttentionSpec(NodeResourceSpec):
             return "kv_gather"
         return exchange
 
+    def splits_eagerly(self, specs: Mapping[str, NodeResourceSpec]) -> bool:
+        # the ring's partner plans and kv_gather's own-query plans differ by rank
+        return self.resolve_exchange(specs) in ("ring", "kv_gather")
+
     def stores_whole(self, kv: NodeResourceSpec) -> bool:
         """Whether every rank holds this attention's KV whole: its window layers of a pool placed
         by position, which keeps them whole on every partner so a decode step reads them with no

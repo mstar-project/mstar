@@ -88,6 +88,10 @@ class LinearAttnSpec(NodeResourceSpec):
 
         return "none" if shard_exchange(self, specs) == "none" else "ulysses"
 
+    def splits_eagerly(self, specs: Mapping[str, NodeResourceSpec]) -> bool:
+        # both exchanges plan their conv halo and hand-off per rank on the host
+        return self.resolve_exchange(specs) != "none"
+
     def split_exchange(self, pool: "RecurrentStateConfig", tp: int, sp: int) -> LinearSpExchange:
         """How a split step's prompt rows reach the recurrence, from the head counts the model
         declared: ``ulysses`` where each TP rank's heads split ``sp`` ways (Mamba-2's B/C groups may

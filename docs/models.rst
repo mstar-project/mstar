@@ -721,12 +721,11 @@ the SP ranks: each runs the layers on its part of the prompt, attention gathers
 the step's queries, keys and values, and the gated DeltaNet layers trade tokens
 for heads (``ulysses``, or ``state_passing`` where
 their heads per TP rank don't divide by ``sp_size``). The DeltaNet split runs
-eagerly only, so the LLM doesn't capture its text prefill, vision prefill and
-mixed buckets of ``min_tokens`` tokens and up: those steps run eagerly and
-split, and decode and smaller steps keep their graphs (:doc:`serving` has the
-band just below ``min_tokens``). At the default ``min_tokens: 0`` that is every
-prefill and every mixed step (a mixed step counts its decode rows), so set
-``llm_shard.min_tokens`` to keep short prompts captured. Chunked prefill is off
+eagerly only, so the LLM never splits a captured step: the shard sets its own floor for
+each of its text prefill, vision prefill and mixed walks, one past that walk's largest
+captured bucket (:doc:`serving`). A prompt that fits a bucket runs copied in its graph, a longer
+one runs eagerly and splits, and decode keeps its graphs; ``llm_shard.min_tokens``
+only raises the floor. Chunked prefill is off
 on SP ranks, so a long prompt splits whole.
 The recurrent state is held whole on every SP rank, so decode is unchanged. No
 shipped config splits yet: a TP2 x SP2 9B config lands with its GPU parity run.

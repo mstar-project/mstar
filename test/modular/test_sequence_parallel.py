@@ -485,6 +485,55 @@ def test_a_step_splits_only_where_every_rank_gets_tokens(shard, step, ranges):
     assert _split(_shard(**shard), **step) == ranges
 
 
+@pytest.mark.parametrize("eager", [False, True], ids=["ulysses-attention", "recurrent-layer"])
+def test_a_node_splitting_eagerly_sets_its_own_floor_above_its_captured_buckets(eager):
+    """A node with a recurrent layer splits eagerly only, and the default ``min_tokens: 0`` leaves its
+    captured buckets alone: each walk's floor is one past its largest bucket (from the capture
+    configs, so alike on every rank), so a step that fits a bucket runs copied in its graph and a
+    bigger one runs eagerly and splits; the deployer's ``min_tokens`` raises it. An attention that
+    splits inside a graph (Ulysses) sets none."""
+    from mstar.engine.accelerator_graph_config import PackedAcceleratorGraphConfig
+    from mstar.engine.resources.linear_attn.config import LinearAttnConfig, LinearAttnSpec, LinearAttnVariant
+
+    blocks = DeltaNetGeometry(num_k_heads=2, num_v_heads=4, head_k_dim=8, head_v_dim=8, conv_kernel_size=4).to_blocks()
+    specs = [
+        KVSpec("kv", {"n"}, PagedKVConfig(num_layers=1, num_kv_heads=2, head_dim=8, max_seq_len=64, num_qo_heads=4)),
+        AttentionSpec("attn", {"n"}, AttentionConfig(kv_cache="kv")),
+        SeqShardSpec("shard", {"n"}, ("main",), 0),
+    ]
+    if eager:
+        specs += [
+            RecurrentStateSpec("state", {"n"}, RecurrentStateConfig(num_layers=1, blocks=blocks)),
+            LinearAttnSpec("linear", {"n"}, LinearAttnConfig("state", LinearAttnVariant.GDN)),
+        ]
+    shard_spec = resolve_spec_dependencies(specs)["shard"]
+    assert shard_spec.eager is eager
+    configs = [
+        PackedAcceleratorGraphConfig(
+            walk, capture_token_lengths=lengths, capture_batch_sizes=[1], make_node_input=lambda n: None,
+        )
+        for walk, lengths in (("prefill", [8, 64, 512]), ("mixed", [16, 128]))
+    ]
+
+    def shard_over(min_tokens=0):
+        shard_spec.min_tokens = min_tokens
+        sp = CommGroup(0, 0, [0, 1])
+        info = EngineResourceInfo(
+            device=CPU, joint_comm_group=JointGroups(tp_group=CommGroup.trivial(), sp_group=sp, instance=sp),
+        )
+        shard = shard_spec.resource_class.build(shard_spec, info)
+        shard.check_captures("n", configs, {})
+        return shard
+
+    shard = shard_over()
+    for walk, largest in (("prefill", 512), ("mixed", 128)):
+        assert (_split(shard, [("r0", "main", largest)], walk=walk) is not None) is not eager
+        assert _split(shard, [("r0", "main", largest + 1)], walk=walk) is not None
+    # the deployer's floor above it
+    assert _split(shard_over(1000), [("r0", "main", 513)], walk="prefill") is None
+    assert _split(shard_over(1000), [("r0", "main", 1000)], walk="prefill") is not None
+
+
 def test_a_split_step_refuses_what_it_cant_range():
     with pytest.raises(ValueError, match="mixes split sources"):
         _split(_shard(labels=("cond",)), [("r0", "cond", 5), ("r0", "text", 5)], combined={("cond", "text"): "cfg"})

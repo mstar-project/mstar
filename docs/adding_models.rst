@@ -2798,8 +2798,9 @@ Splitting is declared in four places:
   a deployment's trade between the exchanges' cost and the split layers' saving, as is
   ``exchange`` (below), how a split step reaches the node's paged attentions. A captured step
   decides from its bucket's size, not its prompt's, so capture and replay split alike; where a
-  resource's split steps run eagerly only, the node doesn't capture the buckets a step could
-  split in (``Resource.captures_bucket``), so such a step runs eagerly. Declare
+  resource's split steps run eagerly only (``NodeResourceSpec.splits_eagerly``), the shard sets
+  its own floor at load, one past each walk's largest captured bucket, so a captured bucket runs
+  copied and only a bigger, eager step splits (``min_tokens`` only raises it). Declare
   the spec over every node of the attention resources that depend on it: a resource spanning
   nodes the shard doesn't cover is refused, as is a KV pool whose attentions depend on two specs.
   ``exchanges=False`` declares that no op on the node mixes the label's units, so nothing
@@ -2855,9 +2856,9 @@ resource takes its own exchange wherever the node's shard splits, whatever the s
   continuing into it from the state it gets). Mamba-2's scan is a loop over tokens, so ``ulysses``
   saves memory there, not time. ``state_passing`` and Mamba-2's split are tested on CPU only and no
   in-tree model adopts them yet. Both exchanges run eagerly, so a node with a recurrent layer
-  doesn't capture the buckets a step could split in (``Resource.captures_bucket``): such a step
-  runs eagerly and splits, and every other step keeps its graph. Prefix snapshots stay off above
-  one rank.
+  never splits a captured step: the shard's floor sits above its largest captured bucket, so
+  a bigger step runs eagerly and splits, and every other step keeps its graph. Prefix snapshots
+  stay off above one rank.
 - A **sliding-window** attention over a pool stored by position keeps its window layers whole on
   every SP rank (``PagedKVConfig.placed_groups``) while the full layers' slots stripe: its copied
   steps (decode included) attend as on one rank, with no collective, and its split steps gather

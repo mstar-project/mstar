@@ -583,7 +583,7 @@ class RingAttentionWrapper:
     masked the same way. A row this partner holds no query of is left out of its plan.
 
     ``paged`` is one eager kernel over this rank's slots per partner, all planned per step.
-    Eager only: the node captures no bucket a step may split in (``captures_bucket``). The partner
+    Eager only: the node never splits a captured step (``SeqShardSpec.eager``). The partner
     plans differ by rank and no admission bounds them: FlashInfer's paged manager, the one backend
     that takes a placed pool (``PlacedAttention``), so the one that plans a ring, bounds no plan at
     admission, as no refusal of its planner on lengths is known. A backend whose planner may refuse

@@ -422,7 +422,7 @@ class FlashInferManager(PlacedAttention):
             r = None if shard_plan is None else shard_plan.ranges.get(label)
             if r is not None and self._split_exchange == "kv_gather":
                 # this rank's own queries over the whole step's keys, every rank storing the
-                # group whole (eager only, `captures_bucket`)
+                # group whole (eager only, `SeqShardSpec.eager`)
                 assert lease is None, "a leased step split under kv_gather"
                 own = own_queries(indptrs, r, self._group.page_size, step.causal)
                 wrapper = self._eager_wrapper(label, False, ctx.slot)

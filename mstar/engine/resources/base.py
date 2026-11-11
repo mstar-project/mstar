@@ -218,19 +218,6 @@ class Resource(ResidentHooks, ABC):
     def can_capture(self) -> bool:
         return True
 
-    def captures_bucket(self, bucket: BucketKey, packed: bool) -> bool:
-        """Whether the node captures ``bucket`` (``packed``: a packed config's) at all. False leaves
-        it out by design, unlike a ``can_capture`` refusal (an error, ``dropped_buckets``): a step
-        that fits only such buckets runs eagerly. A resource whose split steps run eagerly only
-        answers False where a step of the bucket may split, so a leased step never splits.
-        From what every rank shares, so every rank captures the same buckets.
-
-        This relies on a step leasing the tightest bucket of its walk and key: with one config type
-        a walk, every bucket a step fits above a skipped one is skipped too. A walk replaying both a
-        packed and a batched config could lease a kept batched bucket for a step that should split
-        (``select_bucket`` doesn't filter by config type); no in-tree model has one."""
-        return True
-
     # this resource's key among the engine's resources, set by `build_resource`
     resource_key: str | None = None
 

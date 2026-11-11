@@ -566,12 +566,12 @@ A node on ``sp_size`` above 1 shares each step over its SP ranks along two axes.
 declares a sequence shard (``SeqShardSpec``: the DiTs of LTX-2.5, Cosmos3, Wan2.2 and MiniMax-H3,
 Qwen3-Omni's Thinker and Qwen3.5's LLM) splits a step's tokens over them; its ``min_tokens`` runs smaller steps copied on
 every rank instead (default 0: every step that can split does). A captured step decides from its
-bucket's size, not its prompt's. On a node with a resource whose split steps run eagerly only (a
-ring, ``kv_gather``, a recurrent layer such as Qwen3.5's), the node doesn't capture the buckets a
-step could split in (``min_tokens`` and up, not a batched config's one token a row): such a step
-runs eagerly and splits, and every other step keeps its graph. A step below ``min_tokens`` whose tightest bucket
-reaches ``min_tokens`` runs eagerly too, copied. Each walk captures its own buckets, so that band
-is per walk; ``min_tokens`` one past a bucket of a walk closes it for that walk.
+bucket's size, not its prompt's. A node with a resource whose split steps run eagerly only (a
+ring, ``kv_gather``, a recurrent layer such as Qwen3.5's) never splits a captured step: the
+shard sets its own floor at load, for each walk it splits, one past that walk's largest captured
+bucket (from the node's capture configs, so the same on every rank). A step that fits a bucket
+runs copied in its graph, and a bigger one runs eagerly and splits; ``min_tokens`` only raises that
+floor, as a measured crossover does (Qwen3-Omni's Thinker, whose all_gather split replays in a graph).
 Separately, ``context_parallel: true`` stores a paged pool's K/V by position rather than by
 head: each request's positions split over the ranks that would otherwise hold the same KV
 heads, the TP ranks that share a KV head or the node's SP ranks, which is how a model whose

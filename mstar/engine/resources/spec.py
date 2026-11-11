@@ -172,6 +172,13 @@ class NodeResourceSpec(ABC):
         field may still hold its default when the shard derives."""
         return "none"
 
+    def splits_eagerly(self, specs: Mapping[str, "NodeResourceSpec"]) -> bool:
+        """Whether this resource's split steps run eagerly only, their plans differing by rank
+        where a graph holds one: a node with one captures no step that may split
+        (``SeqShardSpec.eager``). False (the default) for one whose split steps replay in a graph.
+        From raw fields, as ``resolve_exchange``."""
+        return False
+
     def split_step_refusals(
         self, node: str, shard: "SeqShardSpec", tp: int, sp: int, specs: Mapping[str, "NodeResourceSpec"],
     ) -> list[str]:

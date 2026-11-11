@@ -868,11 +868,8 @@ class AcceleratorGraphRunner:
 
     def _get_slot_specs(self) -> list[CGSlotSpec]:
         specs = []
-        # buckets a resource leaves out by design (`Resource.captures_bucket`); their steps run eagerly
-        left_out = []
         lean_keys = [key for key, resource in self._resources.items() if resource.lean_capture]
         for config_idx, config in enumerate(self._capture_configs):
-            packed = _is_packed(config)
             # Beside each bucket, a lean twin for every set of the node's lean resources
             # that take this kind of capture (`Resource.lean_captures`), recording none
             # of their kernels; `prepare_for_capture` keeps those whose step drives them.
@@ -891,9 +888,6 @@ class AcceleratorGraphRunner:
                             num_tokens=num_tokens,
                             lean=lean,
                         )
-                        if not all(r.captures_bucket(bucket, packed) for r in self._resources.values()):
-                            left_out.append(bucket)
-                            continue
                         for slot in range(self._num_slots):
                             specs.append(CGSlotSpec(
                                 bucket=bucket,
@@ -901,13 +895,6 @@ class AcceleratorGraphRunner:
                                 config=config,
                                 config_idx=config_idx,
                             ))
-        if left_out:
-            # never warmed, so the capture plan's floor doesn't count these steps' eager peak
-            logger.info(
-                "AcceleratorGraphRunner[%s]: not capturing %d buckets whose steps may split over SP ranks "
-                "eagerly (their eager peak is outside the capture plan's floor): %s",
-                self._submodule_name, len(left_out), left_out,
-            )
         return specs
 
     def _get_addtl_slot_specs(self, spec: CGSlotSpec) -> list[CGSlotSpec]:
