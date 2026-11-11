@@ -40,7 +40,7 @@ class DrafterShare(NamedTuple):
     prompt_steps: Mapping[str, ResourceStep]
     verify_steps: Mapping[str, ResourceStep]
     # the node's resources that correct a verify step's state in its graph, in dependency order
-    settle_keys: tuple[str, ...] = ()
+    correcting_keys: tuple[str, ...] = ()
     # the combined walk of mixed prompt-plus-verify steps (`VerifyNode.mixed_walk`), whose steps take both sets
     mixed_walk: str | None = None
 
