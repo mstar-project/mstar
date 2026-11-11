@@ -2495,7 +2495,10 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                 # A prefill in the other regime declares a different set of
                 # labels, so it keys elsewhere (`cg_key_info`) and runs eager.
                 additional_key_info=regime.name,
-                compile=False,
+                compile=self.config.compile_prefill,
+                compile_mode=(
+                    None if self.config.denoise_compile_mode == "level" else self.config.denoise_compile_mode
+                ),
                 capture_batch_sizes=prefill_bs,
                 caps_eager_batch_size=False,
             ))

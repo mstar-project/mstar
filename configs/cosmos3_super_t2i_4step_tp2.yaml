@@ -7,6 +7,9 @@ resources:
     max_num_pages: 384
 model_kwargs:
   accelerator_graph: true
+  # Compile the captured text prefill: its eager norms and copies are about a
+  # third of its GPU time.
+  compile_prefill: true
   # The default 1024x1024 request (latent 64x64); a conditional-only graph,
   # since the distilled checkpoint runs without guidance.
   gen_capture_image: [[1024, 1024]]
