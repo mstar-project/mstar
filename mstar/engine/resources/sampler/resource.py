@@ -469,13 +469,14 @@ class SamplerResource(Resource):
     def max_repeats(self, step, ctx) -> int:
         """One for a step whose draws read or update state outside the graph
         (a penalty, a history window, an RNG offset scattered on the host) or
-        with a row that wants log-probs or doesn't keep its draw. The rule state
+        with a row that doesn't keep its draw, or while any request wants log-probs
+        (``step_host_rows`` hands the last replay's rows to every step then). The rule state
         a forward stores (``loopback_writes``) is overwritten each replay, and
         commit persists the last one, so it doesn't count."""
         bufs = self._cg_buffers
         if (
             bufs is None or not bufs.ingraph_scatter or self._penalty_live or self._history is not None
-            or (self._logprob_rids and not self._logprob_rids.isdisjoint(ctx.request_ids))
+            or self._logprob_rids
             or self._kept_rids_of(step, ctx) is not None
         ):
             return 1
