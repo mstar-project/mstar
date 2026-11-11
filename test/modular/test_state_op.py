@@ -269,13 +269,13 @@ def test_a_state_op_that_adds_to_a_rewritable_array_is_refused():
     # a Value with no update, which resolves to no op
     h = build_handle(value, {"kv": SimpleNamespace(block=lambda field, layer: None)}, Resolved({}, {"kv": ()}, {}, {}))
     _open(h)
-    with pytest.raises(ValueError, match="Array 'kv': state op 'write_q' adds to kv, and the array is rewritable"):
+    with pytest.raises(ValueError, match="Array 'kv': no layout yet: add on a ValueHandle"):
         _fused_op()(h, 0, *_tensors())
 
 
 def test_a_state_op_that_writes_an_append_only_array_is_refused():
     def reference(kv, layer):
-        pass
+        kv.write(layer, k=torch.zeros(1))
 
     @state_op(writes=("kv",), formats=(), reference=reference)
     def rewrite(kv, layer, *, target):
@@ -283,7 +283,7 @@ def test_a_state_op_that_writes_an_append_only_array_is_refused():
 
     h = _handle()
     _open(h)
-    with pytest.raises(ValueError, match="Array 'kv': state op 'rewrite' writes kv, and the array is append-only"):
+    with pytest.raises(ValueError, match="Array 'kv': write on an append-only array"):
         rewrite(h, 0)
 
 

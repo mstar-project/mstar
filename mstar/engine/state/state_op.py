@@ -109,15 +109,11 @@ def bind_state_ops(handles: Mapping[str, Any]) -> None:
 
 
 def _check_call(op: StateOp, args: Sequence[Any]) -> None:
-    for name, at in op.handle_at.items():
+    for at in op.handle_at.values():
         handle: ArrayHandle = args[at]
         handle._check_open(f"state op {op.name!r}")
         if handle.array.seq_sharded:
             raise handle._no_layout(f"state op {op.name!r} on a seq_sharded array, whose calls carry a rank's share")
-        if name in op.adds and handle.array.rewritable:
-            raise handle._refusal(f"state op {op.name!r} adds to {name}, and the array is rewritable")
-        if name in op.writes and not handle.array.rewritable:
-            raise handle._refusal(f"state op {op.name!r} writes {name}, and the array is append-only")
 
 
 def _call(op: StateOp, args: Sequence[Any]) -> Any:

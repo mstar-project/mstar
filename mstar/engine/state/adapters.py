@@ -768,11 +768,11 @@ class PagedArrayHandle(ArrayHandle):
         return self.first_read.select_last_hidden(x, label=self.label)
 
     def takes_fused(self, op: "StateOp") -> bool:
-        """On a pool in one of ``op``'s formats, while no layer's read takes k and v at its kernel, which would never
-        see the pages the op writes."""
+        """An op that adds to the array, on a pool in one of its formats, while no layer's read takes k and v at its
+        kernel, which would never see the pages the op writes."""
         cache = self._kv.kv_cache
         dtype, device = cache.dtype, cache.device.type
-        return cache.layout is KVLayout.NHD and not any(map(self._holds, self.array.layers)) and any(
+        return bool(op.adds) and cache.layout is KVLayout.NHD and not any(map(self._holds, self.array.layers)) and any(
             (fmt.dtypes is None or dtype in fmt.dtypes) and (fmt.devices is None or device in fmt.devices)
             for fmt in op.formats
         )
