@@ -163,8 +163,10 @@ def submit(api, request_id: str, model_name: str, req, args) -> str:
 async def stream_events(api, request_id: str, raw_request, parser=None, stops=None):
     """``reply_events`` of a streamed request once its results start: a
     request the engine refuses raises its status here rather than inside a 200."""
+    # named before the wait, which a resubmission under the id could outlast
+    key = api.submission_key(request_id)
     batches = await api.open_result_stream(request_id, raw_request, batches=True)
-    return reply_events(api, request_id, parser, stops, batches=batches)
+    return reply_events(api, request_id, parser, stops, batches=batches, key=key)
 
 
 def sse_response(api, request_id: str, body) -> ReleasingStreamingResponse:
@@ -178,25 +180,31 @@ def finish_reason(parser, usage: Usage, stop_string: str | None = None) -> str:
     return "stop" if stop_string is not None else usage.finish_reason
 
 
-def reply_events(api, request_id: str, parser=None, stops: list[str] | None = None, batches=None):
+def reply_events(api, request_id: str, parser=None, stops: list[str] | None = None,
+                 batches=None, key=None):
     """The events of a request's reply, one list per batch of result chunks.
     Bound to the submission when called, as Starlette iterates a stream's body
     later.
 
     A stop string, or a parser that is ``done`` (``parallel_tool_calls:
-    false``), ends the reply: the request stops in the engine, as closing the
-    iterator early does. Usage counts every
+    false``), ends the reply: the request stops in the engine and counts as a
+    success, as the client has its whole reply. Closing the iterator early
+    otherwise, as a client that leaves does, aborts it. Usage counts every
     token read until then, the stop's own included, as vLLM counts them, and
     can count a few past it: the rest of the stop's chunk (up to k under MTP),
     and what was read while the parser held the stop's end back.
-    ``batches`` are the chunk batches already opened (``api.open_result_stream``).
+    ``batches`` and ``key`` are the chunk batches already opened
+    (``api.open_result_stream``) and the submission, named when it was
+    submitted.
     """
     if batches is None:
         batches = api.iter_result_chunk_batches(request_id)
-    return _events(batches, parser, stops, Usage())
+    if key is None:
+        key = api.submission_key(request_id)
+    return _events(batches, lambda: api.abort_submission(key, outcome="success"), parser, stops, Usage())
 
 
-async def _events(batches, parser, stops, usage):
+async def _events(batches, served, parser, stops, usage):
     matcher = StopMatcher(stops) if stops else None
     stop: str | None = None
     # a byte-level BPE token's bytes can end inside a character: hold them
@@ -232,6 +240,7 @@ async def _events(batches, parser, stops, usage):
                         events = []
                     yield [Media(c.modality, c.data)]
             if stop is not None or parser is not None and parser.done:
+                served()  # before the close below, which would count an abort
                 yield [*events, Finish(finish_reason(parser, usage, stop), usage, stop)]
                 return
             if events:

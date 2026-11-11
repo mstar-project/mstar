@@ -432,6 +432,9 @@ class _ChatAPI:
     def submit_request(self, **kwargs):
         self.submitted = kwargs
 
+    def submission_key(self, request_id):
+        return request_id
+
     async def collect_results(self, request_id, raw_request=None):
         return self.chunks
 

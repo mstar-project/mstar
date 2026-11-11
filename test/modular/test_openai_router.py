@@ -62,6 +62,7 @@ class _StubAPI:
         # raised out of the stream after its chunks, like the delivery timeout
         self.raise_after: Exception | None = None
         self.aborted: list = []
+        self.ended: dict = {}  # how each submission stopped early ended
         self.released: list = []
 
     def release_request(self, request_id):
@@ -71,6 +72,16 @@ class _StubAPI:
         self.last_submit = kw
         self._chunks[kw["request_id"]] = list(self.next_chunks)
         return kw["request_id"]
+
+    def submission_key(self, request_id):
+        return request_id
+
+    def abort_submission(self, key, outcome="abort"):
+        # once per submission, as the real one: after a handler ends a whole
+        # reply (a success), the stream's close aborts nothing more
+        if key not in self.ended:
+            self.ended[key] = outcome
+            self.aborted.append(key)
 
     async def collect_results(self, request_id, raw_request=None):
         self.last_raw_request = raw_request
@@ -91,7 +102,7 @@ class _StubAPI:
             finished = True
         finally:
             if not finished:
-                self.aborted.append(request_id)
+                self.abort_submission(request_id)
 
     async def iter_result_chunks(self, request_id):
         batches = self.iter_result_chunk_batches(request_id)
@@ -622,6 +633,9 @@ def test_chat_stream_sends_a_batch_of_tokens_as_one_frame():
     from mstar.api_server.openai.serving_chat import _stream_events
 
     class _Batches:
+        def submission_key(self, request_id):
+            return request_id
+
         async def iter_result_chunk_batches(self, request_id):
             yield [_Chunk("text", b"a"), _Chunk("text", b"b"), _Chunk("text", b"c")]
             yield [_Chunk("text", b"d"), _Chunk("audio", b"\x00\x01"), _Chunk("text", b"e")]
@@ -1072,6 +1086,9 @@ def test_a_parsed_reply_stops_when_its_client_disconnects():
     aborted = []
 
     class _Endless:
+        def submission_key(self, request_id):
+            return request_id
+
         async def iter_result_chunk_batches(self, request_id):
             try:
                 while True:
@@ -1127,6 +1144,7 @@ def test_glm_chat_ends_at_a_stop_string_and_stops_the_request(client_and_stub, s
     # came with them: the request's usage chunk is never read
     assert (usage["prompt_tokens"], usage["completion_tokens"]) == (11, 9)
     assert stub.aborted == [stub.last_submit["request_id"]]
+    assert stub.ended == {stub.last_submit["request_id"]: "success"}  # a whole reply, served
 
 
 def test_a_stop_string_does_not_cut_a_tool_call(client_and_stub):
@@ -1162,6 +1180,7 @@ def test_glm_chat_without_parallel_calls_ends_at_the_first(client_and_stub, stre
     assert [c["function"]["arguments"] for c in calls] == ['{"city": "Paris"}'] and finish == "tool_calls"
     assert "parallel_tool_calls" not in stub.last_submit["model_kwargs"]
     assert stub.aborted == [stub.last_submit["request_id"]]
+    assert stub.ended == {stub.last_submit["request_id"]: "success"}  # a whole reply, served
 
 
 def test_a_whitespace_stop_is_seen_when_text_follows_it(client_and_stub):
