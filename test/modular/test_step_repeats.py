@@ -203,7 +203,7 @@ def test_a_slot_with_a_device_run_never_replays_unstaged():
     inputs = SimpleNamespace(per_request_info={})
 
     with pytest.raises(KeyError, match="alias"):
-        make_engine()._forward(batch, make_mgmt(), runner, inputs, {}, object(), True, [1])
+        make_engine()._forward(batch, make_mgmt(may_repeat=True), runner, inputs, {}, object(), True, [1])
 
 
 def test_a_step_stages_its_device_run_after_the_run_of_the_step_it_continues():
@@ -222,7 +222,7 @@ def test_a_step_stages_its_device_run_after_the_run_of_the_step_it_continues():
 
     engine = make_engine()
     engine._ignore_eos = lambda *args: [False]
-    engine._forward(batch, make_mgmt(), runner, inputs, {}, object(), True, [1])
+    engine._forward(batch, make_mgmt(may_repeat=True), runner, inputs, {}, object(), True, [1])
 
     assert staged[0][-1] is previous_run
     assert ctx.continues is None
@@ -408,6 +408,8 @@ def test_a_device_run_ends_once_every_row_stopped_and_the_next_step_of_its_rows_
     first.replay()
     torch.cuda.synchronize()
     assert first.state.index.item() == 8
+
+
 def test_a_node_no_deployment_asked_to_repeat_replays_as_main():
     """With ``step_repeats`` unset a decode step's forward is main's: the replay
     alone, nothing of the repeat path around it (Qwen3.5 at c64 spent ~30 us a

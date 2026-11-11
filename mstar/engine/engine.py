@@ -2376,26 +2376,21 @@ class Engine:
         ``release_event`` is set as late as possible before the call that drops
         the GIL — the replay, or the submodule forward on the eager path."""
         graph_walk = batch.step_context.graph_walk
-        # read here, once the step this one continues has run its forward and holds its lease
-        before, batch.step_context.continues = batch.step_context.continues, None
         if lease is not None:
             ctx = batch.step_context
             if ctx.resident is not None:
                 ctx.resident.flush(ctx.resident_plan)
-            run = cg_runner.slot_run(lease)
-            if run is not None:
-                lease_before = None if before is None else before.slot_lease
-                previous = None if lease_before is None else cg_runner.slot_run(lease_before)
-                run.stage(
-                    request_ids, self._ignore_eos(submodule_mgmt, graph_walk, engine_inputs, request_ids),
-                    ctx.repeats, previous,
+            if submodule_mgmt.may_repeat:
+                return self._replay_repeating(
+                    batch, submodule_mgmt, cg_runner, engine_inputs, preprocessed, lease, request_ids, release_event,
                 )
-            out = cg_runner.run_forward(
+            return cg_runner.run_forward(
                 lease, preprocessed,
                 plan_done_event=batch.preplan_event,
                 launch_started_event=release_event,
             )
-            return cg_runner.repeat(lease, out, ctx.repeats) if submodule_mgmt.may_repeat else out
+        # an eager step drops the link to the step it continues too (`_replay_repeating`)
+        batch.step_context.continues = None
         if release_event is not None:
             release_event.set()
         if running_batched:
@@ -2414,6 +2409,38 @@ class Engine:
         if isinstance(out, BatchedModelOutput):
             return out
         return BatchedModelOutput.coerce({request_ids[0]: out})
+
+    def _replay_repeating(
+        self,
+        batch: ExecutingBatch,
+        submodule_mgmt: SubmoduleManagement,
+        cg_runner,
+        engine_inputs: ModelInputsFromEngine,
+        preprocessed: dict[str, Any],
+        lease: SlotLease,
+        request_ids: list[str],
+        release_event: "threading.Event | None",
+    ) -> BatchedModelOutput:
+        """``_forward``'s replay on a node a deployment asked to repeat
+        (``may_repeat``): a device run stages its rows first, and the step's
+        iterations come from ``repeat``."""
+        ctx = batch.step_context
+        # read here, once the step this one continues has run its forward and holds its lease
+        before, ctx.continues = ctx.continues, None
+        run = cg_runner.slot_run(lease)
+        if run is not None:
+            lease_before = None if before is None else before.slot_lease
+            previous = None if lease_before is None else cg_runner.slot_run(lease_before)
+            run.stage(
+                request_ids, self._ignore_eos(submodule_mgmt, ctx.graph_walk, engine_inputs, request_ids),
+                ctx.repeats, previous,
+            )
+        out = cg_runner.run_forward(
+            lease, preprocessed,
+            plan_done_event=batch.preplan_event,
+            launch_started_event=release_event,
+        )
+        return cg_runner.repeat(lease, out, ctx.repeats)
 
     def postprocess_batch(
         self, batch: ExecutingBatch, outputs: BatchedModelOutput,
