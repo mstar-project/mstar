@@ -696,7 +696,7 @@ def _split_step(joint: JointGroups, device: torch.device, dtype: torch.dtype, sp
         assert (shard.split_range("main") is not None) == split_it
         # a copied step over a pool stored by position attends as a node without a shard does, so a
         # layer's fused norm/RoPE/KV write stays on (`AttentionCallable.norm_rope_attend`)
-        assert attn.exchanges() == split_it
+        assert attn.step_exchanges() == split_it
         if split_it:
             # a K/V write without attention lands each token on the rank storing it (page 0, the sink, aside)
             attend.write(*shard.scatter("main", k, v))
@@ -1566,7 +1566,7 @@ def _thinker_over_ranks(rank, world, store, placed, exchange):
                 runner.plan(step)
                 assert (res[THINKER_SHARD].split_range("main") is not None) == split
                 # a copied step over KV stored by head still slices its heads, so no fused write
-                assert res[THINKER_ATTN].exchanges() == (split or not placed)
+                assert res[THINKER_ATTN].step_exchanges() == (split or not placed)
                 with torch.no_grad():
                     hidden, layer_0, layer_n = forward(**step_inputs)
                 # what the Thinker samples a prefill from: each row's last token of the whole step

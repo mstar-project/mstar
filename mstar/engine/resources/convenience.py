@@ -67,7 +67,7 @@ class AttentionCallable:
     def _exchanges(self) -> bool:
         # a stand-in attention (Cosmos3's warmup's, the tests' fakes) is no AttentionManager; a node
         # that never splits keeps the direct call
-        return isinstance(self.attn, AttentionManager) and self.attn.exchanges()
+        return isinstance(self.attn, AttentionManager) and self.attn.step_exchanges()
 
     def _exchanged(self, q: torch.Tensor | None, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor | None:
         if self._exchanges():
