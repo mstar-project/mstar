@@ -255,6 +255,10 @@ def _python(server, frames, until, linger):
                 if isinstance(f, float):
                     time.sleep(f)
                     continue
+                if callable(f):   # a wait on the session's own events
+                    while not f(events):
+                        events.append(json.loads(ws.receive_text()))
+                    continue
                 (ws.send_bytes if isinstance(f, bytes) else ws.send_text)(f)
             while until is None or not until(events):
                 events.append(json.loads(ws.receive_text()))
@@ -274,6 +278,10 @@ def _rust_session(port, frames, until, linger):
                 if isinstance(f, float):
                     time.sleep(f)
                     continue
+                if callable(f):   # a wait on the session's own events
+                    while not f(events):
+                        events.append(json.loads(ws.recv(timeout=30)))
+                    continue
                 ws.send(f)
             while until is None or not until(events):
                 events.append(json.loads(ws.recv(timeout=30)))
@@ -285,11 +293,12 @@ def _rust_session(port, frames, until, linger):
 
 def _both(stacks, monkeypatch, kind, events, *, script=(), end=True, refuse=0, until=None, linger=0.0):
     """Each frontend's (events, close code) and what its call got. ``events``
-    may hold floats, seconds to wait; ``until`` stops reading (the socket
+    may hold floats, seconds to wait, and ``_seen`` waits, which read events
+    until the session has sent them; ``until`` stops reading (the socket
     left open), else the session reads until the server closes it."""
     server, port = stacks(kind)
     monkeypatch.setattr(entrypoint, "api_server", server)
-    frames = [e if isinstance(e, (str, bytes, float)) else json.dumps(e) for e in events]
+    frames = [e if isinstance(e, (str, bytes, float)) or callable(e) else json.dumps(e) for e in events]
     out = []
     for run in (lambda: _python(server, frames, until, linger), lambda: _rust_session(port, frames, until, linger)):
         server.reset(script, end, refuse)
@@ -532,30 +541,39 @@ def _session(**session) -> dict:
 
 
 COMMIT = {"type": "input_audio_buffer.commit"}
+
+
+def _seen(suffix: str, count: int = 1):
+    """A wait for the session to have sent ``count`` events whose type ends in
+    ``suffix``: the order comes from its events, not the clock."""
+    return lambda evs: sum(e["type"].endswith(suffix) for e in evs) >= count
+
+
+DELTA, ERROR = _seen(".delta"), _seen("error")
 LIVE = {
     # the knobs and prompt a live model can't apply, and a language change mid-item, refused;
     # two items, each a call, the second opened in the language set between them
     "completed": ([_text(0, b" hello"), _text(1, " wö".encode()[:3]), _text(2, " wö".encode()[3:] + b"rld")], [
         _session(mstar={"chunk_seconds": 1.0}), _session(input_audio_transcription={"prompt": "names"}),
-        _append(_tone(16000, 0.3).tobytes()), 0.3, _session(input_audio_transcription={"language": "de"}),
+        _append(_tone(16000, 0.3).tobytes()), DELTA, _session(input_audio_transcription={"language": "de"}),
         _append(_tone(16000, 0.1).tobytes()), COMMIT,
         _session(input_audio_transcription={"language": "de", "prompt": ""}),
         _append(_tone(16000, 0.2).tobytes()), COMMIT, END]),
     # each item's call fails after its first append: the rest of the item is dropped, its commit reports it
     "failed": ([_text(0, b" hello"), _Chunk("error", b"boom reading /srv/ckpt/model.safetensors", {"status": 500})], [
-        _append(_tone(16000, 0.2).tobytes()), 0.3, _append(_tone(16000, 0.2).tobytes()), COMMIT,
-        _append(_tone(16000, 0.1).tobytes()), 0.3, COMMIT, END]),
+        _append(_tone(16000, 0.2).tobytes()), ERROR, _append(_tone(16000, 0.2).tobytes()), COMMIT,
+        _append(_tone(16000, 0.1).tobytes()), _seen("error", 2), COMMIT, END]),
     # an append that fails inside the server is an error event; the item's call goes on
     "append-fails": ([_text(0, b" hello")], [
         _append(np.array([16384], "<i2").tobytes()), _append(_tone(16000, 0.2).tobytes()), COMMIT, END]),
     # a commit whose end fails inside the server aborts the item's call rather than waiting it out;
     # the item fails and the next one goes on
     "end-fails": ([_text(0, b" hello")], [
-        _append(_tone(16000, 0.2).tobytes()), _append(np.array([-16384], "<i2").tobytes()), 0.3, COMMIT,
+        _append(_tone(16000, 0.2).tobytes()), _append(np.array([-16384], "<i2").tobytes()), DELTA, COMMIT,
         _append(_tone(16000, 0.1).tobytes()), COMMIT, END]),
     # a clear aborts the item's call; the next append opens another
     "cleared": ([_text(0, b" hello")], [
-        _append(_tone(16000, 0.2).tobytes()), 0.3, {"type": "input_audio_buffer.clear"},
+        _append(_tone(16000, 0.2).tobytes()), DELTA, {"type": "input_audio_buffer.clear"},
         _append(_tone(16000, 0.1).tobytes()), COMMIT, END]),
 }
 
