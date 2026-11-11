@@ -94,6 +94,43 @@ def test_a_drain_stays_pending_until_it_begins():
     assert lifecycle.drains_ready(set()) == ["r2"]
 
 
+@pytest.mark.parametrize("drain_before_arrival", [False, True])
+def test_speculation_needs_no_wire_lookup_for_begun_drains(monkeypatch, drain_before_arrival):
+    lifecycle = _lifecycle(1)
+    if not drain_before_arrival:
+        _add(lifecycle, 2, "r2")
+    lifecycle.begin_drain("r2")
+    if drain_before_arrival:
+        _add(lifecycle, 2, "r2")
+
+    def unexpected_lookup(rid):
+        pytest.fail("an admitted drain is already marked failed")
+
+    monkeypatch.setattr(lifecycle._runtime, "get_rid_string", unexpected_lookup)
+    assert lifecycle.is_tearing_down(2)
+    assert not lifecycle.is_tearing_down(1)
+
+
+def test_speculation_only_resolves_pending_drains_after_handle_checks(monkeypatch):
+    lifecycle = _lifecycle(1, 2, 3, 4)
+    lifecycle.fail({1: "boom"})
+    lifecycle.remove(2, RemoveRequest(request_id="r2", source=MessageSource.CONDUCTOR), -1)
+    lifecycle.drain(DrainRequest(request_id="r3", source=MessageSource.CONDUCTOR))
+    lookups = []
+
+    def wire_id(rid):
+        lookups.append(rid)
+        return lifecycle._runtime.names[rid]
+
+    monkeypatch.setattr(lifecycle._runtime, "get_rid_string", wire_id)
+    assert lifecycle.is_tearing_down(1)
+    assert lifecycle.is_tearing_down(2)
+    assert lifecycle.is_tearing_down(3)
+    assert not lifecycle.is_tearing_down(4)
+    assert not lifecycle.is_tearing_down(5)  # never admitted
+    assert lookups == [3, 4]
+
+
 @pytest.mark.parametrize("source", [MessageSource.CONDUCTOR, MessageSource.TP_RANK_0])
 @pytest.mark.parametrize("handle_released", [False, True])
 def test_a_late_drain_after_rank_0s_remove_leaves_no_follower_state(source, handle_released):
