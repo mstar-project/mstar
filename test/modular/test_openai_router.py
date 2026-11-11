@@ -1143,6 +1143,27 @@ def test_a_stop_string_does_not_cut_a_tool_call(client_and_stub):
     assert stub.aborted == []
 
 
+@pytest.mark.parametrize("stream", [False, True])
+def test_glm_chat_without_parallel_calls_ends_at_the_first(client_and_stub, stream):
+    client, stub = client_and_stub
+    stub.model_name = "glm52"
+    call = b"<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call>"
+    stub.next_chunks = _usage_chunks((b"Two.</think>", 3), (call, 9), (b"\n" + call, 9), finish="length")
+    r = client.post("/v1/chat/completions", json={
+        "model": "glm52", "messages": [{"role": "user", "content": "weather?"}], "tools": _GLM_TOOLS,
+        "parallel_tool_calls": False, "stream": stream,
+    })
+    if stream:
+        events = _glm_events(r.text)
+        calls = [c for e in events for c in e["choices"][0]["delta"].get("tool_calls", [])]
+        finish = events[-1]["choices"][0]["finish_reason"]
+    else:
+        calls, finish = r.json()["choices"][0]["message"]["tool_calls"], r.json()["choices"][0]["finish_reason"]
+    assert [c["function"]["arguments"] for c in calls] == ['{"city": "Paris"}'] and finish == "tool_calls"
+    assert "parallel_tool_calls" not in stub.last_submit["model_kwargs"]
+    assert stub.aborted == [stub.last_submit["request_id"]]
+
+
 def test_a_whitespace_stop_is_seen_when_text_follows_it(client_and_stub):
     """The answer's trailing whitespace is held until text follows it, so a
     stop that ends in whitespace ends the reply one chunk later, and that

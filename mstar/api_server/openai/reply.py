@@ -183,8 +183,9 @@ def reply_events(api, request_id: str, parser=None, stops: list[str] | None = No
     Bound to the submission when called, as Starlette iterates a stream's body
     later.
 
-    A stop string ends the reply where it starts: the request stops in the
-    engine, as closing the iterator early does. Usage counts every
+    A stop string, or a parser that is ``done`` (``parallel_tool_calls:
+    false``), ends the reply: the request stops in the engine, as closing the
+    iterator early does. Usage counts every
     token read until then, the stop's own included, as vLLM counts them, and
     can count a few past it: the rest of the stop's chunk (up to k under MTP),
     and what was read while the parser held the stop's end back.
@@ -215,6 +216,8 @@ async def _events(batches, parser, stops, usage):
                     deltas = [{"content": piece}] if parser is None else parser.feed(piece)
                     if (stop := _passed(deltas, matcher, events)) is not None:
                         break
+                    if parser is not None and parser.done:
+                        break
                 elif c.modality == USAGE:
                     usage.close(c.metadata)
                 elif c.modality == "error":
@@ -228,7 +231,7 @@ async def _events(batches, parser, stops, usage):
                         yield events
                         events = []
                     yield [Media(c.modality, c.data)]
-            if stop is not None:
+            if stop is not None or parser is not None and parser.done:
                 yield [*events, Finish(finish_reason(parser, usage, stop), usage, stop)]
                 return
             if events:

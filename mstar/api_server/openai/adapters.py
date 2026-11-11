@@ -232,7 +232,9 @@ def _refuse_unserved_chat(req, mk: dict, serves_tool_calls: bool = False,
         for name in ("tools", "tool_choice", "functions", "function_call"):
             mk.pop(name, None)
     for name in CHAT_ENVELOPE_KEYS:
-        mk.pop(name, None)
+        # an adapter that serves tool calls reads parallel_tool_calls itself
+        if not (serves_tool_calls and name == "parallel_tool_calls"):
+            mk.pop(name, None)
 
 
 def _flatten_template_kwargs(mk: dict) -> None:
@@ -1750,6 +1752,7 @@ class GlmChatAdapter(TextChatAdapter):
     ``"required"`` over several tools leaves to the model (a name it makes up
     stays text). The call opens the reply, so a forced call does not reason,
     and ``enable_thinking`` with it is a 400.
+    ``parallel_tool_calls: false`` ends the request at the end of its first call.
 
     ``enable_thinking`` (GLM-5.2 only: GLM-5.3 always reasons, and turning it
     off is a 400), ``reasoning_effort`` and ``clear_thinking`` reach the
@@ -1787,7 +1790,9 @@ class GlmChatAdapter(TextChatAdapter):
         return args
 
     def make_output_parser(self, req: ChatCompletionRequest):
-        tools, template_kwargs, forced = self._options(_passthrough(req))
+        mk = _passthrough(req)
+        single_call = mk.get("parallel_tool_calls") is False
+        tools, template_kwargs, forced = self._options(mk)
         # truthiness, as the GLM-5.2 template reads it
         thinking = self.always_thinks or bool(template_kwargs.get("enable_thinking", True))
         params = glm_chat.tool_parameters(tools) if tools else None
@@ -1796,7 +1801,7 @@ class GlmChatAdapter(TextChatAdapter):
             # (get_weather -> get_weather_hourly) is not another tool's call
             params = {forced: params[forced]}
         return glm_chat.GlmReplyParser(
-            thinking=thinking, tools=params, forced_call=forced,
+            thinking=thinking, tools=params, forced_call=forced, single_call=single_call,
         )
 
     def _options(self, mk: dict) -> tuple[list | None, dict, str | None]:
@@ -1805,6 +1810,10 @@ class GlmChatAdapter(TextChatAdapter):
         the function's name, or ``""`` for the model to name one."""
         if "reply_prefix" in mk:
             raise ValueError("reply_prefix is not a request field; tool_choice sets it")
+        # false ends the reply at its first call (the parser's single_call); read, not sent on
+        parallel = mk.pop("parallel_tool_calls", None)
+        if parallel is not None and not isinstance(parallel, bool):
+            raise ValueError(f"parallel_tool_calls must be a boolean, got {parallel!r}")
         tools = mk.pop("tools", None) or None
         choice = mk.pop("tool_choice", None)
         names = list(glm_chat.tool_parameters(tools)) if tools is not None else []
