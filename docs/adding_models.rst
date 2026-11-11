@@ -1799,7 +1799,7 @@ deployment turns it on with a ``model_kwargs.draft`` block, which the engine par
 What the model writes, and nothing more:
 
 - ``Model.verify_nodes()`` returns a ``VerifyNode`` per verifying node: the decode walk, the
-  parsed config, the drafter's ``DrafterNeeds`` (taps, KV layer set, input kinds, chunk
+  parsed config, the drafter's ``DrafterNeeds`` (taps, KV layer set, carry, input kinds, chunk
   boundary rule) and the node's ``TokenStop``.
 - ``get_node_resources()`` declares the target's resources as for a plain deployment, with
   ``max_seq_len`` the serving limit, and passes them through
@@ -1849,6 +1849,20 @@ What the model writes, and nothing more:
   attention has other query heads than the pool's attention plans (``num_qo_heads``), or whose
   RoPE base isn't the node's positions' (``rope_theta``).
 
+- A drafter whose state crosses steps declares ``DrafterNeeds.carry`` (``CarrySpec(width,
+  dtype)``, MTP's hidden vector). The engine keeps it as the node sampler's loop-back state
+  ``DRAFT_CARRY``, one row per request from admission to removal: ``drafter_resources`` adds it
+  to the node's ``SamplerSpec.loopback_state`` at that width and dtype (startup checks), and
+  the engine adds it to the ``SamplerStep.loopback_writes`` of the node's prompt and verify
+  steps (``drafter_step``): the node declares a sampler step on both and lists no drafter state.
+  ``propose`` reads the rows' carry in ``DraftInputs.carry``; ``observe`` returns the new one,
+  which the engine stores; a prompt step stores the first with
+  ``engine_inputs.store_draft_carry(carry)``, kept for the rows whose token the step keeps
+  (a prompt's last prefill). A captured verify step reads the carry off the sampler's
+  loop-back masters, which only the in-graph scatter keeps fixed, so a carrying drafter is
+  refused where it is off (``MSTAR_SAMPLER_INGRAPH_SCATTER=0``, or above one rank).
+- A drafter whose ``observe`` reads the target's hidden states declares
+  ``DrafterNeeds(target_hidden=True)``; ``target`` then returns ``(logits, hidden)``.
 - A node that prefills prompts in chunks needs a drafter that declares its rule at a chunk
   boundary (``DrafterNeeds.chunk_boundary``): ``NONE`` when its state at a row depends on that
   row alone (DSpark).
@@ -1918,6 +1932,21 @@ length the resident graph advances by ``accepted + 1``, the token cut at stop id
 budget, and the take-back of rejected tokens at a later admit. A model keeps no state across
 steps and undoes nothing.
 
+**Recurrent state (GDN).** A verify step runs a row's ``k + 1`` tokens through FlashInfer's
+recurrent multi-token kernel (``gated_delta_rule_mtp``) for their outputs, and through the
+multi-token short conv (``causal_conv1d_update(..., update_state=False)``), both leaving the
+row's state and conv window as they were. Right after the sampler's verify, the engine calls each
+resource's ``correct_verify_state(result)``, and the GDN resource reruns the delta rule from the slot with
+the rejected tokens' gates closed, the state's one write, and rebuilds each conv window from the
+untouched window and the kept tokens' inputs (one kernel a layer), inside the step's graph. At rest the state then
+equals a plain run over the kept tokens, within the kernel's float precision: nothing else in the model changes. The pool takes back its own token count and keeps no
+decode snapshot of a verify step; prompt snapshots (prefill, the chunked kernel) are unaffected.
+The kernel reads a float32 pool only, so a verifying node with another state dtype is refused, as
+are KDA and Mamba-2, mixed splits, more than one label and a pool without a sink. It compiles per
+tile path, which the batch size picks: the resource compiles every one a verify step can reach
+when the walk binds, at startup. Either mode works: a resident verify step gathers each row's slot
+off the pool's table in the graph, and replays the rerun its capture recorded.
+
 Every resource on the node states what it can't do, in one ``ResourceCapabilities``: a
 ``verify_refusal`` (fatal for a verifying node) and an ``async_verify_refusal`` (``mode: auto``
 runs synchronously, an explicit ``asynchronous`` is fatal), each a reason or None. The spec
@@ -1929,7 +1958,10 @@ resource with per-token state implements ``Resource.take_back(rids, counts, labe
 runner calls once per result. A resource can also override
 ``Resource.bind_verify_walk(walk, block, slack)``, a no-op by default, called once at load after
 the mode is agreed: pick its kernels (FlashInfer chooses FA3 here), record the verify walk, size
-for the reserved ``slack``. It never refuses; a refusal belongs in ``capabilities``. ``mode: auto`` picks asynchronous mode (step N+1 planned while N runs, needing FA3's
+for the reserved ``slack``. It never refuses; a refusal belongs in ``capabilities``.
+A resource can also override ``correct_verify_state(result)``, called inside the verify step's
+graph right after the sampler's verify (correct what the block wrote in place, as GDN does).
+Startup refuses a recurrent pool on the node that no linear-attention resource reruns. ``mode: auto`` picks asynchronous mode (step N+1 planned while N runs, needing FA3's
 paged kernel, ``verify_backend`` on the attention resource, and resident planning) when every
 resource allows it and logs why it falls back to synchronous otherwise; ``validate_deployment``
 reports every config-level problem before a worker spawns; what only the built resources show

@@ -1644,7 +1644,7 @@ class ARNodeSubmodule(NodeSubmodule):
             raise RuntimeError(f"{type(self).__name__}: a verify step on a node the engine never bound a drafter to")
         return draft_verify_step(
             engine_inputs.resources[share.sampler_key], engine_inputs.request_ids, input_ids, target,
-            self.drafter, engine_inputs.resources, engine_inputs.resident,
+            self.drafter, engine_inputs.resources, engine_inputs.resident, share.settle_keys,
         )
 
     def verify_output(self, result: "VerifyResult", **row_outputs: torch.Tensor) -> "BatchedModelOutput":
@@ -1659,6 +1659,18 @@ class ARNodeSubmodule(NodeSubmodule):
             row_outputs={self.token_stop.buffer: result.tokens, **row_outputs},
             check_stop_buffers={VERIFY_TOKENS: result.tokens, VERIFY_ACCEPTED: result.accepted},
         )
+
+    @torch.compiler.disable
+    def store_draft_carry(self, engine_inputs: ModelInputsFromEngine, carry: torch.Tensor) -> None:
+        """A prompt step's drafter carry, ``[rows, width]``, row i request i: the
+        state the request's first verify step drafts from (a drafter that
+        declares ``DrafterNeeds.carry``). Kept for the rows the step's sampler
+        step keeps (a prompt's last prefill) when it lists `DRAFT_CARRY` in
+        its ``loopback_writes``."""
+        from mstar.engine.resources.draft.drafter import DRAFT_CARRY
+
+        sampler = engine_inputs.resources[self.drafter_share.sampler_key]
+        sampler.store_loopback_state(DRAFT_CARRY, engine_inputs.request_ids, carry)
 
     def _loops_back(self, graph_walk: str) -> bool:
         """Whether this walk's token loops back on the device."""

@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING
 
-from mstar.engine.resources.spec import CombinedSplit, NodeResourceSpec
+from mstar.engine.resources.spec import CombinedSplit, NodeResourceSpec, ResourceCapabilities
 from mstar.engine.resources.step import ResourceStep
 
 if TYPE_CHECKING:
@@ -63,6 +63,18 @@ class LinearAttnSpec(NodeResourceSpec):
 
     def combined_splits(self) -> tuple[CombinedSplit, ...]:
         return self.config.splits
+
+    def resource_capabilities(self, ctx) -> ResourceCapabilities:
+        # GDN reruns a verify step's kept tokens from the slot, which the forward leaves as it was
+        # (`GDNManager.correct_verify_state`)
+        verify = None
+        if self.config.variant is not LinearAttnVariant.GDN:
+            verify = f"undoing a verify step's rejected tokens is implemented for GDN, not {self.config.variant.value}"
+        elif self.config.splits:
+            verify = "mixed prompt-plus-verify steps are not supported yet: declare no splits on a verifying node"
+        # a resident verify step replays the rerun its capture recorded, from the slots the pool's
+        # tables gather
+        return ResourceCapabilities(verify_refusal=verify, async_verify_refusal=None)
 
     @property
     def writes_prefix_snapshots(self) -> bool:

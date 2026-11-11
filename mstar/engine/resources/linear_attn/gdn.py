@@ -1,7 +1,8 @@
 """Gated delta rule through FlashInfer's GDN kernels.
 
-One kernel per batch: all-one-token rows take the recurrent decode path,
-anything else the chunked path, which also handles span-1 and zero-span padding.
+One kernel per batch: all-one-token rows take the recurrent decode path, a
+verify step (k + 1 tokens a row) the recurrent multi-token path, anything else
+the chunked path, which also handles span-1 and zero-span padding.
 
 The pool's plan result arrives through ``ctx.plan_results`` and its per-layer
 block as a plain tensor argument to ``run``.
@@ -19,10 +20,13 @@ from mstar.engine.resources.linear_attn.base import LinearAttnManager
 from mstar.engine.resources.linear_attn.config import LinearAttnConfig, LinearAttnStep
 from mstar.engine.resources.linear_attn.gdn_stage import gdn_stage_applies
 from mstar.engine.resources.linear_attn.wrappers import (
+    CLOSED_GATE,
     GDNDecodeWrapper,
     GDNMixedWrapper,
     GDNPrefillWrapper,
+    GDNVerifyWrapper,
     GDNWrapper,
+    VerifyRerun,
 )
 from mstar.engine.resources.recurrent.config import DeltaNetGeometry
 from mstar.engine.resources.recurrent.pool import (
@@ -121,6 +125,13 @@ class GDNManager(LinearAttnManager):
         self._preplanned = False
         self._cached_plan_output: dict[str, GDNWrapper] | None = None
 
+        # Speculative decoding: walk -> its verify block (k + 1), and the block of the step planned
+        # (None for any other step). A verify step keeps, per layer, what `correct_verify_state` reruns.
+        self._verify_walks: dict[str, int] = {}
+        self._verify_block: int | None = None
+        self._cached_verify_block: int | None = None
+        self._kept: dict[int, VerifyRerun] = {}
+
     @staticmethod
     def _check_state_dtype(
         state_dtype: torch.dtype, geometry: DeltaNetGeometry, has_sink: bool,
@@ -159,7 +170,8 @@ class GDNManager(LinearAttnManager):
         return {self._pool_key}
 
     def resident_refusal(self) -> str | None:
-        # decode addresses the pool by slot alone, which the pool's table holds
+        # Decode and verify address the pool by slot alone, which the pool's table holds; a verify
+        # bucket's rows each run its one span, and its rerun replays as captured.
         return None
 
     def bind_dependencies(self, resources: Mapping[str, Resource]) -> None:
@@ -177,11 +189,13 @@ class GDNManager(LinearAttnManager):
             "planning a different step ahead"
         )
         if ctx.resident is not None:
-            # a replayed decode wrapper reads only the pool's slots, which its graph fills
+            # a replay reads the pool's slots, which its graph gathers; the rest of its wrapper's
+            # plan, and a verify step's conv inputs and rerun, are its capture's
             return self._current
         self.reset_default_cursors()
         if self._preplanned:
             self._current = self._cached_plan_output
+            self._verify_block, self._kept = self._cached_verify_block, {}
             self.clear_preplan()
             return self._current
 
@@ -192,9 +206,19 @@ class GDNManager(LinearAttnManager):
             self._current[label] = self._build_plan(
                 label, segments, addressing[label], ctx
             )
+        block = self._verify_walks.get(ctx.graph_walk)
+        if block is not None and any(seg.span != block for seg in step.segments or ()):
+            raise ValueError(f"gdn: a verify step's rows run {block} tokens each")
+        if block is not None and len(self._current) != 1:
+            # what a layer keeps for the rerun, and the result's rows, are one label's
+            raise ValueError(f"gdn: a verify step runs one label, not {sorted(self._current)}")
         if ctx.is_preplan:
             self._preplanned = True
             self._cached_plan_output = self._current
+            self._cached_verify_block = block
+        else:
+            self._verify_block = block
+            self._kept = {}
         return self._current
 
     def clear_preplan(self):
@@ -212,7 +236,7 @@ class GDNManager(LinearAttnManager):
 
     def _get_wrapper(
         self, label: str, is_decode: bool, lease: SlotLease | None = None,
-        split: CombinedSplit | None = None,
+        split: CombinedSplit | None = None, verify_block: int | None = None,
     ) -> GDNWrapper:
         """The wrapper this (label, walk) plans into, built once and reused.
 
@@ -221,7 +245,8 @@ class GDNManager(LinearAttnManager):
         """
         if lease is None:
             # both walks can run eagerly under one label
-            key, store = (label, "split" if split is not None else is_decode), self._eager_wrappers
+            kind = "split" if split is not None else "verify" if verify_block is not None else is_decode
+            key, store = (label, kind), self._eager_wrappers
             bs, tok = None, None
         else:
             key = CGSlotKey(lease.bucket, lease.slot, label)
@@ -251,6 +276,17 @@ class GDNManager(LinearAttnManager):
                         if lease is not None else None
                     ),
                     stage_inputs=self._stage_prefill,
+                )
+            elif verify_block is not None:
+                store[key] = GDNVerifyWrapper(
+                    device=self._device,
+                    pad_slot_id=PAD_SLOT_ID,
+                    block=verify_block,
+                    sm_scale=self.config.sm_scale,
+                    qk_l2norm=self.config.qk_l2norm,
+                    bs=bs,
+                    accelerator_graph=lease is not None,
+                    null_slot_id=null_slot_id,
                 )
             elif is_decode:
                 store[key] = GDNDecodeWrapper(
@@ -304,6 +340,11 @@ class GDNManager(LinearAttnManager):
         assert every or not addressing.snapshots, (
             f"gdn: a {walk!r} step keeps snapshots for {label!r}, which its KV cache doesn't key there"
         )
+        block = self._verify_walks.get(walk)
+        if block is not None:
+            wrapper = self._get_wrapper(label, False, ctx.slot_lease, verify_block=block)
+            wrapper.plan(spans, slots)
+            return wrapper
         checkpoints = None
         if every and ctx.slot_lease is not None:
             checkpoints = self._checkpoint_buffer(checkpoint_rows(self._cg_max_tokens, self._cg_max_bs, every))
@@ -383,7 +424,11 @@ class GDNManager(LinearAttnManager):
             a = a.contiguous()
             b = b.contiguous()
 
-        return plan.run(q, k, v, a, b, state_layer, a_log, dt_bias)
+        if self._verify_block is None:
+            return plan.run(q, k, v, a, b, state_layer, a_log, dt_bias)
+        # the forward leaves the slots as they were, which is what the rerun starts from
+        rerun = self._kept.setdefault(self._default_layer_idx, VerifyRerun())
+        return plan.run(q, k, v, a, b, state_layer, a_log, dt_bias, rerun=rerun)
 
     @torch.compiler.disable
     def run_conv(
@@ -403,10 +448,119 @@ class GDNManager(LinearAttnManager):
         in place. Padding rows carry the pool's null slot, which both conv
         kernels skip.
         """
-        return self.current_plan(label).run_conv(
+        plan = self.current_plan(label)
+        if self._verify_block is not None:
+            # the verify conv leaves each window as it was; correct_verify_state rebuilds it from these inputs
+            return plan.run_conv(
+                x=x, conv_layer=conv_layer, weight=weight, bias=bias, activation=activation,
+                rerun=self._kept.setdefault(self._default_layer_idx, VerifyRerun()),
+            )
+        return plan.run_conv(
             x=x, conv_layer=conv_layer, weight=weight, bias=bias,
             activation=activation,
         )
+
+    # Speculative decoding
+
+    def capabilities(self):
+        """What the recurrent multi-token kernel can't run: no pool, or a state that
+        isn't float32. Both follow from the deployment (the pool block, or its
+        kv_dtype), so every rank answers alike."""
+        from mstar.engine.resources.spec import ResourceCapabilities
+
+        verify = None
+        if self._pool is None:
+            verify = "gdn: a verifying node needs its recurrent state pool"
+        elif self.state_dtype is not torch.float32:
+            verify = (
+                f"gdn: a verifying node's state is {self.state_dtype}; the multi-token verify kernel "
+                "(flashinfer's gated_delta_rule_mtp) runs on a float32 pool only"
+            )
+        return ResourceCapabilities(verify_refusal=verify, async_verify_refusal=None)
+
+    def bind_verify_walk(self, walk: str, block: int, slack: int) -> None:
+        """``walk`` verifies drafts, ``block`` (k + 1) tokens a row, on the recurrent
+        multi-token kernel: its steps leave each row's state and conv window as
+        they were, and `correct_verify_state` reruns the kept tokens once the result is
+        known. Compiles every variant a verify step can reach before the node
+        serves; what the kernel can't run, `capabilities` refused."""
+        del slack
+        self._verify_walks[walk] = block
+        self._pool.verify_settler = self
+        if self._device.type == "cuda":
+            self._warm_verify(block)
+
+    def _warm_verify(self, block: int) -> None:
+        """Compile the multi-token kernel for every row count a verify step can run
+        (the pool's request slots), forward and rerun. It JITs per tile path, which
+        its batch size picks; one variant left for serving would stall a step."""
+        import time
+
+        from flashinfer.gdn_decode import gated_delta_rule_mtp
+
+        g, device = self.geometry, self._device
+        rows = self._pool.config.usable_slots
+        start = time.perf_counter()
+        state = torch.zeros(rows + 1, g.num_v_heads, g.head_v_dim, g.head_k_dim, device=device)
+        a_log = torch.zeros(g.num_v_heads, device=device)
+        for n in range(1, rows + 1):
+            q = torch.zeros(n, block, g.num_k_heads, g.head_k_dim, dtype=torch.bfloat16, device=device)
+            v = torch.zeros(n, block, g.num_v_heads, g.head_v_dim, dtype=torch.bfloat16, device=device)
+            gates = torch.zeros(n, block, g.num_v_heads, dtype=torch.bfloat16, device=device)
+            index = torch.arange(1, n + 1, dtype=torch.int32, device=device)
+            for frozen in (True, False):
+                gated_delta_rule_mtp(
+                    q=q, k=q, v=v, initial_state=state, initial_state_indices=index, A_log=a_log, a=gates,
+                    dt_bias=a_log, b=gates, scale=self.config.sm_scale, disable_state_update=frozen,
+                    use_qk_l2norm=self.config.qk_l2norm,
+                )
+        torch.cuda.synchronize(device)
+        logger.info(
+            "gdn: verify kernel compiled for 1-%d rows of %d tokens, forward and rerun (%.1f s)",
+            rows, block, time.perf_counter() - start,
+        )
+
+    @torch.compiler.disable
+    def correct_verify_state(self, result) -> None:
+        """Undo a verify step's rejected tokens, in its own graph, right after
+        the sampler's verify (`draft_verify_step`). Each layer reruns the delta
+        rule over the block from the slot (the forward left it as it was), the
+        rejected tokens' gates closed (decay 1, rate 0: the state passes through
+        unchanged), so the slot ends after the kept tokens, within the kernel's
+        float precision; and each conv
+        window (the forward left it as it was too) is rebuilt as the last
+        ``width`` entries of the window and the kept tokens' inputs. Fixed
+        shapes, no host reads: capturable."""
+        if self._verify_block is None or not self._kept:
+            return
+        from flashinfer.gdn_decode import gated_delta_rule_mtp
+
+        from mstar.engine.resources.linear_attn.settle_conv import settle_conv
+
+        accepted = result.accepted
+        for layer, rerun in self._kept.items():
+            if rerun.k is None or rerun.x is None:
+                # its state or its conv window would keep the rejected tokens
+                raise RuntimeError(f"gdn layer {layer}: a verify step ran only one of run_conv and the delta rule")
+        # every layer's rows and block are the step's
+        first = next(iter(self._kept.values()))
+        rows, block = first.k.shape[0], first.k.shape[1]
+        accepted = accepted[:rows]
+        # a row keeps its last token and the drafts it accepted
+        kept = accepted.clamp(max=block - 1) + 1
+        live = (torch.arange(block, device=accepted.device)[None, :] < kept[:, None])[..., None]
+        closed = torch.full((), CLOSED_GATE, dtype=first.a.dtype, device=accepted.device)
+        for layer, rerun in self._kept.items():
+            k, a, b = rerun.k, rerun.a, rerun.b
+            # the outputs are discarded: k stands in for q
+            gated_delta_rule_mtp(
+                q=k, k=k, v=rerun.v, initial_state=self._pool.block("state", layer),
+                initial_state_indices=rerun.index, A_log=rerun.a_log, a=torch.where(live, a, closed),
+                dt_bias=rerun.dt_bias, b=torch.where(live, b, closed), scale=rerun.scale,
+                output=rerun.out, disable_state_update=False, use_qk_l2norm=rerun.qk_l2norm,
+            )
+            settle_conv(self._pool.block("conv", layer), rerun.slots, accepted, rerun.x, block, rerun.null_slot_id)
+        self._kept = {}
 
     # Engine lifecycle
 
