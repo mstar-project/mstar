@@ -18,6 +18,7 @@ protocol are untouched):
                        | {t:"windows", rid, sub, op, plan, ...}
                        | {t:"live", rid, sub, op, call, ..., stream?, audio?(bin)}
                        | {t:"end_of_turn", rid, sub, audio(bin)}
+                       | {t:"lora", rid, sub, op, lora_name, lora_path?}
     bridge -> frontend:  {t:"chunk", rid, sub, modality, data(bin), metadata}
                        | {t:"chunks", subs, modalities, payloads(bin), metadatas}
                        | {t:"err", rid, sub, msg} | {t:"done", rid, sub}
@@ -28,6 +29,8 @@ protocol are untouched):
                        | {t:"windows", rid, sub, metadata:{duration, single, windows} | {error}}
                        | {t:"live", rid, sub, metadata:{taking | accepted | rejected | error, status, error_id?}}
                        | {t:"end_of_turn", rid, sub, metadata:{p} | {error}}
+                       | {t:"lora", rid, sub, metadata:{text} | {error:{status, message}}}
+                       | {t:"served", adapters}   (unsolicited, on every change)
 
 A ``live`` request is one operation on a ``/generate/ws`` live call, the
 submission ``call`` names: ``taking`` (``taking_input``), ``append``
@@ -74,8 +77,8 @@ only, one map of ``PromptPart``'s fields per part. The bridge mesh lives in
 its own socket dir (private to the frontend/bridge pair), so entity names
 never collide with the conductor/worker mesh.
 
-Opt-in: ``mstar-serve --rust-frontend`` replaces ``uvicorn.run`` with the
-``mstar-server`` binary + this loop. Everything else in the process
+``mstar-serve`` runs the ``mstar-server`` binary + this loop in place of
+``uvicorn.run`` (unless ``--python-frontend``). Everything else in the process
 (preprocess worker, conductor spawn, tensor transport) is identical. The
 frontend enforces the API key (``--api-key`` / ``MSTAR_API_KEY``) itself; the
 bridge socket is private to the pair.
@@ -89,8 +92,10 @@ import logging
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sysconfig
+import threading
 from enum import StrEnum
 from pathlib import Path
 
@@ -102,7 +107,7 @@ from mstar.communication.rust_communicator import (
 )
 from mstar.graph.runtime.utils import CHECKOUT_RUST, is_mstar_rust_crate, require_rust_extension
 from mstar.model.multimodal import PromptPart
-from mstar.utils.client_errors import client_error_text, scrub_paths
+from mstar.utils.client_errors import client_error_text, exception_status_text, scrub_paths
 from mstar.utils.threads import ThreadPool
 
 logger = logging.getLogger(__name__)
@@ -475,11 +480,30 @@ class RustFrontendBridge:
         self.loop: asyncio.AbstractEventLoop | None = None
         # a transcription upload's WindowPlanner, by the frontend's plan id, until it closes
         self._planners: dict = {}
+        # mstar-server selects LoRA adapters itself, with no round trip per request:
+        # every change to the served set (a runtime load or unload, a conductor's
+        # answer that came after its request timed out) is pushed to it
+        served = getattr(server, "served_models", None)
+        if served is not None:
+            served.subscribe(self._push_served)
 
     # -- outbound ----------------------------------------------------------
 
     def _send(self, msg: dict) -> None:
         self.comm.send("frontend", msg)
+
+    def _push_served(self, adapters: tuple[str, ...]) -> None:
+        """``ServedModels``' listener: the served adapters, from whichever thread
+        changed them (the conductor's answers arrive on the message thread)."""
+        msg = {"t": "served", "rid": "", "sub": None, "adapters": list(adapters)}
+        loop = self.loop
+        if loop is None:
+            self._send(msg)   # not serving yet: nothing else sends
+            return
+        try:
+            loop.call_soon_threadsafe(self._send, msg)
+        except RuntimeError:
+            pass  # the loop has closed, and the frontend with it
 
     def _err(self, rid: str, sub: int | None, detail: str) -> None:
         self._send({"t": "err", "rid": rid, "sub": sub, "msg": detail})
@@ -703,6 +727,33 @@ class RustFrontendBridge:
         reply["metadata"] = meta
         self._send(reply)
 
+    def _lora(self, msg: dict) -> None:
+        """``/v1/load_lora_adapter`` or ``/v1/unload_lora_adapter``: the API server's
+        ``LoraAdmin`` call, answered with its text or with the error the Python
+        route answers (``exception_status_text``). The served set it changes
+        reaches mstar-server by ``_push_served``."""
+        reply = {"t": "lora", "rid": msg.get("rid"), "sub": msg.get("sub"), "data": b"", "metadata": {}}
+        route = "/v1/load_lora_adapter" if msg.get("op") == "load" else "/v1/unload_lora_adapter"
+
+        async def run() -> None:
+            try:
+                admin = getattr(self.server, "lora_admin", None)
+                if admin is None:
+                    raise RuntimeError("this API server has no LoRA admin")
+                if msg.get("op") == "load":
+                    text = await admin.load(msg.get("lora_name"), msg.get("lora_path"))
+                elif msg.get("op") == "unload":
+                    text = await admin.unload(msg.get("lora_name"))
+                else:
+                    raise RuntimeError(f"unknown lora operation {msg.get('op')!r}")
+                reply["metadata"] = {"text": text}
+            except Exception as exc:  # noqa: BLE001 — the call fails, the bridge goes on
+                status, text = exception_status_text(exc, route, log=logger)
+                reply["metadata"] = {"error": {"status": status, "message": text}}
+            self._send(reply)
+
+        self.loop.create_task(run())
+
     def _end_of_turn(self, msg: dict) -> None:
         """``semantic_vad``'s end-of-turn probability of a turn's last audio
         (float32), by this side's Smart Turn: its int8 model moves by tenths
@@ -846,6 +897,8 @@ class RustFrontendBridge:
             self._windows(msg)
         elif t == "live":
             self._live(msg)
+        elif t == "lora":
+            self._lora(msg)
         elif t == "end_of_turn":
             self._end_of_turn(msg)
         else:
@@ -892,10 +945,20 @@ class RustFrontendBridge:
         pin = getattr(self.server, "pin_result_thread", None)
         if pin is not None:
             pin()
+        # SIGINT and SIGTERM end the loop, as uvicorn's handlers end its server:
+        # asyncio.run installs a SIGINT handler only over Python's default one,
+        # and a server started as a background job inherits SIGINT ignored
+        stop = lambda signum, frame: setattr(self, "running", False)  # noqa: E731
+        handled = (signal.SIGINT, signal.SIGTERM)
+        on_main = threading.current_thread() is threading.main_thread()
+        previous = {sig: signal.signal(sig, stop) for sig in handled} if on_main else {}
         try:
             asyncio.run(self._serve())
         except KeyboardInterrupt:
             pass
+        finally:
+            for sig, handler in previous.items():
+                signal.signal(sig, handler)
 
     def stop(self) -> None:
         self.running = False

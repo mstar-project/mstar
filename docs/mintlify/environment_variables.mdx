@@ -50,9 +50,9 @@ Per-model knobs, read when the submodule is built. They are scoped to one model,
 | `MSTAR_QWEN_ASR_REF` | `refs/Qwen3-ASR` | `test/asr/test_qwen3_asr_parity.py`: a checkout of the qwen-asr SDK, the reference transcripts come from. |
 | `MSTAR_QWEN_ASR_REF_SITE` | unset | `test/asr/test_qwen3_asr_parity.py`: a directory holding transformers 4.57, put first on the path of the subprocess that runs the SDK (whose model code does not run on transformers 5). Unset under transformers 5, the SDK comparison skips. |
 
-## Serving (Python frontend) {#serving-python-frontend}
+## Serving (API server) {#serving-api-server}
 
-Read by `mstar-serve` / `mstar.api_server.entrypoint`.
+Read by `mstar-serve` / `mstar.api_server.entrypoint`, whichever frontend serves HTTP. Where a row describes how a route answers, it is the Python frontend's (`--python-frontend`); `mstar-server`'s rows are under [Serving (Rust frontend)](/environment_variables#serving-rust-frontend).
 
 | Variable | Default | Meaning |
 |----|----|----|
@@ -65,16 +65,16 @@ Read by `mstar-serve` / `mstar.api_server.entrypoint`.
 
 ## Serving (Rust frontend) {#serving-rust-frontend}
 
-Read by the `mstar-server` binary and its bridge (`mstar-serve --rust-frontend`; see [Installation](/installation)).
+Read by the `mstar-server` binary, `mstar serve`'s default HTTP frontend, and its bridge (see [Installation](/installation)).
 
 | Variable | Default | Meaning |
 |----|----|----|
 | `MSTAR_SERVER_BIN` | unset | Path to the `mstar-server` binary. Fallback order: `--rust-frontend-bin`, this variable, the running environment's scripts directory (where the Linux wheels install it), `$PATH`, then the in-repo `rust/server/target/release` build. |
-| `MSTAR_API_KEY` | unset | Same rule as the Python server (`rust/server/src/auth.rs`, read once at startup): every route except `/health` and `/metrics` needs `Authorization: Bearer <key>`. `mstar-serve --rust-frontend` sets it from `--api-key` / its own environment. |
-| `MSTAR_REQUEST_TIMEOUT_S` | `600` | Per-request budget in the Rust frontend, in seconds; on expiry the client gets an error and the request is aborted in the backend. `0` times every request out; a negative, non-finite or unreadable value is the default. `mstar serve --rust-frontend` sets it from `--timeout` (`launch_rust_server`). |
-| `MSTAR_SAMPLE_RATE` | `24000` | Sample rate stamped on the Rust frontend's WAV output. `mstar serve --rust-frontend` sets it to the model's `get_output_sample_rate("audio")`, as the Python frontend reads it. |
+| `MSTAR_API_KEY` | unset | Same rule as the Python server (`rust/server/src/auth.rs`, read once at startup): every route except `/health` and `/metrics` needs `Authorization: Bearer <key>`. `mstar-serve` sets it from `--api-key` / its own environment. |
+| `MSTAR_REQUEST_TIMEOUT_S` | `600` | Per-request budget in the Rust frontend, in seconds; on expiry the client gets an error and the request is aborted in the backend. `0` times every request out; a negative, non-finite or unreadable value is the default. `mstar serve` sets it from `--timeout` (`launch_rust_server`). |
+| `MSTAR_SAMPLE_RATE` | `24000` | Sample rate stamped on the Rust frontend's WAV output. `mstar serve` sets it to the model's `get_output_sample_rate("audio")`, as the Python frontend reads it. |
 | `MSTAR_LIBSNDFILE` | unset | The libsndfile the Rust frontend opens at startup to encode `mp3`, `flac` and `opus` speech (`rust/server/src/sndfile.rs`), called as `soundfile.write` calls it, so the files are the Python frontend's byte for byte (an Ogg stream's random serial aside). Unset, only `wav` and `pcm` are produced, as on the Python frontend without `soundfile`. `launch_rust_server` sets it to the library `soundfile` loaded (`soundfile_library`) and drops an inherited value; it is opened at run time, never linked, as its LAME encoder is LGPL. |
-| `MSTAR_SERVED_MODELS` | unset | The names a Rust-frontend request's `model` may carry, as JSON: the base model's names and the served LoRA adapters (`api_server/served_models.py`, `rust/server/src/served_models.rs`). Unset serves the base model alone. Not for deployments to set: `launch_rust_server` sets it from the API server's `ServedModels`. |
+| `MSTAR_SERVED_MODELS` | unset | The names a Rust-frontend request's `model` may carry, as JSON: the base model's names and the LoRA adapters served at launch (`api_server/served_models.py`, `rust/server/src/served_models.rs`); the API server pushes each later change over the bridge. Unset serves the base model alone. Not for deployments to set: `launch_rust_server` sets it from the API server's `ServedModels`. |
 | `MSTAR_TRANSCRIPTION` | unset | What the Rust frontend's `/v1/audio/transcriptions` needs from the served model, as JSON: the kwargs it declares, the deployment's `max_concurrent_requests`, the adapter's language tables, and the pydantic version its error text cites. Not for deployments to set: `launch_rust_server` sets it from `transcription_facts` for a model with a transcription surface, and drops an inherited value. |
 | `MSTAR_OPENPI` | unset | The deployment's openpi policy (its `openpi:` block as the API server checked it, the metadata frame packed), as JSON; unset serves no socket at `/`. Not for deployments to set: `launch_rust_server` sets it from `openpi_facts`. |
 | `MSTAR_WS_MAX_BYTES` | the body limit | The largest WebSocket message the Rust frontend reads, in bytes: the config's `ws_max_message_mb`. Not for deployments to set: `launch_rust_server` sets it. |
@@ -86,12 +86,8 @@ Read by the `mstar-server` binary and its bridge (`mstar-serve --rust-frontend`;
 | `MSTAR_MAX_CONCURRENT_REQUESTS` | `512` | Admission cap on in-flight generation requests; beyond it clients get an immediate 503 instead of queueing into the request timeout. `/health`, `/metrics` and `/v1/models` bypass the cap. |
 | `MSTAR_MAX_BODY_MB` | `128` | Request body limit (multipart uploads included). |
 | `MSTAR_TOKENIZE_PARALLEL` | `1` | When a long prompt is encoded as parallel chunks, set `TOKENIZERS_PARALLELISM=true` for the process first: the Rust tokenizer only uses its thread pool while that variable reads true, and serving environments often export it false. `0` leaves the variable as it is (the chunked encode then runs serially). |
-| `MSTAR_OPENAI_ADAPTER` | set by the launcher | The class name of the model's adapter in `ADAPTER_REGISTRY` (`openai_adapter_class` in `mstar/api_server/rust_frontend.py`), which picks the OpenAI translation `mstar-server` uses (`adapters::from_python`, which looks it up in `ADAPTERS`). `mstar-serve --rust-frontend` always sets it; a `mstar-server` started by hand without it answers 404 on `/v1/*`. |
+| `MSTAR_OPENAI_ADAPTER` | set by the launcher | The class name of the model's adapter in `ADAPTER_REGISTRY` (`openai_adapter_class` in `mstar/api_server/rust_frontend.py`), which picks the OpenAI translation `mstar-server` uses (`adapters::from_python`, which looks it up in `ADAPTERS`). `mstar-serve` always sets it; a `mstar-server` started by hand without it answers 404 on `/v1/*`. |
 | `MSTAR_TOKENIZER` | unset | Path to a HuggingFace `tokenizer.json` enabling frontend tokenization. Leave unset with the Python backend — its preprocess worker owns tokenization, and the bridge rejects pre-tokenized ingest. |
-
-### Rust frontend limitations {#rust-frontend-limitations}
-
-The Rust frontend serves every route the Python frontend serves but LoRA's runtime updates (`/v1/load_lora_adapter` and `/v1/unload_lora_adapter`, see [Supported Models](/models)): `mstar serve` refuses `--rust-frontend` with `runtime_updates: true`.
 
 ## Request media {#request-media}
 

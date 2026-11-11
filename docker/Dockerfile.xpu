@@ -93,6 +93,7 @@ ARG TORCHAUDIO_VERSION=2.11.0+xpu
 ARG TORCHCODEC_VERSION=0.16.0+cpu
 ARG TORCHCODEC_XPU_VERSION=0.16.0
 # Override upstream's torch<2.13 cap for this XPU image without changing metadata.
+# mstar-server, mstar serve's HTTP frontend, goes on PATH, where find_server_binary looks.
 RUN cd ./mstar && uv pip install --no-cache --torch-backend=xpu \
     --overrides <(printf 'torch==%s\n' "${TORCH_VERSION}") \
     "torch==${TORCH_VERSION}" "torchvision==${TORCHVISION_VERSION}" \
@@ -107,8 +108,10 @@ RUN cd ./mstar && uv pip install --no-cache --torch-backend=xpu \
         import torchcodec_xpu; \
         assert torch.version.xpu is not None; \
         print('M* XPU imports OK:', torch.__version__)" && \
+    cargo build --release --locked --manifest-path rust/server/Cargo.toml && \
+    install -m 755 rust/server/target/release/mstar-server /usr/local/bin/mstar-server && \
     mstar serve --help && \
-    rm -rf rust/target build ./*.egg-info
+    rm -rf rust/target rust/server/target build ./*.egg-info
 
 EXPOSE 8000
 
