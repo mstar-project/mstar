@@ -51,7 +51,7 @@ ROUTES = {
     "transcriptions": ("/v1/audio/transcriptions", {"model": "m"}),
 }
 # Surfaces the Python adapter serves and mstar-server does not yet (#742).
-NOT_PORTED: set[tuple[str, str]] = set()
+NOT_PORTED: set[tuple[str, str]] = {("GlmChatAdapter", "chat")}
 
 
 def _classes() -> dict[str, object]:
@@ -304,6 +304,12 @@ class _PythonServer:
             self.tail = [_Chunk("usage", b"", _USAGE)]
         return kwargs["request_id"]
 
+    def submission_key(self, request_id):
+        return request_id
+
+    def abort_submission(self, key, outcome="abort"):
+        pass
+
     async def collect_results(self, request_id, raw_request=None):
         return [_Chunk("text", b"Hello "), _Chunk("text", b"world"), *self.tail]
 
@@ -415,22 +421,22 @@ def test_both_frontends_list_the_voices_alike(model, voiced, tmp_path, monkeypat
 # ── text-only chat (TextChatAdapter) ─────────────────────────────────────────
 
 def _text(**fields):
-    return {"model": "glm52", "messages": [{"role": "user", "content": "Bonjour, 世界"}], **fields}
+    return {"model": "ripple_65b", "messages": [{"role": "user", "content": "Bonjour, 世界"}], **fields}
 
 
 TEXT_CHAT_CASES = {
     "accepted": _text(temperature=0.3, top_p=0.9, max_tokens=16, seed=2, top_k=5),
     # one input modality per part, or a model that rebuilds its turns from them keeps only the first
-    "multi-turn": {"model": "glm52", "messages": [
+    "multi-turn": {"model": "ripple_65b", "messages": [
         {"role": "system", "content": "be brief"}, {"role": "user", "content": "hi"},
         {"role": "assistant", "content": "hello"}, {"role": "user", "content": "again"},
     ]},
     "text-response-format": _text(response_format={"type": "text"}, best_of=1, n=1, logprobs=False),
-    "image": {"model": "glm52", "messages": [{"role": "user", "content": [
+    "image": {"model": "ripple_65b", "messages": [{"role": "user", "content": [
         {"type": "text", "text": "what is it"},
         {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{PNG}"}},
     ]}]},
-    "no-text": {"model": "glm52", "messages": [{"role": "user", "content": ""}]},
+    "no-text": {"model": "ripple_65b", "messages": [{"role": "user", "content": ""}]},
     "zero-max-tokens": _text(max_tokens=0),
     "zero-max-completion-tokens": _text(max_completion_tokens=0),
     "n": _text(n=2),
@@ -455,11 +461,11 @@ def test_a_text_only_chat_is_refused_or_submitted_as_python_does(case, tmp_path)
 
     body = TEXT_CHAT_CASES[case]
     try:
-        want, refusal = ADAPTER_REGISTRY["glm52"].chat_to_request(_python_request(body), tmp_path), None
+        want, refusal = ADAPTER_REGISTRY["ripple_65b"].chat_to_request(_python_request(body), tmp_path), None
     except ValueError as e:
         want, refusal = None, str(e)
     stub = _StubAPIServer()
-    with _model_stack("glm52", stub) as (port, _upload):
+    with _model_stack("ripple_65b", stub) as (port, _upload):
         status, data = _post(port, ROUTES["chat"][0], body, timeout=30)
     if refusal is not None:
         assert (status, json.loads(data)["error"]["message"]) == (400, refusal)

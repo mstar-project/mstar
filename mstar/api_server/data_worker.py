@@ -623,6 +623,8 @@ class RequestOutputState:
     # A video_frame chunk can carry several frames, so this advances by
     # frame_count rather than chunks.
     frame_index: int = 0
+    # the prompt's token count, stamped on the request's text chunks
+    prompt_tokens: int = 0
 
 
 class EncodedOutput(NamedTuple):
@@ -1114,7 +1116,7 @@ class PreprocessWorkerThread:
             call.held.append(HeldItems(self._store_held(input.request_id, stream_items), None))
 
         self.request_model_kwargs[input.request_id] = model_kwargs
-        self.request_output_state[input.request_id] = RequestOutputState()
+        self.request_output_state[input.request_id] = RequestOutputState(prompt_tokens=num_prompt_tokens)
         preprocess_only = getattr(self.model, "PREPROCESS_ONLY_KWARGS", ())
         conductor_kwargs = {k: v for k, v in model_kwargs.items() if k not in preprocess_only}
         msg = ConductorMessage(
@@ -1837,6 +1839,8 @@ class PreprocessWorkerThread:
             if ready.modality == "video_frame":
                 ready.metadata["frame_index"] = state.frame_index
                 state.frame_index += ready.metadata["frame_count"]
+            elif ready.num_tokens:
+                ready.prompt_tokens = state.prompt_tokens
             self.out_queue.put(ready)
             state.next_emit += 1
 

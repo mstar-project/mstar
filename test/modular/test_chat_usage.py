@@ -433,6 +433,9 @@ class _ChatAPI:
     def submit_request(self, **kwargs):
         self.submitted = kwargs
 
+    def submission_key(self, request_id):
+        return request_id
+
     async def collect_results(self, request_id, raw_request=None):
         return self.chunks
 
@@ -452,7 +455,11 @@ def _chat(chunks, tmp_path, **fields):
     from mstar.api_server.openai.serving_chat import create_chat_completion
 
     api = _ChatAPI(chunks, tmp_path)
-    adapter = SimpleNamespace(chat_to_request=lambda req, upload_dir: SubmitArgs(text="hi", input_modalities=["text"]))
+    adapter = SimpleNamespace(
+        chat_to_request=lambda req, upload_dir: SubmitArgs(text="hi", input_modalities=["text"]),
+        make_output_parser=lambda req: None,
+        stop_strings=lambda req: None,
+    )
     req = ChatCompletionRequest(messages=[{"role": "user", "content": "hi"}], **fields)
 
     async def run():

@@ -7,7 +7,6 @@ from pathlib import Path
 from types import MappingProxyType
 
 import torch
-from jinja2 import TemplateError
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import FINAL_PREFILL
@@ -46,7 +45,7 @@ from mstar.model.glm52.config import (
     SAMPLER_RESOURCE,
     Glm52ModelConfig,
 )
-from mstar.model.multimodal import TEXT, PromptPart, chat_turns
+from mstar.model.multimodal import GLM_TEMPLATE_KWARGS, PromptPart, render_chat_template
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.utils import (
     ByteLevelTextOutput,
@@ -83,6 +82,9 @@ class Glm52Model(ByteLevelTextOutput, Model):
 
     # the conductor builds the fused-MoE align op before spawning the workers
     prebuild_fused_moe = True
+    # read only by process_prompt's template, and kept off the conductor's wire,
+    # which cannot carry every number a tool schema may hold (2**64)
+    PREPROCESS_ONLY_KWARGS = ("messages", "tools", "chat_template_kwargs", "reply_prefix")
     # the checkpoint's sampling defaults, under whatever a request sets (set by
     # `__init__`; a model built without it takes the published recipe)
     sampling_defaults: Mapping[str, object] = DEFAULT_SAMPLING
@@ -364,14 +366,13 @@ class Glm52Model(ByteLevelTextOutput, Model):
                     f"repetition_penalty={sampling.repetition_penalty}); serve with mtp_num_draft_tokens: 0"
                 )
         if self._tokenizer_mode == "byte":
-            # Reduced serve maps UTF-8 bytes directly to token ids, avoiding HF IO.
+            # Reduced serve maps UTF-8 bytes directly to token ids, avoiding HF IO;
+            # the reply prefix (a forced tool call) follows the prompt
             vocab = self.config.vocab_size
-            byte_ids = [min(b, vocab - 1) for b in prompt.encode("utf-8")] or [0]
-            input_ids = torch.tensor(byte_ids, dtype=torch.long)
-        elif getattr(self.tokenizer, "chat_template", None):
-            input_ids = self._render_chat(prompt, prompt_parts)
+            text = (prompt.encode("utf-8") or b"\0") + (kwargs.get("reply_prefix") or "").encode("utf-8")
+            input_ids = torch.tensor([min(b, vocab - 1) for b in text], dtype=torch.long)
         else:
-            input_ids = self.tokenizer(prompt, return_tensors="pt").input_ids[0]
+            input_ids = render_chat_template(self.tokenizer, prompt, prompt_parts, kwargs, GLM_TEMPLATE_KWARGS)
 
         # here, in the data worker, a ValueError reaches the client as a 400
         if input_ids.numel() > self.config.max_prompt_tokens:
@@ -384,30 +385,6 @@ class Glm52Model(ByteLevelTextOutput, Model):
         return ProcessPromptOutput(
             {"text_inputs": [input_ids.to(torch.long)]}, {"kv_layout": {KV_RESOURCE: {"main": layout}}},
         )
-
-    def _render_chat(self, prompt: str, prompt_parts: list[PromptPart] | None) -> torch.Tensor:
-        """The chat's turns, each in its own role, through the checkpoint's template, which
-        adds ``[gMASK]<sop>`` and opens the assistant turn. An entrypoint with no messages
-        sends the prompt as one user turn. TODO: the thinking mode / reasoning_effort dial."""
-        parts = prompt_parts or [PromptPart(modality=TEXT, text=prompt, role="user")]
-        messages = [
-            {"role": turn.role,
-             "content": "\n".join(p.text or "" for p in turn.parts if p.modality == TEXT)}
-            for turn in chat_turns(parts)
-        ]
-        try:
-            input_ids = self.tokenizer.apply_chat_template(
-                messages,
-                add_generation_prompt=True,
-                return_tensors="pt",
-                # transformers 5.x defaults return_dict=True (a BatchEncoding);
-                # keep the bare-tensor return so [0] selects the row
-                return_dict=False,
-            )
-        except TemplateError as exc:
-            # a chat the template refuses is the client's to fix: a 400, not a 500
-            raise ValueError(f"GLM-5.2's chat template refused the chat: {exc}") from exc
-        return input_ids[0]
 
     def get_request_resource_configs(
         self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,

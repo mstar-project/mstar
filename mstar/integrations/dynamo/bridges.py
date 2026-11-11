@@ -43,7 +43,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from mstar.api_server.openai._util import check_inline_result
-from mstar.api_server.openai.adapters import CHAT_ENVELOPE_KEYS, OpenAIAdapter, SubmitArgs
+from mstar.api_server.openai.adapters import CHAT_ENVELOPE_KEYS, OpenAIAdapter, SubmitArgs, _refuse_tool_calls
 from mstar.api_server.openai.protocol import (
     ChatCompletionRequest,
     ImageGenerationRequest,
@@ -225,6 +225,12 @@ class RequestBridge:
             body["modalities"] = ["text"]
         req = ChatCompletionRequest.model_validate(body)
         try:
+            # the bridge parses no tool call out of a reply, even where the adapter serves them
+            _refuse_tool_calls(req.model_extra or {})
+            if self.adapter.stop_strings(req):
+                # matched on the decoded answer by the native chat route; the bridge streams
+                # the model's text as it comes and would run past the stop
+                raise ValueError("stop is not supported on this endpoint")
             args = self.adapter.chat_to_request(req, self.server.upload_dir)
         except ValueError as exc:
             raise _BadRequestError(str(exc)) from exc

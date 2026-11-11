@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, NamedTuple
 
 import torch
+from jinja2 import TemplateError
 
 from mstar.conductor.request_info import FINAL_PREFILL, WalkStep
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Parallel, Sequential
@@ -143,6 +144,63 @@ def messages_from_parts(
     if default_system is not None and not any(m["role"] == "system" for m in messages):
         messages.insert(0, {"role": "system", "content": default_system})
     return messages
+
+
+# What GLM-5.2's and GLM-5.3's chat templates read of ``chat_template_kwargs``; other keys
+# are dropped, as some would collide with apply_chat_template's own arguments.
+GLM_TEMPLATE_KWARGS = ("enable_thinking", "reasoning_effort", "clear_thinking")
+
+
+def render_chat_template(
+    tokenizer, prompt: str, prompt_parts: list[PromptPart] | None, request_kwargs: dict,
+    switches: tuple[str, ...] = (),
+) -> torch.Tensor:
+    """Token ids of a chat through ``tokenizer``'s chat template, with the assistant turn
+    opened: the chat API's ``messages`` and ``tools``, else the prompt's turns, each in its
+    own role. ``chat_template_kwargs`` may set only ``switches``; other keys collide with
+    ``apply_chat_template``'s own arguments. A tokenizer with no chat template tokenizes
+    ``prompt`` as it is. The ids of ``reply_prefix``, what the reply opens with (a forced
+    tool call), follow either. A malformed chat, or one the template refuses, is a
+    ValueError, which reaches the client as a 400."""
+    if getattr(tokenizer, "chat_template", None):
+        input_ids = _apply_chat_template(tokenizer, prompt, prompt_parts, request_kwargs, switches)
+    else:
+        input_ids = tokenizer(prompt, return_tensors="pt").input_ids[0]
+    if prefix := request_kwargs.get("reply_prefix"):
+        # no special tokens: the template's opening ones would land mid prompt
+        prefix_ids = tokenizer.encode(prefix, add_special_tokens=False)
+        input_ids = torch.cat([input_ids, torch.tensor(prefix_ids, dtype=input_ids.dtype)])
+    return input_ids
+
+
+def _apply_chat_template(
+    tokenizer, prompt: str, prompt_parts: list[PromptPart] | None, request_kwargs: dict, switches: tuple[str, ...],
+) -> torch.Tensor:
+    messages = request_kwargs.get("messages")
+    if messages and not isinstance(messages, list):
+        raise ValueError("messages must be a list of chat messages")
+    if not messages:
+        parts = prompt_parts or [PromptPart(modality=TEXT, text=prompt, role="user")]
+        messages = [
+            {"role": turn.role, "content": "\n".join(p.text or "" for p in turn.parts if p.modality == TEXT)}
+            for turn in chat_turns(parts)
+        ]
+    template_kwargs = request_kwargs.get("chat_template_kwargs") or {}
+    if not isinstance(template_kwargs, dict):
+        raise ValueError(f"chat_template_kwargs must be an object; got {template_kwargs!r}")
+    try:
+        input_ids = tokenizer.apply_chat_template(
+            messages,
+            tools=request_kwargs.get("tools"),
+            add_generation_prompt=True,
+            return_tensors="pt",
+            # transformers 5.x returns a BatchEncoding by default; [0] wants the bare tensor
+            return_dict=False,
+            **{k: v for k, v in template_kwargs.items() if k in switches},
+        )
+    except TemplateError as exc:
+        raise ValueError(f"the chat template refused the chat: {exc}") from exc
+    return input_ids[0]
 
 
 def prefill_plan(

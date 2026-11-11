@@ -128,6 +128,9 @@ def load_model(stub: bool):
 
             def postprocess_inline(self, values, modality, request_kwargs):
                 return [str(v).encode() for v in values]
+
+            def text_output(self):
+                return None
         return _M(), list(range(1000, 1600))
     from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
 

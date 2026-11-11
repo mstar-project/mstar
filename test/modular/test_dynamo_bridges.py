@@ -534,18 +534,30 @@ TOOLS_REFUSED = "tool calling is not supported for this model"
     ({"response_format": {"type": "json_object"}},
      "response_format needs constrained decoding; only {'type': 'text'} is served"),
 ], ids=["tools", "required", "named", "penalty", "json"])
-def test_a_chat_that_asks_for_an_unserved_field_is_a_400_with_the_adapters_message(tmp_path, fields, message):
+@pytest.mark.parametrize("model", ["qwen3_omni", "glm52"])
+def test_a_chat_that_asks_for_an_unserved_field_is_a_400_with_the_adapters_message(tmp_path, fields, message, model):
     """Stripped before the adapter, the fields left a chat that ran and ignored them.
+    The bridge parses no call out of a reply, so GLM's adapter, which serves them, is refused too.
 
     Dynamo's worker sends the client the ``code`` and ``message`` it finds on the exception.
     """
     server = _FakeRealtimeServer([_chunk("text", b"hi")], tmp_path)
     with pytest.raises(ValueError) as refused:
-        _chat_through_bridge(server, fields)
+        _chat_through_bridge(server, fields, ADAPTER_REGISTRY[model])
     assert (refused.value.code, refused.value.message) == (400, message), (
         "the client gets a 400 without the adapter's own message"
     )
     assert not server.submitted, "the chat reached the model, which ignores the field"
+
+
+def test_a_chat_with_a_stop_string_is_a_400(tmp_path):
+    """The bridge streams the model's text as it comes and applies no stop string, so it
+    refuses a chat that sends one."""
+    server = _FakeRealtimeServer([_chunk("text", b"hi")], tmp_path)
+    with pytest.raises(ValueError) as refused:
+        _chat_through_bridge(server, {"stop": ["\n"]}, ADAPTER_REGISTRY["glm52"])
+    assert (refused.value.code, refused.value.message) == (400, "stop is not supported on this endpoint")
+    assert not server.submitted
 
 
 def test_the_chat_fields_clients_send_by_default_reach_the_model(tmp_path):

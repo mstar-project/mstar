@@ -264,11 +264,13 @@ change to the API server.
 
 ``text_output(self) -> TextOutput | None``
    Declare how text output (token ids) becomes bytes: a detokenizer, and the ids that
-   end a reply, which are dropped unless the request sets ``ignore_eos``.
-   ``postprocess`` and ``postprocess_inline`` derive their text paths from it. A text
-   chunk may end inside a character, since the API server joins a request's text
-   chunks before decoding them, so declare a detokenizer from ``mstar.model.utils``
-   that emits each token's raw bytes (``TextChunkDetokenizer`` or
+   end a reply, which are dropped unless the request sets ``ignore_eos``. The chat APIs
+   report a reply that used its whole token budget without sampling one of them as cut
+   (``finish_reason: "length"``), so a model that names none is ``length`` whenever it
+   fills its budget. ``postprocess`` and ``postprocess_inline`` derive their text paths from
+   it. A text chunk may end inside a character, since the API server joins a
+   request's text chunks before decoding them, so declare a detokenizer from
+   ``mstar.model.utils`` that emits each token's raw bytes (``TextChunkDetokenizer`` or
    ``ByteLevelDetokenizer`` for byte-level BPE, ``SentencePieceDetokenizer`` for a
    SentencePiece vocabulary) rather than ``tokenizer.decode([id])``, which turns a
    split character into U+FFFD.
