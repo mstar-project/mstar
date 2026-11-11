@@ -729,7 +729,10 @@ class KVManager(AttentionResource):
         self._hosted: set[str] = set()
         self._ran_short: dict[str, ShortGrant] = {}
         self._stalled: set[str] = set()
-        if _DEBUG_ASSERTS and tp_cache:
+        # Every cfg rank holds a full copy of the pool, and a step that declares only its rank's branch share takes
+        # other pages there than rank 0. The trail makes the follower's check of each head raise on that.
+        cfg_group = getattr(joint_comm_group, "cfg_group", None)
+        if (_DEBUG_ASSERTS and tp_cache) or (cfg_group is not None and cfg_group.world_size > 1):
             self._arena.trail = (0, 0)
         self._device = device
         self._lock = threading.RLock()
