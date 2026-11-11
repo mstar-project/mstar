@@ -16,7 +16,7 @@ import torch
 from mstar.engine.windowing import WindowSchedule
 from mstar.model.cosmos3 import constants as C
 from mstar.model.cosmos3.config import Cosmos3Config
-from mstar.model.cosmos3.submodules import Cosmos3DiTSubmodule
+from mstar.model.cosmos3.submodules import COND_LABEL, Cosmos3DiTSubmodule
 from mstar.model.cosmos3.tests.stubs import StubSampler
 from mstar.model.cosmos3.tests.test_rotary_table import stand_in_rotary
 from mstar.model.submodule_base import ARNodeInputs
@@ -30,12 +30,12 @@ def _fake_transformer(cfg):
     )
 
 
-def _dit_with_buckets(monkeypatch):
+def _dit_with_buckets(monkeypatch, **config):
     monkeypatch.setenv("COSMOS3_GEN_CAPTURE_RES", "64x64")
     monkeypatch.setenv("COSMOS3_GEN_CAPTURE_VIDEO", "64x64x9")
     monkeypatch.setenv("COSMOS3_DISABLE_PREFILL_ACCELERATOR_GRAPH", "1")
     monkeypatch.delenv("COSMOS3_DISABLE_ACCELERATOR_GRAPH", raising=False)
-    cfg = Cosmos3Config(compile_denoise=False)
+    cfg = Cosmos3Config(compile_denoise=False, **config)
     sub = Cosmos3DiTSubmodule(transformer=_fake_transformer(cfg), config=cfg, scheduler=None)
     configs = sub.get_accelerator_graph_configs("cpu")
     return sub, configs
@@ -45,8 +45,9 @@ def test_video_capture_buckets_and_keys(monkeypatch) -> None:
     sub, configs = _dit_with_buckets(monkeypatch)
     ch = sub.config.latent_channel
     image_shape, video_shape = (1, ch, 1, 4, 4), (1, ch, 3, 4, 4)  # 9 frames -> 3 latent frames
+    image_key, video_key = (image_shape, "cfg"), (video_shape, "cfg")
     assert [c.capture_graph_walk for c in configs] == [C.IMAGE_GEN_WALK, C.VIDEO_GEN_WALK]
-    assert [c.additional_key_info for c in configs] == [image_shape, video_shape]
+    assert [c.additional_key_info for c in configs] == [image_key, video_key]
     assert configs[1].replay_graph_walks == [C.VIDEO_GEN_WALK, C.VIDEO_GEN_AR_WALK]
     video_inputs = configs[1].single_request_inputs.tensor_inputs
     assert video_inputs["noisy_token_mask"].shape == (12,) and video_inputs["noisy_token_mask"].all()
@@ -66,15 +67,48 @@ def test_video_capture_buckets_and_keys(monkeypatch) -> None:
                        ("odd", st((1, ch, 5, 4, 4)))):
         sub.request_state(rid).add_all(**state)
     info = lambda *rids: {r: None for r in rids}  # noqa: E731
-    assert sub.cg_key_info(C.IMAGE_GEN_WALK, info("img")) == image_shape
-    assert sub.cg_key_info(C.VIDEO_GEN_WALK, info("vid")) == video_shape
-    assert sub.cg_key_info(C.VIDEO_GEN_AR_WALK, info("ch")) == video_shape
+    assert sub.cg_key_info(C.IMAGE_GEN_WALK, info("img")) == image_key
+    assert sub.cg_key_info(C.VIDEO_GEN_WALK, info("vid")) == video_key
+    assert sub.cg_key_info(C.VIDEO_GEN_AR_WALK, info("ch")) == video_key
     assert sub.cg_key_info(C.VIDEO_GEN_AR_WALK, info("kv")) is None
     assert sub.cg_key_info(C.VIDEO_GEN_WALK, info("nocfg")) is None
     assert sub.cg_key_info(C.VIDEO_GEN_WALK, info("odd")) is None
     assert sub.cg_key_info(C.VIDEO_GEN_AR_WALK, info("ch", "kv")) is None  # mixed batch
-    assert sub.cg_key_info(C.VIDEO_GEN_AR_WALK, info("ch", "ch")) == video_shape
-    assert sub.cg_key_info(C.PREFILL_WALK, info("vid")) is True
+    assert sub.cg_key_info(C.VIDEO_GEN_AR_WALK, info("ch", "ch")) == video_key
+    assert sub.cg_key_info(C.PREFILL_WALK, info("vid")) == "cfg"
+    assert sub.cg_key_info(C.PREFILL_WALK, info("nocfg")) == "cond"  # keyed apart; no such bucket here
+    assert sub.cg_key_info(C.PREFILL_WALK, info("vid", "nocfg")) is None  # mixed regimes
+
+
+def test_conditional_only_capture_when_guidance_is_off(monkeypatch) -> None:
+    """A deployment whose default guidance is off (the distilled checkpoints)
+    captures the conditional-only step: one branch's inputs, one plan's
+    capacity, bs=1 only, and a guided request keys to no bucket."""
+    monkeypatch.setenv("COSMOS3_GEN_CAPTURE_BS", "1,4")
+    sub, configs = _dit_with_buckets(monkeypatch, guidance_scale=1.0)
+    monkeypatch.setattr(sub, "get_device", lambda: torch.device("cpu"))
+    ch = sub.config.latent_channel
+    image_key = ((1, ch, 1, 4, 4), "cond")
+    image = configs[0]
+    assert image.additional_key_info == image_key
+    assert image.capture_forward_method == "forward_captured_cond"
+    assert image.total_tokens_multiplier == 1 and list(image.capture_batch_sizes) == [1]
+    assert set(image.single_request_inputs.tensor_inputs) == {
+        "latents", "vision_timesteps", "cos_cond", "sin_cond", "noisy_token_mask",
+    }
+    info = image.single_request_inputs.resource_step_info
+    assert (info.cfg, info.cfg_active, info.capture_key) == (False, False, image_key)
+
+    sub.request_state("off").add_all(latent_shape=image_key[0], uncond=None)
+    sub.request_state("on").add_all(latent_shape=image_key[0], uncond={})
+    assert sub.cg_key_info(C.IMAGE_GEN_WALK, {"off": None}) == image_key
+    assert sub.cg_key_info(C.IMAGE_GEN_WALK, {"on": None}) is None
+    # the captured declaration plans the conditional label alone
+    step = sub.declare_step(
+        C.IMAGE_GEN_WALK, ["off"], [image.single_request_inputs], slot_lease=object(),
+    )
+    assert step.cg_key_info == image_key
+    assert {seg.label for seg in step.segments} == {COND_LABEL}
 
 
 def test_windowed_captured_inputs_carry_the_window_layout(monkeypatch) -> None:
@@ -103,7 +137,7 @@ def test_windowed_captured_inputs_carry_the_window_layout(monkeypatch) -> None:
     t = ni.tensor_inputs
     assert torch.equal(t["noisy_token_mask"], torch.tensor([0.0] * 4 + [1.0] * 8))
     assert t["vision_timesteps"].shape == (12,) and torch.all(t["vision_timesteps"] == 500.0)  # window 1, step 1
-    assert ni.resource_step_info.capture_key == (1, ch, 3, 4, 4)
+    assert ni.resource_step_info.capture_key == ((1, ch, 3, 4, 4), "cfg")
     # The per-frame mask is cached alongside, keyed on the window's statics.
     assert torch.equal(sub._noisy_masks(st, "cpu")[1].flatten(), torch.tensor([0.0, 1.0, 1.0]))
     # A kv request at the same shape stages no captured inputs (it never leases).
