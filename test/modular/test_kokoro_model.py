@@ -910,10 +910,10 @@ def test_bad_request_values_are_400s(voices_dir, kwargs, match):
 
 def test_absent_knobs_take_the_defaults(voices_dir):
     model = make_model(voices_dir)
-    out = model.process_prompt("Hi", ["text"], ["audio"])
+    out = model.process_prompt("Hi", ["text"], ["audio"]).new_input_tensors
     assert out[SPEED][0].tolist() == [model.config.default_speed]
     assert torch.equal(out[REF_STYLE][0][0], model.voices.style(model.config.default_voice, 6))
-    assert model.process_prompt("Hi", ["text"], ["audio"], speed=2)[SPEED][0].tolist() == [2.0]
+    assert model.process_prompt("Hi", ["text"], ["audio"], speed=2).new_input_tensors[SPEED][0].tolist() == [2.0]
 
 
 def test_keyed_noise_is_standard_normal_and_batch_independent():
