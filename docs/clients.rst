@@ -684,7 +684,7 @@ Per-model notes:
   in ``transcription_session.update``; a smaller ``chunk_seconds`` is raised to 0.5. An item holds
   at most 300 s of audio (``max_item_seconds`` in the session, lower if the model hears
   less): commit before then, since an append past it is refused with an ``error``.
-- **Realtime transcription, on a model that hears audio as it comes** (a ``ClientAudio`` client
+- **Realtime transcription, on a model that hears audio as it comes** (one 16 kHz ``ClientAudio`` client
   stream, no ``turn_tokens`` and no audio sent to the client, such as ``nemotron_asr``) — each item is one engine request,
   opened by its first append and ended by its commit, so its text streams as
   ``conversation.item.input_audio_transcription.delta`` events while the audio is still
