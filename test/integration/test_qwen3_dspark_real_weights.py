@@ -13,7 +13,8 @@ What is compared, and how:
 - the KV-pressure run by the fp32 screen (fp32_screen.py): ``ROUNDS`` rounds of
   32 requests in seeded arrival orders against plain under the same pressure,
   judged by transformers' Qwen3-8B in fp32 teacher-forced on each served reply;
-  the TP2 runs by the screen too, against plain one request at a time and at once;
+  the TP2 runs by the screen too, against plain one request at a time and at once,
+  and under the same KV pressure (with the KV debug checks on);
 - everything else (plain vs speculative, FA3 vs FlashInfer, concurrent runs) by
   the margin rule: where two replies
   first differ, the plain model's top-2 log-prob margin at that position, from
@@ -74,6 +75,8 @@ PAGE = 16
 ROUNDS = 4
 # a pool of 16-token pages too small for 32 requests at once
 PRESSURE_PAGES = 128
+# the drafters whose pressure rounds also run on TP2
+TP2_PRESSURE = ("dspark",)
 # requests preempted for pages, and those of them dropped (main's `Preemption` counts)
 PREEMPTION_COUNTERS = ("mstar_kv_preemptions_total", "mstar_kv_drops_total")
 
@@ -153,7 +156,8 @@ def _config(tmp: Path, name: str, drafter: Drafter, *, draft_mode: str | None, v
     return path
 
 
-def _serve(tmp_path_factory, name: str, drafter: Drafter, compile_level: int | None = None, **kw):
+def _serve(tmp_path_factory, name: str, drafter: Drafter, compile_level: int | None = None,
+           debug_asserts: bool = False, **kw):
     tmp = tmp_path_factory.mktemp(name)
     server = _server_module()
     command = [
@@ -165,6 +169,9 @@ def _serve(tmp_path_factory, name: str, drafter: Drafter, compile_level: int | N
     env = {"HF_HUB_OFFLINE": "1", "TZ": "UTC"}
     if compile_level is not None:
         env["MSTAR_COMPILE_LEVEL"] = str(compile_level)
+    if debug_asserts:
+        # the KV debug checks: page trails across ranks, offload/reload fingerprints, preemption victims
+        env["MSTAR_KV_DEBUG_ASSERTS"] = "1"
     return server.Server(REPO, tmp / "config.yaml", tmp / "server.log", command=command, env=env)
 
 
@@ -406,15 +413,35 @@ def test_kv_pressure_offloads_and_completes(tmp_path_factory, drafter, fp32):
                  pressure=True)
     run = _run(tmp_path_factory, drafter, "async_pressure", draft_mode="asynchronous",
                max_num_pages=PRESSURE_PAGES, pressure=True)
+    _check_pressure(f"{drafter.id} pressure", plain, run, fp32)
+
+
+@needs_two
+def test_tp2_kv_pressure_offloads_and_completes(tmp_path_factory, drafter, fp32):
+    """The same rounds on a TP2 node under asynchronous verify, with the KV debug checks on: rank 0 picks each
+    victim and journals its move to the host, the follower replays it, and both ranks apply the row's held results
+    at its first admit back. The replies pass the fp32 screen against plain TP2 under the same pressure."""
+    if drafter.id not in TP2_PRESSURE:
+        pytest.skip(f"the TP2 pressure rounds run for {', '.join(TP2_PRESSURE)}")
+    plain = _run(tmp_path_factory, drafter, "tp2_plain_pressure", draft_mode=None, tp=2,
+                 max_num_pages=PRESSURE_PAGES, pressure=True)
+    run = _run(tmp_path_factory, drafter, "tp2_async_pressure", draft_mode="asynchronous", tp=2,
+               max_num_pages=PRESSURE_PAGES, pressure=True, debug_asserts=True)
+    _check_pressure(f"{drafter.id} tp2 pressure", plain, run, fp32)
+
+
+def _check_pressure(label: str, plain: dict, run: dict, fp32) -> None:
+    """A pressure run's checks against plain's under the same pressure: requests were preempted, none dropped,
+    some reloaded; the fp32 screen; and acceptance."""
     reloads = len(run["events"])
-    print(f"{drafter.id} pressure: preempted {run['preempted']:.0f}, dropped {run['drops']:.0f}, reloads {reloads} "
+    print(f"{label}: preempted {run['preempted']:.0f}, dropped {run['drops']:.0f}, reloads {reloads} "
           f"(plain: preempted {plain['preempted']:.0f}, dropped {plain['drops']:.0f}), tau {run['tau']:.3f}")
     assert run["preempted"] > 0, "the pool never ran out of pages"
     # a verifying node has no rebuild policy, so its victims move to the host and come back
     assert run["drops"] == 0, "a verifying node dropped a request"
     assert reloads > 0, "no preempted request came back from the host"
     try:
-        failed = fp32_screen.screen(f"{drafter.id} pressure", [
+        failed = fp32_screen.screen(label, [
             (fp32_screen.pairs_rounds(plain, run, PROMPTS), None, run["events"])], fp32, GATES)
     finally:
         fp32.release()
