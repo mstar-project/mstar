@@ -1303,7 +1303,7 @@ impl<'py> FromPyObject<'py> for RouteArg {
             inline_values: optional_item::<Vec<Option<i64>>>(ob, "inline_values")?
                 .unwrap_or_default()
                 .into_iter()
-                .map(|v| v.map(postprocess::InlineRun::one))
+                .map(|v| v.map(postprocess::InlineRun::One))
                 .collect(),
             logprobs: optional_item(ob, "logprobs")?.unwrap_or_default(),
             walks: r.walks,
@@ -2768,6 +2768,16 @@ impl GraphRuntime {
                 !self.walk_driven_signals.contains(signal)
                     && self.inline_streams.contains(&(input.node_name.clone(), signal.to_string()))
             });
+        // A stream takes one value a step: a step that repeats has no stream to
+        // a node but its own (`loop_signals` refuses one at load), so its runs
+        // never get here. Refused before any row is routed.
+        if inline_streams && inline_values.iter().flatten().any(|run| run.values().len() != 1) {
+            return Err(PyValueError::new_err(format!(
+                "{}: a streamed {} goes one value a step, and this step ran several",
+                input.node_name,
+                input.inline_signal.as_deref().unwrap_or_default(),
+            )));
+        }
         let mut stream_inline: FxHashMap<(u32, Sym), i64> = FxHashMap::default();
         let logprobs: FxHashMap<u32, f64> = input
             .rids
@@ -2780,7 +2790,10 @@ impl GraphRuntime {
             let mut inline_value = if inline_on { inline_values[i].take() } else { None };
             let inline_row = inline_value.is_some();
             // the row's value when it has one, for a stream to take
-            let one_value = inline_value.as_ref().filter(|run| run.values.len() == 1).map(|run| run.values[0]);
+            let one_value = inline_value.as_ref().and_then(|run| match run.values() {
+                &[value] => Some(value),
+                _ => None,
+            });
             let ctx = &ctxs[rid_walk_idx.map_or(0, |idx| idx[i] as usize)];
             let (wg, node, g, walk_sym, walk_wgs) = (ctx.0, ctx.1, &ctx.2, ctx.3, &ctx.4);
             let walk = walk_sym.unwrap_or_default();
@@ -3124,20 +3137,7 @@ impl GraphRuntime {
                     && matches!(e.dest, Dest::External(_))
                     && Some(e.name) == inline_sym
                     && !e.persist;
-                // A stream takes one value a step: a step that repeats has no
-                // stream to a node but its own (`loop_signals` refuses one at
-                // load), so its runs never get here.
-                let stream_value = match (inline_stream, one_value) {
-                    (false, _) => None,
-                    (true, Some(value)) => Some(value),
-                    (true, None) => {
-                        return Err(PyValueError::new_err(format!(
-                            "{}: a streamed {} goes one value a step, and this step ran several",
-                            input.node_name,
-                            self.interner.name(e.name),
-                        )))
-                    }
-                };
+                let stream_value = if inline_stream { one_value } else { None };
                 if let Some(value) = stream_value {
                     stream_inline.insert((rid, e.name), value);
                 }
@@ -3597,7 +3597,7 @@ impl GraphRuntime {
     ) -> PyResult<postprocess::PostprocessOut> {
         let stored = postprocess::Stored {
             tensors, num_tensors, inline_signal,
-            inline_values: inline_values.into_iter().map(|v| v.map(postprocess::InlineRun::one)).collect(),
+            inline_values: inline_values.into_iter().map(|v| v.map(postprocess::InlineRun::One)).collect(),
             logprobs,
         };
         self.pp_resume_store(py, stored)
@@ -3854,8 +3854,8 @@ impl GraphRuntime {
                             let (_, modality, run) = emit_inline.remove(&rid).unwrap_or_default();
                             let modality = self.interner.name(modality).to_string();
                             // one row of the frame per iteration, in order
-                            for (j, value) in run.values.into_iter().enumerate() {
-                                plan.emit_inline.push((rid, name.clone(), modality.clone(), value, run.first + j as u32));
+                            for (j, &value) in run.values().iter().enumerate() {
+                                plan.emit_inline.push((rid, name.clone(), modality.clone(), value, run.first() + j as u32));
                             }
                         }
                         _ => plan.emit.push((

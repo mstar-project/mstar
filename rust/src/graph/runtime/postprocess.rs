@@ -90,7 +90,10 @@ impl TokenColumn {
         }
         let run = |rid: u32, row: usize| {
             let end = kept.get(&rid).map_or(self.width, |&k| (k as usize).min(self.width));
-            InlineRun { first: self.start as u32, values: (self.start..end).map(|j| self.read_at(row, j)).collect() }
+            if (self.start, end) == (0, 1) {
+                return InlineRun::One(self.read_at(row, 0));
+            }
+            InlineRun::Run { first: self.start as u32, values: (self.start..end).map(|j| self.read_at(row, j)).collect() }
         };
         if row_rids.len() >= rids.len() && row_rids[..rids.len()] == rids[..] {
             return Some(rids.iter().enumerate().map(|(i, &r)| run(r, i)).collect());
@@ -102,16 +105,33 @@ impl TokenColumn {
 }
 
 /// A row's client values on the inline route: iterations `first..` of its
-/// step, in order. Empty when they all went out while the step ran.
-#[derive(Clone, Default)]
-pub struct InlineRun {
-    pub first: u32,
-    pub values: Vec<i64>,
+/// step, in order. Empty when they all went out while the step ran. A step
+/// that ran once, the common case, is `One`: no allocation.
+#[derive(Clone)]
+pub enum InlineRun {
+    One(i64),
+    Run { first: u32, values: Vec<i64> },
+}
+
+impl Default for InlineRun {
+    fn default() -> Self {
+        InlineRun::Run { first: 0, values: Vec::new() }
+    }
 }
 
 impl InlineRun {
-    pub fn one(value: i64) -> Self {
-        InlineRun { first: 0, values: vec![value] }
+    pub fn first(&self) -> u32 {
+        match self {
+            InlineRun::One(_) => 0,
+            InlineRun::Run { first, .. } => *first,
+        }
+    }
+
+    pub fn values(&self) -> &[i64] {
+        match self {
+            InlineRun::One(value) => std::slice::from_ref(value),
+            InlineRun::Run { values, .. } => values,
+        }
     }
 }
 
@@ -482,14 +502,14 @@ impl GraphRuntime {
             all_stopped: rids.iter().all(|r| kept.get(r).is_some_and(|&k| k <= width)),
         };
         for (&rid, run) in rids.iter().zip(runs) {
-            if run.values.is_empty() {
+            if run.values().is_empty() {
                 continue;
             }
             // a row with no state here is one the route skips
             let Some(idx) = self.nested_idxs_interned(wg, rid, node) else { continue };
             out.nested.insert(rid, idx);
-            for (j, value) in run.values.into_iter().enumerate() {
-                out.items.push((rid, signal.to_string(), modality.clone(), value, run.first + j as u32));
+            for (j, &value) in run.values().iter().enumerate() {
+                out.items.push((rid, signal.to_string(), modality.clone(), value, run.first() + j as u32));
             }
         }
         Some(out)
