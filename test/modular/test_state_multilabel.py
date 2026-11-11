@@ -380,7 +380,8 @@ def test_kernel_settings_reach_the_shared_spec_and_two_values_for_one_field_are_
     specs = build_specs([_per_walk()], kernel_settings=shared)
     assert next(spec for spec in specs if spec.resource_key == "attn").config.decode_tensor_cores is False
     with pytest.raises(ValueError, match=r"kernel_settings\['attn'\] and kernel_settings\['attn_image'\] set "
-                                         r"decode_tensor_cores to False and True, and both reads run on 'attn'"):
+                                         r"decode_tensor_cores to False and True, and both reads run on the resource "
+                                         r"'attn', which holds one value"):
         build_specs([_per_walk()], kernel_settings={**shared, "attn_image": {"decode_tensor_cores": True}})
 
 
