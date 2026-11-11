@@ -563,6 +563,7 @@ class APIServer:
         self.served_models = ServedModels.of(
             model_name, model_config, lora.adapter_digests if lora is not None else None,
         )
+        self.served_models.refuse_unserved(model)
         # Requests to a model with client streams keep their input open until
         # the client ends it (see ``stream_input``).
         connections = model.get_partition_topology().client_connections() if model is not None else []
@@ -594,6 +595,7 @@ class APIServer:
             enable_nvtx=self.enable_nvtx,
             is_pending=self.is_pending,
             upload_dir=self.upload_dir,
+            served_models=self.served_models,
         )
 
         # /v1/load_lora_adapter and /v1/unload_lora_adapter; sent from the data worker
@@ -3163,14 +3165,6 @@ def main(argv: list[str] | None = None):
     with open(args.config) as f:
         config = yaml.safe_load(f)
 
-    lora_block = (config.get("resources") or {}).get("lora") if lora_enabled(config) else None
-    if args.rust_frontend and isinstance(lora_block, dict) and lora_block.get("runtime_updates"):
-        # mstar-server reads the served adapters once at launch and has no
-        # /v1/load_lora_adapter or /v1/unload_lora_adapter
-        raise SystemExit(
-            "LoRA runtime updates (`runtime_updates: true` in the serving config's `lora:` block) "
-            "are served by the Python frontend only; drop --rust-frontend or the setting"
-        )
     try:
         _ws_max_size(config)  # here, not at the bind after the workers' compile
     except ValueError as e:

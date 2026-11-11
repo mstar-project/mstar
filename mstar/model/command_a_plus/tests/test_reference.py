@@ -243,7 +243,7 @@ class OfficialTokenizerTests(unittest.TestCase):
                     [{"role": "user", "content": prompt}], tokenize=True,
                     add_generation_prompt=True, return_dict=False,
                 )
-                tensors, _ = model.process_prompt(prompt, ["text"], ["text"])
+                tensors = model.process_prompt(prompt, ["text"], ["text"]).new_input_tensors
                 self.assertEqual(tensors["text_inputs"][0].tolist(), expected)
                 tokens = tokenizer.encode(prompt, add_special_tokens=False)
                 streamed = b"".join(model.postprocess(torch.tensor([i]), "text") for i in tokens)

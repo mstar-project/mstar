@@ -184,6 +184,14 @@ class NodeResourceSpec(ABC):
         settings."""
         return None
 
+    def prefix_variant(self, model_kwargs: dict) -> bytes | None:
+        """What sets a request's KV on this resource apart from another's for the same
+        tokens (a LongRoPE table picked per request), from the kwargs ``request_config``
+        reads; None (the default) for nothing. The API server's data worker folds it into
+        the request's prefix-cache root, so the two never share pages. Called per request
+        on the data worker's threads, so it reads only ``model_kwargs`` and the spec."""
+        return None
+
     def apply_yaml_overrides(self, **kwargs):
         """Patch declared parameters from this resource's YAML block.
 
