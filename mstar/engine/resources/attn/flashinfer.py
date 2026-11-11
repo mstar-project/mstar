@@ -108,18 +108,13 @@ class FlashInferManager(AttentionManager):
         return {self._kv_cache_name}
 
     def max_repeats(self, step, ctx) -> int:
-        """A wrapper whose graph plans it whole sees each replay's lengths. So
-        does a tensor-core one whose graph builds its paged arrays, with its
-        schedule planned for the step's last replay (`resident_gather`)."""
+        """Whether every wrapper of the walk's captures sees each replay's lengths
+        (`supports_repeats`)."""
         walk = ctx.graph_walk
         allowed = self._repeat_walks.get(walk)
         if allowed is None:
             wrappers = [w for key, w in self._cg_plan_states.items() if key.bucket.graph_walk == walk]
-            allowed = self._repeat_walks[walk] = bool(wrappers) and all(
-                w.plans_in_graph
-                or (isinstance(w, FlashInferDecodeWrapper) and w.supports_gather_resident and w.lengths_move)
-                for w in wrappers
-            )
+            allowed = self._repeat_walks[walk] = bool(wrappers) and all(w.supports_repeats for w in wrappers)
         return ANY_REPEATS if allowed else 1
 
     def resident_refusal(self) -> str | None:

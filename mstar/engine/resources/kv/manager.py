@@ -4516,16 +4516,16 @@ class KVManager(AttentionResource):
         a row's reach (its pages, or ``max_seq_len``) there is no table row."""
         if ctx.resident is None:
             return 1
-        requests = ctx.request_ids
-        rows = max(len({(s.request_id, s.label) for s in step.segments if s.span and s.request_id in requests}), 1)
-        evictable = 0 if self._index is None else len(self._index.evictable())
-        if self._arena.num_free + evictable < rows:
-            return 1
+        step_rows = {(s.request_id, s.label) for s in step.segments if s.span and ctx.is_real_row(s.request_id)}
+        with self._lock:
+            # the room a refused admit would count: pages other requests' allotments hold aren't ours
+            if self._room() < max(len(step_rows), 1):
+                return 1
+            longest = max((
+                self._streams[rid][label].stored_len for rid, label in step_rows
+                if label in self._streams.get(rid, ())
+            ), default=0)
         page_size = self._groups[0].page_size
-        longest = max((
-            self._streams[s.request_id][s.label].stored_len for s in step.segments
-            if s.span and s.label in self._streams.get(s.request_id, ())
-        ), default=0)
         reach = min(self.config.max_seq_len, self.config.request_pages * page_size)
         return max(1, min(page_size, reach - longest))
 

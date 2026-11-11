@@ -509,7 +509,7 @@ class Speculator:
         if speculation.is_yield_away and not speculation.gave_way:
             self._consecutive = 0
         else:
-            self._consecutive += speculation.node_batch.step_context.repeats
+            self._consecutive += 1
 
     def chain_ended(self) -> None:
         self._consecutive = 0
@@ -1176,7 +1176,7 @@ class Speculator:
             # walk with no token budget runs its prompts whole and keeps
             # main's order.
             owes_run = self._step_repeats is not None and self._step_repeats.owes_run(
-                pending.node_name, pending.node_batch.step_context.repeats, pending.batch.owed_run,
+                pending.node_name, pending.graph_walk, pending.node_batch.step_context.repeats, pending.batch.owed_run,
             )
             other_ready = self._peek and not owes_run and self.scheduler.chain_yields(
                 chain_key, self._consecutive,
