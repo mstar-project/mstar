@@ -944,10 +944,17 @@ def _t3_config():
 def _chatterbox_t3():
     """Under classifier-free guidance T3 runs every request twice, cond rows then uncond
     rows, and each copy takes the request's adapter. A row is ``[cond, uncond]`` embeddings."""
+    from mstar.engine.state.adapters import node_handles
     from mstar.model.chatterbox.chatterbox_model import ChatterboxModel
     from mstar.model.chatterbox.components.t3 import T3Model
-    from mstar.model.chatterbox.config import ChatterboxConfig
+    from mstar.model.chatterbox.config import T3_ATTN, T3_KV, T3_NODE, T3_POS, T3_SAMPLER, ChatterboxConfig
     from mstar.model.chatterbox.submodules import T3Submodule
+
+    def stub_cores(sub, rows: _Rows):
+        """``sub`` with its handles on T3's declared state bound over stubs of the kernels, which read ``rows``."""
+        resources = {T3_KV: _Unread(), T3_ATTN: _AttendCore(rows), T3_POS: _NoRotation(), T3_SAMPLER: None}
+        sub.bind_node_state(node_handles(model_object(ChatterboxModel, sub.config), T3_NODE, resources))
+        return sub
 
     def weights(c):
         """The reference layout (``tfmr.*``, separate q/k/v and gate/up), from a model's
@@ -972,13 +979,14 @@ def _chatterbox_t3():
     def build(c, group, w):
         model = T3Model(c.t3, comm_group=group).to(DTYPE)
         model.load_weights(w.items())
-        return T3Submodule(model.requires_grad_(False).eval(), c, builtin_voice=None)
+        return stub_cores(T3Submodule(model.requires_grad_(False).eval(), c, builtin_voice=None), _Rows())
 
     def run(sub, rows):
-        k, lengths = len(rows), [r.shape[1] for r in rows] * 2
-        stub_attention(sub.model, lengths)
-        hidden = sub.model.hidden(torch.cat([r[0] for r in rows] + [r[1] for r in rows]), label="cfg")
-        per = _per_row(hidden, sub.model.logits(_last(hidden, lengths)), lengths)
+        k, lengths = len(rows), _Rows([r.shape[1] for r in rows] * 2)
+        stub_cores(sub, lengths)
+        with step_over(sub, lengths, (T3_KV,)):
+            hidden = sub.model.hidden(torch.cat([r[0] for r in rows] + [r[1] for r in rows]))
+        per = _per_row(hidden, sub.model.logits(_last(hidden, lengths.lengths)), lengths.lengths)
         return [tuple(torch.cat(p) for p in zip(per[i], per[i + k], strict=True)) for i in range(k)]
 
     return Stack(
