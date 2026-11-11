@@ -2331,6 +2331,9 @@ predictor's frame-local KV is scratch.
 A model on the contract reads no ``node_resources``, ``engine_inputs.resources``,
 ``request_state`` or ``per_request_states``, and imports the engine only through
 ``mstar.engine.state``; ``test/modular/test_state_lint.py`` holds each ported package to that.
+Qwen3-TTS's ``batch_postprocess`` keeps the opt-in watermark's per-stream state in
+``request_state`` under one named lint exception, until it moves to a watermark node's plain
+Value (the watermark-node issue).
 
 ``ModelInputsFromEngine`` carries six other useful fields:
 

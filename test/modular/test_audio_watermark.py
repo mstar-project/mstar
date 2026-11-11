@@ -1,4 +1,4 @@
-"""AudioSeal watermark (``mstar.model.audio_watermark``), CPU only.
+"""Opt-in AudioSeal watermark (``mstar.model.audio_watermark``), CPU only.
 
 Config and dependency checks need nothing. The streaming checks build the
 streaming generator from its bundled card with random weights, so they need
@@ -75,20 +75,13 @@ def test_missing_audioseal_names_the_extra(monkeypatch):
         AudioSealWatermarker.build(AudioWatermarkConfig(enabled=True), "cpu")
 
 
-def test_qwen3_tts_refuses_the_watermark_before_loading_anything():
-    """A captured codec step can't write per-stream state the watermark needs, so the model names the cause at init
-    and not on a request's first chunk."""
+def test_qwen3_tts_checks_the_watermark_before_loading_anything(monkeypatch):
     pytest.importorskip("transformers")
     from mstar.model.qwen3_tts.qwen3_tts_model import Qwen3TTSModel
 
-    with pytest.raises(ValueError, match="no home a captured codec step can write"):
+    monkeypatch.setitem(sys.modules, "audioseal", None)
+    with pytest.raises(ImportError, match=r"mstar-ai\[audioseal\]"):
         Qwen3TTSModel("does/not-exist", audio_watermark={"enabled": True})
-
-
-def test_qwen3_tts_still_checks_the_watermark_config():
-    pytest.importorskip("transformers")
-    from mstar.model.qwen3_tts.qwen3_tts_model import Qwen3TTSModel
-
     with pytest.raises(ValueError, match="audio_watermark.message"):
         Qwen3TTSModel("does/not-exist", audio_watermark={"enabled": True, "message": "nope"})
 

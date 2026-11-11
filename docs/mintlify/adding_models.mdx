@@ -894,7 +894,7 @@ The engine picks the kernel or the reference at bind. `target` says where this s
 
 Between steps, a model may keep a memo of a pure function of request inputs, whose loss costs time and changes no output, and scratch buffers that it makes at load and that no step reads before writing. Anything else it keeps between steps is declared state or an edge. This rests on the engine running a node's forwards one at a time, in stream order. The diffusion loop's schedule and prefetched seeds are memos, its latents and solver state are loop-back edges, and a code predictor's frame-local KV is scratch.
 
-A model on the contract reads no `node_resources`, `engine_inputs.resources`, `request_state` or `per_request_states`, and imports the engine only through `mstar.engine.state`; `test/modular/test_state_lint.py` holds each ported package to that.
+A model on the contract reads no `node_resources`, `engine_inputs.resources`, `request_state` or `per_request_states`, and imports the engine only through `mstar.engine.state`; `test/modular/test_state_lint.py` holds each ported package to that. Qwen3-TTS's `batch_postprocess` keeps the opt-in watermark's per-stream state in `request_state` under one named lint exception, until it moves to a watermark node's plain Value (the watermark-node issue).
 
 `ModelInputsFromEngine` carries six other useful fields:
 
