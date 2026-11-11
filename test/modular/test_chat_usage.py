@@ -19,9 +19,11 @@ import threading
 from types import SimpleNamespace
 
 import pytest
+import spec_toy
 import torch
 from api_server_helpers import make_test_api_server
 from test_ingest_unpersist import _conductor, _info, _msg, _run, _ToyModel
+from test_spec_engine import _StubTransfer
 
 from mstar.api_server.data_worker import InlineTokens, PreprocessWorkerThread, RequestOutputState
 from mstar.api_server.request_types import (
@@ -34,6 +36,7 @@ from mstar.api_server.request_types import (
 from mstar.api_server.served_models import Selected
 from mstar.communication.event import EventWakeup
 from mstar.conductor.request_info import WalkStep
+from mstar.engine.resources.kv import manager as kv_manager
 from mstar.graph.base import GraphEdge, GraphNode
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import MAX_OUTPUT_TOKENS, Model, TensorAndMetadata
@@ -394,6 +397,64 @@ def test_a_glm_reply_that_ends_on_eos_in_its_last_slot_is_stop(name):
     }
     # and the EOS is not text
     assert [c.data for c in chunks] == [b"H", b""]
+
+
+class _ToyTextModel(_Model):
+    """Declares the speculative toy target's stop id."""
+
+    def text_output(self):
+        return TextOutput(SimpleNamespace(token_bytes=lambda i: b"x", to_bytes=lambda ids: b"x" * len(ids)),
+                          {spec_toy.STOP})
+
+
+def _verified_chunks(prompts: dict[int, list[int]], caps: dict[int, int]) -> dict[int, list[torch.Tensor]]:
+    """Each request's text tensors as a verifying node emits them on the real
+    engine: the prompt step's token, then one run a verify step, of up to
+    k + 1 tokens cut at its stop id and its budget (``Engine.cut_verify_step``)."""
+    driver = spec_toy.Driver(spec_toy.engine(3, spec_toy.oracle))
+    chunks = {rid: [torch.tensor([driver.add(rid, prompt, caps[rid])])] for rid, prompt in prompts.items()}
+    live = list(prompts)
+    for _ in range(max(caps.values())):
+        if not live:
+            break
+        before = {rid: len(driver.out[rid]) for rid in live}
+        stopped = driver.step(live)
+        for rid in live:
+            chunks[rid].append(torch.tensor(driver.out[rid][before[rid]:]))
+        live = [rid for rid in live if not stopped[rid]]
+    assert not live
+    return chunks
+
+
+def test_a_verifying_nodes_runs_report_their_usage_and_finish_reason(monkeypatch):
+    """A verify step's chunk carries several tokens, so its tokens count and its
+    last token is the one that may have ended the reply."""
+    monkeypatch.setattr(kv_manager, "KVTransferManager", _StubTransfer)
+    # by rid: (prompt, max_tokens, finish_reason); the toy's [2, 2] stops at its 7th token, [5, 9, 2] runs past 7
+    cases = {
+        1: ([5, 9, 2], 7, "length"),  # the budget ends inside the second verify step's run
+        2: ([2, 2], 16, "stop"),  # a stop id inside a run
+        3: ([2, 2], 7, "stop"),  # a stop id in the last allowed slot
+    }
+    chunks = _verified_chunks({rid: c[0] for rid, c in cases.items()}, {rid: c[1] for rid, c in cases.items()})
+    for rid, (prompt, cap, finish) in cases.items():
+        assert [c.numel() for c in chunks[rid]] == [1, 4, 2], rid
+        worker = _data_worker(_ToyTextModel())
+        worker.request_model_kwargs["t"] = {"return_token_ids": True}
+        worker.request_output_state["t"] = state = RequestOutputState()
+        worker.tensor_uuid_to_metadata_per_request["t"] = {uuid: {} for uuid in range(len(chunks[rid]))}
+        for uuid, tensor in enumerate(chunks[rid]):
+            state.next_sequence += 1
+            worker._postprocess_inline("t", uuid, "text", uuid, tensor, None)
+        out = [worker.out_queue.get_nowait() for _ in chunks[rid]]
+        token_ids = [i for c in out for i in c.metadata["token_ids"]]
+        assert token_ids == spec_toy.reference(prompt, cap), rid
+        assert [c.stopped for c in out] == [False, False, finish == "stop"], rid
+
+        usage = _collected(_served(None, cap, chunks=out))[-1]
+        assert usage.metadata == {
+            "prompt_tokens": len(_tokenize(PROMPT)), "completion_tokens": len(token_ids), "finish_reason": finish,
+        }, rid
 
 
 def test_a_request_that_did_not_ask_gets_no_usage_chunk():
