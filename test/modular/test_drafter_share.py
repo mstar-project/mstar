@@ -79,10 +79,12 @@ def test_each_walks_step_is_the_one_its_target_declared_before_and_the_target_de
         assert walks[draft.walk][1] == {DRAFT_CARRY, DRAFT_KEEP_FIRST}
 
 
-def test_a_pre_plans_key_is_the_real_steps_on_a_prompt_walk(tmp_path, monkeypatch):
+@pytest.mark.parametrize("method", ["dspark", "eagle3"])
+def test_a_pre_plans_key_is_the_real_steps_on_a_prompt_walk(tmp_path, monkeypatch, method):
     """The runner matches a staged pre-plan to the step that runs by its key, every resource's segments
-    included: both are declared through `engine_step`, so the sampler step's rows are the same in both."""
-    eng = _qwen3_engine(tmp_path, monkeypatch, "dspark")
+    included: both are declared through `engine_step`, so the sampler step's rows are the same in both.
+    EAGLE-3 stores a carry, so its sampler step is the one `drafter_step` replaced with its writes."""
+    eng = _qwen3_engine(tmp_path, monkeypatch, method)
     (node, draft), = eng._drafts.items()
     sub = eng._submodules[node].submodule
     keys = []
@@ -93,6 +95,7 @@ def test_a_pre_plans_key_is_the_real_steps_on_a_prompt_walk(tmp_path, monkeypatc
         keys.append(eng._runner._step_key(step))
     assert keys[0] == keys[1]
     assert dict(keys[0][-1])[draft.sampler_key] == tuple(step.segments)
+    assert bool(step.steps[draft.sampler_key].loopback_writes) == (method == "eagle3")
 
 
 def test_a_target_that_declares_its_drafters_step_itself_is_refused(tmp_path, monkeypatch):
