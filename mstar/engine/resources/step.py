@@ -222,14 +222,15 @@ class SubmoduleStep:
     _ctx: StepContext = None # set by the engine
 
     def __post_init__(self):
-        if self.segments is None and not self.combined_labels:
+        if not self.combined_labels:
             for key, step in self.steps.items():
                 if step.combined_labels:
                     raise ValueError(
                         f"step {key!r} declares combined_labels {step.combined_labels}, its submodule step none: "
                         "declare them once, on the SubmoduleStep"
                     )
-            return
+            if self.segments is None:
+                return
         for key, step in self.steps.items():
             if step.segments is None and self.segments is not None:
                 object.__setattr__(step, "segments", self.segments)

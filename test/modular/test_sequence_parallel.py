@@ -281,8 +281,9 @@ def test_a_split_step_refuses_what_it_cant_range():
     with pytest.raises(ValueError, match="declare them once"):
         SubmoduleStep(combined_labels={("cond", "uncond"): "cfg"},
                       steps={"kv": KVStep(combined_labels={("cond",): "c"})})
-    with pytest.raises(ValueError, match="declare them once"):
-        SubmoduleStep(steps={"kv": KVStep(combined_labels={("cond",): "c"})})
+    for segments in (None, (Segment("r0", "cond", 5),)):
+        with pytest.raises(ValueError, match="declare them once"):
+            SubmoduleStep(segments=segments, steps={"kv": KVStep(combined_labels={("cond",): "c"})})
     # a string would split into characters that match no label, so every step would plan copied
     for names in (dict(labels="video", walks=None), dict(labels=("video",), walks="gen")):
         with pytest.raises(ValueError, match="not strings"):
