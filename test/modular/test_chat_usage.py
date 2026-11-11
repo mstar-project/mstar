@@ -69,6 +69,7 @@ class _Model:
         pads = torch.full((IMAGE_PADS,), 99)
         return {"text_inputs": [torch.cat([ids[:2], pads, ids[2:]])], "pixel_values": [torch.rand(4, 3)]}
 
+    declare_state = Model.declare_state
     prompt_tokens = Model.prompt_tokens
     postprocess_inline = Model.postprocess_inline
     text_output = Model.text_output
@@ -138,7 +139,7 @@ def _qwen3_omni():
 
 
 def _bagel():
-    from test_model_kv_layouts import _bagel
+    from test_state_bagel_port import _bagel
 
     from mstar.model.bagel.submodules import vit_patches, vit_preprocess
 
