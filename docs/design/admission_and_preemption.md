@@ -51,6 +51,11 @@ Each pool decides the class from two facts. The conductor marks a request that s
 | 4 | No rebuild policy on the node that writes its KV | moves only to the host there, or guaranteed | the model declares no way to rebuild the node's KV, as when its decode reads embeddings |
 | 5 | Only `ids` spans | preemptible | its token ids reproduce all of its KV |
 
+A node that verifies drafts (speculative decoding) is row 4 whatever its model declares: the engine leaves it out
+of the rebuild policies (`Engine.rebuild_policies`), so a request there moves only to the host, and with no host pool
+every one is guaranteed. Its reservation covers the verify slack, 2(k + 1) tokens past its verified length, since the
+conductor floors each label's scratch at it, and startup warns about a verifying node on a pool with no host pool.
+
 R5 keeps a host copy of the encoder's output for the rebuild of a row 3 request. R5a covers Qwen3.5 images, and R5b covers Bagel, Qwen3-Omni and Higgs. Without a copy, a rebuild of row 3 would have to run the encoder again, which on Bagel and Qwen3-Omni sits on another worker, so such a request stays guaranteed.
 
 On initial tests, I measured that keeping row 3 guaranteed costs about 9% of TTFT under pressure. On a 48-page pool at c16, Qwen3.5 image requests' TTFT p50 fell from 3.48 s to 3.18 s once R5a made them preemptible.
@@ -355,6 +360,11 @@ class OffloadDelta:
 - A follower whose counts can't take a move exits. A follower replays a reload, or a drop or an offload of a request in its own last step, only once that step has committed, and exits if the move still can't land then. Rank 0 can reload before or after its commit of the step before, but a commit only gives pages back, to the end of the free list, so with nothing evicted the follower's reload takes the pages rank 0's took.
 - A pre-admit takes only free pages and host room already set aside. Rank 0 can't undo an eviction, a host room set aside or a flip for a stage it throws away, and a follower may never plan the step, so the pre-admit refuses and exec admits the step on every rank.
 
+A request on a node that verifies drafts carries verify results not yet applied, which change its lengths only. A
+move to the host applies none of them: rank 0 marks the request returning when it moves it, and a follower marks it
+when it replays that OFFLOAD, in every branch, so each rank applies them at the request's first admit back, at the
+same step. The mark needs no move kind of its own.
+
 With speculation on, rank 0 decides only where pages already move today, after the admit fence or after a refused step, so a speculative step never carries a move made after it was sent.
 
 Why this shape:
@@ -373,10 +383,16 @@ Always on:
 - A grant that a reservation covers and that can't take its pages raises.
 - Counters per node: preemptions, drops, tokens rebuilt, and requests dropped more than once.
 
+- On a node that verifies drafts, rank 0 picks no victim while a request holds a verify step postprocess hasn't
+  recorded. Such a step never reaches that pass, and a victim with one would leave nothing on the host that knows its
+  length.
+
 Under `MSTAR_KV_DEBUG_ASSERTS`:
 
 - The invariant of §2, on each grant.
 - After a drop or a move to the host, the victim holds no page in the pool, and the pool's pages are conserved.
+- On a node that verifies drafts, no victim moved or dropped holds an unrecorded verify step, and none asked again
+  holds a verify result.
 
 ---
 
