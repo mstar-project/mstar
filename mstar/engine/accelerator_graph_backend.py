@@ -215,8 +215,13 @@ class CUDAGraphBackend(_TorchGraphBackend):
             return f"CUDA {torch.version.cuda} has no conditional graph node (12.4 and up)"
         from mstar.engine.device_run import CudaWhile
 
-        if CudaWhile.devrt_path() is None:
-            return "no libcudadevrt.a to link its stop kernel against (set CUDA_HOME)"
+        try:
+            nvjitlink, devrt = CudaWhile.link_libraries(CudaWhile.nvrtc()[1])
+        except OSError as error:
+            return f"no NVRTC to compile its stop kernel with: {error}"
+        missing = [name for name, path in (("libnvJitLink", nvjitlink), ("libcudadevrt.a", devrt)) if path is None]
+        if missing:
+            return f"no {' and '.join(missing)} of the NVRTC's CUDA release to link the stop kernel (set CUDA_HOME)"
         return None
 
     def while_runtime(self) -> Any:

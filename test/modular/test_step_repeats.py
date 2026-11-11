@@ -214,25 +214,34 @@ def test_the_spec_cap_counts_steps_not_the_iterations_a_step_asked_for():
     assert speculator._consecutive == 1
 
 
-def test_nvjitlink_is_looked_for_next_to_nvrtc_before_the_toolkit(tmp_path, monkeypatch):
-    """The linker has to come from the NVRTC's own CUDA release, which a toolkit on the box may not be."""
-    name = "libnvJitLink.so.13"
+@pytest.mark.parametrize(
+    ("which", "name", "sibling"),
+    [(0, "libnvJitLink.so.13", "nvjitlink"), (1, "libcudadevrt.a", "cuda_runtime")],
+    ids=["nvjitlink", "devrt"],
+)
+def test_the_link_libraries_are_looked_for_next_to_nvrtc_before_the_toolkit(
+    tmp_path, monkeypatch, which, name, sibling,
+):
+    """Both have to come from the NVRTC's own CUDA release, which a toolkit on the box may not be."""
+    monkeypatch.setattr(torch.version, "cuda", "13.0")
     nvrtc, toolkit = tmp_path / "cu13" / "lib", tmp_path / "cuda" / "lib64"
     for d in (nvrtc, toolkit):
         d.mkdir(parents=True)
     monkeypatch.setenv("CUDA_HOME", str(tmp_path / "cuda"))
-    # the wheels that split NVRTC and the linker into two directories: ``nvidia/<pkg>/lib``
+    # the wheels that split NVRTC and the rest into directories: ``nvidia/<pkg>/lib``
     split = tmp_path / "nvidia" / "cuda_nvrtc" / "lib"
     split.mkdir(parents=True)
-    (tmp_path / "nvidia" / "nvjitlink" / "lib").mkdir(parents=True)
+    (tmp_path / "nvidia" / sibling / "lib").mkdir(parents=True)
 
-    assert CudaWhile.nvjitlink_path(str(nvrtc), "13") is None
+    def found(nvrtc_dir):
+        return CudaWhile.link_libraries(str(nvrtc_dir))[which]
+
     (toolkit / name).touch()
-    assert CudaWhile.nvjitlink_path(str(nvrtc), "13") == str(toolkit / name)
-    (tmp_path / "nvidia" / "nvjitlink" / "lib" / name).touch()
-    assert CudaWhile.nvjitlink_path(str(split), "13") == str(split / ".." / ".." / "nvjitlink" / "lib" / name)
+    assert found(nvrtc) == str(toolkit / name)
+    (tmp_path / "nvidia" / sibling / "lib" / name).touch()
+    assert found(split) == str(split / ".." / ".." / sibling / "lib" / name)
     (nvrtc / name).touch()
-    assert CudaWhile.nvjitlink_path(str(nvrtc), "13") == str(nvrtc / name)
+    assert found(nvrtc) == str(nvrtc / name)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="compiles and launches the stop kernel")
