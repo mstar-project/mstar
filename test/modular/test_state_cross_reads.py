@@ -326,6 +326,37 @@ def test_a_binding_no_paged_array_holds_is_refused_when_it_attaches():
         RaggedAttend().attach(SimpleNamespace(array=_array("a"), reads={}), "a_read", None)
 
 
+def test_resolve_lays_out_every_reads_queries_by_one_array_its_own_included():
+    a, b = _array("a"), _array("b", queries="a")
+    queries = _resolve([a, b], StateSetup()).queries
+    assert queries["a_read"].array is a and queries["b_read"].array is a, "a self read has no array to ask"
+
+
+def test_a_step_that_lays_an_array_out_under_another_label_is_refused_where_it_plans():
+    """`_check_step` refuses an undeclared label, and doesn't run on a replay. The plan runs under the declared one."""
+    step = SubmoduleStep(state={"a": ArrayStep(segments=(Segment(1, "audio", 4),))})
+    with pytest.raises(ValueError, match=r"Array 'a': a step lays it out under labels \['audio'\], and its plans run "
+                                         r"under its label 'video'"):
+        state_steps(step, _handles([_array("a", label="video")]))
+
+
+def test_two_reads_on_one_resource_that_set_a_kernel_setting_two_ways_are_refused():
+    settings = {"a_read": {"max_segments_per_request": 2}, "b_read": {"max_segments_per_request": 3}}
+    with pytest.raises(ValueError, match=r"kernel_settings\['a_read'\] and kernel_settings\['b_read'\] set "
+                                         r"max_segments_per_request to 2 and 3, and both reads run on the resource "
+                                         r"'a_read', which holds one value"):
+        build_specs([_array("a"), _array("b", label="b")], kernel_settings=settings)
+
+
+def test_a_read_on_a_node_that_shards_no_array_narrows_its_heads_so_they_must_divide():
+    alone = _array("a")
+    (spec,) = build_specs([alone])
+    assert spec.config.shard_over_sp, "a read on a node with no sharded array narrows its heads"
+    assert deployment_problems(_Model(alone), {}, head_shards={"dit": 3}) == [
+        "Array 'a'.reads['a_read']: q_heads 4 doesn't divide by 3, TP times SP, which the read narrows its heads by"
+    ], "a resource whose heads narrow and don't divide fails at boot"
+
+
 def test_a_cross_read_over_other_requests_is_refused_when_it_opens():
     arrays = [_array("a"), _array("b", queries="a")]
     step = SubmoduleStep(state={

@@ -287,6 +287,27 @@ def test_a_state_op_that_writes_an_append_only_array_is_refused():
         rewrite(h, 0)
 
 
+def test_a_state_op_that_writes_never_takes_the_paged_fused_path():
+    @state_op(writes=("kv",), formats=(PagedNHD(devices={"cpu"}),), reference=lambda kv, layer: None)
+    def rewrite(kv, layer, *, target):
+        pass
+
+    assert not _handle().takes_fused(rewrite.op), "a write's kernel would overwrite an append-only array's pages"
+
+
+def test_no_fused_op_runs_on_an_array_where_one_layers_read_takes_k_and_v_at_its_kernel():
+    """A fused op writes the pages, and that read takes its k and v from the add, so the layer's read finds no add."""
+    _fused_op()
+    array = Array("kv", nodes={"llm"}, layers={0, 1}, entry=KVEntry(heads=HEADS, head_dim=DIM), max_len=16, reads={
+        "attn": Read(mask=Causal(), op=Attend(q_heads=HEADS), layers={0}),
+        "held": Read(mask=Causal(), op=Attend(q_heads=HEADS), layers={1}),
+    })
+    resources = {"kv": _StubKV(), "attn": _StubAttn(), "held": _StubAttn(requires_kv_write=False)}
+    h = build_handle(array, resources, _resolve([array], StateSetup()))
+    state_op_module.bind_state_ops({"kv": h})
+    assert h.fused_ops == frozenset(), "layer 1's read would refuse a read with no add before it"
+
+
 def test_a_state_op_on_a_seq_sharded_array_is_refused():
     array = _kv_array(seq_sharded=True)
     # resolve refuses a seq_sharded paged array, so its bound read and that read's resource are given here
