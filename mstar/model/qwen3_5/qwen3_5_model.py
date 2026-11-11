@@ -5,7 +5,6 @@ import torch
 from jinja2 import TemplateError
 from transformers import AutoTokenizer
 
-from mstar.engine.resources.sequence_shard import SeqShardSpec
 from mstar.engine.state import (
     Array,
     Attend,
@@ -20,6 +19,7 @@ from mstar.engine.state import (
     Read,
     Sampler,
     SampleSettings,
+    SeqShard,
     TensorType,
     Value,
 )
@@ -151,6 +151,13 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
                 SAMPLER, nodes={"LLM"}, vocab_size=c.vocab_size, penalty=True,
                 min_p=self._sampler_spec(c.vocab_size).enable_min_p,
             ),
+            # Prefill steps may split over the LLM's SP ranks, and decode never does, so decode's compiled frame
+            # traces the bracket straight through. "none" until a deployment opts in: the LLM on SP ranks over KV
+            # stored by head is refused until it sets ulysses, which has run on CPU only, and over KV stored by
+            # position it runs copied unless it sets all_gather or ring.
+            SeqShard(
+                LLM_SHARD, nodes={"LLM"}, walks={PREFILL_TEXT, *media_walk_names(self.encoders)}, exchange="none",
+            ),
         ]
         if v is not None:
             state.append(Array(
@@ -172,19 +179,7 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
     def get_node_resources(self):
         from mstar.model.qwen3_5.lora import qwen3_5_lora_spec
 
-        return [
-            # a step split over the LLM's SP ranks, where the deployment sets the shard's exchange:
-            # all_gather over KV stored by position, ulysses over KV stored by head. "none" by default,
-            # so one SP rank, or KV stored by position, runs every step copied, and the LLM on SP
-            # ranks over KV stored by head is refused until a deployment opts into Ulysses, which
-            # has run on CPU only. Its prefill walks may split, never decode, so decode's compiled
-            # frame traces the bracket straight through
-            SeqShardSpec(
-                LLM_SHARD, {"LLM"}, labels=("main",), axis=0,
-                walks=(PREFILL_TEXT, *media_walk_names(self.encoders), MIXED), exchange="none",
-            ),
-            qwen3_5_lora_spec(self.config, self.vision_config),
-        ]
+        return [qwen3_5_lora_spec(self.config, self.vision_config)]
 
     def _vision_segment_ceiling(self) -> int:
         """Segments a captured block loop's plan holds. A segment per image, not per request: the resize floors each

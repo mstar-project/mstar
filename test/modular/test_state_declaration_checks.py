@@ -31,6 +31,7 @@ from mstar.engine.state import (
     Read,
     Rope,
     Sampler,
+    SeqShard,
     TensorType,
     Value,
     Window,
@@ -196,6 +197,17 @@ def _gdn_entry() -> Entry:
 def test_a_sampler_may_not_reuse_a_declared_name():
     problem = _one_problem(_array(reads={"r": _read()}), Sampler("r", nodes={"LLM"}, vocab_size=8))
     assert problem.startswith("Sampler 'r'.name") and "declared twice" in problem
+
+
+@pytest.mark.parametrize("shard, problem", [
+    (dict(walks={"mixed"}), "SeqShard 'shard'.walks: 'mixed' is a combined walk"),
+    (dict(walks={"encode"}), "SeqShard 'shard'.walks: 'encode' runs none of the shard's nodes"),
+    (dict(labels={"cfg"}), "SeqShard 'shard'.labels: ['cfg'] are opened by no array on nodes ['LLM']"),
+], ids=["combined walk", "walk off its nodes", "label no array opens"])
+def test_a_sequence_shard_lists_rows_walks_and_labels_its_arrays_open(shard, problem):
+    # a label or walk that never comes would leave the shard copying every step, and nothing would say so
+    declared = SeqShard("shard", nodes={"LLM"}, **shard)
+    assert _one_problem(_array(), declared, combined={"LLM": {"mixed": {"prefill", "decode"}}}).startswith(problem)
 
 
 def test_a_block_read_needs_max_len_zero():

@@ -2,7 +2,7 @@
 storage and op type, and a handle per storage. It builds the specs, steps and layouts everything downstream reads."""
 
 from abc import ABC, abstractmethod
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import asdict, replace
 from functools import partial
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
@@ -27,10 +27,11 @@ from mstar.engine.resources.recurrent.config import (
     RecurrentStep,
 )
 from mstar.engine.resources.sampler.config import SamplerSpec, SamplerStep, SamplingReqConfig
+from mstar.engine.resources.sequence_shard import SeqShardSpec
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
 from mstar.engine.resources.step import SubmoduleStep
 from mstar.engine.state.analysis import position_key
-from mstar.engine.state.calls import ArrayHandle, SamplerHandle
+from mstar.engine.state.calls import ArrayHandle, SamplerHandle, ShardHandle
 from mstar.engine.state.contract import (
     EMPTY,
     Array,
@@ -47,6 +48,7 @@ from mstar.engine.state.contract import (
     Sampler,
     SampleSettings,
     SampleStep,
+    SeqShard,
     TensorType,
     Window,
     is_value,
@@ -58,15 +60,20 @@ if TYPE_CHECKING:
 
 def node_resources(model: "Model") -> list[NodeResourceSpec]:
     """The specs ``model`` declares through `declare_state`, then the ones it writes by hand."""
-    specs = build_specs(model.declare_state(), kernel_settings=model.kernel_settings())
+    specs = build_specs(
+        model.declare_state(), kernel_settings=model.kernel_settings(),
+        combined_walks=model.get_combined_graph_walks(),
+    )
     return specs + list(model.get_node_resources() or [])
 
 
 def build_specs(
-    declarations: Sequence[Array | Sampler], *, kernel_settings: Mapping[str, Mapping[str, Any]] = EMPTY,
+    declarations: Sequence[Array | Sampler | SeqShard], *, kernel_settings: Mapping[str, Mapping[str, Any]] = EMPTY,
+    combined_walks: Mapping[str, Mapping[str, Collection[str]]] = EMPTY,
 ) -> list[NodeResourceSpec]:
     """Each array's specs, from its storage and its ops' bindings, under the names the declarations give, then a
-    `PositionSpec` for each array that declares positions and a `SamplerSpec` per sampler.
+    `PositionSpec` for each array that declares positions, a `SamplerSpec` per sampler and a `SeqShardSpec` per
+    sequence shard, which also lists the combined walks (``combined_walks``, the model's) that combine a listed walk.
 
     Raises ``ValueError`` on an array today's specs can't hold, naming what they lack. That includes a second update of
     one type on an array, a temporary limit: an update call finds its op by type, which today's resources need and the
@@ -79,6 +86,7 @@ def build_specs(
         if array.positions is not None:
             specs.append(_position_spec(array))
     specs += [_sampler_spec(declared) for declared in declarations if isinstance(declared, Sampler)]
+    specs += [_shard_spec(declared, combined_walks) for declared in declarations if isinstance(declared, SeqShard)]
     _apply_kernel_settings(specs, arrays, kernel_settings)
     return specs
 
@@ -122,6 +130,18 @@ def _sampler_spec(sampler: Sampler) -> SamplerSpec:
     )
 
 
+def _shard_spec(shard: SeqShard, combined_walks: Mapping[str, Mapping[str, Collection[str]]]) -> SeqShardSpec:
+    walks = shard.walks
+    if walks is not None:
+        walks = walks | {
+            combined for node in shard.nodes for combined, rows in combined_walks.get(node, {}).items()
+            if walks & set(rows)
+        }
+    return SeqShardSpec(
+        shard.name, shard.nodes, labels=tuple(sorted(shard.labels)), axis=0, walks=walks, exchange=shard.exchange,
+    )
+
+
 def _apply_kernel_settings(
     specs: Sequence[NodeResourceSpec], arrays: Sequence[Array], kernel_settings: Mapping[str, Mapping[str, Any]],
 ) -> None:
@@ -145,7 +165,9 @@ def _apply_kernel_settings(
             setattr(by_key[key].config, field, value)
 
 
-def node_handles(model: "Model", node: str, resources: Mapping[str, Any]) -> dict[str, ArrayHandle | SamplerHandle]:
+def node_handles(
+    model: "Model", node: str, resources: Mapping[str, Any],
+) -> dict[str, ArrayHandle | SamplerHandle | ShardHandle]:
     """``node``'s handles, by declared name, over its built ``resources``."""
     return {
         declared.name: build_handle(declared, resources)
@@ -153,19 +175,27 @@ def node_handles(model: "Model", node: str, resources: Mapping[str, Any]) -> dic
     }
 
 
-def build_handle(declared: Array | Sampler, resources: Mapping[str, Any]) -> ArrayHandle | SamplerHandle:
+def build_handle(
+    declared: Array | Sampler | SeqShard, resources: Mapping[str, Any],
+) -> ArrayHandle | SamplerHandle | ShardHandle:
     """``declared``'s handle over the built ``resources``, with each of its ops bound."""
     if isinstance(declared, Sampler):
         return SamplerHandle(declared, resources[declared.name])
+    if isinstance(declared, SeqShard):
+        return ShardHandle(declared, resources[declared.name])
     storage = storage_of(declared)
     key = None if declared.positions is None else position_key(declared)
     return storage.handle_class(declared, resources, key, _bindings(storage, declared))
 
 
-def state_steps(step: SubmoduleStep | None, handles: Mapping[str, ArrayHandle | SamplerHandle]) -> SubmoduleStep | None:
+def state_steps(
+    step: SubmoduleStep | None, handles: Mapping[str, ArrayHandle | SamplerHandle | ShardHandle],
+) -> SubmoduleStep | None:
     """``step`` as a new step, with what its ``state`` declares expanded into today's step objects, built afresh for
-    each step because `SubmoduleStep` writes the segments onto them."""
-    if step is None or not step.state:
+    each step because `SubmoduleStep` writes the segments onto them. The handles it opens are those of what ``state``
+    lists, then the node's sequence shard's, whose step is the node's segments."""
+    shards = tuple(handle for handle in handles.values() if isinstance(handle, ShardHandle))
+    if step is None or not (step.state or shards):
         return step
     steps = dict(step.steps)
     for name, declared in step.state.items():
@@ -183,10 +213,10 @@ def state_steps(step: SubmoduleStep | None, handles: Mapping[str, ArrayHandle | 
             raise ValueError(
                 f"a step's state[{name!r}] is a {type(declared).__name__}, and on this node {name!r} is "
                 f"{'not declared' if handle is None else type(handle).__name__}, which take an ArrayStep for an array "
-                "and a SampleStep for a sampler"
+                "and a SampleStep for a sampler, and a sequence shard takes none"
             )
     expanded = replace(step, steps=steps)
-    expanded.set_state_handles(tuple(handles[name] for name in step.state))
+    expanded.set_state_handles((*(handles[name] for name in step.state), *shards))
     return expanded
 
 

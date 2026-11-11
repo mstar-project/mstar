@@ -618,8 +618,8 @@ Nothing on the model side is needed for this.
 Step 2a — Declare your state
 ----------------------------
 
-``declare_state(self) -> list[Array | Sampler]`` says what each node keeps between steps.
-The declaration says only what the model's math needs: the shape of each entry, its dtype,
+``declare_state(self) -> list[Array | Sampler | SeqShard]`` says what each node keeps between
+steps, and whether its steps may split over SP ranks. The declaration says only what the model's math needs: the shape of each entry, its dtype,
 which earlier entries each layer reads, and what its kernels update. How the state is
 stored, such as a cache's page size and layout, depends on the deployment, so the engine
 decides it. ``mstar.engine.state`` is the whole surface a model imports, and its ``__all__``
@@ -649,8 +649,8 @@ RoPE position or a ring slot.
            Sampler(SAMPLER, nodes={"LLM"}, vocab_size=c.vocab_size, penalty=True),
        ]
 
-The names you pass (the array's, each read's and update's, the sampler's) share one
-namespace. Existing models define them as module-level constants in ``config.py``. A
+The names you pass (the array's, each read's and update's, the sampler's, the sequence
+shard's) share one namespace. Existing models define them as module-level constants in ``config.py``. A
 deployment YAML tunes them under ``resources:`` (see :ref:`Step 6 <config-yaml>`).
 
 - ``Array(name, nodes=, layers=, entry=, max_len=, reads=, updates=, rewritable=, labels=,
@@ -687,8 +687,22 @@ deployment YAML tunes them under ``resources:`` (see :ref:`Step 6 <config-yaml>`
   sampler calls ``sample``. Each call is a fresh draw that advances each kept row's sampling
   state. Log-probs and a device loop-back take one token per step, so loading refuses both
   above one draw.
+- ``SeqShard(name, nodes=, labels=, walks=, exchange=)``: the node's steps may split over its
+  SP ranks. It extends the state contract of #1232 to sequence parallelism, and the engine
+  builds a ``SeqShardSpec`` from it under ``name`` (see **Sequence and context parallelism**
+  under `Tuning resources per deployment`_). Per step the engine decides whether the tokens of
+  ``labels`` (``{"main"}`` by default) split, from the step alone, so it has no step of its own.
+  ``walks`` are rows' walks, as a read's are, and a combined walk splits where a walk it
+  combines is listed; ``None`` is every walk. List only walks with steps of many tokens a row,
+  so that decode's compiled frame traces the bracket straight through. ``exchange`` is the
+  author's default for how a split step reaches the node's paged attentions (``auto``,
+  ``none``, ``ulysses``, ``all_gather`` or ``ring``), which a deployment's ``resources:`` block
+  overrides under ``name``. The layer stack calls ``scatter`` before it and ``gather`` after it
+  on the shard's handle (`Reaching your state`_); the reads and updates of the node's arrays
+  exchange what a split step needs by themselves. A walk or label the node's arrays don't have
+  is refused at load.
 
-Qwen3.5's declaration shows both kinds of state, and its ViT:
+Qwen3.5's declaration shows both kinds of state, its sequence shard and its ViT:
 
 .. code-block:: python
 
@@ -703,6 +717,9 @@ Qwen3.5's declaration shows both kinds of state, and its ViT:
            Value(GDN_STATE, nodes={"LLM"}, layers=c.linear_layer_indices, entry=gdn,
                  updates={CONV: CausalConv(), LINEAR_ATTN: GatedDeltaNet(qk_l2norm=True)}),
            Sampler(SAMPLER, nodes={"LLM"}, vocab_size=c.vocab_size, penalty=True),
+           # prefills may split, never decode; Ulysses, all_gather and ring are the deployment's to opt into
+           SeqShard(LLM_SHARD, nodes={"LLM"}, walks={PREFILL_TEXT, *media_walk_names(self.encoders)},
+                    exchange="none"),
        ]
        if v is not None:
            state.append(Array(VISION_TOKENS, nodes={"vision_encoder"}, layers=frozenset(range(v.depth)),
@@ -971,8 +988,9 @@ The spec types are:
      - Whether a step's tokens split over the node's sequence-parallel ranks, and each
        listed label's per-rank ranges. Its step is the node's segments (declared by the
        model, as for every resource), and the model brackets its layer stack with the resource's
-       ``scatter`` / ``gather``. See **Sequence and context parallelism** under
-       `Tuning resources per deployment`_.
+       ``scatter`` / ``gather``. A model on the state contract declares a ``SeqShard``
+       instead, from which the engine builds this spec (`Step 2a — Declare your state`_). See
+       **Sequence and context parallelism** under `Tuning resources per deployment`_.
    * - ``LinearAttnSpec(config=LinearAttnConfig(recurrent_state=..., variant=...))``
      - Linear attention planned against a ``RecurrentStateSpec`` pool that holds its
        state: gated DeltaNet (``LinearAttnVariant.GDN``), Kimi delta attention (``KDA``:
@@ -2193,7 +2211,7 @@ lifecycle directly.
 Reaching your state
 ~~~~~~~~~~~~~~~~~~~
 
-The engine binds one handle per declared array and sampler. ``bind_state(self, handles)``
+The engine binds one handle per declared array, sampler and sequence shard. ``bind_state(self, handles)``
 receives them by declared name, on the submodule and on every layer that defines it:
 
 .. code-block:: python
@@ -2240,6 +2258,12 @@ The rest are free functions in ``mstar.engine.state``:
    tokens = sample(self.sampler, logits)      # one token per row, each a fresh draw
    last = at_last_token(self.kv, hidden)      # each row's last token in this step
    ids  = last_sampled(self.sampler)          # each row's last sampled token, for a DeviceLoopback
+   x, cos, sin = scatter(self.shard, x, cos, sin)  # this rank's share where the step splits, else as they are
+   hidden = gather(self.shard, hidden)        # every rank's share, back whole
+
+The shard's handle is opened on every step of its node and takes the label it brackets from the
+step's segments and the walk from the step, so the calls name neither. Both are the identity on a
+copied step, at one SP rank and outside a step.
 
 On an array that keeps entries, every call that touches state breaks the compiled graph and runs
 eagerly, so model code adds no ``torch.compiler.disable`` of its own. A layer stack calls
@@ -2252,8 +2276,9 @@ plain attribute, not a buffer. An eager caller can pass the int.
 included. It is temporary, with that hook.
 
 A model on the contract reads no ``node_resources``, ``engine_inputs.resources``,
-``request_state`` or ``per_request_states``, and imports the engine only through
-``mstar.engine.state``; ``test/modular/test_state_lint.py`` holds each ported package to that.
+``request_state`` or ``per_request_states``, imports the engine only through
+``mstar.engine.state`` and defines no ``bind_resources``; ``test/modular/test_state_lint.py``
+holds each ported package to that.
 
 ``ModelInputsFromEngine`` carries six other useful fields:
 
@@ -3022,7 +3047,7 @@ the model writes no exchange but a ragged attention's ``sp_exchange``:
 Splitting is declared in four places:
 
 - ``SeqShardSpec(resource_key, nodes, labels, axis, walks=None)`` names the labels whose tokens
-  split. ``axis=0`` cuts a label's packed tokens into contiguous ranges; ``axis=1`` cuts each row
+  split (on the state contract, the ``SeqShard`` the model declares, on axis 0). ``axis=0`` cuts a label's packed tokens into contiguous ranges; ``axis=1`` cuts each row
   of a ``[B, S, ...]`` layout alike (every row of the label one length). ``walks`` limits splitting
   to those walks; the others plan copied. A step splits only when it isn't one token a row, its
   listed tokens reach ``max(sp_size, min_tokens)``, and every listed label has at least
@@ -3047,7 +3072,9 @@ Splitting is declared in four places:
   that declares no segments has no shard plan, and the attention resources refuse it, so it fails
   on one GPU. A step whose segments differ from the node's (LTX-2.5's video alone) sets
   them on the ``SubmoduleStep`` and gives the other resources' steps their own.
-- The forward **brackets** its layer stack: ``shard.scatter(label, *xs, dim=None)`` before it
+- The forward **brackets** its layer stack (on the state contract, with ``scatter(shard, *xs)``
+  and ``gather(shard, x)`` on the shard's handle, as Qwen3.5 does in
+  ``mstar/model/qwen3_5/components/language_model.py``): ``shard.scatter(label, *xs, dim=None)`` before it
   (this rank's share of each tensor, ``dim`` the spec's axis by default; ``None`` passes through),
   ``shard.gather(label, x)`` after it. Both are the identity on a copied step, at one SP rank, and
   outside a step (a warmup compile); at one rank they trace straight through a compiled frame,

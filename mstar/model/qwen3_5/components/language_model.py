@@ -16,6 +16,7 @@ from torch import nn
 
 from mstar.distributed.communication import CommGroup
 from mstar.distributed.utils import divide
+from mstar.engine.state import gather, scatter
 from mstar.model.components import Attention, DecoderLayer, RMSNorm
 from mstar.model.components.decoder_layer import eager_frame, no_cursor, run_layers
 from mstar.model.components.distributed import (
@@ -273,12 +274,12 @@ class Qwen3_5ForCausalLM(nn.Module):
         if config.tie_word_embeddings:
             # PEFT adapts the head and the embedding apart even when they share a weight
             self.lm_head.weight = self.model.embed_tokens.weight
-        # the node's sequence shard, which brackets the layer stack (`bind_resources`)
+        # the node's sequence shard, which brackets the layer stack (`bind_state`)
         self.shard = None
 
-    def bind_resources(self, resources: dict) -> None:
-        """The node's sequence shard, if it declares one. See ``NodeSubmodule.bind_node_resources``."""
-        self.shard = resources.get(LLM_SHARD)
+    def bind_state(self, handles: dict) -> None:
+        """The node's sequence shard, where the model declares one. See ``NodeSubmodule.bind_node_state``."""
+        self.shard = handles.get(LLM_SHARD)
 
     def checkpoint_rules(self):
         """How the checkpoint's text tower lands here (the MTP head and the vision tower
@@ -299,19 +300,18 @@ class Qwen3_5ForCausalLM(nn.Module):
 
     def forward(
         self, input_embeds: torch.Tensor, *, label: str,
-        cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None, walk: str | None = None,
+        cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """``(tokens, hidden)`` in, the stack's normed output out. A step split over the SP ranks
         runs the stack on this rank's range of its tokens, and the attention and recurrent
-        resources exchange what they need; identity on a copied step. ``walk`` is the step's, so a
-        compiled frame of a walk the shard never splits traces the bracket straight through. Each
-        row's label comes from the step's segments, so ``label`` is read only to bracket the stack."""
+        resources exchange what they need; identity on a copied step. Each row's label comes
+        from the step's segments, so ``label`` goes unread."""
         if self.shard is None:
             return self.model(input_embeds, cos_sin=cos_sin)
         cos, sin = (None, None) if cos_sin is None else cos_sin
-        input_embeds, cos, sin = self.shard.scatter(label, input_embeds, cos, sin, walk=walk)
+        input_embeds, cos, sin = scatter(self.shard, input_embeds, cos, sin)
         hidden = self.model(input_embeds, cos_sin=None if cos_sin is None else (cos, sin))
-        return self.shard.gather(label, hidden, walk=walk)
+        return gather(self.shard, hidden)
 
     def logits(self, hidden: torch.Tensor) -> torch.Tensor:
         return self.lm_head(hidden)

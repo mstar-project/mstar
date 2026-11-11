@@ -341,9 +341,9 @@ def test_qwen3_5_refuses_a_shape_that_cant_run(overrides, where):
         _qwen3_5(**{**QWEN3_5["9B"], **overrides}).declare_state()
 
 
-def test_qwen3_5_writes_only_lora_and_its_sequence_shard_by_hand():
+def test_qwen3_5_writes_only_lora_by_hand():
     model = _qwen3_5(**QWEN3_5["9B"])
-    assert {spec.resource_key for spec in model.get_node_resources()} == {LORA_RESOURCE_KEY, LLM_SHARD}
+    assert {spec.resource_key for spec in model.get_node_resources()} == {LORA_RESOURCE_KEY}
 
 
 # The tower of Qwen/Qwen3.5-9B's `config.json`

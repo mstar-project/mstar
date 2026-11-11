@@ -11,7 +11,7 @@ from typing import Any
 import torch
 
 from mstar.engine.resources.step import StepHandle
-from mstar.engine.state.contract import Array, ArrayStep, CausalConv, GatedDeltaNet, Op, Sampler
+from mstar.engine.state.contract import Array, ArrayStep, CausalConv, GatedDeltaNet, Op, Sampler, SeqShard
 
 
 class ArrayHandle(StepHandle):
@@ -222,6 +222,38 @@ class SamplerHandle(StepHandle):
         self._open = False
 
 
+class ShardHandle(StepHandle):
+    """A node's calls on its declared `SeqShard`. Its step is the node's segments, so the engine opens it on every
+    step of the node, with no entry in ``state``. It takes the label it brackets from the step's segments, as the
+    array handles do, and the walk from the step, so a compiled frame of a walk the shard never splits traces the
+    bracket straight through. Closed, it holds neither, and the bracket is the resource's outside a step: the
+    identity."""
+
+    def __init__(self, shard: SeqShard, resource: Any):
+        self.shard = shard
+        self.name = shard.name
+        self.resource = resource
+        self.label: str | None = None
+        self.walk: str | None = None
+
+    def _refusal(self, cause: str) -> ValueError:
+        return ValueError(f"SeqShard {self.name!r}: {cause}")
+
+    def begin_step(self, step) -> None:
+        # No refusal of a second open: a region's step inside the node's reopens it on the same step.
+        labels = {segment.label for segment in step.segments or ()} & self.shard.labels
+        if len(labels) > 1 and not step.ctx.replays:
+            raise self._refusal(f"a step touches its labels {sorted(labels)}, and a bracket holds one")
+        self.label = next(iter(labels), None)
+        self.walk = step.ctx.graph_walk
+
+    def check_step(self, step) -> None:
+        return
+
+    def end_step(self, step) -> None:
+        self.label = self.walk = None
+
+
 @torch.compiler.disable
 def causal_conv(
     h: ArrayHandle, layer: int | torch.Tensor, x: torch.Tensor, *, weight: torch.Tensor,
@@ -240,6 +272,17 @@ def gated_delta_net(
     """The declared `GatedDeltaNet`, which reads and writes ``layer``'s ``state`` field in place."""
     run, state = h._update(GatedDeltaNet, "state", h._layer_id(layer))
     return run.run(q, k, v, a, b, state_layer=state, a_log=a_log, dt_bias=dt_bias, label=h.label)
+
+
+def scatter(h: ShardHandle, *xs: torch.Tensor | None):
+    """This rank's share of each of ``xs``, whole on every rank, where this step splits the label; ``xs`` as they are
+    otherwise. One tensor in, one out; several in, a tuple out. None passes through."""
+    return h.resource.scatter(h.label, *xs, walk=h.walk)
+
+
+def gather(h: ShardHandle, *xs: torch.Tensor | None):
+    """`scatter`'s inverse: every rank's share of each of ``xs``, back whole."""
+    return h.resource.gather(h.label, *xs, walk=h.walk)
 
 
 def position(h: ArrayHandle, rid_handle: int, label: str) -> int:

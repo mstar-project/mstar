@@ -24,8 +24,8 @@ from mstar.engine.state.calls import ArrayHandle
 _POSITIONAL = {"Reached", "Segment", "SlotLease", "Span"}
 # The calls take the handle first, then what every call names, and only then keywords.
 _CALLS = {
-    "at_last_token", "causal_conv", "gated_delta_net", "last_sampled", "position", "positions",
-    "rope", "sample",
+    "at_last_token", "causal_conv", "gated_delta_net", "gather", "last_sampled", "position", "positions",
+    "rope", "sample", "scatter",
 }
 # Each public name's parameters as ``[name, kind, default]``. A dataclass's parameters are its fields.
 SNAPSHOT = {
@@ -140,6 +140,13 @@ SNAPSHOT = {
         ["label", "POSITIONAL_OR_KEYWORD", None],
         ["span", "POSITIONAL_OR_KEYWORD", None],
     ],
+    "SeqShard": [
+        ["name", "POSITIONAL_OR_KEYWORD", None],
+        ["nodes", "KEYWORD_ONLY", None],
+        ["labels", "KEYWORD_ONLY", "frozenset({'main'})"],
+        ["walks", "KEYWORD_ONLY", 'None'],
+        ["exchange", "KEYWORD_ONLY", "'auto'"],
+    ],
     "SlotLease": [
         ["slot", "POSITIONAL_OR_KEYWORD", None],
         ["bucket", "POSITIONAL_OR_KEYWORD", None],
@@ -191,6 +198,10 @@ SNAPSHOT = {
         ["a_log", "POSITIONAL_OR_KEYWORD", None],
         ["dt_bias", "POSITIONAL_OR_KEYWORD", None],
     ],
+    "gather": [
+        ["h", "POSITIONAL_OR_KEYWORD", None],
+        ["xs", "VAR_POSITIONAL", None],
+    ],
     "last_sampled": [
         ["s", "POSITIONAL_OR_KEYWORD", None],
     ],
@@ -210,6 +221,10 @@ SNAPSHOT = {
     "sample": [
         ["s", "POSITIONAL_OR_KEYWORD", None],
         ["logits", "POSITIONAL_OR_KEYWORD", None],
+    ],
+    "scatter": [
+        ["h", "POSITIONAL_OR_KEYWORD", None],
+        ["xs", "VAR_POSITIONAL", None],
     ],
 }
 

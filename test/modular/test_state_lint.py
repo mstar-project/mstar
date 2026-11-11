@@ -31,9 +31,9 @@ ALLOWED = {
         for name in ("AcceleratorGraphConfig", "DETERMINISTIC_COMPILE_MODE")
     },
     ("mstar.engine.resources.lora", "LoraSpec"): "the opt-in LoRA spec, written by hand: the contract declares no LoRA",
-    ("mstar.engine.resources.sequence_shard", "SeqShardSpec"):
-        "the LLM's sequence shard, written by hand: the contract declares no split of a step over SP ranks",
 }
+# what a module defines to be handed the node's built resources, rather than its handles (`bind_state`)
+RESOURCE_BINDS = {"bind_resources", "bind_node_resources"}
 
 
 def _violations(source: str) -> tuple[list[str], set[tuple[str, str]]]:
@@ -51,6 +51,8 @@ def _violations(source: str) -> tuple[list[str], set[tuple[str, str]]]:
                     found.append(f"from {node.module} import {alias.name}")
         elif isinstance(node, ast.Import):
             found += [f"import {a.name}" for a in node.names if a.name.startswith("mstar.engine")]
+        elif isinstance(node, ast.FunctionDef) and node.name in RESOURCE_BINDS:
+            found.append(f"def {node.name} at line {node.lineno}, which takes the built resources")
         elif isinstance(node, ast.Attribute) and node.attr in FORBIDDEN_ATTRIBUTES:
             found.append(f".{node.attr} at line {node.lineno}")
         elif isinstance(node, ast.Attribute) and ast.unparse(node).endswith("compiler.disable"):
@@ -91,6 +93,7 @@ def test_every_exception_is_still_used():
     ("def f(self): return self.kv.first_read", ".first_read"),
     ("def f(self): return self.kv.reads['attn']", ".reads"),
     ("@torch.compiler.disable\ndef f(): pass", "torch.compiler.disable"),
+    ("class M:\n    def bind_resources(self, resources): pass", "def bind_resources"),
 ])
 def test_the_lint_catches_each_way_past_the_contract(source, expected):
     found, _ = _violations(source)

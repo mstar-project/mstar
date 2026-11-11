@@ -4,7 +4,6 @@ attention over it, each rank's partial over its slots exchanged and merged."""
 
 from __future__ import annotations
 
-import functools
 import itertools
 import logging
 import math
@@ -520,13 +519,13 @@ def _cp_attention(
 
 
 def _plan(
-    attn, case: _Case, slot: int = 0, bucket: BucketKey | None = None, capture=False, shard=None, **step,
+    attn, case: _Case, slot: int = 0, bucket: BucketKey | None = None, capture=False, shard=None, walk="w", **step,
 ) -> None:
-    """Plans ``case``, its padding rows as a replay's (a capture's rows are all its own), and first
-    on ``shard`` (key ``"shard"``) if given."""
+    """Plans ``case`` on ``walk``, its padding rows as a replay's (a capture's rows are all its own),
+    and first on ``shard`` (key ``"shard"``) if given."""
     views = case.plan["main"].views
     real = views if capture else case.views
-    ctx = StepContext(request_ids=tuple(v.request_id for v in real), graph_walk="w", slot=slot, capture=capture,
+    ctx = StepContext(request_ids=tuple(v.request_id for v in real), graph_walk=walk, slot=slot, capture=capture,
                       slot_lease=None if bucket is None else SlotLease(slot, bucket))
     if len(real) < len(views):
         ctx.set_padded_rids(tuple(v.request_id for v in views))
@@ -1026,12 +1025,16 @@ class _OneRank:
 
 def _layer_over_ranks(rank, world, store, split=None):
     """One rank of an SP placement running a Qwen3.5 attention layer through its KV handle on a
-    prefill, against the same layer attending every key on one rank. With ``split`` (the shard's
-    ``exchange``) the step splits over a sequence shard, whose exchange makes the handle's write and
-    attention one call. The pool's step slots hold NaN until the step writes them, as each case checks."""
-    from mstar.engine.state.adapters import build_handle
+    prefill, bracketed by the handle on Qwen3.5's declared sequence shard, against the same layer
+    attending every key on one rank. The shard's declared exchange, none, runs the step copied; with
+    ``split`` (a deployment's ``exchange``) the step splits, and the shard's exchange makes the KV
+    handle's write and attention one call. The pool's step slots hold NaN until the step writes
+    them, as each case checks."""
+    from mstar.engine.state import SeqShard, gather, scatter
+    from mstar.engine.state.adapters import build_handle, build_specs
     from mstar.engine.state.analysis import position_key
     from mstar.engine.state.contract import ArrayStep
+    from mstar.model.keys import PREFILL_TEXT
     from mstar.model.qwen3_5.components.language_model import Qwen3_5Attention, RopeCache
     from mstar.model.qwen3_5.config import ATTN
 
@@ -1043,7 +1046,9 @@ def _layer_over_ranks(rank, world, store, split=None):
     group.device_group, group.initialized = dist.group.WORLD, True
     try:
         joint = JointGroups(tp_group=CommGroup.trivial(), sp_group=group, instance=group)
-        (array,) = [a for a in _qwen3_5(NODE, {}, None, None).declare_state() if a.name == KV_CACHE]
+        declared = _qwen3_5(NODE, {}, None, None).declare_state()
+        (array,) = [a for a in declared if a.name == KV_CACHE]
+        (declared_shard,) = [d for d in declared if isinstance(d, SeqShard)]
         (layer_id,) = array.layers
         torch.manual_seed(0)
         rope = RopeCache()
@@ -1065,33 +1070,37 @@ def _layer_over_ranks(rank, world, store, split=None):
         layer.bind_state({KV_CACHE: _OneRank(case)})
         want = forward(hidden)
 
-        shard = None if split is None else SequenceShard(
-            ("main",), 0, None, 0, group, stripe_pool="kv" if split == "ring" else None, device=CPU,
-        )
+        # the spec the contract builds from the declaration, as a deployment overrides it and its
+        # derive resolves it: no split under "none", the ring striped by the pool it reads
+        (spec,) = build_specs([declared_shard])
+        if split is not None:
+            spec.apply_yaml_overrides(exchange=split)
+        spec.splits = spec.exchange != "none"
+        spec.stripe_pool = "kv" if split == "ring" else None
+        shard = SequenceShard.build(spec, EngineResourceInfo(device=CPU, joint_comm_group=joint))
         built = []
         attn, placement = _cp_attention(
-            joint, CPU, torch.float32, shard=shard, exchange=split or "auto",
+            joint, CPU, torch.float32, shard=shard, exchange=spec.exchange,
             kv_resource=lambda placement: built.append(_PlacedKV(placement, case)) or built[0],
         )
         (pool,) = built
-        _plan(attn, case, shard=shard)
-        if shard is None:
-            scatter = gather = lambda x: x
-        else:
-            assert shard.split_range("main") is not None
-            scatter, gather = (functools.partial(f, "main") for f in (shard.scatter, shard.gather))
+        _plan(attn, case, shard=shard, walk=PREFILL_TEXT)
+        assert (shard.split_range("main") is not None) == (split is not None)
         handle = build_handle(array, {KV_CACHE: pool, ATTN: attn, position_key(array): None})
+        bracket = build_handle(declared_shard, {LLM_SHARD: shard})
         step = types.SimpleNamespace(
             state={KV_CACHE: ArrayStep()}, segments=tuple(
                 Segment(view.request_id, "main", new) for view, (_, new) in zip(case.views, case.rows, strict=True)
             ),
-            ctx=types.SimpleNamespace(replays=False, capture=False),
+            ctx=types.SimpleNamespace(replays=False, capture=False, graph_walk=PREFILL_TEXT),
         )
-        handle.begin_step(step)
+        for opened in (handle, bracket):
+            opened.begin_step(step)
         layer.bind_state({KV_CACHE: handle})
-        torch.testing.assert_close(gather(forward(scatter(hidden))), want)
-        handle.check_step(step)
-        handle.end_step(step)
+        torch.testing.assert_close(gather(bracket, forward(scatter(bracket, hidden))), want)
+        for opened in (handle, bracket):
+            opened.check_step(step)
+            opened.end_step(step)
         # the step's k and v, in the slots this rank stores (SINK_PAGE takes the rest)
         torch.testing.assert_close(pool.cache[1:], case.cache(placement)[1:], equal_nan=True)
         assert pool.writes == 1, "the step's k and v are written once"
@@ -1103,7 +1112,7 @@ def _layer_over_ranks(rank, world, store, split=None):
 @pytest.mark.parametrize("split", [None, "all_gather", "ring"], ids=["copied", "all-gather", "ring"])
 def test_a_qwen3_5_layer_attends_a_placed_pool_through_its_handle_like_one_rank(tmp_path, split):
     # a prefill attends its own tokens from the k and v the layer adds, beside the pool; a split one
-    # writes and attends them through the shard's exchange
+    # writes and attends them through the shard's exchange, bracketed by its declared handle
     mp.spawn(_layer_over_ranks, args=(P, str(tmp_path / "store"), split), nprocs=P)
 
 

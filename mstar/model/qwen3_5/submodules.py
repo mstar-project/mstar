@@ -261,8 +261,7 @@ class LLMSubmodule(SampledTokenDecoder):
             # (off a captured decode's per-step critical path); the static
             # cos/sin stay unread
             cos_3d, sin_3d = self._decode_cos_sin(engine_inputs, num_tokens)
-        # the walk lets a compiled frame of a walk the shard never splits trace its bracket through
-        return {"cos_sin": (cos_3d, sin_3d), "walk": graph_walk}
+        return {"cos_sin": (cos_3d, sin_3d)}
 
 
 class VisionEncoderSubmodule(PackedBlockLoopEncoder):
