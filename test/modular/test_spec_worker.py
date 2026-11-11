@@ -7,6 +7,9 @@ the toy engine (`spec_toy.py`). The loop paths that decide *when* postprocess
 runs relative to the next admits (yield-away, a TP follower's serial and
 speculative pops) need the Rust graph runtime and are not built here; the TP
 simulator checks the ordering they rely on (`tp_async_sim.explore_verify`).
+
+A real `Preemption` over the toy's pool, with test_kv_host_index's host pool
+copying on the CPU, runs main's preemption of a verifying row end to end.
 """
 from __future__ import annotations
 
@@ -20,8 +23,11 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from spec_toy import NODE, Driver, _batch, engine, every, stub_offload  # noqa: E402
+import test_kv_host_index as host_index  # noqa: E402
+from spec_toy import NODE, STOP, Driver, _batch, engine, every, reference, stub_offload  # noqa: E402
 
+from mstar.conductor.request_info import CurrentForwardPassInfo  # noqa: E402
+from mstar.engine.resources import Residency  # noqa: E402
 from mstar.engine.resources.kv import manager as manager_mod  # noqa: E402
 from mstar.engine.resources.kv.manager import Victims  # noqa: E402
 from mstar.graph.runtime.base import PhasedPostprocess, PostprocessNeed, PostprocessStep  # noqa: E402
@@ -414,3 +420,129 @@ def test_the_debug_victim_check_passes_resident_victims_with_nothing_unrecorded(
     rid = 3 if move == "to_ask" else 2
     assert not eng.verify_unrecorded(NODE, rid) and eng.verify_pending(NODE, rid) is (rid == 2)
     _debug_move(monkeypatch, eng, _victims(move, rid))
+
+
+class _HostPool(host_index._HostPool):
+    """test_kv_host_index's host pool, with its copies made on the CPU, so a row the toy moved to the host and
+    back reads the KV it wrote."""
+
+    def __init__(self, pages: int, device_cache: torch.Tensor):
+        super().__init__(pages)
+        self.cpu = torch.zeros(device_cache.shape[0], pages, *device_cache.shape[2:], dtype=device_cache.dtype)
+
+    def copy_out(self, gpu_kv_cache, copies):
+        super().copy_out(gpu_kv_cache, copies)
+        self.cpu[:, copies.cpu] = gpu_kv_cache[:, copies.gpu]
+
+    def copy_in(self, gpu_kv_cache, copies):
+        super().copy_in(gpu_kv_cache, copies)
+        gpu_kv_cache[:, copies.gpu] = self.cpu[:, copies.cpu]
+
+
+def _hosted(max_num_pages: int, host_pages: int = 64):
+    """The toy engine on a pool with a host pool, and a pipeline whose `Preemption` moves rows over it."""
+    eng = engine(3, every(2), max_num_pages=max_num_pages)
+    kv = eng._resources["kv"]
+    kv._cpu_pool = _HostPool(host_pages, kv.kv_cache.tensor)
+    worker = _chain_worker(eng)
+    preempting(worker)
+    return eng, Driver(eng), worker
+
+
+def _back(eng, rid: int) -> None:
+    """A readiness scan's admit and reload of ``rid``, back from the host."""
+    eng.admit_waiting(lambda other, node: None)
+    info = CurrentForwardPassInfo(str(rid), WALK, 0, 0, 30)
+    assert eng.check_ready(NODE, rid, info).ready
+
+
+
+_PROMPTS = {1: list(range(1, 21)), 2: [5, 9, 2, 7, 1, 3, 3, 8]}
+
+
+def _run_short(worker, eng, driver, rids) -> None:
+    """Verify steps of ``rids`` through the pipeline until one's admit is refused and handled."""
+    for _ in range(60):
+        if _chain_step(worker, eng, driver, rids).admit_error is not None:
+            return
+    raise AssertionError(f"{rids} never ran short")
+
+
+def _decode_back(worker, eng, driver, rid: int, max_tokens: int) -> None:
+    """``rid``, back from the host, decodes to its limit. Every result it held is taken back at its first admit."""
+    ledger = eng._drafts[NODE].ledger
+    held = set(ledger._steps_of.get(rid, ()))
+    _back(eng, rid)
+    _chain_step(worker, eng, driver, [rid])
+    assert not eng.verify_returning(NODE, rid) and held.isdisjoint(ledger._steps_of.get(rid, ()))
+    for _ in range(max_tokens):
+        if len(driver.out[rid]) >= max_tokens or driver.out[rid][-1] == STOP:
+            return
+        assert _chain_step(worker, eng, driver, [rid]).admit_error is None
+    raise AssertionError(f"{rid} never reached its limit")
+
+
+def test_a_row_that_runs_short_moves_a_newer_verifying_row_to_the_host():
+    """`KVManager.preempt` chooses the newer verifying row, `Preemption._move` offloads it and the engine marks it
+    returning, so the results it holds are due at its first admit back, after its reload."""
+    eng, driver, worker = _hosted(max_num_pages=12)
+    for arrival, (rid, prompt) in enumerate(_PROMPTS.items()):
+        driver.add(rid, prompt, 200 if rid == 1 else 30, arrival=arrival)
+    _chain_step(worker, eng, driver, [1, 2])
+    _run_short(worker, eng, driver, [1])
+    assert eng.residency(NODE, 2) is Residency.ON_HOST
+    assert eng.verify_returning(NODE, 2) and eng.verify_pending(NODE, 2)
+    # the victim came from the pool, not from the fallback eviction
+    assert worker.preemption.counts[NODE].victims == 1 and not worker.admission.held_until
+    # the row that ran short runs on in the room the move freed
+    assert _chain_step(worker, eng, driver, [1]).admit_error is None
+    assert driver.out[1] == reference(_PROMPTS[1], 200)[:len(driver.out[1])]
+    eng.remove_request(1)
+    _decode_back(worker, eng, driver, 2, 30)
+    assert driver.out[2] == reference(_PROMPTS[2], 30)
+
+
+def test_a_row_that_runs_short_with_nothing_newer_to_move_moves_itself_to_the_host():
+    """The branch where no victim covers the shortage and the host takes the requester whole
+    (``Victims([rid], [], [])``): it is marked returning as any victim is. In synchronous mode it holds no result
+    by then, since the refused admit took back everything it held before admitting."""
+    eng, driver, worker = _hosted(max_num_pages=12)
+    for arrival, (rid, prompt) in enumerate(_PROMPTS.items()):
+        driver.add(rid, prompt, 30 if rid == 1 else 20, arrival=arrival)
+    _chain_step(worker, eng, driver, [1, 2])
+    _run_short(worker, eng, driver, [2])
+    assert eng.residency(NODE, 2) is Residency.ON_HOST and eng.residency(NODE, 1) is Residency.RESIDENT
+    assert eng.verify_returning(NODE, 2)
+    assert worker.preemption.counts[NODE].victims == 1 and not worker.admission.held_until
+    eng.remove_request(1)
+    _decode_back(worker, eng, driver, 2, 20)
+    assert driver.out[2] == reference(_PROMPTS[2], 20)
+
+
+
+def test_a_returning_row_the_pool_asks_again_passes_the_debug_victim_check(monkeypatch):
+    """Moved to the host, then admitted back with an allotment and no page before it reloads, a verifying row is
+    one `KVManager._choose` asks again when an older row runs short. Under ``MSTAR_KV_DEBUG_ASSERTS`` the move
+    goes through, and the row's results stay held for its first admit back."""
+    from mstar.engine.resources.kv.manager import KVManager
+
+    eng, driver, worker = _hosted(max_num_pages=12)
+    chosen = []
+    preempt = KVManager.preempt
+    monkeypatch.setattr(KVManager, "preempt", lambda self, *args: chosen.append(preempt(self, *args)) or chosen[-1])
+    prompts = {1: list(range(1, 21)), 2: [5, 9, 2, 7], 3: _PROMPTS[2]}
+    for arrival, (rid, prompt) in enumerate(prompts.items()):
+        driver.add(rid, prompt, 20 if rid == 3 else 200, arrival=arrival)
+    _chain_step(worker, eng, driver, [1, 2, 3])
+    _run_short(worker, eng, driver, [1, 2])
+    assert chosen == [Victims([3], [], [])] and eng.verify_returning(NODE, 3)
+    eng.remove_request(1)
+    eng.admit_waiting(lambda other, node: None)
+    assert eng.residency(NODE, 3) is Residency.ON_HOST and eng.verify_pending(NODE, 3)
+    monkeypatch.setattr(manager_mod, "_DEBUG_ASSERTS", True)
+    _run_short(worker, eng, driver, [2])
+    assert chosen[1:] == [Victims([], [], [3])]
+    assert eng.verify_returning(NODE, 3) and eng.verify_pending(NODE, 3)
+    eng.remove_request(2)
+    _decode_back(worker, eng, driver, 3, 20)
+    assert driver.out[3] == reference(_PROMPTS[2], 20)

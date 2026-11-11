@@ -14,6 +14,7 @@ from types import SimpleNamespace
 
 import torch
 
+from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine.engine import Engine, ExecutingBatch
 from mstar.engine.resources.draft.config import DraftConfig
@@ -315,10 +316,20 @@ class Driver:
         self.eng = eng
         self.out: dict[int, list[int]] = {}
 
-    def add(self, rid: int, prompt: list[int], max_tokens: int, temperature: float = 0.0, seed: int = 0):
+    def add(
+        self, rid: int, prompt: list[int], max_tokens: int, temperature: float = 0.0, seed: int = 0,
+        arrival: int | None = None,
+    ):
+        """``arrival``: the conductor's number for the request, which preemption chooses victims by. A numbered
+        request is admitted as a readiness scan admits it, so its pool allots it pages."""
         cfg = SamplingReqConfig(temperature=temperature)
         cfg.apply_conductor_config(seed=seed)
-        self.eng.add_request(rid, {"kv": KVReqConfig(), "sampler": cfg})
+        info = None if arrival is None else CurrentForwardPassInfo(
+            str(rid), "prefill", 0, seed, max_tokens, arrival=arrival,
+        )
+        self.eng.add_request(rid, {"kv": KVReqConfig(), "sampler": cfg}, info)
+        if info is not None:
+            assert self.eng.check_ready(NODE, rid, info).ready
         _take_sampler_row(self.eng, rid)
         self.out[rid] = []
         self._max = getattr(self, "_max", {})
