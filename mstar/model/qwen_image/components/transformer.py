@@ -301,12 +301,28 @@ def _by_token(fn, split: int, tokens: tuple[torch.Tensor, ...], params: tuple[to
                       fn(*(t[:, split:] for t in tokens), *(p[rows:, None] for p in params))], dim=1)
 
 
-def _modulate(x: torch.Tensor, params: torch.Tensor, split: int):
-    """``(x (1 + scale) + shift, gate)`` from ``params [sets * B, 3D]`` (``zero_cond_t``: the step's timestep rows,
-    then timestep 0's, the second set from token ``split``); ``gate`` stays ``[sets * B, D]`` for
-    :func:`_gated_add`."""
-    shift, scale, gate = (p.contiguous() for p in params.chunk(3, dim=-1))
-    scale1p = 1 + scale
+class _Mod(NamedTuple):
+    """One modulation's parameters, each a contiguous ``[sets * B, D]`` (``zero_cond_t``: the step's timestep rows,
+    then timestep 0's, the second set from token ``split``)."""
+
+    shift: torch.Tensor
+    scale1p: torch.Tensor
+    gate: torch.Tensor
+
+
+def _block_mods(linear: nn.Module, act: torch.Tensor) -> tuple[_Mod, _Mod]:
+    """A block's two modulations from ``linear(act) [sets * B, 6D]``: one copy lays the six ``[sets * B, D]`` parts
+    out contiguously (instead of one per part) and one add makes both ``1 + scale``."""
+    params = linear(act)
+    rows, dim = params.shape[0], params.shape[1] // 6
+    parts = params.view(rows, 6, dim).transpose(0, 1).contiguous()
+    scale1p = 1 + parts[1::3]
+    return _Mod(parts[0], scale1p[0], parts[2]), _Mod(parts[3], scale1p[1], parts[5])
+
+
+def _modulate(x: torch.Tensor, mod: _Mod, split: int):
+    """``(x (1 + scale) + shift, gate)``; ``gate`` stays ``[sets * B, D]`` for :func:`_gated_add`."""
+    shift, scale1p, gate = mod
     if kernels.fits(x, shift) and x.is_contiguous():
         return kernels.modulate(x, scale1p, shift, split), gate
     return _by_token(lambda t, s1p, sh: t * s1p + sh, split, (x,), (scale1p, shift)), gate
@@ -319,25 +335,23 @@ def _gated_add(x: torch.Tensor, gate: torch.Tensor, y: torch.Tensor, split: int)
     return _by_token(lambda t, u, g: t + g * u, split, (x, y), (gate,))
 
 
-def _norm_modulate(norm: nn.LayerNorm, x: torch.Tensor, params: torch.Tensor, split: int):
+def _norm_modulate(norm: nn.LayerNorm, x: torch.Tensor, mod: _Mod, split: int):
     """:func:`_modulate` of ``norm(x)``, in one pass where the kernel takes ``x``."""
-    if kernels.fits(x, params) and kernels.norm_fits(x):
-        shift, scale, gate = (p.contiguous() for p in params.chunk(3, dim=-1))
-        return kernels.norm_modulate(x, 1 + scale, shift, split, norm.eps), gate
-    return _modulate(norm(x), params, split)
+    if kernels.fits(x, mod.shift) and kernels.norm_fits(x):
+        return kernels.norm_modulate(x, mod.scale1p, mod.shift, split, norm.eps), mod.gate
+    return _modulate(norm(x), mod, split)
 
 
 def _gated_norm_modulate(
-    x: torch.Tensor, gate: torch.Tensor, y: torch.Tensor, norm: nn.LayerNorm, params: torch.Tensor, split: int,
+    x: torch.Tensor, gate: torch.Tensor, y: torch.Tensor, norm: nn.LayerNorm, mod: _Mod, split: int,
 ):
-    """``r = _gated_add(x, gate, y)`` and ``_modulate(norm(r), params)``: ``(r, modulated, next gate)``, from one
+    """``r = _gated_add(x, gate, y)`` and ``_modulate(norm(r), mod)``: ``(r, modulated, next gate)``, from one
     read of ``x`` and ``y`` where the kernel takes them."""
-    if kernels.fits(x, gate, y, params) and kernels.norm_fits(x) and y.is_contiguous():
-        shift, scale, next_gate = (p.contiguous() for p in params.chunk(3, dim=-1))
-        residual, out = kernels.gated_norm_modulate(x, gate, y, 1 + scale, shift, split, norm.eps)
-        return residual, out, next_gate
+    if kernels.fits(x, gate, y, mod.shift) and kernels.norm_fits(x) and y.is_contiguous():
+        residual, out = kernels.gated_norm_modulate(x, gate, y, mod.scale1p, mod.shift, split, norm.eps)
+        return residual, out, mod.gate
     residual = _gated_add(x, gate, y, split)
-    return (residual, *_modulate(norm(residual), params, split))
+    return (residual, *_modulate(norm(residual), mod, split))
 
 
 class QwenImageBlock(nn.Module):
@@ -358,14 +372,16 @@ class QwenImageBlock(nn.Module):
         self.txt_mlp = _FeedForward(comm_group, dim)
 
     def forward(
-        self, img: torch.Tensor, txt: torch.Tensor, temb: torch.Tensor, layout: QwenStepLayout,
+        self, img: torch.Tensor, txt: torch.Tensor, temb_act: torch.Tensor, layout: QwenStepLayout,
         txt_freqs: torch.Tensor, attend,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """``temb_act``: ``silu(temb)``, the modulations' input, the same for every block (``img_mod`` /
+        ``txt_mod`` are ``SiLU`` then the linear)."""
         # zero_cond_t: the references' tokens (from target_tokens on) take timestep 0's parameters
         split = layout.target_tokens if self.zero_cond_t else img.shape[1]
-        img_mod1, img_mod2 = self.img_mod(temb).chunk(2, dim=-1)
-        txt_temb = temb.chunk(2, dim=0)[0] if self.zero_cond_t else temb
-        txt_mod1, txt_mod2 = self.txt_mod(txt_temb).chunk(2, dim=-1)
+        img_mod1, img_mod2 = _block_mods(self.img_mod[1], temb_act)
+        txt_act = temb_act.chunk(2, dim=0)[0] if self.zero_cond_t else temb_act
+        txt_mod1, txt_mod2 = _block_mods(self.txt_mod[1], txt_act)
         txt_split = txt.shape[1]
 
         img_in, img_gate1 = _norm_modulate(self.img_norm1, img, img_mod1, split)
@@ -434,8 +450,9 @@ class QwenImageTransformer(nn.Module):
             # compiled blocks: one graph for any prompt length, the image dims static
             for tensor in (txt, txt_freqs):
                 torch._dynamo.mark_dynamic(tensor, 1)
+        temb_act = F.silu(temb)
         for block in self.transformer_blocks:
-            img, txt = block(img, txt, temb, layout, txt_freqs, attend)
+            img, txt = block(img, txt, temb_act, layout, txt_freqs, attend)
         if self.config.zero_cond_t:
             temb = temb.chunk(2, dim=0)[0]
         return self.proj_out(self.norm_out(img, temb))
