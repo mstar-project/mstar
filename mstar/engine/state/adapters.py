@@ -1560,6 +1560,8 @@ class Storage(ABC):
     takes_leader: ClassVar[bool] = False
     # whether an array here reads by walk, so a combined walk takes its reads from the walks it batches
     takes_combined_walks: ClassVar[bool] = False
+    # whether an array here holds each row's own entries, whose pages a Value's update snapshots are keyed by
+    holds_row_entries: ClassVar[bool] = False
 
     def __init__(self):
         # `state_steps` reaches a handle's storage, for its step builder, through the handle's class
@@ -1606,6 +1608,7 @@ class PagedStorage(Storage):
     handle_class = PagedArrayHandle
     kernel_settings = frozenset({"max_num_pages"})
     takes_leader = True
+    holds_row_entries = True
 
     def resolve(self, arrays: Sequence[Array], declared: Sequence[Array], setup: "StateSetup") -> Resolved:
         resolved = Resolved({}, {}, {}, {})
@@ -1734,6 +1737,8 @@ class PagedCrossStorage(PagedStorage):
     now the array takes no other read."""
 
     handle_class = PagedCrossHandle
+    # its pages hold a context, not a row's own entries
+    holds_row_entries = False
 
     def resolve(self, arrays: Sequence[Array], declared: Sequence[Array], setup: "StateSetup") -> Resolved:
         for array in arrays:
@@ -1774,9 +1779,7 @@ class ValueStorage(Storage):
         kv_cache = None
         if bound:
             # the snapshots its update kernels take are keyed by the pages of the one paged array on its nodes
-            holders = [
-                other for other in arrays if storage_of(other) in (PAGED, PAGED_BY_WALK) and other.nodes & array.nodes
-            ]
+            holders = [other for other in arrays if storage_of(other).holds_row_entries and other.nodes & array.nodes]
             if len(holders) != 1 or not array.nodes <= holders[0].nodes:
                 raise _no_layout(array, f"its nodes must hold one append-only array, the one "
                                         f"RecurrentStateConfig.kv_cache links to, and they hold "

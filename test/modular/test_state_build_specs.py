@@ -175,6 +175,11 @@ def test_a_cross_read_array_on_the_value_nodes_does_not_stop_the_link():
     assert _by_key(_kv(), context, _gdn())["gdn"].config.kv_cache == "kv", "a context holds no row's own entries"
 
 
+def test_a_value_beside_an_array_whose_reads_differ_by_walk_links_to_its_pages():
+    by_walk = _kv(reads={"attn": _read(walks={"prefill"}), "attn_decode": _read(walks={"decode"})})
+    assert _by_key(by_walk, _gdn())["gdn"].config.kv_cache == "kv", "its pages hold each row's own entries"
+
+
 def test_a_value_specs_sit_on_the_value_nodes_not_the_pool_nodes():
     specs = _by_key(_kv(nodes={"llm", "audio"}), _gdn())
     assert specs["gdn"].nodes == specs["delta"].nodes == {"llm"}, "the state would be built where the value isn't"
