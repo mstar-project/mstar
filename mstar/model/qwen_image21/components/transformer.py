@@ -114,7 +114,7 @@ def gated_add(x: torch.Tensor, gate: torch.Tensor, y: torch.Tensor) -> torch.Ten
     """``x + gate * y``: for the target's ``x``, ``y [R, L, D]`` and ``gate [R, 1, D]`` one fused pass on CUDA, the
     same bits. Under ``torch.compile`` the eager ops, which inductor fuses with the next block's norm."""
     if (not torch.compiler.is_compiling() and x.dim() == 3 and gate.shape == (x.shape[0], 1, x.shape[2])
-            and kernels.fits(x, gate, y) and x.is_contiguous() and y.is_contiguous()):
+            and y.shape == x.shape and kernels.fits(x, gate, y) and x.is_contiguous() and y.is_contiguous()):
         return kernels.gated_add(x, gate.reshape(x.shape[0], -1).contiguous(), y, x.shape[1])
     return x + gate * y
 
