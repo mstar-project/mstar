@@ -822,6 +822,13 @@ The spec types are:
        ``kv_lora_rank`` and ``qk_rope_head_dim``, and sets ``num_kv_heads`` to 1 and
        ``head_dim`` to their sum. Every rank holds the whole latent; only
        ``num_qo_heads`` shards, and MLA attention needs it set to the model's query heads.
+       ``aux_planes`` names per-token state of its own width on the same pages
+       (``AuxPlanes(num_layers, width)``, DSA's index keys for one): it shares the page
+       table, is copied and freed with the pages, and is read and written through
+       ``KVManager.aux_view`` and ``write_aux``. CPU offload, a cross-instance KV
+       retrieve and a pool that keeps a window (below) refuse aux planes for now. An eager
+       forward that runs a long step's tokens in windows writes each window at its own
+       slots inside ``KVManager.token_window(start, end)``.
        A pool keeps only a window of the layers a windowed attention over it runs
        (``AttentionConfig.sliding_window``, below); its ``page_size``, ``max_num_pages``
        and ``cpu_offload_pages`` then work as described there.
@@ -932,6 +939,14 @@ The spec types are:
        attends its pick. GLM-5.2 declares it under ``dsa_long_context``. Planned: the keys
        move onto the MLA cache's pages under its page table, so the allocator, eviction and
        prefix caching cover them, and selection gets fixed-shape buffers so decode captures.
+       ``kpool`` above 1 scores one pooled key per ``kpool`` tokens (GLM-5.3). That
+       resource is the paged one: its index rows sit on the aux planes ``INDEX_PLANES``
+       the model declares on the cache (``3 * index_head_dim`` wide, checked at build), and
+       it scores, picks and attends on device, under CUDA graphs. Its ``plan`` builds the
+       step's rows from the KV plan, into buffers of the capture slot under a lease, and the
+       layers call ``write_index``, ``select`` and ``attend``, which read it; ``rows``
+       narrows it for a forward run in windows. ``sm_scale`` is the absorbed MLA's softmax
+       scale for its sparse-attention plans.
    * - ``CrossAttentionSpec(config=CrossAttentionConfig(...))``
      - Attention over a paged context that is written once and never extended.
        ``backend`` defaults to ``AttnBackend.AUTO``. Only FlashInfer is implemented.
@@ -1129,7 +1144,7 @@ The rows below name specs where a declaration doesn't reach them yet.
    * - Decoder of an encoder-decoder model
      - The three or four specs above, plus a second ``KVSpec`` for the encoder context
        and a ``CrossAttentionSpec`` over that second cache.
-   * - An LLM with DeepSeek sparse attention (GLM-5.2)
+   * - An LLM with DeepSeek sparse attention (GLM-5.2, GLM-5.3)
      - The specs above over an MLA cache (``KVLayout.MLA``, ``AttnBackend.FLASHINFER_MLA``),
        plus a ``DSASpec`` over the same cache.
    * - A node that carries per-request state between steps of a loop (an RNN-T
@@ -3003,6 +3018,13 @@ that a misspelled setting is never silently ignored:
        ``max_segments_per_step``, ``max_tokens_per_request``. The ceilings size CUDA-graph
        buckets, which is a memory-against-coverage trade the deployment makes, not the model.
        A resource sized per step refuses ``max_segments_per_request``, which it would ignore.
+   * - ``DSASpec``
+     - ``workspace_mb`` (MiB each FlashInfer workspace of its sparse plans starts at; one per
+       walk and capture slot, one for eager steps), ``prefill_score_bytes`` (bytes of fp32
+       scores an eager prefill's selection holds per launch), ``shard_min_rows`` (the rows
+       per rank from which a prefill's selection splits across TP ranks); each a positive
+       integer. The defaults (128 MiB, 256 MiB, 64) are what
+       ``configs/glm5_next_tp8_longctx.yaml`` serves with.
    * - ``LoraSpec``
      - ``max_slots`` (adapters resident on the device at once, beside the zero adapter),
        ``max_rank`` (the largest rank served; slots are sized to it), ``cpu_capacity``

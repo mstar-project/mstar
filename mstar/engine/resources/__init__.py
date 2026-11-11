@@ -32,6 +32,7 @@ from mstar.engine.resources.attn.ragged.config import (
 from mstar.engine.resources.base import CGSlotSpec, PublishedInfo, Rebuild, Residency, Resource, StepAllowance
 from mstar.engine.resources.dsa.config import DSAConfig, DSASpec, DSAStep
 from mstar.engine.resources.kv.config import (
+    AuxPlanes,
     KVConfig,
     KVLayout,
     KVReqConfig,
@@ -89,6 +90,7 @@ __all__ = [
     "BlockCausalAttentionSpec",
     "AttentionStep",
     "AttnBackend",
+    "AuxPlanes",
     "BucketKey",
     "CGSlotSpec",
     "CrossAttentionConfig",
