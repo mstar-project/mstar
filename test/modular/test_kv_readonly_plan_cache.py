@@ -148,6 +148,13 @@ def test_a_reset_of_a_real_row_plans_again(kv):
     assert again is not first and _lengths(again)[:2] == [6, 2]
 
 
+def test_a_take_back_of_a_real_row_plans_again(kv):
+    first = _read(kv, ("a", "b"))
+    kv.take_back(["a"], [2], "main")
+    again = _read(kv, ("a", "b"))
+    assert again is not first and _lengths(again)[:2] == [4, 9]
+
+
 def test_a_removed_and_recycled_handle_plans_again(kv):
     first = _read(kv, ("a", "b"))
     kv.remove_request("b")

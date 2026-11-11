@@ -1047,6 +1047,16 @@ The spec types are:
        ValueError at load. The torch reference's prefill can't be captured
        (``KDAManager.prefill_capturable`` is False), so the resource refuses a prefill
        bucket on it and the model leaves those buckets out.
+   * - ``TapSpec`` (``mstar.engine.resources.taps.config``)
+     - Taps: the node's residual stream entering each of ``layers`` (layer ``num_layers``
+       is the stream leaving the last layer, before the final norm), for the rows a step
+       computes, which ``run_layers(..., taps=)`` writes as soon as it exists and another
+       component of the node (a drafter, say) reads later in the same forward. Rewritten
+       every step and keyed by nothing per request, so a prefix hit skips nothing here
+       (``prefix_skip_safe``) and a verify result corrects nothing. A model loop that calls
+       ``taps.write`` itself still obtains the resource through ``step_taps``: it has no
+       abort hook, so a tap step that failed before its commit leaves it armed. See
+       `Speculative decoding (drafting and verifying)`_.
    * - ``LoraSpec`` (built by ``module_lora_spec``)
      - Per-request LoRA adapters on the node's LoRA-capable linears: a pool of device
        slots, a pinned host tier, and the per-step addressing a LoRA kernel reads.
@@ -1768,6 +1778,129 @@ override it keeps strict order, and a request waiting in its queue can't pass an
 that overrides it asks nothing more of a waiting request whose capacity it set aside on its own, as
 the KV cache does when it moves other requests for it, and the request may then start wherever it
 stands in that resource's queue.
+
+Speculative decoding (drafting and verifying)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A node whose decode loop samples one token id per position through ``SamplerResource`` and
+stops through a ``TokenStop`` can draft ``k`` tokens and verify them in one target pass. The
+deployment turns it on with a ``model_kwargs.draft`` block, which the engine parses
+(``DraftConfig``; unknown keys are refused) and without which nothing changes:
+
+.. code-block:: yaml
+
+   model_kwargs:
+     draft:
+       method: dspark                              # or mtp: the target's own MTP head
+       model: deepseek-ai/dspark_qwen3_8b_block7   # omitted for mtp
+       num_draft_tokens: 7
+       mode: auto                                  # auto | synchronous | asynchronous
+
+What the model writes, and nothing more:
+
+- ``Model.verify_nodes()`` returns a ``VerifyNode`` per verifying node: the decode walk, the
+  parsed config, the drafter's ``DrafterNeeds`` (taps, KV layer set, input kinds, chunk
+  boundary rule) and the node's ``TokenStop``.
+- ``get_node_resources()`` declares the target's resources as for a plain deployment, with
+  ``max_seq_len`` the serving limit, and passes them through
+  ``drafter_resources(specs, decl, nodes, config)`` (see *Drafter resources* below). That adds
+  what the drafter declares and derives what follows from the draft ``config`` alone: each of
+  the nodes' paged pools holds the verify slack, ``DraftConfig.kv_slack`` (``2(k + 1)``), past
+  the serving limit (``KVSpec.draft_slack``, and ``max_seq_len`` raised by it), and the one
+  sampler serving the nodes sets ``verifies`` (ingest then refuses a request option verify
+  can't honour, with a 400) and turns the repetition penalty off. A model sets none of these;
+  startup refuses a mismatch, naming ``drafter_resources``. Nor does it put the slack in
+  ``process_prompt``'s ``kv_layout``: the conductor floors each label's scratch at it
+  (``KVSpec.request_layout``), and a verifying label that declares scratch of its own is
+  refused for now.
+- Every row of a verify step runs ``k + 1`` tokens: its last emitted token and ``k`` drafts.
+  ``prepare_inputs`` returns ``input_seq_len = k + 1`` on the verify walk, on a row's first verify
+  step too, when the token arrives routed rather than on the loop-back slot (later rows get the
+  engine's ``uniform_row_inputs``). A row declaring another span fails before admit.
+- The verify walk declares ``k + 1`` tokens a request on its KV and position steps,
+  ``AttentionStep(verify=True)``, and a sampler step of one row a request. The steps of the
+  drafter's own resources (DSpark's attention over the block, with
+  ``AttentionStep(verify=True, causal=False, hide_last=1)`` where its last row must stay hidden,
+  and its taps) are the drafter's: the model passes them in ``VerifyNode.prefill_steps`` and
+  ``VerifyNode.verify_steps``, and the engine adds them to the node's prompt and verify steps
+  (``drafter_step``, from ``engine_step``), so a node declares none of them.
+- The node's submodule sets ``self.drafter`` in ``__init__`` to its ``Drafter``, a class that
+  subclasses ``Drafter`` (beside ``nn.Module`` for one with weights; ``propose`` is abstract, and
+  ``observe(ObserveInputs(block, result))`` defaults to nothing). A class-level ``drafter`` is a
+  TypeError: it would hide an ``nn.Module`` one. A ``DrafterDecl`` subclasses ``DrafterDecl``.
+  Startup refuses a verifying node whose drafter is ``None``, not a ``Drafter``, or defines
+  ``bind_resources`` without being an ``nn.Module``, and a node holding a drafter the model
+  declares no ``VerifyNode`` for.
+- The engine binds a ``DrafterShare`` into the node once at load (``NodeSubmodule.bind_draft``):
+  its verify walk, the sampler that verifies, ``k`` and ``block``. The node's hooks ask
+  ``is_verify_walk(graph_walk)``.
+- Its forward makes one call, ``self.draft_verify_step(engine_inputs, input_ids, target)``,
+  with ``target(ids) -> logits`` over the block's ``n * (k + 1)`` ids, and returns
+  ``self.verify_output(result)``: ``result.tokens`` per row under ``TokenStop.buffer`` plus
+  ``VERIFY_TOKENS`` and ``VERIFY_ACCEPTED`` in ``check_stop_buffers``.
+- A drafter that reads the target's residual stream declares a ``TapSpec`` and names its key in
+  ``DrafterNeeds.tap_key``, and the target passes ``step_taps(engine_inputs, key)`` to
+  ``run_layers(..., taps=)``: the resource on a step that declared a ``TapStep`` for it, else
+  None, so only those steps write taps. A verifying node declares no other ``TapSpec``:
+  ``run_layers`` writes one.
+- A drafter that reads the target declares its shapes in ``DrafterNeeds.geometry`` and the
+  model the target's in ``VerifyNode.target`` (both ``ModelGeometry``); startup refuses a
+  drafter whose taps, layer set, residual width, vocabulary or dtype don't fit, whose
+  attention has other query heads than the pool's attention plans (``num_qo_heads``), or whose
+  RoPE base isn't the node's positions' (``rope_theta``).
+
+- A node that prefills prompts in chunks needs a drafter that declares its rule at a chunk
+  boundary (``DrafterNeeds.chunk_boundary``): ``NONE`` when its state at a row depends on that
+  row alone (DSpark).
+
+**Drafter resources.** A drafter is declared from config alone (``DrafterDecl``): its
+``needs`` and ``node_resources(nodes)``, the resources it adds to the node (DSpark's attention
+with the block's mask and its ``TapSpec``; none for MTP). A drafter whose layers write the
+target's KV declares them as a ``KVLayerSet(kv_cache, name, num_layers, num_kv_heads,
+head_dim)`` in ``DrafterNeeds.kv``, the checkpoint's unsharded counts, derived from its
+``ModelGeometry`` (``geometry.layer_set(kv_cache, name)``) rather than repeated.
+``drafter_resources`` joins it to the pool (``PagedKVConfig.join``): the layers are appended
+after the pool's, so they share its pages, lengths, reservations, take-backs, eviction, offload
+and prefix pages, and the pool records each set's slot (``layer_sets``; the declaring stack's
+is ``"target"``). Only a set of the pool's storage geometry (KV heads and head size) joins; a
+set with its own storage geometry is not supported yet and is refused, as is a name joined twice. Query heads are
+not storage: they belong to the attention over the pool, and startup compares them. Layer
+indices are global across a pool's sets, but a stack never sees that: each of its attention
+layers names the set (``Attention(kv_layer_set=name)``, likewise ``ParallelAttention``), and
+addresses its own layers ``0..n-1``. ``bind_resources`` resolves where the set sits
+(``KVManager.layer_set(name).first``), once, and the layer's ``AttentionCallable`` adds it. The
+engine refuses, at load, a verifying node whose drafter's layer set is not bound by exactly its
+layers, one attention layer each: a stack that forgot ``kv_layer_set`` would write the target's.
+Declare the pool's tunables (``page_size``, ``max_num_pages``) as for any pool: ``max_num_pages``
+counts pages of every layer, the drafter's included, as it always did.
+
+The engine owns everything across steps: the order inside the step (draft, agree on rank 0's
+drafts, target, verify, observe), the bonus token in the sampler's loop-back slot, the KV
+length the resident graph advances by ``accepted + 1``, the token cut at stop ids and the
+budget, and the take-back of rejected tokens at a later admit. A model keeps no state across
+steps and undoes nothing.
+
+Every resource on the node states what it can't do, in one ``ResourceCapabilities``: a
+``verify_refusal`` (fatal for a verifying node) and an ``async_verify_refusal`` (``mode: auto``
+runs synchronously, an explicit ``asynchronous`` is fatal), each a reason or None. The spec
+answers from config alone (``NodeResourceSpec.resource_capabilities(ctx)``; the base refuses
+both, so an unchecked resource is never assumed safe), and each rank's built resource narrows
+it with what its own GPU and kernels can't do (``Resource.capabilities()``, asked at load before
+the mode is agreed, with no side effects); every rank folds both into the one agreement. A
+resource with per-token state implements ``Resource.take_back(rids, counts, label)``, which the
+runner calls once per result. A resource can also override
+``Resource.bind_verify_walk(walk, block, slack)``, a no-op by default, called once at load after
+the mode is agreed: pick its kernels (FlashInfer chooses FA3 here), record the verify walk, size
+for the reserved ``slack``. It never refuses; a refusal belongs in ``capabilities``. ``mode: auto`` picks asynchronous mode (step N+1 planned while N runs, needing FA3's
+paged kernel, ``verify_backend`` on the attention resource, and resident planning) when every
+resource allows it and logs why it falls back to synchronous otherwise; ``validate_deployment``
+reports every config-level problem before a worker spawns; what only the built resources show
+is refused when the engine loads. After capture, an asynchronous node also fails startup if any
+captured verify bucket was planned on the host (an attention without ``AttentionStep(verify=True)``
+on the verify walk), since that plan could attend over the reserved lengths.
+A verifying node never drops a request: ``Engine.rebuild_policies`` leaves it out of the model's
+rebuild policies, which the engine's checks and the worker's rebuilds both read, so a model needs
+no drafting case in ``rebuild_policies``.
 
 Step 3 — Declare the computation graph
 --------------------------------------
@@ -2991,7 +3124,9 @@ that a misspelled setting is never silently ignored:
    * - ``AttentionSpec``
      - ``backend`` (``auto`` / ``flashinfer`` / ``dense`` / ``flex`` / ``xpu_paged``),
        ``flashinfer_backend`` (``auto`` / ``fa2`` / ``fa3``), ``decode_tensor_cores``
-       (``true`` / ``false``), ``decode_fmha`` (``true`` / ``false``)
+       (``true`` / ``false``), ``decode_fmha`` (``true`` / ``false``), ``verify_backend``
+       (``auto`` / ``fa3`` / ``flashinfer``: the kernel a verifying node's verify steps run
+       on; FA3 reads lengths on the device and is what asynchronous mode needs)
    * - ``CrossAttentionSpec``
      - ``backend`` (``auto`` / ``flashinfer``), ``flashinfer_backend``
        (``auto`` / ``fa2`` / ``fa3``), ``decode_tensor_cores`` (``true`` / ``false``)

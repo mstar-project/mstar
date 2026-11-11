@@ -9,6 +9,7 @@ from collections.abc import Callable, Collection
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from mstar.engine.resources.kv import manager as kv_manager
 from mstar.worker.worker_metrics import PreemptionCounts
 
 if TYPE_CHECKING:
@@ -176,11 +177,26 @@ class Preemption:
             raise RuntimeError(f"{self._rid_str(rid)} is in a backlog on {node_name}")
         return self._engine_manager.get_engine(node_name).drop_request(node_name, rid, self._tokens(rid, node_name))
 
+    def _check_verify_victims(self, kv: PagedKVCache, victims: Victims) -> None:
+        """On a verifying node, a victim moved or dropped holds no unrecorded verify step, and one asked again
+        holds no verify result at all: it has written no rows."""
+        for node_name in kv.nodes:
+            engine = self._engine_manager.get_engine(node_name)
+            moved = [rid for rid in (*victims.to_host, *victims.to_drop) if engine.verify_unrecorded(node_name, rid)]
+            asked = [rid for rid in victims.to_ask if engine.verify_pending(node_name, rid)]
+            if moved or asked:
+                raise RuntimeError(
+                    f"preemption on {node_name}: victims with unrecorded verify results {moved}, "
+                    f"asked again with verify results {asked}"
+                )
+
     def _move(self, kv: PagedKVCache, counts: PreemptionCounts, victims: Victims, owner: int) -> None:
         """Count each victim in ``counts`` and move it to the host, drop it, or ask the node's resources again for
         one that gave back its allotment, as ``kv`` decided for ``owner``. A backlogged row goes back to the runtime
         first, so it doesn't run on pages the move gave up."""
         nodes = [node for node in kv.nodes if node in self._rebuilds.nodes]
+        if kv_manager._DEBUG_ASSERTS:
+            self._check_verify_victims(kv, victims)
         for rid in (*victims.to_host, *victims.to_drop, *victims.to_ask):
             record = self._preempted.setdefault(rid, Preempted())
             record.times += 1

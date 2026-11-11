@@ -203,6 +203,10 @@ class _Resource(StubResource):
         self.offloaded.discard(rid)
         return True
 
+    def debug_fingerprint(self, rid):
+        # no device state (`Engine.offload_request` reads it under MSTAR_KV_DEBUG_ASSERTS)
+        return {}
+
 
 class _Rids:
     """Wire string <-> worker-local handle, deliberately NOT identity.

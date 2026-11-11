@@ -25,7 +25,11 @@ _admit_taken, _wants, _reserved}
 (purged by remove_request), ResidentPlanner.{_slot_of, _stale, _moved} (purged by
 release), SamplerCells._cells and SamplerResource._sampled_rids (purged by the
 sampler's remove_request), RopeManager._counters and LongRopeManager._long_rids (purged by their
-remove_request), and WorkerProfileInfo.
+remove_request), VerifyLedger.{_entries, _steps_of, _unrecorded, _returning} and
+NodeDraft.{_emitted, _offsets, _rope_labels} (speculative decoding; purged by
+Engine.remove_request), Engine._offload_prints (MSTAR_KV_DEBUG_ASSERTS only;
+purged by Engine.remove_request), KVManager._dropped_spans (the last commit's
+only: reset at the start of every commit), and WorkerProfileInfo.
 
 Lockstep's follow count is the one deliberate exception: a
 ScheduleTPNode can arrive before the NEW_REQUEST that mints the handle, so it

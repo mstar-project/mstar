@@ -76,6 +76,7 @@ from mstar.engine.resources.step import (
     StepContext,
     SubmoduleStep,
 )
+from mstar.engine.resources.taps.config import TapSpec, TapStep
 
 __all__ = [
     "AdmitFailedReason",
@@ -133,6 +134,8 @@ __all__ = [
     "StepContext",
     "StepRunner",
     "SubmoduleStep",
+    "TapSpec",
+    "TapStep",
     "apply_yaml_overrides",
     "cross_label",
     "resolve_spec_dependencies",

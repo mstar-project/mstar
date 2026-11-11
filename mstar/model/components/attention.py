@@ -54,6 +54,7 @@ class Attention(nn.Module):
         kv_key: str = "kv",
         pos_key: str | None = "rope",
         layer: int | None = None,
+        kv_layer_set: str | None = None,
     ):
         super().__init__()
         # Resource labels this layer calls, as the model declared them in
@@ -63,6 +64,9 @@ class Attention(nn.Module):
         self._attn_key = attn_key
         self._kv_key = kv_key
         self._pos_key = pos_key
+        # the KV pool layer set this layer's stack joined, if any (a drafter's): its layer
+        # indices are the set's own, which the pool places (`AttentionCallable`)
+        self._kv_layer_set = kv_layer_set
         self.attn = None
         self.kv = None
         self.pos = None
@@ -158,7 +162,7 @@ class Attention(nn.Module):
         self.pos = None if self._pos_key is None else resources.get(self._pos_key)
         # One callable per layer is fine here: unlike cosmos3 it is never passed
         # into a traced function, so nothing specializes on its identity.
-        self.attend = AttentionCallable(kv=self.kv, attn=self.attn)
+        self.attend = AttentionCallable(kv=self.kv, attn=self.attn, layer_set=self._kv_layer_set)
 
     def bind_state(self, handles: dict) -> None:
         """Take the handle on this layer's array, where the model declares it, whose calls then replace the

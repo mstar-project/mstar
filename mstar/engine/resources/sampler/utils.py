@@ -1337,6 +1337,17 @@ class SeenTokenMask:
         self._seen_token_mask.scatter_(0, idx, True)
 
 
+class SamplingRows(NamedTuple):
+    """A step's per-row sampling settings on the device, as `Sampler.sample` and an eager verify read them."""
+    temperature: torch.Tensor
+    top_k: torch.Tensor
+    top_p: torch.Tensor
+    # None when no row filters by min-p
+    min_p: torch.Tensor | None
+    seed: torch.Tensor
+    order: "FilterOrder | None"
+
+
 @dataclass
 class Sampler(BaseSampler):
     device: torch.device
@@ -1441,22 +1452,13 @@ class Sampler(BaseSampler):
             if rand_offset is None:
                 self._advance_offsets(request_ids, kept_rids, logits)
             return tokens
-        order = self._gather_filter(configs)
-        temperature = torch.tensor([c.temperature for c in configs], device=logits.device)
-        top_k = torch.tensor([c.top_k if apply_filters else 0 for c in configs],
-                             device=logits.device, dtype=torch.int32)
-        top_p = torch.tensor([c.top_p if apply_filters else 1.0 for c in configs], device=logits.device)
+        temperature, top_k, top_p, min_p, seed, order = self._row_settings(configs, logits.device, apply_filters)
         if self.history is not None:
             # a windowed request's penalty is in ``history``, not the mask
             penalties = [c.presence_penalty for c in configs]
         else:
             penalties = [c.repetition_penalty for c in configs]
         r_pen = torch.tensor(penalties, device=logits.device)
-        min_p = (
-            torch.tensor([c.min_p for c in configs], device=logits.device)
-            if any(c.min_p > 0 for c in configs) else None
-        )
-        seed = torch.tensor([c.seed for c in configs], device=logits.device, dtype=torch.long)
         own_offsets = rand_offset is None
         if own_offsets:
             rand_offset = torch.tensor(
@@ -1594,6 +1596,24 @@ class Sampler(BaseSampler):
             min_tokens=dev[2].to(torch.int32) if self.stop_ids is not None else None,
             stop_ids=self.stop_ids,
         ), rows
+
+    def row_settings(
+        self, request_ids: list[str], device: torch.device, apply_filters: bool = True,
+    ) -> SamplingRows:
+        """Each request's sampling settings, one row a request, as `sample` reads them."""
+        return self._row_settings([self._sampling_config[rid] for rid in request_ids], device, apply_filters)
+
+    def _row_settings(self, configs: list[SamplingConfig], device: torch.device, apply_filters: bool) -> SamplingRows:
+        return SamplingRows(
+            temperature=torch.tensor([c.temperature for c in configs], device=device),
+            top_k=torch.tensor([c.top_k if apply_filters else 0 for c in configs], device=device, dtype=torch.int32),
+            top_p=torch.tensor([c.top_p if apply_filters else 1.0 for c in configs], device=device),
+            min_p=(
+                torch.tensor([c.min_p for c in configs], device=device) if any(c.min_p > 0 for c in configs) else None
+            ),
+            seed=torch.tensor([c.seed for c in configs], device=device, dtype=torch.long),
+            order=self._gather_filter(configs),
+        )
 
     def _gather_filter(self, configs: list[SamplingConfig]) -> "FilterOrder | None":
         """This batch's ``FilterOrder``; ``None`` when the node lacks it or no

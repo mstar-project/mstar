@@ -20,6 +20,7 @@ from mstar.model.base import Model, node_moe_parallel_configs, parse_autocast_dt
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.utils.device import DeviceCapability
 from mstar.utils.streams import reset_device_scheduling
+from mstar.validation.draft import async_scheduling_of
 
 logger = logging.getLogger(__name__)
 
@@ -451,6 +452,7 @@ class EngineManager:
             model=model,
             token_ladders=walk_ladders,
             region_ladders=region_ladders,
+            async_scheduling=async_scheduling_of(model, model_config),
         )
         if not all(isinstance(flag, bool) for flag in override_mixed.values()):
             raise ValueError(f"can_override_mixed_max_tokens takes node -> true/false, not {override_mixed!r}")

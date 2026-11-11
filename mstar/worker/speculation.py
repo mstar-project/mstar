@@ -488,6 +488,7 @@ class Speculator:
         self.engine_manager = services.engine_manager
         self.chunk_loops = layout.chunk_loops
         self.parallel_nodes = layout.parallel_nodes
+        self._synchronous_verify_nodes = layout.synchronous_verify_nodes
         self.scheduler = scheduler
         self.lifecycle = lifecycle
         self.lockstep = lockstep
@@ -520,6 +521,9 @@ class Speculator:
 
     def can_speculate(self, batch: ScheduledBatch) -> bool:
         if not self._async_schedulable(batch):
+            return False
+        if batch.node_name in self._synchronous_verify_nodes:
+            # synchronous speculative decoding: a verify step is planned after the last one's postprocess
             return False
         if batch.node_name in self.parallel_nodes:
             # Only the leader initiates, only under TP async scheduling.
@@ -864,6 +868,12 @@ class Speculator:
         ran = frozenset(outputs_N.row_request_ids or ()) if rows_only else None
         # a mixed N's rows that looped back on the device arrive empty too
         loopback = getattr(outputs_N, "loopback_rids", frozenset())
+        if getattr(outputs_N, "verify_step", False):
+            # a verify step's outputs are uncut until its postprocess; its next
+            # step reads each row's token off the loop-back slot instead. Only a
+            # row N ran wrote one: a row N skipped is dropped, as below.
+            ran_N = set(outputs_N.row_request_ids or ()) | set(outputs_N.per_rid_outputs)
+            loopback = frozenset(rid for rid in speculation.continuing_rids if rid in ran_N)
         chunked = speculation.scheduled_batch.chunk_ranges
         for rid in list(speculation.node_batch.request_ids):
             if rid not in speculation.continuing_rids:

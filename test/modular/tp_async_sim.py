@@ -464,3 +464,173 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# ---------------------------------------------------------------------------
+# Verify results (speculative decoding): record at postprocess, apply at admit
+# ---------------------------------------------------------------------------
+#
+# A verifying node commits step S on every rank; postprocess(S) records its
+# result; the take-back at the head of admit(M) applies results by a due rule
+# (`VerifyLedger.take_due`). Each rank interleaves its own commit, postprocess
+# and admit, constrained only by its worker's stage order:
+#   - admit(S + 1) follows commit(S) (the plan thread waits on S's commit
+#     event; the GPU thread commits in order),
+#   - postprocess(S) follows commit(S),
+#   - asynchronous: postprocess(S) precedes admit(S + 2) (the worker arms S + 2
+#     only after post-processing S); postprocess(S) may land before or after
+#     admit(S + 1),
+#   - synchronous: postprocess(S) precedes admit(S + 1).
+# Invariants: at every admit, every rank applies the same set of results
+# (lockstep: the ranks then admit from the same lengths), and no due result
+# is unrecorded (the ledger raises). Rule "ledger" is `take_due`; rule
+# "arrived" applies whatever is recorded, which the checker must refute.
+
+
+@dataclass
+class VerifyResult:
+    violations: list = field(default_factory=list)
+    states: int = 0
+    # offloads shipped with a speculative head (explore_offload's coverage)
+    speculative_offloads: int = 0
+
+    @property
+    def ok(self):
+        return not self.violations
+
+
+def _due(rule, synchronous, step, recorded, applied):
+    """What admit(``step``) applies on one rank, or None if a due one is unrecorded."""
+    if rule == "arrived":
+        return frozenset(s for s in recorded if s not in applied and s < step)
+    due = {s for s in range(1, step - 1) if s not in applied}
+    if synchronous and step - 1 >= 1 and step - 1 not in applied:
+        # the step's own rows ran step - 1 (one decoding row, every step)
+        due.add(step - 1)
+    if not due <= recorded:
+        return None
+    return frozenset(due)
+
+
+def explore_verify(rule="ledger", synchronous=False, nranks=2, steps=4, stage_order=True) -> VerifyResult:
+    """DFS over every interleaving of the ranks' admit, commit and postprocess.
+    ``stage_order`` False drops the worker's guarantee that postprocess
+    precedes the admit its result comes due at."""
+    res = VerifyResult()
+    # per rank: (admitted, committed, recorded, applied, log)
+    start = tuple((0, 0, frozenset(), frozenset(), ()) for _ in range(nranks))
+    seen = set()
+    stack = [start]
+    while stack:
+        world = stack.pop()
+        if world in seen:
+            continue
+        seen.add(world)
+        res.states += 1
+        moved = False
+        for r, (admitted, committed, recorded, applied, log) in enumerate(world):
+            nxt = []
+            step = admitted + 1
+            gate = (step - 1 in recorded) if synchronous else (step - 2 < 1 or step - 2 in recorded)
+            gate = gate or not stage_order
+            if step <= steps and committed == admitted and (step == 1 or gate):
+                due = _due(rule, synchronous, step, recorded, applied)
+                if due is None:
+                    res.violations.append(("unrecorded-due", r, step))
+                    continue
+                nxt.append((step, committed, recorded, applied | due, log + ((step, due),)))
+            if committed < admitted:
+                nxt.append((admitted, committed + 1, recorded, applied, log))
+            for s in range(1, committed + 1):
+                if s not in recorded:
+                    nxt.append((admitted, committed, recorded | {s}, applied, log))
+                    break  # postprocess runs in step order
+            for rank_state in nxt:
+                moved = True
+                stack.append(world[:r] + (rank_state,) + world[r + 1:])
+        if not moved:
+            logs = [rank[4] for rank in world]
+            if any(log != logs[0] for log in logs):
+                res.violations.append(("diverged", logs))
+        if len(res.violations) > 5:
+            break
+    return res
+
+
+# ---------------------------------------------------------------------------
+# Offload replay of a verifying row (speculative decoding)
+# ---------------------------------------------------------------------------
+#
+# Rank 0 offloads a row V while building step M and ships the move with M's
+# broadcast; it marks V (`Engine._mark_offloaded`), and picks no victim while a
+# row holds an unrecorded step (checked in `StepPipeline._handle_admit_failure`).
+# A follower replays the move when it arms M and marks V there. The check here
+# is the stricter one, that V's steps are all recorded on the follower by then,
+# so V's results can come due at its first admit back on every rank. When it arms M:
+#   - rank 0 builds M speculatively when M - 1 is still un-post-processed on
+#     rank 0, else serially;
+#   - a follower follows a speculative head M after post-processing M - 2 (the
+#     worker arms S + 2 only after S's postprocess), and takes a serial head
+#     only with no step of the node in flight: after post-processing M - 1;
+#   - synchronous verify nodes never speculate.
+# V is in every step until it is offloaded.
+
+
+def explore_offload(synchronous=False, nranks=2, steps=5, serial_gate=True) -> VerifyResult:
+    """DFS over every interleaving, and over which steps V runs in (a row may
+    skip a step: not ready, held back); a violation is a follower replaying V's
+    offload with one of V's steps unrecorded. ``serial_gate`` False lets a follower take
+    a serial head as early as a speculative one (the negative control)."""
+    res = VerifyResult()
+    # per rank: (armed, committed, recorded); then, per step rank 0 built, whether it was
+    # speculative and whether V ran in it; and the step whose broadcast carries V's offload
+    start = (tuple((0, 0, frozenset()) for _ in range(nranks)), (), (), 0)
+    seen, stack = set(), [start]
+    while stack:
+        world = stack.pop()
+        if world in seen:
+            continue
+        seen.add(world)
+        res.states += 1
+        ranks, spec, member, offload_at = world
+        for r, (armed, committed, recorded) in enumerate(ranks):
+            nxt = []
+            m = armed + 1
+            if m <= steps and committed == armed:
+                if r == 0:
+                    gate = (m - 1 < 1 or m - 1 in recorded) if synchronous else (m - 2 < 1 or m - 2 in recorded)
+                    if gate:
+                        speculative = not synchronous and m - 1 >= 1 and m - 1 not in recorded
+                        v_steps = {s for s in range(1, committed + 1) if member[s - 1]}
+                        options = []
+                        if offload_at:
+                            options.append((offload_at, False))
+                        else:
+                            options += [(0, True), (0, False)]
+                            if v_steps <= recorded:
+                                # V is a victim rank 0 may pick now, gone from this step on
+                                options.append((m, False))
+                        for at, runs in options:
+                            if at == m and speculative:
+                                res.speculative_offloads += 1
+                            nxt.append(((m, committed, recorded), spec + (speculative,), member + (runs,), at))
+                elif ranks[0][0] >= m:
+                    lag = 2 if spec[m - 1] or not serial_gate else 1
+                    if m - lag < 1 or m - lag in recorded:
+                        if offload_at == m:
+                            v_steps = {s for s in range(1, min(committed, m - 1) + 1) if member[s - 1]}
+                            if not v_steps <= recorded:
+                                res.violations.append(("unrecorded-at-replay", r, m, sorted(v_steps - recorded)))
+                                continue
+                        nxt.append(((m, committed, recorded), spec, member, offload_at))
+            if committed < armed:
+                nxt.append(((armed, committed + 1, recorded), spec, member, offload_at))
+            for s in range(1, committed + 1):
+                if s not in recorded:
+                    nxt.append(((armed, committed, recorded | {s}), spec, member, offload_at))
+                    break  # postprocess runs in step order
+            for rank_state, spec2, member2, at in nxt:
+                stack.append((ranks[:r] + (rank_state,) + ranks[r + 1:], spec2, member2, at))
+        if len(res.violations) > 5:
+            break
+    return res

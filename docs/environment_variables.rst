@@ -822,7 +822,12 @@ Worker scheduling
        pages, and each commit against its request's layout. A recurrent snapshot's key is
        checked against the KV chain's key at its boundary. Logs a label left under its
        footprint at removal. Above one rank, each follower stops if the reservations it
-       admits a step from differ from rank 0's. Tests and debugging only.
+       admits a step from differ from rank 0's. ``Engine.offload_request`` and
+       ``Engine.reload_request`` compare each resource's ``debug_fingerprint`` of the request
+       at offload and at reload (its KV pages over every layer, its recurrent slots, the
+       sampler's loop-back rows) and raise on a difference; ``ResidentPlanner.flush`` reads
+       each rewritten resident row back against the host's values. Host syncs: tests and
+       debugging only.
 
 Compilation
 -----------

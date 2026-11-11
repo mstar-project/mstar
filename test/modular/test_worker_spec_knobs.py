@@ -46,7 +46,8 @@ def _build(monkeypatch) -> Worker:
     # an engine with no paged KV cache to preempt in
     monkeypatch.setattr(worker_mod.EngineManager, "build", lambda *a, **kw: SimpleNamespace(
         side_keys=(), inline_streams=InlineStreams(frozenset(), {}),
-        engine=SimpleNamespace(paged_kv_caches=list, host_allowance=None, node_dtype=lambda node: None),
+        engine=SimpleNamespace(paged_kv_caches=list, host_allowance=None, node_dtype=lambda node: None,
+                               verifying_nodes=frozenset, synchronous_verify_nodes=frozenset),
     ))
     monkeypatch.setattr(Worker, "_plan_step_cpus", lambda self, *a: (None, frozenset()))
     return Worker(

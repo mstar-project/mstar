@@ -16,6 +16,7 @@ from mstar.engine.state.analysis import deployment_problems, state_declaration_p
 from mstar.model.base import Model, WorkerGraph, built_resources, enabled_resources, parse_autocast_dtype
 from mstar.model.multimodal import SUPPORTED_MODALITIES
 from mstar.validation.client_streams import check_client_streams
+from mstar.validation.draft import check_draft
 from mstar.validation.knobs import check_knobs
 from mstar.validation.placement import check_worker_graphs, node_groups_problems, routing_weights_problems
 from mstar.validation.resources import check_resources, resources_shape_problem
@@ -165,6 +166,7 @@ def validate_deployment(
         except (ValueError, OSError) as e:
             problems.append(f"building the node resources failed: {type(e).__name__}: {e}")
             specs = None
+    problems += _checked("checking speculative decoding", check_draft, model, config, specs)
     # after get_worker_graphs too: a model may shape its walks from the deployment (BAGEL)
     problems += _checked(
         "checking the client streams", check_client_streams,
