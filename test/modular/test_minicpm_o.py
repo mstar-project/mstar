@@ -274,7 +274,10 @@ def test_the_spoken_decode_hands_the_tts_each_rows_id_and_hidden(tmp_path):
     # a mixed step of one-token rows: each row is its own last token
     attn = SimpleNamespace(select_last_hidden=lambda rows: rows)
     walks = {"text": "decode", "spoken": DECODE_SPOKEN, "spoken2": DECODE_SPOKEN}
-    engine_inputs = SimpleNamespace(request_ids=list(walks), resources={SAMPLER: sampler, "attn": attn})
+    infos = {rid: SimpleNamespace(graph_walk=walk) for rid, walk in walks.items()}
+    engine_inputs = SimpleNamespace(
+        request_ids=list(walks), per_request_info=infos, resources={SAMPLER: sampler, "attn": attn},
+    )
     rows = llm.forward_batched("mixed", engine_inputs, input_ids=torch.tensor([5, 6, 7])).row_outputs
     assert rows[ROW_IDS].tolist() == [5, 6, 7]
     assert rows[ROW_HIDDEN].tolist() == [[5.0, 6.0], [6.0, 7.0], [7.0, 8.0]]
@@ -282,7 +285,6 @@ def test_the_spoken_decode_hands_the_tts_each_rows_id_and_hidden(tmp_path):
     outputs = BatchedModelOutput(per_rid_outputs={
         rid: {name: [rows[name][i:i + 1]] for name in rows} for i, rid in enumerate(walks)
     })
-    infos = {rid: SimpleNamespace(graph_walk=walk) for rid, walk in walks.items()}
     llm.batch_postprocess(outputs, infos, [None] * len(walks))
     assert ROW_IDS not in outputs.get("text") and ROW_HIDDEN not in outputs.get("text")
     spoken = [outputs.get(rid)[ROW_HIDDEN][0] for rid in ("spoken", "spoken2")]

@@ -386,6 +386,14 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
         scheduler, and so replay the decode capture already."""
         return len(self._decode_walks) > 1 and self._text_prompts and self.CAPTURE_PREFILL
 
+    def _step_walk(self, graph_walk: str, row_walks: Sequence[str | None]) -> str:
+        """The walk a step runs as. A mixed step of decode rows alone replays the
+        decode capture (`cg_key_info`), so it is a decode step: ``DECODE_WALK``,
+        for what is keyed on the walk (`preprocess`, `_pack_media`, `decoder_kwargs`)."""
+        if graph_walk == MIXED and row_walks and all((w or graph_walk) in self._decode_walks for w in row_walks):
+            return self.DECODE_WALK
+        return graph_walk
+
     def cg_key_info(
         self, graph_walk: str,
         per_request_info: Mapping[int, CurrentForwardPassInfo],
@@ -590,6 +598,8 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
         engine_inputs: ModelInputsFromEngine,
         inputs: list[ARNodeInputs],
     ) -> dict[str, torch.Tensor | Any]:
+        if graph_walk == MIXED:
+            graph_walk = self._step_walk(graph_walk, [inp.graph_walk for inp in inputs])
         if self._has_loopback_rows(inputs):
             # every row's last sampled token, read by slot (padding rows read
             # slot 0); a row whose last step ran elsewhere brought its own
@@ -706,6 +716,8 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
             f"preprocess outputs the forward reads must be tensors: {sorted(tensors)}"
         )
         sampler: SamplerResource = engine_inputs.resources[SAMPLER]
+        if graph_walk == MIXED:
+            graph_walk = self._step_walk(graph_walk, [i.graph_walk for i in engine_inputs.per_request_info.values()])
         if input_ids is None:
             input_ids = sampler.loopback_tokens(engine_inputs.request_ids)
         media, mask = tensors.pop(MEDIA_EMBEDS, None), tensors.pop(MEDIA_MASK, None)
