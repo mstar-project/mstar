@@ -35,7 +35,7 @@ extern "C" __global__ void run_stop(
     const unsigned char* immune, unsigned char* marks,
     long long* index, const long long* limit, long long* continuation
 ) {
-    // a thread a row; a block wider than the device allows strides
+    // a thread a row; rows past one block (1024) stride
     int live = 0;
     for (int row = threadIdx.x; row < rows; row += blockDim.x) {
         unsigned char mark = marks[row];
@@ -123,9 +123,12 @@ class RunState:
         rows = tuple(rows)
         same = previous is not None and previous.rows == rows
         if not (same and previous is self):
-            torch.ge(self._positions, real, out=self.marks)
-            if same:
-                self.marks[:real].copy_(previous.marks[:real])
+            if same and len(previous.marks) == len(self.marks):
+                self.marks.copy_(previous.marks)  # same rows, same bucket: padding is marked alike
+            else:
+                torch.ge(self._positions, real, out=self.marks)
+                if same:
+                    self.marks[:real].copy_(previous.marks[:real])
         self.rows = rows
 
     def keep_token(self, token: torch.Tensor) -> None:

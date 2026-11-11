@@ -97,16 +97,17 @@ def test_a_device_run_starts_with_only_real_rows_live_and_keeps_a_column_an_iter
     assert state.index.item() == 2
 
 
+@pytest.mark.parametrize("before_bucket", [4, 8])  # the same bucket, or a wider one
 @pytest.mark.parametrize("rows, seeded", [
     ((7, 8), [True, False]),
     ((8, 7), [False, False]),  # moved
     ((7,), [False]),  # one left
     ((7, 8, 9), [False, False, False]),  # one joined
 ])
-def test_a_device_run_after_a_run_of_its_rows_starts_with_that_runs_marks(rows, seeded):
+def test_a_device_run_after_a_run_of_its_rows_starts_with_that_runs_marks(rows, seeded, before_bucket):
     """A step speculated past a row's stop ends once the rest stop, whatever the
     model samples after one; rows that moved, left or joined start unmarked."""
-    before, run = (RunState(4, 3, {2}, torch.device("cpu")) for _ in range(2))
+    before, run = (RunState(bucket, 3, {2}, torch.device("cpu")) for bucket in (before_bucket, 4))
     before.stage((7, 8), [False, False], 3, None)
     before.marks[0] = True  # the run's kernel saw request 7 stop
 
@@ -119,24 +120,32 @@ def test_a_device_run_after_a_run_of_its_rows_starts_with_that_runs_marks(rows, 
     assert run.marks.tolist() == [False] * len(rows) + [True] * (4 - len(rows)), "no step before: unmarked"
 
 
-@pytest.mark.parametrize("ceiling", [1, 8])
-def test_only_a_step_that_repeats_continues_the_run_before_it(ceiling):
+@pytest.mark.parametrize("is_new_iter", [False, True])
+def test_only_a_step_that_repeats_continues_the_run_before_it(is_new_iter):
     """A step that repeats runs every row of N one iteration on in N's Loop, so a
-    row N saw stop is one it drops; any other step, the first of a Loop that
-    starts again for the same request included, starts from no marks."""
+    row N saw stop is one it drops. The first step of a Loop that starts again
+    for the same request is no new iteration of N's: it starts from no marks."""
     from mstar.worker.speculation import Speculator
 
+    repeats = StepRepeats({NODE: RepeatConfig(max=8)}, {})
+    repeats._walks.add((NODE, WALK))
     speculator = Speculator.__new__(Speculator)
     speculator._consecutive = 1
-    speculator._step_repeats = SimpleNamespace(ceiling=lambda *args: ceiling)
+    speculator._step_repeats = repeats
+    speculator._graph_runtime = SimpleNamespace(loop_room=lambda *args: 8)
+    speculator._innermost_loop_by_node = {(WALK, NODE): "decode_loop"}
     ctx = SimpleNamespace(repeats=1, continues=None)
     speculation = SimpleNamespace(
-        scheduled_batch=SimpleNamespace(node_name=NODE, graph_walk=WALK), node_batch=SimpleNamespace(step_context=ctx),
+        scheduled_batch=SimpleNamespace(
+            node_name=NODE, graph_walk=WALK, request_to_worker_graph={1: 0}, chunk_ranges=None,
+        ),
+        node_batch=SimpleNamespace(step_context=ctx), is_new_iter=is_new_iter, is_same_node=True,
+        continuing_rids=[1],
     )
     pending = SimpleNamespace(node_batch=SimpleNamespace(step_context=SimpleNamespace(repeats=8)))
 
     speculator._stamp_repeats(speculation, pending, owes_run=False)
-    assert ctx.continues is (pending.node_batch.step_context if ceiling > 1 else None)
+    assert ctx.continues is (pending.node_batch.step_context if is_new_iter else None)
 
 
 def test_a_device_run_that_ended_short_settles_its_width_before_anything_reads_it():
@@ -195,6 +204,28 @@ def test_a_slot_with_a_device_run_never_replays_unstaged():
 
     with pytest.raises(KeyError, match="alias"):
         make_engine()._forward(batch, make_mgmt(), runner, inputs, {}, object(), True, [1])
+
+
+def test_a_step_stages_its_device_run_after_the_run_of_the_step_it_continues():
+    """The engine hands ``stage`` the run of the step ``ctx.continues`` names, and clears the link."""
+    previous_run, staged = object(), []
+    ctx = SimpleNamespace(
+        graph_walk="alias", resident=None, repeats=1, continues=SimpleNamespace(slot_lease="before"),
+    )
+    batch = SimpleNamespace(step_context=ctx, preplan_event=None)
+    run = SimpleNamespace(stage=lambda *args: staged.append(args))
+    runner = SimpleNamespace(
+        slot_run=lambda lease: previous_run if lease == "before" else run,
+        run_forward=lambda *args, **kwargs: BatchedModelOutput(), repeat=lambda lease, out, repeats: out,
+    )
+    inputs = SimpleNamespace(per_request_info={})
+
+    engine = make_engine()
+    engine._ignore_eos = lambda *args: [False]
+    engine._forward(batch, make_mgmt(), runner, inputs, {}, object(), True, [1])
+
+    assert staged[0][-1] is previous_run
+    assert ctx.continues is None
 
 
 def test_a_device_run_refuses_a_walk_with_two_token_stops():
