@@ -392,8 +392,8 @@ class TalkerSubmodule(ARNodeSubmodule):
         """One causal step over the packed batch, the same span in both LMs, and
         each row's progress written at commit.
 
-        The writes come from the draw in the row's inputs. The template carries no
-        ``rng``, so a capture's rows and a replay's padding rows write nothing.
+        The writes come from the draw in the row's inputs. The capture templates carry
+        no ``rng``, so a capture's rows and a replay's padding rows write nothing.
         """
         del graph_walk, slot_lease, piecewise_leases, kwargs
         progress = {
@@ -548,7 +548,6 @@ class TalkerSubmodule(ARNodeSubmodule):
                         "prev_patch": torch.zeros(cfg.patch_size, cfg.feat_dim, dtype=dtype, device=device),
                         "noise": torch.zeros(cfg.feat_dim, cfg.patch_size, dtype=dtype, device=device),
                     },
-                    # no "rng", which is how `declare_step` tells these rows from a request's
                     kwargs={"step": 1, "cfg": cfg.cfg_value},
                 ),
                 capture_batch_sizes=self.DECODE_CAPTURE_BATCH_SIZES,
@@ -572,7 +571,6 @@ class TalkerSubmodule(ARNodeSubmodule):
                 "cond_patch": torch.zeros(cfg.patch_size, cfg.feat_dim, dtype=dtype, device=device),
                 "noise": torch.zeros(cfg.feat_dim, cfg.patch_size, dtype=dtype, device=device),
             },
-            # no "rng", as the decode capture's rows
             kwargs={"step": 0, "cfg": cfg.cfg_value},
         )
 
