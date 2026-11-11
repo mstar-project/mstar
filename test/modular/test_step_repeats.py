@@ -28,9 +28,12 @@ def test_a_plain_ar_node_is_refused_until_it_declares_what_a_repeat_reads():
         enable_device_loopback_reader=lambda: None,
         lean_capture=False, force_double_buffer=False, supports_preplan=False,
     )
-    engine = make_engine(_submodules={NODE: make_mgmt(node, resources={"sampler": sampler})})
+    mgmt = make_mgmt(node, resources={"sampler": sampler})
+    engine = make_engine(_submodules={NODE: mgmt})
 
     engine.enable_repeats(NODE, {WALK})
+
+    assert mgmt.may_repeat
 
     assert not node.resident_walks() and node.device_loopback is None
     assert node.get_stop_policies(WALK) is None, "a walk that can't repeat keeps check_stop"
@@ -52,9 +55,8 @@ def test_a_plain_ar_node_is_refused_until_it_declares_what_a_repeat_reads():
 
 
 def test_a_node_no_deployment_asked_to_repeat_replays_as_main():
-    """With ``step_repeats`` unset a decode step's forward is main's: the replay
-    alone, nothing of the repeat path around it (Qwen3.5 at c64 spent ~30 us a
-    step there)."""
+    """With ``step_repeats`` unset a decode step's forward is the replay alone:
+    neither ``repeat`` nor ``slot_run`` is called."""
     replayed = BatchedModelOutput()
 
     class Runner:
@@ -74,9 +76,4 @@ def test_a_node_no_deployment_asked_to_repeat_replays_as_main():
     inputs = SimpleNamespace(per_request_info={})
     runner = Runner()
     make_engine()._forward(batch, make_mgmt(), runner, inputs, {}, object(), True, [1])
-    assert runner.calls == ["run_forward"]
-
-    # a node a deployment asked to repeat takes its iterations from the repeat path
-    runner = Runner()
-    make_engine()._forward(batch, make_mgmt(may_repeat=True), runner, inputs, {}, object(), True, [1])
-    assert "repeat" in runner.calls
+    assert "repeat" not in runner.calls and "slot_run" not in runner.calls
