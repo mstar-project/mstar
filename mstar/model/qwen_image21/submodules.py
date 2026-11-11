@@ -409,15 +409,21 @@ class QwenImage21DenoiseSubmodule(DenoiseLoopSubmodule):
             return self.prefix_pass.declare_step(graph_walk, request_ids, inputs, per_request_info)
         keys = [inp.resource_step_info for inp in inputs]
         # rows batch at one step key, so every row runs the same branches
-        labels = tuple(BRANCH_LABELS[b] for b in keys[0].branches)
-        segments = tuple(
-            Segment(rid, label, self.num_tokens(key))
-            for label in labels for rid, key in zip(request_ids, keys, strict=True)
-        )
+        local = tuple(BRANCH_LABELS[b] for b in keys[0].branches)
+        # Every cfg rank's pool is a full copy, so a guided step takes scratch on both labels on every rank,
+        # whichever branch the rank runs; its attention reads only the local ones.
+        held = BRANCH_LABELS if keys[0].guided else local
+
+        def segments(labels):
+            return tuple(
+                Segment(rid, label, self.num_tokens(key))
+                for label in labels for rid, key in zip(request_ids, keys, strict=True)
+            )
+
         return SubmoduleStep(cg_key_info=self._uniform_key(keys), steps={
-            KV: KVStep(segments=segments, commit=False,
-                       combined_labels={labels: CFG_LABEL} if len(labels) > 1 else {}),
-            self.target_attn_key(): AttentionStep(segments=segments, causal=False),
+            KV: KVStep(segments=segments(held), commit=False,
+                       combined_labels={local: CFG_LABEL} if len(local) > 1 else {}),
+            self.target_attn_key(): AttentionStep(segments=segments(local), causal=False),
         })
 
     def cg_key_info(self, graph_walk, per_request_info, per_request_input_metadata=None, **kwargs):

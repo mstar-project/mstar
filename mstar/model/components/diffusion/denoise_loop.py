@@ -676,6 +676,9 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         self, graph_walk: str, request_ids: list[str], inputs: list[NodeInputs],
         slot_lease: SlotLease | None = None, piecewise_leases=None, **kwargs,
     ) -> SubmoduleStep | None:
+        """The step's ragged attention over :meth:`attention_segments`. An override that declares a step to a
+        resource that journals (a paged KV, which every cfg rank holds a copy of) must not read ``key.branches``,
+        the rank's own share, or the ranks would take different pages."""
         if self.attn_resource_key is None:
             return None
         # every row (padding rows included) carries its bucket key, so the spans are

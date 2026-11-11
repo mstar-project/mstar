@@ -56,7 +56,8 @@ class PagedAttendStub:
     def begin(self, declared) -> None:
         self._declared = declared
         kv, attn = declared.steps[self.kv_key], declared.steps[self.attn_key]
-        assert [tuple(s) for s in kv.segments] == [tuple(s) for s in attn.segments]
+        # a cfg rank's KV step holds every label; its attention reads its own
+        assert {tuple(s) for s in attn.segments} <= {tuple(s) for s in kv.segments}
         self.causal, self.commit = attn.causal, kv.commit
 
     def bind_step(self, label: str) -> None:

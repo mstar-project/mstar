@@ -302,3 +302,66 @@ def test_a_cache_hit_and_a_batch_land_where_a_request_alone_does():
     assert not torch.equal(each["a"], each["b"])
     for rid in ("a", "b"):
         torch.testing.assert_close(together[rid], each[rid], rtol=0, atol=0)
+
+
+class _Gathers:
+    """One GPU's cfg group: records what each guided step gathers (both branches, every row)."""
+
+    world_size, rank = 1, 0
+
+    def __init__(self):
+        self.gathered: list[torch.Tensor] = []
+
+    def all_gather(self, x, dim):
+        self.gathered.append(x)
+        return x
+
+
+class _CfgRank:
+    """Rank ``rank`` of a two-rank cfg group, run alone: the peer's half of each gather is one GPU's."""
+
+    world_size = 2
+
+    def __init__(self, rank: int, gathered: list[torch.Tensor]):
+        self.rank, self.gathered = rank, list(gathered)
+
+    def all_gather(self, x, dim):
+        full = self.gathered.pop(0)
+        assert dim == 1 and torch.equal(x, full[:, self.rank:self.rank + 1]), f"rank {self.rank}'s branch moved"
+        return full
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+@torch.no_grad()
+def test_a_cfg_rank_runs_its_branch_as_one_gpu_does(rank):
+    """Under cfg_size 2 a rank runs every prefix walk and, in each denoise step, its own branch alone over its
+    own label: that branch's prediction is one GPU's to the bit, and so are the latents after combining the
+    gathered pair. Its KV step still holds both labels, as one GPU's does."""
+    from mstar.model.qwen_image21.components.transformer import QwenImage21Transformer
+    from mstar.model.qwen_image21.submodules import QwenImage21DenoiseSubmodule
+    from mstar.model.qwen_image21.tests.paged_stub import CFG, DIT_CONFIG, PagedAttendStub, dit_node, drive
+
+    dtype = torch.bfloat16
+    torch.manual_seed(0)
+    dit = QwenImage21Transformer(CFG)
+    for p in dit.parameters():
+        p.data = (torch.randn_like(p) * 0.2).to(dtype)
+    dit.set_prefix_modulation()
+    sub, attend, plan, embeds, latents = dit_node(dit, dtype)
+    one_gpu = _Gathers()
+    sub.cfg_group = one_gpu
+    alone = drive(sub, attend, "a", plan, embeds, latents)
+
+    ranked = QwenImage21DenoiseSubmodule(dit, DIT_CONFIG, loop_name="denoise_loop",
+                                         cfg_group=_CfgRank(rank, one_gpu.gathered))
+    stub = PagedAttendStub()
+    ranked.attend = lambda *_: stub
+    declared = []
+    begin = stub.begin
+    stub.begin = lambda step: (declared.append(step), begin(step))
+    got = drive(ranked, stub, "a", plan, embeds, latents)
+
+    torch.testing.assert_close(got, alone, rtol=0, atol=0)
+    denoise = declared[-1]
+    assert {s.label for s in denoise.steps[KV].segments} == {MAIN, UNCOND}
+    assert {s.label for s in denoise.steps[ranked.target_attn_key()].segments} == {(MAIN, UNCOND)[rank]}

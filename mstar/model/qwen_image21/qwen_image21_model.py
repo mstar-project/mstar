@@ -518,21 +518,27 @@ class QwenImage21Model(Model):
         return torch.bfloat16
 
     def get_default_sharding_config(self) -> ShardingConfig:
-        return ShardingConfig(groups=[], tp_enabled_nodes={DIT_NODE}, shard_dim={}, sp_enabled_nodes=set())
+        # the dit's linears split over tp_size; its guidance branches over cfg_size (each cfg rank holds both labels'
+        # prefixes, so its branch attends its own label's)
+        return ShardingConfig(
+            groups=[], tp_enabled_nodes={DIT_NODE}, shard_dim={}, sp_enabled_nodes=set(),
+            cfg_enabled_nodes={DIT_NODE: len(QwenImage21DenoiseSubmodule.GUIDANCE.branches)},
+        )
 
     def capture_buckets(self) -> list[tuple[str, Hashable]]:
         if not self.accelerator_graph:
             return []
         return [(IMAGE_GEN_WALK, DitKey(h // VAE_SCALE, w // VAE_SCALE)) for h, w in self.capture_sizes]
 
-    def get_submodule(self, node_name: str, device="cpu", tp_group=None, autocast_dtype=None, sp_group=None):
+    def get_submodule(self, node_name: str, device="cpu", tp_group=None, autocast_dtype=None, sp_group=None,
+                      moe_parallel=None, cfg_group=None):
         if node_name in self._submodule_cache:
             return self._submodule_cache[node_name]
-        submodule = self._create_submodule(node_name, device, tp_group)
+        submodule = self._create_submodule(node_name, device, tp_group, cfg_group)
         self._submodule_cache[node_name] = submodule
         return submodule
 
-    def _create_submodule(self, node_name: str, device, tp_group=None) -> NodeSubmodule | None:
+    def _create_submodule(self, node_name: str, device, tp_group=None, cfg_group=None) -> NodeSubmodule | None:
         if self.skip_weight_loading:
             return None
         from mstar.model.qwen_image21 import weight_loader
@@ -551,7 +557,7 @@ class QwenImage21Model(Model):
             return QwenImage21DenoiseSubmodule(
                 weight_loader.build_transformer(config.transformer, snapshot, device, comm_group=tp_group), config,
                 loop_name=DENOISE_LOOP, max_batch_size=self.max_batch_size,
-                compile_transformer=self.compile,
+                compile_transformer=self.compile, cfg_group=cfg_group,
                 capture_buckets=self.capture_buckets(), capture_batch_sizes=self.capture_batch_sizes,
             )
         logger.warning("Qwen-Image-2.1 has no submodule for node %r; running it dummy", node_name)
