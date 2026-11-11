@@ -225,6 +225,7 @@ def _replay(res, planner, s, promote=True):
         s.pool_slots = res["pool"]._cg_addressing[ck].slot_indices[: bucket.bs].tolist()
         s.replays.append(SimpleNamespace(
             pages=s.pages, offsets=s.offsets, positions=s.positions, pool_slots=s.pool_slots,
+            table_ids=getattr(s, "table_ids", None),
         ))
         if planner is not None:
             planner.commit_in_graph(s.captured)
@@ -311,13 +312,15 @@ def test_a_repeated_step_addresses_each_replay_as_host_plans_would(repeats):
     """Every replay of a step that repeats writes and attends where a host plan
     of that iteration would, page crossings included, with no host work between
     replays; the host's mirrors then stand where the stream does."""
-    live, ref, planner = _setup({1: 3, 2: 5, 3: 8})
+    live, ref, planner = _setup({1: 3, 2: 17, 3: 8})  # request 2 runs on LongRoPE's long table
     rids = [1, 2, 3]
     for t in range(6):
         a = _captured_step(live, planner, rids, slot=t % 2, bs=4, repeats=repeats)
         for i, replay in enumerate(a.replays):
             b = _captured_step(ref, None, rids, slot=(t + i) % 2, bs=4)
             assert (replay.offsets[:3], replay.positions[:3]) == (b.offsets[:3], b.positions[:3])
+            if replay.table_ids is not None:  # each replay's table row advances with its position
+                assert replay.table_ids[:3] == b.table_ids[:3]
             # a run reserves ahead, so its page numbers aren't the host's: each is the row's own
             for row, rid in enumerate(rids):
                 page = live["kv"]._streams[rid]["main"].page_indices[replay.positions[row] // PAGE]

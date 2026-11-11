@@ -909,3 +909,8 @@ def test_a_pool_does_not_hold_its_node_off_resident_planning(adapters):
 
     planner, why = build_planner("LLM", ("decode",), {"lora": make_pool(adapters[1])}, {}, torch.device("cpu"), 4)
     assert planner is not None and why == ""
+
+
+def test_a_pool_on_resident_planning_still_lets_no_step_repeat(adapters):
+    """It plans on the host each step, so a replay with no host between would reuse stale addressing."""
+    assert make_pool(adapters[1]).max_repeats(None, None) == 1
