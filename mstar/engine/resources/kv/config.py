@@ -22,6 +22,7 @@ from mstar.engine.resources.step import ResourceStep
 
 if TYPE_CHECKING:
     from mstar.engine.resources.base import Resource
+    from mstar.engine.resources.step import Lag
 
 
 class KVLayout(Enum):
@@ -61,6 +62,7 @@ class KVConfig(ABC):
             )
         self._unsharded_kv_heads = self.num_kv_heads
         self._unsharded_qo_heads = self.num_qo_heads
+        self._num_shards = 1
 
     @property
     def total_kv_heads(self) -> int:
@@ -83,12 +85,14 @@ class KVConfig(ABC):
         """
         from mstar.distributed.utils import divide
 
-        if num_shards >= self._unsharded_kv_heads:
-            # fewer KV heads than ranks — every rank holds a replicated head
-            self.num_kv_heads = 1
-        else:
-            self.num_kv_heads = divide(self._unsharded_kv_heads, num_shards)
+        self._num_shards = num_shards
+        self.num_kv_heads = rank_kv_heads(self._unsharded_kv_heads, num_shards)
         self.num_qo_heads = divide(self._unsharded_qo_heads, num_shards)
+
+    @property
+    def num_shards(self) -> int:
+        """The ranks `shard` split the heads over (1 until then)."""
+        return self._num_shards
 
     @abstractmethod
     def apply_yaml_overrides(self, **kwargs) -> None:
@@ -98,6 +102,13 @@ class KVConfig(ABC):
         the rest raise — a paged key against a ring config is a typo, and the
         spec's contract is that a typo is loud.
         """
+
+
+def rank_kv_heads(total: int, num_shards: int) -> int:
+    """One rank's KV heads of ``total``: a slice, or with fewer heads than ranks one replicated head."""
+    from mstar.distributed.utils import divide
+
+    return 1 if num_shards >= total else divide(total, num_shards)
 
 
 DEFAULT_PAGE_SIZE = 128
@@ -125,10 +136,24 @@ class KVLayerSet:
 
 class LayerSetSlot(NamedTuple):
     """Where a layer set's layers sit among a pool's: layer indices are global
-    across the pool's sets. Derived by `PagedKVConfig.join`, never declared."""
+    across the pool's sets and storages. Derived from `PagedKVConfig.join`,
+    never declared."""
 
     first: int
     num_layers: int
+
+
+@dataclass(frozen=True)
+class KVStorage:
+    """The storage of a layer set whose KV geometry isn't the pool's: its own
+    tensor of the pool's pages (``[layers, pages, 2, page, heads, head_dim]``),
+    addressed by the same page ids, so a page is one unit across storages for
+    reservation, take-back, eviction, offload and the prefix index. Counts are
+    the checkpoint's, unsharded."""
+
+    num_layers: int
+    num_kv_heads: int
+    head_dim: int
 
 
 @dataclass(kw_only=True)
@@ -161,9 +186,11 @@ class PagedKVConfig(KVConfig):
     # is kept for first (`keep_window`, which `derive_kv_groups` calls as the specs resolve,
     # before anything builds or sizes from the pool). One group of every layer until then.
     groups: tuple["KVGroup", ...] = field(default=(), init=False, repr=False, compare=False)
-    # Derived, never declared: each layer set's slot among the layers, the declaring stack's
-    # as TARGET_LAYER_SET, then each stack that joined (`join`)
-    layer_sets: dict[str, LayerSetSlot] = field(default_factory=dict, init=False, repr=False, compare=False)
+    # Derived, never declared: the layer sets in join order, the declaring stack's (TARGET_LAYER_SET)
+    # first, each ``(name, num_layers, storage)``: storage 0 is the pool's own, ``i`` is
+    # ``extra_storages[i - 1]`` (`join`). Slots come from these when read (`layer_sets`).
+    joined: tuple[tuple[str, int, int], ...] = field(default=(), init=False, repr=False, compare=False)
+    extra_storages: tuple[KVStorage, ...] = field(default=(), init=False, repr=False, compare=False)
 
     def __post_init__(self):
         self._check_sizes()
@@ -176,7 +203,8 @@ class PagedKVConfig(KVConfig):
             self.num_kv_heads = 1
             self.head_dim = self.kv_lora_rank + self.qk_rope_head_dim
         super().__post_init__()
-        self.layer_sets = {TARGET_LAYER_SET: LayerSetSlot(0, self.num_layers)}
+        self.joined = ((TARGET_LAYER_SET, self.num_layers, 0),)
+        self.extra_storages = ()
         self.keep_window(None, ())
 
     def _check_sizes(self) -> None:
@@ -186,24 +214,84 @@ class PagedKVConfig(KVConfig):
             check_sizes({"page_size": self.page_size})
 
     def join(self, layer_set: KVLayerSet) -> LayerSetSlot:
-        """Append ``layer_set``'s layers to the pool's, after every layer it holds.
-        Only a set of the pool's own storage geometry (KV heads and head size)
-        joins: the layers are more of the pool's tensor."""
+        """Add ``layer_set``'s layers to the pool. A set of the pool's own KV
+        geometry (KV heads and head size) is more of its tensor, after every
+        layer it holds; a set of another gets a storage of its own (`KVStorage`)
+        over the same pages. Returns the set's slot as the pool stands now: an
+        extra storage's layers follow every layer of the pool's own storage, so
+        a later join of the pool's geometry moves them (read `layer_sets` after
+        the last join, as binding does)."""
         if layer_set.name in self.layer_sets:
             raise ValueError(f"KV {layer_set.kv_cache!r}: layer set {layer_set.name!r} joined twice")
-        if (layer_set.num_kv_heads, layer_set.head_dim) != (self.total_kv_heads, self.head_dim):
+        if (layer_set.num_kv_heads, layer_set.head_dim) == (self.total_kv_heads, self.head_dim):
+            self.num_layers += layer_set.num_layers
+            self.joined += ((layer_set.name, layer_set.num_layers, 0),)
+            # every token of every layer until the specs derive the window again
+            self.keep_window(None, ())
+            return self.layer_sets[layer_set.name]
+        if self.layout != KVLayout.NHD:
             raise ValueError(
-                f"KV {layer_set.kv_cache!r}: layer set {layer_set.name!r} has {layer_set.num_kv_heads} KV heads "
-                f"of {layer_set.head_dim}; the pool's are {self.total_kv_heads} of {self.head_dim}. A drafter's KV "
-                "layer set must share the pool's KV heads and head size; a drafter with its own KV storage "
-                "geometry is not supported yet"
+                f"KV {layer_set.kv_cache!r}: layer set {layer_set.name!r} has a KV geometry of its own, which a "
+                f"{self.layout.value} pool can't store beside its own"
             )
-        slot = LayerSetSlot(self.num_layers, layer_set.num_layers)
-        self.num_layers += layer_set.num_layers
-        self.layer_sets[layer_set.name] = slot
-        # every token of every layer until the specs derive the window again
-        self.keep_window(None, ())
-        return slot
+        if len(self.groups) > 1:
+            raise ValueError(
+                f"KV {layer_set.kv_cache!r}: layer set {layer_set.name!r} has a KV geometry of its own, which a "
+                "pool that keeps a sliding window per page group can't store beside its own"
+            )
+        self.extra_storages += (KVStorage(layer_set.num_layers, layer_set.num_kv_heads, layer_set.head_dim),)
+        self.joined += ((layer_set.name, layer_set.num_layers, len(self.extra_storages)),)
+        return self.layer_sets[layer_set.name]
+
+    @property
+    def layer_sets(self) -> dict[str, "LayerSetSlot"]:
+        """Each layer set's slot among the pool's global layer indices: the sets
+        of the pool's own storage in join order, then each extra storage's."""
+        slots, first = {}, 0
+        for name, n, storage in self.joined:
+            if storage == 0:
+                slots[name] = LayerSetSlot(first, n)
+                first += n
+        for name, n, storage in self.joined:
+            if storage:
+                slots[name] = LayerSetSlot(first, n)
+                first += n
+        return slots
+
+    def layer_set_storage(self, name: str) -> int:
+        """The storage holding layer set ``name``: 0 the pool's own, ``i`` ``extra_storages[i - 1]``."""
+        for set_name, _, storage in self.joined:
+            if set_name == name:
+                return storage
+        raise ValueError(f"no layer set {name!r} in this pool; it has {[joined[0] for joined in self.joined]}")
+
+    def geometry_of(self, name: str, num_qo_heads: int | None = None) -> "PagedKVConfig":
+        """A config of layer set ``name``'s geometry over this pool's pages, for an attention
+        binding that plans with it: the set's layers, KV heads (the checkpoint's) and head size,
+        ``num_qo_heads`` query heads (the pool's when None), the pool's pages and page size. A view
+        for planning, not a pool: it has no layer sets of its own and keeps no prefix cache."""
+        storage = self.layer_set_storage(name)
+        layers = self.layer_sets[name].num_layers
+        heads, dim = (self.total_kv_heads, self.head_dim) if storage == 0 else (
+            self.extra_storages[storage - 1].num_kv_heads, self.extra_storages[storage - 1].head_dim)
+        if len(self.groups) > 1:
+            raise ValueError(f"layer set {name!r}: a pool that keeps a sliding window has no view of one layer set")
+        return PagedKVConfig(
+            num_layers=layers, num_kv_heads=heads, head_dim=dim,
+            num_qo_heads=self.total_qo_heads if num_qo_heads is None else num_qo_heads,
+            max_seq_len=self.max_seq_len, max_num_pages=self.max_num_pages, page_size=self.tokens_per_page,
+            layout=self.layout, prefix_cache=False,
+        )
+
+    def storage_kv_heads(self, storage: int) -> int:
+        """One rank's KV heads of extra storage ``storage`` (1-based, as `layer_set_storage`), sharded as the
+        pool is: a slice of its own heads, or one replicated head when it has fewer than ranks."""
+        return rank_kv_heads(self.extra_storages[storage - 1].num_kv_heads, self.num_shards)
+
+    @property
+    def total_layers(self) -> int:
+        """Every layer of every storage: the pool's own ``num_layers``, then each extra storage's."""
+        return self.num_layers + sum(storage.num_layers for storage in self.extra_storages)
 
     def keep_window(self, window: int | None, layers: tuple[int, ...]) -> None:
         """Keep about ``window`` tokens per request of ``layers``, some of the pool's, and every
@@ -213,6 +301,10 @@ class PagedKVConfig(KVConfig):
         S sliding layers, a page holds ``tokens_per_page`` tokens of the full layers or
         ``tokens_per_page·F/S`` of the sliding ones. Derived, it is (S/g)·k, g = gcd(F, S), for
         the smallest k that puts at least MIN_GROUP_PAGE tokens in a page of either group."""
+        if layers and self.extra_storages:
+            raise ValueError(
+                "a pool holding a layer set of its own KV geometry can't keep a sliding window per page group"
+            )
         full = tuple(i for i in range(self.num_layers) if i not in layers)
         if layers and not full:
             raise ValueError("every layer keeps a window; a pool keeps one only beside layers that keep every token")
@@ -1032,6 +1124,11 @@ class KVStep(ResourceStep):
     # itself this step, applied at commit. It rides with the step rather than
     # living on the stream, so an offload has nothing to lose.
     retention: Mapping[tuple[str, str], RetentionPolicy] = field(default_factory=dict)
+    # layer set -> its lag (`Lag`): its layers write each token ``rows`` positions before the step's
+    # other layers do (a draft model's verify block, one row behind the target's), one pass of rows at
+    # a time (`KVManager.select_pass`). Set by the engine from the drafter's declaration (`drafter_step`),
+    # never by a submodule.
+    lag: "Mapping[str, Lag]" = field(default_factory=dict)
     # Set by the manager when the step commits, while copies to the host are on: its count of commits so far.
     # The submodule doesn't declare it, as it doesn't declare `SubmoduleStep`'s context.
     commits: int = field(default=0, init=False, compare=False, repr=False)

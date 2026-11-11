@@ -16,6 +16,7 @@ from mstar.engine.resources.step import ResourceStep
 
 if TYPE_CHECKING:
     from mstar.engine.resources.base import Resource
+    from mstar.engine.resources.step import Lag
 
 logger = logging.getLogger(__name__)
 
@@ -83,9 +84,16 @@ class AttentionConfig:
     # (Hopper only), or FlashInfer's, planned on the host (synchronous mode). "auto" takes
     # FA3 where it runs.
     verify_backend: VerifyBackend = VerifyBackend.AUTO
+    # Plan with layer set ``layer_set``'s KV geometry (`PagedKVConfig.geometry_of`) and
+    # ``num_qo_heads`` query heads (the pool's when None): a draft model's attention over its
+    # own layers of the target's pool. None plans with the pool's own geometry.
+    layer_set: str | None = None
+    num_qo_heads: int | None = None
 
     def __post_init__(self) -> None:
         self.verify_backend = VerifyBackend.parse(self.verify_backend)
+        if self.num_qo_heads is not None and self.layer_set is None:
+            raise ValueError("num_qo_heads names a layer set's query heads, and needs layer_set")
         if self.sliding_window is not None and (
             type(self.sliding_window) is not int or self.sliding_window <= 0
         ):
@@ -309,6 +317,10 @@ class AttentionStep(ResourceStep):
     # Rows at the end of each row's block that no query attends to, the block
     # otherwise seen whole (non-causal): DSpark's drafter over a verify block.
     hide_last: int = 0
+    # a lagged binding's (`Lag`: a draft model one token behind its target, `DrafterNeeds.lag`): it plans
+    # each pass's rows over its own extent, and runs the selected one (`select_pass`). Set by the engine
+    # (`drafter_step`), never by a submodule.
+    lag: "Lag | None" = None
 
     def __post_init__(self):
         if self.hide_last and self.causal:

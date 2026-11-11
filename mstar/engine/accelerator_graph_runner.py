@@ -1253,6 +1253,13 @@ class AcceleratorGraphRunner:
             graph_walk=walk, request_ids=dummy_rids, inputs=dummy_inputs,
             slot_lease=lease, per_request_info=engine_inputs.per_request_info,
         )
+        share = getattr(self._submodule, "drafter_share", None)
+        lag = None if share is None else share.lag
+        if step is not None and lag is not None:
+            from mstar.engine.resources.draft.node import check_lag
+
+            # the graph keeps the lag the capture's step carries, which every replay's must equal
+            check_lag(step, walk, lag)
         if step is not None:
             step.set_ctx(StepContext(
                 request_ids=tuple(dummy_rids),

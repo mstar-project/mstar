@@ -25,7 +25,7 @@ from mstar.engine.resources.attn.wrappers import (
 from mstar.engine.resources.base import CGSlotKey
 from mstar.engine.resources.kv.config import PagedKVConfig
 from mstar.engine.resources.kv.keys import fingerprint
-from mstar.engine.resources.kv.plan import KVPlanOutputs, build_paged_indptrs, hide_tail_views
+from mstar.engine.resources.kv.plan import KVPlanOutputs, build_paged_indptrs, hide_tail_views, lagged_pass_views
 from mstar.engine.resources.spec import CombinedSplit
 from mstar.engine.resources.step import SlotLease, StepContext
 from mstar.utils.profiler import PhaseLaps
@@ -109,6 +109,10 @@ class FlashInferManager(AttentionManager):
         self._verify_backend = VerifyBackend.parse(verify_backend)
         self._verify_fa3 = False
         self._verify_wrappers: dict = {}
+        # a lagged binding (`AttentionStep.lag`): the pass its queries run (`select_pass`), and each captured
+        # step's FA3 pass wrappers, which the resident gather fills: (bucket, slot) -> [wrapper]
+        self._draft_pass: int | None = None
+        self._lagged_cg: dict[tuple, list] = {}
 
     def depends_on(self):
         return {self._kv_cache_name}
@@ -152,6 +156,17 @@ class FlashInferManager(AttentionManager):
     def resident_gather(self, step: "CapturedResidentStep") -> None:
         # planned per label of its KV cache's plan, so its wrapper is under that stream's label
         pool, stream = self._kv_cache_name, step.streams[self._kv_cache_name]
+        lagged = self._lagged_cg.get((step.bucket, step.slot))
+        if lagged is not None:
+            # a lagged binding's passes: FA3's lengths off the tables; FlashInfer's are host plans
+            if not lagged or stream.reads:
+                step.host_planned = True
+                return
+            table = step.block_tables[pool]
+            for wrapper in lagged:
+                wrapper.gather_resident(step.store, step.slots, step.buffers.kv_len[pool], table.stride, table.col)
+            step.reads_tables = True
+            return
         wrapper = self._cg_plan_states.get(CGSlotKey(bucket=step.bucket, slot=step.slot, label=stream.label))
         if wrapper is not None and wrapper.plans_in_graph and not stream.reads:
             table = step.block_tables[pool]
@@ -186,12 +201,19 @@ class FlashInferManager(AttentionManager):
         # the window and scale shape every later layer's K/V
         return fingerprint(type(self).__name__, self._window_left, self._sm_scale)
 
-    def _verify_wrapper(self, step: AttentionStep, num_rows: int, num_tokens: int, lease: SlotLease | None):
-        """FA3's paged wrapper for a verify step of ``num_rows`` blocks, persistent per
-        (bucket, slot) under a lease and per (rows, block) eager. The step's mask in the
-        wrapper's terms: ``kv_extent = span - hide_last`` keys past each row's stored length."""
-        span = num_tokens // num_rows
-        key = (None if lease is None else (lease.bucket, lease.slot), num_rows, span, step.hide_last, step.causal)
+    def _verify_wrapper(
+        self, step: AttentionStep, num_rows: int, num_tokens: int, lease: SlotLease | None, p: int | None = None,
+    ):
+        """FA3's paged wrapper for a verify step of ``num_rows`` blocks, or a lagged step's pass ``p`` of
+        them, persistent per (bucket, slot) under a lease and per (rows, block) eager. The step's mask in
+        the wrapper's terms: ``kv_extent = block - hide_last`` keys past each row's stored length, and a
+        lagged pass runs its own queries through its own extent (`Lag.extent`)."""
+        block = num_tokens // num_rows
+        span, extent = block, block - step.hide_last
+        if p is not None:
+            span, extent = step.lag.passes[p], step.lag.extent(p)
+        key = (None if lease is None else (lease.bucket, lease.slot), num_rows, block, step.hide_last, step.causal,
+               p, extent)
         wrapper = self._verify_wrappers.get(key)
         if wrapper is None:
             from mstar.engine.resources.attn.fa3_paged import FA3PagedWrapper
@@ -199,13 +221,52 @@ class FlashInferManager(AttentionManager):
             page_size = self._group.page_size
             wrapper = self._verify_wrappers[key] = FA3PagedWrapper(
                 page_size=page_size, table_width=self._kv_config.block_table_width(page_size), device=self._device,
-                span=span, kv_extent=span - step.hide_last, causal=step.causal, batch_size=num_rows,
+                span=span, kv_extent=extent, plan_span=block, causal=step.causal, batch_size=num_rows,
                 accelerator_graph=lease is not None, dtype=self._dtype,
             )
         return wrapper
 
+    def _plan_lagged(self, step: AttentionStep, ctx: StepContext, plan_outputs, plan_states) -> None:
+        """A lagged binding's verify step (`AttentionStep.lag`): a plan per pass, keyed (label, "lag", p),
+        each its pass's queries over its own extent. FA3's lengths come off the device on a resident step;
+        FlashInfer plans each pass on the host (synchronous mode only)."""
+        if not step.verify or step.hide_last or not step.causal:
+            raise ValueError("a lagged attention step is a causal verify step that hides nothing")
+        lease = ctx.slot_lease
+        page = self._group.page_size
+        captured = []
+        for label, kv_out in plan_outputs.items():
+            indptrs = kv_out.cpu_indptrs
+            num_rows = indptrs.qo_indptr.shape[0] - 1
+            block = int(indptrs.qo_indptr[-1]) // num_rows
+            for p, queries in enumerate(step.lag.passes):
+                key = (label, "lag", p)
+                if self._verify_fa3:
+                    wrapper = self._verify_wrapper(step, num_rows, num_rows * block, lease, p)
+                    wrapper.plan(dtype=self._dtype, window_left=self._window_left, **indptrs.to_kwargs_dict())
+                    captured.append(wrapper)
+                else:
+                    views = lagged_pass_views(kv_out.views, block, step.lag.extent(p), queries, page)
+                    # one float workspace for every pass of the slot: each plan's data is in its wrapper's own
+                    # int buffers, and the passes run one after another
+                    if lease is not None:
+                        wrapper = self._cg_wrapper(lease, f"{label}.lag{p}", num_rows, force_prefill=True,
+                                                   workspace_label=f"{label}.lag")
+                    else:
+                        wrapper = self._eager_wrapper(f"{label}.lag{p}", False, ctx.slot,
+                                                      workspace_label=f"{label}.lag")
+                    wrapper.plan(causal=True, dtype=self._dtype, window_left=self._window_left,
+                                 **build_paged_indptrs(views, page).to_kwargs_dict())
+                plan_states[key] = wrapper
+        if lease is not None:
+            self._lagged_cg[(lease.bucket, lease.slot)] = captured
+
+    def select_pass(self, p: int | None) -> None:
+        """The pass of a lagged step (`AttentionStep.lag`) the binding's queries run next; None outside one."""
+        self._draft_pass = p
+
     def _cg_wrapper(
-        self, lease: SlotLease, label: str, num_rows: int, force_prefill: bool,
+        self, lease: SlotLease, label: str, num_rows: int, force_prefill: bool, workspace_label: str | None = None,
     ) -> AttentionWrapper:
         """The captured-graph wrapper for one (bucket, slot, label).
 
@@ -229,7 +290,7 @@ class FlashInferManager(AttentionManager):
             return wrapper
 
         bucket = lease.bucket
-        workspace = self._workspaces.get(label, lease.slot)
+        workspace = self._workspaces.get(workspace_label or label, lease.slot)
         kv_kwargs = {
             **self._wrapper_kv_kwargs,
             "max_num_pages": captured_page_capacity(num_rows, bucket.num_tokens, self._kv_config, self._group),
@@ -289,7 +350,7 @@ class FlashInferManager(AttentionManager):
         return wrapper if wrapper.has_kernel(config.head_dim, config.num_qo_heads) else None
 
     def _eager_wrapper(
-        self, label: str, is_decode: bool, slot: int
+        self, label: str, is_decode: bool, slot: int, workspace_label: str | None = None,
     ) -> AttentionWrapper:
         """The persistent eager wrapper for one (label, kind, slot).
 
@@ -300,7 +361,7 @@ class FlashInferManager(AttentionManager):
         key = EagerSlotKey(label=label, slot=slot, is_decode=is_decode)
         wrapper = self._eager_plan_states.get(key)
         if wrapper is None:
-            workspace = self._workspaces.get(label, slot)
+            workspace = self._workspaces.get(workspace_label or label, slot)
             if is_decode:
                 wrapper = FlashInferDecodeWrapper(
                     workspace_buffer=workspace,
@@ -325,6 +386,8 @@ class FlashInferManager(AttentionManager):
         return True
 
     def plan(self, step: AttentionStep, ctx: StepContext):
+        # a pass selected for an earlier step's queries is never this step's
+        self._draft_pass = None
         if ctx.resident is not None and ctx.slot_lease.bucket in ctx.resident.host_plan_free:
             return
         refuse_context_only(step, type(self).__name__)
@@ -358,6 +421,10 @@ class FlashInferManager(AttentionManager):
         plan_states = self._preplan_states if ctx.is_preplan else self._current_plan_states
 
         plan_states.clear()
+        if step.lag is not None:
+            self._plan_lagged(step, ctx, plan_outputs, plan_states)
+            self._preplanned = ctx.is_preplan
+            return
         laps = PhaseLaps(f"{ctx.plan_phase}.attn.")
         if step.verify and self._verify_fa3 and len(plan_outputs) > 1:
             # one FA3 wrapper per (bucket, slot), whichever label: a second label's plan would overwrite the first's
@@ -467,7 +534,14 @@ class FlashInferManager(AttentionManager):
                     f"KV {self._kv_cache_name!r} has more than one group, so its attention needs the "
                     "layer it runs: set_layer_idx, or run(layer_idx=)"
                 )
-        o = self._current_plan_states[label].run(q, kv_cache_layer)
+        if self._draft_pass is not None:
+            label = (label, "lag", self._draft_pass)
+        state = self._current_plan_states.get(label)
+        if state is None:
+            raise RuntimeError(f"FlashInfer: no plan for {label!r}" + (
+                "; a lagged binding attends in a pass (select_pass)"
+                if any(isinstance(key, tuple) for key in self._current_plan_states) else ""))
+        o = state.run(q, kv_cache_layer)
         if o.dtype != q.dtype:
             o = o.to(q.dtype)
         return o

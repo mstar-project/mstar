@@ -95,15 +95,17 @@ def _pool(**kw) -> PagedKVConfig:
     return PagedKVConfig(num_layers=3, num_kv_heads=2, num_qo_heads=4, head_dim=16, max_seq_len=64, **kw)
 
 
-def test_a_join_appends_the_layers_and_refuses_another_geometry_or_a_repeat():
+def test_a_join_appends_the_layers_and_refuses_a_repeat():
     config = _pool()
     assert config.join(KVLayerSet("kv", "draft", 2, 2, 16)) == (3, 2)
     assert config.num_layers == 5 and [list(group.layers) for group in config.groups] == [[0, 1, 2, 3, 4]]
     with pytest.raises(ValueError, match="joined twice"):
         config.join(KVLayerSet("kv", "draft", 1, 2, 16))
     for heads, dim in ((4, 16), (2, 8)):
-        with pytest.raises(ValueError, match="its own KV storage geometry is not supported"):
-            _pool().join(KVLayerSet("kv", "other", 1, heads, dim))
+        # another geometry gets a storage of its own (test_kv_layer_set_storage), past every own layer
+        other = _pool()
+        assert other.join(KVLayerSet("kv", "other", 1, heads, dim)) == (3, 1)
+        assert other.num_layers == 3 and other.total_layers == 4
 
 
 def test_drafter_resources_needs_the_paged_pool_it_names():

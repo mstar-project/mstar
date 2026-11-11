@@ -2,7 +2,7 @@ import logging
 import os
 import threading
 from collections import Counter
-from collections.abc import Callable, Collection, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from concurrent.futures import Future, wait
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, NamedTuple
@@ -62,6 +62,7 @@ from mstar.engine.resources.step import (
     AdmitOutcome,
     AdmitRuntimeError,
     AllocationFailed,
+    Lag,
     RequestOffloading,
     Segment,
     SettingValue,
@@ -539,6 +540,9 @@ class KVPlanState:
     # view of (``KVManager._stage_static``)
     staging: torch.Tensor | None = None
     slot_buffer: "_SlotBuffer | None" = None
+    # a lagged state's tokens a row (`KVStep.lag`): row i's first token, the one a row-0 select can sink
+    # (`KVManager.sink_lagged_rows`), is token ``i * row_span``
+    row_span: int | None = None
 
 
 class _SlotBuffer:
@@ -598,9 +602,22 @@ class KVManager(AttentionResource):
                     "and a read from another group would take pages outside rank 0's order. Serve "
                     "the nodes from one group or set prefix_cache_tp to false."
                 )
+        if cfg.extra_storages and needs_remote_transfer:
+            raise ValueError(
+                f"KV {name}: a pool holding a layer set of its own KV geometry can't be read by another instance "
+                "(KV publication or transfer)"
+            )
         self.kv_cache = KVCache(
             cfg, device, dtype
         )
+        if len(cfg.joined) > 1:
+            logger.info(
+                "KV %s: %s", name, "; ".join(
+                    f"layer set {set_name!r} {per} bytes a token"
+                    + (" (a storage of its own)" if cfg.layer_set_storage(set_name) else "")
+                    for set_name, per in self.kv_cache.layer_set_bytes_per_token().items()
+                ),
+            )
         self.name = name
         self._needs_remote_transfer = needs_remote_transfer
 
@@ -642,10 +659,23 @@ class KVManager(AttentionResource):
         # (index, group) of each group past the first, each a window applied at commit
         self._windows = tuple((g, group) for g, group in enumerate(self._groups) if g)
         # layer -> the index of its group
-        self._layer_group = [0] * cfg.num_layers
+        # every layer of every storage: an extra storage's layers are in the one group (a pool with a
+        # window holds no extra storage)
+        self._layer_group = [0] * cfg.total_layers
         for g, group in enumerate(self._groups):
             for layer in group.layers:
                 self._layer_group[layer] = g
+        # layer -> its layer set, which a step can lag (`KVStep.lag`): its writes then take the
+        # addressing kept at (label, ("lag", set)) rather than (label, group)
+        self._layer_set_of: list[str | None] = [None] * cfg.total_layers
+        for set_name, slot in cfg.layer_sets.items():
+            for layer in range(slot.first, slot.first + slot.num_layers):
+                self._layer_set_of[layer] = set_name
+        # (bucket, slot) -> the lagged addressing a captured step keeps: ((label, set, Lag), ...), which the
+        # resident gather refills each replay
+        self._lagged_captures: dict[tuple, tuple[tuple[str, str, Lag], ...]] = {}
+        # the pass of a lagged step its lagged sets' layers write (`select_pass`)
+        self._draft_pass: int | None = None
         # (node, walk) -> (label, stop buffer name) per request, for the
         # decode-step chain extension; dropped with the request
         self._chain_lookup: dict[str, dict[tuple[str, str], tuple]] = {}
@@ -909,9 +939,8 @@ class KVManager(AttentionResource):
 
     def _open_host_writes(self) -> None:
         assert self._host_allowance is not None, f"KV {self.name}: copies to the host spend the engine's StepAllowance"
-        self._host_writes = HostWrites(
-            self._cpu_pool, self._index, self.kv_cache.tensor[:, 0].nbytes, self._host_allowance,
-        )
+        # a page's bytes over every storage, a drafter's of its own geometry included
+        self._host_writes = HostWrites(self._cpu_pool, self._index, self.kv_cache.page_bytes, self._host_allowance)
         self._arena.writes = self._host_writes
 
     def close_prefix_cache(self) -> None:
@@ -1343,7 +1372,7 @@ class KVManager(AttentionResource):
         with self._lock:
             write = writes.take(step.commits)
         if write is not None:
-            writes.launch(write, self.kv_cache.tensor, self._lock)
+            writes.launch(write, self.kv_cache, self._lock)
 
     def _cache_image_end(self, stream: CacheStream, chain: PrefixChain, end: int, key: bytes) -> None:
         """Cache the page up to the image's end. When the text after the image changes,
@@ -1801,11 +1830,16 @@ class KVManager(AttentionResource):
         return sets[name]
 
     def fingerprint(self) -> bytes:
-        return fingerprint(
+        fields = [
             self.config.layout.value, self.config.tokens_per_page,
             self.kv_cache.tensor.dtype, self._world_size,
             self.config.prefix_cache_salt,
-        )
+        ]
+        if self.config.extra_storages:
+            # a page holds every storage: pools of other drafter geometries must not share pages.
+            # Only then, so every other pool keeps its root.
+            fields += [(s.num_layers, s.num_kv_heads, s.head_dim) for s in self.config.extra_storages]
+        return fingerprint(*fields)
 
     def ingest_request(self, rid, overrides: KVReqConfig | None=None):
         self._touch_plan_cache(rid)
@@ -2067,7 +2101,7 @@ class KVManager(AttentionResource):
             self._add_host_copy(copy)
             stream.host_copy = copy
             self._recount(rid)
-        self._cpu_pool.copy_in(self.kv_cache.tensor, PageCopies(gpu=fresh, cpu=host))
+        self._cpu_pool.copy_in(self.kv_cache, PageCopies(gpu=fresh, cpu=host))
         copy.event = self._cpu_pool.record()
         return label
 
@@ -2500,12 +2534,14 @@ class KVManager(AttentionResource):
         both = self._packed_addressing(indptrs, total, page_size)
         return self._stage_static(static_state, both[:total], both[total:], total)
 
-    def _packed_addressing(self, indptrs: PagedIndptrs, total: int, page_size: int) -> np.ndarray:
+    def _packed_addressing(self, indptrs: PagedIndptrs, total: int, page_size: int, lag: int = 0) -> np.ndarray:
         """Each new token's page, then each one's offset in it (``2 * total``
         int64), from the plan's host indptrs: tokens are appended after each
-        row's stored length. One Rust call when the extension has it."""
+        row's stored length, or ``lag`` positions before that (`KVStep.lag`;
+        a padding row's then floor at its sink page's first slot). One Rust
+        call when the extension has it and nothing lags."""
         qo = indptrs.qo_indptr.numpy()
-        if _rust_packed_addressing is not None:
+        if _rust_packed_addressing is not None and not lag:
             both = np.empty(2 * total, np.int64)
             _rust_packed_addressing(
                 qo, indptrs.paged_kv_indptr.numpy(), indptrs.paged_kv_indices.numpy(),
@@ -2527,6 +2563,8 @@ class KVManager(AttentionResource):
                 f"(spans {spans.tolist()}, kv indptr {kvp.tolist()}, last page lens {last.tolist()})"
             )
         pos = (kv_after - spans - qo[:-1])[seg] + np.arange(total)
+        if lag:
+            pos = np.maximum(pos - lag, 0)
         both = np.empty(2 * total, np.int64)
         page, both[total:] = np.divmod(pos, page_size)
         both[:total] = indptrs.paged_kv_indices.numpy()[kvp[:-1][seg] + page]
@@ -2617,6 +2655,82 @@ class KVManager(AttentionResource):
             else:
                 self._current_plan_states[label] = plan_state
 
+
+    def _setup_lagged_states(
+        self, plan_output: dict[str, KVPlanOutput], ctx: StepContext, lease, lag: "Mapping[str, Lag]",
+    ) -> None:
+        """The write addressing of each lagged layer set (`KVStep.lag`), one state a pass, keyed
+        (label, ("lag", set, pass)): each of the pass's tokens ``lag.rows`` positions before where the
+        step's other layers write it. A verify step's rows are one span each."""
+        if len(self._groups) > 1:
+            raise ValueError(f"KV {self.name}: a pool with full and sliding layers can't lag a layer set")
+        unknown = set(lag) - set(self.config.layer_sets)
+        if unknown:
+            raise KeyError(f"KV {self.name}: a step lags layer sets {sorted(unknown)} the pool doesn't hold")
+        page_size = self._groups[0].page_size
+        states = self._preplan_states if ctx.is_preplan else self._current_plan_states
+        lagged = []
+        for plan_label, indptrs in plan_output.items():
+            if indptrs.is_decode:
+                raise ValueError(f"KV {self.name}: a one-token step can't lag a layer set (label {plan_label!r})")
+            cpu = indptrs.cpu_indptrs
+            spans = np.diff(cpu.qo_indptr.numpy())
+            if len(spans) == 0 or (spans != spans[0]).any():
+                raise ValueError(f"KV {self.name}: a lagged step's rows are one span each, got {spans.tolist()}")
+            span, rows, total = int(spans[0]), len(spans), int(spans.sum())
+            for name, layout in lag.items():
+                if sum(layout.passes) != span:
+                    raise ValueError(f"KV {self.name}: set {name!r}'s passes {layout.passes} cover {span} rows")
+                both = self._packed_addressing(cpu, total, page_size, lag=layout.rows)
+                for p, (start, n) in enumerate(zip(layout.starts, layout.passes, strict=True)):
+                    # pass p's tokens of each row, row-major
+                    at = (np.arange(rows)[:, None] * span + start + np.arange(n)).reshape(-1)
+                    pages, offsets = both[:total][at], both[total:][at]
+                    key = (plan_label, ("lag", name, p))
+                    if lease is not None:
+                        state = self._stage_static(
+                            self._static_plan_state(lease.slot, key, lease.bucket.bs * n), pages, offsets, len(at),
+                        )
+                    else:
+                        dev = torch.empty(2 * len(at), dtype=torch.long, device=self._device)
+                        self._plan_stager.copy_(dev, np.concatenate([pages, offsets]))
+                        state = KVPlanState(token_to_page=dev[:len(at)], token_to_cache=dev[len(at):],
+                                            total_tokens=len(at))
+                    state.row_span = n
+                    states[key] = state
+                if lease is not None:
+                    lagged.append((plan_label, name, layout))
+        if lease is not None:
+            self._lagged_captures[(lease.bucket, lease.slot)] = tuple(lagged)
+
+    def select_pass(self, p: int | None) -> None:
+        """The pass of a lagged step (`KVStep.lag`) the lagged sets' layers write next; None outside one."""
+        self._draft_pass = p
+
+    def _write_state(self, label: str, layer_idx: int) -> KVPlanState:
+        """Layer ``layer_idx``'s write addressing this step: its set's lagged one, for the selected pass,
+        if the step lags it."""
+        name = self._layer_set_of[layer_idx]
+        if name is not None and (label, ("lag", name, 0)) in self._current_plan_states:
+            if self._draft_pass is None:
+                raise RuntimeError(f"KV {self.name}: layer {layer_idx} of lagged set {name!r} writes outside a pass "
+                                   "(select_pass)")
+            return self._current_plan_states[label, ("lag", name, self._draft_pass)]
+        return self._current_plan_states[label, self._layer_group[layer_idx]]
+
+    def sink_lagged_rows(self, keep: torch.Tensor) -> None:
+        """Send each row's first lagged write (its first pass's first token) to the sink page unless ``keep``
+        (``[rows]`` bool, on the device) says to write it: a draft model's row 0 rewrites the token before
+        the step's first, which it wrote last step unless the target accepted every draft. In the graph,
+        no host read."""
+        rows = keep.shape[0]
+        for key, state in self._current_plan_states.items():
+            if not (isinstance(key[1], tuple) and key[1][0] == "lag" and key[1][2] == 0):
+                continue
+            first = torch.arange(rows, device=keep.device) * state.row_span
+            pages, offsets = state.token_to_page, state.token_to_cache
+            pages.index_copy_(0, first, torch.where(keep, pages.index_select(0, first), SINK_PAGE))
+            offsets.index_copy_(0, first, torch.where(keep, offsets.index_select(0, first), 0))
 
     def _plan_output(
         self, views: list[SequenceView], page_size: int, ring: PinnedIndexRing | None,
@@ -2874,6 +2988,8 @@ class KVManager(AttentionResource):
         )
         laps = PhaseLaps(f"{ctx.plan_phase}.{self.name}.")
         self.reset_default_cursors()
+        # a pass selected for an earlier step's writes is never this step's
+        self._draft_pass = None
         if ctx.resident is not None:
             bucket = ctx.slot_lease.bucket
             if bucket in ctx.resident.host_plan_free:
@@ -2960,8 +3076,15 @@ class KVManager(AttentionResource):
         )
         laps.lap("full")
         if ctx.resident is None:
+            # a lagged state is this step's or none: the states dict outlives a step, and a stale one
+            # would take a later step's writes of its set (`_write_state`)
+            states = self._preplan_states if ctx.is_preplan else self._current_plan_states
+            for key in [key for key in states if isinstance(key[1], tuple)]:
+                del states[key]
             for g, outputs in enumerate(res.groups):
                 self._setup_plan_states(outputs, ctx, ctx.slot_lease, g, eager_write=step.eager_write)
+            if step.lag:
+                self._setup_lagged_states(res.groups[0], ctx, None if step.eager_write else ctx.slot_lease, step.lag)
         else:
             # the replay fills the slot's addressing (a stream the step only
             # reads has none), so no reuse may skip re-staging it
@@ -3613,7 +3736,7 @@ class KVManager(AttentionResource):
             )
         if copies is None:
             return False
-        self._cpu_pool.copy_out(self.kv_cache.tensor, copies)
+        self._cpu_pool.copy_out(self.kv_cache, copies)
         return True
 
     def _filed(self, rooted: list[bytes], pages: list[int]) -> int:
@@ -3744,11 +3867,11 @@ class KVManager(AttentionResource):
         return rid not in self._guaranteed
 
     def debug_fingerprint(self, rid: str) -> "dict[str, bytes | torch.Tensor]":
-        """Each on-device stream's private pages, every layer (a drafter's KV layers
-        included: they share the pool), its prefix keys, and its length and position.
-        A keyed page is named by its key alone: a reload may take it from the prefix
-        index, filed there by another request's identical prompt from another batch,
-        whose bytes differ in rounding."""
+        """Each on-device stream's private pages, every layer of every storage (a
+        drafter's KV layers included: they share the pool's pages), its prefix
+        keys, and its length and position. A keyed page is named by its key alone:
+        a reload may take it from the prefix index, filed there by another request's
+        identical prompt from another batch, whose bytes differ in rounding."""
         import hashlib
 
         from mstar.engine.resources.base import tensor_digest
@@ -3762,7 +3885,9 @@ class KVManager(AttentionResource):
                 private = stream.pages()[len(keys):]
                 if private:
                     pages = torch.tensor(private, dtype=torch.long, device=self.kv_cache.tensor.device)
-                    out[f"kv/{label}"] = tensor_digest(self.kv_cache.tensor.index_select(1, pages))
+                    for i, storage in enumerate(self.kv_cache.storages):
+                        part = f"kv/{label}" + (f"/storage{i}" if i else "")
+                        out[part] = tensor_digest(storage.index_select(1, pages))
                 out[f"kv/{label}/keys"] = hashlib.blake2b(b"".join(keys), digest_size=16).digest()
                 out[f"kv/{label}/len"] = f"{stream.stored_len}:{stream.position}".encode()
         return out
@@ -3874,7 +3999,7 @@ class KVManager(AttentionResource):
                 self._recount(rid)
         # The streams stay marked offloaded while the copies are queued outside
         # the lock, so nothing extends or claims their pages.
-        self._cpu_pool.copy_in(self.kv_cache.tensor, copies)
+        self._cpu_pool.copy_in(self.kv_cache, copies)
         # sync outside the lock: orders the reload H2D copies before attention
         # reads them, but the pages are already assigned so it touches no
         # shared state
@@ -5528,6 +5653,10 @@ class KVManager(AttentionResource):
             return
         state = self._static_plan_state(step.slot, (stream.label, 0), step.bucket.num_tokens)
         tables.gather(step, state.token_to_page, state.token_to_cache)
+        for label, name, layout in self._lagged_captures.get((step.bucket, step.slot), ()):
+            for p, (start, n) in enumerate(zip(layout.starts, layout.passes, strict=True)):
+                state = self._static_plan_state(step.slot, (label, ("lag", name, p)), step.bucket.bs * n)
+                tables.gather_lagged(step, state.token_to_page, state.token_to_cache, n, start - layout.rows)
 
     def resident_commit(self, step: "CapturedResidentStep") -> None:
         self._resident.commit(step)
@@ -5652,7 +5781,7 @@ class KVManager(AttentionResource):
             label = self._default_label
         if self.kv_cache.layout != KVLayout.NHD:
             raise NotImplementedError(f"write_target is not implemented for layout {self.kv_cache.layout}")
-        state = self._current_plan_states[label, self._layer_group[layer_idx]]
+        state = self._write_state(label, layer_idx)
         if state.ready is not None:
             torch.cuda.current_stream().wait_event(state.ready)
         return (
@@ -5680,7 +5809,7 @@ class KVManager(AttentionResource):
             layer_idx = self._default_layer_idx
         if plan_label is None:
             plan_label = self._default_label
-        plan_state = self._current_plan_states[plan_label, self._layer_group[layer_idx]]
+        plan_state = self._write_state(plan_label, layer_idx)
         n = plan_state.total_tokens
         return self.kv_cache.read_tokens(
             layer_idx=layer_idx,
@@ -5716,7 +5845,7 @@ class KVManager(AttentionResource):
             layer_idx = self._default_layer_idx
         if label is None:
             label = self._default_label
-        plan_state = self._current_plan_states[label, self._layer_group[layer_idx]]
+        plan_state = self._write_state(label, layer_idx)
         if plan_state.ready is not None:
             torch.cuda.current_stream(k.device).wait_event(plan_state.ready)
         # an eager write may carry only the real rows; the padding rows' tokens

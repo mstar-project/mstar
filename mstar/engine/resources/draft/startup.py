@@ -10,10 +10,14 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Iterable, Mapping
+from typing import TYPE_CHECKING
 
 from mstar.engine.resources.draft.config import DraftMode
 from mstar.engine.resources.draft.drafter import ChunkBoundary, VerifyNode
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceCapabilities
+
+if TYPE_CHECKING:
+    from mstar.engine.resources.draft.node import DraftLag
 
 logger = logging.getLogger(__name__)
 
@@ -95,8 +99,8 @@ def submodule_problems(decl: VerifyNode, submodule) -> list[str]:
 def geometry_problems(decl: VerifyNode, specs: Mapping[str, NodeResourceSpec]) -> list[str]:
     """Whether the drafter fits its target: the taps it reads are the node's
     `TapSpec` and inside the target's layers, the layer set it joins the
-    target's KV pool with is there (`drafter_resources`; the join itself
-    refuses another storage geometry), its attention's query heads are the
+    target's KV pool with is there (`drafter_resources`; a set of another
+    geometry has an attention binding that plans with it), its attention's query heads are the
     ones the pool's attention plans, its RoPE base is the node's positions',
     and the width it reads, its vocabulary and its dtype are the target's. A
     mismatched drafter would load and draft garbage: correct output, no speedup."""
@@ -142,21 +146,37 @@ def geometry_problems(decl: VerifyNode, specs: Mapping[str, NodeResourceSpec]) -
             problems.append(f"{where}: the drafter's layers join KV {kv.kv_cache!r}, which is not a paged pool "
                             "of the node")
         else:
+            from mstar.engine.resources.attn.config import AttentionSpec
+
+            # the attention over the pool that plans with the drafter's set, if one does
+            binding = next((spec for spec in on_node if isinstance(spec, AttentionSpec)
+                            and spec.config.kv_cache == kv.kv_cache and spec.config.layer_set == kv.name), None)
             slot = pool.config.layer_sets.get(kv.name)
-            if slot is not None and slot.first + slot.num_layers > pool.config.num_layers:
+            if slot is not None and slot.first + slot.num_layers > pool.config.total_layers:
                 problems.append(f"{where}: layer set {kv.name!r} holds layers {slot.first}.."
                                 f"{slot.first + slot.num_layers - 1} of KV {kv.kv_cache!r}, which has "
-                                f"{pool.config.num_layers}")
+                                f"{pool.config.total_layers}")
+            elif slot is not None and pool.config.layer_set_storage(kv.name) and binding is None:
+                # an attention over the pool's own geometry would read its storage as the pool's
+                problems.append(
+                    f"{where}: the drafter's layer set {kv.name!r} has a KV geometry of its own "
+                    f"({kv.num_kv_heads} KV heads of {kv.head_dim}; the pool's are {pool.config.total_kv_heads} of "
+                    f"{pool.config.head_dim}), and no attention over KV {kv.kv_cache!r} plans with it: declare "
+                    f"one with AttentionConfig(layer_set={kv.name!r})"
+                )
             elif slot is None or slot.num_layers != kv.num_layers:
                 have = {name: held.num_layers for name, held in pool.config.layer_sets.items()}
                 problems.append(f"{where}: the drafter joins {kv.num_layers} layers to KV {kv.kv_cache!r} as layer "
                                 f"set {kv.name!r}; the pool's layer sets hold {have}")
             # the checkpoint's counts on both sides: a built pool holds one rank's slice of its heads
-            if drafter is not None and drafter.num_qo_heads not in (None, pool.config.total_qo_heads):
+            planned = pool.config.total_qo_heads
+            if binding is not None and binding.config.num_qo_heads is not None:
+                planned = binding.config.num_qo_heads
+            if drafter is not None and drafter.num_qo_heads not in (None, planned):
                 problems.append(
                     f"{where}: the drafter's attention has {drafter.num_qo_heads} query heads; the attention over "
-                    f"KV {kv.kv_cache!r} plans {pool.config.total_qo_heads}. A drafter must attend with the pool's "
-                    "query heads; a drafter with query heads of its own is not supported yet"
+                    f"KV {kv.kv_cache!r} plans {planned}. A drafter with query heads of its own attends through "
+                    f"a binding that declares them: AttentionConfig(layer_set={kv.name!r}, num_qo_heads=...)"
                 )
     if drafter is not None:
         if drafter.rope_theta is not None:
@@ -167,9 +187,14 @@ def geometry_problems(decl: VerifyNode, specs: Mapping[str, NodeResourceSpec]) -
                         and spec.config.rope_theta != drafter.rope_theta:
                     problems.append(f"{where}: the drafter's rope_theta is {drafter.rope_theta}; positions "
                                     f"{spec.resource_key!r} rotate with {spec.config.rope_theta}")
+        # the residual width matters to a drafter that reads the target's (taps, its last hidden state);
+        # a separate draft model reads only tokens
+        reads_width = bool(needs.taps) or needs.target_hidden
         for field, what in (
             ("hidden_size", "residual width"), ("vocab_size", "vocabulary"), ("dtype", "dtype"),
         ):
+            if field == "hidden_size" and not reads_width:
+                continue
             mine, theirs = getattr(drafter, field), getattr(target, field)
             if mine != theirs:
                 problems.append(f"{where}: the drafter's {what} is {mine}; the target's is {theirs}")
@@ -185,6 +210,42 @@ def node_capabilities(decl: VerifyNode, specs: Mapping[str, NodeResourceSpec]) -
     node_specs = {key: spec for key, spec in specs.items() if decl.node in spec.nodes}
     ctx = ResourceCapabilitiesCtx(decl.node, node_specs)
     return {key: spec.resource_capabilities(ctx) for key, spec in node_specs.items()}
+
+
+def draft_lag(decl: VerifyNode, specs: Mapping[str, NodeResourceSpec]):
+    """Where a lagged drafter's lag goes on the node's verify steps (`drafter_step`), and the problems that
+    leave it nowhere to go: ``(DraftLag | None, problems)``. A drafter that doesn't lag gets ``(None, [])``."""
+    from mstar.engine.resources.attn.config import AttentionSpec
+    from mstar.engine.resources.draft.node import DraftLag
+    from mstar.engine.resources.position.config import PositionSpec
+
+    needs, where = decl.needs, f"node {decl.node!r}"
+    lag = needs.lag
+    if lag is None:
+        return None, []
+    if lag.rows != 1:
+        return None, [f"{where}: the drafter lags {lag.rows} rows; a draft model lags its target by one"]
+    if sum(lag.passes) != decl.config.block or min(lag.passes, default=0) < 1:
+        return None, [f"{where}: the drafter's passes {lag.passes} don't split the verify block of "
+                      f"{decl.config.block} rows"]
+    if needs.kv is None:
+        return None, [f"{where}: the drafter lags the target but joins no layers to its KV pool"]
+    pool, name = needs.kv.kv_cache, needs.kv.name
+    on_node = [spec for spec in specs.values() if decl.node in spec.nodes]
+    bindings = [spec.resource_key for spec in on_node if isinstance(spec, AttentionSpec)
+                and spec.config.kv_cache == pool and spec.config.layer_set == name]
+    positions = [spec.resource_key for spec in on_node
+                 if isinstance(spec, PositionSpec) and spec.config.kv_cache == pool]
+    problems = []
+    if len(bindings) != 1:
+        problems.append(f"{where}: the lagged drafter's attention plans its own extent: declare one attention over "
+                        f"KV {pool!r} with AttentionConfig(layer_set={name!r}), not {len(bindings)}")
+    if len(positions) != 1:
+        problems.append(f"{where}: the lagged drafter rotates through the positions over KV {pool!r}; the node "
+                        f"declares {len(positions)}")
+    if problems:
+        return None, problems
+    return DraftLag(decl.walk, lag, pool, name, positions[0], bindings[0]), []
 
 
 def resource_problems(decl: VerifyNode, specs: Mapping[str, NodeResourceSpec]) -> list[str]:
@@ -213,9 +274,16 @@ def resolve_mode(
         blockers.append(why_not_async or "async scheduling is off for the node")
     if not resident_planning:
         blockers.append("resident planning is off (MSTAR_RESIDENT_PLANNING)")
+    lag, _ = draft_lag(decl, specs)
     for key, caps in node_capabilities(decl, specs).items():
-        if caps.async_verify_refusal is not None:
-            blockers.append(f"resource {key!r}: {caps.async_verify_refusal}")
+        refusal = caps.async_verify_refusal
+        if refusal is not None and lag is not None and key == lag.attn_key:
+            # config's refusal (the flashinfer pin) only: every pass of a lagged drafter has an extent
+            # of its own, which only FA3 reads on the device
+            refusal = ("a lagged drafter's passes are planned on the host on FlashInfer, and asynchronous "
+                       "verify reads each pass's length on the device: verify_backend fa3")
+        if refusal is not None:
+            blockers.append(f"resource {key!r}: {refusal}")
     if not blockers:
         return DraftMode.ASYNCHRONOUS, "every resource corrects itself on the device"
     reason = "; ".join(blockers)
@@ -304,16 +372,18 @@ def uncorrected_problems(decl: VerifyNode, specs: Mapping[str, NodeResourceSpec]
 def node_problems(
     decl: VerifyNode, token_stop, specs: Mapping[str, NodeResourceSpec], chunks_prompts: bool,
     combined_walk_of: Mapping[tuple[str, str], str] | None = None, max_seq_len: int | None = None,
-) -> list[str]:
-    """Every problem with one verifying node that its declaration and its resources show: the one list both
-    `check_deployment` (before workers spawn, ``max_seq_len`` the serving config's) and the engine at load (with
-    the built submodule's ``token_stop``) run, so the two can't disagree."""
+) -> tuple[list[str], DraftLag | None]:
+    """Every problem with one verifying node that its declaration and its resources show, and its drafter's lag
+    (`draft_lag`): the one list both `check_deployment` (before workers spawn, ``max_seq_len`` the serving
+    config's) and the engine at load (with the built submodule's ``token_stop``) run, so the two can't disagree."""
     problems = shape_problems(decl, token_stop, specs) + geometry_problems(decl, specs)
     problems += resource_problems(decl, specs) + uncorrected_problems(decl, specs)
+    lag, lag_problems = draft_lag(decl, specs)
+    problems += lag_problems
     for problem in (chunking_problem(decl, chunks_prompts), combined_problem(decl, combined_walk_of or {})):
         if problem is not None:
             problems.append(problem)
-    return problems + slack_problems([decl], specs.values(), max_seq_len)
+    return problems + slack_problems([decl], specs.values(), max_seq_len), lag
 
 
 def log_mode(decl: VerifyNode, mode: DraftMode, reason: str) -> None:
@@ -335,7 +405,7 @@ def check_deployment(
     side = set(side_lane)
     for decl in decls:
         problems += node_problems(decl, decl.token_stop, specs, decl.node in set(chunked), combined_walk_of,
-                                  max_seq_len)
+                                  max_seq_len)[0]
         if streaming_out.get(decl.node):
             problems.append(f"node {decl.node!r}: an outgoing streaming edge expects one item a step")
         if decl.node in side:

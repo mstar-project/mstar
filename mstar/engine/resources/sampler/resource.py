@@ -176,6 +176,18 @@ class SamplerResource(Resource):
         # its sampler rows on the device; None on a host-planned step
         self._step_rows: tuple | None = None
         self._step_index: torch.Tensor | None = None
+        # walk -> the loop-back states its steps' forward reads (`bind_graph_reads`), and those
+        # this step staged for its capture to read
+        self._graph_reads: dict[str, frozenset[str]] = {}
+        self._staged: frozenset[str] = frozenset()
+        # debug only, above one rank: the steps whose drafter carry was compared with rank 0's, and those
+        # that differed, on the device (`_compare_carry_with_rank_0`); the last tally on its way to the host
+        from mstar.engine.resources.kv import manager as kv_manager
+
+        self._compares_carry = kv_manager._DEBUG_ASSERTS and not self._decides
+        self._carry_tally: torch.Tensor | None = None
+        self._carry_compares = 0
+        self._carry_report: tuple | None = None
 
     @property
     def _penalty_live(self) -> bool:
@@ -376,6 +388,8 @@ class SamplerResource(Resource):
             self._history.unregister(rid)
         if self._cg_buffers is not None:
             self._cg_buffers.unregister_request(rid)
+            if self._compares_carry and not self._cg_buffers.live_rows:
+                self._flush_carry_tally()
 
     # Admission: with the in-graph scatter, a request's row in the masters the
     # captured graphs index, of which there are `sampler_slots`. A request takes
@@ -618,6 +632,7 @@ class SamplerResource(Resource):
             self._cg_sampler = None
             self._step_slot = None
             self._step_rows = self._step_index = None
+            self._staged = frozenset()
             self._sampler.logprobs = None
         lease = ctx.slot_lease
         if self._cg_buffers is None or lease is None:
@@ -654,6 +669,69 @@ class SamplerResource(Resource):
             self._cg_sampler = sampler
             self._step_slot = (cg_slot, padded_bs)
 
+    def _compare_carry_with_rank_0(self, step: SamplerStep, ctx: StepContext) -> None:
+        """Debug only (``MSTAR_KV_DEBUG_ASSERTS``), above one rank: digests of this
+        step's drafter carry against rank 0's, on the device. Two of them, in one
+        broadcast: the carry the step stored (its forward's new rows), and, on a
+        step that staged its carry (a captured verify step), the rows the forward
+        read. A stored carry built only from agreed values (the draft model's
+        token, EAGLE-3's from the taps and the agreed tokens) can't differ across
+        ranks, so the read digest is the one that covers the staged read. A
+        different carry changes that rank's next drafts, and only rank 0's reach
+        the output (`agree`), so it is counted and logged, not raised. Every rank
+        broadcasts for the same steps; nothing is read on the host until a tally
+        has landed, or until the sampler holds no request (`_flush_carry_tally`)."""
+        from mstar.engine.resources.base import tensor_digest
+        from mstar.engine.resources.draft.drafter import DRAFT_CARRY
+
+        bufs = self._cg_buffers
+        if bufs is None or DRAFT_CARRY not in step.loopback_writes:
+            return
+        n = len(ctx.request_ids)
+        captured = self._cg_sampler is not None and self._step_slot is not None
+        if captured:
+            rows = bufs.loopback[DRAFT_CARRY].slot_view(*self._step_slot)[:n]
+        else:
+            rows = bufs.loopback_for(DRAFT_CARRY, list(ctx.request_ids))
+        stored = tensor_digest(rows)
+        # the step's kind decides this, alike on every rank
+        staged = captured and DRAFT_CARRY in self._staged
+        read = (
+            tensor_digest(bufs.loopback[DRAFT_CARRY].read_view(*self._step_slot)[:n]) if staged
+            else torch.zeros_like(stored)
+        )
+        lead = self._comm_group.broadcast(torch.cat([stored, read]))
+        one = torch.ones_like(stored[0])
+        tally = torch.stack([
+            one, (stored != lead[:2]).any().long(), one * int(staged), (read != lead[2:]).any().long(),
+        ])
+        self._carry_tally = tally if self._carry_tally is None else self._carry_tally + tally
+        self._carry_compares += 1
+        if self._carry_report is not None and self._carry_report[1].query():
+            self._log_carry_tally(self._carry_report[0].tolist())
+            self._carry_report = None
+        if self._carry_report is None and self._carry_compares % 64 == 0 and tally.is_cuda:
+            host = torch.empty(4, dtype=torch.long, pin_memory=True)
+            host.copy_(self._carry_tally, non_blocking=True)
+            event = torch.cuda.Event()
+            event.record()
+            self._carry_report = (host, event)
+
+    def _log_carry_tally(self, tally: list[int]) -> None:
+        steps, stored, reads, read = tally
+        (logger.warning if stored or read else logger.info)(
+            "carry digest vs rank 0 (debug, rank %d): stored carry differs on %d of %d verify and prompt steps, "
+            "staged read on %d of %d", self._comm_group.rank, stored, steps, read, reads,
+        )
+
+    def _flush_carry_tally(self) -> None:
+        """The whole tally, once the sampler holds no request: what the every-64
+        reports left out. A host read of this rank's own counts, no collective;
+        nothing of this sampler's is in flight then."""
+        self._carry_report = None
+        if self._carry_tally is not None:
+            self._log_carry_tally(self._carry_tally.tolist())
+
     def _gather_dynamic(self, ctx: StepContext, lease: SlotLease):
         """Gather the per-step RNG offset + seen-token mask (and the
         generation history, if any) into this step's slot, inline so they
@@ -683,8 +761,14 @@ class SamplerResource(Resource):
             )
         if self._history is not None:
             self._history.gather_step(ctx.request_ids, padded_bs)
+        # after the index row and on this stream, so after the previous step's commit scattered them
+        self._staged = self._graph_reads.get(ctx.graph_walk, frozenset())
+        if self._staged:
+            self._cg_buffers.stage_loopback(self._staged, cg_slot, padded_bs, index=self._step_index)
 
     def commit(self, step: SamplerStep, ctx: StepContext):
+        if self._compares_carry:
+            self._compare_carry_with_rank_0(step, ctx)
         # None on an eager step, which never gathered one
         if self._cg_buffers is None or self._cg_sampler is None:
             return
@@ -793,6 +877,13 @@ class SamplerResource(Resource):
 
     def bind_verify(self, num_draft_tokens: int) -> None:
         self.verify_draft_tokens = num_draft_tokens
+
+    def bind_graph_reads(self, walk: str, names: frozenset[str]) -> None:
+        """``walk``'s forward reads loop-back states ``names`` (`loopback_state`;
+        a drafter's carry): a leased step of it stages their rows off the masters
+        before the forward (`SamplerBuffers.stage_loopback`), so its capture
+        reads fixed rows whether or not the masters grow."""
+        self._graph_reads[walk] = self._graph_reads.get(walk, frozenset()) | names
 
     @torch.compiler.disable
     def agree(self, values: torch.Tensor) -> torch.Tensor:
@@ -905,8 +996,10 @@ class SamplerResource(Resource):
     @property
     def fixed_loopback_masters(self) -> bool:
         """Whether the loop-back masters are allocated once at their full rows
-        (the in-graph scatter): what a captured forward reading a loop-back
-        state needs, since a grown master is a new tensor its graph never sees."""
+        (the in-graph scatter), so they bound how many requests hold rows at
+        once (`Engine._check_carry_rows` warns when a pool holds more). A
+        captured forward reads none of them directly: last tokens and declared
+        states reach it staged or gathered outside the graph."""
         return self._keep_last_token and sampler_ingraph_scatter() and self._decides
 
     @property
@@ -955,6 +1048,9 @@ class SamplerResource(Resource):
             raise RuntimeError("device loop-back needs the sampler's slot masters")
         if self._cg_sampler is not None and self._step_slot is not None:
             cg_slot, padded_bs = self._step_slot
+            if name in self._staged:
+                # staged before the forward (`bind_graph_reads`)
+                return bufs.loopback[name].read_view(cg_slot, padded_bs)
             return bufs.gather_loopback(name, cg_slot, padded_bs, index=self._step_index)
         return bufs.loopback_for(name, request_ids)
 

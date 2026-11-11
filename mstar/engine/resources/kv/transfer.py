@@ -104,7 +104,8 @@ class MooncakeKVTransferEngine(KVTransferEngine):
         self._kv_cache = kv_cache
         self._transfer_engine = transfer_engine
         self._transfer_engine.register_memory(
-            kv_cache.data_ptr(), kv_cache.nbytes
+            # the primary storage, the region data_ptr addresses (a pool with others is never transferred)
+            kv_cache.data_ptr(), kv_cache.tensor.nbytes
         )
         self._transfer_info = MooncakeKVTransferInfo(
             entity_id=entity_id,

@@ -22,11 +22,14 @@ _NO_INDICES = torch.empty(0, dtype=torch.int32)
 @triton.jit
 def _gather_write_slots_kernel(
     slots_ptr, kv_len_ptr, store_ptr, page_ptr, offset_ptr,
-    STRIDE: tl.constexpr, BLOCK: tl.constexpr, PAGE: tl.constexpr, SPAN: tl.constexpr,
+    STRIDE: tl.constexpr, BLOCK: tl.constexpr, PAGE: tl.constexpr, SPAN: tl.constexpr, OFFSET: tl.constexpr = 0,
 ):
     t = tl.program_id(0)
     i = t // SPAN
     n = tl.load(kv_len_ptr + i) + t % SPAN
+    if OFFSET:
+        # a padding row (length 0) floors at its sink page's first slot
+        n = tl.maximum(n + OFFSET, 0)
     tl.store(page_ptr + t, tl.load(store_ptr + tl.load(slots_ptr + i) * STRIDE + BLOCK + n // PAGE))
     tl.store(offset_ptr + t, n % PAGE)
 
@@ -196,6 +199,28 @@ class KVResidentTables:
         slots = step.slots.repeat_interleave(span) if span > 1 else step.slots
         torch.index_select(store, 0, slots * stride + col + table.col, out=token_to_page[: bs * span])
         token_to_cache[: bs * span].copy_(at - col * page_size)
+
+    def gather_lagged(
+        self, step: CapturedResidentStep, token_to_page: torch.Tensor, token_to_cache: torch.Tensor,
+        span: int, offset: int,
+    ) -> None:
+        """One pass of a lagged layer set's write addressing (`KVStep.lag`): ``span`` tokens a row, from
+        ``offset`` past the row's length on (negative: behind it), off the lengths `gather` read this
+        step. A padding row floors at its sink page."""
+        store, table = self.planner.store, self.block_table
+        kv_len = step.buffers.kv_len[self.key]
+        bs = step.bucket.bs
+        if store.is_cuda:
+            _gather_write_slots_kernel[(bs * span,)](
+                step.slots, kv_len, store, token_to_page, token_to_cache,
+                STRIDE=table.stride, BLOCK=table.col, PAGE=self.page_size, SPAN=span, OFFSET=offset, num_warps=1,
+            )
+            return
+        at = (kv_len[:, None] + torch.arange(span, device=kv_len.device) + offset).clamp(min=0).reshape(-1)
+        col = torch.div(at, self.page_size, rounding_mode="floor")
+        slots = step.slots.repeat_interleave(span) if span > 1 else step.slots
+        torch.index_select(store, 0, slots * table.stride + col + table.col, out=token_to_page[: bs * span])
+        token_to_cache[: bs * span].copy_(at - col * self.page_size)
 
     def commit(self, step: CapturedResidentStep) -> None:
         stream = step.streams[self.key]

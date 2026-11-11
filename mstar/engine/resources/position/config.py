@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceCapabilities, ResourceReqConfig
-from mstar.engine.resources.step import ResourceStep
+from mstar.engine.resources.step import Lag, ResourceStep
 
 if TYPE_CHECKING:
     from mstar.engine.resources.base import Resource
@@ -195,5 +195,9 @@ class PositionStep(ResourceStep):
     # label -> ids for one step
     pos_ids: "dict[str, torch.Tensor] | torch.Tensor | None" = None
     advance: tuple[int, ...] | None = None  # `advance=None` means own rule
+    # a lagged reader's (`Lag`, `KVStep.lag`'s draft model): the manager also keeps each label's
+    # positions of every pass's rows less ``lag.rows``, which `pos_ids` gives during that pass. Set by
+    # the engine from the drafter's declaration (`drafter_step`), never by a submodule.
+    lag: Lag | None = None
     # no combined_labels: positions take the packing off KV's plan output,
     # so the step declares the grouping once, on KVStep

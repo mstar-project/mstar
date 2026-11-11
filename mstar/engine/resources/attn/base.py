@@ -137,6 +137,16 @@ class AttentionManager(AttentionResource):
             )
         # `shard` lives on the KVConfig base, so this is unchanged for both.
         kv_config.shard(info.head_shards)
+        if spec.config.layer_set is not None:
+            if backend != AttnBackend.FLASHINFER:
+                raise ValueError(
+                    f"attention {spec.resource_key!r} plans with layer set {spec.config.layer_set!r}'s geometry, "
+                    f"which the {backend.value} backend doesn't support yet; use the flashinfer backend"
+                )
+            # its own view, sharded by its own head counts (a set of fewer KV heads than ranks
+            # keeps one replicated head a rank, as the pool does)
+            kv_config = kv_config.geometry_of(spec.config.layer_set, spec.config.num_qo_heads)
+            kv_config.shard(info.head_shards)
         if backend == AttnBackend.DENSE:
             # A dense backend runs on FlashAttention-3 (AITER on ROCm). Where
             # that has no kernel for the GPU or does not import, the same pass
