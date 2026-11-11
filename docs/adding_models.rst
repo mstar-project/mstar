@@ -2180,7 +2180,9 @@ handled as special cases. BAGEL and Whisper use today's forms of them:
   example in ``preprocess`` before the replay. Their addressing stays an ordinary plan rather
   than the slot's static buffers, which are sized for the bucket's in-graph tokens. Whisper's
   prefill uses it to write its 1500-token encoder context while replaying a graph sized by
-  its few prompt tokens.
+  its few prompt tokens. The reads of such a step attend the pages alone, so one that needs the
+  step's own k and v (an attention through an exchange, a context-parallel pool on a multi-token
+  step, the dense backend) is refused at the first add.
 
 Only a model that hasn't moved writes ``KVStep(combined_labels=...)``. On the contract, a
 step's calls cover all of its rows in segment order.

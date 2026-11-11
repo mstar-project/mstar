@@ -94,6 +94,9 @@ class _StubAttn:
     def select_last_hidden(self, x, label="main"):
         return x[-1:]
 
+    def reads_step_kv(self, label=None):
+        return not self.requires_kv_write
+
 
 class _StubDense(_StubAttn):
     """Takes k and v at the read, as the dense backend does."""
@@ -654,6 +657,14 @@ def test_adds_outside_the_graph_write_every_layer_before_a_read_attends_the_page
     out = h.read(0, q)
     assert kv.writes == [(layer, "main") for layer in range(LAYERS)]
     assert attn.runs == [(0, "main", False)] and torch.equal(out, q + k)
+
+
+def test_an_add_outside_the_graph_is_refused_where_its_read_needs_the_steps_kv():
+    h = _kv_handle(attn=_StubDense())
+    _begin(h, kv=ArrayStep(eager_add=True))
+    _, k, v = _tensors()
+    _refused(r"Array 'kv': an eager_add step adds layer 0 outside the graph .* needs the step's own k and v",
+             lambda: h.add(0, k=k, v=v))
 
 
 @pytest.mark.parametrize("make, declared, cause", [
