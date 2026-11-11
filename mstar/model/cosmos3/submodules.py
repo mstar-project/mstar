@@ -2515,8 +2515,11 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         replay. ``num_tokens == 0`` is the padding row.
         """
         # an arbitrary split of the bucket's tokens over the regime's branches
-        n = len(regime.labels)
-        lens = {label: num_tokens // n + (i < num_tokens % n) for i, label in enumerate(regime.labels)}
+        branches = len(regime.labels)
+        lens = {
+            label: num_tokens // branches + (i < num_tokens % branches)
+            for i, label in enumerate(regime.labels)
+        }
         tensors = {}
         for label, n in lens.items():
             tensors[f"input_ids_{label}"] = torch.zeros(
@@ -2528,7 +2531,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         return ARNodeInputs(
             input_seq_len=num_tokens,
             tensor_inputs=tensors,
-            kwargs=dict(cfg=n > 1, seq_lens=lens),
+            kwargs=dict(cfg=branches > 1, seq_lens=lens),
         )
 
     # Native bf16, not the engine autocast — as forward()/forward_batched():
