@@ -33,7 +33,15 @@ def test_an_explicit_socket_prefix_is_kept(launched):
     assert _socket_prefix(launched[0]) == "/tmp/mine/"
 
 
-@pytest.mark.parametrize("flag", ["--enable-metrics", "--enable-nvtx"])
-def test_serve_passes_its_flags_to_the_server(launched, flag):
-    cli._serve(cli.build_parser().parse_args(["serve", "kokoro", flag]))
-    assert flag in launched[0]
+@pytest.mark.parametrize("flags", [
+    ["--enable-metrics"], ["--enable-nvtx"], ["--timeout", "1800.0"], ["--tcp-transfer-device", "eth1"],
+])
+def test_serve_passes_its_flags_to_the_server(launched, flags):
+    cli._serve(cli.build_parser().parse_args(["serve", "kokoro", *flags]))
+    argv = launched[0]
+    assert argv[argv.index(flags[0]):argv.index(flags[0]) + len(flags)] == flags
+
+
+def test_serve_leaves_the_server_defaults_alone(launched):
+    cli._serve(cli.build_parser().parse_args(["serve", "kokoro"]))
+    assert not {"--enable-nvtx", "--timeout", "--tcp-transfer-device"} & set(launched[0])

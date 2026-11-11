@@ -84,8 +84,13 @@ mstar serve
        Needs ``.[metrics]``.
    * - ``--enable-nvtx``
      - off
-     - Emit NVTX markers for CUDA profiling (``engine.<node>.<walk>.bs<N>``
-       ranges for an nsys capture). Disabled on XPU and CPU.
+     - Emit NVTX markers for CUDA profiling. Disabled on XPU and CPU.
+   * - ``--timeout``
+     - ``600``
+     - Per-request timeout (seconds).
+   * - ``--tcp-transfer-device``
+     - (auto)
+     - Network device for TCP tensor transport.
 
 Each model maps to a default config (override with ``--config``):
 
