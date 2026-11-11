@@ -150,12 +150,15 @@ class StepRepeats:
     def may_repeat(self, node: str, walk: str) -> bool:
         return (node, walk) in self._walks
 
-    def owes_run(self, node: str, walk: str, repeats: int, owed: bool) -> bool:
+    def owes_run(self, node: str, walks: Collection[str], repeats: int, owed: bool) -> bool:
         """Whether the next step is a run that ready rows wait for: once after a
-        step of a walk that may repeat but ran one iteration, so one narrowed to
-        1 can't keep them out. A prompt or chunk step of the node owes none."""
+        step with rows of a walk that may repeat but ran one iteration, so one
+        narrowed to 1 can't keep them out. A step of prompts and chunks alone owes none."""
         config = self._configs.get(node)
-        return config is not None and config.ready_waits and repeats == 1 and not owed and self.may_repeat(node, walk)
+        return (
+            config is not None and config.ready_waits and repeats == 1 and not owed
+            and any(self.may_repeat(node, walk) for walk in walks)
+        )
 
     def ceiling(self, speculation: Speculation, in_chain: int, loop_room: Callable[[], int]) -> int:
         """The most ``speculation``'s step can repeat. Only a chain's step whose

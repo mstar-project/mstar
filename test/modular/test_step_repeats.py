@@ -66,18 +66,19 @@ def test_a_node_the_config_names_with_no_walk_that_can_repeat_stops_the_worker()
         repeats.settle(lambda node, walk: "resource 'attn' allows one iteration a step")
 
 
-@pytest.mark.parametrize(("ready_waits", "walk", "repeats", "owed", "want"), [
-    (True, WALK, 1, False, True),   # the run the waiting rows are owed
-    (True, WALK, 1, True, False),   # once: a step narrowed to 1 can't keep them out
-    (True, WALK, 8, False, False),  # it just ran long
-    (True, "prefill", 1, False, False),  # a prompt step of the node can never repeat
-    (False, WALK, 1, False, False),  # the policy is off: today's behaviour
+@pytest.mark.parametrize(("ready_waits", "walks", "repeats", "owed", "want"), [
+    (True, [WALK], 1, False, True),   # the run the waiting rows are owed
+    (True, [WALK], 1, True, False),   # once: a step narrowed to 1 can't keep them out
+    (True, [WALK], 8, False, False),  # it just ran long
+    (True, ["prefill"], 1, False, False),  # a prompt step of the node can never repeat
+    (True, ["prefill", WALK], 1, False, True),  # a mixed step has decode rows
+    (False, [WALK], 1, False, False),  # the policy is off: today's behaviour
 ])
-def test_ready_rows_wait_only_for_the_one_run_owed(ready_waits, walk, repeats, owed, want):
+def test_ready_rows_wait_only_for_the_one_run_owed(ready_waits, walks, repeats, owed, want):
     config = RepeatConfig(max=8, ready_waits=ready_waits)
     steps = StepRepeats({NODE: config}, {})
     steps._walks.add((NODE, WALK))
-    assert steps.owes_run(NODE, walk, repeats, owed) is want
+    assert steps.owes_run(NODE, walks, repeats, owed) is want
 
 
 def test_a_device_run_starts_with_only_real_rows_live_and_keeps_a_column_an_iteration():
