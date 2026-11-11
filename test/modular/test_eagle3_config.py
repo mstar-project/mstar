@@ -6,6 +6,7 @@ import json
 import logging
 
 import pytest
+import torch
 
 from mstar.engine.resources.draft.config import DraftConfig
 from mstar.engine.resources.draft.drafter import ChunkBoundary
@@ -205,16 +206,87 @@ def test_the_built_node_drafts_with_its_eagle3_module(tmp_path):
     from mstar.model.components.eagle3 import Eagle3Drafter
 
     target, _ = write_checkpoints(tmp_path)
-    draft = tmp_path / "eagle3"
-    draft.mkdir()
-    # the CPU target's shapes (qwen3_cpu.TARGET), over a 32-token draft vocabulary
+    model = make_model(target, _cpu_eagle3(tmp_path), max_seq_len=512)
+    sub = build_submodule(model)
+    assert isinstance(sub.drafter, Eagle3Drafter) and sub.drafter is sub._modules["drafter"]
+    # k is the engine's to bind at load
+    assert bind_share(sub, 3)._block == 4
+
+
+def _cpu_eagle3(root, k: int = 3) -> dict:
+    """A config-only EAGLE-3 checkpoint at the CPU target's shapes (qwen3_cpu.TARGET), over a 32-token draft
+    vocabulary, and the draft block that names it."""
+    draft = root / "eagle3"
+    draft.mkdir(exist_ok=True)
     layer = {**SPECULATORS["transformer_layer_config"], "hidden_size": 32, "intermediate_size": 48,
              "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 16, "vocab_size": 97,
              "rope_theta": 10_000.0}
     (draft / "config.json").write_text(json.dumps(
         {**SPECULATORS, "draft_vocab_size": 32, "torch_dtype": "float32", "transformer_layer_config": layer}))
-    model = make_model(target, {"method": "eagle3", "model": str(draft), "num_draft_tokens": 3}, max_seq_len=512)
-    sub = build_submodule(model)
-    assert isinstance(sub.drafter, Eagle3Drafter) and sub.drafter is sub._modules["drafter"]
-    # k is the engine's to bind at load
-    assert bind_share(sub, 3)._block == 4
+    return {"method": "eagle3", "model": str(draft), "num_draft_tokens": k}
+
+
+def test_the_drafters_layer_writes_where_the_pool_placed_its_set_and_leaves_the_targets(tmp_path, monkeypatch):
+    """EAGLE-3's one layer names its KV layer set, and the pool places the set after the target's layers: on
+    the real CPU engine, a prompt step writes the drafter's K/V at that layer, and every target layer holds what
+    the same target writes without a drafter."""
+    import qwen3_cpu
+
+    from mstar.model.components.eagle3 import LAYER_SET
+
+    qwen3_cpu.patch_cpu(monkeypatch)
+    target, _ = qwen3_cpu.write_checkpoints(tmp_path)
+    prompt = [5, 9, 2, 7, 11, 3, 8, 4, 6]
+
+    def prefilled(draft):
+        model = qwen3_cpu.make_model(target, draft, max_seq_len=512)
+        eng = qwen3_cpu.engine(model)
+        kv = eng._resources["kv_cache"]
+        kv.kv_cache.tensor.zero_()
+        driver = qwen3_cpu.Driver(eng, model)
+        driver.add(1, prompt, 8)
+        driver.prefill([1], {1: prompt})
+        pages = torch.tensor(list(kv._streams[1]["main"].page_indices))
+        pos = torch.arange(len(prompt))
+        return kv, lambda layer: kv.kv_cache.read_tokens(
+            layer_idx=layer, page_idx=pages[pos // qwen3_cpu.PAGE], cache_idx=pos % qwen3_cpu.PAGE)
+
+    kv, drafted = prefilled(_cpu_eagle3(tmp_path))
+    _, plain = prefilled(None)
+    first = kv.layer_set(LAYER_SET).first
+    assert first == qwen3_cpu.TARGET["num_hidden_layers"]
+    for layer in range(first):
+        assert torch.equal(drafted(layer), plain(layer)), layer
+    assert (drafted(first).abs().sum(dim=(1, 2, 3)) > 0).all()
+
+
+def test_the_node_stores_the_carry_its_hosted_drafters_prefill_returns(tmp_path, monkeypatch):
+    """A prompt step's drafter pass returns each prompt's first carry, which the Qwen3 node stores as the
+    sampler's `DRAFT_CARRY` for the request, where its first verify step reads it."""
+    import qwen3_cpu
+
+    from mstar.engine.resources.draft.drafter import DRAFT_CARRY
+    from mstar.model.components.eagle3 import Eagle3Drafter
+
+    qwen3_cpu.patch_cpu(monkeypatch)
+    returned = []
+    real = Eagle3Drafter.prefill
+
+    def recording(self, inputs):
+        carry = real(self, inputs)
+        returned.append(carry.clone())
+        return carry
+
+    monkeypatch.setattr(Eagle3Drafter, "prefill", recording)
+    target, _ = qwen3_cpu.write_checkpoints(tmp_path)
+    model = qwen3_cpu.make_model(target, _cpu_eagle3(tmp_path), max_seq_len=512)
+    eng = qwen3_cpu.engine(model)
+    driver = qwen3_cpu.Driver(eng, model)
+    prompts = {1: [5, 9, 2, 7, 11, 3], 2: [17, 4, 8]}
+    for rid, prompt in prompts.items():
+        driver.add(rid, prompt, 8)
+    driver.prefill([1, 2], prompts)
+    (carry,) = returned
+    assert carry.shape[0] == 2 and carry.abs().sum() > 0
+    stored = eng._resources["sampler"].loopback_state(DRAFT_CARRY, [1, 2])
+    assert torch.equal(stored[:2].to(carry.dtype), carry)
