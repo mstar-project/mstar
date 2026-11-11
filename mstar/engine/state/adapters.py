@@ -36,7 +36,7 @@ from mstar.engine.resources.recurrent.config import (
 from mstar.engine.resources.sampler.config import SamplerSpec, SamplerStep, SamplingReqConfig
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
 from mstar.engine.resources.step import Segment, SubmoduleStep
-from mstar.engine.state.analysis import position_key
+from mstar.engine.state.analysis import both_sharded, position_key
 from mstar.engine.state.calls import ArrayHandle, SamplerHandle
 from mstar.engine.state.contract import (
     EMPTY,
@@ -60,7 +60,7 @@ from mstar.engine.state.contract import (
     is_value,
 )
 from mstar.engine.state.host_fields import HostFields, is_host_value
-from mstar.model.components.diffusion.attention import joint_attention, sdpa_attention
+from mstar.model.components.diffusion.attention import FrameSDPA, joint_attention, sdpa_attention
 from mstar.model.components.distributed.sequence_parallel import (
     attention_over_sharded_keys,
     sp_seq_split,
@@ -549,7 +549,7 @@ class WithinStepAttend(OpBinding, ABC):
             raise _no_layout(array, f"reads[{key!r}].walks must be None, since a read within a step has no walk")
 
     @abstractmethod
-    def attend(self, run: Any, label: str) -> Callable[..., torch.Tensor]:
+    def attend(self, run: Any, label: str, rows: "RowLayout") -> Callable[..., torch.Tensor]:
         """The attention over rows of one length that the read's exchange runs, where ``run`` is what `bind` gave."""
 
 
@@ -559,7 +559,7 @@ class RaggedAttend(WithinStepAttend):
     kernel_settings = frozenset({"max_segments_per_request", "max_segments_per_step", "compile_op", "workspace_mb"})
     plans = True
 
-    def attend(self, run: Any, label: str) -> Callable[..., torch.Tensor]:
+    def attend(self, run: Any, label: str, rows: "RowLayout") -> Callable[..., torch.Tensor]:
         return functools.partial(joint_attention, ragged=functools.partial(run.run, label=label))
 
 
@@ -577,8 +577,8 @@ class SdpaAttend(WithinStepAttend):
     def bind(self, array: Array, key: str, resources: Mapping[str, Any]) -> Any:
         return sdpa_attention
 
-    def attend(self, run: Any, label: str) -> Callable[..., torch.Tensor]:
-        return run
+    def attend(self, run: Any, label: str, rows: "RowLayout") -> Callable[..., torch.Tensor]:
+        return rows.sdpa(run)
 
 
 class LinearAttnBinding(OpBinding):
@@ -811,6 +811,81 @@ class HostValueHandle(ArrayHandle):
         return fields
 
 
+class RowLayout(ABC):
+    """How a within-step read's rows hold a step's segments. Its handle picks one at bind, from the read."""
+
+    # whether a step that lists the array opens, whatever the read's binding
+    must_open: ClassVar[bool]
+
+    def __init__(self, handle: "WithinStepHandle"):
+        self._handle = handle
+
+    @abstractmethod
+    def begin(self, segments: Sequence[Segment], world_size: int | None) -> list[int] | None:
+        """Take a step's ``segments``, and give each rank's share of a row under a Ulysses exchange over
+        ``world_size`` ranks, None with no exchange."""
+
+    @abstractmethod
+    def end(self) -> None:
+        """Drop what the step's segments gave."""
+
+    def sdpa(self, run: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]:
+        """The SDPA a read on these rows runs, given ``run`` over whole rows."""
+        return run
+
+
+class SpanRows(RowLayout):
+    """A row a segment, all of one span."""
+
+    must_open = False
+
+    def begin(self, segments: Sequence[Segment], world_size: int | None) -> list[int] | None:
+        if world_size is None:
+            return None
+        spans = {s.span for s in segments}
+        if len(spans) > 1:
+            raise self._handle._no_layout(f"a Ulysses exchange over spans {sorted(spans)}, and mixed lengths need a "
+                                          "permutation in the unpack")
+        return sp_seq_split(spans.pop(), world_size) if spans else None
+
+    def end(self) -> None:
+        """A span row keeps nothing of its step."""
+
+
+class SegmentedRows(RowLayout):
+    """A request's segments end to end in one row (`Read.segmented`), which SDPA attends within each segment of."""
+
+    must_open = True
+
+    def __init__(self, handle: "WithinStepHandle"):
+        super().__init__(handle)
+        self._frames = FrameSDPA()
+        self._frames.lengths = None
+        # One callable per array, as the handle's attend is. The disable keeps the spans out of a compiled caller's
+        # guards, so its blocks don't retrace per layout.
+        self._split = functools.partial(joint_attention, ragged=torch.compiler.disable(self._run))
+
+    def begin(self, segments: Sequence[Segment], world_size: int | None) -> list[int] | None:
+        if len({s.request_id for s in segments}) > 1:
+            raise self._handle._no_layout("a segmented read in a step of several requests, whose rows need a split "
+                                          "each")
+        self._frames.lengths = [s.span for s in segments]
+        if world_size is None or not segments:
+            return None
+        return sp_seq_split(sum(self._frames.lengths), world_size)
+
+    def end(self) -> None:
+        self._frames.lengths = None
+
+    def sdpa(self, run: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]:
+        return self._split
+
+    def _run(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        if self._frames.lengths is None:
+            raise self._handle._refusal("read in a step that doesn't list the array")
+        return self._frames.run(q, k, v)
+
+
 class WithinStepHandle(ArrayHandle):
     """The calls on an array with ``max_len`` 0, which a block compiled alone traces. With ``compile_op`` set, the read
     stays in that graph through ``mstar::ragged_attention``. A check here runs only while not compiling: it would guard
@@ -839,14 +914,16 @@ class WithinStepHandle(ArrayHandle):
         sharded = sp_group is not None and sp_group.world_size > 1
         self._keys_sharded = sharded and array.seq_sharded
         self._queries_sharded = sharded and (array if queried is None else queried).seq_sharded
+        self._ulysses = sharded and both_sharded(array, array if queried is None else queried)
+        self._rows = (SegmentedRows if read.segmented else SpanRows)(self)
         # A read on SDPA plans nothing, so a step needs to run for it only to learn a Ulysses exchange's rank sizes.
-        self.needs_step = self._plans or (self._keys_sharded and self._queries_sharded)
+        self.needs_step = self._plans or self._rows.must_open or self._ulysses
         self._seq_sizes: list[int] | None = None
         # Both sides fix the plan's label, so it is one string for the life of the handle. See `cross_label`.
         self._plan_label = min(array.labels) if queried is None else cross_label(min(queried.labels), min(array.labels))
         # One callable per array, not per layer: Dynamo specializes `ulysses_attention` on the identity of the callable
         # it runs, so a callable per layer would retrace that frame per layer.
-        self._attend = self._binding.attend(self.first_read, self._plan_label)
+        self._attend = self._binding.attend(self.first_read, self._plan_label, self._rows)
 
     def begin_step(self, step) -> None:
         super().begin_step(step)
@@ -858,12 +935,11 @@ class WithinStepHandle(ArrayHandle):
             if [s.request_id for s in queries] != [s.request_id for s in segments]:
                 raise self._refusal(f"its segments and those of {self.queried.name!r}, which lay out its queries, must "
                                     "name the same requests in the same order, with one segment to one")
-        if self._keys_sharded and self._queries_sharded:
-            spans = {s.span for s in segments}
-            if len(spans) > 1:
-                raise self._no_layout(f"a Ulysses exchange over spans {sorted(spans)}, and mixed lengths need a "
-                                      "permutation in the unpack")
-            self._seq_sizes = sp_seq_split(spans.pop(), self._sp.world_size) if spans else None
+        self._seq_sizes = self._rows.begin(segments, self._sp.world_size if self._ulysses else None)
+
+    def end_step(self, step) -> None:
+        super().end_step(step)
+        self._rows.end()
 
     def check_step(self, step) -> None:
         """Every add is scratch, so a step keeps none and has nothing to refuse as a whole."""
@@ -910,7 +986,7 @@ class WithinStepHandle(ArrayHandle):
             if not self._packed:
                 raise self._refusal("packed queries on a read declared packed=False")
             return self.first_read.run(q, k, v, label=self._plan_label)
-        if self._keys_sharded and self._queries_sharded:
+        if self._ulysses:
             return ulysses_attention(self._sp, q, k, v, self._attend, self._seq_sizes, seq_dim=1, head_dim=2)
         if self._keys_sharded:
             return attention_over_sharded_keys(self._sp, q, k, v, self._attend)
@@ -1107,7 +1183,7 @@ class WithinStepStorage(Storage):
             config = RaggedAttentionConfig(
                 num_qo_heads=read.op.q_heads, num_kv_heads=heads, head_dim=head_dim, dtype=dtype,
                 # the heads narrow by SP only where the exchange runs over them
-                shard_over_sp=not array.nodes & sharded_nodes or (array.seq_sharded and queried.seq_sharded),
+                shard_over_sp=not array.nodes & sharded_nodes or both_sharded(array, queried),
             )
             spec_class = RaggedAttentionSpec if read.queries is None else RaggedCrossAttentionSpec
             spec = spec_class(resource_key=key, nodes=array.nodes, config=config)

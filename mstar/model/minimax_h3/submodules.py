@@ -27,13 +27,13 @@ from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.communication import CommGroup
 from mstar.engine.resources import AttentionStep, Segment, SubmoduleStep
 from mstar.model.components.batched_rows import BatchedRows
-from mstar.model.components.diffusion.attention import joint_attention, sdpa_attention
+from mstar.model.components.diffusion.attention import FrameSDPA, joint_attention, sdpa_attention
 from mstar.model.components.diffusion.compile_utils import compile_blocks as compile_blocks_
 from mstar.model.components.diffusion.denoise_loop import DenoiseLoopSubmodule, StepScalar
 from mstar.model.components.diffusion.qwen3.encoder import qwen3_inv_freq
 from mstar.model.components.diffusion.qwen3.vl_prompt import qwen3_vl_prompt
 from mstar.model.components.qwen3_vit import vision_interpolation, vision_position_ids, vision_seq_lengths
-from mstar.model.components.qwen_vision import VISION_ATTN, FrameSDPA, QwenVisionModel
+from mstar.model.components.qwen_vision import VISION_ATTN, QwenVisionModel
 from mstar.model.minimax_h3.components.layout import (
     H3Layout,
     modality_tags,

@@ -49,6 +49,12 @@ def position_key(array: Array) -> str:
     return f"{array.name.removesuffix('_kv')}_pos" if array.name.endswith("_kv") else "rope"
 
 
+def both_sharded(array: Array, queried: Array) -> bool:
+    """Whether a read of ``array``, with ``queried`` laying out its queries, runs a Ulysses exchange under sequence
+    parallelism, which narrows its heads."""
+    return array.seq_sharded and queried.seq_sharded
+
+
 def _name_problems(arrays: Sequence[Array], samplers: Sequence[Sampler]) -> list[str]:
     """Names share one namespace while they are resource keys, so a read can't reuse an array's name."""
     problems: list[str] = []
@@ -192,7 +198,7 @@ def deployment_problems(
     for array in arrays.values():
         for key, read in array.reads.items():
             shards = max((head_shards.get(node, 1) for node in array.nodes), default=1)
-            if array.seq_sharded and arrays.get(read.queries, array).seq_sharded and read.op.q_heads % shards:
+            if both_sharded(array, arrays.get(read.queries, array)) and read.op.q_heads % shards:
                 problems.append(f"Array {array.name!r}.reads[{key!r}]: q_heads {read.op.q_heads} doesn't divide by "
                                 f"{shards}, TP times SP, which a read sharded on both sides narrows its heads by")
     return problems
