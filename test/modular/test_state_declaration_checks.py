@@ -453,6 +453,17 @@ def test_a_combined_walk_whose_walks_read_a_layer_with_two_masks_is_refused(mask
         ]
 
 
+def test_a_combined_walk_whose_walks_read_different_layers_is_refused():
+    """The step would read layer 2 for its 'decode' rows, whose walk has no read there."""
+    array = _array(reads={
+        "attn": _read(walks={"prefill"}), "attn_short": _read(walks={"decode"}, layers={0, 1}),
+    })
+    assert _one_problem(array, combined={"LLM": {"mixed": {"prefill", "decode"}}}) == (
+        "Array 'kv': combined walk 'mixed' runs 'prefill', which reads layer 2, and 'decode', which doesn't; a "
+        "combined step reads each layer for all its rows"
+    )
+
+
 @pytest.mark.parametrize("arrays, where, cause", [
     ((_cross(queries="nothing"),), "reads['text_attn'].queries", "'nothing' is not a declared array"),
     ((_within("video", nodes={"vision"}), _cross()), "reads['text_attn'].queries", "isn't on nodes ['LLM']"),

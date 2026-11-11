@@ -265,7 +265,8 @@ def _read_problems(array: Array, walks: Mapping[str, set[str]], combined: set[st
 
 
 def _combined_walk_problems(array: Array, combined: Mapping[str, Collection[str]]) -> list[str]:
-    """A combined walk's rows read by their own walks, and a combined step plans one mask per resource."""
+    """A combined walk's rows read by their own walks, and a combined step reads each layer for all its rows, with one
+    mask per resource."""
     if not reads_differ_by_walk(array):
         return []
     problems: list[str] = []
@@ -282,6 +283,14 @@ def _combined_walk_problems(array: Array, combined: Mapping[str, Collection[str]
                     f"Array {array.name!r}: combined walk {walk!r} runs {one!r} through reads[{key!r}] "
                     f"({type(mask).__name__}) and {other!r} through reads[{other_key!r}] ({type(other_mask).__name__}) "
                     f"on layer {layer}; a combined step plans one mask per resource"
+                )
+                break
+            readers = {member for member, _, _ in reads}
+            if readers and readers != set(members):
+                problems.append(
+                    f"Array {array.name!r}: combined walk {walk!r} runs {min(readers)!r}, which reads layer {layer}, "
+                    f"and {min(set(members) - readers)!r}, which doesn't; a combined step reads each layer for all its "
+                    "rows"
                 )
                 break
     return problems
