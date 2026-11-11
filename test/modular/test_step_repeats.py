@@ -298,20 +298,33 @@ def test_the_link_libraries_are_looked_for_next_to_nvrtc_before_the_toolkit(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="compiles and launches the stop kernel")
-def test_the_stop_kernel_links_to_sass_and_marks_the_rows_that_sampled_a_stop_id():
-    """``load_kernels`` compiles for the device's arch and links with nvJitLink, with no JIT of PTX by the driver."""
-    state = RunState(3, 4, {2}, torch.device("cuda"))
-    state.stage((0, 1, 2), [False] * 3, 4, None)
+@pytest.mark.parametrize("bs", [3, 130, 1100])  # a warp, several, more than one block holds
+def test_the_stop_kernel_links_to_sass_and_marks_the_rows_that_sampled_a_stop_id(bs):
+    """``load_kernels`` compiles for the device's arch and links with nvJitLink, with no JIT of PTX by the
+    driver; a thread a row marks each row, an immune row never, and the run goes on while any row is live."""
+    state = RunState(bs, 4, {2}, torch.device("cuda"))
+    real = bs - 1  # the last row pads
+    state.stage(tuple(range(real)), [row == 1 for row in range(real)], 4, None)
     stream = torch.cuda.current_stream().cuda_stream
     cuda = CudaWhile()
+    tokens = torch.ones(bs, 2, dtype=torch.long, device="cuda")  # a stride of 2: the token is column 0
+    tokens[::2, 0] = 2
 
-    cuda.stop(state, torch.tensor([1, 2, 3], device="cuda"), stream)
+    cuda.stop(state, tokens, stream)
     torch.cuda.synchronize()
-    assert (state.marks.tolist(), state.index.item(), state.continuation.item()) == ([False, True, False], 1, 1)
+    want = [row % 2 == 0 or row == real for row in range(bs)]
+    assert (state.marks.tolist(), state.index.item(), state.continuation.item()) == (want, 1, 1)
 
-    cuda.stop(state, torch.tensor([2, 2, 2], device="cuda"), stream)
+    tokens[:, 0] = 2
+    cuda.stop(state, tokens, stream)
     torch.cuda.synchronize()
-    assert (state.marks.tolist(), state.index.item(), state.continuation.item()) == ([True] * 3, 2, 0)
+    assert state.marks.tolist() == [row != 1 for row in range(bs)], "the immune row is never marked"
+    assert (state.index.item(), state.continuation.item()) == (2, 1), "it keeps the run going"
+
+    for _ in range(2):
+        cuda.stop(state, tokens, stream)
+    torch.cuda.synchronize()
+    assert (state.index.item(), state.continuation.item()) == (4, 0), "the limit ends it"
 
 
 class _CudaRun:

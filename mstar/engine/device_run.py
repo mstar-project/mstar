@@ -35,18 +35,25 @@ extern "C" __global__ void run_stop(
     const unsigned char* immune, unsigned char* marks,
     long long* index, const long long* limit, long long* continuation
 ) {
-    int done = 0;
-    for (int row = 0; row < rows; ++row) {
-        if (!immune[row]) {
-            for (int i = 0; i < num_ids; ++i) {
-                if (tokens[row * stride] == stop_ids[i]) marks[row] = 1;
-            }
+    // a thread a row; a block wider than the device allows strides
+    int live = 0;
+    for (int row = threadIdx.x; row < rows; row += blockDim.x) {
+        unsigned char mark = marks[row];
+        if (!mark && !immune[row]) {
+            long long token = tokens[row * stride];
+            for (int i = 0; i < num_ids; ++i) mark |= token == stop_ids[i];
+            if (mark) marks[row] = 1;
         }
-        done += marks[row];
+        live |= !mark;
     }
-    long long next = *index + 1;
-    *index = next;
-    *continuation = done < rows && next < *limit ? 1 : 0;
+    // a barrier as well as the vote: every row is decided before thread 0,
+    // alone, reads and moves the index and sets the continuation
+    live = __syncthreads_or(live);
+    if (threadIdx.x == 0) {
+        long long next = *index + 1;
+        *index = next;
+        *continuation = live && next < *limit ? 1 : 0;
+    }
 }
 
 extern "C" __global__ void set_graph_condition(
@@ -132,6 +139,8 @@ class RunState:
 
 
 _KERNELS: dict[int, tuple[ctypes.c_void_p, ctypes.c_void_p]] = {}
+# the most threads a CUDA block holds
+_MAX_BLOCK = 1024
 
 
 class _DlInfo(ctypes.Structure):
@@ -285,7 +294,7 @@ class CudaWhile:
         return _KERNELS[device]
 
     def stop(self, state: RunState, tokens: torch.Tensor, stream: int) -> None:
-        """Inside the step's capture: ``run_stop`` on ``stream``."""
+        """Inside the step's capture: ``run_stop`` on ``stream``, a thread a row."""
         row = tokens.reshape(len(state.marks), -1)
         values = [
             ctypes.c_void_p(row.data_ptr()), ctypes.c_int(row.stride(0)), ctypes.c_int(len(state.marks)),
@@ -295,8 +304,10 @@ class CudaWhile:
             ctypes.c_void_p(state.continuation.data_ptr()),
         ]
         args = (ctypes.c_void_p * len(values))(*(ctypes.cast(ctypes.byref(v), ctypes.c_void_p) for v in values))
+        # one block, a thread a row of the capture: flat in the batch size
+        threads = min(len(state.marks), _MAX_BLOCK)
         self._driver_call(
-            "cuLaunchKernel", self.load_kernels()[0], 1, 1, 1, 1, 1, 1, 0, ctypes.c_void_p(stream), args, None,
+            "cuLaunchKernel", self.load_kernels()[0], 1, 1, 1, threads, 1, 1, 0, ctypes.c_void_p(stream), args, None,
         )
 
     def node_refusal(self, step_graph: int) -> str | None:
