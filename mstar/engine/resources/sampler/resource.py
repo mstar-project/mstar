@@ -890,8 +890,9 @@ class GrammarSamplerResource(SamplerResource):
         self._grammar = GrammarRows(text_output, vocab_size, device, grammar_cache_mb << 20)
         self._grammar_stager = PinnedStager(torch.int32)
         # The mask this step applies (None: none), with its rows and slot (None: eager), the static
-        # mask buffer of each cg slot the captures apply, the slots holding a constrained row's mask,
-        # and an eager step's drawn tokens (a captured step's are its slot's last-token row).
+        # mask buffer of each cg slot the captures apply (shared by the slot's buckets), the slots
+        # holding a constrained row's mask in any row, and an eager step's drawn tokens (a captured
+        # step's are its slot's last-token row).
         self._grammar_mask: torch.Tensor | None = None
         self._grammar_rids: tuple = ()
         self._grammar_slot: int | None = None
@@ -1013,7 +1014,9 @@ class GrammarSamplerResource(SamplerResource):
             if slot is not None:
                 self._grammar_dirty.add(slot)
         elif slot in self._grammar_dirty:
-            self._grammar_mask.fill_(-1)
+            # the whole buffer: every bucket on the slot shares it, and a larger one
+            # than this step's may have left a mask past this step's rows
+            self._grammar_masks[slot].fill_(-1)
             self._grammar_dirty.discard(slot)
 
     def commit(self, step: SamplerStep, ctx: StepContext):

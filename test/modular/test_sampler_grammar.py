@@ -136,6 +136,19 @@ def test_a_replay_commits_the_draw_of_the_graph_it_replays():
     assert res.sample([0], logits)[0].item() == b, "the grammar advanced by another graph's draw"
 
 
+def test_a_smaller_bucket_on_a_slot_leaves_no_mask_for_a_larger_one():
+    """The buckets of one slot share its mask buffer: a constrained row's mask in a
+    row a smaller bucket doesn't cover is gone before a larger bucket applies it."""
+    res = _resource(graph=True)
+    res.ingest_request("c", SamplingReqConfig(grammar=grammar_request({"choice": ["ab"]})))
+    step = SamplerStep(apply_penalty=False)
+    for rids in (("f0", "f1", "f2", "c"), ("f0", "f1"), ("f0", "f1", "f2", "f3")):
+        lease = SlotLease(slot=0, bucket=SimpleNamespace(bs=len(rids)))
+        res.plan(step, StepContext(request_ids=rids, graph_walk="w", slot=0, capture=False, slot_lease=lease))
+        res._fill_grammar()
+    assert (res._grammar_masks[0] == -1).all(), "a free row was masked by another request's grammar"
+
+
 class _Pool(StubResource):
     """A KV pool with room for every request, which each new request asks."""
 
