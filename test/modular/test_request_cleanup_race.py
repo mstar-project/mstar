@@ -21,11 +21,17 @@ from mstar.communication.tensor_store import PythonTensorBookkeeping, RustTensor
 from mstar.conductor.conductor import Conductor, RequestData
 from mstar.distributed.base import ShardingConfig
 from mstar.graph.base import GraphEdge
-from mstar.utils.containers import RecentSet
-from mstar.utils.ipc_format import ConductorMessageType, DrainRequest, InputSignals, ReadsDone, WorkerMessageType
+from mstar.testing_utils.worker import deliver, make_worker
+from mstar.utils.ipc_format import (
+    ConductorMessageType,
+    DrainRequest,
+    InputSignals,
+    ReadsDone,
+    WorkerMessage,
+    WorkerMessageType,
+)
 from mstar.worker.rid_table import RidTable
 from mstar.worker.stream_buffers import StreamBufferManager
-from mstar.worker.worker import Worker
 
 
 class _CheckedCopyEngine(tensors.LocalTransferEngine):
@@ -112,34 +118,22 @@ class _Recorder:
 
 
 def _worker(entity_id, manager, rid_table):
-    w = Worker.__new__(Worker)
-    w.worker_id = entity_id
-    w.is_tp_follower = False
-    w._in_flight_rids = set()
-    w._lockstep_led = frozenset()
-    w._removes_awaiting_step = {}
-    w._pending_removes = {}
-    w._draining_rids = set()
-    w._pending_drains = set()
-    w._reads_done_sent = set()
-    w._removed_rids = RecentSet(16)
-    w._unprocessed_messages = {}
-    w.streaming_buffers = {}
-    w.communicator = manager.communicator
-    w.tensor_manager = manager
-    w._graph_runtime = SimpleNamespace(
+    runtime = SimpleNamespace(
         get_rid_handle=rid_table.handle, get_rid_string=rid_table.name,
         get_sharding_config=lambda handle: SimpleNamespace(groups=[]),
         remove_request=rid_table.release,
     )
-    w.engine_manager = SimpleNamespace(remove_request=lambda handle: None)
-    w.request_state = SimpleNamespace(remove_request=lambda handle: None)
-    w.streams = StreamBufferManager(w.request_state, manager, [])
-    w.profile_info = SimpleNamespace(pop_request=lambda handle: None)
-    w.scheduler = SimpleNamespace(
-        clear_rid=lambda handle, wire_id: None, fail_rids=lambda handles: None,
-        pending_tp_follow_count={},
+    handle = rid_table.handle("request")
+    requests = {handle: SimpleNamespace(stream_buffers={})}
+    request_state = SimpleNamespace(per_request_info=requests, remove_request=requests.pop)
+    w = make_worker(
+        worker_id=entity_id, graph_runtime=runtime, communicator=manager.communicator,
+        tensor_manager=manager, request_state=request_state,
+        engine_manager=SimpleNamespace(remove_request=lambda handle: None),
+        streams=StreamBufferManager(request_state, manager, []),
+        scheduler=SimpleNamespace(clear_rid=lambda handle: None, drop_backlogged=lambda handles: None),
     )
+    w.lifecycle.add(handle, "request")
     return w
 
 
@@ -156,6 +150,7 @@ def _conductor():
     c._early_reads_done = {}
     c._drain_ttl_s = 120
     c._draining_deadlines = deque()
+    c._early_reads_done_deadlines = deque()
     c._try_admit_waiting = lambda: None
     return c
 
@@ -233,19 +228,19 @@ def test_successful_cleanup_does_not_invalidate_a_read(
             future.result(timeout=5)
             assert receiver.get_ready_tensors()
             for _, ack in receiver.communicator.sent:
-                workers["w0"]._handle_tensor_received(ack.body)
+                deliver(workers["w0"], ack)
             receiver.communicator.sent.clear()
 
         if read_timing != "after-completion":
             c._process_request_done("request")
         c._handle_reads_done(ReadsDone(request_id="request", entity_id=c.PREPROCESS_WORKER))
         drains = {
-            entity: msg.body for entity, msg in c.communicator.sent
+            entity: msg for entity, msg in c.communicator.sent
             if msg.message_type == WorkerMessageType.DRAIN_REQUEST
         }
         for entity in teardown_order:
             if entity in drains:
-                workers[entity]._drain_request(drains[entity])
+                deliver(workers[entity], drains[entity])
 
         def deliver_reads_done():
             for manager in managers.values():
@@ -266,31 +261,34 @@ def test_successful_cleanup_does_not_invalidate_a_read(
             engine.resume.set()
             future.result(timeout=5)
             assert receiver.get_ready_tensors()
-            workers["w1"]._apply_pending_drains(set())
+            workers["w1"].pipeline._apply_drains(set())
             deliver_reads_done()
 
         # Until READS_DONE, a committed TP step may still need a late input.
         # After the ACK, the real handler must not start any additional read.
         if "w1" in drains:
-            assert "request" in workers["w1"]._reads_done_sent
+            assert not workers["w1"].lifecycle.takes_input("request")
             pending = list(receiver.pending)
-            workers["w1"]._process_new_inputs(InputSignals(
-                request_id="request", inputs=[edge], request_info=None,
+            deliver(workers["w1"], WorkerMessage(
+                WorkerMessageType.INPUT_SIGNALS,
+                InputSignals(request_id="request", inputs=[edge], request_info=None),
             ))
             assert receiver.pending == pending
 
         removals = {
-            entity: msg.body for entity, msg in c.communicator.sent
+            entity: msg for entity, msg in c.communicator.sent
             if msg.message_type == WorkerMessageType.REMOVE_REQUEST
         }
         assert set(removals) == {"w0", "w1", c.PREPROCESS_WORKER}
         assert "request" not in c.requests
         for entity in teardown_order:
-            workers[entity]._remove_request(removals[entity])
+            deliver(workers[entity], removals[entity])
             assert tables[entity].handle("request") is None
-            workers[entity]._drain_request(DrainRequest(request_id="request"))
-            assert not workers[entity]._draining_rids
-            assert not workers[entity]._reads_done_sent
+            deliver(workers[entity], WorkerMessage(
+                WorkerMessageType.DRAIN_REQUEST, DrainRequest(request_id="request"),
+            ))
+            assert not workers[entity].lifecycle.teardowns_pending()
+            assert not workers[entity].lifecycle._reads_done_sent
 
         engine.resume.set()
         try:
@@ -309,7 +307,7 @@ def test_successful_cleanup_does_not_invalidate_a_read(
             reused = tables[entity].intern("next-request")
             assert reused == old_handle
             assert not managers[entity].has_inflight_reads(reused)
-            assert workers[entity]._takes_input("next-request")
+            assert workers[entity].lifecycle.takes_input("next-request")
     finally:
         engine.resume.set()
         for manager in managers.values():

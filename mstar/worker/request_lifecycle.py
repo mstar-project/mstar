@@ -67,9 +67,10 @@ class RequestLifecycle:
         # has consumed it, since rank 0 released their pages between two steps.
         self._removes_awaiting_step: dict[int, list[int]] = {}
 
-        # Drains (completion, abort or failure). Waiting for no step to hold the rid; taking no new
-        # work until the remove; and having sent READS_DONE, after which no read
-        # starts. Keyed by the wire string: a drain can precede the NEW_REQUEST.
+        # Drains on completion, abort or failure: waiting for no step to hold
+        # the rid; taking no new work until the remove; and having sent
+        # READS_DONE, after which no read starts. Keyed by the wire string:
+        # a drain can precede the NEW_REQUEST.
         self.pending_drains: set[str] = set()
         self.draining: set[str] = set()
         self._reads_done_sent: set[str] = set()
@@ -193,10 +194,10 @@ class RequestLifecycle:
     # -- drains --------------------------------------------------------------
 
     def drain(self, body: DrainRequest) -> None:
-        """A DRAIN. A follower honors only the leader's forward, like a remove,
-        but for a request never admitted here: the conductor sends a NEW_REQUEST
-        ahead of its drain on one FIFO socket, so the leader has no handle either
-        and forwards nothing."""
+        """Record a DRAIN unless the request was already removed. A follower
+        honors only the leader's forward, except for a request never admitted
+        here: the conductor sends NEW_REQUEST ahead of its drain on one FIFO
+        socket, so the leader has no handle either and forwards nothing."""
         # A drain on another socket can arrive after the request's removal.
         if body.request_id in self._removed:
             return

@@ -127,7 +127,7 @@ class Lockstep:
         # -- follower --
         self._follow_fifo: deque[ScheduleTPNode] = deque()
         # WIRE STRING -> number of committed (ZMQ received) follow steps still
-        # queued. On the fail/abort path these drain before ACKing READS_DONE, so
+        # queued. These drain before ACKing READS_DONE on every teardown path, so
         # the worker graph queues aren't torn down while a follow still needs to
         # pop from them.
         #

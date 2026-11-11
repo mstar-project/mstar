@@ -36,8 +36,14 @@ from mstar.communication.tensors import (
     create_tensor_communication_manager,
 )
 from mstar.graph.base import GraphEdge, TensorPointerInfo
-from mstar.testing_utils.worker import make_worker
-from mstar.utils.ipc_format import ConductorMessageType, WorkerMessageType
+from mstar.testing_utils.worker import deliver, make_worker
+from mstar.utils.ipc_format import (
+    ConductorMessageType,
+    DrainRequest,
+    RemoveRequest,
+    WorkerMessage,
+    WorkerMessageType,
+)
 
 
 class _Communicator(BaseCommunicator):
@@ -628,7 +634,7 @@ def test_an_unresolved_read_holds_the_drain_until_removal(engine, where, bookkee
     """
     from mstar.communication.tensor_store import PythonTensorBookkeeping, RustTensorBookkeeping, TensorStore
     from mstar.worker.rid_table import RidTable
-    from mstar.worker.worker import Worker
+    from mstar.worker.stream_buffers import StreamBufferManager
 
     bookkeeping = PythonTensorBookkeeping
     if bookkeeper == "rust":
@@ -660,30 +666,40 @@ def test_an_unresolved_read_holds_the_drain_until_removal(engine, where, bookkee
         engine.report(src[1].data_ptr(), 9)
         mgr.get_ready_tensors()
 
-    worker = Worker.__new__(Worker)
-    worker.worker_id = "receiver"
-    worker._graph_runtime = SimpleNamespace(get_rid_handle=table.handle)
-    worker.tensor_manager = mgr
-    worker.communicator = mgr.communicator
-    worker._draining_rids = {"request"}
-    worker._reads_done_sent = set()
-    worker.scheduler = SimpleNamespace(pending_tp_follow_count={})
+    requests = {rid: SimpleNamespace(stream_buffers={})}
+    request_state = SimpleNamespace(per_request_info=requests, remove_request=requests.pop)
+    worker = make_worker(
+        worker_id="receiver", tensor_manager=mgr, communicator=mgr.communicator,
+        graph_runtime=SimpleNamespace(
+            get_rid_handle=table.handle, get_rid_string=table.name,
+            get_sharding_config=lambda handle: SimpleNamespace(groups=[]),
+            remove_request=table.release,
+        ),
+        request_state=request_state,
+        engine_manager=SimpleNamespace(remove_request=lambda handle: None),
+        streams=StreamBufferManager(request_state, mgr, []),
+        scheduler=SimpleNamespace(clear_rid=lambda handle: None, drop_backlogged=lambda handles: None),
+    )
+    worker.lifecycle.add(rid, "request")
+    deliver(worker, WorkerMessage(WorkerMessageType.DRAIN_REQUEST, DrainRequest(request_id="request")))
     for _ in range(3):
         mgr.get_ready_tensors()
-        worker._complete_drain_if_ready("request")
-        assert not worker._reads_done_sent
+        worker.pipeline._apply_drains(set())
+        assert not worker.lifecycle._reads_done_sent
         assert mgr.has_inflight_reads(rid)
     assert _never_freed(mgr) == ptrs
 
-    mgr.force_cleanup_request(rid)
-    table.release(rid)
+    # The conductor's timeout may force removal even though the read is unresolved.
+    deliver(worker, WorkerMessage(WorkerMessageType.REMOVE_REQUEST, RemoveRequest(request_id="request")))
+    assert table.handle("request") is None
+    assert not worker.lifecycle.teardowns_pending()
     assert table.intern("next") == rid
+    worker.lifecycle.add(rid, "next")
     mgr.get_ready_tensors()
     assert not mgr.has_inflight_reads(rid)
     assert mgr._kept_reads == [] and _never_freed(mgr) == ptrs
     assert engine.unregistered == []
-    worker._draining_rids = {"next"}
-    worker._complete_drain_if_ready("next")
+    deliver(worker, WorkerMessage(WorkerMessageType.DRAIN_REQUEST, DrainRequest(request_id="next")))
     [(entity, ack)] = mgr.communicator.sent
     assert entity == "conductor" and ack.message_type == ConductorMessageType.READS_DONE
     assert ack.body.request_id == "next"

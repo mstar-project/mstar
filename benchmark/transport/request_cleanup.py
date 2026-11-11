@@ -1,7 +1,8 @@
 """CPU cost of completion reports and teardown through real handlers and ZMQ.
 
-No GPU, engine resources or tensor payloads: every worker has no reads in
-flight. The API ACK is delivered locally to isolate the worker drain cost.
+No GPU, engine resources or tensor payloads: completing requests have no reads
+in flight; --other-reads adds pending reads for unrelated requests. The API ACK
+is delivered locally to isolate the worker drain cost.
 Run the same script with PYTHONPATH pointing to each checkout for an A/B.
 This measures teardown, not inference throughput or latency under GPU load.
 """
@@ -25,9 +26,9 @@ from types import SimpleNamespace
 from mstar.communication.communicator import make_communicator
 from mstar.communication.tensors import FutureAndPointers, SharedMemoryCommunicationManager
 from mstar.conductor.conductor import Conductor, RequestData
-from mstar.conductor.request_info import CurrentForwardConductorMetadata, PartitionState
+from mstar.conductor.request_info import PartitionState
 from mstar.distributed.base import ShardingConfig
-from mstar.utils.containers import RecentSet
+from mstar.testing_utils.worker import deliver, make_worker
 from mstar.utils.ipc_format import (
     ConductorMessage,
     ConductorMessageType,
@@ -35,62 +36,48 @@ from mstar.utils.ipc_format import (
     WorkerGraphsDone,
     WorkerMessageType,
 )
+from mstar.worker.input_ingest import InputIngest
+from mstar.worker.lockstep import Lockstep
+from mstar.worker.request_lifecycle import RequestLifecycle
 from mstar.worker.rid_table import RidTable
+from mstar.worker.step_pipeline import StepPipeline
 from mstar.worker.stream_buffers import StreamBufferManager
-from mstar.worker.worker import Worker
 
 
 def _worker_loop(worker_id, prefix, other_reads):
     logging.disable(logging.INFO)
     comm = make_communicator(worker_id, ["conductor"], ipc_socket_path_prefix=prefix)
     rids = RidTable()
-    w = Worker.__new__(Worker)
-    w.worker_id = worker_id
-    w.communicator = comm
-    w.is_tp_follower = False
-    w._in_flight_rids = set()
-    w._lockstep_led = frozenset()
-    w._removes_awaiting_step = {}
-    w._pending_removes = {}
-    w._draining_rids = set()
-    w._pending_drains = set()
-    w._reads_done_sent = set()
-    w._removed_rids = RecentSet(1024)
-    w._unprocessed_messages = {}
-    w.streaming_buffers = {}
-    w._graph_runtime = SimpleNamespace(
+    runtime = SimpleNamespace(
         get_rid_handle=rids.handle, get_rid_string=rids.name,
         get_sharding_config=lambda rid: SimpleNamespace(groups=[]),
         remove_request=rids.release,
     )
-    failed = set()
-    w.scheduler = SimpleNamespace(
-        fail_rids=failed.update,
-        clear_rid=lambda rid, wire_id: failed.discard(rid),
-        pending_tp_follow_count={},
-    )
-    w.tensor_manager = SharedMemoryCommunicationManager(
+    tensors = SharedMemoryCommunicationManager(
         my_entity_id=worker_id, hostname="localhost", device="cpu",
         communicator=comm, shm_dir=prefix,
     )
-    w.tensor_manager.rid_to_str = rids.name
+    tensors.rid_to_str = rids.name
+    requests = {}
+    request_state = SimpleNamespace(per_request_info=requests, remove_request=requests.pop)
+    w = make_worker(
+        worker_id=worker_id, graph_runtime=runtime, communicator=comm,
+        tensor_manager=tensors, request_state=request_state,
+        engine_manager=SimpleNamespace(remove_request=lambda rid: None),
+        streams=StreamBufferManager(request_state, tensors, []),
+        scheduler=SimpleNamespace(clear_rid=lambda rid: None, drop_backlogged=lambda rids: None),
+    )
     config = ShardingConfig(tp_enabled_nodes=set(), groups=[], shard_dim={})
     config.setup({})
     if other_reads:
         other = rids.intern("unrelated")
-        w.tensor_manager.register_request(other, config)
-        w.tensor_manager.pending = [
+        tensors.register_request(other, config)
+        tensors.pending = [
             FutureAndPointers(future=Future(), graph_edges=[], request_id=other)
             for _ in range(other_reads)
         ]
-    w.engine_manager = SimpleNamespace(remove_request=lambda rid: None)
-    w.request_state = SimpleNamespace(remove_request=lambda rid: None)
-    w.streams = StreamBufferManager(w.request_state, w.tensor_manager, [])
-    w.profile_info = SimpleNamespace(pop_request=lambda rid: None)
     remaining = 0
     started = 0
-    # Run this same harness against revisions before completion read reports.
-    reports_reads = "has_inflight_reads" in WorkerGraphsDone.__dataclass_fields__
     while True:
         for msg in comm.get_all_new_messages(blocking=True, timeout_s=30):
             if isinstance(msg, dict):
@@ -99,37 +86,36 @@ def _worker_loop(worker_id, prefix, other_reads):
                 if msg["op"] == "prepare":
                     names = msg["rids"]
                     handles = [rids.intern(name) for name in names]
-                    for handle in handles:
-                        w.tensor_manager.register_request(handle, config)
+                    for name, handle in zip(names, handles, strict=True):
+                        tensors.register_request(handle, config)
+                        requests[handle] = SimpleNamespace(stream_buffers={})
+                        w.lifecycle.add(handle, name)
                     remaining = len(names)
                     comm.send("conductor", {"op": "ready"})
                 elif msg["op"] == "complete":
                     started = time.process_time()
-                    reads = w.tensor_manager.inflight_read_rids(handles) if reports_reads else ()
-                    for name, handle in zip(names, handles, strict=True):
-                        report = (
-                            {"worker_id": worker_id, "has_inflight_reads": handle in reads} if reports_reads else {}
-                        )
+                    for name in names:
                         comm.send("conductor", ConductorMessage(
                             message_type=ConductorMessageType.WORKER_GRAPHS_DONE,
                             body=WorkerGraphsDone(
                                 request_id=name, worker_graph_ids=[0],
-                                is_first_tp_rank=worker_id == "worker_0", **report,
+                                is_first_tp_rank=worker_id == "worker_0",
                             ),
                         ))
                 else:
                     raise ValueError(msg)
             elif msg.message_type == WorkerMessageType.DRAIN_REQUEST:
-                w._drain_request(msg.body)
+                deliver(w, msg)
             elif msg.message_type == WorkerMessageType.REMOVE_REQUEST:
-                w._remove_request(msg.body)
+                deliver(w, msg)
                 remaining -= 1
                 if remaining == 0:
                     cpu_us = (time.process_time() - started) * 1e6
-                    assert not failed and not w._draining_rids
+                    assert not w.lifecycle.teardowns_pending() and not w.lifecycle.arrivals
+                    assert not requests
                     assert len(rids) == bool(other_reads)
                     comm.send("conductor", {"op": "removed", "cpu_us": cpu_us})
-        w._apply_pending_drains(set())
+        w.pipeline._apply_drains(set())
 
 
 class _ApiLoopback:
@@ -166,8 +152,7 @@ def _wave(c, comm, workers, concurrency, sequence):
             worker_graph_to_workers={0: workers}, all_worker_graph_ids={0},
             max_output_tokens=1, random_seed=0, resource_configs={},
             partition_states={"default": PartitionState(
-                partition_name="default",
-                metadata=CurrentForwardConductorMetadata(graph_walk="decode", is_prefill=False),
+                partition_name="default", graph_walk="decode",
                 current_worker_graph_ids={0},
             )},
         )
@@ -230,6 +215,7 @@ def main():
             c._client_streams = {}
             c._drain_ttl_s = 120
             c._draining_deadlines = deque()
+            c._early_reads_done_deadlines = deque()
             c._try_admit_waiting = lambda: None
             results = {
                 "platform": platform.platform(), "cpu": platform.processor(),
@@ -242,7 +228,10 @@ def main():
                 cls.__name__: {
                     "path": inspect.getfile(cls),
                     "sha256": hashlib.sha256(Path(inspect.getfile(cls)).read_bytes()).hexdigest(),
-                } for cls in (Conductor, Worker, SharedMemoryCommunicationManager, WorkerGraphsDone)
+                } for cls in (
+                    Conductor, InputIngest, RequestLifecycle, StepPipeline, Lockstep,
+                    SharedMemoryCommunicationManager, WorkerGraphsDone, make_worker,
+                )
             }
             sequence = 0
             for concurrency in args.concurrency:

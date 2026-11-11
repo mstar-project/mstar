@@ -125,8 +125,9 @@ class FailedRead:
 
 @dataclass
 class _KeptRead:
-    """The local buffers of a read that failed or was torn down mid-transfer,
-    kept until every transfer into them has reported that it stopped.
+    """A failed or interrupted read and any local destination buffers, kept
+    until every transfer has reported that it stopped. An unresolved read
+    holds the drain even when it has no listed destination buffers.
 
     ``future`` is set while the read still runs in the reader thread, which
     owns its batch ids until it finishes. ``running`` holds the ids handed
@@ -2124,12 +2125,10 @@ class TensorCommunicationManager(ABC):
         self.tensor_store.increment_ref_batch_uniform(uuids, n)
 
     def has_inflight_reads(self, request_id: Rid) -> bool:
-        """Whether any async read for this request is still touching a remote
-        segment. Synchronous (SHM) reads complete inside ``start_read_tensors``
-        with ``future=None``, so they never count here; only outstanding
-        async (RDMA) futures do. Gates the READS_DONE ACK during a drain.
-        So does a failed read whose transfers have not all stopped: they may
-        still be reading the producer's memory.
+        """Whether a read may still touch this request's remote source memory.
+        Synchronous reads with ``future=None`` never count. Outstanding
+        transfer or event futures, and failed reads whose transfers have not
+        provably stopped, hold the READS_DONE ACK during a drain.
         """
         return any(
             ep.request_id == request_id
