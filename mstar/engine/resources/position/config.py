@@ -156,7 +156,7 @@ class PositionSpec(NodeResourceSpec):
     def depends_on(self) -> set[str]:
         return {self.config.kv_cache}
 
-    def request_config(self, model_kwargs: dict | None) -> "PositionReqConfig | None":
+    def request_config(self, model_kwargs: dict | None, current=None) -> "PositionReqConfig | None":
         """Under LongRoPE, the length the request's table is chosen by, from
         ``MAX_POSITION_KWARG``, which a model sets in ``process_prompt`` (the data worker
         drops a client's); without it, the short table."""
