@@ -145,8 +145,6 @@ class RecurrentStatePool(Resource):
     # the node's planner and this pool's table of slots, once bound
     _resident: "ResidentPlanner | None" = None
     _resident_table: "ResidentTable | None" = None
-    # the resource that settles a verify step's rows in this pool's slots (`GDNManager`)
-    verify_settler: "Resource | None" = None
 
     @classmethod
     def build(
@@ -771,20 +769,14 @@ class RecurrentStatePool(Resource):
     def bind_verify_walk(self, walk: str, block: int, slack: int) -> None:
         """``walk`` verifies drafts, ``block`` tokens a row. Its linear-attention
         resource reruns the kept tokens into the slots in the graph
-        (``verify_settler``); the pool corrects its own count (`take_back`)."""
+        (`GDNManager.correct_verify_state`); the pool corrects its own count (`take_back`)."""
         del block, slack
         self._verify_walks = self._verify_walks | {walk}
 
     def take_back(self, rids, counts, label: str) -> None:
         """A verify step's rejected tokens out of each row's count: the state
         itself was rerun to the kept ones in the step's own graph. Startup refuses
-        a pool no linear-attention resource reruns (`node_problems`); this raises if
-        one still reaches a take-back with nothing bound to rerun it."""
-        if self.verify_settler is None:
-            raise RuntimeError(
-                f"recurrent pool {self._name!r}: a verify result came back and no linear-attention resource "
-                "reruns its state; its rejected tokens would stay in it"
-            )
+        a pool no linear-attention resource reruns (`unsettled_problems`)."""
         with self._lock:
             for rid, n in zip(rids, counts, strict=True):
                 labels = self._slots.get(rid)

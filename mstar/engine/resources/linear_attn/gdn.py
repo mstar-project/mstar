@@ -486,7 +486,6 @@ class GDNManager(LinearAttnManager):
         serves; what the kernel can't run, `capabilities` refused."""
         del slack
         self._verify_walks[walk] = block
-        self._pool.verify_settler = self
         if self._device.type == "cuda":
             self._warm_verify(block)
 
