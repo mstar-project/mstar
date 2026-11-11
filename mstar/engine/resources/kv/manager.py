@@ -1046,7 +1046,7 @@ class KVManager(AttentionResource):
                 if rid in self._dropped:
                     self.rebuild_pages[node_name] = self.rebuild_pages.get(node_name, 0) + len(matched[0])
                 if held:
-                    # the allotment doesn't count them (`_retain_window_match`), so they come out of the room left
+                    # the ask (`_hit`) doesn't size for them, so they come out of the allowance left
                     room = self._allowance(rid) if self._decides else None
                     starts = self._start_pages(chain, held, matched, room=room)
                     if self._world_size == 1:
