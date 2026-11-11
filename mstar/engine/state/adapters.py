@@ -310,7 +310,7 @@ def state_steps(step: SubmoduleStep | None, handles: Mapping[str, ArrayHandle | 
         handle = handles.get(name)
         # the step's type first: a check against a handle's class goes through `ABCMeta` and costs more
         if isinstance(declared, ArrayStep) and isinstance(handle, ArrayHandle):
-            if declared.segments is None and step.segments is None:
+            if segments_of(declared, step) is None:
                 raise ValueError(f"Array {name!r}: a step lists it with no segments, its own or the step's")
             builder = builders.get(handle.storage)
             if builder is None:
