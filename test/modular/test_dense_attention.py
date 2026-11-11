@@ -449,10 +449,15 @@ def _wrapper_classes():
 
 @pytest.mark.parametrize("wrapper_class", _wrapper_classes())
 @pytest.mark.parametrize("causal", [False, True], ids=["full", "causal"])
-def test_dense_matches_sdpa_over_prefix_and_fresh(wrapper_class, causal):
-    """Two segments with different frozen prefixes and GQA: each query block
+@pytest.mark.parametrize("segs", [
+    [("r0", [3, 4], 20, 37), ("r1", [7], 9, 50)],  # rid, prefix pages, prefix, fresh
+    [("r0", [3, 4], 20, 37)],
+], ids=["two", "one"])
+def test_dense_matches_sdpa_over_prefix_and_fresh(wrapper_class, causal, segs):
+    """Segments with different frozen prefixes and GQA: each query block
     attends its own [prefix | fresh] keys, and a causal plan aligns the block
-    to the end of them, on either kernel."""
+    to the end of them, on either kernel. One segment on FA3 takes its
+    fixed-length kernel, with the varlen kernel's bits."""
     dev = torch.device("cuda")
     page, hq, hkv, d = 16, 4, 2, 128
     cfg = PagedKVConfig(
@@ -464,7 +469,6 @@ def test_dense_matches_sdpa_over_prefix_and_fresh(wrapper_class, causal):
     )
     torch.manual_seed(0)
     layer = torch.randn(16, 2, page, hkv, d, device=dev, dtype=torch.bfloat16)
-    segs = [("r0", [3, 4], 20, 37), ("r1", [7], 9, 50)]  # rid, prefix pages, prefix, fresh
     views = [_view(rid, pages + [15], prefix=pre, fresh=fr) for rid, pages, pre, fr in segs]
     manager.plan(AttentionStep(causal=causal), _ctx(views))
     total = sum(fr for *_, fr in segs)
@@ -472,6 +476,16 @@ def test_dense_matches_sdpa_over_prefix_and_fresh(wrapper_class, causal):
     k = torch.randn(total, hkv, d, device=dev, dtype=torch.bfloat16)
     v = torch.randn(total, hkv, d, device=dev, dtype=torch.bfloat16)
     out = manager.run(q, "main", layer, k=k, v=v, layer_idx=0)
+    if wrapper_class is DensePrefixedPrefillWrapper and len(segs) == 1:
+        (_, pages, pre, fr), = segs
+        rows = layer[pages]
+        kk = torch.cat([rows[:, 0].reshape(-1, hkv, d)[:pre], k])
+        vv = torch.cat([rows[:, 1].reshape(-1, hkv, d)[:pre], v])
+        cu_q = torch.tensor([0, fr], dtype=torch.int32, device=dev)
+        cu_k = torch.tensor([0, pre + fr], dtype=torch.int32, device=dev)
+        varlen = dense_module.flash_attn_varlen_func(q, kk, vv, cu_q, cu_k, fr, pre + fr, causal=causal,
+                                        softmax_scale=d ** -0.5)
+        assert torch.equal(out, varlen[0] if isinstance(varlen, tuple) else varlen)
 
     off = 0
     for _, pages, pre, fr in segs:
