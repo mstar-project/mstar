@@ -1856,9 +1856,10 @@ What the model writes, and nothing more:
   the engine adds it to the ``SamplerStep.loopback_writes`` of the node's prompt and verify
   steps (``drafter_step``): the node declares a sampler step on both and lists no drafter state.
   ``propose`` reads the rows' carry in ``DraftInputs.carry``; ``observe`` returns the new one,
-  which the engine stores; a prompt step stores the first with
-  ``engine_inputs.store_draft_carry(carry)``, kept for the rows whose token the step keeps
-  (a prompt's last prefill). A captured verify step reads the carry off the sampler's
+  which the engine stores; a prompt step stores the first, which a scaffold drafter's
+  ``prefill`` returns and the scaffold stores, and any other node with
+  ``self.store_draft_carry(engine_inputs, carry)``; it is kept for the rows whose token the step
+  keeps (a prompt's last prefill). A captured verify step reads the carry off the sampler's
   loop-back masters, which only the in-graph scatter keeps fixed, so a carrying drafter is
   refused where it is off (``MSTAR_SAMPLER_INGRAPH_SCATTER=0``, or above one rank).
 - A drafter whose ``observe`` reads the target's hidden states declares

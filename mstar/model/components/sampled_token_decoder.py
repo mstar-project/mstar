@@ -726,10 +726,12 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
         last = self.last_token_hidden(engine_inputs, hidden)
         tokens = self.sample_tokens(engine_inputs, self.model.logits(last))
         if self._drafting:
-            # the drafter's pass over the prompt rows, after the step samples
-            self.drafter.prefill(PrefillInputs(
+            # the drafter's pass over the prompt rows, after the step samples, and its first carry
+            carry = self.drafter.prefill(PrefillInputs(
                 engine_inputs.resources, input_ids, tokens, hidden, embeds, decoder_kwargs, tensors,
             ))
+            if carry is not None:
+                self.store_draft_carry(engine_inputs, carry)
         return tokens
 
     def _verify(
