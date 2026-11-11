@@ -2111,10 +2111,11 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         return False
 
     def max_batch_size(self, graph_walk: str):
-        if (graph_walk in GEN_WALKS or graph_walk in PREFILL_WALKS) and not self._capture_regime().batches:
-            # Rows of this regime never batch (`can_batch`), and a step of
-            # several unbatched rows runs each eager, without a capture lease;
-            # one row per step replays the regime's bs=1 graphs.
+        if (graph_walk in GEN_WALKS or graph_walk in PREFILL_WALKS) and self.config.distilled_sigmas:
+            # A distilled checkpoint's rows are all conditional-only (it refuses
+            # any other guidance scale), which never batch (`can_batch`); a step
+            # of several unbatched rows runs each eager, without a capture lease,
+            # while one row per step can replay its bs=1 graphs.
             return 1
         if graph_walk in GEN_WALKS or graph_walk in SOUND_WALKS or graph_walk in ACTION_WALKS:
             return self.max_gen_batch_size
