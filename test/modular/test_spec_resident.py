@@ -374,8 +374,18 @@ def test_a_span_a_commit_drops_counts_as_nothing_committed_for_that_row():
     # what a claim leaves on a stream while its copy runs with the lock down
     kv._streams[1]["main"].offloaded = True
     kv.commit(step, ctx)
-    assert kv.committed_spans([1, 2], "main", SPAN) == [0, SPAN]
+    assert step.dropped == {(1, "main")}
+    assert kv.committed_spans(step, [1, 2], "main", SPAN) == [0, SPAN]
     assert kv._streams[1]["main"].stored_len == 5 and kv._streams[2]["main"].stored_len == 5 + SPAN
+    # the drop is that step's: the next step's commit, on a fresh step, counts every row
+    kv._streams[1]["main"].offloaded = False
+    fresh = KVStep(segments=(Segment(1, "main", SPAN), Segment(2, "main", SPAN)))
+    assert kv.admit(fresh, ctx).ok
+    kv.plan(fresh, ctx)
+    kv.commit(fresh, ctx)
+    assert fresh.dropped == frozenset()
+    assert kv.committed_spans(fresh, [1, 2], "main", SPAN) == [SPAN, SPAN]
+    assert kv.committed_spans(step, [1, 2], "main", SPAN) == [0, SPAN]
 
 
 
