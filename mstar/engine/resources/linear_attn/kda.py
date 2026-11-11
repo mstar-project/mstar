@@ -374,9 +374,10 @@ class KDAManager(LinearAttnManager):
         in packed order, each the next run of that row's tokens. A row's state carries over in
         its slot, so windows run in order compute what the whole step would.
 
-        A piece that starts inside one of its row's chunks (the row a window boundary cut) runs
-        its tokens up to the chunk's end first, on their own, so the rest of the row chunks as
-        the whole row would and each snapshot lands on a chunk end."""
+        A piece that starts inside one of its row's chunks (the row a window boundary cut) and
+        keeps a snapshot runs its tokens up to the chunk's end first, on their own, so the rest
+        of the row chunks as the whole row would and the snapshot lands on a chunk end. With no
+        snapshot in it, the piece runs as one, chunked from where it starts."""
         if label is None:
             label = self._default_label
         full = self.current_plan(label)
@@ -385,11 +386,13 @@ class KDAManager(LinearAttnManager):
         chunk = getattr(self.kernels, "chunk", 1)
         heads, rest = [], []
         for row, n in pieces:
-            first = min(-done[row] % chunk, n)
+            at = done[row]
+            keeps = any(kept == row and at < offset <= at + n for kept, offset, _ in full.snapshots)
+            first = min(-at % chunk, n) if keeps else 0
             if first:
-                heads.append((row, done[row], first))
+                heads.append((row, at, first))
             if n > first:
-                rest.append((row, done[row] + first, n - first))
+                rest.append((row, at + first, n - first))
             done[row] += n
         if heads and (len(heads) > 1 or heads[0][0] != pieces[0][0]):
             raise NotImplementedError(
