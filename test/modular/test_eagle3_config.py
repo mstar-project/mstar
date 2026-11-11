@@ -290,3 +290,23 @@ def test_the_node_stores_the_carry_its_hosted_drafters_prefill_returns(tmp_path,
     assert carry.shape[0] == 2 and carry.abs().sum() > 0
     stored = eng._resources["sampler"].loopback_state(DRAFT_CARRY, [1, 2])
     assert torch.equal(stored[:2].to(carry.dtype), carry)
+
+
+@pytest.mark.parametrize("top, inner, want", [
+    ({"torch_dtype": "float32"}, {"dtype": "bfloat16"}, "float32"),
+    ({}, {"dtype": "float16"}, "float16"),
+], ids=["top_level_wins", "inner_level_alone"])
+def test_the_drafters_dtype_comes_from_one_config_level(tmp_path, top, inner, want):
+    """The top level's dtype key if it names one, else transformer_layer_config's: two levels that
+    each agree with themselves are not refused for disagreeing with each other."""
+    import qwen3_cpu
+
+    draft = _cpu_eagle3(tmp_path)
+    path = tmp_path / "eagle3" / "config.json"
+    hf = json.loads(path.read_text())
+    hf.pop("torch_dtype", None)
+    hf.pop("dtype", None)
+    hf = {**hf, **top, "transformer_layer_config": {**hf["transformer_layer_config"], **inner}}
+    path.write_text(json.dumps(hf))
+    target, _ = qwen3_cpu.write_checkpoints(tmp_path)
+    assert qwen3_cpu.make_model(target, draft, max_seq_len=512).drafter_decl.dtype == want
