@@ -536,7 +536,7 @@ def test_sdpa_on_a_read_that_shares_another_reads_resource_names_that_resource()
 def test_a_kernel_setting_of_a_read_on_sdpa_is_refused_by_name():
     handle = node_handles(_Model(_array("a")), "dit", {}, setup=_on_sdpa("a_read"))["a"]
     with pytest.raises(ValueError, match="Array 'a': no max_segments_per_request for read 'a_read', whose binding "
-                                         "SdpaAttend takes no kernel settings"):
+                                         "SdpaAttend reports back none"):
         kernel_setting(handle, "a_read", "max_segments_per_request")
 
 

@@ -97,7 +97,7 @@ def build_specs(
     for array in arrays:
         specs += resolved.specs[array.name]
     specs += [_sampler_spec(declared) for declared in declarations if isinstance(declared, Sampler)]
-    _apply_kernel_settings(specs, arrays, resolved.resource_of, kernel_settings)
+    _apply_kernel_settings(specs, arrays, resolved, kernel_settings)
     return specs
 
 
@@ -107,14 +107,16 @@ def _resolve(arrays: Sequence[Array], setup: "StateSetup") -> "Resolved":
     for array in arrays:
         by_storage.setdefault(storage_of(array), []).append(array)
     specs: dict[str, list[NodeResourceSpec]] = {}
+    bound: dict[str, tuple[BoundOp, ...]] = {}
     resource_of: dict[str, str] = {}
     queries: dict[str, Queries] = {}
     for storage, held in by_storage.items():
         each = storage.resolve(held, arrays, setup)
         specs |= each.specs
+        bound |= each.bound
         resource_of |= each.resource_of
         queries |= each.queries
-    return Resolved(specs, resource_of, queries)
+    return Resolved(specs, bound, resource_of, queries)
 
 
 def state_setup(config: Mapping[str, Any], declarations: Sequence[Array | Sampler]) -> tuple["StateSetup", list[str]]:
@@ -233,14 +235,14 @@ def _sampler_spec(sampler: Sampler) -> SamplerSpec:
 
 
 def _apply_kernel_settings(
-    specs: Sequence[NodeResourceSpec], arrays: Sequence[Array], resource_of: Mapping[str, str],
+    specs: Sequence[NodeResourceSpec], arrays: Sequence[Array], resolved: "Resolved",
     kernel_settings: Mapping[str, Mapping[str, Any]],
 ) -> None:
     """Set the kernel choices and capture sizes the contract leaves to the engine, and refuse any other, so this hook
     can't carry physical choices until the engine picks kernels itself."""
     owners = {
         bound.key: (array, bound.binding)
-        for array in arrays for bound in _bindings(storage_of(array), array) if bound.binding.kernel_settings
+        for array in arrays for bound in resolved.bound[array.name] if bound.binding.kernel_settings
     }
     by_key = {spec.resource_key: spec for spec in specs}
     for key, settings in kernel_settings.items():
@@ -252,11 +254,7 @@ def _apply_kernel_settings(
         if refused:
             raise ValueError(f"Array {array.name!r}: kernel_settings[{key!r}] sets {sorted(refused)}; "
                              f"it may set only {sorted(binding.kernel_settings)}")
-        # a read on SDPA has no spec to set
-        spec = by_key.get(resource_of[key])
-        for field, value in settings.items():
-            if spec is not None:
-                setattr(spec.config, field, value)
+        binding.apply(by_key.get(resolved.resource_of[key]), settings)
 
 
 def node_handles(
@@ -504,6 +502,11 @@ class OpBinding:
         """The key of the resource the op under ``key`` runs on."""
         return key
 
+    def apply(self, spec: NodeResourceSpec | None, settings: Mapping[str, Any]) -> None:
+        """Set ``settings``, the op's `kernel_settings`, on ``spec``, its resource's."""
+        for field, value in settings.items():
+            setattr(spec.config, field, value)
+
     def bind(self, array: Array, key: str, resources: Mapping[str, Any]) -> Any:
         """What a handle calls to run the op, on the resource under ``key``."""
         return resources[key]
@@ -565,6 +568,8 @@ class PositionsBinding(OpBinding):
 class WithinStepAttend(OpBinding, ABC):
     """`Attend` within a step, over the step's own adds."""
 
+    # the model's settings are for the ragged kernel, whichever binding the deployment picks
+    kernel_settings = frozenset({"max_segments_per_request", "max_segments_per_step", "compile_op", "workspace_mb"})
     # whether the read runs a plan its step builds, so its resource has a spec and its calls need the step open
     plans: ClassVar[bool]
 
@@ -582,7 +587,6 @@ class WithinStepAttend(OpBinding, ABC):
 class RaggedAttend(WithinStepAttend):
     """`Attend` within a step, on a ragged resource that the reads of one kind, nodes and config share."""
 
-    kernel_settings = frozenset({"max_segments_per_request", "max_segments_per_step", "compile_op", "workspace_mb"})
     read_back = frozenset({"max_segments_per_request", "max_segments_per_step"})
     plans = True
 
@@ -600,6 +604,9 @@ class SdpaAttend(WithinStepAttend):
         if read.packed:
             raise _no_layout(array, f"reads[{key!r}] runs SDPA, which can't tell one segment of packed queries from "
                                     "the next, and a read of rows of one length declares packed=False")
+
+    def apply(self, spec: NodeResourceSpec | None, settings: Mapping[str, Any]) -> None:
+        """Nothing: SDPA builds no resource to set."""
 
     def bind(self, array: Array, key: str, resources: Mapping[str, Any]) -> Any:
         return sdpa_attention
@@ -1104,10 +1111,12 @@ class WithinStepHandle(ArrayHandle):
 
 
 class Resolved(NamedTuple):
-    """Arrays resolved into today's resources: each array's specs, its ops' included, by its name, the key of the
-    resource each op runs on, and how each read within a step lays out its queries."""
+    """Arrays resolved into today's resources: each array's specs, its ops' included, and its ops with the bindings that
+    run them, by its name, the key of the resource each op runs on, and how each read within a step lays out its
+    queries."""
 
     specs: dict[str, list[NodeResourceSpec]]
+    bound: dict[str, tuple[BoundOp, ...]]
     resource_of: dict[str, str]
     queries: dict[str, Queries]
 
@@ -1131,7 +1140,7 @@ class Storage(ABC):
         sp_group: CommGroup | None,
     ) -> ArrayHandle:
         """``array``'s handle over a node's built ``resources``."""
-        return self.handle_class(array, resources, _bindings(self, array, setup.by_read), resolved)
+        return self.handle_class(array, resources, resolved.bound[array.name], resolved)
 
     def steps(self, handle: ArrayHandle, declared: ArrayStep, steps: dict[str, Any]) -> None:
         """Add the step of the array's own resource, under its name."""
@@ -1154,10 +1163,10 @@ class PagedStorage(Storage):
     handle_class = PagedArrayHandle
 
     def resolve(self, arrays: Sequence[Array], declared: Sequence[Array], setup: "StateSetup") -> Resolved:
-        resolved = Resolved({}, {}, {})
+        resolved = Resolved({}, {}, {}, {})
         for array in arrays:
-            resolved.specs[array.name], bound = self._specs(array, setup)
-            resolved.resource_of.update(_resources_of(array, bound))
+            resolved.specs[array.name], resolved.bound[array.name] = self._specs(array, setup)
+            resolved.resource_of.update(_resources_of(array, resolved.bound[array.name]))
         return resolved
 
     def _specs(self, array: Array, setup: "StateSetup") -> tuple[list[NodeResourceSpec], tuple[BoundOp, ...]]:
@@ -1203,10 +1212,10 @@ class ValueStorage(Storage):
     handle_class = ValueHandle
 
     def resolve(self, arrays: Sequence[Array], declared: Sequence[Array], setup: "StateSetup") -> Resolved:
-        resolved = Resolved({}, {}, {})
+        resolved = Resolved({}, {}, {}, {})
         for array in arrays:
-            resolved.specs[array.name], bound = self._specs(array, declared)
-            resolved.resource_of.update(_resources_of(array, bound))
+            resolved.specs[array.name], resolved.bound[array.name] = self._specs(array, declared)
+            resolved.resource_of.update(_resources_of(array, resolved.bound[array.name]))
         return resolved
 
     def _specs(self, array: Array, arrays: Sequence[Array]) -> tuple[list[NodeResourceSpec], tuple[BoundOp, ...]]:
@@ -1250,7 +1259,7 @@ class HostValueStorage(Storage):
         for array in arrays:
             if array.reads or array.updates:
                 raise _no_layout(array, "a Value of host fields only takes no read or update")
-        return Resolved({array.name: [] for array in arrays}, {}, {})
+        return Resolved({array.name: [] for array in arrays}, {array.name: () for array in arrays}, {}, {})
 
     def handle(
         self, array: Array, resources: Mapping[str, Any], setup: "StateSetup", resolved: Resolved,
@@ -1272,10 +1281,11 @@ class WithinStepStorage(Storage):
         node set and with one config share the spec of the first of them, under its key, so each read is a plan on that
         resource rather than a resource of its own."""
         by_name = {array.name: array for array in declared}
-        resolved = Resolved({}, {}, {})
+        resolved = Resolved({}, {}, {}, {})
         shared: dict[tuple, NodeResourceSpec] = {}
         for array in arrays:
             bound, heads, head_dim, dtype = _within_step_read(array, setup)
+            resolved.bound[array.name] = (bound,)
             key, read = bound.key, bound.declared
             queries = resolved.queries[key] = (OwnQueries if read.queries is None else CrossQueries)(
                 query_array(array, read, by_name),
@@ -1294,7 +1304,7 @@ class WithinStepStorage(Storage):
         self, array: Array, resources: Mapping[str, Any], setup: "StateSetup", resolved: Resolved,
         sp_group: CommGroup | None,
     ) -> ArrayHandle:
-        return WithinStepHandle(array, resources, _bindings(self, array, setup.by_read), resolved, sp_group=sp_group)
+        return WithinStepHandle(array, resources, resolved.bound[array.name], resolved, sp_group=sp_group)
 
 
 PAGED = PagedStorage()
