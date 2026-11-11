@@ -52,6 +52,7 @@ from mstar.engine.state.analysis import (
     position_key,
     query_array,
     reads_differ_by_walk,
+    runs_on_walk,
     written_by_step,
 )
 from mstar.engine.state.calls import ArrayHandle, SamplerHandle, pool_layers, segments_of
@@ -1705,7 +1706,7 @@ def _walk_reads(array: Array, resource_of: Mapping[str, str], combined: Mapping[
     reads: dict[str | None, dict[str, str]] = {}
     covers: dict[str | None, frozenset[int]] = {}
     for walk in (None, *{walk for read in array.reads.values() for walk in read.walks or ()}):
-        covering = [key for key, read in array.reads.items() if read.walks is None or walk in read.walks]
+        covering = [key for key, read in array.reads.items() if runs_on_walk(read, walk)]
         reads[walk] = {resource_of[key]: key for key in covering}
         covers[walk] = frozenset().union(*(read_layers(array, array.reads[key]) for key in covering))
     for walk, members in combined.items():

@@ -57,6 +57,11 @@ def reads_differ_by_walk(array: Array) -> bool:
     return any(read.walks is not None for read in array.reads.values())
 
 
+def runs_on_walk(read: Read, walk: str | None) -> bool:
+    """Whether ``read`` runs on ``walk``, as a read that names no walk runs on every one."""
+    return read.walks is None or walk in read.walks
+
+
 def combined_walks(array: Array, by_node: Mapping[str, Mapping[str, Collection[str]]]) -> dict[str, Collection[str]]:
     """The combined walks of ``array``'s nodes, with the walks each batches, from each node's in ``by_node``."""
     return {walk: members for node in sorted(array.nodes) for walk, members in by_node.get(node, EMPTY).items()}
@@ -192,7 +197,7 @@ def _regrouping_problems(model: "Model", arrays: Sequence[Array], graphs: Mappin
         f"Array {array.name!r}.reads[{key!r}]: {type(read.mask).__name__} on walk {walk!r}, which {cause}. A Block or "
         f"Bidirectional read sees each step's adds as a whole, so {fix}"
         for node, walk, cause, fix in regrouped
-        for array, key, read in whole if node in array.nodes and (read.walks is None or walk in read.walks)
+        for array, key, read in whole if node in array.nodes and runs_on_walk(read, walk)
     ))
 
 
@@ -274,7 +279,7 @@ def _combined_walk_problems(array: Array, combined: Mapping[str, Collection[str]
         for layer in sorted(array.layers):
             reads = [
                 (member, key, read.mask) for member in sorted(members) for key, read in array.reads.items()
-                if layer in read_layers(array, read) and (read.walks is None or member in read.walks)
+                if layer in read_layers(array, read) and runs_on_walk(read, member)
             ]
             clash = next(((a, b) for a in reads for b in reads if a[2] != b[2]), None)
             if clash is not None:
