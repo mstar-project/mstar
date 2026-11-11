@@ -109,6 +109,14 @@ def test_conditional_only_capture_when_guidance_is_off(monkeypatch) -> None:
     )
     assert step.cg_key_info == image_key
     assert {seg.label for seg in step.segments} == {COND_LABEL}
+    # conditional-only rows never batch, so a step holds one and leases the bs=1 graph
+    assert sub.max_batch_size(C.IMAGE_GEN_WALK) == 1 and sub.max_batch_size(C.PREFILL_WALK) == 1
+
+
+def test_two_branch_deployment_keeps_its_batch_caps(monkeypatch) -> None:
+    sub, _ = _dit_with_buckets(monkeypatch)
+    assert sub.max_batch_size(C.IMAGE_GEN_WALK) == sub.max_gen_batch_size
+    assert sub.max_batch_size(C.PREFILL_WALK) is None
 
 
 def test_windowed_captured_inputs_carry_the_window_layout(monkeypatch) -> None:
@@ -241,3 +249,22 @@ def test_masked_capture_matches_eager_layout() -> None:
         assert torch.all(e[:, :, 0] == 0)  # the eager unpatchify leaves the clean frame at zero velocity
         assert torch.allclose(e[:, :, 1:], g[:, :, 1:], atol=1e-5, rtol=1e-4)
         assert not torch.all(g[:, :, 0] == 0)  # the graph predicts it too; postprocess masks it away
+
+
+def test_prefill_capture_inputs_follow_the_regime(monkeypatch) -> None:
+    """The captured prefill's rows declare the labels of their regime, so the
+    capture's own `declare_step` plans exactly those."""
+    for scale, labels in ((6.0, {"main", "uncond"}), (1.0, {"main"})):
+        monkeypatch.setenv("COSMOS3_GEN_CAPTURE_RES", "64x64")
+        monkeypatch.delenv("COSMOS3_DISABLE_PREFILL_ACCELERATOR_GRAPH", raising=False)
+        monkeypatch.delenv("COSMOS3_DISABLE_ACCELERATOR_GRAPH", raising=False)
+        cfg = Cosmos3Config(compile_denoise=False, guidance_scale=scale)
+        sub = Cosmos3DiTSubmodule(transformer=_fake_transformer(cfg), config=cfg, scheduler=None)
+        prefill = next(c for c in sub.get_accelerator_graph_configs("cpu") if c.capture_graph_walk == C.PREFILL_WALK)
+        assert prefill.additional_key_info == ("cfg" if len(labels) == 2 else "cond")
+        (row,) = prefill.get_node_inputs(1, 63)
+        assert row.kwargs["cfg"] == (len(labels) == 2) and set(row.kwargs["seq_lens"]) == labels
+        assert sum(row.kwargs["seq_lens"].values()) == 63
+        step = sub.declare_step(C.PREFILL_WALK, ["r"], [row])
+        assert {seg.label for seg in step.segments} == labels
+        assert step.cg_key_info == prefill.additional_key_info
