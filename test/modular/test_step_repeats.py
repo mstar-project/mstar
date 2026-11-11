@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from mstar.engine.device_run import RunState, WalkAsk
+from mstar.engine.device_run import CudaWhile, RunState, WalkAsk
 from mstar.engine.engine import Engine
 from mstar.graph.base import GraphEdge, GraphNode, Loop
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
@@ -213,3 +213,40 @@ def test_the_spec_cap_counts_steps_not_the_iterations_a_step_asked_for():
     speculator.note_launched(launched)
     assert speculator._consecutive == 1
 
+
+def test_nvjitlink_is_looked_for_next_to_nvrtc_before_the_toolkit(tmp_path, monkeypatch):
+    """The linker has to come from the NVRTC's own CUDA release, which a toolkit on the box may not be."""
+    name = "libnvJitLink.so.13"
+    nvrtc, toolkit = tmp_path / "cu13" / "lib", tmp_path / "cuda" / "lib64"
+    for d in (nvrtc, toolkit):
+        d.mkdir(parents=True)
+    monkeypatch.setenv("CUDA_HOME", str(tmp_path / "cuda"))
+    # the wheels that split NVRTC and the linker into two directories: ``nvidia/<pkg>/lib``
+    split = tmp_path / "nvidia" / "cuda_nvrtc" / "lib"
+    split.mkdir(parents=True)
+    (tmp_path / "nvidia" / "nvjitlink" / "lib").mkdir(parents=True)
+
+    assert CudaWhile.nvjitlink_path(str(nvrtc), "13") is None
+    (toolkit / name).touch()
+    assert CudaWhile.nvjitlink_path(str(nvrtc), "13") == str(toolkit / name)
+    (tmp_path / "nvidia" / "nvjitlink" / "lib" / name).touch()
+    assert CudaWhile.nvjitlink_path(str(split), "13") == str(split / ".." / ".." / "nvjitlink" / "lib" / name)
+    (nvrtc / name).touch()
+    assert CudaWhile.nvjitlink_path(str(nvrtc), "13") == str(nvrtc / name)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="compiles and launches the stop kernel")
+def test_the_stop_kernel_links_to_sass_and_marks_the_rows_that_sampled_a_stop_id():
+    """``load_kernels`` compiles for the device's arch and links with nvJitLink, with no JIT of PTX by the driver."""
+    state = RunState(3, 4, {2}, torch.device("cuda"))
+    state.stage(3, [False] * 3, limit=4)
+    stream = torch.cuda.current_stream().cuda_stream
+    cuda = CudaWhile()
+
+    cuda.stop(state, torch.tensor([1, 2, 3], device="cuda"), stream)
+    torch.cuda.synchronize()
+    assert (state.marks.tolist(), state.index.item(), state.continuation.item()) == ([False, True, False], 1, 1)
+
+    cuda.stop(state, torch.tensor([2, 2, 2], device="cuda"), stream)
+    torch.cuda.synchronize()
+    assert (state.marks.tolist(), state.index.item(), state.continuation.item()) == ([True] * 3, 2, 0)

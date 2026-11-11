@@ -11,7 +11,9 @@ the device only decides when to end.
 
 torch binds no WHILE node, so ``CudaWhile`` calls the CUDA runtime through
 ctypes, and ``cudaGraphSetConditional`` needs a kernel of ours, compiled with
-NVRTC and linked against ``libcudadevrt``.
+NVRTC to a cubin for the device's own arch and linked against ``libcudadevrt``
+by nvJitLink, so the driver loads machine code and JIT-compiles none: a driver
+older than the NVRTC torch ships can't read its PTX.
 """
 from __future__ import annotations
 
@@ -114,6 +116,13 @@ class RunState:
         return {name: self.tokens[:, :repeats] for name in names}
 
 
+class _DlInfo(ctypes.Structure):
+    """``Dl_info``, which ``dladdr`` fills: the library a symbol was loaded from."""
+    _fields_ = [
+        ("path", ctypes.c_char_p), ("base", ctypes.c_void_p), ("name", ctypes.c_char_p), ("addr", ctypes.c_void_p),
+    ]
+
+
 class CudaWhile:
     """The CUDA runtime calls a WHILE run takes, through ctypes."""
 
@@ -148,35 +157,105 @@ class CudaWhile:
                 return path
         return None
 
-    def call(self, name: str, *args) -> None:
-        status = getattr(self._rt, name)(*args)
+    @staticmethod
+    def nvjitlink_path(nvrtc_dir: str | None, major: str) -> str | None:
+        """``libnvJitLink``: the NVRTC's own CUDA release has to link what it compiled, so it is looked for next to
+        the NVRTC torch loaded (in the one ``nvidia/cu13/lib`` directory, or the older wheels' sibling
+        ``nvidia/nvjitlink/lib``), then in the toolkit."""
+        name = f"libnvJitLink.so.{major}"
+        dirs = [nvrtc_dir, nvrtc_dir and os.path.join(nvrtc_dir, "..", "..", "nvjitlink", "lib")]
+        dirs += [os.path.join(root, "lib64") for root in (os.environ.get("CUDA_HOME"), "/usr/local/cuda") if root]
+        return next((os.path.join(d, name) for d in dirs if d and os.path.exists(os.path.join(d, name))), None)
+
+    @staticmethod
+    def _invoke(lib: ctypes.CDLL, name: str, *args, log=None) -> None:
+        status = getattr(lib, name)(*args)
         if status != 0:
-            raise RuntimeError(f"{name} failed with CUDA error {status}")
+            raise RuntimeError(f"{name} failed with error {status}" + (f":\n{log()}" if log else ""))
+
+    def call(self, name: str, *args) -> None:
+        self._invoke(self._rt, name, *args)
 
     def _driver_call(self, name: str, *args) -> None:
-        status = getattr(self._driver, name)(*args)
-        if status != 0:
-            raise RuntimeError(f"{name} failed with CUDA error {status}")
+        self._invoke(self._driver, name, *args)
+
+    def _compile_stop(self, arch: str) -> tuple[bytes, str | None]:
+        """``_STOP_SOURCE`` as a relocatable cubin for ``arch`` (``sm_90``), by torch's NVRTC, and the directory
+        that NVRTC was loaded from."""
+        from torch.cuda._utils import _get_nvrtc_library
+
+        nvrtc = _get_nvrtc_library()
+        prog = ctypes.c_void_p()
+
+        def log() -> str:
+            size = ctypes.c_size_t()
+            nvrtc.nvrtcGetProgramLogSize(prog, ctypes.byref(size))
+            text = ctypes.create_string_buffer(size.value)
+            nvrtc.nvrtcGetProgramLog(prog, text)
+            return text.value.decode()
+
+        self._invoke(
+            nvrtc, "nvrtcCreateProgram", ctypes.byref(prog), _STOP_SOURCE.encode(), b"run_stop.cu", 0, None, None,
+        )
+        try:
+            options = (ctypes.c_char_p * 2)(f"--gpu-architecture={arch}".encode(), b"-rdc=true")
+            self._invoke(nvrtc, "nvrtcCompileProgram", prog, 2, options, log=log)
+            size = ctypes.c_size_t()
+            self._invoke(nvrtc, "nvrtcGetCUBINSize", prog, ctypes.byref(size))
+            cubin = ctypes.create_string_buffer(size.value)
+            self._invoke(nvrtc, "nvrtcGetCUBIN", prog, cubin)
+        finally:
+            nvrtc.nvrtcDestroyProgram(ctypes.byref(prog))
+        info = _DlInfo()
+        found = ctypes.CDLL(None).dladdr(ctypes.cast(nvrtc.nvrtcCreateProgram, ctypes.c_void_p), ctypes.byref(info))
+        return cubin.raw, os.path.dirname(info.path.decode()) if found and info.path else None
+
+    def _link_stop(self, arch: str, cubin: bytes, nvrtc_dir: str | None) -> ctypes.Array:
+        """``cubin`` and ``libcudadevrt`` linked to the device's SASS, by the nvJitLink of the NVRTC's CUDA."""
+        devrt = self.devrt_path()
+        path = self.nvjitlink_path(nvrtc_dir, torch.version.cuda.split(".")[0])
+        if devrt is None or path is None:
+            raise RuntimeError(
+                "linking the device stop kernel needs libcudadevrt.a and libnvJitLink "
+                f"(found {devrt!r} and {path!r}); set CUDA_HOME to a toolkit that has them"
+            )
+        lib, handle = ctypes.CDLL(path), ctypes.c_void_p()
+
+        def log() -> str:
+            size = ctypes.c_size_t()
+            lib.nvJitLinkGetErrorLogSize(handle, ctypes.byref(size))
+            text = ctypes.create_string_buffer(size.value)
+            lib.nvJitLinkGetErrorLog(handle, text)
+            return text.value.decode()
+
+        options = (ctypes.c_char_p * 1)(f"-arch={arch}".encode())
+        self._invoke(lib, "nvJitLinkCreate", ctypes.byref(handle), 1, options)
+        try:
+            # input types: 1 is a cubin, 6 a library
+            self._invoke(
+                lib, "nvJitLinkAddData", handle, 1, ctypes.c_char_p(cubin), ctypes.c_size_t(len(cubin)),
+                b"run_stop.cubin", log=log,
+            )
+            self._invoke(lib, "nvJitLinkAddFile", handle, 6, devrt.encode(), log=log)
+            self._invoke(lib, "nvJitLinkComplete", handle, log=log)
+            size = ctypes.c_size_t()
+            self._invoke(lib, "nvJitLinkGetLinkedCubinSize", handle, ctypes.byref(size), log=log)
+            linked = ctypes.create_string_buffer(size.value)
+            self._invoke(lib, "nvJitLinkGetLinkedCubin", handle, linked, log=log)
+        finally:
+            lib.nvJitLinkDestroy(ctypes.byref(handle))
+        return linked
 
     def load_kernels(self) -> tuple[ctypes.c_void_p, ctypes.c_void_p]:
         """The stop and condition kernels, compiled once a process."""
         if self._kernels is None:
-            from torch.cuda._utils import _nvrtc_compile
-
-            ptx = _nvrtc_compile(_STOP_SOURCE, "run_stop", nvcc_options=["-rdc=true"])
-            ptx = ptx[0] if isinstance(ptx, tuple) else ptx
-            link, cubin, size = ctypes.c_void_p(), ctypes.c_void_p(), ctypes.c_size_t()
-            self._driver_call("cuLinkCreate_v2", 0, None, None, ctypes.byref(link))
-            self._driver_call(
-                "cuLinkAddData_v2", link, 1, ctypes.c_char_p(ptx), len(ptx), b"run_stop.ptx", 0, None, None,
-            )
-            self._driver_call("cuLinkAddFile_v2", link, 4, self.devrt_path().encode(), 0, None, None)
-            self._driver_call("cuLinkComplete", link, ctypes.byref(cubin), ctypes.byref(size))
+            arch = "sm_{}{}".format(*torch.cuda.get_device_capability())
+            cubin, nvrtc_dir = self._compile_stop(arch)
+            linked = self._link_stop(arch, cubin, nvrtc_dir)
             module, stop, condition = ctypes.c_void_p(), ctypes.c_void_p(), ctypes.c_void_p()
-            self._driver_call("cuModuleLoadData", ctypes.byref(module), cubin)
+            self._driver_call("cuModuleLoadData", ctypes.byref(module), linked)
             self._driver_call("cuModuleGetFunction", ctypes.byref(stop), module, b"run_stop")
             self._driver_call("cuModuleGetFunction", ctypes.byref(condition), module, b"set_graph_condition")
-            self._driver_call("cuLinkDestroy", link)
             self._kernels = stop, condition
         return self._kernels
 
