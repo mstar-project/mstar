@@ -178,20 +178,6 @@ class GlmReplyParser:
         self._held_space = ""
         return out
 
-    def message(self, text: str) -> dict:
-        """The whole reply as a chat ``message``, from the deltas a stream sends."""
-        deltas = self.feed(text) + self.finish()
-        content = "".join(d.get("content", "") for d in deltas)
-        reasoning = "".join(d.get("reasoning_content", "") for d in deltas)
-        calls = [{k: v for k, v in c.items() if k != "index"}
-                 for d in deltas for c in d.get("tool_calls", [])]
-        message: dict = {"role": "assistant", "content": content or (None if calls else "")}
-        if reasoning:
-            message["reasoning_content"] = reasoning
-        if calls:
-            message["tool_calls"] = calls
-        return message
-
     def _tags(self) -> tuple[str, ...]:
         calls = (CALL_START,) if self._tools else ()
         if self._state == "reasoning":

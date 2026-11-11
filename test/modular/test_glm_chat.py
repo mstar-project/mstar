@@ -7,8 +7,9 @@ import pytest
 
 pytest.importorskip("pydantic")
 
-from mstar.api_server.openai import adapters, glm_chat  # noqa: E402
+from mstar.api_server.openai import adapters, glm_chat, serving_chat  # noqa: E402
 from mstar.api_server.openai.protocol import ChatCompletionRequest  # noqa: E402
+from mstar.api_server.openai.reply import Finish, Usage  # noqa: E402
 
 WEATHER = {"type": "function", "function": {"name": "get_weather", "parameters": {
     "type": "object",
@@ -22,6 +23,12 @@ CALL = ("<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_valu
 
 def _parser(thinking=True, tools=TOOLS):
     return glm_chat.GlmReplyParser(thinking=thinking, tools=tools)
+
+
+def _message(parser, text) -> dict:
+    """A whole reply's chat ``message``, as the chat handler builds it from the parser's deltas."""
+    events = [*parser.feed(text), *parser.finish(), Finish(parser.finish_reason, Usage())]
+    return serving_chat._text_response("glm52", "chatcmpl-0", events)["choices"][0]["message"]
 
 
 def _streamed(text, pieces, **kw):
@@ -39,7 +46,7 @@ def _streamed(text, pieces, **kw):
 
 def test_tool_call_types_arguments_by_schema():
     p = _parser()
-    msg = p.message("I need the weather.</think>\n" + CALL)
+    msg = _message(p, "I need the weather.</think>\n" + CALL)
     assert msg["content"] is None and msg["reasoning_content"] == "I need the weather."
     (call,) = msg["tool_calls"]
     assert call["type"] == "function" and call["id"].startswith("call_") and "index" not in call
@@ -99,7 +106,7 @@ def test_a_cut_off_call_is_returned_as_text():
     (True, "ok</think>Let me check. <tool_call>", {"content": "Let me check. <tool_call>", "reasoning_content": "ok"}),
 ], ids=["reasoning", "thinking-off", "stray-tags", "think-reopens", "cut-at-call-tag"])
 def test_a_whole_reply_splits_into_reasoning_and_content(thinking, text, message):
-    assert _parser(thinking=thinking).message(text) == {"role": "assistant", **message}
+    assert _message(_parser(thinking=thinking), text) == {"role": "assistant", **message}
 
 
 @pytest.mark.parametrize("schema, raw, want", [
@@ -121,7 +128,7 @@ def test_arguments_take_the_schema_type(schema, raw, want):
     tools = glm_chat.tool_parameters([{"type": "function", "function": {
         "name": "f", "parameters": {"type": "object", "properties": {"a": schema}}}}])
     call = f"<tool_call>f<arg_key>a</arg_key><arg_value>{raw}</arg_value></tool_call>"
-    msg = _parser(tools=tools).message("x</think>" + call)
+    msg = _message(_parser(tools=tools), "x</think>" + call)
     args = json.loads(msg["tool_calls"][0]["function"]["arguments"])  # strict JSON
     assert args == {"a": want} and type(args["a"]) is type(want)
 
@@ -176,7 +183,7 @@ def test_adapter_sends_messages_tools_and_template_switches(tmp_path):
     assert mk["chat_template_kwargs"] == {"reasoning_effort": "high", "enable_thinking": False}
     assert "enable_thinking" not in mk
     p = adapter.make_output_parser(req)
-    assert p.message("Hi") == {"role": "assistant", "content": "Hi"}  # thinking off
+    assert _message(p, "Hi") == {"role": "assistant", "content": "Hi"}  # thinking off
 
 
 @pytest.mark.parametrize("model", ["glm52", "glm5_next"])
@@ -196,12 +203,12 @@ def test_an_agent_turn_with_a_tool_result_reaches_the_template(model, tmp_path):
 def test_a_falsy_enable_thinking_turns_thinking_off(value, tmp_path):
     # the GLM-5.2 template reads truthiness: its prompt ends in <think></think>
     p = adapters.get_adapter("glm52").make_output_parser(_chat(chat_template_kwargs={"enable_thinking": value}))
-    assert p.message("Hello there!") == {"role": "assistant", "content": "Hello there!"}
+    assert _message(p, "Hello there!") == {"role": "assistant", "content": "Hello there!"}
 
 
 def test_glm53_always_reasons(tmp_path):
     adapter = adapters.get_adapter("glm5_next")
-    assert adapter.make_output_parser(_chat()).message("hmm</think>Hi")["reasoning_content"] == "hmm"
+    assert _message(adapter.make_output_parser(_chat()), "hmm</think>Hi")["reasoning_content"] == "hmm"
     adapter.chat_to_request(_chat(enable_thinking=True), tmp_path)
     for value in (False, 0, ""):
         with pytest.raises(ValueError, match="enable_thinking"):
@@ -212,7 +219,7 @@ def test_tool_choice_none_leaves_the_tools_out(tmp_path):
     adapter = adapters.get_adapter("glm52")
     req = _chat(tools=[WEATHER], tool_choice="none")
     assert "tools" not in adapter.chat_to_request(req, tmp_path).model_kwargs
-    assert adapter.make_output_parser(req).message("x</think>" + CALL)["content"] == CALL
+    assert _message(adapter.make_output_parser(req), "x</think>" + CALL)["content"] == CALL
 
 
 @pytest.mark.parametrize("body", [
@@ -309,7 +316,7 @@ def test_an_overflowing_number_stays_text(raw):
     # json.loads gives inf; dumped back it is "Infinity", which JSON.parse rejects
     tools = glm_chat.tool_parameters([{"type": "function", "function": {"name": "f", "parameters": {}}}])
     call = f"<tool_call>f<arg_key>a</arg_key><arg_value>{raw}</arg_value></tool_call>"
-    args = json.loads(_parser(tools=tools).message("x</think>" + call)["tool_calls"][0]["function"]["arguments"])
+    args = json.loads(_message(_parser(tools=tools), "x</think>" + call)["tool_calls"][0]["function"]["arguments"])
     assert args == {"a": raw}
 
 
@@ -329,7 +336,7 @@ def test_a_long_call_is_read_once_and_parses_as_whole():
     assert longest < len(glm_chat.CALL_END) + 4
     [call] = [c for d in deltas for c in d.get("tool_calls", [])]
     assert json.loads(call["function"]["arguments"]) == {"path": "a.py", "content": body}
-    assert _parser(tools=write).message(text)["tool_calls"][0]["function"] == call["function"]
+    assert _message(_parser(tools=write), text)["tool_calls"][0]["function"] == call["function"]
 
 
 @pytest.mark.parametrize("make", [_glm52, _glm53])
@@ -345,3 +352,4 @@ def test_the_chat_stays_in_the_data_worker(make, tmp_path):
     assert {"messages", "tools", "chat_template_kwargs"} <= set(mk) and not {"messages", "tools"} & set(sent)
     body = NewRequestConductor("r", {}, ["text"], ["text"], {}, sent)
     wire.encode(ConductorMessage(message_type=ConductorMessageType.NEW_REQUEST, body=body))
+

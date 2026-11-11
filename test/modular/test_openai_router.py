@@ -29,16 +29,16 @@ from fastapi import FastAPI, HTTPException  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 from mstar.api_server.entrypoint import APIServer  # noqa: E402
-from mstar.api_server.request_types import USAGE  # noqa: E402
+from mstar.api_server.request_types import USAGE, ResultChunk  # noqa: E402
 from mstar.api_server.served_models import ServedModels  # noqa: E402
 from mstar.testing_utils.model import StubModel  # noqa: E402
 
 
-class _Chunk:
-    def __init__(self, modality, data, metadata=None):
-        self.modality = modality
-        self.data = data
-        self.metadata = metadata or {}
+class _Chunk(ResultChunk):
+    """A result chunk, its request's id left out."""
+
+    def __init__(self, modality, data, metadata=None, **fields):
+        super().__init__(request_id="r", modality=modality, data=data, metadata=metadata or {}, **fields)
 
 
 class _StubModel(StubModel):
@@ -618,6 +618,7 @@ def test_chat_stream_sends_a_batch_of_tokens_as_one_frame():
     """Tokens that were waiting together leave as one body frame (one write
     on the socket), still one SSE event per token for the client; a chunk
     of another modality gets a frame of its own."""
+    from mstar.api_server.openai import reply
     from mstar.api_server.openai.serving_chat import _stream_events
 
     class _Batches:
@@ -626,8 +627,8 @@ def test_chat_stream_sends_a_batch_of_tokens_as_one_frame():
             yield [_Chunk("text", b"d"), _Chunk("audio", b"\x00\x01"), _Chunk("text", b"e")]
 
     async def _collect():
-        batches = _Batches().iter_result_chunk_batches("rid")
-        return [frame async for frame in _stream_events(batches, "bagel", "rid", 24000)]
+        events = reply.reply_events(_Batches(), "rid")
+        return [frame async for frame in _stream_events(events, "bagel", "rid")]
 
     frames = asyncio.run(_collect())
     # abc (the role rides on a), d, audio, e, stop, DONE
@@ -1050,6 +1051,39 @@ def test_chat_stream_sends_usage_when_asked(client_and_stub):
     events = [json.loads(l[6:]) for l in text.splitlines() if l.startswith("data: ") and "[DONE]" not in l]
     assert events[-2]["choices"][0]["finish_reason"] == "length"
     assert events[-1]["choices"] == [] and events[-1]["usage"]["completion_tokens"] == 3
+
+
+def test_a_parsed_reply_stops_when_its_client_disconnects():
+    """Non-streaming, a reply is read chunk by chunk; a client that goes away
+    unwinds the chunk iterator, which aborts the request."""
+    from fastapi import HTTPException
+
+    from mstar.api_server.openai import reply
+
+    aborted = []
+
+    class _Endless:
+        async def iter_result_chunk_batches(self, request_id):
+            try:
+                while True:
+                    yield [_Chunk("text", b"x", num_tokens=1)]
+                    await asyncio.sleep(0.01)
+            finally:
+                aborted.append(request_id)
+
+    class _Gone:
+        calls = 0
+
+        async def is_disconnected(self):
+            self.calls += 1
+            return self.calls > 2
+
+    async def _collect():
+        return await reply.collect(reply.reply_events(_Endless(), "r1"), _Gone())
+
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(_collect())
+    assert exc.value.status_code == 499 and aborted == ["r1"]
 
 
 _PNG_URL = "data:image/png;base64," + base64.b64encode(
