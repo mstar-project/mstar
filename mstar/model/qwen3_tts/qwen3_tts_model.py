@@ -85,6 +85,7 @@ from mstar.model.qwen3_tts.config import (
     LANGUAGE_ID_KEY,
     PROMPT_LAYOUT_KEY,
     REF_CLIP_KEY,
+    REF_SAMPLES_KEY,
     SPEAKER_ID_KEY,
     TALKER_ATTN,
     TALKER_KV,
@@ -92,6 +93,7 @@ from mstar.model.qwen3_tts.config import (
     TALKER_POS,
     TALKER_SAMPLER,
     Qwen3TTSModelConfig,
+    mono_samples,
 )
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.utils import load_generation_defaults
@@ -883,7 +885,7 @@ class Qwen3TTSModel(Model):
                 f"(got {len(clips)}); pass it as the request's audio input"
             )
         # Both modes run the speaker encoder over the whole clip.
-        num_samples = int(clips[0].reshape(-1).shape[0])
+        num_samples = mono_samples(clips[0])
         self._check_reference_duration(num_samples / self.config.codec.input_sample_rate)
         ref_text = _text(kwargs, "ref_text", "").strip()
         if _flag(kwargs, "x_vector_only_mode", False):
@@ -898,7 +900,7 @@ class Qwen3TTSModel(Model):
             raise ValueError("Qwen3-TTS reference clip is empty")
         return ref_text, frames
 
-    INTERNAL_KWARGS = (PROMPT_LAYOUT_KEY, SPEAKER_ID_KEY, LANGUAGE_ID_KEY, REF_CLIP_KEY)
+    INTERNAL_KWARGS = (PROMPT_LAYOUT_KEY, SPEAKER_ID_KEY, LANGUAGE_ID_KEY, REF_CLIP_KEY, REF_SAMPLES_KEY)
     LENGTH_KWARGS = ("max_output_tokens", "max_new_tokens")
 
     def process_prompt(
@@ -917,7 +919,7 @@ class Qwen3TTSModel(Model):
         The metadata carries, as host values for the prefill's step metadata,
         ``PROMPT_LAYOUT_KEY`` ``[instruct_len, text_len, stream_text,
         ref_text_len, ref_frames]``, the codec speaker and language tags, and
-        a clone's ``REF_CLIP_KEY`` digest. ``stream_text`` follows the
+        a clone's ``REF_CLIP_KEY`` digest and ``REF_SAMPLES_KEY`` sample count. ``stream_text`` follows the
         reference default per variant (whole text in the prefill for
         CustomVoice and VoiceDesign, one token per frame for Base) unless the
         request sets ``non_streaming_mode``. An in-context clone's
@@ -990,6 +992,7 @@ class Qwen3TTSModel(Model):
         clips = (tensors or {}).get("audio_inputs", [])
         if clips:
             metadata[REF_CLIP_KEY] = clip_digest(clips[0])
+            metadata[REF_SAMPLES_KEY] = mono_samples(clips[0])
         from mstar.model.qwen3_tts.submodules import prefill_rows, text_stream_start
 
         # a clone's x-vector takes the speaker row
@@ -1063,6 +1066,7 @@ class Qwen3TTSModel(Model):
             prompt = {key: model_kwargs[key] for key in (PROMPT_LAYOUT_KEY, SPEAKER_ID_KEY, LANGUAGE_ID_KEY)}
             if clone:
                 prompt[REF_CLIP_KEY] = model_kwargs[REF_CLIP_KEY]
+                prompt[REF_SAMPLES_KEY] = model_kwargs[REF_SAMPLES_KEY]
             if "audio" not in output_modalities:
                 return []
             prefill = WalkStep("talker_prefill_clone" if clone else "talker_prefill", step_metadata=prompt)

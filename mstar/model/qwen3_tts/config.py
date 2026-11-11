@@ -23,6 +23,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import torch
+
 # ---------------------------------------------------------------------------
 # Resource label constants (Talker node)
 # ---------------------------------------------------------------------------
@@ -39,11 +41,34 @@ TALKER_MIXED = "talker_mixed"
 
 # Step-metadata keys ``process_prompt`` settles on the host for the prefill:
 # ``[instruct_len, text_len, stream_text, ref_text_len, ref_frames]``, the
-# codec speaker and language tags (-1 for none), and a clone's clip digest.
+# codec speaker and language tags (-1 for none), and a clone's clip digest and
+# sample count (the RefEncoder's capture bucket follows from it).
 PROMPT_LAYOUT_KEY = "prompt_layout"
 SPEAKER_ID_KEY = "speaker_id"
 LANGUAGE_ID_KEY = "language_id"
 REF_CLIP_KEY = "ref_clip_key"
+REF_SAMPLES_KEY = "ref_samples"
+
+
+def _channels_axis(clip: torch.Tensor) -> int | None:
+    """The axis a reference clip's channels lie on (its shorter one), or None if it is mono."""
+    if clip.ndim > 2:
+        raise ValueError(f"a reference clip is samples or [channels, samples], got shape {tuple(clip.shape)}")
+    if clip.ndim < 2:
+        return None
+    return 0 if clip.shape[0] < clip.shape[-1] else 1
+
+
+def mono_clip(clip: torch.Tensor) -> torch.Tensor:
+    """A reference clip's samples, channels averaged."""
+    axis = _channels_axis(clip)
+    return (clip if axis is None else clip.mean(dim=axis)).reshape(-1)
+
+
+def mono_samples(clip: torch.Tensor) -> int:
+    """The number of samples ``mono_clip`` gives, without averaging."""
+    axis = _channels_axis(clip)
+    return int(clip.numel() if axis is None else clip.shape[1 - axis])
 
 # ---------------------------------------------------------------------------
 # Fixed ChatML wrapper of the assistant turn, as the Qwen2 tokenizer emits it:

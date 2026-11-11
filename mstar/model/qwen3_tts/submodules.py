@@ -38,7 +38,7 @@ import itertools
 import logging
 from collections import OrderedDict
 from collections.abc import Callable, Mapping, Sequence
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import torch
 
@@ -62,6 +62,7 @@ from mstar.model.audio_watermark import AudioSealWatermarker, WatermarkStream
 from mstar.model.components.audio_features import MatchaLogMel
 from mstar.model.components.code_predictor_kernels import ResidualCodePredictor
 from mstar.model.qwen3_tts.components import depth_frame
+from mstar.model.qwen3_tts.components.codec_encoder import PaddedCodecEncoder
 from mstar.model.qwen3_tts.components.incremental_codec import IncrementalDecoder, codec_state_blocks
 from mstar.model.qwen3_tts.components.snake import fuse_snake_activations
 from mstar.model.qwen3_tts.components.speaker_encoder import Qwen3TTSSpeakerEncoder
@@ -74,6 +75,7 @@ from mstar.model.qwen3_tts.config import (
     LANGUAGE_ID_KEY,
     PROMPT_LAYOUT_KEY,
     REF_CLIP_KEY,
+    REF_SAMPLES_KEY,
     SPEAKER_ID_KEY,
     TALKER_ATTN,
     TALKER_KV,
@@ -81,6 +83,7 @@ from mstar.model.qwen3_tts.config import (
     TALKER_POS,
     TALKER_SAMPLER,
     Qwen3TTSModelConfig,
+    mono_clip,
 )
 from mstar.model.submodule_base import (
     EMPTY_INPUT_METADATA,
@@ -1373,6 +1376,13 @@ class CodecSubmodule(ARNodeSubmodule):
 # ===========================================================================
 
 
+class RefBucket(NamedTuple):
+    """A RefEncoder capture: clips of up to ``frames`` codec frames, with or without their codes."""
+
+    frames: int
+    codes: bool
+
+
 class RefEncoderSubmodule(NodeSubmodule):
     """Encode one reference clip into the Talker's voice conditioning.
 
@@ -1384,15 +1394,30 @@ class RefEncoderSubmodule(NodeSubmodule):
     encoder stay in float32, the speaker encoder runs in the Talker's dtype
     as the reference does.
 
+    Eager, a clip costs about two thousand kernel launches, so a clip of up to
+    ``FRAME_BUCKETS[-1]`` frames replays the engine's capture of its bucket
+    (``RefBucket``): the step's clips are zero-padded to the bucket's width and
+    each encoded as its own unpadded clip would be, up to kernel choice
+    (``forward_padded``). A longer clip and a step of mixed buckets run the same
+    encode eagerly, padded to a multiple of ``EAGER_STEP_FRAMES``.
+
     The same clip recurs: a voice is reused across a session, and every
     sentence chunk of a long clone request carries it. The conditioning is
-    memoised by clip content, so the encoders run once per distinct clip and a
-    repeat costs the prefill alone.
+    memoised by clip content, so a clip already encoded costs the prefill alone.
     """
 
     disable_torch_compile = True
     disable_autocast = True
     CONDITIONING_CACHE_SIZE = 64
+    # codec frames (12.5 Hz): clips of up to 2.6 to 20.5 s
+    FRAME_BUCKETS = (32, 48, 64, 96, 128, 192, 256)
+    CAPTURE_BATCH_SIZES = [1, 2, 4]
+    MAX_BATCH_SIZE = CAPTURE_BATCH_SIZES[-1]
+    # Codec frames one pass of the codec encoder takes: its full-rate
+    # activations set the graph pool, so a wide bucket's rows run a few at a time.
+    CODEC_PASS_FRAMES = 256
+    # an eager clip's width is rounded up to whole multiples of this many frames
+    EAGER_STEP_FRAMES = 32
 
     def __init__(
         self,
@@ -1408,6 +1433,27 @@ class RefEncoderSubmodule(NodeSubmodule):
         self.config = config
         # (clip digest, ref_frames) -> (speaker_embed, ref_codes), oldest first.
         self._conditioning: OrderedDict[tuple[str, int], tuple[torch.Tensor, torch.Tensor]] = OrderedDict()
+        self._samples_stager = PinnedStager(torch.long, numel=self.MAX_BATCH_SIZE)
+        self.padded_codec = PaddedCodecEncoder(codec_encoder, config.codec.num_quantizers)
+        if self.padded_codec.hop != config.codec.encode_downsample_rate:
+            raise ValueError(
+                f"the codec encoder steps {self.padded_codec.hop} samples a frame, "
+                f"the config says {config.codec.encode_downsample_rate}"
+            )
+
+    def _bucket(self, step_metadata: Mapping[str, Any]) -> RefBucket | None:
+        """The capture a request's clip fits, None past the ladder."""
+        frames = self._bucket_frames(step_metadata)
+        return None if frames is None else RefBucket(frames, self._ref_frames(step_metadata) > 0)
+
+    def _bucket_frames(self, step_metadata: Mapping[str, Any]) -> int | None:
+        frames = self.config.codec.frames_for_samples(step_metadata[REF_SAMPLES_KEY])
+        return next((bucket for bucket in self.FRAME_BUCKETS if bucket >= frames), None)
+
+    @staticmethod
+    def _ref_frames(step_metadata: Mapping[str, Any]) -> int:
+        layout = step_metadata[PROMPT_LAYOUT_KEY]
+        return int(layout[4]) if len(layout) >= 5 else 0
 
     def prepare_inputs(
         self,
@@ -1418,53 +1464,217 @@ class RefEncoderSubmodule(NodeSubmodule):
     ) -> NodeInputs:
         del graph_walk, kwargs
         waveform = inputs["audio_inputs"][0].to(device=self.get_device(), dtype=torch.float32)
-        if waveform.ndim > 1:
-            waveform = waveform.mean(dim=0) if waveform.shape[0] < waveform.shape[-1] else waveform.mean(dim=-1)
+        waveform = mono_clip(waveform)
         # ``process_prompt`` settled the layout and hashed the clip on the host.
-        layout = fwd_info.step_metadata[PROMPT_LAYOUT_KEY]
-        ref_frames = int(layout[4]) if len(layout) >= 5 else 0
+        step_metadata = fwd_info.step_metadata
+        if waveform.numel() != step_metadata[REF_SAMPLES_KEY]:
+            # the bucket and the frame count were sized from that count: fail this
+            # request here rather than every row of its replay in preprocess
+            raise ValueError(
+                f"reference clip has {waveform.numel()} samples, its prompt was laid out for "
+                f"{step_metadata[REF_SAMPLES_KEY]}"
+            )
+        ref_frames = self._ref_frames(step_metadata)
         return NodeInputs(
-            tensor_inputs={"waveform": waveform.reshape(-1)},
-            kwargs={"ref_frames": ref_frames, "clip_key": (fwd_info.step_metadata[REF_CLIP_KEY], ref_frames)},
+            tensor_inputs={"waveform": waveform},
+            kwargs={
+                "ref_frames": ref_frames,
+                "clip_key": (step_metadata[REF_CLIP_KEY], ref_frames),
+                "samples": waveform.numel(),
+                "bucket_frames": self._bucket_frames(step_metadata),
+            },
+            # a batched capture matches on rows
+            input_seq_len=1,
         )
+
+    def cg_key_info(
+        self,
+        graph_walk: str,
+        per_request_info: Mapping[str, CurrentForwardPassInfo],
+        per_request_input_metadata: Mapping[str, InputMetadata] | None = None,
+        **kwargs: Any,
+    ) -> RefBucket | None:
+        """The step's bucket when its clips share one; None (eager) otherwise,
+        and for a memoised clip, which needs no encode. Nothing is declared
+        for the step, so a clip memoised after the lease still replays (and is
+        encoded again), and one evicted after it is encoded eagerly."""
+        del graph_walk, per_request_input_metadata, kwargs
+        keys = set()
+        for info in per_request_info.values():
+            metadata = info.step_metadata
+            memoised = (metadata[REF_CLIP_KEY], self._ref_frames(metadata)) in self._conditioning
+            keys.add(None if memoised else self._bucket(metadata))
+        return keys.pop() if len(keys) == 1 else None
+
+    def split_batches_by_capture_key(self, graph_walk: str) -> bool:
+        # two buckets share no replay, and the eager step encodes row by row
+        del graph_walk
+        return True
+
+    def can_batch(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
+        del batch
+        return 0 < len(model_inputs) <= self.MAX_BATCH_SIZE
+
+    def max_batch_size(self, graph_walk: str) -> int:
+        del graph_walk
+        return self.MAX_BATCH_SIZE
+
+    def preprocess(
+        self,
+        graph_walk: str,
+        engine_inputs: ModelInputsFromEngine,
+        inputs: list[NodeInputs],
+    ) -> dict[str, Any]:
+        """A replay's clips as ``[B, width]`` zero-padded samples and their
+        sample counts; an eager step's clips as they are."""
+        del graph_walk
+        if not engine_inputs.captured:
+            return {
+                "waveforms": [item.tensor_inputs["waveform"] for item in inputs],
+                "ref_frames": [item.kwargs["ref_frames"] for item in inputs],
+                "clip_keys": [item.kwargs["clip_key"] for item in inputs],
+            }
+        buckets = {RefBucket(item.kwargs["bucket_frames"], item.kwargs["ref_frames"] > 0) for item in inputs}
+        if len(buckets) != 1:
+            raise ValueError(f"a RefEncoder replay holds clips of several buckets: {buckets}")
+        bucket = buckets.pop()
+        width = bucket.frames * self.config.codec.encode_downsample_rate
+        waveform = torch.zeros(len(inputs), width, dtype=torch.float32, device=self.get_device())
+        for row, item in zip(waveform, inputs, strict=True):
+            clip = item.tensor_inputs["waveform"]
+            row[:clip.numel()].copy_(clip)
+        samples = torch.empty(len(inputs), dtype=torch.long, device=waveform.device)
+        self._samples_stager.copy_(samples, [item.kwargs["samples"] for item in inputs])
+        return {"waveform": waveform, "samples": samples, "codes": bucket.codes}
+
+    def forward_padded(
+        self,
+        graph_walk: str,
+        engine_inputs: ModelInputsFromEngine,
+        waveform: torch.Tensor,
+        samples: torch.Tensor,
+        codes: bool,
+        **kwargs: Any,
+    ) -> BatchedModelOutput:
+        """The captured encode: ``[B, width]`` clips padded to one bucket ->
+        ``speaker_embed`` ``[B, dim]`` and ``ref_codes`` ``[B, frames, quantizers]``
+        (one zero frame without codes); ``postprocess`` cuts each row's frames."""
+        del graph_walk, engine_inputs, kwargs
+        with torch.autocast(device_type=waveform.device.type, enabled=False):
+            mels = self.mel_front_end(waveform, samples).transpose(1, 2)
+            encoder_dtype = next(self.speaker_encoder.parameters()).dtype
+            speaker_embed = self.speaker_encoder(mels.to(encoder_dtype), self.mel_front_end.num_frames(samples))
+            if codes:
+                frames = waveform.shape[1] // self.config.codec.encode_downsample_rate
+                rows = max(1, self.CODEC_PASS_FRAMES // frames)
+                ref_codes = torch.cat([
+                    self.padded_codec(waveform[i:i + rows], samples[i:i + rows])
+                    for i in range(0, waveform.shape[0], rows)
+                ])
+            else:
+                ref_codes = torch.zeros(
+                    waveform.shape[0], 1, self.config.codec.num_quantizers, dtype=torch.long, device=waveform.device,
+                )
+        return BatchedModelOutput(row_outputs={"speaker_embed": speaker_embed, "ref_codes": ref_codes})
+
+    def _encode(self, waveform: torch.Tensor, ref_frames: int, clip_key: tuple[str, int] | None) -> NameToTensorList:
+        """One clip at its own length, or its memoised conditioning."""
+        if clip_key is not None and clip_key in self._conditioning:
+            speaker_embed, codes = self._conditioning[clip_key]
+            return {"speaker_embed": [speaker_embed], "ref_codes": [codes]}
+        # The replay's padded encode, at a width rounded up to EAGER_STEP_FRAMES:
+        # cuDNN builds plans per conv shape, and every clip has a new length.
+        step = self.EAGER_STEP_FRAMES * self.config.codec.encode_downsample_rate
+        width = -(-waveform.numel() // step) * step
+        padded = torch.nn.functional.pad(waveform.float(), (0, width - waveform.numel())).unsqueeze(0)
+        samples = torch.full((1,), waveform.numel(), dtype=torch.long, device=waveform.device)
+        out = self.forward_padded("", None, padded, samples, ref_frames > 0).row_outputs
+        # postprocess cuts the codes to the clip's frames, as it does a replay's row
+        return {"speaker_embed": [out["speaker_embed"][0]], "ref_codes": [out["ref_codes"][0]]}
 
     def forward(
         self,
         graph_walk: str,
         engine_inputs: ModelInputsFromEngine,
-        waveform: torch.Tensor,
-        ref_frames: int = 0,
-        clip_key: tuple[str, int] | None = None,
+        waveforms: list[torch.Tensor],
+        ref_frames: list[int],
+        clip_keys: list[tuple[str, int] | None],
         **kwargs: Any,
     ) -> NameToTensorList:
         del graph_walk, engine_inputs, kwargs
-        if clip_key is not None and clip_key in self._conditioning:
-            self._conditioning.move_to_end(clip_key)
-            speaker_embed, codes = self._conditioning[clip_key]
-            return {"speaker_embed": [speaker_embed], "ref_codes": [codes]}
-        device_type = waveform.device.type
-        with torch.autocast(device_type=device_type, enabled=False):
-            mels = self.mel_front_end(waveform.unsqueeze(0)).transpose(1, 2)  # [1, frames, mel]
-        encoder_dtype = next(self.speaker_encoder.parameters()).dtype
-        speaker_embed = self.speaker_encoder(mels.to(encoder_dtype))[0]
+        return self._encode(waveforms[0], ref_frames[0], clip_keys[0])
 
-        num_quantizers = self.config.codec.num_quantizers
-        if ref_frames > 0:
-            with torch.autocast(device_type=device_type, enabled=False):
-                encoded = self.codec_encoder.encode(
-                    input_values=waveform.view(1, 1, -1).float(), return_dict=True
-                )
-            codes = encoded.audio_codes[0, :num_quantizers, :ref_frames].t().contiguous().long()
-            if codes.shape[0] < ref_frames:
-                raise ValueError(
-                    f"codec encoder produced {codes.shape[0]} frames for a clip declared as {ref_frames}"
-                )
-        else:
-            # x-vector-only clone: no in-context frames. The edge still needs
-            # a tensor; the Talker ignores it because the layout says 0 frames.
-            codes = torch.zeros(1, num_quantizers, dtype=torch.long, device=waveform.device)
+    def forward_batched(
+        self,
+        graph_walk: str,
+        engine_inputs: ModelInputsFromEngine,
+        waveforms: list[torch.Tensor],
+        ref_frames: list[int],
+        clip_keys: list[tuple[str, int] | None],
+        **kwargs: Any,
+    ) -> BatchedModelOutput:
+        """An eager step: each clip at its own length."""
+        del graph_walk, kwargs
+        rows = zip(waveforms, ref_frames, clip_keys, strict=True)
+        return BatchedModelOutput(per_rid_outputs={
+            rid: self._encode(*row) for rid, row in zip(engine_inputs.request_ids, rows, strict=True)
+        })
+
+    def postprocess(
+        self,
+        request_id: str,
+        request_info: CurrentForwardPassInfo,
+        outputs: dict[str, list[torch.Tensor]],
+        inputs: NodeInputs | None = None,
+        **kwargs: Any,
+    ) -> None:
+        """Cut a replay's row to the clip's ``ref_frames`` frames (one placeholder
+        frame without them), and memoise the clip's conditioning."""
+        del request_id, request_info, kwargs
+        if "speaker_embed" not in outputs:
+            return
+        if inputs is None:
+            raise ValueError("RefEncoder postprocess needs the pass's inputs for the clip's frames")
+        ref_frames = inputs.kwargs["ref_frames"]
+        speaker_embed = outputs["speaker_embed"][0].reshape(-1)
+        codes = outputs["ref_codes"][0].reshape(-1, self.config.codec.num_quantizers)[:max(ref_frames, 1)]
+        if codes.shape[0] < ref_frames:
+            raise ValueError(f"codec encoder produced {codes.shape[0]} frames for a clip declared as {ref_frames}")
+        outputs["speaker_embed"][0], outputs["ref_codes"][0] = speaker_embed, codes
+        clip_key = inputs.kwargs["clip_key"]
         if clip_key is not None:
-            self._conditioning[clip_key] = (speaker_embed, codes)
+            # copies: the routed tensors are views of the step's output, and the memo
+            # must not see a later request's in-place change to them
+            self._conditioning[clip_key] = (speaker_embed.clone(), codes.clone())
+            self._conditioning.move_to_end(clip_key)
             while len(self._conditioning) > self.CONDITIONING_CACHE_SIZE:
                 self._conditioning.popitem(last=False)
-        return {"speaker_embed": [speaker_embed], "ref_codes": [codes]}
+
+    def get_accelerator_graph_configs(
+        self, device: torch.device, tp_world_size: int = 1
+    ) -> list[AcceleratorGraphConfig]:
+        """Each bucket, with and without codes (x-vector-only clones skip the
+        codec encoder). The template row is a whole bucket of silence; its empty
+        waveform keeps a replay's padding rows from copying any samples."""
+        del tp_world_size
+        hop = self.config.codec.encode_downsample_rate
+        return [
+            BatchedAcceleratorGraphConfig(
+                capture_graph_walk="talker_prefill_clone",
+                single_request_inputs=NodeInputs(
+                    tensor_inputs={"waveform": torch.zeros(0, device=device)},
+                    kwargs={
+                        "ref_frames": frames if codes else 0, "clip_key": None,
+                        "samples": frames * hop, "bucket_frames": frames,
+                    },
+                    input_seq_len=1,
+                ),
+                additional_key_info=RefBucket(frames, codes),
+                capture_batch_sizes=self.CAPTURE_BATCH_SIZES,
+                capture_forward_method="forward_padded",
+                compile=False,
+                input_seq_dims={"waveform": 0, "samples": 0},
+            )
+            for frames in self.FRAME_BUCKETS
+            for codes in (True, False)
+        ]

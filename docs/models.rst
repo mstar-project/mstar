@@ -1254,7 +1254,12 @@ Qwen3-TTS notes
   ``client.tts(text, reference_audio="ref.wav", ref_text="...")``. The clip's
   conditioning (x-vector and codec frames) is memoised by content, so a voice
   reused across requests, or by the sentence chunks of one long request, is
-  encoded once; named, persisted voices arrive with the shared voice registry.
+  not encoded again once its conditioning is memoised; named, persisted voices
+  arrive with the shared voice registry.
+  A new clip of up to 20.5 s replays the engine's capture of its frame bucket
+  (``RefEncoderSubmodule.FRAME_BUCKETS``), padded to the bucket and encoded as
+  the unpadded clip would be, up to kernel choice; a longer clip runs the same
+  encode eagerly.
 - Text layout follows the reference defaults: CustomVoice and VoiceDesign put
   the whole text in the prefill; Base feeds it one token per frame. Override
   per request with ``non_streaming_mode``.
