@@ -31,6 +31,8 @@ ALLOWED = {
         for name in ("AcceleratorGraphConfig", "DETERMINISTIC_COMPILE_MODE")
     },
     ("mstar.engine.resources.lora", "LoraSpec"): "the opt-in LoRA spec, written by hand: the contract declares no LoRA",
+    ("mstar.engine.resources.sequence_shard", "SeqShardSpec"):
+        "the LLM's sequence shard, written by hand: the contract declares no split of a step over SP ranks",
 }
 
 

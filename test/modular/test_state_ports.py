@@ -47,6 +47,7 @@ from mstar.engine.resources.recurrent.config import (
     RecurrentStep,
 )
 from mstar.engine.resources.sampler.config import SamplerSpec, SamplerStep, SamplingReqConfig
+from mstar.engine.resources.sequence_shard import SeqShardSpec
 from mstar.engine.resources.spec import CombinedSplit, apply_yaml_overrides
 from mstar.engine.resources.step import ResourceStep, Segment, StepContext, SubmoduleStep
 from mstar.engine.state import Array, ArrayStep, Layout, Span
@@ -75,8 +76,8 @@ from mstar.model.command_a_plus.command_a_plus_model import CommandAPlusModel
 from mstar.model.command_a_plus.submodules import CommandAPlusLLMSubmodule
 from mstar.model.components.block_loop_encoder import VISION_BLOCK_LOOP
 from mstar.model.components.request_kwargs import sampler_capabilities
-from mstar.model.keys import MIXED, ROPE
-from mstar.model.multimodal import vision_encoder
+from mstar.model.keys import MIXED, PREFILL_TEXT, ROPE
+from mstar.model.multimodal import media_walk_names, vision_encoder
 from mstar.model.multimodal_decoder import MultimodalDecoderModel
 from mstar.model.qwen3_5.components.language_model import Qwen3_5ForCausalLM, Qwen3_5LanguageModel
 from mstar.model.qwen3_5.config import (
@@ -87,6 +88,7 @@ from mstar.model.qwen3_5.config import (
     KV_CACHE,
     LINEAR_ATTENTION,
     LINEAR_ATTN,
+    LLM_SHARD,
     SAMPLER,
     VISION_ATTN,
     VISION_TOKENS,
@@ -145,7 +147,7 @@ def _qwen3_5_state_dtype(config) -> torch.dtype:
 
 # Less the opt-in LoRA spec, which `enabled_resources` builds only when a deployment names it. It holds callables, so
 # a second build wouldn't equal it.
-def _qwen3_5_reference(config) -> list:
+def _qwen3_5_reference(config, encoders=()) -> list:
     return [
         KVSpec(
             resource_key=KV_CACHE, nodes={"LLM"},
@@ -185,6 +187,8 @@ def _qwen3_5_reference(config) -> list:
         SamplerSpec(
             resource_key=SAMPLER, nodes={"LLM"}, vocab_size=config.vocab_size, enable_repetition_penalty=True,
         ),
+        SeqShardSpec(LLM_SHARD, {"LLM"}, labels=("main",), axis=0, walks=(PREFILL_TEXT, *media_walk_names(encoders), MIXED),
+                     exchange="none"),
     ]
 
 
@@ -335,9 +339,9 @@ def test_qwen3_5_refuses_a_shape_that_cant_run(overrides, where):
         _qwen3_5(**{**QWEN3_5["9B"], **overrides}).declare_state()
 
 
-def test_qwen3_5_writes_only_lora_by_hand():
+def test_qwen3_5_writes_only_lora_and_its_sequence_shard_by_hand():
     model = _qwen3_5(**QWEN3_5["9B"])
-    assert {spec.resource_key for spec in model.get_node_resources()} == {LORA_RESOURCE_KEY}
+    assert {spec.resource_key for spec in model.get_node_resources()} == {LORA_RESOURCE_KEY, LLM_SHARD}
 
 
 # The tower of Qwen/Qwen3.5-9B's `config.json`
@@ -373,7 +377,7 @@ def _qwen3_5_vision_reference(model) -> RaggedAttentionSpec:
 
 def test_qwen3_5_vision_spec_equals_the_hand_written_one(monkeypatch):
     model = _qwen3_5_vision(monkeypatch)
-    reference = [*_qwen3_5_reference(model.config), _qwen3_5_vision_reference(model)]
+    reference = [*_qwen3_5_reference(model.config, model.encoders), _qwen3_5_vision_reference(model)]
     _assert_equal_per_key(enabled_resources(model, {}), reference)
     assert state_declaration_problems(model) == []
 
@@ -381,7 +385,7 @@ def test_qwen3_5_vision_spec_equals_the_hand_written_one(monkeypatch):
 def test_a_yaml_override_of_the_vision_ceiling_still_holds(monkeypatch):
     model = _qwen3_5_vision(monkeypatch)
     overrides = {"resources": {VISION_ATTN: {"max_segments_per_step": 3}}}
-    reference = [*_qwen3_5_reference(model.config), _qwen3_5_vision_reference(model)]
+    reference = [*_qwen3_5_reference(model.config, model.encoders), _qwen3_5_vision_reference(model)]
     apply_yaml_overrides(reference, overrides)
     specs = serving_resources(model, overrides)
     _assert_equal_per_key(specs, reference)
