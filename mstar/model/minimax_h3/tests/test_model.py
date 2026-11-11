@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 import torch
+import yaml
 
 from mstar.graph.base import GraphNode, Loop, Parallel, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
@@ -41,6 +44,9 @@ from mstar.model.minimax_h3.minimax_h3_model import (
 )
 from mstar.model.minimax_h3.schedule import h3_schedule
 from mstar.model.minimax_h3.submodules import LATENTS, TEXT_INPUTS, H3DenoiseSubmodule, layout_from_metadata
+from mstar.validation import validate_deployment
+
+CONFIGS = Path(__file__).parents[4] / "configs"
 
 
 def _model(**kwargs) -> H3Model:
@@ -117,6 +123,15 @@ def test_resources_per_backend():
     assert specs[DIT_ATTN].nodes == {"dit"} and specs[DIT_ATTN].sp_exchange == "ulysses"
     assert specs[REFINER_ATTN].nodes == {"text_encoder"} and specs[REFINER_ATTN].sp_exchange is None
     assert not specs[VAE_SHARD].exchanges and specs[DIT_SHARD].exchanges
+
+
+@pytest.mark.parametrize("name", ["minimax_h3.yaml", "minimax_h3_sp2.yaml", "minimax_h3_sp8.yaml"])
+def test_the_shipped_sp_configs_pass_the_conductors_checks(name):
+    """The DiT and the video decoder share one SP group, and every node on SP ranks must declare how
+    it splits: the decoder's frame split (``exchanges=False``) is what the conductor accepts."""
+    path = CONFIGS / name
+    config = yaml.safe_load(path.read_text())
+    assert validate_deployment(_model(**(config.get("model_kwargs") or {})), config, str(path)).worker_graphs
 
 
 def test_request_defaults_and_validation():
@@ -522,10 +537,10 @@ def _sp_resources(model: H3Model, keys, group) -> dict:
 def _plan(node, res: dict, rids, layout) -> None:
     """The node's step for ``rids`` at ``layout``, planned over ``res`` as the runner does."""
     from mstar.engine.resources import StepContext, StepRunner
-    from mstar.model.submodule_base import NodeInputs
+    from mstar.model.submodule_base import NodeInputs, engine_step
 
     node.bind_node_resources(res)
-    step = node.declare_step("w", rids, [NodeInputs(resource_step_info=layout)] * len(rids))
+    step = engine_step(node, "w", rids, [NodeInputs(resource_step_info=layout)] * len(rids))
     step.set_ctx(StepContext(request_ids=rids, graph_walk="w", slot=0, capture=False))
     StepRunner(res).plan(step)
 
