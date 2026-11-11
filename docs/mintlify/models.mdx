@@ -46,6 +46,7 @@ Registered model families
 | `qwen3_asr` | `Qwen/Qwen3-ASR-1.7B` | Qwen3-ASR: AuT audio encoder (8 s attention windows, ragged attention)<br /><br />+ dense Qwen3 decoder; up to 20 min of audio per request, 30 languages (detected or forced), `/v1/audio/transcriptions`. A repetition loop in the transcript is collapsed as the reference SDK does. |
 | `qwen3_asr_realtime` | `Qwen/Qwen3-ASR-0.6B` | The 0.6B Qwen3-ASR checkpoint on the same class, sized in its config for the short steps of `/v1/realtime` sessions. |
 | `higgs_audio` *(Beta)* | `bosonai/higgs-audio-v3-stt` | Audio-tower + Qwen3 LLM speech-to-text. Beta / un-optimized. |
+| `phi4mm` *(Beta)* | `microsoft/Phi-4-multimodal-instruct` | Phi-4-mini with a SigLIP vision tower and a conformer audio tower: text, images and audio in, text out. Each request runs under the checkpoint's vision or speech LoRA as its media call for, from the engine's LoRA pool. |
 | `omnilingual_asr_ctc_{300m,1b,3b,7b}` | `facebook/omniASR-CTC-300M` (v1); v2 from Meta's CDN (default) | Meta Omnilingual ASR, CTC variants: wav2vec 2.0 encoder + CTC head, speech-to-text in 1,600+ languages with no language code. Not autoregressive; batched across requests. Apache-2.0. |
 | `canary` | `nvidia/canary-1b-v2` | FastConformer encoder + Transformer decoder: speech recognition in 25 European languages and translation to or from English (`language`, English if unset, and `target_language` or `task="translate"`). Clips up to 40 s; longer uploads are windowed. No timestamps. |
 | `canary_qwen` | `nvidia/canary-qwen-2.5b` | English speech recognition by an LLM: Canary's FastConformer encoder projected into Qwen3-1.7B (LoRA merged at load). Clips up to 40 s; longer uploads are windowed. The OpenAI `prompt` is ignored. No timestamps. |
@@ -257,7 +258,7 @@ lora: {max_slots: 4, max_rank: 16, adapters: {tcg: <heftyTuna/qwen35-27b-tcg-lor
 
 Under TP the LLM's targets split as its linears do (the 27B's single K/V head per rank at TP4, and the DeltaNet `a` gate padded per rank, included); the vision encoder runs on one GPU in every shipped config.
 
-Both frontends serve LoRA: a request's `model` names the adapter it runs under (`ServedModels`), and `/v1/models` lists the adapters beside the base model. Runtime updates (below) are the Python frontend's only for now: `mstar-server` reads the served adapters once at launch and has neither route, so `mstar serve` refuses `--rust-frontend` with `runtime_updates: true`.
+Both frontends serve LoRA: a request's `model` names the adapter it runs under (`ServedModels`), and `/v1/models` lists the adapters beside the base model. Both serve runtime updates (below) too: `mstar-server` selects the adapter itself, and the API server pushes it the served set after every change, so a request pays no extra round trip for it.
 
 Adapters can also be loaded and unloaded while the server runs, with vLLM's endpoints and bodies. They make the server read paths a client names, so they are off unless the `lora` block opts in, and answer 404 otherwise (as vLLM's do without `VLLM_ALLOW_RUNTIME_LORA_UPDATING`). The block may name no adapters at all (`resources: {lora: {max_slots: 4, runtime_updates: true}}`):
 

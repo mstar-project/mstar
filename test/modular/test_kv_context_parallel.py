@@ -60,8 +60,8 @@ from mstar.engine.resources.kv.config import KVLayout, KVReqConfig, KVSpec, KVSt
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.kv.plan import SINK_PAGE, KVPlanOutput, KVPlanOutputs, SequenceView, build_paged_indptrs
 from mstar.engine.resources.kv.transfer import KVReadInfo, ShmKVTransferEngine
-from mstar.engine.resources.position.config import PositionConfig, PositionStep
-from mstar.engine.resources.position.manager import RopeManager
+from mstar.engine.resources.position.config import LongRoPE, PositionConfig, PositionReqConfig, PositionStep
+from mstar.engine.resources.position.manager import LongRopeManager, RopeManager
 from mstar.engine.resources.runner import StepRunner
 from mstar.engine.resources.sampler.config import SamplingReqConfig
 from mstar.engine.resources.sequence_shard import SeqShardSpec, SequenceShard
@@ -873,11 +873,22 @@ def test_a_split_label_reached_outside_an_exchange_is_refused():
         kv.write_slots("main")
 
 
-def test_rope_in_a_layer_rotates_a_split_labels_range_at_its_own_positions(monkeypatch):
+@pytest.mark.parametrize("longrope", [False, True], ids=["rope", "longrope"])
+def test_rope_in_a_layer_rotates_a_split_labels_range_at_its_own_positions(monkeypatch, longrope):
     """A layer that ropes through the position resource holds its range of a split label, and so
-    do the positions it rotates at; an explicit ``pos_ids`` of the whole label is refused."""
+    do the ids it rotates at (a LongRoPE request's table ids, past its positions by the long
+    half's offset); an explicit ``pos_ids`` of the whole label is refused (a LongRoPE request refuses
+    any)."""
     shard = SequenceShard(("main",), 0, None, 0, _group(1, P))
-    pos = RopeManager(config=PositionConfig(kv_cache="kv"), device=CPU, max_seq_len=64, head_dim=8)
+    if longrope:
+        table = LongRoPE((1.0,) * 4, (2.0,) * 4, original_max_position_embeddings=16, max_position_embeddings=512)
+        pos = LongRopeManager(
+            config=PositionConfig(kv_cache="kv", rotary_dim=8, longrope=table), device=CPU, max_seq_len=64, head_dim=8,
+        )
+        for i in range(len(PREFILL_ROWS)):
+            pos.ingest_request(f"r{i}", PositionReqConfig(max_position=100))
+    else:
+        pos = RopeManager(config=PositionConfig(kv_cache="kv"), device=CPU, max_seq_len=64, head_dim=8)
     pos._shard_key = "shard"
     pos.bind_dependencies({"shard": shard})
     rows = [(f"r{i}", "main", new) for i, (_, new) in enumerate(PREFILL_ROWS)]
@@ -891,9 +902,9 @@ def test_rope_in_a_layer_rotates_a_split_labels_range_at_its_own_positions(monke
     # rank 1 of 2 holds the step's last 5 of 11 tokens
     q = torch.zeros(5, 2, 8, dtype=torch.bfloat16)
     pos.apply_qk(q, q.clone(), label="main")
-    assert rotated[0].tolist() == [1, 2, 0, 1, 0]
+    assert rotated[0].tolist() == [i + 64 * longrope for i in (1, 2, 0, 1, 0)]
     assert pos.pos_ids("main").shape[0] == 11
-    with pytest.raises(ValueError, match="this rank's range's positions"):
+    with pytest.raises(ValueError, match="explicit pos_ids" if longrope else "this rank's range's positions"):
         pos.apply_qk(q, q.clone(), label="main", pos_ids=torch.arange(11))
 
 
