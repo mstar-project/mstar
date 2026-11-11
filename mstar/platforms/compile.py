@@ -1,4 +1,5 @@
-"""The platform's inductor settings, applied to one compiled callable."""
+"""The platform's Inductor settings for one compiled callable, and a process-wide fix to
+Inductor's autotuning."""
 
 from __future__ import annotations
 
@@ -42,40 +43,52 @@ def with_inductor_overrides(
     return forward
 
 
+def _below_split_scan_minimum(meta: dict, name: str, val: int) -> bool:
+    return (
+        meta.get("grid_type") == "SplitScanGrid"
+        and name.startswith("R") and name.endswith("BLOCK")
+        and val < meta.get("min_split_scan_rblock", 256)
+    )
+
+
 @functools.cache
 def keep_split_scans_in_their_workspace() -> None:
-    """Stop Inductor's coordinate descent from tuning a split scan's block size below the
-    one its workspace is sized for. Process-wide; the engine installs it before anything
-    compiles.
+    """Keep a split scan's block size at or above the one its workspace is sized for, in
+    Inductor's coordinate descent and in the picks it cached. Process-wide; the engine
+    installs it before anything compiles.
 
-    A split scan (a long 1-D ``cumsum``, e.g. ``splice_media``'s over a media walk's
-    pads) keeps one look-back slot per block in a workspace sized at codegen for blocks of
-    at least ``config.triton.min_split_scan_rblock`` elements, and its autotune configs
-    are clamped to that. Coordinate descent (``coordinate_descent_tuning``, on at
-    compile level 1 and 2) halves ``R0_BLOCK`` past it all the same, checking only for
-    zero. The scan then runs twice the blocks its workspace holds and reads and writes
-    past it: an illegal memory access when what follows is unmapped, and otherwise a
-    silent overwrite of a neighbouring allocation, which a captured graph repeats on every
-    replay. On Phi-4-multimodal it faulted at startup in 5 of about 40 boots, in the
-    12288- and 16384-token media buckets' scans at R0_BLOCK 128 (torch 2.11).
+    A split scan (a long 1-D ``cumsum``) sizes its look-back workspace for blocks of at
+    least ``config.triton.min_split_scan_rblock``. Coordinate descent's only lower bound is
+    zero, so it can tune below that, and the scan then writes past its workspace: an
+    illegal memory access, or a silent overwrite of what follows. A pick cached before this
+    was installed skips coordinate descent, so one below the minimum reads as a miss and is
+    retuned. Upstream: pytorch/pytorch#197493.
     """
     try:
+        from torch._inductor.runtime import autotune_cache
         from torch._inductor.runtime.coordinate_descent_tuner import CoordescTuner
     except ImportError:
         return
     below_any = CoordescTuner.value_too_small
 
     def value_too_small(self, name: str, val: int) -> bool:
-        meta = self.inductor_meta
-        if (
-            meta.get("grid_type") == "SplitScanGrid"
-            and name.startswith("R") and name.endswith("BLOCK")
-            and val < meta.get("min_split_scan_rblock", 256)
-        ):
-            return True
-        return below_any(self, name, val)
+        return _below_split_scan_minimum(self.inductor_meta, name, val) or below_any(self, name, val)
 
     CoordescTuner.value_too_small = value_too_small
+
+    load_cached = getattr(autotune_cache, "_load_cached_autotuning", None)
+    if load_cached is None:
+        return
+
+    def load_cached_autotuning(best_config, configs_hash, configs, inductor_meta):
+        found = load_cached(best_config, configs_hash, configs, inductor_meta)
+        if found is not None and any(
+            _below_split_scan_minimum(inductor_meta, k, v) for k, v in found.kwargs.items()
+        ):
+            return None
+        return found
+
+    autotune_cache._load_cached_autotuning = load_cached_autotuning
 
 
 @functools.cache
