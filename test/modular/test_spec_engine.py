@@ -976,6 +976,24 @@ def test_a_workers_own_capability_refusal_enters_the_one_agreement(monkeypatch, 
         assert joint.asked == [[1, 1]] and "another rank" in reason
 
 
+@pytest.mark.parametrize("mode", ["auto", "asynchronous"])
+def test_a_verifying_node_that_shares_a_resource_never_runs_asynchronous(mode):
+    """Another node's offload releases this node's slots on the resources they share, and marks no
+    verify ledger but its own; so such a node runs synchronous, whose rule needs no mark."""
+    from spec_toy import ToyModel
+
+    eng = engine(3, oracle, mode=mode)
+    mgmt = eng._submodules[NODE]
+    eng._resource_nodes["rope"] = frozenset({NODE, "other"})
+    decl = ToyModel(3, mode).verify_nodes()[0]
+    if mode == "asynchronous":
+        with pytest.raises(RuntimeError, match="resource 'rope' is shared by nodes"):
+            eng._agreed_mode(decl, mgmt, _toy_specs(), (True, ""))
+        return
+    got, reason = eng._agreed_mode(decl, mgmt, _toy_specs(), (True, ""))
+    assert got.value == "synchronous" and "resource 'rope' is shared by nodes ['LLM', 'other']" in reason
+
+
 def test_the_built_resources_must_be_the_declared_ones():
     from spec_toy import ToyModel
 
