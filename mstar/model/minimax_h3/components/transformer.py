@@ -237,8 +237,23 @@ class H3TextConditioner(nn.Module):
         return self.token_refiner.final_norm(x)
 
 
+class StepHeads(nn.Module):
+    """One linear head per sampling step, stacked: ``weight [n, out, in]``, ``bias [n, out]``.
+    ``forward`` runs the head ``index`` (a ``[1]`` device tensor) names as a plain linear, so
+    a captured step reads its head from the step's scalar rather than a Python int."""
+
+    def __init__(self, num_heads: int, in_features: int, out_features: int):
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(num_heads, out_features, in_features))
+        self.bias = nn.Parameter(torch.empty(num_heads, out_features))
+
+    def forward(self, x: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
+        return F.linear(x, self.weight.index_select(0, index)[0], self.bias.index_select(0, index)[0])
+
+
 class H3FinalLayer(nn.Module):
-    """``norm_out`` + the two fp32 heads. The modulation is per timestep."""
+    """``norm_out`` + the fp32 heads (video, and audio when the model has it). The
+    modulation is per timestep."""
 
     def __init__(self, cfg: H3TransformerConfig):
         super().__init__()
@@ -246,8 +261,11 @@ class H3FinalLayer(nn.Module):
         self.norm = nn.RMSNorm(cfg.hidden_size, eps=cfg.final_norm_eps)
         self.adaln_proj = nn.Module()
         self.adaln_proj.linear = nn.Linear(cfg.time_embed_dim, cfg.final_adaln_out_features)
-        self.video_out = nn.Linear(cfg.hidden_size, cfg.patch_dim)
-        self.audio_out = nn.Linear(cfg.hidden_size, cfg.audio_latents_dim)
+        if cfg.num_output_heads == 1:
+            self.video_out = nn.Linear(cfg.hidden_size, cfg.patch_dim)
+        else:
+            self.video_out = StepHeads(cfg.num_output_heads, cfg.hidden_size, cfg.patch_dim)
+        self.audio_out = nn.Linear(cfg.hidden_size, cfg.audio_latents_dim) if cfg.audio_enabled else None
 
     def forward(self, x: torch.Tensor, temb: torch.Tensor, row_class: torch.Tensor) -> torch.Tensor:
         """``[B, S, hidden]`` -> the normed, modulated rows in the heads' dtype."""
@@ -328,7 +346,7 @@ class H3DiT(nn.Module):
             # before the first request
             raise ValueError(f"MiniMax-H3's {heads} heads don't split over sp_size {self.sp_group.world_size}")
         self.video_patch_proj = nn.Linear(cfg.patch_dim, cfg.hidden_size)
-        self.audio_patch_proj = nn.Linear(cfg.audio_latents_dim, cfg.hidden_size)
+        self.audio_patch_proj = nn.Linear(cfg.audio_latents_dim, cfg.hidden_size) if cfg.audio_enabled else None
         self.time_embedder = H3TimeEmbedder(cfg)
         self.blocks = nn.ModuleList(H3Block(cfg, comm_group) for _ in range(cfg.num_layers))
         self.final_layer = H3FinalLayer(cfg)
@@ -339,7 +357,10 @@ class H3DiT(nn.Module):
 
     def keep_fp32(self) -> None:
         for name in self.FP32_MODULES:
-            self.get_submodule(name).float()
+            parent, _, leaf = name.rpartition(".")
+            module = getattr(self.get_submodule(parent), leaf)
+            if module is not None:  # a model without audio has no audio modules
+                module.float()
 
     @property
     def dtype(self) -> torch.dtype:
@@ -381,12 +402,15 @@ class H3DiT(nn.Module):
 
     def forward(
         self, inputs: H3Inputs, layout: H3StepLayout, attend: Attend, row_class: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """``inputs.timesteps`` is ``[B, 3]`` (video, audio, keyframe), or ``[B, 1]`` when all
-        are one value: the reference then runs its AdaLN GEMMs on one row, which rounds
-        differently from three. ``row_class`` (tests) indexes timesteps laid out as the
-        reference's distinct values. ``attend`` attends within ``layout.segments``, so no
-        request row sees a padding row."""
+        head: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """``inputs.timesteps`` is ``[B, n]``: one timestep per class ``layout.row_class``
+        indexes (H3: video, audio, keyframe), or ``[B, 1]`` when all are one value: the
+        reference then runs its AdaLN GEMMs on one row, which rounds differently from three.
+        ``row_class`` (tests) indexes timesteps laid out as the reference's distinct values.
+        ``attend`` attends within ``layout.segments``, so no request row sees a padding row.
+        ``head`` (``[1]``) picks the step's video head when the model has one per step. The
+        audio velocity is None for a model without audio."""
         cond, pad = layout.num_condition_rows, layout.num_pad_rows
         sp, start, count = None, 0, layout.num_rows
         if self.sp_group.world_size > 1:
@@ -409,12 +433,16 @@ class H3DiT(nn.Module):
         for block in self.blocks:
             x = block(x, temb, row_index, rope, attend, sp)
         h = self.final_layer(x, temb, row_class)
-        # both heads over this rank's rows, then the rows gathered: [B, S, patch_dim + audio_dim]
-        out = torch.cat([self.final_layer.video_out(h), self.final_layer.audio_out(h)], dim=-1)
+        final = self.final_layer
+        video_out = final.video_out(h) if head is None else final.video_out(h, head)
+        # the heads over this rank's rows, then the rows gathered: [B, S, patch_dim (+ audio_dim)]
+        out = video_out if final.audio_out is None else torch.cat([video_out, final.audio_out(h)], dim=-1)
         if sp is not None:
             out = gather_sequence(sp.group, out, sp.sizes, dim=1)
         text, audio_rows, end = layout.text_len, layout.num_audio_rows, layout.num_rows - pad
         patch_dim = self.cfg.patch_dim
+        if final.audio_out is None:
+            return out[:, text:end], None
         video_v = torch.cat(
             [out[:, text:text + cond, :patch_dim], out[:, text + cond + audio_rows:end, :patch_dim]], dim=1,
         )

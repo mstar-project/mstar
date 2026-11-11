@@ -145,7 +145,9 @@ class H3TextEncoderSubmodule(NodeSubmodule):
         tensors = {TEXT_INPUTS: ids}
         grids: tuple[tuple[int, int, int], ...] = ()
         if inputs.get(VISION_PIXELS):
-            tensors[VISION_PIXELS] = inputs[VISION_PIXELS][0]
+            # one tensor of the processor's rows, or one per image (MiniMax-H3-Image), in packed order
+            pixels = inputs[VISION_PIXELS]
+            tensors[VISION_PIXELS] = pixels[0] if len(pixels) == 1 else torch.cat([p.flatten(0, -2) for p in pixels])
             grids = tuple(tuple(int(v) for v in g) for g in fwd_info.step_metadata["keyframe_grids"])
         return NodeInputs(tensor_inputs=tensors, input_seq_len=int(ids.shape[0]),
                           resource_step_info=TextStep(int(ids.shape[0]), grids))
@@ -166,7 +168,7 @@ class H3TextEncoderSubmodule(NodeSubmodule):
         if vision_pixels is None:
             hidden = self.encoder(ids[None], torch.ones_like(ids[None]), padded=False)
         else:
-            hidden = self._encode_with_images(ids, vision_pixels.to(device), list(step.grids))
+            hidden = self._encode_with_images(ids, vision_pixels.flatten(0, -2).to(device), list(step.grids))
         return {TEXT_EMBEDS: [self.conditioner(hidden, self.attend())[0]]}
 
     def _encode_with_images(self, ids: torch.Tensor, pixels: torch.Tensor, grids: list) -> torch.Tensor:
@@ -238,26 +240,17 @@ class H3VaeEncoderSubmodule(NodeSubmodule):
 # dit (denoise loop body)
 # ---------------------------------------------------------------------------
 
-class H3DenoiseSubmodule(DenoiseLoopSubmodule):
-    """One denoise step of the packed audio-video DiT (``DenoiseLoopSubmodule``). The
-    loop carries the video rows (keyframe rows first) and the audio rows, fp32; only the
-    generated rows are stepped. The fp32 GEMMs run at full fp32, as the reference's do.
-    """
+class H3PackedDenoise(DenoiseLoopSubmodule):
+    """What the MiniMax-H3 family's ``dit`` nodes share: one request per step over the
+    packed-sequence DiT, its rows padded to a bucket as a tail segment of their own, and the
+    step's attention within the segments. A bucket key carries ``total_rows``, ``text_len``,
+    ``num_condition_rows`` and ``num_audio_rows``; a subclass gives its rows' positions,
+    timestep classes and tags (:meth:`step_layout`)."""
 
-    SOLVER_STATE = (AUDIO_LATENTS,)
-    STEP_SCALARS = {
-        "sigma": StepScalar("sigmas"),
-        "sigma_next": StepScalar("sigmas", offset=1, capture_fill=0.0),
-        "timestep": StepScalar("timesteps", broadcast=False, capture_fill=0.5),
-        "audio_sigma": StepScalar("audio_sigmas"),
-        "audio_sigma_next": StepScalar("audio_sigmas", offset=1, capture_fill=0.0),
-        "audio_timestep": StepScalar("audio_timesteps", broadcast=False, capture_fill=0.5),
-        "cond_timestep": StepScalar("cond_timesteps", broadcast=False, capture_fill=1.0),
-    }
     PREFETCH_SEEDS = True  # the noise depends on the layout and the seed alone
     float32_matmul_precision = "highest"
 
-    def __init__(self, transformer: nn.Module, config: H3Config, *, loop_name: str, attn_resource_key: str | None,
+    def __init__(self, transformer: nn.Module, config, *, loop_name: str, attn_resource_key: str | None,
                  max_batch_size: int = 1, compile_blocks: bool = False, row_bucket: int = 1):
         if max_batch_size != 1:
             # a batch's rows would have to agree on the step's first-step decisions (denoise)
@@ -282,6 +275,65 @@ class H3DenoiseSubmodule(DenoiseLoopSubmodule):
             # compiles once (5-8 s), and a step then runs the same kernels, at static speed, whatever
             # was served before it (dynamic-shape kernels ran 14-19% slower per step)
             compile_blocks_(transformer.blocks, dynamic=False)
+
+    def padded_rows(self, bucket_key) -> int:
+        return -(-bucket_key.total_rows // self.row_multiple) * self.row_multiple
+
+    def num_tokens(self, bucket_key) -> int:
+        return self.padded_rows(bucket_key)
+
+    def attention_segments(self, bucket_key) -> tuple[tuple[str, int], ...]:
+        rows, pad = bucket_key.total_rows, self.padded_rows(bucket_key) - bucket_key.total_rows
+        return ((self.MAIN_SPAN, rows),) + (((self.MAIN_SPAN, pad),) if pad else ())
+
+    def step_layout(self, bucket_key, positions: torch.Tensor, classes: torch.Tensor, tags: torch.Tensor,
+                    device) -> H3StepLayout:
+        """The bucket's per-row tensors on ``device`` from its rows' ``[S, 3]`` float64 positions,
+        timestep classes and modality tags, padded to :meth:`padded_rows`."""
+        pad = self.padded_rows(bucket_key) - bucket_key.total_rows
+
+        def padded(rows: torch.Tensor) -> torch.Tensor:
+            # a padding row sits at position 0 (rope cos 1, sin 0) on AdaLN table row 0
+            return torch.cat([rows, rows.new_zeros((pad, *rows.shape[1:]))])
+
+        # the positions travel to the device in fp64 and round to fp32 there, as the reference's do
+        pos = padded(positions).to(device)
+        cfg = self.config.transformer
+        rope = rope_table(pos, rope_inv_freq(cfg), self.transformer.dtype, cfg.attention_head_dim)
+        classes, tags = padded(classes), padded(tags)
+        return H3StepLayout(
+            rope=rope, row_index=(classes * NUM_MODALITIES + tags).to(device), row_class=classes.to(device),
+            no_class=torch.zeros_like(classes).to(device), tags=tags.to(device), text_len=bucket_key.text_len,
+            num_condition_rows=bucket_key.num_condition_rows, num_audio_rows=bucket_key.num_audio_rows,
+            num_pad_rows=pad,
+        )
+
+    def attend(self, layout: H3StepLayout):
+        """The step's attention within ``layout.segments``: the ragged resource's plan of
+        ``attention_segments``, or SDPA over each segment."""
+        ragged = self.ragged_for(self.MAIN_SPAN)
+        if ragged is None:
+            self._sdpa.lengths = list(layout.segments)
+            ragged = self._sdpa_run
+        return functools.partial(joint_attention, ragged=ragged)
+
+
+class H3DenoiseSubmodule(H3PackedDenoise):
+    """One denoise step of the packed audio-video DiT (``DenoiseLoopSubmodule``). The
+    loop carries the video rows (keyframe rows first) and the audio rows, fp32; only the
+    generated rows are stepped. The fp32 GEMMs run at full fp32, as the reference's do.
+    """
+
+    SOLVER_STATE = (AUDIO_LATENTS,)
+    STEP_SCALARS = {
+        "sigma": StepScalar("sigmas"),
+        "sigma_next": StepScalar("sigmas", offset=1, capture_fill=0.0),
+        "timestep": StepScalar("timesteps", broadcast=False, capture_fill=0.5),
+        "audio_sigma": StepScalar("audio_sigmas"),
+        "audio_sigma_next": StepScalar("audio_sigmas", offset=1, capture_fill=0.0),
+        "audio_timestep": StepScalar("audio_timesteps", broadcast=False, capture_fill=0.5),
+        "cond_timestep": StepScalar("cond_timesteps", broadcast=False, capture_fill=1.0),
+    }
 
     # hooks -----------------------------------------------------------------
     def bucket_key_for(self, fwd_info: CurrentForwardPassInfo) -> H3Layout:
@@ -318,16 +370,6 @@ class H3DenoiseSubmodule(DenoiseLoopSubmodule):
             tensors[COND_LATENTS] = inputs[COND_LATENTS][0]
         return tensors
 
-    def padded_rows(self, bucket_key: H3Layout) -> int:
-        return -(-bucket_key.total_rows // self.row_multiple) * self.row_multiple
-
-    def num_tokens(self, bucket_key: H3Layout) -> int:
-        return self.padded_rows(bucket_key)
-
-    def attention_segments(self, bucket_key: H3Layout) -> tuple[tuple[str, int], ...]:
-        rows, pad = bucket_key.total_rows, self.padded_rows(bucket_key) - bucket_key.total_rows
-        return ((self.MAIN_SPAN, rows),) + (((self.MAIN_SPAN, pad),) if pad else ())
-
     def capture_request_inputs(self, bucket_key: H3Layout, device) -> dict[str, torch.Tensor]:
         cfg = self.config.transformer
         return {
@@ -342,32 +384,8 @@ class H3DenoiseSubmodule(DenoiseLoopSubmodule):
         }
 
     def build_layout(self, bucket_key: H3Layout, device) -> H3StepLayout:
-        pad = self.padded_rows(bucket_key) - bucket_key.total_rows
-
-        def padded(rows: torch.Tensor) -> torch.Tensor:
-            # a padding row sits at position 0 (rope cos 1, sin 0) on AdaLN table row 0
-            return torch.cat([rows, rows.new_zeros((pad, *rows.shape[1:]))])
-
-        # the positions travel to the device in fp64 and round to fp32 there, as the reference's do
-        pos = padded(position_ids(bucket_key)).to(device)
-        cfg = self.config.transformer
-        rope = rope_table(pos, rope_inv_freq(cfg), self.transformer.dtype, cfg.attention_head_dim)
-        classes, tags = padded(timestep_classes(bucket_key)), padded(modality_tags(bucket_key))
-        return H3StepLayout(
-            rope=rope, row_index=(classes * NUM_MODALITIES + tags).to(device), row_class=classes.to(device),
-            no_class=torch.zeros_like(classes).to(device), tags=tags.to(device), text_len=bucket_key.text_len,
-            num_condition_rows=bucket_key.num_condition_rows, num_audio_rows=bucket_key.num_audio_rows,
-            num_pad_rows=pad,
-        )
-
-    def attend(self, layout: H3StepLayout):
-        """The step's attention within ``layout.segments``: the ragged resource's plan of
-        ``attention_segments``, or SDPA over each segment."""
-        ragged = self.ragged_for(self.MAIN_SPAN)
-        if ragged is None:
-            self._sdpa.lengths = list(layout.segments)
-            ragged = self._sdpa_run
-        return functools.partial(joint_attention, ragged=ragged)
+        return self.step_layout(bucket_key, position_ids(bucket_key), timestep_classes(bucket_key),
+                                modality_tags(bucket_key), device)
 
     def denoise(
         self, engine_inputs, bucket_key: H3Layout, latents, timestep, sigma, sigma_next,

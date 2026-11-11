@@ -67,17 +67,21 @@ class Presentation(NamedTuple):
     tags: list[int]       # per token: TEXT_TAG, or VIDEO_TAG for a vision block
 
 
-def vision_spans(tokenizer, image_tokens: list[int]) -> list[tuple[int, int]]:
+# H3's label of picture i; MiniMax-H3-Image's has no angle brackets ("Picture {}: ")
+PICTURE_LABEL = "<Picture {}>: "
+
+
+def vision_spans(tokenizer, image_tokens: list[int], label: str = PICTURE_LABEL) -> list[tuple[int, int]]:
     """``(start, length)`` of each keyframe's vision block in ``presentation``'s rows."""
     spans, start = [], 0
     for index, count in enumerate(image_tokens):
-        start += len(tokenizer.encode(f"<Picture {index + 1}>: ", add_special_tokens=False).ids)
+        start += len(tokenizer.encode(label.format(index + 1), add_special_tokens=False).ids)
         spans.append((start, count + 2))
         start += count + 2
     return spans
 
 
-def presentation(tokenizer, prompt: str, image_tokens: list[int]) -> Presentation:
+def presentation(tokenizer, prompt: str, image_tokens: list[int], label: str = PICTURE_LABEL) -> Presentation:
     """``tokenizer`` is the checkpoint's ``tokenizers.Tokenizer``; ``image_tokens`` is each
     keyframe's merged token count (``grid_t * grid_h * grid_w / merge^2``)."""
     start, pad, end = (tokenizer.token_to_id(t) for t in ("<|vision_start|>", "<|image_pad|>", "<|vision_end|>"))
@@ -86,9 +90,9 @@ def presentation(tokenizer, prompt: str, image_tokens: list[int]) -> Presentatio
     token_ids: list[int] = []
     tags: list[int] = []
     for index, count in enumerate(image_tokens):
-        label = tokenizer.encode(f"<Picture {index + 1}>: ", add_special_tokens=False).ids
+        label_ids = tokenizer.encode(label.format(index + 1), add_special_tokens=False).ids
         vision = [start] + [pad] * count + [end]
-        token_ids += label + vision
-        tags += [TEXT_TAG] * len(label) + [VIDEO_TAG] * len(vision)
+        token_ids += label_ids + vision
+        tags += [TEXT_TAG] * len(label_ids) + [VIDEO_TAG] * len(vision)
     text = tokenizer.encode(prompt, add_special_tokens=False).ids
     return Presentation(token_ids + text, tags + [TEXT_TAG] * len(text))

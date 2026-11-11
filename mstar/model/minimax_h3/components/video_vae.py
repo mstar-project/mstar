@@ -26,16 +26,14 @@ def vae_rope_inv_freq(rot_dim: int, theta: float, num_axes: int = 3) -> torch.Te
     return 1.0 / theta ** torch.arange(0, 1, 2 * num_axes / rot_dim, dtype=torch.float32, device="cpu")
 
 
-def vae_rope_table(frames: int, height: int, width: int, num_suffix: int, inv_freq: torch.Tensor, device):
-    """cos / sin ``[N + suffix, 1, rot_dim]`` fp32 of one tile: per axis, voxel centres in
-    [-1, 1), times ``2 pi * inv_freq``, the three axes concatenated and doubled; the
-    suffix tokens sit at 0."""
-    grids = [
-        2.0 * (torch.arange(0.5, size, dtype=torch.float32, device=device) / size) - 1.0
-        for size in (frames, height, width)
-    ]
-    pos = torch.stack(torch.meshgrid(*grids, indexing="ij"), dim=-1).flatten(0, 2)
-    pos = torch.cat([pos, pos.new_zeros(num_suffix, 3)])
+def vae_rope_table(sizes: tuple[int, ...], num_suffix: int, inv_freq: torch.Tensor, device):
+    """cos / sin ``[N + suffix, 1, rot_dim]`` fp32 of one tile over the axes ``sizes``
+    (``(frames, height, width)``, or ``(height, width)`` for the image decoder): per axis,
+    voxel centres in [-1, 1), times ``2 pi * inv_freq``, the axes concatenated and doubled;
+    the suffix tokens sit at 0."""
+    grids = [2.0 * (torch.arange(0.5, size, dtype=torch.float32, device=device) / size) - 1.0 for size in sizes]
+    pos = torch.stack(torch.meshgrid(*grids, indexing="ij"), dim=-1).flatten(0, len(sizes) - 1)
+    pos = torch.cat([pos, pos.new_zeros(num_suffix, len(sizes))])
     angles = 2.0 * math.pi * pos[:, :, None] * inv_freq.to(device)[None, None, :]
     angles = angles.flatten(1, 2).tile(2).unsqueeze(1)
     return angles.cos(), angles.sin()
@@ -103,12 +101,16 @@ class H3VaeBlock(nn.Module):
 
 
 class H3ViTDecoder(nn.Module):
-    """``[B, C, F, H, W]`` latents (one tile) -> ``[B, 3, 4F, 16H, 16W]`` pixels."""
+    """``[B, C, F, H, W]`` latents (one tile) -> ``[B, 3, 4F, 16H, 16W]`` pixels. With
+    ``cfg.decoder_2d`` (MiniMax-H3-Image) a tile is one latent frame decoded to one image,
+    its rotary over ``(h, w)`` alone."""
 
     def __init__(self, cfg: H3VideoVAEConfig, eps: float = 1e-5, num_register_tokens: int = 4, out_channels: int = 3):
         super().__init__()
         dim = cfg.decoder_heads * cfg.decoder_head_dim
-        self.out_channels, self.ps, self.pt = out_channels, cfg.spatial_compression, cfg.temporal_compression
+        self.spatial_only = cfg.decoder_2d
+        self.out_channels, self.ps = out_channels, cfg.spatial_compression
+        self.pt = 1 if self.spatial_only else cfg.temporal_compression
         self.num_register_tokens = num_register_tokens
         self.x_embedder = nn.Linear(cfg.latent_channels, dim)
         self.register_tokens = nn.Parameter(torch.zeros(1, num_register_tokens, dim))
@@ -118,7 +120,7 @@ class H3ViTDecoder(nn.Module):
         self.norm_out = nn.LayerNorm(dim, eps=eps)
         self.proj_out = nn.Linear(dim, out_channels * self.pt * self.ps * self.ps)
         self.rope_inv_freq = vae_rope_inv_freq(int(cfg.decoder_head_dim * cfg.decoder_rope_dim_ratio),
-                                               cfg.decoder_rope_theta)
+                                               cfg.decoder_rope_theta, num_axes=2 if self.spatial_only else 3)
 
     def forward(self, z: torch.Tensor, attend: Attend) -> torch.Tensor:
         b, c, f, h, w = z.shape
@@ -126,7 +128,8 @@ class H3ViTDecoder(nn.Module):
         n = x.shape[1]
         suffix = [self.register_tokens.expand(b, -1, -1).to(x.dtype), torch.zeros_like(x[:, :1])]
         x = torch.cat([x, *suffix], dim=1)
-        rope = vae_rope_table(f, h, w, self.num_register_tokens + 1, self.rope_inv_freq, z.device)
+        sizes = (h, w) if self.spatial_only else (f, h, w)
+        rope = vae_rope_table(sizes, self.num_register_tokens + 1, self.rope_inv_freq, z.device)
         for block in self.transformer_blocks:
             x = block(x, rope, attend)
         x = self.proj_out(self.norm_out(x).to(self.proj_out.weight.dtype))[:, :n]
@@ -242,16 +245,13 @@ class ClipWalk(NamedTuple):
         return out
 
 
-class H3VideoDecoder(nn.Module):
-    """``post_quant_conv`` + the ViT decoder, and the reference's clip / tile walk."""
+class TiledViTDecoder(nn.Module):
+    """What the video and image decoders share: the ViT decoder's fp32 modules and the
+    spatial tile walk. A subclass sets ``cfg``, ``decoder`` and ``ratio``."""
 
-    def __init__(self, cfg: H3VideoVAEConfig):
-        super().__init__()
-        self.cfg = cfg
-        self.post_quant_conv = nn.Conv3d(cfg.latent_channels, cfg.latent_channels, kernel_size=1)
-        self.decoder = H3ViTDecoder(cfg)
-        self.ratio = cfg.spatial_compression
-        self.walk = ClipWalk.of(cfg)
+    cfg: H3VideoVAEConfig
+    decoder: H3ViTDecoder
+    ratio: int
 
     def keep_fp32(self) -> None:
         """The modules the reference keeps fp32 under a bf16 load (diffusers matches its
@@ -267,13 +267,25 @@ class H3VideoDecoder(nn.Module):
         return split_tiles(length, self.cfg.tile_size, self.cfg.tile_overlap_min, self.ratio)
 
     def tile_slices(self, height: int, width: int) -> tuple[list[list[tuple[slice, slice]]], list[int], list[int]]:
-        """The latent slices of a clip's spatial tiles (row-major) and the pixel overlaps."""
+        """The latent slices of the spatial tiles (row-major) and the pixel overlaps."""
         r = self.ratio
         ys, y_lens, y_overlaps = self.split_tiles(height * r)
         xs, x_lens, x_overlaps = self.split_tiles(width * r)
         grid = [[(slice(y // r, (y + ylen) // r), slice(x // r, (x + xlen) // r))
                  for x, xlen in zip(xs, x_lens, strict=True)] for y, ylen in zip(ys, y_lens, strict=True)]
         return grid, y_overlaps, x_overlaps
+
+
+class H3VideoDecoder(TiledViTDecoder):
+    """``post_quant_conv`` + the ViT decoder, and the reference's clip / tile walk."""
+
+    def __init__(self, cfg: H3VideoVAEConfig):
+        super().__init__()
+        self.cfg = cfg
+        self.post_quant_conv = nn.Conv3d(cfg.latent_channels, cfg.latent_channels, kernel_size=1)
+        self.decoder = H3ViTDecoder(cfg)
+        self.ratio = cfg.spatial_compression
+        self.walk = ClipWalk.of(cfg)
 
     def decode_tiles(self, tiles: list[torch.Tensor], attend: Attend, batch: int) -> list[torch.Tensor]:
         """Decode same-shape tiles ``batch`` at a time. One at a time (``batch = 1``) is the
