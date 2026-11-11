@@ -316,8 +316,7 @@ def test_a_lockstep_node_keeps_ids_and_sets_the_pool_aside():
     model = make_model(rebuild_policies=lambda: {NODE: POLICY}, get_graph_walk_graphs=_graphs)
 
     my_walks = {(NODE, PREFILL), (NODE, DECODE)}
-    engine = SimpleNamespace(host_allowance=None, node_dtype=lambda node: torch.float32,
-                             rebuild_policies=lambda model: model.rebuild_policies())
+    engine = SimpleNamespace(host_allowance=None, node_dtype=lambda node: torch.float32)
     rebuilds = _make_rebuilds(model, {"rebuild_host_mb": 1}, my_walks, {NODE}, torch.device("cpu"), engine)
 
     assert rebuilds.pool is not None and NODE in rebuilds.nodes, "a follower would have no ids to replay a drop from"
@@ -330,8 +329,7 @@ def _make_media_rebuilds(config: dict) -> Rebuilds:
 
     model = SimpleNamespace(rebuild_policies=lambda: {NODE: MEDIA}, get_graph_walk_graphs=media_graphs)
     my_walks = {(NODE, PREFILL), (NODE, VISION), (NODE, DECODE)}
-    engine = SimpleNamespace(host_allowance=StepAllowance(), node_dtype=lambda node: torch.float32,
-                             rebuild_policies=lambda model: model.rebuild_policies())
+    engine = SimpleNamespace(host_allowance=StepAllowance(), node_dtype=lambda node: torch.float32)
     return _make_rebuilds(model, config, my_walks, set(), torch.device("cpu"), engine)
 
 
@@ -349,8 +347,7 @@ def test_a_follower_of_a_lockstep_node_sets_aside_twice_the_pool():
     monkeypatch = pytest.MonkeyPatch()
     monkeypatch.setattr(worker_mod, "HostPool", lambda nbytes, device: SimpleNamespace(nbytes=nbytes))
     model = SimpleNamespace(rebuild_policies=lambda: {NODE: POLICY}, get_graph_walk_graphs=_graphs)
-    engine = SimpleNamespace(host_allowance=StepAllowance(), node_dtype=lambda node: torch.float32,
-                             rebuild_policies=lambda model: model.rebuild_policies())
+    engine = SimpleNamespace(host_allowance=StepAllowance(), node_dtype=lambda node: torch.float32)
     my_walks = {(NODE, PREFILL), (NODE, DECODE)}
     try:
         leader = _make_rebuilds(model, {"rebuild_host_mb": 1}, my_walks, set(), torch.device("cpu"), engine)
@@ -366,8 +363,7 @@ def test_a_follower_of_a_lockstep_node_sets_aside_twice_the_pool():
 def test_a_follower_of_a_lockstep_node_takes_room_past_its_pool_for_every_log():
     """Rank 0's pool decides which requests keep a log, so a follower whose pool is full still takes room for one."""
     model = SimpleNamespace(rebuild_policies=lambda: {NODE: POLICY}, get_graph_walk_graphs=_graphs)
-    engine = SimpleNamespace(host_allowance=StepAllowance(), node_dtype=lambda node: torch.float32,
-                             rebuild_policies=lambda model: model.rebuild_policies())
+    engine = SimpleNamespace(host_allowance=StepAllowance(), node_dtype=lambda node: torch.float32)
     my_walks = {(NODE, PREFILL), (NODE, DECODE)}
     rebuilds = _make_rebuilds(
         model, {"rebuild_host_mb": 1}, my_walks, {NODE}, torch.device("cpu"), engine, frozenset({NODE}),
@@ -717,7 +713,6 @@ def test_a_follower_worker_takes_room_past_twice_the_rebuild_pool(monkeypatch):
     engine = SimpleNamespace(
         get_stop_policies=lambda node, walk: None, paged_kv_caches=list, host_allowance=StepAllowance(),
         node_dtype=lambda node: torch.float32, verifying_nodes=frozenset, synchronous_verify_nodes=frozenset,
-        rebuild_policies=lambda model: model.rebuild_policies(),
     )
     monkeypatch.setattr(worker_mod, "EngineManager", SimpleNamespace(
         build=lambda *a, **kw: SimpleNamespace(
