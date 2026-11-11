@@ -38,6 +38,7 @@ from mstar.engine.resources.recurrent.pool import (
 )
 from mstar.engine.resources.spec import CombinedSplit
 from mstar.engine.resources.step import Segment, SlotLease, StepContext
+from mstar.platforms import current_platform
 from mstar.platforms.compile import compiled
 from mstar.utils.causal_conv1d import PAD_SLOT_ID
 
@@ -80,6 +81,7 @@ class GDNManager(LinearAttnManager):
         has_sink: bool,
         device: torch.device,
         max_rows_in_combined: Mapping[str, int | None] | None = None,
+        world_size: int = 1,
     ):
         self.config = config
         self._splits = {split.combined_walk: split for split in config.splits}
@@ -90,6 +92,8 @@ class GDNManager(LinearAttnManager):
         self._device = device
         self._pool_key = config.recurrent_state
         self._has_sink = has_sink
+        # ranks in the node's lockstep instance
+        self._world_size = world_size
 
         major = (
             torch.cuda.get_device_capability(device)[0]
@@ -463,9 +467,11 @@ class GDNManager(LinearAttnManager):
     # Speculative decoding
 
     def capabilities(self):
-        """What the recurrent multi-token kernel can't run: no pool, or a state that
-        isn't float32. Both follow from the deployment (the pool block, or its
-        kv_dtype), so every rank answers alike."""
+        """What the recurrent multi-token kernel can't run: no pool, a state that
+        isn't float32, a lockstep instance of more than one rank (no test covers
+        the rerun under TP yet), or a worker off CUDA or whose FlashInfer lacks
+        the kernel. The first three follow from the deployment, so every rank
+        answers alike; the engine agrees the last across the instance."""
         from mstar.engine.resources.spec import ResourceCapabilities
 
         verify = None
@@ -476,7 +482,28 @@ class GDNManager(LinearAttnManager):
                 f"gdn: a verifying node's state is {self.state_dtype}; the multi-token verify kernel "
                 "(flashinfer's gated_delta_rule_mtp) runs on a float32 pool only"
             )
+        elif self._world_size > 1:
+            verify = (
+                f"gdn: a verifying node runs on one rank, not a lockstep instance of {self._world_size}; "
+                "the verify rerun has no TP test yet"
+            )
+        else:
+            verify = self._verify_kernel_refusal()
         return ResourceCapabilities(verify_refusal=verify, async_verify_refusal=None)
+
+    @staticmethod
+    def _verify_kernel_refusal() -> str | None:
+        """Why this worker can't run the multi-token verify kernel, or None."""
+        if not current_platform.is_cuda():
+            return (
+                "gdn: the multi-token verify kernel (flashinfer's gated_delta_rule_mtp) runs on CUDA, "
+                f"not {current_platform.name}"
+            )
+        try:
+            from flashinfer.gdn_decode import gated_delta_rule_mtp  # noqa: F401
+        except ImportError as e:
+            return f"gdn: the multi-token verify kernel (flashinfer's gated_delta_rule_mtp) doesn't import ({e})"
+        return None
 
     def bind_verify_walk(self, walk: str, block: int, slack: int) -> None:
         """``walk`` verifies drafts, ``block`` (k + 1) tokens a row, on the recurrent
@@ -486,7 +513,7 @@ class GDNManager(LinearAttnManager):
         serves; what the kernel can't run, `capabilities` refused."""
         del slack
         self._verify_walks[walk] = block
-        if self._device.type == "cuda":
+        if self._device.type == "cuda" and self._verify_kernel_refusal() is None:
             self._warm_verify(block)
 
     def _warm_verify(self, block: int) -> None:

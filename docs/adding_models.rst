@@ -1944,8 +1944,9 @@ untouched window and the kept tokens' inputs (one kernel a layer), inside the st
 equals a plain run over the kept tokens, within the kernel's float precision: nothing else in the model changes. The pool takes back its own token count and keeps no
 decode snapshot of a verify step; prompt snapshots (prefill, the chunked kernel) are unaffected.
 The kernel reads a float32 pool only, so a verifying node with another state dtype is refused, as
-are KDA and Mamba-2, mixed splits, more than one label and a pool without a sink. It compiles per
-tile path, which the batch size picks: the resource compiles every one a verify step can reach
+are KDA and Mamba-2, mixed splits, more than one label and a pool without a sink. So are a
+worker off CUDA or whose FlashInfer lacks the kernel, and, until the rerun has a TP test, a node
+on more than one rank. It compiles per tile path, which the batch size picks: the resource compiles every one a verify step can reach
 when the walk binds, at startup. Either mode works: a resident verify step gathers each row's slot
 off the pool's table in the graph, and replays the rerun its capture recorded.
 

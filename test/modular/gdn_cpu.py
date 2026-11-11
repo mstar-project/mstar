@@ -166,7 +166,7 @@ def causal_conv1d_update(x, conv_state, weight, bias=None, activation=None, conv
 
 def install(monkeypatch) -> None:
     """Route the GDN resource's kernels to the stand-ins, and its compiled
-    helpers to plain calls."""
+    helpers to plain calls; its verify check sees CUDA, where the real kernels run."""
     import mstar.utils.causal_conv1d as conv
     from mstar.engine.resources.linear_attn import gdn, wrappers
 
@@ -183,3 +183,4 @@ def install(monkeypatch) -> None:
     monkeypatch.setattr(conv, "causal_conv1d_update", causal_conv1d_update)
     monkeypatch.setattr(wrappers, "compiled", lambda fn, **options: fn)
     monkeypatch.setattr(gdn, "compiled", lambda fn, **options: fn)
+    monkeypatch.setattr(gdn, "current_platform", types.SimpleNamespace(is_cuda=lambda: True, name="cuda"))
