@@ -10,7 +10,8 @@ the callers run the eager ops (``fits``).
   summed in the order of PyTorch's reduction for a contiguous 128-wide row: 32 lanes of 4 consecutive values,
   ``((x0 + x1) + x2) + x3``, then a shuffle-down tree (offsets 16, 8, 4, 2, 1); the rotation is CUDA's complex
   multiply, ``re = fma(a, c, -(b d))``, ``im = fma(a, d, b c)``. Text and image parts go straight into the joint
-  q (or k) tensor, so there is no concatenation either.
+  q (or k) tensor, so there is no concatenation either. One program per token reads its rotation once for all
+  heads; :func:`joint_qk_pair_norm_rope` does q and k in the same launch.
 * :func:`modulate`: ``x * (1 + scale) + shift`` with two parameter sets along the tokens (``zero_cond_t``: the
   target's tokens take the step's, the references' timestep 0's), one pass instead of the per-token select.
 * :func:`gated_add`: ``x + gate * y``, the same two parameter sets.
@@ -29,7 +30,6 @@ try:
 except ImportError:  # pragma: no cover - CPU-only installs
     triton = None
 
-_ROWS = 16
 _BLOCK = 1024
 
 if triton is not None:
@@ -41,19 +41,16 @@ if triton is not None:
         return a + b
 
     @triton.jit
-    def _qk_norm_rope_kernel(x_ptr, w_ptr, f_ptr, o_ptr, n_rows, S, H, eps,
-                             sx_r, sx_s, sx_h, sf_r, sf_s, so_r, so_s, so_h, ROWS: tl.constexpr):
-        rows = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
-        rmask = (rows < n_rows)[:, None]
-        h = (rows % H).to(tl.int64)
-        s = ((rows // H) % S).to(tl.int64)
-        r = (rows // (H * S)).to(tl.int64)
+    def _norm_rope_heads(x_ptr, w_ptr, o_ptr, x_off, o_off, sx_h, so_h, c, sn, H, eps, HB: tl.constexpr):
+        # one token's heads (HB lanes, H used): QwenRMSNorm of each 128-wide head, then the rotation by (c, sn)
+        h = tl.arange(0, HB).to(tl.int64)
+        hmask = (h < H)[:, None]
         d = tl.arange(0, 128)
-        x = tl.load(x_ptr + (r * sx_r + s * sx_s + h * sx_h)[:, None] + d[None, :], mask=rmask, other=0.0)
+        x = tl.load(x_ptr + x_off + (h * sx_h)[:, None] + d[None, :], mask=hmask, other=0.0)
         x = x.to(tl.float32)
         sq = x * x
         # lane t: elements 4t..4t+3, summed in order
-        e0, e1 = tl.split(tl.reshape(sq, (ROWS, 32, 2, 2)))
+        e0, e1 = tl.split(tl.reshape(sq, (HB, 32, 2, 2)))
         x0, x2 = tl.split(e0)
         x1, x3 = tl.split(e1)
         lane = ((x0 + x1) + x2) + x3
@@ -62,18 +59,33 @@ if triton is not None:
         lane = _halves(lane, 4)
         lane = _halves(lane, 2)
         lane = _halves(lane, 1)
-        mean = tl.reshape(lane, (ROWS,)) * (1.0 / 128.0)
+        mean = tl.reshape(lane, (HB,)) * (1.0 / 128.0)
         rstd = tl.math.rsqrt(mean + eps)
         y = (x * rstd[:, None]).to(tl.bfloat16).to(tl.float32)
         y = (tl.load(w_ptr + d).to(tl.float32)[None, :] * y).to(tl.bfloat16).to(tl.float32)
-        a, b = tl.split(tl.reshape(y, (ROWS, 64, 2)))
-        f_off = (r * sf_r + s * sf_s)[:, None] + 2 * tl.arange(0, 64)[None, :]
-        c = tl.load(f_ptr + f_off, mask=rmask, other=0.0)
-        sn = tl.load(f_ptr + f_off + 1, mask=rmask, other=0.0)
+        a, b = tl.split(tl.reshape(y, (HB, 64, 2)))
+        c = tl.broadcast_to(c, (HB, 64))
+        sn = tl.broadcast_to(sn, (HB, 64))
         re = tl.fma(a, c, -(b * sn))
         im = tl.fma(a, sn, b * c)
-        out = tl.reshape(tl.join(re, im), (ROWS, 128)).to(tl.bfloat16)
-        tl.store(o_ptr + (r * so_r + s * so_s + h * so_h)[:, None] + d[None, :], out, mask=rmask)
+        out = tl.reshape(tl.join(re, im), (HB, 128)).to(tl.bfloat16)
+        tl.store(o_ptr + o_off + (h * so_h)[:, None] + d[None, :], out, mask=hmask)
+
+    @triton.jit
+    def _qk_norm_rope_kernel(x_ptr, w_ptr, f_ptr, o_ptr, x2_ptr, w2_ptr, o2_ptr, S, H, eps,
+                             sx_r, sx_s, sx_h, sf_r, sf_s, so_r, so_s, so_h, HB: tl.constexpr, PAIR: tl.constexpr):
+        # one program per token: its rotation is read once for every head (and for k beside q when PAIR)
+        tok = tl.program_id(0)
+        r = (tok // S).to(tl.int64)
+        s = (tok % S).to(tl.int64)
+        f_off = r * sf_r + s * sf_s + 2 * tl.arange(0, 64)
+        c = tl.load(f_ptr + f_off)[None, :]
+        sn = tl.load(f_ptr + f_off + 1)[None, :]
+        x_off = r * sx_r + s * sx_s
+        o_off = r * so_r + s * so_s
+        _norm_rope_heads(x_ptr, w_ptr, o_ptr, x_off, o_off, sx_h, so_h, c, sn, H, eps, HB)
+        if PAIR:
+            _norm_rope_heads(x2_ptr, w2_ptr, o2_ptr, x_off, o_off, sx_h, so_h, c, sn, H, eps, HB)
 
     @triton.jit
     def _params(p_ptr, rows_per_set, row, token, split, D, col, mask):
@@ -111,14 +123,20 @@ def fits(*tensors: torch.Tensor) -> bool:
     return triton is not None and all(t.is_cuda and t.dtype == torch.bfloat16 for t in tensors)
 
 
-def _norm_rope_into(x: torch.Tensor, weight: torch.Tensor, freqs: torch.Tensor, eps: float, out: torch.Tensor) -> None:
+def _norm_rope_into(x: torch.Tensor, weight: torch.Tensor, freqs: torch.Tensor, eps: float, out: torch.Tensor,
+                    pair: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None) -> None:
+    """``out = rope(norm(x))``, and for ``pair = (x2, weight2, out2)`` (same shape and strides) the same with the
+    same rotation in the one launch."""
     rows, seq, heads, _ = x.shape
     f = torch.view_as_real(freqs.contiguous())
     sf_r, sf_s = (0, f.stride(0)) if f.dim() == 3 else (f.stride(0), f.stride(1))
-    n = rows * seq * heads
-    _qk_norm_rope_kernel[(triton.cdiv(n, _ROWS),)](
-        x, weight, f, out, n, seq, heads, eps, x.stride(0), x.stride(1), x.stride(2), sf_r, sf_s,
-        out.stride(0), out.stride(1), out.stride(2), ROWS=_ROWS, enable_fp_fusion=False,
+    x2, w2, o2 = pair if pair is not None else (x, weight, out)
+    if pair is not None and (x2.stride() != x.stride() or o2.stride() != out.stride()):
+        raise ValueError("qk_norm_rope pair: both parts must share the strides")
+    _qk_norm_rope_kernel[(rows * seq,)](
+        x, weight, f, out, x2, w2, o2, seq, heads, eps, x.stride(0), x.stride(1), x.stride(2), sf_r, sf_s,
+        out.stride(0), out.stride(1), out.stride(2), HB=triton.next_power_of_2(heads), PAIR=pair is not None,
+        enable_fp_fusion=False,
     )
 
 
@@ -156,6 +174,28 @@ def joint_qk_norm_rope(
 def _(txt, img, txt_weight, img_weight, txt_freqs, img_freqs, eps):
     rows, lt, heads, dim = txt.shape
     return txt.new_empty((rows, lt + img.shape[1], heads, dim))
+
+
+@torch.library.custom_op("mstar::qwen_image_joint_qk_pair_norm_rope", mutates_args=())
+def joint_qk_pair_norm_rope(
+    q_txt: torch.Tensor, q_img: torch.Tensor, k_txt: torch.Tensor, k_img: torch.Tensor,
+    q_txt_weight: torch.Tensor, q_img_weight: torch.Tensor, k_txt_weight: torch.Tensor, k_img_weight: torch.Tensor,
+    txt_freqs: torch.Tensor, img_freqs: torch.Tensor, eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """:func:`joint_qk_norm_rope` of q and of k (each part of k shaped and strided as q's), one launch per part."""
+    rows, lt, heads, dim = q_txt.shape
+    q = torch.empty((rows, lt + q_img.shape[1], heads, dim), dtype=q_img.dtype, device=q_img.device)
+    k = torch.empty_like(q)
+    _norm_rope_into(q_txt, q_txt_weight, txt_freqs, eps, q[:, :lt], (k_txt, k_txt_weight, k[:, :lt]))
+    _norm_rope_into(q_img, q_img_weight, img_freqs, eps, q[:, lt:], (k_img, k_img_weight, k[:, lt:]))
+    return q, k
+
+
+@joint_qk_pair_norm_rope.register_fake
+def _(q_txt, q_img, k_txt, k_img, q_txt_weight, q_img_weight, k_txt_weight, k_img_weight, txt_freqs, img_freqs, eps):
+    rows, lt, heads, dim = q_txt.shape
+    q = q_txt.new_empty((rows, lt + q_img.shape[1], heads, dim))
+    return q, torch.empty_like(q)
 
 
 @torch.library.custom_op("mstar::qwen_image_modulate", mutates_args=())

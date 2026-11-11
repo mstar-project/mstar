@@ -212,23 +212,31 @@ class QwenImageJointAttention(nn.Module):
         def heads(x: torch.Tensor) -> torch.Tensor:
             return x.unflatten(-1, (-1, self.head_dim))
 
-        q = self._norm_rope(heads(self.add_q_proj(txt)), heads(self.to_q(img)), self.norm_added_q, self.norm_q,
-                            txt_freqs, layout.img_freqs)
-        k = self._norm_rope(heads(self.add_k_proj(txt)), heads(self.to_k(img)), self.norm_added_k, self.norm_k,
-                            txt_freqs, layout.img_freqs)
+        q, k = self._norm_rope(
+            (heads(self.add_q_proj(txt)), heads(self.to_q(img)), self.norm_added_q, self.norm_q),
+            (heads(self.add_k_proj(txt)), heads(self.to_k(img)), self.norm_added_k, self.norm_k),
+            txt_freqs, layout.img_freqs,
+        )
         v = heads(_joint_linear(self.add_v_proj, txt, self.to_v, img))
         out = attend(q, k, v).flatten(2, 3).to(q.dtype)
         num_txt = txt.shape[1]
         return _rows_linear(self.to_out[0], out[:, num_txt:]), _rows_linear(self.to_add_out, out[:, :num_txt])
 
     @staticmethod
-    def _norm_rope(txt, img, txt_norm, img_norm, txt_freqs, img_freqs) -> torch.Tensor:
-        """``[txt | img]`` along the tokens, each per-head normed and rotated: one fused pass each on CUDA."""
-        if kernels.fits(txt, img) and txt.shape[-1] == 128 and txt_norm.eps == img_norm.eps:
-            return kernels.joint_qk_norm_rope(
-                txt, img, txt_norm.weight, img_norm.weight, txt_freqs, img_freqs, txt_norm.eps,
+    def _norm_rope(q_parts, k_parts, txt_freqs, img_freqs) -> tuple[torch.Tensor, torch.Tensor]:
+        """q and k, each ``[txt | img]`` along the tokens with every part per-head normed and rotated: one fused
+        pass per part for both on CUDA. Each ``*_parts`` is ``(txt, img, txt_norm, img_norm)``."""
+        (q_txt, q_img, q_txt_norm, q_img_norm), (k_txt, k_img, k_txt_norm, k_img_norm) = q_parts, k_parts
+        norms = (q_txt_norm, q_img_norm, k_txt_norm, k_img_norm)
+        if (kernels.fits(q_txt, q_img, k_txt, k_img) and q_txt.shape[-1] == 128 and len({n.eps for n in norms}) == 1
+                and q_txt.stride() == k_txt.stride() and q_img.stride() == k_img.stride()):
+            return kernels.joint_qk_pair_norm_rope(
+                q_txt, q_img, k_txt, k_img, *(n.weight for n in norms), txt_freqs, img_freqs, q_txt_norm.eps,
             )
-        return torch.cat([apply_rope(txt_norm(txt), txt_freqs), apply_rope(img_norm(img), img_freqs)], dim=1)
+        return tuple(
+            torch.cat([apply_rope(tn(t), txt_freqs), apply_rope(im(i), img_freqs)], dim=1)
+            for t, i, tn, im in (q_parts, k_parts)
+        )
 
 
 def _plain(linear: nn.Module, cls: type) -> bool:

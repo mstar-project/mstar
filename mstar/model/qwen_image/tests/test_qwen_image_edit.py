@@ -239,7 +239,8 @@ def test_the_fused_kernels_round_as_the_eager_ops(zero_cond_t, monkeypatch):
     assert torch.equal(fused, forward())
     # the one-part op on a token axis of its own ([N, H, 128], Qwen-Image-2.1's layout)
     attn = dit.transformer_blocks[0].attn
-    x = torch.randn(40, 2, 128, generator=g).to("cuda", torch.bfloat16)
+    # three heads: a head count that is not a power of two (the masked lanes)
+    x = torch.randn(40, 3, 128, generator=g).to("cuda", torch.bfloat16)
     want = apply_rope(attn.norm_q(x[None]), layout.img_freqs)[0]
     assert torch.equal(kernels.qk_norm_rope(x, attn.norm_q.weight, layout.img_freqs, attn.norm_q.eps), want)
 
