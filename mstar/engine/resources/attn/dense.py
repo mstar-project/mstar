@@ -99,6 +99,29 @@ def _dense_unavailable_reason(device: torch.device | None = None) -> str | None:
     return None if flashinfer is None else f"{fa3}; {flashinfer}"
 
 
+def _views_as_int64(t: torch.Tensor) -> bool:
+    """whether ``t`` reads as int64 elements over its last dim: rows of whole,
+    aligned 8-byte words"""
+    size = t.element_size()
+    return (
+        t.stride(-1) == 1
+        and (t.shape[-1] * size) % 8 == 0
+        and (t.storage_offset() * size) % 8 == 0
+        and all((stride * size) % 8 == 0 for stride in t.stride()[:-1])
+    )
+
+
+def _cat_rows(parts: list[torch.Tensor]) -> torch.Tensor:
+    """``torch.cat(parts)`` along dim 0, through int64 views when every part
+    has one: the same bytes, but a strided part (V sliced out of a fused QKV
+    projection) moves 8 bytes per element instead of 2. On Qwen-Image-2.1
+    (H200) that is 1.6 ms of a 111.5 ms denoise step instead of 3.4."""
+    dtype = parts[0].dtype
+    if all(p.dtype == dtype and _views_as_int64(p) for p in parts):
+        return torch.cat([p.view(torch.int64) for p in parts]).view(dtype)
+    return torch.cat(parts)
+
+
 @dataclass(frozen=True)
 class DenseSegment:
     """(request, label) of dense plan; frozen prefix and fresh tokens"""
@@ -425,7 +448,7 @@ class DenseAttentionManager(AttentionManager):
             v_parts.append(v[offset:offset + segment.q_len])
             offset += segment.q_len
 
-        key = torch.cat(k_parts, dim=0)
-        val = torch.cat(v_parts, dim=0)
+        key = _cat_rows(k_parts)
+        val = _cat_rows(v_parts)
         return plan.wrapper.run(q, key, val)
 

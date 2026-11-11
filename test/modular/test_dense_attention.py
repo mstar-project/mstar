@@ -425,6 +425,19 @@ def test_flashinfer_backend_the_gpu_cannot_run_fails_at_build(backend):
         )
 
 
+@pytest.mark.parametrize("head_dim, offset", [(128, 0), (128, 1), (3, 0)], ids=["int64", "unaligned", "odd-dim"])
+def test_cat_rows_is_torch_cat_for_strided_parts(head_dim, offset):
+    """The K/V assembly reads a strided V (a slice of a fused QKV row) and a
+    contiguous prefix as int64 words where it can; any part it cannot read
+    that way sends the whole cat down the plain path. Same bytes either way."""
+    qkv = torch.randn(9, 3 * 2 * head_dim + offset, dtype=torch.bfloat16)
+    v = qkv[:, offset + 2 * 2 * head_dim:offset + 3 * 2 * head_dim].reshape(9, 2, head_dim)
+    prefix = torch.randn(4, 2, head_dim, dtype=torch.bfloat16)
+    parts = [prefix, v[:5], prefix[:2], v[5:]]
+    out = dense_module._cat_rows(parts)
+    assert out.dtype == torch.bfloat16 and torch.equal(out, torch.cat(parts))
+
+
 def _wrapper_classes():
     classes = []
     if _gpu_flashinfer():
