@@ -50,8 +50,7 @@ ALLOWED_IN_FUNCTION = {
     ("mstar/model/qwen3_tts/components/depth_frame/frame.py", "DepthFrame.run", "disable"):
         "the depth kernel's Gluon launch, which a compiled decode can't trace; no state call sits behind it",
     ("mstar/model/qwen3_tts/submodules.py", "CodecSubmodule.batch_postprocess", "request_state"):
-        "the opt-in watermark's per-stream state, until it moves to a watermark node's plain Value (the "
-        "watermark-node issue)",
+        "the opt-in watermark's per-stream state, until it moves to a watermark node's plain Value (issue #1447)",
 }
 
 
