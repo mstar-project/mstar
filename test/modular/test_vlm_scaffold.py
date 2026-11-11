@@ -208,7 +208,7 @@ def test_a_media_row_pads_with_the_captures_rows_on_the_device():
     device = torch.device("meta")  # a device other than the host, as an accelerator is
     llm = _qwen_llm()
     llm.prompt_positions = lambda start, layout, n: (None, None)
-    llm.kv = SimpleNamespace(positions=SimpleNamespace(position=lambda rid, label: 0))
+    llm.next_position = lambda rid_handle: 0
     (config,) = [
         c for c in llm.get_accelerator_graph_configs(device) if c.capture_graph_walk == "prefill_vision"
     ]
@@ -253,7 +253,7 @@ def test_encoders_sharing_a_placeholder_take_their_rows_from_the_layout(tile):
     tiles = MediaEncoder("tile", "tile_encoder", ("tile_values",), "tile_embeds")
     llm = _qwen_llm((VISION, AUDIO, tiles))
     llm.prompt_positions = lambda start, layout, n: (None, None)
-    llm.kv = SimpleNamespace(positions=SimpleNamespace(position=lambda rid, label: 0))
+    llm.next_position = lambda rid_handle: 0
     unk = 0
     ids = torch.tensor([1, unk, unk, 2, unk, 3, unk])
     layout = {"offset": [1, 4, 5, 6], "tokens": [2, 1, 0, 1],

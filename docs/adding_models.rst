@@ -443,8 +443,8 @@ A prompt on a walk the keys don't name sets 0, because the data worker refuses a
 from any other walk. This key is temporary, with ``kv_labels``.
 A name either key doesn't declare fails the request.
 
-The footprint adds the spans, the growth at each loop's iterations and the
-scratch, and rounds up to whole pages per label. A span's own scratch counts only with the spans before
+The footprint adds the spans, the growth at each loop's iterations (up to a ``LabelLayout``'s
+``max_growth``) and the scratch, and rounds up to whole pages per label. A span's own scratch counts only with the spans before
 it, so a window's denoise steps and its commit count once. Under a ``RetentionPolicy`` it
 takes the window's peak instead. ``KVReqConfig.validate`` refuses a request whose footprint
 is bigger than its pool with a 400 at intake, and ``KVReqConfig.loop_room`` cuts the default
@@ -828,6 +828,12 @@ The spec types are:
        reserved or released per step. ``attend`` takes an optional per-distance score
        term (``rel_bias``) for relative-position attention. Float32 by default (Triton
        kernels). See `Bounded (sink + window) caches`_.
+   * - ``RollingKVSpec(config=RollingKVConfig(...))``
+     - Per-request sink + window K/V kept compacted in stream order, in regions of a pool
+       reserved at startup (``pool_tokens``), with no attention of its own: a step writes its
+       tokens with ``write`` and hands ``window`` (one contiguous range) to whatever attention
+       the model runs, a ragged one say. For long chunks where that kernel's speed matters (a
+       causal video DiT). See `Rolling (compacted) caches`_.
    * - ``AttentionSpec(config=AttentionConfig(kv_cache=...))``
      - Self-attention planned over the named cache. ``backend`` selects
        ``AttnBackend.AUTO`` (the default, which lets the engine pick the platform's
@@ -1392,6 +1398,41 @@ within itself and matches the offline mask. ``rel_bias`` is then indexed by that
 compute in it. The streaming FastConformer (``encoder_kv_config`` in
 ``mstar/model/components/fastconformer_stream.py``, Nemotron VoiceChat's ``ENCODER_KV``) is
 the per-query example.
+
+Rolling (compacted) caches
+^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+A causal video DiT that denoises chunk after chunk against a sink and a sliding window of
+earlier chunks (Self-Forcing's rolling cache; LingBot-World's ``DIT_KV``) declares a
+``RollingKVSpec``. Its chunks are thousands of queries over tens of thousands of keys, so
+the attention kernel dominates the step, and bounded KV's Triton kernel (built for short
+streaming steps) is several times slower there than the ragged FlashInfer one. The rolling
+store therefore runs no attention: it keeps the stream's first ``sink`` tokens and its last
+``window`` (the step's included) in stream order, shifting the window left behind the sink
+when a step would overflow, so a step's keys are always one contiguous slice.
+
+Each step declares its rows' ``RollingPosition(written, sink, window)`` in tokens
+(``RollingKVStep``), so the retention can follow a request's own geometry. ``plan`` applies
+the shift, once per step even when planned twice; the model then calls ``write(layer, k, v)``
+(as often as its denoise loop rewrites the chunk; the last write stays) and attends
+``window(layer)`` with its own kernel.
+
+The K/V live in one pool reserved at startup, ``pool_tokens`` a layer. The model declares
+each request's size by returning ``RollingKVReqConfig(tokens=sink + window)`` from
+``get_request_resource_configs``; a request it declares nothing for fails at its first step.
+A request waits in the engine's admission queue, in arrival order, until the pool has its
+room, which is then set aside for it, and one larger than the whole pool is a 400 at the
+conductor. Its first step takes a contiguous region of exactly that size (first fit), given
+back when the request ends, so requests of different sizes share the pool instead of each
+holding the largest. When no free gap holds a new request but the free tokens do, the
+resident regions slide left to join the gaps, a copy of what they hold, between steps; one
+that slides across a short gap is copied through a staging block of 512 tokens a layer,
+reserved with the pool (90 MiB at LingBot-World's geometry), rather than in many small
+copies. How many requests run at once is the deployment's ``max_concurrent_requests``, not
+the store's: the pool counts tokens, so it admits many small requests, and any state a
+model keeps per request outside the store is bounded only by that limit (LingBot-World
+requires it to be 1 for this reason). A step that declares this store runs eager (no
+capture yet), and it does not shard across ranks yet.
 
 Per-request LoRA adapters
 ~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -2287,6 +2328,19 @@ the prefill) still brings it routed, and that read puts it over the slot's.
 and a node on it that reads the routed token sets ``device_loopback = None``; Whisper and
 Qwen3-Omni's Thinker declare their own. Qwen3.5 reads the tokens with ``last_sampled``.
 
+A token that also streams to another node can go down the stream by value, when the
+stream's ``Connection`` sets ``by_value=True``: its consumer then takes a window of the
+stream as one CPU int64 tensor of its items' values. A step whose node names the signal
+in ``inline_signals(walk)`` sends each row's value in the step's ``EDGE_ITEMS`` frame
+instead of a tensor, with nothing to stage, read or acknowledge. A step carries one
+inline signal, the first of those it outputs, so a client token and a different stream
+token cannot both ride inline. The step keeps its rows on the device only if every
+output is one of ``device_loopback_signals``, so the streamed signal must also be the
+loop-back signal: MiniCPM-o's TTS decode loops its code back on the device and streams
+the same code to the vocoder by value. A lockstep node's streams keep their tensors,
+and a ``by_value`` connection cannot join its items, drive its consumer's walk or come
+from the client.
+
 On such a node a captured step writes each row's token and RNG offset back to the request's
 row inside the graph (``knobs: sampler_ingraph_scatter``, on by default). Those rows are
 allocated once, ``knobs: sampler_slots`` of them, so a request takes its row when the runner
@@ -2515,7 +2569,8 @@ Both types share the base ``CudaGraphConfig`` fields:
 - ``capture_graph_walk`` is the walk to capture.
 - ``replay_graph_walks`` lists the walks that may replay this capture. One capture can
   therefore serve several walks, for example ``prefill_audio`` reusing ``prefill_text``.
-- ``capture_batch_sizes`` lists the batch sizes to record.
+- ``capture_batch_sizes`` lists the batch sizes to record. ``None`` uses the runner
+  default; ``[]`` records none.
 - ``additional_key_info`` is an extra hashable component of the capture bucket key. Use it
   when one walk must be captured more than once because the batch shape alone does not
   identify the capture. Its value must equal both the value returned by the submodule's
@@ -2690,7 +2745,12 @@ Both types share the base ``PiecewiseCudaGraphConfig`` fields:
   none, since its replay would address every request's tokens to the first request's
   adapter.
 - ``capture_batch_sizes`` lists the batch sizes to record. ``None`` uses the runner
-  default.
+  default; ``[]`` records none, for an eager-only region (below).
+- ``eager_fallback`` runs a shape with no graph eagerly through ``run`` instead of
+  raising: the runner declares, plans and commits the region's step over the real rows
+  (as a replay declares it, without padding), so the caller has one path for captured
+  and uncaptured shapes. Off, the caller checks ``can_run`` first. MiniCPM-o's vocoder
+  uses it, with eager-only regions for the shapes it never captures.
 - ``compile`` runs ``torch.compile`` on ``capture_fn`` before capture. The default is
   ``False``.
 - ``compile_mode`` is that ``torch.compile``'s mode, as on ``AcceleratorGraphConfig``.
@@ -2884,6 +2944,8 @@ that a misspelled setting is never silently ignored:
      - ``num_sessions``
    * - ``BoundedKVSpec``
      - ``max_slots``
+   * - ``RollingKVSpec``
+     - ``pool_tokens``
    * - ``SamplerSpec``
      - ``enable_logprobs``, ``enable_processed_logprobs`` (see ``SamplingReqConfig``),
        ``greedy_capture`` (``true`` / ``false``; by default a sampler past the one-kernel
@@ -3904,8 +3966,8 @@ streams (audio and video, say): each has its own buffer and its own end.
   and a final chunk, and a loop fed by the stream ends as any stream-terminated loop does.
   Over ``/generate/ws`` a client that opens with ``end_input: false`` appends and ends
   input explicitly (see :doc:`clients`), and a ``/v1/realtime`` conversation keeps it open
-  for the call's life; every other request ends the input as soon as it is submitted. ``/generate/ws``
-  and ``/v1/realtime`` are on the Python frontend only, not ``--rust-frontend``.
+  for the call's life; every other request ends the input as soon as it is submitted. Both
+  frontends serve ``/generate/ws`` and ``/v1/realtime``.
 - The API server's data worker is the stream's producer. The conductor tells it the
   consuming node and its ranks once per call, when it dispatches the request, and the data
   worker sends each append's items to every one of those ranks itself, and then the

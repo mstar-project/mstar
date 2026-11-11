@@ -47,8 +47,8 @@ def test_decode_keeps_its_token_on_the_device_only_with_slot_masters():
     sub = _submodule()
     assert sub.device_loopback_signals("decode") == {"text_inputs"}
     assert sub.device_loopback_signals("prefill_audio") == frozenset()
-    assert sub.inline_client_signals("decode") == {"text_inputs": "new_token"}
-    assert sub.inline_client_signals("prefill_audio") == {}
+    assert sub.inline_signals("decode") == {"text_inputs": "new_token"}
+    assert sub.inline_signals("prefill_audio") == {}
     row = sub.prepare_inputs("decode", _info(), {}, has_loopback=True)
     assert row.input_ids is None and row.input_seq_len == 1
     assert sub.uniform_row_inputs("decode", has_loopback=True).input_seq_len == 1
