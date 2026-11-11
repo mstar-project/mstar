@@ -275,6 +275,7 @@
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.engine.state.html">mstar.engine.state</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.state.adapters.html">mstar.engine.state.adapters</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.state.analysis.html">mstar.engine.state.analysis</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.engine.state.calls.html">mstar.engine.state.calls</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.state.contract.html">mstar.engine.state.contract</a></li>
 </ul>
 </details></li>
@@ -1236,6 +1237,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.StepContext.plan_results"><code class="docutils literal notranslate"><span class="pre">StepContext.plan_results</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.StepContext.real_rows"><code class="docutils literal notranslate"><span class="pre">StepContext.real_rows()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.StepContext.rebuild_rids"><code class="docutils literal notranslate"><span class="pre">StepContext.rebuild_rids</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.StepContext.replays"><code class="docutils literal notranslate"><span class="pre">StepContext.replays</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.StepContext.request_ids"><code class="docutils literal notranslate"><span class="pre">StepContext.request_ids</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.StepContext.request_walks"><code class="docutils literal notranslate"><span class="pre">StepContext.request_walks</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.StepContext.reserve_whole_prefill"><code class="docutils literal notranslate"><span class="pre">StepContext.reserve_whole_prefill</span></code></a></li>
@@ -1290,12 +1292,18 @@
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SubmoduleStep"><code class="docutils literal notranslate"><span class="pre">SubmoduleStep</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SubmoduleStep.begin_calls"><code class="docutils literal notranslate"><span class="pre">SubmoduleStep.begin_calls()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SubmoduleStep.cg_key_info"><code class="docutils literal notranslate"><span class="pre">SubmoduleStep.cg_key_info</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SubmoduleStep.check_calls"><code class="docutils literal notranslate"><span class="pre">SubmoduleStep.check_calls()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SubmoduleStep.ctx"><code class="docutils literal notranslate"><span class="pre">SubmoduleStep.ctx</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SubmoduleStep.end_calls"><code class="docutils literal notranslate"><span class="pre">SubmoduleStep.end_calls()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SubmoduleStep.get"><code class="docutils literal notranslate"><span class="pre">SubmoduleStep.get()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SubmoduleStep.keys"><code class="docutils literal notranslate"><span class="pre">SubmoduleStep.keys()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SubmoduleStep.segments"><code class="docutils literal notranslate"><span class="pre">SubmoduleStep.segments</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SubmoduleStep.set_ctx"><code class="docutils literal notranslate"><span class="pre">SubmoduleStep.set_ctx()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SubmoduleStep.set_state_handles"><code class="docutils literal notranslate"><span class="pre">SubmoduleStep.set_state_handles()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SubmoduleStep.state"><code class="docutils literal notranslate"><span class="pre">SubmoduleStep.state</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SubmoduleStep.state_handles"><code class="docutils literal notranslate"><span class="pre">SubmoduleStep.state_handles</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SubmoduleStep.steps"><code class="docutils literal notranslate"><span class="pre">SubmoduleStep.steps</span></code></a></li>
 </ul>
 </li>
@@ -5225,6 +5233,12 @@ should reserve, address and commit nothing on its behalf.</p>
 <span class="sig-name descname"><span class="pre">rebuild_rids</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#frozenset" title="(in Python v3.12)"><span class="pre">frozenset</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="p"><span class="pre">]</span></span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">frozenset({})</span></span><a class="headerlink" href="#mstar.engine.resources.StepContext.rebuild_rids" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
+<dl class="py property">
+<dt class="sig sig-object py" id="mstar.engine.resources.StepContext.replays">
+<span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">replays</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><a class="headerlink" href="#mstar.engine.resources.StepContext.replays" title="Link to this definition">#</a></dt>
+<dd><p>Whether this step replays a captured graph, so its forward runs no Python.</p>
+</dd></dl>
+
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.engine.resources.StepContext.request_ids">
 <span class="sig-name descname"><span class="pre">request_ids</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Sequence" title="(in Python v3.12)"><span class="pre">Sequence</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.engine.resources.StepContext.request_ids" title="Link to this definition">#</a></dt>
@@ -5916,7 +5930,7 @@ a node that declares them for this request. Purged on removal.</p>
 
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.engine.resources.SubmoduleStep">
-<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.</span></span><span class="sig-name descname"><span class="pre">SubmoduleStep</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">steps</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><span class="pre">dict</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference internal" href="mstar.engine.resources.step.html#mstar.engine.resources.step.ResourceStep" title="mstar.engine.resources.step.ResourceStep"><span class="pre">mstar.engine.resources.step.ResourceStep</span></a><span class="p"><span class="pre">]</span></span></span></em>, <em class="sig-param"><span class="n"><span class="pre">segments</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><span class="pre">list</span></a><span class="p"><span class="pre">[</span></span><a class="reference internal" href="mstar.engine.resources.step.html#mstar.engine.resources.step.Segment" title="mstar.engine.resources.step.Segment"><span class="pre">mstar.engine.resources.step.Segment</span></a><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">cg_key_info</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Any" title="(in Python v3.12)"><span class="pre">Any</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">_ctx</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference internal" href="mstar.engine.resources.step.html#mstar.engine.resources.step.StepContext" title="mstar.engine.resources.step.StepContext"><span class="pre">mstar.engine.resources.step.StepContext</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/step.html#SubmoduleStep"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.SubmoduleStep" title="Link to this definition">#</a></dt>
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.</span></span><span class="sig-name descname"><span class="pre">SubmoduleStep</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">steps</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">dict[str</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">mstar.engine.resources.step.ResourceStep]</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">&lt;factory&gt;</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">segments</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><span class="pre">list</span></a><span class="p"><span class="pre">[</span></span><a class="reference internal" href="mstar.engine.resources.step.html#mstar.engine.resources.step.Segment" title="mstar.engine.resources.step.Segment"><span class="pre">mstar.engine.resources.step.Segment</span></a><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">cg_key_info</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Any" title="(in Python v3.12)"><span class="pre">Any</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">_ctx</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference internal" href="mstar.engine.resources.step.html#mstar.engine.resources.step.StepContext" title="mstar.engine.resources.step.StepContext"><span class="pre">mstar.engine.resources.step.StepContext</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">state</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">collections.abc.Mapping[str</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">typing.Any]</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">&lt;factory&gt;</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/step.html#SubmoduleStep"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.SubmoduleStep" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
@@ -5925,18 +5939,49 @@ a node that declares them for this request. Purged on removal.</p>
 <li><p><strong>segments</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference internal" href="mstar.engine.resources.step.html#mstar.engine.resources.step.Segment" title="mstar.engine.resources.step.Segment"><em>Segment</em></a><em>] </em><em>| </em><em>None</em>)</p></li>
 <li><p><strong>cg_key_info</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Any" title="(in Python v3.12)"><em>Any</em></a><em> | </em><em>None</em>)</p></li>
 <li><p><strong>_ctx</strong> (<a class="reference internal" href="mstar.engine.resources.step.html#mstar.engine.resources.step.StepContext" title="mstar.engine.resources.step.StepContext"><em>StepContext</em></a>)</p></li>
+<li><p><strong>state</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Mapping" title="(in Python v3.12)"><em>Mapping</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Any" title="(in Python v3.12)"><em>Any</em></a><em>]</em>)</p></li>
 </ul>
 </dd>
 </dl>
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.SubmoduleStep.begin_calls">
+<span class="sig-name descname"><span class="pre">begin_calls</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/step.html#SubmoduleStep.begin_calls"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.SubmoduleStep.begin_calls" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.engine.resources.SubmoduleStep.cg_key_info">
 <span class="sig-name descname"><span class="pre">cg_key_info</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Any" title="(in Python v3.12)"><span class="pre">Any</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.engine.resources.SubmoduleStep.cg_key_info" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.SubmoduleStep.check_calls">
+<span class="sig-name descname"><span class="pre">check_calls</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/step.html#SubmoduleStep.check_calls"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.SubmoduleStep.check_calls" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
 <dl class="py property">
 <dt class="sig sig-object py" id="mstar.engine.resources.SubmoduleStep.ctx">
 <span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">ctx</span></span><a class="headerlink" href="#mstar.engine.resources.SubmoduleStep.ctx" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.SubmoduleStep.end_calls">
+<span class="sig-name descname"><span class="pre">end_calls</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/step.html#SubmoduleStep.end_calls"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.SubmoduleStep.end_calls" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
 
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.SubmoduleStep.get">
@@ -5969,6 +6014,29 @@ a node that declares them for this request. Purged on removal.</p>
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.SubmoduleStep.set_ctx">
 <span class="sig-name descname"><span class="pre">set_ctx</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">ctx</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/step.html#SubmoduleStep.set_ctx"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.SubmoduleStep.set_ctx" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.SubmoduleStep.set_state_handles">
+<span class="sig-name descname"><span class="pre">set_state_handles</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">handles</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/step.html#SubmoduleStep.set_state_handles"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.SubmoduleStep.set_state_handles" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>handles</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><em>tuple</em></a><em>[</em><a class="reference internal" href="mstar.engine.resources.step.html#mstar.engine.resources.step.StepHandle" title="mstar.engine.resources.step.StepHandle"><em>StepHandle</em></a><em>, </em><em>...</em><em>]</em>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.SubmoduleStep.state">
+<span class="sig-name descname"><span class="pre">state</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Mapping" title="(in Python v3.12)"><span class="pre">Mapping</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Any" title="(in Python v3.12)"><span class="pre">Any</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.engine.resources.SubmoduleStep.state" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.SubmoduleStep.state_handles">
+<span class="sig-name descname"><span class="pre">state_handles</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><span class="pre">tuple</span></a><span class="p"><span class="pre">[</span></span><a class="reference internal" href="mstar.engine.resources.step.html#mstar.engine.resources.step.StepHandle" title="mstar.engine.resources.step.StepHandle"><span class="pre">StepHandle</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="p"><span class="pre">...</span></span><span class="p"><span class="pre">]</span></span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">()</span></span><a class="headerlink" href="#mstar.engine.resources.SubmoduleStep.state_handles" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
@@ -6648,6 +6716,7 @@ conductor validates a deployment.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.StepContext.plan_results"><code class="docutils literal notranslate"><span class="pre">StepContext.plan_results</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.StepContext.real_rows"><code class="docutils literal notranslate"><span class="pre">StepContext.real_rows()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.StepContext.rebuild_rids"><code class="docutils literal notranslate"><span class="pre">StepContext.rebuild_rids</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.StepContext.replays"><code class="docutils literal notranslate"><span class="pre">StepContext.replays</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.StepContext.request_ids"><code class="docutils literal notranslate"><span class="pre">StepContext.request_ids</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.StepContext.request_walks"><code class="docutils literal notranslate"><span class="pre">StepContext.request_walks</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.StepContext.reserve_whole_prefill"><code class="docutils literal notranslate"><span class="pre">StepContext.reserve_whole_prefill</span></code></a></li>
@@ -6702,12 +6771,18 @@ conductor validates a deployment.</p>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SubmoduleStep"><code class="docutils literal notranslate"><span class="pre">SubmoduleStep</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SubmoduleStep.begin_calls"><code class="docutils literal notranslate"><span class="pre">SubmoduleStep.begin_calls()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SubmoduleStep.cg_key_info"><code class="docutils literal notranslate"><span class="pre">SubmoduleStep.cg_key_info</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SubmoduleStep.check_calls"><code class="docutils literal notranslate"><span class="pre">SubmoduleStep.check_calls()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SubmoduleStep.ctx"><code class="docutils literal notranslate"><span class="pre">SubmoduleStep.ctx</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SubmoduleStep.end_calls"><code class="docutils literal notranslate"><span class="pre">SubmoduleStep.end_calls()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SubmoduleStep.get"><code class="docutils literal notranslate"><span class="pre">SubmoduleStep.get()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SubmoduleStep.keys"><code class="docutils literal notranslate"><span class="pre">SubmoduleStep.keys()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SubmoduleStep.segments"><code class="docutils literal notranslate"><span class="pre">SubmoduleStep.segments</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SubmoduleStep.set_ctx"><code class="docutils literal notranslate"><span class="pre">SubmoduleStep.set_ctx()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SubmoduleStep.set_state_handles"><code class="docutils literal notranslate"><span class="pre">SubmoduleStep.set_state_handles()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SubmoduleStep.state"><code class="docutils literal notranslate"><span class="pre">SubmoduleStep.state</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SubmoduleStep.state_handles"><code class="docutils literal notranslate"><span class="pre">SubmoduleStep.state_handles</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SubmoduleStep.steps"><code class="docutils literal notranslate"><span class="pre">SubmoduleStep.steps</span></code></a></li>
 </ul>
 </li>

@@ -36,6 +36,7 @@ mstar.engine.resources.step
       SettingValue
       SlotLease
       StepContext
+      StepHandle
       SubmoduleStep
    
    

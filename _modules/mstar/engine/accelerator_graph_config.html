@@ -628,6 +628,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../_autosummary/mstar.engine.state.html">mstar.engine.state</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.engine.state.adapters.html">mstar.engine.state.adapters</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.engine.state.analysis.html">mstar.engine.state.analysis</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.engine.state.calls.html">mstar.engine.state.calls</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.engine.state.contract.html">mstar.engine.state.contract</a></li>
 </ul>
 </details></li>
@@ -1033,6 +1034,7 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources</span><span class="w"> </span><span class="kn">import</span> <span class="n">AttentionStep</span><span class="p">,</span> <span class="n">Segment</span><span class="p">,</span> <span class="n">SubmoduleStep</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.state.contract</span><span class="w"> </span><span class="kn">import</span> <span class="n">ArrayStep</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.submodule_base</span><span class="w"> </span><span class="kn">import</span> <span class="n">ModelInputsFromEngine</span><span class="p">,</span> <span class="n">NodeInputs</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">capture_ladder</span>
 
@@ -1757,11 +1759,15 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># non-causal "main" segment per row on it; a `one_row_per_step` region's</span>
     <span class="c1"># lengths are all segments of its one row.</span>
     <span class="n">attn_key</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="c1"># The same for a node on the state contract: the declared array, whose reads the region runs.</span>
+    <span class="n">array</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">__post_init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="n">__post_init__</span><span class="p">()</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">attn_key</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">declare_step</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">"attn_key declares the region's step; leave declare_step None"</span><span class="p">)</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">array</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">attn_key</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">declare_step</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">):</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">"array declares the region's step; leave attn_key and declare_step None"</span><span class="p">)</span>
 
 <div class="viewcode-block" id="PiecewisePackedConfig.region_step">
 <a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.PiecewisePackedConfig.region_step">[docs]</a>
@@ -1769,18 +1775,18 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="p">,</span> <span class="n">request_ids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">],</span> <span class="n">seq_lens</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span>
         <span class="n">label_seq_lens</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">SubmoduleStep</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">attn_key</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">attn_key</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">array</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="k">return</span> <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="n">region_step</span><span class="p">(</span><span class="n">request_ids</span><span class="p">,</span> <span class="n">seq_lens</span><span class="p">,</span> <span class="n">label_seq_lens</span><span class="p">)</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">one_row_per_step</span><span class="p">:</span>
             <span class="p">(</span><span class="n">rid</span><span class="p">,)</span> <span class="o">=</span> <span class="n">request_ids</span>
             <span class="n">request_ids</span> <span class="o">=</span> <span class="p">[</span><span class="n">rid</span><span class="p">]</span> <span class="o">*</span> <span class="nb">len</span><span class="p">(</span><span class="n">seq_lens</span><span class="p">)</span>
-        <span class="k">return</span> <span class="n">SubmoduleStep</span><span class="p">(</span>
-            <span class="n">segments</span><span class="o">=</span><span class="p">[</span>
-                <span class="n">Segment</span><span class="p">(</span><span class="n">request_id</span><span class="o">=</span><span class="n">rid</span><span class="p">,</span> <span class="n">label</span><span class="o">=</span><span class="s2">"main"</span><span class="p">,</span> <span class="n">span</span><span class="o">=</span><span class="n">n</span><span class="p">)</span>
-                <span class="k">for</span> <span class="n">rid</span><span class="p">,</span> <span class="n">n</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span><span class="n">request_ids</span><span class="p">,</span> <span class="n">seq_lens</span><span class="p">,</span> <span class="n">strict</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
-            <span class="p">],</span>
-            <span class="n">steps</span><span class="o">=</span><span class="p">{</span><span class="bp">self</span><span class="o">.</span><span class="n">attn_key</span><span class="p">:</span> <span class="n">AttentionStep</span><span class="p">(</span><span class="n">causal</span><span class="o">=</span><span class="kc">False</span><span class="p">)},</span>
-        <span class="p">)</span></div>
+        <span class="n">segments</span> <span class="o">=</span> <span class="p">[</span>
+            <span class="n">Segment</span><span class="p">(</span><span class="n">request_id</span><span class="o">=</span><span class="n">rid</span><span class="p">,</span> <span class="n">label</span><span class="o">=</span><span class="s2">"main"</span><span class="p">,</span> <span class="n">span</span><span class="o">=</span><span class="n">n</span><span class="p">)</span>
+            <span class="k">for</span> <span class="n">rid</span><span class="p">,</span> <span class="n">n</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span><span class="n">request_ids</span><span class="p">,</span> <span class="n">seq_lens</span><span class="p">,</span> <span class="n">strict</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+        <span class="p">]</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">array</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">return</span> <span class="n">SubmoduleStep</span><span class="p">(</span><span class="n">segments</span><span class="o">=</span><span class="n">segments</span><span class="p">,</span> <span class="n">state</span><span class="o">=</span><span class="p">{</span><span class="bp">self</span><span class="o">.</span><span class="n">array</span><span class="p">:</span> <span class="n">ArrayStep</span><span class="p">()})</span>
+        <span class="k">return</span> <span class="n">SubmoduleStep</span><span class="p">(</span><span class="n">segments</span><span class="o">=</span><span class="n">segments</span><span class="p">,</span> <span class="n">steps</span><span class="o">=</span><span class="p">{</span><span class="bp">self</span><span class="o">.</span><span class="n">attn_key</span><span class="p">:</span> <span class="n">AttentionStep</span><span class="p">(</span><span class="n">causal</span><span class="o">=</span><span class="kc">False</span><span class="p">)})</span></div>
 
 
 <div class="viewcode-block" id="PiecewisePackedConfig.get_config_type">

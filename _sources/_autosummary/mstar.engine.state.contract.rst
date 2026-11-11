@@ -26,15 +26,25 @@ mstar.engine.state.contract
    .. autosummary::
    
       Array
+      ArrayStep
       Attend
+      Block
       Causal
       CausalConv
       Entry
+      Fork
       FrozenMap
       GatedDeltaNet
+      Layout
       Mask
       Op
+      Positions
+      Reached
       Read
+      Rope
+      SampleSettings
+      SampleStep
+      Sampler
       TensorType
       Window
    

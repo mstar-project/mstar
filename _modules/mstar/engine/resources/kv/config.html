@@ -628,6 +628,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.state.html">mstar.engine.state</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.state.adapters.html">mstar.engine.state.adapters</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.state.analysis.html">mstar.engine.state.analysis</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.state.calls.html">mstar.engine.state.calls</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.state.contract.html">mstar.engine.state.contract</a></li>
 </ul>
 </details></li>
@@ -1034,7 +1035,7 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Collection</span><span class="p">,</span> <span class="n">Iterable</span><span class="p">,</span> <span class="n">Mapping</span><span class="p">,</span> <span class="n">Sequence</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span><span class="p">,</span> <span class="n">replace</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">enum</span><span class="w"> </span><span class="kn">import</span> <span class="n">Enum</span><span class="p">,</span> <span class="n">StrEnum</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">TYPE_CHECKING</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">TYPE_CHECKING</span><span class="p">,</span> <span class="n">NamedTuple</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.spec</span><span class="w"> </span><span class="kn">import</span> <span class="n">NodeResourceSpec</span><span class="p">,</span> <span class="n">ResourceReqConfig</span><span class="p">,</span> <span class="n">RoutingContext</span><span class="p">,</span> <span class="n">check_sizes</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.step</span><span class="w"> </span><span class="kn">import</span> <span class="n">ResourceStep</span>
@@ -1409,6 +1410,35 @@ window.runMermaid = runMermaid;</script>
     <span class="n">IDS</span> <span class="o">=</span> <span class="s2">"ids"</span>
     <span class="n">DIGEST</span> <span class="o">=</span> <span class="s2">"digest"</span>
     <span class="n">ROWS</span> <span class="o">=</span> <span class="s2">"rows"</span></div>
+
+
+
+<div class="viewcode-block" id="Span">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.state.html#mstar.engine.resources.Span">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">Span</span><span class="p">(</span><span class="n">NamedTuple</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""One write to a KV stream. A layout lists them in the order the walks write.</span>
+
+<span class="sd">    Each span is one step's row, unless a span sets ``opens_step`` False: the step of</span>
+<span class="sd">    the span before it then writes it too, in the same row, as text around an attachment is.</span>
+<span class="sd">    That span is of the same walk, since a step runs one.</span>
+
+<span class="sd">    ``length`` is how many KV slots the write fills, and ``advance`` is how far</span>
+<span class="sd">    it moves the position counter, which is the length for text. ``source`` is</span>
+<span class="sd">    the tensor whose next entry an ids span keys, or the file of a digest span</span>
+<span class="sd">    as ``(modality, index)``. ``params`` are the preprocessing arguments that</span>
+<span class="sd">    change the tensors made from the file. A ``rows`` span writes KV made from</span>
+<span class="sd">    anything else, such as another node's outputs, and is never keyed.</span>
+<span class="sd">    ``scratch`` is the most a non-committing step writes before the span</span>
+<span class="sd">    commits into those slots, as a denoised window does.</span>
+<span class="sd">    """</span>
+    <span class="n">kind</span><span class="p">:</span> <span class="n">SpanKind</span>
+    <span class="n">walk</span><span class="p">:</span> <span class="nb">str</span>
+    <span class="n">length</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">advance</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">source</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">]</span>
+    <span class="n">params</span><span class="p">:</span> <span class="nb">tuple</span> <span class="o">=</span> <span class="p">()</span>
+    <span class="n">scratch</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>
+    <span class="n">opens_step</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span></div>
 
 
 

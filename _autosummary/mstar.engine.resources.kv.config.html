@@ -275,6 +275,7 @@
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.engine.state.html">mstar.engine.state</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.state.adapters.html">mstar.engine.state.adapters</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.state.analysis.html">mstar.engine.state.analysis</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.engine.state.calls.html">mstar.engine.state.calls</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.state.contract.html">mstar.engine.state.contract</a></li>
 </ul>
 </details></li>
@@ -861,6 +862,17 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.RingKVStep.frames"><code class="docutils literal notranslate"><span class="pre">RingKVStep.frames</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.Span"><code class="docutils literal notranslate"><span class="pre">Span</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.Span.advance"><code class="docutils literal notranslate"><span class="pre">Span.advance</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.Span.kind"><code class="docutils literal notranslate"><span class="pre">Span.kind</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.Span.length"><code class="docutils literal notranslate"><span class="pre">Span.length</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.Span.opens_step"><code class="docutils literal notranslate"><span class="pre">Span.opens_step</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.Span.params"><code class="docutils literal notranslate"><span class="pre">Span.params</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.Span.scratch"><code class="docutils literal notranslate"><span class="pre">Span.scratch</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.Span.source"><code class="docutils literal notranslate"><span class="pre">Span.source</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.Span.walk"><code class="docutils literal notranslate"><span class="pre">Span.walk</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.SpanKind"><code class="docutils literal notranslate"><span class="pre">SpanKind</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.SpanKind.DIGEST"><code class="docutils literal notranslate"><span class="pre">SpanKind.DIGEST</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.SpanKind.IDS"><code class="docutils literal notranslate"><span class="pre">SpanKind.IDS</span></code></a></li>
@@ -978,10 +990,13 @@ without pulling FlashInfer in behind it.</p>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.config.RingKVStep" title="mstar.engine.resources.kv.config.RingKVStep"><code class="xref py py-obj docutils literal notranslate"><span class="pre">RingKVStep</span></code></a>([segments])</p></td>
 <td><p>One ring clock per request in the step's batch.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.config.SpanKind" title="mstar.engine.resources.kv.config.SpanKind"><code class="xref py py-obj docutils literal notranslate"><span class="pre">SpanKind</span></code></a>(*values)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.config.Span" title="mstar.engine.resources.kv.config.Span"><code class="xref py py-obj docutils literal notranslate"><span class="pre">Span</span></code></a>(kind, walk, length, advance, source[, ...])</p></td>
+<td><p>One write to a KV stream.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.config.SpanKind" title="mstar.engine.resources.kv.config.SpanKind"><code class="xref py py-obj docutils literal notranslate"><span class="pre">SpanKind</span></code></a>(*values)</p></td>
 <td><p>What a span writes: token <code class="docutils literal notranslate"><span class="pre">IDS</span></code>, a file's KV keyed by its <code class="docutils literal notranslate"><span class="pre">DIGEST</span></code>, or <code class="docutils literal notranslate"><span class="pre">ROWS</span></code> of anything else.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.config.StreamLayout" title="mstar.engine.resources.kv.config.StreamLayout"><code class="xref py py-obj docutils literal notranslate"><span class="pre">StreamLayout</span></code></a>([spans, growth, scratch, ...])</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.config.StreamLayout" title="mstar.engine.resources.kv.config.StreamLayout"><code class="xref py py-obj docutils literal notranslate"><span class="pre">StreamLayout</span></code></a>([spans, growth, scratch, ...])</p></td>
 <td><p><cite>LabelLayout</cite> as the KV manager holds it.</p></td>
 </tr>
 </tbody>
@@ -1983,6 +1998,86 @@ padding session is a real, addressable span.</p>
 </dd></dl>
 
 <dl class="py class">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.config.Span">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.kv.config.</span></span><span class="sig-name descname"><span class="pre">Span</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">kind</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">walk</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">length</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">advance</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">source</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">params</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">()</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">scratch</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">opens_step</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">True</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/config.html#Span"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.config.Span" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.NamedTuple" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">NamedTuple</span></code></a></p>
+<p>One write to a KV stream. A layout lists them in the order the walks write.</p>
+<p>Each span is one step’s row, unless a span sets <code class="docutils literal notranslate"><span class="pre">opens_step</span></code> False: the step of
+the span before it then writes it too, in the same row, as text around an attachment is.
+That span is of the same walk, since a step runs one.</p>
+<p><code class="docutils literal notranslate"><span class="pre">length</span></code> is how many KV slots the write fills, and <code class="docutils literal notranslate"><span class="pre">advance</span></code> is how far
+it moves the position counter, which is the length for text. <code class="docutils literal notranslate"><span class="pre">source</span></code> is
+the tensor whose next entry an ids span keys, or the file of a digest span
+as <code class="docutils literal notranslate"><span class="pre">(modality,</span> <span class="pre">index)</span></code>. <code class="docutils literal notranslate"><span class="pre">params</span></code> are the preprocessing arguments that
+change the tensors made from the file. A <code class="docutils literal notranslate"><span class="pre">rows</span></code> span writes KV made from
+anything else, such as another node’s outputs, and is never keyed.
+<code class="docutils literal notranslate"><span class="pre">scratch</span></code> is the most a non-committing step writes before the span
+commits into those slots, as a denoised window does.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>kind</strong> (<a class="reference internal" href="#mstar.engine.resources.kv.config.SpanKind" title="mstar.engine.resources.kv.config.SpanKind"><em>SpanKind</em></a>)</p></li>
+<li><p><strong>walk</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>length</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>advance</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>source</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><em>tuple</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
+<li><p><strong>params</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><em>tuple</em></a>)</p></li>
+<li><p><strong>scratch</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>opens_step</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.config.Span.advance">
+<span class="sig-name descname"><span class="pre">advance</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.engine.resources.kv.config.Span.advance" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 3</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.config.Span.kind">
+<span class="sig-name descname"><span class="pre">kind</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference internal" href="#mstar.engine.resources.kv.config.SpanKind" title="mstar.engine.resources.kv.config.SpanKind"><span class="pre">SpanKind</span></a></span><a class="headerlink" href="#mstar.engine.resources.kv.config.Span.kind" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 0</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.config.Span.length">
+<span class="sig-name descname"><span class="pre">length</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.engine.resources.kv.config.Span.length" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 2</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.config.Span.opens_step">
+<span class="sig-name descname"><span class="pre">opens_step</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><a class="headerlink" href="#mstar.engine.resources.kv.config.Span.opens_step" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 7</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.config.Span.params">
+<span class="sig-name descname"><span class="pre">params</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><span class="pre">tuple</span></a></span><a class="headerlink" href="#mstar.engine.resources.kv.config.Span.params" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 5</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.config.Span.scratch">
+<span class="sig-name descname"><span class="pre">scratch</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.engine.resources.kv.config.Span.scratch" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 6</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.config.Span.source">
+<span class="sig-name descname"><span class="pre">source</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><span class="pre">tuple</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.engine.resources.kv.config.Span.source" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 4</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.config.Span.walk">
+<span class="sig-name descname"><span class="pre">walk</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span><a class="headerlink" href="#mstar.engine.resources.kv.config.Span.walk" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 1</p>
+</dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.config.SpanKind">
 <span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.kv.config.</span></span><span class="sig-name descname"><span class="pre">SpanKind</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="o"><span class="pre">*</span></span><span class="n"><span class="pre">values</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/config.html#SpanKind"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.config.SpanKind" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/enum.html#enum.StrEnum" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">StrEnum</span></code></a></p>
@@ -2476,6 +2571,17 @@ before the configs go out with every frame between workers.</p>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.RingKVStep"><code class="docutils literal notranslate"><span class="pre">RingKVStep</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.RingKVStep.frames"><code class="docutils literal notranslate"><span class="pre">RingKVStep.frames</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.Span"><code class="docutils literal notranslate"><span class="pre">Span</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.Span.advance"><code class="docutils literal notranslate"><span class="pre">Span.advance</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.Span.kind"><code class="docutils literal notranslate"><span class="pre">Span.kind</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.Span.length"><code class="docutils literal notranslate"><span class="pre">Span.length</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.Span.opens_step"><code class="docutils literal notranslate"><span class="pre">Span.opens_step</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.Span.params"><code class="docutils literal notranslate"><span class="pre">Span.params</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.Span.scratch"><code class="docutils literal notranslate"><span class="pre">Span.scratch</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.Span.source"><code class="docutils literal notranslate"><span class="pre">Span.source</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.Span.walk"><code class="docutils literal notranslate"><span class="pre">Span.walk</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.SpanKind"><code class="docutils literal notranslate"><span class="pre">SpanKind</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">

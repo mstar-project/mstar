@@ -628,6 +628,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../../_autosummary/mstar.engine.state.html">mstar.engine.state</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.state.adapters.html">mstar.engine.state.adapters</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.state.analysis.html">mstar.engine.state.analysis</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.state.calls.html">mstar.engine.state.calls</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.state.contract.html">mstar.engine.state.contract</a></li>
 </ul>
 </details></li>
@@ -1030,9 +1031,12 @@ window.runMermaid = runMermaid;</script>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Iterator</span><span class="p">,</span> <span class="n">Mapping</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">KW_ONLY</span><span class="p">,</span> <span class="n">dataclass</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">ClassVar</span><span class="p">,</span> <span class="n">Literal</span><span class="p">,</span> <span class="n">get_args</span><span class="p">,</span> <span class="n">get_origin</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">ClassVar</span><span class="p">,</span> <span class="n">Literal</span><span class="p">,</span> <span class="n">NamedTuple</span><span class="p">,</span> <span class="n">get_args</span><span class="p">,</span> <span class="n">get_origin</span>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.kv.config</span><span class="w"> </span><span class="kn">import</span> <span class="n">Span</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.step</span><span class="w"> </span><span class="kn">import</span> <span class="n">Segment</span>
 
 
 <div class="viewcode-block" id="FrozenMap">
@@ -1131,6 +1135,14 @@ window.runMermaid = runMermaid;</script>
 <span class="w">    </span><span class="sd">"""Sees {k : q - size &lt; k &lt;= q}."""</span>
 
     <span class="n">size</span><span class="p">:</span> <span class="nb">int</span></div>
+
+
+
+<div class="viewcode-block" id="Block">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.state.contract.html#mstar.engine.state.Block">[docs]</a>
+<span class="nd">@dataclass</span><span class="p">(</span><span class="n">frozen</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">Block</span><span class="p">(</span><span class="n">Mask</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""Sees the entries of q's own segment in this step, on an array with ``max_len`` 0."""</span></div>
 
 
 
@@ -1242,6 +1254,35 @@ window.runMermaid = runMermaid;</script>
 
 
 
+<div class="viewcode-block" id="Rope">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.state.contract.html#mstar.engine.state.Rope">[docs]</a>
+<span class="nd">@dataclass</span><span class="p">(</span><span class="n">frozen</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">kw_only</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">Rope</span><span class="p">:</span>
+    <span class="n">theta</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">10000.0</span>
+    <span class="n">rotary_dim</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>              <span class="c1"># None: head_dim</span>
+    <span class="n">interleave</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+    <span class="n">scale</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">1.0</span>
+    <span class="c1"># Llama 3.1 scaling: all three or none</span>
+    <span class="n">low_freq_factor</span><span class="p">:</span> <span class="nb">float</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">high_freq_factor</span><span class="p">:</span> <span class="nb">float</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">old_context_len</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">dtype</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">dtype</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>           <span class="c1"># None: q's</span>
+    <span class="n">table_dtype</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">dtype</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>     <span class="c1"># None: angles in the kernel</span></div>
+
+
+
+<div class="viewcode-block" id="Positions">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.state.contract.html#mstar.engine.state.Positions">[docs]</a>
+<span class="nd">@dataclass</span><span class="p">(</span><span class="n">frozen</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">kw_only</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">Positions</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Each row's position on the array, which the model rotates or embeds its next tokens at. It reads no entries,</span>
+<span class="sd">    and it lives on the host and moves when a step is planned: by the row's span, by ``ArrayStep.advance`` or by</span>
+<span class="sd">    ``ArrayStep.position_ids``. It forks and takes prefix hits with its array."""</span>
+
+    <span class="n">rope</span><span class="p">:</span> <span class="n">Rope</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>    <span class="c1"># None: a counter only</span></div>
+
+
+
 <div class="viewcode-block" id="Array">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.engine.state.contract.html#mstar.engine.state.Array">[docs]</a>
 <span class="nd">@dataclass</span><span class="p">(</span><span class="n">frozen</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
@@ -1252,6 +1293,7 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">    the same length at the end of every step. ``nodes`` lists who may touch the array, and the engine places it.</span>
 <span class="sd">    ``updates`` are kernels that replace a Value's entry with its next version. The version they overwrite is gone,</span>
 <span class="sd">    so prefix caching and undo save a copy before one runs.</span>
+<span class="sd">    With ``max_len`` 0 an array keeps nothing between steps, so every add is scratch.</span>
 <span class="sd">    """</span>
 
     <span class="n">name</span><span class="p">:</span> <span class="nb">str</span>
@@ -1263,10 +1305,13 @@ window.runMermaid = runMermaid;</script>
     <span class="n">reads</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Read</span><span class="p">]</span> <span class="o">=</span> <span class="n">EMPTY</span>    <span class="c1"># empty: read whole</span>
     <span class="n">updates</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Op</span><span class="p">]</span> <span class="o">=</span> <span class="n">EMPTY</span>
     <span class="n">rewritable</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+    <span class="n">labels</span><span class="p">:</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="nb">frozenset</span><span class="p">({</span><span class="s2">"main"</span><span class="p">})</span>
+    <span class="n">positions</span><span class="p">:</span> <span class="n">Positions</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">__post_init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="nb">object</span><span class="o">.</span><span class="fm">__setattr__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="s2">"nodes"</span><span class="p">,</span> <span class="nb">frozenset</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">nodes</span><span class="p">))</span>
         <span class="nb">object</span><span class="o">.</span><span class="fm">__setattr__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="s2">"layers"</span><span class="p">,</span> <span class="nb">frozenset</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">layers</span><span class="p">))</span>
+        <span class="nb">object</span><span class="o">.</span><span class="fm">__setattr__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="s2">"labels"</span><span class="p">,</span> <span class="nb">frozenset</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">labels</span><span class="p">))</span>
         <span class="nb">object</span><span class="o">.</span><span class="fm">__setattr__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="s2">"reads"</span><span class="p">,</span> <span class="n">FrozenMap</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">reads</span><span class="p">))</span>
         <span class="nb">object</span><span class="o">.</span><span class="fm">__setattr__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="s2">"updates"</span><span class="p">,</span> <span class="n">FrozenMap</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">updates</span><span class="p">))</span>
         <span class="n">where</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">"Array </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">name</span><span class="si">!r}</span><span class="s2">"</span>
@@ -1276,8 +1321,10 @@ window.runMermaid = runMermaid;</script>
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">where</span><span class="si">}</span><span class="s2">.layers must be ints &gt;= 0, got </span><span class="si">{</span><span class="nb">sorted</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">layers</span><span class="p">,</span><span class="w"> </span><span class="n">key</span><span class="o">=</span><span class="nb">repr</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
         <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">layers</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">is_value</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">where</span><span class="si">}</span><span class="s2">.layers is empty, and only a Value may declare no layers"</span><span class="p">)</span>
-        <span class="k">if</span> <span class="ow">not</span> <span class="n">_is_positive</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">max_len</span><span class="p">):</span>
-            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">where</span><span class="si">}</span><span class="s2">.max_len must be a positive int, got </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">max_len</span><span class="si">!r}</span><span class="s2">"</span><span class="p">)</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">labels</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">where</span><span class="si">}</span><span class="s2">.labels must be non-empty"</span><span class="p">)</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="p">(</span><span class="nb">type</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">max_len</span><span class="p">)</span> <span class="ow">is</span> <span class="nb">int</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_len</span> <span class="o">&gt;=</span> <span class="mi">0</span><span class="p">):</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">where</span><span class="si">}</span><span class="s2">.max_len must be an int &gt;= 0, got </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">max_len</span><span class="si">!r}</span><span class="s2">"</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_check_entry</span><span class="p">()</span>
         <span class="k">for</span> <span class="n">key</span><span class="p">,</span> <span class="n">read</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">reads</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_check_read</span><span class="p">(</span><span class="n">key</span><span class="p">,</span> <span class="n">read</span><span class="p">)</span>
@@ -1345,6 +1392,115 @@ window.runMermaid = runMermaid;</script>
 <span class="k">def</span><span class="w"> </span><span class="nf">Value</span><span class="p">(</span><span class="n">name</span><span class="p">,</span> <span class="o">*</span><span class="p">,</span> <span class="n">nodes</span><span class="p">,</span> <span class="n">layers</span><span class="p">,</span> <span class="n">entry</span><span class="p">,</span> <span class="n">updates</span><span class="o">=</span><span class="n">EMPTY</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Array</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">"""A rewritable array of one entry."""</span>
     <span class="k">return</span> <span class="n">Array</span><span class="p">(</span><span class="n">name</span><span class="p">,</span> <span class="n">nodes</span><span class="o">=</span><span class="n">nodes</span><span class="p">,</span> <span class="n">layers</span><span class="o">=</span><span class="n">layers</span><span class="p">,</span> <span class="n">entry</span><span class="o">=</span><span class="n">entry</span><span class="p">,</span> <span class="n">updates</span><span class="o">=</span><span class="n">updates</span><span class="p">,</span> <span class="n">max_len</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span> <span class="n">rewritable</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span></div>
+
+
+
+<div class="viewcode-block" id="Sampler">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.state.contract.html#mstar.engine.state.Sampler">[docs]</a>
+<span class="nd">@dataclass</span><span class="p">(</span><span class="n">frozen</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">Sampler</span><span class="p">:</span>
+    <span class="n">name</span><span class="p">:</span> <span class="nb">str</span>
+    <span class="n">_</span><span class="p">:</span> <span class="n">KW_ONLY</span>
+    <span class="n">nodes</span><span class="p">:</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span>
+    <span class="n">vocab_size</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">penalty</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
+    <span class="n">min_p</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+    <span class="n">eos_ids</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span> <span class="o">=</span> <span class="p">()</span>    <span class="c1"># the ids min_tokens bars</span>
+    <span class="n">draws</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span>                   <span class="c1"># calls to sample in each step that lists it</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">__post_init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="nb">object</span><span class="o">.</span><span class="fm">__setattr__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="s2">"nodes"</span><span class="p">,</span> <span class="nb">frozenset</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">nodes</span><span class="p">))</span>
+        <span class="nb">object</span><span class="o">.</span><span class="fm">__setattr__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="s2">"eos_ids"</span><span class="p">,</span> <span class="nb">tuple</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">eos_ids</span><span class="p">))</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">nodes</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Sampler </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">name</span><span class="si">!r}</span><span class="s2">.nodes must be non-empty"</span><span class="p">)</span></div>
+
+
+
+<div class="viewcode-block" id="SampleSettings">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.state.contract.html#mstar.engine.state.SampleSettings">[docs]</a>
+<span class="nd">@dataclass</span><span class="p">(</span><span class="n">frozen</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">kw_only</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">SampleSettings</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""A request's settings for one sampler, keyed by the sampler's name in `get_request_resource_configs`."""</span>
+
+    <span class="n">temperature</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">0.6</span>
+    <span class="n">top_k</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>
+    <span class="n">top_p</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">1.0</span>
+    <span class="n">min_p</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">0.0</span>
+    <span class="n">repetition_penalty</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">1.0</span>
+    <span class="n">repetition_window</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>
+    <span class="n">penalize_prompt</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
+    <span class="n">min_tokens</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>
+    <span class="n">ignore_eos</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+    <span class="n">top_p_first</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+    <span class="n">top_p_min_keep</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span>
+    <span class="n">return_logprobs</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+    <span class="n">logprobs_mode</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"raw"</span></div>
+
+
+
+<div class="viewcode-block" id="Fork">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.state.contract.html#mstar.engine.state.Fork">[docs]</a>
+<span class="nd">@dataclass</span><span class="p">(</span><span class="n">frozen</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">kw_only</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">Fork</span><span class="p">:</span>
+    <span class="n">src</span><span class="p">:</span> <span class="nb">str</span>
+    <span class="n">dst</span><span class="p">:</span> <span class="nb">str</span>
+    <span class="n">at</span><span class="p">:</span> <span class="n">Literal</span><span class="p">[</span><span class="s2">"start"</span><span class="p">,</span> <span class="s2">"end"</span><span class="p">]</span>           <span class="c1"># before the step plans or writes, or at commit</span>
+    <span class="n">rows</span><span class="p">:</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>    <span class="c1"># None: every row</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">__post_init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">at</span> <span class="ow">not</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">"start"</span><span class="p">,</span> <span class="s2">"end"</span><span class="p">):</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Fork.at must be 'start' or 'end', got </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">at</span><span class="si">!r}</span><span class="s2">"</span><span class="p">)</span></div>
+
+
+
+<div class="viewcode-block" id="ArrayStep">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.state.contract.html#mstar.engine.state.ArrayStep">[docs]</a>
+<span class="nd">@dataclass</span><span class="p">(</span><span class="n">frozen</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">kw_only</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">ArrayStep</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""What one step does to one array, under `SubmoduleStep.state`."""</span>
+
+    <span class="n">segments</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="n">Segment</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>    <span class="c1"># None: the step's segments</span>
+    <span class="n">keep</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>                              <span class="c1"># False: every add this step is scratch</span>
+    <span class="n">forks</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="n">Fork</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span> <span class="o">=</span> <span class="p">()</span>
+    <span class="n">placeholders</span><span class="p">:</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">str</span><span class="p">]]</span> <span class="o">=</span> <span class="nb">frozenset</span><span class="p">()</span>    <span class="c1"># (row, label): holds a place, reads and keeps nothing</span>
+    <span class="n">eager_add</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>                        <span class="c1"># this step's adds run outside the captured graph</span>
+    <span class="n">advance</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>         <span class="c1"># positions per row; None: the span</span>
+    <span class="n">position_ids</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>       <span class="c1"># explicit ids, (tokens,) in segment order</span></div>
+
+
+
+<div class="viewcode-block" id="SampleStep">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.state.contract.html#mstar.engine.state.SampleStep">[docs]</a>
+<span class="nd">@dataclass</span><span class="p">(</span><span class="n">frozen</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">kw_only</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">SampleStep</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""What one step does with one sampler, under `SubmoduleStep.state`."""</span>
+
+    <span class="n">apply_penalty</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
+    <span class="n">apply_filters</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
+    <span class="n">prompt_tokens</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="n">EMPTY</span>    <span class="c1"># row -&gt; ids the penalty counts</span>
+    <span class="n">kept_rows</span><span class="p">:</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>              <span class="c1"># None: every row's sample is kept</span></div>
+
+
+
+<div class="viewcode-block" id="Layout">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.state.contract.html#mstar.engine.state.Layout">[docs]</a>
+<span class="nd">@dataclass</span><span class="p">(</span><span class="n">frozen</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">kw_only</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">Layout</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""What a request writes to one label of one array, from `process_prompt`'s ``state_layout``."""</span>
+
+    <span class="n">spans</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="n">Span</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span> <span class="o">=</span> <span class="p">()</span>
+    <span class="n">growth</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">],</span> <span class="o">...</span><span class="p">]</span> <span class="o">=</span> <span class="p">()</span>    <span class="c1"># (loop, entries per iteration)</span>
+    <span class="n">scratch</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>                            <span class="c1"># most one scratch step writes past the kept length</span></div>
+
+
+
+<div class="viewcode-block" id="Reached">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.state.contract.html#mstar.engine.state.Reached">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">Reached</span><span class="p">(</span><span class="n">NamedTuple</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""What a read with no op returns: each field's reached entries packed by row, and where each row starts."""</span>
+
+    <span class="n">fields</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]</span>
+    <span class="n">row_offsets</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span></div>
 
 </pre></div>
 

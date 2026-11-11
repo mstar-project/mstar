@@ -51,7 +51,7 @@
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
     <link rel="next" title="mstar.engine.windowing" href="mstar.engine.windowing.html" />
-    <link rel="prev" title="mstar.engine.state.analysis" href="mstar.engine.state.analysis.html" />
+    <link rel="prev" title="mstar.engine.state.calls" href="mstar.engine.state.calls.html" />
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
@@ -275,6 +275,7 @@
 <li class="toctree-l3 current active has-children"><a class="reference internal" href="mstar.engine.state.html">mstar.engine.state</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul class="current">
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.state.adapters.html">mstar.engine.state.adapters</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.state.analysis.html">mstar.engine.state.analysis</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.engine.state.calls.html">mstar.engine.state.calls</a></li>
 <li class="toctree-l4 current active"><a class="current reference internal" href="#">mstar.engine.state.contract</a></li>
 </ul>
 </details></li>
@@ -734,13 +735,25 @@
                 <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Array"><code class="docutils literal notranslate"><span class="pre">Array</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Array.entry"><code class="docutils literal notranslate"><span class="pre">Array.entry</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Array.labels"><code class="docutils literal notranslate"><span class="pre">Array.labels</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Array.layers"><code class="docutils literal notranslate"><span class="pre">Array.layers</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Array.max_len"><code class="docutils literal notranslate"><span class="pre">Array.max_len</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Array.name"><code class="docutils literal notranslate"><span class="pre">Array.name</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Array.nodes"><code class="docutils literal notranslate"><span class="pre">Array.nodes</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Array.positions"><code class="docutils literal notranslate"><span class="pre">Array.positions</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Array.reads"><code class="docutils literal notranslate"><span class="pre">Array.reads</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Array.rewritable"><code class="docutils literal notranslate"><span class="pre">Array.rewritable</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Array.updates"><code class="docutils literal notranslate"><span class="pre">Array.updates</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.ArrayStep"><code class="docutils literal notranslate"><span class="pre">ArrayStep</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.ArrayStep.advance"><code class="docutils literal notranslate"><span class="pre">ArrayStep.advance</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.ArrayStep.eager_add"><code class="docutils literal notranslate"><span class="pre">ArrayStep.eager_add</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.ArrayStep.forks"><code class="docutils literal notranslate"><span class="pre">ArrayStep.forks</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.ArrayStep.keep"><code class="docutils literal notranslate"><span class="pre">ArrayStep.keep</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.ArrayStep.placeholders"><code class="docutils literal notranslate"><span class="pre">ArrayStep.placeholders</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.ArrayStep.position_ids"><code class="docutils literal notranslate"><span class="pre">ArrayStep.position_ids</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.ArrayStep.segments"><code class="docutils literal notranslate"><span class="pre">ArrayStep.segments</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Attend"><code class="docutils literal notranslate"><span class="pre">Attend</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -749,6 +762,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Attend.reads"><code class="docutils literal notranslate"><span class="pre">Attend.reads</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Block"><code class="docutils literal notranslate"><span class="pre">Block</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Causal"><code class="docutils literal notranslate"><span class="pre">Causal</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.CausalConv"><code class="docutils literal notranslate"><span class="pre">CausalConv</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.CausalConv.activation"><code class="docutils literal notranslate"><span class="pre">CausalConv.activation</span></code></a></li>
@@ -762,6 +776,13 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Entry.tensors"><code class="docutils literal notranslate"><span class="pre">Entry.tensors</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Fork"><code class="docutils literal notranslate"><span class="pre">Fork</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Fork.at"><code class="docutils literal notranslate"><span class="pre">Fork.at</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Fork.dst"><code class="docutils literal notranslate"><span class="pre">Fork.dst</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Fork.rows"><code class="docutils literal notranslate"><span class="pre">Fork.rows</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Fork.src"><code class="docutils literal notranslate"><span class="pre">Fork.src</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.FrozenMap"><code class="docutils literal notranslate"><span class="pre">FrozenMap</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.GatedDeltaNet"><code class="docutils literal notranslate"><span class="pre">GatedDeltaNet</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.GatedDeltaNet.check"><code class="docutils literal notranslate"><span class="pre">GatedDeltaNet.check()</span></code></a></li>
@@ -772,6 +793,12 @@
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.KVEntry"><code class="docutils literal notranslate"><span class="pre">KVEntry()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Layout"><code class="docutils literal notranslate"><span class="pre">Layout</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Layout.growth"><code class="docutils literal notranslate"><span class="pre">Layout.growth</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Layout.scratch"><code class="docutils literal notranslate"><span class="pre">Layout.scratch</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Layout.spans"><code class="docutils literal notranslate"><span class="pre">Layout.spans</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Mask"><code class="docutils literal notranslate"><span class="pre">Mask</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Op"><code class="docutils literal notranslate"><span class="pre">Op</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Op.adds"><code class="docutils literal notranslate"><span class="pre">Op.adds</span></code></a></li>
@@ -781,11 +808,65 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Op.writes"><code class="docutils literal notranslate"><span class="pre">Op.writes</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Positions"><code class="docutils literal notranslate"><span class="pre">Positions</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Positions.rope"><code class="docutils literal notranslate"><span class="pre">Positions.rope</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Reached"><code class="docutils literal notranslate"><span class="pre">Reached</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Reached.fields"><code class="docutils literal notranslate"><span class="pre">Reached.fields</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Reached.row_offsets"><code class="docutils literal notranslate"><span class="pre">Reached.row_offsets</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Read"><code class="docutils literal notranslate"><span class="pre">Read</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Read.layers"><code class="docutils literal notranslate"><span class="pre">Read.layers</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Read.mask"><code class="docutils literal notranslate"><span class="pre">Read.mask</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Read.op"><code class="docutils literal notranslate"><span class="pre">Read.op</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Read.walks"><code class="docutils literal notranslate"><span class="pre">Read.walks</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Rope"><code class="docutils literal notranslate"><span class="pre">Rope</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Rope.dtype"><code class="docutils literal notranslate"><span class="pre">Rope.dtype</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Rope.high_freq_factor"><code class="docutils literal notranslate"><span class="pre">Rope.high_freq_factor</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Rope.interleave"><code class="docutils literal notranslate"><span class="pre">Rope.interleave</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Rope.low_freq_factor"><code class="docutils literal notranslate"><span class="pre">Rope.low_freq_factor</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Rope.old_context_len"><code class="docutils literal notranslate"><span class="pre">Rope.old_context_len</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Rope.rotary_dim"><code class="docutils literal notranslate"><span class="pre">Rope.rotary_dim</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Rope.scale"><code class="docutils literal notranslate"><span class="pre">Rope.scale</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Rope.table_dtype"><code class="docutils literal notranslate"><span class="pre">Rope.table_dtype</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Rope.theta"><code class="docutils literal notranslate"><span class="pre">Rope.theta</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.SampleSettings"><code class="docutils literal notranslate"><span class="pre">SampleSettings</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.SampleSettings.ignore_eos"><code class="docutils literal notranslate"><span class="pre">SampleSettings.ignore_eos</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.SampleSettings.logprobs_mode"><code class="docutils literal notranslate"><span class="pre">SampleSettings.logprobs_mode</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.SampleSettings.min_p"><code class="docutils literal notranslate"><span class="pre">SampleSettings.min_p</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.SampleSettings.min_tokens"><code class="docutils literal notranslate"><span class="pre">SampleSettings.min_tokens</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.SampleSettings.penalize_prompt"><code class="docutils literal notranslate"><span class="pre">SampleSettings.penalize_prompt</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.SampleSettings.repetition_penalty"><code class="docutils literal notranslate"><span class="pre">SampleSettings.repetition_penalty</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.SampleSettings.repetition_window"><code class="docutils literal notranslate"><span class="pre">SampleSettings.repetition_window</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.SampleSettings.return_logprobs"><code class="docutils literal notranslate"><span class="pre">SampleSettings.return_logprobs</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.SampleSettings.temperature"><code class="docutils literal notranslate"><span class="pre">SampleSettings.temperature</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.SampleSettings.top_k"><code class="docutils literal notranslate"><span class="pre">SampleSettings.top_k</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.SampleSettings.top_p"><code class="docutils literal notranslate"><span class="pre">SampleSettings.top_p</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.SampleSettings.top_p_first"><code class="docutils literal notranslate"><span class="pre">SampleSettings.top_p_first</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.SampleSettings.top_p_min_keep"><code class="docutils literal notranslate"><span class="pre">SampleSettings.top_p_min_keep</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.SampleStep"><code class="docutils literal notranslate"><span class="pre">SampleStep</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.SampleStep.apply_filters"><code class="docutils literal notranslate"><span class="pre">SampleStep.apply_filters</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.SampleStep.apply_penalty"><code class="docutils literal notranslate"><span class="pre">SampleStep.apply_penalty</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.SampleStep.kept_rows"><code class="docutils literal notranslate"><span class="pre">SampleStep.kept_rows</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.SampleStep.prompt_tokens"><code class="docutils literal notranslate"><span class="pre">SampleStep.prompt_tokens</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Sampler"><code class="docutils literal notranslate"><span class="pre">Sampler</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Sampler.draws"><code class="docutils literal notranslate"><span class="pre">Sampler.draws</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Sampler.eos_ids"><code class="docutils literal notranslate"><span class="pre">Sampler.eos_ids</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Sampler.min_p"><code class="docutils literal notranslate"><span class="pre">Sampler.min_p</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Sampler.name"><code class="docutils literal notranslate"><span class="pre">Sampler.name</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Sampler.nodes"><code class="docutils literal notranslate"><span class="pre">Sampler.nodes</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Sampler.penalty"><code class="docutils literal notranslate"><span class="pre">Sampler.penalty</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Sampler.vocab_size"><code class="docutils literal notranslate"><span class="pre">Sampler.vocab_size</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.TensorType"><code class="docutils literal notranslate"><span class="pre">TensorType</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -836,8 +917,14 @@
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.state.contract.Array" title="mstar.engine.state.contract.Array"><code class="xref py py-obj docutils literal notranslate"><span class="pre">Array</span></code></a>(name, *, nodes, layers, entry, max_len)</p></td>
 <td><p>Per request, per label and per declared layer, entries at log positions 0 to n - 1, with n &lt;= <code class="docutils literal notranslate"><span class="pre">max_len</span></code>.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.state.contract.Attend" title="mstar.engine.state.contract.Attend"><code class="xref py py-obj docutils literal notranslate"><span class="pre">Attend</span></code></a>(q_heads)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.state.contract.ArrayStep" title="mstar.engine.state.contract.ArrayStep"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ArrayStep</span></code></a>(*[, segments, keep, forks, ...])</p></td>
+<td><p>What one step does to one array, under <cite>SubmoduleStep.state</cite>.</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.state.contract.Attend" title="mstar.engine.state.contract.Attend"><code class="xref py py-obj docutils literal notranslate"><span class="pre">Attend</span></code></a>(q_heads)</p></td>
 <td><p></p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.state.contract.Block" title="mstar.engine.state.contract.Block"><code class="xref py py-obj docutils literal notranslate"><span class="pre">Block</span></code></a>()</p></td>
+<td><p>Sees the entries of q's own segment in this step, on an array with <code class="docutils literal notranslate"><span class="pre">max_len</span></code> 0.</p></td>
 </tr>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.state.contract.Causal" title="mstar.engine.state.contract.Causal"><code class="xref py py-obj docutils literal notranslate"><span class="pre">Causal</span></code></a>()</p></td>
 <td><p>Sees {k : k &lt;= q}.</p></td>
@@ -848,11 +935,17 @@
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.state.contract.Entry" title="mstar.engine.state.contract.Entry"><code class="xref py py-obj docutils literal notranslate"><span class="pre">Entry</span></code></a>(tensors, *[, host])</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.state.contract.FrozenMap" title="mstar.engine.state.contract.FrozenMap"><code class="xref py py-obj docutils literal notranslate"><span class="pre">FrozenMap</span></code></a>([items])</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.state.contract.Fork" title="mstar.engine.state.contract.Fork"><code class="xref py py-obj docutils literal notranslate"><span class="pre">Fork</span></code></a>(*, src, dst, at[, rows])</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.state.contract.FrozenMap" title="mstar.engine.state.contract.FrozenMap"><code class="xref py py-obj docutils literal notranslate"><span class="pre">FrozenMap</span></code></a>([items])</p></td>
 <td><p>A read-only copy of a mapping, in its order, that hashes, which <cite>MappingProxyType</cite> doesn't.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.state.contract.GatedDeltaNet" title="mstar.engine.state.contract.GatedDeltaNet"><code class="xref py py-obj docutils literal notranslate"><span class="pre">GatedDeltaNet</span></code></a>(*[, qk_l2norm, scale])</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.state.contract.GatedDeltaNet" title="mstar.engine.state.contract.GatedDeltaNet"><code class="xref py py-obj docutils literal notranslate"><span class="pre">GatedDeltaNet</span></code></a>(*[, qk_l2norm, scale])</p></td>
 <td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.state.contract.Layout" title="mstar.engine.state.contract.Layout"><code class="xref py py-obj docutils literal notranslate"><span class="pre">Layout</span></code></a>(*[, spans, growth, scratch])</p></td>
+<td><p>What a request writes to one label of one array, from <cite>process_prompt</cite>'s <code class="docutils literal notranslate"><span class="pre">state_layout</span></code>.</p></td>
 </tr>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.state.contract.Mask" title="mstar.engine.state.contract.Mask"><code class="xref py py-obj docutils literal notranslate"><span class="pre">Mask</span></code></a>()</p></td>
 <td><p>Which entries a read at log position q sees.</p></td>
@@ -860,8 +953,26 @@
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.state.contract.Op" title="mstar.engine.state.contract.Op"><code class="xref py py-obj docutils literal notranslate"><span class="pre">Op</span></code></a>()</p></td>
 <td><p>A kernel the engine plans before the step and runs on an array's entries.</p></td>
 </tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.state.contract.Positions" title="mstar.engine.state.contract.Positions"><code class="xref py py-obj docutils literal notranslate"><span class="pre">Positions</span></code></a>(*[, rope])</p></td>
+<td><p>Each row's position on the array, which the model rotates or embeds its next tokens at.</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.state.contract.Reached" title="mstar.engine.state.contract.Reached"><code class="xref py py-obj docutils literal notranslate"><span class="pre">Reached</span></code></a>(fields, row_offsets)</p></td>
+<td><p>What a read with no op returns: each field's reached entries packed by row, and where each row starts.</p></td>
+</tr>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.state.contract.Read" title="mstar.engine.state.contract.Read"><code class="xref py py-obj docutils literal notranslate"><span class="pre">Read</span></code></a>(*, mask[, op, layers, walks])</p></td>
 <td><p>A view of the entries a row has kept.</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.state.contract.Rope" title="mstar.engine.state.contract.Rope"><code class="xref py py-obj docutils literal notranslate"><span class="pre">Rope</span></code></a>(*[, theta, rotary_dim, interleave, ...])</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.state.contract.SampleSettings" title="mstar.engine.state.contract.SampleSettings"><code class="xref py py-obj docutils literal notranslate"><span class="pre">SampleSettings</span></code></a>(*[, temperature, top_k, ...])</p></td>
+<td><p>A request's settings for one sampler, keyed by the sampler's name in <cite>get_request_resource_configs</cite>.</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.state.contract.SampleStep" title="mstar.engine.state.contract.SampleStep"><code class="xref py py-obj docutils literal notranslate"><span class="pre">SampleStep</span></code></a>(*[, apply_penalty, ...])</p></td>
+<td><p>What one step does with one sampler, under <cite>SubmoduleStep.state</cite>.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.state.contract.Sampler" title="mstar.engine.state.contract.Sampler"><code class="xref py py-obj docutils literal notranslate"><span class="pre">Sampler</span></code></a>(name, *, nodes, vocab_size[, ...])</p></td>
+<td><p></p></td>
 </tr>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.state.contract.TensorType" title="mstar.engine.state.contract.TensorType"><code class="xref py py-obj docutils literal notranslate"><span class="pre">TensorType</span></code></a>(shape, *, dtype[, shard])</p></td>
 <td><p></p></td>
@@ -874,13 +985,14 @@
 </div>
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.engine.state.contract.Array">
-<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.state.contract.</span></span><span class="sig-name descname"><span class="pre">Array</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">name</span></span></em>, <em class="sig-param"><span class="keyword-only-separator o"><abbr title="Keyword-only parameters separator (PEP 3102)"><span class="pre">*</span></abbr></span></em>, <em class="sig-param"><span class="n"><span class="pre">nodes</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">layers</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">entry</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">max_len</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">reads</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">FrozenMap({})</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">updates</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">FrozenMap({})</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rewritable</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/state/contract.html#Array"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.state.contract.Array" title="Link to this definition">#</a></dt>
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.state.contract.</span></span><span class="sig-name descname"><span class="pre">Array</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">name</span></span></em>, <em class="sig-param"><span class="keyword-only-separator o"><abbr title="Keyword-only parameters separator (PEP 3102)"><span class="pre">*</span></abbr></span></em>, <em class="sig-param"><span class="n"><span class="pre">nodes</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">layers</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">entry</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">max_len</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">reads</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">FrozenMap({})</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">updates</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">FrozenMap({})</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rewritable</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">labels</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">frozenset({'main'})</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">positions</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/state/contract.html#Array"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.state.contract.Array" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
 <p>Per request, per label and per declared layer, entries at log positions 0 to n - 1, with n &lt;= <code class="docutils literal notranslate"><span class="pre">max_len</span></code>.</p>
 <p>An append-only array only grows, and a rewritable one also takes writes in place. All layers of an array have
 the same length at the end of every step. <code class="docutils literal notranslate"><span class="pre">nodes</span></code> lists who may touch the array, and the engine places it.
 <code class="docutils literal notranslate"><span class="pre">updates</span></code> are kernels that replace a Value’s entry with its next version. The version they overwrite is gone,
-so prefix caching and undo save a copy before one runs.</p>
+so prefix caching and undo save a copy before one runs.
+With <code class="docutils literal notranslate"><span class="pre">max_len</span></code> 0 an array keeps nothing between steps, so every add is scratch.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
@@ -892,12 +1004,19 @@ so prefix caching and undo save a copy before one runs.</p>
 <li><p><strong>reads</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Mapping" title="(in Python v3.12)"><em>Mapping</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference internal" href="#mstar.engine.state.contract.Read" title="mstar.engine.state.contract.Read"><em>Read</em></a><em>]</em>)</p></li>
 <li><p><strong>updates</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Mapping" title="(in Python v3.12)"><em>Mapping</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference internal" href="#mstar.engine.state.contract.Op" title="mstar.engine.state.contract.Op"><em>Op</em></a><em>]</em>)</p></li>
 <li><p><strong>rewritable</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
+<li><p><strong>labels</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#frozenset" title="(in Python v3.12)"><em>frozenset</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>]</em>)</p></li>
+<li><p><strong>positions</strong> (<a class="reference internal" href="#mstar.engine.state.contract.Positions" title="mstar.engine.state.contract.Positions"><em>Positions</em></a><em> | </em><em>None</em>)</p></li>
 </ul>
 </dd>
 </dl>
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.engine.state.contract.Array.entry">
 <span class="sig-name descname"><span class="pre">entry</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference internal" href="#mstar.engine.state.contract.Entry" title="mstar.engine.state.contract.Entry"><span class="pre">Entry</span></a></span><a class="headerlink" href="#mstar.engine.state.contract.Array.entry" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.state.contract.Array.labels">
+<span class="sig-name descname"><span class="pre">labels</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#frozenset" title="(in Python v3.12)"><span class="pre">frozenset</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">]</span></span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">frozenset({'main'})</span></span><a class="headerlink" href="#mstar.engine.state.contract.Array.labels" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
@@ -921,6 +1040,11 @@ so prefix caching and undo save a copy before one runs.</p>
 <dd></dd></dl>
 
 <dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.state.contract.Array.positions">
+<span class="sig-name descname"><span class="pre">positions</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference internal" href="#mstar.engine.state.contract.Positions" title="mstar.engine.state.contract.Positions"><span class="pre">Positions</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.engine.state.contract.Array.positions" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.engine.state.contract.Array.reads">
 <span class="sig-name descname"><span class="pre">reads</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Mapping" title="(in Python v3.12)"><span class="pre">Mapping</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference internal" href="#mstar.engine.state.contract.Read" title="mstar.engine.state.contract.Read"><span class="pre">Read</span></a><span class="p"><span class="pre">]</span></span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">FrozenMap({})</span></span><a class="headerlink" href="#mstar.engine.state.contract.Array.reads" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
@@ -933,6 +1057,61 @@ so prefix caching and undo save a copy before one runs.</p>
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.engine.state.contract.Array.updates">
 <span class="sig-name descname"><span class="pre">updates</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Mapping" title="(in Python v3.12)"><span class="pre">Mapping</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference internal" href="#mstar.engine.state.contract.Op" title="mstar.engine.state.contract.Op"><span class="pre">Op</span></a><span class="p"><span class="pre">]</span></span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">FrozenMap({})</span></span><a class="headerlink" href="#mstar.engine.state.contract.Array.updates" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.engine.state.contract.ArrayStep">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.state.contract.</span></span><span class="sig-name descname"><span class="pre">ArrayStep</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="keyword-only-separator o"><abbr title="Keyword-only parameters separator (PEP 3102)"><span class="pre">*</span></abbr></span></em>, <em class="sig-param"><span class="n"><span class="pre">segments</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">keep</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">True</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">forks</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">()</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">placeholders</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">frozenset({})</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">eager_add</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">advance</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">position_ids</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/state/contract.html#ArrayStep"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.state.contract.ArrayStep" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
+<p>What one step does to one array, under <cite>SubmoduleStep.state</cite>.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>segments</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><em>tuple</em></a><em>[</em><a class="reference internal" href="mstar.engine.resources.step.html#mstar.engine.resources.step.Segment" title="mstar.engine.resources.step.Segment"><em>Segment</em></a><em>, </em><em>...</em><em>] </em><em>| </em><em>None</em>)</p></li>
+<li><p><strong>keep</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
+<li><p><strong>forks</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><em>tuple</em></a><em>[</em><a class="reference internal" href="#mstar.engine.state.contract.Fork" title="mstar.engine.state.contract.Fork"><em>Fork</em></a><em>, </em><em>...</em><em>]</em>)</p></li>
+<li><p><strong>placeholders</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#frozenset" title="(in Python v3.12)"><em>frozenset</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><em>tuple</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>]</em><em>]</em>)</p></li>
+<li><p><strong>eager_add</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
+<li><p><strong>advance</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><em>tuple</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>, </em><em>...</em><em>] </em><em>| </em><em>None</em>)</p></li>
+<li><p><strong>position_ids</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a><em> | </em><em>None</em>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.state.contract.ArrayStep.advance">
+<span class="sig-name descname"><span class="pre">advance</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><span class="pre">tuple</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="p"><span class="pre">...</span></span><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.engine.state.contract.ArrayStep.advance" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.state.contract.ArrayStep.eager_add">
+<span class="sig-name descname"><span class="pre">eager_add</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></span><a class="headerlink" href="#mstar.engine.state.contract.ArrayStep.eager_add" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.state.contract.ArrayStep.forks">
+<span class="sig-name descname"><span class="pre">forks</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><span class="pre">tuple</span></a><span class="p"><span class="pre">[</span></span><a class="reference internal" href="#mstar.engine.state.contract.Fork" title="mstar.engine.state.contract.Fork"><span class="pre">Fork</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="p"><span class="pre">...</span></span><span class="p"><span class="pre">]</span></span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">()</span></span><a class="headerlink" href="#mstar.engine.state.contract.ArrayStep.forks" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.state.contract.ArrayStep.keep">
+<span class="sig-name descname"><span class="pre">keep</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">True</span></span><a class="headerlink" href="#mstar.engine.state.contract.ArrayStep.keep" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.state.contract.ArrayStep.placeholders">
+<span class="sig-name descname"><span class="pre">placeholders</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#frozenset" title="(in Python v3.12)"><span class="pre">frozenset</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><span class="pre">tuple</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">]</span></span><span class="p"><span class="pre">]</span></span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">frozenset({})</span></span><a class="headerlink" href="#mstar.engine.state.contract.ArrayStep.placeholders" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.state.contract.ArrayStep.position_ids">
+<span class="sig-name descname"><span class="pre">position_ids</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><span class="pre">Tensor</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.engine.state.contract.ArrayStep.position_ids" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.state.contract.ArrayStep.segments">
+<span class="sig-name descname"><span class="pre">segments</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><span class="pre">tuple</span></a><span class="p"><span class="pre">[</span></span><a class="reference internal" href="mstar.engine.resources.step.html#mstar.engine.resources.step.Segment" title="mstar.engine.resources.step.Segment"><span class="pre">Segment</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="p"><span class="pre">...</span></span><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.engine.state.contract.ArrayStep.segments" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 </dd></dl>
@@ -974,6 +1153,15 @@ holds every field the op names.</p>
 <span class="sig-name descname"><span class="pre">reads</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.ClassVar" title="(in Python v3.12)"><span class="pre">ClassVar</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><span class="pre">tuple</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="p"><span class="pre">...</span></span><span class="p"><span class="pre">]</span></span><span class="p"><span class="pre">]</span></span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">('k',</span> <span class="pre">'v')</span></span><a class="headerlink" href="#mstar.engine.state.contract.Attend.reads" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.engine.state.contract.Block">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.state.contract.</span></span><span class="sig-name descname"><span class="pre">Block</span></span><a class="reference internal" href="../_modules/mstar/engine/state/contract.html#Block"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.state.contract.Block" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference internal" href="#mstar.engine.state.contract.Mask" title="mstar.engine.state.contract.Mask"><code class="xref py py-class docutils literal notranslate"><span class="pre">Mask</span></code></a></p>
+<p>Sees the entries of q’s own segment in this step, on an array with <code class="docutils literal notranslate"><span class="pre">max_len</span></code> 0.</p>
+<dl class="field-list simple">
+</dl>
 </dd></dl>
 
 <dl class="py class">
@@ -1049,6 +1237,42 @@ holds every field the op names.</p>
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.engine.state.contract.Entry.tensors">
 <span class="sig-name descname"><span class="pre">tensors</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Mapping" title="(in Python v3.12)"><span class="pre">Mapping</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference internal" href="#mstar.engine.state.contract.TensorType" title="mstar.engine.state.contract.TensorType"><span class="pre">TensorType</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.engine.state.contract.Entry.tensors" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.engine.state.contract.Fork">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.state.contract.</span></span><span class="sig-name descname"><span class="pre">Fork</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="keyword-only-separator o"><abbr title="Keyword-only parameters separator (PEP 3102)"><span class="pre">*</span></abbr></span></em>, <em class="sig-param"><span class="n"><span class="pre">src</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span></em>, <em class="sig-param"><span class="n"><span class="pre">dst</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span></em>, <em class="sig-param"><span class="n"><span class="pre">at</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Literal</span><span class="p"><span class="pre">[</span></span><span class="s"><span class="pre">'start'</span></span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="s"><span class="pre">'end'</span></span><span class="p"><span class="pre">]</span></span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rows</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#frozenset" title="(in Python v3.12)"><span class="pre">frozenset</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/state/contract.html#Fork"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.state.contract.Fork" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>src</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>dst</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>at</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Literal" title="(in Python v3.12)"><em>Literal</em></a><em>[</em><em>'start'</em><em>, </em><em>'end'</em><em>]</em>)</p></li>
+<li><p><strong>rows</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#frozenset" title="(in Python v3.12)"><em>frozenset</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>] </em><em>| </em><em>None</em>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.state.contract.Fork.at">
+<span class="sig-name descname"><span class="pre">at</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Literal" title="(in Python v3.12)"><span class="pre">Literal</span></a><span class="p"><span class="pre">[</span></span><span class="s"><span class="pre">'start'</span></span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="s"><span class="pre">'end'</span></span><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.engine.state.contract.Fork.at" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.state.contract.Fork.dst">
+<span class="sig-name descname"><span class="pre">dst</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span><a class="headerlink" href="#mstar.engine.state.contract.Fork.dst" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.state.contract.Fork.rows">
+<span class="sig-name descname"><span class="pre">rows</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#frozenset" title="(in Python v3.12)"><span class="pre">frozenset</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.engine.state.contract.Fork.rows" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.state.contract.Fork.src">
+<span class="sig-name descname"><span class="pre">src</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span><a class="headerlink" href="#mstar.engine.state.contract.Fork.src" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 </dd></dl>
@@ -1130,6 +1354,37 @@ holds every field the op names.</p>
 </dd></dl>
 
 <dl class="py class">
+<dt class="sig sig-object py" id="mstar.engine.state.contract.Layout">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.state.contract.</span></span><span class="sig-name descname"><span class="pre">Layout</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="keyword-only-separator o"><abbr title="Keyword-only parameters separator (PEP 3102)"><span class="pre">*</span></abbr></span></em>, <em class="sig-param"><span class="n"><span class="pre">spans</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">()</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">growth</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">()</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">scratch</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/state/contract.html#Layout"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.state.contract.Layout" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
+<p>What a request writes to one label of one array, from <cite>process_prompt</cite>’s <code class="docutils literal notranslate"><span class="pre">state_layout</span></code>.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>spans</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><em>tuple</em></a><em>[</em><a class="reference internal" href="mstar.engine.resources.kv.config.html#mstar.engine.resources.kv.config.Span" title="mstar.engine.resources.kv.config.Span"><em>Span</em></a><em>, </em><em>...</em><em>]</em>)</p></li>
+<li><p><strong>growth</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><em>tuple</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><em>tuple</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em><em>, </em><em>...</em><em>]</em>)</p></li>
+<li><p><strong>scratch</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.state.contract.Layout.growth">
+<span class="sig-name descname"><span class="pre">growth</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><span class="pre">tuple</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><span class="pre">tuple</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="p"><span class="pre">]</span></span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="p"><span class="pre">...</span></span><span class="p"><span class="pre">]</span></span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">()</span></span><a class="headerlink" href="#mstar.engine.state.contract.Layout.growth" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.state.contract.Layout.scratch">
+<span class="sig-name descname"><span class="pre">scratch</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">0</span></span><a class="headerlink" href="#mstar.engine.state.contract.Layout.scratch" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.state.contract.Layout.spans">
+<span class="sig-name descname"><span class="pre">spans</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><span class="pre">tuple</span></a><span class="p"><span class="pre">[</span></span><a class="reference internal" href="mstar.engine.resources.kv.config.html#mstar.engine.resources.kv.config.Span" title="mstar.engine.resources.kv.config.Span"><span class="pre">Span</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="p"><span class="pre">...</span></span><span class="p"><span class="pre">]</span></span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">()</span></span><a class="headerlink" href="#mstar.engine.state.contract.Layout.spans" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
 <dt class="sig sig-object py" id="mstar.engine.state.contract.Mask">
 <span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.state.contract.</span></span><span class="sig-name descname"><span class="pre">Mask</span></span><a class="reference internal" href="../_modules/mstar/engine/state/contract.html#Mask"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.state.contract.Mask" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
@@ -1184,6 +1439,52 @@ holds every field the op names.</p>
 </dd></dl>
 
 <dl class="py class">
+<dt class="sig sig-object py" id="mstar.engine.state.contract.Positions">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.state.contract.</span></span><span class="sig-name descname"><span class="pre">Positions</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="keyword-only-separator o"><abbr title="Keyword-only parameters separator (PEP 3102)"><span class="pre">*</span></abbr></span></em>, <em class="sig-param"><span class="n"><span class="pre">rope</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/state/contract.html#Positions"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.state.contract.Positions" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
+<p>Each row’s position on the array, which the model rotates or embeds its next tokens at. It reads no entries,
+and it lives on the host and moves when a step is planned: by the row’s span, by <code class="docutils literal notranslate"><span class="pre">ArrayStep.advance</span></code> or by
+<code class="docutils literal notranslate"><span class="pre">ArrayStep.position_ids</span></code>. It forks and takes prefix hits with its array.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>rope</strong> (<a class="reference internal" href="#mstar.engine.state.contract.Rope" title="mstar.engine.state.contract.Rope"><em>Rope</em></a><em> | </em><em>None</em>)</p>
+</dd>
+</dl>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.state.contract.Positions.rope">
+<span class="sig-name descname"><span class="pre">rope</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference internal" href="#mstar.engine.state.contract.Rope" title="mstar.engine.state.contract.Rope"><span class="pre">Rope</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.engine.state.contract.Positions.rope" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.engine.state.contract.Reached">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.state.contract.</span></span><span class="sig-name descname"><span class="pre">Reached</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">fields</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">row_offsets</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/state/contract.html#Reached"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.state.contract.Reached" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.NamedTuple" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">NamedTuple</span></code></a></p>
+<p>What a read with no op returns: each field’s reached entries packed by row, and where each row starts.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>fields</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Mapping" title="(in Python v3.12)"><em>Mapping</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a><em>]</em>)</p></li>
+<li><p><strong>row_offsets</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.state.contract.Reached.fields">
+<span class="sig-name descname"><span class="pre">fields</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Mapping" title="(in Python v3.12)"><span class="pre">Mapping</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><span class="pre">Tensor</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.engine.state.contract.Reached.fields" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 0</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.state.contract.Reached.row_offsets">
+<span class="sig-name descname"><span class="pre">row_offsets</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><span class="pre">Tensor</span></a></span><a class="headerlink" href="#mstar.engine.state.contract.Reached.row_offsets" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 1</p>
+</dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
 <dt class="sig sig-object py" id="mstar.engine.state.contract.Read">
 <span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.state.contract.</span></span><span class="sig-name descname"><span class="pre">Read</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="keyword-only-separator o"><abbr title="Keyword-only parameters separator (PEP 3102)"><span class="pre">*</span></abbr></span></em>, <em class="sig-param"><span class="n"><span class="pre">mask</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">op</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">layers</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">walks</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/state/contract.html#Read"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.state.contract.Read" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
@@ -1217,6 +1518,254 @@ can free the rest and tell when two requests can share a prefix. A read leaves t
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.engine.state.contract.Read.walks">
 <span class="sig-name descname"><span class="pre">walks</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#frozenset" title="(in Python v3.12)"><span class="pre">frozenset</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.engine.state.contract.Read.walks" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.engine.state.contract.Rope">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.state.contract.</span></span><span class="sig-name descname"><span class="pre">Rope</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="keyword-only-separator o"><abbr title="Keyword-only parameters separator (PEP 3102)"><span class="pre">*</span></abbr></span></em>, <em class="sig-param"><span class="n"><span class="pre">theta</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><span class="pre">float</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">10000.0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rotary_dim</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">interleave</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">scale</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><span class="pre">float</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">1.0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">low_freq_factor</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><span class="pre">float</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">high_freq_factor</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><span class="pre">float</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">old_context_len</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">dtype</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensor_attributes.html#torch.dtype" title="(in PyTorch v2.15)"><span class="pre">torch.dtype</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">table_dtype</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensor_attributes.html#torch.dtype" title="(in PyTorch v2.15)"><span class="pre">torch.dtype</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/state/contract.html#Rope"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.state.contract.Rope" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>theta</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><em>float</em></a>)</p></li>
+<li><p><strong>rotary_dim</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>interleave</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
+<li><p><strong>scale</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><em>float</em></a>)</p></li>
+<li><p><strong>low_freq_factor</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><em>float</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>high_freq_factor</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><em>float</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>old_context_len</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>dtype</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensor_attributes.html#torch.dtype" title="(in PyTorch v2.15)"><em>dtype</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>table_dtype</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensor_attributes.html#torch.dtype" title="(in PyTorch v2.15)"><em>dtype</em></a><em> | </em><em>None</em>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.state.contract.Rope.dtype">
+<span class="sig-name descname"><span class="pre">dtype</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensor_attributes.html#torch.dtype" title="(in PyTorch v2.15)"><span class="pre">dtype</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.engine.state.contract.Rope.dtype" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.state.contract.Rope.high_freq_factor">
+<span class="sig-name descname"><span class="pre">high_freq_factor</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><span class="pre">float</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.engine.state.contract.Rope.high_freq_factor" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.state.contract.Rope.interleave">
+<span class="sig-name descname"><span class="pre">interleave</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></span><a class="headerlink" href="#mstar.engine.state.contract.Rope.interleave" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.state.contract.Rope.low_freq_factor">
+<span class="sig-name descname"><span class="pre">low_freq_factor</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><span class="pre">float</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.engine.state.contract.Rope.low_freq_factor" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.state.contract.Rope.old_context_len">
+<span class="sig-name descname"><span class="pre">old_context_len</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.engine.state.contract.Rope.old_context_len" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.state.contract.Rope.rotary_dim">
+<span class="sig-name descname"><span class="pre">rotary_dim</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.engine.state.contract.Rope.rotary_dim" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.state.contract.Rope.scale">
+<span class="sig-name descname"><span class="pre">scale</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><span class="pre">float</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">1.0</span></span><a class="headerlink" href="#mstar.engine.state.contract.Rope.scale" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.state.contract.Rope.table_dtype">
+<span class="sig-name descname"><span class="pre">table_dtype</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensor_attributes.html#torch.dtype" title="(in PyTorch v2.15)"><span class="pre">dtype</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.engine.state.contract.Rope.table_dtype" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.state.contract.Rope.theta">
+<span class="sig-name descname"><span class="pre">theta</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><span class="pre">float</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">10000.0</span></span><a class="headerlink" href="#mstar.engine.state.contract.Rope.theta" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.engine.state.contract.SampleSettings">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.state.contract.</span></span><span class="sig-name descname"><span class="pre">SampleSettings</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="keyword-only-separator o"><abbr title="Keyword-only parameters separator (PEP 3102)"><span class="pre">*</span></abbr></span></em>, <em class="sig-param"><span class="n"><span class="pre">temperature</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0.6</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">top_k</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">top_p</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">1.0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">min_p</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0.0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">repetition_penalty</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">1.0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">repetition_window</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">penalize_prompt</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">True</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">min_tokens</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">ignore_eos</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">top_p_first</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">top_p_min_keep</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">1</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">return_logprobs</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">logprobs_mode</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'raw'</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/state/contract.html#SampleSettings"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.state.contract.SampleSettings" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
+<p>A request’s settings for one sampler, keyed by the sampler’s name in <cite>get_request_resource_configs</cite>.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>temperature</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><em>float</em></a>)</p></li>
+<li><p><strong>top_k</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>top_p</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><em>float</em></a>)</p></li>
+<li><p><strong>min_p</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><em>float</em></a>)</p></li>
+<li><p><strong>repetition_penalty</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><em>float</em></a>)</p></li>
+<li><p><strong>repetition_window</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>penalize_prompt</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
+<li><p><strong>min_tokens</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>ignore_eos</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
+<li><p><strong>top_p_first</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
+<li><p><strong>top_p_min_keep</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>return_logprobs</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
+<li><p><strong>logprobs_mode</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.state.contract.SampleSettings.ignore_eos">
+<span class="sig-name descname"><span class="pre">ignore_eos</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></span><a class="headerlink" href="#mstar.engine.state.contract.SampleSettings.ignore_eos" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.state.contract.SampleSettings.logprobs_mode">
+<span class="sig-name descname"><span class="pre">logprobs_mode</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'raw'</span></span><a class="headerlink" href="#mstar.engine.state.contract.SampleSettings.logprobs_mode" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.state.contract.SampleSettings.min_p">
+<span class="sig-name descname"><span class="pre">min_p</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><span class="pre">float</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">0.0</span></span><a class="headerlink" href="#mstar.engine.state.contract.SampleSettings.min_p" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.state.contract.SampleSettings.min_tokens">
+<span class="sig-name descname"><span class="pre">min_tokens</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">0</span></span><a class="headerlink" href="#mstar.engine.state.contract.SampleSettings.min_tokens" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.state.contract.SampleSettings.penalize_prompt">
+<span class="sig-name descname"><span class="pre">penalize_prompt</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">True</span></span><a class="headerlink" href="#mstar.engine.state.contract.SampleSettings.penalize_prompt" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.state.contract.SampleSettings.repetition_penalty">
+<span class="sig-name descname"><span class="pre">repetition_penalty</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><span class="pre">float</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">1.0</span></span><a class="headerlink" href="#mstar.engine.state.contract.SampleSettings.repetition_penalty" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.state.contract.SampleSettings.repetition_window">
+<span class="sig-name descname"><span class="pre">repetition_window</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">0</span></span><a class="headerlink" href="#mstar.engine.state.contract.SampleSettings.repetition_window" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.state.contract.SampleSettings.return_logprobs">
+<span class="sig-name descname"><span class="pre">return_logprobs</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></span><a class="headerlink" href="#mstar.engine.state.contract.SampleSettings.return_logprobs" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.state.contract.SampleSettings.temperature">
+<span class="sig-name descname"><span class="pre">temperature</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><span class="pre">float</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">0.6</span></span><a class="headerlink" href="#mstar.engine.state.contract.SampleSettings.temperature" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.state.contract.SampleSettings.top_k">
+<span class="sig-name descname"><span class="pre">top_k</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">0</span></span><a class="headerlink" href="#mstar.engine.state.contract.SampleSettings.top_k" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.state.contract.SampleSettings.top_p">
+<span class="sig-name descname"><span class="pre">top_p</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><span class="pre">float</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">1.0</span></span><a class="headerlink" href="#mstar.engine.state.contract.SampleSettings.top_p" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.state.contract.SampleSettings.top_p_first">
+<span class="sig-name descname"><span class="pre">top_p_first</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></span><a class="headerlink" href="#mstar.engine.state.contract.SampleSettings.top_p_first" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.state.contract.SampleSettings.top_p_min_keep">
+<span class="sig-name descname"><span class="pre">top_p_min_keep</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">1</span></span><a class="headerlink" href="#mstar.engine.state.contract.SampleSettings.top_p_min_keep" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.engine.state.contract.SampleStep">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.state.contract.</span></span><span class="sig-name descname"><span class="pre">SampleStep</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="keyword-only-separator o"><abbr title="Keyword-only parameters separator (PEP 3102)"><span class="pre">*</span></abbr></span></em>, <em class="sig-param"><span class="n"><span class="pre">apply_penalty</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">True</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">apply_filters</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">True</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">prompt_tokens</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">FrozenMap({})</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">kept_rows</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/state/contract.html#SampleStep"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.state.contract.SampleStep" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
+<p>What one step does with one sampler, under <cite>SubmoduleStep.state</cite>.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>apply_penalty</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
+<li><p><strong>apply_filters</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
+<li><p><strong>prompt_tokens</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Mapping" title="(in Python v3.12)"><em>Mapping</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>, </em><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a><em>]</em>)</p></li>
+<li><p><strong>kept_rows</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#frozenset" title="(in Python v3.12)"><em>frozenset</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>] </em><em>| </em><em>None</em>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.state.contract.SampleStep.apply_filters">
+<span class="sig-name descname"><span class="pre">apply_filters</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">True</span></span><a class="headerlink" href="#mstar.engine.state.contract.SampleStep.apply_filters" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.state.contract.SampleStep.apply_penalty">
+<span class="sig-name descname"><span class="pre">apply_penalty</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">True</span></span><a class="headerlink" href="#mstar.engine.state.contract.SampleStep.apply_penalty" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.state.contract.SampleStep.kept_rows">
+<span class="sig-name descname"><span class="pre">kept_rows</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#frozenset" title="(in Python v3.12)"><span class="pre">frozenset</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.engine.state.contract.SampleStep.kept_rows" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.state.contract.SampleStep.prompt_tokens">
+<span class="sig-name descname"><span class="pre">prompt_tokens</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Mapping" title="(in Python v3.12)"><span class="pre">Mapping</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><span class="pre">Tensor</span></a><span class="p"><span class="pre">]</span></span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">FrozenMap({})</span></span><a class="headerlink" href="#mstar.engine.state.contract.SampleStep.prompt_tokens" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.engine.state.contract.Sampler">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.state.contract.</span></span><span class="sig-name descname"><span class="pre">Sampler</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">name</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span></em>, <em class="sig-param"><span class="keyword-only-separator o"><abbr title="Keyword-only parameters separator (PEP 3102)"><span class="pre">*</span></abbr></span></em>, <em class="sig-param"><span class="n"><span class="pre">nodes</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#frozenset" title="(in Python v3.12)"><span class="pre">frozenset</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">]</span></span></span></em>, <em class="sig-param"><span class="n"><span class="pre">vocab_size</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span></em>, <em class="sig-param"><span class="n"><span class="pre">penalty</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">True</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">min_p</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">eos_ids</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><span class="pre">tuple</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="p"><span class="pre">...</span></span><span class="p"><span class="pre">]</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">()</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">draws</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">1</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/state/contract.html#Sampler"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.state.contract.Sampler" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>name</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>nodes</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#frozenset" title="(in Python v3.12)"><em>frozenset</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>]</em>)</p></li>
+<li><p><strong>vocab_size</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>penalty</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
+<li><p><strong>min_p</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
+<li><p><strong>eos_ids</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><em>tuple</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>, </em><em>...</em><em>]</em>)</p></li>
+<li><p><strong>draws</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.state.contract.Sampler.draws">
+<span class="sig-name descname"><span class="pre">draws</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">1</span></span><a class="headerlink" href="#mstar.engine.state.contract.Sampler.draws" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.state.contract.Sampler.eos_ids">
+<span class="sig-name descname"><span class="pre">eos_ids</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><span class="pre">tuple</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="p"><span class="pre">...</span></span><span class="p"><span class="pre">]</span></span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">()</span></span><a class="headerlink" href="#mstar.engine.state.contract.Sampler.eos_ids" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.state.contract.Sampler.min_p">
+<span class="sig-name descname"><span class="pre">min_p</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></span><a class="headerlink" href="#mstar.engine.state.contract.Sampler.min_p" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.state.contract.Sampler.name">
+<span class="sig-name descname"><span class="pre">name</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span><a class="headerlink" href="#mstar.engine.state.contract.Sampler.name" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.state.contract.Sampler.nodes">
+<span class="sig-name descname"><span class="pre">nodes</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#frozenset" title="(in Python v3.12)"><span class="pre">frozenset</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.engine.state.contract.Sampler.nodes" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.state.contract.Sampler.penalty">
+<span class="sig-name descname"><span class="pre">penalty</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">True</span></span><a class="headerlink" href="#mstar.engine.state.contract.Sampler.penalty" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.state.contract.Sampler.vocab_size">
+<span class="sig-name descname"><span class="pre">vocab_size</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.engine.state.contract.Sampler.vocab_size" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 </dd></dl>
@@ -1306,12 +1855,12 @@ can free the rest and tell when two requests can share a prefix. A read leaves t
                   
 <div class="prev-next-area">
     <a class="left-prev"
-       href="mstar.engine.state.analysis.html"
+       href="mstar.engine.state.calls.html"
        title="previous page">
       <i class="fa-solid fa-angle-left"></i>
       <div class="prev-next-info">
         <p class="prev-next-subtitle">previous</p>
-        <p class="prev-next-title">mstar.engine.state.analysis</p>
+        <p class="prev-next-title">mstar.engine.state.calls</p>
       </div>
     </a>
     <a class="right-next"
@@ -1343,13 +1892,25 @@ can free the rest and tell when two requests can share a prefix. A read leaves t
     <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Array"><code class="docutils literal notranslate"><span class="pre">Array</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Array.entry"><code class="docutils literal notranslate"><span class="pre">Array.entry</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Array.labels"><code class="docutils literal notranslate"><span class="pre">Array.labels</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Array.layers"><code class="docutils literal notranslate"><span class="pre">Array.layers</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Array.max_len"><code class="docutils literal notranslate"><span class="pre">Array.max_len</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Array.name"><code class="docutils literal notranslate"><span class="pre">Array.name</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Array.nodes"><code class="docutils literal notranslate"><span class="pre">Array.nodes</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Array.positions"><code class="docutils literal notranslate"><span class="pre">Array.positions</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Array.reads"><code class="docutils literal notranslate"><span class="pre">Array.reads</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Array.rewritable"><code class="docutils literal notranslate"><span class="pre">Array.rewritable</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Array.updates"><code class="docutils literal notranslate"><span class="pre">Array.updates</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.ArrayStep"><code class="docutils literal notranslate"><span class="pre">ArrayStep</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.ArrayStep.advance"><code class="docutils literal notranslate"><span class="pre">ArrayStep.advance</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.ArrayStep.eager_add"><code class="docutils literal notranslate"><span class="pre">ArrayStep.eager_add</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.ArrayStep.forks"><code class="docutils literal notranslate"><span class="pre">ArrayStep.forks</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.ArrayStep.keep"><code class="docutils literal notranslate"><span class="pre">ArrayStep.keep</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.ArrayStep.placeholders"><code class="docutils literal notranslate"><span class="pre">ArrayStep.placeholders</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.ArrayStep.position_ids"><code class="docutils literal notranslate"><span class="pre">ArrayStep.position_ids</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.ArrayStep.segments"><code class="docutils literal notranslate"><span class="pre">ArrayStep.segments</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Attend"><code class="docutils literal notranslate"><span class="pre">Attend</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -1358,6 +1919,7 @@ can free the rest and tell when two requests can share a prefix. A read leaves t
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Attend.reads"><code class="docutils literal notranslate"><span class="pre">Attend.reads</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Block"><code class="docutils literal notranslate"><span class="pre">Block</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Causal"><code class="docutils literal notranslate"><span class="pre">Causal</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.CausalConv"><code class="docutils literal notranslate"><span class="pre">CausalConv</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.CausalConv.activation"><code class="docutils literal notranslate"><span class="pre">CausalConv.activation</span></code></a></li>
@@ -1371,6 +1933,13 @@ can free the rest and tell when two requests can share a prefix. A read leaves t
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Entry.tensors"><code class="docutils literal notranslate"><span class="pre">Entry.tensors</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Fork"><code class="docutils literal notranslate"><span class="pre">Fork</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Fork.at"><code class="docutils literal notranslate"><span class="pre">Fork.at</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Fork.dst"><code class="docutils literal notranslate"><span class="pre">Fork.dst</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Fork.rows"><code class="docutils literal notranslate"><span class="pre">Fork.rows</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Fork.src"><code class="docutils literal notranslate"><span class="pre">Fork.src</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.FrozenMap"><code class="docutils literal notranslate"><span class="pre">FrozenMap</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.GatedDeltaNet"><code class="docutils literal notranslate"><span class="pre">GatedDeltaNet</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.GatedDeltaNet.check"><code class="docutils literal notranslate"><span class="pre">GatedDeltaNet.check()</span></code></a></li>
@@ -1381,6 +1950,12 @@ can free the rest and tell when two requests can share a prefix. A read leaves t
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.KVEntry"><code class="docutils literal notranslate"><span class="pre">KVEntry()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Layout"><code class="docutils literal notranslate"><span class="pre">Layout</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Layout.growth"><code class="docutils literal notranslate"><span class="pre">Layout.growth</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Layout.scratch"><code class="docutils literal notranslate"><span class="pre">Layout.scratch</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Layout.spans"><code class="docutils literal notranslate"><span class="pre">Layout.spans</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Mask"><code class="docutils literal notranslate"><span class="pre">Mask</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Op"><code class="docutils literal notranslate"><span class="pre">Op</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Op.adds"><code class="docutils literal notranslate"><span class="pre">Op.adds</span></code></a></li>
@@ -1390,11 +1965,65 @@ can free the rest and tell when two requests can share a prefix. A read leaves t
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Op.writes"><code class="docutils literal notranslate"><span class="pre">Op.writes</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Positions"><code class="docutils literal notranslate"><span class="pre">Positions</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Positions.rope"><code class="docutils literal notranslate"><span class="pre">Positions.rope</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Reached"><code class="docutils literal notranslate"><span class="pre">Reached</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Reached.fields"><code class="docutils literal notranslate"><span class="pre">Reached.fields</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Reached.row_offsets"><code class="docutils literal notranslate"><span class="pre">Reached.row_offsets</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Read"><code class="docutils literal notranslate"><span class="pre">Read</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Read.layers"><code class="docutils literal notranslate"><span class="pre">Read.layers</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Read.mask"><code class="docutils literal notranslate"><span class="pre">Read.mask</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Read.op"><code class="docutils literal notranslate"><span class="pre">Read.op</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Read.walks"><code class="docutils literal notranslate"><span class="pre">Read.walks</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Rope"><code class="docutils literal notranslate"><span class="pre">Rope</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Rope.dtype"><code class="docutils literal notranslate"><span class="pre">Rope.dtype</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Rope.high_freq_factor"><code class="docutils literal notranslate"><span class="pre">Rope.high_freq_factor</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Rope.interleave"><code class="docutils literal notranslate"><span class="pre">Rope.interleave</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Rope.low_freq_factor"><code class="docutils literal notranslate"><span class="pre">Rope.low_freq_factor</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Rope.old_context_len"><code class="docutils literal notranslate"><span class="pre">Rope.old_context_len</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Rope.rotary_dim"><code class="docutils literal notranslate"><span class="pre">Rope.rotary_dim</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Rope.scale"><code class="docutils literal notranslate"><span class="pre">Rope.scale</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Rope.table_dtype"><code class="docutils literal notranslate"><span class="pre">Rope.table_dtype</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Rope.theta"><code class="docutils literal notranslate"><span class="pre">Rope.theta</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.SampleSettings"><code class="docutils literal notranslate"><span class="pre">SampleSettings</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.SampleSettings.ignore_eos"><code class="docutils literal notranslate"><span class="pre">SampleSettings.ignore_eos</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.SampleSettings.logprobs_mode"><code class="docutils literal notranslate"><span class="pre">SampleSettings.logprobs_mode</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.SampleSettings.min_p"><code class="docutils literal notranslate"><span class="pre">SampleSettings.min_p</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.SampleSettings.min_tokens"><code class="docutils literal notranslate"><span class="pre">SampleSettings.min_tokens</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.SampleSettings.penalize_prompt"><code class="docutils literal notranslate"><span class="pre">SampleSettings.penalize_prompt</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.SampleSettings.repetition_penalty"><code class="docutils literal notranslate"><span class="pre">SampleSettings.repetition_penalty</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.SampleSettings.repetition_window"><code class="docutils literal notranslate"><span class="pre">SampleSettings.repetition_window</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.SampleSettings.return_logprobs"><code class="docutils literal notranslate"><span class="pre">SampleSettings.return_logprobs</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.SampleSettings.temperature"><code class="docutils literal notranslate"><span class="pre">SampleSettings.temperature</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.SampleSettings.top_k"><code class="docutils literal notranslate"><span class="pre">SampleSettings.top_k</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.SampleSettings.top_p"><code class="docutils literal notranslate"><span class="pre">SampleSettings.top_p</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.SampleSettings.top_p_first"><code class="docutils literal notranslate"><span class="pre">SampleSettings.top_p_first</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.SampleSettings.top_p_min_keep"><code class="docutils literal notranslate"><span class="pre">SampleSettings.top_p_min_keep</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.SampleStep"><code class="docutils literal notranslate"><span class="pre">SampleStep</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.SampleStep.apply_filters"><code class="docutils literal notranslate"><span class="pre">SampleStep.apply_filters</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.SampleStep.apply_penalty"><code class="docutils literal notranslate"><span class="pre">SampleStep.apply_penalty</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.SampleStep.kept_rows"><code class="docutils literal notranslate"><span class="pre">SampleStep.kept_rows</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.SampleStep.prompt_tokens"><code class="docutils literal notranslate"><span class="pre">SampleStep.prompt_tokens</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Sampler"><code class="docutils literal notranslate"><span class="pre">Sampler</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Sampler.draws"><code class="docutils literal notranslate"><span class="pre">Sampler.draws</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Sampler.eos_ids"><code class="docutils literal notranslate"><span class="pre">Sampler.eos_ids</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Sampler.min_p"><code class="docutils literal notranslate"><span class="pre">Sampler.min_p</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Sampler.name"><code class="docutils literal notranslate"><span class="pre">Sampler.name</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Sampler.nodes"><code class="docutils literal notranslate"><span class="pre">Sampler.nodes</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Sampler.penalty"><code class="docutils literal notranslate"><span class="pre">Sampler.penalty</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.Sampler.vocab_size"><code class="docutils literal notranslate"><span class="pre">Sampler.vocab_size</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.contract.TensorType"><code class="docutils literal notranslate"><span class="pre">TensorType</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">

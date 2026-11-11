@@ -628,6 +628,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../../_autosummary/mstar.engine.state.html">mstar.engine.state</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.state.adapters.html">mstar.engine.state.adapters</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.state.analysis.html">mstar.engine.state.analysis</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.state.calls.html">mstar.engine.state.calls</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.state.contract.html">mstar.engine.state.contract</a></li>
 </ul>
 </details></li>
@@ -1024,6 +1025,7 @@ window.runMermaid = runMermaid;</script>
                   
   <h1>Source code for mstar.engine.resources.step</h1><div class="highlight"><pre>
 <span></span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">ABC</span><span class="p">,</span> <span class="n">abstractmethod</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Callable</span><span class="p">,</span> <span class="n">Collection</span><span class="p">,</span> <span class="n">KeysView</span><span class="p">,</span> <span class="n">Mapping</span><span class="p">,</span> <span class="n">Sequence</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">enum</span><span class="w"> </span><span class="kn">import</span> <span class="n">Enum</span>
@@ -1036,7 +1038,7 @@ window.runMermaid = runMermaid;</script>
 
 
 <div class="viewcode-block" id="Segment">
-<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.step.html#mstar.engine.resources.Segment">[docs]</a>
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.state.html#mstar.engine.resources.Segment">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">Segment</span><span class="p">(</span><span class="n">NamedTuple</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">"""One step's addition to a request's cache stream.</span>
 
@@ -1052,6 +1054,7 @@ window.runMermaid = runMermaid;</script>
     <span class="n">request_id</span><span class="p">:</span> <span class="nb">str</span>
     <span class="n">label</span><span class="p">:</span> <span class="nb">str</span>
     <span class="n">span</span><span class="p">:</span> <span class="nb">int</span></div>
+
 
 
 <div class="viewcode-block" id="ResourceStep">
@@ -1095,7 +1098,7 @@ window.runMermaid = runMermaid;</script>
 
 
 <div class="viewcode-block" id="SlotLease">
-<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.step.html#mstar.engine.resources.SlotLease">[docs]</a>
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.state.html#mstar.engine.resources.SlotLease">[docs]</a>
 <span class="nd">@dataclass</span><span class="p">(</span><span class="n">frozen</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
 <span class="k">class</span><span class="w"> </span><span class="nc">SlotLease</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">"""attention `admit` gives to inform which slot to plan and replay</span>
@@ -1208,6 +1211,11 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># every row. Set by the engine; a piecewise region's step takes its bucket's.</span>
     <span class="n">lean</span><span class="p">:</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="nb">frozenset</span><span class="p">()</span>
 
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">replays</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Whether this step replays a captured graph, so its forward runs no Python."""</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">slot_lease</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">capture</span>
+
 <div class="viewcode-block" id="StepContext.walk_of">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.step.html#mstar.engine.resources.StepContext.walk_of">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">walk_of</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
@@ -1273,11 +1281,40 @@ window.runMermaid = runMermaid;</script>
 
 
 
+<div class="viewcode-block" id="StepHandle">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.step.html#mstar.engine.resources.StepHandle">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">StepHandle</span><span class="p">(</span><span class="n">ABC</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""What a layer holds for something a step's ``state`` lists. The engine opens it around each step's calls."""</span>
+
+<div class="viewcode-block" id="StepHandle.begin_step">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.step.html#mstar.engine.resources.StepHandle.begin_step">[docs]</a>
+    <span class="nd">@abstractmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">begin_step</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">step</span><span class="p">:</span> <span class="s2">"SubmoduleStep"</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Answer for ``step`` from here on. Raises if the handle is already open."""</span></div>
+
+
+<div class="viewcode-block" id="StepHandle.check_step">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.step.html#mstar.engine.resources.StepHandle.check_step">[docs]</a>
+    <span class="nd">@abstractmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">check_step</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">step</span><span class="p">:</span> <span class="s2">"SubmoduleStep"</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Refuse the step's calls as a whole, before any resource commits them."""</span></div>
+
+
+<div class="viewcode-block" id="StepHandle.end_step">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.step.html#mstar.engine.resources.StepHandle.end_step">[docs]</a>
+    <span class="nd">@abstractmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">end_step</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">step</span><span class="p">:</span> <span class="s2">"SubmoduleStep"</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Close the handle, on any path out of the step."""</span></div>
+</div>
+
+
+
 <div class="viewcode-block" id="SubmoduleStep">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.step.html#mstar.engine.resources.SubmoduleStep">[docs]</a>
 <span class="nd">@dataclass</span><span class="p">(</span><span class="n">frozen</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
 <span class="k">class</span><span class="w"> </span><span class="nc">SubmoduleStep</span><span class="p">:</span>
-    <span class="n">steps</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">ResourceStep</span><span class="p">]</span> <span class="c1"># resource key -&gt; step within cumulative</span>
+    <span class="c1"># resource key -&gt; step within cumulative</span>
+    <span class="n">steps</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">ResourceStep</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">dict</span><span class="p">)</span>
 
     <span class="c1"># used for convenience only: if a ResourceStep does not specify segments,</span>
     <span class="c1"># it gets this list</span>
@@ -1287,6 +1324,12 @@ window.runMermaid = runMermaid;</script>
     <span class="n">cg_key_info</span><span class="p">:</span> <span class="n">Any</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
 
     <span class="n">_ctx</span><span class="p">:</span> <span class="n">StepContext</span> <span class="o">=</span> <span class="kc">None</span> <span class="c1"># set by the engine</span>
+
+    <span class="c1"># declared array or sampler -&gt; what this step does to it, which the engine</span>
+    <span class="c1"># expands into ``steps`` (`mstar.engine.state.adapters.state_steps`)</span>
+    <span class="n">state</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">dict</span><span class="p">)</span>
+    <span class="c1"># the handles of what ``state`` lists, set by that expansion</span>
+    <span class="n">state_handles</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="n">StepHandle</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="p">(),</span> <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">__post_init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">segments</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
@@ -1305,6 +1348,33 @@ window.runMermaid = runMermaid;</script>
         <span class="c1"># the step is frozen so a submodule can't rewrite its own declaration;</span>
         <span class="c1"># the engine still owns this one field</span>
         <span class="nb">object</span><span class="o">.</span><span class="fm">__setattr__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="s2">"_ctx"</span><span class="p">,</span> <span class="n">ctx</span><span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="SubmoduleStep.set_state_handles">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.step.html#mstar.engine.resources.SubmoduleStep.set_state_handles">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">set_state_handles</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">handles</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="n">StepHandle</span><span class="p">,</span> <span class="o">...</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="nb">object</span><span class="o">.</span><span class="fm">__setattr__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="s2">"state_handles"</span><span class="p">,</span> <span class="n">handles</span><span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="SubmoduleStep.begin_calls">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.step.html#mstar.engine.resources.SubmoduleStep.begin_calls">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">begin_calls</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">for</span> <span class="n">handle</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">state_handles</span><span class="p">:</span>
+            <span class="n">handle</span><span class="o">.</span><span class="n">begin_step</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="SubmoduleStep.check_calls">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.step.html#mstar.engine.resources.SubmoduleStep.check_calls">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">check_calls</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">for</span> <span class="n">handle</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">state_handles</span><span class="p">:</span>
+            <span class="n">handle</span><span class="o">.</span><span class="n">check_step</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="SubmoduleStep.end_calls">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.step.html#mstar.engine.resources.SubmoduleStep.end_calls">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">end_calls</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">for</span> <span class="n">handle</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">state_handles</span><span class="p">:</span>
+            <span class="n">handle</span><span class="o">.</span><span class="n">end_step</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span></div>
 
 
 <div class="viewcode-block" id="SubmoduleStep.get">

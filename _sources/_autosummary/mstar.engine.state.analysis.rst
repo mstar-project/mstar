@@ -14,6 +14,8 @@ mstar.engine.state.analysis
    .. autosummary::
    
       declaration_digest
+      deployment_problems
+      position_key
       state_declaration_problems
    
    

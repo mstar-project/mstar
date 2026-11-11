@@ -628,6 +628,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../_autosummary/mstar.engine.state.html">mstar.engine.state</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.engine.state.adapters.html">mstar.engine.state.adapters</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.engine.state.analysis.html">mstar.engine.state.analysis</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.engine.state.calls.html">mstar.engine.state.calls</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.engine.state.contract.html">mstar.engine.state.contract</a></li>
 </ul>
 </details></li>
@@ -2048,6 +2049,8 @@ window.runMermaid = runMermaid;</script>
         <span class="c1"># embedder, scratch caches), bound once at load. Empty until then</span>
         <span class="c1"># and on engines that build none.</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">node_resources</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="c1"># This node's handles on its declared state (`mstar.engine.state`), bound once at load.</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">state_handles</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
 
 <div class="viewcode-block" id="NodeSubmodule.bind_node_resources">
 <a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.NodeSubmodule.bind_node_resources">[docs]</a>
@@ -2073,6 +2076,18 @@ window.runMermaid = runMermaid;</script>
         <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.components.lora.modules</span><span class="w"> </span><span class="kn">import</span> <span class="n">bind_module_lora</span>
 
         <span class="n">bind_module_lora</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">resources</span><span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="NodeSubmodule.bind_node_state">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.NodeSubmodule.bind_node_state">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">bind_node_state</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">handles</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Receive this node's state handles, by declared name, and pass them to each module with a ``bind_state``:</span>
+<span class="sd">        the layers that call them and the submodule itself."""</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">state_handles</span> <span class="o">=</span> <span class="n">handles</span>
+        <span class="k">for</span> <span class="n">module</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">modules</span><span class="p">():</span>
+            <span class="n">bind</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">module</span><span class="p">,</span> <span class="s2">"bind_state"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">bind</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">bind</span><span class="p">(</span><span class="n">handles</span><span class="p">)</span></div>
 
 
 <div class="viewcode-block" id="NodeSubmodule.cg_key_info">
@@ -2810,9 +2825,14 @@ window.runMermaid = runMermaid;</script>
 <span class="k">def</span><span class="w"> </span><span class="nf">engine_step</span><span class="p">(</span><span class="n">submodule</span><span class="p">,</span> <span class="o">*</span><span class="n">args</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">SubmoduleStep</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">"""What the engine calls for a node's step: its ``declare_step``, with a step of its</span>
 <span class="sd">    segments under each resource that takes them as they are (``with_segment_steps``),</span>
-<span class="sd">    so a model declares nothing for such a resource (a LoRA pool)."""</span>
+<span class="sd">    so a model declares nothing for such a resource (a LoRA pool), and what it declares</span>
+<span class="sd">    about its state expanded (``state_steps``)."""</span>
     <span class="c1"># the engine drives duck-typed submodules too</span>
-    <span class="k">return</span> <span class="n">with_segment_steps</span><span class="p">(</span><span class="n">submodule</span><span class="o">.</span><span class="n">declare_step</span><span class="p">(</span><span class="o">*</span><span class="n">args</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">),</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">submodule</span><span class="p">,</span> <span class="s2">"segment_keys"</span><span class="p">,</span> <span class="p">()))</span></div>
+    <span class="n">step</span> <span class="o">=</span> <span class="n">with_segment_steps</span><span class="p">(</span><span class="n">submodule</span><span class="o">.</span><span class="n">declare_step</span><span class="p">(</span><span class="o">*</span><span class="n">args</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">),</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">submodule</span><span class="p">,</span> <span class="s2">"segment_keys"</span><span class="p">,</span> <span class="p">()))</span>
+    <span class="c1"># Imported here because the adapters load the resources' Triton kernels, which importing mstar.model must not need.</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.state.adapters</span><span class="w"> </span><span class="kn">import</span> <span class="n">state_steps</span>
+
+    <span class="k">return</span> <span class="n">state_steps</span><span class="p">(</span><span class="n">step</span><span class="p">,</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">submodule</span><span class="p">,</span> <span class="s2">"state_handles"</span><span class="p">,</span> <span class="p">{}))</span></div>
 
 
 
@@ -2830,6 +2850,17 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># Set by a submodule whose decode walk reads its last sampled token back on</span>
     <span class="c1"># the device; the loop-back hooks below follow from it.</span>
     <span class="n">device_loopback</span><span class="p">:</span> <span class="n">DeviceLoopback</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+
+<div class="viewcode-block" id="ARNodeSubmodule.bind_node_state">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.ARNodeSubmodule.bind_node_state">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">bind_node_state</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">handles</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="n">bind_node_state</span><span class="p">(</span><span class="n">handles</span><span class="p">)</span>
+        <span class="n">loopback</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">device_loopback</span>
+        <span class="n">sampler</span> <span class="o">=</span> <span class="kc">None</span> <span class="k">if</span> <span class="n">loopback</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">handles</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">loopback</span><span class="o">.</span><span class="n">sampler</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">sampler</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">sampler</span><span class="o">.</span><span class="n">sampler</span><span class="o">.</span><span class="n">draws</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Sampler </span><span class="si">{</span><span class="n">loopback</span><span class="o">.</span><span class="n">sampler</span><span class="si">!r}</span><span class="s2">: a device loop-back reads one token per step, and draws "</span>
+                             <span class="sa">f</span><span class="s2">"is </span><span class="si">{</span><span class="n">sampler</span><span class="o">.</span><span class="n">sampler</span><span class="o">.</span><span class="n">draws</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span></div>
+
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_loops_back</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""Whether this walk's token loops back on the device."""</span>

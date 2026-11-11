@@ -43,6 +43,7 @@ mstar.engine.resources.kv.config
       RingKVConfig
       RingKVLayerConfig
       RingKVStep
+      Span
       SpanKind
       StreamLayout
    

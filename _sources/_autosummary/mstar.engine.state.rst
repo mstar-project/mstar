@@ -29,5 +29,6 @@ mstar.engine.state
 
    adapters
    analysis
+   calls
    contract
 
