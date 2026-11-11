@@ -137,14 +137,20 @@ def _read_problems(array: Array, walks: Mapping[str, set[str]], combined: set[st
     return problems
 
 
+_ONE_DRAW_OPTIONS = (
+    ("enable_logprobs", "log-probs take one token per step"),
+    ("enable_grammar", "a grammar masks one draw per step"),
+)
+
+
 def deployment_problems(model: "Model", resources: Mapping[str, Mapping[str, object]]) -> list[str]:
     """What a deployment's ``resources:`` block asks of a declared sampler that it can't do."""
     return [
-        f"Sampler {declared.name!r}.draws: enable_logprobs, and draws is {declared.draws}; log-probs take one token "
-        "per step"
+        f"Sampler {declared.name!r}.draws: {key}, and draws is {declared.draws}; {why}"
         for declared in model.declare_state()
         if isinstance(declared, Sampler) and declared.draws > 1
-        and resources.get(declared.name, {}).get("enable_logprobs")
+        for key, why in _ONE_DRAW_OPTIONS
+        if resources.get(declared.name, {}).get(key)
     ]
 
 

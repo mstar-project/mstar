@@ -792,8 +792,8 @@ unmasked, so a model whose loop stops on tokens of its own should declare them t
 with it yet: speculative decoding (no model that declares ``text_output()`` drafts outside its
 sampler), resident planning, a declared ``Sampler`` with ``draws`` above 1 (its capture would
 split twice), and a text sampler whose walks run on different ranks (a prefill/decode split);
-the deployment is refused at startup for the last, and for ``enable_grammar`` on more than one
-sampler or on one narrower than the text vocabulary.
+the deployment is refused at startup for the last two, and for ``enable_grammar`` on more than
+one sampler or on one narrower than the text vocabulary.
 
 **LoRA adapters.** A ``resources: lora:`` block in the serving config serves
 per-request LoRA adapters (PEFT ``adapter_model.safetensors``; the scaling comes
