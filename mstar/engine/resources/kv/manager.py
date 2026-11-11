@@ -356,13 +356,14 @@ class KVPageCounts(NamedTuple):
 
 
 class Reservation(NamedTuple):
-    """The pages an admit acquired for one stream's group in one grant, and the arena's trail before that admit,
-    which `KVManager.rollback_admit` puts back."""
+    """The pages an admit acquired for one stream's group in one grant, the arena's trail before that admit, and
+    how many of the pages the request had taken back, all of which `KVManager.rollback_admit` puts back."""
     rid: int
     label: str
     group: int
     pages: list[int]
     trail: tuple[int, int] | None
+    took_back: int = 0
 
 
 @dataclass(slots=True)
@@ -535,6 +536,8 @@ class AllocResult:
     success: bool = True
     error: AdmitFailedReason | None = None
     new_pages: list[int] | None = None
+    # how many of ``new_pages`` the request had taken back
+    took_back: int = 0
 
 
 @dataclass
@@ -2187,7 +2190,9 @@ class KVManager(AttentionResource):
                     if not alloc_res.success:
                         return AdmitOutcome(ok=False, reason=alloc_res.error)
                     if alloc_res.new_pages:
-                        self._admit_reserved_pages.append(Reservation(rid, to_label, 0, alloc_res.new_pages, trail))
+                        self._admit_reserved_pages.append(Reservation(
+                            rid, to_label, 0, alloc_res.new_pages, trail, alloc_res.took_back,
+                        ))
 
             page_size = self.config.tokens_per_page
             sink = step.sink
@@ -2247,7 +2252,9 @@ class KVManager(AttentionResource):
                             ok=False, reason=self._sized_refusal(step, ctx, alloc_res.error),
                         )
                     if alloc_res.new_pages:
-                        self._admit_reserved_pages.append(Reservation(rid, label, g, alloc_res.new_pages, trail))
+                        self._admit_reserved_pages.append(Reservation(
+                            rid, label, g, alloc_res.new_pages, trail, alloc_res.took_back,
+                        ))
 
             # marked here rather than in plan so the mark also covers
             # admit -> plan, where an offload would otherwise release pages
@@ -2379,7 +2386,7 @@ class KVManager(AttentionResource):
             mine = [held for held in self._admit_reserved_pages if ctx.is_real_row(held.rid)]
             self._forget_step_reservations(ctx)
             # newest first, since each goes back to the front of the free list
-            for rid, label, g, pages, trail in reversed(mine):
+            for rid, label, g, pages, trail, took_back in reversed(mine):
                 stream = self._streams.get(rid, {}).get(label)
                 if stream is None:
                     continue  # reset or removed under us; its pages went with it
@@ -2396,7 +2403,9 @@ class KVManager(AttentionResource):
                 del part.page_indices[-len(pages):]
                 self._arena.give_back(pages)
                 self._arena.trail = trail
-                self._recount(rid)
+                # A guaranteed request takes back again what the grant took out of its taken-back pages, or it would
+                # lend them. A rank that throws away a pre-admit its followers never made would then lend more.
+                self._recount(rid, took_back=took_back)
                 # so an offload that claimed this stream mid-admit notices its
                 # host copy no longer describes it and aborts
                 part.generation += 1
@@ -5475,6 +5484,7 @@ class KVManager(AttentionResource):
             # a stream that already holds enough pages acquires none, and has
             # nothing for ``rollback_admit`` to give back
             new_pages: list[int] = []
+            took_back = 0
             if num_new_pages > 0:
                 short = self._cover_move(request_id, num_new_pages, undoable)
                 allotment = self._allotments.get(request_id)
@@ -5509,10 +5519,9 @@ class KVManager(AttentionResource):
                     )
                 stream.page_indices.extend(new_pages)
                 if within:
+                    took_back = min(within, allotment.taken_back)
                     # what `_recount` would count, without its pass over the streams
-                    self._count(
-                        request_id, allotment, allotment.remaining - within, max(0, allotment.taken_back - within),
-                    )
+                    self._count(request_id, allotment, allotment.remaining - within, allotment.taken_back - took_back)
                 stream.generation += 1
                 # a later group's pages have no footprint of their own
                 if not group and stream.footprint is not None and len(stream.page_indices) > stream.footprint:
@@ -5521,7 +5530,7 @@ class KVManager(AttentionResource):
                     if not group:
                         stream.peak = max(stream.peak, len(stream.page_indices))
                     self.assert_pages_conserved()
-        return AllocResult(new_pages=new_pages)
+        return AllocResult(new_pages=new_pages, took_back=took_back)
 
     def _grant(self, rid: str, label: str, n: int, past: int, undoable: bool = False) -> list[int] | None:
         """Take ``n`` free pages for ``rid``, of which ``past`` go beyond what its allotment holds

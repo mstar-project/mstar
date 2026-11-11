@@ -1374,6 +1374,28 @@ def test_a_guaranteed_request_takes_back_what_it_lent_by_moving_the_newest_preem
     assert _step(kv, "g", 4 * PAGE_SIZE).ok and kv._allotments["g"].pages == pages, "g grew instead of taking back"
 
 
+def test_a_refused_step_leaves_a_guaranteed_request_holding_back_what_it_took_back(monkeypatch):
+    """g took back what v freed, and a step whose grant to g writes one of those pages is refused at o's row. Undone,
+    the grant left g lending that page, so o borrowed a page g had taken back."""
+    monkeypatch.setattr(manager_mod, "_DEBUG_ASSERTS", True)
+    kv = _pool()
+    _running(kv, "o", 3, arrival=0)
+    _running(kv, "g", 1, arrival=1, guaranteed=True)
+    _running(kv, "v", 1, arrival=2)
+    assert _step(kv, "o", 2 * PAGE_SIZE).ok
+    short = _step(kv, "g", 4 * PAGE_SIZE).reason.pages_short
+    assert _preempt(kv, "g", short, droppable=lambda rid: True).to_drop == ["v"]
+    _drop(kv, "v")
+    taken_back = kv._allotments["g"].taken_back
+    assert taken_back and kv._spare() == 0
+    step, ctx = KVStep(segments=(Segment("g", "main", PAGE_SIZE), Segment("o", "main", 4 * PAGE_SIZE))), _ctx("g", "o")
+
+    assert not kv.admit(step, ctx).ok
+    kv.rollback_admit(step, ctx)
+
+    assert kv._allotments["g"].taken_back == taken_back and kv._spare() == 0, "o can borrow a page g took back"
+
+
 @pytest.mark.parametrize("moves", ["is dropped", "moves to the host"])
 def test_a_guaranteed_request_takes_back_what_it_lent_from_an_older_borrower(moves):
     """o arrived before g and borrowed what g hasn't written. A request that runs short moves only newer ones, so g

@@ -1896,6 +1896,37 @@ def test_a_follower_holds_back_what_rank_0_took_back_from_an_older_borrower(monk
     assert _step(leader, "g", 4 * PAGE_SIZE).ok and _step(follower, "g", 4 * PAGE_SIZE).ok
 
 
+def test_a_borrower_rank_0_lets_grow_after_it_throws_a_pre_plan_away_grows_on_every_rank(monkeypatch):
+    """g took back what o freed. Rank 0 then pre-plans g's next page, one of those, and throws the stage away, and a
+    follower never planned the step. Undone on rank 0, the grant left g lending the page there alone, so rank 0 let
+    r, growing past its allotment, borrow it, and the follower refused r's step while rank 0 ran it."""
+    (leader, lead), (follower, follow) = _pool_rank(monkeypatch, 0), _pool_rank(monkeypatch, 1)
+    _ingest((leader, follower), "r", 2, arrival=0)
+    _ingest((leader, follower), "o", 3, arrival=1)
+    _ingest((leader, follower), "g", 1, arrival=2, guaranteed=True)
+    assert _admits(leader, "r") and _admits(leader, "o") and _admits(leader, "g")
+    assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
+    for rid, tokens in (("r", 2 * PAGE_SIZE), ("o", 3 * PAGE_SIZE), ("g", PAGE_SIZE), ("o", 3 * PAGE_SIZE)):
+        assert _step(leader, rid, tokens).ok and _step(follower, rid, tokens).ok
+    outcome = _step(leader, "g", 4 * PAGE_SIZE)
+    assert not outcome.ok and not _step(follower, "g", 4 * PAGE_SIZE).ok
+    runner = _ENGINES[id(leader)]._runner
+    victims = leader.preempt("g", outcome.reason.pages_short, runner.newer_than("g"), runner.older_than("g"), bool)
+    assert victims.takes_back
+    lead.drop_request(NODE, "o", 6 * PAGE_SIZE)
+    assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
+    step = SubmoduleStep({"kv": KVStep()}, segments=[Segment("g", "main", PAGE_SIZE)])
+    step.set_ctx(StepContext(["g"], "decode", 0, False, is_preplan=True))
+    assert lead._runner.pre_admit(step).ok
+    step.ctx.is_preplan = False
+    lead._runner.clear_preplan()
+
+    while (granted := _step(leader, "r", PAGE_SIZE).ok) and _step(follower, "r", PAGE_SIZE).ok:
+        pass
+    assert not granted, "rank 0 ran r's step, which the follower refused"
+    assert _counts(leader) == _counts(follower)
+
+
 def test_a_short_grant_with_no_room_to_claim_leaves_the_allotment_alike_on_every_rank(monkeypatch):
     """r ran short with no room left, so rank 0 claims nothing for r as it chooses v. Allotting r nothing still raised
     r's allotment to the pages r held past it, on rank 0 alone, since a claim of nothing goes unjournaled."""
