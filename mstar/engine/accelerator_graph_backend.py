@@ -209,7 +209,7 @@ class CUDAGraphBackend(_TorchGraphBackend):
         return int(self._runtime.current_stream(self.device).cuda_stream)
 
     def while_refusal(self) -> str | None:
-        if not torch.version.cuda or torch.version.hip is not None:
+        if not torch.version.cuda:
             return "this torch has no CUDA runtime"
         if tuple(int(part) for part in torch.version.cuda.split(".")[:2]) < (12, 4):
             return f"CUDA {torch.version.cuda} has no conditional graph node (12.4 and up)"

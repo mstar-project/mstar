@@ -105,6 +105,31 @@ def test_a_device_run_that_ended_short_settles_its_width_before_anything_reads_i
     assert ctx.repeats == 2
 
 
+def test_a_device_run_leaves_a_resources_host_row_whole():
+    """A one-iteration run with a log-prob row: that row is one value a row, not a column."""
+    rows = HostRows(
+        (1, 2), {"new_token": torch.tensor([[5], [6]]), "sampled_logprob": torch.tensor([-0.5, -0.7])}, torch.tensor([1]),
+    )
+    ctx = SimpleNamespace(repeats=1)
+    batch_n = SimpleNamespace(node_batch=SimpleNamespace(step_context=ctx), graph_walk=WALK)
+
+    StepExecutor._settle_device_run(batch_n, rows)
+
+    assert rows.buffers["sampled_logprob"].tolist() == pytest.approx([-0.5, -0.7])
+    assert rows.buffers["new_token"].tolist() == [[5], [6]]
+
+
+def test_a_capture_another_walk_replays_is_refused_at_load_for_a_device_run():
+    from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner
+
+    runner = AcceleratorGraphRunner.__new__(AcceleratorGraphRunner)
+    runner._run_asks, runner._run_failures = {WALK: object()}, {}
+    spec = SimpleNamespace(bucket=SimpleNamespace(graph_walk=WALK), config=SimpleNamespace(replay_graph_walks=[WALK, "alias"]))
+
+    assert runner._capture_run(spec, None) is None
+    assert "alias" in runner.device_run_refusal(WALK)
+
+
 def test_a_slot_with_a_device_run_never_replays_unstaged():
     """A walk that shares the capture of an asked walk gets its WHILE graph but
     no stop policy: it must fail, not replay on the last run's device state."""

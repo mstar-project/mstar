@@ -923,11 +923,14 @@ class StepExecutor:
     @staticmethod
     def _settle_device_run(batch_N: PendingBatch, host_rows: HostRows) -> None:
         """A device run that ended short (every row stopped) wrote only the
-        columns it ran; everything after this reads the width it really had."""
+        columns it ran; everything after this reads the width it really had.
+        Only the run's own token columns are cut: a resource's host row (the
+        log-probs of a one-iteration step) is one value a row, with no columns."""
         ran = int(host_rows.ran[0])
         phase_record(f"repeats.{batch_N.graph_walk}.ran#", ran)
         for name, column in host_rows.buffers.items():
-            host_rows.buffers[name] = column[:, :ran]
+            if column.dim() > 1:
+                host_rows.buffers[name] = column[:, :ran]
         batch_N.node_batch.step_context.repeats = ran
 
     def repeat_refusal(self, node_name: str, graph_walk: str) -> str | None:
