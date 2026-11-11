@@ -14,6 +14,11 @@ from mstar.engine.resources.step import StepHandle
 from mstar.engine.state.contract import Array, ArrayStep, CausalConv, GatedDeltaNet, Op, Sampler
 
 
+def pool_layers(array: Array) -> dict[int, int]:
+    """Each of ``array``'s layers to its index in the array's pool, which holds only those layers, in order."""
+    return {layer: i for i, layer in enumerate(sorted(array.layers))}
+
+
 class ArrayHandle(StepHandle):
     """A node's calls on one declared array. Each kind of storage has a handle that implements the calls it runs, and
     this class refuses the rest as having no layout yet.
@@ -38,7 +43,7 @@ class ArrayHandle(StepHandle):
         rope = None if array.positions is None else array.positions.rope
         self.rope_dtype = None if rope is None else rope.dtype
 
-        self._pool_layer = {layer: i for i, layer in enumerate(sorted(array.layers))}
+        self._pool_layer = pool_layers(array)
 
         # This step's calls, checked in eager steps and at capture.
         # `_held` is the k and v an add left for `_held_layer`'s read, on a kernel that takes them there.

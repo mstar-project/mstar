@@ -37,7 +37,7 @@ from mstar.engine.resources.sampler.config import SamplerSpec, SamplerStep, Samp
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
 from mstar.engine.resources.step import Segment, SubmoduleStep
 from mstar.engine.state.analysis import both_sharded, position_key
-from mstar.engine.state.calls import ArrayHandle, SamplerHandle
+from mstar.engine.state.calls import ArrayHandle, SamplerHandle, pool_layers
 from mstar.engine.state.contract import (
     EMPTY,
     Array,
@@ -521,8 +521,8 @@ class PagedAttend(OpBinding):
 
     def specs(self, array: Array, key: str, read: Read) -> list[NodeResourceSpec]:
         windowed = isinstance(read.mask, Window)
-        # the pool holds only the array's layers, so AttentionConfig.layers counts among them
-        kv_layer = {layer: i for i, layer in enumerate(sorted(array.layers))}
+        # AttentionConfig.layers counts among the pool's layers
+        kv_layer = pool_layers(array)
         return [AttentionSpec(
             resource_key=key, nodes=array.nodes,
             config=AttentionConfig(
