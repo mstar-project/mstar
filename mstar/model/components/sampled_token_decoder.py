@@ -59,6 +59,7 @@ its positions under ``POS_KEY`` (``ROPE`` by default).
 """
 
 import functools
+import logging
 import os
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
@@ -95,6 +96,8 @@ from mstar.model.submodule_base import (
 )
 from mstar.utils.h2d import to_device_nonblocking
 from mstar.utils.profiler import PHASE_PERIOD, PhaseLaps, phase_record
+
+logger = logging.getLogger(__name__)
 
 # A media row's encoder rows in prompt order, and its tokens' mask of where
 # they go (`SampledTokenDecoder._media_inputs`)
@@ -316,6 +319,11 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
         # from the packed one its prompt rows need (`cg_key_info`)
         mix = self._decode_rows_mix
         top = max(self.DECODE_CAPTURE_BATCH_SIZES)
+        if mix and (dropped := [b for b in self.MIXED_CAPTURE_BATCH_SIZES if b > top]):
+            logger.warning(
+                f"{type(self).__name__}: mixed capture sizes {dropped} are above the decode ladder's top "
+                f"{top} and are dropped",
+            )
         configs: list[AcceleratorGraphConfig] = [
             BatchedAcceleratorGraphConfig(
                 capture_graph_walk=self.DECODE_WALK,

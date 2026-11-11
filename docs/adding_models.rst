@@ -3617,6 +3617,8 @@ The decode loop may run under more than one walk: every walk whose graph runs th
 ``DECODE_LOOP`` is a decode walk, and a second one is built with ``decode_walk(max_iters, node,
 accumulated)``. Their rows share the decode capture, the client token inline, the stop, the
 mixed step and the KV label's growth, and only ``DECODE_WALK`` keeps its token on the device.
+A mixed step of decode rows alone replays the decode capture, keyed apart from a step with prompt rows
+(``PROMPT_ROWS``), and the mixed ladder tops out at the decode ladder's top.
 MiniCPM-o's spoken reply decodes on ``decode_spoken``, whose graph also sends each row's input
 id and post-norm hidden state to its TTS (``ROW_IDS``, ``ROW_HIDDEN``, which a walk routes
 together). The scaffold reads both sets off the model's graph as one value
