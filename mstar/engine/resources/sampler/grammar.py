@@ -337,54 +337,59 @@ class GrammarRows:
             if row is not None and row.error is None:
                 row.error = why
 
-    def stop_masks(self, rids) -> torch.Tensor:
-        """The host bitmask for a step's rows whose fill failed: all ones for a
-        free row, and only the stop ids for every grammar row."""
-        mask = torch.full((len(rids), self.words), -1, dtype=torch.int32)
-        if self._stops is not None:
-            for i, rid in enumerate(rids):
-                if rid in self._rows:
-                    mask[i] = self._stops
-        return mask
+    def failed_mask(self, fails_request: bool):
+        """What a row whose fill failed may draw: every token but the stops when its
+        request fails (a stop would end the reply before the error lands), and only
+        the stops when it may not (under several ranks); all ones for a model that
+        declares no stop."""
+        if self._stops is None:
+            return -1
+        return ~self._stops if fails_request else self._stops
 
-    def fill(self, rids, fail_rows: bool) -> torch.Tensor:
-        """The host bitmask for a step's rows: all ones for a free row, and only
-        the stop ids for a failed one. A row whose own fill raises (below the batch
-        size) is failed (`failures`) and left all ones when ``fail_rows``, else
-        left only a stop; the other rows fill as usual."""
+    def fill(self, rids) -> tuple[torch.Tensor, dict]:
+        """The host bitmask for a step's rows, and the reason for each rid whose own
+        fill raised: all ones for a free row, and only the stop ids for a finished
+        one. A failed row is left all ones for the caller to set (`failed_mask`).
+        If the batched call raises, its rows fill one by one, so only the bad row fails."""
         mask = torch.full((len(rids), self.words), -1, dtype=torch.int32)
+        failed = {}
         matchers, index = [], []
         for i, rid in enumerate(rids):
             row = self._rows.get(rid)
             if row is None:
                 continue
-            matcher = row.matcher
-            if matcher is None:
-                if self._stops is not None:
-                    mask[i] = self._stops
-            elif not matcher.is_terminated():
-                matchers.append(matcher)
-                index.append(i)
-        threads = min(self._fill_threads, len(matchers) // FILL_ROWS_PER_THREAD)
-        if threads < 2:
-            for matcher, i in zip(matchers, index, strict=True):
-                try:
-                    matcher.fill_next_token_bitmask(mask, i)
-                except Exception as exc:  # noqa: BLE001 - that request's error, not the step's
-                    logger.exception("structured_outputs: filling a row's grammar mask failed")
-                    mask[i] = -1
-                    if fail_rows:
-                        self.fail([rids[i]], f"structured_outputs grammar failed to fill its mask: {exc}")
-                    elif self._stops is not None:
+            try:
+                matcher = row.matcher
+                if matcher is None:
+                    if self._stops is not None:
                         mask[i] = self._stops
-        else:
+                elif not matcher.is_terminated():
+                    matchers.append(matcher)
+                    index.append(i)
+            except Exception as exc:  # noqa: BLE001 - that request's error, not the step's
+                logger.exception("structured_outputs: reading a row's grammar failed")
+                failed[rid] = f"structured_outputs grammar failed to fill its mask: {exc}"
+        threads = min(self._fill_threads, len(matchers) // FILL_ROWS_PER_THREAD)
+        if threads >= 2:
             batch = self._batches.get(threads)
             if batch is None:
                 import xgrammar as xgr
 
                 batch = self._batches[threads] = xgr.BatchGrammarMatcher(max_threads=threads)
-            batch.batch_fill_next_token_bitmask(matchers, mask, index)
-        return mask
+            try:
+                batch.batch_fill_next_token_bitmask(matchers, mask, index)
+                return mask, failed
+            except Exception:  # noqa: BLE001 - the loop below finds the row
+                logger.exception("structured_outputs: a batched mask fill failed, retrying row by row")
+        # a fill rewrites its whole row and leaves the matcher's state, so a retry is sound
+        for matcher, i in zip(matchers, index, strict=True):
+            try:
+                matcher.fill_next_token_bitmask(mask, i)
+            except Exception as exc:  # noqa: BLE001 - that request's error, not the step's
+                logger.exception("structured_outputs: filling a row's grammar mask failed")
+                mask[i] = -1
+                failed[rids[i]] = f"structured_outputs grammar failed to fill its mask: {exc}"
+        return mask, failed
 
     def apply(self, logits: torch.Tensor, mask: torch.Tensor) -> None:
         """Set every disallowed logit to -inf, in place; capturable (no host

@@ -996,12 +996,13 @@ class GrammarSamplerResource(SamplerResource):
         already running.
 
         A row whose accept fails, as a draw its grammar refuses does, fails its
-        request at admit, on every rank alike. A fill that raises (on rank 0
-        alone, which fills) fails its rows only when this rank serves alone, and
-        leaves them unmasked for this one draw, so the request reaches the next
-        admit and fails there with the error rather than ending at a stop first. Under
-        several ranks an error set on one would split the ranks' admits, so the rows
-        may only stop."""
+        request at admit, on every rank alike. A row whose fill raises (on rank 0
+        alone, which fills) fails its request only when this rank serves alone, and
+        may draw anything but a stop that once, so the request reaches the next
+        admit and fails there with the error rather than ending at a stop first (unless
+        it reaches its length limit). Under several ranks an error set on one would
+        split the ranks' admits, so the row may only stop. `fill` isolates each row,
+        so nothing else here raises."""
         grammar, rids, slot = self._grammar, self._grammar_rids, self._grammar_slot
         # MSTAR_PHASE_TIMING: accept includes draw_wait (`accept_pending`)
         laps = PhaseLaps("res.grammar.")
@@ -1009,15 +1010,12 @@ class GrammarSamplerResource(SamplerResource):
         laps.lap("accept")
         if not self._fills_masks:
             return
-        try:
-            masks = grammar.fill(rids, fail_rows=self._decides) if grammar.any_of(rids) else None
-        except Exception as exc:  # noqa: BLE001 - the rows' failure, not the step's
-            logger.exception("structured_outputs: filling a step's grammar masks failed")
-            if self._decides:
-                grammar.fail(rids, f"structured_outputs grammar failed to fill its mask: {exc}")
-                masks = torch.full((len(rids), grammar.words), -1, dtype=torch.int32)
-            else:
-                masks = grammar.stop_masks(rids)
+        masks, failed = grammar.fill(rids) if grammar.any_of(rids) else (None, {})
+        for i, rid in enumerate(rids):
+            if rid in failed:
+                if self._decides:
+                    grammar.fail([rid], failed[rid])
+                masks[i] = grammar.failed_mask(self._decides)
         laps.lap("fill")
         if masks is not None:
             self._grammar_stager.copy_(self._grammar_mask, masks.numpy().reshape(-1), pad_value=-1)

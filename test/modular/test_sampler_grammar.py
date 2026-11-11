@@ -245,7 +245,7 @@ def test_a_fill_or_accept_that_raises_fails_what_every_rank_agrees_on(monkeypatc
         graph.replay()
     assert replayed == ["forward", "draw"]
     logits = torch.zeros(4, V)
-    logits[:, VOCAB.index(b"a")] = 1.0
+    logits[:, EOS] = 1.0  # the model's own pick is its stop
     res._grammar.apply(logits, res._grammar_mask)
     forced_stop = logits[0].argmax().item() == EOS
     assert forced_stop == (ranks > 1), "a lone rank's failed fill must not end the reply before its error"
@@ -261,7 +261,7 @@ def test_a_fill_or_accept_that_raises_fails_what_every_rank_agrees_on(monkeypatc
         is_terminated=real.is_terminated, fill_next_token_bitmask=lambda mask, i: 1 / 0)
     res._fill_grammar()
     res._grammar.apply(logits := torch.zeros(4, V), res._grammar_mask)
-    assert logits[0].argmax().item() == (EOS if ranks > 1 else 0), "the failed row's mask"
+    assert (logits[0].argmax().item() == EOS) == (ranks > 1), "the failed row's mask"
     assert logits[1, VOCAB.index(b"a")] == 0 and logits[1, VOCAB.index(b"b")] == float("-inf"), \
         "the healthy row lost its mask"
     assert [r for r in (1, 2) if res._grammar.failures([r])] == ([] if ranks > 1 else [1])
@@ -300,20 +300,23 @@ def test_only_rank_0_fills_masks_and_every_rank_fails_a_refused_draw_alike(monke
         monkeypatch.setattr(grammar, "FILL_ROWS_PER_THREAD", 1)
     lease = SlotLease(slot=0, bucket=SimpleNamespace(bs=4))
     step = SamplerStep(apply_penalty=False)
-    ctx = StepContext(request_ids=(0, 1), graph_walk="w", slot=0, capture=False, slot_lease=lease)
+    ctx = StepContext(request_ids=(9, 0, 1), graph_walk="w", slot=0, capture=False, slot_lease=lease)
     filled, outcomes = [], []
     for rank in (0, 1):
         res = _resource(graph=True, comm_group=SimpleNamespace(world_size=2, rank=rank))
         res._grammar._fill_threads = 2 if batched else 1
+        res.ingest_request(9, SamplingReqConfig())  # a free row first, so the rows' indices are not their ranks
         for rid in (0, 1):
             res.ingest_request(rid, SamplingReqConfig(grammar=grammar_request({"choice": ["ab"]})))
         res.plan(step, ctx)
         res._fill_grammar()
-        filled.append([bool((res._grammar_mask[i] != -1).any()) for i in (0, 1)])
+        filled.append([bool((res._grammar_mask[i] != -1).any()) for i in (1, 2)])
+        assert (res._grammar_mask[0] == -1).all()
         if rank == 0:
             assert bool(res._grammar._batches) == batched
             res._grammar.apply(logits := torch.zeros(4, V), res._grammar_mask)
-            assert (logits[:2] == 0).sum().item() == 2 and logits[:2, VOCAB.index(b"a")].eq(0).all()
+            assert (logits[1:3] == 0).sum().item() == 2 and logits[1:3, VOCAB.index(b"a")].eq(0).all()
+            assert (logits[0] == 0).all(), "the free row was masked"
         # a draw the mask did not cover
         res._cg_sampler.last_token_buf.fill_(VOCAB.index(b"x"))
         res.commit(step, ctx)
@@ -323,6 +326,20 @@ def test_only_rank_0_fills_masks_and_every_rank_fails_a_refused_draw_alike(monke
         outcomes.append((outcome.ok, outcome.reason and outcome.reason.request_ids))
     assert filled == [[True, True], [False, False]]
     assert outcomes == [(False, {0, 1}), (False, {0, 1})]
+
+    # one bad row fails only itself, however the rows are filled
+    res = _resource(graph=True, comm_group=SimpleNamespace(world_size=1, rank=0))
+    res._grammar._fill_threads = 2 if batched else 1
+    for rid in (0, 1):
+        res.ingest_request(rid, SamplingReqConfig(grammar=grammar_request({"choice": ["ab"]})))
+    ctx = StepContext(request_ids=(0, 1), graph_walk="w", slot=0, capture=False, slot_lease=lease)
+    res.plan(step, ctx)
+    res._grammar._rows[1]._matcher = SimpleNamespace(
+        is_terminated=lambda: False, fill_next_token_bitmask=lambda mask, i: 1 / 0)
+    res._fill_grammar()
+    assert not res._grammar.failures([0]) and res._grammar.failures([1])
+    res._grammar.apply(logits := torch.zeros(4, V), res._grammar_mask)
+    assert logits[0, VOCAB.index(b"b")] == float("-inf"), "the healthy row lost its mask"
 
 
 def test_after_starts_the_grammar_once_the_reply_holds_its_text():
