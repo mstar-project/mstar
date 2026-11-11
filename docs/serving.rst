@@ -82,6 +82,10 @@ mstar serve
      - off
      - Serve Prometheus metrics at ``/metrics`` (see :ref:`serving-metrics`).
        Needs ``.[metrics]``.
+   * - ``--enable-nvtx``
+     - off
+     - Emit NVTX markers for CUDA profiling (``engine.<node>.<walk>.bs<N>``
+       ranges for an nsys capture). Disabled on XPU and CPU.
 
 Each model maps to a default config (override with ``--config``):
 

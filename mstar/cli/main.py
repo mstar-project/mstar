@@ -285,6 +285,8 @@ def _serve(args: argparse.Namespace) -> None:
         argv += ["--log-stats-file", args.log_stats_file]
     if args.enable_metrics:
         argv += ["--enable-metrics"]
+    if args.enable_nvtx:
+        argv += ["--enable-nvtx"]
     # Passing --rust-frontend-bin implies --rust-frontend: naming a binary but
     # silently staying on uvicorn would be a footgun.
     if args.rust_frontend or args.rust_frontend_bin:
@@ -344,6 +346,10 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument(
         "--enable-metrics", action="store_true",
         help="serve Prometheus metrics at /metrics (needs mstar-ai[metrics])",
+    )
+    serve.add_argument(
+        "--enable-nvtx", action="store_true",
+        help="mark steps with NVTX ranges for an nsys capture (CUDA only)",
     )
     serve.add_argument(
         "--rust-frontend", action="store_true",

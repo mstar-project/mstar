@@ -31,3 +31,9 @@ def test_servers_on_different_ports_get_different_socket_prefixes(launched):
 def test_an_explicit_socket_prefix_is_kept(launched):
     cli._serve(cli.build_parser().parse_args(["serve", "kokoro", "--socket-path-prefix", "/tmp/mine/"]))
     assert _socket_prefix(launched[0]) == "/tmp/mine/"
+
+
+@pytest.mark.parametrize("flag", ["--enable-metrics", "--enable-nvtx"])
+def test_serve_passes_its_flags_to_the_server(launched, flag):
+    cli._serve(cli.build_parser().parse_args(["serve", "kokoro", flag]))
+    assert flag in launched[0]
