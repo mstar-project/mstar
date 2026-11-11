@@ -1727,7 +1727,9 @@ class AcceleratorGraphRunner:
         carries = self._repeat_carries.get(walk)
         if carries is None:
             if repeats > 1:
-                raise ValueError(f"a step of {walk!r} asks for {repeats} iterations, but the walk never accepted repeats")
+                raise ValueError(
+                    f"a step of {walk!r} asks for {repeats} iterations, but the walk never accepted repeats"
+                )
             return out
         profiler.phase_record(f"repeats.{walk}#", repeats)
         if repeats == 1:

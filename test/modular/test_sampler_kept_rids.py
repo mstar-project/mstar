@@ -221,14 +221,20 @@ def test_commit_keeps_only_selected_rows_and_ignores_padding(buffer_device, kept
     assert res._cg_buffers.offset.master[0].item() == 0
 
 
-def test_no_step_repeats_while_any_request_wants_logprobs():
-    """The log-prob host rows go to every step of the sampler, so a request waiting
-    elsewhere keeps a decode step of other rows from repeating."""
-    res = SamplerResource(vocab_size=V, enable_repetition_penalty=False, enable_logprobs=True, device=torch.device("cpu"))
+def test_a_request_asking_for_logprobs_mid_step_gives_that_step_no_log_prob_rows():
+    """A request ingested after a step settled its repeats is no row of it: a step of several
+    iterations keeps no log-prob rows, which its postprocess can't take."""
+    res = SamplerResource(
+        vocab_size=V, enable_repetition_penalty=False, enable_logprobs=True, device=torch.device("cpu"),
+    )
     res._cg_buffers = SimpleNamespace(ingraph_scatter=True)
     res.ingest_request(KEPT, SamplingReqConfig(temperature=1.0))
     ctx = StepContext(request_ids=(KEPT,), graph_walk="decode", slot=0, capture=False)
     assert res.max_repeats(SamplerStep(), ctx) > 1
 
     res.ingest_request(DROPPED, SamplingReqConfig(temperature=1.0, return_logprobs=True))
-    assert res.max_repeats(SamplerStep(), ctx) == 1
+    ctx.repeats = 8
+    res.plan(SamplerStep(), ctx)
+    assert res.step_host_rows() == {}
+    own = StepContext(request_ids=(DROPPED,), graph_walk="decode", slot=0, capture=False)
+    assert res.max_repeats(SamplerStep(), own) == 1
