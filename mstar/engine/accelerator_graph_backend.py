@@ -27,12 +27,15 @@ class SplitGraph:
         self.graphs = graphs
         self.fn = fn
 
-    def replay(self) -> None:
+    def replay(self, launching: Callable[[], None] | None = None) -> None:
+        """``launching`` runs just before the second graph's launch, after ``fn``."""
         first, second = self.graphs
         first.replay()
         try:
             self.fn()
         finally:
+            if launching is not None:
+                launching()
             second.replay()
 
     def reset(self) -> None:

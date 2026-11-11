@@ -1695,13 +1695,19 @@ class AcceleratorGraphRunner:
                 )
             target.copy_(value)
 
-    def _replay(self, lease: SlotLease) -> dict:
+    def _replay(self, lease: SlotLease, launching: Callable[[], None] | None = None) -> dict:
+        """Replay ``lease``'s slot; ``launching`` runs just before its last launch."""
         slot = self.slot_for(lease)
         # The launch, not the GPU work: replay is async, so this range measures
         # enqueue cost only. GPU-side duration comes from --cuda-graph-trace.
         if self._enable_nvtx:
             profiler.range_push(f"cg.replay.slot[{lease.slot}]")
-        slot.graph.replay()
+        if isinstance(slot.graph, SplitGraph):
+            slot.graph.replay(launching)
+        else:
+            if launching is not None:
+                launching()
+            slot.graph.replay()
         if self._enable_nvtx:
             profiler.range_pop()
         return slot.static_outputs
@@ -1717,20 +1723,19 @@ class AcceleratorGraphRunner:
         buffers on another stream, so the replay has to wait for those writes
         before it reads them.
 
-        ``launch_started_event`` releases the submitting thread. It is set HERE
-        rather than before the forward: staging copies each preprocessed tensor
-        into its static buffer and holds the GIL while doing so, so releasing
-        earlier hands the main thread a GIL the GPU thread still needs. Only
-        `graph.replay()` below drops it in C++.
+        ``launch_started_event`` releases the submitting thread. It is set just
+        before the replay's last launch rather than before the forward: staging
+        copies each preprocessed tensor into its static buffer, and a
+        `SplitGraph`'s host call runs between its launches, both holding the GIL
+        for stretches, so releasing earlier hands the main thread a GIL the GPU
+        thread still needs before the step is fully launched.
         """
         laps = profiler.PhaseLaps("engine.forward.")
         self._stage(lease, preprocessed)
         if plan_done_event is not None:
             self._graph_backend.current_stream().wait_event(plan_done_event)
-        if launch_started_event is not None:
-            launch_started_event.set()
         laps.lap("stage")
-        out = self._replay(lease)
+        out = self._replay(lease, None if launch_started_event is None else launch_started_event.set)
         laps.lap("replay")
         return out
 
