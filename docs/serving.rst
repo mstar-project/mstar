@@ -426,11 +426,16 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        any request on the node uses a repetition penalty, every step on it runs once. With recurrent
        prefix snapshots on (``prefix_slots``, as in ``qwen3_5_0.8b.yaml``), a step ends at the nearest
        page edge of any of its rows, so the iterations a step runs fall as concurrency rises and reach
-       about one at a few dozen rows; measure with ``prefix_slots: 0`` too. ``ready_waits: true`` makes ready rows wait
-       for a full-length run after a step that ran once, trading admission latency for longer runs;
-       measure it, it is not a free improvement. Needs a ``TokenStop``, every output on the device,
-       resources that can all run on resident tables, and a decode kernel that reads its lengths per replay (for Whisper,
-       ``decode_tensor_cores: true`` on its attention resources). A node or walk that can't is refused at
+       about one at a few dozen rows; measure with ``prefix_slots: 0`` too. A run delays the next admission
+       even without ``ready_waits``: a request that arrives mid-run waits for the run to end, so time to
+       first token can rise where the throughput gain doesn't pay for it (Canary's closed-loop c16 TTFT went
+       from 51 to 103 ms at ``max: 8``; Whisper large-v3 and Qwen3-ASR lost TTFT with no throughput gain), and a
+       streaming client receives up to ``max`` tokens at once, with gaps of up to ``max`` steps between them.
+       ``ready_waits: true`` makes ready rows wait for a full-length run after a step that ran once, trading
+       more admission latency for longer runs; measure it, it is not a free improvement. Needs a ``TokenStop``, every output on the device,
+       resources that can all run on resident tables, and a decode kernel that reads its lengths per replay (any node on
+       FlashInfer's CUDA-core decode, such as Whisper or Qwen3-ASR, is refused with "allows one iteration a step"
+       until ``decode_tensor_cores: true`` is set on its attention resources). A node or walk that can't is refused at
        load with the reason; a lockstep (TP/SP/CFG) node is refused. A ``SampledTokenDecoder`` node named here
        runs the walks asked on resident tables, with the runtime's stop and its token looped back on
        the device; another AR node must declare those itself (see :doc:`adding_models`), and a node
