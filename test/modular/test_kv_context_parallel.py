@@ -69,7 +69,7 @@ from mstar.engine.resources.sequence_shard import SeqShardSpec, SeqShardStep, Se
 from mstar.engine.resources.spec import NodeResourceSpec, apply_yaml_overrides, resolve_spec_dependencies
 from mstar.engine.resources.step import BucketKey, Segment, SlotLease, StepContext
 from mstar.model.base import declared_resources
-from mstar.model.qwen3_5.config import GDN_STATE, KV_CACHE
+from mstar.model.qwen3_5.config import GDN_STATE, KV_CACHE, LLM_SHARD
 from mstar.model.submodule_base import NodeInputs
 
 P = 2
@@ -338,7 +338,10 @@ def test_a_node_that_splits_its_steps_owns_its_recurrent_layers_and_refuses_what
     groups = _sp_groups(NODE)
     # what a deployment without a `lora:` block builds
     specs = enabled_resources(_qwen3_5(NODE, {}, tmp_path, monkeypatch), {})
-    apply_yaml_overrides(specs, {"resources": {KV_CACHE: {"max_num_pages": 8}, GDN_STATE: {"max_slots": 4}}})
+    # by-head Ulysses is the deployment's opt-in on Qwen3.5
+    apply_yaml_overrides(specs, {"resources": {
+        KV_CACHE: {"max_num_pages": 8}, GDN_STATE: {"max_slots": 4}, LLM_SHARD: {"exchange": "ulysses"},
+    }})
     pool, = (spec for spec in specs if spec.resource_key == GDN_STATE)
     heads = pool.config.blocks["state"].shape[0]
 
