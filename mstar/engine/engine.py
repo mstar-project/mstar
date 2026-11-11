@@ -1084,14 +1084,15 @@ class Engine:
                 "off the sampler's loop-back rows, which grow (and move) unless the in-graph scatter keeps them "
                 "fixed: MSTAR_SAMPLER_INGRAPH_SCATTER=1, device loop-back on, and one rank (not yet under TP)"
             )
+        from mstar.engine.resources.recurrent.pool import RecurrentStatePool
+
         rows = sampler_slots()
         for key, resource in mgmt.resources.items():
-            usable = getattr(getattr(resource, "config", None), "usable_slots", None)
-            if isinstance(usable, int) and usable > rows:
+            if isinstance(resource, RecurrentStatePool) and resource.config.usable_slots > rows:
                 logger.warning(
                     "speculative decoding on %s: %r holds %d requests, the sampler's carry rows %d "
                     "(MSTAR_SAMPLER_SLOTS); requests past those wait while its slots idle",
-                    decl.node, key, usable, rows,
+                    decl.node, key, resource.config.usable_slots, rows,
                 )
 
     def _agreed_mode(
