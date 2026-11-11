@@ -19,10 +19,11 @@ import torch
 from jinja2 import TemplateError
 
 from mstar.engine.state import Array, Attend, Causal, Draft, KVEntry, Positions, Read, Rope, Sampler
+from mstar.model.hf_config import hf_weight_dtype
 from mstar.model.keys import KV_CACHE, ROPE, SAMPLER
 from mstar.model.multimodal import TEXT, PromptPart, chat_turns
 from mstar.model.multimodal_decoder import DeclaredDecoderModel
-from mstar.model.qwen3.config import ATTN, LLM_NODE, checkpoint_dtype, qwen3_lm_config
+from mstar.model.qwen3.config import ATTN, LLM_NODE, qwen3_lm_config
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.utils.fast_tokenize import encode_ids
 from mstar.utils.hf_snapshot import resolve_snapshot_dir
@@ -123,7 +124,7 @@ class Qwen3Model(DeclaredDecoderModel):
                 method=self.draft.method, model=self.draft.model, checkpoint=str(self._drafter_dir),
                 num_draft_tokens=self.draft.num_draft_tokens, mode=self.draft.mode.value,
                 num_layers=cfg.num_hidden_layers, hidden_size=cfg.hidden_size,
-                dtype=checkpoint_dtype(self.hf_config), input_kinds={TEXT},
+                dtype=hf_weight_dtype(self.hf_config), input_kinds={TEXT},
             ))
         return state
 

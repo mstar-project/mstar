@@ -32,9 +32,10 @@ from mstar.engine.state import Draft  # noqa: E402
 from mstar.engine.state.adapters import StateSetup, draft_config, node_handles, node_resources  # noqa: E402
 from mstar.engine.state.analysis import declaration_digests  # noqa: E402
 from mstar.model.base import enabled_resources, serving_resources  # noqa: E402
+from mstar.model.hf_config import hf_weight_dtype  # noqa: E402
 from mstar.model.keys import KV_CACHE, PREFILL_TEXT, ROPE, SAMPLER  # noqa: E402
 from mstar.model.multimodal import TEXT  # noqa: E402
-from mstar.model.qwen3.config import ATTN, LLM_NODE, checkpoint_dtype  # noqa: E402
+from mstar.model.qwen3.config import ATTN, LLM_NODE  # noqa: E402
 from mstar.model.submodule_base import ARNodeInputs, engine_step  # noqa: E402
 
 K = 3
@@ -93,7 +94,7 @@ def test_the_verify_node_equals_the_hand_written_one(model):
         input_kinds=frozenset({TEXT}),
         target=ModelGeometry(
             num_layers=cfg.num_hidden_layers, num_kv_heads=cfg.num_key_value_heads, head_dim=cfg.head_dim,
-            hidden_size=cfg.hidden_size, vocab_size=cfg.vocab_size, dtype=checkpoint_dtype(model.hf_config),
+            hidden_size=cfg.hidden_size, vocab_size=cfg.vocab_size, dtype=hf_weight_dtype(model.hf_config),
         ),
         checkpoint=str(model._drafter_dir),
         prefill_steps=decl.prefill_steps(), verify_steps=decl.verify_steps(),

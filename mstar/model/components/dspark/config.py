@@ -15,6 +15,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from mstar.model.hf_config import hf_weight_dtype
+
 
 @dataclass(frozen=True)
 class DSparkConfig:
@@ -92,5 +94,5 @@ class DSparkConfig:
             rope_theta=float(rope.get("rope_theta", hf.get("rope_theta", 1_000_000.0))),
             max_position_embeddings=hf.get("max_position_embeddings", 32768),
             tie_word_embeddings=bool(hf.get("tie_word_embeddings", False)),
-            dtype=str(hf.get("dtype") or hf.get("torch_dtype") or "bfloat16"),
+            dtype=hf_weight_dtype(hf),
         )
