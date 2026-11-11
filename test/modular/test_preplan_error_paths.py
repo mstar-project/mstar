@@ -251,7 +251,7 @@ def test_a_pre_plan_records_its_event_even_when_it_raises(monkeypatch) -> None:
             pre_plan=_raiser(RuntimeError("plan failed")),
         ),
     )
-    step = SimpleNamespace(set_ctx=lambda ctx: None)
+    step = SimpleNamespace(set_ctx=lambda ctx: None, state={})
     submodule = SimpleNamespace(declare_step=lambda **kw: step)
     cg_runner = SimpleNamespace(
         declare_inputs_for=lambda lease: [], step_ids=lambda lease, rids: rids,
