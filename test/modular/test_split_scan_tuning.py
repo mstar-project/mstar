@@ -1,19 +1,22 @@
 """A split scan's block size stays at or above the one its workspace is sized for
-(`keep_split_scans_in_their_workspace`), in coordinate descent and in cached picks, and
-other kernels' tuning is left alone.
+(`keep_split_scans_in_their_workspace`): coordinate descent never steps below it, every
+config is raised to it before launch, and other kernels are left alone.
 
 Drives Inductor's own `CoordescTuner.autotune` with a timing function that favours small
 blocks, so the test fails if the tuner could still reach one. No GPU needed."""
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 triton = pytest.importorskip("triton")
-from torch._inductor.runtime import autotune_cache  # noqa: E402
 from torch._inductor.runtime.coordinate_descent_tuner import CoordescTuner  # noqa: E402
+from torch._inductor.runtime.triton_heuristics import CachingAutotuner  # noqa: E402
 
 import mstar.engine.engine as engine_module  # noqa: E402
+import mstar.platforms.compile as compile_mod  # noqa: E402
 from mstar.platforms.compile import keep_split_scans_in_their_workspace  # noqa: E402
 from mstar.testing_utils.engine import make_engine  # noqa: E402
 
@@ -58,21 +61,55 @@ def test_installing_twice_wraps_once():
     assert CoordescTuner.value_too_small is first
 
 
-def _cached_pick(grid_type: str, rblock: int):
-    """What the autotune cache hands back for a pick coordinate descent saved earlier."""
-    saved = {"R0_BLOCK": rblock, "num_warps": 4, "num_stages": 1,
-             "found_by_coordesc": True, "configs_hash": "h"}
-    meta = {**_meta(grid_type), "coordinate_descent_tuning": True}
-    return autotune_cache._load_cached_autotuning(saved, "h", [], meta)
+class _Result:
+    """A compile result: only its config matters here."""
+
+    def __init__(self, cfg):
+        self.config = cfg
 
 
-def test_a_split_scan_pick_cached_below_its_minimum_is_retuned():
-    assert _cached_pick("SplitScanGrid", MIN_RBLOCK // 2) is None
+class _Tuner:
+    """The `CachingAutotuner` fields the clamp reads, and a compile that records its configs."""
+
+    def __init__(self, grid_type: str, rblocks: list[int], *, from_worker: bool = False):
+        self.inductor_meta = _meta(grid_type)
+        self.compile_results = [_Result(triton.Config({"R0_BLOCK": r}, num_warps=4)) for r in rblocks]
+        self.fn = SimpleNamespace(fn=None if from_worker else "source")
+        self._reload_kernel = lambda: SimpleNamespace(fn=SimpleNamespace(fn="reloaded"))
+        self.compiled = []
+
+    def _precompile_config(self, cfg):
+        self.compiled.append(cfg)
+        return _Result(cfg)
 
 
-def test_other_cached_picks_still_load():
-    assert _cached_pick("SplitScanGrid", MIN_RBLOCK).kwargs["R0_BLOCK"] == MIN_RBLOCK
-    assert _cached_pick("Grid2D", MIN_RBLOCK // 2).kwargs["R0_BLOCK"] == MIN_RBLOCK // 2
+def _rblocks(tuner) -> list[int]:
+    return [r.config.kwargs["R0_BLOCK"] for r in tuner.compile_results]
+
+
+def test_a_split_scan_config_below_its_minimum_is_raised_before_launch():
+    tuner = _Tuner("SplitScanGrid", [1, MIN_RBLOCK // 2, 2 * MIN_RBLOCK])
+    compile_mod._raise_split_scan_blocks(tuner)
+    assert _rblocks(tuner) == [MIN_RBLOCK, MIN_RBLOCK, 2 * MIN_RBLOCK]
+    assert len(tuner.compiled) == 2
+    # coordinate descent retunes from the raised config instead of trusting the old pick
+    assert all(cfg.found_by_coordesc is False for cfg in tuner.compiled)
+
+
+def test_a_worker_compiled_split_scan_reloads_its_source_to_recompile():
+    tuner = _Tuner("SplitScanGrid", [MIN_RBLOCK // 2], from_worker=True)
+    compile_mod._raise_split_scan_blocks(tuner)
+    assert tuner.fn.fn == "reloaded" and _rblocks(tuner) == [MIN_RBLOCK]
+
+
+def test_other_kernels_launch_their_configs_as_tuned():
+    tuner = _Tuner("Grid2D", [MIN_RBLOCK // 2])
+    compile_mod._raise_split_scan_blocks(tuner)
+    assert _rblocks(tuner) == [MIN_RBLOCK // 2] and not tuner.compiled
+
+
+def test_launchers_go_through_the_clamp():
+    assert "keep_split_scans_in_their_workspace" in CachingAutotuner._make_launchers.__qualname__
 
 
 def test_the_engine_installs_it(monkeypatch):
