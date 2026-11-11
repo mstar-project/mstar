@@ -274,7 +274,7 @@ def test_a_frame_draws_through_the_contract_as_the_sampler_would(_frame):
         bufs.register_request(rid, config)
     bufs.gather_static(rows, 13, 0)
     bufs.gather_dynamic(rows, 13, 0)
-    resource = SamplerResource(vocab_size=2048, enable_repetion_penalty=False, device=torch.device("cuda"))
+    resource = SamplerResource(vocab_size=2048, enable_repetition_penalty=False, device=torch.device("cuda"))
     resource._cg_sampler = bufs.sampler_for(13, 0)
     handle = SamplerHandle(Sampler("code_predictor", nodes={"Talker"}, vocab_size=2048, draws=15), resource)
     handle._open = True
