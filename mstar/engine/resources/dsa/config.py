@@ -18,15 +18,20 @@ INDEX_PLANES = "dsa_index"
 
 @dataclass
 class DSAConfig:
-    # the paged MLA cache: a step's rows come from its plan, the attended latents from its pages
+    # the paged MLA cache: the step's rows come from its plan; its pages hold the latents and,
+    # in aux_planes[INDEX_PLANES], the index keys
     kv_cache: str
     # the keys a query attends once it sees more: its top ``topk`` by the indexer's score
     topk: int
-    # tokens per pooled key (GLM-5.3's k-pool indexer: paged.py); 1 scores every token's key
+    # tokens per pooled key (GLM-5.3's k-pool indexer); 1 scores every token's key
     kpool: int = 1
     # the absorbed MLA's softmax scale, which every sparse attention runs at
     sm_scale: float | None = None
-    # kpool > 1: the indexer's key width; an INDEX_PLANES row is three of them wide
+    # attend densely while no row sees more than topk keys (there, the same computation): such
+    # a step plans no sparse attention
+    dense_below_topk: bool = False
+    # the indexer's key width: an INDEX_PLANES row is one key wide, or with kpool > 1 three
+    # (key, gate, the key of the pool ending there)
     index_head_dim: int | None = None
     # bytes of fp32 scores an eager prefill's selection holds per launch: a chunk of rows is
     # as wide as its last row's pools
@@ -47,10 +52,6 @@ class DSASpec(NodeResourceSpec):
 
     @property
     def resource_class(self) -> "type[Resource]":
-        if self.config.kpool > 1:
-            from mstar.engine.resources.dsa.manager import KPoolDSA
-
-            return KPoolDSA
         from mstar.engine.resources.dsa.manager import DSAManager
 
         return DSAManager

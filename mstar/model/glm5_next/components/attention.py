@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
-from mstar.engine.resources.dsa.manager import KPoolDSA
+from mstar.engine.resources.dsa.manager import DSAManager
 from mstar.model.components.mla import MLAAttention
 from mstar.model.glm5_next.config import ATTN, DSA, KV_CACHE, LABEL, Glm5NextModelConfig
 
@@ -80,9 +80,9 @@ class Glm5NextMLAAttention(MLAAttention):
         # every full-attention layer, the MTP layer's too, ships its own indexer
         self.indexer = Glm5NextIndexer(config)
         # dsa_long_context: this layer's index plane (its latent plane's, on the same pages),
-        # and the DSA resource, which holds the step's plan (the step declares DSAStep)
+        # and the DSA resource whose context the submodule opens per forward
         self.index_plane = kv_plane if config.dsa_long_context else None
-        self._dsa: KPoolDSA | None = None
+        self._dsa: DSAManager | None = None
         self.dsa_group = (comm_group or CommGroup.trivial()) if config.dsa_shard_prefill else None
 
     def bind_resources(self, resources: dict) -> None:
@@ -99,8 +99,8 @@ class Glm5NextMLAAttention(MLAAttention):
         if self._dsa is None:
             return None
         k, gate = self.indexer.keys_and_gate(hidden_states)
-        self._dsa.write_index(self.index_plane, k, gate, self.indexer.index_kpool_compress_ape,
-                              LABEL)
+        self._dsa.write_index(self.index_plane, k, gate=gate,
+                              ape=self.indexer.index_kpool_compress_ape, label=LABEL)
         q, w = self.indexer.query_and_weights(q_c, hidden_states)
         return self._dsa.select(self.index_plane, q, w, self.dsa_group, LABEL)
 

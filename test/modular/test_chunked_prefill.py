@@ -944,8 +944,8 @@ def test_a_walk_with_no_token_ladder_to_set_is_refused():
 
 
 def test_a_walk_a_node_captures_nothing_for_at_runtime_is_skipped(caplog):
-    """GLM-5.2 captures nothing under ``dsa_long_context``, and serves eagerly
-    whatever the ladder."""
+    """GLM-5.2's prefill captures nothing under ``dsa_long_context`` with MTP, and
+    runs eagerly whatever the ladder."""
     import logging
 
     from mstar.model.glm52.config import Glm52ModelConfig
@@ -953,7 +953,8 @@ def test_a_walk_a_node_captures_nothing_for_at_runtime_is_skipped(caplog):
 
     language_model = torch.nn.Module()
     language_model.lm_head = torch.nn.Identity()
-    glm = Glm52LLMSubmodule(language_model, Glm52ModelConfig(dsa_long_context=True, mla_absorb=True))
+    glm = Glm52LLMSubmodule(language_model, Glm52ModelConfig(
+        dsa_long_context=True, mla_absorb=True, mtp_num_draft_tokens=1))
     engine = _budgeted_engine()
     with caplog.at_level(logging.WARNING):
         assert _captured_buckets(glm, "prefill", {"prefill": [64]}, engine) == []

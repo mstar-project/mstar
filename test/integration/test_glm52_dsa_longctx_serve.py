@@ -17,11 +17,17 @@ from mstar.engine.resources import (
     resolve_spec_dependencies,
 )
 from mstar.engine.resources.base import EngineResourceInfo, build_resource
+from mstar.engine.resources.dsa.config import INDEX_PLANES
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.model.glm52._testing import per_request_outputs
 from mstar.model.glm52.components.causal_lm import Glm52ForCausalLM
 from mstar.model.glm52.components.moe import Glm52SparseMoeBlock
-from mstar.model.glm52.config import ATTN_RESOURCE, DSA_RESOURCE, KV_RESOURCE, Glm52ModelConfig
+from mstar.model.glm52.config import (
+    ATTN_RESOURCE,
+    DSA_RESOURCE,
+    KV_RESOURCE,
+    Glm52ModelConfig,
+)
 from mstar.model.glm52.submodules import Glm52LLMSubmodule
 from mstar.model.submodule_base import END_PARTITION, ModelInputsFromEngine
 
@@ -37,7 +43,8 @@ TOPK = 8
 PROMPT_LEN = 6
 MAX_TOKENS = 14  # 1 prefill + 13 decode tokens: final context 6 + 13 = 19, far past topk
 # 8-token pages, 16 of them (one is the sink page): 120 cached tokens for a
-# 20-token context, and the torch fallback's page table spans every page.
+# 20-token context, and the torch fallback's page table spans every page. The
+# index keys sit on the same pages.
 KV_YAML = {"resources": {KV_RESOURCE: {"max_num_pages": 16, "page_size": 8}}}
 
 
@@ -161,6 +168,9 @@ class _Serve:
             )
             for spec in specs
         }
+        for spec in specs:  # as the engine binds them (the DSA resource reads its KV pool)
+            self.resources[spec.resource_key].bind_dependencies(
+                {key: self.resources[key] for key in spec.depends_on()})
         self.runner = StepRunner(self.resources, node_resources={NODE: list(self.resources)})
         submodule.requires_grad_(False)
         submodule.bind_node_resources(self.resources)
@@ -180,8 +190,8 @@ class _Serve:
     def step(self, walk: str, info: CurrentForwardPassInfo, text: torch.Tensor,
              batched: bool = True) -> dict:
         """declare -> admit -> plan -> preprocess -> forward -> commit. The
-        plan runs BEFORE preprocess, as in the engine: the DSA resource plans
-        this step's rows off the KV plan."""
+        plan runs BEFORE preprocess, as in the engine: the DSA resource stages
+        this step's rows from the KV plan."""
         rid = self.rid
         inputs = [self.submodule.prepare_inputs(walk, info, {"text_inputs": [text]})]
         step = self.submodule.declare_step(walk, [rid], inputs)
@@ -215,14 +225,15 @@ class _Serve:
 
 
 def _generate_greedy(model, submodule, prompt_ids, max_tokens):
-    """The real serve loop (prefill -> decode to the request's loop cap or a
-    stop) on the sparse path; returns (generated tokens, the DSA resource's
-    stored key counts of layers 0 and 1 before retirement, the requests it
-    still tracks after)."""
+    """The real serve loop (prefill -> decode -> check_stop, the decode loop capped at the
+    model's get_loop_caps as the graph runtime caps it) on the sparse path; returns
+    (generated tokens, what ended the reply: "stop" or "cap", _stored_rows before retirement)."""
     serve = _Serve(model, submodule)
     dsa = serve.resources[DSA_RESOURCE]
     info = serve.info(max_tokens)
+    cap = model.get_loop_caps(max_output_tokens=max_tokens)["decode_loop"]
     generated: list[int] = []
+    ended = "cap"
     try:
         out = serve.step("prefill", info, prompt_ids)
         new_token = out["new_token"][0]
@@ -230,20 +241,34 @@ def _generate_greedy(model, submodule, prompt_ids, max_tokens):
         generated.append(int(new_token.item()))
         next_token = out["text_inputs"][0]
         # as the runtime: a prefill stop ends the request (END_PARTITION); otherwise decode
-        if END_PARTITION not in submodule.check_stop(serve.rid, info, out):
+        if END_PARTITION in submodule.check_stop(serve.rid, info, out):
+            ended = "stop"
+        else:
             info.graph_walk = "decode"
-            for _ in range(model.get_loop_caps(max_output_tokens=max_tokens)["decode_loop"]):
+            for _ in range(cap):
                 out = serve.step("decode", info, next_token)
                 new_token = out["new_token"][0]
                 submodule.postprocess(serve.rid, info, out)
                 generated.append(int(new_token.item()))
                 next_token = out["text_inputs"][0]
                 if submodule.check_stop(serve.rid, info, out):
+                    ended = "stop"
                     break
-        stored = (dsa.keys.tokens(serve.rid, 0), dsa.keys.tokens(serve.rid, 1))
+        stored = _stored_rows(serve.resources[KV_RESOURCE], serve.rid)
+        assert dsa.current() is not None  # the engine planned the declared DSA step
     finally:
-        serve.close(cleanup_request=False)
-    return generated, stored, dsa.keys.tracked_requests()
+        serve.close()
+    return generated, ended, stored
+
+
+def _stored_rows(kv, rid):
+    """The request's stored latent rows, and how many of them have their index keys (the first
+    index plane's rows at the same slots)."""
+    n = kv.stored_len(rid)
+    pos = torch.arange(n)
+    pages = torch.tensor(kv._streams[rid]["main"].page_indices)[pos // kv.config.page_size]
+    keys = kv.aux_view(INDEX_PLANES, 0)[pages.to(DEVICE), (pos % kv.config.page_size).to(DEVICE)]
+    return n, int((keys != 0).any(-1).sum())
 
 
 def _teacher_forced_logits(model, submodule, prompt_ids, forced_tokens):
@@ -280,11 +305,6 @@ def test_dsa_longctx_decode_past_topk(tmp_path):
 
     submodule = model.get_submodule(NODE, device="cuda", autocast_dtype=DTYPE)
     assert isinstance(submodule, Glm52LLMSubmodule)
-    # Long-context serving is eager-only (the DSA resource selects per request
-    # on the host, which a captured graph would not replay): neither
-    # whole-forward nor piecewise.
-    assert submodule.get_accelerator_graph_configs(DEVICE) == []
-    assert submodule.get_piecewise_accelerator_graph_configs(DEVICE, DTYPE) == {}
     # The absorbed declaration: one latent row per token, the MLA resource
     # planned over it (its torch fallback at reduced dims).
     specs = {spec.resource_key: spec for spec in model.get_node_resources()}
@@ -292,20 +312,20 @@ def test_dsa_longctx_decode_past_topk(tmp_path):
     assert specs[KV_RESOURCE].config.head_dim == cfg.kv_lora_rank + cfg.qk_rope_head_dim
     assert specs[KV_RESOURCE].config.kv_lora_rank == cfg.kv_lora_rank
     assert specs[ATTN_RESOURCE].config.backend is AttnBackend.FLASHINFER_MLA
+    # the index keys on the latents' pages: one index_head_dim row per token per FULL layer
+    assert specs[KV_RESOURCE].config.aux_planes[INDEX_PLANES].width == cfg.index_head_dim
 
     prompt_ids = torch.arange(10, 10 + PROMPT_LEN, device=DEVICE)
 
     # ---- (1) the sparse path serves to the loop cap ------------------
-    generated, stored, tracked = _generate_greedy(
-        model, submodule, prompt_ids, MAX_TOKENS)
-    assert len(generated) == MAX_TOKENS, generated  # max_tokens counts the prefill-emitted token (vLLM semantics)
+    generated, ended, stored = _generate_greedy(model, submodule, prompt_ids, MAX_TOKENS)
+    # ignore_eos: only the loop cap ends it, and max_tokens counts the prefill's token (vLLM semantics)
+    assert ended == "cap" and len(generated) == MAX_TOKENS, (ended, generated)
     assert all(0 <= t < cfg.vocab_size for t in generated), generated
 
-    # key store lifecycle on the real path: one row per token per FULL layer
-    # (prefill 6 + one per decode forward), gone after retirement.
-    assert stored[0] == PROMPT_LEN + MAX_TOKENS - 1  # 6 prompt rows + 13 decode forwards
-    assert stored[1] == 0  # SHARED layer: none
-    assert tracked == set()
+    # every stored token has its index keys, at its latent's slot
+    # (prefill 6 + one per decode forward)
+    assert stored == (PROMPT_LEN + MAX_TOKENS - 1,) * 2  # 6 prompt rows + 13 decode forwards
 
     # ---- teacher-forced replays of the generated sequence --------------
     forced = generated[:-1]  # the last token is never fed back

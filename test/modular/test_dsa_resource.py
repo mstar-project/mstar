@@ -1,268 +1,272 @@
-"""The DSA resource on CPU: its key store, the rows it plans from the KV plan, IndexShare's
-shared pick, and sparse attention against an independent masked reference."""
+"""The DSA resource on CPU: its build over an MLA cache with index planes, the rows its declared
+step plans from the KV plan (``plan``), and the plan the layers read (``current``, ``rows`` /
+``pick`` / ``dense``)."""
 import sys
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from mstar.engine.resources.base import EngineResourceInfo, build_resource
+from mstar.engine.resources.dsa.config import INDEX_PLANES, DSAConfig, DSASpec, DSAStep
+from mstar.engine.resources.dsa.manager import DSAManager
+from mstar.engine.resources.kv.config import AuxPlanes, KVLayout, KVSpec, PagedKVConfig
+from mstar.engine.resources.kv.plan import PagedIndptrs, SequenceView
+from mstar.engine.resources.step import BucketKey, SlotLease, StepContext
 
-from mstar.engine.resources.dsa import manager as dsa_manager  # noqa: E402
-from mstar.engine.resources.dsa.config import DSAConfig, DSASpec, DSAStep  # noqa: E402
-from mstar.engine.resources.dsa.manager import (  # noqa: E402
-    DSAManager,
-    DSAPlan,
-    IndexKeyStore,
-    index_topk,
-)
-from mstar.engine.resources.kv.plan import SequenceView  # noqa: E402
-
-# ---------------------------------------------------------------------------
-# IndexKeyStore
-# ---------------------------------------------------------------------------
+KV = "kv"
+PAGE, TOPK, HEADS, MAX_SEQ_LEN = 4, 4, 16, 64
 
 
-def test_key_store_append_history_grow_and_evict():
-    store = IndexKeyStore()
-    d = 16
-    first = torch.randn(3, d)
-    second = torch.randn(70, d)  # crosses the initial 64-row capacity
-
-    store.append("r0", 0, first, start_pos=0)
-    store.append("r0", 0, second, start_pos=3)
-    assert store.tokens("r0", 0) == 73
-    hist = store.history("r0", 0, 73)
-    torch.testing.assert_close(hist, torch.cat([first, second]), rtol=0, atol=0)
-    # Windowed view (what a mid-sequence selection scores against).
-    torch.testing.assert_close(store.history("r0", 0, 2), first[:2], rtol=0, atol=0)
-
-    # Growth doubled capacity but content survived the buffer swap above;
-    # a request/layer never touched reports 0, not KeyError.
-    assert store.tokens("r0", 1) == 0
-    assert store.tokens("nope", 0) == 0
-
-    store.evict("r0")
-    assert store.tracked_requests() == set()
-    assert store.tokens("r0", 0) == 0
-    store.evict("r0")  # idempotent
+D = 16  # index_head_dim
 
 
-def test_key_store_desync_and_overrun_raise():
-    store = IndexKeyStore()
-    store.append("r0", 0, torch.randn(4, 8), start_pos=0)
-    with pytest.raises(RuntimeError, match="desync"):
-        store.append("r0", 0, torch.randn(1, 8), start_pos=3)  # overlap
-    with pytest.raises(RuntimeError, match="desync"):
-        store.append("r0", 0, torch.randn(1, 8), start_pos=5)  # gap
-    with pytest.raises(RuntimeError, match="holds 4"):
-        store.history("r0", 0, 5)  # window beyond stored history
+def _spec(topk=TOPK, **config) -> DSASpec:
+    config.setdefault("index_head_dim", D)
+    return DSASpec(resource_key="dsa", nodes={"LLM"},
+                   config=DSAConfig(kv_cache=KV, topk=topk, **config))
 
 
-def test_removing_a_request_drops_its_keys():
-    dsa = _manager()
-    dsa.keys.append("r0", 0, torch.randn(5, 16), start_pos=0)
-    dsa.remove_request("r0")
-    assert dsa.keys.tracked_requests() == set()
-    dsa.remove_request("r0")  # idempotent, like the base hook
+def _kv_spec(index_planes: bool = True, width: int = D, page_size: int = PAGE) -> KVSpec:
+    return KVSpec(resource_key=KV, nodes={"LLM"}, config=PagedKVConfig(
+        num_layers=2, num_kv_heads=1, head_dim=48, max_seq_len=MAX_SEQ_LEN,
+        max_num_pages=32, page_size=page_size, num_qo_heads=HEADS, layout=KVLayout.MLA,
+        kv_lora_rank=32, qk_rope_head_dim=16,
+        aux_planes={INDEX_PLANES: AuxPlanes(num_layers=2, width=width)} if index_planes else {}))
 
 
-# ---------------------------------------------------------------------------
-# plan: the rows of a step, from the KV plan
-# ---------------------------------------------------------------------------
+def _manager(world_size: int = 1, kpool: int = 1, topk: int = TOPK, page_size: int = PAGE,
+             device: str = "cpu", kv_dtype: torch.dtype = torch.bfloat16) -> DSAManager:
+    """The resource as the engine builds it, from its spec and its cache's spec."""
+    info = EngineResourceInfo(
+        device=torch.device(device), kv_dtype=kv_dtype,
+        joint_comm_group=SimpleNamespace(world_size=world_size),
+        dependencies={KV: _kv_spec(width=D if kpool == 1 else 3 * D, page_size=page_size)})
+    return build_resource(_spec(topk=topk, kpool=kpool, sm_scale=0.1), info)
 
 
-def _manager(topk=4, page_size=4) -> DSAManager:
-    return DSAManager(DSAConfig(kv_cache="kv", topk=topk), page_size=page_size,
-                      device=torch.device("cpu"))
+def _step(walk: str, pages, lengths, to_compute, lease=None, is_preplan=False) -> StepContext:
+    """A step whose KV plan holds one view per request: request i has ``lengths[i]`` tokens
+    after the step, its last ``to_compute[i]`` new."""
+    views = [SequenceView(f"r{i}", "main", p, length=n, to_compute=c)
+             for i, (p, n, c) in enumerate(zip(pages, lengths, to_compute, strict=True))]
+    indptr = torch.tensor([0, *torch.tensor([len(p) for p in pages]).cumsum(0).tolist()])
+    flat = torch.tensor([page for p in pages for page in p], dtype=torch.int32)
+    plan = SimpleNamespace(views=views, cpu_indptrs=PagedIndptrs(
+        qo_indptr=None, paged_kv_indptr=indptr, paged_kv_indices=flat,
+        paged_kv_last_page_len=None))
+    return StepContext(
+        request_ids=tuple(f"r{i}" for i in range(len(lengths))), graph_walk=walk,
+        slot=0 if lease is None else lease.slot, capture=False,
+        plan_results={KV: {"main": plan}}, slot_lease=lease, is_preplan=is_preplan)
 
 
-def _plan(dsa: DSAManager, views: list[SequenceView]) -> dict[str, DSAPlan]:
-    ctx = SimpleNamespace(plan_results={"kv": {"main": SimpleNamespace(views=views)}})
-    return dsa.plan(DSAStep(), ctx)
+def _stage(dsa: DSAManager, walk: str, pages, lengths, to_compute, lease=None):
+    """The step's plan for its one label, as the engine runs it (``DSAStep()``)."""
+    return dsa.plan(DSAStep(), _step(walk, pages, lengths, to_compute, lease))["main"]
 
 
-def test_the_spec_builds_over_its_kv_cache():
-    spec = DSASpec(resource_key="dsa", nodes={"LLM"}, config=DSAConfig(kv_cache="kv", topk=8))
-    assert spec.depends_on() == {"kv"}
-    assert spec.resource_class is DSAManager
-
-
-def test_plan_reads_each_requests_rows_off_the_kv_plan():
-    dsa = _manager(topk=16)
-    tables = [[0, 1, 2], [5, 6, 7]]
-    plans = _plan(dsa, [
-        SequenceView("r0", "main", tables[0], length=4, to_compute=4),  # a 4-token prompt
-        SequenceView("r1", "main", tables[1], length=9, to_compute=4),  # 5 cached, 4 new
-    ])
-    plan = plans["main"]
-    assert plan.needs_selection is False  # every row sees at most topk keys: dense
-    (s0, s1) = plan.spans
-    assert (s0.request_id, s0.q_start, s0.q_len, s0.ctx_start) == ("r0", 0, 4, 0)
-    assert (s1.request_id, s1.q_start, s1.q_len, s1.ctx_start) == ("r1", 4, 4, 5)
-    assert s1.pages == [5, 6, 7]
-    # Page tables are snapshots: later plan growth must not alias.
-    tables[0].append(99)
-    assert s0.pages == [0, 1, 2]
-
-
-def test_plan_selects_once_a_row_sees_more_than_topk_keys():
-    dsa = _manager(topk=4)
-    _plan(dsa, [SequenceView("r0", "main", [0], length=4, to_compute=1)])
-    assert dsa.needs_selection() is False
-    _plan(dsa, [SequenceView("r0", "main", [0, 1], length=5, to_compute=1)])
-    assert dsa.needs_selection() is True
-    assert dsa._plans["main"].last_selection is None  # a fresh pick every forward
+def _prefill(dsa: DSAManager, pages=([0], [5, 6, 7])):
+    """A fresh 3-token prompt and a 4-token one past 5 cached tokens: 9 keys, past topk."""
+    return _stage(dsa, "prefill", pages, lengths=[3, 9], to_compute=[3, 4])
 
 
 # ---------------------------------------------------------------------------
-# select / shared_selection
+# spec and build
 # ---------------------------------------------------------------------------
 
 
-def test_select_scores_each_request_over_its_own_keys():
-    """Two decode rows of different requests each pick from their own keys, and SHARED layers
-    get that very pick."""
-    torch.manual_seed(0)
-    topk, heads, d = 4, 2, 8
-    dsa = _manager(topk=topk)
-    keys = {"r0": torch.randn(6, d), "r1": torch.randn(9, d)}
-    for rid, k in keys.items():
-        dsa.keys.append(rid, 0, k[:-1], start_pos=0)
-    _plan(dsa, [SequenceView("r0", "main", [0, 1], length=6, to_compute=1),
-                SequenceView("r1", "main", [2, 3, 4], length=9, to_compute=1)])
-    dsa.store_keys(0, torch.stack([keys["r0"][-1], keys["r1"][-1]]))
-    q, w = torch.randn(2, heads, d), torch.rand(2, heads)
-
-    picked = dsa.select(0, q, w)
-    for row, k in enumerate(keys.values()):
-        n = k.shape[0]
-        want = index_topk(q[row:row + 1], w[row:row + 1], k, torch.tensor([n - 1]), topk)
-        assert torch.equal(picked[row], want[0])
-    assert dsa.shared_selection(1) is picked
+def test_the_resource_plans_this_ranks_query_heads():
+    assert _manager(world_size=2).num_heads == HEADS // 2
 
 
-def test_shared_layer_without_a_full_pick_raises():
-    """A SHARED layer reached in selection mode with no published rows is a threading bug and
-    must fail loudly, not attend densely off-spec."""
-    dsa = _manager(topk=4)
-    _plan(dsa, [SequenceView("r0", "main", [0, 1], length=7, to_compute=1)])
-    with pytest.raises(RuntimeError, match="no FULL layer ran"):
-        dsa.shared_selection(1)
-
-
-@pytest.mark.parametrize("autocast", [False, True])
-def test_scores_stay_fp32_under_bf16_autocast(autocast):
-    torch.manual_seed(3)
-    q, w, keys = torch.randn(3, 2, 8), torch.rand(3, 2), torch.randn(40, 8)
-    positions = torch.tensor([20, 30, 39])
-    ref = index_topk(q, w, keys, positions, 8)
-    with torch.autocast("cpu", dtype=torch.bfloat16, enabled=autocast):
-        assert torch.equal(index_topk(q, w, keys, positions, 8), ref)
-
-
-# ---------------------------------------------------------------------------
-# attend vs an independent mask-based reference
-# ---------------------------------------------------------------------------
-
-
-def _independent_masked_reference(latent_cache, pages, page_size, positions,
-                                  selection_row, q_all, scale, latent_dim):
-    """Dense MQA over ALL cached positions with an additive mask keeping only the selected
-    ones — written from scratch, sharing no code with ``DSAManager.attend``."""
-    pos = torch.arange(positions)
-    flat = latent_cache[pages[pos // page_size], pos % page_size].float()
-    scores = q_all.float() @ flat.T * scale  # (H, positions)
-    mask = torch.full((positions,), float("-inf"))
-    mask[selection_row[selection_row >= 0].long()] = 0.0
-    weights = (scores + mask).softmax(-1)
-    return weights @ flat[:, :latent_dim]
-
-
-@pytest.mark.parametrize("autocast", [False, True])
-@pytest.mark.parametrize("selection_row", [
-    [9, 2, 7, 0],      # full topk row, unsorted, includes self (position 9)
-    [5, 9, -1, -1],    # padded row: -1 entries must be excluded, not scored
+@pytest.mark.parametrize("kpool, width, head_dim", [
+    (1, 3 * D, D),      # kpool 1: a row is one key
+    (4, D, D),          # kpool 4: [key | gate | pool key]
+    (4, 3 * D, None),   # the key width undeclared
 ])
-def test_attend_matches_masked_reference(selection_row, autocast):
-    """The engine runs the forward under bf16 autocast, which must not reach this fp32 math."""
-    torch.manual_seed(2)
-    page_size, heads, rank, rope = 4, 4, 32, 16
-    dsa = _manager(topk=4, page_size=page_size)
-    cache = torch.zeros(8, page_size, rank + rope)  # (pages, page_size, latent), the MLA layer
-    pages = torch.tensor([3, 1, 6], dtype=torch.long)  # non-monotonic on purpose
-
-    current = 9  # decode position; its own latent already written, as the layer does first
-    for pos in range(current + 1):
-        cache[pages[pos // page_size], pos % page_size] = torch.randn(rank + rope)
-    _plan(dsa, [SequenceView("r0", "main", pages.tolist(), length=current + 1, to_compute=1)])
-
-    q_nope = torch.randn(1, heads, rank)
-    q_pe = torch.randn(1, heads, rope)
-    selection = torch.tensor([selection_row], dtype=torch.int32)
-    scale = (rank + rope) ** -0.5
-
-    with torch.autocast("cpu", dtype=torch.bfloat16, enabled=autocast):
-        out = dsa.attend(selection, q_nope, q_pe, cache, scale)
-
-    q_all = torch.cat([q_nope, q_pe], dim=-1)[0]
-    ref = _independent_masked_reference(
-        cache, pages, page_size, current + 1, selection[0], q_all, scale, rank)
-    torch.testing.assert_close(out[0], ref, rtol=1e-6, atol=1e-6)
-
-    # Discrimination control: attending the WHOLE prefix must not match — otherwise this
-    # test could not catch a sparse path that ignores the selection.
-    dense_row = torch.arange(current + 1, dtype=torch.int32)
-    dense_ref = _independent_masked_reference(
-        cache, pages, page_size, current + 1, dense_row, q_all, scale, rank)
-    assert not torch.allclose(out[0], dense_ref, rtol=1e-3, atol=1e-3)
+def test_index_planes_of_another_width_are_refused_at_build(kpool, width, head_dim):
+    """A mis-sized INDEX_PLANES row booted, then failed on the first prefill."""
+    info = EngineResourceInfo(device=torch.device("cpu"), joint_comm_group=None,
+                              dependencies={KV: _kv_spec(width=width)})
+    with pytest.raises(ValueError, match="wide"):
+        build_resource(_spec(kpool=kpool, index_head_dim=head_dim), info)
 
 
-def test_attend_batches_requests_over_their_own_pages():
-    """Two decode rows of different requests, with their own page tables and a nonzero first
-    slot, attend in one batch exactly as each would alone."""
-    torch.manual_seed(4)
-    page_size, heads, rank, rope = 4, 2, 16, 8
-    dsa = _manager(topk=4, page_size=page_size)
-    cache = torch.randn(10, page_size, rank + rope)
-    views = [SequenceView("r0", "main", [7, 2], length=6, to_compute=1),
-             SequenceView("r1", "main", [4, 9, 0], length=9, to_compute=1, start=2)]
-    _plan(dsa, views)
-    selection = torch.tensor([[5, 1, 3, -1], [8, 0, 6, 2]], dtype=torch.int32)
-    q_nope, q_pe = torch.randn(2, heads, rank), torch.randn(2, heads, rope)
-    out = dsa.attend(selection, q_nope, q_pe, cache, 0.25)
-
-    for row, view in enumerate(views):
-        pages = torch.tensor(view.page_idxs)
-        slot = torch.arange(view.length) + view.start
-        flat = cache[pages[slot // page_size], slot % page_size]
-        ref = _independent_masked_reference(
-            flat.unsqueeze(1), torch.arange(view.length), 1, view.length, selection[row],
-            torch.cat([q_nope, q_pe], dim=-1)[row], 0.25, rank)
-        torch.testing.assert_close(out[row], ref, rtol=1e-6, atol=1e-6)
+def test_a_cache_without_index_planes_is_refused():
+    info = EngineResourceInfo(device=torch.device("cpu"), joint_comm_group=None,
+                              dependencies={KV: _kv_spec(index_planes=False)})
+    with pytest.raises(ValueError, match=INDEX_PLANES):
+        build_resource(_spec(), info)
 
 
-def test_a_selecting_step_stages_its_page_tables_once(monkeypatch):
-    """Every layer reads the same page tables: one H2D per step, not one per layer and row."""
-    dsa = _manager(topk=4)
-    calls = []
-    stage = dsa_manager.to_device_nonblocking
-    monkeypatch.setattr(
-        dsa_manager, "to_device_nonblocking",
-        lambda v, d, dtype=None: calls.append(v) or stage(v, d, dtype=dtype),
-    )
-    _plan(dsa, [SequenceView("r0", "main", [0, 1], length=6, to_compute=1),
-                SequenceView("r1", "main", [2, 3], length=7, to_compute=1)])
-    for _ in range(3):
-        dsa.attend(torch.zeros(2, 4, dtype=torch.int32), torch.randn(2, 2, 16),
-                   torch.randn(2, 2, 8), torch.randn(4, 4, 24), 1.0)
-    assert calls == [[0, 1, 2, 3, 0, 2, 0, 0]]  # pages, each row's offset, each row's start
-    _plan(dsa, [SequenceView("r0", "main", [0], length=3, to_compute=1)])
-    assert len(calls) == 1  # dense: nothing to stage
+@pytest.mark.parametrize("kpool, page_size, match", [
+    (4, 18, "multiple of index_kpool"),  # pools would straddle pages
+    (4, 12, "power of two"),  # 3 pools a page, which flashinfer's page-table transform cannot take
+    (1, 96, "kv page_size=96 must be a power of two"),
+])
+def test_a_page_size_the_pools_cannot_take_is_refused_at_build(kpool, page_size, match):
+    with pytest.raises(ValueError, match=match):
+        _manager(kpool=kpool, page_size=page_size)
 
 
-def test_plan_refuses_a_prefill_past_topk():
-    dsa = _manager(topk=4)
-    with pytest.raises(RuntimeError, match="decode-only"):
-        _plan(dsa, [SequenceView("r0", "main", [1, 2], length=7, to_compute=2)])
+def test_a_non_bf16_cache_on_cuda_is_refused_at_build():
+    """The DSA kernels take a bf16 cache; on another the torch paths sync with the host and
+    nothing captures, so the resource refuses it at load rather than serving slow."""
+    with pytest.raises(ValueError, match="bf16"):
+        _manager(device="cuda", kv_dtype=torch.float16)
+    _manager(kv_dtype=torch.float16)  # CPU runs the torch paths on any dtype
+
+
+@pytest.mark.parametrize("version, refused", [("0.6.17", True), ("0.6.18", False)])
+def test_a_flashinfer_without_page_size_is_refused_at_build_on_cuda(monkeypatch, version, refused):
+    """FlashInfer's top-k transform takes ``page_size`` from 0.6.18. Only the CUDA paths call
+    it, so a CPU build never asks."""
+    from mstar.engine.resources.attn import flashinfer_mla
+
+    monkeypatch.setitem(sys.modules, "flashinfer", SimpleNamespace(__version__=version))
+    flashinfer_mla._flashinfer_at_least.cache_clear()  # it remembers the installed version
+    try:
+        _manager()
+        if refused:
+            with pytest.raises(ValueError, match="FlashInfer >= 0.6.18"):
+                _manager(device="cuda")
+        else:
+            _manager(device="cuda")
+    finally:
+        flashinfer_mla._flashinfer_at_least.cache_clear()
+
+
+# ---------------------------------------------------------------------------
+# plan: the declared step's rows, from the KV plan
+# ---------------------------------------------------------------------------
+
+
+def test_a_capture_past_one_sparse_plan_is_refused_before_it_runs():
+    """A captured step plans its whole bucket as one sparse plan, which FlashInfer faults on
+    past ``MAX_ROWS`` rows: the resource refuses such a bucket when the captures are sized."""
+    from mstar.engine.resources.base import CGSlotSpec
+    from mstar.engine.resources.dsa.sparse_mla import MAX_ROWS
+    from mstar.engine.resources.step import BucketKey
+
+    def specs(*tokens):
+        return [CGSlotSpec(bucket=BucketKey("prefill", 1, n), slot=0, config=None) for n in tokens]
+
+    dsa = _manager()
+    dsa.build_accelerator_graph_buffers(specs(64, MAX_ROWS), max_bs=1, max_seq_len=MAX_ROWS)
+    with pytest.raises(ValueError, match="sparse plan"):
+        dsa.build_accelerator_graph_buffers(specs(64, 2 * MAX_ROWS), max_bs=1,
+                                            max_seq_len=2 * MAX_ROWS)
+
+
+def test_an_eager_prefill_plans_its_rows_and_pages():
+    """Each request's new rows and its pages, flat, from the KV plan, as the layers read them:
+    the plan of the step's ``DSAStep``, with nothing from preprocess."""
+    dsa = _manager()
+    ctx = _prefill(dsa)
+    assert dsa.current() is ctx
+    assert ctx.row_req.tolist() == [0, 0, 0, 1, 1, 1, 1]
+    assert ctx.pos.tolist() == ctx.host_pos == [0, 1, 2, 5, 6, 7, 8]
+    assert ctx.pages.dtype == torch.int32 and ctx.pages.tolist() == [0, 5, 6, 7]
+    assert ctx.page_start.tolist() == ctx.host_page_start == [0, 1]
+    assert ctx.spans == [(0, 3, 0), (3, 4, 1)]  # (first row, rows, request)
+    assert ctx.max_pools == 9  # the step's longest context
+    # a row sees 9 keys, past topk; prefill rows score in chunks of one request
+    assert ctx.needs_selection and not ctx.decode_rows and ctx.sparse_plan is None
+    assert ctx.attn_lens() == [1, 2, 3, 4, 4, 4, 4]
+    # pooled keys score in pools: 9 keys are 4 complete pools of 2
+    assert _prefill(_manager(kpool=2)).max_pools == 4
+    # a step that declared no DSAStep has no plan to read
+    with pytest.raises(KeyError, match="DSAStep"):
+        _manager().current()
+
+
+def test_an_eager_decode_scores_every_row_on_its_own():
+    dsa = _manager()
+    # r0 at position 6 (past topk), r1 at position 2
+    ctx = _stage(dsa, "decode", pages=[[1, 2], [4]], lengths=[7, 3], to_compute=[1, 1])
+    assert ctx.decode_rows and ctx.needs_selection and ctx.max_pools == 7
+    # below topk every row attends all it sees: dense MLA is the same computation
+    short = _stage(dsa, "decode", pages=[[1], [4]], lengths=[4, 3], to_compute=[1, 1])
+    assert short.needs_selection is False
+
+
+def test_a_pre_plan_is_promoted_not_redone():
+    """A plan made a step ahead (the plan thread's) stays pending until the step runs, which
+    takes it rather than planning again."""
+    dsa = _manager()
+    assert dsa.supports_preplan
+    _stage(dsa, "decode", [[1, 2]], [7], [1])
+    ahead = dsa.plan(DSAStep(), _step("decode", [[1, 2]], [8], [1], is_preplan=True))["main"]
+    assert dsa.current().host_pos == [6]  # the live plan stays until the step runs
+    assert _stage(dsa, "decode", [[3]], [2], [1]) is ahead and dsa.current().host_pos == [7]
+
+
+def test_plans_under_one_capture_lease_fill_the_same_buffers():
+    """A captured graph reads a slot's rows where the capture saw them: each later plan under
+    that lease refills them in place, from the buffers its captures were sized with."""
+    from mstar.engine.resources.base import CGSlotSpec
+
+    dsa = _manager()
+    bucket = BucketKey("decode", bs=2, num_tokens=2)
+    dsa.build_accelerator_graph_buffers([CGSlotSpec(bucket=bucket, slot=1, config=None)], 2, 2)
+    lease = SlotLease(slot=1, bucket=bucket)
+    first = _stage(dsa, "decode", [[1, 2], [4]], [7, 3], [1, 1], lease)
+    second = _stage(dsa, "decode", [[3, 5], [6]], [8, 2], [1, 1], lease)
+    assert second.pos.data_ptr() == first.pos.data_ptr()
+    assert second.pages.data_ptr() == first.pages.data_ptr()
+    assert second.pos.tolist() == [7, 1] and second.pages[:3].tolist() == [3, 5, 6]
+    # every row scores on its own over the serving window's keys
+    assert second.host_pos is None and second.decode_rows and second.max_pools == MAX_SEQ_LEN
+
+
+# ---------------------------------------------------------------------------
+# rows / pick / dense: passes over part of the step, or none of it
+# ---------------------------------------------------------------------------
+
+
+def test_rows_and_pick_are_passes_over_part_of_the_step():
+    ctx = _prefill(_manager())
+    ctx.last_selection = torch.zeros(7, TOPK, dtype=torch.int32)
+    tail = ctx.rows(2, 6)  # r0's last row and r1's first three
+    assert tail.pos.tolist() == [2, 5, 6, 7] and tail.row_req.tolist() == [0, 1, 1, 1]
+    assert tail.host_pos == [2, 5, 6, 7]
+    assert tail.spans == [(0, 1, 0), (1, 3, 1)]
+    assert tail.max_pools == 8
+    # its own selection, its own eager plan: dense attention would plan the whole step
+    assert tail.needs_selection and tail.last_selection is None and tail.sparse_plan is None
+    assert tail.pages is ctx.pages and tail.page_start is ctx.page_start
+    last = ctx.pick([2, 6])  # each request's last row
+    assert last.pos.tolist() == [2, 8] and last.row_req.tolist() == [0, 1]
+    assert last.spans == [(0, 1, 0), (1, 1, 1)]
+
+
+def test_rows_pick_and_dense_narrow_the_plan_for_a_block_and_restore_it():
+    dsa = _manager()
+    step = _prefill(dsa)
+    with dsa.rows(3, 7):  # r1's rows, a pass of their own over the step's plan
+        assert dsa.current().host_pos == [5, 6, 7, 8] and dsa.current().spans == [(0, 4, 1)]
+        with dsa.dense():  # a dense block inside it
+            assert dsa.current() is None
+        assert dsa.current().host_pos == [5, 6, 7, 8]
+    assert dsa.current() is step
+    with dsa.pick([2, 6]):
+        assert dsa.current().host_pos == [2, 8]
+    assert dsa.current() is step
+    # a block that fails still restores the step's plan
+    with pytest.raises(RuntimeError, match="boom"), dsa.dense():
+        raise RuntimeError("boom")
+    assert dsa.current() is step
+
+
+def test_a_node_with_dsa_double_buffers_its_captures_without_pre_plan(monkeypatch):
+    """A replay reads its slot's sparse plan, which ``plan`` re-plans through FlashInfer's
+    pinned staging: the node keeps two capture slots and fences their reuse even when no
+    pre-plan asks for them."""
+    from mstar.engine import engine as engine_mod
+
+    monkeypatch.setattr(engine_mod.knobs, "pre_plan_enabled", lambda: False)
+    mgmt = engine_mod.SubmoduleManagement(
+        submodule=None, forward=None, forward_batched=None, joint_comm_group=None,
+        resources={"dsa": _manager()})
+    assert mgmt.num_slots == 2 and mgmt.needs_slot_fence

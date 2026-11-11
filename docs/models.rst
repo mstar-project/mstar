@@ -91,6 +91,7 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
      - GLM-5.2 (753B/40B): MLA + DSA MoE causal LM, fp8 block-scale weights, TP8.
        ``model_kwargs.kernels`` is ``auto`` (the tuned kernels) or ``reference``, the numerics
        anchor, served eager. ``configs/glm52_tp8_mtp.yaml`` drafts with MTP k=3 (greedy only).
+       ``configs/glm52_tp8_longctx.yaml`` serves 256k tokens on the paged DSA (``dsa_long_context``).
    * - ``orpheus``
      - ``canopylabs/orpheus-3b-0.1-ft``
      - TTS: Llama 3.2 3B LLM emitting audio tokens + SNAC 24 kHz decoder.
@@ -600,8 +601,9 @@ GLM-5.2 / GLM-5.3-Flash (``glm52``, ``glm5_next``)
 - GLM-5.2's ``max_tokens`` may run to its serving window (``index_topk``, or
   ``max_seq_len`` with ``dsa_long_context``). GLM-5.3-Flash holds contexts to
   ``index_topk`` (2048), where dense MLA computes exactly what its sparse attention does,
-  so ``max_tokens`` above 2048 is a 400 rather than being shortened; under MTP, a
-  ``max_tokens`` past the room the prompt leaves is refused too.
+  unless ``dsa_long_context`` serves up to ``max_seq_len``. A ``max_tokens`` past the window
+  is a 400 rather than being shortened; under MTP, a ``max_tokens`` past the room the
+  prompt leaves is refused too.
 
 Muse Glimmer (``muse_glimmer``)
 -------------------------------

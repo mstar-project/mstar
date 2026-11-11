@@ -45,7 +45,7 @@ def _ctx(tables, row_req, positions, device, max_pools=None, graph=False):
         starts.append(len(flat))
         flat.extend(t)
     spans = None if graph else [(r, 1, q) for r, q in enumerate(row_req)]
-    return dsa.KPoolContext(
+    return dsa.DSAContext(
         pos=torch.tensor(positions, dtype=torch.int32, device=device),
         row_req=torch.tensor(row_req, dtype=torch.int32, device=device),
         pages=torch.tensor(flat, dtype=torch.int32, device=device),
@@ -89,7 +89,7 @@ def test_decode_selection_matches_torch(lens):
     q = torch.randn(len(lens), NH, D, device=DEV).bfloat16()
     w = torch.randn(len(lens), NH, device=DEV)
     ctx = _ctx(tables, list(range(len(lens))), positions, DEV)
-    scores = dsa._decode_scores(q, w, view, ctx)
+    scores = dsa._decode_scores(q, w, view, ctx, ctx.pos, ctx.row_req, ctx.max_pools)
     ref = dsa._scores_torch(q, w, view, ctx, ctx.row_req.long(), ctx.pos, ctx.max_pools)
     for r, p in enumerate(positions):
         n = (p + 1) // KP
@@ -208,5 +208,6 @@ def test_captured_decode_matches_eager():
         graph.replay()
         eager_ctx = _ctx(tables, list(range(rows)), positions, DEV)
         slots = dsa.select(q, w, view, eager_ctx)
-        want = dsa.sparse_attend(q_nope, q_pe, latent, slots, eager_ctx, 0.0625, eager)
+        eager_ctx.eager = eager
+        want = dsa.sparse_attend(q_nope, q_pe, latent, slots, eager_ctx, 0.0625)
         assert torch.allclose(out.float(), want.float(), atol=1e-2, rtol=1e-2), trial

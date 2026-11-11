@@ -491,7 +491,7 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
                       for r0, n, req in ctx.spans if r0 < end and r0 + n > start]
             ends = [(i, r - start) for i, r in enumerate(last) if start <= r < end]
             rows = _upload(self._long_stager, [r for _, r in ends] or [end - start - 1], input_ids.device)
-            with dsa.rows(start, end, pieces, LABEL), kv.token_window(start, end, LABEL), \
+            with dsa.rows(start, end, LABEL), kv.token_window(start, end, LABEL), \
                     kda.token_window([(req, b - a) for a, b, req in pieces], LABEL):
                 out = self.language_model.model(input_ids[start:end], rows=rows)
             for k, (i, _) in enumerate(ends):

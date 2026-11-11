@@ -126,6 +126,9 @@ class _Node:
             )
             for spec in specs
         }
+        for spec in specs:  # as the engine binds them (the DSA resource reads its KV pool)
+            self.resources[spec.resource_key].bind_dependencies(
+                {key: self.resources[key] for key in spec.depends_on()})
         self.runner = StepRunner(self.resources, node_resources={NODE: list(self.resources)})
         submodule.bind_node_resources(self.resources)
         self.overrides = model.get_request_resource_configs(
@@ -160,7 +163,9 @@ class _Node:
         lease = None
         if self.cg is not None:
             lease = self.cg.lease_slot(walk, len(rids), slot=0, num_tokens=num_tokens)
-            assert lease is not None, f"no captured bucket for {walk} bs={len(rids)}"
+            if lease is None:  # fine only for a walk the submodule does not capture
+                walks = {c.capture_graph_walk for c in self.sub.get_accelerator_graph_configs(DEVICE)}
+                assert walk not in walks, f"no captured bucket for {walk} bs={len(rids)}"
         step_ids, meta = rids, infos
         if lease is not None:
             inputs = self.cg.pad_inputs(lease, inputs)
@@ -291,4 +296,53 @@ def test_capture_with_fused_mla_prep_matches_eager_and_unfused(tmp_path, monkeyp
     for rid, stream in streams[True].items():
         assert len(stream) == MAX_TOKENS and len(set(stream)) > 2, (rid, stream)
         assert stream == streams["eager"][rid], (rid, stream, streams["eager"][rid])
+        assert stream == streams[False][rid], (rid, stream, streams[False][rid])
+
+
+# the dense arm runs uncompiled: compiled, Inductor's arithmetic flips its last token at a
+# near tie (its eager forward, captured, matches token for token)
+@pytest.mark.parametrize("topk,compiled", [(8, True), (16, False)],
+                         ids=["bucket-selects", "bucket-dense"])
+def test_paged_dsa_capture_matches_eager(tmp_path, monkeypatch, topk, compiled):
+    """Captured DSA steps emit the eager tokens: a padded prefill bucket that selects (wider
+    than index_topk) or attends densely, and sparse decode on the slot's re-planned plan."""
+    monkeypatch.setattr(AcceleratorGraphRunner, "CAPTURE_BATCH_SIZES", [1, 2, 4])
+    overrides = dict(dsa_long_context=True, index_topk=topk, index_n_heads=16,
+                     index_head_dim=64, max_seq_len=64,  # the indexer ropes its first 64 dims
+                     graph_compile=compiled)
+    model, submodule = _load(tmp_path, monkeypatch, False, cfg_overrides=overrides)
+    walks = [c.capture_graph_walk for c in submodule.get_accelerator_graph_configs(DEVICE)]
+    assert walks == ["decode", "prefill"]
+    eager = _Node(model, submodule, capture=False, prompts=PROMPTS)
+    eager_streams = eager.generate()
+    eager.close()
+    node = _Node(model, submodule, capture=True, prompts=PROMPTS)
+    assert node.cg.any_graphs and node.cg.dropped_buckets == []
+    captured_streams = node.generate()
+    node.close()
+    for rid, stream in eager_streams.items():
+        assert len(stream) == MAX_TOKENS and len(set(stream)) > 2, (rid, stream)
+        assert captured_streams[rid] == stream, (rid, captured_streams[rid], stream)
+
+
+@pytest.mark.parametrize("compiled", [False, True], ids=["eager-forward", "compiled"])
+def test_paged_dsa_with_fused_mla_prep_matches_the_unfused_path(tmp_path, monkeypatch, compiled):
+    """Captured with the fused MLA prep, the selecting path emits the op-by-op path's tokens
+    (q_lora_rank 256: a width the fused norms take)."""
+    monkeypatch.setattr(AcceleratorGraphRunner, "CAPTURE_BATCH_SIZES", [1, 2, 4])
+    streams = {}
+    for fused_prep in (False, True):
+        ckpt = tmp_path / f"fused{int(fused_prep)}"
+        ckpt.mkdir()
+        overrides = dict(dsa_long_context=True, index_topk=8, index_n_heads=16,
+                         index_head_dim=64, max_seq_len=64, q_lora_rank=256,
+                         graph_compile=compiled)
+        model, submodule = _load(ckpt, monkeypatch, False, cfg_overrides=overrides)
+        _fused_prep(submodule, fused_prep)
+        node = _Node(model, submodule, capture=True, prompts=PROMPTS)
+        assert node.cg.any_graphs and node.cg.dropped_buckets == []
+        streams[fused_prep] = node.generate()
+        node.close()
+    for rid, stream in streams[True].items():
+        assert len(stream) == MAX_TOKENS and len(set(stream)) > 2, (rid, stream)
         assert stream == streams[False][rid], (rid, stream, streams[False][rid])
