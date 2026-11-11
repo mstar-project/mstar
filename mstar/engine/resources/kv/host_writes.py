@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 import torch
 
 from mstar.engine.resources.base import StepAllowance
+from mstar.engine.resources.kv.cache import KVCache
 from mstar.engine.resources.kv.cpu_page_pool import CPUPagePool, PageCopies
 from mstar.engine.resources.kv.prefix_index import PrefixIndex
 
@@ -144,7 +145,7 @@ class HostWrites:
             key = self._index.parent_key(self._index.page_for(key))
         return chain[::-1], None
 
-    def launch(self, write: HostWrite, gpu_kv_cache: torch.Tensor, lock) -> None:
+    def launch(self, write: HostWrite, gpu_kv_cache: "KVCache | torch.Tensor", lock) -> None:
         """Queue ``write``'s copies, without the lock. A copy that fails to launch cancels the write, since
         the pages stay cached on the device."""
         try:

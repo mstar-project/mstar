@@ -287,7 +287,10 @@ def test_a_verify_rows_per_request_stop_check_never_passes_silently():
     from mstar.engine.resources.draft.node import DrafterShare
     from mstar.model.submodule_base import ARNodeSubmodule
 
-    share = DrafterShare("decode", "sampler", K, frozenset({"prefill"}), frozenset(), {}, {})
+    share = DrafterShare(
+        verify_walk="decode", sampler_key="sampler", num_draft_tokens=K, prompt_walks=frozenset({"prefill"}),
+        prompt_writes=frozenset(), verify_writes=frozenset(), prompt_steps={}, verify_steps={},
+    )
     sub = SimpleNamespace(token_stop=_node().token_stop, drafter_share=share)
     sub.is_verify_walk = ARNodeSubmodule.is_verify_walk.__get__(sub)
     info = SimpleNamespace(graph_walk="decode")

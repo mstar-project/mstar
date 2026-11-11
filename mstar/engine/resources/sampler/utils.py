@@ -2326,11 +2326,15 @@ class RowBuffer:
     """``Buffer`` for a per-request row of ``width`` values (a declared
     ``LoopbackState``): ``buf`` ``[cg_slots, max_bs, width]`` is the per-step
     row a captured forward writes, ``master`` ``[capacity, width]`` the slot
-    cache commit scatters it to and the next step gathers from."""
+    cache commit scatters it to and the next step gathers from, and ``read``
+    ``[cg_slots, max_bs, width]`` the rows staged off the master for a captured
+    forward to read (`SamplerBuffers.stage_loopback`)."""
     buf: torch.Tensor
     master: torch.Tensor
     default: torch.Tensor  # [width], on the device
+    read: torch.Tensor | None = None
     _slot_views: dict = field(default_factory=dict)
+    _read_views: dict = field(default_factory=dict)
 
     @classmethod
     def allocate(
@@ -2342,6 +2346,7 @@ class RowBuffer:
             buf=row.repeat(cg_slots, max_bs, 1),
             master=row.repeat(capacity, 1),
             default=row,
+            read=row.repeat(cg_slots, max_bs, 1),
         )
 
     def grow_master(self, new_capacity: int) -> None:
@@ -2358,6 +2363,14 @@ class RowBuffer:
         view = self._slot_views.get(key)
         if view is None:
             view = self._slot_views[key] = self.buf[cg_slot, :bs]
+        return view
+
+    def read_view(self, cg_slot: int, bs: int) -> torch.Tensor:
+        """This slot's staged rows, memoized: a fixed address a captured forward reads."""
+        key = (cg_slot, bs)
+        view = self._read_views.get(key)
+        if view is None:
+            view = self._read_views[key] = self.read[cg_slot, :bs]
         return view
 
     def scatter(
@@ -2737,8 +2750,9 @@ class SamplerBuffers:
             last_token=Buffer.allocate(max_batch_size, graph_rows, device, torch.long, 0, cg_slots),
             tp_group=tp_group,
             seen_tokens=seen_tokens,
-            # a captured forward reads these masters (`gather_loopback`), so with the in-graph
-            # scatter they are allocated once at its rows, like offset and last_token
+            # with the in-graph scatter they are allocated once at its rows, like offset and
+            # last_token; a captured read of a bound state goes through the staged rows
+            # (`stage_loopback`), not these masters
             loopback={
                 name: RowBuffer.allocate(
                     max_batch_size, graph_rows if ingraph_scatter else rows, device, state.dtype, state.default,
@@ -2895,7 +2909,14 @@ class SamplerBuffers:
         if not self.ingraph_scatter:
             for buf in self.loopback.values():
                 buf.grow_master(rows)
+            # rare (the rows double), and every row's master moves
+            logger.info("sampler masters grew to %d request rows", cap)
         self._device_capacity = cap
+
+    @property
+    def live_rows(self) -> int:
+        """Requests that hold a master row of their own (padding rows read the trash row)."""
+        return sum(slot != self._trash_slot for slot in self._rid_to_slot.values())
 
     @property
     def free_rows(self) -> int:
@@ -3335,6 +3356,21 @@ class SamplerBuffers:
         return self.loopback[name].master.index_select(
             0, self._slot_idx_gpu[cg_slot, :padded_bs] if index is None else index
         )
+
+    def stage_loopback(
+        self, names, cg_slot: int, padded_bs: int, index: torch.Tensor | None = None,
+    ) -> None:
+        """Each state in ``names``, for the batch staged on ``cg_slot``, off the
+        masters into the slot's fixed read rows (`RowBuffer.read_view`), outside
+        any graph: a captured forward reads those, so a master may grow into a
+        new tensor (above one rank they do) without moving what the graph
+        reads. Call after the slot's index row is up (``gather_dynamic``,
+        ``gather_rows``), on the stream the previous step's commit scattered on."""
+        self._sync_loopback()
+        idx = self._slot_idx_gpu[cg_slot, :padded_bs] if index is None else index
+        for name in names:
+            buf = self.loopback[name]
+            torch.index_select(buf.master, 0, idx, out=buf.read_view(cg_slot, padded_bs))
 
     def loopback_for(self, name: str, request_ids: list[str]) -> torch.Tensor:
         """Rows of state ``name`` of registered requests, for an eager step."""

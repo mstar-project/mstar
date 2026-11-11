@@ -432,11 +432,12 @@ class _HostPool(host_index._HostPool):
 
     def copy_out(self, gpu_kv_cache, copies):
         super().copy_out(gpu_kv_cache, copies)
-        self.cpu[:, copies.cpu] = gpu_kv_cache[:, copies.gpu]
+        # the toy's pool has the one storage
+        self.cpu[:, copies.cpu] = gpu_kv_cache.tensor[:, copies.gpu]
 
     def copy_in(self, gpu_kv_cache, copies):
         super().copy_in(gpu_kv_cache, copies)
-        gpu_kv_cache[:, copies.gpu] = self.cpu[:, copies.cpu]
+        gpu_kv_cache.tensor[:, copies.gpu] = self.cpu[:, copies.cpu]
 
 
 def _hosted(max_num_pages: int, host_pages: int = 64):

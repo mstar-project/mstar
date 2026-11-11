@@ -566,6 +566,9 @@ class _PlacedKV:
     pool's does (``write_slots``) and the cache's own scatter."""
 
     write_kv = KVManager.write_kv
+    _write_state = KVManager._write_state
+    # its one layer is in no lagged layer set (`KVStep.lag`), so a write takes the layer's own addressing
+    _lags, _layer_set_of = False, (None,)
 
     def __init__(self, placement, case: _Case):
         self.placement, self._sequence_shard = placement, None

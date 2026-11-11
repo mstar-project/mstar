@@ -35,7 +35,7 @@ from mstar.engine.resources.position.rope import (
 from mstar.engine.resources.resident import gather_column
 from mstar.engine.resources.resident_hooks import ANY_REPEATS
 from mstar.engine.resources.sequence_shard import check_shard_plan
-from mstar.engine.resources.step import ADMIT_OK, AdmitOutcome, StepContext
+from mstar.engine.resources.step import ADMIT_OK, AdmitOutcome, Lag, StepContext
 
 # a LongRoPE plan label's table ids, keyed beside its positions
 _TABLE_IDS = "#longrope"
@@ -199,6 +199,15 @@ class RopeManager(PositionManager):
         # ranks; swapped with the ids
         self._current_split_pos_ids: dict[str, torch.Tensor] = {}
         self._preplan_split_pos_ids: dict[str, torch.Tensor] = {}
+        # plan label -> each pass's lagged positions, for a lagged step (`PositionStep.lag`)
+        self._current_lagged: dict[str, list[torch.Tensor]] = {}
+        self._preplan_lagged: dict[str, list[torch.Tensor]] = {}
+        # (bucket, slot) -> the lag a captured step keeps, which its resident gather derives in the graph
+        self._lagged_captures: dict[tuple, Lag] = {}
+        # (rows, span, start, n, device) -> the step's token indices of a pass's rows
+        self._pass_rows: dict[tuple, torch.Tensor] = {}
+        # the pass a lagged reader runs (`select_pass`)
+        self._draft_pass: int | None = None
         self._preplanned = False
         # (rid, to_label, counter) for each pre-fork applied, so
         # `clear_preplan` can put the targets back. Unlike KV's, these forks are
@@ -370,6 +379,7 @@ class RopeManager(PositionManager):
         self._preplanned = False
         self._preplan_pos_ids = {}
         self._preplan_split_pos_ids = {}
+        self._preplan_lagged = {}
 
     def plan(self, step: PositionStep, ctx: StepContext) -> dict[str, torch.Tensor]:
         """submits one position id vector for each plan label
@@ -379,6 +389,8 @@ class RopeManager(PositionManager):
             "position preplan is already pending; clear_preplan before "
             "planning a different step ahead"
         )
+        # a pass selected for an earlier step's reads is never this step's
+        self._draft_pass = None
         if ctx.resident is not None:
             # the replay fills the slot's buffer from the tables itself
             return self._current_pos_ids
@@ -435,6 +447,18 @@ class RopeManager(PositionManager):
                 split_out[plan_label] = (
                     r.local(ids) if r.rows is None else r.local(ids[: r.rows * sum(r.counts)].view(r.rows, -1), 1)
                 )
+        lagged_out = self._preplan_lagged if ctx.is_preplan else self._current_lagged
+        lagged_out.clear()
+        if step.lag is not None:
+            if shard_plan is not None:
+                raise ValueError("positions: a lagged step can't split over SP ranks")
+            for plan_label, pos_ids in pos_ids_out.items():
+                rows = lease.bucket.bs if lease is not None else pos_ids.shape[0] // sum(step.lag.passes)
+                lagged_out[plan_label] = [
+                    self._lag(pos_ids, plan_label, lease, step.lag, p, rows) for p in range(len(step.lag.passes))
+                ]
+            if lease is not None:
+                self._lagged_captures[(lease.bucket, lease.slot)] = step.lag
         self._preplanned = ctx.is_preplan
         return pos_ids_out
 
@@ -443,6 +467,8 @@ class RopeManager(PositionManager):
         self._current_split_pos_ids = self._preplan_split_pos_ids
         self._preplan_pos_ids = {}
         self._preplan_split_pos_ids = {}
+        self._current_lagged = self._preplan_lagged
+        self._preplan_lagged = {}
         self._preplanned = False
         # Promotion, not abandonment: the staged forks are kept, so the
         # undo record is dropped rather than replayed.
@@ -468,6 +494,35 @@ class RopeManager(PositionManager):
         del is_preplan
         return self._place(self._build_pos_ids(rows, plan_label, lease), plan_label, lease)
 
+    def _pass_index(self, rows: int, lag: Lag, p: int) -> torch.Tensor:
+        """The step's token index of each of pass ``p``'s rows, row-major: a constant of the bucket."""
+        span, start, n = sum(lag.passes), lag.starts[p], lag.passes[p]
+        key = (rows, span, start, n, self._device)
+        index = self._pass_rows.get(key)
+        if index is None:
+            index = self._pass_rows[key] = (
+                torch.arange(rows)[:, None] * span + start + torch.arange(n)
+            ).reshape(-1).to(self._device)
+        return index
+
+    def _lag(self, pos_ids: torch.Tensor, plan_label: str, lease, lag: Lag, p: int, rows: int) -> torch.Tensor:
+        """Pass ``p``'s rows of the step's positions less ``lag.rows``, floored at 0 (a padding row's would
+        index a rotary table at -1), into a lagged reader's own buffer under a lease. Derived on the device
+        from the placed positions, so it follows them on every path: host-staged, or gathered in the graph
+        (`resident_gather`)."""
+        index = self._pass_index(rows, lag, p)
+        if lease is None:
+            return (pos_ids.index_select(0, index) - lag.rows).clamp_(min=0)
+        key = CGSlotKey(bucket=lease.bucket, slot=lease.slot, label=(plan_label, "lag", p))
+        buffer = self._static_buffer(key, index.shape[0])
+        torch.index_select(pos_ids, 0, index, out=buffer)
+        buffer.sub_(lag.rows).clamp_(min=0)
+        return buffer
+
+    def select_pass(self, p: int | None) -> None:
+        """The pass of a lagged step (`PositionStep.lag`) a lagged reader runs next; None outside one."""
+        self._draft_pass = p
+
     # Resident planning: a stream's position runs ahead of its stored length by a
     # fixed amount between host-planned steps, so a row keeps that offset
 
@@ -490,8 +545,19 @@ class RopeManager(PositionManager):
         row[self._resident_delta.col] = self.position(rid, label) - writes.kv_len[self._kv_cache_name]
 
     def resident_gather(self, step: "CapturedResidentStep") -> None:
-        key = CGSlotKey(bucket=step.bucket, slot=step.slot, label=self._resident_label(step))
-        self._gather_offset(step, self._resident_delta, self._static_buffer(key, step.bucket.num_tokens))
+        label = self._resident_label(step)
+        key = CGSlotKey(bucket=step.bucket, slot=step.slot, label=label)
+        buffer = self._static_buffer(key, step.bucket.num_tokens)
+        self._gather_offset(step, self._resident_delta, buffer)
+        lag = self._lagged_captures.get((step.bucket, step.slot))
+        if lag is not None:
+            for p in range(len(lag.passes)):
+                index = self._pass_index(step.bucket.bs, lag, p)
+                lagged = self._static_buffer(
+                    CGSlotKey(bucket=step.bucket, slot=step.slot, label=(label, "lag", p)), index.shape[0],
+                )
+                torch.index_select(buffer, 0, index, out=lagged)
+                lagged.sub_(lag.rows).clamp_(min=0)
 
     def _resident_label(self, step: "CapturedResidentStep") -> str:
         own, pool = step.streams[self._resident_key], step.streams[self._kv_cache_name]
@@ -666,6 +732,11 @@ class RopeManager(PositionManager):
         return self._counters[rid].get(label, 0)
 
     def pos_ids(self, label: str) -> torch.Tensor | None:
+        """The step's positions on ``label``; while a lagged reader runs a pass (`select_pass`), that
+        pass's lagged positions. Only the reader runs during its passes, so a layer reads its own
+        without knowing it lags."""
+        if self._draft_pass is not None and label in self._current_lagged:
+            return self._current_lagged[label][self._draft_pass]
         return self._current_pos_ids.get(label)
 
     @property
@@ -753,7 +824,11 @@ class RopeManager(PositionManager):
         SP ranks, ``q`` holds this rank's range of it, and so do the planned positions."""
         split = self._current_split_pos_ids.get(label) if self._can_split else None
         if pos_ids is None:
-            pos_ids = self._rotation_ids(label) if split is None else split.flatten()
+            if self._draft_pass is not None and label in self._current_lagged:
+                # a lagged reader's pass (`select_pass`); startup refuses a lag over LongRoPE (`draft_lag`)
+                pos_ids = self._current_lagged[label][self._draft_pass]
+            else:
+                pos_ids = self._rotation_ids(label) if split is None else split.flatten()
         elif split is not None:
             # refused on what every rank shares: the counts differ by rank, so a refusal on them could
             # stop some ranks before the exchange's collectives and hang the others

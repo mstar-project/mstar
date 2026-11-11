@@ -796,7 +796,6 @@ Worker scheduling
        the masters grow and the scatter runs after the replay, as with ``0``.
        Loop-back state masters (a drafter's carry, Whisper's timestamp rule)
        are allocated once too.
-       A drafter with a carry is refused at startup where the masters grow.
    * - ``MSTAR_SAMPLER_SLOTS``
      - config's ``knobs: sampler_slots``, else ``4096``
      - Request rows of the sampler masters a captured graph indexes when
@@ -829,9 +828,12 @@ Worker scheduling
        ``Engine.reload_request`` compare each resource's ``debug_fingerprint`` of the request
        at offload and at reload (its KV pages over every layer, its recurrent slots, the
        sampler's loop-back rows) and raise on a difference; ``ResidentPlanner.flush`` reads
-       each rewritten resident row back against the host's values. Around each state op that
-       runs its fused kernel in an eager step, checks that the array changed only at the
-       step's slots, through a host copy of the array. Host syncs: tests and debugging only.
+       each rewritten resident row back against the host's values. Above one rank, each step
+       that stores a drafter's carry compares its digest with rank 0's on the device (one
+       broadcast a step) and logs how many differed
+       (``SamplerResource._compare_carry_with_rank_0``). Around each state op that runs its
+       fused kernel in an eager step, checks that the array changed only at the step's slots,
+       through a host copy of the array. Host syncs: tests and debugging only.
 
 Compilation
 -----------

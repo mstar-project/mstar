@@ -28,6 +28,27 @@ class Segment(NamedTuple):
     span: int
 
 
+class Lag(NamedTuple):
+    """A reader that trails a verify step's block by ``rows`` and runs over it in passes (a draft model
+    one token behind its target, `DrafterNeeds.lag`). Pass ``p`` covers rows ``starts[p] ..
+    starts[p] + passes[p] - 1`` of each request's block, and attends through ``extent(p)`` tokens past
+    the request's stored length. The engine sets it on a verify step's KV, position and attention steps;
+    the reader picks the pass it runs (``select_pass``)."""
+    rows: int
+    passes: tuple[int, ...]
+
+    @property
+    def starts(self) -> tuple[int, ...]:
+        out, at = [], 0
+        for n in self.passes:
+            out.append(at)
+            at += n
+        return tuple(out)
+
+    def extent(self, p: int) -> int:
+        return self.starts[p] + self.passes[p] - self.rows
+
+
 @dataclass(frozen=True)
 class ResourceStep:
     # Work for one resource, for one step
