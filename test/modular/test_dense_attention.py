@@ -30,11 +30,10 @@ from mstar.engine.resources import (
     StepContext,
 )
 from mstar.engine.resources.attn import dense as dense_module
+from mstar.engine.resources.attn import fa3 as fa3_module
 from mstar.engine.resources.attn.base import AttentionManager
-from mstar.engine.resources.attn.dense import (
-    DenseAttentionManager,
-    _fa3_unavailable_reason,
-)
+from mstar.engine.resources.attn.dense import DenseAttentionManager
+from mstar.engine.resources.attn.fa3 import _fa3_unavailable_reason
 from mstar.engine.resources.attn.flashinfer import FlashInferManager
 from mstar.engine.resources.attn.ragged.dense_wrappers import DensePrefixedPrefillWrapper
 from mstar.engine.resources.attn.ragged.wrappers import FlashInferPrefixedPrefillWrapper
@@ -272,7 +271,7 @@ class TestBackendSelection:
         availability forced; nothing runs, so this passes on CPU."""
         monkeypatch.setattr(dense_module, "workspace_bytes", lambda: 1024)
         monkeypatch.setattr(DenseAttentionManager, "_check_flashinfer_backend", lambda self: None)
-        monkeypatch.setattr(dense_module, "_fa3_unavailable_reason", lambda device=None: fa3_reason)
+        monkeypatch.setattr(fa3_module, "_fa3_unavailable_reason", lambda device=None: fa3_reason)
         monkeypatch.setattr(
             dense_module, "_flashinfer_ragged_unavailable_reason", lambda device=None: flashinfer_reason,
         )
@@ -319,7 +318,7 @@ class TestBackendSelection:
         from mstar.engine.resources.attn.ragged.base import dense_or_flashinfer
 
         for reason, want in ((None, "dense"), ("no kernel", "flashinfer")):
-            monkeypatch.setattr(dense_module, "_fa3_unavailable_reason", lambda device=None, r=reason: r)
+            monkeypatch.setattr(fa3_module, "_fa3_unavailable_reason", lambda device=None, r=reason: r)
             assert dense_or_flashinfer(torch.device("cuda", 0), "dense", "flashinfer", "Test") == want
 
     def test_dense_without_fa3_or_flashinfer_goes_paged(self, monkeypatch, caplog):

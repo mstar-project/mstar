@@ -28,7 +28,7 @@ from mstar.engine.resources import (
     StepContext,
     cross_label,
 )
-from mstar.engine.resources.attn.dense import _fa3_unavailable_reason
+from mstar.engine.resources.attn.fa3 import _fa3_unavailable_reason
 from mstar.engine.resources.attn.ragged.dense import DenseRaggedCrossManager, DenseRaggedManager
 from mstar.engine.resources.attn.ragged.dense_wrappers import (
     DenseRaggedCrossPrefillWrapper,

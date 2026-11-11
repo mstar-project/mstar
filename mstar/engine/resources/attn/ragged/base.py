@@ -100,7 +100,7 @@ def dense_or_flashinfer(device: torch.device, dense, flashinfer, what: str):
     else ``flashinfer``. The one place that choice is made, for the ragged
     managers and the KV-backed dense backend's wrappers alike; ``what`` names
     the caller in the log line."""
-    from mstar.engine.resources.attn.dense import _fa3_unavailable_reason
+    from mstar.engine.resources.attn.fa3 import _fa3_unavailable_reason
     from mstar.engine.resources.attn.ragged.dense import _warn_dense_on_flashinfer
 
     reason = _fa3_unavailable_reason(device)
