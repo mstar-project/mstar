@@ -646,6 +646,86 @@ def _over_ranks(rank, world, backend, store, over_sp, rows, captured=False, padd
         dist.destroy_process_group()
 
 
+class _OneRank:
+    """A Qwen3.5 layer's KV handle as one rank attending every key: ``case``'s stored context, then
+    the k and v the layer adds, which it writes into ``case`` as the step's own tokens."""
+
+    def __init__(self, case: _Case):
+        self.case = case
+
+    def add(self, layer, *, k, v):
+        new, at = torch.stack([k, v], 1), 0
+        for kv, (context, n) in zip(self.case.keys, self.case.rows, strict=True):
+            kv[context:] = new[at:at + n]
+            at += n
+
+    def read(self, layer, q):
+        self.case.q = q.contiguous()
+        return self.case.want()
+
+
+def _layer_over_ranks(rank, world, store):
+    """One rank of an SP placement running a Qwen3.5 attention layer through its KV handle on a
+    prefill, against the same layer attending every key on one rank."""
+    from mstar.engine.state.adapters import build_handle
+    from mstar.engine.state.analysis import position_key
+    from mstar.engine.state.contract import ArrayStep
+    from mstar.model.qwen3_5.components.language_model import Qwen3_5Attention, RopeCache
+    from mstar.model.qwen3_5.config import ATTN
+
+    os.environ["MSTAR_WORKSPACE_BUFFER_MB"] = "1"
+    dist.init_process_group("gloo", init_method=f"file://{store}", rank=rank, world_size=world)
+    torch.set_num_threads(1)
+    sys.modules["flashinfer"] = _reference_flashinfer()
+    group = CommGroup(rank, rank, list(range(world)))
+    group.device_group, group.initialized = dist.group.WORLD, True
+    try:
+        joint = JointGroups(tp_group=CommGroup.trivial(), sp_group=group, instance=group)
+        attn, placement = _cp_attention(joint, CPU, torch.float32)
+        (array,) = [a for a in _qwen3_5(NODE, {}, None, None).declare_state() if a.name == KV_CACHE]
+        (layer_id,) = array.layers
+        torch.manual_seed(0)
+        rope = RopeCache()
+        layer = Qwen3_5Attention(
+            rope_cache=rope, hidden_size=32, num_heads=Q_HEADS, num_kv_heads=1, head_dim=HEAD_DIM, qk_norm=True,
+            attn_key=ATTN, kv_key=KV_CACHE, pos_key=None, layer=layer_id,
+        )
+        for param in layer.parameters():
+            param.data.normal_(0, 0.1)
+        case = _Case.build(PREFILL_ROWS, CPU, torch.float32)
+        n = case.q.shape[0]
+        hidden = torch.randn(n, 32)
+        # a rotation of none: the handle, not the rope, is under test
+        rope.set(torch.ones(n, 16), torch.zeros(n, 16))
+        layer.bind_state({KV_CACHE: _OneRank(case)})
+        want = layer(hidden)
+
+        _plan(attn, case)
+        cache = case.cache(placement)
+        pool = types.SimpleNamespace(
+            layer_view=lambda i: cache, write_kv=lambda *args, **kwargs: None, opens_label=lambda *args: True,
+        )
+        handle = build_handle(array, {KV_CACHE: pool, ATTN: attn, position_key(array): None})
+        step = types.SimpleNamespace(
+            state={KV_CACHE: ArrayStep()}, segments=tuple(
+                Segment(view.request_id, "main", new) for view, (_, new) in zip(case.views, case.rows, strict=True)
+            ),
+            ctx=types.SimpleNamespace(replays=False, capture=False),
+        )
+        handle.begin_step(step)
+        layer.bind_state({KV_CACHE: handle})
+        torch.testing.assert_close(layer(hidden), want)
+        handle.end_step(step)
+    finally:
+        group.device_group = None
+        dist.destroy_process_group()
+
+
+def test_a_qwen3_5_layer_attends_a_placed_pool_through_its_handle_like_one_rank(tmp_path):
+    # a prefill attends its own tokens from the k and v the layer adds, beside the pool
+    mp.spawn(_layer_over_ranks, args=(P, str(tmp_path / "store")), nprocs=P)
+
+
 @pytest.mark.parametrize("attention, refused", [
     # as long as the pool's sequences, so it keeps no window of pages and gets past the window checks
     (dict(sliding_window=64), "sliding_window"),
