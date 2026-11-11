@@ -383,6 +383,18 @@ def test_a_drafter_that_doesnt_fit_its_target_is_refused(tmp_path, change, messa
     assert any(message in p for p in problems), problems
 
 
+@pytest.mark.parametrize("change", [{"num_key_value_heads": 4}, {"head_dim": 8}], ids=["kv_heads", "head_dim"])
+def test_a_drafter_of_another_kv_geometry_is_refused_at_startup(tmp_path, change):
+    """Its layers get a storage of their own in the pool, but its attention would plan with the
+    pool's geometry: refused until an attention binding plans with its set's."""
+    target, dspark = write_checkpoints(tmp_path, dspark=change)
+    model = make_model(target, draft_block(dspark, 3))
+    specs = {spec.resource_key: spec for spec in model.get_node_resources()}
+    assert specs["kv_cache"].config.layer_set_storage("dspark") == 1
+    problems = _problems(model)
+    assert any("no attention over KV 'kv_cache' plans with it" in p for p in problems), problems
+
+
 def test_a_drafter_that_cant_join_the_pool_is_reported_once(tmp_path, monkeypatch):
     """Its join fails while the model declares its resources: validation lists that, and the
     speculative-decoding checks, which read the declarations, add nothing on top."""

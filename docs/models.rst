@@ -106,8 +106,9 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
        one entry; the server refuses to start otherwise.
    * - ``qwen3_8b``
      - ``Qwen/Qwen3-8B``
-     - Dense Qwen3 text chat, optionally with a DSpark drafter for speculative
-       decoding (``configs/qwen3_8b_dspark.yaml``); see the notes below.
+     - Dense Qwen3 text chat, optionally with a DSpark, EAGLE-3 or separate draft-model drafter
+       for speculative decoding (``configs/qwen3_8b_dspark.yaml``, ``qwen3_8b_eagle3.yaml``,
+       ``qwen3_8b_draft_model.yaml``); see the notes below.
    * - ``qwen3_5_{0.8,2,4,9,27}b``
      - ``Qwen/Qwen3.5-4B``
      - Hybrid-attention VLM (text + image in, text out): gated DeltaNet linear
@@ -668,6 +669,26 @@ vocabulary or dtype differ from the target's, or that reads a layer the target
 lacks. ``mode: auto`` runs asynchronously where FA3's paged kernel serves the
 verify step (Hopper) and synchronously elsewhere; the startup log names the mode
 and why. :doc:`serving` covers the ``draft`` block for operators.
+
+``configs/qwen3_8b_eagle3.yaml`` drafts with EAGLE-3
+(``RedHatAI/Qwen3-8B-speculator.eagle3``, ``k = 3``, its trained depth): one decoder layer reading
+the streams entering target layers 2, 18 and 33 (a checkpoint may name its own), chaining its
+passes like Qwen3.5's MTP head, over a 32,000-token vocabulary that its ``d2t`` table maps back to
+the target's. Its K/V is one more layer of the pool (36 + 1).
+
+``configs/qwen3_8b_draft_model.yaml`` drafts with Qwen3-0.6B (``k = 3``, at most 4): a separate
+draft model with its own 28 layers and 16 query heads. Its KV is a layer set of the target's pool
+(36 + 28 layers; one of another KV geometry gets a storage of its own over the same pages). It
+runs a token behind the target: a verify step's block for it is the target's shifted back one
+row, run in one-row passes after a first pass of two (``[prev, bonus]``), each attending through
+its own extent; its row 0 rewrites the token before the block only when the target accepted every
+draft last step. A prompt step writes every prompt row for it, one-token prompts included. With
+FlashInfer verify its passes are planned on the host (synchronous mode only); FA3 plans them on
+the device.
+
+EAGLE-3 and the draft model, like DSpark, also draft on a tensor-parallel node: both verified at
+TP2 on 2xH100 in synchronous and asynchronous mode. No TP config ships for them; set
+``node_groups`` as ``configs/qwen3_8b_dspark_tp2.yaml`` does.
 
 Qwen3.5 / Qwen3.8 (``qwen3_5_*``, ``qwen3_8_27b``)
 --------------------------------------------------

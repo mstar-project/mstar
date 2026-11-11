@@ -920,14 +920,27 @@ one target pass) turns it on with a ``draft`` block; without one it decodes as u
 
    model_kwargs:
      draft:
-       method: dspark                              # the drafter
-       model: deepseek-ai/dspark_qwen3_8b_block7   # its checkpoint
-       num_draft_tokens: 7
+       method: dspark                              # dspark | eagle3 | draft_model | mtp (Qwen3.5's own head)
+       model: deepseek-ai/dspark_qwen3_8b_block7   # its checkpoint (none for mtp)
+       num_draft_tokens: 7                         # k; eagle3 and draft_model default to 3
        mode: auto                                  # auto | synchronous | asynchronous
 
 ``mode: auto`` runs asynchronously (the next step planned while one runs) where every rank
 can, which needs FlashAttention-3 on Hopper (see :doc:`installation`), and synchronously
-otherwise, logging why; ``asynchronous`` refuses to start where it can't run. The engine
+otherwise, logging why; ``asynchronous`` refuses to start where it can't run.
+
+``method: eagle3`` (Qwen3; e.g. ``RedHatAI/Qwen3-8B-speculator.eagle3``) reads the
+``speculators`` library's checkpoints and the EAGLE authors' Llama-style ones; ``k`` defaults to
+3 and runs to 7, with a warning past the depth the checkpoint was trained to chain. Variants no
+supported checkpoint uses are refused at startup: more than one decoder layer,
+``norm_before_fc``, ``fc_norm``, ``norm_output``, parallel drafting, biases. ``method:
+draft_model`` (Qwen3; e.g. ``Qwen/Qwen3-0.6B`` for Qwen3-8B) drafts with a smaller model of
+the target's family; ``k`` defaults to 3 and runs to 4, the largest value measured under the
+target's verify step (``k = 7`` is over it at every row count). Startup refuses a draft model outside the Qwen3 dense family, a
+mixture-of-experts or sliding-window one, and one with another vocabulary or tokenizer. Its
+attention's ``verify_backend`` defaults to ``auto``, which takes FA3 where it runs (Hopper), so
+asynchronous mode needs nothing set there; an explicit ``verify_backend: flashinfer`` plans on the
+host and keeps the node synchronous (``asynchronous`` refuses it). The engine
 refuses unknown keys, and a block on a model that serves none. Requests on such a
 deployment can't ask for ``repetition_penalty`` other than 1, ``repetition_window``,
 ``min_tokens``, ``return_logprobs`` or ``penalize_prompt: false`` (see :doc:`clients`).
