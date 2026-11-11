@@ -25,7 +25,7 @@ use serde_json::{json, Map, Value};
 
 use super::audio::{self, AudioFormat, OPENAI_PCM_RATE};
 use super::resample::StreamResampler;
-use super::{append_error, clip, error_event, event, excerpt, invalid, object};
+use super::{append_error, call_error, error_event, event, excerpt, invalid, object, open_call, stream_audio};
 use crate::adapters::SubmitArgs;
 use crate::serving::{AppState, Out, OutStream};
 use crate::utf8::Utf8Stream;
@@ -55,10 +55,13 @@ pub struct Facts {
     pub streams: usize,
     pub turn_tokens: bool,
     pub channels: i64,
-    /// the rest only for a model that converses
-    stream: String,
-    rate: usize,
-    frame_samples: usize,
+    /// the stream of a model that hears transcription as it comes
+    /// (`Model.live_transcription_stream`); `None`: it doesn't
+    pub(super) live: Option<LiveFacts>,
+    /// the rest only for a model that converses: its stream, and how it replies
+    pub(super) stream: String,
+    pub(super) rate: usize,
+    pub(super) frame_samples: usize,
     output_rate: usize,
     voice: Option<String>,
     idle_steps: Option<i64>,
@@ -73,10 +76,17 @@ pub fn facts() -> Option<&'static Facts> {
             let all: Value = serde_json::from_str(&std::env::var("MSTAR_REALTIME").ok()?).ok()?;
             let f = all.get("conversation")?.as_object()?;
             let int = |k: &str| f.get(k).and_then(Value::as_u64).unwrap_or(0) as usize;
+            let live = f.get("live").and_then(Value::as_object).map(|l| LiveFacts {
+                stream: l.get("stream").and_then(Value::as_str).unwrap_or_default().to_string(),
+                rate: l.get("rate").and_then(Value::as_u64).unwrap_or(0) as usize,
+                frame_samples: l.get("frame_samples").and_then(Value::as_u64).unwrap_or(0) as usize,
+                max_items: l.get("max_items").and_then(Value::as_u64).map(|n| n as usize),
+            });
             Some(Facts {
                 streams: int("streams"),
                 turn_tokens: f.get("turn_tokens").and_then(Value::as_bool).unwrap_or(false),
                 channels: f.get("channels").and_then(Value::as_i64).unwrap_or(1),
+                live,
                 stream: f.get("stream").and_then(Value::as_str).unwrap_or_default().to_string(),
                 rate: int("rate"),
                 frame_samples: int("frame_samples"),
@@ -87,6 +97,15 @@ pub fn facts() -> Option<&'static Facts> {
             })
         })
         .as_ref()
+}
+
+/// `conversation_facts`' `live`: the stream a live transcription hears.
+pub(super) struct LiveFacts {
+    pub(super) stream: String,
+    pub(super) rate: usize,
+    pub(super) frame_samples: usize,
+    /// the most samples the stream takes in a call (`None`: no bound)
+    pub(super) max_items: Option<usize>,
 }
 
 impl Facts {
@@ -106,11 +125,6 @@ impl Facts {
 
 fn hex_id(prefix: &str, n: usize) -> String {
     format!("{prefix}_{}", &uuid::Uuid::new_v4().simple().to_string()[..n])
-}
-
-/// The OpenAI error `type` for a status (`_util.error_type`).
-fn error_type(status: u16) -> &'static str {
-    if (400..500).contains(&status) { "invalid_request_error" } else { "server_error" }
 }
 
 /// A GA `realtime.response`, as `response.created` / `.done` carry it.
@@ -133,7 +147,7 @@ fn content_event(kind: &str, response_id: &str, item_id: &str, fields: Value) ->
 }
 
 /// Python's truthiness, for a JSON value.
-fn truthy(v: Option<&Value>) -> bool {
+pub(super) fn truthy(v: Option<&Value>) -> bool {
     match v {
         None | Some(Value::Null) => false,
         Some(Value::Bool(b)) => *b,
@@ -372,8 +386,7 @@ impl Conversation {
                             }
                         },
                         Some(Out::Error { status, message, .. }) => {
-                            let message = clip(&super::scrub_paths(&message, &self.st.upload_dir));
-                            self.send(error_event(&message, error_type(status), None)).await;
+                            self.send(call_error(&self.st, status, &message)).await;
                             Ending { status: "failed", code: if status >= 500 { 1011 } else { 1000 } }
                         }
                         None => Ending { status: "incomplete", code: 1000 },
@@ -639,31 +652,11 @@ impl Conversation {
         if audio.is_empty() {
             return true;
         }
-        let (Some(sub), Some(bridge)) = (self.sub, self.st.bridge.clone()) else { return false };
-        let timeout = crate::BRIDGE_PROBE_TIMEOUT * 5;
-        let reply = bridge.live_audio(sub, &self.facts.stream, &audio, timeout).await;
-        match reply.as_ref().and_then(Value::as_object) {
-            Some(meta) if meta.get("error").is_none() => meta.get("accepted").and_then(Value::as_bool).unwrap_or(false),
-            Some(meta) if meta.get("status").and_then(Value::as_u64) == Some(400) => {
-                // past the call's input budget: the call ends with it
-                let error = meta.get("error").and_then(Value::as_str).unwrap_or_default();
-                let mut op = Map::new();
-                op.insert("error".into(), Value::from(format!("append rejected: {error}")));
-                op.insert("status".into(), Value::from(400));
-                bridge.live(sub, "reject", op, timeout).await;
-                false
-            }
-            meta => {
-                let error_id = meta
-                    .and_then(|m| m.get("error_id"))
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-                    .unwrap_or_else(|| {
-                        let id = uuid::Uuid::new_v4().simple().to_string()[..12].to_string();
-                        eprintln!("realtime append failed (error id {id}, session {}): the API server did not answer", self.session_id);
-                        id
-                    });
-                self.send(error_event(&format!("the append failed (error id {error_id})"), "server_error", None)).await;
+        let Some(sub) = self.sub else { return false };
+        match stream_audio(&self.st, sub, &self.facts.stream, &audio, &self.session_id).await {
+            Ok(taken) => taken,
+            Err(error) => {
+                self.send(error).await;
                 false
             }
         }
@@ -698,31 +691,18 @@ impl Conversation {
             end_input: Some(Value::Bool(false)),
             ..SubmitArgs::default()
         };
-        let rid = crate::serving::rid(&format!("rt-{}", self.session_id));
-        let refused = match crate::serving::live_result_stream(&self.st, &args, &rid) {
-            Ok((mut stream, Some(sub))) => {
-                // The submission is the bridge's to accept: it answers `taking`
-                // only once it has, and a refusal has reached the stream by then.
-                let bridge = self.st.bridge.clone().expect("a submission went over the bridge");
-                let taking = bridge.live(sub, "taking", Map::new(), crate::BRIDGE_PROBE_TIMEOUT * 5).await;
-                if taking.as_ref().and_then(|m| m.get("taking")).and_then(Value::as_bool) == Some(true) {
-                    self.sub = Some(sub);
-                    self.output = Some(stream);
-                    self.played_until = self.now();
-                    return true;
-                }
-                match tokio::time::timeout(crate::BRIDGE_PROBE_TIMEOUT, stream.next()).await {
-                    Ok(Some(Out::Error { status, message, .. })) => (status, message),
-                    _ => (500, "the server could not open the call".to_string()),
-                }
+        match open_call(&self.st, &args, &self.session_id).await {
+            Ok((sub, output)) => {
+                self.sub = Some(sub);
+                self.output = Some(output);
+                self.played_until = self.now();
+                true
             }
-            Ok((_, None)) => (500, "this server has no backend to open the call on".to_string()),
-            Err(refused) => refused,
-        };
-        let (status, message) = refused;
-        let message = if status == 400 { clip(&super::scrub_paths(&message, &self.st.upload_dir)) } else { message };
-        self.send(error_event(&message, error_type(status), None)).await;
-        false
+            Err(error) => {
+                self.send(error).await;
+                false
+            }
+        }
     }
 
     async fn on_chunk(&mut self, chunk: crate::bridge::ResultChunk) -> Result<(), String> {

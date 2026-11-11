@@ -703,6 +703,15 @@ def test_realtime_is_gated_on_the_adapter(client_and_stub):
             ws.receive_text()
 
 
+def test_realtime_serves_a_server_built_without_a_model(client_and_stub):
+    """An API server built with no model has no live stream to look up: its
+    adapter's re-decoding session opens."""
+    client, stub = client_and_stub
+    stub.model = None
+    with client.websocket_connect("/v1/realtime") as ws:
+        assert json.loads(ws.receive_text())["type"] == "transcription_session.created"
+
+
 @pytest.mark.parametrize("transcription", [
     {"language": ["en"]},
     {"language": True},
@@ -1764,3 +1773,121 @@ def test_unsupported_events_are_errors_and_the_call_goes_on(duplex):
         _recv_until(ws, "input_audio_buffer.committed")
         assert not api.aborted
     assert len(api.submits) == 1 and len(api.appends) == 2
+
+
+class _LiveTranscriptionAPI(_DuplexAPI):
+    """A model with one audio client stream and no turn marks: one call per
+    item, whose output ends once its input does, or after an error chunk."""
+
+    def __init__(self, outputs=()):
+        from mstar.streaming.topology import PartitionTopology
+
+        super().__init__(outputs)
+        self.model.turn_tokens = None
+        self.model.get_partition_topology = lambda: PartitionTopology(["Encoder"], self.client_audio)
+        self.ended: list = []
+        self.input_ended: asyncio.Event | None = None
+
+    def stream_input(self, key, file_paths=None, end_input=False, *, samples=None, **kw):
+        assert file_paths is None
+        if end_input:
+            self.ended.append(key)
+            self.input_ended.set()
+        else:
+            self.appends.append(samples["audio_in"])
+        return True
+
+    async def _chunks(self):
+        self.input_ended = asyncio.Event()
+        for chunk in self.outputs:
+            yield chunk
+            if chunk.modality == "error":
+                return
+        await self.input_ended.wait()
+
+
+def _live_socket(monkeypatch, api, path="/v1/realtime?intent=transcription"):
+    import mstar.api_server
+    from mstar.api_server.openai import router as router_module
+
+    fake_ep = types.ModuleType("mstar.api_server.entrypoint")
+    fake_ep.api_server = api
+    monkeypatch.setitem(sys.modules, "mstar.api_server.entrypoint", fake_ep)
+    monkeypatch.setattr(mstar.api_server, "entrypoint", fake_ep, raising=False)
+    monkeypatch.setattr(router_module, "get_adapter", lambda name: adapters.TransducerAdapter())
+    app = FastAPI()
+    app.include_router(router_module.router)
+    return TestClient(app).websocket_connect(path)
+
+
+def test_transcription_of_a_live_model_streams_one_call_per_item(monkeypatch):
+    api = _LiveTranscriptionAPI([_text(0, b" hello"), _text(1, b" world")])
+    with _live_socket(monkeypatch, api) as ws:
+        assert ws.receive_json()["type"] == "transcription_session.created"
+        ws.send_text(json.dumps({"type": "input_audio_buffer.append", "audio": _pcm(0.2)}))
+        ws.send_text(json.dumps({"type": "input_audio_buffer.commit"}))
+        events = _recv_until(ws, "conversation.item.input_audio_transcription.completed")
+        assert len(api.appends) == 1 and api.appends[0].size == 3200
+        assert api.ended == [api.submits[0]["request_id"]]
+        assert "".join(e["delta"] for e in events if e["type"].endswith(".delta")) == "hello world"
+        assert events[-1]["transcript"] == "hello world"
+        # the next item is a call of its own
+        ws.send_text(json.dumps({"type": "input_audio_buffer.append", "audio": _pcm(0.1)}))
+        ws.send_text(json.dumps({"type": "input_audio_buffer.commit"}))
+        _recv_until(ws, "conversation.item.input_audio_transcription.completed")
+        assert len(api.submits) == 2
+
+
+def test_a_live_item_whose_call_fails_is_reported_failed(monkeypatch):
+    """A call that fails mid-item sends its error; the rest of the item's
+    audio goes nowhere, its commit reports it failed, not completed, and the
+    next item opens a call of its own."""
+    api = _LiveTranscriptionAPI([_text(0, b" hello"), _Chunk("error", b"boom", {"status": 500})])
+    with _live_socket(monkeypatch, api) as ws:
+        assert ws.receive_json()["type"] == "transcription_session.created"
+        ws.send_text(json.dumps({"type": "input_audio_buffer.append", "audio": _pcm(0.2)}))
+        assert _recv_until(ws, "error")[-1]["error"] == {"type": "server_error", "message": "boom"}
+        ws.send_text(json.dumps({"type": "input_audio_buffer.append", "audio": _pcm(0.2)}))
+        ws.send_text(json.dumps({"type": "input_audio_buffer.commit"}))
+        _recv_until(ws, "input_audio_buffer.committed")
+        failed = ws.receive_json()
+        assert failed["type"] == "conversation.item.input_audio_transcription.failed"
+        assert failed["error"]["message"] == "boom"
+        assert len(api.appends) == 1 and not api.ended
+        api.outputs = [_text(0, b" again")]
+        ws.send_text(json.dumps({"type": "input_audio_buffer.append", "audio": _pcm(0.1)}))
+        ws.send_text(json.dumps({"type": "input_audio_buffer.commit"}))
+        done = _recv_until(ws, "conversation.item.input_audio_transcription.completed")[-1]
+        assert done["transcript"] == "again" and len(api.submits) == 2
+
+
+def test_a_live_model_transcribes_with_intent_omitted(monkeypatch):
+    """Transcription is the intent a live transcription model serves, so an
+    omitted intent opens it; an intent it can't serve is refused with a
+    close reason within RFC 6455's 123 bytes, however long the intent."""
+    with _live_socket(monkeypatch, _LiveTranscriptionAPI(), "/v1/realtime") as ws:
+        assert ws.receive_json()["type"] == "transcription_session.created"
+    with pytest.raises(WebSocketDisconnect) as refused:
+        with _live_socket(monkeypatch, _LiveTranscriptionAPI(), "/v1/realtime?intent=" + "x" * 200) as ws:
+            ws.receive_text()
+    assert refused.value.code == 1008 and len(refused.value.reason.encode()) <= 123
+
+
+def test_a_live_session_refuses_what_it_cannot_apply(monkeypatch):
+    """The re-decoding knobs and a prompt do nothing on a live model, so an
+    update naming them is refused, as is a language change while an item's
+    call is open; the session shows no re-decoding knobs."""
+    api = _LiveTranscriptionAPI()
+    with _live_socket(monkeypatch, api) as ws:
+        assert "chunk_seconds" not in ws.receive_json()["session"]["mstar"]
+        for session in ({"mstar": {"chunk_seconds": 1.0}}, {"input_audio_transcription": {"prompt": "names"}}):
+            _send(ws, "transcription_session.update", session=session)
+            assert ws.receive_json()["type"] == "error"
+        _send(ws, "input_audio_buffer.append", audio=_pcm(0.2))
+        _send(ws, "transcription_session.update", session={"input_audio_transcription": {"language": "de"}})
+        assert "language" in ws.receive_json()["error"]["message"]
+        _send(ws, "input_audio_buffer.commit")
+        _recv_until(ws, "conversation.item.input_audio_transcription.completed")
+        update = {"input_audio_transcription": {"language": "de", "prompt": ""}}
+        _send(ws, "transcription_session.update", session=update)
+        assert ws.receive_json()["session"]["input_audio_transcription"]["language"] == "de"

@@ -1294,7 +1294,7 @@ def _config(monkeypatch, tmp_path, text="model: fake\n") -> str:
     """A config for a model that needs nothing to build."""
     from mstar.model import registry
 
-    class _Model:
+    class _Model(StubModel):
         PREPROCESS_TORCH_THREADS = None
 
         def __init__(self, **kwargs):

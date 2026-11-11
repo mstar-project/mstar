@@ -322,11 +322,14 @@ def onnxruntime_library() -> str | None:
 
 
 def conversation_facts(server) -> dict | None:
-    """What a ``/v1/realtime`` conversation needs from a model with a
-    ``ClientAudio`` client stream, as the Python route reads it off the model:
-    how many such streams, whether it has turn tokens and its output channels
-    (which decide whether it converses), and, for one that does, its stream
-    and the reply settings. ``None`` for a model with no such stream."""
+    """What ``/v1/realtime`` needs from a model with a ``ClientAudio`` client
+    stream, as the Python route reads it off the model: how many such streams,
+    whether it has turn tokens and its output channels (which decide whether
+    it converses), and, for one that does, its stream and the reply settings.
+    A model that hears transcription as it comes instead
+    (``Model.live_transcription_stream``) gets ``live``: its stream and that
+    stream's bound on a call's samples (``max_items``, None for none). ``None``
+    for a model with no such stream."""
     audio = list(getattr(server, "client_audio", None) or [])
     if not audio:
         return None
@@ -340,19 +343,26 @@ def conversation_facts(server) -> dict | None:
             output_rate=model.get_output_sample_rate("audio"), voice=model.get_default_voice(),
             idle_steps=model.turn_idle_steps, silence_rms=float(model.turn_silence_rms),
         )
+    elif (stream := model.live_transcription_stream) is not None:
+        facts["live"] = {
+            "stream": stream.edge_name, "rate": stream.audio.sample_rate, "frame_samples": stream.audio.frame_samples,
+            "max_items": stream.limits.max_items if stream.limits is not None else None,
+        }
     return facts
 
 
 def realtime_facts(server, adapter, directory: str) -> dict | None:
     """``REALTIME_ENV``'s value for a model with a ``/v1/realtime`` surface.
     ``conversation`` is ``conversation_facts``'. For a realtime transcription
-    surface: ONNX Runtime's library and Silero's weights (``None`` where this
-    server has none, which leaves server_vad off as it is here), why Smart
-    Turn did not load (``None`` when it did), and the model's tokenizer,
-    saved under ``directory`` for the stable prefix. ``None`` for any other
-    model."""
+    surface (an adapter that re-decodes, or a model that hears it live): ONNX
+    Runtime's library and Silero's weights (``None`` where this server has
+    none, which leaves server_vad off as it is here), why Smart Turn did not
+    load (``None`` when it did), and the model's tokenizer, saved under
+    ``directory`` for the stable prefix. ``None`` for any other model."""
     conversation = conversation_facts(server)
-    transcribes = adapter is not None and getattr(adapter, "supports_realtime_transcription", False)
+    # a live transcription model's sessions take turn detection as the re-decoding ones do
+    live = conversation is not None and "live" in conversation
+    transcribes = adapter is not None and (getattr(adapter, "supports_realtime_transcription", False) or live)
     if not transcribes and conversation is None:
         return None
     facts = {"conversation": conversation}
@@ -673,8 +683,10 @@ class RustFrontendBridge:
 
     def _live(self, msg: dict) -> None:
         """One operation on a live call (``/generate/ws``, or a ``/v1/realtime``
-        conversation, whose appends carry ``audio``: float32 samples for the
-        ``ClientAudio`` stream ``stream``), answered as the Python route would
+        session (a conversation or a live transcription), whose ops name its
+        ``ClientAudio`` stream ``stream`` and whose appends carry ``audio``,
+        float32 samples for it; a live transcription's commit is an
+        ``end_input`` append with none), answered as the Python route would
         act on it. The call is the submission its ``call`` names; one that has
         ended has no key and takes nothing."""
         key = self._keys.get(msg.get("call"))
@@ -716,8 +728,10 @@ class RustFrontendBridge:
                 except ValueError as exc:  # the client's fault
                     meta = {"error": scrub_paths(str(exc)), "status": 400}
                 except Exception as exc:  # noqa: BLE001 — the append fails, the bridge goes on
-                    route = "realtime" if audio else "generate/ws"
-                    text, error_id = client_error_text(exc, f"{route} append failed", log=logger, type_name=False)
+                    # a realtime op names its stream; its commit carries no audio
+                    what = "generate/ws append" if not msg.get("stream") else \
+                        "realtime append" if audio else "realtime commit"
+                    text, error_id = client_error_text(exc, f"{what} failed", log=logger, type_name=False)
                     meta = {"error": text, "status": 500, "error_id": error_id}
         except Exception as exc:  # noqa: BLE001 — an unknown op included
             text, _ = client_error_text(exc, f"live {msg.get('op')!r} failed", log=logger, type_name=False)

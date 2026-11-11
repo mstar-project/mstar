@@ -104,27 +104,42 @@ def test_mstar_server_gets_the_api_servers_served_models(launched, monkeypatch):
 def test_realtime_facts_carry_what_a_conversation_reads_off_the_model(tmp_path):
     """A model with a ClientAudio stream gets ``conversation`` facts; only one
     that can converse (turn tokens, one audio stream, mono output) gets its
-    stream and reply settings, which only a conversation reads."""
+    stream and reply settings, which only a conversation reads. One with no
+    turn tokens hears transcription as it comes: its stream and the stream's
+    bound on a call, and, with an adapter, what turn detection needs."""
     from types import SimpleNamespace
 
+    from mstar.api_server.openai.adapters import get_adapter
     from mstar.model.base import Model
-    from mstar.streaming.topology import CLIENT, ClientAudio, Connection
+    from mstar.streaming.topology import CLIENT, ClientAudio, ClientStreamLimits, Connection, PartitionTopology
+
+    ear = Connection(CLIENT, "Encoder", "audio_in", chunk_policy_factory=lambda: None, audio=ClientAudio(16000, 1280),
+                     limits=ClientStreamLimits(max_items=16000 * 60))
 
     class _Duplex:
         turn_tokens, turn_idle_steps, turn_silence_rms = (1, 2), 25, 0.01
         get_output_sample_rate = Model.get_output_sample_rate
         get_output_audio_channels = Model.get_output_audio_channels
+        live_transcription_stream = Model.live_transcription_stream
 
         def get_default_voice(self):
             return "Aria"
 
-    ear = Connection(CLIENT, "Encoder", "audio_in", chunk_policy_factory=lambda: None, audio=ClientAudio(16000, 1280))
+        def get_partition_topology(self):
+            return PartitionTopology(["Encoder"], [ear])
+
+        def get_graph_walk_graphs(self):
+            return {}
+
     server = SimpleNamespace(model=_Duplex(), client_audio=[ear])
     assert rust_frontend.realtime_facts(server, None, str(tmp_path)) == {"conversation": {
         "streams": 1, "turn_tokens": True, "channels": 1, "stream": "audio_in", "rate": 16000, "frame_samples": 1280,
         "output_rate": 24000, "voice": "Aria", "idle_steps": 25, "silence_rms": 0.01,
     }}
     server.model.turn_tokens = None
-    assert rust_frontend.realtime_facts(server, None, str(tmp_path)) == {
-        "conversation": {"streams": 1, "turn_tokens": False, "channels": 1}}
+    live = {"streams": 1, "turn_tokens": False, "channels": 1, "live": {
+        "stream": "audio_in", "rate": 16000, "frame_samples": 1280, "max_items": 16000 * 60}}
+    assert rust_frontend.realtime_facts(server, None, str(tmp_path)) == {"conversation": live}
+    facts = rust_frontend.realtime_facts(server, get_adapter("nemotron_asr"), str(tmp_path))
+    assert facts["conversation"] == live and {"onnxruntime", "silero", "smart_turn_problem"} <= set(facts)
     assert rust_frontend.realtime_facts(SimpleNamespace(model=_Duplex(), client_audio=[]), None, str(tmp_path)) is None

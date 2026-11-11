@@ -4,6 +4,7 @@ installed transformers has them), batch invariance offline and causal, the
 causal variant's causality, the BatchNorm fold and NeMo's weight names; and the
 stream node, whose frames over any chunking are the offline ones.
 """
+import dataclasses
 from types import SimpleNamespace
 
 import pytest
@@ -359,14 +360,18 @@ def test_replay_plan_covers_every_row_and_merges_short_clips():
 KV, CONV, FRONT = "encoder_kv", "encoder_state", "encoder_front"
 
 
-def _stream_node(n_fft=512, win_length=400, lookahead=0, normalize=False, reflect_edges=True):
-    """The stream node over a shrunk causal [6, 0] encoder with random weights
-    and a featurizer with random filters, NeMo's pre-2.5 convention."""
+def _stream_node(n_fft=512, win_length=400, lookahead=0, normalize=False, reflect_edges=True, stream_lookahead=None,
+                 **stream_config):
+    """The stream node over a shrunk causal [6, lookahead] encoder with random
+    weights (the same at any lookahead) and a featurizer with random filters,
+    NeMo's pre-2.5 convention; ``stream_lookahead`` streams narrower, and
+    ``stream_config`` overrides more of the stream's config."""
     torch.manual_seed(0)
-    enc = FastConformerEncoder(FastConformerConfig(
+    config = FastConformerConfig(
         hidden_size=64, num_heads=4, num_layers=3, intermediate_size=256, num_mel_bins=32, subsampling_channels=8,
         attention_bias=False, convolution_bias=False, causal=True, left_context=6, lookahead=lookahead,
-    ), kv_key=KV, conv_key=CONV)
+    )
+    enc = FastConformerEncoder(config, kv_key=KV, conv_key=CONV)
     proj = nn.Linear(64, 48)
     with torch.no_grad():
         for t in [*enc.parameters(), *proj.parameters()]:
@@ -375,8 +380,11 @@ def _stream_node(n_fft=512, win_length=400, lookahead=0, normalize=False, reflec
         num_mel_bins=32, n_fft=n_fft, win_length=win_length, normalize=normalize, reflect_edges=reflect_edges,
         mel_filters=torch.rand(32, n_fft // 2 + 1),
     )
+    if stream_lookahead is not None:
+        stream_config["lookahead"] = stream_lookahead
+    config = dataclasses.replace(config, **stream_config)
     return FastConformerStreamSubmodule(
-        enc.eval(), log_mel, proj.eval(), input_edge="audio_in", output_edge="audio_frame",
+        enc.eval(), log_mel, proj.eval(), config=config, input_edge="audio_in", output_edge="audio_frame",
         front_key=FRONT, batch_sizes=[1, 2, 4, 8, 16, 32],
     )
 
@@ -432,7 +440,7 @@ class _Encoder:
 
     def __init__(self, **featurizer):
         self.node = _stream_node(**featurizer)
-        config, hop = self.node.encoder.config, self.node.log_mel.hop_length
+        config, hop = self.node.config, self.node.log_mel.hop_length
 
         def pool(key, num_layers, blocks):
             spec = RecurrentStateSpec(key, {"conformer_encoder"},
@@ -814,16 +822,39 @@ def test_encoder_takes_no_batch_wider_than_its_graphs():
     assert engine.get_max_batch_size("conformer_encoder", "encode") == max(node.capture_batch_sizes)
 
 
-@pytest.mark.parametrize("unsupported", [
-    dict(lookahead=3), dict(normalize=True), dict(reflect_edges=False), dict(n_fft=2048),
-])
+@pytest.mark.parametrize("unsupported", [dict(normalize=True), dict(n_fft=2048), dict(left_context=2)])
 def test_encoder_refuses_what_it_cannot_stream(unsupported):
-    """A right context, a per-clip normalization, the 2.5 featurizer (whose
-    zero-padded edges a stream's front end does not cut) or a window longer
-    than the samples the front end keeps are refused when the node is built,
-    not met as wrong frames mid-stream."""
+    """A per-clip normalization, a window longer than the samples the front
+    end keeps, or a stream config that is not its encoder's but for the
+    lookahead are refused when the node is built, not met as wrong frames
+    mid-stream."""
     with pytest.raises(ValueError, match=next(iter(unsupported))):
         _stream_node(**unsupported)
+
+
+# -1: a stream that ends just short of a chunk, whose last step runs into one chunk more
+@pytest.mark.parametrize("n", [16000 * 2 + 777, 16000 * 2, 1600 + 160, -1])
+@pytest.mark.parametrize("regions", [False, True])
+@pytest.mark.parametrize(("lookahead", "clip_lookahead", "reflect_edges"),
+                         [(0, 0, False), (3, 3, False), (3, 3, True), (6, 6, False), (3, 13, False)])
+def test_encoder_chunks_stream_the_offline_frames(lookahead, clip_lookahead, reflect_edges, regions, n):
+    """A stream cut on the chunk grid, a zero-padded or reflected featurizer and
+    the checkpoint's chunked attention: the frames, in order, are the whole-clip
+    encoding at the stream's lookahead, a short last chunk included, with and
+    without the graphs, also from an encoder whose clips run wider."""
+    enc = _Encoder(lookahead=clip_lookahead, stream_lookahead=lookahead, reflect_edges=reflect_edges)
+    if regions:
+        enc.regions = _encoder_regions(enc, STEP, LAYERS)
+    n = n if n > 0 else 4 * enc.node.chunk_samples - 100
+    wav = torch.randn(n) * 0.1
+    enc.node.item_per_step = True
+    got = _stream(enc, {1: wav}, {1: enc.node.chunk_samples})[1]
+    want = _Encoder(lookahead=lookahead, reflect_edges=reflect_edges).offline(wav)
+    # a decoder takes an item as one chunk of frames, at most a chunk's
+    assert max(item.shape[0] for item in got) <= lookahead + 1
+    got = torch.cat(got)
+    assert got.shape[0] == want.shape[0]
+    assert torch.allclose(got, want, atol=1e-5)
 
 
 @pytest.mark.parametrize("n_fft", [512, 1024])
@@ -927,6 +958,21 @@ def test_encoder_steps_do_not_reproject_the_relative_positions():
     for at in range(0, wav.numel(), 1280):
         enc.encode(1, wav[at:at + 1280])
     assert not calls
+
+
+def test_encoder_layers_stream_at_one_chunk():
+    """The layers keep one stream's chunk, with its band of distances and its
+    retained frames, and that stream's KV and conv pool: binding them at
+    another chunk, or to another node's resources, is refused, not served
+    with the first one's."""
+    enc = _Encoder(lookahead=3)
+    with pytest.raises(ValueError, match="chunk of 4 frames"):
+        enc.node.encoder.bind_stream(1, enc.resources)
+    with pytest.raises(ValueError, match="one node's KV"):
+        enc.node.encoder.bind_stream(4, {**enc.resources, KV: object()})
+    with pytest.raises(ValueError, match="one node's state pool"):
+        enc.node.encoder.layers[0].conv.bind_stream(object())
+    enc.node.encoder.bind_stream(4, enc.resources)
 
 
 def test_encoder_waits_for_enough_audio_to_featurize():

@@ -242,7 +242,7 @@ jobs:
           # websockets and onnxruntime: the WebSocket parity cases and realtime's
           # turn detection; tokenizers: the realtime suite's stand-in tokenizer;
           # silero-vad only for its bundled ONNX file, so without its torchaudio
-          pip install pytest==9.2.0 msgpack numpy pyyaml prometheus-client \
+          pip install pytest==9.2.0 pytest-timeout==2.4.0 msgpack numpy pyyaml prometheus-client \
             fastapi uvicorn python-multipart httpx soundfile websockets onnxruntime tokenizers
           pip install --no-deps silero-vad
           # cpu torch + triton: the arena test imports the tensor-transport

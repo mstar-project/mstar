@@ -8,6 +8,14 @@ transcription-session events) streams speech-to-text with partial results.
 Both take audio in OpenAI's formats, converted on the socket to what the
 model hears.
 
+On a model that hears audio as it comes (one ``ClientAudio`` client stream,
+no turn tokens and no audio to the client,
+``Model.live_transcription_stream``), the transcription intent is
+:class:`RealtimeLiveTranscription`: each item is one engine request, opened by
+its first append and ended by its commit, whose tokens stream out as deltas
+while the audio arrives. What follows about re-decoding,
+``chunk_seconds`` and the unfixed counts is the other models' path.
+
 The transcription intent is a subset of OpenAI's Realtime transcription
 session, enough for a client that streams microphone audio and wants partial
 transcripts:
@@ -197,6 +205,9 @@ class RealtimeSession:
     resampler: media_io.StreamResampler | None = None
     # samples the last chunk was short of its boundary (see take_chunk)
     short: int = 0
+    # samples already on a live model's stream (RealtimeLiveTranscription): an
+    # item's length without holding its audio
+    streamed_samples: int = 0
     # server turn detection (None: the client commits); the segmenter, like
     # the resampler, spans turns, so a commit does not reset either
     turn_detection: realtime_vad.ServerVAD | realtime_vad.SemanticVAD | None = None
@@ -265,7 +276,7 @@ class RealtimeSession:
         arrive, rounded once over the whole item (not per append), so the cap
         does not depend on how the audio was split."""
         held = self.resampler.held(extra) if self.resampler is not None else extra
-        return self.pending_samples + held + sum(int(a.size) for a in self.heard)
+        return self.pending_samples + held + self.streamed_samples + sum(int(a.size) for a in self.heard)
 
     def take_chunk(self) -> np.ndarray | None:
         """Every full chunk of pending audio as one array, or None until
@@ -297,7 +308,7 @@ class RealtimeSession:
 
     def clear(self) -> None:
         """Start a new item; the stream state (resampler, segmenter, odd byte) goes on."""
-        self.pending, self.pending_samples, self.heard, self.short = [], 0, [], 0
+        self.pending, self.pending_samples, self.heard, self.short, self.streamed_samples = [], 0, [], 0, 0
         self.chunk_id, self.raw_hypothesis, self.emitted = 0, "", ""
         self.item_id = f"item_{uuid.uuid4().hex[:12]}"
 
@@ -350,6 +361,14 @@ def decode_append(payload: str, carry: bytes = b"", codec: str = "audio/pcm") ->
         return media_io.g711_decode(raw, codec).astype(np.float32) / 32768.0, b""
     whole = len(raw) - len(raw) % 2
     return np.frombuffer(raw[:whole], dtype="<i2").astype(np.float32) / 32768.0, raw[whole:]
+
+
+def _failed_in_server(what: str, exc: Exception, session_id: str) -> dict:
+    """The error event for an ``append`` or ``commit`` that failed inside the
+    server: an error id, under which the log has the error."""
+    error_id = uuid.uuid4().hex[:12]
+    logger.error("realtime %s failed (error id %s, session %s)", what, error_id, session_id, exc_info=exc)
+    return error_event(f"the {what} failed (error id {error_id})", kind="server_error")
 
 
 def _append_error(audio: np.ndarray, rate: int) -> dict | None:
@@ -584,6 +603,29 @@ def error_event(message: str, kind: str = "invalid_request_error", code: str | N
     return server_event("error", error=error)
 
 
+def _open_call(api, session_id: str, relay, **submit) -> tuple[str, asyncio.Task]:
+    """Open a realtime call's engine request, its input left open, and start
+    ``relay`` on its result stream, bound now (see ``APIServer._bind``): its
+    submission key and the relay's task. A refused call raises what
+    ``submit_request`` raises (``HTTPException``, ``ValueError``); see
+    ``_call_error``."""
+    request_id = api.submit_request(streaming=True, end_input=False, request_id=rid(f"rt-{session_id}"), **submit)
+    return api.submission_key(request_id), asyncio.create_task(relay(api.iter_result_chunks(request_id)))
+
+
+def _call_error(failure, upload_dir) -> tuple[dict, int]:
+    """The ``error`` event for a realtime call's failure, and its HTTP status:
+    a refused opening (``HTTPException`` or ``ValueError``), the
+    ``HTTPException`` its result stream raised, or its in-band error chunk."""
+    if isinstance(failure, HTTPException):
+        return error_event(str(failure.detail), kind=error_type(failure.status_code)), failure.status_code
+    if isinstance(failure, ValueError):
+        return error_event(_clip(_scrub_paths(str(failure), upload_dir))), 400
+    status = int((failure.metadata or {}).get("status") or 500)
+    message = bytes(failure.data).decode("utf-8", "replace")
+    return error_event(_clip(_scrub_paths(message, upload_dir)), kind=error_type(status)), status
+
+
 def response_object(response_id: str, status: str, modalities: list[str], output: list | None = None,
                     status_details: dict | None = None) -> dict:
     """A GA ``realtime.response``, as ``response.created`` / ``.done`` carry it."""
@@ -727,13 +769,16 @@ class RealtimeTranscription:
                     return
             await self.commit()
         elif kind == "input_audio_buffer.clear":
-            s = self.session
-            s.clear()
-            s.odd_byte = b""
-            s.reset_stream()
+            self.clear_item()
             await self.send(server_event("input_audio_buffer.cleared"))
         else:
             await self.send(error_event(f"unknown event {_excerpt(kind)}"))
+
+    def clear_item(self) -> None:
+        s = self.session
+        s.clear()
+        s.odd_byte = b""
+        s.reset_stream()
 
     async def apply(self, ops: list[tuple]) -> None:
         """Carry out segmenter operations in order (see ``TurnSegmenter``).
@@ -748,7 +793,7 @@ class RealtimeTranscription:
         for i, op in enumerate(ops):
             if op[0] == "audio":
                 s.add(op[1])
-                if i == len(ops) - 1 and (chunk := s.take_chunk()) is not None:
+                if i == len(ops) - 1 and (chunk := self.take_chunk()) is not None:
                     await self.step(chunk)
             elif op[0] == "commit":
                 await self.commit()
@@ -852,6 +897,10 @@ class RealtimeTranscription:
     def current_text(self) -> str:
         return self.adapter.parse_transcript(self.session.raw_hypothesis, self.session.request).text
 
+    def take_chunk(self) -> np.ndarray | None:
+        """The audio the next step hears, or None until a chunk is in."""
+        return self.session.take_chunk()
+
     def _tokenizer(self):
         return getattr(getattr(self.api, "model", None), "tokenizer", None)
 
@@ -935,6 +984,178 @@ class RealtimeTranscription:
             ))
 
 
+# a re-decoding session's knobs, which a live transcription has no use for
+_REDECODE_KNOBS = ("chunk_seconds", "unfixed_chunks", "unfixed_tokens")
+
+
+class RealtimeLiveTranscription(RealtimeTranscription):
+    """A transcription session on a model that hears audio as it comes (one
+    ``ClientAudio`` client stream, no turn tokens and no audio to the client,
+    ``Model.live_transcription_stream``): each item is one engine request,
+    opened by its first audio and ended by its commit, whose tokens go out as
+    deltas; nothing is re-decoded. If the item's call fails (or can't open),
+    the client gets an ``error``, the rest of the item's audio is dropped, and
+    its commit reports it failed."""
+
+    def __init__(self, api, model_name: str, adapter, websocket: WebSocket, stream: Connection):
+        super().__init__(api, model_name, adapter, websocket)
+        self.stream = stream.edge_name
+        self.chunk_seconds = stream.audio.frame_samples / stream.audio.sample_rate
+        # the stream's own bound on one item's length, not the re-decoding path's
+        if stream.limits is not None and stream.limits.max_items is not None:
+            self.session.max_item_seconds = stream.limits.max_items / stream.audio.sample_rate
+        self.key: str | None = None
+        self.relay_task: asyncio.Task | None = None
+        # the error event of this item's failed call (None: not failed)
+        self.failure: dict | None = None
+
+    async def run(self) -> None:
+        try:
+            await super().run()
+        finally:
+            self._abort()
+
+    def _abort(self) -> None:
+        key, task = self.key, self.relay_task
+        self.key = self.relay_task = None
+        if task is not None:
+            task.cancel()
+        if key is not None:
+            self.api.abort_submission(key)
+
+    async def _fail(self, event: dict) -> None:
+        """The item's call failed, or ended before its commit: it has ended, so
+        it takes no more of the item's audio."""
+        self.key = None
+        if self.failure is None:
+            self.failure = event
+            await self.send(event)
+
+    async def _open(self) -> bool:
+        s = self.session
+        kwargs = {"language": s.request.language} if s.request.language else None
+        try:
+            self.key, self.relay_task = _open_call(
+                self.api, s.session_id, self.relay, text=None, input_modalities=[], output_modalities=["text"],
+                model_kwargs=kwargs, model=s.request.model,
+            )
+        except (HTTPException, ValueError) as exc:
+            await self._fail(_call_error(exc, self.api.upload_dir)[0])
+            return False
+        return True
+
+    async def relay(self, chunks) -> None:
+        """The call's text as deltas of the item, until the call ends."""
+        s = self.session
+        decoder = Utf8Stream()
+        try:
+            async for chunk in chunks:
+                if chunk.modality == "text":
+                    s.raw_hypothesis += decoder.feed(bytes(chunk.data))
+                    text = self.current_text()
+                    await self.emit(text, hold=0)
+                    # the step this text came from covers its chunk of audio
+                    step = (chunk.metadata or {}).get("step", s.chunk_id)
+                    await self.send(server_event(
+                        "mstar.transcription.partial", item_id=s.item_id, text=text, chunk_id=step,
+                        audio_seconds=min((step + 1) * self.chunk_seconds, s.streamed_samples / SAMPLE_RATE),
+                        created=now(),
+                    ))
+                elif chunk.modality == "error":
+                    await self._fail(_call_error(chunk, self.api.upload_dir)[0])
+        except HTTPException as exc:   # the request failed, so it has ended too
+            await self._fail(_call_error(exc, self.api.upload_dir)[0])
+            return
+        if self.key is not None:   # not ended by the commit
+            await self._fail(error_event("this item's transcription ended before its commit", kind="server_error"))
+
+    def _session_view(self) -> dict:
+        view = super()._session_view()
+        for name in _REDECODE_KNOBS:
+            del view["mstar"][name]
+        return view
+
+    def update(self, session: dict) -> None:
+        """As a re-decoding session's, but its knobs and a prompt do nothing
+        here, so they are refused, and an open item's call keeps the language
+        it opened with."""
+        knobs = [name for name in _REDECODE_KNOBS if name in _object(session.get("mstar"), "mstar")]
+        if knobs:
+            raise ValueError(f"mstar.{knobs[0]} does not apply here: this model hears audio as it comes and "
+                             "re-decodes nothing")
+        transcription = _object(session.get("input_audio_transcription"), "input_audio_transcription")
+        if transcription.get("prompt"):
+            raise ValueError("input_audio_transcription.prompt is not supported by this model")
+        if self.key is not None and "language" in transcription \
+                and (transcription["language"] or None) != (self.session.request.language or None):
+            raise ValueError("commit or clear the input audio buffer before changing the language")
+        super().update(session)
+
+    def take_chunk(self) -> np.ndarray | None:
+        """All the audio in: the data worker cuts it on the model's chunk."""
+        return self.session.flush()
+
+    async def step(self, chunk: np.ndarray, final: bool = False) -> None:
+        s = self.session
+        if self.failure is not None or (self.key is None and not await self._open()):
+            return   # the item has failed: its error is sent, and its commit reports it
+        try:
+            if not self.api.stream_input(self.key, samples={self.stream: chunk}):
+                return   # the call has ended: its relay reports why
+        except ValueError as exc:  # past the call's input budget: the item ends with it
+            self.api.reject_input(self.key, f"append rejected: {exc}", 400)
+            return
+        except Exception as exc:  # noqa: BLE001 — an error event, and the session goes on, as a conversation's
+            await self.send(_failed_in_server("append", exc, s.session_id))
+            return
+        s.streamed_samples += int(chunk.size)
+        s.chunk_id += 1
+
+    async def commit(self) -> None:
+        """End the item: its stream ends, and the rest of its tokens arrive."""
+        s = self.session
+        tail = s.flush()
+        if tail is not None and tail.size:
+            await self.step(tail, final=True)
+        key, task = self.key, self.relay_task
+        try:
+            ended = key is None or self.api.stream_input(key, end_input=True)
+        except Exception as exc:  # noqa: BLE001 — the item fails, and the session goes on
+            # whether the call's input ended is unknown, so its output may never
+            # end: the call is aborted rather than waited out
+            self._abort()
+            await self._fail(_failed_in_server("commit", exc, s.session_id))
+            ended, task = True, None
+        else:
+            # cleared with no await since stream_input, so the relay sees the
+            # commit's end of input, not an early end
+            self.key = self.relay_task = None
+        if task is not None:
+            await task
+        if not ended:
+            await self._fail(error_event("this item's transcription ended before its commit", kind="server_error"))
+        await self.send(server_event("input_audio_buffer.committed", item_id=s.item_id))
+        if self.failure is not None:
+            await self.send(server_event(
+                "conversation.item.input_audio_transcription.failed",
+                item_id=s.item_id, content_index=0, error=self.failure["error"],
+            ))
+        else:
+            await self.emit(self.current_text(), hold=0)
+            await self.send(server_event(
+                "conversation.item.input_audio_transcription.completed",
+                item_id=s.item_id, transcript=self.current_text(),
+            ))
+        self.failure = None
+        s.clear()
+
+    def clear_item(self) -> None:
+        """A clear drops the item's call too: what it heard can't be unheard."""
+        self._abort()
+        self.failure = None
+        super().clear_item()
+
+
 # Client events a conversation refuses with an ``unsupported`` error, the call
 # going on: the model decides when it speaks and has no turn to cancel or edit.
 _UNSUPPORTED_EVENTS = frozenset({
@@ -998,7 +1219,6 @@ class RealtimeConversation:
         self.instructions = ""
         self.turn_detection = "server_vad"
         self.odd_byte = b""
-        self.request_id: str | None = None
         self.key: str | None = None
         self.relay_task: asyncio.Task | None = None
         self.clock_task: asyncio.Task | None = None
@@ -1227,10 +1447,7 @@ class RealtimeConversation:
                 self.api.reject_input(self.key, f"append rejected: {exc}", 400)
                 return False
             except Exception as exc:  # noqa: BLE001 — the client gets an error event, not a bare close
-                error_id = uuid.uuid4().hex[:12]
-                logger.error("realtime append failed (error id %s, session %s)", error_id, self.session_id,
-                             exc_info=exc)
-                await self.send(error_event(f"the append failed (error id {error_id})", kind="server_error"))
+                await self.send(_failed_in_server("append", exc, self.session_id))
                 return False
 
     async def _clock(self) -> None:
@@ -1257,19 +1474,13 @@ class RealtimeConversation:
         the server refused it (at capacity, say)."""
         text = self.instructions or None
         try:
-            self.request_id = self.api.submit_request(
+            self.key, self.relay_task = _open_call(
+                self.api, self.session_id, self.relay,
                 text=text, input_modalities=["text"] if text else [], output_modalities=["text", "audio"],
-                streaming=True, request_id=rid(f"rt-{self.session_id}"), end_input=False,
             )
-        except HTTPException as exc:
-            await self.send(error_event(str(exc.detail), kind=error_type(exc.status_code)))
+        except (HTTPException, ValueError) as exc:
+            await self.send(_call_error(exc, self.api.upload_dir)[0])
             return False
-        except ValueError as exc:
-            await self.send(error_event(_clip(_scrub_paths(str(exc), self.api.upload_dir))))
-            return False
-        self.key = self.api.submission_key(self.request_id)
-        # bound now, before anything else runs (see APIServer._bind)
-        self.relay_task = asyncio.create_task(self.relay(self.api.iter_result_chunks(self.request_id)))
         self.played_until = time.monotonic()
         self.clock_task = asyncio.create_task(self._clock())
         return True
@@ -1286,15 +1497,13 @@ class RealtimeConversation:
                 elif chunk.modality == "audio":
                     await self._on_audio(chunk)
                 elif chunk.modality == "error":
-                    http_status = int((chunk.metadata or {}).get("status") or 500)
-                    message = bytes(chunk.data).decode("utf-8", "replace")
-                    await self.send(error_event(_clip(_scrub_paths(message, self.api.upload_dir)),
-                                           kind=error_type(http_status)))
+                    event, http_status = _call_error(chunk, self.api.upload_dir)
+                    await self.send(event)
                     status, code = "failed", 1011 if http_status >= 500 else 1000
             self.call_over = True
         except HTTPException as exc:   # the request failed, so it has ended too
             self.call_over = True
-            await self.send(error_event(str(exc.detail), kind=error_type(exc.status_code)))
+            await self.send(_call_error(exc, self.api.upload_dir)[0])
             status, code = "failed", 1011
         except Exception as exc:  # noqa: BLE001 — the socket must still close
             error_id = uuid.uuid4().hex[:12]

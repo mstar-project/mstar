@@ -15,8 +15,13 @@ from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import WalkStep
 from mstar.model.parakeet.config import (
     DECODE_LOOP,
+    LIVE_DECODE_WALK,
+    LIVE_ENCODE_WALK,
     NUM_FRAMES,
     PROMPT_ID,
+    STREAM_CONV,
+    STREAM_FRONT,
+    STREAM_KV,
     TRANSDUCER_STATE,
     WALK,
     ParakeetModelConfig,
@@ -78,8 +83,9 @@ def test_nemotron_config_and_prompt(tmp_path):
         with pytest.raises(ValueError):
             cfg.prompt_id(bad)
     assert ParakeetModelConfig.from_pretrained(snap, lookahead=3).encoder.lookahead == 3
-    with pytest.raises(ValueError):
-        ParakeetModelConfig.from_pretrained(snap, lookahead=5)
+    for bad in (5, False, 3.0, "3"):
+        with pytest.raises(ValueError, match="lookahead"):
+            ParakeetModelConfig.from_pretrained(snap, lookahead=bad)
 
 
 def test_unsupported_checkpoint(tmp_path):
@@ -162,9 +168,7 @@ def test_one_walk_the_encoder_then_a_decode_loop(tmp_path, nemotron):
     speculates a request's first iteration but no next one; the request runs
     it once."""
     model = ParakeetModel(str(_snapshot(tmp_path, nemotron)))
-    walks = model.get_graph_walk_graphs()
-    assert walks.keys() == {WALK}
-    walk = walks[WALK]
+    walk = model.get_graph_walk_graphs()[WALK]
     assert isinstance(walk, Sequential)
     encoder, loop = walk.sections
     assert encoder.name == "audio_encoder"
@@ -189,6 +193,70 @@ def test_one_walk_the_encoder_then_a_decode_loop(tmp_path, nemotron):
     ]
 
 
+def test_a_cache_aware_checkpoint_serves_a_clip_or_a_live_call(tmp_path):
+    """A whole clip runs its one walk, and a live call the two stream walks,
+    each in its own partition; the partitions a request doesn't use are done
+    from the start."""
+    model = ParakeetModel(str(_snapshot(tmp_path, nemotron=True)), live_lookahead=3)
+    assert {p.name for p in model.get_partitions()} == {"default", "Encoder", "Decoder"}
+    client = model.get_partition_topology().client_connections()
+    assert [c.audio.frame_samples for c in client] == [1280 * model.chunk_frames]
+    for walk, partition in ((LIVE_ENCODE_WALK, "Encoder"), (LIVE_DECODE_WALK, "Decoder")):
+        assert isinstance(model.get_graph_walk_graphs()[walk], Loop), partition
+
+    def done(signals):
+        return {p: not model.walk_plan(p, ["audio"], ["text"], signals, {})
+                for p in ("default", "Encoder", "Decoder")}
+
+    assert done({"audio": [_pointer(1)]}) == {"default": False, "Encoder": True, "Decoder": True}
+    assert done({}) == {"default": True, "Encoder": False, "Decoder": False}
+    # a live call opens with no audio: nothing for the data worker to load, only the prompt
+    out = model.process_prompt(None, [], ["text"], tensors={}, language="de", open_streams=frozenset({"audio_in"}))
+    assert out.new_input_tensors == {} and out.metadata == {PROMPT_ID: 2}
+    # a live call that opens with a clip, or a one-shot call with no audio, is refused
+    clip = {"audio_inputs": [torch.zeros(16000)]}
+    with pytest.raises(ValueError, match="stream"):
+        model.process_prompt(None, ["audio"], ["text"], tensors=clip, open_streams=frozenset({"audio_in"}))
+    with pytest.raises(ValueError, match="exactly one audio input"):
+        model.process_prompt(None, [], ["text"], tensors={}, open_streams=frozenset())
+
+
+def test_a_deployment_hears_live_calls_only_when_it_asks(tmp_path):
+    """Off by default: a cache-aware checkpoint serves whole clips on the one
+    walk, with no live partitions or stream state for every request to carry.
+    A live lookahead the checkpoint doesn't support, or on a checkpoint that
+    can't stream, is refused at load."""
+    (tmp_path / "n").mkdir()
+    (tmp_path / "p").mkdir()
+    clip = ParakeetModel(str(_snapshot(tmp_path / "n", nemotron=True)))
+    assert [p.name for p in clip.get_partitions()] == ["default"]
+    assert not clip.get_partition_topology().client_connections()
+    assert set(clip.get_graph_walk_graphs()) == {WALK}
+    with pytest.raises(ValueError, match="cache-aware"):
+        ParakeetModel(str(_snapshot(tmp_path / "p", nemotron=False)), live_lookahead=3)
+    for bad in (5, True, 3.0, "3"):
+        with pytest.raises(ValueError, match="live_lookahead"):
+            ParakeetModel(str(tmp_path / "n"), live_lookahead=bad)
+
+
+def test_a_live_deployment_shares_its_encoder_at_two_lookaheads(tmp_path, monkeypatch):
+    """The clip's and the live call's encoder nodes run the same layers
+    (``forward`` / ``forward_stream``): one copy of the weights, not two. Clips
+    keep the checkpoint's widest lookahead while live calls stream at the
+    deployment's."""
+    from mstar.model.components.fastconformer import FastConformerEncoder
+
+    monkeypatch.setattr(
+        FastConformerEncoder, "load",
+        classmethod(lambda cls, config, weights, *, device, dtype=None, **keys: cls(config, **keys)),
+    )
+    model = ParakeetModel(str(_snapshot(tmp_path, nemotron=True)), live_lookahead=3)
+    clip, live = (model.get_submodule(node) for node in ("audio_encoder", "stream_encoder"))
+    assert clip.encoder is live.encoder
+    assert clip.encoder.config.lookahead == 13
+    assert live.chunk_frames == model.chunk_frames == 4
+
+
 def test_startup_refuses_more_requests_than_slots(tmp_path):
     model = ParakeetModel(str(_snapshot(tmp_path, nemotron=False)))
     model.validate_config_yaml({"max_concurrent_requests": 128}, "a.yaml")
@@ -206,6 +274,20 @@ def test_startup_refuses_more_requests_than_slots(tmp_path):
     # slot 0 is the sink, so one slot leaves none to admit into, with or without a cap
     with pytest.raises(ValueError, match="max_slots must be an int >= 2"):
         model.validate_config_yaml({"resources": {TRANSDUCER_STATE: {"max_slots": 1}}}, "a.yaml")
+
+
+@pytest.mark.parametrize("default", [STREAM_KV, STREAM_CONV, STREAM_FRONT])
+def test_live_startup_refuses_more_requests_than_stream_slots(tmp_path, default):
+    model = ParakeetModel(str(_snapshot(tmp_path, nemotron=True)), live_lookahead=3)
+    pools = (STREAM_KV, STREAM_CONV, STREAM_FRONT)
+    config = {"max_concurrent_requests": 200, "resources": {
+        TRANSDUCER_STATE: {"max_slots": 201}, **{k: {"max_slots": 201} for k in pools if k != default},
+    }}
+    # the pool left at its 128-request default would stall the 129th live call
+    with pytest.raises(ValueError, match=rf"resources\.{default}, which holds 128"):
+        model.validate_config_yaml(config, "a.yaml")
+    config["resources"][default] = {"max_slots": 201}
+    model.validate_config_yaml(config, "a.yaml")
 
 
 @pytest.mark.parametrize("nemotron", [False, True])

@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from mstar.model.components.fastconformer import FastConformerConfig
@@ -16,6 +16,12 @@ from mstar.model.utils import GRANARY_LANGUAGES, base_language
 SUPPORTED_MODEL_TYPES = ("parakeet_tdt", "parakeet_rnnt", "nemotron3_5_asr")
 
 WALK, DECODE_LOOP = "transcribe", "decode_loop"
+# a live call's walks, one per partition, and the edges between them
+LIVE_ENCODE_WALK, LIVE_ENCODE_LOOP = "encode_stream", "encode_stream_loop"
+LIVE_DECODE_WALK, LIVE_DECODE_LOOP = "decode_stream", "decode_stream_loop"
+AUDIO_IN, ENCODER_FRAMES = "audio_in", "encoder_frames"
+# a live stream's encoder state: the bounded KV, conv tails and front-end tails
+STREAM_KV, STREAM_CONV, STREAM_FRONT = "stream_kv", "stream_conv", "stream_front"
 # each request's decoding state between iterations of the decode loop
 TRANSDUCER_STATE = "transducer_state"
 # model_kwargs and step_metadata keys, from process_prompt: the clip's encoder
@@ -40,6 +46,9 @@ class ParakeetModelConfig:
     model_type: str
     encoder: FastConformerConfig
     transducer: TransducerConfig
+    # a live call's encoder: the clip's at the deployment's live lookahead
+    # (None: the deployment hears no live calls)
+    live_encoder: FastConformerConfig | None = None
     # offline checkpoints standardize each mel bin over the clip; streaming
     # ones cannot (the clip isn't known yet) and don't
     normalize_features: bool = True
@@ -53,7 +62,9 @@ class ParakeetModelConfig:
         return self.transducer.num_prompts > 0
 
     @classmethod
-    def from_pretrained(cls, local_dir: str | Path, lookahead: int | None = None) -> ParakeetModelConfig:
+    def from_pretrained(
+        cls, local_dir: str | Path, lookahead: int | None = None, live_lookahead: int | None = None,
+    ) -> ParakeetModelConfig:
         local_dir = Path(local_dir)
         hf = json.loads((local_dir / "config.json").read_text())
         model_type = hf["model_type"]
@@ -61,18 +72,29 @@ class ParakeetModelConfig:
             raise ValueError(f"unsupported transducer checkpoint {model_type!r}; supported: {SUPPORTED_MODEL_TYPES}")
         gen = json.loads((local_dir / "generation_config.json").read_text())
         proc = json.loads((local_dir / "processor_config.json").read_text())
-        supported = hf["encoder_config"].get("supported_num_lookahead_tokens") or []
-        if lookahead is None and supported:
-            # M* hears whole clips, so the widest lookahead the checkpoint was
-            # trained with: the most accurate, at the same cost
-            lookahead = max(supported)
-        elif lookahead is not None and supported and lookahead not in supported:
-            raise ValueError(f"lookahead {lookahead} is not one of the checkpoint's {supported}")
-        encoder = FastConformerConfig.from_hf(hf["encoder_config"], lookahead=lookahead)
+        enc = hf["encoder_config"]
+        allowed = enc.get("supported_num_lookahead_tokens") or [enc.get("default_num_lookahead_tokens", 0)]
+
+        def checked(name: str, value) -> int:
+            # an int, not a bool (False would read as 0) or a float (3.0 would be found)
+            if type(value) is not int or value not in allowed:
+                raise ValueError(f"{name} must be one of the checkpoint's lookaheads {sorted(allowed)}; got {value!r}")
+            return value
+
+        # M* hears whole clips, so by default the widest lookahead the checkpoint
+        # was trained with: the most accurate, at the same cost
+        lookahead = max(allowed) if lookahead is None else checked("lookahead", lookahead)
+        encoder = FastConformerConfig.from_hf(enc, lookahead=lookahead)
+        live_encoder = None
+        if live_lookahead is not None:
+            if not encoder.causal:
+                raise ValueError(f"live_lookahead needs a cache-aware (causal) checkpoint; {model_type} is not one")
+            live_encoder = replace(encoder, lookahead=checked("live_lookahead", live_lookahead))
         prompts = dict(proc.get("prompt_dictionary", {}))
         return cls(
             model_type=model_type,
             encoder=encoder,
+            live_encoder=live_encoder,
             transducer=TransducerConfig.from_hf(hf, start_token_id=gen["decoder_start_token_id"]),
             normalize_features=not encoder.causal,
             default_prompt_id=hf.get("default_prompt_id", prompts.get("auto", 0)),

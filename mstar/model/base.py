@@ -38,7 +38,7 @@ from mstar.graph.base import (
     Sequential,
     TensorPointerInfo,
 )
-from mstar.graph.special_destinations import EMPTY_DESTINATION
+from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.media_limits import VideoBudget, decoding_upload, read_image, video_decode_threads
 from mstar.model.multimodal import TEXT, PromptPart
 from mstar.model.rebuild import RebuildPolicy
@@ -144,6 +144,7 @@ if TYPE_CHECKING:
 
 if TYPE_CHECKING:
     from mstar.engine.state import Array, Sampler, SampleSettings
+    from mstar.streaming.topology import Connection
     from mstar.worker.scheduling_policy import WalkPriority
 
 DECODE = "decode"
@@ -1318,6 +1319,26 @@ class Model(ABC):
     # and open them.
     turn_idle_steps: int | None = None
     turn_silence_rms: float = 0.005
+
+    @property
+    def live_transcription_stream(self) -> "Connection | None":
+        """The client stream ``/v1/realtime?intent=transcription`` hears as it
+        comes: the model's one ``ClientAudio`` stream when it declares no
+        ``turn_tokens`` and sends the client no audio, so its text is a
+        transcript rather than replies (such as Nemotron ASR with
+        ``live_lookahead``) and takes 16 kHz audio, the rate the session
+        hands it. None otherwise."""
+        if self.turn_tokens is not None:
+            return None
+        audio = [conn for conn in self.get_partition_topology().client_connections() if conn.audio is not None]
+        if len(audio) != 1 or audio[0].audio.sample_rate != 16000:
+            return None
+        walks = self.get_graph_walk_graphs().values()
+        edges = [edge for walk in walks for node in walk.get_nodes().values() for edge in node.outputs]
+        edges += [edge for walk in walks for loop in walk.get_loops().values()
+                  for edge in loop.outputs + loop.accumulated_outputs]
+        speaks = any(edge.next_node == EMIT_TO_CLIENT and edge.output_modality == "audio" for edge in edges)
+        return None if speaks else audio[0]
 
     def get_output_audio_channels(self, modality: str = "audio") -> int:
         """Channel count of the interleaved 16-bit PCM ``postprocess`` emits for

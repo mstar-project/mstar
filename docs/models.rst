@@ -198,9 +198,11 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
    * - ``nemotron_asr``
      - ``nvidia/nemotron-3.5-asr-streaming-0.6b``
      - Cache-aware streaming FastConformer + RNN-T with a language prompt (``language``: a locale
-       such as ``en-US``, a bare code, or ``auto``); served over whole clips, with the streaming
-       model's chunked attention at its widest lookahead (``lookahead`` in the YAML's
-       ``model_kwargs``). Clips up to 10 min; longer uploads are windowed. No timestamps.
+       such as ``en-US``, a bare code, or ``auto``); serves whole clips, at its widest lookahead by
+       default (``lookahead`` in the YAML's ``model_kwargs``), and with ``live_lookahead``
+       (``configs/nemotron_asr_live.yaml``) live calls too, over
+       ``/v1/realtime?intent=transcription``. Clips up to 10 min; longer uploads are windowed. No
+       timestamps.
    * - ``wan22``
      - ``Wan-AI/Wan2.2-TI2V-5B-Diffusers``
      - Wan2.2-TI2V-5B video diffusion: text-to-video and image-to-video, 5B dense DiT.
@@ -506,6 +508,19 @@ FastConformer ASR (``canary``, ``canary_qwen``, ``parakeet``, ``nemotron_asr``) 
 - Install with ``.[asr]``. Uploads that libsndfile can't read (M4A, WebM) are decoded by
   torchcodec, which needs FFmpeg.
 - One GPU per deployment: both nodes share a rank, and there is no tensor parallelism.
+- ``nemotron_asr`` also hears a live call as it comes, over
+  ``/v1/realtime?intent=transcription`` (see :doc:`clients`) or ``/generate/ws``, with
+  ``live_lookahead`` in ``model_kwargs``, one of the checkpoint's lookaheads (0, 3, 6 or 13;
+  ``configs/nemotron_asr_live.yaml`` sets 3): in steps of ``live_lookahead + 1`` encoder
+  frames, 80 ms each, decoded chunk by chunk, not re-decoded, so its transcript is the
+  checkpoint's streaming output. A live call opens with no audio (``end_input: false``) and
+  appends it; an opening clip is refused. ``live_lookahead`` sets a live call's latency, 320 ms
+  at 3 and 1.12 s at 13; clips keep ``lookahead``, the widest unless set. A live call's state is
+  bounded however long it runs; the live path took about 0.9 GB of GPU memory beside the
+  whole-clip path's 4.6 GB at lookahead 3, 1.15 GB at 13 (each stream's bounded state and the
+  live captures; both paths share one copy of the weights). With it on, whole clips ran up to
+  8% slower at 32 at once on an H200 (the cause is not traced), so a
+  whole-clip deployment leaves it off and runs exactly the clip graph.
 - All four run the FastConformer encoder ``nemotron_duplex`` streams
   (``mstar/model/components/fastconformer.py``), over the whole clip. Canary, Parakeet and
   Nemotron ASR read its dimensions from the HF ``encoder_config``; Canary-Qwen from NeMo's
@@ -532,7 +547,9 @@ FastConformer ASR (``canary``, ``canary_qwen``, ``parakeet``, ``nemotron_asr``) 
   cursor) sits in a recurrent state slot from its first decode iteration until the request
   is torn down; the YAMLs size ``resources.transducer_state.max_slots`` (129) for
   ``max_concurrent_requests`` (128) and the sink slot, and startup refuses a cap the pool
-  can't hold. A decode iteration is 64 greedy steps, and its tokens stream out as it ends. ``compile_step: false`` in
+  can't hold. A live deployment also sizes ``stream_kv``, ``stream_conv`` and
+  ``stream_front`` ``max_slots`` (``stream_kv`` holds the cap, the other two the cap plus
+  a sink slot). A decode iteration is 64 greedy steps, and its tokens stream out as it ends. ``compile_step: false`` in
   their ``model_kwargs`` decodes with eager kernels instead of the compiled step.
 - Canary's and Canary-Qwen's YAMLs size the KV caches for ``max_concurrent_requests`` (64),
   and startup refuses a cap the caches can't hold.

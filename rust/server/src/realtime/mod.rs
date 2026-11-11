@@ -6,10 +6,12 @@
 //! transcribed again as one engine request whose assistant turn is prefilled
 //! with the previous hypothesis minus its last `unfixed_tokens` tokens (the
 //! Qwen3-ASR SDK's streaming algorithm); the tail can still change, the head
-//! is fixed. Turn detection (`server_vad`, `semantic_vad`) is [`vad`].
+//! is fixed. Turn detection (`server_vad`, `semantic_vad`) is [`vad`]. A
+//! model that hears audio as it comes transcribes live instead ([`live`]).
 
 mod audio;
 mod conversation;
+mod live;
 mod resample;
 mod vad;
 
@@ -20,8 +22,10 @@ use axum::extract::{Query, State};
 use axum::response::Response;
 use serde_json::{json, Map, Value};
 
-use crate::adapters::OpenAIAdapter;
-use crate::serving::{collect, rid, try_result_stream, AppState};
+use futures::StreamExt;
+
+use crate::adapters::{OpenAIAdapter, SubmitArgs};
+use crate::serving::{collect, rid, try_result_stream, AppState, Out, OutStream};
 use crate::transcription::TranscriptionRequest;
 use audio::AudioFormat;
 use resample::StreamResampler;
@@ -241,6 +245,83 @@ fn invalid(message: &str) -> Value {
     error_event(message, "invalid_request_error", None)
 }
 
+/// The OpenAI error `type` for a status (`_util.error_type`).
+fn error_type(status: u16) -> &'static str {
+    if (400..500).contains(&status) { "invalid_request_error" } else { "server_error" }
+}
+
+// ── a call: one engine request whose input stays open ────────────────────────
+
+/// `_call_error` for a call's failure on its output: the message cut and
+/// without server paths.
+fn call_error(st: &AppState, status: u16, message: &str) -> Value {
+    error_event(&clip(&scrub_paths(message, &st.upload_dir)), error_type(status), None)
+}
+
+/// `_open_call`: open a realtime call's engine request, its input left open:
+/// its submission and output, or the `error` event for the server's refusal
+/// (at capacity, say), as `_call_error` words it.
+async fn open_call(st: &AppState, args: &SubmitArgs, session_id: &str) -> Result<(u64, OutStream), Value> {
+    let rid = rid(&format!("rt-{session_id}"));
+    let (status, message) = match crate::serving::live_result_stream(st, args, &rid) {
+        Ok((mut stream, Some(sub))) => {
+            // The submission is the bridge's to accept: it answers `taking`
+            // only once it has, and a refusal has reached the stream by then.
+            let bridge = st.bridge.clone().expect("a submission went over the bridge");
+            let taking = bridge.live(sub, "taking", Map::new(), crate::BRIDGE_PROBE_TIMEOUT * 5).await;
+            if taking.as_ref().and_then(|m| m.get("taking")).and_then(Value::as_bool) == Some(true) {
+                return Ok((sub, stream));
+            }
+            match tokio::time::timeout(crate::BRIDGE_PROBE_TIMEOUT, stream.next()).await {
+                Ok(Some(Out::Error { status, message, .. })) => (status, message),
+                _ => (500, "the server could not open the call".to_string()),
+            }
+        }
+        Ok((_, None)) => (500, "this server has no backend to open the call on".to_string()),
+        Err(refused) => refused,
+    };
+    // a ValueError's text is cut and loses its paths; an HTTPException's detail is sent as is
+    let message = if status == 400 { clip(&scrub_paths(&message, &st.upload_dir)) } else { message };
+    Err(error_event(&message, error_type(status), None))
+}
+
+/// `stream_input(samples=...)`: append `audio`, at the stream's rate, to the
+/// call `sub`'s `ClientAudio` stream `stream`; whether it was taken. Not when
+/// the call has ended (its output says why) or the append passed the call's
+/// input budget, which ends the call with the refusal (`reject_input`; its
+/// output says so too). An append that failed inside the server is the
+/// `error` event returned.
+async fn stream_audio(st: &AppState, sub: u64, stream: &str, audio: &[f32], session_id: &str) -> Result<bool, Value> {
+    let Some(bridge) = st.bridge.clone() else { return Ok(false) };
+    let timeout = crate::BRIDGE_PROBE_TIMEOUT * 5;
+    let reply = bridge.live_audio(sub, stream, audio, timeout).await;
+    match reply.as_ref().and_then(Value::as_object) {
+        Some(meta) if meta.get("error").is_none() => Ok(meta.get("accepted").and_then(Value::as_bool).unwrap_or(false)),
+        Some(meta) if meta.get("status").and_then(Value::as_u64) == Some(400) => {
+            // past the call's input budget: the call ends with it
+            let error = meta.get("error").and_then(Value::as_str).unwrap_or_default();
+            let mut op = Map::new();
+            op.insert("error".into(), Value::from(format!("append rejected: {error}")));
+            op.insert("status".into(), Value::from(400));
+            bridge.live(sub, "reject", op, timeout).await;
+            Ok(false)
+        }
+        meta => Err(failed_in_server("append", meta, session_id)),
+    }
+}
+
+/// `_failed_in_server`: the `error` event for an `append` or `commit` whose
+/// bridge reply `meta` was an error (logged on the API server under its
+/// error id) or never came.
+fn failed_in_server(what: &str, meta: Option<&Map<String, Value>>, session_id: &str) -> Value {
+    let error_id = meta.and_then(|m| m.get("error_id")).and_then(Value::as_str).map(str::to_string).unwrap_or_else(|| {
+        let id = uuid::Uuid::new_v4().simple().to_string()[..12].to_string();
+        eprintln!("realtime {what} failed (error id {id}, session {session_id}): the API server did not answer");
+        id
+    });
+    error_event(&format!("the {what} failed (error id {error_id})"), "server_error", None)
+}
+
 // ── settings ─────────────────────────────────────────────────────────────────
 
 /// `_append_error`: the `error` for an append of more than `MAX_ITEM_SECONDS`
@@ -430,6 +511,9 @@ struct Session {
     stream_samples: i64,
     clock_base: i64,
     clock_in: i64,
+    /// samples already on a live model's stream ([`live`]): an item's length
+    /// without holding its audio
+    streamed_samples: usize,
 }
 
 fn item_id() -> String {
@@ -437,6 +521,35 @@ fn item_id() -> String {
 }
 
 impl Session {
+    fn new(st: &AppState, adapter: &dyn OpenAIAdapter) -> Session {
+        Session {
+            id: uuid::Uuid::new_v4().simple().to_string()[..16].to_string(),
+            model_name: st.model_name.clone(),
+            request: TranscriptionRequest { model: Some(st.model_name.clone()), ..TranscriptionRequest::default() },
+            chunk_seconds: DEFAULT_CHUNK_SECONDS,
+            unfixed_chunks: DEFAULT_UNFIXED_CHUNKS,
+            unfixed_tokens: DEFAULT_UNFIXED_TOKENS,
+            max_item_seconds: adapter.transcription_policy().max_audio_seconds.unwrap_or(f64::INFINITY).min(MAX_ITEM_SECONDS),
+            pending: Vec::new(),
+            heard: Vec::new(),
+            chunk_id: 0,
+            raw_hypothesis: String::new(),
+            emitted: String::new(),
+            item_id: item_id(),
+            failures: ItemFailures::default(),
+            odd_byte: None,
+            input_format: AudioFormat::pcm(SAMPLE_RATE),
+            resampler: None,
+            short: 0,
+            turn_detection: None,
+            segmenter: None,
+            stream_samples: 0,
+            clock_base: 0,
+            clock_in: 0,
+            streamed_samples: 0,
+        }
+    }
+
     fn chunk_samples(&self) -> usize {
         (self.chunk_seconds * SAMPLE_RATE as f64).round_ties_even() as usize
     }
@@ -495,7 +608,7 @@ impl Session {
 
     /// Samples in the item once `extra` more input samples arrive.
     fn item_samples(&self, extra: usize) -> usize {
-        self.pending.len() + self.held(extra) + self.heard.len()
+        self.pending.len() + self.held(extra) + self.streamed_samples + self.heard.len()
     }
 
     /// Every full chunk of pending audio, or `None` until enough arrived.
@@ -520,6 +633,7 @@ impl Session {
         self.pending.clear();
         self.heard.clear();
         self.short = 0;
+        self.streamed_samples = 0;
         self.chunk_id = 0;
         self.raw_hypothesis.clear();
         self.emitted.clear();
@@ -562,25 +676,146 @@ struct StepError {
     type_name: &'static str,
 }
 
-struct Realtime {
+/// How a transcription session turns an item's audio into text: re-decoded
+/// from the start each chunk ([`Redecode`], `RealtimeTranscription`), or heard
+/// as it comes on one call ([`live::Live`], `RealtimeLiveTranscription`). The
+/// rest of the session (events, formats, caps, turn detection) is
+/// [`Realtime`]'s.
+trait ItemDecoder: Sized + Send + 'static {
+    /// The pending audio to step on now, if any.
+    fn take_chunk(&self, s: &mut Session) -> Option<Vec<f32>>;
+
+    /// Hear `chunk` (the item's last when `final_`), sending what it adds to the text.
+    async fn step(rt: &mut Realtime<Self>, chunk: Vec<f32>, final_: bool);
+
+    /// End the item: the rest of its text, `committed`, and how it ended.
+    async fn commit(rt: &mut Realtime<Self>);
+
+    /// What a session update refuses before the rest of it applies.
+    fn refuse_update(_rt: &Realtime<Self>, _session: &Map<String, Value>) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// `transcription_session.*`'s view of the session, adjusted.
+    fn view(&self, _view: &mut Value) {}
+
+    /// A clear drops what the decoder holds for the item.
+    fn clear(&mut self) {}
+
+    /// The item's output arriving on its own, to [`ItemDecoder::relay`].
+    fn output(&mut self) -> Option<&mut OutStream> {
+        None
+    }
+
+    /// One item of [`ItemDecoder::output`]; `None`: it ended.
+    async fn relay(_rt: &mut Realtime<Self>, _item: Option<Out>) {}
+}
+
+/// Re-decoding: every `chunk_seconds`, the audio heard so far is transcribed
+/// again, continuing from the stable prefix of the last hypothesis.
+struct Redecode;
+
+impl ItemDecoder for Redecode {
+    fn take_chunk(&self, s: &mut Session) -> Option<Vec<f32>> {
+        s.take_chunk()
+    }
+
+    /// Hear `chunk`, decode everything so far again from the stable prefix, and
+    /// send the newly firm text and the whole hypothesis.
+    async fn step(rt: &mut Realtime<Self>, chunk: Vec<f32>, final_: bool) {
+        let chunk_len = chunk.len();
+        rt.s.heard.extend(chunk);
+        let tok = tokenizer();
+        let prefix = if rt.s.chunk_id < rt.s.unfixed_chunks {
+            String::new()
+        } else {
+            stable_prefix(&rt.s.raw_hypothesis, tok, rt.s.unfixed_tokens)
+        };
+        let (st, adapter, request, heard, id) = (rt.st.clone(), rt.adapter, rt.s.request.clone(), rt.s.heard.clone(), rt.s.id.clone());
+        match run_step(st, adapter, request, heard, id, prefix).await {
+            Ok(raw) => rt.s.raw_hypothesis = raw,
+            Err(e) => {
+                rt.step_failed(e).await;
+                return;
+            }
+        }
+        // a coalesced step counts every chunk it heard
+        let chunks = (chunk_len as f64 / rt.s.chunk_samples() as f64).round_ties_even() as i64;
+        rt.s.chunk_id += chunks.max(1);
+        let text = rt.current_text();
+        let hold = if final_ || tok.is_none() {
+            0
+        } else {
+            let stable = stable_prefix(&rt.s.raw_hypothesis, tok, rt.s.unfixed_tokens);
+            let stable_text = rt.adapter.parse_transcript(&stable, &rt.s.request).text;
+            text.chars().count().saturating_sub(stable_text.chars().count())
+        };
+        rt.emit(&text, hold).await;
+        let partial = event(
+            "mstar.transcription.partial",
+            json!({
+                "item_id": rt.s.item_id, "text": text, "chunk_id": rt.s.chunk_id,
+                "audio_seconds": rt.s.heard.len() as f64 / SAMPLE_RATE as f64, "created": crate::serving::now(),
+            }),
+        );
+        rt.send(partial).await;
+    }
+
+    async fn commit(rt: &mut Realtime<Self>) {
+        match rt.s.flush() {
+            Some(tail) => Self::step(rt, tail, true).await,
+            None => {
+                // nothing left to hear: what was held back is final now
+                let text = rt.current_text();
+                rt.emit(&text, 0).await;
+            }
+        }
+        let committed = event("input_audio_buffer.committed", json!({"item_id": rt.s.item_id}));
+        rt.send(committed).await;
+        let completed = event(
+            "conversation.item.input_audio_transcription.completed",
+            json!({"item_id": rt.s.item_id, "transcript": rt.current_text()}),
+        );
+        rt.send(completed).await;
+        rt.s.clear();
+    }
+}
+
+struct Realtime<D> {
     st: AppState,
     adapter: &'static dyn OpenAIAdapter,
     socket: WebSocket,
     s: Session,
+    d: D,
 }
 
-impl Realtime {
+impl<D: ItemDecoder> Realtime<D> {
     async fn send(&mut self, event: Value) -> bool {
         self.socket.send(Message::Text(event.to_string())).await.is_ok()
     }
 
+    /// The session as `transcription_session.*` shows it.
+    fn view(&self) -> Value {
+        let mut view = self.s.view();
+        self.d.view(&mut view);
+        view
+    }
+
     async fn run(mut self) {
-        let created = event("transcription_session.created", json!({"session": self.s.view()}));
+        let created = event("transcription_session.created", json!({"session": self.view()}));
         if !self.send(created).await {
             return;
         }
         loop {
-            let message = match self.socket.recv().await {
+            let received = tokio::select! {
+                received = self.socket.recv() => received,
+                // the item's output, as it comes
+                item = async { self.d.output().unwrap().next().await }, if self.d.output().is_some() => {
+                    D::relay(&mut self, item).await;
+                    continue;
+                }
+            };
+            let message = match received {
                 Some(Ok(m)) => m,
                 Some(Err(e)) => {
                     if let Some(close) = crate::ws::read_failure_close(&e) {
@@ -628,7 +863,7 @@ impl Realtime {
                         self.send(invalid(&e)).await;
                     }
                     Ok(()) => {
-                        let updated = event("transcription_session.updated", json!({"session": self.s.view()}));
+                        let updated = event("transcription_session.updated", json!({"session": self.view()}));
                         self.send(updated).await;
                     }
                 }
@@ -685,9 +920,10 @@ impl Realtime {
                         return;
                     }
                 }
-                self.commit().await;
+                D::commit(self).await;
             }
             Some("input_audio_buffer.clear") => {
+                self.d.clear();
                 self.s.clear();
                 self.s.odd_byte = None;
                 self.s.reset_stream();
@@ -715,12 +951,12 @@ impl Realtime {
                 Op::Audio(audio) => {
                     self.s.add(&audio);
                     if i == n - 1 {
-                        if let Some(chunk) = self.s.take_chunk() {
-                            self.step(chunk, false).await;
+                        if let Some(chunk) = self.d.take_chunk(&mut self.s) {
+                            D::step(self, chunk, false).await;
                         }
                     }
                 }
-                Op::Commit => self.commit().await,
+                Op::Commit => D::commit(self).await,
                 Op::SpeechStarted(ms) => {
                     let e = event("input_audio_buffer.speech_started", json!({"audio_start_ms": ms, "item_id": self.s.item_id}));
                     self.send(e).await;
@@ -748,27 +984,9 @@ impl Realtime {
         self.send(error_event(&message, "server_error", Some("end_of_turn_failed"))).await;
     }
 
-    async fn commit(&mut self) {
-        match self.s.flush() {
-            Some(tail) => self.step(tail, true).await,
-            None => {
-                // nothing left to hear: what was held back is final now
-                let text = self.current_text();
-                self.emit(&text, 0).await;
-            }
-        }
-        let committed = event("input_audio_buffer.committed", json!({"item_id": self.s.item_id}));
-        self.send(committed).await;
-        let completed = event(
-            "conversation.item.input_audio_transcription.completed",
-            json!({"item_id": self.s.item_id, "transcript": self.current_text()}),
-        );
-        self.send(completed).await;
-        self.s.clear();
-    }
-
     /// Apply a session update, all or nothing.
     fn update(&mut self, session: Map<String, Value>) -> Result<(), String> {
+        D::refuse_update(self, &session)?;
         let s = &self.s;
         let fmt = input_format(session.get("input_audio_format"), s.input_format)?;
         if fmt != s.input_format && s.item_samples(0) > 0 {
@@ -870,48 +1088,6 @@ impl Realtime {
         self.adapter.parse_transcript(&self.s.raw_hypothesis, &self.s.request).text
     }
 
-    /// Hear `chunk`, decode everything so far again from the stable prefix, and
-    /// send the newly firm text and the whole hypothesis.
-    async fn step(&mut self, chunk: Vec<f32>, final_: bool) {
-        let chunk_len = chunk.len();
-        self.s.heard.extend(chunk);
-        let tok = tokenizer();
-        let prefix = if self.s.chunk_id < self.s.unfixed_chunks {
-            String::new()
-        } else {
-            stable_prefix(&self.s.raw_hypothesis, tok, self.s.unfixed_tokens)
-        };
-        let (st, adapter, request, heard, id) =
-            (self.st.clone(), self.adapter, self.s.request.clone(), self.s.heard.clone(), self.s.id.clone());
-        match run_step(st, adapter, request, heard, id, prefix).await {
-            Ok(raw) => self.s.raw_hypothesis = raw,
-            Err(e) => {
-                self.step_failed(e).await;
-                return;
-            }
-        }
-        // a coalesced step counts every chunk it heard
-        let chunks = (chunk_len as f64 / self.s.chunk_samples() as f64).round_ties_even() as i64;
-        self.s.chunk_id += chunks.max(1);
-        let text = self.current_text();
-        let hold = if final_ || tok.is_none() {
-            0
-        } else {
-            let stable = stable_prefix(&self.s.raw_hypothesis, tok, self.s.unfixed_tokens);
-            let stable_text = self.adapter.parse_transcript(&stable, &self.s.request).text;
-            text.chars().count().saturating_sub(stable_text.chars().count())
-        };
-        self.emit(&text, hold).await;
-        let partial = event(
-            "mstar.transcription.partial",
-            json!({
-                "item_id": self.s.item_id, "text": text, "chunk_id": self.s.chunk_id,
-                "audio_seconds": self.s.heard.len() as f64 / SAMPLE_RATE as f64, "created": crate::serving::now(),
-            }),
-        );
-        self.send(partial).await;
-    }
-
     /// `_step_failed`: a request error keeps its message (cut, without server
     /// paths); anything else is a generic message with an error id. Each
     /// distinct failure is logged once per item.
@@ -1009,14 +1185,22 @@ pub async fn realtime(
         Ok(ws) => ws,
         Err(not_found) => return not_found,
     };
-    // As the Python router decides: a model with a ClientAudio stream converses
-    // when it can and no intent is named; otherwise the transcription intent.
+    // As the Python router decides: a model that hears transcription as it
+    // comes serves it, with the intent named or omitted; a model with a
+    // ClientAudio stream converses when it can and no intent is named;
+    // otherwise the transcription intent.
     let intent = query.get("intent").map(String::as_str);
     let audio = conversation::facts();
     let no_conversation = audio.and_then(conversation::Facts::problem);
     let converses = audio.is_some() && no_conversation.is_none();
     let limit = crate::ws::max_message_bytes();
     let ws = ws.max_message_size(limit).max_frame_size(limit);
+    if let (Some(facts), None | Some("transcription")) = (audio.and_then(|f| f.live.as_ref()), intent) {
+        if let Some(adapter) = crate::adapters::from_python(&st.python_adapter) {
+            let s = Session::new(&st, adapter);
+            return ws.on_upgrade(move |socket| live::Live::session(st, adapter, socket, s, facts).run());
+        }
+    }
     if converses && intent.is_none() {
         let facts = audio.unwrap();
         return ws.on_upgrade(move |socket| conversation::Conversation::new(st, socket, facts).run());
@@ -1030,43 +1214,29 @@ pub async fn realtime(
         },
         Some(other) => Some(format!(
             "unsupported intent {}; {}",
-            crate::media::py_repr(other),
+            crate::media::py_repr(&other.chars().take(32).collect::<String>()),
             if converses { "omit intent for a conversation" } else { "use intent=transcription" }
         )),
     };
-    if let Some(reason) = refusal {
+    if let Some(mut reason) = refusal {
+        // a close frame's reason is at most 123 bytes (RFC 6455); a model's name is in some
+        let mut end = reason.len().min(123);
+        while !reason.is_char_boundary(end) {
+            end -= 1;
+        }
+        reason.truncate(end);
         return ws.on_upgrade(move |mut socket| async move {
             let _ = socket.send(Message::Close(Some(CloseFrame { code: 1008, reason: reason.into() }))).await;
         });
     }
     let adapter = crate::resolve_message(&st, crate::Surface::RealtimeTranscription).expect("resolved above");
-    let max_item = adapter.transcription_policy().max_audio_seconds.unwrap_or(f64::INFINITY).min(MAX_ITEM_SECONDS);
-    let session = Session {
-        id: uuid::Uuid::new_v4().simple().to_string()[..16].to_string(),
-        model_name: st.model_name.clone(),
-        request: TranscriptionRequest { model: Some(st.model_name.clone()), ..TranscriptionRequest::default() },
-        chunk_seconds: DEFAULT_CHUNK_SECONDS,
-        unfixed_chunks: DEFAULT_UNFIXED_CHUNKS,
-        unfixed_tokens: DEFAULT_UNFIXED_TOKENS,
-        max_item_seconds: max_item,
-        pending: Vec::new(),
-        heard: Vec::new(),
-        chunk_id: 0,
-        raw_hypothesis: String::new(),
-        emitted: String::new(),
-        item_id: item_id(),
-        failures: ItemFailures::default(),
-        odd_byte: None,
-        input_format: AudioFormat::pcm(SAMPLE_RATE),
-        resampler: None,
-        short: 0,
-        turn_detection: None,
-        segmenter: None,
-        stream_samples: 0,
-        clock_base: 0,
-        clock_in: 0,
-    };
-    ws.on_upgrade(move |socket| Realtime { st, adapter, socket, s: session }.run())
+    let s = Session::new(&st, adapter);
+    ws.on_upgrade(move |socket| Realtime { st, adapter, socket, s, d: Redecode }.run())
+}
+
+/// Whether the model hears transcription as it comes (`Model.live_transcription_stream`).
+pub fn live_transcription() -> bool {
+    conversation::facts().is_some_and(|f| f.live.is_some())
 }
 
 /// Load the turn detection models once at startup, so a missing one is a

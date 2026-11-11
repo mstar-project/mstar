@@ -513,7 +513,8 @@ Endpoints and model coverage:
        each agent reply out as one response (audio and its transcript). The model
        decides when to speak; see below.
    * - ``WS /v1/realtime?intent=transcription``
-     - models whose adapter can continue a hypothesis
+     - models whose adapter can continue a hypothesis, and models that hear audio as it
+       comes (``nemotron_asr`` with ``live_lookahead``; ``intent`` may be omitted)
      - Streaming speech-to-text: ``input_audio_buffer.append`` chunks in,
        ``conversation.item.input_audio_transcription.delta`` (append-only) and
        ``mstar.transcription.partial`` (whole current hypothesis) out; ``commit``
@@ -683,6 +684,21 @@ Per-model notes:
   in ``transcription_session.update``; a smaller ``chunk_seconds`` is raised to 0.5. An item holds
   at most 300 s of audio (``max_item_seconds`` in the session, lower if the model hears
   less): commit before then, since an append past it is refused with an ``error``.
+- **Realtime transcription, on a model that hears audio as it comes** (one 16 kHz ``ClientAudio`` client
+  stream, no ``turn_tokens`` and no audio sent to the client, such as ``nemotron_asr``) — each item is one engine request,
+  opened by its first append and ended by its commit, so its text streams as
+  ``conversation.item.input_audio_transcription.delta`` events while the audio is still
+  arriving, and ``mstar.transcription.partial`` events report the audio covered so far. Nothing
+  is re-decoded, so an update naming ``chunk_seconds``, ``unfixed_chunks``, ``unfixed_tokens``
+  or a ``prompt`` is refused, as is a ``language`` change while an item is open. An item holds
+  up to the model's bound on a live call. If an
+  item's request fails (or can't open), the server sends an ``error``, drops the rest of the
+  item's audio, and answers its commit with
+  ``conversation.item.input_audio_transcription.failed``; the next item opens a request of its
+  own. An append that fails inside the server gets an ``error`` with an error
+  id; that audio is not heard, and the item goes on. If ending the item's request at its commit
+  fails inside the server (or gets no answer), the request is aborted, the server sends an
+  ``error``, and the commit is answered with ``failed``; the session goes on.
 - **Realtime turn detection** — by default the client ends each utterance with
   ``input_audio_buffer.commit``. With ``"turn_detection": {"type": "server_vad"}`` the
   server does it, as OpenAI's server VAD does: ``threshold`` (default 0.5),

@@ -6,6 +6,11 @@ iteration reads its rows' state from the recurrent pool, runs ``CHUNK`` greedy
 steps, each projecting the frames under the cursors (with Nemotron's language
 prompt), writes the state back and emits the iteration's tokens; the stop
 check ends a request's loop once its cursor has passed its last frame.
+
+A live call's decode loop (``LiveTransducerSubmodule``) takes one chunk of
+frames per iteration from the stream encoder: enough greedy steps to finish any
+chunk, so the cursor is at the chunk's end when the iteration writes it back,
+and the next chunk starts from frame 0 of its own frames.
 """
 from __future__ import annotations
 
@@ -22,7 +27,15 @@ from mstar.engine.fp32_precision import fp32_precision_scope, node_fp32_precisio
 from mstar.engine.resources import Segment, SlotLease, SubmoduleStep
 from mstar.engine.resources.recurrent import RecurrentStatePool, RecurrentStep
 from mstar.model.components.transducer import CHUNK, TransducerHead
-from mstar.model.parakeet.config import DECODE_LOOP, NUM_FRAMES, PROMPT_ID, TRANSDUCER_STATE, WALK
+from mstar.model.parakeet.config import (
+    DECODE_LOOP,
+    ENCODER_FRAMES,
+    LIVE_DECODE_WALK,
+    NUM_FRAMES,
+    PROMPT_ID,
+    TRANSDUCER_STATE,
+    WALK,
+)
 from mstar.model.submodule_base import (
     BatchedModelOutput,
     HostRows,
@@ -71,7 +84,7 @@ class TransducerSubmodule(NodeSubmodule):
         super().__init__()
         self.head = head
         self.frame_buckets = tuple(frame_buckets)
-        # steps an iteration; the model's loop cap counts CHUNK, so only tests
+        # steps an iteration; the clip loop's cap counts CHUNK, so only tests
         # that drive the node by hand pass fewer
         self.chunk = chunk
         # the encoder output's dtype, which the captures' frames buffers take
@@ -110,11 +123,13 @@ class TransducerSubmodule(NodeSubmodule):
             raise ValueError(
                 f"the encoder heard {states.shape[0]} frames of this clip, process_prompt counted {counted}"
             )
+        return self._node_inputs(states, fwd_info, self._bucket(states.shape[0]))
+
+    def _node_inputs(self, states: torch.Tensor, fwd_info: CurrentForwardPassInfo, bucket: int | None) -> NodeInputs:
         # the prompt is known on the host, so it rides the step metadata
         kwargs = {PROMPT_ID: fwd_info.step_metadata[PROMPT_ID]} if self.head.prompt_projector is not None else {}
         return NodeInputs(
-            tensor_inputs={"encoder_states": states}, kwargs=kwargs, input_seq_len=1,
-            resource_step_info=self._bucket(states.shape[0]),
+            tensor_inputs={"encoder_states": states}, kwargs=kwargs, input_seq_len=1, resource_step_info=bucket,
         )
 
     def _padding(self, rows: int, like: torch.Tensor) -> torch.Tensor:
@@ -184,24 +199,23 @@ class TransducerSubmodule(NodeSubmodule):
         """One decode capture per frame bucket. The template row carries no
         frames, so a replay's padding rows copy none; preprocess pads every
         row to the bucket."""
-        hidden = self.head.config.encoder_hidden_size
+        return [self._capture_config(device, WALK, bucket, self.encoder_dtype) for bucket in self.frame_buckets]
+
+    def _capture_config(
+        self, device: torch.device, walk: str, bucket: int, dtype: torch.dtype,
+    ) -> BatchedAcceleratorGraphConfig:
         kwargs = {PROMPT_ID: 0} if self.head.prompt_projector is not None else {}
-        return [
-            BatchedAcceleratorGraphConfig(
-                capture_graph_walk=WALK,
-                single_request_inputs=NodeInputs(
-                    tensor_inputs={"encoder_states": torch.zeros(0, hidden, dtype=self.encoder_dtype, device=device)},
-                    kwargs=kwargs,
-                    input_seq_len=1,
-                    resource_step_info=bucket,
-                ),
-                additional_key_info=bucket,
-                capture_batch_sizes=_batch_sizes(bucket),
-                # the step inside is compiled already, once for every capture
-                compile=False,
-            )
-            for bucket in self.frame_buckets
-        ]
+        frames = torch.zeros(0, self.head.config.encoder_hidden_size, dtype=dtype, device=device)
+        return BatchedAcceleratorGraphConfig(
+            capture_graph_walk=walk,
+            single_request_inputs=NodeInputs(
+                tensor_inputs={"encoder_states": frames}, kwargs=kwargs, input_seq_len=1, resource_step_info=bucket,
+            ),
+            additional_key_info=bucket,
+            capture_batch_sizes=_batch_sizes(bucket),
+            # the step inside is compiled already, once for every capture
+            compile=False,
+        )
 
     # -- forward ------------------------------------------------------------------
 
@@ -271,3 +285,68 @@ class TransducerSubmodule(NodeSubmodule):
         if pairs is None:
             return None
         return {rid: {DECODE_LOOP} for rid, active in pairs if not active}
+
+
+class LiveTransducerSubmodule(TransducerSubmodule):
+    """A live call's decoder: each iteration takes one chunk of ``frames``
+    stream-encoder frames (in fp32, as ``FastConformerStreamSubmodule`` sends
+    them) and runs enough greedy steps to finish any chunk, a frame taking at
+    most ``max_symbols_per_step``. The cursor is then at the chunk's end, and
+    the next chunk starts from frame 0 of its own frames. Its loop ends with
+    its stream, not a stop check."""
+
+    def __init__(self, head: TransducerHead, frames: int, compile_step: bool = True):
+        super().__init__(head, compile_step=compile_step, frame_buckets=(frames,),
+                         chunk=frames * head.config.max_symbols_per_step)
+        self.frames = frames
+
+    def prepare_inputs(
+        self,
+        graph_walk: str,
+        fwd_info: CurrentForwardPassInfo,
+        inputs: NameToTensorList,
+        is_final_stream_chunk: bool = False,
+        **kwargs,
+    ) -> NodeInputs | None:
+        frames = inputs.get(ENCODER_FRAMES)
+        if not frames:
+            # the stream's terminal chunk is empty when its last frames were
+            # taken before its end reached this worker; declined, it ends the loop
+            assert is_final_stream_chunk, "an empty chunk before the end of the stream"
+            return None
+        return self._node_inputs(frames[0], fwd_info, self.frames)
+
+    def cg_key_info(
+        self, graph_walk: str,
+        per_request_info: Mapping[str, CurrentForwardPassInfo],
+        per_request_input_metadata=None,
+        **kwargs: Any,
+    ) -> int:
+        return self.frames
+
+    def get_accelerator_graph_configs(
+        self, device: torch.device, tp_world_size: int = 1,
+    ) -> list[AcceleratorGraphConfig]:
+        return [self._capture_config(device, LIVE_DECODE_WALK, self.frames, torch.float32)]
+
+    def _decode(
+        self, engine_inputs: ModelInputsFromEngine, encoder_states: torch.Tensor, lengths: torch.Tensor,
+        prompt_ids: torch.Tensor | None = None,
+    ) -> BatchedModelOutput:
+        pool: RecurrentStatePool = engine_inputs.resources[TRANSDUCER_STATE]
+        state = {name: pool.gather(name, start=start) for name, start in self._start.items()}
+        tokens, _active = self.head.advance(encoder_states, lengths, state, self.chunk, self._step, prompt_ids)
+        # the next chunk's frames start at 0
+        state["cursor"] = state["cursor"] - lengths
+        for name, value in state.items():
+            pool.scatter_(name, value)
+        # nothing to stop on; the tokens' host rows give the client its copy
+        return BatchedModelOutput(row_outputs={"tokens": tokens}, check_stop_buffers={"tokens": tokens})
+
+    def check_stop_batched(
+        self,
+        request_ids: list[str],
+        request_infos: dict[str, CurrentForwardPassInfo],
+        host_rows: HostRows,
+    ) -> dict[str, set[str]]:
+        return {}
