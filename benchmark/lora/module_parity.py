@@ -359,7 +359,7 @@ def _qwen3_tts() -> ModelSpec:
 
     def run(sub, ids, lengths, rope=None):
         _stub_attention(sub.model, lengths, rope)
-        hidden = sub.model(sub.model.model.codec_embedding(ids), label="main")
+        hidden = sub.model(sub.model.model.codec_embedding(ids))
         return sub.model.codec_head(_last(hidden, lengths)).float()
 
     def hf(model):
