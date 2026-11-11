@@ -420,13 +420,6 @@ class MultimodalDecoderModel(Model):
     def text_output(self) -> TextOutput:
         return TextOutput(self._chunk_detokenizer(), self.config.stop_token_ids)
 
-    def postprocess(
-        self, output: torch.Tensor, modality: str, request_kwargs: dict | None = None,
-    ) -> bytes:
-        if modality == "text":
-            return super().postprocess(output, modality, request_kwargs)
-        raise ValueError(f"Unsupported modality for {self.NAME}: {modality!r}")
-
     # -----------------------------------------------------------------------
     # Sampling
     # -----------------------------------------------------------------------

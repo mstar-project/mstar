@@ -66,7 +66,7 @@ from mstar.engine.resources.recurrent.config import (
 )
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.base import KVLabel, LabelLayout, Model, ProcessPromptOutput, Span, WalkStep
+from mstar.model.base import KVLabel, LabelLayout, ProcessPromptOutput, Span, WalkStep
 from mstar.model.components.audio_features import HOP_LENGTH, LogMelSpectrogram
 from mstar.model.components.sampled_token_decoder import ROW_HIDDEN, ROW_IDS
 from mstar.model.keys import KV_CACHE, ROPE, VISION_ATTN
@@ -709,10 +709,6 @@ class MiniCPMOModel(MultimodalDecoderModel):
                 raise ValueError(f"voice {name!r} is not 16 kHz mono")
             cached = self._voices[name] = torch.from_numpy(audio)
         return cached
-
-    def postprocess(self, output: torch.Tensor, modality: str, request_kwargs: dict | None = None) -> bytes:
-        # the scaffold's refuses audio; Model's encodes it as it does text (#1134)
-        return Model.postprocess(self, output, modality, request_kwargs)
 
     # ------------------------------------------------------------------
     # Walks
