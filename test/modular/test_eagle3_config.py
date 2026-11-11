@@ -292,6 +292,28 @@ def test_the_node_stores_the_carry_its_hosted_drafters_prefill_returns(tmp_path,
     assert torch.equal(stored[:2].to(carry.dtype), carry)
 
 
+def test_a_carrying_drafter_whose_prefill_returns_none_is_refused(tmp_path, monkeypatch):
+    """EAGLE-3 declares a carry, so a prefill that forgets to return it is refused while the step is
+    traced, as an observe that returns none is."""
+    import qwen3_cpu
+
+    from mstar.model.components.eagle3 import Eagle3Drafter
+
+    qwen3_cpu.patch_cpu(monkeypatch)
+    real = Eagle3Drafter.prefill
+
+    def forgets(self, inputs):
+        real(self, inputs)
+
+    monkeypatch.setattr(Eagle3Drafter, "prefill", forgets)
+    target, _ = qwen3_cpu.write_checkpoints(tmp_path)
+    model = qwen3_cpu.make_model(target, _cpu_eagle3(tmp_path), max_seq_len=512)
+    driver = qwen3_cpu.Driver(qwen3_cpu.engine(model), model)
+    driver.add(1, [5, 9, 2, 7], 8)
+    with pytest.raises(RuntimeError, match="returned none from prefill"):
+        driver.prefill([1], {1: [5, 9, 2, 7]})
+
+
 @pytest.mark.parametrize("top, inner, want", [
     ({"torch_dtype": "float32"}, {"dtype": "bfloat16"}, "float32"),
     ({}, {"dtype": "float16"}, "float16"),
