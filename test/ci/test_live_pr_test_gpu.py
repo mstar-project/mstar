@@ -1,15 +1,16 @@
-"""Check live-pr-test's gpu.py: the Eras Cloud provider."""
+"""Check live-pr-test's gpu.py: the Eras Cloud and DigitalOcean providers, and what every provider shares."""
 
 import argparse
 import base64
 import contextlib
 import functools
+import gzip
 import hashlib
 import io
 import json
 import os
-import runpy
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -17,12 +18,21 @@ import unittest.mock
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-GPU = runpy.run_path(str(REPO_ROOT / ".claude/skills/live-pr-test/scripts/gpu.py"))
+sys.path.insert(0, str(REPO_ROOT / ".claude/skills/live-pr-test/scripts"))
+import gpu as gpu_module  # noqa: E402
+
+GPU = vars(gpu_module)  # patched in place, with each test's cleanup restoring it
+
+
+def keys(*names):
+    """The environment with only these providers' API keys set, so no test reaches a real provider."""
+    return unittest.mock.patch.dict(os.environ, {cls.key_env: "k" if cls.name in names else ""
+                                                 for cls in GPU["PROVIDERS"].values()})
 
 
 class TestEras(unittest.TestCase):
     def eras_launch(self, write=None, max_running=None, held=("v1",), refused_by="preview", dry_run=False, run=None,
-                    inputs=(), gone=()):
+                    inputs=(), gone=(), boxes=1):
         """gpu.py launch on a fake Eras whose cache volumes, v1 and v2, look free, but the preview (or the
         create, `refused_by`) refuses those `held` (as the spec has it), as when another box took them in
         between, and those `gone` no longer exist; the calls it made."""
@@ -57,16 +67,16 @@ class TestEras(unittest.TestCase):
                        "/volumes/v2": {"attachment": None}}
             return replies.get(path, tpl)
 
-        saved = {k: GPU["cmd_launch"].__globals__[k] for k in ("eras", "find_offer", "STATE", "LEDGER")}
-        self.addCleanup(GPU["cmd_launch"].__globals__.update, saved)
-        GPU["cmd_launch"].__globals__.update(
+        saved = {k: GPU[k] for k in ("eras", "find_offer", "STATE", "LEDGER")}
+        self.addCleanup(GPU.update, saved)
+        GPU.update(
             eras=eras, STATE=state, LEDGER=state / "instances.json", find_offer=lambda cfg, offer: {
                 "id": "eras:l1", "provider": "eras", "gpu": "H200", "count": 1, "usd_per_hour": 3.0, "region": "x",
                 "storage": True})
         cfg = {"ssh_public_key": str(key), "eras": {"cache_volume_ids": ["v1", "v2"]},
                "budget": {"max_usd_per_hour": 30, "max_hours": 4, "max_running": max_running}}
-        args = argparse.Namespace(offer="eras:l1", pr=0, hours=1, tag="c", run=run, input=list(inputs), cache="ro",
-                                  cache_write=write, allow_over_budget=False, dry_run=dry_run)
+        args = argparse.Namespace(boxes=boxes, offer="eras:l1", pr=0, hours=1, tag="c", run=run, input=list(inputs),
+                                  cache="ro", cache_write=write, allow_over_budget=False, dry_run=dry_run)
         with unittest.mock.patch.object(subprocess, "Popen"), contextlib.redirect_stdout(io.StringIO()), \
                 unittest.mock.patch.dict(os.environ, {"ERAS_API_KEY": "k"}), contextlib.redirect_stderr(io.StringIO()):
             try:
@@ -124,7 +134,7 @@ class TestEras(unittest.TestCase):
                                             "so the next volume or a cold box would never launch")
 
     def test_a_create_whose_answer_was_lost_is_not_sent_again(self):
-        posts, globs = [], GPU["eras"].__globals__
+        posts, globs = [], GPU
         self.addCleanup(globs.update, {"_eras_org": globs["_eras_org"]})
         globs["_eras_org"] = "org"
 
@@ -154,7 +164,7 @@ class TestEras(unittest.TestCase):
                      {"id": "i-9", "name": "live-pr-7-t", "status": "active"}]
             return {"items": items if path == "/instances" else [], "next_page_token": None}
 
-        globs = GPU["terminate"].__globals__
+        globs = GPU
         self.addCleanup(globs.update, {k: globs[k] for k in ("eras", "STATE", "LEDGER")})
         globs.update(eras=eras, STATE=state, LEDGER=state / "instances.json")
         e = {"provider": "eras", "instance_id": None, "name": "live-pr-7-t", "launched_at": 0, "usd_per_hour": 1.0,
@@ -166,7 +176,7 @@ class TestEras(unittest.TestCase):
         self.assertEqual(GPU["ledger"](), {})
 
     def test_extend_cant_outrun_a_deadline_fixed_at_launch(self):
-        globs = GPU["cmd_extend"].__globals__
+        globs = GPU
         self.addCleanup(globs.update, {k: globs[k] for k in ("STATE", "LEDGER")})
         state = Path(tempfile.mkdtemp())
         globs.update(STATE=state, LEDGER=state / "instances.json")
@@ -186,17 +196,56 @@ class TestEras(unittest.TestCase):
         self.assertLess(GPU["ledger"]()["eras:i"]["deadline"], soon)
         self.assertGreater(GPU["ledger"]()["runpod:i"]["deadline"], soon)
 
-    def test_max_running_counts_this_tools_live_instances_on_every_page(self):
-        globs = GPU["running"].__globals__
-        self.addCleanup(globs.update, {"eras": globs["eras"]})
+    def test_max_running_counts_this_tools_live_instances_on_every_page_of_every_provider(self):
+        globs = GPU
+        self.addCleanup(globs.update, {k: globs[k] for k in ("eras", "runpod")})
         globs["eras"] = lambda *a, params=None, **k: (
             {"items": [{"id": "i1", "name": "live-pr-4-8-1", "status": "active"},
                        {"id": "i3", "name": "someone-else", "status": "active"}]} if params.get("page_token")
             else {"items": [{"id": "i2", "name": "live-pr-2-1-1", "status": "ended"}], "next_page_token": "p2"})
-        with unittest.mock.patch.dict(os.environ, {"ERAS_API_KEY": "k"}):
+        globs["runpod"] = lambda *a, **k: {"pods": [{"id": "p1", "name": "live-pr-5-x", "status": "RUNNING"}]}
+        with keys("eras", "runpod"):
             up = GPU["running"]({"eras": {}})
-        self.assertEqual([line.split()[0] for line in up], ["eras:i1"],
+        self.assertEqual([line.split()[0] for line in up], ["eras:i1", "runpod:p1"],
                          "every live test would hold its own box, past budget.max_running")
+
+        def down(*a, **k):
+            raise GPU["ApiError"](503, "down")
+        globs["runpod"] = down
+        with keys("eras", "runpod"), self.assertRaises(GPU["ApiError"], msg="a provider it can't list would count 0"):
+            GPU["running"]({"eras": {}})
+
+    def test_offers_are_of_the_vendor_asked_for_and_eras_offers_no_amd(self):
+        globs = GPU
+        self.addCleanup(globs.update, {"eras": globs["eras"]})
+        listing = [{"id": f"l{i}", "hourly_price": 3.0, "launches_available": 1,
+                    "access_method": {"is_available": True},
+                    "hardware": {"gpu": {"model": model, "count": 1, "memory_per_device": "192Gi"}}}
+                   for i, model in enumerate(("H200", "MI300X", "A100"))]
+        globs["eras"] = lambda *a, **k: {"items": listing}
+
+        def offers(vendor):
+            printed = io.StringIO()
+            args = argparse.Namespace(gpus=1, vendor=vendor, min_vram=80, all_regions=False, allow_arm=False, json=True)
+            with keys("eras"), contextlib.redirect_stdout(printed):
+                GPU["cmd_offers"](args, {"budget": {"max_usd_per_hour": 30}})
+            return [(o["id"], o["vendor"]) for o in json.loads(printed.getvalue())["offers"]]
+
+        self.assertEqual(offers("nvidia"), [("eras:l0", "nvidia")], "an A100 or an AMD box would pass for Hopper")
+        self.assertEqual(offers("amd"), [], "an AMD box would get the Eras template, which asks for nvidia.com/gpu")
+
+    def test_run_is_refused_where_the_box_cant_take_it(self):
+        globs = GPU
+        self.addCleanup(globs.update, {"find_offer": globs["find_offer"]})
+        globs["find_offer"] = lambda cfg, offer: {"id": "runpod:H100:dc:1", "provider": "runpod", "gpu": "H100",
+                                                  "count": 1, "usd_per_hour": 3.0, "region": "dc", "storage": True}
+        key = Path(tempfile.mkdtemp()) / "key.pub"
+        key.write_text("ssh-ed25519 AAAA test")
+        args = argparse.Namespace(boxes=1, offer="runpod:H100:dc:1", pr=0, hours=1, tag="t", run="box.sh", input=[],
+                                  allow_over_budget=False, dry_run=True)
+        with self.assertRaises(SystemExit, msg="a pod would hold GPUs with nothing running on them"), \
+                contextlib.redirect_stderr(io.StringIO()):
+            GPU["cmd_launch"](args, {"ssh_public_key": str(key), "budget": {"max_usd_per_hour": 30, "max_hours": 4}})
 
     def test_an_eras_ssh_key_on_a_later_page_is_reused(self):
         key = base64.b64encode(b"key").decode()
@@ -209,12 +258,17 @@ class TestEras(unittest.TestCase):
                 return {"id": "new"}
             return {"items": [{"id": "k2", "fingerprint": fingerprint}]} if params.get("page_token") \
                 else {"items": [{"id": "k1", "fingerprint": "other"}], "next_page_token": "p2"}
-        globs = GPU["eras_ssh_key_id"].__globals__
+        globs = GPU
         self.addCleanup(globs.update, {"eras": globs["eras"]})
         globs["eras"] = eras
         self.assertEqual(GPU["eras_ssh_key_id"](f"ssh-ed25519 {key} me", "live-pr-1"), "k2",
                          "a key on a later page would be registered again on every launch")
         self.assertEqual(posts, [])
+
+    def test_an_error_is_cut_at_whole_lines(self):
+        text = "x" * 300 + "\n" + "y" * 300 + "\nlast line\n"
+        self.assertEqual(GPU["tail_lines"](text, 400), "y" * 300 + "\nlast line",
+                         "a provider's error would be cut mid-word")
 
     def test_a_launch_past_the_caps_registers_nothing(self):
         calls = self.eras_launch(max_running=0)
@@ -222,6 +276,202 @@ class TestEras(unittest.TestCase):
                          "a refused launch would leave an ssh key in the organization")
         self.assertIn(("POST", "/instances"), [c[:2] for c in self.eras_launch(max_running=1, held=())],
                       "a launch under budget.max_running would be refused")
+        self.assertIn(("exit", 4), [c[:2] for c in self.eras_launch(max_running=1, held=(), boxes=2)],
+                      "the first of a run's two boxes would start with room for one, and the second be refused")
+        self.assertEqual([c[:2] for c in self.eras_launch(max_running=0, held=(), boxes=0) if c[0] != "GET"],
+                         [("exit", 1)], "--boxes 0 would launch past budget.max_running")
+
+
+def do_size(slug, model, count, vram, price, regions=("nyc2", "tor1"), available=True):
+    """A GPU size as DigitalOcean's GET /v2/sizes lists it (the spec's size and gpu_info)."""
+    return {"slug": slug, "memory": 245760 * count, "vcpus": 20 * count, "disk": 720, "transfer": 15.0,
+            "price_monthly": round(price * 730, 2), "price_hourly": price, "regions": list(regions),
+            "available": available, "description": f"{model} GPU - {count}X",
+            "disk_info": [{"type": "local", "size": {"amount": 720, "unit": "gib"}},
+                          {"type": "scratch", "size": {"amount": 5120, "unit": "gib"}}],
+            "gpu_info": {"count": count, "vram": {"amount": vram, "unit": "gib"}, "model": model}}
+
+
+DO_SIZES = [  # two pages, as the API pages them
+    {"sizes": [{"slug": "s-1vcpu-1gb", "memory": 1024, "vcpus": 1, "disk": 25, "transfer": 1.0, "price_monthly": 6,
+                "price_hourly": 0.00893, "regions": ["nyc1"], "available": True, "description": "Basic"},
+               do_size("gpu-h100x1-80gb", "nvidia_h100", 1, 80, 3.39),
+               do_size("gpu-h100x8-640gb", "nvidia_h100", 8, 80, 23.92),
+               do_size("gpu-h200x1-141gb", "nvidia_h200", 1, 141, 3.44, regions=()),  # "available", in no region
+               do_size("gpu-l40sx1-48gb", "nvidia_l40s", 1, 48, 1.57)],
+     "links": {"pages": {"last": "https://api.digitalocean.com/v2/sizes?page=2",
+                         "next": "https://api.digitalocean.com/v2/sizes?page=2"}}, "meta": {"total": 10}},
+    {"sizes": [do_size("gpu-mi300x1-192gb", "amd_mi300x", 1, 192, 1.99, regions=()),  # likewise
+               do_size("gpu-h200x8-1128gb-contracted", "nvidia_h200", 8, 141, 27.52),
+               do_size("gpu-h100x1-80gb-spot", "nvidia_h100", 1, 80, 1.99),
+               do_size("gpu-b300x1-288gb-lc-spot", "nvidia_b300", 1, 288, 6.17),
+               do_size("gpu-mi300x8-1536gb", "amd_mi300x", 8, 192, 15.92)],
+     "links": {"pages": {"first": "https://api.digitalocean.com/v2/sizes?page=1",
+                         "prev": "https://api.digitalocean.com/v2/sizes?page=1"}}, "meta": {"total": 10}},
+]
+
+
+def ago(hours):
+    """A time `hours` ago as DigitalOcean writes created_at."""
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - hours * 3600))
+
+
+class TestDigitalOcean(unittest.TestCase):
+    def setUp(self):
+        self.calls, self.keys = [], []
+        self.droplets = [{"id": 3164444, "name": "live-pr-7-1-1-amd", "status": "active", "created_at": ago(1),
+                          "networks": {"v4": [{"ip_address": "10.0.0.2", "type": "private"},
+                                              {"ip_address": "104.236.32.182", "type": "public"}]}},
+                         {"id": 3164445, "name": "someone-else", "status": "active", "created_at": ago(1)},
+                         {"id": 3164446, "name": "live-pr-6-x", "status": "archive", "created_at": ago(1)}]
+        saved = {k: GPU[k] for k in ("digitalocean", "STATE", "LEDGER", "find_offer")}
+        self.addCleanup(GPU.update, saved)
+        state = Path(tempfile.mkdtemp())
+        GPU.update(digitalocean=self.api, STATE=state, LEDGER=state / "instances.json")
+        env = keys("digitalocean")
+        env.start()
+        self.addCleanup(env.stop)
+
+    def api(self, method, path, body=None, params=None, retry=True):
+        self.calls.append((method, path, body, params))
+        if path == "/sizes":
+            return DO_SIZES[params["page"] - 1]
+        if path == "/droplets" and method == "GET":
+            return {"droplets": self.droplets, "links": {}, "meta": {"total": len(self.droplets)}}
+        if path == "/droplets":
+            return {"droplet": {"id": 3164447, "name": body["name"], "status": "new"}, "links": {"actions": []}}
+        if method == "DELETE":
+            self.droplets = [d for d in self.droplets if f"/droplets/{d['id']}" != path]
+            return {}
+        if path.startswith("/droplets/"):
+            found = [d for d in self.droplets if str(d["id"]) == path.split("/")[-1]]
+            if not found:
+                raise GPU["ApiError"](404, {"id": "not_found", "message": "The resource you requested could not be "
+                                                                          "found."})
+            return {"droplet": found[0]}
+        if path.startswith("/account/keys/"):
+            if not self.keys:
+                raise GPU["ApiError"](404, {"id": "not_found", "message": "not found"})
+            return {"ssh_key": self.keys[0]}
+        if path == "/account/keys":
+            self.keys.append({"id": 512189, "fingerprint": "f", "public_key": body["public_key"], "name": body["name"]})
+            return {"ssh_key": self.keys[-1]}
+        raise AssertionError(f"unexpected {method} {path}")
+
+    def offers(self, vendor, gpus=1, all_regions=False):
+        printed = io.StringIO()
+        args = argparse.Namespace(gpus=gpus, vendor=vendor, min_vram=80, all_regions=all_regions, allow_arm=False,
+                                  json=True)
+        with contextlib.redirect_stdout(printed):
+            GPU["cmd_offers"](args, {"budget": {"max_usd_per_hour": 30}})
+        return {o["id"]: (o["vendor"], o["gpu"], o["count"], o["usd_per_hour"], o["availability"])
+                for o in json.loads(printed.getvalue())["offers"]}
+
+    def test_offers_are_its_self_serve_gpu_sizes_by_vendor(self):
+        self.assertEqual(self.offers("nvidia"), {
+            "digitalocean:gpu-h100x1-80gb": ("nvidia", "NVIDIA H100", 1, 3.39, "available"),
+            "digitalocean:gpu-h100x8-640gb": ("nvidia", "NVIDIA H100", 8, 23.92, "available")},
+            "a size under 80 GB, sold only under contract or as spot, or in no region would be offered")
+        self.assertEqual(self.offers("amd"), {
+            "digitalocean:gpu-mi300x8-1536gb": ("amd", "AMD MI300X", 8, 15.92, "available")},
+            "a size listed available but in no region would be offered, and its create refused")
+        self.assertEqual(list(self.offers("amd", gpus=2)), ["digitalocean:gpu-mi300x8-1536gb"])
+        self.assertEqual(self.offers("nvidia", all_regions=True)["digitalocean:gpu-h200x1-141gb"][-1], "none",
+                         "--all-regions would hide a size a person may want to see")
+        with self.assertRaises(SystemExit, msg="a size whose regions emptied since the listing would be created"):
+            GPU["find_offer"]({}, "digitalocean:gpu-mi300x1-192gb")
+
+    def launch(self, run, inputs=(), dry_run=False, offer="digitalocean:gpu-mi300x1-192gb", gpu="AMD MI300X",
+               count=1, cfg=None):
+        """cmd_launch of `offer`; the create's body, or None when nothing was created."""
+        key = Path(tempfile.mkdtemp()) / "key.pub"
+        key.write_text("ssh-ed25519 AAAA test")
+        GPU["find_offer"] = lambda cfg, oid: {"id": offer, "provider": "digitalocean", "gpu": gpu, "count": count,
+                                              "usd_per_hour": 1.99, "region": "ric1", "storage": True}
+        args = argparse.Namespace(boxes=1, offer=offer, pr=7, hours=1, tag="1-1-amd", run=run, input=list(inputs),
+                                  allow_over_budget=False, dry_run=dry_run)
+        cfg = {"ssh_public_key": str(key), "budget": {"max_usd_per_hour": 30, "max_hours": 4, "max_running": 4},
+               **(cfg or {})}
+        with unittest.mock.patch.object(subprocess, "Popen"), contextlib.redirect_stdout(io.StringIO()) as out, \
+                contextlib.redirect_stderr(io.StringIO()):
+            GPU["cmd_launch"](args, cfg)
+        self.printed = out.getvalue()
+        return next((c[2] for c in self.calls if c[:2] == ("POST", "/droplets")), None)
+
+    def test_a_run_is_written_and_started_by_cloud_init(self):
+        d = Path(tempfile.mkdtemp())
+        box, body = d / "box.sh", d / "pr-body.md"
+        box.write_text("echo hello\n")
+        body.write_text("Generated with Claude Code \N{ROBOT FACE}\n", encoding="utf-8")
+        cfg = {"digitalocean": {"run_secret_env": "BOX_KEY"}}
+        with unittest.mock.patch.dict(os.environ, {"BOX_KEY": "sk-ant-box"}):
+            self.launch(str(box), [str(body)], dry_run=True, cfg=cfg)
+            self.assertEqual([c[:2] for c in self.calls if c[0] != "GET"], [], "a dry run would register the key")
+            self.assertNotIn("sk-ant-box", self.printed, "a dry run would print the box's key")
+            created = self.launch(str(box), [str(body)], cfg=cfg)
+        self.assertEqual(created["image"], "gpu-amd-base", "an AMD box would boot an image with no ROCm")
+        self.assertEqual(created["region"], "ric1", "the create would land where the size isn't, and be refused")
+        self.assertEqual(created["ssh_keys"], ["f"], "the box would get a root password, not the runner's key")
+        header, config = created["user_data"].split("\n", 1)
+        self.assertEqual(header, "#cloud-config")
+        config = json.loads(config)
+        files = {f["path"]: gzip.decompress(base64.b64decode(f["content"])) for f in config["write_files"]}
+        self.assertEqual(files, {"/run/live-pr/box.sh": box.read_bytes(), "/run/live-pr/pr-body.md": body.read_bytes(),
+                                 "/run/live-pr-key/value": b"sk-ant-box"},
+                         "the box would read changed inputs, or have no Anthropic key")
+        self.assertEqual({f["permissions"] for f in config["write_files"]}, {"0600"})
+        self.assertEqual(config["runcmd"], [["systemd-run", "--unit", "live-pr", "bash", "/run/live-pr/box.sh"]],
+                         "the droplet would boot and bill with nothing running")
+        self.assertEqual(list(GPU["ledger"]()), ["digitalocean:3164447"])
+
+        self.calls.clear()
+        GPU["save_ledger"]({})
+        created = self.launch(str(box), offer="digitalocean:gpu-h100x8-640gb", gpu="NVIDIA H100", count=8)
+        self.assertEqual(created["image"], "gpu-h100x8-base")
+        self.assertNotIn(("POST", "/account/keys"), [c[:2] for c in self.calls], "the key would be registered twice")
+        self.assertNotIn("/run/live-pr-key/value", created["user_data"])
+        big = d / "big.md"
+        big.write_bytes(os.urandom(60 * 1024))
+        self.calls.clear()
+        GPU["save_ledger"]({})
+        with self.assertRaises(SystemExit, msg="DigitalOcean would refuse the create, or cut the box's files"):
+            self.launch(str(box), [str(big)])
+        self.assertIsNone(next((c for c in self.calls if c[:2] == ("POST", "/droplets")), None))
+
+    def test_this_tools_gpu_droplets_count_and_a_deleted_one_has_ended(self):
+        with keys("digitalocean"):
+            self.assertEqual(GPU["running"]({}), ["digitalocean:3164444  live-pr-7-1-1-amd  active"],
+                             "the bot's AMD boxes would run past budget.max_running")
+        listed = [c[3] for c in self.calls if c[:2] == ("GET", "/droplets")]
+        self.assertTrue(listed and all(params.get("type") == "gpus" for params in listed),
+                        "GPU droplets aren't in DigitalOcean's default listing")
+        e = {"provider": "digitalocean", "instance_id": "3164444", "region": "any"}
+        self.assertEqual(GPU["status"](e, {}), ("active", "104.236.32.182", 22))
+        self.assertEqual(GPU["status"]({**e, "instance_id": "9"}, {})[0], "ended",
+                         "the bot would wait on a deleted droplet until its timeout")
+
+    def test_reap_releases_only_this_tools_boxes_past_their_deadline(self):
+        self.droplets = [{"id": 1, "name": "live-pr-7-1-1-amd", "status": "active", "created_at": ago(6)},  # runaway
+                         {"id": 2, "name": "live-pr-8-2-1-amd", "status": "active", "created_at": ago(4.5)},
+                         {"id": 3, "name": "someone-else", "status": "active", "created_at": ago(30)},
+                         {"id": 4, "name": "live-pr-9-3-1-amd", "status": "active", "created_at": ago(0.5)}]
+        past = {"launched_at": time.time() - 1800, "deadline": time.time() - 60, "usd_per_hour": 1.99}
+        GPU["save_ledger"]({"digitalocean:4": {"provider": "digitalocean", "instance_id": "4",
+                                               "name": "live-pr-9-3-1-amd", **past},
+                            # its Pod's deadline ends it; reap must leave it alone even past the ledger's
+                            "eras:e1": {"provider": "eras", "instance_id": "e1", "name": "live-pr-5-x", **past}})
+        self.addCleanup(GPU.update, {"eras": GPU["eras"]})
+        eras_calls = []
+        GPU["eras"] = lambda method, path, *a, **k: eras_calls.append((method, path)) or {
+            "items": [{"id": "e1", "name": "live-pr-5-x", "status": "active"}]}
+        with keys("digitalocean", "eras"), contextlib.redirect_stderr(io.StringIO()):
+            created = self.launch(None, cfg={"budget": {"max_usd_per_hour": 30, "max_hours": 4, "max_running": 4,
+                                                        "max_concurrent_instances": 3}})
+        self.assertEqual(sorted(d["name"] for d in self.droplets), ["live-pr-8-2-1-amd", "someone-else"],
+                         "a box whose runner died would bill until someone noticed, or a live or foreign one would go")
+        self.assertIsNotNone(created, "runaway boxes would hold budget.max_running")
+        self.assertEqual([c for c in eras_calls if c[0] != "GET"], [],
+                         "an Eras box, which its Pod's deadline ends, would be released early")
 
 
 if __name__ == "__main__":

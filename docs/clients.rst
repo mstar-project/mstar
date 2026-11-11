@@ -203,8 +203,7 @@ not the end of a request, and the call goes on. A live call that opens while the
 is at ``max_concurrent_requests`` ends at once with ``status`` 503, rather than wait for a
 slot and start that far behind its input; a one-shot request waits in the queue. Other
 models ignore ``end_input``, and an append to them is rejected.
-Live input needs the Python frontend: ``--rust-frontend`` serves no ``/generate/ws``
-or ``/v1/realtime``. On either route, a model that declares its audio frame (Nemotron
+On either route, a model that declares its audio frame (Nemotron
 VoiceChat: 80 ms, 1280 samples at 16 kHz) gets a live call's audio in whole frames: each
 whole frame of an append goes on as a step of its own and the rest waits for the next
 append, or goes with the stream's end, so appends of any size keep the call on the steps
@@ -256,8 +255,8 @@ On a server with the block, ``GET /healthz`` answers ``OK`` without a key, as op
 server does, and with ``--api-key`` the handshake takes ``Authorization: Api-Key <key>``
 (what the client sends for ``api_key``) as well as ``Bearer``. Every other route still
 takes only ``Bearer``. A server without the block has none of this: it refuses the
-handshake and has no ``/healthz``. Only the Python frontend serves this route;
-``--rust-frontend`` and the Dynamo worker log a warning and serve without it.
+handshake and has no ``/healthz``. Both of ``mstar serve``'s frontends serve this
+route; the Dynamo worker logs a warning and serves without it.
 
 ``openpi_client`` sets no size limit on its messages, but the server does:
 ``ws_max_message_mb`` (by default ``MSTAR_MAX_BODY_MB``, see :doc:`serving`). A larger
@@ -366,7 +365,8 @@ Booleans stay strict: ``"false"`` is not a boolean, and ``true`` is not a number
 is the same as leaving the knob out: the model's default applies, which is the
 checkpoint's own ``generation_config.json`` value where it ships one. BAGEL and Orpheus
 are the exception: their files are the backbone's chat presets, so only their
-``do_sample: false`` is read and the models' own defaults stay. Multi-stage models
+``do_sample: false`` is read and the models' own defaults stay. MiniCPM-o keeps
+upstream ``chat``'s defaults over its file. Multi-stage models
 take a stage prefix (``talker_temperature``, ``code_predictor_top_k``) with the same
 rules; an unprefixed knob sets the primary stage (the thinker of Qwen3-Omni, the talker
 of Qwen3-TTS), and a prefixed one wins over it for its stage.
@@ -705,7 +705,7 @@ Per-model notes:
   drops what the VAD has not put in a turn yet. ``create_response`` and
   ``interrupt_response`` are accepted and echoed but do nothing in a transcription
   session; ``idle_timeout_ms`` and other types are refused. With 24 kHz input each
-  decision waits 3 ms more for the resampler. Install ``mstar[vad]`` (Silero VAD, MIT,
+  decision waits 3 ms more for the resampler. Install ``mstar-ai[vad]`` (Silero VAD, MIT,
   bundled 2 MB ONNX weights, run by onnxruntime on one CPU thread) or point
   ``MSTAR_SILERO_VAD_PATH`` at the ONNX file (``silero_vad.onnx``; the package's other
   exports take other inputs, and with one of them ``server_vad`` is refused); weights are
@@ -721,7 +721,7 @@ Per-model notes:
   Speech starts on Silero's 0.5 with 300 ms of prefix padding; the events are the same
   as server_vad's. Smart Turn (BSD-2, 8 MB int8 ONNX, about 45 ms per pause on one CPU
   thread) runs off the event loop. It needs ``onnxruntime`` and ``transformers``
-  (``mstar[vad]``) and its weights at ``MSTAR_SMART_TURN_PATH`` or in the local Hugging
+  (``mstar-ai[vad]``) and its weights at ``MSTAR_SMART_TURN_PATH`` or in the local Hugging
   Face cache (``hf download pipecat-ai/smart-turn-v3 smart-turn-v3.2-cpu.onnx``). Without
   them, or with an ONNX file whose inputs or outputs differ, the server warns at startup
   and refuses ``semantic_vad`` with an ``error`` event that says why (no weights, a

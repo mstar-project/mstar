@@ -5,6 +5,7 @@ import os
 import re
 from collections.abc import Container
 from dataclasses import dataclass, field
+from functools import cached_property
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -457,6 +458,19 @@ class TextChunkDetokenizer:
         return data
 
 
+class ByteIdDetokenizer:
+    """Token ids that are bytes, as a reduced model's byte tokenizer
+    (``tokenizer_mode: byte``) makes them: an id is its low byte."""
+
+    @staticmethod
+    def to_bytes(token_ids: list[int]) -> bytes:
+        return bytes(t & 0xFF for t in token_ids)
+
+    @staticmethod
+    def token_bytes(token_id: int) -> bytes:
+        return bytes((token_id & 0xFF,))
+
+
 class SentencePieceDetokenizer:
     """Per-token detokenization for SentencePiece-style vocabularies (``▁``
     marks a word start, ``<0xNN>`` pieces are byte fallback), read from an HF
@@ -491,13 +505,29 @@ class TextOutput(NamedTuple):
     declares it, and ``Model.postprocess`` and ``Model.postprocess_inline``
     derive their text paths from it."""
 
-    detokenizer: ByteLevelDetokenizer | TextChunkDetokenizer | SentencePieceDetokenizer
+    detokenizer: ByteLevelDetokenizer | TextChunkDetokenizer | SentencePieceDetokenizer | ByteIdDetokenizer
     # ids that end a reply, dropped unless the request sets ``ignore_eos``
     stop_token_ids: Container[int] = frozenset()
     # the text that ends the model's reasoning, None for a model that does not
     # reason: a reply's ``structured_outputs`` grammar starts after it on a turn
     # whose prompt leaves the reasoning open (`grammar.after_reasoning`)
     reasoning_end: str | None = None
+
+
+class ByteLevelTextOutput:
+    """``Model.text_output`` for a model over a byte-level BPE tokenizer: each
+    token's raw bytes with special tokens dropped, ``config.eos_token_ids``
+    ending a reply. Built on first use, as the host's ``tokenizer`` may load
+    lazily; a reduced model's byte ids (``_tokenizer_mode`` of ``"byte"``)
+    never touch it."""
+
+    @cached_property
+    def _text_output(self) -> TextOutput:
+        detokenizer = ByteIdDetokenizer() if self._tokenizer_mode == "byte" else ByteLevelDetokenizer(self.tokenizer)
+        return TextOutput(detokenizer, frozenset(self.config.eos_token_ids))
+
+    def text_output(self) -> TextOutput:
+        return self._text_output
 
 
 def drop_stop_tokens(

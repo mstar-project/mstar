@@ -39,6 +39,7 @@ from mstar.model.multimodal import (
     VIDEO,
     MediaEncoder,
     MediaPads,
+    MediaRun,
     PromptPart,
     check_attachments,
     expand_media_pads,
@@ -46,6 +47,7 @@ from mstar.model.multimodal import (
     media_layout,
     media_prefill_step,
     media_walk_name,
+    media_walk_names,
     media_walks,
     parts_from_modalities,
     text_combined_walks,
@@ -84,11 +86,15 @@ class PreparedMedia(NamedTuple):
 class MediaIntake:
     """How a prompt's attachments of one ``modality`` reach their encoder.
 
-    Each attachment fills ``runs(metadata)`` placeholders ``pad`` in the
-    rendered prompt (one when ``runs`` is None); ``prepare(attachment,
-    metadata)`` gives its `PreparedMedia`, and each placeholder is expanded
-    to its run's tokens, between ``sentinels`` when given. ``metadata`` is
-    the attachment's loader metadata, ``{}`` when it came with none.
+    Each attachment fills ``runs(attachment, metadata)`` placeholders
+    ``pad`` in the rendered prompt (one when ``runs`` is None);
+    ``prepare(attachment, metadata)`` gives its `PreparedMedia`, and each
+    placeholder is expanded to its run's tokens, between ``sentinels`` when
+    given. ``metadata`` is the attachment's loader metadata, ``{}`` when it
+    came with none. Intakes may share a ``pad`` (and then its sentinels):
+    the nth placeholder of a pad goes to the nth attachment of that pad in
+    the order of the prompt's parts, which is where `_prompt_ids` renders
+    each attachment.
     """
 
     modality: str
@@ -96,16 +102,16 @@ class MediaIntake:
     pad: int
     prepare: Callable[[torch.Tensor, dict], PreparedMedia]
     sentinels: tuple[int, int] | None = None
-    runs: Callable[[dict], int] | None = None
+    runs: Callable[[torch.Tensor, dict], int] | None = None
 
 
 class MediaPrompt(NamedTuple):
-    """A prompt after intake: its ids with each placeholder expanded, every
-    encoder's inputs in prompt order, and the runs' grids by pad."""
+    """A prompt after intake: its ids with each placeholder expanded to its
+    run (each run's encoder output and grid), and every encoder's inputs in
+    prompt order."""
 
     pads: MediaPads
     inputs: NameToTensorList
-    grids: dict[int, list[Sequence[int]]]
 
 
 class MultimodalDecoderModel(Model):
@@ -190,13 +196,14 @@ class MultimodalDecoderModel(Model):
         return media_walks(self.config.max_position_embeddings, self.encoders, text=self.TEXT_PROMPTS)
 
     def rebuild_policies(self) -> dict[str, RebuildPolicy]:
-        # A dropped text request reprefills its ids on the text walk. A media prompt prefills on
-        # its media walk, which keeps no ids, so the KV cache never drops it; nor anything of a
-        # model with no text walk (TEXT_PROMPTS False).
-        if not self.TEXT_PROMPTS:
-            return {}
-        return {"LLM": RebuildPolicy(walk="prefill_text", ids_input="text_inputs", sample_output="new_token",
-                                     loop="decode_loop")}
+        # A media prompt is rebuilt from host copies of its encoders' outputs, one embedding per pad. Its layout
+        # places them, so a pad id sampled into the rebuild row's tail takes none and needs no `pad_ids`.
+        media = media_walk_names(self.encoders)
+        text = {PREFILL_TEXT} if self.TEXT_PROMPTS else set()
+        return {"LLM": RebuildPolicy(
+            walks=frozenset({*text, *media}), ids_input="text_inputs", sample_output="new_token",
+            loop="decode_loop", copy_width={walk: self.config.hidden_size for walk in media},
+        )}
 
     # -----------------------------------------------------------------------
     # KV layout
@@ -204,8 +211,8 @@ class MultimodalDecoderModel(Model):
 
     def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
         # A text prompt's one `ids` span is keyed for the prefix cache, and its replies extend the
-        # keys; a media prompt's one `rows` span is not (`LabelLayout.keyed_count`), so nothing of
-        # it is.
+        # keys. Nothing of a media prompt is, since its one step carries tensor inputs, which the
+        # prefix cache never cuts.
         if not self.TEXT_PROMPTS:
             return {KV_CACHE: {"main": KVLabel(growth=(("decode", "decode_loop"),))}}
         return {KV_CACHE: {"main": KVLabel(
@@ -216,18 +223,34 @@ class MultimodalDecoderModel(Model):
     def checkpoint_path(self) -> str:
         return self._resolve_weights()
 
-    def kv_layout(self, layout: dict, length: int, advance: int | None = None) -> dict:
+    def kv_layout(self, layout: dict, length: int) -> dict:
         """`process_prompt`'s ``kv_layout`` for a prompt of ``length`` tokens
         and its ``MEDIA_LAYOUT``: the whole prompt, written by its one prefill
-        walk, then a slot per decode step. ``advance`` is how far the prompt
-        moves the position counter, its length by default."""
+        walk, then a slot per decode step. A media prompt's runs of pads are
+        ``rows`` spans, which the encoders' outputs fill, and the text around
+        them ``ids`` spans."""
         present = media_encoders(self.encoders, layout)
-        span = Span(
-            "rows" if present else "ids",
-            media_walk_name(present) if present else PREFILL_TEXT,
-            length, length if advance is None else advance, "text_inputs",
-        )
-        return {KV_CACHE: {"main": LabelLayout(spans=(span,), growth=(("decode_loop", 1),))}}
+        if not present:
+            span = Span("ids", PREFILL_TEXT, length, length, "text_inputs")
+            return {KV_CACHE: {"main": LabelLayout(spans=(span,), growth=(("decode_loop", 1),))}}
+        walk, spans, end = media_walk_name(present), [], 0
+        for offset, tokens, grid in zip(layout["offset"], layout["tokens"], layout["grid"], strict=True):
+            if offset > end:
+                spans.append(Span("ids", walk, offset - end, offset - end, "text_inputs"))
+            spans.append(Span("rows", walk, tokens, self.media_advance(tokens, grid), "text_inputs"))
+            end = offset + tokens
+        if length > end:
+            spans.append(Span("ids", walk, length - end, length - end, "text_inputs"))
+        # one row writes the whole prompt
+        spans[1:] = [span._replace(opens_step=False) for span in spans[1:]]
+        # Key no span. The default keys the leading text span, and `rebuild_refusal` refuses a prompt keyed only in
+        # part.
+        return {KV_CACHE: {"main": LabelLayout(spans=tuple(spans), growth=(("decode_loop", 1),), keyed_spans=0)}}
+
+    def media_advance(self, tokens: int, grid: list[int]) -> int:
+        """How far a run of ``tokens`` pads moves the position counter: one a
+        pad, unless the model places media by their patch ``grid``."""
+        return tokens
 
     # -----------------------------------------------------------------------
     # Intake
@@ -237,8 +260,10 @@ class MultimodalDecoderModel(Model):
         self, parts: list[PromptPart], raw: dict[str, list[torch.Tensor]], **kwargs,
     ) -> torch.Tensor:
         """The rendered prompt's host ids, each attachment's placeholders in
-        place. ``raw`` is each modality's attachments; ``kwargs`` are
-        `process_prompt`'s."""
+        place, the attachments rendered in the order of ``parts``: intake
+        gives the nth placeholder of a pad to the nth attachment of that pad
+        in part order (`MediaIntake`). ``raw`` is each modality's
+        attachments; ``kwargs`` are `process_prompt`'s."""
         raise NotImplementedError
 
     def process_prompt(
@@ -310,31 +335,39 @@ class MultimodalDecoderModel(Model):
 
         ids = self._prompt_ids(parts, raw, **kwargs)
         # before any attachment is prepared: user text that spells a placeholder
+        # (per pad id, which intakes may share)
+        want: dict[int, int] = {}
         for m, intake in media.items():
-            found = int((ids == intake.pad).sum())
-            want = sum(
-                1 if intake.runs is None else intake.runs(metadata(m, i)) for i in range(len(raw[m]))
+            want[intake.pad] = want.get(intake.pad, 0) + sum(
+                1 if intake.runs is None else intake.runs(raw[m][i], metadata(m, i)) for i in range(len(raw[m]))
             )
-            if found != want:
+        for pad, n in want.items():
+            found = int((ids == pad).sum())
+            if found != n:
+                names = " / ".join(m.modality for m in self.media if m.pad == pad)
                 raise ValueError(
-                    f"multimodal placement mismatch: the prompt holds {found} {m} "
-                    f"placeholders for {want} {m} inputs"
+                    f"multimodal placement mismatch: the prompt holds {found} {names} "
+                    f"placeholders for {n} {names} inputs"
                 )
+        sentinels: dict[int, tuple[int, int]] = {}
+        for m in self.media:
+            if m.sentinels is not None and sentinels.setdefault(m.pad, m.sentinels) != m.sentinels:
+                raise ValueError(f"{self.NAME}: intakes sharing placeholder {m.pad} wrap it in different sentinels")
         inputs: NameToTensorList = {}
-        counts: dict[int, list[int]] = {m.pad: [] for m in self.media}
-        grids: dict[int, list[Sequence[int]]] = {}
+        # per pad id, its runs in prompt order: the nth placeholder of a pad is its nth run
+        pad_runs: dict[int, list[MediaRun]] = {m.pad: [] for m in self.media}
         for part in parts:
             intake = media.get(part.modality)
             if intake is None:
                 continue
             prepared = intake.prepare(raw[part.modality][part.index], metadata(part.modality, part.index))
-            counts[intake.pad] += prepared.tokens
-            if prepared.grids is not None:
-                grids.setdefault(intake.pad, []).extend(prepared.grids)
+            grids = [()] * len(prepared.tokens) if prepared.grids is None else prepared.grids
+            pad_runs[intake.pad] += [
+                MediaRun(n, intake.encoder.output, grid) for n, grid in zip(prepared.tokens, grids, strict=True)
+            ]
             for name, tensor in prepared.inputs.items():
                 inputs.setdefault(name, []).append(tensor)
-        sentinels = {m.pad: m.sentinels for m in self.media if m.sentinels is not None}
-        return MediaPrompt(expand_media_pads(ids, counts, sentinels), inputs, grids)
+        return MediaPrompt(expand_media_pads(ids, pad_runs, sentinels), inputs)
 
     def max_input_files(self) -> dict[str, int]:
         # an attachment no intake takes, refused before any file is decoded
@@ -344,9 +377,7 @@ class MultimodalDecoderModel(Model):
     def prompt_layout(self, prompt_in: MediaPrompt) -> dict[str, list]:
         """The prompt's ``MEDIA_LAYOUT``. Always set, so a layout the client
         sent never reaches the LLM."""
-        return media_layout(
-            prompt_in.pads, {m.pad: m.encoder.output for m in self.media}, prompt_in.grids,
-        )
+        return media_layout(prompt_in.pads)
 
     # -----------------------------------------------------------------------
     # Output

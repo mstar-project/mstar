@@ -86,7 +86,7 @@ class MuseGlimmerModel(MultimodalDecoderModel):
             self.config.eot_token_id = eot
         # the vision tower, whose output fills the images' pads in prompt order
         self.media = (MediaIntake(
-            "image", vision_encoder((self._image_pad_id,)), self._image_pad_id, self._image_intake,
+            "image", vision_encoder(), self._image_pad_id, self._image_intake,
             sentinels=(self._image_start_id, self._image_end_id),
         ),)
         if self._image_pad_id != self.config.image_token_id:
@@ -94,7 +94,6 @@ class MuseGlimmerModel(MultimodalDecoderModel):
                 f"tokenizer's {IMAGE_PAD} is {self._image_pad_id}, config's image "
                 f"token {self.config.image_token_id}"
             )
-        self._bos_id = self.tokenizer.bos_token_id
         self._processor = self._read_processor_config()
 
     def _read_processor_config(self) -> dict:
@@ -192,12 +191,7 @@ class MuseGlimmerModel(MultimodalDecoderModel):
     # -----------------------------------------------------------------------
 
     def _encode(self, text: str) -> torch.Tensor:
-        """The rendered template opens with BOS; the tokenizer's own
-        post-processor would add a second on the short-prompt path."""
-        ids = encode_ids(self.tokenizer, text)
-        if len(ids) >= 2 and ids[0] == ids[1] == self._bos_id:
-            ids = ids[1:]
-        return torch.tensor(ids, dtype=torch.long)
+        return torch.tensor(encode_ids(self.tokenizer, text), dtype=torch.long)
 
     def request_kwargs(self) -> frozenset[str]:
         return super().request_kwargs() | {"reasoning_strength", "reasoning_effort", "current_date"}

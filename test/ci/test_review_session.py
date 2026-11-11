@@ -54,6 +54,10 @@ class TestUsage(unittest.TestCase):
                          "calls missing from the transcript, e.g. another model's, would be left out")
         self.assertEqual(u["models"]["claude-haiku-4-5"]["cost_usd"], 0.01)
 
+    def test_a_run_cut_off_before_its_result_is_priced_from_its_tokens(self):
+        # 2 input, 100 cache writes, 1000 cache reads and 10 output tokens at Opus 5.5's prices.
+        self.assertAlmostEqual(usage([assistant("msg_a", text("x"))])["total_cost_usd"], 908 / 1e6)
+
     def test_synthetic_messages_are_not_api_calls(self):
         msg = assistant("msg_s", text("Credit balance is too low"))
         msg["message"]["model"] = "<synthetic>"
@@ -150,6 +154,8 @@ class TestHandoff(unittest.TestCase):
                 # A hunk the PR's author wrote to look like a quoted path.
                 '@@ -1 +1 @@\n--- a/x\n+++ "b/x" ' + "+" * 30000 + "\n")
         self.assertEqual(diff_paths(diff), ["y", "caf\u00e9\t1"], "a path git quotes would be left out")
+        self.assertEqual(diff_paths("--- a/y\n+++ b/y\n@@ -1 +1 @@\nR1 |+x\u2028--- a/z\u2028+++ b/z\n"), ["y"],
+                         "a line separator in a source line would fake a changed file")
 
     def test_numbered_gives_each_hunk_line_its_file_line_across_files_renames_and_deletions(self):
         def diff(a, r, b, c, d, e):

@@ -12,13 +12,14 @@ from pathlib import Path
 
 import torch
 
+from mstar.engine.state.adapters import node_handles, node_resources
 from mstar.model.command_a_plus.command_a_plus_model import CommandAPlusModel
 from mstar.model.command_a_plus.components.language_model import CommandAPlusForCausalLM
 from mstar.model.command_a_plus.config import KV_CACHE, SAMPLER, CommandAPlusConfig
 from mstar.model.command_a_plus.submodules import CommandAPlusLLMSubmodule
-from mstar.model.command_a_plus.tests.test_backbone import bind_test_resources
+from mstar.model.command_a_plus.tests.test_backbone import begin_test_step, bind_test_resources
 from mstar.model.command_a_plus.tests.test_integration import FIXTURE, info
-from mstar.model.submodule_base import ModelInputsFromEngine
+from mstar.model.submodule_base import ModelInputsFromEngine, engine_step
 
 
 def reference_weights(reference):
@@ -109,7 +110,8 @@ class ReferenceTests(unittest.TestCase):
         cache, errors = None, {}
         for start, stop in [(0, 5), (5, 6), (6, 7), (7, 8), (8, 9)]:
             pos.positions["main"] = torch.arange(start, stop)
-            hidden = actual(actual.model.embed_tokens(tokens[start:stop]), label="main")
+            begin_test_step(actual, stop - start)
+            hidden = actual(actual.model.embed_tokens(tokens[start:stop]))
             result = reference(tokens[None, start:stop], past_key_values=cache, use_cache=True)
             cache = result.past_key_values
             observed["logits"] = actual.logits(hidden)
@@ -143,7 +145,7 @@ class ReferenceTests(unittest.TestCase):
         directory = self.enterContext(tempfile.TemporaryDirectory())
         (Path(directory) / "config.json").write_text(json.dumps(raw))
         model = CommandAPlusModel(directory)
-        specs = {s.resource_key: s for s in model.get_node_resources()}
+        specs = {s.resource_key: s for s in node_resources(model)}
         # resolved as a server resolves them: 6-token full pages and 2-token pages of the local
         # layers, so the cache keeps their 4-token window and frees what's behind it
         apply_yaml_overrides(list(specs.values()), {"resources": {KV_CACHE: {"page_size": 6, "max_num_pages": 16}}})
@@ -158,6 +160,7 @@ class ReferenceTests(unittest.TestCase):
         self.addCleanup(lambda: [resource.cleanup() for resource in resources.values()])
         node = CommandAPlusLLMSubmodule(actual, actual.config, (model.image_encoder,)).eval()
         node.bind_node_resources(resources)
+        node.bind_node_state(node_handles(model, "LLM", resources))
         observed, handles = observe(actual)
         expected, ref_handles = observe(reference)
         self.addCleanup(lambda: [h.remove() for h in handles + ref_handles])
@@ -179,12 +182,15 @@ class ReferenceTests(unittest.TestCase):
                     walk = "prefill" if iteration == 0 else "decode"
                     inputs = [node.prepare_inputs(walk, info(walk, max_tokens=20, ignore_eos=True),
                               {"text_inputs": [row]}) for row in rows]
-                    step = node.declare_step(walk, rids, inputs)
+                    step = engine_step(node, graph_walk=walk, request_ids=rids, inputs=inputs)
                     step.set_ctx(StepContext(rids, walk, slot=iteration % 2, capture=False))
                     admitted = runner.admit(step)
                     self.assertTrue(admitted.ok and admitted.ready, admitted)
                     runner.plan(step)
+                    step.begin_calls()
                     output = node.forward_batched(walk, engine, **node.preprocess(walk, engine, inputs))
+                    step.check_calls()
+                    step.end_calls()
                     predicted = output.row_outputs["new_token"]
                     runner.commit(step)
                     per_request, ref_logits = [], []
@@ -237,7 +243,7 @@ class OfficialTokenizerTests(unittest.TestCase):
                     [{"role": "user", "content": prompt}], tokenize=True,
                     add_generation_prompt=True, return_dict=False,
                 )
-                tensors, _ = model.process_prompt(prompt, ["text"], ["text"])
+                tensors = model.process_prompt(prompt, ["text"], ["text"]).new_input_tensors
                 self.assertEqual(tensors["text_inputs"][0].tolist(), expected)
                 tokens = tokenizer.encode(prompt, add_special_tokens=False)
                 streamed = b"".join(model.postprocess(torch.tensor([i]), "text") for i in tokens)

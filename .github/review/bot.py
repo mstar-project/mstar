@@ -10,6 +10,7 @@ step fails. Every call to another program (`gh`, `git`, gpu.py, ssh-keygen) goes
 one place a test replaces. Text the bot posts reaches `gh` on stdin, never its command line.
 """
 import base64
+import datetime
 import fnmatch
 import inspect
 import json
@@ -20,6 +21,7 @@ import shutil
 import subprocess
 import sys
 import time
+import urllib.parse
 from pathlib import Path
 
 import render_summary
@@ -45,16 +47,78 @@ REFUSED = "<!-- claude-review-continue-refused -->"
 # What Claude Code wrote of the run: the action's execution file, and the session transcripts.
 EXECUTION = "claude-execution-output.json"
 TYPES = render_summary.TYPES
+# The first line of the bot's live-test comment (gpu_review.py), the only line of it the bot reads: the commit,
+# the verdict and the GPU vendors it ran on (a comment from before vendors were written ran on NVIDIA alone).
+LIVE_TEST = re.compile(r"<!-- claude-live-test sha=([0-9a-f]{40}) verdict=([a-z]+)(?: vendors=([a-z,]+))? -->")
+# Hardware other than NVIDIA's, as a word in a PR can name it (untestable): the backstop for the review's own
+# `untestable` field. Lookarounds rather than \b, so `rocm_env`, `is_amd`, `amdsmi` and `isAMD` count, and
+# `amd64`, `AuthenticAMD` (a CPU), `hipster` and `bare_metal` don't. Not `mps`: here that is usually NVIDIA's
+# Multi-Process Service. `TPU` in capitals only: `tpu` is also an ordinary local variable. The AMD box runs only for
+# the AMD words it can cover (covered AMD words, covered_by_amd), which stop counting once it passed there.
+AMD_MODEL = r"mi\d{3}[ax]?"
+AMD = rf"(?:is)?amd(?!64|ahl)[a-z0-9]*|rocm|hip(?:cc)?|{AMD_MODEL}"  # not Amdahl's law
+UNTESTABLE_HARDWARE = re.compile(rf"(?<![a-z0-9])(?:{AMD}|xpu|gaudi|hpu|(?-i:TPU)|(?<!bare[- _])metal"
+                                 r"|apple[ _-]?silicon)(?![a-z0-9])", re.IGNORECASE)
+AMD_HARDWARE = re.compile(AMD, re.IGNORECASE)
+AMD_RENTED = re.compile(r"\bMI3[0-5]\d?X\b", re.IGNORECASE)  # the AMD GPUs an AMD box can be (gpu.py SUPPORTED)
+# The GPU vendors a live test runs on, in the order their boxes start and their reports show: NVIDIA always, AMD
+# for a PR that names covered AMD words.
+VENDORS = {"nvidia": "NVIDIA", "amd": "AMD"}
 # A branch name safe for the API path and the command line.
 BRANCH = re.compile(r"[A-Za-z0-9._/][A-Za-z0-9._/-]*")
 THREADS = """query($owner: String!, $name: String!, $pr: Int!, $endCursor: String) {
   repository(owner: $owner, name: $name) { pullRequest(number: $pr) {
     reviewThreads(first: 100, after: $endCursor) {
       pageInfo { hasNextPage endCursor }
-      nodes { isResolved isOutdated comments(first: 1) { nodes { databaseId author { login } body path line } } }
+      nodes { isResolved isOutdated comments(first: 1) {
+        nodes { databaseId author { login } body path line lastEditedAt } } }
     } } } }"""
-# A commenter's author_association that makes them a contributor (see the workflow's header).
-CONTRIBUTORS = ("OWNER", "MEMBER", "COLLABORATOR", "CONTRIBUTOR")
+# Every merged PR with its live approvals. Each author's __typename separates the bot from a person who took its
+# name, which GraphQL's bare logins (no `[bot]`) can't.
+MERGED_APPROVALS = """query($owner: String!, $name: String!, $endCursor: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequests(states: MERGED, first: 100, after: $endCursor) {
+      pageInfo { hasNextPage endCursor }
+      nodes { number mergedAt reviews(states: APPROVED, first: 100) { nodes { author { __typename login } } } }
+    } } }"""
+# What starts the status issue's body, how the bot finds its own issue.
+STATUS_ISSUE = "<!-- review-bot-status -->"
+# The monitor's state in the status issue's body (signals already reported), base64 JSON.
+MONITOR = re.compile(r"<!-- review-monitor-state ([A-Za-z0-9+/=]+) -->")
+MONITOR_DAYS = 60
+# How a PR's body says it fixes or reverts another, and the subjects `szz` treats as fixes.
+FIXES = re.compile(r"\b(?:fix(?:e[sd])?|revert(?:s|ed)?)\s+#(\d+)\b", re.IGNORECASE)
+# A fix-word, unless what follows is a typo, or all it fixes is a comment, docs or lint: such a word ending the
+# subject, before a `.` or a PR number.
+FIX_SUBJECT = re.compile(r"\b(?:fix(?:e[sd]|ing)?|bugs?|bugfix(?:es)?|revert(?:s|ed|ing)?)\b"
+                         r"(?!:?\s+(?:a\s+|the\s+)?(?:typos?\b|(?:comments?|docs?|lint|format\w*)\s*\.?\s*"
+                         r"(?:\(#\d+\)\s*)?$))",
+                         re.IGNORECASE)
+# author_association values: the team, and the team plus anyone with a merged PR (see the workflow's header).
+TEAM = ("OWNER", "MEMBER", "COLLABORATOR")
+CONTRIBUTORS = (*TEAM, "CONTRIBUTOR")
+# The improvement run, every other day: the days of evidence it reads (its cadence, so issues don't repeat it: only
+# comments and reviews dated inside it, and the bot's resolved findings on a PR active inside it), how much a reader
+# needs (PRs read, and comments kept per PR; characters of a comment), and what the model returns.
+IMPROVE_DAYS = 2
+IMPROVE_ITEMS = 30
+IMPROVE_TEXT = 800
+IMPROVE_SCHEMA = {
+    "type": "object",
+    "properties": {"improvements": {"type": "array", "maxItems": 10, "description": "most useful first; may be empty",
+                                    "items": {
+        "type": "object",
+        "properties": {
+            "title": {"type": "string"},
+            "change": {"type": "string", "description": "what to change, concretely"},
+            "where": {"type": "string", "description": "the skill or code file, and its section or function"},
+            "evidence": {"type": "array", "minItems": 1, "maxItems": 5, "items": {"type": "string"},
+                         "description": "`url` values from the evidence files"},
+        },
+        "required": ["title", "change", "where", "evidence"],
+    }}},
+    "required": ["improvements"],
+}
 
 
 def run(argv, input=None, check=True, timeout=None):
@@ -96,11 +160,18 @@ def read(fetch, *args):
         return None
 
 
-def graphql(query, repo, pr):
-    """The pages of a paginated GraphQL query on the PR."""
+def graphql(query, repo, pr=None):
+    """The pages of a paginated GraphQL query on the repository, or on PR `pr`."""
     owner, name = repo.split("/")
-    return api("graphql", "--paginate", "--slurp", "-F", f"owner={owner}", "-F", f"name={name}", "-F", f"pr={pr}",
+    number = () if pr is None else ("-F", f"pr={pr}")
+    return api("graphql", "--paginate", "--slurp", "-F", f"owner={owner}", "-F", f"name={name}", *number,
                "-f", f"query={query}")
+
+
+def log_value(value):
+    """Untrusted `value` for a log line, where it can't run a workflow command: on one line, as JSON (a newline would
+    start a new command), and without `##[`, which the runner's older command parser finds anywhere in a line."""
+    return json.dumps(value).replace("##[", "# #[")
 
 
 def write(path, text):
@@ -126,11 +197,12 @@ def last_summary(conversation):
 
 
 def oneline(commits):
-    """since-commits.txt: one line per commit."""
+    """since-commits.txt and since-live-test-commits.txt: one line per commit, merges marked."""
     lines = []
     for c in commits:
+        merge = "[merge] " if len(c["parents"]) > 1 else ""
         subject = c["commit"]["message"].split("\n")[0]
-        lines.append(f"{c['sha'][:10]} {subject}\n")
+        lines.append(f"{c['sha'][:10]} {merge}{subject}\n")
     return "".join(lines)
 
 
@@ -144,6 +216,17 @@ def permission(repo, login):
     return (read(api, f"repos/{repo}/collaborators/{login}/permission") or {}).get("permission", "none")
 
 
+def head_trusted(repo, pull):
+    """Whether the PR's code is held by someone `repo` trusts: a branch of `repo` itself, or a fork whose owner has
+    write access. An author with write access can open a PR from anyone's fork, so the author alone doesn't say. A
+    head repository GitHub no longer shows means no."""
+    head = (pull.get("head") or {}).get("repo") or {}
+    owner = (head.get("owner") or {}).get("login")
+    if head.get("full_name") == repo:
+        return True
+    return bool(owner) and permission(repo, owner) in WRITE
+
+
 def redact(text, exact=()):
     """`text` without the exact values in `exact`, then without credential-shaped strings."""
     for value in exact:
@@ -152,6 +235,33 @@ def redact(text, exact=()):
     for pattern in REDACT:
         text = pattern.sub("[REDACTED]", text)
     return text
+
+
+def utcnow():
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+def status_issue(repo):
+    """The bot's status issue, or None before the monitor, its one writer, has made it: the issue a bot login
+    created whose body starts with STATUS_ISSUE."""
+    for login in POSTING_BOT_USERS:
+        creator = login.replace("[", "%5B").replace("]", "%5D")
+        for i in api_list(f"repos/{repo}/issues?state=all&creator={creator}&per_page=100"):
+            if (i.get("user") or {}).get("login") in POSTING_BOT_USERS \
+                    and (i.get("body") or "").startswith(STATUS_ISSUE):
+                return i
+    return None
+
+
+def ensure_label(repo, label):
+    """Create the label if the repository doesn't have it yet."""
+    if gh("api", f"repos/{repo}/labels/{label.replace('/', '%2F')}", check=False).returncode:
+        gh("api", "-X", "POST", f"repos/{repo}/labels", "-f", f"name={label}", "-f", "color=fbca04")
+
+
+def comment_on_issue(repo, number, body):
+    """Post `body` as a comment on an issue, from stdin."""
+    gh("issue", "comment", str(number), "--repo", repo, "--body-file", "-", input=body)
 
 
 # ---------------------------------------------------------------- preflight job
@@ -166,26 +276,36 @@ def preflight(out, repo, pr, key_set, command, actor, author, assoc, skip_label,
     and with which turn cap; a request it turns down for a reason the commenter can act on gets a
     one-line reply. Write access is checked against the actor's permission; a contributor may run
     `/review light` or `/review continue` on their own PR, and only then is `non_write_user` set. A nogpu
-    review also takes an author with write access; a /review continue is held to its mode's rule in restore."""
+    or full review also takes an author with write access (author_association can't tell write from read);
+    a full one runs the PR's code, so also a head repository head_trusted accepts, and a PR that can't be
+    read means no. A /review continue is held to its mode's rule in restore."""
     if key_set != "true":
         print("::warning::ANTHROPIC_API_KEY is not set; skipping the review.")
         out["run"] = "false"
         return
-    if command not in ("light", "nogpu", "continue"):
+    if command not in ("light", "nogpu", "full", "continue"):
         out["run"] = "false"
         return
     mode = "" if command == "continue" else command  # the stopped review's mode, from its handoff
+
     perm = permission(repo, actor)
     if perm in WRITE:
-        if command == "nogpu" and permission(repo, author) not in WRITE:
+        if command in ("nogpu", "full") and permission(repo, author) not in WRITE:
             print(f"::notice::{author} lacks write access; this review needs it.")
             out["run"] = "false"
             reply(repo, pr, AUTHOR_NEEDS_WRITE)
             return
+        if command == "full" and not head_trusted(repo, read(api, f"repos/{repo}/pulls/{pr}") or {}):
+            print("::notice::The PR's head repository lacks write access; a full review runs its code.")
+            out["run"] = "false"
+            reply(repo, pr, "`/review` runs this PR's code on GPUs, so it takes a head branch on this repository or "
+                            "a fork owned by someone with write access; comment `/review nogpu` for the review "
+                            "without the live test.")
+            return
         out.update(run="true", mode=mode, turns=team_turns)
         return
     own = assoc in CONTRIBUTORS and actor != "" and actor == author and skip_label != "true"
-    if own and command != "nogpu":
+    if own and command in ("light", "continue"):
         print(f"::notice::{actor} has '{perm}' access; reviewing their own PR as its author ({assoc}).")
         out.update(run="true", mode=mode, non_write_user=actor, turns=self_turns)
         return
@@ -203,7 +323,7 @@ def reply(repo, pr, text):
     try:
         comment(repo, pr, text)
     except RuntimeError as e:
-        print(f"::warning::Couldn't reply: {e}")
+        print(f"::warning::Couldn't reply: {log_value(str(e))}")
 
 
 # ---------------------------------------------------------------- review job: before the review
@@ -214,7 +334,7 @@ def react(out, repo, comment_id):
     try:
         gh("api", "-X", "POST", f"repos/{repo}/issues/comments/{comment_id}/reactions", "-f", "content=eyes")
     except RuntimeError as e:
-        print(f"::warning::Couldn't react to the comment: {e}")
+        print(f"::warning::Couldn't react to the comment: {log_value(str(e))}")
 
 
 def resolve(out, repo, pr, mode, runner_temp, non_write=""):
@@ -237,7 +357,7 @@ def resolve(out, repo, pr, mode, runner_temp, non_write=""):
             out.update(why="the saved handoff couldn't be read; try `/review continue` again", refused="true")
             raise
     else:
-        out["mode"] = "nogpu" if mode == "nogpu" else "light"  # sets the prompt's reporting bar
+        out["mode"] = mode if mode in ("nogpu", "full") else "light"  # sets the prompt's reporting bar
 
 
 def restore(out, repo, pr, head_sha, runner_temp, non_write="", author=""):
@@ -293,6 +413,8 @@ def restore(out, repo, pr, head_sha, runner_temp, non_write="", author=""):
     if str(meta.get("head_sha")) != head_sha:
         fail("the PR has new commits since that review stopped; ask for a new review of the current head with "
              "`/review light` or `/review`")
+    if mode == "full":
+        fail("a `/review` that stopped can't be continued (its live test never started); comment `/review` again")
     if mode not in ("light", "nogpu"):
         fail("the saved handoff is malformed")
     if mode == "nogpu" and (non_write or permission(repo, author) not in WRITE):
@@ -382,6 +504,33 @@ def interdiff(old, new):
     return text + (DROPPED + "".join(line for f in dropped for line in before[f]) if dropped else "")
 
 
+def discussion(repo, pr):
+    """(inline review comments, conversation-tab comments) of the PR. An inline comment is marked with its
+    thread's resolved and outdated state (only GraphQL has those), and `mine` when this bot posted it."""
+    threads = {}
+    for page in graphql(THREADS, repo, pr):
+        for t in page["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]:
+            first = t["comments"]["nodes"][:1]
+            if first:
+                threads[first[0]["databaseId"]] = {"resolved": t["isResolved"], "outdated": t["isOutdated"]}
+    comments = []
+    for c in api_list(f"repos/{repo}/pulls/{pr}/comments"):
+        user = (c.get("user") or {}).get("login")
+        comments.append({"id": c["id"], "user": user, "user_type": (c.get("user") or {}).get("type"),
+                         "path": c.get("path"), "line": c.get("line"), "side": c.get("side"),
+                         "in_reply_to_id": c.get("in_reply_to_id"), "body": c.get("body"),
+                         "author_association": c.get("author_association"),
+                         "created_at": c.get("created_at"), "url": c.get("html_url"),
+                         **threads.get(c.get("in_reply_to_id") or c["id"], {}), "mine": user in POSTING_BOT_USERS})
+    # The conversation tab: replies to the summary, and the author's answers.
+    conversation = [{"id": c["id"], "user": (c.get("user") or {}).get("login"),
+                     "user_type": (c.get("user") or {}).get("type"), "created_at": c.get("created_at"),
+                     "author_association": c.get("author_association"), "url": c.get("html_url"),
+                     "body": c.get("body")}
+                    for c in api_list(f"repos/{repo}/issues/{pr}/comments")]
+    return comments, conversation
+
+
 def collect(out, repo, pr, head_sha, mode, prev=""):
     """The review's inputs, in the workspace: pr.diff (its hunks numbered, session.numbered), pr-body.md,
     pr-comments.json (with each thread's
@@ -389,7 +538,8 @@ def collect(out, repo, pr, head_sha, mode, prev=""):
     last-review.json with since.diff and since-commits.txt or interdiff.diff (rereview_inputs),
     stacked-above.json and above-<n>.diff, and open-issues.json; and the diff's length and the summary's
     schema as outputs. The PR's text and comments are untrusted: they only ever reach files the prompt
-    calls untrusted."""
+    calls untrusted. In full mode, whose review steers a session with a shell, only the team's comments and
+    issue titles (from_the_team) reach those files, and always the bot's own."""
     if prev:
         shutil.copyfile(Path(prev, "handoff.md"), "handoff.md")
     pull = api(f"repos/{repo}/pulls/{pr}")
@@ -400,34 +550,24 @@ def collect(out, repo, pr, head_sha, mode, prev=""):
     write("pr.diff", session.numbered(diff))
     write("pr-body.md", (pull["body"] or "") + "\n")
 
-    # Inline review comments, each marked with its thread's resolved and outdated state (only GraphQL
-    # has those), and `mine` when this bot posted it.
-    threads = {}
-    for page in graphql(THREADS, repo, pr):
-        for t in page["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]:
-            first = t["comments"]["nodes"][:1]
-            if first:
-                threads[first[0]["databaseId"]] = {"resolved": t["isResolved"], "outdated": t["isOutdated"]}
-    comments = []
-    for c in api_list(f"repos/{repo}/pulls/{pr}/comments"):
-        user = (c.get("user") or {}).get("login")
-        comments.append({"id": c["id"], "user": user, "path": c.get("path"), "line": c.get("line"),
-                         "side": c.get("side"), "in_reply_to_id": c.get("in_reply_to_id"), "body": c.get("body"),
-                         **threads.get(c.get("in_reply_to_id") or c["id"], {}), "mine": user in POSTING_BOT_USERS})
-    write_json("pr-comments.json", comments)
-
-    # The conversation tab: replies to the summary, and the author's answers.
-    conversation = [{"id": c["id"], "user": (c.get("user") or {}).get("login"), "created_at": c.get("created_at"),
-                     "body": c.get("body")} for c in api_list(f"repos/{repo}/issues/{pr}/comments")]
-    write_json("pr-conversation.json", conversation)
+    comments, conversation = discussion(repo, pr)
+    write_json("pr-comments.json", from_the_team(comments) if mode == "full" else comments)
+    write_json("pr-conversation.json", from_the_team(conversation) if mode == "full" else conversation)
 
     if not prev:
         rereview_inputs(out, repo, pull, head_sha, diff, conversation)
-    write_stacked_above(repo, pull, head_sha)
-    write_open_issues(repo)
+    if mode == "full":
+        since_live_test(repo, pull, head_sha, conversation)
+    write_stacked_above(out, repo, pull, head_sha)
+    write_open_issues(repo, mode)
     out["lines"] = diff.count("\n")
     # The summary's fields, from main, for --json-schema.
     out["schema"] = json.dumps(render_summary.SCHEMA, separators=(",", ":"))
+
+
+def from_the_team(comments):
+    """Of `comments` (`discussion`), those by the team or the bot (its findings, which a re-review judges)."""
+    return [c for c in comments if c["user"] in POSTING_BOT_USERS or c.get("author_association") in TEAM]
 
 
 def rereview_inputs(out, repo, pull, head_sha, diff, conversation):
@@ -467,7 +607,138 @@ def rereview_inputs(out, repo, pull, head_sha, diff, conversation):
         out["rereview"] = "true"
 
 
-def write_stacked_above(repo, pull, head_sha):
+def untouched(earlier):
+    """The earlier review's findings outside the diff (`earlier`, what render_summary.carried carries over)
+    whose file no commit since that review touched, by the files since.diff or interdiff.diff touches
+    (rereview_inputs; not interdiff's dropped part, which holds the old patches as written, unnumbered). With
+    neither (no last-review.json, or a /review continue) every one counts as untouched, since that is unknown. Such a
+    finding has no thread to show its lines changed, so the approval reads a re-review's `fixed` or `moot` on it as
+    `disputed` (gpu_review.for_approval), and the saved state keeps it (render_summary.render)."""
+    since = next((Path(p) for p in ("since.diff", "interdiff.diff") if Path(p).exists()), None)
+    # As bytes: the diff holds what the commits hold, which needn't be UTF-8, and a CR in a line isn't its end.
+    text = since.read_bytes().decode("utf-8", "replace") if since else ""
+    touched = touched_files(text.partition(DROPPED)[0])
+    return [f for f in (earlier or {}).get("outside_diff", []) if f["location"].partition(":")[0] not in touched]
+
+
+GIT_HEADER = re.compile(r'diff --git ("(?:[^"\\]|\\.)*"|\S+) ("(?:[^"\\]|\\.)*"|\S+)')
+
+
+def touched_files(diff_text):
+    """Every file a diff touches, on either side: changed, added, deleted (`+++ /dev/null`), renamed from or to,
+    and binary or mode-only changes, by their `diff --git` line. Unlike session.diff_paths, the files a review
+    can open, a file that is gone counts. Lines end only at \\n, as in session.diff_paths. A binary or mode-only
+    change to a path with a space isn't caught (git doesn't quote spaces in its `diff --git` line, so the line can't
+    be split), which fails closed: its finding reads as untouched."""
+    lines = diff_text.split("\n")
+    paths = set()
+    for before, line in zip([""] + lines, lines, strict=False):
+        sides = ()
+        if before.startswith("--- ") and line.startswith("+++ "):
+            sides = ((before[len("--- "):], "a/"), (line[len("+++ "):], "b/"))
+        elif line.startswith(("rename from ", "rename to ")):
+            sides = ((line.split(" ", 2)[2], ""),)
+        elif m := GIT_HEADER.fullmatch(line):
+            sides = ((m[1], "a/"), (m[2], "b/"))
+        for raw, prefix in sides:
+            path = session.unquoted(raw)
+            if path and path.startswith(prefix):
+                paths.add(path[len(prefix):])
+    return paths
+
+
+def last_live_test(comments):
+    """The bot's last conclusive live-test comment among `comments` ({"user": login, "body": text}), {"sha",
+    "verdict", "vendors", "body"}, or None: any but an `unavailable` one (no GPUs, or a box that couldn't start
+    the session), which says nothing, so a failure before it still stands. A verdict outside pass, partial and
+    fail (`none`: a session wrote no valid one) is conclusive too, and counts as a failure (gpu_review.carry).
+    Only its first line, the marker, is read: the report below it is the box's text."""
+    last = None
+    for c in comments:
+        m = LIVE_TEST.fullmatch((c["body"] or "").split("\n")[0])
+        if m and c["user"] in BOT_USERS and m[2] != "unavailable":
+            last = {"sha": m[1], "verdict": m[2], "vendors": (m[3] or "nvidia").split(","), "body": c["body"]}
+    return last
+
+
+def passed_on_ancestor(repo, live, head_sha):
+    """Whether the live test `live` (last_live_test, or None) passed on an ancestor of `head_sha`. A compare
+    that can't be read counts as no."""
+    if not live or live["verdict"] != "pass":
+        return False
+    status = (read(api, f"repos/{repo}/compare/{live['sha']}...{head_sha}") or {}).get("status")
+    return status in ("ahead", "identical")
+
+
+def changed_files(repo, base, sha):
+    """GitHub's entries for the files changed from `base` (a commit or branch) to SHA, or None when its list is too
+    long to check (300 max)."""
+    files = api(f"repos/{repo}/compare/{base}...{sha}").get("files")
+    return None if files is None or len(files) >= 300 else files
+
+
+def file_names(files):
+    """The names in changed_files' entries, a rename's old name too."""
+    return [name for f in files for name in (f["filename"], f.get("previous_filename")) if name]
+
+
+def hardware_named(pull, changes):
+    """The words of UNTESTABLE_HARDWARE in the PR's title, file names and changed lines (`changes`, changed_files'
+    entries), lowercased."""
+    text = [pull["title"], *file_names(changes)]
+    for f in changes:
+        text += [line[1:] for line in (f.get("patch") or "").splitlines() if line[:1] in ("+", "-")]
+    return sorted({m.lower() for line in text for m in UNTESTABLE_HARDWARE.findall(line)})
+
+
+def covered_by_amd(word):
+    """Whether a pass on an AMD box covers this hardware word: an AMD word that names no GPU model (`rocm`,
+    `is_amd`), or one of the MI3xxX models gpu.py rents, or their series (`MI300`; an MI300A or MI250 stays
+    untestable). The box is the cheapest of those models, so an MI355X change can pass on an MI300X, as a B200
+    change can pass on an H200."""
+    if not AMD_HARDWARE.fullmatch(word):
+        return False
+    series = re.fullmatch(r"mi\d{3}", word, re.IGNORECASE)  # no letter: the series of the X model
+    return not re.fullmatch(AMD_MODEL, word, re.IGNORECASE) \
+        or bool(AMD_RENTED.search(word + "x" if series else word))
+
+
+def vendors_of(words):
+    """The vendors whose GPUs the live test runs on, given the hardware words the PR names (hardware_named): AMD
+    only when a word is one its box covers (a PR naming just an MI300A can't pass there, so no box is rented)."""
+    return [v for v in VENDORS if v == "nvidia" or any(covered_by_amd(w) for w in words)]
+
+
+def vendors_for(repo, pull, sha):
+    """The vendors whose GPUs the live test of `pull` at `sha` runs on (vendors_of), by the hardware it names
+    against the default branch, as the approval reads it. The live test decides with it (gpu_review.carry), and so
+    does the review's since-live-test diff (since_live_test)."""
+    return vendors_of(hardware_named(pull, changed_files(repo, pull["base"]["repo"]["default_branch"], sha) or []))
+
+
+def since_live_test(repo, pull, head_sha, conversation):
+    """Full mode: since-live-test.diff and since-live-test-commits.txt, the diff and commits since the PR's
+    last live test, when it passed on an ancestor of the head (last_live_test, passed_on_ancestor) on every GPU
+    vendor this PR's live test needs (vendors_for, as the live-test job decides), for the review's
+    live-test call (review-prompt.md, Re-review step 4). Without both files (GitHub refused either, or the vendors
+    couldn't be read) the review judges the whole PR."""
+    live = last_live_test(conversation)
+    if not passed_on_ancestor(repo, live, head_sha):
+        return
+    vendors = read(vendors_for, repo, pull, head_sha)
+    if vendors is None or not set(vendors) <= set(live["vendors"]):  # unknown, or a vendor that pass didn't run on
+        return
+    tested = f"repos/{repo}/compare/{live['sha']}...{head_sha}"
+    try:
+        live_diff = gh("api", "-H", "Accept: application/vnd.github.diff", tested).stdout
+        commits = oneline(c for page in api(tested, "--paginate", "--slurp") for c in page["commits"])
+    except UNREADABLE:
+        return
+    write("since-live-test.diff", live_diff)
+    write("since-live-test-commits.txt", commits)
+
+
+def write_stacked_above(out, repo, pull, head_sha):
     """stacked-above.json and above-<n>.diff. A failed fetch leaves none of these files, so a finding said to
     be fixed above stays open, and the review still runs."""
     above = read(stacked_above, repo, pull, head_sha)
@@ -476,16 +747,18 @@ def write_stacked_above(repo, pull, head_sha):
             f.unlink()
     else:
         write_json("stacked-above.json", above)
+        out["above"] = json.dumps(above, separators=(",", ":"))
 
 
-def write_open_issues(repo):
-    """The open issues, [{number, title}], so a latent bug on main can name the one that tracks it. Titles are
-    user text: the model reads them as untrusted data. A failed fetch leaves no file, and the review says
-    it couldn't check."""
-    r = gh("issue", "list", "--repo", repo, "--state", "open", "--limit", "1000", "--json", "number,title",
-           check=False)
-    if r.returncode == 0:
-        write("open-issues.json", r.stdout)
+def write_open_issues(repo, mode):
+    """The open issues, [{number, title}], so a latent bug on main can name the one that tracks it, in full mode
+    only the team's. Titles are user text: the model reads them as untrusted data. A failed fetch leaves no
+    file, and the review says it couldn't check."""
+    issues = read(api_list, f"repos/{repo}/issues?state=open&per_page=100")
+    if issues is not None:
+        write_json("open-issues.json", [{"number": i["number"], "title": i["title"]} for i in issues
+                                        if "pull_request" not in i
+                                        and (mode != "full" or i.get("author_association") in TEAM)])
 
 
 # ---------------------------------------------------------------- review job: after the review
@@ -542,39 +815,53 @@ def salvage(out, repo, pr, runner_temp):
             result.get("subtype"), "Claude Code ended without a result")
 
 
-def usage(out, pr, head_sha, mode, outcome, runner_temp, home, github_run_id, github_run_attempt,
-          github_step_summary, prev=""):
+def usage(out, pr, head_sha, mode, outcome, runner_temp, home, github_step_summary, prev=""):
     """What the run used, from the execution file or, after a timeout, the session transcript: a table in
-    the job summary, and a small record ($RUNNER_TEMP/usage/) to compare runs by. Never posted on the PR,
-    and never fails: a record that couldn't be read says why in its `error` field."""
-    record = {"pr": pr, "head_sha": head_sha, "mode": mode, "continue": prev != "", "run_id": github_run_id,
-              "run_attempt": github_run_attempt, "outcome": outcome}
+    the job summary. Never posted on the PR, and never fails: a run that couldn't be read says why in its
+    `Error` row."""
+    record = {"pr": pr, "head_sha": head_sha, "mode": mode, "continue": prev != "", "outcome": outcome}
     try:
         record.update(session.usage(session.load([Path(runner_temp, EXECUTION), Path(home, ".claude/projects")])))
     except Exception as e:
         record["error"] = f"{type(e).__name__}: {e}"
-        print(f"::warning::Couldn't read the review's usage: {record['error']}")
+        print(f"::warning::Couldn't read the review's usage: {log_value(record['error'])}")
     try:
-        path = Path(runner_temp, "usage", f"review-usage-{pr}-{github_run_id}-{github_run_attempt}.json")
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(record, indent=1) + "\n")
         with open(github_step_summary, "a") as f:
             f.write(session.usage_table(record))
     except Exception as e:
-        print(f"::warning::Couldn't write the usage record: {e}")
+        print(f"::warning::Couldn't write the job summary: {e}")
 
 
-def earlier_outside_diff(repo, pr):
-    """The findings outside the diff of the last review, which stay open until a review judges them: what
-    last-review.json showed this run, or the last summary's own when the run had no last-review.json (no
-    earlier diff, a partial review, or a /review continue)."""
-    if Path("last-review.json").exists():
-        state = json.loads(Path("last-review.json").read_text())
-    else:
-        summary = last_summary([{"user": (c.get("user") or {}).get("login"), "body": c.get("body")}
-                                for c in api_list(f"repos/{repo}/issues/{pr}/comments")])
-        state = summary and render_summary.saved_state(summary)
-    return (state or {}).get("outside_diff") or []
+def earlier_review(repo, pr):
+    """(state, answered): the state of the last review, what render_summary.carried carries over: what
+    last-review.json showed this run, or the last summary's when it had no last-review.json (no earlier
+    diff, a partial review, or a /review continue); and whether a person other than the author has
+    commented since that review. Not knowing reads as not answered; not being able to read the state fails.
+    Answering takes someone with write access (the bar `/review` uses) who isn't the author, and a comment that
+    isn't a `/review` command."""
+    path, state = Path("last-review.json"), None
+    if path.exists():
+        state = json.loads(path.read_text())
+    try:
+        conversation = api_list(f"repos/{repo}/issues/{pr}/comments")
+        summaries = [c for c in conversation if (c.get("user") or {}).get("login") in BOT_USERS
+                     and (c["body"] or "").startswith(render_summary.MARKER)]
+        if state is None and summaries:
+            state = render_summary.saved_state(summaries[-1]["body"])
+        if not state or not summaries:
+            return state, False
+        since = summaries[-1]["created_at"]
+        author = api(f"repos/{repo}/pulls/{pr}")["user"]["login"]
+        spoken = [*conversation, *api_list(f"repos/{repo}/pulls/{pr}/comments"),
+                  *api_list(f"repos/{repo}/pulls/{pr}/reviews?per_page=100")]
+    except UNREADABLE:
+        if state is None:
+            raise
+        return state, False
+    answering = {u["login"] for c in spoken if (c.get("submitted_at") or c.get("created_at") or "") > since
+                 and (u := c.get("user") or {}).get("type") != "Bot" and u.get("login") not in (author, None)
+                 and not (c.get("body") or "").startswith("/review")}
+    return state, any(permission(repo, login) in WRITE for login in answering)
 
 
 def post_inline(repo, pr, head_sha, review, exact=()):
@@ -597,9 +884,9 @@ def post_inline(repo, pr, head_sha, review, exact=()):
             new = json.loads(gh("api", "-X", "POST", f"repos/{repo}/pulls/{pr}/comments", "--input", "-",
                                 input=json.dumps(fields)).stdout)
             posted[str(new["id"])] = tag[1] if tag else "P2"
-        except UNREADABLE as e:  # json.dumps: a newline in the model's path or gh's echo would start a command
+        except UNREADABLE as e:  # the model's path and gh's echo are untrusted
             where = f"{c['path']}:{c['line']}"
-            print(f"::warning::Couldn't post the inline comment on {json.dumps(where)}: {json.dumps(str(e))}")
+            print(f"::warning::Couldn't post the inline comment on {log_value(where)}: {log_value(str(e))}")
             claim, _, detail = body[tag.end() if tag else 0:].strip().partition("\n")
             review["outside_diff"].append({"priority": tag[1] if tag else "P2", "claim": claim, "location": where,
                                            "detail": session.shorten(detail.strip(), 2000)})
@@ -624,28 +911,38 @@ def job_token_forms(token):
     return (token, base64.b64encode(token.encode()).decode().rstrip("=")) if token else ()
 
 
-def post(out, repo, pr, runner_temp, head_sha, mode, salvaged, detail="", job_token=""):
+def post(out, repo, pr, runner_temp, head_sha, mode, salvaged, detail="", max_gpus="4", job_token="", team=""):
     """Post the review's inline comments and the summary, rendered from the review's fields by render_summary and
     redacted, and with the job's token removed however it is spelled (`job_token`): model output from untrusted
     input. Read the PR's threads after posting the inline comments, so the
     status line counts them along with earlier ones still open. Each run posts its own summary comment, so a
     re-review doesn't overwrite the last one. A "didn't complete" comment an earlier run left is then rewritten to
-    point here, and loses its marker so a later failure starts a fresh one."""
+    point here, and loses its marker so a later failure starts a fresh one. `team`: the run had the team's turn
+    cap, under which a skipped file means the review didn't finish (render_summary.render)."""
     exact = job_token_forms(job_token)
     try:
-        review = finished_review(runner_temp)
-        post_inline(repo, pr, head_sha, review, exact)
+        review = render_summary.over_gpu_cap(finished_review(runner_temp), max_gpus)
+        posted = post_inline(repo, pr, head_sha, review, exact)
         pages = graphql(THREADS, repo, pr)
         # Before rendering: the summary's hidden state is base64, where `redact` over the finished text can't see it.
-        review = redact_fields(render_summary.carried(review, earlier_outside_diff(repo, pr)), exact)
-        text = render_summary.render(review, pages, head_sha, mode, render_summary.stacked_above("stacked-above.json"))
+        earlier, answered = earlier_review(repo, pr)
+        # And the earlier findings outside the diff whose file nothing since touched, for the approval and the state.
+        review = redact_fields({**render_summary.carried(review, earlier, answered, pages),
+                                "untouched": untouched(earlier)}, exact)
+        text = render_summary.render(review, pages, head_sha, mode, render_summary.stacked_above("stacked-above.json"),
+                                     salvaged == "true", team == "true")
     except Exception as e:
         text = ""
-        print(f"::warning::The review's summary didn't render: {type(e).__name__}: {json.dumps(str(e))}")
+        print(f"::warning::The review's summary didn't render: {type(e).__name__}: {log_value(str(e))}")
     text = redact(text, exact)
     if not text.strip():
         print("::warning::The review returned no summary to render.")
         sys.exit(1)
+    # What the approval rule reads, with what it carried over and the inline findings as they stand now (and this
+    # run's as post_inline made them, so one deleted the moment it posted is still seen), for the rule to check
+    # they are still there, unchanged.
+    result = {**review, "inline": {**render_summary.inline_findings(pages), **posted}}
+    out["result"] = json.dumps(redact_fields(result, exact))
     if salvaged == "true":
         text += (f"\n<sub>This review finished but went past the workflow's turn limit ({detail}), so the action "
                  "reported it as failed.</sub>\n")
@@ -657,7 +954,7 @@ def post(out, repo, pr, runner_temp, head_sha, mode, salvaged, detail="", job_to
             gh("api", "-X", "PATCH", f"repos/{repo}/issues/comments/{cid}", "--input", "-",
                input=json.dumps({"body": body}))
         except RuntimeError as e:
-            print(f"::warning::Couldn't mark comment {cid} resolved: {e}")
+            print(f"::warning::Couldn't mark comment {cid} resolved: {log_value(str(e))}")
 
 
 def hide(out, repo, pr, new_id):
@@ -695,8 +992,7 @@ def labels(out, repo, pr, runner_temp):
         if old.startswith("type/") and old not in wanted:
             gh("api", "-X", "DELETE", f"repos/{repo}/issues/{pr}/labels/{old.replace('/', '%2F')}")
     for label in wanted:
-        if gh("api", f"repos/{repo}/labels/{label.replace('/', '%2F')}", check=False).returncode:
-            gh("api", "-X", "POST", f"repos/{repo}/labels", "-f", f"name={label}", "-f", "color=fbca04")
+        ensure_label(repo, label)
         gh("api", "-X", "POST", f"repos/{repo}/issues/{pr}/labels", "-f", f"labels[]={label}")
 
 
@@ -756,6 +1052,318 @@ def incomplete(out, repo, pr, run_url, why="a step failed", detail="", can_conti
         comment(repo, pr, text)
 
 
+# ---------------------------------------------------------------- monitor (a daily job; no model)
+
+def main_commits(since):
+    """Main's commits since `since`, newest first: {sha, parents, subject, body}."""
+    text = run(["git", "log", f"--since={since}", "--format=%H%x1f%P%x1f%s%x1f%b%x1e"]).stdout
+    return [dict(zip(("sha", "parents", "subject", "body"), rec.strip("\n").split("\x1f"), strict=False))
+            for rec in text.split("\x1e") if rec.strip()]
+
+
+def after_merge(commits, merge):
+    """The commits newer than `merge` (all of them when it isn't in the list)."""
+    index = next((i for i, c in enumerate(commits) if c["sha"] == merge), len(commits))
+    return commits[:index]
+
+
+def reverted(commits, shas, number, merge):
+    """The commits on main after the merge that revert PR `number`: by the commit named in the message, or
+    the default subject of a revert of a squash-merged PR."""
+    subject = re.compile(rf'Revert ".*\(#{number}\)"')
+
+    def names_a_commit(c):
+        named = re.findall(r"This reverts commit ([0-9a-f]{7,40})", c["body"])
+        return any(s.startswith(n) for n in named for s in shas)
+
+    return [c for c in after_merge(commits, merge) if names_a_commit(c) or subject.match(c["subject"])]
+
+
+def referenced(timeline, number, repo):
+    """(signals, mentions) from the PR's cross-references: an issue labeled `bug`, a `type/bug` PR or one that
+    says it fixes or reverts this PR, merged or by someone with write access, is a signal; any other reference a
+    mention, the bot's own issues aside."""
+    signals, mentions = [], []
+    for event in timeline:
+        if event.get("event") != "cross-referenced":
+            continue
+        source = (event.get("source") or {}).get("issue") or {}
+        if (source.get("user") or {}).get("login") in POSTING_BOT_USERS:
+            continue
+        ref, labels = source.get("number"), {x.get("name") for x in source.get("labels") or []}
+        is_pr = "pull_request" in source
+        claims = is_pr and number in map(int, FIXES.findall(source.get("body") or "")) and bool(
+            (source.get("pull_request") or {}).get("merged_at")
+            or permission(repo, (source.get("user") or {}).get("login")) in WRITE)
+        if (is_pr and (claims or "type/bug" in labels)) or (not is_pr and "bug" in labels):
+            how = "fixes or reverts" if claims else "reports a bug in"
+            signals.append({"key": f"{number}:ref:{ref}",
+                            "text": f"`#{ref}` ({safe(source.get('title'))}) {how} `#{number}`"})
+        else:
+            mentions.append(f"#{ref}")
+    return signals, mentions
+
+
+def safe(text):
+    """Untrusted text for an issue or comment: redacted, on one line, and made inert (render_summary.inert)."""
+    return render_summary.inert(redact(" ".join(str(text or "").split())))
+
+
+def szz(commits, shas, number, files, bug_prs=(), since=""):
+    """Signals for the fixes on main that changed lines PR `number` wrote (`shas` are its commits and merge,
+    `files` the files it touched): `git blame` of each fix's parent, back to `since`, on the lines it removed
+    or changed. A hit means the fix touched those lines, not that the PR broke them."""
+    hits = []
+    for c in commits:
+        match = re.search(r"\(#(\d+)\)\s*$|Merge pull request #(\d+)", c["subject"])
+        fix_pr = int(match[1] or match[2]) if match else None
+        if fix_pr == number or not (FIX_SUBJECT.search(c["subject"]) or fix_pr in bug_prs):
+            continue
+        path = None
+        for line in run(["git", "show", "--format=", "-U0", c["sha"]], check=False).stdout.split("\n"):
+            if line.startswith("--- "):
+                path = line[6:] if line.startswith("--- a/") else None
+            hunk = re.match(r"@@ -(\d+)(?:,(\d+))? \+", line) if path in files else None
+            if not hunk or not int(hunk[2] or 1):
+                continue
+            blame = run(["git", "blame", "-l", "-s", *([f"--since={since}"] if since else []), "-L",
+                         f"{hunk[1]},+{hunk[2] or 1}", f"{c['sha']}^", "--", path], check=False).stdout
+            for offset, row in enumerate(blame.split("\n")):
+                if row.lstrip("^").split(" ")[0] in shas:
+                    name = f"`#{fix_pr}`" if fix_pr else f"`{c['sha'][:10]}`"
+                    at = int(hunk[1]) + offset
+                    hits.append({"key": f"{number}:szz:{c['sha'][:10]}:{path}:{at}",
+                                 "text": f"{name} changed lines `#{number}` wrote at `{path}:{at}`"})
+                    break
+    return hits
+
+
+def ci_regressions(repo, number, merge, parent):
+    """Checks that passed on the merge's parent and failed on the merge."""
+    def conclusions(sha):
+        runs = api(f"repos/{repo}/commits/{sha}/check-runs?per_page=100")["check_runs"]
+        return {r["name"]: r.get("conclusion") for r in runs}
+
+    try:
+        before, after = conclusions(parent), conclusions(merge)
+    except UNREADABLE:
+        return []
+    return [{"key": f"{number}:ci:{name}",
+             "text": f"`#{number}`: check `{safe(name)}` failed on `{merge[:10]}`, its parent passed"}
+            for name, c in after.items() if c in ("failure", "timed_out") and before.get(name) == "success"]
+
+
+def pr_signals(repo, pull, commits, bug_prs, window=""):
+    """Everything known about what happened to a PR the bot approved: (signals, mentions), each signal
+    {key, text} (key stable across days)."""
+    number, merge = pull["number"], pull.get("merge_commit_sha")
+    timeline = api_list(f"repos/{repo}/issues/{number}/timeline?per_page=100")
+    signals, mentions = referenced(timeline, number, repo)
+    if merge:
+        shas = {merge} | {c["sha"] for c in api_list(f"repos/{repo}/pulls/{number}/commits?per_page=100")}
+        signals += [{"key": f"{number}:reverted:{c['sha'][:10]}",
+                     "text": f"`#{number}` reverted by `{c['sha'][:10]}` ({safe(c['subject'])})"}
+                    for c in reverted(commits, shas, number, merge)]
+        files = set(run(["git", "diff", "--name-only", f"{merge}^", merge], check=False).stdout.split())
+        signals += szz(after_merge(commits, merge), shas, number, files, bug_prs, window)
+        parents = next((c["parents"].split() for c in commits if c["sha"] == merge), [])
+        if parents:
+            signals += ci_regressions(repo, number, merge, parents[0])
+    return signals, mentions
+
+
+def monitor(out, repo, approvals=""):
+    """The daily report (review-monitor.yml), with no model: what happened to the PRs merged in the last 60
+    days with the bot's approval (GitHub's own record: an APPROVED review of the bot's), the kill switch and
+    new bug reports, written to the status issue's body. Signals not reported before go out as one comment,
+    so subscribers get at most one notification a day. Also makes the `skip-ai-review` label if it's missing,
+    so neither it nor the issue is a setup step. Untrusted titles go through `safe`, text reaches
+    `gh` on stdin."""
+    now = utcnow()
+    window = (now - datetime.timedelta(days=MONITOR_DAYS)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    existing = status_issue(repo)
+    number = existing["number"] if existing else json.loads(gh(
+        "api", "-X", "POST", f"repos/{repo}/issues", "--input", "-",
+        input=json.dumps({"title": "Review bot status",
+                          "body": f"{STATUS_ISSUE}\nThe review bot's status: a daily report in this body.\n"})
+    ).stdout)["number"]
+    body = api(f"repos/{repo}/issues/{number}").get("body") or ""
+    try:
+        state = json.loads(base64.b64decode(MONITOR.search(body)[1]))
+    except (ValueError, TypeError):
+        state = {}
+    last = state.get("last") or window
+    approved = sorted((p["number"] for page in graphql(MERGED_APPROVALS, repo)
+                       for p in page["data"]["repository"]["pullRequests"]["nodes"] if p["mergedAt"] >= window
+                       and any((r.get("author") or {}).get("__typename") == "Bot"
+                               and r["author"]["login"] in render_summary.BOTS for r in p["reviews"]["nodes"])),
+                      reverse=True)
+    commits = main_commits(window)
+    bug_prs = {i["number"] for i in api_list(f"repos/{repo}/issues?state=closed&labels=type%2Fbug&since={window}"
+                                             "&per_page=100")
+               if (i.get("pull_request") or {}).get("merged_at")}
+    rows, signals, linked, unread = [], [], set(), set()
+    for pr in approved:
+        try:
+            pull = api(f"repos/{repo}/pulls/{pr}")
+            found, mentions = pr_signals(repo, {**pull, "number": pr}, commits, bug_prs, window)
+        except UNREADABLE as e:
+            rows.append(f"| `#{pr}` | couldn't read: {safe(e).replace('|', '/')} |")
+            unread.add(str(pr))
+            continue
+        signals += found
+        linked |= {s["key"].split(":")[-1] for s in found if ":ref:" in s["key"]} | {m.lstrip("#") for m in mentions}
+        cell = "; ".join(s["text"] for s in found) or "none"
+        if mentions:
+            cell += " (also mentioned in " + ", ".join(f"`{m}`" for m in mentions) + ")"
+        rows.append(f"| `#{pr}` {safe(pull.get('title')).replace('|', '/')} | {cell.replace('|', '/')} |")
+    bugs = [i for i in api_list(f"repos/{repo}/issues?state=all&labels=bug&since={last}&per_page=100")
+            if "pull_request" not in i and (i.get("created_at") or "") >= last and str(i["number"]) not in linked]
+    new_prs = [p for p in api(f"repos/{repo}/pulls?state=all&sort=created&direction=desc&per_page=100") or []
+               if (p.get("created_at") or "") >= last]
+    reported = set(state.get("signals") or [])
+    current = {s["key"]: s for s in signals}
+    fresh = [current[k]["text"] for k in sorted(current) if k not in reported]
+    switch = f"**{'on' if approvals == 'on' else 'off'}** (`REVIEW_APPROVALS`)."
+    if approvals == "on" and not os.environ.get("REVIEW_APP_CLIENT_ID"):  # the app reads the switch and approves
+        switch = "**off**: `REVIEW_APPROVALS` is on, but `REVIEW_APP_CLIENT_ID` isn't set, so no app can approve."
+    head = [STATUS_ISSUE, "### Review bot status", f"Updated {now.strftime('%Y-%m-%d %H:%M')} UTC.", "",
+            f"Approvals: {switch}", "",
+            f"#### PRs merged with the bot's approval, last {MONITOR_DAYS} days", "| PR | Signals |", "| --- | --- |"]
+    tail = ["", f"New PRs since the last report: {len(new_prs)}.",
+            "#### New bug reports not linked to an approved PR"]
+    tail += [f"- `#{i['number']}` {safe(i.get('title'))}" for i in bugs] or ["None."]
+    kept = {k for k in reported if k.split(":")[0] in unread}  # a failed read isn't a signal gone
+    saved = {"last": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "signals": sorted(set(current) | kept)}
+    tail.append(f"\n<!-- review-monitor-state {base64.b64encode(json.dumps(saved).encode()).decode()} -->")
+    while len("\n".join(head + rows + tail)) > 60_000 and rows:
+        rows.pop()  # the oldest PRs go first: `approved` is newest first
+    if fresh:  # first: the body below records these as reported, so a failed post goes out tomorrow
+        comment_on_issue(repo, number, "**New signals on PRs the bot approved:**\n\n"
+                         + "\n".join(f"- {text}" for text in fresh) + "\n")
+    gh("api", "-X", "PATCH", f"repos/{repo}/issues/{number}", "--input", "-",
+       input=json.dumps({"body": "\n".join(head + (rows or ["| | none yet |"]) + tail) + "\n"}))
+    ensure_label(repo, "skip-ai-review")  # after the report: a failed write here must not cost the day's report
+
+
+# ---------------------------------------------------------------- improve (every other day)
+
+def scrub(text):
+    """Comment or model text for the improvement run: `safe` and clipped, with names and links taken out,
+    which `safe` only makes inert."""
+    text = re.sub(r"(?i)[a-z][a-z0-9+.-]*://[^\s`]+|(?<![a-z0-9])www\.[^\s`]+", "[link]",
+                  re.sub(r"@[\w-]+", "@someone", str(text or "")))
+    return safe(text)[:IMPROVE_TEXT]
+
+
+def pr_evidence(repo, pr, since):
+    """What happened on PR `pr` since `since`, for the improvement run: the findings a later review judged moot,
+    its reviews, inline comments and conversation. Logins become a role. GitHub doesn't say when a thread was
+    resolved, so a finding of the bot's someone resolved is kept, however old, only when the PR is active since
+    `since`: a review or comment from a person or this bot dated inside the window. A quiet PR gives nothing."""
+    author = (api(f"repos/{repo}/pulls/{pr}").get("user") or {}).get("login")
+    inline, conversation = discussion(repo, pr)
+    reviews = [{"user": (r.get("user") or {}).get("login"), "user_type": (r.get("user") or {}).get("type"),
+                "created_at": r.get("submitted_at"), "url": r.get("html_url"), "body": r.get("body")}
+               for r in api_list(f"repos/{repo}/pulls/{pr}/reviews?per_page=100")
+               if (r.get("user") or {}).get("login") not in BOT_USERS]
+
+    def read(c):  # what a reader sees: not empty, and not another bot's
+        return c.get("body") and not (c.get("user_type") == "Bot" and c["user"] not in POSTING_BOT_USERS)
+
+    # A person's review counts whatever its text (most approvals have none); a comment, when a reader sees it.
+    active = any((c.get("created_at") or "") >= since
+                 for c in [*[r for r in reviews if r["user_type"] != "Bot"], *filter(read, [*inline, *conversation])])
+
+    def kept(comments):
+        rows = []
+        for c in comments:
+            mine = c["user"] in POSTING_BOT_USERS
+            if not read(c):
+                continue
+            if (c.get("created_at") or "") >= since or (active and mine and c.get("resolved")):
+                rows.append({**{k: c[k] for k in ("id", "path", "line", "in_reply_to_id", "resolved", "outdated",
+                                                  "url") if k in c},
+                             "role": "bot" if mine else "author" if c["user"] == author else "other",
+                             "body": scrub(c["body"])})
+        return rows[-IMPROVE_ITEMS:]
+
+    moot = [{"ref": scrub(f.get("ref")), "why": scrub(f.get("why")), "url": c["url"]}
+            for c in conversation
+            if c["user"] in BOT_USERS and (c["body"] or "").startswith(render_summary.MARKER)
+            and (c.get("created_at") or "") >= since
+            for f in (render_summary.saved_state(c["body"]) or {}).get("moot", [])]
+    return {"moot": moot, "reviews": kept(reviews), "inline": kept(inline),
+            "conversation": kept(conversation)}
+
+
+def improve_inputs(out, repo, key_set):
+    """The evidence for the improvement run (review-improve.yml), in improve-evidence/: one file per PR with a
+    review summary or a stopped review of the bot's in the last three weeks (where to look: a reply can come long
+    after a review) and anything from the last IMPROVE_DAYS days (the evidence), and status.json, the status
+    issue's signals. `run` stays false without an API key, or with nothing
+    to read."""
+    out["run"] = "false"
+    if key_set != "true":
+        print("::warning::ANTHROPIC_API_KEY is not set; skipping the improvement run.")
+        return
+    now = utcnow()
+    stamp = "%Y-%m-%dT%H:%M:%SZ"
+    since = (now - datetime.timedelta(days=IMPROVE_DAYS)).strftime(stamp)
+    newest_first = dict.fromkeys(
+        int(c["issue_url"].rsplit("/", 1)[1])
+        for c in reversed(api_list(f"repos/{repo}/issues/comments"
+                                   f"?since={(now - datetime.timedelta(days=21)).strftime(stamp)}&per_page=100"))
+        if (c.get("user") or {}).get("login") in BOT_USERS
+        and (c.get("body") or "").startswith((render_summary.MARKER, INCOMPLETE)))
+    files = {}
+    for pr in list(newest_first)[:IMPROVE_ITEMS]:
+        evidence = pr_evidence(repo, pr, since)
+        if any(evidence.values()):
+            files[f"{pr}.json"] = {"pr": pr, **evidence}
+    found = status_issue(repo)
+    status = [{"url": c.get("html_url"), "text": scrub(line)}
+              for c in (api_list(f"repos/{repo}/issues/{found['number']}/comments?since={since}&per_page=100")
+                        if found else [])
+              if (c.get("user") or {}).get("login") in POSTING_BOT_USERS
+              for line in (c.get("body") or "").splitlines() if line.strip()]
+    if status:
+        files["status.json"] = status[-IMPROVE_ITEMS:]
+    if not files:
+        print(f"::notice::The bot did nothing in the last {IMPROVE_DAYS} days; no improvement run.")
+        return
+    Path("improve-evidence").mkdir()
+    for name, value in files.items():
+        write_json(f"improve-evidence/{name}", value)
+    out.update(run="true", schema=json.dumps(IMPROVE_SCHEMA, separators=(",", ":")))
+
+
+def improve_post(out, repo, output=""):
+    """Open the run's issue, named by the days its evidence covers, from the improvement run's structured output,
+    redacted, on stdin. Evidence links stay inside this repository (no `..`, which would climb out of it) and go
+    through redirect.github.com, which keeps them off the PRs' timelines. An empty list opens nothing; a run that
+    returned no list fails. Never touches code, PRs or the bot."""
+    try:
+        items = json.loads(output)["improvements"]
+    except (ValueError, KeyError, TypeError):
+        sys.exit("The improvement run returned no list, so no issue was opened.")
+    if not items:
+        print("::notice::Nothing worth raising this time; no issue opened.")
+        return
+    link = re.compile(rf"https://github\.com/({re.escape(repo)}/[\w./?=#&%-]+)")
+    parts = ["What the review bot could improve about itself, most useful first. It changes nothing on its own."]
+    for n, item in enumerate(items, 1):
+        links = [f"- https://redirect.github.com/{m[1]}" for m in map(link.fullmatch, item["evidence"])
+                 if m and ".." not in urllib.parse.unquote(m[1])]
+        parts.append("\n".join([f"### {n}. {scrub(item['title'])}", "", f"**Change:** {scrub(item['change'])}", "",
+                                f"**Where:** {scrub(item['where'])}", "", "**Evidence:**", *links]))
+    now = utcnow()
+    days = f"{now - datetime.timedelta(days=IMPROVE_DAYS):%Y-%m-%d} to {now:%Y-%m-%d}"
+    body = json.dumps({"title": f"Review bot: what to improve, {days}",
+                       "body": redact("\n\n".join(parts)) + "\n"})
+    gh("api", "-X", "POST", f"repos/{repo}/issues", "--input", "-", input=body)
+
+
 # ---------------------------------------------------------------- dispatcher
 
 def main(steps):
@@ -786,8 +1394,55 @@ def main(steps):
                     f.write(f"{key}={value}\n")
 
 
+# ---------------------------------------------------------------- merge-queue check
+
+# A merge-queue branch GitHub makes for an entry: gh-readonly-queue/<base>/pr-<number>-<base sha>.
+QUEUE_REF = re.compile(r"(?:refs/heads/)?gh-readonly-queue/.+/pr-(\d+)-[0-9a-f]{40}")
+# The states that change where a reviewer stands. COMMENTED and PENDING don't.
+DECIDING = ("APPROVED", "CHANGES_REQUESTED", "DISMISSED")
+
+
+def merge_approved(reviews, head, has_write, bots):
+    """(passes, why): whether the PR, at `head`, may merge on its reviews (GitHub's, oldest first): someone stands at
+    APPROVED who is a person with write access, or one of the bot's `bots` logins, on `head`. A person's approval
+    is GitHub's business and doesn't go stale on a push (`main`'s protection as it is). A later CHANGES_REQUESTED or
+    a dismissal takes back that reviewer's approval. A person without write access doesn't count, or their word
+    would rescue a stale bot approval that GitHub's own rule still counts."""
+    standing = {}
+    for r in reviews:
+        if r.get("state") in DECIDING and r.get("user"):
+            standing[r["user"]["login"]] = r
+    approved = {login: r for login, r in standing.items() if r["state"] == "APPROVED"}
+    people = [login for login, r in approved.items() if r["user"].get("type") == "User" and login not in bots]
+    person = next((login for login in people if has_write(login)), None)
+    if person:
+        return True, f"approved by {person}"
+    bot = [r for login, r in approved.items() if login in bots]
+    if any(r.get("commit_id") == head for r in bot):
+        return True, f"the bot approved the PR's head {head[:7]}"
+    return False, (f"the bot's approval is on {bot[-1].get('commit_id', '?')[:7]}, not the PR's head {head[:7]}: "
+                   "a new `/review` or a person's approval is needed" if bot else "no current approval")
+
+
+def approval_current(out, repo, head_ref):
+    """The merge-queue check that a bot approval counts only for the commit it reviewed (review-approval-current.yml).
+    A ref that doesn't parse or any failed read fails it."""
+    m = QUEUE_REF.fullmatch(head_ref)
+    if not m:
+        sys.exit(f"::error::Not a merge-queue branch: {head_ref}")
+    pr = int(m[1])
+    head = api(f"repos/{repo}/pulls/{pr}")["head"]["sha"]
+    passes, why = merge_approved(api_list(f"repos/{repo}/pulls/{pr}/reviews"), head,
+                                 lambda login: permission(repo, login) in WRITE, BOT_USERS)
+    if not passes:
+        sys.exit(f"::error::PR #{pr} has no approval for its current commit: {why}")
+    print(f"::notice::PR #{pr}: {why}.")
+
+
 STEPS = {"preflight": preflight, "react": react, "resolve": resolve, "collect": collect, "salvage": salvage,
-         "usage": usage, "post": post, "hide": hide, "labels": labels, "handoff": handoff, "incomplete": incomplete}
+         "usage": usage, "post": post, "hide": hide, "labels": labels, "handoff": handoff, "incomplete": incomplete,
+         "monitor": monitor, "improve_inputs": improve_inputs, "improve_post": improve_post,
+         "approval_current": approval_current}
 
 if __name__ == "__main__":
     main(STEPS)

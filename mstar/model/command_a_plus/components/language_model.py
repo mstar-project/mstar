@@ -113,47 +113,26 @@ class CommandAPlusAttention(ParallelAttention):
             qkv_bias=False,
             o_bias=False,
             qk_norm=False,
-            rope_theta=config.rope_theta,
             attn_key=LOCAL_ATTN if is_local else GLOBAL_ATTN,
             kv_key=KV_CACHE,
             pos_key=ROPE if is_local else None,
-        )
-
-    def bind_resources(self, resources: dict) -> None:
-        # Missing local RoPE must fail instead of silently disabling positions.
-        required = [self._attn_key, self._kv_key]
-        if self._pos_key is not None:
-            required.append(self._pos_key)
-        for key in required:
-            if resources.get(key) is None:
-                raise ValueError(f"Command A+ attention requires resource {key!r}")
-        super().bind_resources(resources)
-
-    def _apply_rope(
-        self, q: torch.Tensor, k: torch.Tensor, label: str,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if self._pos_key is None:
-            return q, k
-        return self.pos.apply_qk(
-            q, k, label=label,
-            rotary_dim=self.head_dim,
-            interleave=True,
-            rope_theta=self.rope_theta,
-            rope_scale=1.0,
-            rope_dtype=q.dtype,
+            layer=layer_idx,
         )
 
 
 class CommandAPlusDecoderLayer(nn.Module):
     """Parallel residual block: x + Attention(LN(x)) + MoE(LN(x))."""
 
-    # once fused (``fuse_weights``, on CUDA) ``fused_branches`` runs these as slices of its GEMMs
+    # once fused (``fuse_weights``, on CUDA) ``fused_branches`` runs these through their weights
     lora_unservable = dict.fromkeys(
         ("self_attn.qkv_proj", "self_attn.o_proj",
          "mlp.shared_experts.gate_up_proj", "mlp.shared_experts.down_proj"),
         "fused into the decoder layer's GEMMs at load on CUDA (fuse_weights); refused on every "
         "device so the spec does not depend on it",
-    )
+    ) | {
+        "mlp.experts": "run by the decoder layer's fused path on CUDA (fused_branches calls the "
+        "MoE kernel on their weights); refused on every device so the spec does not depend on it",
+    }
 
     def __init__(
         self,
@@ -229,9 +208,7 @@ class CommandAPlusDecoderLayer(nn.Module):
         q = q.view(tokens, attn.num_heads, attn.head_dim)
         k = k.view(tokens, attn.num_kv_heads, attn.head_dim)
         v = v.view(tokens, attn.num_kv_heads, attn.head_dim)
-        q, k = attn._apply_rope(q, k, attn.attend.label)
-
-        attn_out = attn.attend(q, k, v).reshape(tokens, -1)
+        attn_out = attn._attend_state(q, k, v).reshape(tokens, -1)
         shared_act = torch.empty(
             (tokens, self.output_weight.shape[1] - self._attn_width),
             dtype=normalized.dtype, device=normalized.device,
@@ -319,27 +296,20 @@ class CommandAPlusLanguageModel(nn.Module):
             return self.embed_tokens(input_ids)
         return F.embedding(input_ids, self._replicated_embedding)
 
-    def forward(self, query_sequence: torch.Tensor, *, label: str) -> torch.Tensor:
+    def forward(self, query_sequence: torch.Tensor) -> torch.Tensor:
         if self.fused:
-            return self._fused_forward(query_sequence, label=label)
-        for layer_idx, layer in enumerate(self.layers):
-            # Both attention managers need the current label. The shared KV
-            # cache uses the actual transformer index, not an index within
-            # the local/global subset of layers.
-            layer.self_attn.attend.bind_step(label)
-            layer.self_attn.attend.set_layer_idx(layer_idx)
+            return self._fused_forward(query_sequence)
+        for layer in self.layers:
             query_sequence = layer(query_sequence)
         return self.norm(query_sequence)
 
-    def _fused_forward(self, query_sequence: torch.Tensor, *, label: str) -> torch.Tensor:
+    def _fused_forward(self, query_sequence: torch.Tensor) -> torch.Tensor:
         """Same math as ``forward``, with one all-reduce per layer (attention and
         MoE partials summed on-rank first) and each layer's residual add fused
         into the next layer's LayerNorm."""
         norms = [layer.input_layernorm for layer in self.layers] + [self.norm]
         residual, normalized = norms[0].add_forward(query_sequence, None)
         for layer_idx, layer in enumerate(self.layers):
-            layer.self_attn.attend.bind_step(label)
-            layer.self_attn.attend.set_layer_idx(layer_idx)
             delta = self.comm_group.all_reduce(layer.fused_branches(normalized))
             residual, normalized = norms[layer_idx + 1].add_forward(residual, delta)
         return normalized
@@ -367,7 +337,9 @@ class CommandAPlusForCausalLM(nn.Module):
         *,
         label: str,
     ) -> torch.Tensor:
-        return self.model(query_sequence, label=label)
+        """``label`` is the scaffold's to pass and goes unread, since each row's label comes from the step's
+        segments."""
+        return self.model(query_sequence)
 
     def logits(
         self,

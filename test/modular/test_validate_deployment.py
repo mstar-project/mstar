@@ -129,6 +129,22 @@ def test_mps_that_is_not_a_bool_is_refused(tmp_path):
     _refused(_Model(), _cfg(tmp_path, mps="yes"), r"mps must be true or false, got 'yes'")
 
 
+def test_unpausable_outputs_that_are_not_a_list_are_refused(tmp_path):
+    _refused(
+        _Model(), _cfg(tmp_path, unpausable_outputs="audio"),
+        r"unpausable_outputs must be a list of output modalities from \[.*\], got 'audio'",
+    )
+
+
+@pytest.mark.parametrize("outputs", [["Audio"], ["speech"]])
+def test_unpausable_outputs_that_name_no_output_modality_are_refused(tmp_path, outputs):
+    """A misspelled modality matched no request's outputs, so every voice stream was preemptible."""
+    _refused(
+        _Model(), _cfg(tmp_path, unpausable_outputs=outputs),
+        rf"unpausable_outputs must be a list of output modalities from \[.*\], got \['{outputs[0]}'\]",
+    )
+
+
 def test_missing_node_groups_is_refused(tmp_path):
     cfg = tmp_path / "cfg.yaml"
     cfg.write_text("max_seq_len: 64\n")
@@ -457,10 +473,9 @@ class _TrailSpec(_Spec):
     (_TrailSpec("kv", {"a", "b"}), {}),
 ], ids=["kv_offload_off", "page_trail_only"])
 def test_lockstep_nodes_sharing_a_journaled_resource_are_refused(spec, resources, tmp_path):
-    """Rank 0's decisions on a resource (page moves, prefix leases, page
-    trails) reach the followers per node, riding on one node's next step, so
-    two lockstep nodes over one resource could admit out of step. Refused until
-    rank 0 journals a shared resource in one stream."""
+    """Rank 0's prefix leases and page trails on a resource reach the followers
+    per node, riding on one node's next step, so two lockstep nodes over one
+    resource could admit out of step."""
     labels = {"kv": {"main": KVLabel()}} if isinstance(spec, KVSpec) else None
     model = _Model(_a_then_b, specs=[spec], kv_labels=labels, tp_enabled_nodes=["a", "b"])
     cfg = _cfg(tmp_path, [{"node_names": ["a", "b"], **_TP2}], resources=resources)
