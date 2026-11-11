@@ -39,13 +39,14 @@ def check_rows(got, y0, want, live, dtype, what):
 
 
 def ragged_layout(tokens, g):
-    """Tokens over the slots in uneven runs (one slot takes most), as ``(token slots, order, indptr)``."""
+    """Tokens over the slots in uneven runs (one slot takes most), as ``(token slots, order, indptr)``,
+    the slots int32 as the ops take them."""
     weights = torch.tensor([1.0, 6.0, 2.0, 1.0, 0.5, 3.0], device="cuda")
     token_slots = torch.multinomial(weights, tokens, replacement=True, generator=g)
     order = torch.argsort(token_slots, stable=True).to(torch.int32)
     indptr = torch.zeros(SLOTS + 1, dtype=torch.int32, device="cuda")
     indptr[1:] = torch.cumsum(torch.bincount(token_slots, minlength=SLOTS), 0)
-    return token_slots, order, indptr
+    return token_slots.to(torch.int32), order, indptr
 
 
 def case(max_rank, in_features, slices, tokens, seed):
@@ -64,12 +65,12 @@ def case(max_rank, in_features, slices, tokens, seed):
     return a, b, scalings, ranks, token_slots, order, indptr, x, y0
 
 
-def reference(a, b, scalings, ranks, order, indptr, x, y0, slices, dtype):
+def reference(a, b, scalings, ranks, token_slots, x, y0, slices, dtype):
     """The fp32 reference on the inputs as the kernels see them in ``dtype``."""
     a, b, x = (t.to(dtype).float() for t in (a, b, x))
     want = y0.clone()
-    h = ref_ops.shrink_reference(x, a, order, indptr, ranks, len(slices))
-    ref_ops.expand_reference_(want, h, b, order, indptr, ranks, scalings, list(slices))
+    h = ref_ops.shrink_reference(x, a, token_slots, ranks, len(slices))
+    ref_ops.expand_reference_(want, h, b, token_slots, ranks, scalings, list(slices))
     return want
 
 
@@ -86,9 +87,10 @@ def test_apply_matches_the_reference(max_rank, in_features, slices, tokens, dtyp
     """``lora_apply_`` (whose shrink writes zeros past each slot's rank for its expand) against
     the fp32 reference, row by row; base rows and the rank-0 slot's rows bitwise untouched."""
     a, b, scalings, ranks, token_slots, order, indptr, x, y0 = case(max_rank, in_features, slices, tokens, tokens)
-    want = reference(a, b, scalings, ranks, order, indptr, x, y0, slices, dtype)
+    want = reference(a, b, scalings, ranks, token_slots, x, y0, slices, dtype)
     got = y0.to(dtype, copy=True)
-    ops.lora_apply_(got, x.to(dtype), a.to(dtype), b.to(dtype), order, indptr, ranks, scalings, list(slices))
+    ops.lora_apply_(got, x.to(dtype), a.to(dtype), b.to(dtype), order, indptr, token_slots, ranks, scalings,
+                    list(slices))
     check_rows(got, y0, want, ranks.long()[token_slots] > 0, dtype, f"apply r{max_rank} T{tokens}")
     untouched = (token_slots == 0) | (token_slots == 3)
     assert torch.equal(got[untouched], y0.to(dtype)[untouched])
@@ -101,13 +103,13 @@ def test_shrink_then_expand_with_anything_past_the_rank(max_rank, in_features, s
     """The separate ops: ``lora_expand_`` masks ``h`` past each slot's rank itself, since its ``h``
     may come from anywhere (here, inf where the expand must not read)."""
     a, b, scalings, ranks, token_slots, order, indptr, x, y0 = case(max_rank, in_features, slices, tokens, 7)
-    want = reference(a, b, scalings, ranks, order, indptr, x, y0, slices, dtype)
-    h = ops.lora_shrink(x.to(dtype), a.to(dtype), order, indptr, ranks, len(slices))
+    want = reference(a, b, scalings, ranks, token_slots, x, y0, slices, dtype)
+    h = ops.lora_shrink(x.to(dtype), a.to(dtype), order, indptr, token_slots, ranks, len(slices))
     rank = ranks.long()[token_slots]
     col = torch.arange(h.shape[1], device="cuda") % max_rank
     h = torch.where(col[None, :] < rank[:, None], h, float("inf"))
     got = y0.to(dtype, copy=True)
-    ops.lora_expand_(got, h, b.to(dtype), order, indptr, ranks, scalings, list(slices))
+    ops.lora_expand_(got, h, b.to(dtype), order, indptr, token_slots, ranks, scalings, list(slices))
     check_rows(got, y0, want, rank > 0, dtype, f"shrink + expand r{max_rank} T{tokens}")
 
 
@@ -122,7 +124,7 @@ def test_shrink_zeros_past_each_slots_rank(tokens):
     h = torch.full((splits, tokens, len(slices) * max_rank), float("nan"), device="cuda")
     tb._shrink_into(h, x.to(torch.bfloat16), a.to(torch.bfloat16), order, indptr, ranks, len(slices), splits,
                     k_per_split, tiles)
-    want = ref_ops.shrink_reference(x.to(torch.bfloat16).float(), a.to(torch.bfloat16).float(), order, indptr, ranks,
+    want = ref_ops.shrink_reference(x.to(torch.bfloat16).float(), a.to(torch.bfloat16).float(), token_slots, ranks,
                                     len(slices))
     live = ranks.long()[token_slots] > 0
     err = (h.sum(0)[live] - want[live]).norm(dim=1) / want[live].norm(dim=1)
@@ -146,10 +148,10 @@ def test_b_past_a_slots_rank_must_be_finite(op, tokens):
     def run(b_):
         y = y0.clone()
         if op == "apply":
-            ops.lora_apply_(y, x, a, b_.to(torch.bfloat16), order, indptr, ranks, scalings, list(slices))
+            ops.lora_apply_(y, x, a, b_.to(torch.bfloat16), order, indptr, token_slots, ranks, scalings, list(slices))
         else:
-            h = ops.lora_shrink(x, a, order, indptr, ranks, len(slices))
-            ops.lora_expand_(y, h, b_.to(torch.bfloat16), order, indptr, ranks, scalings, list(slices))
+            h = ops.lora_shrink(x, a, order, indptr, token_slots, ranks, len(slices))
+            ops.lora_expand_(y, h, b_.to(torch.bfloat16), order, indptr, token_slots, ranks, scalings, list(slices))
         return y
 
     zero_padded = run(torch.where(past, 0.0, b))
@@ -170,7 +172,7 @@ def launch_both(tokens, max_rank, dtype, cfg):
     kernels."""
     in_features, slices = 3072, (3072, 1024, 1024)
     a, b, scalings, ranks, token_slots, order, indptr, x, y0 = case(max_rank, in_features, slices, tokens, 9)
-    want = reference(a, b, scalings, ranks, order, indptr, x, y0, slices, dtype)
+    want = reference(a, b, scalings, ranks, token_slots, x, y0, slices, dtype)
     h = torch.empty(1, tokens, a.shape[1], device="cuda", dtype=dtype)
     shrink = tb._shrink_into(h, x.to(dtype), a.to(dtype), order, indptr, ranks, len(slices), 1, in_features,
                              cfg.shrink)
@@ -225,9 +227,9 @@ def test_an_fp32_pool_on_a_small_gpu_through_the_op(monkeypatch):
     monkeypatch.setattr(tb, "_smem_limit", lambda index: SMEM_LIMITS["sm86"])
     max_rank, in_features, slices, tokens = 320, 3072, (3072, 1024, 1024), 2048
     a, b, scalings, ranks, token_slots, order, indptr, x, y0 = case(max_rank, in_features, slices, tokens, 13)
-    want = reference(a, b, scalings, ranks, order, indptr, x, y0, slices, torch.float32)
+    want = reference(a, b, scalings, ranks, token_slots, x, y0, slices, torch.float32)
     got = y0.clone()
-    ops.lora_apply_(got, x, a, b, order, indptr, ranks, scalings, list(slices))
+    ops.lora_apply_(got, x, a, b, order, indptr, token_slots, ranks, scalings, list(slices))
     check_rows(got, y0, want, ranks.long()[token_slots] > 0, torch.float32, "fp32 at sm86's limit")
 
 
@@ -257,7 +259,8 @@ def test_a_high_rank_inside_a_captured_graph(tokens, op):
     b = (torch.randn(SLOTS, sum(slices), max_rank, generator=g, device="cuda") / 18).to(torch.bfloat16)
     scalings = torch.rand(SLOTS, generator=g, device="cuda") + 0.5
     ranks = torch.zeros(SLOTS, dtype=torch.int32, device="cuda")
-    _, order, indptr = ragged_layout(tokens, g)
+    token_slots, order, indptr = ragged_layout(tokens, g)
+    token_slots.zero_()
     indptr.zero_()
     indptr[1:] = tokens  # every row on the zero adapter
     x, y = torch.zeros(tokens, in_features, **bf16), torch.zeros(tokens, sum(slices), **bf16)
@@ -265,17 +268,18 @@ def test_a_high_rank_inside_a_captured_graph(tokens, op):
     def run():
         out = y.clone()
         if op == "apply":
-            ops.lora_apply_(out, x, a, b, order, indptr, ranks, scalings, slices)
+            ops.lora_apply_(out, x, a, b, order, indptr, token_slots, ranks, scalings, slices)
         else:
-            h = ops.lora_shrink(x, a, order, indptr, ranks, len(slices))
-            ops.lora_expand_(out, h, b, order, indptr, ranks, scalings, slices)
+            h = ops.lora_shrink(x, a, order, indptr, token_slots, ranks, len(slices))
+            ops.lora_expand_(out, h, b, order, indptr, token_slots, ranks, scalings, slices)
         return out
 
     graph, out = capture(run)
     for mix_ranks, seed in (([0, 320, 33, 0, 256, 100], 1), ([0, 16, 320, 64, 0, 319], 2), ([0] * SLOTS, 3)):
         gm = torch.Generator(device="cuda").manual_seed(seed)
         ranks.copy_(torch.tensor(mix_ranks, dtype=torch.int32))
-        _, o, p = ragged_layout(tokens, gm)
+        t, o, p = ragged_layout(tokens, gm)
+        token_slots.copy_(t)
         order.copy_(o)
         indptr.copy_(p)
         x.copy_(torch.randn(x.shape, generator=gm, device="cuda").to(torch.bfloat16))

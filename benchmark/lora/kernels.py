@@ -41,6 +41,7 @@ class Case(NamedTuple):
     y: torch.Tensor
     token_order: torch.Tensor
     slot_indptr: torch.Tensor
+    token_slot: torch.Tensor
     ranks: torch.Tensor
     scalings: torch.Tensor
     out_slices: tuple[int, ...]
@@ -52,8 +53,8 @@ Apply = Callable[[Case, torch.Tensor, torch.Tensor], None]
 
 
 def triton_apply(c: Case, a: torch.Tensor, b: torch.Tensor) -> None:
-    torch.ops.mstar.lora_apply_(c.y, c.x, a, b, c.token_order, c.slot_indptr, c.ranks, c.scalings,
-                                list(c.out_slices))
+    torch.ops.mstar.lora_apply_(c.y, c.x, a, b, c.token_order, c.slot_indptr, c.token_slot, c.ranks,
+                                c.scalings, list(c.out_slices))
 
 
 def cublas_apply(c: Case, a: torch.Tensor, b: torch.Tensor) -> None:
@@ -90,6 +91,8 @@ def time_target(apply: Apply, rows: int, rank: int, adapters: int, in_features: 
         y=torch.zeros(rows, sum(out_slices), device="cuda", dtype=dtype),
         token_order=torch.arange(rows, device="cuda", dtype=torch.int32),
         slot_indptr=torch.tensor(bounds, device="cuda", dtype=torch.int32),
+        token_slot=torch.repeat_interleave(torch.arange(slots, device="cuda", dtype=torch.int32),
+                                           torch.tensor(bounds, device="cuda").diff()),
         ranks=torch.tensor([0] + [rank] * adapters, device="cuda", dtype=torch.int32),
         scalings=torch.tensor([0.0] + [2.0] * adapters, device="cuda"),
         out_slices=tuple(out_slices), bounds=bounds, scale=2.0,
