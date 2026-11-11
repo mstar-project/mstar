@@ -516,13 +516,13 @@ class Rebuilds:
                 kept is not None and ctx.is_real_row(rid) and rid not in ctx.rebuild_rids and rid not in skip_rids
                 and rid not in prefilling
             ):
-                ids = token if isinstance(token, list) else [token]
-                if (
-                    any(i in policy.pad_ids for i in ids)
-                    and any(name != policy.ids_input for name in kept.records[-1].inputs)
-                ):
+                ids = token if isinstance(token, list) else None  # a repeated step's row holds its iterations' ids
+                pad = token in policy.pad_ids if ids is None else not policy.pad_ids.isdisjoint(ids)
+                if pad and any(name != policy.ids_input for name in kept.records[-1].inputs):
                     self.forget(rid, node)
                     forgot.append(rid)
+                elif ids is None:
+                    kept.sampled.append(token)
                 else:
                     kept.sampled.extend(ids)
         return forgot
