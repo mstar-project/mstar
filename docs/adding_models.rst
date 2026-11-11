@@ -645,6 +645,26 @@ can be selected, so every request on one has its root; one that arrives without 
 cached.
 Nothing on the model side is needed for this.
 
+A model that picks a request's adapter itself (Phi-4-multimodal runs an image prompt on
+its ``vision`` adapter and an audio prompt on ``speech``) names the adapters it may pick
+in ``Model.prompt_lora_adapters`` and returns its pick as ``ProcessPromptOutput.lora_adapter``
+(``None`` for the base model; left at ``KEEP_ADAPTER``, the client's choice stands). The
+API server refuses at startup a deployment whose ``resources: lora: adapters:`` block does
+not serve them all. The data worker then gives the request what ``ServedModels.select``
+gives a client that names the adapter: its digest and its root, from the API server's
+``ServedModels``, so runtime loads and unloads apply. An adapter unloaded since startup,
+or one other than the adapter the client named (``None`` included), refuses the request
+with a 400; a pick outside ``prompt_lora_adapters`` is a 500.
+
+A resource whose KV differs per request for the same tokens (a LongRoPE table picked by
+prompt length) says so in ``NodeResourceSpec.prefix_variant(model_kwargs)``: opaque
+bytes, from the same kwargs its ``request_config`` reads, or None. The data worker folds
+every declared spec's variant into the root after any adapter's, in declaration order and
+under the spec's key (``variant_root`` in ``mstar/engine/resources/kv/keys.py``), keys the
+prompt and sends that root on, so generated pages are keyed under it too. Requests share
+pages only under the same variants, and a request whose resources name none keys under the
+root it had.
+
 .. _Step 2a — Declare your state:
 
 Step 2a — Declare your state
@@ -1596,7 +1616,8 @@ placed exactly as weights are.
   the deployment.
 - **Requests.** Nothing per model. ``LoraSpec.request_config`` opens a request that
   names an adapter in the ``lora_adapter`` kwarg, which the OpenAI ``model`` field maps
-  onto, with a ``LoraReqConfig``, which each node's pool takes; a base-model request
+  onto (or which the model's ``process_prompt`` sets; see **Cross-request prefix
+  reuse**), with a ``LoraReqConfig``, which each node's pool takes; a base-model request
   carries none. The API server refuses, with a 400, an adapter it does not serve
   (``ServedModels``), and the conductor, with a 409, one a runtime load or unload is in
   flight for; an adapter is checked when it is registered (rank within
