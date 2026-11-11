@@ -655,8 +655,10 @@ def build_planner(
     resident_nodes: Collection[str] = (), sharded_nodes: Collection[str] = (),
 ) -> tuple[ResidentPlanner | None, str]:
     """A planner for ``node``, or None and why not. Every resource of the node
-    must be able to, since a capture is one graph: one host-planned resource
-    would need the row a resident step no longer stages.
+    must be able to, since a capture is one graph: a resource that reads
+    another's host plan would need the row a resident step no longer stages. One
+    that addresses its rows from the step alone (the sampler without cells, the
+    LoRA pool) keeps its host plan and doesn't refuse.
 
     A resource shared with other nodes binds this one planner, so it is refused
     when another node sharing it names resident walks too (``resident_nodes``),
