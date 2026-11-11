@@ -38,10 +38,10 @@ STRUCTURED_OUTPUTS_KWARG = "structured_outputs"
 GRAMMAR_KINDS = ("json", "json_object", "regex", "choice", "grammar")
 # a grammar compiles while its request waits for admission, so its size is bounded
 MAX_GRAMMAR_CHARS = 1 << 17
-# xgrammar's batch fill starts every one of its threads on each call, however few the rows
-# (about 25 us of the caller's time per thread), so a fill takes a thread per this many rows,
-# up to 8 threads: a microbench had a large pool cost bs=6 about 2.5 ms, and bs=64 on 8
-# threads take 1.1 ms; below 16 rows a serial loop wins
+# xgrammar's batch fill starts every one of its threads on each call, however few the rows:
+# measured on the dev machine, about 25 us of the caller's time per thread, and a 6-row fill
+# took 0.29 ms serially against 0.23 ms with 2 threads. A fill takes a thread per this many
+# rows, up to 8 threads; the 16-row cut is provisional until the H200 profile sets it
 FILL_ROWS_PER_THREAD = 8
 
 
