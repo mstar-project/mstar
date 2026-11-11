@@ -20,7 +20,10 @@ CUDA), which no one real-arithmetic formula reproduces on every device.
 
 On CUDA the elementwise work between the GEMMs runs as fused kernels (``kernels``) that round where
 the eager ops do: the q/k norms with the rotation, the LayerNorms with the modulation after them (the
-attention's gated residual too) and the gated residuals. The output is bit-identical to the eager ops (the CPU path), in a fraction of the memory traffic.
+attention's gated residual too) and the gated residuals. Those are bit-identical to the eager ops (the CPU path),
+in a fraction of the memory traffic. The one fusion that is not is the MLP's bias and tanh-GELU, in the
+up-projection's GEMM epilogue (``ffn.addmm_gelu_tanh``, as SGLang runs it): it rounds once from the fp32
+accumulator where eager rounds the GEMM and then the GELU, so it is held to the fp32 yardstick, not to bits.
 
 Linears are tensor-parallel (``comm_group``): q/k/v and the MLP's first linear split by
 column, the attention outputs and the MLP's second by row; the modulation linears stay whole.
@@ -40,8 +43,10 @@ from torch import nn
 
 from mstar.distributed.communication import CommGroup
 from mstar.distributed.utils import divide
+from mstar.model.components.diffusion.ffn import addmm_gelu_tanh
 from mstar.model.components.diffusion.qwen import dit_kernels as kernels
 from mstar.model.components.distributed.linear import ColumnParallelLinear, RowParallelLinear
+from mstar.model.components.lora.capable import LoraBound
 from mstar.model.components.norm import QwenRMSNorm
 
 # The rotary tables' extent in the reference (``QwenEmbedRope``'s 4096 positions per sign).
@@ -184,13 +189,17 @@ class _TimeTextEmbed(nn.Module):
 
 
 class _GeluProj(nn.Module):
-    """diffusers ``GELU(approximate="tanh")``: a column-parallel projection and the activation."""
+    """diffusers ``GELU(approximate="tanh")``: a column-parallel projection and the activation, on CUDA in one
+    GEMM (the bias and the GELU in its epilogue). The column shard is a local GEMM with its bias on every rank."""
 
     def __init__(self, comm_group: CommGroup, dim: int, inner: int):
         super().__init__()
         self.proj = ColumnParallelLinear(comm_group, dim, inner, bias=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # a LoRA-bound projection adds its delta in its forward, before the GELU
+        if x.is_cuda and not isinstance(self.proj, LoraBound):
+            return addmm_gelu_tanh(x, self.proj.weight, self.proj.bias)
         return F.gelu(self.proj(x), approximate="tanh")
 
 

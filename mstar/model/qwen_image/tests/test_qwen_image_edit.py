@@ -10,6 +10,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 import torch
+import torch.nn.functional as F
 
 diffusers = pytest.importorskip("diffusers")
 
@@ -210,7 +211,8 @@ def test_rope_rounds_as_the_reference(device):
 def test_the_fused_kernels_round_as_the_eager_ops(zero_cond_t, monkeypatch):
     """On CUDA the q/k norms with the rotation, the LayerNorms with the modulation, and the gated residuals run as
     fused kernels. They round where the eager ops do (the LayerNorm's statistics in torch's own order), so a bf16
-    forward is the eager forward (and so the reference's) bit for bit."""
+    forward is the forward with the eager elementwise ops bit for bit (the MLP's GELU epilogue, the one fusion that
+    is not exact, runs in both: the next test's)."""
     from mstar.model.components.diffusion.attention import joint_attention
     from mstar.model.components.diffusion.qwen import dit_kernels as kernels
     from mstar.model.qwen_image.components.transformer import QwenStepLayout, apply_rope, qwen_rope_tables
@@ -259,6 +261,34 @@ def test_the_fused_kernels_round_as_the_eager_ops(zero_cond_t, monkeypatch):
                    (residual, want)))
     assert torch.equal(kernels.norm_modulate(x, 1 + scale, shift, 16, norm.eps),
                        kernels.modulate(norm(x), 1 + scale, shift, 16))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the GELU epilogue runs on CUDA")
+def test_the_mlp_up_projection_takes_its_bias_and_gelu_in_the_gemm():
+    """On CUDA the MLP's up-projection is one GEMM with the bias and the tanh-GELU in cuBLASLt's epilogue (as SGLang
+    runs it). That rounds once, from the fp32 accumulator, where eager rounds the GEMM's output and then the GELU's:
+    not eager's bits, but within one bf16 step of the exact result everywhere and nearer it than eager on average."""
+    from mstar.distributed.communication import CommGroup
+    from mstar.model.qwen_image.components.transformer import _GeluProj
+
+    torch.manual_seed(0)
+    # the served width (3072 -> 12288), two rows of an odd token count
+    up = _GeluProj(CommGroup.trivial(), 3072, 4 * 3072)
+    with torch.no_grad():
+        up.proj.weight.normal_(std=3072 ** -0.5)
+        up.proj.bias.normal_(std=0.5)
+    up = up.to("cuda", torch.bfloat16)
+    x = torch.randn(2, 37, 3072).to("cuda", torch.bfloat16)
+    weight, bias = up.proj.weight, up.proj.bias
+    with torch.no_grad():
+        got = up(x)
+        eager = F.gelu(up.proj(x), approximate="tanh")
+        exact = F.gelu(torch.addmm(bias.double(), x.flatten(0, 1).double(), weight.double().t()),
+                       approximate="tanh").view(got.shape)
+    assert torch.equal(got, torch._addmm_activation(bias, x.flatten(0, 1), weight.t(), use_gelu=True).view(got.shape))
+    # one bf16 step (2^-7 relative); the absolute floor covers the fp32 accumulation where the GELU is near zero
+    torch.testing.assert_close(got.double(), exact, rtol=2 ** -7, atol=1e-5)
+    assert (got.double() - exact).abs().mean() < (eager.double() - exact).abs().mean()
 
 
 def _vaes():
