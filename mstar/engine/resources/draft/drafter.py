@@ -94,7 +94,7 @@ class DrafterNeeds(NamedTuple):
     kv: KVLayerSet | None = None
     carry: CarrySpec | None = None
     # ``observe`` reads the target's last hidden state of every block row: the
-    # target function returns ``(logits, hidden)``
+    # target function sets ``TargetOutput.hidden``
     target_hidden: bool = False
     input_kinds: frozenset[str] = frozenset({"text"})
     chunk_boundary: ChunkBoundary = ChunkBoundary.UNDECLARED
@@ -239,7 +239,8 @@ class Drafter(Protocol):
 
     def prefill(self, inputs: PrefillInputs) -> None:
         """After a prompt step samples: the drafter's pass over the step's prompt
-        rows. Nothing by default."""
+        rows, returning the rows' first carry for a drafter that declares one
+        (`DrafterNeeds.carry`), which the scaffold stores. Nothing by default."""
         return None
 
 
@@ -275,7 +276,11 @@ def draft_verify_step(
     # every rank writes KV for rank 0's drafts
     drafts = sampler.agree(drafts.long())
     block = torch.cat([input_ids.reshape(n, 1).long(), drafts], dim=1)
-    logits, hidden = target(block.reshape(-1))
+    out = target(block.reshape(-1))
+    if not isinstance(out, TargetOutput):
+        # a bare logits tensor would unpack along its rows; checked once, while the step is traced
+        raise TypeError(f"a verify step's target returns a TargetOutput, not {type(out).__name__}")
+    logits, hidden = out
     if needs.target_hidden and hidden is None:
         raise RuntimeError("the drafter reads the target's hidden states (DrafterNeeds.target_hidden), and the "
                            "target returned none")
