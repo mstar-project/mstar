@@ -239,7 +239,7 @@ def _listed(resources, steps=None):
 
     def declare_step(graph_walk, **kwargs):
         keys = resources.keys() if steps is None else steps[graph_walk]
-        return SimpleNamespace(steps=dict.fromkeys(keys, object()), segments=None)
+        return SimpleNamespace(steps=dict.fromkeys(keys, object()), segments=None, state={})
 
     submodule = SimpleNamespace(get_accelerator_graph_configs=lambda *args: configs, declare_step=declare_step,
                                 compiled_entries_per_shape=1)
