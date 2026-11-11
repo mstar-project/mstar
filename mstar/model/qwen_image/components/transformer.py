@@ -28,6 +28,7 @@ column, the attention outputs and the MLP's second by row; the modulation linear
 
 from __future__ import annotations
 
+import functools
 import math
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -97,33 +98,51 @@ def _rope_axis(index: torch.Tensor, dim: int, theta: float) -> torch.Tensor:
     return torch.polar(torch.ones_like(freqs), freqs)
 
 
-def qwen_rope_tables(
-    axes_dims: Sequence[int], img_grids: Sequence[tuple[int, int]], text_lengths: Sequence[int], text_rows: int,
-    theta: float = 10_000.0,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """``(img_freqs, txt_freqs)`` on the host, complex64, as ``QwenEmbedRope`` (``scale_rope``)
-    builds them: ``img_grids`` are the target's then each reference's ``(h, w)`` in tokens, and
-    ``text_lengths`` the real text of each local branch, left-padded to ``text_rows``."""
+@functools.lru_cache(maxsize=4)
+def _rope_axes(axes_dims: tuple[int, ...], theta: float) -> tuple[list[torch.Tensor], list[torch.Tensor], torch.Tensor]:
+    """Each axis's rotations at positions ``0..ROPE_POSITIONS-1`` and at the negative ones, and the positive axes
+    side by side (the text's table): constants, built once."""
     pos_index = torch.arange(ROPE_POSITIONS)
     neg_index = torch.arange(ROPE_POSITIONS).flip(0) * -1 - 1
     pos = [_rope_axis(pos_index, d, theta) for d in axes_dims]
     neg = [_rope_axis(neg_index, d, theta) for d in axes_dims]
+    return pos, neg, torch.cat(pos, dim=1)
+
+
+@functools.lru_cache(maxsize=16)
+def _image_rope(axes_dims: tuple[int, ...], img_grids: tuple[tuple[int, int], ...], theta: float) -> torch.Tensor:
+    """The image tokens' table, a function of the grids alone. Cached: building it is ~10^6-element host ops
+    that run on torch's intra-op pool, and two ranks of one host building at once (cfg-parallel, each rank's
+    first step of a request) contend for the cores: ~4 ms alone, ~300-400 ms together."""
+    pos, neg, _ = _rope_axes(axes_dims, theta)
     img = []
     for frame, (h, w) in enumerate(img_grids):
         t_freqs = pos[0][frame:frame + 1].view(1, 1, 1, -1).expand(1, h, w, -1)
         h_freqs = torch.cat([neg[1][-(h - h // 2):], pos[1][:h // 2]]).view(1, h, 1, -1).expand(1, h, w, -1)
         w_freqs = torch.cat([neg[2][-(w - w // 2):], pos[2][:w // 2]]).view(1, 1, w, -1).expand(1, h, w, -1)
         img.append(torch.cat([t_freqs, h_freqs, w_freqs], dim=-1).reshape(h * w, -1))
-    img_freqs = torch.cat(img)
+    return torch.cat(img).contiguous()
+
+
+def qwen_rope_tables(
+    axes_dims: Sequence[int], img_grids: Sequence[tuple[int, int]], text_lengths: Sequence[int], text_rows: int,
+    theta: float = 10_000.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``(img_freqs, txt_freqs)`` on the host, complex64, as ``QwenEmbedRope`` (``scale_rope``)
+    builds them: ``img_grids`` are the target's then each reference's ``(h, w)`` in tokens, and
+    ``text_lengths`` the real text of each local branch, left-padded to ``text_rows``. ``img_freqs`` is
+    shared between calls: read it, don't write it."""
+    axes_dims, img_grids = tuple(axes_dims), tuple(tuple(g) for g in img_grids)
+    img_freqs = _image_rope(axes_dims, img_grids, theta)
     start = max(max(h // 2, w // 2) for h, w in img_grids)
-    all_axes = torch.cat(pos, dim=1)
+    all_axes = _rope_axes(axes_dims, theta)[2]
     txt = []
     for length in text_lengths:
         # a pad row reads the first real position; it attends only itself
         index = (torch.arange(text_rows) - (text_rows - length)).clamp(min=0) + start
         txt.append(all_axes[index])
     txt_freqs = torch.stack(txt)
-    return img_freqs.contiguous(), txt_freqs.contiguous()
+    return img_freqs, txt_freqs.contiguous()
 
 
 def apply_rope(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
