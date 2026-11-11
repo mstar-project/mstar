@@ -109,7 +109,11 @@ def test_conditional_only_capture_when_guidance_is_off(monkeypatch) -> None:
     )
     assert step.cg_key_info == image_key
     assert {seg.label for seg in step.segments} == {COND_LABEL}
-    # conditional-only rows never batch, so a step holds one and leases the bs=1 graph
+    # guided rows can still arrive in this deployment and batch, so its caps stay
+    assert sub.max_batch_size(C.IMAGE_GEN_WALK) == sub.max_gen_batch_size
+    assert sub.max_batch_size(C.PREFILL_WALK) is None
+    # a distilled checkpoint's rows are all conditional-only: one per step
+    sub.config.distilled_sigmas = (1.0, 0.5)
     assert sub.max_batch_size(C.IMAGE_GEN_WALK) == 1 and sub.max_batch_size(C.PREFILL_WALK) == 1
 
 
