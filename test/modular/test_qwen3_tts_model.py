@@ -1327,7 +1327,7 @@ def test_qwen3_tts_talker_preprocess_packs_the_tensors_the_per_row_device_copies
 
     seen = []
 
-    def main_input(input_embeds, label):
+    def main_input(input_embeds):
         seen.append(input_embeds)
         raise RuntimeError("the main Talker ran")
 
@@ -1671,16 +1671,17 @@ def test_qwen3_tts_checkpoint_min_p_turns_the_capability_on():
         **model._generation_defaults(), "min_p": 0.05, "code_predictor_min_p": 0.1,
     }
     specs = {
-        spec.resource_key: spec for spec in model.get_node_resources()
+        spec.resource_key: spec for spec in node_resources(model)
         if isinstance(spec, SamplerSpec)
     }
     assert specs[TALKER_SAMPLER].enable_min_p and specs[CODE_PRED_SAMPLER].enable_min_p
     # a plain request takes those defaults and is not refused
-    for key, config in model.get_request_resource_configs([], [], {}).items():
+    configs = sampling_configs(model.get_request_resource_configs([], [], {}), model.declare_state())
+    for key, config in configs.items():
         config.validate(specs[key])
     # without them the capability stays off
     plain = {
-        spec.resource_key: spec for spec in _make_model().get_node_resources()
+        spec.resource_key: spec for spec in node_resources(_make_model())
         if isinstance(spec, SamplerSpec)
     }
     assert not plain[TALKER_SAMPLER].enable_min_p and not plain[CODE_PRED_SAMPLER].enable_min_p
