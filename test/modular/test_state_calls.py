@@ -534,13 +534,25 @@ def test_an_add_after_a_kept_add_raises():
     _refused(r"Array 'kv': an add on layer 0 after its kept add", lambda: h.add(0, k=k, v=v))
 
 
-def test_an_add_after_a_read_in_the_same_layer_raises():
+def test_a_kept_add_after_a_read_in_the_same_layer_raises():
     h = _kv_handle()
     _begin(h)
     q, k, v = _tensors()
     h.add(0, keep=False, k=k, v=v)
     h.read(0, q)
-    _refused(r"Array 'kv': an add on layer 0 after a read in the same layer", lambda: h.add(0, keep=False, k=k, v=v))
+    _refused(r"Array 'kv': a kept add on layer 0 after a read in the same layer", lambda: h.add(0, k=k, v=v))
+
+
+def test_a_scratch_add_after_a_read_starts_another_pass():
+    """Pi0.5's action step runs every Euler step in one engine step: each adds the action tokens again and reads."""
+    h = _kv_handle()
+    step = _begin(h, kv=ArrayStep(keep=False))
+    q, k, v = _tensors()
+    for _ in range(2):
+        for layer in range(LAYERS):
+            h.add(layer, k=k, v=v)
+            h.read(layer, q)
+    h.check_step(step)
 
 
 def test_write_on_an_append_only_array_raises():
