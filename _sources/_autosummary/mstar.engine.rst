@@ -44,5 +44,6 @@
    fp32_precision
    node_dtype
    resources
+   state
    windowing
 
