@@ -443,8 +443,8 @@ class Resource(ResidentHooks, ABC):
     # Speculative decoding: a verify step commits its whole block of k + 1
     # tokens a row, and the runner later takes the rejected ones back
 
-    def committed_spans(self, rids, label: str, span: int) -> list[int]:
-        """The span the last commit counted for each of ``rids``' ``label``
+    def committed_spans(self, step, rids, label: str, span: int) -> list[int]:
+        """The span ``step``'s commit counted for each of ``rids``' ``label``
         stream, which a take-back may give back at most."""
         return [span] * len(rids)
 

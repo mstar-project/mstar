@@ -1021,8 +1021,8 @@ class KVStep(ResourceStep):
     # the rows the forks apply to; None is every row. A chunked prompt forks
     # on some of its chunks only, e.g. a pre-fork on its first
     fork_rids: frozenset | None = None
-    # (request_id, label) pairs that run against SINK_PAGE and hold no pages
-    sink: frozenset[tuple[str, str]] = frozenset()
+    # (request handle, label) pairs that run against SINK_PAGE and hold no pages
+    sink: frozenset[tuple[int, str]] = frozenset()
     # (request_id, label) -> the retention a committing stream declares for
     # itself this step, applied at commit. It rides with the step rather than
     # living on the stream, so an offload has nothing to lose.
@@ -1030,6 +1030,10 @@ class KVStep(ResourceStep):
     # Set by the manager when the step commits, while copies to the host are on: its count of commits so far.
     # The submodule doesn't declare it, as it doesn't declare `SubmoduleStep`'s context.
     commits: int = field(default=0, init=False, compare=False, repr=False)
+    # Set by the manager at commit and read by `NodeDraft.committed` right after it, under the same per-step
+    # freshness `commits` relies on: the (handle, label) streams whose span the commit dropped because they were
+    # offloaded mid-step. A union, so a step two pools commit keeps both pools' drops.
+    dropped: frozenset[tuple[int, str]] = field(default=frozenset(), init=False, compare=False, repr=False)
 
 
 @dataclass(frozen=True, kw_only=True)

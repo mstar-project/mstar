@@ -125,7 +125,7 @@ class NodeDraft:
             segments = (resource_step.segments if resource_step is not None else None) or step.segments
             seg = segments[0]
             labels[key] = seg.label
-            spans = resources[key].committed_spans(rids, seg.label, seg.span)
+            spans = resources[key].committed_spans(resource_step, rids, seg.label, seg.span)
             if counted is None:
                 counted = list(spans)
                 continue
