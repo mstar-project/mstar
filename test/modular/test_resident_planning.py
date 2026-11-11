@@ -1746,6 +1746,7 @@ class _Fmha:
 
     plans_in_graph = True
     supports_gather_resident = False
+    supports_repeats = True
 
     def __init__(self):
         self.calls = []
@@ -2231,3 +2232,16 @@ def test_a_cross_attention_without_a_query_pool_plans_on_the_host():
     step = SimpleNamespace(streams={}, host_planned=False, bucket=None, slot=0, lengths_only=set())
     manager.resident_gather(step)
     assert step.host_planned and not step.lengths_only
+
+
+def test_a_walk_repeats_only_if_every_captured_wrapper_says_it_sees_each_replays_lengths():
+    from mstar.engine.resources.attn.wrappers import FlashInferPrefillWrapper
+
+    fmha = _fmha_manager("kv", _Fmha())
+    fmha._repeat_walks = {}
+    ctx = SimpleNamespace(graph_walk=WALK)
+    assert fmha.max_repeats(None, ctx) > 1
+    # a prefill wrapper's host plan fixes the lengths its replays see
+    prefill = _fmha_manager("kv", FlashInferPrefillWrapper.__new__(FlashInferPrefillWrapper))
+    prefill._repeat_walks = {}
+    assert prefill.max_repeats(None, ctx) == 1

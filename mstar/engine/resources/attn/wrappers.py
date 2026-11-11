@@ -151,6 +151,8 @@ class FlashInferPrefillWrapper:
     # planned on the host: a resident step fills nothing of it in its graph
     plans_in_graph = False
     supports_gather_resident = False
+    # a replay's lengths are fixed by the host plan
+    supports_repeats = False
 
     def __init__(
         self,
@@ -468,6 +470,13 @@ class FlashInferDecodeWrapper:
     # the host still plans FlashInfer's schedule (`supports_gather_resident`)
     plans_in_graph = False
 
+    @property
+    def supports_repeats(self) -> bool:
+        """Whether the captured kernels see each replay's lengths: the tensor-core
+        kernel with paged arrays its graph builds, its schedule planned for the
+        step's last replay (`resident_gather`)."""
+        return self.supports_gather_resident and self.lengths_move
+
     def __init__(
         self,
         workspace_buffer: Workspace,
@@ -780,6 +789,8 @@ class FmhaDecodeWrapper:
     # host plan at all; `supports_gather_resident` is the paged wrappers' half-way case
     plans_in_graph = True
     supports_gather_resident = False
+    # its graph plans it whole, so a replay sees its own lengths
+    supports_repeats = True
 
     def __init__(
         self,
@@ -948,6 +959,8 @@ class FlashInferMixedWrapper:
     # planned on the host: a resident step fills nothing of it in its graph
     plans_in_graph = False
     supports_gather_resident = False
+    # a replay's lengths are fixed by the host plan
+    supports_repeats = False
 
     def __init__(
         self,
