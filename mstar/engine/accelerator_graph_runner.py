@@ -1348,6 +1348,9 @@ class AcceleratorGraphRunner:
                 else None
             )
 
+            # a verify step writes the rows' KV advance into it, in the graph
+            engine_inputs.resident = resident
+
             def run_forward():
                 if resident is not None:
                     planner.gather(resident)
@@ -1568,6 +1571,16 @@ class AcceleratorGraphRunner:
             graph_walk in config.replay_graph_walks
             for config in self._capture_configs
         )
+
+    def captured_buckets(self, graph_walk: str) -> list[BucketKey]:
+        """The buckets of ``graph_walk`` captured with a slot to replay.
+        Captures are agreed across the ranks of an instance
+        (`_buckets_captured_everywhere`), so every rank answers alike."""
+        return [key for key, bucket in self._buckets.items() if key.graph_walk == graph_walk and bucket.slots]
+
+    def max_captured_bs(self, graph_walk: str) -> int:
+        """The widest of `captured_buckets`, 0 when none was captured."""
+        return max((key.bs for key in self.captured_buckets(graph_walk)), default=0)
 
     def max_batch_size_for(self, graph_walk: str) -> int | None:
         """Largest batch this walk was captured for, or None for no cap.

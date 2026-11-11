@@ -25,6 +25,7 @@ from mstar.model.base import (
 )
 from mstar.model.multimodal import SUPPORTED_MODALITIES
 from mstar.validation.client_streams import check_client_streams
+from mstar.validation.draft import check_draft
 from mstar.validation.knobs import check_knobs
 from mstar.validation.placement import check_worker_graphs, node_groups_problems, routing_weights_problems
 from mstar.validation.resources import check_resources, resources_shape_problem
@@ -195,6 +196,7 @@ def validate_deployment(
             # the placement checks still see the specs built whole; a per-node one (LoRA) may be what
             # failed, and reading it again would raise again
             specs = [spec for spec in specs if not spec.per_node]
+    problems += _checked("checking speculative decoding", check_draft, model, config, specs)
     # after get_worker_graphs too: a model may shape its walks from the deployment (BAGEL)
     problems += _checked(
         "checking the client streams", check_client_streams,

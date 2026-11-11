@@ -32,6 +32,7 @@ from mstar.engine.resources.kv.config import (
     KVReqConfig,
     KVSpec,
     KVStep,
+    LayerSetSlot,
     PagedKVConfig,
     PrefixSpan,
     RetentionPolicy,
@@ -761,6 +762,11 @@ class KVManager(AttentionResource):
         self._cg_max_seq_len = 0
         # the SINK_PAGE run a plan points its sink rows at
         self._sink_pages = self._arena.new_stream()
+        # the reserved length's slack past the verified one, on a pool a verifying node uses
+        self._verify_slack = 0
+        # (rid, label) streams whose span the last commit dropped (offloaded
+        # mid-step), read by `committed_spans` right after it; reset by the next commit
+        self._dropped_spans: set[tuple[str, str]] = set()
         # FlashInfer's index arrays from page-locked memory (see PinnedIndexRing)
         self._indptr_ring = (
             PinnedIndexRing() if kv_pinned_indptrs() and torch.cuda.is_available() else None
@@ -1813,6 +1819,14 @@ class KVManager(AttentionResource):
         the resources over it read here; None when it is off."""
         return self.kv_cache.placement
 
+    def layer_set(self, name: str) -> LayerSetSlot:
+        """Where layer set ``name``'s layers sit in this pool, for a stack that
+        joined it (`PagedKVConfig.join`). Read at bind time, never in a step."""
+        sets = self.config.layer_sets
+        if name not in sets:
+            raise KeyError(f"KV {self.name}: no layer set {name!r}; the pool holds {sorted(sets)}")
+        return sets[name]
+
     def fingerprint(self) -> bytes:
         cp = self.placement
         return fingerprint(
@@ -1829,6 +1843,13 @@ class KVManager(AttentionResource):
             self.flush_chain_backlog()
         if overrides is None:
             overrides = KVReqConfig()
+        if self._verify_slack and overrides.kv_layout:
+            short = [label for label, layout in overrides.kv_layout.items() if layout.scratch < self._verify_slack]
+            if short:
+                raise ValueError(
+                    f"KV {self.name}: the layout of {rid}'s labels {short} holds less than the "
+                    f"{self._verify_slack} slots of scratch a verifying node's reserved length needs"
+                )
         # guards `_streams`/`_overrides` against a concurrent admit/plan/commit
         # or reset/remove on another thread (see `_lock`)
         with self._lock:
@@ -3130,6 +3151,9 @@ class KVManager(AttentionResource):
     def commit(self, step: KVStep, ctx: StepContext):
         streams = self._streams
         retention = step.retention
+        if self._dropped_spans:
+            # what `committed_spans` reads is this commit's alone
+            self._dropped_spans = set()
         if not step.commit:
             self._readonly_epoch += 1
         rows = self._readonly_rows
@@ -3181,6 +3205,8 @@ class KVManager(AttentionResource):
                             segment.request_id, segment.label,
                         )
                         self._readonly_epoch += 1
+                        # a verify step's take-back then has nothing to take
+                        self._dropped_spans.add((segment.request_id, segment.label))
                         continue
                     stream.stored_len += span
                     if stream.converted and self._world_size > 1 and stream.chain is not None:
@@ -3249,6 +3275,9 @@ class KVManager(AttentionResource):
                 f"{stream.span_cursor.spans[index].walk}"
             )
         written, bound = stream.stored_len + stream.released, layout.slots(overrides.loop_caps)
+        if self._verify_slack:
+            # a verify step's reserved length runs past the spans and growth, into the scratch
+            bound += layout.scratch
         assert written <= bound, f"{where}: committed {written} slots, past its layout's spans and growth ({bound})"
         assert policy is None or policy == layout.retention, (
             f"{where}: a step declares {policy}, where its layout declares {layout.retention}"
@@ -3682,18 +3711,12 @@ class KVManager(AttentionResource):
                 if stream.offloaded or not stream.page_indices:
                     continue
                 stream.offloaded = True
-                chain = stream.chain
                 claimed.append(ClaimedStream(
                     label=label,
                     groups=on_pages(stream.groups, stream.pages()),
                     position=stream.position,
                     protected_prefix=stream.protected_prefix,
-                    # past a front release `page_indices[k]` is no longer page k of the chain
-                    keys=(
-                        chain.keys[:chain.cursor]
-                        if self._index is not None and chain is not None and not stream.released
-                        else []
-                    ),
+                    keys=self._offload_keys(stream),
                 ))
                 if stream.read_future is not None:
                     read_futures.append(stream.read_future)
@@ -3779,6 +3802,39 @@ class KVManager(AttentionResource):
     def can_offload(self, rid: str) -> bool:
         """False for a guaranteed request, which reserves what it grows into so that nothing preempts it."""
         return rid not in self._guaranteed
+
+    def debug_fingerprint(self, rid: str) -> "dict[str, bytes | torch.Tensor]":
+        """Each on-device stream's private pages, every layer (a drafter's KV layers
+        included: they share the pool), its prefix keys, and its length and position.
+        A keyed page is named by its key alone: a reload may take it from the prefix
+        index, filed there by another request's identical prompt from another batch,
+        whose bytes differ in rounding."""
+        import hashlib
+
+        from mstar.engine.resources.base import tensor_digest
+
+        out = {}
+        with self._lock:
+            for label, stream in (self._streams.get(rid) or {}).items():
+                if stream.offloaded or not stream.page_indices:
+                    continue
+                keys = self._offload_keys(stream)
+                private = stream.pages()[len(keys):]
+                if private:
+                    pages = torch.tensor(private, dtype=torch.long, device=self.kv_cache.tensor.device)
+                    out[f"kv/{label}"] = tensor_digest(self.kv_cache.tensor.index_select(1, pages))
+                out[f"kv/{label}/keys"] = hashlib.blake2b(b"".join(keys), digest_size=16).digest()
+                out[f"kv/{label}/len"] = f"{stream.stored_len}:{stream.position}".encode()
+        return out
+
+    def _offload_keys(self, stream: CacheStream) -> list:
+        """The prefix keys of ``stream``'s leading pages that an offload files with it, and its reload
+        may take from the index: none past a front release, where ``page_indices[k]`` is no longer
+        page k of the chain."""
+        chain = stream.chain
+        if self._index is None or chain is None or stream.released:
+            return []
+        return chain.keys[:chain.cursor]
 
     def can_reload(self, rid: str) -> bool:
         """Whether `_reload_room` covers the pages ``rid``'s reload takes. A request that asks again after
@@ -5509,10 +5565,8 @@ class KVManager(AttentionResource):
         from mstar.engine.resources.kv.resident import KVResidentTables
 
         page_size = self._groups[0].page_size
-        # the pool's own context or override (not the serving config's top-level
-        # `max_seq_len`), and a stream's pages are distinct pages of the pool
-        width = min(-(-self.config.max_seq_len // page_size), self.config.request_pages)
-        self._resident = KVResidentTables(planner, key, page_size, width)
+        # the pool's own context or override (not the serving config's top-level `max_seq_len`)
+        self._resident = KVResidentTables(planner, key, page_size, self.config.block_table_width(page_size))
 
     def resident_row(self, rid: int, slot: int, row: list[int], writes: "ResidentWrites") -> None:
         tables = self._resident
@@ -5523,14 +5577,23 @@ class KVManager(AttentionResource):
                 f"KV {self.name}: {rid}/{label} released {stream.released} tokens, "
                 "which a block table row can't address"
             )
-        tables.row(stream.stored_len, stream.page_indices, slot, row, writes)
+        pending = tables.planner.pending
+        tables.row(
+            stream.stored_len, stream.page_indices, slot, row, writes,
+            keep_len=pending is not None and pending(rid),
+        )
 
     def resident_stage(self, plan: "ResidentPlan") -> None:
         tables, streams = self._resident, self._streams
         stream = plan.writes.streams[tables.key]
         label, planner = stream.label, tables.planner
         if not stream.reads:
+            pending = planner.pending
             for rid in plan.moved:
+                if pending is not None and pending(rid):
+                    raise RuntimeError(
+                        f"KV {self.name}: a host-planned step moved {rid} while it had unapplied verify results"
+                    )
                 tables.refresh_len(streams[rid][label].stored_len, planner.slot_of(rid), plan.writes)
         tables.stage_step(
             plan, lambda rid: streams[rid][label].stored_len, lambda rid: streams[rid][label].page_indices,
@@ -5552,6 +5615,102 @@ class KVManager(AttentionResource):
 
     def resident_commit(self, step: "CapturedResidentStep") -> None:
         self._resident.commit(step)
+
+    # Speculative decoding: a verify step commits its whole block, and its
+    # result later takes the rejected tokens back off the length
+
+    def committed_spans(self, rids: Sequence[int], label: str, span: int) -> list[int]:
+        """The span the last commit counted for each of ``rids``' ``label``
+        stream: ``span``, or 0 where the stream was offloaded mid-step and
+        commit dropped it. Read right after that commit, on its thread."""
+        with self._lock:
+            dropped, self._dropped_spans = self._dropped_spans, set()
+        if not dropped:
+            return [span] * len(rids)
+        return [0 if (rid, label) in dropped else span for rid in rids]
+
+    def capabilities(self):
+        from mstar.engine.resources.spec import ResourceCapabilities
+
+        if self._needs_remote_transfer:
+            # a consumer elsewhere would fetch the reserved length, rejected drafts and all; from the
+            # global topology, so the same on every rank of an instance
+            return ResourceCapabilities(
+                verify_refusal=(
+                    f"KV {self.name!r} is read by another instance (KV publication or transfer), which a "
+                    "verifying node's KV can't serve"
+                ),
+                async_verify_refusal=None,
+            )
+        return ResourceCapabilities.granting_all()
+
+    def bind_verify_walk(self, walk: str, block: int, slack: int) -> None:
+        """A node of this pool verifies drafts: a request's reserved length runs
+        up to ``slack`` past its verified one, so its layout must hold that much
+        scratch (`StreamLayout.scratch`) for its footprint and debug bounds."""
+        del walk, block
+        self._verify_slack = max(self._verify_slack, slack)
+
+    def take_back(self, rids: Sequence[int], counts: Sequence[int], label: str) -> None:
+        """Lower each of ``rids``' ``label`` stream by ``counts`` tokens, the
+        rejected drafts of a verify step it committed whole. A length, never
+        pages: the next step overwrites the rejected slots, so no page move has
+        to be ordered against it. The ranks' lengths still have to agree at each
+        admit. The ledger makes a take-back due at the same step on every rank,
+        at the head of its admit, the one place results are applied. Raises,
+        never clamps, on anything that says the ledger is wrong."""
+        resident = self._resident
+        planner = None if resident is None else resident.planner
+        touched = False
+        with self._lock:
+            for rid, n in zip(rids, counts, strict=True):
+                if n == 0:
+                    # no generation bump, so an open offload claim isn't aborted for nothing
+                    continue
+                streams = self._streams.get(rid)
+                stream = None if streams is None else streams.get(label)
+                if stream is None:
+                    raise RuntimeError(f"KV {self.name}: take-back of {n} for {rid}/{label}, which has no stream")
+                if stream.later:
+                    raise RuntimeError(f"KV {self.name}: take-back on a pool of more than one group ({rid}/{label})")
+                if stream.step_in_flight:
+                    raise RuntimeError(f"KV {self.name}: take-back for {rid}/{label} with a step in flight")
+                # Each copy that holds the stream is lowered, whatever its residency, so a
+                # take-back never depends on where an offload of the row stands: mid-offload
+                # (both copies; the generation bump below aborts the offload's commit) or
+                # offloaded (the host's alone).
+                host = (
+                    None if self._cpu_pool is None
+                    else self._cpu_pool.offloaded.get(rid, {}).get(label)
+                )
+                on_device = not stream.offloaded or len(stream.page_indices) > 0
+                if host is None and not on_device:
+                    raise RuntimeError(f"KV {self.name}: take-back of {n} for {rid}/{label}, held by no copy")
+                if host is not None:
+                    if n < 0 or host.groups[0].stored_len - n < stream.protected_prefix:
+                        raise RuntimeError(f"KV {self.name}: take-back of {n} past {rid}/{label}'s host copy")
+                    for part in host.groups:
+                        part.stored_len -= n
+                if not on_device:
+                    continue
+                if n < 0 or stream.stored_len - n < 0:
+                    raise RuntimeError(
+                        f"KV {self.name}: take-back of {n} from {rid}/{label} at {stream.stored_len}"
+                    )
+                stream.stored_len -= n
+                # an open offload claim snapshotted the longer length: its commit must abort
+                stream.generation += 1
+                # nothing publishes a verify node's KV, so no consumer refetches for this
+                stream.reset_generation += 1
+                if planner is not None:
+                    slot = planner.slot_of(rid)
+                    if slot is not None:
+                        resident.take_back(slot, n)
+                if rid in self._readonly_rows:
+                    touched = True
+            if touched:
+                # never `_touch_plan_cache(rid)`: that rewrites the resident row from the host
+                self._drop_readonly_plans()
 
     def resident_advance(self, plan: "ResidentPlan") -> None:
         self._resident.advance(plan)

@@ -92,6 +92,10 @@ class WorkerLayout:
     # likewise filled in after the engines
     tensor_streams: Mapping[tuple[str, str], frozenset[str]] = field(default_factory=_no_entries)
     inline_carried: Mapping[tuple[str, str], frozenset[str]] = field(default_factory=_no_entries)
+    # nodes that verify drafts (speculative decoding), and those of them in
+    # synchronous mode, which are never speculated; filled in with side_keys
+    verifying_nodes: frozenset[str] = frozenset()
+    synchronous_verify_nodes: frozenset[str] = frozenset()
     # wg id -> its nodes, for every worker graph of the deployment
     all_wg_nodes: Mapping[int, set[str]] = field(default_factory=_no_entries)
     # (graph_walk, node) -> innermost enclosing loop

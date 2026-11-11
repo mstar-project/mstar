@@ -539,7 +539,7 @@ def test_qwen3_omni_plain_keys_target_the_thinker_and_prefixed_keys_win(omni_rel
 
 
 def test_qwen3_omni_code_predictor_gets_no_penalty_and_refuses_one(omni_released):
-    spec = SimpleNamespace(enable_repetition_penalty=False, enable_min_p=False)
+    spec = SimpleNamespace(enable_repetition_penalty=False, enable_min_p=False, verifies=False)
     config = _omni_samplers(omni_released, {})[CODE_PRED_SAMPLER]
     assert config.repetition_penalty == 1
     config.validate(spec)

@@ -24,10 +24,16 @@ class AttentionCallable:
     ``run(q, k, v, label=...)`` with the span's label bound.
     """
 
-    def __init__(self, kv: KVManager, attn: AttentionManager | None=None):
+    def __init__(
+        self, kv: KVManager, attn: AttentionManager | None=None, layer_set: str | None = None,
+    ):
         self.kv = kv
         # Can be changed at runtime, e.g., for a model that switches
         self.attn = attn
+        # A stack that joined the pool as a layer set (a drafter's) addresses its own layers
+        # 0..n-1: the pool's layers from where the set sits (`KVManager.layer_set`).
+        self.layer_set = layer_set
+        self._layer_offset = 0 if layer_set is None else kv.layer_set(layer_set).first
 
     @torch.compiler.disable
     def bind_step(self, label: str, attn: AttentionManager | None = None) -> None:
@@ -50,6 +56,8 @@ class AttentionCallable:
 
     @torch.compiler.disable
     def set_layer_idx(self, layer_idx: int) -> None:
+        """``layer_idx`` among this stack's layers: its layer set's, if it joined one."""
+        layer_idx += self._layer_offset
         self.attn.set_default_layer_idx(layer_idx)
         self.kv.set_default_layer_idx(layer_idx)
 

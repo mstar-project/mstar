@@ -30,6 +30,7 @@ from mstar.engine.resources import (
     Segment,
     StepContext,
 )
+from mstar.engine.resources.base import same_fingerprint
 from mstar.engine.resources.kv import cpu_page_pool, page_copier
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.cache import GroupPages
@@ -80,7 +81,7 @@ def _stub_transfer(monkeypatch):
 
 def _make_manager(
     max_num_pages: int = 16, cpu_offload_pages: int = 16,
-    layout: KVLayout = KVLayout.NHD,
+    layout: KVLayout = KVLayout.NHD, dtype: torch.dtype = torch.float32,
 ):
     mla = (dict(kv_lora_rank=3, qk_rope_head_dim=1, num_qo_heads=2)
            if layout == KVLayout.MLA else {})
@@ -97,7 +98,7 @@ def _make_manager(
     )
     return KVManager(
         cfg=cfg, name="kv", joint_comm_group=None, transfer_engine_info=None,
-        device=torch.device("cuda"), dtype=torch.float32,
+        device=torch.device("cuda"), dtype=dtype,
     )
 
 
@@ -184,17 +185,25 @@ def _hook_host_copy(mgr: KVManager, hook):
 
 
 @requires_cuda
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("layout", [KVLayout.NHD, KVLayout.MLA])
-def test_offload_reload_round_trip(layout):
-    mgr = _make_manager(layout=layout)
+def test_offload_reload_round_trip(layout, dtype):
+    """Bit for bit, on every element of every layer (bf16 as served), and the
+    manager's debug fingerprint (`KVManager.debug_fingerprint`) agrees."""
+    mgr = _make_manager(layout=layout, dtype=dtype)
     mgr.ingest_request("r0")
     _grow(mgr, "r0", "main", 3 * PAGE_SIZE)
 
     stream = _stream(mgr, "r0")
     pages = list(stream.page_indices)
     assert len(pages) == 3
-    _paint(mgr, pages, base=1.0)
+    gen = torch.Generator(device="cuda").manual_seed(0)
+    for page in pages:
+        mgr.kv_cache.tensor[:, page] = torch.randn(
+            mgr.kv_cache.tensor[:, page].shape, generator=gen, device="cuda",
+        ).to(dtype)
     expected = _snapshot(mgr, pages)
+    prints = mgr.debug_fingerprint("r0")
     free_before = mgr._arena.num_free
 
     assert mgr.offload("r0") == 3
@@ -211,7 +220,8 @@ def test_offload_reload_round_trip(layout):
     stream = _stream(mgr, "r0")
     assert stream.stored_len == 3 * PAGE_SIZE
     assert len(stream.page_indices) == 3
-    torch.testing.assert_close(_snapshot(mgr, stream.page_indices), expected)
+    assert torch.equal(_snapshot(mgr, stream.page_indices), expected)
+    assert same_fingerprint(mgr.debug_fingerprint("r0"), prints)
     _assert_pages_conserved(mgr)
 
 

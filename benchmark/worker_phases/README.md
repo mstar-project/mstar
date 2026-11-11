@@ -84,6 +84,14 @@ Consequences:
   leaves inside the step. `gpu_exec.<walk>` is the same per graph walk.
 * `postprocess_batch` contains several of the `postprocess.*` phases, so it
   does not sum with them.
+* **The verify timers are nested, so never add them to a work total.** On a
+  node that verifies drafts, `engine.verify.cut` (the token cut and its per-row
+  slices) runs inside `worker.postprocess.prematerialize`,
+  `res.verify.take_back` (applying due verify results) inside `engine.admit`
+  or `engine.pre_admit`, whichever reached the step first, and
+  `engine.verify.commit` (the ledger's record of the step) inside
+  `engine.commit`. Each is already counted in its enclosing phase; none moves
+  the postprocess stage stopwatch. `--phases verify` shows the three.
 * **GPU busy time is not in this table**, and `iter_total - event_sync` is not
   GPU idle time. A non-zero `event_sync` means the CPU did wait on the GPU; a
   small one means the GPU-bound component is marginal, not absent. For the

@@ -337,6 +337,7 @@ class AttentionManager(AttentionResource):
                 decode_fmha=spec.config.decode_fmha,
                 layers=spec.config.layers,
                 sm_scale=spec.config.sm_scale,
+                verify_backend=spec.config.verify_backend,
             )
 
         if backend == AttnBackend.FLEX:

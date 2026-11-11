@@ -101,6 +101,44 @@ class RoutingMirror(Protocol):
         walk that uses the resource), so the resource may hold what it left."""
 
 
+@dataclass(frozen=True)
+class ResourceCapabilities:
+    """What a resource can't take part in, each as the reason; None means it
+    can. Answered twice: by the spec from config (`NodeResourceSpec.resource_capabilities`),
+    then narrowed on each rank by the built resource (`Resource.capabilities`). The
+    field refused says how severe: no field defaults, so a direct construction
+    names each one."""
+    # fatal for a verifying node
+    verify_refusal: str | None
+    # ``mode: auto`` runs synchronously; ``mode: asynchronous`` is fatal
+    async_verify_refusal: str | None
+
+    @classmethod
+    def refusing_all(cls, owner: str) -> "ResourceCapabilities":
+        return cls(
+            verify_refusal=f"{owner} declares no speculative decoding support",
+            async_verify_refusal=f"{owner} corrects nothing on the device",
+        )
+
+    @classmethod
+    def granting_all(cls) -> "ResourceCapabilities":
+        return cls(verify_refusal=None, async_verify_refusal=None)
+
+    def narrowed(self, local: "ResourceCapabilities") -> "ResourceCapabilities":
+        """Field by field, this refusal if set, else ``local``'s: a worker can
+        refuse what config allows, never grant what it refuses."""
+        return ResourceCapabilities(**{
+            f.name: getattr(self, f.name) if getattr(self, f.name) is not None else getattr(local, f.name)
+            for f in dataclasses.fields(self)
+        })
+
+
+class ResourceCapabilitiesCtx(NamedTuple):
+    """What a spec's capabilities may read: the node asking and every spec on it, by key."""
+    node: str
+    node_specs: Mapping[str, "NodeResourceSpec"]
+
+
 @dataclass
 class NodeResourceSpec(ABC):
     resource_key: str
@@ -196,6 +234,18 @@ class NodeResourceSpec(ABC):
         `AttentionManager`, whose `build` picks a backend subclass.
         """
 
+    def resource_capabilities(self, ctx: ResourceCapabilitiesCtx) -> ResourceCapabilities:
+        """What a node that verifies drafts (speculative decoding) can't do with
+        this resource. A verify step writes ``k + 1`` tokens a row and keeps
+        ``accepted + 1``: a resource that keeps per-token state corrects it from
+        the result (`Resource.take_back`), and one that keeps none says so; an
+        asynchronous one is planned from upper-bound lengths while the step
+        before runs, and corrected on the device. From the specs alone, no env
+        and no device: `validate_deployment` and every rank's startup ask it
+        before any collective, so it gives the same answer everywhere. Refused
+        by default, so a resource nobody checked is never assumed safe."""
+        return ResourceCapabilities.refusing_all(type(self).__name__)
+
     def routing_mirror(self, ctx: RoutingContext) -> RoutingMirror | None:
         """A mirror of this resource for the replicas ``ctx`` describes; None
         (the default) leaves the resource out of the replica pick there."""
@@ -259,6 +309,12 @@ class ResourceReqConfig:
     tag of its own — a marker base, with no contract beyond the hooks below."""
 
     def apply_conductor_config(self, **kwargs):
+        return
+
+    def apply_spec(self, spec: "NodeResourceSpec | None" = None) -> None:
+        """Fold in what the deployment's ``spec`` decides for the request (a
+        verifying pool's scratch floor, say). The conductor calls it once the
+        request's conductor config is applied, before `loop_room` and `validate`."""
         return
 
     def loop_room(self, spec: "NodeResourceSpec | None" = None) -> dict[str, int]:

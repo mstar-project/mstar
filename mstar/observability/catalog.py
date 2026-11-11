@@ -137,6 +137,27 @@ KV_RETURNS_PREEMPTED = Family(
     "keep a rebuild log are counted.",
     ("component",),
 )
+SPEC_DRAFT_TOKENS = Family(
+    "mstar_spec_draft_tokens_total", COUNTER,
+    "Draft tokens a node that verifies drafts (speculative decoding) proposed.",
+    ("component",),
+)
+SPEC_ACCEPTED_TOKENS = Family(
+    "mstar_spec_accepted_tokens_total", COUNTER,
+    "Draft tokens the target accepted, before any stop or budget cut.",
+    ("component",),
+)
+SPEC_VERIFY_ROWS = Family(
+    "mstar_spec_verify_rows_total", COUNTER,
+    "Request rows of verify steps: one per request per step.",
+    ("component",),
+)
+SPEC_ACCEPTED_PER_ROW = Family(
+    "mstar_spec_accepted_per_row", HISTOGRAM,
+    "Drafts one verify row accepted.",
+    ("component",),
+    buckets=tuple(float(n) for n in range(16)),
+)
 COMPONENT_PENDING_STEPS = Family(
     "mstar_component_pending_steps", GAUGE,
     "Requests whose next step on this graph node is ready (its inputs arrived) "
@@ -197,6 +218,7 @@ WORKER_FAMILIES: dict[str, Family] = {
         KV_PREEMPTED_AGAIN, KV_RETURNS_PREEMPTED, KV_REBUILD_CACHED_PAGES, COMPONENT_PENDING_STEPS,
         REBUILD_HOST_BYTES_USED, REBUILD_HOST_BYTES_TOTAL,
         TRANSFER_BYTES, TRANSFERS, TRANSFER_SECONDS,
+        SPEC_DRAFT_TOKENS, SPEC_ACCEPTED_TOKENS, SPEC_VERIFY_ROWS, SPEC_ACCEPTED_PER_ROW,
     )
 }
 
