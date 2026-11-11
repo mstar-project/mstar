@@ -55,7 +55,7 @@ from mstar.engine.state.adapters import (
     sampling_configs,
 )
 from mstar.engine.state.analysis import state_declaration_problems
-from mstar.model.base import LabelLayout, keyed_labels, serving_resources
+from mstar.model.base import LabelLayout, enabled_resources, keyed_labels, serving_resources
 from mstar.model.kokoro.kokoro_model import KokoroModel
 from mstar.model.omnilingual_asr.config import ctc_config
 from mstar.model.omnilingual_asr.omnilingual_asr_model import OmnilingualASRModel
@@ -108,7 +108,10 @@ def _orpheus_reference(model) -> list:
             ),
         ),
         AttentionSpec(resource_key=ATTN, nodes={"LLM"}, config=AttentionConfig(kv_cache=KV_CACHE)),
-        SamplerSpec(resource_key=SAMPLER, nodes={"LLM"}, vocab_size=c.vocab_size, enable_repetion_penalty=True),
+        SamplerSpec(
+            resource_key=SAMPLER, nodes={"LLM"}, vocab_size=c.vocab_size, enable_repetition_penalty=True,
+            enable_min_p=c.min_p > 0,
+        ),
         PositionSpec(
             resource_key=ROPE, nodes={"LLM"},
             config=PositionConfig(
@@ -186,7 +189,7 @@ def test_the_published_configs_are_found():
 def test_specs_equal_the_hand_written_ones(name):
     build, reference, _ = MODELS[name]
     model = build()
-    _assert_equal_per_key(node_resources(model), reference(model))
+    _assert_equal_per_key(enabled_resources(model, {}, StateSetup()), reference(model))
 
 
 @pytest.mark.parametrize("name", MODELS)
@@ -273,7 +276,7 @@ def _omnivoice_backbone() -> OmniVoiceBackboneSubmodule:
 
 def _region_step(node, config, rids, lengths) -> SubmoduleStep:
     runner = object.__new__(PiecewiseAcceleratorGraphRunner)
-    runner._config, runner._lora_keys, runner._state_handles = config, (), node.state_handles
+    runner._config, runner._segment_keys, runner._state_handles = config, (), node.state_handles
     return runner._region_step(rids, lengths)
 
 
@@ -423,7 +426,7 @@ def test_voxcpm2_layout_converts_to_the_hand_written_one_for_both_arrays(tiny_vo
 ], ids=["orpheus", "orpheus-defaults"])
 def test_request_settings_equal_the_hand_written_config(build, kwargs, reference):
     model = build()
-    configs = sampling_configs(model.get_request_resource_configs({}, kwargs), model.declare_state())
+    configs = sampling_configs(model.get_request_resource_configs([], [], kwargs), model.declare_state())
     assert configs == {SAMPLER: reference}
 
 
