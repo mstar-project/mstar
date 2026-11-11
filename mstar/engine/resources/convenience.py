@@ -18,7 +18,9 @@ class AttentionCallable:
     callable. Recommended to use instance per transformer, *not* one per layer,
     as Dynamo specializes ``ulysses_attention`` on the identity of its
     `run_attention` argument, so a per-layer callable retraces that frame once
-    per layer and blows the recompile limit.
+    per layer and blows the recompile limit. A drafter's KV layer set is the
+    exception: the engine counts its layers by their callables, so each layer
+    of the set holds its own.
 
     That sharing is why the label is one cursor for the whole stack. No model
     varies its label per layer today; one that needs to should thread the label
