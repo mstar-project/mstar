@@ -5668,10 +5668,11 @@ class KVManager(AttentionResource):
                     raise RuntimeError(f"KV {self.name}: take-back on a pool of more than one group ({rid}/{label})")
                 if stream.step_in_flight:
                     raise RuntimeError(f"KV {self.name}: take-back for {rid}/{label} with a step in flight")
-                # Each copy that holds the stream is lowered, whatever its residency, so a
-                # take-back never depends on where an offload of the row stands: mid-offload
-                # (both copies; the generation bump below aborts the offload's commit) or
-                # offloaded (the host's alone).
+                # Each copy that holds the stream is lowered. Results are applied at an admit,
+                # after check_ready's reload, so the device copy holds it; an open offload
+                # claim may hold a host copy too (the generation bump below aborts its commit).
+                # No admit reaches a stream the host alone holds, since a reload discards the
+                # host copy first; that case is lowered alike rather than refused.
                 host = (
                     None if self._cpu_pool is None
                     else self._cpu_pool.offloaded.get(rid, {}).get(label)
