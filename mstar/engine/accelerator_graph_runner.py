@@ -16,6 +16,7 @@ from mstar.engine import recompile_limit, with_recompile_limit
 from mstar.engine.accelerator_graph_backend import (
     AcceleratorGraphPool,
     CapturedGraph,
+    SplitGraph,
 )
 from mstar.engine.accelerator_graph_config import (
     DEFAULT_CAPTURE_BATCH_SIZES,
@@ -174,14 +175,14 @@ def capture_into_graph(
 ):
     """Capture ``run`` into a new CUDA graph allocated from ``pool``.
 
-    Returns the graph and what ``run`` returned. A capture that fails part
+    Returns the graph and what ``run`` returned. The graph is a `SplitGraph`
+    if ``run`` called `split_capture`. A capture that fails part
     way leaves two things behind that would sink every later capture on the
     same pool: the caching allocator keeps routing this thread's allocations
     into the pool (the next capture_begin fails with "already recording to
-    mempool_id"), and torch.cuda.graph never switches the thread back off its
-    capture stream. Undo both before re-raising, so the buckets after a
-    failed one still capture and the thread keeps running on the stream it
-    came in on.
+    mempool_id"), and the thread may be left on its capture stream. Undo both
+    before re-raising, so the buckets after a failed one still capture and
+    the thread keeps running on the stream it came in on.
 
     A torch.compile'd forward that would recompile inside the capture is
     failed up front with the guard that broke: dynamo saves the CUDA RNG state
@@ -198,20 +199,22 @@ def capture_into_graph(
     # candidates and emptying the allocator's cache, which fails the capture
     benchmark = torch.backends.cudnn.benchmark
     torch.backends.cudnn.benchmark = False
+    capture = None
     try:
         with torch.compiler.set_stance("fail_on_recompile"), \
                 autocast_scope(autocast_dtype, backend.device_type, node_name):
-            with backend.capture(graph, pool=pool, stream=stream):
+            with backend.capture(graph, pool=pool, stream=stream, keep_graph=keep_graph) as capture:
                 output = run()
     except BaseException:
-        pool.on_failure(graph)
+        # every piece of a split capture
+        pool.on_failure(graph if capture is None else capture.graph())
         backend.recover_failed_capture(pool, prev_stream)
         raise
     finally:
         torch.backends.cudnn.benchmark = benchmark
     backend.synchronize()
     pool.on_success()
-    return graph, output
+    return capture.graph(), output
 
 
 def capture_with_static_outputs(
@@ -446,7 +449,9 @@ def _capture_thrown_away(
         if counted:
             nodes = _graph_nodes(graph)
             if nodes and executable.per_node is None:
-                executable.measure(graph, nodes)
+                # a split graph's rate is its first part's, which holds the forward
+                first = graph.graphs[0] if isinstance(graph, SplitGraph) else graph
+                executable.measure(first, _graph_nodes(first))
                 if executable.per_node is None:
                     # Leave the graph unsized. Counted as zero, its executable memory would go unplanned.
                     logger.warning("Could not measure the executable memory of %s", what)
@@ -482,6 +487,8 @@ def _pool_bytes(pool_id) -> int:
 
 def _graph_nodes(graph) -> int:
     """``graph`` must be captured with ``keep_graph=True``, so the driver still holds it to count."""
+    if isinstance(graph, SplitGraph):
+        return sum(_graph_nodes(part) for part in graph.graphs)
     count = ctypes.c_size_t(0)
     status = ctypes.CDLL("libcuda.so.1").cuGraphGetNodes(
         ctypes.c_void_p(graph.raw_cuda_graph()), None, ctypes.byref(count),

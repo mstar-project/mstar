@@ -10,6 +10,7 @@ import torch
 from mstar.engine.accelerator_graph_backend import (
     AcceleratorGraphBackend,
     CUDAGraphBackend,
+    GraphCapture,
     XPUGraphBackend,
     get_accelerator_graph_backend,
 )
@@ -78,7 +79,9 @@ def test_runner_retains_failed_graphs_only_for_xpu(monkeypatch, device_type):
     stream = object()
     monkeypatch.setattr(backend, "create_graph", create_graph)
     monkeypatch.setattr(backend, "current_stream", lambda: stream)
-    monkeypatch.setattr(backend, "capture", lambda *args, **kwargs: nullcontext())
+    monkeypatch.setattr(
+        backend, "capture", lambda graph, **kwargs: nullcontext(GraphCapture(backend, [graph], False)),
+    )
     monkeypatch.setattr(backend, "synchronize", lambda: None)
     recovery = Mock()
     monkeypatch.setattr(backend, "recover_failed_capture", recovery)
