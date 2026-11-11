@@ -170,6 +170,11 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
    * - ``higgs_audio`` *(Beta)*
      - ``bosonai/higgs-audio-v3-stt``
      - Audio-tower + Qwen3 LLM speech-to-text. Beta / un-optimized.
+   * - ``phi4mm`` *(Beta)*
+     - ``microsoft/Phi-4-multimodal-instruct``
+     - Phi-4-mini with a SigLIP vision tower and a conformer audio tower: text, images
+       and audio in, text out. Each request runs under the checkpoint's vision or speech
+       LoRA as its media call for, from the engine's LoRA pool.
    * - ``omnilingual_asr_ctc_{300m,1b,3b,7b}``
      - ``facebook/omniASR-CTC-300M`` (v1); v2 from Meta's CDN (default)
      - Meta Omnilingual ASR, CTC variants: wav2vec 2.0 encoder + CTC head, speech-to-text
