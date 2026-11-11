@@ -3,13 +3,17 @@ they reach the conductor in arrival order, output delivery runs meanwhile, and a
 abandoned request ends as it does inline. A model that doesn't declare it runs as before."""
 from __future__ import annotations
 
+import os
 import queue
 import threading
 import time
+import wave
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
+from test_parakeet_model import _snapshot
 
 from mstar.api_server.data_worker import InlineTokens, PreprocessWorkerThread, ResultQueue
 from mstar.api_server.request_types import PreprocessInput
@@ -27,13 +31,17 @@ class _Model(StubModel):
 
     def __init__(self):
         self.gates: dict[str, threading.Event] = {}
+        self.opened = False  # the test is over: every gate, even one made later, is open
         self.threads: dict[str, str] = {}
         self.overlap = 0
         self._running = 0
         self._lock = threading.Lock()
 
     def gate(self, text: str) -> threading.Event:
-        return self.gates.setdefault(text, threading.Event())
+        event = self.gates.setdefault(text, threading.Event())
+        if self.opened:
+            event.set()
+        return event
 
     def process_prompt(self, text, input_modalities, output_modalities, **kwargs):
         self.threads[text] = threading.current_thread().name
@@ -58,10 +66,12 @@ class _Serial(_Model):
 class _Tensors:
     def __init__(self):
         self.stored: list[tuple[str, str]] = []
+        self.tensors: dict[str, dict] = {}
         self.dropped: list[str] = []
 
     def store_and_return_tensor_info(self, request_id, tensors):
         self.stored.append((request_id, threading.current_thread().name))
+        self.tensors.setdefault(request_id, {}).update(tensors)
         return {}
 
     def register_for_send(self, request_id, tensor_infos):
@@ -101,14 +111,40 @@ class _Comm:
         return True
 
 
-def _thread(model, config=None, pending=None) -> PreprocessWorkerThread:
-    return PreprocessWorkerThread(
+def _thread(model, config=None, pending=None, sized=True) -> PreprocessWorkerThread:
+    """A data-worker thread, ``sized``: with its prepare pool sized, as its first request sizes it."""
+    wt = PreprocessWorkerThread(
         in_queue=queue.Queue(), result_tensor_queue=queue.Queue(), out_queue=ResultQueue(EventWakeup()),
         profile_queue=ResultQueue(EventWakeup()), cleanup_request_queue=queue.Queue(),
         abort_request_queue=queue.Queue(), reads_done_queue=queue.Queue(),
         discard_tensor_queue=queue.Queue(), stop_event=threading.Event(), communicator=_Comm(),
         tensor_manager=_Tensors(), model=model, model_config=config, is_pending=pending,
     )
+    if sized:
+        wt._size_prepare_pool()
+    _threads.append(wt)
+    return wt
+
+
+_threads: list[PreprocessWorkerThread] = []
+
+
+@pytest.fixture(autouse=True)
+def _close_threads():
+    """Stop each test's threads and close their two eventfds, so a long run doesn't
+    leave select() fds past its 1024 limit for the tests after it."""
+    yield
+    while _threads:
+        wt = _threads.pop()
+        if isinstance(wt.model, _Model):
+            wt.model.opened = True
+            for gate in list(wt.model.gates.values()):
+                gate.set()
+        for pool in (wt._prepare_pool, wt._encode_pool):
+            if pool is not None:
+                pool.shutdown(wait=True)
+        for results in (wt.out_queue, wt.profile_queue):
+            os.close(results.wakeup.fd)
 
 
 @pytest.fixture(autouse=True)
@@ -121,12 +157,7 @@ def _two_intra_op_threads(monkeypatch):
 @pytest.fixture
 def worker(monkeypatch):
     monkeypatch.setattr(cpus, "_plan", cpus.CpuPlan(frozenset(range(8)), usable=8))
-    wt = _thread(_Model())
-    yield wt
-    for gate in wt.model.gates.values():
-        gate.set()
-    wt._prepare_pool.shutdown(wait=True)
-    wt._encode_pool.shutdown(wait=True)
+    return _thread(_Model())
 
 
 def _input(request_id: str, text: str | None = None) -> PreprocessInput:
@@ -324,6 +355,8 @@ def test_the_run_loop_delivers_outputs_while_a_request_prepares(monkeypatch):
         wt.model.gate("slow").set()
         wt.stop_event.set()
         thread.join(timeout=5)
+        if thread.is_alive():
+            _threads.remove(wt)  # its loop may still flush to the eventfds; leave them open
     assert not thread.is_alive()
 
 
@@ -342,13 +375,84 @@ def test_a_thread_built_without_init_prepares_inline():
 
 @pytest.mark.parametrize("workers", ["auto", 0, -2, True, 2.0])
 def test_a_bad_preprocess_workers_fails_startup(workers, tmp_path):
-    """Refused where the server starts, not by the data-worker thread, which
-    would end on it and leave every request waiting."""
-    from mstar.api_server.data_worker import PreprocessWorker
-    from mstar.communication.communicator import CommProtocol
+    """Refused by the conductor's validate_deployment with the deployment's other
+    problems; the data-worker thread, which starts before it runs, sizes its pool
+    only with the first request."""
+    from mstar.validation import DeploymentError, validate_deployment
 
-    with pytest.raises(ValueError, match="preprocess_workers"):
-        PreprocessWorker(
-            model=_Model(), model_config={"preprocess_workers": workers},
-            tensor_comm_protocol=CommProtocol.SHM, socket_path_prefix=str(tmp_path / "pw"),
+    with pytest.raises(DeploymentError, match=r"preprocess_workers must be a positive integer"):
+        validate_deployment(_Model(), {"max_seq_len": 64, "preprocess_workers": workers}, str(tmp_path / "cfg.yaml"))
+
+
+def _speech_model(kind, path):
+    if kind == "omnilingual":
+        from mstar.model.omnilingual_asr.omnilingual_asr_model import OmnilingualASRModel
+
+        # the upload's decode and normalize read nothing the constructor sets
+        return OmnilingualASRModel.__new__(OmnilingualASRModel)
+    from mstar.model.parakeet.parakeet_model import ParakeetModel
+
+    return ParakeetModel(str(_snapshot(path, nemotron=kind == "nemotron")))
+
+
+@pytest.mark.parametrize("kind", ["parakeet", "nemotron", "omnilingual"])
+def test_a_speech_model_prepares_each_upload_on_the_pool(kind, tmp_path, monkeypatch):
+    """Uploads that overlap each get their own samples and metadata, the same as
+    one at a time, and reach the conductor in arrival order. The first four hold
+    each other inside ``load_audio``, so a pool that stops overlapping fails."""
+    monkeypatch.setattr(cpus, "_plan", cpus.CpuPlan(frozenset(range(8)), usable=8))
+    model = _speech_model(kind, tmp_path)
+    wt = _thread(model)
+    assert wt._prepare_workers == 4
+    ids, inputs, expected = [str(i) for i in range(24)], [], {}
+    for i, rid in enumerate(ids):
+        path = tmp_path / f"{rid}.wav"
+        samples = 0.5 * np.sin(2 * np.pi * (200 + 40 * i) * np.arange(8000 + 700 * i) / 16_000)
+        with wave.open(str(path), "wb") as wf:
+            wf.setnchannels(1), wf.setsampwidth(2), wf.setframerate(16_000)
+            wf.writeframes((samples * 32767).astype("<i2").tobytes())
+        kwargs = {"language": "de" if i % 2 else "en"} if kind == "nemotron" else {}
+        expected[rid] = model.process_prompt(
+            None, ["audio"], ["text"],
+            tensors={"audio_inputs": [model.load_audio(str(path), "cpu").data]}, **kwargs,
         )
+        inputs.append(PreprocessInput(rid, None, {"audio": [str(path)]}, ["audio"], ["text"], kwargs))
+        wt.in_queue.put(inputs[-1])
+
+    overlap, load = threading.Barrier(wt._prepare_workers), model.load_audio
+    starts = iter(range(wt._prepare_workers))
+
+    def held_load(path, device):
+        if next(starts, None) is not None:
+            overlap.wait(timeout=10)
+        return load(path, device)
+
+    monkeypatch.setattr(model, "load_audio", held_load)
+    give_up = time.monotonic() + 30
+    while len(_sent(wt)) < len(ids):
+        assert time.monotonic() < give_up, _sent(wt)
+        for item in wt._next_inputs():
+            wt._process_waiting_input(item)
+        wt._release_prepared()
+    wt._prepare_pool.shutdown(wait=True)
+    wt._encode_pool.shutdown(wait=True)
+
+    assert _sent(wt) == ids
+    for rid, want in expected.items():
+        out = want if isinstance(want, ProcessPromptOutput) else ProcessPromptOutput(want, {})
+        tensors, metadata = out.new_input_tensors, out.metadata
+        for name, values in tensors.items():
+            assert torch.equal(wt.tensor_manager.tensors[rid][name][0], values[0]), (rid, name)
+        for key, value in metadata.items():
+            assert wt.request_model_kwargs[rid][key] == value, (rid, key)
+
+
+def test_the_prepare_pool_is_sized_with_the_first_request(monkeypatch):
+    monkeypatch.setattr(cpus, "_plan", cpus.CpuPlan(frozenset(range(8)), usable=8))
+    wt = _thread(_Model(), {"preprocess_workers": 2}, sized=False)
+    assert wt._prepare_pool is None and wt._prepare_workers is None
+    wt._process_waiting_input(_input("a"))
+    assert wt._prepare_workers == 2 and len(wt._preparing) == 1
+    wt.model.gate("a").set()
+    wt._prepare_pool.shutdown(wait=True)
+    wt._encode_pool.shutdown()

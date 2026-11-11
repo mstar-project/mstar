@@ -142,7 +142,8 @@ def test_teacher_forced_fp32_steps_match_the_reference(model, prompts, design, m
 
     bind_dense_resources = _helper("fake_resources").bind_dense_resources
 
-    # mstar::rms_norm runs fp32 inputs in bf16 on CUDA
+    # mstar::rms_norm runs fp32 inputs in bf16 on CUDA, and so does the fallback of
+    # mstar::fused_add_rms_norm, which the local stacks' residual adds go through
     monkeypatch.setattr(
         norm,
         "run_rms_norm",
@@ -150,6 +151,13 @@ def test_teacher_forced_fp32_steps_match_the_reference(model, prompts, design, m
             x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps) * weight
         ),
     )
+
+    def fp32_add_rms_norm(hidden_states, residual, weight, eps, gemma_mode=False):
+        assert not gemma_mode
+        summed = hidden_states + residual
+        return summed * torch.rsqrt(summed.pow(2).mean(-1, keepdim=True) + eps) * weight, summed
+
+    monkeypatch.setattr(norm, "add_rms_norm", fp32_add_rms_norm)
     case = prompts["design"]
     device = torch.device("cuda")
     tf32 = torch.backends.cuda.matmul.allow_tf32
@@ -162,7 +170,6 @@ def test_teacher_forced_fp32_steps_match_the_reference(model, prompts, design, m
         t_span = cfm_t_span(model.inference_timesteps, device, torch.float32)
         cfg = torch.tensor([2.0], device=device)
         tokens = torch.tensor(case["tokens"], device=device)
-        empty = torch.zeros(0, 4, 64, device=device)
         preds, stops = [], []
         with torch.inference_mode():
             reset()
@@ -170,8 +177,7 @@ def test_teacher_forced_fp32_steps_match_the_reference(model, prompts, design, m
             patch, stop = generator.prefill(
                 tokens,
                 torch.ones_like(tokens, dtype=torch.bool),
-                empty,
-                tokens.new_zeros(0),
+                torch.zeros(tokens.numel(), 4, 64, device=device),
                 torch.tensor([tokens.numel() - 1], device=device),
                 torch.zeros(1, 4, 64, device=device),
                 torch.randn((1, 64, 4), generator=noise, device=device),

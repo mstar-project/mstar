@@ -79,7 +79,7 @@ def _tiny_config() -> tuple[VJepa2Config, VJepa2ACPredictorConfig]:
     return cfg, ac_cfg
 
 
-def _make_request_info(iter_idx: int, rollout_horizon: int) -> CurrentForwardPassInfo:
+def _make_request_info(iter_idx: int) -> CurrentForwardPassInfo:
     """Minimal ``CurrentForwardPassInfo`` that exposes the loop iter count
     the submodule expects (populated by ``worker.py`` in production).
     """
@@ -91,7 +91,6 @@ def _make_request_info(iter_idx: int, rollout_horizon: int) -> CurrentForwardPas
         max_tokens=0,
     )
     info.dynamic_loop_iter_counts["rollout_loop"] = iter_idx
-    info.step_metadata["rollout_horizon"] = rollout_horizon
     return info
 
 
@@ -216,7 +215,7 @@ def _submodule_loop(
     next_ehs: list[torch.Tensor] = []
     with torch.no_grad():
         for k in range(num_steps):
-            info = _make_request_info(iter_idx=k, rollout_horizon=num_steps)
+            info = _make_request_info(iter_idx=k)
             out = _step(submodule, info, eh, actions, states, handle=handle)
             new_tgs.append(out["predicted_hidden"][0])
             eh = out["encoder_hidden"][0]
@@ -311,7 +310,7 @@ class TestACRolloutParity:
 
         with torch.no_grad():
             for k in range(num_steps):
-                info = _make_request_info(iter_idx=k, rollout_horizon=num_steps)
+                info = _make_request_info(iter_idx=k)
                 out = _step(submodule, info, eh, actions, states, handle=handle)
                 predicted = out["predicted_hidden"][0]
                 next_eh = out["encoder_hidden"][0]
@@ -354,7 +353,7 @@ class TestACRolloutParity:
         states = torch.randn(b, t_total, cfg.ac_predictor.action_embed_dim)
 
         for k in range(3):
-            info = _make_request_info(iter_idx=k, rollout_horizon=3)
+            info = _make_request_info(iter_idx=k)
             node_inputs = submodule.prepare_inputs(
                 graph_walk=_GRAPH_WALK,
                 fwd_info=info,
@@ -371,41 +370,3 @@ class TestACRolloutParity:
             torch.testing.assert_close(
                 node_inputs.tensor_inputs["states"], states[:, k : k + 1]
             )
-
-
-class TestACRolloutEarlyExit:
-    def test_register_loop_stop_at_requested_horizon(self):
-        """After iter == horizon - 1 the submodule registers a stop signal
-        on the ``rollout_loop`` — same contract as masked rollout.
-        """
-        torch.manual_seed(3)
-        cfg, _ac = _tiny_config()
-        predictor = VisionTransformerPredictorAC(cfg.ac_predictor).eval()
-        submodule = VJepa2ACRolloutPredictorSubmodule(predictor, cfg)
-
-        b = 1
-        # One frame group of context per iter — the rollout's window is
-        # [B, H*W, D], one timestep of actions/states per step.
-        n = cfg.grid_size * cfg.grid_size
-        horizon = 3
-        # Provide enough trajectory for horizon + 2 iters so the loop can
-        # over-shoot and we observe the stop signal actually firing at
-        # horizon - 1.
-        t_total = horizon + 2
-
-        eh = torch.randn(b, n, cfg.hidden_size)
-        actions = torch.randn(b, t_total, cfg.ac_predictor.action_embed_dim)
-        states = torch.randn(b, t_total, cfg.ac_predictor.action_embed_dim)
-
-        stop_seen_at: list[int] = []
-        with torch.no_grad():
-            for k in range(horizon + 2):
-                info = _make_request_info(iter_idx=k, rollout_horizon=horizon)
-                out = _step(submodule, info, eh, actions, states)
-                eh = out["encoder_hidden"][0]
-                if "rollout_loop" in submodule.check_stop(info.request_id, info, out):
-                    stop_seen_at.append(k)
-
-        assert stop_seen_at, "submodule never registered a loop stop"
-        assert stop_seen_at[0] == horizon - 1
-

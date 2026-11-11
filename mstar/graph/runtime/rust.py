@@ -302,6 +302,9 @@ class RustGraphRuntime(GraphRuntime):
 
     supports_inline_emit = True
 
+    def set_inline_streams(self, keys: frozenset[tuple[str, str]]) -> None:
+        self._rust.set_inline_streams(sorted(keys))
+
     # --------- Bookkeeping ----------
 
     def set_node_metadata(
@@ -683,6 +686,15 @@ class RustGraphRuntime(GraphRuntime):
                     strict=True,
                 )
             },
+            local_stream_values_by_signal={
+                name: ParallelList(rids, values)
+                for name, rids, values in zip(
+                    out.local_stream_value_signals,
+                    out.local_stream_value_rids,
+                    out.local_stream_values,
+                    strict=True,
+                )
+            },
             rids_needing_request_info=frozenset(out.rids_needing_request_info),
             freed_inputs=FreedTensors(
                 out.freed_input_uuids, out.freed_input_registered,
@@ -702,7 +714,9 @@ class RustGraphRuntime(GraphRuntime):
     def register_stop_limits(self, rid: int, info: CurrentForwardPassInfo) -> None:
         cap = (1 << 32) - 1  # also "no limit": a loop count never reaches it
         for (node, walk), policies in self._stop_policies.items():
-            if not policies:
+            # a node's limits come from its own partition's info: another partition's
+            # carries that partition's settings, which are not the node's
+            if not policies or self._node_to_partition.get(node, info.partition_name) != info.partition_name:
                 continue
             limits = [p.limits(info) for p in policies.values()]
             self._rust.set_stop_limits(
@@ -881,14 +895,6 @@ class RustGraphRuntime(GraphRuntime):
             ],
             ntc_rids=input.new_token_counts.keys,
             new_token_counts=input.new_token_counts.values,
-            consumed_rids=(
-                [] if input.stream_tokens_consumed is None
-                else input.stream_tokens_consumed.keys
-            ),
-            stream_tokens_consumed=(
-                [] if input.stream_tokens_consumed is None
-                else input.stream_tokens_consumed.values
-            ),
             prof_rids=[] if input.profiling is None else input.profiling.keys,
             # encode_fields, not encode: a bare tuple has no wire tag, so
             # encode would wrap it in a data envelope, which Rust cannot

@@ -40,14 +40,6 @@ class RotaryTable(NamedTuple):
         return RotaryTable(self.cos[:, :, start:start + count], self.sin[:, :, start:start + count])
 
 
-class SeqParallel(NamedTuple):
-    """Ulysses sequence parallelism over a ``[B, L, H, D]`` stream, the video: ``sizes``
-    is each rank's share of its ``L``. An attention's exchange is its array's read."""
-
-    group: CommGroup
-    sizes: list[int]
-
-
 def apply_split_rope(x: torch.Tensor, rope: RotaryTable) -> torch.Tensor:
     """``apply_split_rotary_emb`` for ``[B, T, H, D]``: each head's dims are two halves
     ``(x1, x2)`` rotated to ``(x1 cos - x2 sin, x2 cos + x1 sin)``, in fp32.

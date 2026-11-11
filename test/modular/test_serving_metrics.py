@@ -1333,7 +1333,7 @@ def test_metrics_start_after_the_warmup_requests_and_before_the_bind(monkeypatch
 
     class _Server:
         fatal_error = None
-        lora_adapter_digests: dict = {}
+        model_config: dict = {}
 
         def __init__(self, **kwargs):
             pass
@@ -1374,8 +1374,10 @@ def test_metrics_start_after_the_warmup_requests_and_before_the_bind(monkeypatch
                         lambda method: types.SimpleNamespace(Process=lambda **kw: _Conductor()))
     monkeypatch.setattr(entrypoint, "_data_parallel_replicas",
                         lambda model, config_path: entrypoint.DataParallelReplicas(1, 1))
-    monkeypatch.setattr(entrypoint, "_run_warmup_requests", lambda server, specs, replicas: events.append("warmup"))
+    monkeypatch.setattr(entrypoint, "_run_warmup_requests",
+                        lambda server, specs, replicas, **kw: events.append("warmup"))
     monkeypatch.setattr(entrypoint.uvicorn, "Server", _Uvicorn)
+    monkeypatch.setattr(entrypoint.ws_frames, "start", lambda: None)
     monkeypatch.setattr(entrypoint, "_shutdown_conductor_process", lambda proc: None)
 
     entrypoint.main(["--config", cfg, "--enable-metrics"])
@@ -1389,7 +1391,7 @@ def _conductor_spawn_kwargs(monkeypatch, tmp_path, *argv) -> dict:
 
     class _Server:
         fatal_error = None
-        lora_adapter_digests: dict = {}
+        model_config: dict = {}
 
         def __init__(self, **kwargs):
             pass
@@ -1415,7 +1417,7 @@ def _conductor_spawn_kwargs(monkeypatch, tmp_path, *argv) -> dict:
 
 def test_the_conductor_gets_a_status_interval_only_with_metrics_on(monkeypatch, tmp_path):
     assert _conductor_spawn_kwargs(monkeypatch, tmp_path, "--enable-metrics") == {
-        "status_interval_s": 1.0, "lora_adapter_digests": {}}
+        "status_interval_s": 1.0, "model_config": {}}
     assert _conductor_spawn_kwargs(monkeypatch, tmp_path).get("status_interval_s") is None
 
 
@@ -1446,7 +1448,7 @@ def test_the_conductor_process_hands_the_status_interval_to_the_conductor(monkey
 def test_enable_metrics_without_the_package_stops_before_anything_starts(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(entrypoint, "MISSING_DEPENDENCY", ModuleNotFoundError("prometheus_client"))
     assert not _main_until_api_server(monkeypatch, tmp_path, "--enable-metrics")
-    assert "mstar[metrics]" in capsys.readouterr().err
+    assert "mstar-ai[metrics]" in capsys.readouterr().err
     assert _main_until_api_server(monkeypatch, tmp_path)
 
 
@@ -1477,7 +1479,7 @@ def test_a_missing_package_is_reported_and_a_broken_one_raises(monkeypatch):
             m.setitem(sys.modules, "prometheus_client", None)
             importlib.reload(metrics_module)
             assert metrics_module.MISSING_DEPENDENCY is not None
-            with pytest.raises(RuntimeError, match=r"mstar\[metrics\]"):
+            with pytest.raises(RuntimeError, match=r"mstar-ai\[metrics\]"):
                 metrics_module.ServingMetrics("dummy", in_flight=int, data_worker_queue_depth=int)
         with monkeypatch.context() as m:
             m.setitem(sys.modules, "prometheus_client.core", None)

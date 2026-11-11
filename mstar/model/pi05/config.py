@@ -8,6 +8,10 @@ from dataclasses import dataclass, field
 LLM_KV = "kv"
 LLM_ATTN = "attn"
 LLM_POS = "rope"
+# The prefix expert and the action expert read and write one KV cache.
+LLM_NODES = ("LLM", "action_expert")
+# The one graph walk: camera images and prompt in, an action chunk out.
+CHUNK_WALK = "action_chunk"
 
 
 @dataclass
@@ -97,6 +101,7 @@ _HF_KEY_RENAMES: dict[str, str] = {
     "num_attention_heads": "num_qo_heads",
     "num_key_value_heads": "num_kv_heads",
     "intermediate_size": "pali_intermediate_size",
+    "max_state_dim": "state_dim",
     # lerobot's name for openpi's action_horizon (50 for pi05_base, 15 for pi05_droid)
     "chunk_size": "action_horizon",
 }

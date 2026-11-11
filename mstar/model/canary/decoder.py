@@ -88,12 +88,8 @@ class CanaryDecoderModel(nn.Module):
         self.norm = nn.LayerNorm(h)
         self.proj_out = nn.Linear(h, config.vocab_size)
 
-    def embed(self, input_ids: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
-        """Token embeddings plus sinusoids at the array's planned position ids
-        (a static buffer under a captured graph), then the LayerNorm."""
-        tokens = self.embed_tokens(input_ids)
-        pos = sinusoid_positions(position_ids[:input_ids.shape[0]], self.config.hidden_size).to(tokens.dtype)
-        return self.embedding_layernorm(tokens + pos)
+    def embed(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.embed_tokens(input_ids)
 
     def add_context(self, encoder_states: torch.Tensor) -> None:
         """Project the encoder output to per-layer K/V and add it to the
@@ -102,11 +98,22 @@ class CanaryDecoderModel(nn.Module):
         for layer in self.layers:
             layer.encoder_attn.add_context(encoder_states)
 
-    def lm_head(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.proj_out(hidden_states)
 
-    def forward(self, input_embeds: torch.Tensor) -> torch.Tensor:
-        hidden_states = input_embeds
+    def forward(
+        self, input_embeds: torch.Tensor, *, label: str, position_ids: torch.Tensor,
+        encoder_states: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """The token embeddings plus sinusoids at ``position_ids`` (one per
+        token), through the stack and its final norm. ``encoder_states``, on
+        the prefill only, is added to the context array before the layers read it.
+        ``label`` is the scaffold's to pass and goes unread, since each row's
+        label comes from the step's segments."""
+        if encoder_states is not None:
+            self.add_context(encoder_states)
+        pos = sinusoid_positions(position_ids, self.config.hidden_size).to(input_embeds.dtype)
+        hidden_states = self.embedding_layernorm(input_embeds + pos)
         for layer in self.layers:
             hidden_states = layer(hidden_states)
         return self.norm(hidden_states)

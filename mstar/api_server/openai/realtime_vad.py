@@ -11,7 +11,7 @@ drops the start of the next utterance, and each sample is committed exactly once
 The probability comes from Silero VAD (MIT), its 2 MB ONNX export run by
 onnxruntime on one CPU thread, about 0.15 ms per 32 ms frame. Its weights are
 read from disk only: ``MSTAR_SILERO_VAD_PATH``, else the copy bundled with
-the ``silero-vad`` package (``pip install 'mstar[vad]'``). ``semantic_vad`` adds
+the ``silero-vad`` package (``pip install 'mstar-ai[vad]'``). ``semantic_vad`` adds
 Pipecat's Smart Turn v3 (BSD-2), an 8 MB ONNX model that judges from the audio
 whether a pause ends the turn; without it (or onnxruntime), or with a file
 that is not that model, ``semantic_vad`` is refused with an error event.
@@ -179,7 +179,7 @@ def smart_turn() -> Callable[[np.ndarray], float] | None:
         return SmartTurn(path)
     except Exception as exc:  # noqa: BLE001 — missing onnxruntime/transformers or a bad file
         logger.warning("semantic_vad is unavailable: cannot load Smart Turn from %s (%s: %s); "
-                       "it needs mstar[vad] and the %s file", path, type(exc).__name__, exc, SMART_TURN_FILE)
+                       "it needs mstar-ai[vad] and the %s file", path, type(exc).__name__, exc, SMART_TURN_FILE)
         if isinstance(exc, ImportError):
             _smart_turn_problem = "onnxruntime or transformers is not installed"
         elif isinstance(exc, _NotSmartTurnError):
@@ -262,7 +262,7 @@ def silero_factory() -> Callable[[], SpeechProbability] | None:
     path = silero_weights()
     if path is None:
         logger.warning("server_vad is unavailable: no Silero VAD weights (set MSTAR_SILERO_VAD_PATH "
-                       "or install mstar[vad])")
+                       "or install mstar-ai[vad])")
         return None
     try:
         import onnxruntime as ort
@@ -275,7 +275,7 @@ def silero_factory() -> Callable[[], SpeechProbability] | None:
         session = ort.InferenceSession(str(path), options, providers=["CPUExecutionProvider"])
     except Exception:  # noqa: BLE001 — a bad file disables server_vad, not the server
         logger.exception("server_vad is unavailable: cannot load Silero VAD from %s (needs onnxruntime, "
-                         "mstar[vad])", path)
+                         "mstar-ai[vad])", path)
         return None
     if (why := _mismatch(session)) is not None:
         logger.warning("server_vad is unavailable: %s is not the Silero VAD export this server runs "
