@@ -1877,8 +1877,8 @@ deployment turns it on with a ``model_kwargs.draft`` block, which the engine par
 
    model_kwargs:
      draft:
-       method: dspark                              # or mtp: the target's own MTP head
-       model: deepseek-ai/dspark_qwen3_8b_block7   # omitted for mtp
+       method: dspark
+       model: deepseek-ai/dspark_qwen3_8b_block7   # the drafter's checkpoint
        num_draft_tokens: 7
        mode: auto                                  # auto | synchronous | asynchronous
 
@@ -1941,7 +1941,7 @@ What the model writes, and nothing more:
 
 **Drafter resources.** A drafter is declared from config alone (``DrafterDecl``): its
 ``needs`` and ``node_resources(nodes)``, the resources it adds to the node (DSpark's attention
-with the block's mask and its ``TapSpec``; none for MTP). A drafter whose layers write the
+with the block's mask and its ``TapSpec``). A drafter whose layers write the
 target's KV declares them as a ``KVLayerSet(kv_cache, name, num_layers, num_kv_heads,
 head_dim)`` in ``DrafterNeeds.kv``, the checkpoint's unsharded counts, derived from its
 ``ModelGeometry`` (``geometry.layer_set(kv_cache, name)``) rather than repeated.
@@ -2263,7 +2263,7 @@ and ends at the prompt's length. To opt a walk in:
     chunked rows sets one too, since its steps run under it. Its step may pass it
     beside a speculation chain's decode rows, by at most those rows' tokens, and the
     engine trims a serving config's ``prefill_token_buckets`` assuming each such row
-    runs one token. A walk whose decode rows run more (an MTP verify row's k+1)
+    runs one token. A walk whose decode rows run more (a verify row's k+1)
     passes that bound, and its steps past a trimmed ladder's top run eagerly.
   - ``accumulated_outputs``: output edges a consumer needs every chunk of. They arrive as
     one item per chunk, all when the prompt finishes.

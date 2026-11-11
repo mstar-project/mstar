@@ -558,7 +558,7 @@ class ChunkingPolicy:
     assuming each chain row is a one-token decode row
     (``ChunkingManagement.max_step_tokens``) and trims a serving config's
     ``prefill_token_buckets`` to that bound. A walk whose decode rows run more
-    (an MTP verify row's k+1) passes it, and its steps past a trimmed ladder's
+    (a verify row's k+1) passes it, and its steps past a trimmed ladder's
     top run eagerly.
     """
     walks: tuple[str, ...] = ()
