@@ -342,7 +342,9 @@ def test_command_a_plus_specs_equal_the_hand_written_ones_after_yaml_overrides(t
     kv = {spec.resource_key: spec for spec in specs}[KV_CACHE].config
     expected = {spec.resource_key: spec for spec in reference}[KV_CACHE].config
     assert kv.groups == expected.groups, "groups don't compare in the dataclass, and they hold the window's layers"
-    assert len(kv.groups) == 2 and kv.prefix_cache is True, "the local layers should keep only their window, and the cache still prefix caches"
+    assert len(kv.groups) == 2 and kv.prefix_cache is True, (
+        "the local layers should keep only their window, and the cache still prefix caches"
+    )
 
 
 @pytest.mark.parametrize("path", _published("CommandAPlusModel"), ids=lambda path: path.stem)

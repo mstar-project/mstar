@@ -377,11 +377,14 @@ _DISAGREEING = {
 }
 
 
+@pytest.mark.parametrize("window", [None, 32], ids=["full", "window"])
 @pytest.mark.parametrize("disagree", _DISAGREEING.values(), ids=_DISAGREEING.keys())
-def test_a_walk_the_layout_no_longer_describes_keeps_the_pages_the_cache_served(disagree):
-    node = _Node([list(range(1, 33)), IMAGE, TAIL])
+def test_a_walk_the_layout_no_longer_describes_keeps_the_pages_the_cache_served(disagree, window):
+    node = _Node([list(range(1, 33)), IMAGE, TAIL], window=window)
     node.walk(TEXT_WALK, 32)
     lease = node.stream.lease.pages()
+    # A window keeps other pages at the served text's end than at the lease's, so they must outlive eviction.
+    node.kv._index.evict(len(node.kv._index.evictable()))
 
     disagree(node)
 
@@ -389,6 +392,23 @@ def test_a_walk_the_layout_no_longer_describes_keeps_the_pages_the_cache_served(
         "the chain dropped at the image let go of the text the cache served, so "
         "the image would be written from slot 0 with that text missing"
     )
+
+
+def test_a_walk_is_served_whole_only_up_to_where_the_lease_holds_the_window():
+    """A cut of the lease falls where it holds the window, so a walk ending elsewhere isn't served whole. Here the
+    cache lost the window page ending at the text's end, so the text is served the 16 slots before it, and a layout
+    dropped at the image keeps the text it wrote rather than failing the request."""
+    node = _Node([list(range(1, 33)), IMAGE, TAIL], window=32)
+    kv, chain = node.kv, node.stream.chain
+    kv._root_chain(chain)
+    g, group = kv._windows[0]
+    last = 32 // group.page_size - 1
+    kv._index._remove(kv._index.page_for(kv._window_key(chain.rooted[kv._ends_on(g, last)], g, last)))
+
+    assert node.walk(TEXT_WALK, 32) == PAGE_SIZE
+    node.probe(IMAGE_WALK, IMAGE + 1)
+
+    assert (node.stream.chain, node.stream.stored_len) == (None, 32)
 
 
 def test_a_mismatch_the_served_walks_cannot_survive_fails_the_request():
