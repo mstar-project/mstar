@@ -646,7 +646,9 @@ mixed prefill/decode step and decode are captured. Sampling defaults come from t
 checkpoint's ``generation_config.json``. A request is bounded by the checkpoint's
 context: one that asks no length decodes to the room its prompt leaves, and a prompt
 past it is a 400. Rope scaling, sliding windows and attention biases are refused at
-startup rather than ignored.
+startup rather than ignored. ``model_kwargs.accelerator_graph: false`` (default ``true``)
+runs the LLM node uncaptured, so it has no resident steps and a ``draft`` block
+verifies synchronously.
 
 **Speculative decoding.** ``configs/qwen3_8b_dspark.yaml`` (and its TP2
 variant) adds DeepSeek's DSpark drafter for Qwen3-8B
