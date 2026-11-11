@@ -141,8 +141,7 @@ class _KeptRead:
     nbytes: int
     future: Future | None = None
     running: dict[int, int] = field(default_factory=dict)
-    # No status can prove these transfers stopped. Hold READS_DONE until the
-    # request is forcibly removed; its destination buffers stay pinned.
+    # Unknown transfer status blocks READS_DONE until forced removal.
     unresolved: bool = False
 
 
@@ -2126,9 +2125,8 @@ class TensorCommunicationManager(ABC):
 
     def has_inflight_reads(self, request_id: Rid) -> bool:
         """Whether a read may still touch this request's remote source memory.
-        Synchronous reads with ``future=None`` never count. Outstanding
-        transfer or event futures, and failed reads whose transfers have not
-        provably stopped, hold the READS_DONE ACK during a drain.
+        Unfinished transfer/event futures and unresolved failures hold READS_DONE;
+        synchronous reads have no future.
         """
         return any(
             ep.request_id == request_id

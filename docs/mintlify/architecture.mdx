@@ -35,17 +35,7 @@ A worker that dies (an exception during setup, an OOM kill, a segfault) sends no
 3.  Workers execute the ready graph nodes on GPU through the engine. The engine declares and admits each step's resource work around the forward pass. Workers then route the output tensors to downstream nodes and workers.
 4.  Outputs marked for the client are post-processed (`postprocess`) and streamed back.
 
-Successful cleanup waits for every worker's `READS_DONE` before removing request
-state. Model workers are drained; the API data worker ACKs after delivering all
-expected outputs. A read whose transfer status cannot be determined still holds
-the barrier, even if it has no listed destination buffers. Any retained
-destination buffers remain pinned. The existing
-`MSTAR_DRAIN_TTL_S` timeout can still force cleanup of a stalled request.
-While waiting for a forward's CPU work, a worker without a speculative plan or
-side lane services teardown messages after admission has settled. Requests held
-by the running step stay protected; unrelated requests can drain and release
-their concurrency slots without waiting for that forward to return.
-GPU completion waits also service unrelated teardowns once every launched step
-has admitted and no unsubmitted pre-plan holds state. Both the current and next
-batch, including side-lane rows, remain protected until their usual teardown
-points. A completion waiter wakes the main thread as soon as the GPU finishes.
+Successful requests are removed after every participating worker has finished its
+reads and the API data worker has delivered the outputs. The drain timeout can
+force removal. Workers service unrelated teardown during completion waits when
+admission and active batches permit it.
