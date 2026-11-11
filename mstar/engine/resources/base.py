@@ -249,8 +249,8 @@ class Resource(ResidentHooks, ABC):
     # Whether this resource's step on a node is the node's own segments
     # (``SubmoduleStep.segments``: a request's span of tokens each, in the order the node
     # packs its rows), so the node declares nothing for it: ``engine_step`` adds a
-    # ``ResourceStep`` of them under the resource's key (the LoRA pool, whose rows are the
-    # node's tokens).
+    # ``ResourceStep`` of them (and of its ``combined_labels``) under the resource's key (the
+    # LoRA pool, whose rows are the node's tokens; the sequence shard).
     steps_from_segments: bool = False
 
     # stays correct when a hit skips the front of a request; required of every resource on a keyed node

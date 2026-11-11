@@ -41,6 +41,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from mstar.model.components.diffusion.attention import Attend, RaggedAttentionFn, joint_attention
+from mstar.model.components.diffusion.denoise_loop import MAIN_SPAN
 from mstar.model.components.diffusion.ffn import gelu_tanh_ffn
 from mstar.model.components.diffusion.modulation import ada_layer_norm
 from mstar.model.components.diffusion.qk_norm_rope import rms_norm_rope
@@ -271,18 +272,13 @@ class Wan22DiTBlock(nn.Module):
         ).type_as(hidden_states).flatten(1, 2)
 
 
-# the label a denoise step declares a row's tokens under (``DenoiseLoopSubmodule.MAIN_SPAN``),
-# which the node's sequence shard splits
-TOKENS = "main"
-
-
 @torch.compiler.disable
 def _token_runs(shard, timestep: torch.Tensor, per_frame: int) -> torch.Tensor:
     """``timestep`` ``[B, frames]`` as this rank's share of its tokens takes it: whole frames
     unless the shard splits the step's tokens. A rank's share need not be whole frames, so it
     then modulates per run of tokens, the longest run that tiles a frame and every rank's share:
     ``[B, count / run]``. Eager, so a compiled forward doesn't guard on the step's plan."""
-    r = shard.split_range(TOKENS)
+    r = shard.split_range(MAIN_SPAN)
     if r is None:
         return timestep
     run = math.gcd(per_frame, *r.counts)
@@ -361,7 +357,7 @@ class Wan22DiT(nn.Module):
         ``self_attn_fn`` runs the self-attention on the engine's ragged
         resource; without it, and always for the cross-attention, SDPA.
         ``shard``: the node's sequence shard (``SequenceShard``), which on a
-        step it splits cuts each row's tokens (label ``TOKENS``) to this
+        step it splits cuts each row's tokens (label ``MAIN_SPAN``) to this
         rank's share; ``self_attn_fn`` then exchanges them inside its
         resource."""
         batch_size, _, num_frames, height, width = hidden_states.shape
@@ -380,8 +376,8 @@ class Wan22DiT(nn.Module):
         # `can_split` is fixed at bind: at one SP rank a compiled forward traces straight through
         if shard is not None and shard.can_split:
             timestep = _token_runs(shard, timestep, hidden_states.shape[1] // grid[0])
-            hidden_states = shard.scatter(TOKENS, hidden_states)
-            rotary_emb = shard.scatter(TOKENS, *rotary_emb, dim=0)  # [S, D] tables
+            hidden_states = shard.scatter(MAIN_SPAN, hidden_states)
+            rotary_emb = shard.scatter(MAIN_SPAN, *rotary_emb, dim=0)  # [S, D] tables
         self_attend = functools.partial(joint_attention, ragged=self_attn_fn)
 
         temb, timestep_proj, encoder_hidden_states = self.condition_embedder(
@@ -397,7 +393,7 @@ class Wan22DiT(nn.Module):
         _, hidden_states = ada_layer_norm(hidden_states, shift, scale, eps=self.norm_out.eps)
         hidden_states = self.proj_out(hidden_states)
         if shard is not None:
-            hidden_states = shard.gather(TOKENS, hidden_states)
+            hidden_states = shard.gather(MAIN_SPAN, hidden_states)
 
         hidden_states = hidden_states.reshape(batch_size, *grid, p_t, p_h, p_w, -1)
         hidden_states = hidden_states.permute(0, 7, 1, 4, 2, 5, 3, 6)

@@ -65,12 +65,12 @@ from mstar.engine.resources.position.config import PositionConfig, PositionStep
 from mstar.engine.resources.position.manager import RopeManager
 from mstar.engine.resources.runner import StepRunner
 from mstar.engine.resources.sampler.config import SamplingReqConfig
-from mstar.engine.resources.sequence_shard import SeqShardSpec, SeqShardStep, SequenceShard
+from mstar.engine.resources.sequence_shard import SeqShardSpec, SequenceShard
 from mstar.engine.resources.spec import NodeResourceSpec, apply_yaml_overrides, resolve_spec_dependencies
-from mstar.engine.resources.step import BucketKey, Segment, SlotLease, StepContext
+from mstar.engine.resources.step import BucketKey, ResourceStep, Segment, SlotLease, StepContext
 from mstar.model.base import declared_resources
 from mstar.model.qwen3_5.config import GDN_STATE, KV_CACHE
-from mstar.model.submodule_base import NodeInputs
+from mstar.model.submodule_base import NodeInputs, engine_step, with_segment_steps
 
 P = 2
 CPU = torch.device("cpu")
@@ -329,15 +329,27 @@ def test_attention_over_a_placed_pool_that_cant_plan_it_is_refused_at_load(kv, a
         )
 
 
-def test_a_node_that_splits_its_steps_refuses_a_resource_that_cant_take_them(tmp_path, monkeypatch):
-    """Qwen3.5's recurrent state holds no split strategy: a node splitting its steps over SP ranks
-    can't own one."""
+@pytest.mark.parametrize("kind", ["recurrent_state", "block_causal"])
+def test_a_node_that_splits_its_steps_refuses_a_resource_that_cant_take_them(kind, tmp_path, monkeypatch):
+    """Qwen3.5's recurrent state holds no split strategy, nor does block-causal attention (its
+    builder sets no sequence shard): a node splitting its steps over SP ranks can't own one."""
     from mstar.model.base import enabled_resources
 
     groups = _sp_groups(NODE)
-    # what a deployment without a `lora:` block builds
-    specs = enabled_resources(_qwen3_5(NODE, {}, tmp_path, monkeypatch), {})
-    apply_yaml_overrides(specs, {"resources": {KV_CACHE: {"max_num_pages": 8}, GDN_STATE: {"max_slots": 4}}})
+    if kind == "recurrent_state":
+        # what a deployment without a `lora:` block builds
+        specs = enabled_resources(_qwen3_5(NODE, {}, tmp_path, monkeypatch), {})
+        apply_yaml_overrides(specs, {"resources": {KV_CACHE: {"max_num_pages": 8}, GDN_STATE: {"max_slots": 4}}})
+    else:
+        specs = [
+            KVSpec(resource_key="kv", nodes={NODE}, config=PagedKVConfig(
+                num_layers=1, num_kv_heads=2, head_dim=64, max_seq_len=256, num_qo_heads=4, max_num_pages=8,
+                page_size=PAGE_SIZE,
+            )),
+            BlockCausalAttentionSpec(resource_key="attn", nodes={NODE}, block_size=8, config=AttentionConfig(
+                kv_cache="kv", backend=AttnBackend.FLASHINFER,
+            )),
+        ]
     specs.append(SeqShardSpec("shard", {NODE}, ("main",), 0))
     with pytest.raises(ValueError, match="does not support steps split over SP ranks"):
         Engine(graph_runtime=None).load_model(
@@ -498,7 +510,7 @@ def _plan(
     ctx.plan_results["kv"] = case.plan
     if shard is not None:
         segments = tuple(Segment(v.request_id, "main", v.to_compute) for v in views)
-        ctx.plan_results["shard"] = shard.plan(SeqShardStep(segments=segments), ctx)
+        ctx.plan_results["shard"] = shard.plan(ResourceStep(segments=segments), ctx)
     attn.plan(AttentionStep(**step), ctx)
 
 
@@ -932,7 +944,7 @@ def test_a_split_label_reached_outside_an_exchange_is_refused():
     with pytest.raises(ValueError, match="two sequence shards"):
         kv.bind_sequence_shard(SequenceShard(("main",), 0, None, 0, _group(0, P)))
     ctx = StepContext(request_ids=("r0",), graph_walk="w", slot=0, capture=False)
-    shard.plan(SeqShardStep(segments=(Segment("r0", "main", 6),)), ctx)
+    shard.plan(ResourceStep(segments=(Segment("r0", "main", 6),)), ctx)
     k = torch.zeros(3, 1, 2)
     for write in (lambda: kv.write_kv(k, k, label="main"), lambda: kv.write_slots("main"),
                   lambda: kv.write_target(label="main")):
@@ -946,7 +958,7 @@ def test_a_split_label_reached_outside_an_exchange_is_refused():
     # heads in it too: only the exchange's head slice may write
     shard.exchanging = False
     shard.commit(None, ctx)
-    shard.plan(SeqShardStep(segments=(Segment("r0", "main", 1),)), ctx)
+    shard.plan(ResourceStep(segments=(Segment("r0", "main", 1),)), ctx)
     assert shard.split_range("main") is None
     with pytest.raises(ValueError, match="'main', whose KV this rank stores a head slice of, outside an exchange"):
         kv.write_target(label="main")
@@ -960,7 +972,7 @@ def test_a_split_label_reached_outside_an_exchange_is_refused():
         attn, _ = _cp_attention(joint, CPU, torch.float32, shard=shard)
         ctx = StepContext(request_ids=("r0",), graph_walk="w", slot=0, capture=False, slot_lease=lease,
                           force_prefill=True)
-        shard.plan(SeqShardStep(segments=(Segment("r0", "main", 6),)), ctx)
+        shard.plan(ResourceStep(segments=(Segment("r0", "main", 6),)), ctx)
         assert shard.split_range("main").counts == (8, 8)
         q = torch.zeros(8, Q_HEADS, HEAD_DIM)
         with pytest.raises(ValueError, match="attention run reached label 'main'.*outside an exchange"):
@@ -991,7 +1003,7 @@ def test_a_ring_deployment_loads_with_the_pool_it_stripes_by_planned_before_its_
 
 def test_rope_in_a_layer_rotates_a_split_labels_range_at_its_own_positions(monkeypatch):
     """A layer that ropes through the position resource holds its range of a split label, and so
-    do the positions it rotates at; an explicit ``pos_ids`` of another length is refused."""
+    do the positions it rotates at; an explicit ``pos_ids`` of the whole label is refused."""
     shard = SequenceShard(("main",), 0, None, 0, _group(1, P))
     pos = RopeManager(config=PositionConfig(kv_cache="kv"), device=CPU, max_seq_len=64, head_dim=8)
     pos._shard_key = "shard"
@@ -1000,7 +1012,7 @@ def test_rope_in_a_layer_rotates_a_split_labels_range_at_its_own_positions(monke
     ctx = StepContext(request_ids=tuple(rid for rid, _, _ in rows), graph_walk="w", slot=0, capture=False)
     ctx.plan_results["kv"] = KVPlanOutputs({"main": KVPlanOutput(None, rows=rows)})
     segments = tuple(Segment(*row) for row in rows)
-    ctx.plan_results["shard"] = shard.plan(SeqShardStep(segments=segments), ctx)
+    ctx.plan_results["shard"] = shard.plan(ResourceStep(segments=segments), ctx)
     pos.plan(PositionStep(segments=segments), ctx)
     rotated = []
     monkeypatch.setattr(torch.ops.mstar, "rope_apply_qk_inplace", lambda q, k, ids, *a, **kw: rotated.append(ids))
@@ -1084,7 +1096,7 @@ def _cosmos3_steps(sub, resources, statics, latents, timesteps) -> tuple[list[to
     runner.ingest_request("r0", {"kv": KVReqConfig(needed_labels=[COND_LABEL, UNCOND_LABEL])})
     cond, uncond = statics
     prefill = sub._get_prefill_node_inputs(cond, uncond)
-    step = sub.declare_step(C.PREFILL_WALK, ["r0"], [prefill])
+    step = engine_step(sub, C.PREFILL_WALK, ["r0"], [prefill])
     _run_step(runner, step, C.PREFILL_WALK)
     labels = (COND_LABEL, UNCOND_LABEL)
     tower.prefill_und(
@@ -1101,7 +1113,7 @@ def _cosmos3_steps(sub, resources, statics, latents, timesteps) -> tuple[list[to
     for batched_cfg in (True, False):
         sub.batched_cfg = batched_cfg
         for run in range(2 if batched_cfg else 1):
-            step = sub.declare_step(C.IMAGE_GEN_WALK, ["r0"], [gen])
+            step = engine_step(sub, C.IMAGE_GEN_WALK, ["r0"], [gen])
             _run_step(runner, step, C.IMAGE_GEN_WALK)
             if not batched_cfg:
                 out += [tower.denoise_step(latents, timesteps, s["rotary"], *layout, label, attn)
@@ -1167,7 +1179,7 @@ def _cosmos3_over_ranks(rank, world, store):
                 (cond, uncond), latents, timesteps = inputs(height, width)
                 res[SEQ_SHARD].min_tokens = min_tokens
                 for _ in range(2):
-                    step = sub.declare_step(C.IMAGE_GEN_WALK, ["r0"], [_gen_input(cond)])
+                    step = engine_step(sub, C.IMAGE_GEN_WALK, ["r0"], [_gen_input(cond)])
                     _run_step(runner, step, C.IMAGE_GEN_WALK)
                     assert (res[SEQ_SHARD].split_range(CFG_BATCHED_LABEL) is None) == bool(min_tokens)
                     cfg_step(
@@ -1187,10 +1199,11 @@ def test_two_sp_ranks_run_cosmos3s_dit_like_one_rank(tmp_path):
     mp.spawn(_cosmos3_over_ranks, args=(P, str(tmp_path / "store")), nprocs=P)
 
 
-def test_cosmos3s_reasoner_shares_the_dits_sequence_shard_and_declares_it(monkeypatch):
+def test_cosmos3s_reasoner_shares_the_dits_sequence_shard_and_plans_it(monkeypatch):
     """Edge's reasoner attends the DiT's pool through the same attention, so the sequence shard
-    spans both nodes (one over the DiT alone is refused), and the reasoner's steps declare it: one
-    runs through the runner on one rank, where the attention refuses a step without it."""
+    spans both nodes (one over the DiT alone is refused), and the reasoner's steps plan it (the
+    engine adds its step of the node's segments): one runs through the runner on one rank, where
+    the attention refuses a step without its plan."""
     from dataclasses import replace as replaced
 
     from mstar.model.cosmos3 import constants as C
@@ -1211,7 +1224,8 @@ def test_cosmos3s_reasoner_shares_the_dits_sequence_shard_and_declares_it(monkey
     runner = StepRunner(res)
     runner.ingest_request("t", {"kv": KVReqConfig(needed_labels=[REASONER_LABEL]), SAMPLER: SamplingReqConfig()})
     reasoner = Cosmos3ReasonerSubmodule(sub.transformer, model.config)
-    step = reasoner.declare_step(C.REASONER_PREFILL_WALK, ["t"], [ARNodeInputs(input_ids=torch.arange(6),
+    reasoner.bind_node_resources(res)
+    step = engine_step(reasoner, C.REASONER_PREFILL_WALK, ["t"], [ARNodeInputs(input_ids=torch.arange(6),
                                                                                 input_seq_len=6)])
     _run_step(runner, step, C.REASONER_PREFILL_WALK, rids=("t",))
     assert not runner.resources[SEQ_SHARD].can_split
@@ -1529,12 +1543,10 @@ def _thinker_over_ranks(rank, world, store, placed, exchange):
             forward = torch.compile(thinker, backend="eager") if compiled else thinker
             out = []
             for rows, step_inputs in zip(steps, inputs, strict=True):
-                step = SubmoduleStep(
+                step = with_segment_steps(SubmoduleStep(
                     segments=[Segment(rid, "main", span) for rid, span in rows],
-                    steps={
-                        THINKER_KV: KVStep(), THINKER_ATTN: AttentionStep(causal=True), THINKER_SHARD: SeqShardStep(),
-                    },
-                )
+                    steps={THINKER_KV: KVStep(), THINKER_ATTN: AttentionStep(causal=True)},
+                ), [THINKER_SHARD])
                 step.set_ctx(StepContext(request_ids=tuple(rid for rid, _ in rows), graph_walk="prefill_text",
                                          slot=0, capture=False))
                 assert runner.admit(step).ok

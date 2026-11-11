@@ -63,7 +63,7 @@ from mstar.engine.accelerator_graph_config import (
     check_inductor_options,
 )
 from mstar.engine.fp32_precision import cudnn_benchmark
-from mstar.engine.resources import AttentionStep, KVStep, Segment, SeqShardStep, SlotLease, SubmoduleStep
+from mstar.engine.resources import AttentionStep, KVStep, Segment, SlotLease, SubmoduleStep
 from mstar.engine.resources.kv.config import RetentionPolicy
 from mstar.engine.resources.step import ResourceStep
 from mstar.engine.windowing import WindowSchedule
@@ -1060,7 +1060,6 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             segments=self._segments(request_ids, labels, [spans] * len(labels)),
             combined_labels={labels: CFG_BATCHED_LABEL} if cfg and self.batched_cfg else {},
             steps={
-                SEQ_SHARD: SeqShardStep(),
                 KV_CACHE: KVStep(
                     commit=True,
                     retention={
@@ -1516,7 +1515,6 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                     ],
                 ),
                 steps={
-                    SEQ_SHARD: SeqShardStep(),
                     KV_CACHE: KVStep(commit=True),
                     ATTN: AttentionStep(causal=True),
                 },
@@ -1616,7 +1614,6 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                 request_ids, labels, [spans] * len(labels)
             ),
             steps={
-                SEQ_SHARD: SeqShardStep(),
                 KV_CACHE: KVStep(commit=False),
                 attn_key: AttentionStep(causal=False),
             },
@@ -3287,7 +3284,7 @@ class Cosmos3ReasonerSubmodule(SampledTokenDecoder):
         super().__init__(Cosmos3TextTower(transformer), config, encoders)
 
     def layer_steps(self) -> dict[str, ResourceStep]:
-        return {SEQ_SHARD: SeqShardStep(), KV_CACHE: KVStep(), ATTN: AttentionStep(causal=True)}
+        return {KV_CACHE: KVStep(), ATTN: AttentionStep(causal=True)}
 
     def capture_compile_mode(self, graph_walk: str) -> str | None:
         # Decode keeps the mode it was tuned with; prefills take the
