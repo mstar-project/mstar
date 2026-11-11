@@ -220,9 +220,12 @@ class _Row:
 
 class GrammarRows:
     """The sampler's constrained rows: one matcher per request, the drawn tokens
-    still on their way to the host, and the bitmask each step applies."""
+    still on their way to the host, and the bitmask each step applies. ``decides``: this
+    rank serves alone, so a row whose fill fails fails its request (`fill`)."""
 
-    def __init__(self, text_output: TextOutput, vocab_size: int | None, device: torch.device, cache_bytes: int):
+    def __init__(
+        self, text_output: TextOutput, vocab_size: int | None, device: torch.device, cache_bytes: int, decides: bool,
+    ):
         import xgrammar as xgr
 
         detok = text_output.detokenizer
@@ -243,8 +246,11 @@ class GrammarRows:
             vocab = [detok.token_bytes(i) for i in range(size)]
             self.info = xgr.TokenizerInfo(vocab, vocab_type=xgr.VocabType.RAW, vocab_size=size, stop_token_ids=stop)
         self.vocab_size = size
+        self._decides = decides
         self.words = math.ceil(size / 32)
-        # the mask of a row whose grammar failed, until its request fails: only a stop
+        # the mask of a row whose grammar failed, until its request fails: only a stop. The
+        # stops are the ids xgrammar resolved: the model's, else its tokenizer's EOS
+        stop = sorted(self.info.stop_token_ids)
         bits = torch.zeros(self.words * 32, dtype=torch.int64)
         bits[stop] = 1
         words = (bits.view(-1, 32) << torch.arange(32)).sum(-1)
@@ -330,29 +336,15 @@ class GrammarRows:
                     logger.exception("structured_outputs: accepting a drawn token failed")
                     row.error = f"structured_outputs grammar failed to accept drawn token {drawn[i]}: {exc}"
 
-    def fail(self, rids, why: str) -> None:
-        """Fail the grammar rows of ``rids`` (`failures`) with ``why``."""
-        for rid in rids:
-            row = self._rows.get(rid)
-            if row is not None and row.error is None:
-                row.error = why
-
-    def failed_mask(self, fails_request: bool):
-        """What a row whose fill failed may draw: every token but the stops when its
-        request fails (a stop would end the reply before the error lands), and only
-        the stops when it may not (under several ranks); all ones for a model that
-        declares no stop."""
-        if self._stops is None:
-            return -1
-        return ~self._stops if fails_request else self._stops
-
-    def fill(self, rids) -> tuple[torch.Tensor, dict]:
-        """The host bitmask for a step's rows, and the reason for each rid whose own
-        fill raised: all ones for a free row, and only the stop ids for a finished
-        one. A failed row is left all ones for the caller to set (`failed_mask`).
-        If the batched call raises, its rows fill one by one, so only the bad row fails."""
+    def fill(self, rids) -> torch.Tensor:
+        """The host bitmask for a step's rows: all ones for a free row, and only the stop
+        ids for a row whose grammar failed earlier. A row whose own fill raises fails its
+        request when this rank serves alone, and draws anything but a stop that once (a stop
+        would end the reply before the error lands); otherwise (under several ranks, where an
+        error set on rank 0 alone would split the admits) it may only stop. A model that
+        resolves no stop gets all ones either way. If the batched call raises, its rows fill
+        one by one, so only the bad row fails."""
         mask = torch.full((len(rids), self.words), -1, dtype=torch.int32)
-        failed = {}
         matchers, index = [], []
         for i, rid in enumerate(rids):
             row = self._rows.get(rid)
@@ -368,17 +360,18 @@ class GrammarRows:
                     index.append(i)
             except Exception as exc:  # noqa: BLE001 - that request's error, not the step's
                 logger.exception("structured_outputs: reading a row's grammar failed")
-                failed[rid] = f"structured_outputs grammar failed to fill its mask: {exc}"
+                self._failed(row, mask, i, exc)
         threads = min(self._fill_threads, len(matchers) // FILL_ROWS_PER_THREAD)
         if threads >= 2:
-            batch = self._batches.get(threads)
-            if batch is None:
-                import xgrammar as xgr
-
-                batch = self._batches[threads] = xgr.BatchGrammarMatcher(max_threads=threads)
+            # a matcher's raise inside a batch worker comes back as a Python error (xgrammar 0.2.9)
             try:
+                batch = self._batches.get(threads)
+                if batch is None:
+                    import xgrammar as xgr
+
+                    batch = self._batches[threads] = xgr.BatchGrammarMatcher(max_threads=threads)
                 batch.batch_fill_next_token_bitmask(matchers, mask, index)
-                return mask, failed
+                return mask
             except Exception:  # noqa: BLE001 - the loop below finds the row
                 logger.exception("structured_outputs: a batched mask fill failed, retrying row by row")
         # a fill rewrites its whole row and leaves the matcher's state, so a retry is sound
@@ -387,9 +380,16 @@ class GrammarRows:
                 matcher.fill_next_token_bitmask(mask, i)
             except Exception as exc:  # noqa: BLE001 - that request's error, not the step's
                 logger.exception("structured_outputs: filling a row's grammar mask failed")
-                mask[i] = -1
-                failed[rids[i]] = f"structured_outputs grammar failed to fill its mask: {exc}"
-        return mask, failed
+                self._failed(self._rows[rids[i]], mask, i, exc)
+        return mask
+
+    def _failed(self, row: _Row, mask: torch.Tensor, i: int, exc: Exception) -> None:
+        if self._decides and row.error is None:
+            row.error = f"structured_outputs grammar failed to fill its mask: {exc}"
+        if self._stops is None:
+            mask[i] = -1
+        else:
+            mask[i] = ~self._stops if self._decides else self._stops
 
     def apply(self, logits: torch.Tensor, mask: torch.Tensor) -> None:
         """Set every disallowed logit to -inf, in place; capturable (no host

@@ -36,11 +36,17 @@ def _argmax_draw(monkeypatch):
     monkeypatch.setattr(utils, "sample_accelerator_graphable_gpu", lambda logits, *a, **kw: logits.argmax(-1))
 
 
-def _resource(graph: bool, comm_group=None) -> GrammarSamplerResource:
-    text_output = SimpleNamespace(
-        detokenizer=SimpleNamespace(token_bytes=lambda i: VOCAB[i] if i < len(VOCAB) else b""),
-        stop_token_ids=frozenset({EOS}),
-    )
+def _resource(graph: bool, comm_group=None, tokenizer_eos: bool = False) -> GrammarSamplerResource:
+    """``tokenizer_eos``: the model declares no stop and its HF tokenizer's EOS is the only one."""
+    detok = SimpleNamespace(token_bytes=lambda i: VOCAB[i] if i < len(VOCAB) else b"")
+    if tokenizer_eos:
+        from tokenizers import Tokenizer, models
+        from transformers import PreTrainedTokenizerFast
+
+        words = {(v.decode() or "<eos>"): i for i, v in enumerate(VOCAB)}
+        detok.tokenizer = PreTrainedTokenizerFast(
+            tokenizer_object=Tokenizer(models.WordLevel(words, unk_token="{")), eos_token="<eos>")
+    text_output = SimpleNamespace(detokenizer=detok, stop_token_ids=frozenset() if tokenizer_eos else frozenset({EOS}))
     res = GrammarSamplerResource(
         vocab_size=V, enable_repetition_penalty=False, device=torch.device("cpu"),
         text_output=text_output, grammar_cache_mb=16, comm_group=comm_group,
@@ -222,16 +228,19 @@ def test_a_grammar_that_can_no_longer_hold_fails_its_request(monkeypatch, failur
     assert not outcome.ok and outcome.reason.terminal and outcome.reason.request_ids == {0}
 
 
+@pytest.mark.parametrize("tokenizer_eos", [False, True])
 @pytest.mark.parametrize("ranks", [1, 2])
-def test_a_fill_or_accept_that_raises_fails_what_every_rank_agrees_on(monkeypatch, ranks):
+def test_a_fill_or_accept_that_raises_fails_what_every_rank_agrees_on(monkeypatch, ranks, tokenizer_eos):
     """A replay fills the masks between its forward and its draw: a fill that raises
-    still draws. On a lone rank the row is left unmasked for that draw, so its request
+    still draws. On a lone rank the row may draw anything but a stop for that draw, so its request
     reaches the next admit and fails there with the error (a stop would end the reply
     first, as a 200); under several ranks the row may only stop, since a fill runs on
     rank 0 alone and an error set there would split the admits. One row's own fill
     raising fails only that row. An accept runs on every rank, so one that raises
-    fails its row's request on each, and the other rows' draws are still accepted."""
-    res = _resource(graph=True, comm_group=SimpleNamespace(world_size=ranks, rank=0))
+    fails its row's request on each, and the other rows' draws are still accepted. The
+    stops are the ones xgrammar resolves, so a model that declares none but whose tokenizer
+    has an EOS is masked alike."""
+    res = _resource(graph=True, comm_group=SimpleNamespace(world_size=ranks, rank=0), tokenizer_eos=tokenizer_eos)
     res.ingest_request(0, SamplingReqConfig(grammar=grammar_request({"choice": ["ab"]})))
     lease = SlotLease(slot=0, bucket=SimpleNamespace(bs=4))
     step = SamplerStep(apply_penalty=False)
@@ -251,7 +260,7 @@ def test_a_fill_or_accept_that_raises_fails_what_every_rank_agrees_on(monkeypatc
     assert forced_stop == (ranks > 1), "a lone rank's failed fill must not end the reply before its error"
     assert res.admit(step, ctx).ok == (ranks > 1)
 
-    res = _resource(graph=True, comm_group=SimpleNamespace(world_size=ranks, rank=0))
+    res = _resource(graph=True, comm_group=SimpleNamespace(world_size=ranks, rank=0), tokenizer_eos=tokenizer_eos)
     for rid in (1, 2):
         res.ingest_request(rid, SamplingReqConfig(grammar=grammar_request({"choice": ["ab"]})))
     ctx2 = StepContext(request_ids=(1, 2), graph_walk="w", slot=0, capture=False, slot_lease=lease)

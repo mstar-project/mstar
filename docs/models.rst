@@ -751,16 +751,18 @@ The grammar compiles in the background, on every rank, while its request waits a
 behind it start. The captured sampler then applies a bitmask on every step but a greedy one
 without a constrained row (the lean twin). A step holding a constrained row launches its
 forward, then waits for its rows' last draws to reach the host and fills their masks while the
-forward runs, before it launches the draw (its capture is split there). A grammar that fails to compile, or
-whose matcher fails to start or to accept a draw, fails its request with an error. A failed mask fill fails its request with an error on a single-GPU deployment: its row
-draws anything but a stop that once, and the next step's admit reports the error (unless the
-reply reaches its length limit at that draw; one row's own fill failing fails only that row).
-Under tensor parallelism only the first rank fills, so the row may only stop there, and the
-reply ends at that stop. A drawn token the grammar refuses (only a mask that failed to cover
-the draw lets one through) fails its request at the step after the next, and meanwhile the reply
-may only draw one of the model's stop tokens (any token, for a model that declares none); when the
-reply finishes first (a stop or its length limit; always without async scheduling), it ends
-normally with the refused token in it. Not served
+forward runs, before it launches the draw (its capture is split there). A grammar that fails to
+compile, or whose matcher fails to start or to accept a draw, fails its request with an error. A
+failed mask fill fails its request with an error on a single-GPU deployment: its row draws
+anything but a stop that once (any token, for a model with no stop token), and the next step's
+admit reports the error (unless the reply reaches its length limit at that draw; one row's own
+fill failing fails only that row). Under tensor parallelism only the first rank fills, so the
+row may only stop there (it runs unmasked, for a model with no stop token), and the reply ends
+at that stop. A drawn token the grammar refuses (only a mask that failed to cover the draw lets
+one through) fails its request at the step after the next, and meanwhile the reply may only draw
+one of the model's stop tokens (any token, for a model with no stop token); when the reply
+finishes first (a stop or its length limit; always without async scheduling), it ends normally
+with the refused token in it. Not served
 with it yet: speculative decoding (no model that declares ``text_output()`` drafts outside its
 sampler), resident planning, and a text sampler whose walks run on different ranks (a
 prefill/decode split); the deployment is refused at startup for the last, and for

@@ -887,7 +887,7 @@ class GrammarSamplerResource(SamplerResource):
         if text_output is None:
             raise ValueError("enable_grammar needs a model that declares text_output()")
         super().__init__(vocab_size, enable_repetition_penalty, device, **kwargs)
-        self._grammar = GrammarRows(text_output, vocab_size, device, grammar_cache_mb << 20)
+        self._grammar = GrammarRows(text_output, vocab_size, device, grammar_cache_mb << 20, self._decides)
         self._grammar_stager = PinnedStager(torch.int32)
         # The mask this step applies (None: none), with its rows and slot (None: eager), the static
         # mask buffer of each cg slot the captures apply (shared by the slot's buckets), the slots
@@ -997,11 +997,7 @@ class GrammarSamplerResource(SamplerResource):
 
         A row whose accept fails, as a draw its grammar refuses does, fails its
         request at admit, on every rank alike. A row whose fill raises (on rank 0
-        alone, which fills) fails its request only when this rank serves alone, and
-        may draw anything but a stop that once, so the request reaches the next
-        admit and fails there with the error rather than ending at a stop first (unless
-        it reaches its length limit). Under several ranks an error set on one would
-        split the ranks' admits, so the row may only stop. `fill` isolates each row,
+        alone, which fills) is handled by `fill` (`GrammarRows`): it isolates each row,
         so nothing else here raises."""
         grammar, rids, slot = self._grammar, self._grammar_rids, self._grammar_slot
         # MSTAR_PHASE_TIMING: accept includes draw_wait (`accept_pending`)
@@ -1010,12 +1006,7 @@ class GrammarSamplerResource(SamplerResource):
         laps.lap("accept")
         if not self._fills_masks:
             return
-        masks, failed = grammar.fill(rids) if grammar.any_of(rids) else (None, {})
-        for i, rid in enumerate(rids):
-            if rid in failed:
-                if self._decides:
-                    grammar.fail([rid], failed[rid])
-                masks[i] = grammar.failed_mask(self._decides)
+        masks = grammar.fill(rids) if grammar.any_of(rids) else None
         laps.lap("fill")
         if masks is not None:
             self._grammar_stager.copy_(self._grammar_mask, masks.numpy().reshape(-1), pad_value=-1)
