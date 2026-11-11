@@ -616,8 +616,9 @@ class GDNDecodeWrapper(GDNWrapper):
 
 # A rejected token's raw gate inputs in the verify rerun: the decay
 # exp(-exp(A_log) softplus(a + dt_bias)) goes to 1 and the rate sigmoid(b) to 0,
-# so the state passes through the token unchanged. Finite, since -inf turns NaN
-# on the multi-token kernel's wider-batch path.
+# so the state passes through the token unchanged. Finite: -inf gave NaN on the
+# multi-token kernel's wider-batch path, 16 rows and more (the cause is a
+# hypothesis), which test_gdn_verify_device's wide-batch rerun case guards.
 CLOSED_GATE = -1e4
 
 
