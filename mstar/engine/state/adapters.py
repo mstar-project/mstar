@@ -268,7 +268,10 @@ def _apply_kernel_settings(
             if was != value:
                 raise ValueError(f"kernel_settings[{other!r}] and kernel_settings[{key!r}] set {field} to {was!r} and "
                                  f"{value!r}, and both reads run on the resource {resource!r}, which holds one value")
-        owner.apply(by_key.get(resource), settings)
+        try:
+            owner.apply(by_key.get(resource), settings)
+        except ValueError as e:
+            raise ValueError(f"Array {array.name!r}: kernel_settings[{key!r}]: {e}") from e
 
 
 def node_handles(
@@ -1193,10 +1196,7 @@ class Storage(ABC):
         """Size the array's pool ``spec`` through its own YAML path, so a value here means what the same key under
         `resources:` means."""
         if settings:
-            try:
-                spec.apply_yaml_overrides(**settings)
-            except ValueError as e:
-                raise ValueError(f"Array {spec.resource_key!r}: kernel_settings[{spec.resource_key!r}]: {e}") from e
+            spec.apply_yaml_overrides(**settings)
 
 
 class PagedStorage(Storage):
