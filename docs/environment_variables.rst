@@ -423,8 +423,10 @@ and its bridge (see :doc:`installation`).
    * - ``MSTAR_CHAT_TEMPLATE``
      - unset
      - What the Rust frontend's GLM chat needs of the model's chat template, as
-       JSON: whether the model always reasons and the ``chat_template_kwargs`` keys
-       the template reads. Not for deployments to set:
+       JSON: whether the model always reasons, the ``chat_template_kwargs`` keys
+       the template reads, and its ``reasoning_effort`` levels, which
+       ``/v1/messages`` and ``/v1/responses`` map an effort onto. Not for
+       deployments to set:
        ``launch_rust_server`` sets it from ``chat_template_facts`` for
        ``glm52`` and ``glm5_next``.
    * - ``MSTAR_ALLOW_REMOTE``

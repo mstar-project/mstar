@@ -19,6 +19,8 @@ protocol are untouched):
                        | {t:"live", rid, sub, op, call, ..., stream?, audio?(bin)}
                        | {t:"end_of_turn", rid, sub, audio(bin)}
                        | {t:"lora", rid, sub, op, lora_name, lora_path?}
+                       | {t:"count_tokens", rid, sub, text, input_modalities, output_modalities,
+                          model_kwargs, prompt_parts}
     bridge -> frontend:  {t:"chunk", rid, sub, modality, data(bin), metadata, num_tokens, prompt_tokens}
                        | {t:"chunks", subs, modalities, payloads(bin), metadatas, token_counts, prompt_counts}
                        | {t:"err", rid, sub, msg} | {t:"done", rid, sub}
@@ -30,6 +32,7 @@ protocol are untouched):
                        | {t:"live", rid, sub, metadata:{taking | accepted | rejected | error, status, error_id?}}
                        | {t:"end_of_turn", rid, sub, metadata:{p} | {error}}
                        | {t:"lora", rid, sub, metadata:{text} | {error:{status, message}}}
+                       | {t:"count_tokens", rid, sub, metadata:{input_tokens} | {error:{status, message}}}
                        | {t:"served", adapters}   (unsolicited, on every change)
 
 A ``live`` request is one operation on a ``/generate/ws`` live call, the
@@ -352,15 +355,16 @@ def conversation_facts(server) -> dict | None:
 
 def chat_template_facts(adapter) -> dict | None:
     """``CHAT_TEMPLATE_ENV``'s value for an adapter whose port renders the chat
-    template's switches (``GlmChatAdapter``): whether the model always reasons
-    and the ``chat_template_kwargs`` keys its template reads. ``None`` for any
-    other adapter."""
+    template's switches (``GlmChatAdapter``): whether the model always reasons,
+    the ``chat_template_kwargs`` keys its template reads, and its
+    ``reasoning_effort`` levels, least first. ``None`` for any other adapter."""
     from mstar.api_server.openai.adapters import GlmChatAdapter
     from mstar.model.multimodal import GLM_TEMPLATE_KWARGS
 
     if not isinstance(adapter, GlmChatAdapter):
         return None
-    return {"always_thinks": adapter.always_thinks, "template_kwargs": list(GLM_TEMPLATE_KWARGS)}
+    return {"always_thinks": adapter.always_thinks, "template_kwargs": list(GLM_TEMPLATE_KWARGS),
+            "reasoning_efforts": list(adapter.reasoning_efforts)}
 
 
 def realtime_facts(server, adapter, directory: str) -> dict | None:
@@ -783,6 +787,31 @@ class RustFrontendBridge:
 
         self.loop.create_task(run())
 
+    def _count_tokens(self, msg: dict) -> None:
+        """``/v1/messages/count_tokens``: the tokens the model's own
+        ``process_prompt`` renders the submission's prompt to, called as the data
+        worker calls it and off the loop; or the error the Python route answered
+        (``exception_status_text``)."""
+        reply = {"t": "count_tokens", "rid": msg.get("rid"), "sub": msg.get("sub"), "data": b"", "metadata": {}}
+
+        async def run() -> None:
+            try:
+                parts = msg.get("prompt_parts")
+                tensors = await asyncio.to_thread(
+                    self.server.model.process_prompt, msg.get("text"), list(msg.get("input_modalities") or []),
+                    list(msg.get("output_modalities") or ["text"]),
+                    prompt_parts=[PromptPart(**p) for p in parts] if parts else None,
+                    **dict(msg.get("model_kwargs") or {}))
+                # a model that also lays out its KV returns a ProcessPromptOutput
+                tensors = getattr(tensors, "new_input_tensors", tensors)
+                reply["metadata"] = {"input_tokens": sum(t.numel() for t in tensors.get("text_inputs", []))}
+            except Exception as exc:  # noqa: BLE001 — the call fails, the bridge goes on
+                status, text = exception_status_text(exc, "/v1/messages/count_tokens", log=logger)
+                reply["metadata"] = {"error": {"status": status, "message": text}}
+            self._send(reply)
+
+        self.loop.create_task(run())
+
     def _end_of_turn(self, msg: dict) -> None:
         """``semantic_vad``'s end-of-turn probability of a turn's last audio
         (float32), by this side's Smart Turn: its int8 model moves by tenths
@@ -928,6 +957,8 @@ class RustFrontendBridge:
             self._live(msg)
         elif t == "lora":
             self._lora(msg)
+        elif t == "count_tokens":
+            self._count_tokens(msg)
         elif t == "end_of_turn":
             self._end_of_turn(msg)
         else:

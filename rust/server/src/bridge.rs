@@ -23,6 +23,8 @@
 //!                        | {t:"voices", rid, sub}
 //!                        | {t:"windows", rid, sub, op, plan, ...}
 //!                        | {t:"live", rid, sub, op, call, ...}
+//!                        | {t:"count_tokens", rid, sub, text, input_modalities,
+//!                           output_modalities, model_kwargs, prompt_parts}
 //!   conductor -> frontend: {t:"chunk", rid, sub, modality, data(bin), metadata,
 //!                           num_tokens, prompt_tokens}
 //!                        | {t:"chunks", subs, modalities, payloads(bin), metadatas,
@@ -34,6 +36,7 @@
 //!                        | {t:"voices", rid, sub, metadata:{voices?}}
 //!                        | {t:"windows", rid, sub, metadata:{duration, single, windows} | {error}}
 //!                        | {t:"live", rid, sub, metadata:{taking | accepted | rejected | error, status}}
+//!                        | {t:"count_tokens", rid, sub, metadata:{input_tokens} | {error:{status, message}}}
 //!
 //! A `metrics` request carries this frontend's cumulative refusal counts
 //! (`refusals.rs`) as three parallel lists, for the API server to export. Its
@@ -573,6 +576,38 @@ impl Bridge {
         }
     }
 
+    /// `/v1/messages/count_tokens`: how many tokens the model's own
+    /// `process_prompt` renders the submission's prompt to, or the error the
+    /// Python route answered (`exception_status_text`).
+    pub async fn count_tokens(
+        &self,
+        args: &SubmitArgs,
+        timeout: Duration,
+    ) -> Result<u64, (u16, String)> {
+        let mut op = serde_json::Map::new();
+        op.insert("text".into(), args.text.as_deref().map_or(Value::Null, Value::from));
+        op.insert("input_modalities".into(), Value::from(args.input_modalities.clone()));
+        op.insert("output_modalities".into(), Value::from(args.output_modalities.clone()));
+        op.insert("model_kwargs".into(), Value::Object(args.model_kwargs.clone()));
+        let parts = serde_json::to_value(&args.parts).unwrap_or_default();
+        op.insert("prompt_parts".into(), parts);
+        let extras = Extras { op: Some(&op), ..Extras::default() };
+        let chunk = match self.round_trip("count_tokens", extras, timeout).await {
+            Some(StreamItem::Chunk(chunk)) => chunk,
+            None => return Err((500, "Request timed out".to_string())),
+            _ => return Err((503, "backend bridge unreachable".to_string())),
+        };
+        if let Some(n) = chunk.metadata.get("input_tokens").and_then(Value::as_u64) {
+            return Ok(n);
+        }
+        let Some(error) = chunk.metadata.get("error") else {
+            return Err((500, "the server could not count the prompt's tokens".to_string()));
+        };
+        let status = error.get("status").and_then(Value::as_u64).unwrap_or(500) as u16;
+        let message = error.get("message").and_then(Value::as_str).unwrap_or_default();
+        Err((status, message.to_string()))
+    }
+
     /// Have the API server check a saved reference clip with the model's
     /// loader (`media_io.check_saved_ref_audio`): `Ok`, or the refusal's
     /// `(status, message)`, as the Python adapter refuses it. A refused clip is
@@ -656,7 +691,7 @@ fn deliver(routes: &Routes, msg: Inbound) {
             Some(message) => (Some(StreamItem::Error { status: msg.status.unwrap_or(400), message, refused: false }), true),
             None => (Some(StreamItem::Done), true),
         },
-        "metrics" | "voices" | "windows" | "live" | "end_of_turn" | "lora" => (
+        "metrics" | "voices" | "windows" | "live" | "end_of_turn" | "lora" | "count_tokens" => (
             Some(StreamItem::Chunk(ResultChunk {
                 modality: msg.t,
                 data: msg.data.into_vec(),

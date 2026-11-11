@@ -84,7 +84,7 @@ def test_the_chat_template_facts_are_the_launchers_and_never_inherited(launched,
     monkeypatch.setenv("MSTAR_CHAT_TEMPLATE", '{"always_thinks": true}')
     rust_frontend.launch_rust_server("bin", "kokoro", 8000, "/b", "/u")
     assert "MSTAR_CHAT_TEMPLATE" not in launched["env"]
-    facts = {"always_thinks": False, "template_kwargs": ["enable_thinking"]}
+    facts = {"always_thinks": False, "template_kwargs": ["enable_thinking"], "reasoning_efforts": ["high"]}
     rust_frontend.launch_rust_server("bin", "glm52", 8000, "/b", "/u", chat_template=facts)
     assert json.loads(launched["env"]["MSTAR_CHAT_TEMPLATE"]) == facts
 
@@ -95,8 +95,10 @@ def test_the_chat_template_facts_are_the_glm_adapters():
 
     keys = list(GLM_TEMPLATE_KWARGS)
     facts = rust_frontend.chat_template_facts
-    assert facts(get_adapter("glm52")) == {"always_thinks": False, "template_kwargs": keys}
-    assert facts(get_adapter("glm5_next")) == {"always_thinks": True, "template_kwargs": keys}
+    assert facts(get_adapter("glm52")) == {"always_thinks": False, "template_kwargs": keys,
+                                           "reasoning_efforts": ["high", "max"]}
+    assert facts(get_adapter("glm5_next")) == {"always_thinks": True, "template_kwargs": keys,
+                                               "reasoning_efforts": ["low", "high", "max"]}
     assert facts(get_adapter("ripple_65b")) is None
     assert facts(None) is None
 

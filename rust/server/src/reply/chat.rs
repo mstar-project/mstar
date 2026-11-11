@@ -143,6 +143,7 @@ impl WireFormat for ChatReply {
         let mut out = Vec::new();
         for (i, event) in batch.iter().enumerate() {
             match event {
+                Event::Start { .. } => {}
                 Event::Delta(_) if matches!(batch.get(i + 1), Some(Event::Finish(_))) => {}
                 Event::Delta(delta) => out.push(self.chunk(delta_json(delta), None)),
                 Event::Finish(f) => {

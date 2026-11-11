@@ -30,6 +30,10 @@ pub struct TemplateFacts {
     /// The `chat_template_kwargs` keys the template reads (`GLM_TEMPLATE_KWARGS`).
     #[serde(default)]
     pub template_kwargs: Vec<String>,
+    /// Its `reasoning_effort` levels, least first, which `/v1/messages` and
+    /// `/v1/responses` map an effort onto.
+    #[serde(default)]
+    pub reasoning_efforts: Vec<String>,
 }
 
 pub fn template_facts() -> &'static TemplateFacts {
@@ -57,6 +61,18 @@ struct Options {
 impl OpenAIAdapter for GlmChat {
     fn supports_chat(&self) -> bool {
         true
+    }
+
+    fn supports_messages(&self) -> bool {
+        true
+    }
+
+    fn supports_responses(&self) -> bool {
+        true
+    }
+
+    fn reasoning_efforts(&self) -> Vec<String> {
+        template_facts().reasoning_efforts.clone()
     }
 
     fn serves_tool_calls(&self) -> bool {

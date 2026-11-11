@@ -1,5 +1,6 @@
-//! A text reply as events, which an API writes in its own shape: OpenAI chat
-//! ([`chat`]). [`events`] reads a submission's result stream once:
+//! A text reply as events, which each API writes in its own shape: OpenAI chat
+//! ([`chat`]), Anthropic Messages (`crate::anthropic`) and OpenAI Responses
+//! (`crate::responses`). [`events`] reads a submission's result stream once:
 //! the adapter's [`OutputParser`] splits the text into reasoning, answer and
 //! tool calls, and the request's stop strings end the answer. [`serve`] answers
 //! with a [`WireFormat`], whole or as server-sent events. A chat whose adapter
@@ -90,6 +91,11 @@ pub struct Finish {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
+    /// Before the first delta or finish: the prompt's token count, which
+    /// Messages reports up front.
+    Start {
+        prompt_tokens: u64,
+    },
     Delta(Delta),
     /// The request failed after it was submitted; nothing follows.
     Failure {
@@ -143,6 +149,7 @@ struct Reader {
     usage: Usage,
     /// A call's head has gone out: a stop string can cut a call the parser read.
     calls_out: bool,
+    started: bool,
 }
 
 impl Reader {
@@ -178,6 +185,20 @@ impl Reader {
         })
     }
 
+    /// `events`, with [`Event::Start`] ahead of the reply's first.
+    fn started(&mut self, mut events: Vec<Event>) -> Vec<Event> {
+        if !self.started && !events.is_empty() {
+            self.started = true;
+            events.insert(
+                0,
+                Event::Start {
+                    prompt_tokens: self.usage.prompt,
+                },
+            );
+        }
+        events
+    }
+
     /// The events of the next chunk that makes any; `None` once the reply is told.
     async fn next(&mut self) -> Option<Vec<Event>> {
         loop {
@@ -191,7 +212,8 @@ impl Reader {
                 }
                 None => {
                     self.stream = None;
-                    return Some(self.tail());
+                    let tail = self.tail();
+                    return Some(self.started(tail));
                 }
             };
             match chunk.modality.as_str() {
@@ -228,10 +250,10 @@ impl Reader {
                 self.outcome.served();
                 self.stream = None;
                 events.push(self.finish(stop));
-                return Some(events);
+                return Some(self.started(events));
             }
             if !events.is_empty() {
-                return Some(events);
+                return Some(self.started(events));
             }
         }
     }
@@ -278,6 +300,7 @@ pub fn events(
         text: Utf8Stream::default(),
         usage: Usage::default(),
         calls_out: false,
+        started: false,
     };
     futures::stream::unfold(reader, |mut r| async move {
         r.next().await.map(|events| (events, r))
@@ -361,6 +384,13 @@ impl SseEvent {
         Self {
             name: None,
             data: data.into(),
+        }
+    }
+
+    pub fn named(name: &'static str, data: &Value) -> Self {
+        Self {
+            name: Some(name),
+            data: data.to_string(),
         }
     }
 }
@@ -490,6 +520,7 @@ mod tests {
             usage(4, "length"),
         ];
         let (events, served) = read(chunks, Some(parser), &[]);
+        assert_eq!(events[0], Event::Start { prompt_tokens: 11 });
         // the chunk that closes the reasoning began inside it, so it counts
         let want = Usage {
             prompt: 11,
@@ -563,18 +594,23 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_reply_still_finishes() {
+    fn an_empty_reply_still_starts_and_finishes() {
         let (events, _) = read(vec![text("", 1), usage(1, "stop")], None, &["END"]);
         let want = Usage {
             prompt: 11,
             completion: 1,
             ..Usage::default()
         };
-        let finish = Finish {
-            reason: FinishReason::Stop,
-            usage: want,
-            stop_string: None,
-        };
-        assert_eq!(events, vec![Event::Finish(finish)]);
+        assert_eq!(
+            events,
+            vec![
+                Event::Start { prompt_tokens: 11 },
+                Event::Finish(Finish {
+                    reason: FinishReason::Stop,
+                    usage: want,
+                    stop_string: None
+                })
+            ]
+        );
     }
 }

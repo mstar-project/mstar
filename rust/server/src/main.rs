@@ -26,6 +26,7 @@
 //! generator that proves the HTTP/adapter/media/streaming layer standalone).
 
 mod adapters;
+mod anthropic;
 mod auth;
 mod bridge;
 mod client_errors;
@@ -35,6 +36,7 @@ mod protocol;
 mod realtime;
 mod refusals;
 mod reply;
+mod responses;
 mod served_models;
 mod lora_admin;
 mod serving;
@@ -42,6 +44,7 @@ mod sndfile;
 mod speech_chunking;
 mod tokenizer;
 mod transcription;
+mod translate;
 mod unicode_marks;
 mod utf8;
 mod ws;
@@ -212,6 +215,9 @@ async fn main() {
         .route("/v1/images/edits", post(images_edits))
         .route("/v1/videos/generations", post(videos_generations))
         .route("/generate", post(generate))
+        // coding agents' APIs, on the chat path
+        .route("/v1/messages", post(anthropic::messages))
+        .route("/v1/responses", post(responses::responses))
         .route_layer(axum::middleware::from_fn_with_state(permits, admission));
 
     let api_key = auth::ApiKey::from_env();
@@ -230,6 +236,8 @@ async fn main() {
         .route("/v1/load_lora_adapter", post(lora_admin::load_lora_adapter))
         .route("/v1/unload_lora_adapter", post(lora_admin::unload_lora_adapter))
         .route("/v1/audio/voices", get(audio_voices))
+        // renders a prompt and generates nothing: outside the admission cap
+        .route("/v1/messages/count_tokens", post(anthropic::count_tokens))
         // long-lived sockets: outside the admission cap, as on the Python frontend
         .route("/", any(ws::openpi::openpi_ws))
         .route("/healthz", get(ws::openpi::healthz))
@@ -367,6 +375,8 @@ async fn admission(
 
 enum Surface {
     Chat,
+    Messages,
+    Responses,
     Speech,
     Images,
     Videos,
@@ -557,6 +567,8 @@ fn resolve_message(st: &AppState, surface: Surface) -> Result<&'static dyn OpenA
     let adapter = adapters::from_python(&st.python_adapter).ok_or(message)?;
     let ok = match surface {
         Surface::Chat => adapter.supports_chat(),
+        Surface::Messages => adapter.supports_messages(),
+        Surface::Responses => adapter.supports_responses(),
         Surface::Speech => adapter.supports_speech(),
         Surface::Images => adapter.supports_images(),
         Surface::Videos => adapter.supports_videos(),

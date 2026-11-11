@@ -214,6 +214,21 @@ pub trait OpenAIAdapter: Send + Sync {
         false
     }
 
+    /// `/v1/messages` (Anthropic) and `/v1/responses`, translated onto chat.
+    fn supports_messages(&self) -> bool {
+        false
+    }
+
+    fn supports_responses(&self) -> bool {
+        false
+    }
+
+    /// The chat template's `reasoning_effort` levels, least first, which the
+    /// agent routes map an effort onto; none for a template without them.
+    fn reasoning_efforts(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     /// `/v1/realtime`: the model can continue a hypothesis it is handed.
     fn supports_realtime_transcription(&self) -> bool {
         false

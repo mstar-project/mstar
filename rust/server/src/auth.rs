@@ -1,7 +1,8 @@
 //! Optional API key (`MSTAR_API_KEY`), the same rule as the Python server's
 //! `mstar/api_server/auth.py`: when set, every route except the probes in
 //! `UNAUTHENTICATED_PATHS` needs `Authorization: Bearer <key>`, a WebSocket at
-//! its handshake. A deployment that serves the openpi socket also takes
+//! its handshake. Anthropic's routes take `x-api-key: <key>` too, and refuse in
+//! Anthropic's error shape. A deployment that serves the openpi socket also takes
 //! openpi_client's conventions there, and only there: `Authorization: Api-Key
 //! <key>` on the `/` handshake, and `/healthz` without a key. Applied once as a
 //! layer over the whole router, so a route added later is covered too.
@@ -23,6 +24,10 @@ pub const API_KEY_ENV: &str = "MSTAR_API_KEY";
 /// name; never prompts or outputs).
 pub const UNAUTHENTICATED_PATHS: &[&str] = &["/health", "/metrics"];
 
+/// Anthropic's routes. Its SDKs and Claude Code send an API key as `x-api-key`
+/// (`Authorization: Bearer` only for an auth token), so these take either.
+pub const ANTHROPIC_PATHS: &[&str] = &["/v1/messages", "/v1/messages/count_tokens"];
+
 /// The deployment's key; `None` turns the check off. An empty value is no key.
 #[derive(Clone)]
 pub struct ApiKey(Option<Arc<[u8]>>);
@@ -43,12 +48,20 @@ impl ApiKey {
         self.0.is_some()
     }
 
-    fn accepts(&self, authorization: Option<&[u8]>, schemes: &[&[u8]]) -> bool {
+    /// The key under `Authorization` with one of `schemes`, or as `x_api_key`
+    /// when given (Anthropic's routes). Each token given is compared, whichever matches.
+    fn accepts(
+        &self,
+        authorization: Option<&[u8]>,
+        schemes: &[&[u8]],
+        x_api_key: Option<&[u8]>,
+    ) -> bool {
         let Some(key) = &self.0 else { return true };
-        let Some(token) = authorization.and_then(|v| scheme_token(v, schemes)) else {
-            return false;
-        };
-        ct_eq(key, token)
+        let bearer = authorization
+            .and_then(|v| scheme_token(v, schemes))
+            .is_some_and(|t| ct_eq(key, t));
+        let x = x_api_key.is_some_and(|t| ct_eq(key, t.trim_ascii()));
+        bearer | x
     }
 }
 
@@ -90,18 +103,32 @@ pub async fn require_api_key(State(key): State<ApiKey>, req: Request, next: Next
     let openpi = matches!(path, "/" | "/healthz") && crate::ws::openpi::policy().is_some();
     let openpi_health = openpi && path == "/healthz" && !socket;
     let schemes = if openpi && path == "/" && socket { OPENPI_SCHEMES } else { SCHEMES };
-    if UNAUTHENTICATED_PATHS.contains(&path) || openpi_health || key.accepts(authorization, schemes) {
+    let anthropic = ANTHROPIC_PATHS.contains(&path);
+    let x_api_key = anthropic
+        .then(|| req.headers().get("x-api-key").map(|v| v.as_bytes()))
+        .flatten();
+    if UNAUTHENTICATED_PATHS.contains(&path)
+        || openpi_health
+        || key.accepts(authorization, schemes, x_api_key)
+    {
         return next.run(req).await;
     }
     if socket {
         // the Python frontend refuses the handshake (closing before accept): a 403
         return axum::http::StatusCode::FORBIDDEN.into_response();
     }
-    let mut resp = crate::error(
-        401,
-        "missing or invalid API key; send 'Authorization: Bearer <key>'",
-        "invalid_request_error",
-    );
+    let mut resp = if anthropic {
+        crate::anthropic::error(
+            401,
+            "missing or invalid API key; send 'x-api-key: <key>' or 'Authorization: Bearer <key>'",
+        )
+    } else {
+        crate::error(
+            401,
+            "missing or invalid API key; send 'Authorization: Bearer <key>'",
+            "invalid_request_error",
+        )
+    };
     resp.headers_mut()
         .insert(WWW_AUTHENTICATE, "Bearer".parse().unwrap());
     resp
@@ -186,6 +213,36 @@ mod tests {
                 "{path}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn anthropic_routes_take_x_api_key_and_refuse_in_their_shape() {
+        let app = |key: Option<&str>| {
+            Router::new()
+                .route("/v1/messages", axum::routing::post(|| async { "message" }))
+                .route("/v1/models", get(|| async { "models" }))
+                .layer(axum::middleware::from_fn_with_state(ApiKey::new(key.map(str::to_string)), require_api_key))
+        };
+        let send = |path: &str, headers: &[(&str, &str)]| {
+            let mut req = axum::http::Request::builder().method(if path == "/v1/messages" { "POST" } else { "GET" }).uri(path);
+            for (k, v) in headers {
+                req = req.header(*k, *v);
+            }
+            app(Some("s3cret")).oneshot(req.body(Body::empty()).unwrap())
+        };
+        assert_eq!(send("/v1/messages", &[("x-api-key", " s3cret ")]).await.unwrap().status(), StatusCode::OK);
+        assert_eq!(send("/v1/messages", &[("authorization", "Bearer s3cret")]).await.unwrap().status(), StatusCode::OK);
+        // a wrong bearer beside the right x-api-key: each is compared, whichever matches
+        assert_eq!(send("/v1/messages", &[("x-api-key", "s3cret"), ("authorization", "Bearer no")]).await.unwrap().status(), StatusCode::OK);
+        assert_eq!(send("/v1/models", &[("x-api-key", "s3cret")]).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+        let denied = send("/v1/messages", &[("x-api-key", "wrong")]).await.unwrap();
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(denied.headers()[WWW_AUTHENTICATE], "Bearer");
+        let body = axum::body::to_bytes(denied.into_body(), 1 << 16).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["type"], "error");
+        assert_eq!(body["error"]["type"], "authentication_error");
+        assert_eq!(app(None).oneshot(axum::http::Request::post("/v1/messages").body(Body::empty()).unwrap()).await.unwrap().status(), StatusCode::OK);
     }
 
     #[test]

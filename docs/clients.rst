@@ -496,11 +496,11 @@ Endpoints and model coverage:
    * - ``POST /v1/messages``, ``POST /v1/messages/count_tokens``
      - ``glm52``, ``glm5_next``
      - Anthropic's Messages API, for Claude Code: streamed or whole, tools, thinking blocks
-       (not on ``--rust-frontend``; see :ref:`coding-agents`).
+       (see :ref:`coding-agents`).
    * - ``POST /v1/responses``
      - ``glm52``, ``glm5_next``
      - OpenAI's Responses API, stateless, for Codex: streamed or whole, function tools,
-       reasoning items (not on ``--rust-frontend``; see :ref:`coding-agents`).
+       reasoning items (see :ref:`coding-agents`).
    * - ``POST /v1/load_lora_adapter``, ``POST /v1/unload_lora_adapter``
      - any LoRA model whose ``resources: lora:`` block sets ``runtime_updates: true``;
        404 otherwise
@@ -754,14 +754,16 @@ Per-model notes:
 Coding agents
 -------------
 
-GLM-5.2 (``glm52``) and GLM-5.3 (``glm5_next``) serve the three APIs coding agents speak, on
-the Python frontend only (``--rust-frontend`` answers ``404``): ``POST /v1/chat/completions``,
-Anthropic's ``POST /v1/messages`` and ``POST /v1/messages/count_tokens`` (Claude Code), and
-OpenAI's ``POST /v1/responses`` (Codex). All three run one chat path: the messages and
-``tools`` go to the checkpoint's chat template, and the reply comes back with its reasoning
-and tool calls split out, streamed or whole. Any ``model`` name gets the loaded model
-(with LoRA adapters served, ``model`` picks one as on chat completions), ``count_tokens`` counts the prompt as the same request would render it, and responses are
-stateless.
+GLM-5.2 (``glm52``) and GLM-5.3 (``glm5_next``) serve the three APIs coding agents speak:
+``POST /v1/chat/completions``, Anthropic's ``POST /v1/messages`` and
+``POST /v1/messages/count_tokens`` (Claude Code), and OpenAI's ``POST /v1/responses``
+(Codex). All three run one chat path, on ``mstar-server`` and the Python frontend alike: the
+messages and ``tools`` go to the checkpoint's chat template, and the reply comes back with its
+reasoning and tool calls split out, streamed or whole. Any ``model`` name gets the loaded
+model (with LoRA adapters served, ``model`` picks one as on chat completions),
+``count_tokens`` counts the prompt as the same request would render it, and responses are
+stateless. On ``mstar-server``, a stream that fails after it started ends with an error event
+in its API's shape and no ``[DONE]`` or ``message_stop``.
 
 - **Stop strings.** ``stop`` (chat completions, at most 4) and ``stop_sequences`` (Messages,
   at most 16), each of at most 256 characters, match the answer only, not the reasoning or a
@@ -782,8 +784,8 @@ stateless.
   checked as Anthropic checks it but not enforced. ``output_config.effort`` (Messages) and
   ``reasoning.effort`` (Responses) pick the template's level by name: ``high`` (Claude Code's
   default) and ``medium`` are GLM's ``high``, ``max`` and ``xhigh`` its ``max``.
-  ``context_management`` is served for keeping every thinking block; other edits are a ``400``. Claude Code's deferred
-  tools (``defer_loading``) and its tool search's ``tool_reference`` results go to the
+  ``context_management`` is served for keeping every thinking block; other edits are a
+  ``400``. Claude Code's deferred tools (``defer_loading``) and its tool search's ``tool_reference`` results go to the
   template, which lists a deferred tool once a result references it. Thinking blocks carry
   an empty ``signature``; a Responses reply carries its reasoning as a ``reasoning`` item's
   text.

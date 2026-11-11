@@ -607,7 +607,8 @@ GLM-5.2 / GLM-5.3-Flash (``glm52``, ``glm5_next``)
   strings of up to 256 characters, matched on the answer. ``enable_thinking``,
   ``reasoning_effort`` and ``clear_thinking`` reach the template, flat in the body or under
   ``chat_template_kwargs``, which drops any other key. GLM-5.3-Flash always reasons, so
-  ``enable_thinking: false`` is a 400 there.
+  ``enable_thinking: false`` is a 400 there. See :ref:`coding-agents` for
+  ``/v1/messages`` and ``/v1/responses``.
 - GLM-5.2's ``max_tokens`` may run to its serving window (``index_topk``, or
   ``max_seq_len`` with ``dsa_long_context``). GLM-5.3-Flash holds contexts to
   ``index_topk`` (2048), where dense MLA computes exactly what its sparse attention does,
