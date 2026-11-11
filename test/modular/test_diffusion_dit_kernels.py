@@ -232,6 +232,12 @@ def test_dit_kernels_round_as_the_eager_ops():
         norm.weight.normal_(std=0.2)
     x, f = rand(40, 3, 128), freqs(40)
     assert torch.equal(dit_kernels.qk_norm_rope(x, norm.weight, f, norm.eps), rope(norm(x), f))
+    k = rand(40, 3, 128)
+    kn = QwenRMSNorm(128, 1e-6).to(dev, bf16)
+    with torch.no_grad():
+        kn.weight.normal_(std=0.2)
+    got = dit_kernels.qk_pair_norm_rope(x, k, norm.weight, kn.weight, f, norm.eps)
+    assert all(map(torch.equal, got, (rope(norm(x), f), rope(kn(k), f))))
     x = rand(2, 40, 3, 128)
     for f in (freqs(40), freqs(2, 40)):
         assert torch.equal(dit_kernels.qk_norm_rope(x, norm.weight, f, norm.eps), rope(norm(x), f))

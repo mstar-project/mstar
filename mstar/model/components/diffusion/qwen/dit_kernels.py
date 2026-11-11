@@ -5,13 +5,14 @@ Each kernel rounds to bf16 exactly where the eager ops do, so the fused and the 
 (the served output stays identical to the reference pipeline's). Off CUDA, or for a shape a kernel does not take,
 the callers run the eager ops (``fits``).
 
-* :func:`qk_norm_rope` (one part) and :func:`joint_qk_norm_rope` (text and image parts into one joint tensor):
+* :func:`qk_norm_rope` (one part; :func:`qk_pair_norm_rope` does q and k in one launch) and
+  :func:`joint_qk_pair_norm_rope` (text and image parts of q and k into joint tensors):
   ``QwenRMSNorm`` of each 128-wide head, then the complex rotary product. The variance is
   summed in the order of PyTorch's reduction for a contiguous 128-wide row: 32 lanes of 4 consecutive values,
   ``((x0 + x1) + x2) + x3``, then a shuffle-down tree (offsets 16, 8, 4, 2, 1); the rotation is CUDA's complex
   multiply, ``re = fma(a, c, -(b d))``, ``im = fma(a, d, b c)``. Text and image parts go straight into the joint
   q (or k) tensor, so there is no concatenation either. One program per token reads its rotation once for all
-  heads; :func:`joint_qk_pair_norm_rope` does q and k in the same launch.
+  heads (and for k beside q).
 * :func:`modulate`: ``x * (1 + scale) + shift`` with two parameter sets along the tokens (``zero_cond_t``: the
   target's tokens take the step's, the references' timestep 0's), one pass instead of the per-token select.
 * :func:`gated_add`: ``x + gate * y``, the same two parameter sets.
@@ -240,25 +241,21 @@ def _(x, weight, freqs, eps):
     return torch.empty(x.shape, dtype=x.dtype, device=x.device)
 
 
-@torch.library.custom_op("mstar::qwen_image_joint_qk_norm_rope", mutates_args=())
-def joint_qk_norm_rope(
-    txt: torch.Tensor, img: torch.Tensor, txt_weight: torch.Tensor, img_weight: torch.Tensor,
-    txt_freqs: torch.Tensor, img_freqs: torch.Tensor, eps: float,
-) -> torch.Tensor:
-    """``cat([rope(norm_txt(txt), txt_freqs), rope(norm_img(img), img_freqs)], dim=1)``: ``txt [R, Lt, H, 128]`` and
-    ``img [R, Li, H, 128]`` bf16 (last dim contiguous), ``txt_freqs`` complex64 ``[R, Lt, 64]`` (or ``[Lt, 64]``),
-    ``img_freqs`` ``[Li, 64]``; each part written straight into its slice of the joint ``[R, Lt + Li, H, 128]``."""
-    rows, lt, heads, dim = txt.shape
-    out = torch.empty((rows, lt + img.shape[1], heads, dim), dtype=img.dtype, device=img.device)
-    _norm_rope_into(txt, txt_weight, txt_freqs, eps, out[:, :lt])
-    _norm_rope_into(img, img_weight, img_freqs, eps, out[:, lt:])
-    return out
+@torch.library.custom_op("mstar::dit_qk_pair_norm_rope", mutates_args=())
+def qk_pair_norm_rope(
+    q: torch.Tensor, k: torch.Tensor, q_weight: torch.Tensor, k_weight: torch.Tensor, freqs: torch.Tensor, eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """:func:`qk_norm_rope` of q and of k (``[N, H, 128]``, k shaped and strided as q) in one launch."""
+    oq = torch.empty(q.shape, dtype=q.dtype, device=q.device)
+    ok = torch.empty_like(oq)
+    _norm_rope_into(q[None], q_weight, freqs, eps, oq[None], (k[None], k_weight, ok[None]))
+    return oq, ok
 
 
-@joint_qk_norm_rope.register_fake
-def _(txt, img, txt_weight, img_weight, txt_freqs, img_freqs, eps):
-    rows, lt, heads, dim = txt.shape
-    return txt.new_empty((rows, lt + img.shape[1], heads, dim))
+@qk_pair_norm_rope.register_fake
+def _(q, k, q_weight, k_weight, freqs, eps):
+    oq = torch.empty(q.shape, dtype=q.dtype, device=q.device)
+    return oq, torch.empty_like(oq)
 
 
 @torch.library.custom_op("mstar::dit_joint_qk_pair_norm_rope", mutates_args=())
@@ -267,7 +264,10 @@ def joint_qk_pair_norm_rope(
     q_txt_weight: torch.Tensor, q_img_weight: torch.Tensor, k_txt_weight: torch.Tensor, k_img_weight: torch.Tensor,
     txt_freqs: torch.Tensor, img_freqs: torch.Tensor, eps: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """:func:`joint_qk_norm_rope` of q and of k (each part of k shaped and strided as q's), one launch per part."""
+    """``[txt | img]`` along the tokens of q and of k, every part per-head normed and rotated (``txt [R, Lt, H, 128]``,
+    ``img [R, Li, H, 128]``, ``txt_freqs`` ``[R, Lt, 64]`` or ``[Lt, 64]``, ``img_freqs`` ``[Li, 64]``; each part of k
+    shaped and strided as q's): each part is written straight into its slice of the joint tensor, one launch per
+    part for q and k together."""
     rows, lt, heads, dim = q_txt.shape
     q = torch.empty((rows, lt + q_img.shape[1], heads, dim), dtype=q_img.dtype, device=q_img.device)
     k = torch.empty_like(q)
