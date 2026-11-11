@@ -223,8 +223,12 @@ def test_tool_choice_none_leaves_the_tools_out(tmp_path):
 
 
 @pytest.mark.parametrize("body", [
-    {"tools": [WEATHER], "tool_choice": "required"},
-    {"tools": [WEATHER], "tool_choice": {"type": "function", "function": {"name": "get_weather"}}},
+    {"tool_choice": "required"},
+    {"tools": [WEATHER], "tool_choice": "any"},
+    {"tools": [WEATHER], "tool_choice": {"type": "function", "function": {"name": "get_time"}}},
+    {"tools": [WEATHER], "tool_choice": {"type": "function", "name": "get_weather"}},
+    {"tools": [WEATHER], "tool_choice": "required", "enable_thinking": True},
+    {"reply_prefix": "<tool_call>get_weather"},
     {"tools": [{"type": "function"}]},
     {"tools": "get_weather"},
     {"tools": [{"type": "function", "function": {"name": "f", "parameters": "{}"}}]},
@@ -249,6 +253,54 @@ def test_a_refused_image_leaves_no_upload(model, tmp_path):
     assert list(tmp_path.iterdir()) == []
 
 
+TIME = {"type": "function", "function": {"name": "get_time", "parameters": {"type": "object", "properties": {}}}}
+
+
+ARGS = "<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call>"
+
+
+@pytest.mark.parametrize("model, choice, tools, prefix, thinking, reply", [
+    # one tool: it is named, and the reply starts at the arguments
+    ("glm52", "required", [WEATHER], "<tool_call>get_weather", False, ARGS),
+    ("glm52", "required", [WEATHER, TIME], "<tool_call>", False, "get_weather" + ARGS),
+    ("glm52", {"type": "function", "function": {"name": "get_weather"}}, [WEATHER, TIME],
+     "<tool_call>get_weather", False, ARGS),
+    ("glm5_next", "required", [WEATHER, TIME], "</think><tool_call>", None, "get_weather" + ARGS),
+    ("glm5_next", {"type": "function", "function": {"name": "get_weather"}}, [WEATHER, TIME],
+     "</think><tool_call>get_weather", None, ARGS),
+])
+def test_a_forced_tool_choice_opens_the_call_in_the_prompt(model, choice, tools, prefix, thinking, reply, tmp_path):
+    adapter = adapters.get_adapter(model)
+    req = _chat(tools=tools, tool_choice=choice)
+    mk = adapter.chat_to_request(req, tmp_path).model_kwargs
+    assert mk["reply_prefix"] == prefix and mk["tools"] == tools
+    # GLM-5.2's prompt ends <think></think>, as a turn that does not reason
+    assert mk["chat_template_kwargs"].get("enable_thinking") is thinking
+    p = adapter.make_output_parser(req)
+    msg = _message(p, reply)
+    (call,) = msg["tool_calls"]
+    assert call["function"] == {"name": "get_weather", "arguments": '{"city": "Paris"}'}
+    assert msg["content"] is None and "reasoning_content" not in msg and p.finish_reason == "tool_calls"
+
+
+@pytest.mark.parametrize("model", ["glm52", "glm5_next"])
+def test_a_forced_function_is_the_only_one_its_call_can_name(model):
+    """A forced get_weather's call cannot turn into one to get_weather_hourly."""
+    hourly = {"type": "function", "function": {
+        "name": "get_weather_hourly", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}}
+    req = _chat(tools=[WEATHER, hourly], tool_choice={"type": "function", "function": {"name": "get_weather"}})
+    p = adapters.get_adapter(model).make_output_parser(req)
+    msg = _message(p, "_hourly" + ARGS)
+    assert not msg.get("tool_calls") and p.finish_reason == "stop"
+    assert msg["content"].startswith("<tool_call>get_weather_hourly")
+
+
+def test_a_forced_call_to_a_made_up_function_stays_text():
+    p = glm_chat.GlmReplyParser(thinking=False, tools=TOOLS, forced_call="")
+    msg = _message(p, "rm_rf<arg_key>path</arg_key><arg_value>/</arg_value></tool_call>")
+    assert msg["content"].startswith("<tool_call>rm_rf<arg_key>") and p.finish_reason == "stop"
+
+
 class _RecordingTokenizer:
     chat_template = "{{ messages }}"
     refuse = False
@@ -264,6 +316,10 @@ class _RecordingTokenizer:
             raise TemplateError("tool messages must follow a call")
         self.calls.append((messages, kw))
         return torch.tensor([[1, 2, 3]])
+
+    def encode(self, text, add_special_tokens=True):
+        assert not add_special_tokens  # no [gMASK]<sop> mid prompt
+        return [100 + len(text)]
 
 
 def _glm52():
@@ -311,6 +367,19 @@ def test_process_prompt_renders_the_chat(make, tmp_path):
         m.process_prompt("hello", ["text"], ["text"])
 
 
+@pytest.mark.parametrize("make", [_glm52, _glm53])
+def test_process_prompt_ends_with_the_reply_prefix(make, tmp_path):
+    pytest.importorskip("torch")
+    m = make()
+    mk = adapters.get_adapter("glm52").chat_to_request(
+        _chat(tools=[WEATHER], tool_choice="required"), tmp_path).model_kwargs
+    out = m.process_prompt("ignored", ["text"], ["text"], **mk)
+    assert out.new_input_tensors["text_inputs"][0].tolist() == [1, 2, 3, 100 + len("<tool_call>get_weather")]
+    m._tokenizer_mode = "byte"
+    out = m.process_prompt("hi", ["text"], ["text"], reply_prefix="<t")
+    assert out.new_input_tensors["text_inputs"][0].tolist() == list(b"hi<t")
+
+
 @pytest.mark.parametrize("raw", ["1e400", "[1e309]", "-1e999", '{"x": 1e400}'])
 def test_an_overflowing_number_stays_text(raw):
     # json.loads gives inf; dumped back it is "Infinity", which JSON.parse rejects
@@ -347,9 +416,11 @@ def test_the_chat_stays_in_the_data_worker(make, tmp_path):
     tool = {"type": "function", "function": {"name": "f", "parameters": {
         "type": "object", "properties": {"n": {"type": "integer", "maximum": 2**64}}}}}
     mk = adapters.get_adapter("glm52").chat_to_request(_chat(tools=[tool]), tmp_path).model_kwargs
+    mk["reply_prefix"] = "<tool_call>f"
     # what the data worker sends the conductor: the wire carries no int past 64 bits
     sent = {k: v for k, v in mk.items() if k not in make().PREPROCESS_ONLY_KWARGS}
-    assert {"messages", "tools", "chat_template_kwargs"} <= set(mk) and not {"messages", "tools"} & set(sent)
+    assert {"messages", "tools", "chat_template_kwargs"} <= set(mk)
+    assert not {"messages", "tools", "reply_prefix"} & set(sent)
     body = NewRequestConductor("r", {}, ["text"], ["text"], {}, sent)
     wire.encode(ConductorMessage(message_type=ConductorMessageType.NEW_REQUEST, body=body))
 
