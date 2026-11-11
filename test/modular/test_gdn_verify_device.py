@@ -582,12 +582,14 @@ def test_the_settle_kernel_is_the_old_settle_bit_for_bit(dtype, accepted):
 @pytest.mark.parametrize("corrupt", [None, "kv", "gdn", "carry"])
 def test_an_offload_with_a_pending_verify_result_brings_every_resource_back(monkeypatch, corrupt):
     """Row 2's verify result is recorded but not applied when it is offloaded:
-    the offload settles it first, moves its KV pages to host, and gives up its
-    resident row; the reload brings the pages back, and its GDN slot and the
-    sampler's rows, which stayed on device, are as they were (the engine's
-    fingerprints, under the debug switch). The run is then plain greedy. The
-    controls change the GDN slot or the sampler's last-token row while the
-    request is offloaded, or its KV pages' host copy, and the reload raises."""
+    the offload moves its KV pages to host, gives up its resident row and marks
+    the row returning (`Engine._mark_offloaded`), leaving the result held. The
+    reload brings the pages back, and its GDN slot and the sampler's rows, which
+    stayed on device, are as they were (the engine's fingerprints, under the
+    debug switch); the held result comes due at the row's first admit back, and
+    the run is then plain greedy. The controls change the GDN slot or the
+    sampler's last-token row while the request is offloaded, or its KV pages'
+    host copy, and the reload raises."""
     if (reason := _cuda_reason()) is not None:
         pytest.skip(reason)
     import hybrid_toy as toy
@@ -604,9 +606,11 @@ def test_an_offload_with_a_pending_verify_result_brings_every_resource_back(monk
     driver.step([1, 2])
     driver.step([1])
     ledger = eng._drafts[toy.NODE].ledger
-    assert ledger.pending(2) and not eng.verify_unrecorded(2)
+    assert ledger.pending(2) and not eng.verify_unrecorded(toy.NODE, 2)
     assert eng.offload_request(toy.NODE, 2) > 0
-    assert not ledger.pending(2) and eng.residency(toy.NODE, 2) == Residency.ON_HOST
+    # the result stays held, due at the row's first admit back
+    assert ledger.pending(2) and 2 in ledger._returning
+    assert eng.residency(toy.NODE, 2) == Residency.ON_HOST
     if corrupt == "kv":
         host = eng._resources["kv"]._cpu_pool
         (state,) = host.offloaded[2].values()
@@ -625,5 +629,9 @@ def test_an_offload_with_a_pending_verify_result_brings_every_resource_back(monk
             eng._poll_print_checks(wait=True)
         return
     assert eng.reload_request(toy.NODE, 2)
+    assert 2 in ledger._returning
+    driver.step([1, 2])
+    # its first admit back took everything it held
+    assert 2 not in ledger._returning
     driver.run(list(PROMPTS))
     _check(driver.out, twin)
