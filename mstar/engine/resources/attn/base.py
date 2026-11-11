@@ -87,7 +87,7 @@ class AttentionManager(AttentionResource):
     # first alone, and a window group is whole on every partner
     _group_idx: int = 0
 
-    def exchanges(self, label: str | None = None) -> bool:
+    def step_exchanges(self, label: str | None = None) -> bool:
         """Whether a call for ``label`` (the current one by default) goes through `exchange`: on a node
         whose steps may split over SP ranks, so a copied step's heads are sliced over a pool stored by
         head too. A pool stored by position (`PlacedAttention`) exchanges only a step that splits
@@ -498,8 +498,8 @@ class PlacedAttention(AttentionManager):
             kwargs.get("batch_size"), max_total_tokens,
         )
 
-    def exchanges(self, label: str | None = None) -> bool:
-        if not super().exchanges(label):
+    def step_exchanges(self, label: str | None = None) -> bool:
+        if not super().step_exchanges(label):
             return False
         return self._placement is None or self._shard.split_range(label or self._default_label) is not None
 
