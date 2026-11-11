@@ -366,7 +366,7 @@ def test_synchronous_and_asynchronous_verify_agree_exactly(tmp_path_factory, dra
     assert sync["tau_concurrent"] == pytest.approx(async_["tau_concurrent"], rel=0.05)
 
 
-def test_flashinfer_and_fa3_verify_kernels_agree(tmp_path_factory, drafter, margin_of):
+def test_flashinfer_and_fa3_paged_kernels_agree(tmp_path_factory, drafter, margin_of):
     plain = _run(tmp_path_factory, drafter, "plain", draft_mode=None)
     fi = _run(tmp_path_factory, drafter, "sync_flashinfer", draft_mode="synchronous", verify_backend="flashinfer")
     _check_margins(plain["sequential"], fi["sequential"], margin_of, "flashinfer verify")
