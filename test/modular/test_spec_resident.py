@@ -341,7 +341,8 @@ def test_a_row_runs_to_the_client_limit_inside_the_slack(synchronous):
 
 
 def test_a_take_back_lowers_every_copy_that_holds_the_stream():
-    """A follower replaying rank 0's offload may be mid-offload or mid-reload."""
+    """Every copy that holds the stream is lowered: both while an offload claim is open, and the host's alone,
+    which no admit reaches today."""
     from mstar.engine.resources.kv.cache import GroupPages
 
     node = _Node({1: 5})
