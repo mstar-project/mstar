@@ -86,3 +86,11 @@ expected outputs. A read whose transfer status cannot be determined still holds
 the barrier, even if it has no listed destination buffers. Any retained
 destination buffers remain pinned. The existing
 ``MSTAR_DRAIN_TTL_S`` timeout can still force cleanup of a stalled request.
+While waiting for a forward's CPU work, a worker without a speculative plan or
+side lane services teardown messages after admission has settled. Requests held
+by the running step stay protected; unrelated requests can drain and release
+their concurrency slots without waiting for that forward to return.
+GPU completion waits also service unrelated teardowns once every launched step
+has admitted and no unsubmitted pre-plan holds state. Both the current and next
+batch, including side-lane rows, remain protected until their usual teardown
+points. A completion waiter wakes the main thread as soon as the GPU finishes.

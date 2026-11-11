@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import time as _time
 from collections.abc import Collection, Iterable, Mapping
+from concurrent.futures import wait
 from functools import partial
 from types import MappingProxyType
 
@@ -366,6 +367,7 @@ class StepPipeline:
             if enable_nvtx:
                 range_push("worker.await_gpu", synchronize=False)
             t0 = _time.perf_counter() if phase_period else 0.0
+            self._wait_with_teardown(pending)
             outputs = self._step_result(pending)
             if phase_period:
                 timer.record("await_gpu", _time.perf_counter() - t0)
@@ -669,7 +671,12 @@ class StepPipeline:
             set_step_key(step_key(step.node_name, step.graph_walk))
         try:
             with self.timer.span(span, cpu=f"{span}.cpu"):
-                self.executor.postprocess(step, outputs, clear_loop_stops=chain)
+                if self.executor.device.type == "cpu":
+                    self.executor.postprocess(step, outputs, clear_loop_stops=chain)
+                else:
+                    self.executor.postprocess(
+                        step, outputs, clear_loop_stops=chain, while_waiting=self._service_gpu_teardown,
+                    )
         finally:
             if keyed:
                 set_step_key(None)
@@ -677,6 +684,25 @@ class StepPipeline:
         self._report_failures()
         if self._metrics is not None:
             self._metrics.step_done(step.node_name, step.graph_walk, step.node_batch.inputs, step.submitted_at)
+
+    def _service_gpu_teardown(self) -> None:
+        """Release unrelated rows after every launched step has admitted."""
+        if self._speculation is not None and self._speculation.plan_future is not None:
+            return
+        steps = (self.pending, self._spec_pending, self.side_pending)
+        for step in steps:
+            if step is not None:
+                admitted = step.node_batch.launch_started_event
+                if admitted is not None and not admitted.is_set():
+                    return
+        # N+1 is submitted before N's postprocess, but does not replace the
+        # chain's held rows until afterwards. Its fresh rows need protection too.
+        held = set(self.in_flight_rids)
+        for step in steps:
+            if step is not None:
+                held.update(step.batch.request_to_worker_graph)
+        self.ingest.process_messages()
+        self._teardown(held)
 
     def _count_turn(self, pending: "PendingBatch | None") -> None:
         """Once ``pending``'s admit has settled (``_await_admit_settled``): if
@@ -728,6 +754,21 @@ class StepPipeline:
             last_in_line=partial(self.scheduler.last_in_line, node, walk),
             could_refill=partial(self.scheduler.could_refill, node, walk, batch_ids),
         )
+
+    def _wait_with_teardown(self, pending: PendingBatch) -> None:
+        """Service teardown while a serial step's CPU forward is outstanding.
+
+        A speculation may own a pre-plan, and a side step may still be admitting;
+        those paths keep their existing fences. In-flight rows stay protected.
+        """
+        if self._speculation is not None or self._has_side_lane:
+            return
+        while not pending.future.done():
+            if wait((pending.future,), timeout=0.01).done:
+                break
+            self._await_admit_settled(pending)
+            self.ingest.process_messages()
+            self._teardown(self.in_flight_rids)
 
     def _step_result(self, pending: PendingBatch) -> BatchedModelOutput:
         """N's outputs. A forward that raised becomes N's verdict instead: no

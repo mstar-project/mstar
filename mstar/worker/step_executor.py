@@ -1,6 +1,6 @@
 """One step, from launch to publish: the GPU thread's body, the plan thread's
 pre-plan, and the postprocess that waits on the GPU, checks stops and routes the
-outputs. Owns both thread pools, since everything that runs on them is its code:
+outputs. Owns its thread pools, since everything that runs on them is its code:
 the pipeline gets back futures and events to wait on."""
 from __future__ import annotations
 
@@ -9,9 +9,10 @@ import math
 import threading
 import time
 import time as _time
-from collections.abc import Collection, Mapping
-from concurrent.futures import Future
+from collections.abc import Callable, Collection, Mapping
+from concurrent.futures import Future, wait
 from dataclasses import dataclass
+from functools import partial
 from typing import Any, NamedTuple
 
 import torch
@@ -367,6 +368,7 @@ class StepExecutor:
         )
         self._gpu_pool: ThreadPool | InlineExecutor | None = None
         self._plan_pool: ThreadPool | InlineExecutor | None = None
+        self._wait_pool: ThreadPool | None = None
         # ``knobs: step_threads: serial``: the GPU and plan threads' work runs on the main thread
         self._serial_steps = False
         # lane -> its stream, made on the lane's first step
@@ -688,19 +690,39 @@ class StepExecutor:
         not the pipeline's per-lane rows, which defer teardowns."""
         self._set_in_flight(batch, False)
 
-    def wait_for_step(self, batch_N: PendingBatch) -> None:
+    def wait_for_step(self, batch_N: PendingBatch, *, while_waiting: Callable[[], None] | None = None) -> None:
         """Wait for batch N's GPU work: its completion event, or the whole
         device when it has none."""
         if self.device.type == "cpu":
             return
         if batch_N.node_batch.completion_event is not None:
             with self.timer.span("worker.postprocess.event_sync"):
-                batch_N.node_batch.completion_event.synchronize()
+                event = batch_N.node_batch.completion_event
+                if while_waiting is None:
+                    event.synchronize()
+                elif not event.query():
+                    # Wake at GPU completion, including short steps; a polling
+                    # sleep on the main thread would add its timeout to them.
+                    if self._wait_pool is None:
+                        self._wait_pool = ThreadPool(
+                            max_workers=1, thread_name_prefix=f"mstar-wait-{self.worker_id}",
+                            initializer=self.pin_this_thread,
+                        )
+                    future = self._wait_pool.submit(event.synchronize)
+                    try:
+                        while not wait((future,), timeout=0.01).done:
+                            while_waiting()
+                    finally:
+                        # A callback failure must not abandon the GPU fence.
+                        future.result()
         else:
             with self.timer.span("worker.postprocess.device_sync"):
                 torch.accelerator.synchronize(self.device)
 
-    def _finish_rebuild_rows(self, batch_N: PendingBatch, outputs: BatchedModelOutput) -> None:
+    def _finish_rebuild_rows(
+        self, batch_N: PendingBatch, outputs: BatchedModelOutput,
+        *, wait_for_step: Callable[[PendingBatch], None] | None = None,
+    ) -> None:
         """Take the step's rebuild rows off it and advance their rebuilds. A row's last chunk moves its rebuild to
         the next row, and the last row's lands the rebuild and lets its request's decode row run."""
         batch, node_batch = batch_N.batch, batch_N.node_batch
@@ -724,7 +746,7 @@ class StepExecutor:
         }
         if ended:
             # the step's kernels read the prepared input released here
-            self.wait_for_step(batch_N)
+            (wait_for_step or self.wait_for_step)(batch_N)
             engine = self.engine_manager.get_engine(node)
             for rid, run in ended.items():
                 self.preemption.rebuilt(rid, node, run.ran)
@@ -750,6 +772,7 @@ class StepExecutor:
         self, batch_N: PendingBatch,
         outputs: BatchedModelOutput,
         clear_loop_stops: bool = True,
+        *, while_waiting: Callable[[], None] | None = None,
     ):
         # Stage stopwatch named like the NVTX ranges below; a clock stamp, not
         # a nested `_span`, because of the two early returns.
@@ -762,7 +785,10 @@ class StepExecutor:
             self.timer.buf[f"worker.postprocess.{name}"].append(now - _pp_t)
             _pp_t = now
 
-        self._finish_rebuild_rows(batch_N, outputs)
+        wait_for_step = self.wait_for_step if while_waiting is None else partial(
+            self.wait_for_step, while_waiting=while_waiting,
+        )
+        self._finish_rebuild_rows(batch_N, outputs, wait_for_step=wait_for_step)
         if self.enable_nvtx:
             range_push("worker.postprocess.cleanup_inputs", synchronize=False)
 
@@ -809,7 +835,7 @@ class StepExecutor:
         if not valid_rids:
             # no outputs leave, but the step's kernels may still be running
             # in the slot a later step reuses
-            self.wait_for_step(batch_N)
+            wait_for_step(batch_N)
             if self.enable_nvtx:
                 range_pop(synchronize=False)
             return
@@ -836,7 +862,7 @@ class StepExecutor:
                 if not valid_rids:
                     # no outputs leave, but the step's kernels may still be
                     # running in the capture slot a later step reuses
-                    self.wait_for_step(batch_N)
+                    wait_for_step(batch_N)
                     if self.enable_nvtx:
                         range_pop(synchronize=False)
                     return
@@ -858,7 +884,7 @@ class StepExecutor:
         # Wait for batch N's completion event before proceeding
         # TODO: may need to refine this based on how it affects performance?
         if batch_N.batch.request_to_worker_graph:
-            self.wait_for_step(batch_N)
+            wait_for_step(batch_N)
 
         if self.enable_prof:
             batch_N.node_batch.exec_timings.fwd_end = time.perf_counter()

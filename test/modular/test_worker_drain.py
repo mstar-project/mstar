@@ -5,6 +5,8 @@ is in flight; no read may start after that. The hard cleanup
 (force_cleanup_request) waits for the conductor's REMOVE_REQUEST.
 """
 
+from concurrent.futures import Future
+from threading import Event
 from types import SimpleNamespace
 
 import pytest
@@ -114,6 +116,84 @@ def _reads_done(w):
     ]
 
 
+def test_long_forward_services_other_requests_teardown_before_it_finishes():
+    w = _worker(known_rids=("old", "busy"), in_flight=("busy",))
+    future = Future()
+    admitted = Event()
+    admitted.set()
+    pending = SimpleNamespace(future=future, node_batch=SimpleNamespace(launch_started_event=admitted))
+    polls = []
+
+    def messages():
+        assert not future.done()
+        polls.append(True)
+        if len(polls) == 1:
+            return [WorkerMessage(WorkerMessageType.DRAIN_REQUEST, DrainRequest(rid))
+                    for rid in ("old", "busy")]
+        assert [m.body.request_id for m in _reads_done(w)] == ["old"]
+        assert w.forced == [], "draining must retain tensors until REMOVE"
+        return [WorkerMessage(WorkerMessageType.REMOVE_REQUEST, RemoveRequest(rid))
+                for rid in ("old", "busy")]
+
+    def release(rid):
+        assert rid == "old" and not future.done()
+        future.set_result(BatchedModelOutput())
+
+    w.communicator.get_all_new_messages = messages
+    w.engine_manager.remove_request = release
+    w.pipeline._wait_with_teardown(pending)
+
+    assert w.forced == ["old"]
+    assert "busy" in w.lifecycle.pending_drains
+    assert "busy" in w.lifecycle.pending_removes
+    assert w.pipeline._step_result(pending) == future.result()
+
+
+@pytest.mark.parametrize("speculation,side_lane", [(object(), False), (None, True)])
+def test_forward_wait_keeps_existing_fences_for_speculation_and_side_steps(speculation, side_lane):
+    w = _worker()
+    w.pipeline._speculation = speculation
+    w.pipeline._has_side_lane = side_lane
+    # These paths must not touch even the future until their usual wait.
+    w.pipeline._wait_with_teardown(SimpleNamespace())
+
+
+@pytest.mark.parametrize("unsettled", ["current", "next", "side", "preplan"])
+def test_gpu_wait_defers_teardown_until_admission_and_preplan_settle(unsettled):
+    w = _worker()
+    polled = []
+    w.communicator.get_all_new_messages = lambda: polled.append(True) or []
+    admitted = Event()
+    step = SimpleNamespace(
+        node_batch=SimpleNamespace(launch_started_event=admitted),
+        batch=ScheduledBatch(node_name="n", graph_walk="w", request_to_worker_graph={}),
+    )
+    if unsettled == "preplan":
+        w.pipeline._speculation = SimpleNamespace(plan_future=Future())
+    else:
+        setattr(w.pipeline, {"current": "pending", "next": "_spec_pending", "side": "side_pending"}[unsettled], step)
+
+    w.pipeline._service_gpu_teardown()
+    assert polled == []
+    if unsettled == "preplan":
+        w.pipeline._speculation.plan_future.set_result(None)
+        w.pipeline._service_gpu_teardown()
+        assert polled == [], "a finished pre-plan still owns its reserved state"
+
+    admitted.set()
+    if unsettled == "preplan":
+        w.pipeline._speculation.plan_future = None
+    w.pipeline._service_gpu_teardown()
+    assert polled == [True]
+
+
+def test_gpu_wait_ready_event_does_not_start_a_waiter():
+    w = _worker(device=torch.device("cuda"))
+    step = SimpleNamespace(node_batch=SimpleNamespace(completion_event=SimpleNamespace(query=lambda: True)))
+    w.executor.wait_for_step(step, while_waiting=lambda: pytest.fail("already complete"))
+    assert w.executor._wait_pool is None
+
+
 @pytest.mark.parametrize("enable_nvtx", [False, True])
 def test_stopped_speculative_batch_cleans_inputs_without_unmatched_nvtx(
     monkeypatch, enable_nvtx,
@@ -166,7 +246,8 @@ def test_stopped_speculative_batch_cleans_inputs_without_unmatched_nvtx(
 
 
 @pytest.mark.parametrize("has_event", [True, False])
-def test_stopped_speculative_batch_still_waits_for_its_gpu_work(monkeypatch, has_event):
+@pytest.mark.parametrize("cooperative", [False, True])
+def test_stopped_speculative_batch_still_waits_for_its_gpu_work(monkeypatch, has_event, cooperative):
     """No output of the step leaves, but a later step reuses its slot while
     its kernels may still run, so postprocess waits for them anyway."""
     w = _worker(device=torch.device("cuda"))
@@ -174,7 +255,7 @@ def test_stopped_speculative_batch_still_waits_for_its_gpu_work(monkeypatch, has
     w.tensor_manager.cleanup_collectable = lambda *args: None
     w._graph_runtime.pending_loop_stop_rids = lambda *args: {7}
     waits = []
-    event = SimpleNamespace(synchronize=lambda: waits.append("event")) if has_event else None
+    event = SimpleNamespace(synchronize=lambda: waits.append("event"), query=lambda: False) if has_event else None
     pending = SimpleNamespace(
         batch=ScheduledBatch(
             node_name="LLM", graph_walk="decode", request_to_worker_graph={7: 0},
@@ -188,7 +269,14 @@ def test_stopped_speculative_batch_still_waits_for_its_gpu_work(monkeypatch, has
     )
     monkeypatch.setattr(torch.accelerator, "synchronize", lambda device=None: waits.append("device"))
 
-    w.executor.postprocess(pending, BatchedModelOutput(per_rid_outputs={7: {}}))
+    try:
+        w.executor.postprocess(
+            pending, BatchedModelOutput(per_rid_outputs={7: {}}),
+            while_waiting=(lambda: None) if cooperative else None,
+        )
+    finally:
+        if w.executor._wait_pool is not None:
+            w.executor._wait_pool.shutdown()
 
     assert waits == ["event" if has_event else "device"]
     assert pending.batch.request_to_worker_graph == {}
