@@ -41,15 +41,15 @@ from mstar.engine.resources.recurrent.config import (
 from mstar.engine.resources.sequence_shard import (
     SeqRange,
     SeqShardSpec,
-    SeqShardStep,
     all_gather,
     head_slice,
     sharded_key_merge,
     ulysses,
 )
 from mstar.engine.resources.spec import apply_yaml_overrides, resolve_spec_dependencies
-from mstar.engine.resources.step import BucketKey, Segment, SlotLease, StepContext, SubmoduleStep
+from mstar.engine.resources.step import BucketKey, ResourceStep, Segment, SlotLease, StepContext, SubmoduleStep
 from mstar.model.components.diffusion.attention import sdpa_attention
+from mstar.model.submodule_base import with_segment_steps
 
 HEADS = 6
 CPU = torch.device("cpu")
@@ -447,10 +447,10 @@ def _split(shard, segments, walk="w", lease=None, force_prefill=False, combined=
     ctx = StepContext(request_ids=rids, graph_walk=walk, slot=0, capture=False, slot_lease=lease,
                       force_prefill=force_prefill)
     # declared once on the submodule step, as a model does, which hands it to every resource step
-    step = SubmoduleStep(
+    step = with_segment_steps(SubmoduleStep(
         segments=tuple(Segment(*seg) for seg in segments), combined_labels=combined or {},
-        steps={"shard": SeqShardStep(), "kv": KVStep()},
-    )
+        steps={"kv": KVStep()},
+    ), ["shard"])
     assert step.steps["kv"].combined_labels == (combined or {})
     plan = shard.plan(step.steps["shard"], ctx)
     return {label: (r.counts, r.rows) for label, r in plan.ranges.items()} if plan.split else None
@@ -493,7 +493,14 @@ def test_a_split_step_refuses_what_it_cant_range():
     # a resource step can't group the step's labels differently from the shard
     with pytest.raises(ValueError, match="declare them once"):
         SubmoduleStep(combined_labels={("cond", "uncond"): "cfg"},
-                      steps={"shard": SeqShardStep(), "kv": KVStep(combined_labels={("cond",): "c"})})
+                      steps={"kv": KVStep(combined_labels={("cond",): "c"})})
+    for segments in (None, (Segment("r0", "cond", 5),)):
+        with pytest.raises(ValueError, match="declare them once"):
+            SubmoduleStep(segments=segments, steps={"kv": KVStep(combined_labels={("cond",): "c"})})
+    # a string would split into characters that match no label, so every step would plan copied
+    for names in (dict(labels="video", walks=None), dict(labels=("video",), walks="gen")):
+        with pytest.raises(ValueError, match="not strings"):
+            SeqShardSpec("shard", {"n"}, axis=1, **names)
     shard = _shard()
     x = torch.arange(10.0)
     _split(shard, [("r0", "main", 10)])
@@ -524,7 +531,7 @@ def test_a_striped_shard_gives_each_rank_its_stored_positions(world, rows, count
     shard.stripe_pool = "kv"
     ctx = StepContext(request_ids=("r0", "r1"), graph_walk="w", slot=0, capture=False)
     ctx.plan_results["kv"] = _kv_plan(*rows)
-    plan = shard.plan(SeqShardStep(segments=tuple(Segment(f"r{i}", "main", n) for i, (_, n) in enumerate(rows))), ctx)
+    plan = shard.plan(ResourceStep(segments=tuple(Segment(f"r{i}", "main", n) for i, (_, n) in enumerate(rows))), ctx)
     if counts is None:
         assert not plan.split
         return
@@ -537,7 +544,7 @@ def test_a_striped_shard_refuses_a_step_it_cant_stripe():
     shard.stripe_pool = "kv"
     ctx = StepContext(request_ids=("r0",), graph_walk="w", slot=0, capture=False)
     ctx.plan_results["kv"] = KVPlanOutputs({})
-    step = SeqShardStep(segments=(Segment("r0", "main", 8),))
+    step = ResourceStep(segments=(Segment("r0", "main", 8),))
     with pytest.raises(ValueError, match="plans no such label there"):
         shard.plan(step, ctx)
     with pytest.raises(ValueError, match="which a combined label's rows"):
@@ -646,7 +653,7 @@ def _linear_step(manager, layers, variant, layout, walk, x, weight, gates, param
         tuple(slots), tuple(has),
     )}
     if shard is not None:
-        ctx.plan_results["shard"] = shard.plan(SeqShardStep(segments=segments), ctx)
+        ctx.plan_results["shard"] = shard.plan(ResourceStep(segments=segments), ctx)
         x, gates = shard.scatter("main", x, gates)
     manager.plan(LinearAttnStep(segments=segments), ctx)
     manager.set_default_label("main")
@@ -668,7 +675,7 @@ def _linear_step(manager, layers, variant, layout, walk, x, weight, gates, param
             c.reshape(n, g.n_groups, g.state_size), layers["ssm"], params["a_log"], params["d"], params["dt_bias"],
         )
     if shard is not None:
-        shard.commit(SeqShardStep(), ctx)
+        shard.commit(ResourceStep(), ctx)
     return x, out
 
 
@@ -860,7 +867,7 @@ def test_a_split_plan_ends_with_its_step(end):
     x = torch.arange(10.0)
     _split(shard, [("r0", "main", 10)])
     if end == "commit":
-        shard.commit(SeqShardStep(), None)
+        shard.commit(None, None)
     else:
         shard.reset_request("r0", free=True)
     assert shard.split_range("main") is None
@@ -881,9 +888,10 @@ def test_an_exchange_of_a_label_the_stack_didnt_scatter_is_refused_on_every_rank
         AttentionManager.exchange(attn, lambda q, k, v: q, x, x, x, label="b")
 
 
-def test_a_step_that_doesnt_declare_its_nodes_shard_is_refused_at_one_rank():
-    """A dependent of the shard refuses a step without it at any SP size, so a declare_step branch
-    that forgets it fails single-GPU tests rather than first on an SP box."""
+def test_a_step_the_shard_has_no_plan_for_is_refused_at_one_rank():
+    """A dependent of the shard refuses a step without its plan (a declare_step branch that declares
+    no segments, which the shard's step is made of) at any SP size, so it fails single-GPU tests
+    rather than first on an SP box."""
     specs = [
         KVSpec("kv", {"n"}, PagedKVConfig(num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=64, num_qo_heads=1)),
         PositionSpec("pos", {"n"}, PositionConfig(kv_cache="kv")),
@@ -896,7 +904,7 @@ def test_a_step_that_doesnt_declare_its_nodes_shard_is_refused_at_one_rank():
     pos.bind_dependencies({"shard": _shard(world=1)})
     ctx = StepContext(request_ids=("r0",), graph_walk="w", slot=0, capture=False)
     ctx.plan_results["kv"] = KVPlanOutputs({})
-    with pytest.raises(ValueError, match="doesn't declare"):
+    with pytest.raises(ValueError, match="doesn't plan"):
         pos.plan(PositionStep(segments=(Segment("r0", "main", 4),)), ctx)
 
 
@@ -973,7 +981,7 @@ def _wan_step(rank, world, grid):
 
     from mstar.engine.resources import RaggedAttentionConfig, StepRunner
     from mstar.engine.resources.base import build_resource
-    from mstar.model.submodule_base import NodeInputs
+    from mstar.model.submodule_base import NodeInputs, engine_step
     from mstar.model.wan22.components.dit import Wan22DiT
     from mstar.model.wan22.config import Wan22Config
     from mstar.model.wan22.submodules import Wan22DitSubmodule, WanStepKey
@@ -1012,7 +1020,7 @@ def _wan_step(rank, world, grid):
     split.bind_node_resources(res)
     frames, height, width = grid
     key = WanStepKey(frames, height, width, guidance=5.0, i2v=False)
-    step = split.declare_step("video_gen", ["r0"], [NodeInputs(resource_step_info=key)])
+    step = engine_step(split, "video_gen", ["r0"], [NodeInputs(resource_step_info=key)])
     step.set_ctx(StepContext(request_ids=["r0"], graph_walk="video_gen", slot=0, capture=False))
     StepRunner(split.node_resources).plan(step)
     tokens = split.num_tokens(key)

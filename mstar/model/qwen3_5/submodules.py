@@ -21,7 +21,6 @@ from mstar.engine.resources.attn.config import AttentionStep
 from mstar.engine.resources.kv.config import KVStep
 from mstar.engine.resources.linear_attn.config import LinearAttnStep
 from mstar.engine.resources.recurrent.config import RecurrentStep
-from mstar.engine.resources.sequence_shard import SeqShardStep
 from mstar.engine.resources.step import ResourceStep
 from mstar.model.components.block_loop_encoder import PackedBlockLoopEncoder
 from mstar.model.components.mrope import layout_position_ids, mrope_position_ids
@@ -42,7 +41,6 @@ from mstar.model.qwen3_5.config import (
     GDN_STATE,
     KV_CACHE,
     LINEAR_ATTN,
-    LLM_SHARD,
     ROPE,
     Qwen3_5Config,
     Qwen3_5VisionConfig,
@@ -147,7 +145,6 @@ class LLMSubmodule(SampledTokenDecoder):
             ATTN: AttentionStep(causal=True),
             GDN_STATE: RecurrentStep(),
             LINEAR_ATTN: LinearAttnStep(),
-            LLM_SHARD: SeqShardStep(),
         }
 
     # ------------------------------------------------------------------

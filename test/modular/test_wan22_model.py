@@ -911,6 +911,6 @@ def test_wan22_dit_declares_its_attention_on_the_ragged_resource():
         graph_walk=Wan22Model.VIDEO_GEN_WALK, fwd_info=_dit_info(5.0), inputs=_dit_loop_inputs(),
     )
     step = submodule.declare_step(Wan22Model.VIDEO_GEN_WALK, ["r0"], [node_inputs])
-    assert set(step.steps) == {Wan22DitSubmodule.SEQ_SHARD, Wan22DitSubmodule.SELF_ATTN}
+    assert set(step.steps) == {Wan22DitSubmodule.SELF_ATTN}
     sdpa = Wan22DitSubmodule(transformer=None, config=Wan22Config(attention_backend="sdpa"))
     assert sdpa.declare_step(Wan22Model.VIDEO_GEN_WALK, ["r0"], [node_inputs]) is None

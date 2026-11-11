@@ -88,9 +88,11 @@ class AttentionManager(AttentionResource):
     # first alone, and a window group is whole on every partner
     _group_idx: int = 0
 
-    @property
-    def splits(self) -> bool:
-        """Whether this node's steps may split over SP ranks, so a call goes through `exchange`."""
+    def exchanges(self, label: str | None = None) -> bool:
+        """Whether a call for ``label`` (the current one by default) goes through `exchange`: on a node
+        whose steps may split over SP ranks, so a copied step's heads are sliced over a pool stored by
+        head too. A pool stored by position (`PlacedAttention`) exchanges only a step that splits
+        the label, which a copied step attends as a node without a shard does."""
         return self._shard is not None
 
     # Remains abstract except for build; will build based
@@ -505,6 +507,11 @@ class PlacedAttention(AttentionManager):
             self._placement, self._kv_config.tokens_per_page, self._dtype, context, new, self._device,
             kwargs.get("batch_size"), max_total_tokens,
         )
+
+    def exchanges(self, label: str | None = None) -> bool:
+        if not super().exchanges(label):
+            return False
+        return self._placement is None or self._shard.split_range(label or self._default_label) is not None
 
     def _exchange_over_pool(self, run, q, k, v, r):
         if self._placement is None:

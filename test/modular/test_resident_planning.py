@@ -35,11 +35,12 @@ from mstar.engine.resources.recurrent.config import (  # noqa: E402
 )
 from mstar.engine.resources.recurrent.pool import SINK_SLOT, RecurrentStatePool  # noqa: E402
 from mstar.engine.resources.resident import TRASH_SLOT, ResidentPlanner, build_planner  # noqa: E402
-from mstar.engine.resources.sequence_shard import SeqShardStep, SequenceShard  # noqa: E402
+from mstar.engine.resources.sequence_shard import SequenceShard  # noqa: E402
 from mstar.engine.resources.spec import resolve_spec_dependencies  # noqa: E402
 from mstar.engine.resources.step import (  # noqa: E402
     AllocationFailed,
     BucketKey,
+    ResourceStep,
     Segment,
     SlotLease,
     StepContext,
@@ -1835,7 +1836,7 @@ def test_a_sequence_shard_leaves_the_node_resident():
     _host_step(res, [1], [3])
     s = _captured_step(res, planner, [1], 0, 2)
     assert s.positions[0] == 3
-    assert not res["shard"].plan(SeqShardStep(segments=s.kv.segments), s.ctx).split
+    assert not res["shard"].plan(ResourceStep(segments=s.kv.segments), s.ctx).split
     planner, why = _build({"shard": SequenceShard(("main",), 0, None, 0, SimpleNamespace(world_size=2))})
     assert planner is not None and why == ""
 

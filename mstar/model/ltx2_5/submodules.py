@@ -29,7 +29,6 @@ from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.resources import (
     RaggedCrossAttentionStep,
     Segment,
-    SeqShardStep,
     SlotLease,
     SubmoduleStep,
     cross_label,
@@ -382,10 +381,11 @@ class LTXDenoiseSubmodule(DenoiseLoopSubmodule):
             audio.append(Segment(request_id=rid, label=AUDIO_SPAN, span=shape.audio_frames))
             text.append(Segment(request_id=rid, label=TEXT_SPAN, span=shape.text_len))
         # Every span whole: on a split step the attention resources cut the video spans to
-        # this rank's share themselves.
+        # this rank's share themselves. The step's segments are the video's alone: those are
+        # the sequence shard's, and every other step here declares its own.
         return SubmoduleStep(
+            segments=video,
             steps={
-                VIDEO_SHARD: SeqShardStep(segments=tuple(video)),
                 VIDEO_ATTN: self.attention_step(video),
                 AUDIO_ATTN: self.attention_step(audio),
                 VIDEO_XATTN: RaggedCrossAttentionStep(
