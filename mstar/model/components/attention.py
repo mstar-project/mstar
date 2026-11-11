@@ -199,6 +199,15 @@ class Attention(nn.Module):
             old_context_len=self.rope_old_context_len,
         )
 
+    def write_kv(self, hidden_states: torch.Tensor) -> None:
+        """``hidden_states``' K/V, normed and rotated as `forward` does, written at
+        this layer's cursor without attending: context a stack writes but doesn't
+        run (DSpark's). The unfused path: projection, norm and RoPE as their own ops."""
+        q, k, v = self._project_qkv(hidden_states)
+        q, k = self._apply_qk_norm(q, k)
+        _, k = self._apply_rope(q, k, self.attend.label)
+        self.kv.write_kv(k, v)
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """The label and layer index are cursors on the resources, set by the
         caller running the layer stack (``attend.bind_step`` once, then
