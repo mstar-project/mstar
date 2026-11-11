@@ -346,6 +346,40 @@ def test_a_returning_row_with_an_unrecorded_result_trips_its_first_admit():
         ledger.take_due(ledger.next_step, {1})
 
 
+def test_the_acceptance_log_opens_its_window_at_the_first_verify_step(monkeypatch, caplog):
+    """Loading can take longer than a window: the first verify step opens it, and each line
+    counts its own window, not the totals since load."""
+    import logging
+    import time
+
+    import numpy as np
+
+    from mstar.engine.resources.draft import node as node_mod
+
+    draft = engine(3, every(2))._drafts[NODE]
+    # a load that took longer than a window
+    clock = [time.monotonic() + 1000.0]
+    monkeypatch.setattr(node_mod, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    caplog.set_level(logging.INFO, logger=node_mod.logger.name)
+
+    def lines():
+        return [r.getMessage() for r in caplog.records if "tau" in r.getMessage()]
+
+    draft._count(np.array([3, 3]))
+    clock[0] += 30.0
+    draft._count(np.array([0]))
+    assert lines() == []
+    clock[0] += 31.0
+    draft._count(np.array([1]))
+    (first,) = lines()
+    assert "the last 61 s: tau 2.75 over 4 verify rows" in first
+    clock[0] += 61.0
+    draft._count(np.array([0, 0]))
+    assert "the last 61 s: tau 1.00 over 2 verify rows" in lines()[1]
+    # the totals are the node's lifetime ones
+    assert draft.verify_rows == 6 and draft.acceptance_length() == (7 + 6) / 6
+
+
 def test_a_removed_request_takes_its_offload_mark_with_it():
     """Handle-keyed (invariant 14): a recycled handle must not inherit it."""
     eng = engine(3, every(2))
