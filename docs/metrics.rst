@@ -325,7 +325,8 @@ TP, SP or CFG instance count once: the instance's first rank reports.
 
 ``mstar_kv_returns_preempted_total{model_name, component}``
    Counter. Requests preempted again before they sampled a token since they were last preempted. Only
-   requests that keep a rebuild log are counted.
+   requests that keep a rebuild log are counted. A request moved to the host again before its next step,
+   or that gave back an allotment it never wrote into, counts too, though neither move cost it a token.
 
 ``mstar_kv_take_backs_total{model_name, component}``
    Counter. Preempted requests that moved so a guaranteed request could take back pages

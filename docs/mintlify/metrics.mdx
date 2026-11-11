@@ -184,7 +184,7 @@ Counter. Pages a rebuild row found in the prefix cache.
 Counter. Requests preempted a second time. A steady rate means the pool is too small for the load, and more pages or fewer concurrent requests stop it.
 
 `mstar_kv_returns_preempted_total{model_name, component}` <br />
-Counter. Requests preempted again before they sampled a token since they were last preempted. Only requests that keep a rebuild log are counted.
+Counter. Requests preempted again before they sampled a token since they were last preempted. Only requests that keep a rebuild log are counted. A request moved to the host again before its next step, or that gave back an allotment it never wrote into, counts too, though neither move cost it a token.
 
 `mstar_kv_take_backs_total{model_name, component}` <br />
 Counter. Preempted requests that moved so a guaranteed request could take back pages it lent. They count in `mstar_kv_preemptions_total` too.
