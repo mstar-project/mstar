@@ -331,7 +331,7 @@ def test_a_step_repeats_only_when_its_rows_all_continue(in_chain, fresh, same_no
 def test_a_row_a_host_step_moved_does_not_rewind_on_each_replay(repeats):
     """A one-token host step leaves a row's length to be refreshed. A run after
     it refreshes it once, not at the head of every replay; a one-iteration step
-    refreshes it as main does, a cell on the graph's scatter, with nothing to flush."""
+    writes it as a cell on the graph's scatter, with nothing to flush."""
     live, ref, planner = _setup({1: 5})
     _captured_step(live, planner, [1], slot=0, bs=1)
     _captured_step(ref, None, [1], slot=0, bs=1)
@@ -343,7 +343,7 @@ def test_a_row_a_host_step_moved_does_not_rewind_on_each_replay(repeats):
         b = _captured_step(ref, None, [1], slot=(1 + i) % 2, bs=1)
         assert (replay.offsets[:1], replay.positions[:1]) == (b.offsets[:1], b.positions[:1])
     if repeats == 1:
-        assert not a.ctx.resident_plan.writes.rows, "a one-iteration step flushed a run main writes as a cell"
+        assert not a.ctx.resident_plan.writes.rows, "a one-iteration step flushed a run the graph's scatter writes as a cell"
 
 
 def test_a_steady_batch_keeps_its_row():

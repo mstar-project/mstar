@@ -234,7 +234,8 @@ class SubmoduleManagement:
     # the node's request slots and device tables, where it runs on them
     resident: ResidentPlanner | None = None
     # a deployment asks a walk of this node to repeat (`Engine.enable_repeats`):
-    # only then does a step take the repeat path; every other node runs main's
+    # only then does a step take the repeat path; every other node replays its
+    # captured graph and nothing more
     may_repeat: bool = False
     # the serving config's prefill_token_buckets for the node: capture walk -> ladder,
     # and piecewise region label -> ladder
@@ -2371,7 +2372,7 @@ class Engine:
                 plan_done_event=batch.preplan_event,
                 launch_started_event=release_event,
             )
-            return cg_runner.repeat(lease, out, ctx.repeats) if submodule_mgmt.may_repeat else out
+            return cg_runner.repeat(lease, out, ctx.repeats) if submodule_mgmt.may_repeat or ctx.repeats != 1 else out
         if release_event is not None:
             release_event.set()
         if running_batched:
