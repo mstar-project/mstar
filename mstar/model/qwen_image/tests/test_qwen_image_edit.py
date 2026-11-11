@@ -212,10 +212,12 @@ def test_the_fused_kernels_round_as_the_eager_ops(zero_cond_t, monkeypatch):
     """On CUDA the q/k norms with the rotation, the LayerNorms with the modulation, and the gated residuals run as
     fused kernels. They round where the eager ops do (the LayerNorm's statistics in torch's own order), so a bf16
     forward is the forward with the eager elementwise ops bit for bit (the MLP's GELU epilogue, the one fusion that
-    is not exact, runs in both: the next test's). The kernels alone: ``test/modular/test_diffusion_dit_kernels.py``."""
+    is not exact, runs in both: the next test's). The copy-free GEMMs are held to bf16 rounding of the plain path.
+    The kernels alone: ``test/modular/test_diffusion_dit_kernels.py``."""
     from mstar.model.components.diffusion.attention import joint_attention
     from mstar.model.components.diffusion.qwen import dit_kernels as kernels
-    from mstar.model.qwen_image.components.transformer import QwenStepLayout, qwen_rope_tables
+    from mstar.model.qwen_image.components import transformer
+    from mstar.model.qwen_image.components.transformer import QwenStepLayout, _GeluProj, qwen_rope_tables
 
     # four 128-wide heads: a 512-wide model, the narrowest the LayerNorm kernel takes
     config = QwenImageTransformerConfig(
@@ -242,6 +244,13 @@ def test_the_fused_kernels_round_as_the_eager_ops(zero_cond_t, monkeypatch):
     fused = forward()
     monkeypatch.setattr(kernels, "fits", lambda *tensors: False)
     assert torch.equal(fused, forward())
+    # the copy-free GEMMs (v written into the joint tensor, the output projections reading in place) against the
+    # plain cat / contiguous path: the same math in a different GEMM shape, so cuBLAS may split K differently
+    # and the bits are not promised (bit-exact at the served shape on H200). The GELU epilogue's
+    # projections stay as they are.
+    gelu_projs = {id(m.proj) for m in dit.modules() if isinstance(m, _GeluProj)}
+    monkeypatch.setattr(transformer, "_plain", lambda linear, cls: id(linear) in gelu_projs)
+    torch.testing.assert_close(fused, forward(), rtol=3e-2, atol=3e-2)  # a few bf16 steps (2^-7 each)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="the GELU epilogue runs on CUDA")

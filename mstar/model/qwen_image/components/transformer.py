@@ -275,7 +275,8 @@ def _plain(linear: nn.Module, cls: type) -> bool:
 def _joint_linear(txt_linear: ColumnParallelLinear, txt: torch.Tensor, img_linear: ColumnParallelLinear,
                   img: torch.Tensor) -> torch.Tensor:
     """``cat([txt_linear(txt), img_linear(img)], dim=1)``, each row's GEMMs writing straight into its slice of the
-    joint ``[R, Lt + Li, N]`` (a column shard is a local GEMM on every rank)."""
+    joint ``[R, Lt + Li, N]`` (a column shard is a local GEMM on every rank). Bit-exact with the cat at the served shape
+    on H200 (a different GEMM shape may round differently elsewhere: the CUDA test holds it to bf16 rounding)."""
     if not (txt.is_cuda and _plain(txt_linear, ColumnParallelLinear) and _plain(img_linear, ColumnParallelLinear)
             and not txt_linear._local_output_start and not img_linear._local_output_start
             and not (txt_linear.gather_output and txt_linear.tp_size > 1)
@@ -291,7 +292,8 @@ def _joint_linear(txt_linear: ColumnParallelLinear, txt: torch.Tensor, img_linea
 
 def _rows_linear(linear: RowParallelLinear, x: torch.Tensor) -> torch.Tensor:
     """``linear(x)`` for a token slice ``x [R, L, K]`` of a larger tensor, one GEMM per row from its contiguous
-    rows instead of a copy of the slice (one GPU; under TP the row shard's all-reduce runs as usual)."""
+    rows instead of a copy of the slice (one GPU; under TP the row shard's all-reduce runs as usual). Bit-exact with
+    the copy at the served shape on H200 (see :func:`_joint_linear`)."""
     if not (x.is_cuda and _plain(linear, RowParallelLinear) and linear.tp_size == 1 and x[0].is_contiguous()):
         return linear(x.contiguous())
     out = x.new_empty(*x.shape[:2], linear.weight.shape[0])
