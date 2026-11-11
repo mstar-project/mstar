@@ -304,6 +304,7 @@ def test_a_mixed_step_without_a_prompt_row_leases_the_batched_decode_capture(tmp
     template rows as a pre-plan declares it, and over its own rows."""
     from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner
     from mstar.engine.resources.step import StepContext
+    from mstar.model.components.sampled_token_decoder import PROMPT_ROWS
     from mstar.model.submodule_base import ARNodeInputs
     from mstar.testing_utils.engine import make_engine, make_mgmt
 
@@ -328,6 +329,14 @@ def test_a_mixed_step_without_a_prompt_row_leases_the_batched_decode_capture(tmp
     lease = engine.reserve_replay_slot(batch)
     if prompt:
         assert lease is None
+        # at exec time the packed capture is leased, keyed apart, and the step names it
+        rows = [ARNodeInputs(input_seq_len=1, graph_walk=w) for w in list(walks.values())[:-1]]
+        ids = torch.zeros(5, dtype=torch.long)
+        rows.append(ARNodeInputs(input_seq_len=5, graph_walk="prefill_text", input_ids=ids))
+        packed = runner.lease_slot("mixed", len(rows), 0, num_tokens=8, cg_key_info=PROMPT_ROWS)
+        assert packed is not None and runner.is_packed(packed)
+        step = llm.declare_step("mixed", list(walks), rows, per_request_info=infos)
+        assert step.cg_key_info == packed.bucket.cg_key_info
         return
     assert lease is not None and not runner.is_packed(lease)
     template = runner.config_for(lease).single_request_inputs
