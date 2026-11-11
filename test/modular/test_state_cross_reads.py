@@ -589,7 +589,8 @@ def test_a_read_sharded_on_both_sides_needs_heads_that_divide_by_tp_times_sp():
     (problem,) = deployment_problems(_Model(_array("a", sharded=True, heads=HEADS)), {}, head_shards={"dit": 3})
     assert problem.startswith("Array 'a'.reads['a_read']: q_heads 4 doesn't divide by 3")
     assert deployment_problems(_Model(_array("a", sharded=True)), {}, head_shards={"dit": 4}) == []
-    assert deployment_problems(_Model(_array("a")), {}, head_shards={"dit": 3}) == [], "only both sides narrow"
+    unexchanged = _Model(_array("a", sharded=True, heads=6), _array("b", queries="a"))
+    assert deployment_problems(unexchanged, {}, head_shards={"dit": 3}) == [], "a read with no exchange keeps its heads"
 
 
 # A segmented read

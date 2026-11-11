@@ -2,7 +2,7 @@
 
 import hashlib
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import fields, is_dataclass
 from itertools import product
 from typing import TYPE_CHECKING, get_origin
@@ -57,8 +57,15 @@ def query_array(array: Array, read: Read, arrays: Mapping[str, Array]) -> Array:
 
 def both_sharded(array: Array, queried: Array) -> bool:
     """Whether a read of ``array``, with ``queried`` laying out its queries, runs a Ulysses exchange under sequence
-    parallelism, which narrows its heads."""
+    parallelism."""
     return array.seq_sharded and queried.seq_sharded
+
+
+def narrows_heads(array: Array, queried: Array, arrays: Iterable[Array]) -> bool:
+    """Whether a read within a step of ``array``, with ``queried`` laying out its queries, splits its heads over the SP
+    ranks as well as TP's: where its Ulysses exchange runs over them, and on nodes where none of ``arrays`` is
+    sequence sharded."""
+    return both_sharded(array, queried) or not any(other.seq_sharded and other.nodes & array.nodes for other in arrays)
 
 
 def _name_problems(arrays: Sequence[Array], samplers: Sequence[Sampler]) -> list[str]:
@@ -191,7 +198,7 @@ def deployment_problems(
     model: "Model", resources: Mapping[str, Mapping[str, object]], *, head_shards: Mapping[str, int] = EMPTY,
 ) -> list[str]:
     """What a deployment asks of the declarations that they can't do: its ``resources:`` block of a sampler, and
-    ``head_shards``, TP times SP per node above SP1, of a read sharded on both sides."""
+    ``head_shards``, TP times SP per node above SP1, of a read within a step that narrows its heads by them."""
     declarations = model.declare_state()
     arrays = {declared.name: declared for declared in declarations if isinstance(declared, Array)}
     problems = [
@@ -204,9 +211,10 @@ def deployment_problems(
     for array in arrays.values():
         for key, read in array.reads.items():
             shards = max((head_shards.get(node, 1) for node in array.nodes), default=1)
-            if both_sharded(array, query_array(array, read, arrays)) and read.op.q_heads % shards:
+            narrows = not array.max_len and narrows_heads(array, query_array(array, read, arrays), arrays.values())
+            if narrows and read.op.q_heads % shards:
                 problems.append(f"Array {array.name!r}.reads[{key!r}]: q_heads {read.op.q_heads} doesn't divide by "
-                                f"{shards}, TP times SP, which a read sharded on both sides narrows its heads by")
+                                f"{shards}, TP times SP, which the read narrows its heads by")
     return problems
 
 

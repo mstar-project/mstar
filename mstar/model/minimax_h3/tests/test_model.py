@@ -765,8 +765,8 @@ def test_an_sp_size_the_heads_do_not_divide_is_refused_at_validation():
     model.set_config(H3Config(transformer=_sp_cfg()))
     assert deployment_problems(model, {}, head_shards={"dit": 4}) == []
     assert deployment_problems(model, {}, head_shards={"dit": 3}) == [
-        f"Array {DIT_ROWS!r}.reads[{DIT_ATTN!r}]: q_heads 8 doesn't divide by 3, TP times SP, which a read sharded on "
-        "both sides narrows its heads by"
+        f"Array {DIT_ROWS!r}.reads[{DIT_ATTN!r}]: q_heads 8 doesn't divide by 3, TP times SP, which the read narrows "
+        "its heads by"
     ]
 
 

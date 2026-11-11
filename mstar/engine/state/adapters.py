@@ -37,7 +37,7 @@ from mstar.engine.resources.recurrent.config import (
 from mstar.engine.resources.sampler.config import SamplerSpec, SamplerStep, SamplingReqConfig
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
 from mstar.engine.resources.step import Segment, SubmoduleStep
-from mstar.engine.state.analysis import both_sharded, position_key, query_array
+from mstar.engine.state.analysis import both_sharded, narrows_heads, position_key, query_array
 from mstar.engine.state.calls import ArrayHandle, SamplerHandle, pool_layers, segments_of
 from mstar.engine.state.contract import (
     EMPTY,
@@ -1271,7 +1271,6 @@ class WithinStepStorage(Storage):
         """A ragged spec per read, a `RaggedCrossAttentionSpec` for a read with ``queries``. Reads of one kind, on one
         node set and with one config share the spec of the first of them, under its key, so each read is a plan on that
         resource rather than a resource of its own."""
-        sharded_nodes = {node for array in declared if array.seq_sharded for node in array.nodes}
         by_name = {array.name: array for array in declared}
         resolved = Resolved({}, {}, {})
         shared: dict[tuple, NodeResourceSpec] = {}
@@ -1283,8 +1282,7 @@ class WithinStepStorage(Storage):
             )
             config = RaggedAttentionConfig(
                 num_qo_heads=read.op.q_heads, num_kv_heads=heads, head_dim=head_dim, dtype=dtype,
-                # the heads narrow by SP only where the exchange runs over them
-                shard_over_sp=not array.nodes & sharded_nodes or both_sharded(array, queries.array),
+                shard_over_sp=narrows_heads(array, queries.array, declared),
             )
             spec = queries.spec_class(resource_key=key, nodes=array.nodes, config=config)
             spec = shared.setdefault((queries.spec_class, array.nodes, astuple(config)), spec)
