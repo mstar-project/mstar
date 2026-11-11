@@ -88,10 +88,13 @@ Consequences:
   node that verifies drafts, `engine.verify.cut` (the token cut and its per-row
   slices) runs inside `worker.postprocess.prematerialize`,
   `res.verify.take_back` (applying due verify results) inside `engine.admit`
-  or `engine.pre_admit`, whichever reached the step first, and
-  `engine.verify.commit` (the ledger's record of the step) inside
-  `engine.commit`. Each is already counted in its enclosing phase; none moves
-  the postprocess stage stopwatch. `--phases verify` shows the three.
+  and `engine.pre_admit`, and `engine.verify.commit` (the ledger's record of
+  the step) inside `engine.commit`. Each is already counted in its enclosing
+  phase; none moves the postprocess stage stopwatch. `res.verify.take_back`
+  records once per admit and once per pre_admit: on a pre-planned step the
+  second call finds nothing due and records near zero, so its mean is not a
+  per-step cost; read its total as samples × mean. `--phases verify` shows the
+  three, their `.cpu` twins, and their step-keyed copies.
 * **GPU busy time is not in this table**, and `iter_total - event_sync` is not
   GPU idle time. A non-zero `event_sync` means the CPU did wait on the GPU; a
   small one means the GPU-bound component is marginal, not absent. For the
