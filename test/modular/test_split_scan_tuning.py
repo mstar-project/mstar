@@ -80,8 +80,11 @@ def _autotuner(grid_type: str, rblocks: list[int], *, from_worker: bool = False)
     tuner.launchers = []
     tuner.fn = SimpleNamespace(fn=None if from_worker else "source")
     tuner._reload_kernel = lambda: SimpleNamespace(fn=SimpleNamespace(fn="reloaded"))
-    # what `DeviceGuard` calls around building the launchers
-    device = SimpleNamespace(exchange_device=lambda index: 0, maybe_exchange_device=lambda index: 0)
+    # what building the launchers calls on the device (`DeviceGuard`; torch 2.10 also synchronizes)
+    device = SimpleNamespace(
+        exchange_device=lambda index: 0, maybe_exchange_device=lambda index: 0,
+        current_device=lambda: 0, synchronize=lambda index: None,
+    )
     tuner.get_device_interface = lambda: device
     tuner.compiled = []
 
