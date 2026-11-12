@@ -950,6 +950,12 @@ def test_a_bounded_read_takes_padded_rows_and_no_walks(read, refusal):
     _no_layout(refusal, _unbounded(reads={"enc_attn": read}))
 
 
+def test_an_unbounded_array_s_entry_is_a_kv_entry():
+    entry = Entry({"k": TensorType((4, 16), dtype=None), "v": TensorType((4, 16), dtype=None)})
+    _no_layout("entry must be a KVEntry, which may declare one dtype, all BoundedKVConfig holds",
+               _unbounded(entry=entry))
+
+
 def test_a_bounded_read_has_as_many_query_heads_as_its_entry():
     _no_layout("reads['enc_attn'].op.q_heads is 8, and the bounded kernels run one query head per head of the "
                "entry's 4", _unbounded(reads={"enc_attn": _window(op=Attend(q_heads=8))}))
