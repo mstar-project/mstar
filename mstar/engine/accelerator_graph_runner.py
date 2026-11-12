@@ -682,6 +682,15 @@ class DummyRowPool:
             self.reset(rids, free=True)
 
 
+def _carried(outputs: BatchedModelOutput, name: str) -> torch.Tensor | None:
+    """The buffer a replay leaves ``name`` in: a stop buffer, else a row output."""
+    for buffers in (outputs.check_stop_buffers, outputs.row_outputs):
+        value = (buffers or {}).get(name)
+        if isinstance(value, torch.Tensor):
+            return value
+    return None
+
+
 @dataclass
 class AcceleratorGraphSlot:
     """One captured graph + the buffers its replay reads and writes.
@@ -820,6 +829,9 @@ class AcceleratorGraphRunner:
         # config_idx -> its compiled forward, shared by every bucket of that
         # config so shapes captured twice (once per slot) compile once
         self._compiled_forwards: dict[int, Any] = {}
+        # walk -> how a step of it that repeats carries each loop-back signal
+        # (output -> static input), once ``accept_repeats`` has said it may
+        self._repeat_carries: dict[str, Mapping[str, str]] = {}
 
         # Plan-overlap stream. Lazily created the first time pre_plan
         # is called from StepExecutor's plan thread.
@@ -1738,6 +1750,59 @@ class AcceleratorGraphRunner:
         if self._enable_nvtx:
             profiler.range_pop()
         return slot.static_outputs
+
+    def accept_repeats(self, walk: str, carries: Mapping[str, str]) -> None:
+        """A step of ``walk`` may repeat, carrying its signals as ``carries``."""
+        self._repeat_carries[walk] = carries
+
+    def repeat(self, lease: SlotLease, out: BatchedModelOutput, repeats: int) -> BatchedModelOutput:
+        """``out``, the step's first launch, with the rest of its iterations:
+        its stop buffers gain a column per iteration. The graph replays,
+        copying every loop-back signal's output into the static input it feeds
+        before each replay, and each column out on the stream before the next
+        replay overwrites it. A walk that can't repeat returns ``out`` as it is
+        for one iteration, and refuses more: every resource would commit them."""
+        slot = self.slot_for(lease)
+        walk = lease.bucket.graph_walk
+        carries = self._repeat_carries.get(walk)
+        if carries is None:
+            if repeats > 1:
+                raise ValueError(
+                    f"a step of {walk!r} asks for {repeats} iterations, but the walk never accepted repeats"
+                )
+            return out
+        profiler.phase_record(f"repeats.{walk}#", repeats)
+        if repeats == 1:
+            return out
+        buffers = slot.static_outputs.check_stop_buffers
+        copies = [
+            (_carried(slot.static_outputs, output), slot.static_inputs[target]) for output, target in carries.items()
+        ]
+        unique = {id(t): t for t in buffers.values()}
+        columns = {key: t.new_empty(t.shape[0], repeats) for key, t in unique.items()}
+        for i in range(repeats):
+            if i:
+                for source, target in copies:
+                    target.copy_(source.reshape(target.shape))
+                slot.graph.replay()
+            for key, tensor in unique.items():
+                columns[key][:, i].copy_(tensor.reshape(-1))
+        return replace(out, check_stop_buffers={name: columns[id(tensor)] for name, tensor in buffers.items()})
+
+    def carry_refusal(self, walk: str, carries: Mapping[str, str]) -> str | None:
+        """Why a capture of ``walk`` can't carry each loop-back output into the
+        static input it feeds, or None: both must be buffers it holds, one size."""
+        for bucket in self._buckets.values():
+            if bucket.config.capture_graph_walk != walk:
+                continue
+            for slot in bucket.slots:
+                for output, target in sorted(carries.items()):
+                    source, into = _carried(slot.static_outputs, output), slot.static_inputs.get(target)
+                    if source is None or not isinstance(into, torch.Tensor):
+                        return f"its capture holds no {output!r} -> {target!r} to carry between replays"
+                    if source.numel() != into.numel():
+                        return f"its capture's {output!r} and {target!r} differ in size"
+        return None
 
     def run_forward(
         self, lease: SlotLease, preprocessed: dict[str, Any],

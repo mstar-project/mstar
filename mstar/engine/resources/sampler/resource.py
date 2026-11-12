@@ -7,6 +7,7 @@ import torch
 from mstar.distributed.communication import JointGroups
 from mstar.engine.resources.base import CachedPrefix, EngineResourceInfo, Resource
 from mstar.engine.resources.resident import CapturedResidentStep, ResidentPlan, ResidentPlanner, ResidentWrites
+from mstar.engine.resources.resident_hooks import ANY_REPEATS
 from mstar.engine.resources.sampler.config import (
     SAMPLED_LOGPROB,
     LoopbackState,
@@ -129,6 +130,7 @@ class SamplerResource(Resource):
         # Resident requests that asked for log-probs: with none, no step's
         # log-prob rows are copied to the host.
         self._logprob_rids: set[str] = set()
+        self._logprobs_this_step = False
         # Resident requests that don't sample greedily (`samples_greedy`), so
         # a step over the rest runs lean. Kept like the two sets above, and read
         # per step only when it isn't empty.
@@ -473,6 +475,21 @@ class SamplerResource(Resource):
     # Resident planning: the scalars as cells of the planner's rows, by its
     # slot; the rest by this sampler's own rows (`sampler/resident.py`).
 
+    def max_repeats(self, step, ctx) -> int:
+        """One for a step whose draws read or update state outside the graph
+        (a penalty, a history window, an RNG offset scattered on the host) or
+        with a row that wants log-probs or doesn't keep its draw. The rule state
+        a forward stores (``loopback_writes``) is overwritten each replay, and
+        commit persists the last one, so it doesn't count."""
+        bufs = self._cg_buffers
+        if (
+            bufs is None or not bufs.ingraph_scatter or self._penalty_live or self._history is not None
+            or (self._logprob_rids and not self._logprob_rids.isdisjoint(ctx.request_ids))
+            or self._kept_rids_of(step, ctx) is not None
+        ):
+            return 1
+        return ANY_REPEATS
+
     def resident_refusal(self) -> str | None:
         # never holds a node back: without a planner it stages its rows on the host
         return None
@@ -566,6 +583,10 @@ class SamplerResource(Resource):
             self._set_greedy_flag(ctx)
             self._kept_rids = self._kept_rids_of(step, ctx)
             self._sampled_this_step = False
+            # a step of several iterations keeps no log-prob row: `max_repeats` let it
+            # repeat because none of its rows asked, and a request ingested since is
+            # no row of it. Its one row per request would be the last replay's.
+            self._logprobs_this_step = bool(self._logprob_rids) and ctx.repeats == 1
         if not ctx.is_preplan and self._penalty_live:
             configs = self._sampler._sampling_config
             for rid, tokens in step.prefill_tracked_tokens.items():
@@ -779,7 +800,7 @@ class SamplerResource(Resource):
         token is the row's emitted one, which ``sample`` enforces while
         log-probs are on; a node that samples more than once (a code
         predictor) needs its own path."""
-        if not self._logprob_rids:
+        if not self._logprobs_this_step:
             return {}
         # a replay never calls `sample`: its rows are the slot's static ones
         rows = self._cg_sampler.logprob_buf if self._cg_sampler is not None else self._sampler.logprobs
