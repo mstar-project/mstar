@@ -238,6 +238,7 @@ class FastConformerStreamSubmodule(NodeSubmodule):
             "steady": [inp.kwargs.get("steady", False) for inp in inputs],
             "n": [inp.kwargs.get("n", 0) for inp in inputs],
             "before": [inp.kwargs.get("before") for inp in inputs],
+            "after": [inp.kwargs.get("after") for inp in inputs],
         }
 
     def can_batch(self, batch, model_inputs) -> bool:
@@ -376,12 +377,13 @@ class FastConformerStreamSubmodule(NodeSubmodule):
         return self._blocks_stream(new, chunk.new_ones(chunk.shape[0], dtype=torch.long))
 
     def _front(self, chunks: list[torch.Tensor | None], final: list[bool], n: list[int],
-               before: list[tuple[int, int, int]]) -> torch.Tensor | None:
-        """Append each stream's chunk to a stream ``before[i]`` = (samples, mel
-        frames, encoder frames) in; the ``n`` block inputs it made final
-        (``new_frames``, counted before the step), ``(B, max(n), hidden)``
-        zero-padded, or None when no stream has one. A stream with no chunk and
-        not at its end is left as it is."""
+               before: list[tuple[int, int, int]], after: list[dict]) -> torch.Tensor | None:
+        """Append each stream's chunk to its front end, which holds the stream's
+        samples, mel frames and encoder frames counted before the step
+        (``before[i]``), up to the mel frames ``prepare_inputs`` counted for
+        after it (``after[i]``). Returns the ``n[i]`` block inputs each stream
+        made final, ``(B, max(n), hidden)`` zero-padded, or None when no stream
+        has one. A stream with no chunk that doesn't end is left as it is."""
         f = self.encoder.config.subsampling_factor
         keep_sig, keep_mel = self.frame_samples, 2 * f
         busy = [i for i, (ch, fin) in enumerate(zip(chunks, final, strict=True))
@@ -391,22 +393,20 @@ class FastConformerStreamSubmodule(NodeSubmodule):
         front = self.front_state.read(0).fields
         last, sig, mel_tail = front["last"], front["sig"], front["mel"]
         new_sig, new_last, new_mel = list(sig), list(last), list(mel_tail)
-        samples = {i: before[i][0] for i in busy}
         mels = {i: before[i][1] for i in busy}
         rows, lo_hi, mel_rows = [], [], []
         for i in busy:
             chunk = chunks[i]
-            held = min(samples[i], keep_sig)
-            win, base = sig[i, keep_sig - held:], samples[i] - held          # win[0] is sample ``base``
+            held = min(before[i][0], keep_sig)
+            win, base = sig[i, keep_sig - held:], before[i][0] - held       # win[0] is sample ``base``
             if chunk is not None and chunk.numel():
                 xr = chunk.to(torch.float32).reshape(-1)
                 # ``last`` reads 0 in a fresh slot: the featurizer's preemphasis keeps the first sample
                 y = xr - self.log_mel.preemphasis * torch.cat([last[i], xr[:-1]])
                 win = torch.cat([win, y])
                 new_last[i] = xr[-1:]
-                samples[i] += xr.numel()
             new_sig[i] = F.pad(win[-keep_sig:], (max(0, keep_sig - win.numel()), 0))
-            lo, hi = mels[i], self.log_mel.complete_frames(samples[i], final[i])
+            lo, hi = mels[i], after[i]["mels"]
             if hi <= lo:
                 continue
             rows.append(self.log_mel.stream_span(win, base, lo, hi, final[i]))
@@ -456,7 +456,7 @@ class FastConformerStreamSubmodule(NodeSubmodule):
         return moved
 
     def forward_batched(self, graph_walk, engine_inputs, chunk=None, final=None, steady=None, n=None, before=None,
-                        **kwargs):
+                        after=None, **kwargs):
         rids = list(engine_inputs.request_ids)
         device = self.projection.weight.device
         chunks = self._to_device(chunk, device)
@@ -496,7 +496,7 @@ class FastConformerStreamSubmodule(NodeSubmodule):
         # a step of its own (see can_batch).
         x = None
         if len(steady) < len(rids):
-            x = self._front(chunks, final, eager_n, before)
+            x = self._front(chunks, final, eager_n, before, after)
         if x is not None:
             new = [i for i, k in enumerate(eager_n) if k]
             if layers_graph(new):
