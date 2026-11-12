@@ -181,6 +181,27 @@ def test_compiled_sequence_parallel_stack_takes_new_pack_lengths_without_recompi
     _run(_compiled_packs, world, tmp_path / "store")
 
 
+def _opened_on_sdpa(dit, config, group, tokens: int) -> None:
+    """``dit`` with its handles bound and open for a step of one row on SDPA, as the engine would on a node set to it:
+    the array's read runs the exchange."""
+    from mstar.engine.resources.step import Segment, StepContext, SubmoduleStep
+    from mstar.engine.state import ArrayStep
+    from mstar.engine.state.adapters import node_handles, state_setup, state_steps
+    from mstar.model.wan22.config import DIT_TOKENS, SELF_ATTN
+    from mstar.model.wan22.wan22_model import Wan22Model
+
+    model = object.__new__(Wan22Model)
+    model.config = config
+    setup, _ = state_setup({"resources": {SELF_ATTN: {"backend": "sdpa"}}}, model.declare_state())
+    handles = node_handles(model, "dit", {}, sp_group=group, setup=setup)
+    for module in dit.modules():
+        if hasattr(module, "bind_state"):
+            module.bind_state(handles)
+    step = state_steps(SubmoduleStep(segments=[Segment(0, "main", tokens)], state={DIT_TOKENS: ArrayStep()}), handles)
+    step.set_ctx(StepContext(request_ids=[0], graph_walk="video_gen", slot=0, capture=False))
+    step.begin_calls()
+
+
 def _wan_dit_forward(grid, sp_group=None) -> torch.Tensor:
     from mstar.model.wan22.components.dit import Wan22DiT
     from mstar.model.wan22.config import Wan22Config
@@ -195,6 +216,9 @@ def _wan_dit_forward(grid, sp_group=None) -> torch.Tensor:
         torch.nn.init.normal_(param, std=0.2)
     gen = torch.Generator().manual_seed(1)
     frames, height, width = grid
+    if sp_group is not None:
+        p_t, p_h, p_w = config.patch_size
+        _opened_on_sdpa(dit, config, sp_group, frames // p_t * (height // p_h) * (width // p_w))
     latents = torch.randn(1, 4, frames, height, width, generator=gen)
     timestep = torch.rand(1, frames, generator=gen) * 1000
     text = torch.randn(1, 5, 8, generator=gen)

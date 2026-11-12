@@ -10,6 +10,7 @@ from mstar.engine.state.calls import (
     at_last_token,
     causal_conv,
     gated_delta_net,
+    host,
     kernel_setting,  # noqa: F401
     last_sampled,
     position,
@@ -29,6 +30,8 @@ from mstar.engine.state.contract import (
     GatedDeltaNet,
     KVEntry,
     Layout,
+    PagedNHD,
+    PagedNHDTarget,
     Positions,
     Reached,
     Read,
@@ -40,6 +43,7 @@ from mstar.engine.state.contract import (
     Value,
     Window,
 )
+from mstar.engine.state.state_op import state_op
 
 # `kernel_setting` and `SubmoduleStep` stay out of `__all__`, whose names can't be removed after release.
 # `kernel_setting` is temporary. `SubmoduleStep` is the engine's own dataclass, and the rebuild after release replaces
@@ -56,6 +60,8 @@ __all__ = [
     "GatedDeltaNet",
     "KVEntry",
     "Layout",
+    "PagedNHD",
+    "PagedNHDTarget",
     "Positions",
     "Reached",
     "Read",
@@ -72,9 +78,11 @@ __all__ = [
     "at_last_token",
     "causal_conv",
     "gated_delta_net",
+    "host",
     "last_sampled",
     "position",
     "positions",
     "rope",
     "sample",
+    "state_op",
 ]

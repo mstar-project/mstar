@@ -89,32 +89,6 @@ class AttentionCallable:
         )
         return self.attn.run(q, kv_cache_layer=self.kv.layer_view())
 
-    @torch.compiler.disable
-    def norm_rope_table_attend(
-        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, q_norm: torch.nn.Module, k_norm: torch.nn.Module,
-        cos_sin: tuple[torch.Tensor, torch.Tensor],
-    ) -> torch.Tensor:
-        """``norm_rope_attend`` rotating by each token's rotate-half ``cos_sin``
-        rows (both halves equal), for a multimodal RoPE whose position grids one
-        position can't express. The KV write rides in the kernel
-        (``qk_norm_rope_table_kv_write``) on CUDA with a paged backend; anywhere
-        else the norm and rotation run unfused."""
-        from mstar.utils.attention import qk_norm_rope_table_kv_write
-
-        eps = _norm_eps(q_norm, k_norm)
-        if not (q.is_cuda and self.attn.requires_kv_write):
-            cos, sin = (t[: q.shape[0], None] for t in cos_sin)
-            q, k = (
-                _rotate_half_rope(norm(x.reshape(-1, x.shape[-1])).view(x.shape), cos, sin)
-                for x, norm in ((q, q_norm), (k, k_norm))
-            )
-            return self(q, k, v)
-        layer, page_idx, slot_idx, n = self.kv.write_target()
-        qk_norm_rope_table_kv_write(
-            q, k, v, q_norm.weight, k_norm.weight, *cos_sin, layer, page_idx, slot_idx, min(n, q.shape[0]), *eps,
-        )
-        return self.attn.run(q, kv_cache_layer=self.kv.layer_view())
-
 
 def _norm_eps(q_norm: torch.nn.Module, k_norm: torch.nn.Module) -> tuple[float, float]:
     """The q and k norms' epsilons. The fused kernels scale by ``weight``, so a
@@ -122,12 +96,6 @@ def _norm_eps(q_norm: torch.nn.Module, k_norm: torch.nn.Module) -> tuple[float, 
     if getattr(q_norm, "gemma_mode", False) or getattr(k_norm, "gemma_mode", False):
         raise ValueError("the fused q/k norm kernels scale by weight; a gemma_mode RMSNorm needs its own path")
     return float(q_norm.variance_epsilon), float(k_norm.variance_epsilon)
-
-
-def _rotate_half_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    """``x * cos + rotate_half(x) * sin``, the unfused rotation by rotate-half tables."""
-    half = x.shape[-1] // 2
-    return x * cos + torch.cat((-x[..., half:], x[..., :half]), dim=-1) * sin
 
 
 class _KDALayerBlocks(NamedTuple):
@@ -213,6 +181,8 @@ class KDACallable:
         prefix_len, side = self.pool.block("spec_len"), self.pool.block("spec_side")
         prefix_len.index_copy_(0, slots, count)
         side.index_copy_(0, slots, 1 - side.index_select(0, slots))
+
+
 class Mamba2Callable:
     """A recurrent state pool plus the resource running a Mamba-2 layer's kernels against it: the conv, then the SSD
     recurrence, each handed this layer's block of the pool as a plain tensor.

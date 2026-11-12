@@ -20,7 +20,6 @@ import torch.nn.functional as F
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
-from mstar.model.components.diffusion.attention import Attend, sdpa_attention
 from mstar.model.ltx2_5.components.layers import (
     GatedAttention,
     GeluFeedForward,
@@ -46,8 +45,8 @@ class ConnectorBlock(nn.Module):
         self.attn1 = GatedAttention(dim, heads, head_dim, comm_group, gated=gated)
         self.ff = GeluFeedForward(dim, comm_group)
 
-    def forward(self, x: torch.Tensor, rope: RotaryTable, attend: Attend) -> torch.Tensor:
-        x = x + self.attn1(F.rms_norm(x, (self.dim,), eps=1e-6), attend, q_rope=rope)
+    def forward(self, x: torch.Tensor, rope: RotaryTable) -> torch.Tensor:
+        x = x + self.attn1(F.rms_norm(x, (self.dim,), eps=1e-6), q_rope=rope)
         return x + self.ff(F.rms_norm(x, (self.dim,), eps=1e-6))
 
 
@@ -72,7 +71,7 @@ class Connector1d(nn.Module):
         positions = torch.arange(seq_len, dtype=torch.float32, device=device).view(1, -1, 1)
         return split_rope_table(positions, self.dim, self.heads, self.rope_theta, (float(self.rope_base_seq_len),))
 
-    def forward(self, tokens: torch.Tensor, valid: list[int], seq_len: int, attend: Attend) -> torch.Tensor:
+    def forward(self, tokens: torch.Tensor, valid: list[int], seq_len: int) -> torch.Tensor:
         """``tokens``: ``[B, max(valid), dim]`` projected prompt tokens, front-aligned,
         row ``i`` real for its first ``valid[i]``. Returns ``[B, seq_len, dim]``."""
         registers = self.learnable_registers.repeat(seq_len // self.learnable_registers.shape[0], 1)
@@ -82,7 +81,7 @@ class Connector1d(nn.Module):
         x = torch.stack(rows)
         rope = self.rope(seq_len, x.device)
         for block in self.transformer_blocks:
-            x = block(x, rope, attend)
+            x = block(x, rope)
         return F.rms_norm(x, (self.dim,), eps=1e-6)
 
 
@@ -107,9 +106,7 @@ class LTX2TextConnectors(nn.Module):
             **common,
         )
 
-    def forward(
-        self, hidden: torch.Tensor, valid: list[int], seq_len: int, attend: Attend = sdpa_attention,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, hidden: torch.Tensor, valid: list[int], seq_len: int) -> tuple[torch.Tensor, torch.Tensor]:
         """``hidden``: ``[B, T, caption_channels, layers + 1]`` Gemma states of the real
         tokens, front-aligned (row ``i`` real for its first ``valid[i]``). Returns the
         video ``[B, seq_len, 4096]`` and audio ``[B, seq_len, 2048]`` text embeddings."""
@@ -117,6 +114,6 @@ class LTX2TextConnectors(nn.Module):
         video = self.video_text_proj_in(normed * math.sqrt(self.cfg.video_hidden_dim / self.cfg.caption_channels))
         audio = self.audio_text_proj_in(normed * math.sqrt(self.cfg.audio_hidden_dim / self.cfg.caption_channels))
         return (
-            self.video_connector(video, valid, seq_len, attend),
-            self.audio_connector(audio, valid, seq_len, attend),
+            self.video_connector(video, valid, seq_len),
+            self.audio_connector(audio, valid, seq_len),
         )

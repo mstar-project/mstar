@@ -172,13 +172,8 @@ def sp_head_gather(sp_group: CommGroup, x: torch.Tensor) -> torch.Tensor:
 class SeqParallel(NamedTuple):
     """Ulysses sequence parallelism over a ``[B, L, H, D]`` token stream: ``sizes`` is
     each rank's share of its ``L``. ``scatter`` cuts a replicated per-token tensor to
-    this rank's tokens and ``gather`` reassembles them, both a no-op on one rank.
-
-    Only an attention whose queries and keys are both the sharded stream needs the
-    exchange: it attends every token over this rank's head-group (``attend``). A
-    query shard attending a replicated stream needs nothing, and a replicated query
-    attending the sharded keys merges the ranks' partial attentions by their
-    log-sum-exps (``attend_shards``; ``run`` must take ``return_lse``)."""
+    this rank's tokens and ``gather`` reassembles them, both a no-op on one rank. An
+    attention's exchange is its array's read."""
 
     group: CommGroup
     sizes: list[int]
@@ -188,13 +183,3 @@ class SeqParallel(NamedTuple):
 
     def gather(self, x: torch.Tensor, dim: int = 1) -> torch.Tensor:
         return gather_sequence(self.group, x, self.sizes, dim=dim)
-
-    def attend(
-        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, run: Callable[..., torch.Tensor],
-    ) -> torch.Tensor:
-        return ulysses_attention(self.group, q, k, v, run, self.sizes, seq_dim=1, head_dim=2)
-
-    def attend_shards(
-        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, run: Callable[..., torch.Tensor],
-    ) -> torch.Tensor:
-        return attention_over_sharded_keys(self.group, q, k, v, run)
