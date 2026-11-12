@@ -911,6 +911,9 @@ class PagedCrossHandle(PagedArrayHandle):
         ((key, _),) = array.reads.items()
         self.queries = resolved.queries[key]
         self._query_label = "main"
+        # The cross read attends the pages and takes no k and v, so no layer has an attention its add is held for:
+        # `add` writes the pages. The cross resource has no ``requires_kv_write`` to ask either.
+        self._cross, self._attn = self._attn, {}
 
     def begin_step(self, step) -> None:
         super().begin_step(step)
@@ -920,12 +923,12 @@ class PagedCrossHandle(PagedArrayHandle):
         if queries:
             self._query_label = queries[0].label
 
-    def _holds(self, layer: int) -> bool:
-        """Never: a cross read attends the pages, and its resource has no ``requires_kv_write``."""
+    def _needs_step_kv(self, attn: Any) -> bool:
+        """Never: a cross read attends the pages alone, and its resource has no ``reads_step_kv``."""
         return False
 
     def _run(self, layer: int, q: torch.Tensor) -> torch.Tensor:
-        return self._attn[layer].run(q, label=self._query_label, kv_cache_layer=self._views[layer])
+        return self._cross[layer].run(q, label=self._query_label, kv_cache_layer=self._views[layer])
 
     def at_last_token(self, x: torch.Tensor) -> torch.Tensor:
         self._check_open("at_last_token")
