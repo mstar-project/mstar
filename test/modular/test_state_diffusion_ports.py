@@ -217,8 +217,12 @@ class _StubRagged:
         return q
 
 
+def _step_key(key):
+    return key if isinstance(key, StepKey) else StepKey(key)
+
+
 def _inputs(key):
-    return NodeInputs(tensor_inputs={}, resource_step_info=key if isinstance(key, StepKey) else StepKey(key))
+    return NodeInputs(tensor_inputs={}, resource_step_info=_step_key(key))
 
 
 def _expanded(model, sub, keys, rids):
@@ -257,7 +261,7 @@ def test_klein_steps_equal_the_hand_written_one(rids):
     sub = KleinDenoiseSubmodule(None, model.config, loop_name=DENOISE_LOOP, compile_transformer=False)
     segments = [Segment(request_id=rid, label="main", span=key.total_tokens) for rid in rids]
     reference = SubmoduleStep(
-        segments=segments, steps={KLEIN_ATTN: AttentionStep(causal=False, fixed_layout=True)}, cg_key_info=key,
+        segments=segments, steps={KLEIN_ATTN: AttentionStep(causal=False, fixed_layout=True)}, cg_key_info=_step_key(key),
     )
     _assert_plans_equal(_expanded(model, sub, [key] * len(rids), rids), reference, KLEIN_ATTN)
 
@@ -272,7 +276,7 @@ def test_z_image_steps_equal_the_hand_written_one(rids):
         for label, span in (("image", key.image_tokens_padded), ("caption", 32), ("main", key.total_tokens))
     ]
     reference = SubmoduleStep(
-        segments=segments, steps={Z_ATTN: AttentionStep(causal=False, fixed_layout=True)}, cg_key_info=key,
+        segments=segments, steps={Z_ATTN: AttentionStep(causal=False, fixed_layout=True)}, cg_key_info=_step_key(key),
     )
     _assert_plans_equal(_expanded(model, sub, [key] * len(rids), rids), reference, Z_ATTN)
 
@@ -285,7 +289,7 @@ def test_wan22_steps_equal_the_hand_written_one(guidance, branches):
     tokens = sub.num_tokens(key)
     segments = [Segment(request_id=0, label="main", span=tokens)] * branches
     reference = SubmoduleStep(
-        segments=segments, steps={SELF_ATTN: AttentionStep(causal=False, fixed_layout=True)}, cg_key_info=key,
+        segments=segments, steps={SELF_ATTN: AttentionStep(causal=False, fixed_layout=True)}, cg_key_info=_step_key(key),
     )
     _assert_plans_equal(_expanded(model, sub, [key], [0]), reference, SELF_ATTN)
 
@@ -327,7 +331,7 @@ def test_wan22_parallel_configs_plan_each_ranks_step_as_main_did(path, guidance)
         key = sub._key(WanStepKey(frames=3, height=8, width=8, i2v=False), None, guidance > 1.0)
         segments = [Segment(request_id=0, label="main", span=sub.num_tokens(key))] * branches
         reference = SubmoduleStep(
-            segments=segments, steps={SELF_ATTN: AttentionStep(causal=False, fixed_layout=True)}, cg_key_info=key,
+            segments=segments, steps={SELF_ATTN: AttentionStep(causal=False, fixed_layout=True)}, cg_key_info=_step_key(key),
         )
         for sp_rank in range(axes["sp"]):
             sp_group = SimpleNamespace(world_size=axes["sp"], rank=sp_rank)
@@ -517,7 +521,7 @@ def test_ltx_steps_equal_the_hand_written_ones_per_rank(rids, world_size, rank, 
     declared = sub.declare_step("generate_av", rids, [_inputs(shape)] * len(rids))
     step = state_steps(declared, handles)
     reference = _ltx_reference_step(rids, shape, shard)
-    assert step.steps.keys() == reference.keys() and step.cg_key_info == shape
+    assert step.steps.keys() == reference.keys() and step.cg_key_info == StepKey(shape)
     for key, expected in reference.items():
         assert _by_label(step.steps[key]) == _by_label(expected), key
         if isinstance(expected, RaggedCrossAttentionStep):
@@ -630,7 +634,7 @@ def test_h3_steps_equal_the_hand_written_one_on_every_rank(world):
     assert (padded > rows) == (world > 1)
     segments = [Segment(request_id=0, label="main", span=span) for span in (rows, padded - rows) if span]
     reference = SubmoduleStep(
-        segments=segments, steps={H3_ATTN: AttentionStep(causal=False, fixed_layout=True)}, cg_key_info=layout,
+        segments=segments, steps={H3_ATTN: AttentionStep(causal=False, fixed_layout=True)}, cg_key_info=StepKey(layout),
     )
     for rank in range(world):
         sp_group = SimpleNamespace(world_size=world, rank=rank)
