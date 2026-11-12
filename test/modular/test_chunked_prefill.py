@@ -850,7 +850,7 @@ def _captured_buckets(submodule, walk, ladders, engine, bs=1) -> list[int]:
     runner = AcceleratorGraphRunner(
         submodule_name="LLM", submodule=submodule, resources={}, step_runner=None,
         device=torch.device("cpu"), autocast_dtype=None,
-        joint_comm_group=SimpleNamespace(world_size=1), num_slots=1,
+        joint_comm_group=SimpleNamespace(world_size=1), num_slots=1, head_shards=1,
         token_ladders=ladders, step_tokens=functools.partial(engine._chunking.max_step_tokens, "LLM"),
     )
     return sorted({

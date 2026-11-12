@@ -17,11 +17,13 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal, NamedTuple
 
 import torch
 
+from mstar.distributed.utils import kv_head_replicas
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig, check_sizes, instance_key
 from mstar.utils.client_errors import scrub_paths
 
 if TYPE_CHECKING:
     from mstar.engine.resources.base import Resource
+    from mstar.engine.resources.sequence_shard import SeqShardSpec
 
 # The resource key a model's ``LoraSpec`` is declared under, and so the serving YAML's
 # ``resources:`` block that turns LoRA on (see ``mstar.engine.resources.lora.serving``).
@@ -272,8 +274,8 @@ class LoraTarget:
             return 0, rows
         units = rows if self.slice_units is None else self.slice_units[slice_idx]
         if units < world_size:
-            # replicated: each group of `world_size // units` ranks holds one unit
-            replicas = _divide(world_size, units)
+            # replicated: each group of consecutive ranks holds one unit, as the base loads it
+            _, replicas = kv_head_replicas(units, world_size)
             size = rows // units
             return (rank // replicas) * size, size
         size = _divide(rows, world_size)
@@ -437,6 +439,14 @@ class LoraSpec(NodeResourceSpec):
         from mstar.engine.resources.lora.pool import LoraAdapterPool
 
         return LoraAdapterPool
+
+    def split_step_refusals(self, node: str, shard: SeqShardSpec, tp: int, sp: int) -> list[str]:
+        # a node placing its KV positions over its SP ranks instead runs every row on every rank
+        return [
+            f"LoRA resource {self.resource_key!r} serves node {node!r}, which splits tokens over {sp} SP "
+            f"ranks (SeqShardSpec {shard.resource_key!r}): LoRA lays its rows out per request, while each "
+            "SP rank holds a shard of the tokens. Serve this node without SP, or drop the 'lora:' block"
+        ]
 
     def for_node(self, node: str) -> "LoraSpec | None":
         """``node``'s pool: the targets on it, keyed ``lora@<node>``; None when the

@@ -40,5 +40,6 @@ def make_mgmt(submodule=None, **overrides) -> SubmoduleManagement:
         "forward_batched": getattr(submodule, "forward_batched", None),
         "joint_comm_group": None,
         "resources": {},
+        "head_shards": 1,
     }
     return SubmoduleManagement(submodule=submodule, **(defaults | overrides))

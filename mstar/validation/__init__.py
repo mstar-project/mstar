@@ -13,8 +13,15 @@ from typing import Any, NamedTuple
 from mstar.distributed.base import ShardingConfig
 from mstar.engine.resources.lora.serving import refuse_unresolved_lora_adapters
 from mstar.engine.state.adapters import StateSetup, spec_overrides, state_setup
-from mstar.engine.state.analysis import deployment_problems, state_declaration_problems
-from mstar.model.base import Model, WorkerGraph, built_resources, enabled_resources, parse_autocast_dtype
+from mstar.engine.state.analysis import deployment_problems, split_read_problems, state_declaration_problems
+from mstar.model.base import (
+    Model,
+    WorkerGraph,
+    built_resources,
+    enabled_resources,
+    node_moe_parallel_configs,
+    parse_autocast_dtype,
+)
 from mstar.model.multimodal import SUPPORTED_MODALITIES
 from mstar.validation.client_streams import check_client_streams
 from mstar.validation.knobs import check_knobs
@@ -154,11 +161,16 @@ def validate_deployment(
             # a `resources:` block check_resources refuses turns no resource on
             specs = enabled_resources(model, config if resources_readable else {**config, "resources": None}, setup)
             if resources_readable:
-                head_shards = {} if deployment is None else {
-                    node: graph.tp_size * graph.sp_size for graph in deployment.worker_graphs if graph.sp_size > 1
+                sp_nodes = set() if deployment is None else {
+                    node for graph in deployment.worker_graphs if graph.sp_size > 1
                     for node in graph.section.get_nodes()
                 }
-                problems += deployment_problems(model, config.get("resources") or {}, head_shards=head_shards)
+                split = {
+                    node: spec.labels for spec in specs if spec.splits_steps for node in spec.nodes & sp_nodes
+                }
+                sdpa_reads = [read for read, binding in setup.by_read.items() if not binding.plans]
+                problems += deployment_problems(model, config.get("resources") or {})
+                problems += split_read_problems(model.declare_state(), sdpa_reads, split)
     except (ValueError, OSError) as e:
         problems.append(
             f"declaring the node resources failed: {type(e).__name__}: {e}; "
@@ -174,16 +186,20 @@ def validate_deployment(
             specs = built_resources(specs)
         except (ValueError, OSError) as e:
             problems.append(f"building the node resources failed: {type(e).__name__}: {e}")
-            specs = None
+            # the placement checks still see the specs built whole; a per-node one (LoRA) may be what
+            # failed, and reading it again would raise again
+            specs = [spec for spec in specs if not spec.per_node]
     # after get_worker_graphs too: a model may shape its walks from the deployment (BAGEL)
     problems += _checked(
         "checking the client streams", check_client_streams,
         model, config, deployment.sharding_config if deployment is not None else None,
     )
     if deployment is not None:
+        # get_sharding_config parsed these already, so this can't raise here
+        moe_parallel = node_moe_parallel_configs(config["node_groups"])
         problems += _checked(
             "checking the worker graphs", check_worker_graphs,
-            model, deployment.worker_graphs, deployment.sharding_config, specs,
+            model, deployment.worker_graphs, deployment.sharding_config, specs, moe_parallel,
         )
 
     if problems:
