@@ -127,6 +127,36 @@ def test_all_to_all_of_several_tensors_matches_one_at_a_time(tmp_path, world, to
     _run(_several_at_once, world, tmp_path / "store", total, batched)
 
 
+def _ulysses_halves(rank, world, total, rows, rest):
+    group = _group(rank, world)
+    sizes = sp_seq_split(total, world)
+    batched = rows is not None
+    seq_dim, head_dim = _layout(batched)
+    shape = ((rows,) if batched else ()) + (total, HEADS) + rest
+    full = torch.randn(shape, generator=torch.Generator().manual_seed(rows or 0))
+    shard = full.narrow(seq_dim, sum(sizes[:rank]), sizes[rank])
+    per_rank = HEADS // world
+    packed = shard.flatten(0, 1) if batched else shard
+    heads = group.tokens_to_heads(packed, sizes, rows)
+    want = full.narrow(head_dim, rank * per_rank, per_rank)
+    assert torch.equal(heads, want.flatten(0, 1) if batched else want)
+    back = group.heads_to_tokens(heads, sizes, rows)
+    assert torch.equal(back, packed)
+    # a strided view of the tokens (a slice of a wider projection) packs the same
+    wide = torch.cat([packed, packed], dim=1)[:, :HEADS]
+    assert not wide.is_contiguous()
+    assert torch.equal(group.tokens_to_heads(wide, sizes, rows), heads)
+
+
+@pytest.mark.parametrize("rest", [(4,), (), (2, 3)], ids=["HD", "H", "HXY"])
+@pytest.mark.parametrize("rows", [None, 1, 2], ids=["packed", "1-row", "2-rows"])
+@pytest.mark.parametrize("world,total", [(2, 6), (2, 7), (3, 11)], ids=["2-even", "2-uneven", "3-uneven"])
+def test_ulysses_halves_trade_tokens_for_heads_row_by_row(tmp_path, world, total, rows, rest):
+    """``tokens_to_heads`` gives each rank every token of its block of heads, each row's tokens together, and
+    ``heads_to_tokens`` undoes it, bit for bit, for any trailing dims (a recurrent layer's gates have none)."""
+    _run(_ulysses_halves, world, tmp_path / "store", total, rows, rest)
+
+
 def _sharded_keys(rank, world, total):
     group = _group(rank, world)
     sizes = sp_seq_split(total, world)
