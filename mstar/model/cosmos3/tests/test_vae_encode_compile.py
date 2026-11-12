@@ -107,7 +107,7 @@ def test_droid_deployments_compile_the_robolab_observation_and_warm_it(name):
 
 
 def test_the_nano_droid_warmup_is_a_policy_request_at_the_compiled_size(tmp_path):
-    """Nano's checkpoint.json is empty, so the warmup's chunk, fps and domain
+    """Nano's checkpoint.json is empty, so the warmups' chunk, fps and domain
     come from the config's policy_* fields, as a RoboLab request's do."""
     cfg = yaml.safe_load((CONFIGS / "cosmos3_droid.yaml").read_text())
     root = tmp_path / "nano"
@@ -115,11 +115,15 @@ def test_the_nano_droid_warmup_is_a_policy_request_at_the_compiled_size(tmp_path
     (root / "transformer" / "config.json").write_text(json.dumps({"_class_name": "Cosmos3OmniTransformer"}))
     (root / "checkpoint.json").write_text("{}")
     model = Cosmos3Model(model_path_hf=str(root), skip_weight_loading=True)
-    for k in ("policy_action_chunk_size", "policy_conditioning_fps", "policy_domain_name"):
+    for k in ("policy_action_chunk_size", "policy_conditioning_fps", "policy_domain_name", "guidance_scale_action"):
         setattr(model.config, k, cfg["model_kwargs"][k])
-    warmup = cfg["warmup_requests"][0]
-    p = model._resolve_gen_params(warmup["model_kwargs"], ["image", "text"], warmup["output_modalities"])
-    assert p["action_mode"] == "policy" and p["action_state_rows"] == 1
-    assert p["action_chunk_size"] == 32 and p["num_frames"] == 33
     width, height = cfg["model_kwargs"]["compile_vae_encode_size"]
-    assert (p["width"], p["height"]) == (width, height)
+    guidance = []
+    for warmup in cfg["warmup_requests"]:
+        p = model._resolve_gen_params(warmup["model_kwargs"], ["image", "text"], warmup["output_modalities"])
+        assert p["action_mode"] == "policy" and p["action_state_rows"] == 1
+        assert p["action_chunk_size"] == 32 and p["num_frames"] == 33
+        assert (p["width"], p["height"]) == (width, height)
+        guidance.append(float(p["guidance_scale"]))
+    # the guided step and the conditional-only one (guidance 1) are both built at startup
+    assert guidance[0] != 1.0 and 1.0 in guidance

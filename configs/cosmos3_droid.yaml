@@ -55,3 +55,8 @@ warmup_requests:
     files: [hf://nvidia/Cosmos3-Edge/assets/example_i2v_input.jpg]
     output_modalities: [action]
     model_kwargs: {size: 736x544, robot_state: [0, 0, 0, 0, 0, 0, 0, 0]}
+  # guidance 1 runs the conditional branch alone, a step the guided request doesn't build
+  - text: warmup
+    files: [hf://nvidia/Cosmos3-Edge/assets/example_i2v_input.jpg]
+    output_modalities: [action]
+    model_kwargs: {size: 736x544, robot_state: [0, 0, 0, 0, 0, 0, 0, 0], guidance_scale: 1.0}
