@@ -559,6 +559,8 @@ class TestStorageFreeProviders(unittest.TestCase):
             return subprocess.CompletedProcess(command, 1 if self.ssh_fails else 0, "", "boom")
 
         def cmd_wait(args, cfg):
+            if self.api_down:
+                raise GPU["ApiError"](503, "x")
             e = GPU["ledger"]()[args.instance]
             with GPU["ledger_txn"]() as ledger:
                 ledger[args.instance].update(host="1.2.3.4", port=2222)
@@ -573,21 +575,22 @@ class TestStorageFreeProviders(unittest.TestCase):
                "budget": {"max_usd_per_hour": 30, "max_hours": 4, "max_running": None}}
         args = argparse.Namespace(boxes=1, offer="runpod:H100:dc:1", pr=7, hours=1, tag="t", run=str(box),
                                   input=[str(extra)], allow_over_budget=False, dry_run=False)
-        for self.ssh_fails in (False, True):
+        for self.ssh_fails, self.api_down in ((False, False), (True, False), (False, True)):
             sent.clear(), ended.clear(), created.clear()
-            with self.subTest(ssh_fails=self.ssh_fails), unittest.mock.patch.object(subprocess, "Popen"), \
+            with self.subTest(ssh_fails=self.ssh_fails, api_down=self.api_down), \
+                    unittest.mock.patch.object(subprocess, "Popen"), \
                     unittest.mock.patch.object(subprocess, "run", fake_run), \
                     unittest.mock.patch.dict(os.environ, {"RUNPOD_API_KEY": "k", "BOX_KEY": "sk-ant-box"}), \
                     contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                 GPU["save_ledger"]({})
                 try:
                     GPU["cmd_launch"](args, cfg)
-                except SystemExit:
+                except (SystemExit, GPU["ApiError"]):
                     pass
             self.assertNotIn("sk-ant-box", json.dumps(created), "the key would reach RunPod's API")
-            self.assertEqual(ended, ["runpod:p1"] if self.ssh_fails else [],
+            self.assertEqual(ended, ["runpod:p1"] if self.ssh_fails or self.api_down else [],
                              "a pod without its run would bill idle, or a started one would be ended")
-            if not self.ssh_fails:
+            if not (self.ssh_fails or self.api_down):
                 self.assertEqual(sent[-1][0][-1].split()[:3], ["setsid", "nohup", "bash"], "the run would not start")
                 self.assertEqual(sent[-2][1], "sk-ant-box", "the box would have no Anthropic key")
                 self.assertIn(str(extra), sent[1][0], "the box would miss its inputs")

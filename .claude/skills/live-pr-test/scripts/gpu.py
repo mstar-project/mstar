@@ -1012,7 +1012,8 @@ def start_run_over_ssh(key: str, cfg: dict, args) -> None:
     """`launch --run` for a provider that can't carry the files in its create request (run_by_ssh): once the box
     answers ssh, copy the script and its inputs to /run/live-pr and the run secret to /run/live-pr-key/value, and
     start the script detached. The secret goes over scp from a file, never in a command line or the provider's
-    API. A box that can't be reached or written to is terminated, so no GPU idles on a run that never started."""
+    API. A box whose run can't be started, for whatever reason, is terminated, so no GPU idles on a run that never
+    started."""
     try:
         cmd_wait(argparse.Namespace(instance=key, timeout=RUN_SSH_WAIT), cfg)
         e = reachable(key)
@@ -1034,7 +1035,7 @@ def start_run_over_ssh(key: str, cfg: dict, args) -> None:
                 r = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True, check=False)
                 if r.returncode:
                     die(f"couldn't {what} on {key}: {tail_lines(r.stderr or r.stdout, 300)}")
-    except SystemExit:
+    except BaseException:  # a die, an API error or an interrupt: all end the pod
         terminate(key, entry(key))
         raise
 
