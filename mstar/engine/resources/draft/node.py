@@ -26,14 +26,20 @@ class DrafterShare(NamedTuple):
     """What the engine binds into a verifying node once at load
     (`NodeSubmodule.bind_draft`), from its `VerifyNode` and the draft config, so
     no model declares it: the walk it verifies on, the sampler that verifies, k,
-    and the steps it adds for its drafter (`drafter_step`). The same on every rank."""
+    and what it adds to the node's steps for its drafter (`drafter_step`): the
+    drafter's resource steps and its carry's loop-back writes. The same on every rank."""
     verify_walk: str
     sampler_key: str
     num_draft_tokens: int
     prompt_walks: frozenset[str]
+    # the sampler loop-back state the drafter's carry is stored through, on its prompt and verify steps
+    # (`carry_writes`)
+    loopback_writes: frozenset[str]
     # the drafter's own resources' steps (`VerifyNode.prefill_steps`, `VerifyNode.verify_steps`)
     prompt_steps: Mapping[str, ResourceStep]
     verify_steps: Mapping[str, ResourceStep]
+    # the node's resources that correct a verify step's state in its graph, in dependency order
+    correcting_keys: tuple[str, ...] = ()
 
     @property
     def block(self) -> int:
@@ -43,8 +49,8 @@ class DrafterShare(NamedTuple):
 
 def drafter_step(step, graph_walk: str, share: DrafterShare | None):
     """``step`` with its drafter's share, as a new step: on a prompt or verify step, the drafter's resource
-    steps. The engine derives them from the drafter's declaration, so a captured graph and each step it
-    replays agree by construction."""
+    steps and its loop-back writes on the node's sampler step. The engine derives all of it from the drafter's
+    declaration, so a captured graph and each step it replays agree by construction."""
     if share is None or step is None:
         return step
     if graph_walk == share.verify_walk:
@@ -53,9 +59,16 @@ def drafter_step(step, graph_walk: str, share: DrafterShare | None):
         own = share.prompt_steps
     else:
         return step
+    writes = share.loopback_writes
     steps = dict(step.steps)
     if clash := sorted(steps.keys() & own.keys()):
         raise RuntimeError(f"a {graph_walk!r} step declares {clash}, its drafter's steps, which the engine adds")
+    if writes:
+        sampler_step = steps.get(share.sampler_key)
+        if sampler_step is None:
+            raise RuntimeError(f"a {graph_walk!r} step declares no {share.sampler_key!r} step, which its "
+                               f"drafter's loop-back state {sorted(writes)} is stored through")
+        steps[share.sampler_key] = replace(sampler_step, loopback_writes=sampler_step.loopback_writes | writes)
     # fresh each step, as a declaration's are: a resource may stamp its own step (KV's commit count)
     steps.update((key, replace(resource_step)) for key, resource_step in own.items())
     return replace(step, steps=steps)

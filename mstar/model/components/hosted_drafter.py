@@ -16,9 +16,11 @@ if TYPE_CHECKING:
 
 class HostedDrafter(Drafter, Protocol):
     @abstractmethod
-    def prefill(self, inputs: PrefillInputs) -> None:
+    def prefill(self, inputs: PrefillInputs) -> torch.Tensor | None:
         """Its state over a prompt step's rows, after the target's forward wrote what it reads.
-        A hosted drafter runs its own stack over the prompt, so it has to say what it keeps."""
+        A hosted drafter runs its own stack over the prompt, so it has to say what it keeps: for
+        one that declares a carry (`DrafterNeeds.carry`), the rows' first carry, which the
+        scaffold stores; None otherwise."""
         ...
 
 

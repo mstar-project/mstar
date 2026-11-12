@@ -89,7 +89,7 @@ def test_a_drafter_observes_nothing_unless_it_says_otherwise():
 
 
 def _share(k=3):
-    return DrafterShare("decode", "sampler", k, frozenset({"prefill"}), {}, {})
+    return DrafterShare("decode", "sampler", k, frozenset({"prefill"}), frozenset(), {}, {})
 
 
 def test_the_share_is_bound_once_and_answers_for_the_verify_walk():

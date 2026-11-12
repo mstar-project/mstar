@@ -192,6 +192,8 @@ class RecurrentStatePool(Resource):
             )
             for name, block in config.blocks.items()
         }
+        # walks that verify drafts, whose commits count a block's rejected tokens until the take-back
+        self._verify_walks: frozenset[str] = frozenset()
         # slot -> its views of every block, a list per dtype (`_zero_slot`)
         self._slot_views: dict[int, list[list[torch.Tensor]]] = {}
 
@@ -734,6 +736,7 @@ class RecurrentStatePool(Resource):
             if self._admit_restores or self._admit_snaps:
                 self._forget_prefix_admit(lambda key: ctx.is_real_row(key[0]))
             page = self._kv.config.tokens_per_page if self._kv is not None else 0
+            verifying = ctx.graph_walk in self._verify_walks
             slots, is_pad = self._slots, ctx.is_padding_row
             for segment in step.segments or ():
                 if segment.span <= 0 or is_pad(segment.request_id):
@@ -746,8 +749,9 @@ class RecurrentStatePool(Resource):
                         slot.has_state = True
                         self._version += 1
                     slot.tokens += segment.span
-                    # a row too short to checkpoint that ends on a page (a decode step) is saved here, after its forward
-                    if page and segment.span < page and not slot.tokens % page:
+                    # a row too short to checkpoint that ends on a page (a decode step) is saved here, after its
+                    # forward; never a verify step's, whose count runs past the tokens it keeps
+                    if page and segment.span < page and not slot.tokens % page and not verifying:
                         self._save_decode(segment.request_id, segment.label, slot)
             if self._snap_writes:
                 self._file_writes(step)
@@ -759,6 +763,26 @@ class RecurrentStatePool(Resource):
                 continue
             for from_label, to_label in step.post_forks:
                 self._apply_fork(rid, from_label, to_label)
+
+    # Speculative decoding
+
+    def bind_verify_walk(self, walk: str, block: int, slack: int) -> None:
+        """``walk`` verifies drafts, ``block`` tokens a row. Its linear-attention
+        resource reruns the kept tokens into the slots in the graph
+        (`GDNManager.correct_verify_state`); the pool corrects its own count (`take_back`)."""
+        del block, slack
+        self._verify_walks = self._verify_walks | {walk}
+
+    def take_back(self, rids, counts, label: str) -> None:
+        """A verify step's rejected tokens out of each row's count: the state
+        itself was rerun to the kept ones in the step's own graph. Startup refuses
+        a pool no linear-attention resource reruns (`uncorrected_problems`)."""
+        with self._lock:
+            for rid, n in zip(rids, counts, strict=True):
+                labels = self._slots.get(rid)
+                slot = labels.get(label) if labels else None
+                if slot is not None:
+                    slot.tokens -= n
 
     def _apply_fork(
         self, rid: str, from_label: str, to_label: str,
@@ -1280,10 +1304,15 @@ class RecurrentStatePool(Resource):
         stream = step.streams[self._resident_key]
         if stream.reads:
             raise ValueError(f"recurrent pool {self._resident_key!r}: a resident step advances its state, not reads it")
+        verifying = step.bucket.graph_walk in self._verify_walks
+        if stream.span != 1 and not verifying:
+            # only a verify step's rejected tokens are undone, by its linear-attention resource's rerun
+            raise ValueError(f"recurrent pool {self._resident_key!r}: a resident step advances one token a row")
         key = CGSlotKey(bucket=step.bucket, slot=step.slot, label=stream.label)
         table = self._resident_table
+        addressing = self._cg_addressing[key]
         # a padding row reads the trash row's zero, which is SINK_SLOT
-        gather_column(self._resident.store, step.slots, table.stride, table.col, self._cg_addressing[key].slot_indices)
+        gather_column(self._resident.store, step.slots, table.stride, table.col, addressing.slot_indices)
 
     # Engine lifecycle
 

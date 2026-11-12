@@ -614,6 +614,155 @@ class GDNDecodeWrapper(GDNWrapper):
         return out.squeeze(1)
 
 
+# A rejected token's raw gate inputs in the verify rerun: the decay
+# exp(-exp(A_log) softplus(a + dt_bias)) goes to 1 and the rate sigmoid(b) to 0,
+# so the state passes through the token unchanged. Finite: -inf gave NaN on the
+# multi-token kernel's wider-batch path, 16 rows and more (the cause is a
+# hypothesis), which test_gdn_verify_device's wide-batch rerun case guards.
+CLOSED_GATE = -1e4
+
+
+@dataclass(slots=True)
+class VerifyRerun:
+    """What `GDNManager.correct_verify_state` reruns for one layer of a verify step:
+    `GDNVerifyWrapper.run_conv` fills the conv input and the rows' slots,
+    `GDNVerifyWrapper.run` the block's k, v and raw gates, the kernel slots, the
+    output buffer and the kernel's own settings."""
+    x: torch.Tensor | None = None
+    slots: torch.Tensor | None = None
+    null_slot_id: int | None = None
+    k: torch.Tensor | None = None
+    v: torch.Tensor | None = None
+    a: torch.Tensor | None = None
+    b: torch.Tensor | None = None
+    index: torch.Tensor | None = None
+    a_log: torch.Tensor | None = None
+    dt_bias: torch.Tensor | None = None
+    out: torch.Tensor | None = None
+    scale: float | None = None
+    qk_l2norm: bool = False
+
+
+class GDNVerifyWrapper(GDNWrapper):
+    """A verify step's rows, ``block`` (k + 1) tokens each, through FlashInfer's
+    recurrent multi-token kernel (`gated_delta_rule_mtp`), and their conv through
+    the multi-token `causal_conv1d_update`. The forward leaves every row's state
+    and conv window as they were: `GDNManager.correct_verify_state` reruns the kept
+    tokens from the state, the rejected ones' gates closed, and rebuilds the
+    window; those are the only writes. A padding row (the
+    null slot) goes to the kernel as -1, which it neither reads nor writes, and
+    to the conv as the null slot, which it skips: the row's conv output is
+    left unwritten and reaches only its own skipped kernel row, and its delta-rule
+    output is what the buffer held."""
+
+    qk_l2norm_in_kernel: bool = True
+    # FlashInfer's multi-token kernel reads the projection's column views of v, a and b as they are
+    takes_strided_inputs: bool = True
+
+    def __init__(
+        self,
+        device: torch.device,
+        pad_slot_id: int,
+        block: int,
+        sm_scale: float | None = None,
+        qk_l2norm: bool = True,
+        bs: int | None = None,
+        accelerator_graph: bool = False,
+        null_slot_id: int = 0,
+    ):
+        super().__init__(
+            device=device,
+            pad_slot_id=pad_slot_id,
+            sm_scale=sm_scale,
+            qk_l2norm=qk_l2norm,
+            num_tokens=None if bs is None else bs * block,
+            bs=bs,
+            accelerator_graph=accelerator_graph,
+            null_slot_id=null_slot_id,
+        )
+        self.block = block
+        self._plan_state: GDNDecodePlan | None = None
+        # each row's slot as the kernel reads it: -1 on a padding row
+        self._index: torch.Tensor | None = None
+        # the delta rule's outputs, allocated once at the bucket's rows (a captured step's are
+        # its graph's): every layer's forward, and the rerun, write it in turn
+        self.out: torch.Tensor | None = None
+
+    def plan(self, spans: list[int], slots: torch.Tensor):
+        if any(span != self.block for span in spans):
+            raise ValueError(f"gdn verify: every row runs {self.block} tokens, got {spans}")
+        rows = len(spans)
+        self._plan_state = GDNDecodePlan(slots=slots, num_rows=rows)
+        if self._index is None or self._index.shape[0] < rows:
+            self._index = torch.empty(max(rows, self._bs or 0), dtype=torch.int32, device=self._device)
+
+    def _buffer(self, name: str, shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
+        buf = getattr(self, name)
+        if buf is None or buf.shape[0] < shape[0] or buf.shape[1:] != shape[1:] or buf.dtype != dtype:
+            buf = torch.zeros((max(shape[0], self._bs or 0), *shape[1:]), dtype=dtype, device=self._device)
+            setattr(self, name, buf)
+        return buf[: shape[0]]
+
+    def run_conv(
+        self,
+        x: torch.Tensor,
+        conv_layer: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor | None = None,
+        activation: str | None = "silu",
+        rerun: VerifyRerun | None = None,
+    ):
+        from mstar.utils.causal_conv1d import causal_conv1d_update
+
+        rows, block, dim = self._plan_state.num_rows, self.block, x.shape[-1]
+        if rerun is not None:
+            rerun.x, rerun.slots, rerun.null_slot_id = x, self._plan_state.slots, self._null_slot_id
+        # a layer's own: its k and v, cut from it, are what the rerun reads after the last layer
+        out = torch.empty(rows, block, dim, dtype=x.dtype, device=x.device)
+        # [rows, dim, block] views, the channel axis innermost as the kernel reads it
+        causal_conv1d_update(
+            x=x.reshape(rows, block, dim).transpose(1, 2),
+            conv_state=conv_layer,
+            weight=weight,
+            bias=bias,
+            activation=activation,
+            conv_state_indices=self._plan_state.slots,
+            null_block_id=self._null_slot_id,
+            out=out.transpose(1, 2),
+            # the window stays as it was; `GDNManager.correct_verify_state` writes it after the kept tokens
+            update_state=False,
+        )
+        return out.reshape(rows * block, dim)
+
+    def run(self, q, k, v, a, b, state, a_log, dt_bias, rerun: VerifyRerun | None = None):
+        """The forward over each row's block from its slot, outputs only.
+        ``rerun`` (`GDNManager.correct_verify_state`) receives what the rerun reads:
+        the block's k, v and raw gates, and the rows' kernel slots."""
+        from flashinfer.gdn_decode import gated_delta_rule_mtp
+
+        rows, block = self._plan_state.num_rows, self.block
+
+        def by_row(t: torch.Tensor) -> torch.Tensor:
+            return t.reshape(rows, block, *t.shape[1:])
+
+        q, k, v, a, b = (by_row(t) for t in (q, k, v, a, b))
+        index = self._index[:rows]
+        slots = self._plan_state.slots
+        torch.where(slots == self._null_slot_id, torch.full_like(slots, -1), slots, out=index)
+        out = self._buffer("out", tuple(v.shape), v.dtype)
+        gated_delta_rule_mtp(
+            q=q, k=k, v=v, initial_state=state, initial_state_indices=index,
+            A_log=a_log, a=a, dt_bias=dt_bias, b=b, scale=self._sm_scale, output=out,
+            disable_state_update=True, use_qk_l2norm=self._qk_l2norm,
+        )
+        if rerun is not None:
+            # ``out`` is the step's rows of the buffer, the shape the rerun's q/k/v have
+            rerun.k, rerun.v, rerun.a, rerun.b, rerun.index = k, v, a, b, index
+            rerun.a_log, rerun.dt_bias, rerun.out = a_log, dt_bias, out
+            rerun.scale, rerun.qk_l2norm = self._sm_scale, self._qk_l2norm
+        return out.reshape(rows * block, *out.shape[2:])
+
+
 class _PinnedIndexStage:
     """Host index arrays a plan uploads, through page-locked staging buffers
     the wrapper owns. A packed step plans inline on the gpu thread behind the

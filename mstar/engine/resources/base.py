@@ -472,6 +472,15 @@ class Resource(ResidentHooks, ABC):
         in `capabilities`, which ran before."""
         return
 
+    def correct_verify_state(self, result) -> None:
+        """A resource whose state a verify step's block wrote in place for every
+        row's ``k + 1`` tokens rewrites it to what the row kept, from the sampler's
+        ``result`` (accepted counts), inside the verify step's own graph and before
+        the drafter observes (`draft_verify_step`). It runs once a verify step,
+        capturable, reading nothing on the host. Only an override is called: the
+        engine binds the overriding resources at load (`DrafterShare.correcting_keys`)."""
+        return
+
     def plan(self, step: ResourceStep, ctx: StepContext) -> Any:
         """ret is immutable and opaque to runner; only gives to `ctx.plan_results`"""
         return None

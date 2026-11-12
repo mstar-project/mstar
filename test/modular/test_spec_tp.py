@@ -62,12 +62,13 @@ def _run(rank: int, mode: str) -> dict:
     target = sub._target
 
     def skewed(engine_inputs, ids):
-        logits = target(engine_inputs, ids)
+        out = target(engine_inputs, ids)
+        logits = out.logits
         if rank == 1 and engine_inputs.step.ctx.graph_walk == "decode":
             # rank 1's argmax moves on every third row of a verify step (the toy's
             # prompt step takes the argmax without the sampler's broadcast)
             logits[::3] = logits[::3].roll(1, dims=-1)
-        return logits
+        return out
 
     sub._target = skewed
     if mode != "no_broadcast":

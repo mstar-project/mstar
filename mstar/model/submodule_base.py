@@ -1632,8 +1632,9 @@ class ARNodeSubmodule(NodeSubmodule):
     ) -> "VerifyResult":
         """A verify step of speculative decoding, in the engine's order
         (`draft_verify_step`): ``input_ids`` ``[n]`` are each row's last
-        emitted token, ``target`` maps the block's ids ``[n * (k + 1)]`` to
-        logits, and the node's drafter proposes. The sampler is the one the
+        emitted token, ``target`` maps the block's ids ``[n * (k + 1)]`` to a
+        `TargetOutput` (its logits, and its hidden states for a drafter that
+        reads them), and the node's drafter proposes. The sampler is the one the
         engine bound (`bind_draft`). Traced with the forward, so the target
         and the drafter compile with it; the sampler's ``agree`` and
         ``verify`` are out of the graph, as ``sample`` is."""
@@ -1644,7 +1645,7 @@ class ARNodeSubmodule(NodeSubmodule):
             raise RuntimeError(f"{type(self).__name__}: a verify step on a node the engine never bound a drafter to")
         return draft_verify_step(
             engine_inputs.resources[share.sampler_key], engine_inputs.request_ids, input_ids, target,
-            self.drafter, engine_inputs.resources, engine_inputs.resident,
+            self.drafter, engine_inputs.resources, engine_inputs.resident, share.correcting_keys,
         )
 
     def verify_output(self, result: "VerifyResult", **row_outputs: torch.Tensor) -> "BatchedModelOutput":
@@ -1659,6 +1660,18 @@ class ARNodeSubmodule(NodeSubmodule):
             row_outputs={self.token_stop.buffer: result.tokens, **row_outputs},
             check_stop_buffers={VERIFY_TOKENS: result.tokens, VERIFY_ACCEPTED: result.accepted},
         )
+
+    @torch.compiler.disable
+    def store_draft_carry(self, engine_inputs: ModelInputsFromEngine, carry: torch.Tensor) -> None:
+        """A prompt step's drafter carry, ``[rows, width]``, row i request i: the
+        state the request's first verify step drafts from (a drafter that
+        declares ``DrafterNeeds.carry``). Kept for the rows the step's sampler
+        step keeps (a prompt's last prefill) when it lists `DRAFT_CARRY` in
+        its ``loopback_writes``."""
+        from mstar.engine.resources.draft.drafter import DRAFT_CARRY
+
+        sampler = engine_inputs.resources[self.drafter_share.sampler_key]
+        sampler.store_loopback_state(DRAFT_CARRY, engine_inputs.request_ids, carry)
 
     def _loops_back(self, graph_walk: str) -> bool:
         """Whether this walk's token loops back on the device."""

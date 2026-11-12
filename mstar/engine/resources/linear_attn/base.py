@@ -82,5 +82,6 @@ class LinearAttnManager(AttentionResource):
                 state_dtype=pool_config.blocks["state"].resolved_dtype(info.kv_dtype),
                 has_sink=not pool_config.disable_sink_slot,
                 device=info.device,
+                world_size=1 if info.joint_comm_group is None else info.joint_comm_group.world_size,
             )
         raise ValueError(f"Unknown linear attention variant {variant!r}")

@@ -48,6 +48,16 @@ def shape_problems(decl: VerifyNode, token_stop, specs: Mapping[str, NodeResourc
             "sets on the one sampler serving the node"
         )
     needs = decl.needs
+    if needs.carry is not None and isinstance(sampler, SamplerSpec):
+        from mstar.engine.resources.draft.drafter import DRAFT_CARRY
+
+        state = (sampler.loopback_state or {}).get(DRAFT_CARRY)
+        if state is None or (state.width, state.dtype) != (needs.carry.width, needs.carry.dtype):
+            have = None if state is None else (state.width, state.dtype)
+            problems.append(
+                f"{where}: the drafter carries {needs.carry.width} values of {needs.carry.dtype} a request, which "
+                f"the sampler keeps as loop-back state {DRAFT_CARRY!r}; it declares {have}"
+            )
     if needs.kv_overhang:
         problems.append(f"{where}: the drafter writes {needs.kv_overhang} KV slots past the verify block")
     missing = decl.input_kinds - needs.input_kinds
@@ -274,6 +284,23 @@ def chunking_problem(decl: VerifyNode, chunks_prompts: bool) -> str | None:
     return None
 
 
+def uncorrected_problems(decl: VerifyNode, specs: Mapping[str, NodeResourceSpec]) -> list[str]:
+    """Each recurrent pool of the node that no linear-attention resource reruns
+    after a verify step (a `LinearAttnSpec` naming it as its ``recurrent_state``):
+    it would keep the rejected tokens in its state. `LinearAttnSpec` refuses the
+    variants that don't rerun, so naming the pool is enough."""
+    from mstar.engine.resources.linear_attn.config import LinearAttnSpec
+    from mstar.engine.resources.recurrent.config import RecurrentStateSpec
+
+    on_node = [spec for spec in specs.values() if decl.node in spec.nodes]
+    rerun = {spec.config.recurrent_state for spec in on_node if isinstance(spec, LinearAttnSpec)}
+    return [
+        f"node {decl.node!r}: recurrent pool {spec.resource_key!r}: no linear-attention resource reruns its state "
+        "after a verify step (only GDN's does); its rejected tokens would stay in the state"
+        for spec in on_node if isinstance(spec, RecurrentStateSpec) and spec.resource_key not in rerun
+    ]
+
+
 def node_problems(
     decl: VerifyNode, token_stop, specs: Mapping[str, NodeResourceSpec], chunks_prompts: bool,
     combined_walk_of: Mapping[tuple[str, str], str] | None = None, max_seq_len: int | None = None,
@@ -282,7 +309,7 @@ def node_problems(
     `check_deployment` (before workers spawn, ``max_seq_len`` the serving config's) and the engine at load (with
     the built submodule's ``token_stop``) run, so the two can't disagree."""
     problems = shape_problems(decl, token_stop, specs) + geometry_problems(decl, specs)
-    problems += resource_problems(decl, specs)
+    problems += resource_problems(decl, specs) + uncorrected_problems(decl, specs)
     for problem in (chunking_problem(decl, chunks_prompts), combined_problem(decl, combined_walk_of or {})):
         if problem is not None:
             problems.append(problem)

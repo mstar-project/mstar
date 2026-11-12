@@ -19,11 +19,14 @@ from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine.engine import Engine, ExecutingBatch
 from mstar.engine.resources.draft.config import DraftConfig
 from mstar.engine.resources.draft.drafter import (
+    CarrySpec,
     ChunkBoundary,
     Drafter,
     DrafterDecl,
     DrafterNeeds,
     DraftInputs,
+    ObserveInputs,
+    TargetOutput,
     VerifyNode,
     drafter_resources,
 )
@@ -88,8 +91,40 @@ class _Drafter(Drafter):
         return torch.stack(drafts, dim=1)
 
 
+class _CarryDrafter(_Drafter):
+    """The oracle, reading the sum of its row's KV tokens off its carry (the
+    engine's `DRAFT_CARRY`) instead of the cache: the prompt's last prefill
+    stores the prompt's sum, and each ``observe`` adds the tokens the step kept."""
+
+    def __init__(self, k: int):
+        super().__init__(k)
+        self.needs = DrafterNeeds(chunk_boundary=ChunkBoundary.NONE, carry=CarrySpec(1, torch.float32))
+        self._sums = None
+
+    def propose(self, inputs: DraftInputs) -> torch.Tensor:
+        n, k = inputs.input_ids.shape[0], self.k
+        position = inputs.resources["rope"].pos_ids("main").view(n, k + 1)[:, 0]
+        # what the KV held before the step, then the step's input token
+        self._sums = inputs.carry[:, 0].round().long()
+        kv_sum, token, drafts = self._sums + inputs.input_ids, inputs.input_ids, []
+        for j in range(k):
+            token = next_token(token, position + j, kv_sum)
+            kv_sum = kv_sum + token
+            drafts.append(token)
+        return torch.stack(drafts, dim=1)
+
+    def observe(self, inputs: ObserveInputs) -> torch.Tensor:
+        block, result = inputs.block, inputs.result
+        kept = torch.arange(block.shape[1])[None, :] <= result.accepted[:, None]
+        return (self._sums + (block * kept).sum(1)).float()[:, None]
+
+
 def oracle(k):
     return _Drafter(k)
+
+
+def carry_oracle(k):
+    return _CarryDrafter(k)
 
 
 def always_wrong(k):
@@ -155,6 +190,7 @@ class ToyLM(ARNodeSubmodule):
     def declare_step(self, graph_walk, request_ids, inputs, **kwargs):
         segments = tuple(Segment(rid, "main", inp.input_seq_len) for rid, inp in zip(request_ids, inputs, strict=True))
         one = tuple(Segment(rid, "main", 1) for rid in request_ids)
+        # the engine adds the drafter's carry to the sampler step (`drafter_step`)
         return SubmoduleStep(
             steps={
                 "kv": KVStep(segments=segments), "rope": PositionStep(segments=segments),
@@ -168,7 +204,7 @@ class ToyLM(ARNodeSubmodule):
             return {"ids": torch.cat([inp.input_ids.reshape(-1) for inp in inputs])}
         return {"ids": self.loopback_inputs(engine_inputs, inputs)["input_ids"]}
 
-    def _target(self, engine_inputs, ids: torch.Tensor) -> torch.Tensor:
+    def _target(self, engine_inputs, ids: torch.Tensor) -> TargetOutput:
         """Write ``ids`` to the KV cache, then each row's logits: a one-hot at
         its next token, which reads the cache up to and including itself."""
         kv, rope = engine_inputs.resources["kv"], engine_inputs.resources["rope"]
@@ -181,7 +217,7 @@ class ToyLM(ARNodeSubmodule):
             before = view.length - view.to_compute
             sums.append(seen.cumsum(0)[before:])
         token = next_token(ids, positions[: ids.numel()], torch.cat(sums))
-        return torch.nn.functional.one_hot(token, VOCAB).float() * 20.0
+        return TargetOutput(torch.nn.functional.one_hot(token, VOCAB).float() * 20.0)
 
     def forward(self, graph_walk, engine_inputs, ids, **kwargs):
         return self.forward_batched(graph_walk, engine_inputs, ids, **kwargs)
@@ -191,10 +227,15 @@ class ToyLM(ARNodeSubmodule):
         kv = engine_inputs.resources["kv"]
         kv._current_plan_outputs_for_toy = engine_inputs.step.ctx.plan_results["kv"]["main"].views
         if graph_walk == "prefill":
-            logits = self._target(engine_inputs, ids)
+            logits = self._target(engine_inputs, ids).logits
             ends = torch.tensor([v.to_compute for v in _views(kv)]).cumsum(0) - 1
             # main's sampler draws on an accelerator only; the prompt step is greedy here
             tokens = logits[ends].argmax(-1)
+            if self.drafter.needs.carry is not None and not getattr(self, "skip_prefill_carry", False):
+                # each prompt's token sum, which its first verify step drafts from
+                starts = torch.cat([torch.zeros(1, dtype=torch.long), ends[:-1] + 1])
+                sums = torch.stack([ids[s: e + 1].sum() for s, e in zip(starts.tolist(), ends.tolist(), strict=True)])
+                self.store_draft_carry(engine_inputs, sums.float()[:, None])
             return BatchedModelOutput(
                 per_rid_outputs={rid: {"new_token": [tokens[i: i + 1]]} for i, rid in enumerate(rids)},
             )
@@ -251,14 +292,17 @@ class ToyModel:
 
 
 class _ToyDecl(DrafterDecl):
-    """The toy drafter as a model declares it: no resources of its own, no layers in the pool."""
-    needs = DrafterNeeds(chunk_boundary=ChunkBoundary.NONE)
+    """The toy drafter as a model declares it: no resources of its own, no layers in the pool,
+    and the carry it keeps, if any."""
+
+    def __init__(self, carry: CarrySpec | None = None):
+        self.needs = DrafterNeeds(chunk_boundary=ChunkBoundary.NONE, carry=carry)
 
     def node_resources(self, nodes):
         return []
 
 
-def specs(k: int, max_num_pages: int = 256, greedy_capture: bool | None = None):
+def specs(k: int, max_num_pages: int = 256, carry: CarrySpec | None = None, greedy_capture: bool | None = None):
     """The node's specs as a model declares them, then through `drafter_resources`, which
     holds the KV slack past the 256-token limit and makes the sampler a verifying one."""
     declared = [
@@ -270,7 +314,7 @@ def specs(k: int, max_num_pages: int = 256, greedy_capture: bool | None = None):
         SamplerSpec("sampler", {NODE}, vocab_size=VOCAB, greedy_capture=greedy_capture),
     ]
     config = DraftConfig.parse({"method": "dspark", "model": "toy", "num_draft_tokens": k})
-    return drafter_resources(declared, _ToyDecl(), {NODE}, config)
+    return drafter_resources(declared, _ToyDecl(carry), {NODE}, config)
 
 
 def engine(
@@ -281,7 +325,8 @@ def engine(
     sub = ToyLM(k, drafter_factory)
     eng = Engine(graph_runtime=None)
     eng.load_model(
-        {NODE: sub}, specs(k, max_num_pages, greedy_capture), WorkerParallelGroups(num_workers=1, global_rank=0),
+        {NODE: sub}, specs(k, max_num_pages, sub.drafter.needs.carry, greedy_capture),
+        WorkerParallelGroups(num_workers=1, global_rank=0),
         torch.device("cpu"), transfer_engine_info=None, kv_cache_type=torch.float32,
         model=ToyModel(k, mode, sub.token_stop, sub.drafter.needs),
     )

@@ -976,6 +976,7 @@ class Engine:
         and bind what its verify steps read: the sampler's ``k``, the ledger, and
         the node's share (`NodeSubmodule.bind_draft`). Every rank of an instance
         picks the same."""
+        from mstar.engine.resources.draft.drafter import carry_writes
         from mstar.engine.resources.draft.node import DrafterShare, NodeDraft
         from mstar.engine.resources.draft.startup import log_mode, node_problems, submodule_problems
 
@@ -998,6 +999,8 @@ class Engine:
         if stop.runtime_check:
             logger.info("speculative decoding on %s: the runtime stop check is off for walk %s", decl.node, decl.walk)
         sampler = mgmt.resources[stop.sampler]
+        if decl.needs.carry is not None:
+            self._check_carry_rows(decl, sampler, mgmt)
         sampler.bind_verify(decl.config.num_draft_tokens)
         for resource in mgmt.resources.values():
             # never refuses: what a resource can't do, its capabilities said before the agreement
@@ -1009,9 +1012,16 @@ class Engine:
             _warn_hostless(decl.node, mgmt.resources)
         # every check above derives from config and built shapes, so a raise was every rank's; from here
         # every step the engine declares for the node, capture's and each replay's, carries its drafter's share
+        # the resources whose state a verify step's block wrote in place (GDN's), in the runner's order
+        correcting_keys = tuple(
+            key for key in self._runner.order
+            if key in mgmt.resources
+            and type(mgmt.resources[key]).correct_verify_state is not Resource.correct_verify_state
+        )
         submodule.bind_draft(DrafterShare(
             decl.walk, stop.sampler, decl.config.num_draft_tokens, stop.prefill_walks,
-            decl.prefill_steps, decl.verify_steps,
+            carry_writes(decl.needs), decl.prefill_steps, decl.verify_steps,
+            correcting_keys,
         ))
         return draft
 
@@ -1059,6 +1069,30 @@ class Engine:
                     f"speculative decoding on {node_name}: capture planned {planned} on the host, which an "
                     "asynchronous verify step can't prove exact. Declare the walk's attention with "
                     "AttentionStep(verify=True), or set model_kwargs.draft.mode: synchronous"
+                )
+
+    def _check_carry_rows(self, decl: "VerifyNode", sampler, mgmt: SubmoduleManagement) -> None:
+        """A captured verify step reads the drafter's carry off the sampler's
+        loop-back masters, which must then never be replaced: refused where they
+        grow (the in-graph scatter off, as above one rank). A recurrent pool
+        holding more requests than those rows only idles its extra slots."""
+        from mstar.utils.knobs import sampler_slots
+
+        if not sampler.fixed_loopback_masters:
+            raise RuntimeError(
+                f"speculative decoding on {decl.node}: its drafter's carry is read in the captured verify step "
+                "off the sampler's loop-back rows, which grow (and move) unless the in-graph scatter keeps them "
+                "fixed: MSTAR_SAMPLER_INGRAPH_SCATTER=1, device loop-back on, and one rank (not yet under TP)"
+            )
+        from mstar.engine.resources.recurrent.pool import RecurrentStatePool
+
+        rows = sampler_slots()
+        for key, resource in mgmt.resources.items():
+            if isinstance(resource, RecurrentStatePool) and resource.config.usable_slots > rows:
+                logger.warning(
+                    "speculative decoding on %s: %r holds %d requests, the sampler's carry rows %d "
+                    "(MSTAR_SAMPLER_SLOTS); requests past those wait while its slots idle",
+                    decl.node, key, resource.config.usable_slots, rows,
                 )
 
     def _agreed_mode(
