@@ -982,9 +982,10 @@ capped at 2048 tokens, which keeps the vocoder's conformer caches (whole, as the
 keeps them) within their size; a request asking for more is a 400.
 
 Voices are reference clips in the serving config's ``model_kwargs.voices_dir``, named by
-file stem; nothing is downloaded. Put the GitHub repo's ``assets/default_female.wav`` (the
-default) and ``default_male.wav`` there, or set ``voices_dir`` elsewhere. Startup refuses a
-config without one. Cloning a voice from a request's own ``ref_audio`` is not served yet
+file stem. When the directory is empty, the first start fetches the GitHub repo's
+``assets/default_female.wav`` (the default) and ``default_male.wav`` into it, at a pinned
+commit and checked against their hashes; with ``HF_HUB_OFFLINE`` set it fetches nothing, and
+startup refuses with the commands that copy them in. Other clips put there are voices too. Cloning a voice from a request's own ``ref_audio`` is not served yet
 (both frontends and ``/generate`` refuse it with a 400). Tool calls, the think mode and
 video input are not supported.
 
