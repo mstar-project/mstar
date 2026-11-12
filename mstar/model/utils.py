@@ -720,9 +720,9 @@ def check_kv_pools_fit(
     spec's `capacity_problem` answers: the first problem raises.
 
     A request keeps its pages from prefill to its last token. Past a pool, a
-    step is refused and waits for pages, or, where the pool has host pages
-    (``cpu_offload_pages``), the worker offloads decoding requests to admit it,
-    which costs far more than queueing would. So the cap's requests
+    prefill batch is refused. With host pages (``cpu_offload_pages``) the worker
+    offloads decoding requests to admit it, which costs far more than queueing
+    would. Without them it retries until requests time out. So the cap's requests
     at full length must fit each cache next to its sink page; the conductor
     queues the rest. Warnings go to the model's ``log``. ``request_layouts``
     gives the `Layout` per array and label of the request the deployment is
@@ -737,8 +737,9 @@ def check_kv_pools_fit(
     if cap is None:
         log.warning(
             "%s sets no max_concurrent_requests: past the requests the KV caches "
-            "hold, requests wait in the worker for pages, or are offloaded where a "
-            "cache has cpu_offload_pages, instead of queueing in the conductor", config_path,
+            "hold, new ones aren't queued. A cache with cpu_offload_pages offloads "
+            "decoding requests to admit them, and one without stalls until requests "
+            "time out", config_path,
         )
         return
     if not isinstance(cap, int) or isinstance(cap, bool) or cap < 1:

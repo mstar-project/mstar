@@ -40,6 +40,8 @@ THINKER_POS = "thinker_pos"
 TALKER_POS = "talker_pos"
 
 THINKER_SAMPLER = "thinker_sampler"
+# whether a Thinker step's tokens split over its SP ranks
+THINKER_SHARD = "thinker_shard"
 # combined walk of the Thinker's text/audio prefill and decode
 THINKER_MIXED = "thinker_mixed"
 # the decode walk of a request with no audio output: no states for the Talker

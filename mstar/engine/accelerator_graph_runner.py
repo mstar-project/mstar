@@ -29,10 +29,11 @@ from mstar.engine.accelerator_graph_config import (
     apply_token_ladders,
 )
 from mstar.engine.node_dtype import node_scope
-from mstar.engine.resources import BucketKey, CGSlotSpec, Resource, SlotLease, StepContext, StepRunner
+from mstar.engine.resources import BucketKey, CGSlotSpec, KVStep, Resource, SlotLease, StepContext, StepRunner
 from mstar.engine.resources.resident import ResidentPlanner
 from mstar.engine.resources.step import PIECEWISE_WALK, lean_subsets
 from mstar.engine.state.adapters import check_capture, state_steps
+from mstar.engine.state.calls import ShardHandle
 from mstar.engine.state.contract import EMPTY
 from mstar.model.submodule_base import (
     BatchedModelOutput,
@@ -115,6 +116,19 @@ def blocked_capture_resources(step, resources: Mapping[str, Resource]) -> list[s
     if step is None:
         return []
     return sorted(key for key in step.steps if not resources[key].can_capture())
+
+
+def placed_combined_pools(step, resources: Mapping[str, Resource]) -> list[str]:
+    """The context-parallel KV pools the declared step combines labels over. A combined plan is
+    label-major, so a replay's padding rows sit between real ones, and attention over a placed pool
+    plans them only after the real rows."""
+    if step is None:
+        return []
+    return sorted(
+        key for key, resource_step in step.steps.items()
+        if isinstance(resource_step, KVStep) and resource_step.combined_labels
+        and resources[key].placement is not None
+    )
 
 
 @contextmanager
@@ -669,6 +683,15 @@ class DummyRowPool:
             self.reset(rids, free=True)
 
 
+def _carried(outputs: BatchedModelOutput, name: str) -> torch.Tensor | None:
+    """The buffer a replay leaves ``name`` in: a stop buffer, else a row output."""
+    for buffers in (outputs.check_stop_buffers, outputs.row_outputs):
+        value = (buffers or {}).get(name)
+        if isinstance(value, torch.Tensor):
+            return value
+    return None
+
+
 @dataclass
 class AcceleratorGraphSlot:
     """One captured graph + the buffers its replay reads and writes.
@@ -726,13 +749,16 @@ class AcceleratorGraphRunner:
         autocast_dtype: torch.dtype | None,
         joint_comm_group: JointGroups,
         num_slots: int,
+        *,
+        head_shards: int,
         enable_nvtx: bool=False,
         device_capability: DeviceCapability | None = None,
         capture_stream: Any = None,
         token_ladders: Mapping[str, Any] | None = None,
         step_tokens: Callable[[str, int], int | None] = lambda walk, max_rows: None,
     ):
-        """``token_ladders``: the serving config's ``prefill_token_buckets``
+        """``head_shards`` is the node's `EngineResourceInfo.head_shards`.
+        ``token_ladders``: the serving config's ``prefill_token_buckets``
         for this node, applied to its packed captures under ``step_tokens``
         ((walk, the capture's widest batch) -> the most tokens the scheduler
         gives such a step, None for no budget; `apply_token_ladders`)."""
@@ -743,9 +769,7 @@ class AcceleratorGraphRunner:
         self._resident: ResidentPlanner | None = None
 
         self._capture_configs: list[AcceleratorGraphConfig] = (
-            submodule.get_accelerator_graph_configs(
-                device, joint_comm_group.world_size
-            )
+            submodule.get_accelerator_graph_configs(device, head_shards)
         )
         for config in self._capture_configs:
             check_capture(
@@ -810,6 +834,9 @@ class AcceleratorGraphRunner:
         # config_idx -> its compiled forward, shared by every bucket of that
         # config so shapes captured twice (once per slot) compile once
         self._compiled_forwards: dict[int, Any] = {}
+        # walk -> how a step of it that repeats carries each loop-back signal
+        # (output -> static input), once ``accept_repeats`` has said it may
+        self._repeat_carries: dict[str, Mapping[str, str]] = {}
 
         # Plan-overlap stream. Lazily created the first time pre_plan
         # is called from StepExecutor's plan thread.
@@ -941,6 +968,14 @@ class AcceleratorGraphRunner:
                         spec.config_idx, self._submodule_name, blocked,
                     )
                     blocked_configs.add(spec.config_idx)
+                # the config's widest capture, as the specs run widest first; one row never pads
+                elif spec.bs > 1 and (pools := placed_combined_pools(step, self._resources)):
+                    raise ValueError(
+                        f"{self._submodule_name}: the capture of {spec.bucket.graph_walk!r} at batch size "
+                        f"{spec.bs} combines labels into one plan, whose padding rows attention over "
+                        f"context-parallel KV pools {pools} can't plan: capture it at batch size 1 only, "
+                        "or turn context_parallel off"
+                    )
             self._blocked_buckets = list(dict.fromkeys(
                 spec.bucket for spec in slot_specs if spec.config_idx in blocked_configs and not spec.bucket.lean
             ))
@@ -1617,6 +1652,10 @@ class AcceleratorGraphRunner:
     def slot_for(self, lease: SlotLease) -> AcceleratorGraphSlot:
         return self._buckets[lease.bucket].slots[lease.slot]
 
+    @property
+    def capture_configs(self) -> list[AcceleratorGraphConfig]:
+        return self._capture_configs
+
     def config_for(self, lease: SlotLease) -> AcceleratorGraphConfig:
         return self._buckets[lease.bucket].config
 
@@ -1720,6 +1759,59 @@ class AcceleratorGraphRunner:
         if self._enable_nvtx:
             profiler.range_pop()
         return slot.static_outputs
+
+    def accept_repeats(self, walk: str, carries: Mapping[str, str]) -> None:
+        """A step of ``walk`` may repeat, carrying its signals as ``carries``."""
+        self._repeat_carries[walk] = carries
+
+    def repeat(self, lease: SlotLease, out: BatchedModelOutput, repeats: int) -> BatchedModelOutput:
+        """``out``, the step's first launch, with the rest of its iterations:
+        its stop buffers gain a column per iteration. The graph replays,
+        copying every loop-back signal's output into the static input it feeds
+        before each replay, and each column out on the stream before the next
+        replay overwrites it. A walk that can't repeat returns ``out`` as it is
+        for one iteration, and refuses more: every resource would commit them."""
+        slot = self.slot_for(lease)
+        walk = lease.bucket.graph_walk
+        carries = self._repeat_carries.get(walk)
+        if carries is None:
+            if repeats > 1:
+                raise ValueError(
+                    f"a step of {walk!r} asks for {repeats} iterations, but the walk never accepted repeats"
+                )
+            return out
+        profiler.phase_record(f"repeats.{walk}#", repeats)
+        if repeats == 1:
+            return out
+        buffers = slot.static_outputs.check_stop_buffers
+        copies = [
+            (_carried(slot.static_outputs, output), slot.static_inputs[target]) for output, target in carries.items()
+        ]
+        unique = {id(t): t for t in buffers.values()}
+        columns = {key: t.new_empty(t.shape[0], repeats) for key, t in unique.items()}
+        for i in range(repeats):
+            if i:
+                for source, target in copies:
+                    target.copy_(source.reshape(target.shape))
+                slot.graph.replay()
+            for key, tensor in unique.items():
+                columns[key][:, i].copy_(tensor.reshape(-1))
+        return replace(out, check_stop_buffers={name: columns[id(tensor)] for name, tensor in buffers.items()})
+
+    def carry_refusal(self, walk: str, carries: Mapping[str, str]) -> str | None:
+        """Why a capture of ``walk`` can't carry each loop-back output into the
+        static input it feeds, or None: both must be buffers it holds, one size."""
+        for bucket in self._buckets.values():
+            if bucket.config.capture_graph_walk != walk:
+                continue
+            for slot in bucket.slots:
+                for output, target in sorted(carries.items()):
+                    source, into = _carried(slot.static_outputs, output), slot.static_inputs.get(target)
+                    if source is None or not isinstance(into, torch.Tensor):
+                        return f"its capture holds no {output!r} -> {target!r} to carry between replays"
+                    if source.numel() != into.numel():
+                        return f"its capture's {output!r} and {target!r} differ in size"
+        return None
 
     def run_forward(
         self, lease: SlotLease, preprocessed: dict[str, Any],
@@ -2353,12 +2445,14 @@ class PiecewiseAcceleratorGraphRunner:
     ):
         """The config's step for the region, with a step of its own segments under each of
         the node's resources that takes them (``with_segment_steps``), and what it declares
-        about its state expanded (``state_steps``)."""
+        about its state expanded (``state_steps``). The node's shard handle stays out: the region runs inside the node's
+        step, which holds it open, and a region's step would close it at its end."""
         step = with_segment_steps(
             self._config.region_step(list(request_ids), list(seq_lens), label_seq_lens),
             self._segment_keys,
         )
-        return state_steps(step, self._state_handles)
+        handles = {name: h for name, h in self._state_handles.items() if not isinstance(h, ShardHandle)}
+        return state_steps(step, handles)
 
     def _plan(self, step, shape: PiecewiseCaptureShape) -> None:
         if step is None:

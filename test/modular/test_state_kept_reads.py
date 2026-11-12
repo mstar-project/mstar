@@ -44,7 +44,15 @@ from mstar.engine.state import (
     Window,
     at_last_token,
 )
-from mstar.engine.state.adapters import StateSetup, _resolve, build_handle, build_specs, node_handles, state_steps
+from mstar.engine.state.adapters import (
+    Queries,
+    StateSetup,
+    _resolve,
+    build_handle,
+    build_specs,
+    node_handles,
+    state_steps,
+)
 from mstar.engine.state.calls import ArrayHandle
 from mstar.engine.state.contract import Entry
 from mstar.model.components.distributed.attention import ParallelCrossAttention
@@ -153,6 +161,12 @@ def test_a_kept_reads_mask_picks_the_steps_flag(mask, causal):
     assert step.steps["attn"].causal is causal, f"{mask} plans the other flag"
 
 
+def test_a_kept_cross_reads_query_side_holds_the_queried_array_and_no_ragged_plan():
+    queries = _resolve([_self_array(), _context_array()], StateSetup()).queries["cross"]
+    assert queries.array.name == "kv"
+    assert not isinstance(queries, Queries), "its own cross resource plans it, so a ragged plan would be a dead member"
+
+
 def test_a_kept_cross_read_plans_over_its_arrays_segments_with_no_causal_flag():
     handles = _bound()
     context = (Segment("a", CONTEXT, 13), Segment("b", CONTEXT, 7))
@@ -178,7 +192,7 @@ def test_a_kept_cross_read_builds_todays_spec_over_its_arrays_one_label():
 
 
 @pytest.mark.parametrize("arrays, cause", [
-    ([_self_array(), _context_array(labels={CONTEXT, "other"})], "a cross read's array declares one label"),
+    ([_self_array(), _context_array(labels={CONTEXT, "other"})], "a plan runs under one label, and Array 'context'"),
     (
         [_self_array(), _context_array(
             reads={
@@ -296,8 +310,8 @@ def test_a_max_len_0_read_over_a_kept_array_reads_through_node_handles():
 
 def test_a_max_len_0_read_over_queries_on_two_labels_has_no_layout_yet():
     """A step on the second label would plan a label the handle never reads."""
-    with pytest.raises(ValueError, match=r"Array 'text': no layout yet: reads\['text_attn'\] reads the queries of "
-                                         r"'kv', .* and 'kv' has \['cond', 'uncond'\]"):
+    with pytest.raises(ValueError, match=r"Array 'text': no layout yet: a plan runs under one label, and Array 'kv' "
+                                         r"declares \['cond', 'uncond'\]"):
         build_specs(_form_b(labels=frozenset({"cond", "uncond"})))
 
 
@@ -473,6 +487,21 @@ def test_the_handle_path_adds_the_projected_context_and_reads_through_the_handle
     assert torch.equal(handle.added[0][1], k) and torch.equal(handle.added[0][2], v)
     assert layer(torch.randn(2, 8)).shape == (2, 8)
     assert handle.read_at == [3], "the layer id reaches the handle"
+
+
+def test_a_layer_on_a_node_without_its_context_array_is_refused_at_bind():
+    with pytest.raises(ValueError, match="layer 0 reads the array 'context', which this node doesn't declare"):
+        _cross_attention(context_kv_key="context", layer=0).bind_state({"kv": _StubContext()})
+
+
+@torch.no_grad()
+def test_a_layer_on_a_node_with_no_handles_is_refused_at_its_first_call():
+    """The engine calls `bind_state` only on a node with handles."""
+    layer = _cross_attention(context_kv_key="context", layer=0)
+    with pytest.raises(ValueError, match="layer 0 reads the array 'context'"):
+        layer.add_context(torch.randn(5, 8))
+    with pytest.raises(ValueError, match="layer 0 reads the array 'context'"):
+        layer(torch.randn(2, 8))
 
 
 # Through real resources

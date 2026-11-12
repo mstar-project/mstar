@@ -33,6 +33,8 @@ from mstar.engine.resources.position.rope import (
     rope_apply_qk_inplace,  # noqa: F401  (registers mstar::rope_apply_qk_inplace)
 )
 from mstar.engine.resources.resident import gather_column
+from mstar.engine.resources.resident_hooks import ANY_REPEATS
+from mstar.engine.resources.sequence_shard import check_shard_plan
 from mstar.engine.resources.step import ADMIT_OK, AdmitOutcome, StepContext
 
 # a LongRoPE plan label's table ids, keyed beside its positions
@@ -78,6 +80,8 @@ class PublishedPositionInfo(PublishedInfo):
 class PositionManager(Resource):
     # only under a sequential scheme, which the load check enforces
     prefix_skip_safe = True
+    # a split label's ids are its range's (`apply_qk`)
+    supports_split_steps = True
 
     # NOTE: not an `AttentionResource`, so no label/layer cursors — this is
     # called once per step, not per layer. Layers reach `apply_qk` with the
@@ -88,14 +92,15 @@ class PositionManager(Resource):
         # `dependency` hands back the SPEC; its `.config` is the KVConfig
         kv_spec: KVSpec = info.dependency(spec.config.kv_cache)
         if spec.config.backend == PosBackend.ROPE:
-            manager = RopeManager if spec.config.longrope is None else LongRopeManager
-            return manager(
+            manager = (RopeManager if spec.config.longrope is None else LongRopeManager)(
                 config=spec.config,
                 device=info.device,
                 max_seq_len=kv_spec.config.max_seq_len,
                 head_dim=kv_spec.config.head_dim,
                 dtype=info.kv_dtype,
             )
+            manager._shard_key = spec.shard_key
+            return manager
         raise ValueError(f"Unknown position backend {spec.config.backend!r}")
 
     def fusable_rope_theta(self, head_dim: int) -> float | None:
@@ -108,6 +113,13 @@ class PositionManager(Resource):
 
 class RopeManager(PositionManager):
     """rotary position on top flashinfer in-place kernels"""
+
+    # reads the KV plan's rows (request, label, tokens) and its own counters, never a page
+    supports_context_parallel = True
+    # the sequence shard over its node (`PositionSpec.derive`), set by `build`; and whether it can
+    # split (`bind_dependencies`)
+    _shard_key: str | None = None
+    _can_split = False
 
     def __init__(
         self,
@@ -183,6 +195,10 @@ class RopeManager(PositionManager):
         self._current_pos_ids: dict[str, torch.Tensor] = {}
 
         self._preplan_pos_ids: dict[str, torch.Tensor] = {}
+        # plan label -> its ids' view over this rank's range, for a label the step splits over SP
+        # ranks; swapped with the ids
+        self._current_split_pos_ids: dict[str, torch.Tensor] = {}
+        self._preplan_split_pos_ids: dict[str, torch.Tensor] = {}
         self._preplanned = False
         # (rid, to_label, counter) for each pre-fork applied, so
         # `clear_preplan` can put the targets back. Unlike KV's, these forks are
@@ -198,7 +214,14 @@ class RopeManager(PositionManager):
         return float(cfg.rope_theta) if plain else None
 
     def depends_on(self):
-        return {self._kv_cache_name}
+        keys = {self._kv_cache_name}
+        if self._shard_key is not None:
+            keys.add(self._shard_key)
+        return keys
+
+    def bind_dependencies(self, resources) -> None:
+        if self._shard_key is not None:
+            self._can_split = resources[self._shard_key].can_split
 
     def _static_buffer(self, key: CGSlotKey, num_tokens: int) -> torch.Tensor:
         """The captured-graph pos_ids buffer for one (bucket, slot, label).
@@ -334,6 +357,7 @@ class RopeManager(PositionManager):
         # rebind rather than clear: a consumed preplan dict is the live one
         self._preplanned = False
         self._preplan_pos_ids = {}
+        self._preplan_split_pos_ids = {}
 
     def plan(self, step: PositionStep, ctx: StepContext) -> dict[str, torch.Tensor]:
         """submits one position id vector for each plan label
@@ -372,6 +396,11 @@ class RopeManager(PositionManager):
             undo=self._preplan_fork_undo if ctx.is_preplan else None,
         )
 
+        shard_plan = None
+        if self._shard_key is not None:
+            shard_plan = check_shard_plan(f"positions over KV {self._kv_cache_name!r}", self._shard_key, ctx)
+            if not (self._can_split and shard_plan.split):
+                shard_plan = None
         pos_ids_out = self._begin_staging(ctx.is_preplan)
         for plan_label, kv_out in plan_outputs.items():
             pos_ids = self._explicit_pos_ids(step, plan_label, len(plan_outputs))
@@ -382,12 +411,26 @@ class RopeManager(PositionManager):
             if rows is None:
                 rows = [(v.request_id, v.label, v.to_compute) for v in kv_out.views]
             pos_ids_out[plan_label] = self._stage_rows(rows, plan_label, lease, ctx.is_preplan)
+        if shard_plan is not None:
+            split_out = self._preplan_split_pos_ids if ctx.is_preplan else self._current_split_pos_ids
+            for plan_label in pos_ids_out:
+                r = shard_plan.ranges.get(plan_label)
+                if r is None:
+                    continue
+                ids = self._rotation_ids(plan_label, ctx.is_preplan)
+                # a view of a contiguous range, so a captured graph reads the slot's buffer. A packed
+                # replay's range covers its bucket's padding too, which the buffer holds
+                split_out[plan_label] = (
+                    r.local(ids) if r.rows is None else r.local(ids[: r.rows * sum(r.counts)].view(r.rows, -1), 1)
+                )
         self._preplanned = ctx.is_preplan
         return pos_ids_out
 
     def _promote_preplan(self) -> None:
         self._current_pos_ids = self._preplan_pos_ids
+        self._current_split_pos_ids = self._preplan_split_pos_ids
         self._preplan_pos_ids = {}
+        self._preplan_split_pos_ids = {}
         self._preplanned = False
         # Promotion, not abandonment: the staged forks are kept, so the
         # undo record is dropped rather than replayed.
@@ -397,7 +440,12 @@ class RopeManager(PositionManager):
         """The (emptied) label -> positions dict this plan fills."""
         out = self._preplan_pos_ids if is_preplan else self._current_pos_ids
         out.clear()
+        (self._preplan_split_pos_ids if is_preplan else self._current_split_pos_ids).clear()
         return out
+
+    def _rotation_ids(self, label: str, is_preplan: bool = False) -> torch.Tensor:
+        """The ids ``apply_qk`` rotates ``label``'s rows at: their positions."""
+        return (self._preplan_pos_ids if is_preplan else self._current_pos_ids)[label]
 
     def _place_explicit(self, pos_ids: torch.Tensor, plan_label: str, lease) -> torch.Tensor:
         """A step's own positions for ``plan_label`` (``PositionStep.pos_ids``)."""
@@ -410,6 +458,9 @@ class RopeManager(PositionManager):
 
     # Resident planning: a stream's position runs ahead of its stored length by a
     # fixed amount between host-planned steps, so a row keeps that offset
+
+    def max_repeats(self, step: PositionStep, ctx: StepContext) -> int:
+        return ANY_REPEATS  # a resident row's position is its length plus a fixed offset
 
     def resident_refusal(self) -> str | None:
         if self._config.scheme != PosScheme.SEQUENTIAL:
@@ -448,7 +499,7 @@ class RopeManager(PositionManager):
         )
 
     def commit(self, step: PositionStep, ctx: StepContext):
-        all_counters = self._counters
+        all_counters, repeats = self._counters, ctx.repeats
         for segment, advance in zip(
             step.segments, self._advances(step), strict=True
         ):
@@ -456,7 +507,7 @@ class RopeManager(PositionManager):
                 counters = all_counters.get(segment.request_id)
                 if counters is None:
                     counters = all_counters[segment.request_id] = {}
-                counters[segment.label] = counters.get(segment.label, 0) + advance
+                counters[segment.label] = counters.get(segment.label, 0) + advance * repeats
 
         # post-forks copy the source after this step advanced it, matching
         # where KV applies them
@@ -679,9 +730,22 @@ class RopeManager(PositionManager):
     ):
         """Rotate ``q`` and ``k`` at ``label``'s planned positions, or at ``pos_ids``, one per
         row, for a model that threads positions itself (an offset, or a slice of the step).
-        ``k=None`` rotates ``q`` alone and returns ``(q, None)``."""
+        ``k=None`` rotates ``q`` alone and returns ``(q, None)``. On a label this step splits over
+        SP ranks, ``q`` holds this rank's range of it, and so do the planned positions."""
+        split = self._current_split_pos_ids.get(label) if self._can_split else None
         if pos_ids is None:
-            pos_ids = self._current_pos_ids[label]
+            pos_ids = self._rotation_ids(label) if split is None else split.flatten()
+        elif split is not None:
+            # refused on what every rank shares: the counts differ by rank, so a refusal on them could
+            # stop some ranks before the exchange's collectives and hang the others
+            if pos_ids.shape[0] == self._current_pos_ids[label].shape[0]:
+                raise ValueError(
+                    f"apply_qk on label {label!r}, which this step splits over SP ranks, got the whole label's "
+                    f"{pos_ids.shape[0]} positions: pass this rank's range's positions"
+                )
+            assert pos_ids.shape[0] == q.shape[0], (
+                f"apply_qk got {pos_ids.shape[0]} positions for {q.shape[0]} tokens this rank holds of label {label!r}"
+            )
         config = self._config
         alone = k is None
         if alone:
@@ -854,6 +918,10 @@ class LongRopeManager(RopeManager):
         self._current_table_ids = self._preplan_table_ids
         self._preplan_table_ids = {}
 
+    def _rotation_ids(self, label: str, is_preplan: bool = False) -> torch.Tensor:
+        # rows into the short or the long half of the table
+        return (self._preplan_table_ids if is_preplan else self._current_table_ids)[label]
+
     def _begin_staging(self, is_preplan: bool) -> dict[str, torch.Tensor]:
         (self._preplan_table_ids if is_preplan else self._current_table_ids).clear()
         return super()._begin_staging(is_preplan)
@@ -915,8 +983,7 @@ class LongRopeManager(RopeManager):
                 "LongRoPE picks each row's table from its request; explicit pos_ids don't say "
                 "which rows are whose"
             )
-        # rows into the short or the long half of the table
-        return super().apply_qk(q, k, label, *args, pos_ids=self._current_table_ids[label], **kwargs)
+        return super().apply_qk(q, k, label, *args, **kwargs)
 
 
 # TODO: mrope / 3D positions (qwen omni, cosmos), learned position embeddings
