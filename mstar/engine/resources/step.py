@@ -137,6 +137,10 @@ class StepContext:
     # plan prefill attention even when every row is one token: a packed
     # capture's forward reads per-row token offsets
     force_prefill: bool = False
+    # How many times this step's capture replays: the host plans once and the
+    # step counts for this many iterations. The worker asks, and `StepRunner`
+    # narrows it to what the step's resources allow (`Resource.max_repeats`).
+    repeats: int = 1
     # the node's `ResidentPlanner` when this step's capture reads the resident
     # tables: a resource then stages nothing per row (see `resources/resident.py`)
     resident: Any = None

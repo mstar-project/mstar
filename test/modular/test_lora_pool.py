@@ -34,6 +34,7 @@ from mstar.engine.resources.step import (  # noqa: E402
     Segment,
     SlotLease,
     StepContext,
+    SubmoduleStep,
 )
 from mstar.model.components.lora.modules import ModuleLoraMap  # noqa: E402
 from mstar.model.loader.base import CheckpointRules, StackedParamRule  # noqa: E402
@@ -909,3 +910,10 @@ def test_a_pool_does_not_hold_its_node_off_resident_planning(adapters):
 
     planner, why = build_planner("LLM", ("decode",), {"lora": make_pool(adapters[1])}, {}, torch.device("cpu"), 4)
     assert planner is not None and why == ""
+
+
+def test_a_step_on_a_lora_pool_is_refused_a_repeat_naming_the_pool(adapters):
+    """It plans on the host each step, so a replay with no host between would reuse stale addressing."""
+    runner = lora_runner(make_pool(adapters[1]))
+    refusal = runner.repeat_refusal(SubmoduleStep(steps={"lora": step(["r1"])}, _ctx=ctx(["r1"])))
+    assert refusal is not None and "'lora'" in refusal
