@@ -1207,8 +1207,10 @@ pub struct SendPlan {
     #[pyo3(get)] pub persist: Vec<(u32, String, Vec<u64>)>,
     /// (rid, signal, modality, tensors) -- sliced, as to_workers is.
     pub emit: Vec<(u32, String, String, Vec<TensorRef>)>,
-    /// (rid, signal, modality, value): emitted inline, one frame per step.
-    pub emit_inline: Vec<(u32, String, String, i64)>,
+    /// (rid, signal, modality, value, iteration): emitted inline, one frame
+    /// per send (the step's, and each `emit_prefix` while it ran);
+    /// `iteration` is the value's within its step, from 0.
+    pub emit_inline: Vec<(u32, String, String, i64, u32)>,
     /// rid -> the log-prob its emits carry, inline or tensor.
     pub logprobs: FxHashMap<u32, f64>,
     /// (rid, finished worker graph ids, is_first_tp_rank, the walk the rid
@@ -1254,15 +1256,14 @@ pub struct RouteArg {
     /// One output signal whose per-request value is a scalar the worker
     /// already holds on the host (a sampled token). Its EMIT_TO_CLIENT edge
     /// then rides inline in one frame per step instead of as a tensor per
-    /// request; `inline_values` are in `rids` order, or empty for none. A
-    /// row whose value is None (it ran no forward) takes the tensor path.
+    /// request; `inline_values` are in `rids` order, or empty for none: a
+    /// run of values a row, one per iteration of a repeated step. A row whose
+    /// value is None (it ran no forward) takes the tensor path; an empty run
+    /// sends nothing (it went out while the step ran).
     /// Both keys may be absent or None: a caller with no inline signal sends
     /// the plain route input.
     inline_signal: Option<String>,
-    inline_values: Vec<Option<i64>>,
-    /// A repeated step's values after each row's first, in `rids` order, or
-    /// empty for a step that ran once.
-    inline_tails: Vec<Vec<i64>>,
+    inline_values: Vec<Option<postprocess::InlineRun>>,
     /// The log-prob of the token row i sampled (None without one): it rides
     /// with the row's client emits, inline or in a tensor emit's metadata.
     /// Empty (or absent) when no row has one.
@@ -1299,8 +1300,11 @@ impl<'py> FromPyObject<'py> for RouteArg {
             tensors: r.tensors,
             num_tensors: r.num_tensors,
             inline_signal: optional_item(ob, "inline_signal")?,
-            inline_values: optional_item(ob, "inline_values")?.unwrap_or_default(),
-            inline_tails: Vec::new(),
+            inline_values: optional_item::<Vec<Option<i64>>>(ob, "inline_values")?
+                .unwrap_or_default()
+                .into_iter()
+                .map(|v| v.map(postprocess::InlineRun::One))
+                .collect(),
             logprobs: optional_item(ob, "logprobs")?.unwrap_or_default(),
             walks: r.walks,
             rid_walk_idx: r.rid_walk_idx,
@@ -1396,11 +1400,9 @@ pub struct Completion {
     /// have to ask for it per rid, convert it to strings on the way out, and
     /// hand it back to be re-interned.
     pub nested: FxHashMap<u32, (Vec<Sym>, Vec<(Sym, u32)>, u32)>,
-    /// Per rid: (signal, modality, value) of the emit edge that rides inline
+    /// Per rid: (signal, modality, values) of the emit edge that rides inline
     /// instead of as a tensor. Empty unless the route carried inline values.
-    pub emit_inline: FxHashMap<u32, (Sym, Sym, i64)>,
-    /// Per rid: the values after `emit_inline`'s of a repeated step.
-    pub emit_inline_tails: FxHashMap<u32, Vec<i64>>,
+    pub emit_inline: FxHashMap<u32, (Sym, Sym, postprocess::InlineRun)>,
     /// (rid, signal) -> the value of a streamed edge to another worker that
     /// rides inline instead of as a tensor (`EdgeItems` values).
     pub stream_inline: FxHashMap<(u32, Sym), i64>,
@@ -2662,7 +2664,7 @@ impl GraphRuntime {
     /// signal s. The routing is parked under the returned completion id for
     /// `send_outputs` to consume.
     fn complete_and_route_batch(
-        &mut self, input: RouteArg,
+        &mut self, mut input: RouteArg,
     ) -> PyResult<RouteOut> {
         // Tensors freed outright below, dropped when this returns -- after
         // every bookkeeping guard, since it is declared before them. Under the
@@ -2754,8 +2756,8 @@ impl GraphRuntime {
             .and_then(|s| self.interner.get(s));
         let inline_on = inline_sym.is_some()
             && input.inline_values.len() == input.rids.len();
-        let mut emit_inline: FxHashMap<u32, (Sym, Sym, i64)> = FxHashMap::default();
-        let mut emit_inline_tails: FxHashMap<u32, Vec<i64>> = FxHashMap::default();
+        let mut emit_inline: FxHashMap<u32, (Sym, Sym, postprocess::InlineRun)> = FxHashMap::default();
+        let mut inline_values = std::mem::take(&mut input.inline_values);
         // A streamed edge of the inline signal carries its value too, when the
         // node streams that signal inline, unless its consumer's walk follows
         // the producer's (a walk-driven stream tags every item with it), which
@@ -2775,7 +2777,13 @@ impl GraphRuntime {
             .collect();
 
         for (i, &rid) in input.rids.iter().enumerate() {
-            let inline_value = if inline_on { input.inline_values[i] } else { None };
+            let mut inline_value = if inline_on { inline_values[i].take() } else { None };
+            let inline_row = inline_value.is_some();
+            // the row's value when it has one, for a stream to take
+            let one_value = inline_value.as_ref().and_then(|run| match run.values() {
+                &[value] => Some(value),
+                _ => None,
+            });
             let ctx = &ctxs[rid_walk_idx.map_or(0, |idx| idx[i] as usize)];
             let (wg, node, g, walk_sym, walk_wgs) = (ctx.0, ctx.1, &ctx.2, ctx.3, &ctx.4);
             let walk = walk_sym.unwrap_or_default();
@@ -3114,12 +3122,26 @@ impl GraphRuntime {
                 // compiles to External (Orpheus streams new_token from the LLM
                 // graph into the snac_decoder graph).
                 let inline_stream = inline_streams
-                    && inline_value.is_some()
+                    && inline_row
                     && e.streaming
                     && matches!(e.dest, Dest::External(_))
                     && Some(e.name) == inline_sym
                     && !e.persist;
-                if let (true, Some(value)) = (inline_stream, inline_value) {
+                // A stream takes one value a step: a step that repeats has no
+                // stream to a node but its own (`loop_signals` refuses one at
+                // load), so its runs never get here.
+                let stream_value = match (inline_stream, one_value) {
+                    (false, _) => None,
+                    (true, Some(value)) => Some(value),
+                    (true, None) => {
+                        return Err(PyValueError::new_err(format!(
+                            "{}: a streamed {} goes one value a step, and this step ran several",
+                            input.node_name,
+                            self.interner.name(e.name),
+                        )))
+                    }
+                };
+                if let Some(value) = stream_value {
                     stream_inline.insert((rid, e.name), value);
                 }
                 if e.streaming && is_local && !e.tensors.is_empty() {
@@ -3139,7 +3161,7 @@ impl GraphRuntime {
                         rids_for_edge.push(rid);
                         uuids_for_edge.push(t.uuid);
                     }
-                } else if let (true, true, Some(value)) = (inline_stream, is_local, inline_value) {
+                } else if let (true, Some(value)) = (is_local, stream_value) {
                     // No tensor: the step kept its rows on the device, and the
                     // item rides inline into this worker's buffer.
                     {
@@ -3165,14 +3187,13 @@ impl GraphRuntime {
                 // A tensor handled locally is not staged for a remote read;
                 // Python leaves streaming_local and the locally-ingested edge
                 // out of the register set for the same reason.
-                let inline_edge = inline_value.is_some()
+                let inline_edge = inline_row
                     && matches!(e.dest, Dest::EmitToClient)
                     && Some(e.name) == inline_sym
                     && !e.persist;
-                if let (true, Some(value)) = (inline_edge, inline_value) {
-                    emit_inline.insert(rid, (e.name, e.modality, value));
-                    if let Some(tail) = input.inline_tails.get(i).filter(|t| !t.is_empty()) {
-                        emit_inline_tails.insert(rid, tail.clone());
+                if inline_edge {
+                    if let Some(run) = inline_value.take() {
+                        emit_inline.insert(rid, (e.name, e.modality, run));
                     }
                 }
                 let remote = (e.persist && has_remote)
@@ -3238,7 +3259,7 @@ impl GraphRuntime {
                         // An inline emit holds no reference: nothing reads
                         // the tensor on the api server's behalf.
                         Dest::EmitToClient => i64::from(
-                            !(inline_value.is_some() && Some(e.name) == inline_sym && !e.persist),
+                            !(inline_row && Some(e.name) == inline_sym && !e.persist),
                         ),
                         // Nor does a streamed item sent as its value: no
                         // consumer reads the tensor.
@@ -3394,7 +3415,6 @@ impl GraphRuntime {
                 speculative,
                 nested: nested_snapshot,
                 emit_inline,
-                emit_inline_tails,
                 stream_inline,
                 logprobs,
             },
@@ -3491,6 +3511,7 @@ impl GraphRuntime {
         token_ptr, token_rows, token_stride, token_dtype, row_rids,
         inline_signal, inline_ptr, inline_rows, inline_stride, inline_dtype,
         partition_done, python_send, loop_strides = None, token_width = 1,
+        token_iter_stride = 1, inline_iter_stride = 1, inline_start = 0,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn begin_postprocess(
@@ -3503,13 +3524,13 @@ impl GraphRuntime {
         inline_signal: Option<String>, inline_ptr: usize, inline_rows: usize,
         inline_stride: usize, inline_dtype: &str,
         partition_done: Vec<u32>, python_send: bool, loop_strides: Option<Vec<u32>>,
-        token_width: usize,
+        token_width: usize, token_iter_stride: usize, inline_iter_stride: usize, inline_start: usize,
     ) -> PyResult<postprocess::PostprocessOut> {
         let tokens = postprocess::TokenColumn::new(token_ptr, token_rows, token_stride, token_dtype)
-            .map(|col| col.wide(token_width));
+            .map(|col| col.wide(token_width, token_iter_stride));
         let inline = inline_signal.and_then(|signal| {
             postprocess::TokenColumn::new(inline_ptr, inline_rows, inline_stride, inline_dtype)
-                .map(|col| (signal, col.wide(token_width)))
+                .map(|col| (signal, col.wide(token_width, inline_iter_stride).from(inline_start)))
         });
         let pp = postprocess::Postprocess::new(
             partition, node_name, graph_walk, output_signals, rids, walks, rid_walk_idx,
@@ -3518,6 +3539,49 @@ impl GraphRuntime {
         );
         self.postprocess = None;
         self.pp_run(py, pp)
+    }
+
+    /// Send the client the values a repeated step has landed so far, while
+    /// it runs: iterations `start..end` of its inline column, each row cut at
+    /// its stop by the same check its postprocess runs (`stops_over`), so
+    /// nothing past a stop goes out and postprocess, given `start` = what this
+    /// returns, sends the rest. Decides nothing: no stop, count or route.
+    ///
+    /// The caller knows `end` has landed (its replay's event, waited on this
+    /// thread, which orders these reads after it). Returns the end it
+    /// sent up to, `start` when the check can't decide every row, and whether
+    /// every row has stopped by then, after which nothing more of the step
+    /// goes out. The columns are as `begin_postprocess` takes them; `rids`
+    /// are the step's routed rows, in the step's one walk.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_prefix(
+        &mut self, py: Python<'_>,
+        partition: String, node_name: String, graph_walk: String, rids: Vec<u32>, row_rids: Vec<u32>,
+        token_ptr: usize, token_rows: usize, token_stride: usize, token_iter_stride: usize, token_dtype: &str,
+        inline_signal: String, inline_ptr: usize, inline_rows: usize, inline_stride: usize,
+        inline_iter_stride: usize, inline_dtype: &str,
+        start: u32, end: u32,
+    ) -> PyResult<(u32, bool)> {
+        if end <= start {
+            return Ok((start, false));
+        }
+        let Some(tokens) = postprocess::TokenColumn::new(token_ptr, token_rows, token_stride, token_dtype) else {
+            return Ok((start, false));
+        };
+        let Some(inline) = postprocess::TokenColumn::new(inline_ptr, inline_rows, inline_stride, inline_dtype)
+        else {
+            return Ok((start, false));
+        };
+        let tokens = tokens.wide(end as usize, token_iter_stride);
+        let inline = inline.wide(end as usize, inline_iter_stride).from(start as usize);
+        let Some(prefix) = self.prefix_items(
+            &partition, &node_name, &graph_walk, &rids, &row_rids, &tokens, &inline_signal, &inline,
+        ) else {
+            return Ok((start, false));
+        };
+        let frames = self.inline_frames(prefix.items, &prefix.nested, &FxHashMap::default())?;
+        self.send_frames(py, frames)?;
+        Ok((end, prefix.all_stopped))
     }
 
     /// Resume a step parked for its stops (STOPS): the loops each rid stops,
@@ -3535,7 +3599,9 @@ impl GraphRuntime {
         inline_signal: Option<String>, inline_values: Vec<Option<i64>>, logprobs: Vec<Option<f64>>,
     ) -> PyResult<postprocess::PostprocessOut> {
         let stored = postprocess::Stored {
-            tensors, num_tensors, inline_signal, inline_values, inline_tails: Vec::new(), logprobs,
+            tensors, num_tensors, inline_signal,
+            inline_values: inline_values.into_iter().map(|v| v.map(postprocess::InlineRun::One)).collect(),
+            logprobs,
         };
         self.pp_resume_store(py, stored)
     }
@@ -3737,8 +3803,7 @@ impl GraphRuntime {
         })?;
         // The graph is resolved per walk in the loop below: a completion that
         // spans a combined walk has no single `c.wg`.
-        let emit_inline = std::mem::take(&mut c.emit_inline);
-        let mut emit_inline_tails = std::mem::take(&mut c.emit_inline_tails);
+        let mut emit_inline = std::mem::take(&mut c.emit_inline);
         let stream_inline = std::mem::take(&mut c.stream_inline);
         let mut plan = SendPlan {
             partition: c.partition.clone(),
@@ -3788,26 +3853,12 @@ impl GraphRuntime {
                 let name = self.interner.name(e.name).to_string();
                 match e.dest {
                     Dest::EmitToClient => match emit_inline.get(&rid) {
-                        Some(&(sig, modality, value)) if sig == e.name => {
-                            plan.emit_inline.push((
-                                rid,
-                                name.clone(),
-                                self.interner.name(modality).to_string(),
-                                value,
-                            ));
-                            // one row of the frame per iteration, in order: a step that repeated
-                            let tails = if emit_inline_tails.is_empty() {
-                                Vec::new()
-                            } else {
-                                emit_inline_tails.remove(&rid).unwrap_or_default()
-                            };
-                            for tail in tails {
-                                plan.emit_inline.push((
-                                    rid,
-                                    name.clone(),
-                                    self.interner.name(modality).to_string(),
-                                    tail,
-                                ));
+                        Some((sig, _, _)) if *sig == e.name => {
+                            let (_, modality, run) = emit_inline.remove(&rid).unwrap_or_default();
+                            let modality = self.interner.name(modality).to_string();
+                            // one row of the frame per iteration, in order
+                            for (j, &value) in run.values().iter().enumerate() {
+                                plan.emit_inline.push((rid, name.clone(), modality.clone(), value, run.first() + j as u32));
                             }
                         }
                         _ => plan.emit.push((
@@ -4023,6 +4074,70 @@ impl GraphRuntime {
         Ok(())
     }
 
+    /// The RESULT_TOKENS frames of inline client values, one per (signal,
+    /// modality), usually one: each value pushes its signal onto the request's
+    /// pending output signals, which the completion report counts, and carries
+    /// the loop context it was produced in (`nested`, the step's, advanced by
+    /// the value's iteration within the step). The route's send and
+    /// `emit_prefix` both build their frames here, so the two are the same.
+    #[allow(clippy::type_complexity)]
+    fn inline_frames(
+        &mut self,
+        items: Vec<(u32, String, String, i64, u32)>,
+        nested: &FxHashMap<u32, (Vec<Sym>, Vec<(Sym, u32)>, u32)>,
+        logprobs: &FxHashMap<u32, f64>,
+    ) -> PyResult<Vec<(String, Vec<u8>)>> {
+        let mut frames = Vec::new();
+        let mut groups: Vec<((String, String), Vec<(u32, i64, u32)>)> = Vec::new();
+        for (rid, signal, modality, value, iteration) in items {
+            let key = (signal, modality);
+            match groups.iter_mut().find(|(k, _)| *k == key) {
+                Some((_, items)) => items.push((rid, value, iteration)),
+                None => groups.push((key, vec![(rid, value, iteration)])),
+            }
+        }
+        for ((signal, modality), items) in groups {
+            let sig = self.interner.intern(&signal);
+            let mut request_ids: Vec<String> = Vec::with_capacity(items.len());
+            let mut values: Vec<i64> = Vec::with_capacity(items.len());
+            let mut loop_indices = Vec::with_capacity(items.len());
+            let with_logprobs = !logprobs.is_empty();
+            let mut row_logprobs: Vec<Option<f64>> = Vec::new();
+            for (rid, value, iteration) in items {
+                let request_id = self.rid_name(rid)?;
+                let idx = nested.get(&rid).map(|(order, indices, fwd)| {
+                    // the iteration of the innermost loop this value is
+                    let inner = order.last().copied();
+                    let indices = indices
+                        .iter()
+                        .map(|&(name, at)| (name, if Some(name) == inner { at + iteration } else { at }))
+                        .collect();
+                    (order.clone(), indices, *fwd)
+                });
+                if let Some(info) = self.requests[rid as usize].as_mut() {
+                    info.pending.output_signals.push(sig);
+                }
+                request_ids.push(request_id);
+                values.push(value);
+                loop_indices.push(idx);
+                if with_logprobs {
+                    row_logprobs.push(logprobs.get(&rid).copied());
+                }
+            }
+            let bytes = frames::ResultTokens {
+                request_ids: &request_ids,
+                values: &values,
+                loop_indices: &loop_indices,
+                signal: &signal,
+                modality: &modality,
+                logprobs: &row_logprobs,
+            }
+            .encode(&self.interner);
+            frames.push(("api_server".to_string(), bytes));
+        }
+        Ok(frames)
+    }
+
     /// `send_outputs` up to the dispatch: consumes the parked completion and
     /// encodes its frames. Touches no Python object.
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
@@ -4226,50 +4341,10 @@ impl GraphRuntime {
             }
 
             // Inline emits: one RESULT_TOKENS frame per (signal, modality)
-            // per step, with the same per-request bookkeeping as a tensor
-            // emit so the completion report counts the chunk. Usually one
-            // group.
-            if !plan.emit_inline.is_empty() {
-                let mut groups: Vec<((String, String), Vec<(u32, i64)>)> = Vec::new();
-                for (rid, signal, modality, value) in plan.emit_inline {
-                    let key = (signal, modality);
-                    match groups.iter_mut().find(|(k, _)| *k == key) {
-                        Some((_, items)) => items.push((rid, value)),
-                        None => groups.push((key, vec![(rid, value)])),
-                    }
-                }
-                for ((signal, modality), items) in groups {
-                    let sig = self.interner.intern(&signal);
-                    let mut request_ids: Vec<String> = Vec::with_capacity(items.len());
-                    let mut values: Vec<i64> = Vec::with_capacity(items.len());
-                    let mut loop_indices = Vec::with_capacity(items.len());
-                    let with_logprobs = !plan.logprobs.is_empty();
-                    let mut logprobs: Vec<Option<f64>> = Vec::new();
-                    for (rid, value) in items {
-                        let request_id = self.rid_name(rid)?;
-                        let idx = nested.get(&rid).cloned();
-                        if let Some(info) = self.requests[rid as usize].as_mut() {
-                            info.pending.output_signals.push(sig);
-                        }
-                        request_ids.push(request_id);
-                        values.push(value);
-                        loop_indices.push(idx);
-                        if with_logprobs {
-                            logprobs.push(plan.logprobs.get(&rid).copied());
-                        }
-                    }
-                    let bytes = frames::ResultTokens {
-                        request_ids: &request_ids,
-                        values: &values,
-                        loop_indices: &loop_indices,
-                        signal: &signal,
-                        modality: &modality,
-                        logprobs: &logprobs,
-                    }
-                    .encode(&self.interner);
-                    frames.push(("api_server".to_string(), bytes));
-                }
-            }
+            // per send, with the same per-request bookkeeping as a tensor
+            // emit so the completion report counts the chunk.
+            let emit_inline = std::mem::take(&mut plan.emit_inline);
+            frames.extend(self.inline_frames(emit_inline, &nested, &plan.logprobs)?);
 
             for (rid, signal, uuids) in plan.persist {
                 let sig = self.interner.intern(&signal);

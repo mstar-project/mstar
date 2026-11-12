@@ -7,8 +7,9 @@
 //! one call they replaced did: nothing in them touches Python.
 //!
 //! Python's `PhasedPostprocess` (`mstar/graph/runtime/base.py`) is the
-//! reference: the phases below follow it, and
-//! `test/rust/test_postprocess.py` drives both over the same steps.
+//! reference for a step that ran one iteration: the phases below follow it,
+//! and `test/rust/test_postprocess.py` drives both over the same steps. A
+//! repeated step's width is handled here alone.
 
 use super::*;
 
@@ -20,14 +21,19 @@ pub(super) const NEED_SEND: u8 = 3;
 
 /// A step's token column, read in place: `rows` integers of `itemsize`
 /// bytes, `stride` elements apart, row i belonging to the caller's
-/// `row_rids[i]`. A step that repeated holds `width` values per row, side by
-/// side, one per iteration. The caller holds the tensor for the step.
+/// `row_rids[i]`. A step that repeated holds `width` values per row, one per
+/// iteration, `iter_stride` elements apart. The inline route sends a row's
+/// values from iteration `start` on: the ones before it went out while the
+/// step ran (`GraphRuntime::emit_prefix`). The caller holds the tensor for the
+/// step.
 pub(super) struct TokenColumn {
     ptr: usize,
     rows: usize,
     stride: usize,
     itemsize: usize,
     width: usize,
+    iter_stride: usize,
+    start: usize,
 }
 
 impl TokenColumn {
@@ -38,18 +44,24 @@ impl TokenColumn {
             "int32" => 4,
             _ => return None,
         };
-        (ptr != 0).then_some(TokenColumn { ptr, rows, stride, itemsize, width: 1 })
+        (ptr != 0).then_some(TokenColumn { ptr, rows, stride, itemsize, width: 1, iter_stride: 1, start: 0 })
     }
 
-    /// The same column with `width` values per row (`stride` at least that).
-    pub(super) fn wide(mut self, width: usize) -> Self {
+    /// The same column with `width` values per row, `iter_stride` apart.
+    pub(super) fn wide(mut self, width: usize, iter_stride: usize) -> Self {
         self.width = width.max(1);
+        self.iter_stride = iter_stride.max(1);
         self
     }
 
-    /// Row `row`'s value; the callers check `row < self.rows`.
-    fn read(&self, row: usize) -> i64 {
-        self.read_at(row, 0)
+    /// The same column, its inline route starting at iteration `start`.
+    pub(super) fn from(mut self, start: usize) -> Self {
+        self.start = start;
+        self
+    }
+
+    pub(super) fn width(&self) -> usize {
+        self.width
     }
 
     /// Row `row`'s value of iteration `at < self.width`.
@@ -58,7 +70,7 @@ impl TokenColumn {
         // SAFETY: row < rows and iter < width, which the callers check against
         // the column the caller holds for the step.
         unsafe {
-            let at = (self.ptr as *const u8).add((row * self.stride + iter) * self.itemsize);
+            let at = (self.ptr as *const u8).add((row * self.stride + iter * self.iter_stride) * self.itemsize);
             if self.itemsize == 8 {
                 std::ptr::read_unaligned(at as *const i64)
             } else {
@@ -67,31 +79,59 @@ impl TokenColumn {
         }
     }
 
-    /// The column in `rids` order; None when a rid has no row.
-    fn values_for(&self, rids: &[u32], row_rids: &[u32]) -> Option<Vec<i64>> {
+    /// Each row's inline run, in `rids` order: its values from `start` up to
+    /// the iteration it stopped at (`kept`: rid -> iterations that count; a
+    /// row not there keeps them all). None when a rid has no row.
+    pub(super) fn runs_for(
+        &self, rids: &[u32], row_rids: &[u32], kept: &FxHashMap<u32, u32>,
+    ) -> Option<Vec<InlineRun>> {
         if row_rids.len() > self.rows {
             return None;
         }
+        let run = |rid: u32, row: usize| {
+            let end = kept.get(&rid).map_or(self.width, |&k| (k as usize).min(self.width));
+            if (self.start, end) == (0, 1) {
+                return InlineRun::One(self.read_at(row, 0));
+            }
+            InlineRun::Run { first: self.start as u32, values: (self.start..end).map(|j| self.read_at(row, j)).collect() }
+        };
         if row_rids.len() >= rids.len() && row_rids[..rids.len()] == rids[..] {
-            return Some((0..rids.len()).map(|i| self.read(i)).collect());
+            return Some(rids.iter().enumerate().map(|(i, &r)| run(r, i)).collect());
         }
         let row_of: FxHashMap<u32, usize> =
             row_rids.iter().enumerate().map(|(i, &r)| (r, i)).collect();
-        rids.iter().map(|r| row_of.get(r).map(|&i| self.read(i))).collect()
+        rids.iter().map(|&r| row_of.get(&r).map(|&i| run(r, i))).collect()
+    }
+}
+
+/// A row's client values on the inline route: iterations `first..` of its
+/// step, in order. Empty when they all went out while the step ran. A step
+/// that ran once, the common case, is `One`: no allocation.
+#[derive(Clone)]
+pub enum InlineRun {
+    One(i64),
+    Run { first: u32, values: Vec<i64> },
+}
+
+impl Default for InlineRun {
+    fn default() -> Self {
+        InlineRun::Run { first: 0, values: Vec::new() }
+    }
+}
+
+impl InlineRun {
+    pub fn first(&self) -> u32 {
+        match self {
+            InlineRun::One(_) => 0,
+            InlineRun::Run { first, .. } => *first,
+        }
     }
 
-    /// Each row's values after its first, up to the iteration it stopped at
-    /// (`kept`: rid -> iterations that count; a row not there keeps them all).
-    fn tails_for(&self, rids: &[u32], row_rids: &[u32], kept: &FxHashMap<u32, u32>) -> Option<Vec<Vec<i64>>> {
-        let row_of: FxHashMap<u32, usize> =
-            row_rids.iter().enumerate().map(|(i, &r)| (r, i)).collect();
-        rids.iter()
-            .map(|r| {
-                let row = *row_of.get(r)?;
-                let end = kept.get(r).map_or(self.width, |&k| (k as usize).min(self.width));
-                Some((1..end).map(|j| self.read_at(row, j)).collect())
-            })
-            .collect()
+    pub fn values(&self) -> &[i64] {
+        match self {
+            InlineRun::One(value) => std::slice::from_ref(value),
+            InlineRun::Run { values, .. } => values,
+        }
     }
 }
 
@@ -106,9 +146,7 @@ pub(super) struct Stored {
     pub tensors: Vec<u64>,
     pub num_tensors: Vec<usize>,
     pub inline_signal: Option<String>,
-    pub inline_values: Vec<Option<i64>>,
-    /// A repeated step's values after each row's first, in `rids` order
-    pub inline_tails: Vec<Vec<i64>>,
+    pub inline_values: Vec<Option<InlineRun>>,
     pub logprobs: Vec<Option<f64>>,
 }
 
@@ -223,7 +261,6 @@ impl Postprocess {
             num_tensors: s.num_tensors,
             inline_signal: s.inline_signal,
             inline_values: s.inline_values,
-            inline_tails: s.inline_tails,
             logprobs: s.logprobs,
             walks: if self.rid_walk_idx.is_some() { self.walks.clone() } else { None },
             rid_walk_idx: self.rid_walk_idx.clone(),
@@ -244,6 +281,14 @@ impl Postprocess {
             ..Default::default()
         }
     }
+}
+
+/// `emit_prefix`'s values: (rid, signal, modality, value, iteration), the
+/// rows' loop context, and whether every row has stopped.
+pub(super) struct Prefix {
+    pub items: Vec<(u32, String, String, i64, u32)>,
+    pub nested: FxHashMap<u32, (Vec<Sym>, Vec<(Sym, u32)>, u32)>,
+    pub all_stopped: bool,
 }
 
 /// `_merged_stops`: the loops each rid stops, in first-seen order.
@@ -428,6 +473,48 @@ impl GraphRuntime {
         Ok((stopped_rids, frames))
     }
 
+    /// The values the route would emit inline for `inline`'s iterations from
+    /// its start, each row cut where `stops_over` stops it, as of now: a
+    /// row's loop context and stop limits are what its step's postprocess
+    /// will see, since nothing moves them while the step is in flight. None
+    /// when the check can't decide every row, which leaves it all to
+    /// postprocess.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn prefix_items(
+        &self, partition: &str, node_name: &str, graph_walk: &str, rids: &[u32], row_rids: &[u32],
+        tokens: &TokenColumn, signal: &str, inline: &TokenColumn,
+    ) -> Option<Prefix> {
+        let found = self.stops_over(partition, node_name, graph_walk, rids, Some(tokens), row_rids).ok()?;
+        if !found.missing.is_empty() {
+            return None;
+        }
+        let kept: FxHashMap<u32, u32> = found.rids.iter().copied().zip(found.kept.iter().copied()).collect();
+        let wg = self.owner_of(node_name, graph_walk)?;
+        let node = self.nid(wg, node_name)?;
+        let sig = self.interner.get(signal)?;
+        let edge = self.g(wg).node(node).outputs.iter()
+            .find(|e| e.name == sig && matches!(e.dest, Dest::EmitToClient) && !e.persist)?;
+        let modality = self.interner.name(edge.modality).to_string();
+        let runs = inline.runs_for(rids, row_rids, &kept)?;
+        let width = inline.width() as u32;
+        let mut out = Prefix {
+            items: Vec::new(), nested: FxHashMap::default(),
+            all_stopped: rids.iter().all(|r| kept.get(r).is_some_and(|&k| k <= width)),
+        };
+        for (&rid, run) in rids.iter().zip(runs) {
+            if run.values().is_empty() {
+                continue;
+            }
+            // a row with no state here is one the route skips
+            let Some(idx) = self.nested_idxs_interned(wg, rid, node) else { continue };
+            out.nested.insert(rid, idx);
+            for (j, &value) in run.values().iter().enumerate() {
+                out.items.push((rid, signal.to_string(), modality.clone(), value, run.first() + j as u32));
+            }
+        }
+        Some(out)
+    }
+
     /// The loop name of each of (node, walk)'s stop rules, by index.
     fn stop_rule_loops(&self, node_name: &str, graph_walk: &str) -> Vec<String> {
         let key = (self.sym_or_none(node_name), self.sym_or_none(graph_walk));
@@ -519,15 +606,11 @@ impl GraphRuntime {
             self.send_frames(py, frames)?;
             return Ok(pp.done(completed));
         }
-        let values = pp.inline.as_ref().and_then(|(_, col)| col.values_for(&pp.rids, &pp.row_rids));
-        let Some(values) = values else {
+        let runs = pp.inline.as_ref().and_then(|(_, col)| col.runs_for(&pp.rids, &pp.row_rids, &pp.kept));
+        let Some(runs) = runs else {
             pp.refuse_repeated("store")?;
             return Ok(self.pp_park(pp, NEED_STORE));
         };
-        let tails = pp.inline.as_ref()
-            .filter(|(_, col)| col.width > 1)
-            .and_then(|(_, col)| col.tails_for(&pp.rids, &pp.row_rids, &pp.kept))
-            .unwrap_or_default();
         // Inline: nothing stored, so nothing here touches Python.
         let n = pp.rids.len() * pp.output_signals.len();
         let signal = pp.inline.as_ref().map(|(s, _)| s.clone());
@@ -535,7 +618,7 @@ impl GraphRuntime {
         let sent = py.detach(|| -> PyResult<Result<Vec<u32>, RouteOut>> {
             let route = self.complete_and_route_batch(pp.route_arg(Stored {
                 tensors: Vec::new(), num_tensors: vec![0; n], inline_signal: signal,
-                inline_values: values.into_iter().map(Some).collect(), inline_tails: tails, logprobs: Vec::new(),
+                inline_values: runs.into_iter().map(Some).collect(), logprobs: Vec::new(),
             }))?;
             pp.completion_id = route.completion_id;
             if pp.send_needs_python(&route) {

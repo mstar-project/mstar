@@ -1,6 +1,6 @@
 import logging
 from abc import ABC, abstractmethod
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import IntEnum
 from types import MappingProxyType
@@ -583,11 +583,15 @@ class PostprocessNeed(IntEnum):
 
 
 class InlineColumn(NamedTuple):
-    """A device-loopback step's client signal, one host scalar per row: its
-    emit edge rides inline, and nothing is stored."""
+    """A device-loopback step's client signal, held on the host, a value per
+    row and iteration: its emit edge rides inline, and nothing is stored."""
     signal: str
-    # 1-D host view, row i for ``PostprocessRequest.row_rids[i]``
+    # host view, row i for ``PostprocessRequest.row_rids[i]``; a repeated
+    # step's has a column per iteration (``PostprocessRequest.token_width``)
     column: "torch.Tensor"
+    # the first iteration the route sends; those before it went out while the
+    # step ran (``GraphRuntime.emit_prefix``)
+    start: int = 0
 
 
 class PostprocessRequest(NamedTuple):
@@ -700,7 +704,9 @@ class PhasedPostprocess:
     ``stop_loops_batched``), the route (``complete_and_route_batch``) and the
     send (``send_outputs``). It stops for the worker where a phase needs
     Python (``PostprocessNeed``). The reference the Rust runtime's native
-    postprocess (``rust/src/graph/runtime/postprocess.rs``) follows."""
+    postprocess (``rust/src/graph/runtime/postprocess.rs``) follows for a step
+    that ran one iteration; a repeated step's (``token_width``, a row's stop
+    inside it, ``InlineColumn.start``) is the native one's alone."""
 
     _postprocess: _Postprocess | None = None
 
@@ -1360,6 +1366,22 @@ class GraphRuntime(PhasedPostprocess, ABC):
         """``(counts, caps)``: row i's ``loop_names[i]`` (as ``set_loop_caps``),
         its count so far and the count it ends at; -1 for both for a row this
         worker does not hold."""
+        pass
+
+    @abstractmethod
+    def emit_prefix(
+        self, partition: str, node_name: str, graph_walk: str, rids: list[int], row_rids: Sequence[int],
+        tokens: "torch.Tensor", inline: InlineColumn, end: int,
+    ) -> tuple[int, bool]:
+        """While a repeated step runs, send the client its inline values of
+        iterations ``inline.start`` up to ``end``, which have landed, each row
+        cut at its stop by the check its postprocess runs, so nothing past a
+        stop goes out. ``tokens`` is the stop's column, ``rids`` the rows the
+        step routes. Decides nothing: the postprocess, its ``inline.start``
+        set to what this returns, sends the rest.
+
+        Returns how far it sent (``inline.start`` when the check can't decide
+        every row), and whether every row has stopped by then."""
         pass
 
     @abstractmethod

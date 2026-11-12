@@ -1019,6 +1019,26 @@ def test_an_inline_emit_is_not_staged_for_the_client():
     assert rt.pop_rids("dec", WALK, [rid]) is not None
 
 
+def test_an_inline_emit_holds_no_reference_for_the_client():
+    """The value rides in the frame, so the stored tensor is held for every
+    reader but the client: one reference fewer than the tensor path's."""
+
+    def held(inline_value):
+        rt = _client_loop_runtime()
+        rid = _admit(rt)
+        rt._communicator = _Recorder()
+        _reach_dec(rt, rid, 100)
+        out = _run_dec_step(rt, rid, 101, inline_value=inline_value)
+        rt.send_outputs(_send_input(rid, out.completion_id))
+        bk, n = rt._bookkeeping_for_test, 0
+        while not bk.can_gc(101) and n < 8:
+            bk.dereference(101, 1)
+            n += 1
+        return n
+
+    assert held(151645) == held(None) - 1
+
+
 @pytest.mark.parametrize("inline_values", [[], [None]])
 def test_a_row_with_no_inline_value_takes_the_tensor_path(inline_values):
     rt = _client_loop_runtime()

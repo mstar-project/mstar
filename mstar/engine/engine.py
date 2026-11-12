@@ -2721,6 +2721,7 @@ class Engine:
                 check_stop_buffers=raw_outputs.check_stop_buffers,
                 row_request_ids=tuple(request_ids),
                 rows_only=True,
+                landing=raw_outputs.landing,
             )
         out_ids = (
             step_request_ids if lease is None
@@ -2753,6 +2754,7 @@ class Engine:
             row_views=row_views,
             output_spans=spans or None,
             span_request_ids=tuple(request_ids) if spans else None,
+            landing=raw_outputs.landing,
         )
 
     @staticmethod
@@ -3024,7 +3026,9 @@ class Engine:
     def record_tokens(self, batch: ExecutingBatch, host_rows: HostRows, info_of) -> None:
         self._submodules[batch.node_name].submodule.record_tokens(batch.step_context.graph_walk, host_rows, info_of)
 
-    def repeat_refusal(self, node_name: str, graph_walk: str, loop_back: Collection[str]) -> str | None:
+    def repeat_refusal(
+        self, node_name: str, graph_walk: str, loop_back: Collection[str], limit: int,
+    ) -> str | None:
         """Why no step of this walk can replay with no host work between, or
         None. After capture: its node must run the walk on resident tables,
         carry every loop-back signal, and every resource must allow it."""
@@ -3040,7 +3044,7 @@ class Engine:
             step.ctx.resident = mgmt.resident  # the capture's context; its step is over
             refusal = self._runner.repeat_refusal(step)
         if refusal is None:
-            mgmt.accelerator_graph_runner.accept_repeats(graph_walk, carries)
+            mgmt.accelerator_graph_runner.accept_repeats(graph_walk, carries, limit)
         return refusal
 
     def batch_cap_varies(self, node_name: str, graph_walk: str) -> bool:

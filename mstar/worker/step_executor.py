@@ -45,6 +45,7 @@ from mstar.worker.preemption import Preemption
 from mstar.worker.request_lifecycle import RequestLifecycle
 from mstar.worker.services import WorkerLayout, WorkerServices
 from mstar.worker.speculation import Speculation
+from mstar.worker.step_repeats import stream_run
 from mstar.worker.worker_metrics import WorkerMetrics
 
 logger = logging.getLogger(__name__)
@@ -811,7 +812,9 @@ class StepExecutor:
 
         # Wait for batch N's completion event before proceeding
         # TODO: may need to refine this based on how it affects performance?
+        inline_start = 0
         if batch_N.batch.request_to_worker_graph:
+            inline_start = self._stream_run(batch_N, outputs)
             self.wait_for_step(batch_N)
 
         if self.enable_prof:
@@ -859,7 +862,7 @@ class StepExecutor:
             checked = self._check_stops(batch_N, outputs, cpu_outputs, host_rows, engine).stops
             _pp_stage("check_stop")
         request = self._get_postprocess_request(
-            batch_N, host_rows, engine, runtime_stops, tokens, checked,
+            batch_N, host_rows, engine, runtime_stops, tokens, checked, inline_start,
         )
         if self.enable_nvtx:
             range_pop(synchronize=False)
@@ -950,8 +953,9 @@ class StepExecutor:
         signals = self._graph_runtime.get_output_signals(node_name, graph_walk)
         if not self._body.all_on_device(engine, node_name, graph_walk, signals):
             return "node: an output of it doesn't stay on the device between steps"
+        repeats = self._layout.step_repeats
         return engine.repeat_refusal(
-            node_name, graph_walk, self._layout.step_repeats.loop_back(node_name, graph_walk),
+            node_name, graph_walk, repeats.loop_back(node_name, graph_walk), repeats.limit(node_name),
         )
 
     def _runtime_stop_column(
@@ -974,16 +978,11 @@ class StepExecutor:
         tokens = _host_column(host_rows, token_signal, batch_N.node_batch.step_context.repeats)
         return tokens is not None, tokens
 
-    def _get_postprocess_request(
-        self, batch_N: PendingBatch, host_rows: "HostRows | None", engine,
-        runtime_stops: bool, tokens: "torch.Tensor | None",
-        checked: dict[int, set[str]] | None,
-    ) -> PostprocessRequest:
-        """The step's ``PostprocessRequest``: its rows, its stops known before
-        the runtime's check (``checked``: the model's, when the runtime does
-        not check), and the host columns the runtime reads in place."""
+    def _route_rows(self, batch_N: PendingBatch) -> tuple[list[int], list[int] | None, list[str], list[str]]:
+        """The rows the step routes; each one's index into its walks when the
+        step mixes walks (None for one walk); the walks; the signals they
+        route under."""
         batch = batch_N.batch
-        repeats = batch_N.node_batch.step_context.repeats
         by_walk = batch.rids_by_walk()
         walks = list(by_walk) or [batch_N.graph_walk]
         if len(by_walk) <= 1:
@@ -1003,6 +1002,70 @@ class StepExecutor:
             signals = list(dict.fromkeys(
                 signal for walk in walks for signal in self._body.walk_signals(batch, walk)
             ))
+        return rids, rid_walk_idx, walks, signals
+
+    def _inline_column(
+        self, batch_N: PendingBatch, host_rows: "HostRows | None", engine, signals: list[str],
+        rid_walk_idx: list[int] | None,
+    ) -> InlineColumn | None:
+        """The step's client column, when it rides inline. Device loop-back:
+        every routed signal stays on the device and the client's copy rides
+        inline, so the route stores nothing. A step with log-probs stores
+        instead: STORE passes them to the route."""
+        if not (
+            host_rows is not None and rid_walk_idx is None
+            and SAMPLED_LOGPROB not in host_rows.buffers
+            # an inline route carries every output, a withheld one too
+            and not batch_N.node_batch.withheld_outputs
+            and self._body.all_on_device(engine, batch_N.node_name, batch_N.graph_walk, signals)
+        ):
+            return None
+        client = engine.inline_signals(batch_N.node_name, batch_N.graph_walk)
+        signal = next((s for s in client if s in signals), None)
+        column = None if signal is None else _host_column(
+            host_rows, client[signal], batch_N.node_batch.step_context.repeats,
+        )
+        return None if column is None else InlineColumn(signal, column)
+
+    def _stream_run(self, batch_N: PendingBatch, outputs: BatchedModelOutput) -> int:
+        """While a repeated step runs, send the client its tokens as they land
+        (``stream_run``): how many iterations went out, from which the step's
+        postprocess sends the rest. Before the step's wait, over the rows its
+        route takes: those the worker dropped (stopped a step ago, torn down)
+        are gone from it already."""
+        host_rows, event = outputs.host_rows, batch_N.node_batch.completion_event
+        if (
+            host_rows is None or event is None or outputs.landing is None
+            or batch_N.node_batch.step_context.repeats < 2
+        ):
+            return 0
+        runtime_stops, tokens = self._runtime_stop_column(batch_N, host_rows)
+        if not runtime_stops or tokens is None:
+            return 0
+        rids, rid_walk_idx, walks, signals = self._route_rows(batch_N)
+        engine = self.engine_manager.get_engine(batch_N.node_name)
+        inline = self._inline_column(batch_N, host_rows, engine, signals, rid_walk_idx)
+        if inline is None:
+            return 0
+        with self.timer.span("worker.postprocess.stream_run"):
+            return stream_run(
+                self._graph_runtime, batch_N.partition, batch_N.node_name, walks[0], rids, host_rows.request_ids,
+                tokens, inline, outputs.landing, event,
+            )
+
+    def _get_postprocess_request(
+        self, batch_N: PendingBatch, host_rows: "HostRows | None", engine,
+        runtime_stops: bool, tokens: "torch.Tensor | None",
+        checked: dict[int, set[str]] | None, inline_start: int = 0,
+    ) -> PostprocessRequest:
+        """The step's ``PostprocessRequest``: its rows, its stops known before
+        the runtime's check (``checked``: the model's, when the runtime does
+        not check), and the host columns the runtime reads in place.
+        ``inline_start``: the iterations of the client column that went out
+        while the step ran (``_stream_run``)."""
+        batch = batch_N.batch
+        repeats = batch_N.node_batch.step_context.repeats
+        rids, rid_walk_idx, walks, signals = self._route_rows(batch_N)
         # Stream-terminated loop: a stream-consuming node inside a loop has no
         # internal stop signal (unlike a self-EOS loop), so when it consumes
         # the terminal chunk of its stream (``final_stream_rids``: the
@@ -1020,22 +1083,12 @@ class StepExecutor:
                 stops.setdefault(rid, set()).add(loop_name)
         for rid, loops in (checked or {}).items():
             stops.setdefault(rid, set()).update(loops)
-        # Device loop-back: every routed signal stays on the device and the
-        # client's copy rides inline, so the route stores nothing.
-        # A step with log-probs stores instead: STORE passes them to the route.
-        inline = None
-        if (
-            host_rows is not None and rid_walk_idx is None
-            and SAMPLED_LOGPROB not in host_rows.buffers
-            # an inline route carries every output, a withheld one too
-            and not batch_N.node_batch.withheld_outputs
-            and self._body.all_on_device(engine, batch_N.node_name, batch_N.graph_walk, signals)
-        ):
-            client = engine.inline_signals(batch_N.node_name, batch_N.graph_walk)
-            signal = next((s for s in client if s in signals), None)
-            column = None if signal is None else _host_column(host_rows, client[signal], repeats)
-            if column is not None:
-                inline = InlineColumn(signal, column)
+        inline = self._inline_column(batch_N, host_rows, engine, signals, rid_walk_idx)
+        if inline_start:
+            if inline is None:
+                raise RuntimeError(f"{batch_N.node_name}/{walks[0]}: tokens went out while the step ran, but its "
+                                   "route no longer rides inline")
+            inline = inline._replace(start=inline_start)
         return PostprocessRequest(
             partition=batch_N.partition, node_name=batch_N.node_name, graph_walk=walks[0],
             output_signals=signals,
