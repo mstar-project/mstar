@@ -111,6 +111,8 @@ class H3TextEncoderSubmodule(NodeSubmodule):
     """
 
     disable_torch_compile = True
+    # the Qwen3 rotary angles are an fp32 matmul (``inv_freq @ positions``); TF32 rounds them
+    float32_matmul_precision = "highest"
 
     def __init__(self, encoder: nn.Module, conditioner: nn.Module, *, attn_resource_key: str | None = None,
                  vision: QwenVisionModel | None = None, config: H3Config | None = None):

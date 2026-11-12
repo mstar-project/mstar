@@ -39,7 +39,11 @@ def generate(url: str, engine: str, prompt: str, size: str, seed: int, min_area:
     body = {"model": MODEL[engine], "prompt": prompt, "size": size, "seed": seed, "generator_device": "cpu",
             "response_format": "b64_json", "output_format": "png", "n": 1}
     if min_area is not None:
-        body["min_generation_area"] = min_area
+        # vllm-omni reads the model's own knobs from extra_args
+        if engine == "vllm-omni":
+            body["extra_args"] = {"min_generation_area": min_area}
+        else:
+            body["min_generation_area"] = min_area
     res = requests.post(f"{url}/v1/images/generations", json=body, timeout=3600)
     res.raise_for_status()
     return base64.b64decode(res.json()["data"][0]["b64_json"])
