@@ -162,17 +162,7 @@ def validate_deployment(
             # a `resources:` block check_resources refuses turns no resource on
             specs = enabled_resources(model, config if resources_readable else {**config, "resources": None}, setup)
             if resources_readable:
-                sp_nodes = set() if deployment is None else {
-                    node for graph in deployment.worker_graphs if graph.sp_size > 1
-                    for node in graph.section.get_nodes()
-                }
-                split = {
-                    node: spec.labels for spec in specs if isinstance(spec, SeqShardSpec) and spec.splits
-                    for node in spec.nodes & sp_nodes
-                }
-                sdpa_reads = [read for read, binding in setup.by_read.items() if not binding.plans]
                 problems += deployment_problems(model, config.get("resources") or {})
-                problems += split_read_problems(model.declare_state(), sdpa_reads, split)
     except (ValueError, OSError) as e:
         problems.append(
             f"declaring the node resources failed: {type(e).__name__}: {e}; "
@@ -183,6 +173,20 @@ def validate_deployment(
     checked_config = spec_overrides(config) if resources_readable else config
     if specs is not None:
         problems += _checked("checking the node resources", check_resources, model, specs, checked_config)
+        if resources_readable and deployment is not None:
+            # from the finished specs (overrides and `derive` applied), as the engine passes them
+            sp_nodes = {
+                node for graph in deployment.worker_graphs if graph.sp_size > 1
+                for node in graph.section.get_nodes()
+            }
+            split = {
+                node: spec.labels for spec in specs if isinstance(spec, SeqShardSpec) and spec.splits
+                for node in spec.nodes & sp_nodes
+            }
+            sdpa_reads = [read for read, binding in setup.by_read.items() if not binding.plans]
+            problems += _checked(
+                "checking the split reads", split_read_problems, model.declare_state(), sdpa_reads, split,
+            )
         # the placement checks see what the workers build of them
         try:
             specs = built_resources(specs)
