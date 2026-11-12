@@ -622,6 +622,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../../_autosummary/mstar.engine.resources.rms_norm.html">mstar.engine.resources.rms_norm</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../../_autosummary/mstar.engine.resources.runner.html">mstar.engine.resources.runner</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../../_autosummary/mstar.engine.resources.sampler.html">mstar.engine.resources.sampler</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../../_autosummary/mstar.engine.resources.sequence_shard.html">mstar.engine.resources.sequence_shard</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../../_autosummary/mstar.engine.resources.spec.html">mstar.engine.resources.spec</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../../_autosummary/mstar.engine.resources.step.html">mstar.engine.resources.step</a></li>
 </ul>
@@ -1038,9 +1039,10 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">a submodule can declare a step without pulling FlashInfer in behind it.</span>
 <span class="sd">"""</span>
 
-<span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Collection</span><span class="p">,</span> <span class="n">Mapping</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">enum</span><span class="w"> </span><span class="kn">import</span> <span class="n">Enum</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">TYPE_CHECKING</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">TYPE_CHECKING</span><span class="p">,</span> <span class="n">Literal</span>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
 
@@ -1049,6 +1051,7 @@ window.runMermaid = runMermaid;</script>
 
 <span class="k">if</span> <span class="n">TYPE_CHECKING</span><span class="p">:</span>
     <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">Resource</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.sequence_shard</span><span class="w"> </span><span class="kn">import</span> <span class="n">SeqShardSpec</span>
 
 
 <div class="viewcode-block" id="cross_label">
@@ -1144,11 +1147,6 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># engine's KV dtype (which is actually a misnamed autocast dtype) is used.</span>
     <span class="n">dtype</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">dtype</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
 
-    <span class="c1"># False keeps every head on each sequence-parallel rank (TP still shards</span>
-    <span class="c1"># them), for an attention a rank runs whole over its own tokens: one over a</span>
-    <span class="c1"># replicated stream, or a cross-attention from the rank's query shard.</span>
-    <span class="n">shard_over_sp</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
-
     <span class="c1"># Where each label's FlashInfer workspace starts, per slot; None takes</span>
     <span class="c1"># MSTAR_WORKSPACE_BUFFER_MB, which a declared size wins over. A floor: a plan that</span>
     <span class="c1"># asks for more grows it. FA3 plans don't use it; FA2 spends it on split-KV</span>
@@ -1202,6 +1200,14 @@ window.runMermaid = runMermaid;</script>
 <span class="w">    </span><span class="sd">"""The config and deployment overrides both ragged specs share."""</span>
 
     <span class="n">config</span><span class="p">:</span> <span class="n">RaggedAttentionConfig</span>
+    <span class="c1"># the sequence shard over its nodes, if any (`derive`, on the kinds that take split steps)</span>
+    <span class="n">shard_key</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="nb">repr</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+    <span class="c1"># how a split label's tokens reach the heads: declared on self-attention (`RaggedAttentionSpec`),</span>
+    <span class="c1"># derived per pair on cross-attention</span>
+    <span class="n">sp_exchange</span> <span class="o">=</span> <span class="kc">None</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">depends_on</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">set</span><span class="p">[</span><span class="nb">str</span><span class="p">]:</span>
+        <span class="k">return</span> <span class="nb">set</span><span class="p">()</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">shard_key</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="p">{</span><span class="bp">self</span><span class="o">.</span><span class="n">shard_key</span><span class="p">}</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">apply_yaml_overrides</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span>
@@ -1241,7 +1247,52 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../../../../_autosummary/mstar.engine.resources.attn.ragged.config.html#mstar.engine.resources.RaggedAttentionSpec">[docs]</a>
 <span class="nd">@dataclass</span>
 <span class="k">class</span><span class="w"> </span><span class="nc">RaggedAttentionSpec</span><span class="p">(</span><span class="n">_RaggedSpecBase</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">"""Cacheless self-attention within each declared span (``AttentionStep``)."""</span>
+<span class="w">    </span><span class="sd">"""Cacheless self-attention within each declared span (``AttentionStep``).</span>
+
+<span class="sd">    ``labels`` are the labels its plans run under that may split; the state contract fills them from the arrays it</span>
+<span class="sd">    reads. Where its node's sequence shard lists one of them, the resource attends a split step's label by Ulysses</span>
+<span class="sd">    (one all-to-all from split tokens to split heads, and back) and shards heads over every TP and SP rank, slicing</span>
+<span class="sd">    them on a copied step (``sp_exchange`` "ulysses", derived); otherwise it attends only copied labels, heads over</span>
+<span class="sd">    TP. On SP ranks every label of a Ulysses resource goes through an exchange, so ``run(..., return_lse=True)``</span>
+<span class="sd">    raises there."""</span>
+
+    <span class="n">labels</span><span class="p">:</span> <span class="n">Collection</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="nb">frozenset</span><span class="p">(),</span> <span class="n">kw_only</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+    <span class="c1"># how a split label's tokens reach the heads, from ``labels`` and the node's sequence shard (`derive`)</span>
+    <span class="n">sp_exchange</span><span class="p">:</span> <span class="n">Literal</span><span class="p">[</span><span class="s2">"ulysses"</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">__post_init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="n">__post_init__</span><span class="p">()</span>
+        <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">labels</span><span class="p">,</span> <span class="nb">str</span><span class="p">):</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"ragged attention </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">resource_key</span><span class="si">!r}</span><span class="s2">: labels is a collection, not a string"</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">labels</span> <span class="o">=</span> <span class="nb">frozenset</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">labels</span><span class="p">)</span>
+
+<div class="viewcode-block" id="RaggedAttentionSpec.derive">
+<a class="viewcode-back" href="../../../../../../_autosummary/mstar.engine.resources.attn.ragged.config.html#mstar.engine.resources.RaggedAttentionSpec.derive">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">derive</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">specs</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">NodeResourceSpec</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]:</span>
+        <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.sequence_shard</span><span class="w"> </span><span class="kn">import</span> <span class="n">take_shard_edge</span>
+
+        <span class="n">problems</span> <span class="o">=</span> <span class="n">take_shard_edge</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">specs</span><span class="p">)</span>
+        <span class="n">split</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">shard_key</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">labels</span> <span class="o">&amp;</span> <span class="nb">set</span><span class="p">(</span><span class="n">specs</span><span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">shard_key</span><span class="p">]</span><span class="o">.</span><span class="n">labels</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">sp_exchange</span> <span class="o">=</span> <span class="s2">"ulysses"</span> <span class="k">if</span> <span class="n">split</span> <span class="k">else</span> <span class="kc">None</span>
+        <span class="k">return</span> <span class="n">problems</span></div>
+
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">attends_split_steps</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">sp_exchange</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+
+<div class="viewcode-block" id="RaggedAttentionSpec.split_step_refusals">
+<a class="viewcode-back" href="../../../../../../_autosummary/mstar.engine.resources.attn.ragged.config.html#mstar.engine.resources.RaggedAttentionSpec.split_step_refusals">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">split_step_refusals</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">node</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">shard</span><span class="p">:</span> <span class="s2">"SeqShardSpec"</span><span class="p">,</span> <span class="n">tp</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">sp</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]:</span>
+        <span class="n">cfg</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span>
+        <span class="n">q</span><span class="p">,</span> <span class="n">kv</span> <span class="o">=</span> <span class="n">cfg</span><span class="o">.</span><span class="n">_unsharded_qo_heads</span><span class="p">,</span> <span class="n">cfg</span><span class="o">.</span><span class="n">_unsharded_kv_heads</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">sp_exchange</span> <span class="o">==</span> <span class="s2">"ulysses"</span> <span class="ow">and</span> <span class="p">(</span><span class="n">q</span> <span class="o">%</span> <span class="p">(</span><span class="n">tp</span> <span class="o">*</span> <span class="n">sp</span><span class="p">)</span> <span class="ow">or</span> <span class="n">kv</span> <span class="o">%</span> <span class="p">(</span><span class="n">tp</span> <span class="o">*</span> <span class="n">sp</span><span class="p">)):</span>
+            <span class="k">return</span> <span class="p">[</span>
+                <span class="sa">f</span><span class="s2">"ragged attention </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">resource_key</span><span class="si">!r}</span><span class="s2"> attends labels its sequence shard splits (Ulysses), and "</span>
+                <span class="sa">f</span><span class="s2">"its </span><span class="si">{</span><span class="n">q</span><span class="si">}</span><span class="s2"> query and </span><span class="si">{</span><span class="n">kv</span><span class="si">}</span><span class="s2"> KV heads don't split over </span><span class="si">{</span><span class="n">tp</span><span class="si">}</span><span class="s2"> TP x </span><span class="si">{</span><span class="n">sp</span><span class="si">}</span><span class="s2"> SP ranks"</span>
+            <span class="p">]</span>
+        <span class="k">return</span> <span class="p">[]</span></div>
+
 
     <span class="nd">@property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">resource_class</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">"type[Resource]"</span><span class="p">:</span>
@@ -1261,7 +1312,35 @@ window.runMermaid = runMermaid;</script>
 
 <span class="sd">    Separate from ``RaggedAttentionSpec`` so a resource is one kind of attention:</span>
 <span class="sd">    a model with both declares one of each per head geometry.</span>
+
+<span class="sd">    On a node whose sequence shard splits a step, each pair's exchange follows from which side</span>
+<span class="sd">    is split: split queries over copied keys attend locally, copied queries over split keys merge</span>
+<span class="sd">    every rank's partial (``sharded_key_merge``), and both split is refused at load</span>
+<span class="sd">    (``mstar.engine.state.analysis.split_read_problems``). The shard must split</span>
+<span class="sd">    each row (``axis=1``) with exchanges: a packed split (``axis=0``) or one with ``exchanges=False``</span>
+<span class="sd">    can leave a rank none of a row.</span>
 <span class="sd">    """</span>
+
+<div class="viewcode-block" id="RaggedCrossAttentionSpec.derive">
+<a class="viewcode-back" href="../../../../../../_autosummary/mstar.engine.resources.attn.ragged.config.html#mstar.engine.resources.RaggedCrossAttentionSpec.derive">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">derive</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">specs</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">NodeResourceSpec</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]:</span>
+        <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.sequence_shard</span><span class="w"> </span><span class="kn">import</span> <span class="n">take_shard_edge</span>
+
+        <span class="k">return</span> <span class="n">take_shard_edge</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">specs</span><span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="RaggedCrossAttentionSpec.split_step_refusals">
+<a class="viewcode-back" href="../../../../../../_autosummary/mstar.engine.resources.attn.ragged.config.html#mstar.engine.resources.RaggedCrossAttentionSpec.split_step_refusals">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">split_step_refusals</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">node</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">shard</span><span class="p">:</span> <span class="s2">"SeqShardSpec"</span><span class="p">,</span> <span class="n">tp</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">sp</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]:</span>
+        <span class="k">if</span> <span class="n">shard</span><span class="o">.</span><span class="n">axis</span> <span class="o">==</span> <span class="mi">0</span> <span class="ow">or</span> <span class="ow">not</span> <span class="n">shard</span><span class="o">.</span><span class="n">exchanges</span><span class="p">:</span>
+            <span class="n">how</span> <span class="o">=</span> <span class="s2">"splits packed tokens (axis 0)"</span> <span class="k">if</span> <span class="n">shard</span><span class="o">.</span><span class="n">axis</span> <span class="o">==</span> <span class="mi">0</span> <span class="k">else</span> <span class="s2">"declares exchanges=False"</span>
+            <span class="k">return</span> <span class="p">[</span>
+                <span class="sa">f</span><span class="s2">"ragged cross-attention </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">resource_key</span><span class="si">!r}</span><span class="s2"> on node </span><span class="si">{</span><span class="n">node</span><span class="si">!r}</span><span class="s2">, whose sequence shard "</span>
+                <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">shard</span><span class="o">.</span><span class="n">resource_key</span><span class="si">!r}</span><span class="s2"> </span><span class="si">{</span><span class="n">how</span><span class="si">}</span><span class="s2">, which can leave a rank no tokens of a row to attend: split "</span>
+                <span class="s2">"each row (axis 1) with exchanges"</span>
+            <span class="p">]</span>
+        <span class="k">return</span> <span class="p">[]</span></div>
+
 
     <span class="nd">@property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">resource_class</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">"type[Resource]"</span><span class="p">:</span>

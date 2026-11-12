@@ -51,7 +51,7 @@
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
     <link rel="next" title="mstar.engine.resources.step" href="mstar.engine.resources.step.html" />
-    <link rel="prev" title="mstar.engine.resources.sampler.config" href="mstar.engine.resources.sampler.config.html" />
+    <link rel="prev" title="mstar.engine.resources.sequence_shard" href="mstar.engine.resources.sequence_shard.html" />
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
@@ -269,6 +269,7 @@
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.rms_norm.html">mstar.engine.resources.rms_norm</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.runner.html">mstar.engine.resources.runner</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.sampler.html">mstar.engine.resources.sampler</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.sequence_shard.html">mstar.engine.resources.sequence_shard</a></li>
 <li class="toctree-l4 current active"><a class="current reference internal" href="#">mstar.engine.resources.spec</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.step.html">mstar.engine.resources.step</a></li>
 </ul>
@@ -749,6 +750,7 @@
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.NodeResourceSpec"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.NodeResourceSpec.apply_yaml_overrides"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.apply_yaml_overrides()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.NodeResourceSpec.attends_split_steps"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.attends_split_steps</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.NodeResourceSpec.combined_splits"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.combined_splits()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.NodeResourceSpec.depends_on"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.depends_on()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.NodeResourceSpec.derive"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.derive()</span></code></a></li>
@@ -764,6 +766,8 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.NodeResourceSpec.resource_key"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.resource_key</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.NodeResourceSpec.restores_prefix"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.restores_prefix</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.NodeResourceSpec.routing_mirror"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.routing_mirror()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.NodeResourceSpec.split_step_refusals"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.split_step_refusals()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.NodeResourceSpec.splits_steps"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.splits_steps</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.NodeResourceSpec.writes_prefix_snapshots"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.writes_prefix_snapshots</span></code></a></li>
 </ul>
 </li>
@@ -947,6 +951,18 @@ implementations, at the cost of silently accepting anything named
 alike.</p>
 </dd></dl>
 
+<dl class="py property">
+<dt class="sig sig-object py" id="mstar.engine.resources.spec.NodeResourceSpec.attends_split_steps">
+<span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">attends_split_steps</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><a class="headerlink" href="#mstar.engine.resources.spec.NodeResourceSpec.attends_split_steps" title="Link to this definition">#</a></dt>
+<dd><p>a node that splits
+its steps needs one.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>Whether this is an attention that can take a split step’s tokens</p>
+</dd>
+</dl>
+</dd></dl>
+
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.spec.NodeResourceSpec.combined_splits">
 <span class="sig-name descname"><span class="pre">combined_splits</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/spec.html#NodeResourceSpec.combined_splits"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.spec.NodeResourceSpec.combined_splits" title="Link to this definition">#</a></dt>
@@ -1114,6 +1130,33 @@ those of the resources it depends on that restore.</p>
 <dd class="field-even"><p><a class="reference internal" href="#mstar.engine.resources.spec.RoutingMirror" title="mstar.engine.resources.spec.RoutingMirror"><em>RoutingMirror</em></a> | None</p>
 </dd>
 </dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.spec.NodeResourceSpec.split_step_refusals">
+<span class="sig-name descname"><span class="pre">split_step_refusals</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">node</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">shard</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">tp</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">sp</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/spec.html#NodeResourceSpec.split_step_refusals"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.spec.NodeResourceSpec.split_step_refusals" title="Link to this definition">#</a></dt>
+<dd><p>What this resource can’t run on <code class="docutils literal notranslate"><span class="pre">node</span></code>, whose steps <code class="docutils literal notranslate"><span class="pre">shard</span></code> splits over <code class="docutils literal notranslate"><span class="pre">sp</span></code> SP
+ranks (<code class="docutils literal notranslate"><span class="pre">tp</span></code> TP ranks each); each a sentence.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>node</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>shard</strong> (<a class="reference internal" href="mstar.engine.resources.html#mstar.engine.resources.SeqShardSpec" title="mstar.engine.resources.SeqShardSpec"><em>SeqShardSpec</em></a>)</p></li>
+<li><p><strong>tp</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>sp</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)">list</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a>]</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py property">
+<dt class="sig sig-object py" id="mstar.engine.resources.spec.NodeResourceSpec.splits_steps">
+<span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">splits_steps</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><a class="headerlink" href="#mstar.engine.resources.spec.NodeResourceSpec.splits_steps" title="Link to this definition">#</a></dt>
+<dd><p>Whether this resource splits its nodes’ steps over their SP ranks
+(<code class="docutils literal notranslate"><span class="pre">mstar.engine.resources.sequence_shard</span></code>).</p>
 </dd></dl>
 
 <dl class="py property">
@@ -1437,12 +1480,12 @@ takes from the others (<cite>NodeResourceSpec.derive</cite>).</p>
                   
 <div class="prev-next-area">
     <a class="left-prev"
-       href="mstar.engine.resources.sampler.config.html"
+       href="mstar.engine.resources.sequence_shard.html"
        title="previous page">
       <i class="fa-solid fa-angle-left"></i>
       <div class="prev-next-info">
         <p class="prev-next-subtitle">previous</p>
-        <p class="prev-next-title">mstar.engine.resources.sampler.config</p>
+        <p class="prev-next-title">mstar.engine.resources.sequence_shard</p>
       </div>
     </a>
     <a class="right-next"
@@ -1480,6 +1523,7 @@ takes from the others (<cite>NodeResourceSpec.derive</cite>).</p>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.NodeResourceSpec"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.NodeResourceSpec.apply_yaml_overrides"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.apply_yaml_overrides()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.NodeResourceSpec.attends_split_steps"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.attends_split_steps</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.NodeResourceSpec.combined_splits"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.combined_splits()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.NodeResourceSpec.depends_on"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.depends_on()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.NodeResourceSpec.derive"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.derive()</span></code></a></li>
@@ -1495,6 +1539,8 @@ takes from the others (<cite>NodeResourceSpec.derive</cite>).</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.NodeResourceSpec.resource_key"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.resource_key</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.NodeResourceSpec.restores_prefix"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.restores_prefix</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.NodeResourceSpec.routing_mirror"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.routing_mirror()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.NodeResourceSpec.split_step_refusals"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.split_step_refusals()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.NodeResourceSpec.splits_steps"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.splits_steps</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.NodeResourceSpec.writes_prefix_snapshots"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.writes_prefix_snapshots</span></code></a></li>
 </ul>
 </li>

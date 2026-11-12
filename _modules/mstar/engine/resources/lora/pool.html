@@ -622,6 +622,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.rms_norm.html">mstar.engine.resources.rms_norm</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.runner.html">mstar.engine.resources.runner</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.sampler.html">mstar.engine.resources.sampler</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.sequence_shard.html">mstar.engine.resources.sequence_shard</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.spec.html">mstar.engine.resources.spec</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.step.html">mstar.engine.resources.step</a></li>
 </ul>
@@ -1105,7 +1106,6 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">import</span><span class="w"> </span><span class="nn">numpy</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">np</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
 
-<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.distributed.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">PARALLEL_AXES</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">CGSlotKey</span><span class="p">,</span> <span class="n">EngineResourceInfo</span><span class="p">,</span> <span class="n">Resource</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.lora.backend</span><span class="w"> </span><span class="kn">import</span> <span class="n">LoraBackend</span><span class="p">,</span> <span class="n">make_backend</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.lora.config</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span>
@@ -1416,20 +1416,16 @@ window.runMermaid = runMermaid;</script>
         <span class="n">rank</span><span class="p">,</span> <span class="n">world_size</span><span class="p">,</span> <span class="n">agree</span><span class="p">,</span> <span class="n">decides</span> <span class="o">=</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="kc">None</span><span class="p">,</span> <span class="kc">True</span>
         <span class="n">joint</span> <span class="o">=</span> <span class="n">info</span><span class="o">.</span><span class="n">joint_comm_group</span>
         <span class="k">if</span> <span class="n">joint</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="c1"># its rows are laid out per request over the whole batch; every axis but TP</span>
-            <span class="c1"># (cfg branches, sp token shards) hands each rank only part of it, except SP</span>
-            <span class="c1"># under a node whose pools place positions over its SP ranks, which runs</span>
-            <span class="c1"># replicated over them</span>
-            <span class="k">for</span> <span class="n">axis</span> <span class="ow">in</span> <span class="n">PARALLEL_AXES</span><span class="p">:</span>
-                <span class="k">if</span> <span class="n">axis</span> <span class="o">==</span> <span class="s2">"tp"</span> <span class="ow">or</span> <span class="p">(</span><span class="n">axis</span> <span class="o">==</span> <span class="s2">"sp"</span> <span class="ow">and</span> <span class="n">info</span><span class="o">.</span><span class="n">replicated_over_sp</span><span class="p">):</span>
-                    <span class="k">continue</span>
-                <span class="k">if</span> <span class="p">(</span><span class="n">size</span> <span class="o">:=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">joint</span><span class="p">,</span> <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">axis</span><span class="si">}</span><span class="s2">_group"</span><span class="p">)</span><span class="o">.</span><span class="n">world_size</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
-                    <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
-                        <span class="sa">f</span><span class="s2">"LoRA resource </span><span class="si">{</span><span class="n">spec</span><span class="o">.</span><span class="n">resource_key</span><span class="si">!r}</span><span class="s2"> serves a node at </span><span class="si">{</span><span class="n">axis</span><span class="si">}</span><span class="s2">_size </span><span class="si">{</span><span class="n">size</span><span class="si">}</span><span class="s2">, "</span>
-                        <span class="s2">"which LoRA does not support: its rows are laid out per request over the "</span>
-                        <span class="sa">f</span><span class="s2">"whole batch, while each </span><span class="si">{</span><span class="n">axis</span><span class="o">.</span><span class="n">upper</span><span class="p">()</span><span class="si">}</span><span class="s2"> rank runs only part of it. Serve "</span>
-                        <span class="sa">f</span><span class="s2">"this node at </span><span class="si">{</span><span class="n">axis</span><span class="si">}</span><span class="s2">_size 1, or drop the 'lora:' block"</span>
-                    <span class="p">)</span>
+            <span class="c1"># its rows are laid out per request over the whole batch, which each CFG rank runs only</span>
+            <span class="c1"># part of; every SP rank runs every row, as a node splitting its steps over them is</span>
+            <span class="c1"># refused (`LoraSpec.split_step_refusals`)</span>
+            <span class="k">if</span> <span class="p">(</span><span class="n">size</span> <span class="o">:=</span> <span class="n">joint</span><span class="o">.</span><span class="n">cfg_group</span><span class="o">.</span><span class="n">world_size</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                    <span class="sa">f</span><span class="s2">"LoRA resource </span><span class="si">{</span><span class="n">spec</span><span class="o">.</span><span class="n">resource_key</span><span class="si">!r}</span><span class="s2"> serves a node at cfg_size </span><span class="si">{</span><span class="n">size</span><span class="si">}</span><span class="s2">, "</span>
+                    <span class="s2">"which LoRA does not support: its rows are laid out per request over the "</span>
+                    <span class="s2">"whole batch, while each CFG rank runs only part of it. Serve "</span>
+                    <span class="s2">"this node at cfg_size 1, or drop the 'lora:' block"</span>
+                <span class="p">)</span>
             <span class="c1"># the base linears split over the TP group</span>
             <span class="n">rank</span><span class="p">,</span> <span class="n">world_size</span> <span class="o">=</span> <span class="n">joint</span><span class="o">.</span><span class="n">tp_group</span><span class="o">.</span><span class="n">rank</span><span class="p">,</span> <span class="n">joint</span><span class="o">.</span><span class="n">tp_group</span><span class="o">.</span><span class="n">world_size</span>
             <span class="k">if</span> <span class="n">joint</span><span class="o">.</span><span class="n">world_size</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>

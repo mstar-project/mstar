@@ -622,6 +622,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.resources.rms_norm.html">mstar.engine.resources.rms_norm</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.resources.runner.html">mstar.engine.resources.runner</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.resources.sampler.html">mstar.engine.resources.sampler</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.resources.sequence_shard.html">mstar.engine.resources.sequence_shard</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.resources.spec.html">mstar.engine.resources.spec</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.resources.step.html">mstar.engine.resources.step</a></li>
 </ul>
@@ -1771,7 +1772,9 @@ window.runMermaid = runMermaid;</script>
 
 
 
-<span class="k">def</span><span class="w"> </span><span class="nf">_position_pools</span><span class="p">(</span><span class="n">specs</span><span class="p">:</span> <span class="n">Iterable</span><span class="p">[</span><span class="n">NodeResourceSpec</span><span class="p">],</span> <span class="n">node</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">bool</span><span class="p">]:</span>
+<div class="viewcode-block" id="position_pools">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.context_parallel.html#mstar.engine.resources.context_parallel.position_pools">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">position_pools</span><span class="p">(</span><span class="n">specs</span><span class="p">:</span> <span class="n">Iterable</span><span class="p">[</span><span class="n">NodeResourceSpec</span><span class="p">],</span> <span class="n">node</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">bool</span><span class="p">]:</span>
 <span class="w">    </span><span class="sd">"""``node``'s resources that hold token positions, each to whether it places them</span>
 <span class="sd">    (``NodeResourceSpec.places_positions``). Raises when one is placed and another isn't."""</span>
     <span class="n">pools</span> <span class="o">=</span> <span class="p">{</span>
@@ -1783,34 +1786,7 @@ window.runMermaid = runMermaid;</script>
             <span class="sa">f</span><span class="s2">"node </span><span class="si">{</span><span class="n">node</span><span class="si">!r}</span><span class="s2"> places positions over its ranks, so every pool of them it uses must: "</span>
             <span class="sa">f</span><span class="s2">"set context_parallel on </span><span class="si">{</span><span class="nb">sorted</span><span class="p">(</span><span class="n">key</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="n">key</span><span class="p">,</span><span class="w"> </span><span class="n">placed</span><span class="w"> </span><span class="ow">in</span><span class="w"> </span><span class="n">pools</span><span class="o">.</span><span class="n">items</span><span class="p">()</span><span class="w"> </span><span class="k">if</span><span class="w"> </span><span class="ow">not</span><span class="w"> </span><span class="n">placed</span><span class="p">)</span><span class="si">}</span><span class="s2"> too"</span>
         <span class="p">)</span>
-    <span class="k">return</span> <span class="n">pools</span>
-
-
-<div class="viewcode-block" id="positions_over_sp">
-<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.context_parallel.html#mstar.engine.resources.context_parallel.positions_over_sp">[docs]</a>
-<span class="k">def</span><span class="w"> </span><span class="nf">positions_over_sp</span><span class="p">(</span><span class="n">specs</span><span class="p">:</span> <span class="n">Iterable</span><span class="p">[</span><span class="n">NodeResourceSpec</span><span class="p">],</span> <span class="n">node</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">sp_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">sp_enabled_nodes</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">"""Whether ``node``, on ``sp_size`` SP ranks, places its pools' positions over them, sharding</span>
-<span class="sd">    heads over TP alone and running replicated across SP, so the model loads without its SP group;</span>
-<span class="sd">    otherwise it runs the model's own sequence parallelism (it is in ``sp_enabled_nodes``). False on</span>
-<span class="sd">    one SP rank. Raises when it does neither, or both, or places one pool and not another."""</span>
-    <span class="k">if</span> <span class="n">sp_size</span> <span class="o">==</span> <span class="mi">1</span><span class="p">:</span>
-        <span class="k">return</span> <span class="kc">False</span>
-    <span class="n">pools</span> <span class="o">=</span> <span class="n">_position_pools</span><span class="p">(</span><span class="n">specs</span><span class="p">,</span> <span class="n">node</span><span class="p">)</span>
-    <span class="n">placed</span> <span class="o">=</span> <span class="nb">any</span><span class="p">(</span><span class="n">pools</span><span class="o">.</span><span class="n">values</span><span class="p">())</span>
-    <span class="k">if</span> <span class="n">placed</span> <span class="ow">and</span> <span class="n">node</span> <span class="ow">in</span> <span class="n">sp_enabled_nodes</span><span class="p">:</span>
-        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
-            <span class="sa">f</span><span class="s2">"node </span><span class="si">{</span><span class="n">node</span><span class="si">!r}</span><span class="s2"> runs its own sequence parallelism (sp_enabled_nodes), and a paged KV pool over "</span>
-            <span class="s2">"it sets context_parallel, which would replace it: turn context_parallel off, or use sp_size 1 "</span>
-            <span class="s2">"to place positions over TP ranks"</span>
-        <span class="p">)</span>
-    <span class="k">if</span> <span class="ow">not</span> <span class="n">placed</span> <span class="ow">and</span> <span class="n">node</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">sp_enabled_nodes</span><span class="p">:</span>
-        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
-            <span class="sa">f</span><span class="s2">"node </span><span class="si">{</span><span class="n">node</span><span class="si">!r}</span><span class="s2"> on </span><span class="si">{</span><span class="n">sp_size</span><span class="si">}</span><span class="s2"> SP ranks is not in sp_enabled_nodes </span><span class="si">{</span><span class="nb">sorted</span><span class="p">(</span><span class="n">sp_enabled_nodes</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span>
-            <span class="o">+</span> <span class="p">(</span><span class="s2">": set context_parallel on its paged KV pools to place positions over the SP ranks instead"</span>
-               <span class="k">if</span> <span class="n">pools</span> <span class="k">else</span> <span class="s2">", and holds no paged KV pool to place over them: put it in a node group of "</span>
-               <span class="s2">"its own with sp_size 1"</span><span class="p">)</span>
-        <span class="p">)</span>
-    <span class="k">return</span> <span class="n">placed</span></div>
+    <span class="k">return</span> <span class="n">pools</span></div>
 
 </pre></div>
 

@@ -622,6 +622,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.resources.rms_norm.html">mstar.engine.resources.rms_norm</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.resources.runner.html">mstar.engine.resources.runner</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.resources.sampler.html">mstar.engine.resources.sampler</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.resources.sequence_shard.html">mstar.engine.resources.sequence_shard</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.resources.spec.html">mstar.engine.resources.spec</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.resources.step.html">mstar.engine.resources.step</a></li>
 </ul>
@@ -1050,6 +1051,8 @@ window.runMermaid = runMermaid;</script>
 
 <span class="c1"># The DiT's self-attention: the array over its tokens, and the read that names its resource.</span>
 <span class="n">DIT_TOKENS</span><span class="p">,</span> <span class="n">SELF_ATTN</span> <span class="o">=</span> <span class="s2">"dit_tokens"</span><span class="p">,</span> <span class="s2">"dit_self_attn"</span>
+<span class="c1"># On SP ranks, splits each row of the DiT's tokens over them (Wan22Model.get_node_resources).</span>
+<span class="n">DIT_SHARD</span> <span class="o">=</span> <span class="s2">"dit_seq_shard"</span>
 
 
 <div class="viewcode-block" id="Wan22Config">

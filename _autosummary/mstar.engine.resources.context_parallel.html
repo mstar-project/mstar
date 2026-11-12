@@ -269,6 +269,7 @@
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.rms_norm.html">mstar.engine.resources.rms_norm</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.runner.html">mstar.engine.resources.runner</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.sampler.html">mstar.engine.resources.sampler</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.sequence_shard.html">mstar.engine.resources.sequence_shard</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.spec.html">mstar.engine.resources.spec</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.step.html">mstar.engine.resources.step</a></li>
 </ul>
@@ -810,7 +811,7 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.context_parallel.local_indptrs"><code class="docutils literal notranslate"><span class="pre">local_indptrs()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.context_parallel.merge"><code class="docutils literal notranslate"><span class="pre">merge()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.context_parallel.merge_lse"><code class="docutils literal notranslate"><span class="pre">merge_lse()</span></code></a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.context_parallel.positions_over_sp"><code class="docutils literal notranslate"><span class="pre">positions_over_sp()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.context_parallel.position_pools"><code class="docutils literal notranslate"><span class="pre">position_pools()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.context_parallel.zigzag_capture"><code class="docutils literal notranslate"><span class="pre">zigzag_capture()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.context_parallel.zigzag_rows"><code class="docutils literal notranslate"><span class="pre">zigzag_rows()</span></code></a></li>
 </ul>
@@ -850,8 +851,8 @@ exactly.</p>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.context_parallel.merge_lse" title="mstar.engine.resources.context_parallel.merge_lse"><code class="xref py py-obj docutils literal notranslate"><span class="pre">merge_lse</span></code></a>(outs, lses)</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">merge</span></code>, and the union's natural-log lse, fp32, to merge again.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.context_parallel.positions_over_sp" title="mstar.engine.resources.context_parallel.positions_over_sp"><code class="xref py py-obj docutils literal notranslate"><span class="pre">positions_over_sp</span></code></a>(specs, node, sp_size, ...)</p></td>
-<td><p>Whether <code class="docutils literal notranslate"><span class="pre">node</span></code>, on <code class="docutils literal notranslate"><span class="pre">sp_size</span></code> SP ranks, places its pools' positions over them, sharding heads over TP alone and running replicated across SP, so the model loads without its SP group; otherwise it runs the model's own sequence parallelism (it is in <code class="docutils literal notranslate"><span class="pre">sp_enabled_nodes</span></code>).</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.context_parallel.position_pools" title="mstar.engine.resources.context_parallel.position_pools"><code class="xref py py-obj docutils literal notranslate"><span class="pre">position_pools</span></code></a>(specs, node)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">node</span></code>'s resources that hold token positions, each to whether it places them (<code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.places_positions</span></code>).</p></td>
 </tr>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.context_parallel.zigzag_capture" title="mstar.engine.resources.context_parallel.zigzag_capture"><code class="xref py py-obj docutils literal notranslate"><span class="pre">zigzag_capture</span></code></a>(size, rows, tokens)</p></td>
 <td><p>A zigzag share's kernel captured for a bucket of <code class="docutils literal notranslate"><span class="pre">rows</span></code> rows and <code class="docutils literal notranslate"><span class="pre">tokens</span></code> tokens: its fixed rows (at most 2 chunks a row, and one more for the padding queries) and queries (at most <code class="docutils literal notranslate"><span class="pre">ceil(T</span> <span class="pre">/</span> <span class="pre">2P)</span></code> a chunk).</p></td>
@@ -1561,22 +1562,19 @@ fp32.</p>
 </dd></dl>
 
 <dl class="py function">
-<dt class="sig sig-object py" id="mstar.engine.resources.context_parallel.positions_over_sp">
-<span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.context_parallel.</span></span><span class="sig-name descname"><span class="pre">positions_over_sp</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">specs</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">node</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">sp_size</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">sp_enabled_nodes</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/context_parallel.html#positions_over_sp"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.context_parallel.positions_over_sp" title="Link to this definition">#</a></dt>
-<dd><p>Whether <code class="docutils literal notranslate"><span class="pre">node</span></code>, on <code class="docutils literal notranslate"><span class="pre">sp_size</span></code> SP ranks, places its pools’ positions over them, sharding
-heads over TP alone and running replicated across SP, so the model loads without its SP group;
-otherwise it runs the model’s own sequence parallelism (it is in <code class="docutils literal notranslate"><span class="pre">sp_enabled_nodes</span></code>). False on
-one SP rank. Raises when it does neither, or both, or places one pool and not another.</p>
+<dt class="sig sig-object py" id="mstar.engine.resources.context_parallel.position_pools">
+<span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.context_parallel.</span></span><span class="sig-name descname"><span class="pre">position_pools</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">specs</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">node</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/context_parallel.html#position_pools"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.context_parallel.position_pools" title="Link to this definition">#</a></dt>
+<dd><p><code class="docutils literal notranslate"><span class="pre">node</span></code>’s resources that hold token positions, each to whether it places them
+(<code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.places_positions</span></code>). Raises when one is placed and another isn’t.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
 <li><p><strong>specs</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Iterable" title="(in Python v3.12)"><em>Iterable</em></a><em>[</em><a class="reference internal" href="mstar.engine.resources.spec.html#mstar.engine.resources.spec.NodeResourceSpec" title="mstar.engine.resources.spec.NodeResourceSpec"><em>NodeResourceSpec</em></a><em>]</em>)</p></li>
 <li><p><strong>node</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
-<li><p><strong>sp_size</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
 </ul>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
-<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)">bool</a></p>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)">dict</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a>, <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)">bool</a>]</p>
 </dd>
 </dl>
 </dd></dl>
@@ -1741,7 +1739,7 @@ chunk’s last (or the row’s, not causal).</p>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.context_parallel.local_indptrs"><code class="docutils literal notranslate"><span class="pre">local_indptrs()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.context_parallel.merge"><code class="docutils literal notranslate"><span class="pre">merge()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.context_parallel.merge_lse"><code class="docutils literal notranslate"><span class="pre">merge_lse()</span></code></a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.context_parallel.positions_over_sp"><code class="docutils literal notranslate"><span class="pre">positions_over_sp()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.context_parallel.position_pools"><code class="docutils literal notranslate"><span class="pre">position_pools()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.context_parallel.zigzag_capture"><code class="docutils literal notranslate"><span class="pre">zigzag_capture()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.context_parallel.zigzag_rows"><code class="docutils literal notranslate"><span class="pre">zigzag_rows()</span></code></a></li>
 </ul>

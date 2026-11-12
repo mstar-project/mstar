@@ -43,6 +43,7 @@ mstar.engine.resources
    rms_norm
    runner
    sampler
+   sequence_shard
    spec
    step
 

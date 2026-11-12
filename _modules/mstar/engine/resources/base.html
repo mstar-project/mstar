@@ -622,6 +622,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.resources.rms_norm.html">mstar.engine.resources.rms_norm</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.resources.runner.html">mstar.engine.resources.runner</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.resources.sampler.html">mstar.engine.resources.sampler</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.resources.sequence_shard.html">mstar.engine.resources.sequence_shard</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.resources.spec.html">mstar.engine.resources.spec</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.resources.step.html">mstar.engine.resources.step</a></li>
 </ul>
@@ -1097,14 +1098,14 @@ window.runMermaid = runMermaid;</script>
 
 <div class="viewcode-block" id="head_shards">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.head_shards">[docs]</a>
-<span class="k">def</span><span class="w"> </span><span class="nf">head_shards</span><span class="p">(</span><span class="n">group</span><span class="p">:</span> <span class="n">JointGroups</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span> <span class="n">positions_over_sp</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">head_shards</span><span class="p">(</span><span class="n">group</span><span class="p">:</span> <span class="n">JointGroups</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span> <span class="n">places_positions</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">"""How many ways a node's ranks split its attention heads: its TP and SP ranks (CFG ranks run</span>
 <span class="sd">    whole branches, every head), or TP alone when its pools place positions over the SP ranks</span>
-<span class="sd">    (``context_parallel.positions_over_sp``)."""</span>
+<span class="sd">    (``PagedKVConfig.context_parallel``)."""</span>
     <span class="k">if</span> <span class="n">group</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
         <span class="k">return</span> <span class="mi">1</span>
     <span class="n">tp</span> <span class="o">=</span> <span class="n">group</span><span class="o">.</span><span class="n">tp_group</span><span class="o">.</span><span class="n">world_size</span>
-    <span class="k">return</span> <span class="n">tp</span> <span class="k">if</span> <span class="n">positions_over_sp</span> <span class="k">else</span> <span class="n">tp</span> <span class="o">*</span> <span class="n">group</span><span class="o">.</span><span class="n">sp_group</span><span class="o">.</span><span class="n">world_size</span></div>
+    <span class="k">return</span> <span class="n">tp</span> <span class="k">if</span> <span class="n">places_positions</span> <span class="k">else</span> <span class="n">tp</span> <span class="o">*</span> <span class="n">group</span><span class="o">.</span><span class="n">sp_group</span><span class="o">.</span><span class="n">world_size</span></div>
 
 
 
@@ -1142,7 +1143,8 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># before any resource is built, for one that sizes itself by its own</span>
     <span class="n">prefix_caches</span><span class="p">:</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="nb">frozenset</span><span class="p">()</span>
     <span class="c1"># whether the resource's nodes run replicated over their SP ranks, because their pools place</span>
-    <span class="c1"># positions over them (`context_parallel.positions_over_sp`), rather than running their own SP</span>
+    <span class="c1"># positions over them (``PagedKVConfig.context_parallel``), rather than splitting their steps</span>
+    <span class="c1"># over them (``SeqShardSpec``)</span>
     <span class="n">replicated_over_sp</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
     <span class="c1"># what each step may still copy to the host once its outputs are sent, or on a pass that runs no step</span>
     <span class="n">host_allowance</span><span class="p">:</span> <span class="n">StepAllowance</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
@@ -1150,8 +1152,8 @@ window.runMermaid = runMermaid;</script>
     <span class="nd">@property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">head_shards</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""How many ways the node's ranks split its attention heads, which each builder sizes head</span>
-<span class="sd">        counts by (`head_shards`). A ragged resource declaring</span>
-<span class="sd">        ``RaggedAttentionConfig.shard_over_sp=False`` splits over TP only."""</span>
+<span class="sd">        counts by (`head_shards`). A ragged resource splits over TP only, unless it attends a label</span>
+<span class="sd">        its node's sequence shard splits (``RaggedAttentionSpec.sp_exchange``, derived)."""</span>
         <span class="k">return</span> <span class="n">head_shards</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">joint_comm_group</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">replicated_over_sp</span><span class="p">)</span>
 
 <div class="viewcode-block" id="EngineResourceInfo.dependency">
@@ -1343,14 +1345,17 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># Whether this resource's step on a node is the node's own segments</span>
     <span class="c1"># (``SubmoduleStep.segments``: a request's span of tokens each, in the order the node</span>
     <span class="c1"># packs its rows), so the node declares nothing for it: ``engine_step`` adds a</span>
-    <span class="c1"># ``ResourceStep`` of them under the resource's key (the LoRA pool, whose rows are the</span>
-    <span class="c1"># node's tokens).</span>
+    <span class="c1"># ``ResourceStep`` of them (and of its ``combined_labels``) under the resource's key (the</span>
+    <span class="c1"># LoRA pool, whose rows are the node's tokens; the sequence shard).</span>
     <span class="n">steps_from_segments</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
 
     <span class="c1"># stays correct when a hit skips the front of a request; required of every resource on a keyed node</span>
     <span class="n">prefix_skip_safe</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
     <span class="c1"># stays correct when a pool it depends on has a `placement`; the engine refuses to load it otherwise</span>
     <span class="n">supports_context_parallel</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+    <span class="c1"># stays correct on a node whose steps split over its SP ranks (`SeqShardSpec`); the engine</span>
+    <span class="c1"># refuses to load it on one otherwise</span>
+    <span class="n">supports_split_steps</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
 
     <span class="nd">@property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">placement</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">"ContextParallel | None"</span><span class="p">:</span>
@@ -1749,7 +1754,8 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="Resource.reset_request">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.Resource.reset_request">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">reset_request</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">free</span><span class="p">:</span> <span class="nb">bool</span><span class="o">=</span><span class="kc">False</span><span class="p">):</span>
-<span class="w">        </span><span class="sd">"""For clearing dummy RIDs during cuda graph capture"""</span>
+<span class="w">        </span><span class="sd">"""Clear a dummy rid's state: during accelerator graph capture, after each replayed step</span>
+<span class="sd">        and when a pre-plan is discarded."""</span>
         <span class="k">return</span></div>
 
 
@@ -1891,6 +1897,15 @@ window.runMermaid = runMermaid;</script>
 
 
     <span class="c1"># Engine lifecycle</span>
+
+<div class="viewcode-block" id="Resource.check_captures">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.Resource.check_captures">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">check_captures</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">node</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">configs</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">AcceleratorGraphConfig</span><span class="p">],</span> <span class="n">piecewise</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Raise ``ValueError`` for a capture of ``node`` this resource can't replay, before any</span>
+<span class="sd">        is taken: ``configs`` its whole-forward capture configs, ``piecewise`` its piecewise</span>
+<span class="sd">        runners by region."""</span>
+        <span class="k">return</span></div>
+
 
 <div class="viewcode-block" id="Resource.build_accelerator_graph_buffers">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.Resource.build_accelerator_graph_buffers">[docs]</a>

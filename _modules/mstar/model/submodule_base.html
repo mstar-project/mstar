@@ -622,6 +622,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.engine.resources.rms_norm.html">mstar.engine.resources.rms_norm</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.engine.resources.runner.html">mstar.engine.resources.runner</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.engine.resources.sampler.html">mstar.engine.resources.sampler</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.engine.resources.sequence_shard.html">mstar.engine.resources.sequence_shard</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.engine.resources.spec.html">mstar.engine.resources.spec</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.engine.resources.step.html">mstar.engine.resources.step</a></li>
 </ul>
@@ -2037,7 +2038,7 @@ window.runMermaid = runMermaid;</script>
     <span class="n">capture_cudnn_benchmark</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
 
     <span class="c1"># The keys of this node's resources whose step is its segments</span>
-    <span class="c1"># (``Resource.steps_from_segments``: the LoRA pools); set by `bind_node_resources`. The</span>
+    <span class="c1"># (``Resource.steps_from_segments``: the LoRA pools, the sequence shard); set by `bind_node_resources`. The</span>
     <span class="c1"># engine adds a step of the segments under each to the node's step (``engine_step``),</span>
     <span class="c1"># and to each piecewise region's from the region's own: in order, the rows the node's</span>
     <span class="c1"># computation sees, each a request's span of tokens (a request may have several, as</span>
@@ -2057,6 +2058,9 @@ window.runMermaid = runMermaid;</script>
         <span class="c1"># embedder, scratch caches), bound once at load. Empty until then</span>
         <span class="c1"># and on engines that build none.</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">node_resources</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="c1"># This node's sequence shard (`SeqShardSpec`; a node takes one), whose `scatter` / `gather` bracket the layer</span>
+        <span class="c1"># stack under sequence parallelism; None on a node that declares none. Set by `bind_node_resources`.</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">sequence_shard</span><span class="p">:</span> <span class="n">Any</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="c1"># This node's handles on its declared state (`mstar.engine.state`), bound once at load.</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">state_handles</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
 
@@ -2073,10 +2077,13 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        ``get_node_resources``; a layer that names a label this node doesn't</span>
 <span class="sd">        have fails at bind rather than in the middle of a forward.</span>
 <span class="sd">        """</span>
+        <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.sequence_shard</span><span class="w"> </span><span class="kn">import</span> <span class="n">SequenceShard</span>
+
         <span class="bp">self</span><span class="o">.</span><span class="n">segment_keys</span> <span class="o">=</span> <span class="nb">tuple</span><span class="p">(</span>
             <span class="n">key</span> <span class="k">for</span> <span class="n">key</span><span class="p">,</span> <span class="n">resource</span> <span class="ow">in</span> <span class="n">resources</span><span class="o">.</span><span class="n">items</span><span class="p">()</span> <span class="k">if</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">resource</span><span class="p">,</span> <span class="s2">"steps_from_segments"</span><span class="p">,</span> <span class="kc">False</span><span class="p">)</span>
         <span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">node_resources</span> <span class="o">=</span> <span class="n">resources</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">sequence_shard</span> <span class="o">=</span> <span class="nb">next</span><span class="p">((</span><span class="n">r</span> <span class="k">for</span> <span class="n">r</span> <span class="ow">in</span> <span class="n">resources</span><span class="o">.</span><span class="n">values</span><span class="p">()</span> <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">r</span><span class="p">,</span> <span class="n">SequenceShard</span><span class="p">)),</span> <span class="kc">None</span><span class="p">)</span>
         <span class="k">for</span> <span class="n">module</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">modules</span><span class="p">():</span>
             <span class="n">bind</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">module</span><span class="p">,</span> <span class="s2">"bind_resources"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
             <span class="k">if</span> <span class="n">bind</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">module</span> <span class="ow">is</span> <span class="ow">not</span> <span class="bp">self</span><span class="p">:</span>
@@ -2846,12 +2853,15 @@ window.runMermaid = runMermaid;</script>
 <span class="k">def</span><span class="w"> </span><span class="nf">with_segment_steps</span><span class="p">(</span><span class="n">step</span><span class="p">:</span> <span class="n">SubmoduleStep</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span> <span class="n">keys</span><span class="p">:</span> <span class="n">Sequence</span><span class="p">[</span><span class="nb">str</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="n">SubmoduleStep</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">"""``step`` with a ``ResourceStep`` of its segments under each of ``keys`` (the</span>
 <span class="sd">    resources whose step is the segments, ``Resource.steps_from_segments``) that it does</span>
-<span class="sd">    not declare itself, as a new step (a declaration reused across calls keeps its own). A</span>
-<span class="sd">    step without segments gets none: a resource that needs one refuses for want of a plan</span>
-<span class="sd">    (``LoraLayerDelta``)."""</span>
+<span class="sd">    not declare itself, as a new step carrying its ``combined_labels`` (a declaration reused</span>
+<span class="sd">    across calls keeps its own). A step without segments gets none: a resource that needs one</span>
+<span class="sd">    refuses for want of a plan (``LoraLayerDelta``, the sequence shard's dependents)."""</span>
     <span class="k">if</span> <span class="n">keys</span> <span class="ow">and</span> <span class="n">step</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">step</span><span class="o">.</span><span class="n">segments</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
         <span class="n">segments</span> <span class="o">=</span> <span class="nb">tuple</span><span class="p">(</span><span class="n">step</span><span class="o">.</span><span class="n">segments</span><span class="p">)</span>
-        <span class="n">added</span> <span class="o">=</span> <span class="p">{</span><span class="n">key</span><span class="p">:</span> <span class="n">ResourceStep</span><span class="p">(</span><span class="n">segments</span><span class="o">=</span><span class="n">segments</span><span class="p">)</span> <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="n">keys</span> <span class="k">if</span> <span class="n">key</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">step</span><span class="o">.</span><span class="n">steps</span><span class="p">}</span>
+        <span class="n">added</span> <span class="o">=</span> <span class="p">{</span>
+            <span class="n">key</span><span class="p">:</span> <span class="n">ResourceStep</span><span class="p">(</span><span class="n">segments</span><span class="o">=</span><span class="n">segments</span><span class="p">,</span> <span class="n">combined_labels</span><span class="o">=</span><span class="n">step</span><span class="o">.</span><span class="n">combined_labels</span><span class="p">)</span>
+            <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="n">keys</span> <span class="k">if</span> <span class="n">key</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">step</span><span class="o">.</span><span class="n">steps</span>
+        <span class="p">}</span>
         <span class="k">if</span> <span class="n">added</span><span class="p">:</span>
             <span class="n">step</span> <span class="o">=</span> <span class="n">replace</span><span class="p">(</span><span class="n">step</span><span class="p">,</span> <span class="n">steps</span><span class="o">=</span><span class="p">{</span><span class="o">**</span><span class="n">step</span><span class="o">.</span><span class="n">steps</span><span class="p">,</span> <span class="o">**</span><span class="n">added</span><span class="p">})</span>
     <span class="k">return</span> <span class="n">step</span></div>

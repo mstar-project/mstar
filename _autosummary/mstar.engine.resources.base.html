@@ -269,6 +269,7 @@
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.rms_norm.html">mstar.engine.resources.rms_norm</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.runner.html">mstar.engine.resources.runner</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.sampler.html">mstar.engine.resources.sampler</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.sequence_shard.html">mstar.engine.resources.sequence_shard</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.spec.html">mstar.engine.resources.spec</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.step.html">mstar.engine.resources.step</a></li>
 </ul>
@@ -840,6 +841,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.can_offload"><code class="docutils literal notranslate"><span class="pre">Resource.can_offload()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.can_reload"><code class="docutils literal notranslate"><span class="pre">Resource.can_reload()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.cap_cached_prefix"><code class="docutils literal notranslate"><span class="pre">Resource.cap_cached_prefix()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.check_captures"><code class="docutils literal notranslate"><span class="pre">Resource.check_captures()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.check_drop"><code class="docutils literal notranslate"><span class="pre">Resource.check_drop()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.chunk_alignment"><code class="docutils literal notranslate"><span class="pre">Resource.chunk_alignment</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.cleanup"><code class="docutils literal notranslate"><span class="pre">Resource.cleanup()</span></code></a></li>
@@ -896,6 +898,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.supports_drop"><code class="docutils literal notranslate"><span class="pre">Resource.supports_drop</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.supports_eviction"><code class="docutils literal notranslate"><span class="pre">Resource.supports_eviction</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.supports_preplan"><code class="docutils literal notranslate"><span class="pre">Resource.supports_preplan</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.supports_split_steps"><code class="docutils literal notranslate"><span class="pre">Resource.supports_split_steps</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.unreserve"><code class="docutils literal notranslate"><span class="pre">Resource.unreserve()</span></code></a></li>
 </ul>
 </li>
@@ -925,8 +928,8 @@
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.base.build_resource" title="mstar.engine.resources.base.build_resource"><code class="xref py py-obj docutils literal notranslate"><span class="pre">build_resource</span></code></a>(spec, info)</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.base.head_shards" title="mstar.engine.resources.base.head_shards"><code class="xref py py-obj docutils literal notranslate"><span class="pre">head_shards</span></code></a>(group[, positions_over_sp])</p></td>
-<td><p>How many ways a node's ranks split its attention heads: its TP and SP ranks (CFG ranks run whole branches, every head), or TP alone when its pools place positions over the SP ranks (<code class="docutils literal notranslate"><span class="pre">context_parallel.positions_over_sp</span></code>).</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.base.head_shards" title="mstar.engine.resources.base.head_shards"><code class="xref py py-obj docutils literal notranslate"><span class="pre">head_shards</span></code></a>(group[, places_positions])</p></td>
+<td><p>How many ways a node's ranks split its attention heads: its TP and SP ranks (CFG ranks run whole branches, every head), or TP alone when its pools place positions over the SP ranks (<code class="docutils literal notranslate"><span class="pre">PagedKVConfig.context_parallel</span></code>).</p></td>
 </tr>
 </tbody>
 </table>
@@ -1239,8 +1242,8 @@ TypeError rather than something silently swallowed by a <code class="docutils li
 <dt class="sig sig-object py" id="mstar.engine.resources.base.EngineResourceInfo.head_shards">
 <span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">head_shards</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.engine.resources.base.EngineResourceInfo.head_shards" title="Link to this definition">#</a></dt>
 <dd><p>How many ways the node’s ranks split its attention heads, which each builder sizes head
-counts by (<cite>head_shards</cite>). A ragged resource declaring
-<code class="docutils literal notranslate"><span class="pre">RaggedAttentionConfig.shard_over_sp=False</span></code> splits over TP only.</p>
+counts by (<cite>head_shards</cite>). A ragged resource splits over TP only, unless it attends a label
+its node’s sequence shard splits (<code class="docutils literal notranslate"><span class="pre">RaggedAttentionSpec.sp_exchange</span></code>, derived).</p>
 </dd></dl>
 
 <dl class="py attribute">
@@ -1682,6 +1685,26 @@ resource that holds only some lengths.</p>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
 <dd class="field-even"><p><a class="reference internal" href="#mstar.engine.resources.base.CachedPrefix" title="mstar.engine.resources.base.CachedPrefix"><em>CachedPrefix</em></a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.base.Resource.check_captures">
+<span class="sig-name descname"><span class="pre">check_captures</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">node</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">configs</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">piecewise</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/base.html#Resource.check_captures"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.base.Resource.check_captures" title="Link to this definition">#</a></dt>
+<dd><p>Raise <code class="docutils literal notranslate"><span class="pre">ValueError</span></code> for a capture of <code class="docutils literal notranslate"><span class="pre">node</span></code> this resource can’t replay, before any
+is taken: <code class="docutils literal notranslate"><span class="pre">configs</span></code> its whole-forward capture configs, <code class="docutils literal notranslate"><span class="pre">piecewise</span></code> its piecewise
+runners by region.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>node</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>configs</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference internal" href="mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.AcceleratorGraphConfig" title="mstar.engine.accelerator_graph_config.AcceleratorGraphConfig"><em>AcceleratorGraphConfig</em></a><em>]</em>)</p></li>
+<li><p><strong>piecewise</strong> (<em>Mapping</em>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>None</p>
 </dd>
 </dl>
 </dd></dl>
@@ -2325,7 +2348,8 @@ would take nothing for it, and the request may then start wherever it stands in 
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.base.Resource.reset_request">
 <span class="sig-name descname"><span class="pre">reset_request</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">rid</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">free</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/base.html#Resource.reset_request"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.base.Resource.reset_request" title="Link to this definition">#</a></dt>
-<dd><p>For clearing dummy RIDs during cuda graph capture</p>
+<dd><p>Clear a dummy rid’s state: during accelerator graph capture, after each replayed step
+and when a pre-plan is discarded.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
@@ -2444,6 +2468,11 @@ the stop buffers. Read right after the forward and not cloned.</p>
 <span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">supports_preplan</span></span><a class="headerlink" href="#mstar.engine.resources.base.Resource.supports_preplan" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.base.Resource.supports_split_steps">
+<span class="sig-name descname"><span class="pre">supports_split_steps</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></span><a class="headerlink" href="#mstar.engine.resources.base.Resource.supports_split_steps" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.base.Resource.unreserve">
 <span class="sig-name descname"><span class="pre">unreserve</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">rid</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/base.html#Resource.unreserve"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.base.Resource.unreserve" title="Link to this definition">#</a></dt>
@@ -2517,15 +2546,15 @@ step, once its last copy has landed.</p>
 
 <dl class="py function">
 <dt class="sig sig-object py" id="mstar.engine.resources.base.head_shards">
-<span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.base.</span></span><span class="sig-name descname"><span class="pre">head_shards</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">group</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">positions_over_sp</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/base.html#head_shards"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.base.head_shards" title="Link to this definition">#</a></dt>
+<span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.base.</span></span><span class="sig-name descname"><span class="pre">head_shards</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">group</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">places_positions</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/base.html#head_shards"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.base.head_shards" title="Link to this definition">#</a></dt>
 <dd><p>How many ways a node’s ranks split its attention heads: its TP and SP ranks (CFG ranks run
 whole branches, every head), or TP alone when its pools place positions over the SP ranks
-(<code class="docutils literal notranslate"><span class="pre">context_parallel.positions_over_sp</span></code>).</p>
+(<code class="docutils literal notranslate"><span class="pre">PagedKVConfig.context_parallel</span></code>).</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
 <li><p><strong>group</strong> (<em>JointGroups</em><em> | </em><em>None</em>)</p></li>
-<li><p><strong>positions_over_sp</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
+<li><p><strong>places_positions</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
 </ul>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
@@ -2682,6 +2711,7 @@ whole branches, every head), or TP alone when its pools place positions over the
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.can_offload"><code class="docutils literal notranslate"><span class="pre">Resource.can_offload()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.can_reload"><code class="docutils literal notranslate"><span class="pre">Resource.can_reload()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.cap_cached_prefix"><code class="docutils literal notranslate"><span class="pre">Resource.cap_cached_prefix()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.check_captures"><code class="docutils literal notranslate"><span class="pre">Resource.check_captures()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.check_drop"><code class="docutils literal notranslate"><span class="pre">Resource.check_drop()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.chunk_alignment"><code class="docutils literal notranslate"><span class="pre">Resource.chunk_alignment</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.cleanup"><code class="docutils literal notranslate"><span class="pre">Resource.cleanup()</span></code></a></li>
@@ -2738,6 +2768,7 @@ whole branches, every head), or TP alone when its pools place positions over the
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.supports_drop"><code class="docutils literal notranslate"><span class="pre">Resource.supports_drop</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.supports_eviction"><code class="docutils literal notranslate"><span class="pre">Resource.supports_eviction</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.supports_preplan"><code class="docutils literal notranslate"><span class="pre">Resource.supports_preplan</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.supports_split_steps"><code class="docutils literal notranslate"><span class="pre">Resource.supports_split_steps</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.unreserve"><code class="docutils literal notranslate"><span class="pre">Resource.unreserve()</span></code></a></li>
 </ul>
 </li>

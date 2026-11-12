@@ -269,6 +269,7 @@
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.rms_norm.html">mstar.engine.resources.rms_norm</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.runner.html">mstar.engine.resources.runner</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.sampler.html">mstar.engine.resources.sampler</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.sequence_shard.html">mstar.engine.resources.sequence_shard</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.spec.html">mstar.engine.resources.spec</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.step.html">mstar.engine.resources.step</a></li>
 </ul>
@@ -1374,6 +1375,8 @@ them by that name:</p>
 <span class="w">  </span><span class="nt">vit_attn</span><span class="p">:</span><span class="w">                  </span><span class="c1"># a cacheless (ragged) attention resource</span>
 <span class="w">    </span><span class="nt">max_segments_per_request</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">2</span><span class="w">  </span><span class="c1"># also: max_segments_per_step, max_tokens_per_request,</span>
 <span class="w">                                 </span><span class="c1"># flashinfer_backend</span>
+<span class="w">  </span><span class="nt">seq_shard</span><span class="p">:</span><span class="w">                 </span><span class="c1"># a node's sequence shard (SP ranks)</span>
+<span class="w">    </span><span class="nt">min_tokens</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">2048</span><span class="w">         </span><span class="c1"># steps below this run copied on every SP rank</span>
 <span class="w">  </span><span class="nt">sampler</span><span class="p">:</span>
 <span class="w">    </span><span class="nt">greedy_capture</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">false</span><span class="w">    </span><span class="c1"># also: enable_logprobs, enable_processed_logprobs</span>
 </pre></div>
@@ -1402,12 +1405,18 @@ ranks. Loading fails otherwise. A cache that keeps
 a sliding window (<code class="docutils literal notranslate"><span class="pre">AttentionConfig.sliding_window</span></code>) has no prefix cache yet: its
 <code class="docutils literal notranslate"><span class="pre">prefix_cache</span></code> goes off (logged at info), and a serving config that sets
 <code class="docutils literal notranslate"><span class="pre">prefix_cache:</span> <span class="pre">true</span></code> on it is refused.</p>
-<p><code class="docutils literal notranslate"><span class="pre">context_parallel:</span> <span class="pre">true</span></code> splits each request’s positions over the ranks that would
-otherwise hold the same KV heads: the TP ranks that share a KV head, or the node’s SP ranks
-when it has them, which is how a model with no sequence parallelism of its own (such as
-Qwen3.5) runs on <code class="docutils literal notranslate"><span class="pre">sp_size</span></code> above 1. Raise <code class="docutils literal notranslate"><span class="pre">max_num_pages</span></code> by that factor to turn the
-freed memory into context. <strong>Context parallelism</strong> in <a class="reference internal" href="adding_models.html"><span class="doc">Adding a New Model</span></a> covers when each mode applies and
-what it refuses.</p>
+<p>A node on <code class="docutils literal notranslate"><span class="pre">sp_size</span></code> above 1 shares each step over its SP ranks along two axes. A model that
+declares a sequence shard (<code class="docutils literal notranslate"><span class="pre">SeqShardSpec</span></code>: the DiTs of LTX-2.5, Cosmos3, Wan2.2 and MiniMax-H3) splits a step’s tokens
+over them; its <code class="docutils literal notranslate"><span class="pre">min_tokens</span></code> runs smaller steps copied on every rank instead (default 0: every
+step that can split does). A captured step decides from its bucket’s size, not its prompt’s.
+Separately, <code class="docutils literal notranslate"><span class="pre">context_parallel:</span> <span class="pre">true</span></code> stores a paged pool’s K/V by position rather than by
+head: each request’s positions split over the ranks that would otherwise hold the same KV
+heads, the TP ranks that share a KV head or the node’s SP ranks, which is how a model with no
+sequence shard (such as Qwen3.5) runs on <code class="docutils literal notranslate"><span class="pre">sp_size</span></code> above 1. Raise <code class="docutils literal notranslate"><span class="pre">max_num_pages</span></code> by that
+factor to turn the freed memory into context. A node on SP ranks needs at least one of the two,
+and can’t yet have both: a node that splits its steps stores its pools by head.
+<strong>Sequence and context parallelism</strong> in <a class="reference internal" href="adding_models.html"><span class="doc">Adding a New Model</span></a> covers what each combination does
+and what is refused.</p>
 <p>A request waits at the head of its pool’s queue until its reservation fits beside the
 reservations already admitted. A request behind it starts first when its own pages fit, output
 included, less the cached part of its prompt that running requests keep from eviction and, on a
@@ -1644,8 +1653,10 @@ details.</p>
 <p><strong>Sequence and guidance parallelism.</strong> <code class="docutils literal notranslate"><span class="pre">sp_size</span></code> splits a node’s token sequence over
 that many ranks (Ulysses: an all-to-all around attention), and <code class="docutils literal notranslate"><span class="pre">cfg_size</span></code> splits its
 classifier-free-guidance branches, each rank running its share of them and the noise
-predictions gathered every step. Each needs the model to declare the node SP- or
-CFG-enabled, and <code class="docutils literal notranslate"><span class="pre">cfg_size</span></code> must divide the node’s guidance branches (two for Wan2.2).
+predictions gathered every step. <code class="docutils literal notranslate"><span class="pre">sp_size</span></code> needs the node to declare a sequence shard
+(<code class="docutils literal notranslate"><span class="pre">SeqShardSpec</span></code>) or place its KV positions over the SP ranks, <code class="docutils literal notranslate"><span class="pre">cfg_size</span></code> needs the model to
+declare the node CFG-enabled, and <code class="docutils literal notranslate"><span class="pre">cfg_size</span></code> must divide the node’s guidance branches (two for
+Wan2.2).
 The axes compose: a group’s <code class="docutils literal notranslate"><span class="pre">ranks</span></code> form lockstep instances of
 <code class="docutils literal notranslate"><span class="pre">cfg_size</span> <span class="pre">*</span> <span class="pre">sp_size</span> <span class="pre">*</span> <span class="pre">tp_size</span></code> ranks, laid out <code class="docutils literal notranslate"><span class="pre">[cfg][sp][tp]</span></code> (TP on adjacent ranks),
 each instance’s ranks listed in ascending order, and the conductor routes each request to

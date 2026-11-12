@@ -622,6 +622,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.resources.rms_norm.html">mstar.engine.resources.rms_norm</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.resources.runner.html">mstar.engine.resources.runner</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.resources.sampler.html">mstar.engine.resources.sampler</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.resources.sequence_shard.html">mstar.engine.resources.sequence_shard</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.resources.spec.html">mstar.engine.resources.spec</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.resources.step.html">mstar.engine.resources.step</a></li>
 </ul>
@@ -1036,14 +1037,14 @@ window.runMermaid = runMermaid;</script>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">hashlib</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">json</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Iterable</span><span class="p">,</span> <span class="n">Mapping</span><span class="p">,</span> <span class="n">Sequence</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Collection</span><span class="p">,</span> <span class="n">Mapping</span><span class="p">,</span> <span class="n">Sequence</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">fields</span><span class="p">,</span> <span class="n">is_dataclass</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">itertools</span><span class="w"> </span><span class="kn">import</span> <span class="n">product</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">TYPE_CHECKING</span><span class="p">,</span> <span class="n">get_origin</span>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
 
-<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.state.contract</span><span class="w"> </span><span class="kn">import</span> <span class="n">EMPTY</span><span class="p">,</span> <span class="n">Array</span><span class="p">,</span> <span class="n">Block</span><span class="p">,</span> <span class="n">Read</span><span class="p">,</span> <span class="n">Sampler</span><span class="p">,</span> <span class="n">read_layers</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.state.contract</span><span class="w"> </span><span class="kn">import</span> <span class="n">Array</span><span class="p">,</span> <span class="n">Block</span><span class="p">,</span> <span class="n">Read</span><span class="p">,</span> <span class="n">Sampler</span><span class="p">,</span> <span class="n">read_layers</span>
 
 <span class="k">if</span> <span class="n">TYPE_CHECKING</span><span class="p">:</span>
     <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">Model</span>
@@ -1095,25 +1096,6 @@ window.runMermaid = runMermaid;</script>
 <span class="w">    </span><span class="sd">"""The array whose segments lay out the queries of ``array``'s ``read``: the one of ``arrays`` its ``queries``</span>
 <span class="sd">    names, or else ``array``."""</span>
     <span class="k">return</span> <span class="n">arrays</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">read</span><span class="o">.</span><span class="n">queries</span><span class="p">,</span> <span class="n">array</span><span class="p">)</span></div>
-
-
-
-<div class="viewcode-block" id="both_sharded">
-<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.state.analysis.html#mstar.engine.state.analysis.both_sharded">[docs]</a>
-<span class="k">def</span><span class="w"> </span><span class="nf">both_sharded</span><span class="p">(</span><span class="n">array</span><span class="p">:</span> <span class="n">Array</span><span class="p">,</span> <span class="n">queried</span><span class="p">:</span> <span class="n">Array</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">"""Whether a read of ``array``, with ``queried`` laying out its queries, runs a Ulysses exchange under sequence</span>
-<span class="sd">    parallelism."""</span>
-    <span class="k">return</span> <span class="n">array</span><span class="o">.</span><span class="n">seq_sharded</span> <span class="ow">and</span> <span class="n">queried</span><span class="o">.</span><span class="n">seq_sharded</span></div>
-
-
-
-<div class="viewcode-block" id="narrows_heads">
-<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.state.analysis.html#mstar.engine.state.analysis.narrows_heads">[docs]</a>
-<span class="k">def</span><span class="w"> </span><span class="nf">narrows_heads</span><span class="p">(</span><span class="n">array</span><span class="p">:</span> <span class="n">Array</span><span class="p">,</span> <span class="n">queried</span><span class="p">:</span> <span class="n">Array</span><span class="p">,</span> <span class="n">arrays</span><span class="p">:</span> <span class="n">Iterable</span><span class="p">[</span><span class="n">Array</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">"""Whether a read within a step of ``array``, with ``queried`` laying out its queries, splits its heads over the SP</span>
-<span class="sd">    ranks as well as TP's: where its Ulysses exchange runs over them, and on nodes where none of ``arrays`` is</span>
-<span class="sd">    sequence sharded."""</span>
-    <span class="k">return</span> <span class="n">both_sharded</span><span class="p">(</span><span class="n">array</span><span class="p">,</span> <span class="n">queried</span><span class="p">)</span> <span class="ow">or</span> <span class="ow">not</span> <span class="nb">any</span><span class="p">(</span><span class="n">other</span><span class="o">.</span><span class="n">seq_sharded</span> <span class="ow">and</span> <span class="n">other</span><span class="o">.</span><span class="n">nodes</span> <span class="o">&amp;</span> <span class="n">array</span><span class="o">.</span><span class="n">nodes</span> <span class="k">for</span> <span class="n">other</span> <span class="ow">in</span> <span class="n">arrays</span><span class="p">)</span></div>
 
 
 
@@ -1245,27 +1227,49 @@ window.runMermaid = runMermaid;</script>
 
 <div class="viewcode-block" id="deployment_problems">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.engine.state.analysis.html#mstar.engine.state.analysis.deployment_problems">[docs]</a>
-<span class="k">def</span><span class="w"> </span><span class="nf">deployment_problems</span><span class="p">(</span>
-    <span class="n">model</span><span class="p">:</span> <span class="s2">"Model"</span><span class="p">,</span> <span class="n">resources</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">object</span><span class="p">]],</span> <span class="o">*</span><span class="p">,</span> <span class="n">head_shards</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">EMPTY</span><span class="p">,</span>
-<span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]:</span>
-<span class="w">    </span><span class="sd">"""What a deployment asks of the declarations that they can't do: its ``resources:`` block of a sampler, and</span>
-<span class="sd">    ``head_shards``, TP times SP per node above SP1, of a read within a step that narrows its heads by them."""</span>
-    <span class="n">declarations</span> <span class="o">=</span> <span class="n">model</span><span class="o">.</span><span class="n">declare_state</span><span class="p">()</span>
-    <span class="n">arrays</span> <span class="o">=</span> <span class="p">{</span><span class="n">declared</span><span class="o">.</span><span class="n">name</span><span class="p">:</span> <span class="n">declared</span> <span class="k">for</span> <span class="n">declared</span> <span class="ow">in</span> <span class="n">declarations</span> <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">declared</span><span class="p">,</span> <span class="n">Array</span><span class="p">)}</span>
-    <span class="n">problems</span> <span class="o">=</span> <span class="p">[</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">deployment_problems</span><span class="p">(</span><span class="n">model</span><span class="p">:</span> <span class="s2">"Model"</span><span class="p">,</span> <span class="n">resources</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">object</span><span class="p">]])</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]:</span>
+<span class="w">    </span><span class="sd">"""What a deployment's ``resources:`` block asks of the declarations that they can't do: of a sampler."""</span>
+    <span class="k">return</span> <span class="p">[</span>
         <span class="sa">f</span><span class="s2">"Sampler </span><span class="si">{</span><span class="n">declared</span><span class="o">.</span><span class="n">name</span><span class="si">!r}</span><span class="s2">.draws: enable_logprobs, and draws is </span><span class="si">{</span><span class="n">declared</span><span class="o">.</span><span class="n">draws</span><span class="si">}</span><span class="s2">; log-probs take one token "</span>
         <span class="s2">"per step"</span>
-        <span class="k">for</span> <span class="n">declared</span> <span class="ow">in</span> <span class="n">declarations</span>
+        <span class="k">for</span> <span class="n">declared</span> <span class="ow">in</span> <span class="n">model</span><span class="o">.</span><span class="n">declare_state</span><span class="p">()</span>
         <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">declared</span><span class="p">,</span> <span class="n">Sampler</span><span class="p">)</span> <span class="ow">and</span> <span class="n">declared</span><span class="o">.</span><span class="n">draws</span> <span class="o">&gt;</span> <span class="mi">1</span>
         <span class="ow">and</span> <span class="n">resources</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">declared</span><span class="o">.</span><span class="n">name</span><span class="p">,</span> <span class="p">{})</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"enable_logprobs"</span><span class="p">)</span>
-    <span class="p">]</span>
+    <span class="p">]</span></div>
+
+
+
+<div class="viewcode-block" id="split_read_problems">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.state.analysis.html#mstar.engine.state.analysis.split_read_problems">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">split_read_problems</span><span class="p">(</span>
+    <span class="n">declarations</span><span class="p">:</span> <span class="n">Sequence</span><span class="p">[</span><span class="n">Array</span> <span class="o">|</span> <span class="n">Sampler</span><span class="p">],</span> <span class="n">sdpa_reads</span><span class="p">:</span> <span class="n">Collection</span><span class="p">[</span><span class="nb">str</span><span class="p">],</span> <span class="n">split</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Collection</span><span class="p">[</span><span class="nb">str</span><span class="p">]],</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]:</span>
+<span class="w">    </span><span class="sd">"""What a read within a step asks of a node on SP ranks that no exchange serves, where ``split`` gives, per such</span>
+<span class="sd">    node, the labels its sequence shard lists: SDPA (``sdpa_reads``, the reads a ``backend: sdpa`` block binds) over</span>
+<span class="sd">    split keys, which runs outside the engine's resources and so would attend one rank's share, and a cross read whose</span>
+<span class="sd">    queries split as well as its keys. The engine refuses these at load and ``validate_deployment`` reports them, both</span>
+<span class="sd">    from the declarations, so neither waits for a step that splits."""</span>
+    <span class="n">arrays</span> <span class="o">=</span> <span class="p">{</span><span class="n">declared</span><span class="o">.</span><span class="n">name</span><span class="p">:</span> <span class="n">declared</span> <span class="k">for</span> <span class="n">declared</span> <span class="ow">in</span> <span class="n">declarations</span> <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">declared</span><span class="p">,</span> <span class="n">Array</span><span class="p">)}</span>
+    <span class="n">problems</span> <span class="o">=</span> <span class="p">[]</span>
     <span class="k">for</span> <span class="n">array</span> <span class="ow">in</span> <span class="n">arrays</span><span class="o">.</span><span class="n">values</span><span class="p">():</span>
+        <span class="k">if</span> <span class="n">array</span><span class="o">.</span><span class="n">max_len</span><span class="p">:</span>
+            <span class="k">continue</span>
+        <span class="n">nodes</span> <span class="o">=</span> <span class="p">[</span><span class="n">node</span> <span class="k">for</span> <span class="n">node</span> <span class="ow">in</span> <span class="nb">sorted</span><span class="p">(</span><span class="n">array</span><span class="o">.</span><span class="n">nodes</span><span class="p">)</span> <span class="k">if</span> <span class="n">array</span><span class="o">.</span><span class="n">labels</span> <span class="o">&amp;</span> <span class="nb">set</span><span class="p">(</span><span class="n">split</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">node</span><span class="p">,</span> <span class="p">()))]</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">nodes</span><span class="p">:</span>
+            <span class="k">continue</span>
         <span class="k">for</span> <span class="n">key</span><span class="p">,</span> <span class="n">read</span> <span class="ow">in</span> <span class="n">array</span><span class="o">.</span><span class="n">reads</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
-            <span class="n">shards</span> <span class="o">=</span> <span class="nb">max</span><span class="p">((</span><span class="n">head_shards</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">node</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span> <span class="k">for</span> <span class="n">node</span> <span class="ow">in</span> <span class="n">array</span><span class="o">.</span><span class="n">nodes</span><span class="p">),</span> <span class="n">default</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span>
-            <span class="n">narrows</span> <span class="o">=</span> <span class="ow">not</span> <span class="n">array</span><span class="o">.</span><span class="n">max_len</span> <span class="ow">and</span> <span class="n">narrows_heads</span><span class="p">(</span><span class="n">array</span><span class="p">,</span> <span class="n">query_array</span><span class="p">(</span><span class="n">array</span><span class="p">,</span> <span class="n">read</span><span class="p">,</span> <span class="n">arrays</span><span class="p">),</span> <span class="n">arrays</span><span class="o">.</span><span class="n">values</span><span class="p">())</span>
-            <span class="k">if</span> <span class="n">narrows</span> <span class="ow">and</span> <span class="n">read</span><span class="o">.</span><span class="n">op</span><span class="o">.</span><span class="n">q_heads</span> <span class="o">%</span> <span class="n">shards</span><span class="p">:</span>
-                <span class="n">problems</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Array </span><span class="si">{</span><span class="n">array</span><span class="o">.</span><span class="n">name</span><span class="si">!r}</span><span class="s2">.reads[</span><span class="si">{</span><span class="n">key</span><span class="si">!r}</span><span class="s2">]: q_heads </span><span class="si">{</span><span class="n">read</span><span class="o">.</span><span class="n">op</span><span class="o">.</span><span class="n">q_heads</span><span class="si">}</span><span class="s2"> doesn't divide by "</span>
-                                <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">shards</span><span class="si">}</span><span class="s2">, TP times SP, which the read narrows its heads by"</span><span class="p">)</span>
+            <span class="n">queries</span> <span class="o">=</span> <span class="n">query_array</span><span class="p">(</span><span class="n">array</span><span class="p">,</span> <span class="n">read</span><span class="p">,</span> <span class="n">arrays</span><span class="p">)</span>
+            <span class="n">where</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">"Array </span><span class="si">{</span><span class="n">array</span><span class="o">.</span><span class="n">name</span><span class="si">!r}</span><span class="s2">.reads[</span><span class="si">{</span><span class="n">key</span><span class="si">!r}</span><span class="s2">]"</span>
+            <span class="k">if</span> <span class="n">key</span> <span class="ow">in</span> <span class="n">sdpa_reads</span><span class="p">:</span>
+                <span class="n">problems</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">where</span><span class="si">}</span><span class="s2">: backend sdpa over labels </span><span class="si">{</span><span class="nb">sorted</span><span class="p">(</span><span class="n">array</span><span class="o">.</span><span class="n">labels</span><span class="p">)</span><span class="si">}</span><span class="s2">, which the sequence shard "</span>
+                                <span class="sa">f</span><span class="s2">"of </span><span class="si">{</span><span class="n">nodes</span><span class="si">}</span><span class="s2"> splits over SP ranks; SDPA would attend one rank's share: run it on the "</span>
+                                <span class="s2">"ragged resource (drop `backend: sdpa`)"</span><span class="p">)</span>
+                <span class="k">continue</span>
+            <span class="n">both</span> <span class="o">=</span> <span class="p">[</span><span class="n">node</span> <span class="k">for</span> <span class="n">node</span> <span class="ow">in</span> <span class="n">nodes</span> <span class="k">if</span> <span class="n">queries</span> <span class="ow">is</span> <span class="ow">not</span> <span class="n">array</span> <span class="ow">and</span> <span class="n">queries</span><span class="o">.</span><span class="n">labels</span> <span class="o">&amp;</span> <span class="nb">set</span><span class="p">(</span><span class="n">split</span><span class="p">[</span><span class="n">node</span><span class="p">])]</span>
+            <span class="k">if</span> <span class="n">both</span><span class="p">:</span>
+                <span class="n">problems</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">where</span><span class="si">}</span><span class="s2">: its queries (Array </span><span class="si">{</span><span class="n">queries</span><span class="o">.</span><span class="n">name</span><span class="si">!r}</span><span class="s2">, labels </span><span class="si">{</span><span class="nb">sorted</span><span class="p">(</span><span class="n">queries</span><span class="o">.</span><span class="n">labels</span><span class="p">)</span><span class="si">}</span><span class="s2">) and "</span>
+                                <span class="sa">f</span><span class="s2">"keys (labels </span><span class="si">{</span><span class="nb">sorted</span><span class="p">(</span><span class="n">array</span><span class="o">.</span><span class="n">labels</span><span class="p">)</span><span class="si">}</span><span class="s2">) both split over the SP ranks of </span><span class="si">{</span><span class="n">both</span><span class="si">}</span><span class="s2">, which "</span>
+                                <span class="s2">"no exchange serves: list only one side in the sequence shard"</span><span class="p">)</span>
     <span class="k">return</span> <span class="n">problems</span></div>
 
 

@@ -622,6 +622,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.resources.rms_norm.html">mstar.engine.resources.rms_norm</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.resources.runner.html">mstar.engine.resources.runner</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.resources.sampler.html">mstar.engine.resources.sampler</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.resources.sequence_shard.html">mstar.engine.resources.sequence_shard</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.resources.spec.html">mstar.engine.resources.spec</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.resources.step.html">mstar.engine.resources.step</a></li>
 </ul>
@@ -1150,8 +1151,6 @@ window.runMermaid = runMermaid;</script>
     <span class="k">for</span> <span class="n">at</span> <span class="ow">in</span> <span class="n">op</span><span class="o">.</span><span class="n">handle_at</span><span class="o">.</span><span class="n">values</span><span class="p">():</span>
         <span class="n">handle</span><span class="p">:</span> <span class="n">ArrayHandle</span> <span class="o">=</span> <span class="n">args</span><span class="p">[</span><span class="n">at</span><span class="p">]</span>
         <span class="n">handle</span><span class="o">.</span><span class="n">_check_open</span><span class="p">(</span><span class="sa">f</span><span class="s2">"state op </span><span class="si">{</span><span class="n">op</span><span class="o">.</span><span class="n">name</span><span class="si">!r}</span><span class="s2">"</span><span class="p">)</span>
-        <span class="k">if</span> <span class="n">handle</span><span class="o">.</span><span class="n">array</span><span class="o">.</span><span class="n">seq_sharded</span><span class="p">:</span>
-            <span class="k">raise</span> <span class="n">handle</span><span class="o">.</span><span class="n">_no_layout</span><span class="p">(</span><span class="sa">f</span><span class="s2">"state op </span><span class="si">{</span><span class="n">op</span><span class="o">.</span><span class="n">name</span><span class="si">!r}</span><span class="s2"> on a seq_sharded array, whose calls carry a rank's share"</span><span class="p">)</span>
 
 
 <span class="k">def</span><span class="w"> </span><span class="nf">_call</span><span class="p">(</span><span class="n">op</span><span class="p">:</span> <span class="n">StateOp</span><span class="p">,</span> <span class="n">args</span><span class="p">:</span> <span class="n">Sequence</span><span class="p">[</span><span class="n">Any</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="n">Any</span><span class="p">:</span>

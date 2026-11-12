@@ -269,6 +269,7 @@
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.rms_norm.html">mstar.engine.resources.rms_norm</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.runner.html">mstar.engine.resources.runner</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.sampler.html">mstar.engine.resources.sampler</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.sequence_shard.html">mstar.engine.resources.sequence_shard</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.spec.html">mstar.engine.resources.spec</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.step.html">mstar.engine.resources.step</a></li>
 </ul>
@@ -3070,7 +3071,9 @@ tokens over a pair of ranks (<code class="docutils literal notranslate"><span cl
 self-attention) to cut one request’s latency. Split the guidance branches
 first (<code class="docutils literal notranslate"><span class="pre">cfg_size:</span> <span class="pre">2</span></code>), then add <code class="docutils literal notranslate"><span class="pre">sp_size</span></code> on top: on two GPUs,
 <code class="docutils literal notranslate"><span class="pre">sp_size:</span> <span class="pre">2</span></code> alone is slower than <code class="docutils literal notranslate"><span class="pre">cfg_size:</span> <span class="pre">2</span></code>.
-<code class="docutils literal notranslate"><span class="pre">sp_size</span></code> must divide the dit’s 24 attention heads. Under concurrency, data
+<code class="docutils literal notranslate"><span class="pre">sp_size</span></code> must divide the dit’s 24 attention heads, and SP needs the
+ragged resource (<code class="docutils literal notranslate"><span class="pre">backend:</span> <span class="pre">sdpa</span></code> on <code class="docutils literal notranslate"><span class="pre">dit_self_attn</span></code> runs outside the engine’s resources, so
+it is refused on SP ranks). Under concurrency, data
 parallelism stays the throughput layout: at 1280x704x81 and 4 concurrent, four
 replicas (<code class="docutils literal notranslate"><span class="pre">wan22_dp2.yaml</span></code>’s layout over four ranks) serve 8.6 videos/min
 against 7.2 for this layout on H200s, and 11.0 against 7.4 in a separate run on
@@ -3105,12 +3108,16 @@ in VAE tiles, as the card does for this decode.</p></li>
 <code class="docutils literal notranslate"><span class="pre">POST</span> <span class="pre">/v1/videos/generations</span></code> returns one mp4 with the audio muxed in as AAC
 (<code class="docutils literal notranslate"><span class="pre">&quot;audio&quot;:</span> <span class="pre">false</span></code> in the body for video alone); the mux needs the <code class="docutils literal notranslate"><span class="pre">ffmpeg</span></code> binary
 on the server’s <code class="docutils literal notranslate"><span class="pre">PATH</span></code> and falls back to video only without it.</p>
-<p><code class="docutils literal notranslate"><span class="pre">ltx2_5_sp2</span></code> shards the video tokens (Ulysses): each rank holds the whole DiT and
-half the tokens, and only the video self-attention exchanges them (one all-to-all
-each way); the cross-attentions run on each rank’s own tokens, and the audio queries
-over the video merge the ranks’ partial attentions. <code class="docutils literal notranslate"><span class="pre">ltx2_5_tp2</span></code> shards the
-weights instead and all-reduces after every block’s attentions and feed-forwards.</p>
-<p>Performance (2x H100, warm; diffusers with the same recipe and seeds):</p>
+<p><code class="docutils literal notranslate"><span class="pre">ltx2_5_sp2</span></code> splits each step’s video tokens over the two ranks (the DiT’s sequence
+shard): each rank holds the whole DiT and half the tokens, and only the video
+self-attention exchanges them (Ulysses, one all-to-all each way); the cross-attentions
+run on each rank’s own tokens, and the audio queries over the video merge the ranks’
+partial attentions. The attention resources do the exchanges, so it needs
+the ragged resources (<code class="docutils literal notranslate"><span class="pre">backend:</span> <span class="pre">sdpa</span></code> on one is refused on SP ranks where it reads split
+keys). <code class="docutils literal notranslate"><span class="pre">ltx2_5_tp2</span></code> shards
+the weights instead and all-reduces after every block’s attentions and feed-forwards.</p>
+<p>Performance (2x H100, warm; diffusers with the same recipe and seeds; the <code class="docutils literal notranslate"><span class="pre">ltx2_5_sp2</span></code> column
+was measured before the exchanges moved into the attention resources):</p>
 <div class="pst-scrollable-table-container"><table class="table">
 <thead>
 <tr class="row-odd"><th class="head"></th>
@@ -3197,7 +3204,8 @@ another tile count compiles again. A 768p clip’s share decodes in 2.1 s instea
 on one H200, within 62.9 dB of eager.</p></li>
 </ul>
 <p>The attention kernel is a resource’s setting: <code class="docutils literal notranslate"><span class="pre">backend:</span> <span class="pre">sdpa</span></code> on the <code class="docutils literal notranslate"><span class="pre">dit_attn</span></code> and
-<code class="docutils literal notranslate"><span class="pre">refiner_attn</span></code> resources runs the reference’s kernel, and FlashInfer runs without it.</p>
+<code class="docutils literal notranslate"><span class="pre">refiner_attn</span></code> resources runs the reference’s kernel, and FlashInfer runs without it. SDPA on
+<code class="docutils literal notranslate"><span class="pre">dit_attn</span></code> is refused on SP ranks, which every shipped config but <code class="docutils literal notranslate"><span class="pre">minimax_h3_2gpu.yaml</span></code> is.</p>
 <p>Async scheduling is on for the DiT and the decoder, the default for parallel nodes
 (<code class="docutils literal notranslate"><span class="pre">tp_async_sched:</span> <span class="pre">false</span></code> turns it off); on and off measured within noise. Runtime needs:
 PyAV, transformers’ image processor (a server that can’t import it, e.g. next to a
@@ -3211,7 +3219,8 @@ FA3 and the compiled DiT are not bit-exact. Served at 768p (50 steps, SP2 on H20
 seeds), clips are 23.7-32.8 dB (video) and 17.8-22.3 dB (audio) from diffusers’, where the
 reference on another SDPA kernel is 23.5-33.1 and 21.6-22.3 dB from itself; per seed, the
 served clip is below that spread on one seed’s video and another’s audio.</p>
-<p>Seconds per clip, one request at a time, each engine on the same H200s (M* on torch
+<p>Seconds per clip, one request at a time, each engine on the same H200s, M* measured before the
+DiT and the decoder moved onto the sequence shard (M* on torch
 2.12.1+cu132 and FlashInfer 0.7.2; text only, 1344x768, 124 frames, 49 DiT forwards, seed 0,
 median of 3 after a warmup; <code class="docutils literal notranslate"><span class="pre">benchmark/minimax_h3/bench_video.py</span> <span class="pre">--seed</span> <span class="pre">0</span></code> sends these
 requests):</p>

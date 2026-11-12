@@ -622,6 +622,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.rms_norm.html">mstar.engine.resources.rms_norm</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.runner.html">mstar.engine.resources.runner</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.sampler.html">mstar.engine.resources.sampler</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.sequence_shard.html">mstar.engine.resources.sequence_shard</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.spec.html">mstar.engine.resources.spec</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.step.html">mstar.engine.resources.step</a></li>
 </ul>
@@ -1057,6 +1058,7 @@ window.runMermaid = runMermaid;</script>
 
 <span class="k">if</span> <span class="n">TYPE_CHECKING</span><span class="p">:</span>
     <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">Resource</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.sequence_shard</span><span class="w"> </span><span class="kn">import</span> <span class="n">SeqShardSpec</span>
 
 <span class="c1"># The resource key a model's ``LoraSpec`` is declared under, and so the serving YAML's</span>
 <span class="c1"># ``resources:`` block that turns LoRA on (see ``mstar.engine.resources.lora.serving``).</span>
@@ -1516,6 +1518,17 @@ window.runMermaid = runMermaid;</script>
         <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.lora.pool</span><span class="w"> </span><span class="kn">import</span> <span class="n">LoraAdapterPool</span>
 
         <span class="k">return</span> <span class="n">LoraAdapterPool</span>
+
+<div class="viewcode-block" id="LoraSpec.split_step_refusals">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.lora.config.html#mstar.engine.resources.lora.LoraSpec.split_step_refusals">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">split_step_refusals</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">node</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">shard</span><span class="p">:</span> <span class="n">SeqShardSpec</span><span class="p">,</span> <span class="n">tp</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">sp</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]:</span>
+        <span class="c1"># a node placing its KV positions over its SP ranks instead runs every row on every rank</span>
+        <span class="k">return</span> <span class="p">[</span>
+            <span class="sa">f</span><span class="s2">"LoRA resource </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">resource_key</span><span class="si">!r}</span><span class="s2"> serves node </span><span class="si">{</span><span class="n">node</span><span class="si">!r}</span><span class="s2">, which splits tokens over </span><span class="si">{</span><span class="n">sp</span><span class="si">}</span><span class="s2"> SP "</span>
+            <span class="sa">f</span><span class="s2">"ranks (SeqShardSpec </span><span class="si">{</span><span class="n">shard</span><span class="o">.</span><span class="n">resource_key</span><span class="si">!r}</span><span class="s2">): LoRA lays its rows out per request, while each "</span>
+            <span class="s2">"SP rank holds a shard of the tokens. Serve this node without SP, or drop the 'lora:' block"</span>
+        <span class="p">]</span></div>
+
 
 <div class="viewcode-block" id="LoraSpec.for_node">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.lora.config.html#mstar.engine.resources.lora.LoraSpec.for_node">[docs]</a>
