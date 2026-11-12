@@ -5,7 +5,7 @@ from dataclasses import asdict, replace
 import pytest
 import torch
 
-from mstar.engine.resources.position.config import PositionConfig, YaRNConfig
+from mstar.engine.resources.position.config import LongRoPE, PositionConfig, YaRNConfig
 from mstar.engine.resources.position.manager import RopeManager
 
 YARN = YaRNConfig(factor=16, original_max_position_embeddings=16384)
@@ -74,10 +74,20 @@ def test_each_yarn_parameter_changes_prefix_identity(field, value):
     assert manager(yarn=None).fingerprint() != manager().fingerprint()
 
 
-@pytest.mark.parametrize("kwargs", [dict(rope_scale=2), dict(low_freq_factor=1), dict(rope_theta=1)])
+@pytest.mark.parametrize("kwargs", [
+    dict(rope_scale=2), dict(low_freq_factor=1), dict(rope_theta=1),
+    dict(longrope=LongRoPE((1.0,) * 64, (2.0,) * 64, 16384, 262144)),
+])
 def test_refuse_incompatible_config(kwargs):
     with pytest.raises(ValueError, match="YaRN"):
         manager(**kwargs)
+
+
+@pytest.mark.parametrize("rotary_dim,interleave,alignment", [(16, False, 32), (8, True, 16)])
+def test_yarn_table_rejects_unsafe_cuda_width_before_allocation(rotary_dim, interleave, alignment):
+    config = PositionConfig(kv_cache="kv", rotary_dim=rotary_dim, interleave=interleave, yarn=YARN)
+    with pytest.raises(ValueError, match=f"multiple of {alignment}"):
+        RopeManager(config, torch.device("cuda"))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA and FlashInfer")

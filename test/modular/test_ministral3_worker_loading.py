@@ -15,6 +15,7 @@ from test_ministral3_vision import bind
 
 import mstar.model.ministral3.ministral3_model as model_module
 from mstar.engine.node_dtype import resolve_node_dtype
+from mstar.engine.resources.sequence_shard import SeqShardSpec
 from mstar.model.components.scalar_fp8_linear import FP8_DTYPE
 from mstar.model.ministral3.checkpoint import HF_FILENAME, checkpoint_node_keys, load_vision_weights, text_tensor_schema
 from mstar.model.ministral3.components.vision import Ministral3Vision, PixtralConfig
@@ -235,5 +236,6 @@ def test_all_checkpoint_keys_have_exactly_one_node_owner(payload):
     text, vision = checkpoint_node_keys(directory / HF_FILENAME, model.config, model.vision_config)
     assert not text & vision and text | vision == values.keys()
     sharding = model.get_default_sharding_config()
-    assert not sharding.tp_enabled_nodes and not sharding.sp_enabled_nodes
+    assert not sharding.tp_enabled_nodes
+    assert not any(isinstance(spec, SeqShardSpec) for spec in model.get_node_resources())
     assert set(model.get_graph_walk_graphs()["prefill_vision"].get_nodes()) == {LLM_NODE, VISION_NODE}

@@ -31,10 +31,9 @@ pub struct ShardingTemplate {
     /// whose value is None reads exactly like an absent one (`.get(sig) is
     /// None` == replicated), so the Nones are dropped on the way in.
     pub shard_dim: FxHashMap<Sym, u32>,
-    /// Gate config validation only -- they add no shard_dim entries and do not
+    /// Gates config validation only -- adds no shard_dim entries and does not
     /// affect routing. Carried so this type is the whole ShardingConfig.
     pub tp_enabled_nodes: FxHashSet<Sym>,
-    pub sp_enabled_nodes: FxHashSet<Sym>,
     pub me: Sym,
 }
 
@@ -426,7 +425,6 @@ mod tests {
             groups,
             shard_dim: FxHashMap::default(),
             tp_enabled_nodes: FxHashSet::default(),
-            sp_enabled_nodes: FxHashSet::default(),
             me: 100,
         }
     }

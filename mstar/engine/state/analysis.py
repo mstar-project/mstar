@@ -2,14 +2,14 @@
 
 import hashlib
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import fields, is_dataclass
 from itertools import product
 from typing import TYPE_CHECKING, get_origin
 
 import torch
 
-from mstar.engine.state.contract import Array, Block, Sampler
+from mstar.engine.state.contract import Array, Block, Read, Sampler, SeqShard, read_layers
 
 if TYPE_CHECKING:
     from mstar.model.base import Model
@@ -24,21 +24,27 @@ def state_declaration_problems(model: "Model") -> list[str]:
     if not declarations:
         return []
     arrays = [d for d in declarations if isinstance(d, Array)]
-    samplers = [d for d in declarations if isinstance(d, Sampler)]
-    problems = _name_problems(arrays, samplers)
+    problems = _name_problems(declarations)
     walks = {walk: set(graph.get_nodes()) for walk, graph in model.get_graph_walk_graphs().items()}
     nodes = sorted(set().union(*walks.values()))
     combined = {walk for by_name in model.get_combined_graph_walks().values() for walk in by_name}
-    for array in arrays:
+    for declared in declarations:
         problems += [
-            f"Array {array.name!r}.nodes: {node!r} is not a node of the model, which has {nodes}"
-            for node in sorted(array.nodes - set(nodes))
+            f"{type(declared).__name__} {declared.name!r}.nodes: {node!r} is not a node of the model, which has "
+            f"{nodes}"
+            for node in sorted(declared.nodes - set(nodes))
         ]
+    for array in arrays:
         problems += _read_problems(array, walks, combined)
         problems += _array_problems(array)
     problems += _kv_label_problems(model.kv_labels(), arrays)
-    for sampler in samplers:
-        problems += _sampler_problems(sampler, nodes)
+    problems += _cross_read_problems(arrays)
+    problems += _host_problems(arrays, model.kv_labels())
+    for declared in declarations:
+        if isinstance(declared, Sampler):
+            problems += _sampler_problems(declared)
+        elif isinstance(declared, SeqShard):
+            problems += _shard_problems(declared, arrays, walks, combined)
     return problems
 
 
@@ -47,20 +53,29 @@ def position_key(array: Array) -> str:
     return f"{array.name.removesuffix('_kv')}_pos" if array.name.endswith("_kv") else "rope"
 
 
-def _name_problems(arrays: Sequence[Array], samplers: Sequence[Sampler]) -> list[str]:
+def query_array(array: Array, read: Read, arrays: Mapping[str, Array]) -> Array:
+    """The array whose segments lay out the queries of ``array``'s ``read``: the one of ``arrays`` its ``queries``
+    names, or else ``array``."""
+    return arrays.get(read.queries, array)
+
+
+def _name_problems(declarations: Sequence[Array | Sampler | SeqShard]) -> list[str]:
     """Names share one namespace while they are resource keys, so a read can't reuse an array's name."""
     problems: list[str] = []
     declared: dict[str, str] = {}
     for field, name in (
         *(
-            pair for array in arrays for pair in (
+            pair for array in declarations if isinstance(array, Array) for pair in (
                 (f"Array {array.name!r}.name", array.name),
                 *((f"Array {array.name!r}.reads", key) for key in array.reads),
                 *((f"Array {array.name!r}.updates", key) for key in array.updates),
                 *(() if array.positions is None else ((f"Array {array.name!r}.positions", position_key(array)),)),
             )
         ),
-        *((f"Sampler {sampler.name!r}.name", sampler.name) for sampler in samplers),
+        *(
+            (f"{type(other).__name__} {other.name!r}.name", other.name)
+            for other in declarations if not isinstance(other, Array)
+        ),
     ):
         if name in declared:
             problems.append(f"{field}: the name {name!r} is declared twice, also by {declared[name]}")
@@ -102,17 +117,95 @@ def _kv_label_problems(kv_labels: Mapping[str, Mapping[str, object]], arrays: Se
     return problems
 
 
-def _sampler_problems(sampler: Sampler, nodes: Sequence[str]) -> list[str]:
-    where = f"Sampler {sampler.name!r}"
-    problems = [
-        f"{where}.nodes: {node!r} is not a node of the model, which has {nodes}"
-        for node in sorted(sampler.nodes - set(nodes))
+def _cross_read_problems(arrays: Sequence[Array]) -> list[str]:
+    by_name = {array.name: array for array in arrays}
+    problems: list[str] = []
+    for array in arrays:
+        for key, read in array.reads.items():
+            if read.queries is None:
+                continue
+            where = f"Array {array.name!r}.reads[{key!r}].queries"
+            queried = by_name.get(read.queries)
+            if queried is None:
+                problems.append(f"{where}: {read.queries!r} is not a declared array, of {sorted(by_name)}")
+            elif not array.nodes <= queried.nodes:
+                problems.append(f"{where}: {read.queries!r} isn't on nodes {sorted(array.nodes - queried.nodes)}, so a "
+                                "step there has no segments to lay the queries out by")
+            elif queried.max_len:
+                problems.append(f"{where}: {read.queries!r} keeps entries, and queries are laid out by the segments "
+                                "of an array with max_len 0")
+    return problems
+
+
+def _host_problems(arrays: Sequence[Array], kv_labels: Mapping[str, Mapping[str, object]]) -> list[str]:
+    """A prefix hit restores a Value's snapshot, and a snapshot doesn't carry host fields yet."""
+    holders = [array for array in arrays if array.entry.host]
+    if not holders:
+        return []
+    keyed = {
+        node for array in arrays if any(label.keys is not None for label in kv_labels.get(array.name, {}).values())
+        for node in array.nodes
+    }
+    return [
+        f"Array {array.name!r}.entry.host: nodes {sorted(array.nodes & keyed)} have prefix keys, and a prefix hit "
+        "wouldn't restore host fields"
+        for array in holders if array.nodes & keyed
     ]
+
+
+def _sampler_problems(sampler: Sampler) -> list[str]:
+    where = f"Sampler {sampler.name!r}"
+    problems = []
     if sampler.vocab_size < 1:
         problems.append(f"{where}.vocab_size must be at least 1, got {sampler.vocab_size}")
     if sampler.draws < 1:
         problems.append(f"{where}.draws must be at least 1, got {sampler.draws}")
     return problems
+
+
+def _shard_problems(
+    shard: SeqShard, arrays: Sequence[Array], walks: Mapping[str, set[str]], combined: set[str],
+) -> list[str]:
+    """``walks`` are rows' walks, as a read's are, and ``labels`` those an array on the shard's nodes opens: a label
+    nothing opens would never split, and nothing would say so. The shard's handle brackets one label."""
+    where = f"SeqShard {shard.name!r}"
+    problems: list[str] = []
+    if len(shard.labels) > 1:
+        problems.append(f"{where}.labels: {sorted(shard.labels)} are several, and the handle brackets one")
+    for walk in sorted(shard.walks or ()):
+        if walk in combined:
+            problems.append(f"{where}.walks: {walk!r} is a combined walk; list the walks it combines, and it splits "
+                            "where one of them does")
+        elif walk not in walks:
+            problems.append(f"{where}.walks: {walk!r} is not a walk of the model, which has {sorted(walks)}")
+        elif not walks[walk] & shard.nodes:
+            problems.append(f"{where}.walks: {walk!r} runs none of the shard's nodes {sorted(shard.nodes)}")
+    opened = {label for array in arrays if array.nodes & shard.nodes for label in array.labels}
+    if shard.labels - opened:
+        problems.append(f"{where}.labels: {sorted(shard.labels - opened)} are opened by no array on nodes "
+                        f"{sorted(shard.nodes)}, which open {sorted(opened)}")
+    if len(_query_rows(shard, arrays)) > 1:
+        problems.append(f"{where}.labels: reads on nodes {sorted(shard.nodes)} take queries on {sorted(shard.labels)} "
+                        "both as rows of one span (packed=False) and as packed tokens or a segmented row, and the "
+                        "shard cuts its label's tensors on one axis")
+    return problems
+
+
+def shard_axis(shard: SeqShard, arrays: Sequence[Array]) -> int:
+    """The axis ``shard`` cuts its label's tensors on, from how the reads on its nodes take queries on the label: 1
+    where they take rows of one span (`Read.packed` False, not `segmented`), every row cut alike; 0 where they take
+    packed tokens or a request's segments in one row, cut contiguously. `_shard_problems` refuses a mix."""
+    return 1 if _query_rows(shard, arrays) == {True} else 0
+
+
+def _query_rows(shard: SeqShard, arrays: Sequence[Array]) -> set[bool]:
+    """Whether each read on ``shard``'s nodes whose queries open its labels takes them as rows of one span."""
+    by_name = {array.name: array for array in arrays}
+    return {
+        not read.packed and not read.segmented
+        for array in arrays if array.nodes & shard.nodes
+        for read in array.reads.values() if query_array(array, read, by_name).labels & shard.labels
+    }
 
 
 def _read_problems(array: Array, walks: Mapping[str, set[str]], combined: set[str]) -> list[str]:
@@ -129,7 +222,7 @@ def _read_problems(array: Array, walks: Mapping[str, set[str]], combined: set[st
                 problems.append(f"{where}.walks: {walk!r} is not a walk of the model, which has {sorted(walks)}")
             elif walk not in array_walks:
                 problems.append(f"{where}.walks: {walk!r} runs none of the array's nodes {sorted(array.nodes)}")
-        for layer, walk in product(sorted(read.layers or array.layers), sorted(read.walks or array_walks)):
+        for layer, walk in product(sorted(read_layers(array, read)), sorted(read.walks or array_walks)):
             other = reader.setdefault((layer, walk), key)
             if other != key and (other, key) not in clashes:
                 clashes.add((other, key))
@@ -138,7 +231,7 @@ def _read_problems(array: Array, walks: Mapping[str, set[str]], combined: set[st
 
 
 def deployment_problems(model: "Model", resources: Mapping[str, Mapping[str, object]]) -> list[str]:
-    """What a deployment's ``resources:`` block asks of a declared sampler that it can't do."""
+    """What a deployment's ``resources:`` block asks of the declarations that they can't do: of a sampler."""
     return [
         f"Sampler {declared.name!r}.draws: enable_logprobs, and draws is {declared.draws}; log-probs take one token "
         "per step"
@@ -148,7 +241,40 @@ def deployment_problems(model: "Model", resources: Mapping[str, Mapping[str, obj
     ]
 
 
-def declaration_digest(declarations: Sequence[Array | Sampler]) -> str:
+def split_read_problems(
+    declarations: Sequence[Array | Sampler | SeqShard], sdpa_reads: Collection[str],
+    split: Mapping[str, Collection[str]],
+) -> list[str]:
+    """What a read within a step asks of a node on SP ranks that no exchange serves, where ``split`` gives, per such
+    node, the labels its sequence shard lists: SDPA (``sdpa_reads``, the reads a ``backend: sdpa`` block binds) over
+    split keys, which runs outside the engine's resources and so would attend one rank's share, and a cross read whose
+    queries split as well as its keys. The engine refuses these at load and ``validate_deployment`` reports them, both
+    from the declarations, so neither waits for a step that splits."""
+    arrays = {declared.name: declared for declared in declarations if isinstance(declared, Array)}
+    problems = []
+    for array in arrays.values():
+        if array.max_len:
+            continue
+        nodes = [node for node in sorted(array.nodes) if array.labels & set(split.get(node, ()))]
+        if not nodes:
+            continue
+        for key, read in array.reads.items():
+            queries = query_array(array, read, arrays)
+            where = f"Array {array.name!r}.reads[{key!r}]"
+            if key in sdpa_reads:
+                problems.append(f"{where}: backend sdpa over labels {sorted(array.labels)}, which the sequence shard "
+                                f"of {nodes} splits over SP ranks; SDPA would attend one rank's share: run it on the "
+                                "ragged resource (drop `backend: sdpa`)")
+                continue
+            both = [node for node in nodes if queries is not array and queries.labels & set(split[node])]
+            if both:
+                problems.append(f"{where}: its queries (Array {queries.name!r}, labels {sorted(queries.labels)}) and "
+                                f"keys (labels {sorted(array.labels)}) both split over the SP ranks of {both}, which "
+                                "no exchange serves: list only one side in the sequence shard")
+    return problems
+
+
+def declaration_digest(declarations: Sequence[Array | Sampler | SeqShard]) -> str:
     """A SHA-256 that matches across processes, which Python's `hash` doesn't, since it randomizes strings per process.
 
     Every field of every declaration goes in, with keys sorted and dtypes and classes by name.

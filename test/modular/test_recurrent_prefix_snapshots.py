@@ -492,7 +492,8 @@ def test_a_keyed_node_refuses_a_pool_whose_backend_writes_no_snapshots(variant):
     assert problems and "'state' cannot serve a request" in problems[0], problems
 
 
-@pytest.mark.parametrize("depends_on", [set(), {"kv"}])
+# an undeclared dependency is reported by `spec_dependency_problems`, and mustn't crash this check
+@pytest.mark.parametrize("depends_on", [set(), {"kv"}, {"undeclared"}])
 def test_a_keyed_node_still_refuses_a_resource_that_cant_skip_a_prefix(depends_on):
     class _Unskippable(NodeResourceSpec):
         @property
@@ -696,6 +697,30 @@ def test_a_decode_step_onto_a_page_boundary_saves_its_state():
     assert decode.tokens == 4 and decode.key == pool._kv.chain_key("a", "main", 1)
     assert pool._snap_by_key[decode.key] == decode.slot
     assert bool((pool._blocks["state"][:, decode.slot] == 3.0).all()), "the snapshot is not the state at 4"
+
+
+def test_a_step_that_repeats_snapshots_the_length_its_replays_reach():
+    """One host step stands for five decode iterations: the state it leaves covers
+    3 + 5 tokens, so its snapshot is the second page's, not the first's."""
+    pool = _pool()
+    _reply(pool)
+    step, ctx = _step("a", 1), _ctx("a")
+    ctx.repeats = 5
+    assert pool.admit(step, ctx).ok
+    pool.plan(step, ctx)
+    pool.commit(step, ctx)
+    decode = pool._decode[("a", "main")]
+    assert decode.tokens == 8 and decode.key == pool._kv.chain_key("a", "main", 2)
+
+
+def test_a_run_ends_on_the_next_page_boundary_while_snapshots_are_on():
+    """A replay can't stop to copy the state mid-run, so a run that crossed a
+    boundary would skip that page's snapshot."""
+    pool = _pool()
+    _reply(pool)
+    assert pool.max_repeats(_step("a", 1), _ctx("a")) == 1  # at 3 of a 4-token page
+    _decode(pool, "a", 1)
+    assert pool.max_repeats(_step("a", 1), _ctx("a")) == PAGE
 
 
 def test_a_decode_snapshot_is_filed_once_the_chain_keys_its_page():

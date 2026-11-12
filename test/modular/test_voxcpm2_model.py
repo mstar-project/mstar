@@ -305,7 +305,8 @@ def _request(model, text: str, clip: torch.Tensor | None = None, **kwargs) -> tu
     as the data worker and the conductor build them."""
     modalities = ["text", "audio"] if clip is not None else ["text"]
     tensors = {"audio_inputs": [clip]} if clip is not None else None
-    edges, metadata = model.process_prompt(text, modalities, ["audio"], tensors=tensors, **kwargs)
+    prompt = model.process_prompt(text, modalities, ["audio"], tensors=tensors, **kwargs)
+    edges, metadata = prompt.new_input_tensors, prompt.metadata
     if clip is not None:
         edges = {**edges, "audio_inputs": [clip]}
     return edges, dict(model.walk_plan("Talker", modalities, ["audio"], {}, metadata)[0].step_metadata)
@@ -320,7 +321,8 @@ def _layout(metadata: dict) -> list:
 
 
 def test_process_prompt_builds_each_reference_mode(model):
-    zero, zero_meta = model.process_prompt("hello  world\n", ["text"], ["audio"], seed=3, cfg_value=1.5)
+    prompt = model.process_prompt("hello  world\n", ["text"], ["audio"], seed=3, cfg_value=1.5)
+    zero, zero_meta = prompt.new_input_tensors, prompt.metadata
     assert zero["text_inputs"][0].tolist() == [10, 11, AUDIO_START_TOKEN]
     assert _layout(zero_meta) == [MODE_ZERO_SHOT, 2 * 6 + 10, 2] and zero_meta[REF_DIGEST_KEY] is None
     assert zero["gen_params"][0].tolist() == [1.5]
@@ -333,17 +335,17 @@ def test_process_prompt_builds_each_reference_mode(model):
     assert cjk["text_inputs"][0].tolist() == [13, 14, AUDIO_START_TOKEN]  # split like the reference
 
     clip = torch.zeros(16000)  # 1 s: 7 patches of 2560 samples
-    _, ref_meta = model.process_prompt("hello", ["text", "audio"], ["audio"], tensors={"audio_inputs": [clip]})
+    ref_meta = model.process_prompt("hello", ["text", "audio"], ["audio"], tensors={"audio_inputs": [clip]}).metadata
     assert ref_meta[PROMPT_MODE_KEY] == MODE_REFERENCE
     cont = model.process_prompt(
         "hello", ["text", "audio"], ["audio"], tensors={"audio_inputs": [clip]}, ref_text="world "
     )
-    tensors, metadata = cont
+    tensors, metadata = cont.new_input_tensors, cont.metadata
     assert tensors["text_inputs"][0].tolist() == [11, 10, AUDIO_START_TOKEN]  # transcript first
     # transcript and target are tokenized as one string, with no separator added, as the reference does
-    joined, _ = model.process_prompt(
+    joined = model.process_prompt(
         "hello", ["text", "audio"], ["audio"], tensors={"audio_inputs": [clip]}, ref_text="world"
-    )
+    ).new_input_tensors
     assert joined["text_inputs"][0].tolist() == [3, AUDIO_START_TOKEN]  # "worldhello"
     # max patches follow the target text only
     digest = hashlib.blake2b(clip.numpy().tobytes(), digest_size=16).hexdigest()
@@ -390,7 +392,7 @@ def test_patch_cap_reads_the_standard_and_model_knobs_in_one_order(model, kwargs
     """``max_new_tokens``, then the standard ``max_output_tokens``, then ``max_len``,
     the same in the conductor's cap and in the prompt's patch budget."""
     assert model.get_max_output_tokens(**kwargs) == cap
-    _, metadata = model.process_prompt("hello world", ["text"], ["audio"], **kwargs)
+    metadata = model.process_prompt("hello world", ["text"], ["audio"], **kwargs).metadata
     assert metadata[PATCH_BUDGET_KEY] == model.config.max_patches(2, cap)
 
 
@@ -578,15 +580,15 @@ def test_build_prompt_matches_the_reference_layout():
 
 
 def test_walk_plan_clones_through_the_ref_encoder(model):
-    _, metadata = model.process_prompt(
+    metadata = model.process_prompt(
         "hello", ["text", "audio"], ["audio"], tensors={"audio_inputs": [torch.zeros(16000)]}
-    )
+    ).metadata
     talker = model.walk_plan("Talker", ["text", "audio"], ["audio"], {}, {**metadata, "unrelated": 1})
     assert [step.walk for step in talker] == ["talker_prefill_clone", "talker_decode"]
     # the prompt facts ride step metadata to the Talker partition's nodes
     keys = (PATCH_BUDGET_KEY, PROMPT_MODE_KEY, MIN_LEN_KEY, REF_DIGEST_KEY)
     assert [dict(step.step_metadata) for step in talker] == [{key: metadata[key] for key in keys}, {}]
-    _, zero_shot = model.process_prompt("hello", ["text"], ["audio"])
+    zero_shot = model.process_prompt("hello", ["text"], ["audio"]).metadata
     plain = model.walk_plan("Talker", ["text"], ["audio"], {}, zero_shot)
     assert [step.walk for step in plain] == ["talker_prefill", "talker_decode"]
     assert [step.walk for step in model.walk_plan("VAEDecoder", ["text"], ["audio"], {}, zero_shot)] == ["vae_chunk"]
@@ -597,9 +599,9 @@ def test_the_talker_walk_follows_the_prompt_mode_not_input_modalities(model, ref
     """``/generate`` takes ``input_modalities`` from the client: a clip sent with
     ``["text"]`` builds a cloning prompt, so the conductor must run the
     RefEncoder walk for it too, or the Talker has no reference latents."""
-    _, metadata = model.process_prompt(
+    metadata = model.process_prompt(
         "hello", ["text"], ["audio"], tensors={"audio_inputs": [torch.zeros(16000)]}, ref_text=ref_text
-    )
+    ).metadata
     assert metadata[PROMPT_MODE_KEY] != MODE_ZERO_SHOT
     prefill = model.walk_plan("Talker", ["text"], ["audio"], {}, metadata)[0]
     assert prefill.walk == "talker_prefill_clone"
@@ -1568,10 +1570,10 @@ def test_wrong_types_and_ranges_are_value_errors(model, kwargs, message):
 
 
 def test_whole_floats_pass_for_integer_knobs(model):
-    _, metadata = model.process_prompt(
+    metadata = model.process_prompt(
         "hello world", ["text"], ["audio"], max_new_tokens=9.0, min_len=2.0,
         inference_timesteps=float(model.inference_timesteps), cfg_value=2,
-    )
+    ).metadata
     assert metadata[PATCH_BUDGET_KEY] == model.config.max_patches(2, 9) and metadata[MIN_LEN_KEY] == 2
     assert type(metadata[MIN_LEN_KEY]) is int
     assert model.get_loop_caps(max_new_tokens=9.0) == {TALKER_LOOP: 8}

@@ -56,6 +56,7 @@ from mstar.engine.resources.sampler.config import (
     SamplerStep,
     SamplingReqConfig,
 )
+from mstar.engine.resources.sequence_shard import SeqShardSpec
 from mstar.engine.resources.spec import (
     NodeResourceSpec,
     ResourceReqConfig,
@@ -128,6 +129,7 @@ __all__ = [
     "SamplerStep",
     "SamplingReqConfig",
     "Segment",
+    "SeqShardSpec",
     "SlotLease",
     "StepAllowance",
     "StepContext",

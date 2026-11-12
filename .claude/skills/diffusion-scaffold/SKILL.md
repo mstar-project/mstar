@@ -24,7 +24,7 @@ Batching rarely buys throughput for a large video DiT: one 544×960×121 row is 
 
 ## Schedules, seeding and per-step scalars
 
-- `schedule_for` returns a `FlowMatchSchedule`; the base stages its tensors on the device once per request, and `STEP_SCALARS` slices `sigma`, `sigma_next` and `timestep` out per step as `[1]` device tensors. Rows at different steps therefore share one forward, and a captured graph reads them from staged buffers. A scheduler that needs another per-step value (a guidance scale) adds a `StepScalar` entry instead of overriding `prepare_inputs`.
+- `schedule_for(walk, settings, bucket_key)` returns a `FlowMatchSchedule` and reads nothing else, since the base memoizes it and its device copies by those three arguments, so requests with the same settings share one copy. `settings` is `schedule_settings(fwd_info)`, the request's step count by default; a model whose request sets more of its schedule returns that too, and keeps it out of the bucket key. `STEP_SCALARS` slices `sigma`, `sigma_next` and `timestep` out per step as `[1]` device tensors. Rows at different steps therefore share one forward, and a captured graph reads them from staged buffers. A scheduler that needs another per-step value (a guidance scale) adds a `StepScalar` entry instead of overriding `prepare_inputs`.
 - **Match the reference's RNG exactly.** `seed_latents` draws from a CPU generator the base seeds per request; draw the same shapes in the same order and dtype as the reference pipeline, or the comparison against the oracle is meaningless from step 0. A recipe that draws more than once (a second stage's noise) has to continue the same generator, not reseed.
 - Seeded noise and the schedule reach the device through `to_device_nonblocking` (`mstar/utils/h2d.py`: one memcpy into pinned memory, one non-blocking copy); `tensor.to(device)` from pageable memory blocks the GPU thread and stalls the pre-plan.
 - `SOLVER_STATE` names extra loop-back edges for a multi-step scheduler; `seed_loop_back` supplies iteration 0's values and `denoise` returns them alongside the sample. For UniPC, subclass `UniPCDenoiseLoopSubmodule` and implement `model_output`: the base carries the state and steps each row by the loop counter from its own tables. `components/diffusion/unipc.py` is the one port of the scheduler; cosmos3 calls it too. Keep its host sigma in `unipc_convert_model_output`: a 0-dim device tensor would round the multiply in the operand's dtype.
@@ -33,18 +33,18 @@ Batching rarely buys throughput for a large video DiT: one 544×960×121 row is 
 
 A recipe such as LTX-2.5's two-stage distilled one (half-resolution denoise → latent upsampler → a short refine schedule at full resolution) is several walks over the same `dit` node, each with its own schedule and bucket key.
 
-- **The schedule is per (request, walk).** A request returns to the node on a new walk with a different schedule; cache keyed by the request alone and the second stage runs the first stage's sigmas.
+- **The schedule is per walk.** A request returns to the node on a new walk with a different schedule, and the walk in the memo's key gives the second stage its own sigmas.
 - **Iteration 0 of a later stage is not fresh noise**: it is the previous stage's output (upsampled) blended with noise at the stage's first sigma. That is a seeding hook, not model code in `denoise`: `initial_loop_back(fwd_info, inputs, bucket_key, generator)`, which defaults to `seed_loop_back` (added in #373).
 
 ## Attention
 
-Every attention in the DiT should go through a ragged resource, so the model gets the engine's kernels and its backend can change in config.
+Every attention in the DiT should go through the read of an array with `max_len=0`, so the model gets the engine's kernels and `backend: sdpa` on the read's resource can swap them. A layer holds its id as a 0-d CPU tensor and calls `attend(self.state, self.layer, q, k, v)`: an int on the module recompiles the frame per layer when the read breaks the graph.
 
-- `attention_segments(bucket_key)` declares every span a request's layers attend over, as `(label, length)`; the default is one `"main"` span of all its tokens. A layer that attends over a sub-span (a refiner over the image tokens alone, a joint model's per-modality self-attention) gets its own label, and `ragged_for(label)` gives that layer its callable.
-- `ragged_for` memoizes one callable per label (the resource's `run` with the label bound) for the life of a binding, and a rebinding drops them so none attends through the old resource.
-- A model with more than one head geometry (LTX-2.5's video 32×128 and audio 32×64 heads) declares one resource per geometry.
-- Cross-attention between spans of the same request (video queries over text keys) is a separate cross-attention resource kind (`RaggedCrossAttentionSpec`, added in #372) whose step names `(q_label, kv_label)` pairs; see "Cross-attention between spans" in `docs/adding_models.rst`. Don't fall back to SDPA for it because the shapes are fixed inside a bucket.
-- `joint_attention` in `attention.py` packs per-row q/k/v into the ragged layout (or runs SDPA when no resource is bound, which is what a parity backend uses).
+- `attention_segments(bucket_key)` declares, per array, every span a request's layers attend over, as `(label, length)`. A layer that attends over a sub-span (a refiner over the image tokens alone, a joint model's per-modality self-attention) binds its own array with its own label.
+- Reads of one kernel configuration on one node fold into one resource, so a model with more than one head geometry (LTX-2.5's video 32×128 and audio 32×64 heads) gets one resource per geometry.
+- Cross-attention between spans of the same request (video queries over text keys) is a read with `queries=` naming the array that lays out its queries, which builds `RaggedCrossAttentionSpec` and its `(q_label, kv_label)` pairs; see "Cross-attention between spans" in `docs/adding_models.rst`. Don't fall back to SDPA for it because the shapes are fixed inside a bucket.
+- Under sequence parallelism the node's sequence shard (`SeqShardSpec` in `get_node_resources`) lists the labels that split, and the forward brackets its layer stack with `shard.scatter` / `shard.gather`; each read's resource exchanges by itself, so a layer's calls stay the same at SP1 and above.
+- A DiT's read declares `packed=False`, since its layers pass rows of one length rather than packed tokens.
 
 ## Compile and capture
 
@@ -58,7 +58,7 @@ The loop ends on its iteration count. A model whose request picks its step count
 
 ## State
 
-Per-request state lives in `self.request_state(fwd_info.rid_handle)`, which the engine frees with the request. It is keyed by the integer handle (the key cleanup receives), not by the `request_id` string; see invariant 14.
+The latents and the solver's values ride loop-back edges, which pass a tensor without a copy and carry any shape. The schedule and the seeds are memos of the base, recomputed from their inputs. Anything else per request lives in `self.request_state(fwd_info.rid_handle)`, which the engine frees with the request. It is keyed by the integer handle (the key cleanup receives), not by the `request_id` string; see invariant 14.
 
 ## Validating
 
