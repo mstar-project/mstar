@@ -1638,10 +1638,10 @@ def _unbounded(**overrides) -> Array:
     })
 
 
-def _bounded(array=None, dtype=torch.float32) -> tuple[ArrayHandle, BoundedKVManager]:
+def _bounded(array=None, dtype=torch.float32, device="cpu") -> tuple[ArrayHandle, BoundedKVManager]:
     array = array or _unbounded()
     (spec,) = build_specs([array])
-    kv = BoundedKVManager(spec.config, torch.device("cpu"), dtype)
+    kv = BoundedKVManager(spec.config, torch.device(device), dtype)
     return build_handle(array, {array.name: kv}, _resolve([array], StateSetup())), kv
 
 
@@ -1674,6 +1674,27 @@ def test_a_bounded_read_equals_the_manager_s_own_attend():
     assert out.shape == (1, 2, HEADS, BOUNDED_DIM), "a read returns (rows, T, heads, head_dim)"
     assert torch.equal(out, expected), "the binding converts only the input layout"
     assert torch.equal(kv.layer(1), direct.layer(1)) and not kv.layer(0).any(), "the read stored layer 6's keys"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the bounded kernels need a GPU")
+def test_a_bounded_read_on_the_device_equals_the_torch_path():
+    """The read's conversions reach the Triton kernels as they reach the torch path, over two steps of three frames
+    whose second reads what the window keeps of the first."""
+    torch.manual_seed(0)
+    arms = [_bounded(), _bounded(device="cuda")]
+    for _ in range(2):
+        q, k, v, bias = _frames(t=3)
+        outs = []
+        for (h, kv), device in zip(arms, ("cpu", "cuda"), strict=True):
+            step = _bounded_step(h, kv, spans=(3,))
+            for layer in sorted(h.array.layers):
+                h.add(layer, k=k.to(device), v=v.to(device))
+                outs.append(h.read(layer, q.to(device), distance_bias=bias.to(device)).cpu())
+            h.check_step(step)
+            kv.commit(step.steps[h.name], step.ctx)
+            h.end_step(step)
+        for host, dev in zip(outs[:2], outs[2:], strict=True):
+            torch.testing.assert_close(dev, host, atol=1e-4, rtol=1e-4)
 
 
 def test_a_bounded_read_casts_q_to_the_kv_dtype():

@@ -323,16 +323,87 @@ def test_duplex_layouts_equal_main_s(prompt, length):
 # The talker's noise and first step
 
 
-def test_the_noise_memo_s_row_k_is_a_fresh_generator_s_kth_draw():
+_CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+
+
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=_CUDA)])
+def test_the_noise_memo_s_row_k_is_a_fresh_generator_s_kth_draw(device):
     sub = _make_talker_sub()
+    sub.talker.to(device)
+    sub.bind_state({TALKER_KV: None, TALKER_PREV: sub.prev, CODEC_STATE: None})     # the memo on the talker's device
     e = sub.config.eartts
-    sub._noise([3], torch.device("cpu"))
+    sub._noise([3], torch.device(device))
     for k in range(4):
-        gen = torch.Generator().manual_seed(e.inference_seed)
+        gen = torch.Generator(device=device).manual_seed(e.inference_seed)
         for _ in range(k + 1):
-            u = torch.rand((e.inference_num_iter, 1, e.mog_num_predictions), generator=gen)
-            eps = torch.randn((e.inference_num_iter, 1, e.code_dim), generator=gen)
+            u = torch.rand((e.inference_num_iter, 1, e.mog_num_predictions), device=device, generator=gen)
+            eps = torch.randn((e.inference_num_iter, 1, e.code_dim), device=device, generator=gen)
         assert torch.equal(sub._noise_u[k], u) and torch.equal(sub._noise_eps[k], eps), f"row {k}"
+
+
+@_CUDA
+def test_mamba2_and_causal_conv_on_the_device_equal_the_mixer_s_own_math():
+    """The nano's Mamba-2 layer through its Value on the real pool and Mamba-2 manager, on the device: a prefill of two
+    rows of 3 and 5 tokens, then a decode step, give the outputs and the states of the layer's own prefill and decode
+    from a fresh state."""
+    from mstar.engine.resources.base import EngineResourceInfo, build_resource
+    from mstar.engine.resources.runner import StepRunner
+    from mstar.engine.state import CausalConv, Entry, Mamba2, TensorType, Value
+    from mstar.engine.state.adapters import StateSetup, _resolve, build_handle, build_specs
+    from mstar.model.nemotron_duplex.config import MAMBA_CONV
+
+    torch.manual_seed(0)
+    nano = NanoConfig(
+        num_hidden_layers=1, hybrid_override_pattern="M", hidden_size=32, intermediate_size=64, vocab_size=64,
+        mamba_num_heads=4, mamba_head_dim=16, ssm_state_size=16, n_groups=2, time_step_rank=8, combined_embed_dim=32,
+    )
+    device = torch.device("cuda")
+    layer = Mamba2Mixer(nano, 0).to(device)
+    alone = Mamba2Mixer(nano, 0).to(device)
+    alone.load_state_dict(layer.state_dict())
+    value = Value(MAMBA_STATE, nodes={"nano_llm"}, layers={0}, entry=Entry({
+        "ssm": TensorType((nano.mamba_num_heads, nano.mamba_head_dim, nano.ssm_state_size), dtype=torch.float32),
+        "conv": TensorType((nano.conv_dim, nano.conv_kernel - 1), dtype=None),
+    }), updates={MAMBA_CONV: CausalConv(), MAMBA: Mamba2(time_step_limit=nano.time_step_limit)})
+    specs = {spec.resource_key: spec for spec in build_specs([value], kernel_settings={MAMBA_STATE: {"max_slots": 4}})}
+    resources = {}
+    for key in (MAMBA_STATE, MAMBA):
+        resources[key] = build_resource(specs[key], EngineResourceInfo(
+            device=device, kv_dtype=torch.float32, dependencies={dep: specs[dep] for dep in specs[key].depends_on()}))
+    handle = build_handle(value, resources, _resolve([value], StateSetup()))
+    layer.bind_state({MAMBA_STATE: handle})
+    runner = StepRunner(resources)
+    for rid in (1, 2):
+        runner.ingest_request(rid)
+
+    def step(spans, x):
+        declared = SubmoduleStep(segments=[Segment(rid, "main", span) for rid, span in zip((1, 2), spans, strict=True)],
+                                 state={MAMBA_STATE: ArrayStep()})
+        ctx = StepContext(request_ids=(1, 2), graph_walk="decode", slot=0, capture=False)
+        declared.set_ctx(ctx)
+        expanded = state_steps(declared, {MAMBA_STATE: handle})
+        expanded.set_ctx(ctx)
+        assert runner.admit(expanded).ok
+        runner.plan(expanded)
+        expanded.begin_calls()
+        with torch.no_grad():
+            out = layer(x)
+        expanded.check_calls()
+        runner.commit(expanded)
+        expanded.commit_calls()
+        expanded.end_calls()
+        return out
+
+    rows = [torch.randn(n, nano.hidden_size, device=device) for n in (3, 5)]
+    out = step((3, 5), torch.cat(rows))
+    news = [torch.randn(1, nano.hidden_size, device=device) for _ in rows]
+    decoded = step((1, 1), torch.cat(news))
+    with torch.no_grad():
+        for i, (x, new) in enumerate(zip(rows, news, strict=True)):
+            want, conv, ssm = alone.prefill(x)
+            torch.testing.assert_close(out[:3] if i == 0 else out[3:], want, atol=1e-3, rtol=1e-3)
+            want, conv, ssm = alone.decode_step(new, conv, ssm)
+            torch.testing.assert_close(decoded[i:i + 1], want, atol=1e-3, rtol=1e-3)
 
 
 def test_the_noise_memo_holds_the_talker_loop_s_cap_plus_one(monkeypatch):
