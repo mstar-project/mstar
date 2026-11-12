@@ -4514,7 +4514,8 @@ class KVManager(AttentionResource):
                     counts = None, None
                 if self._keeper not in self._asks and rid not in self._passers:
                     self._keeper = rid
-                return RoomMark(rid, node_name, graph_walk, published, room, *counts)
+                # read again, since `_admit` may have turned ``rid`` guaranteed, whose room is another
+                return RoomMark(rid, node_name, graph_walk, published, self._room_for(rid), *counts)
             return None
 
     def reserve_past(

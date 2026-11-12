@@ -1418,6 +1418,22 @@ def test_a_guaranteed_request_another_resource_holds_back_lends_again_what_its_g
     assert _admitted(kv, "g") and allotment.pages == counts[0], "g's allotment grew past its footprint"
 
 
+def test_a_request_that_turns_guaranteed_as_it_is_refused_is_tried_again_once_it_fits():
+    """h can't be dropped and the host is full, so no move frees it, and its refused admission turns it guaranteed.
+    Its mark kept the room it was measured against before, which counted what g lends and was the whole pool, so
+    nothing tried h again once g left."""
+    kv = _pool()
+    kv._cpu_pool = host._HostPool(0)
+    _request(kv, "g", 1, arrival=0, guaranteed=True)
+    assert _ready(kv, "g")
+    _request(kv, "h", 3, arrival=1, rebuildable=False)
+    assert not _admitted(kv, "h") and "h" in kv._guaranteed
+
+    _remove(kv, "g")
+
+    assert _admitted(kv, "h"), "h fits the empty pool and nothing tried it again"
+
+
 @pytest.mark.parametrize("moves", ["is dropped", "moves to the host"])
 def test_a_guaranteed_request_takes_back_what_it_lent_from_an_older_borrower(moves):
     """o arrived before g and borrowed what g hasn't written. A request that runs short moves only newer ones, so g
