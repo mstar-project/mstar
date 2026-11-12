@@ -136,6 +136,7 @@ class H3KeyframeEncoder(nn.Module):
         fp32 on that device (``encode_vae_condition``)."""
         return self.posterior_latents(self.frame_moments(frame), torch.Generator().manual_seed(seed))
 
+    @torch.no_grad()
     def frame_moments(self, frame: torch.Tensor) -> torch.Tensor:
         """uint8 ``[3, H, W]`` on the device -> ``[1, 48, 1, H / 16, W / 16]``, ImageNet-normalized
         in fp32 first."""
@@ -145,6 +146,7 @@ class H3KeyframeEncoder(nn.Module):
         pixels = (frame[None, :, None].to(torch.float32).div(255.0) - mean) / std
         return self.moments(pixels.to(self.quant_conv.weight.dtype))
 
+    @torch.no_grad()
     def posterior_latents(self, moments: torch.Tensor, generator: torch.Generator) -> torch.Tensor:
         """``DiagonalGaussianDistribution.sample`` from ``generator`` (a CPU one), rounded to fp16,
         then normalized with the VAE's latent statistics."""

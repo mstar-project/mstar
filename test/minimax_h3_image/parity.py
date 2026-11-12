@@ -249,7 +249,8 @@ def run(args, report: dict, failures: list[str]) -> None:
             info = types.SimpleNamespace(step_metadata=request)
             rows = H3ImageDenoiseSubmodule.seed_loop_back(modules.denoise, info, layout, gen)["latents"].to(dev)
             if n:
-                cond = modules.vae_encoder.forward(None, None, prompted[REFERENCE_PIXELS], seed)
+                with torch.no_grad():
+                    cond = modules.vae_encoder.forward(None, None, prompted[REFERENCE_PIXELS], seed)
                 t = torch.tensor(REFERENCE_NOISE_AUG, dtype=torch.float32, device=dev)
                 rows = torch.cat([t * cond["cond_latents"][0].to(dev) + (1.0 - t) * rows[:n], rows[n:]])
             # the port's own text rows from here on
