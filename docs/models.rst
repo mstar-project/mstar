@@ -2340,14 +2340,20 @@ Deployment knobs (``model_kwargs``; the SP configs set ``compile``, ``vae_tile_b
   output rows move on the copy engines (CUDA IPC peer copies, stream memory operations) while the previous group
   attends, instead of one NCCL all-to-all each way, which runs on the SMs and doesn't overlap. Bit-identical: the
   first call of each shape checks against the NCCL exchange on every rank, which a shape keeps if not (or if the
-  buffers, ~0.5 GB a rank at 768p 5 s, don't fit). The SP4 config sets 2: 1344x768x124 at 49 forwards on 4 H200s
+  buffers, ~0.8 GB a rank at 768p 5 s, don't fit). Each group's output rows land straight in the owner's output,
+  and a compiled DiT has its fused q/k norm-rope write q and k straight into the exchange buffers, a group at a
+  time. The SP4 config sets 2: 1344x768x124 at 49 forwards on 4 H200s
   takes 74.7 s instead of 76.7 s (step 1470 vs 1510 ms; 7 groups saves 6 ms, too few heads a group). At SP8 (7
   heads a rank) neither 7 groups (+6% a clip) nor the copy engines alone (same step) helps, so that config keeps 1.
 - ``ulysses_group_streams``: with ``ulysses_head_groups`` > 1, each head group attends on a stream of its own,
   so one group's last wave of attention tiles runs beside the next group's first. On 4 B300s with the FA4 ragged
   backend (one tile a CTA: 7 heads by 150 tiles is 7.1 waves on 148 SMs), 7 groups on their own streams take
   34.8 s a clip instead of 35.6 s for 2 groups on one stream (2 groups with streams 35.0 s, 14 groups 35.1 s);
-  clips are bit-identical. Off by default: on H200 it measured the same as one stream.
+  clips are bit-identical. With the copies above and FA4's dense calls, 7 groups on streams take 33.2 s a clip
+  (SGLang 0.5.23, Ulysses 4: 33.4 s; same GPUs, same hour). Off by default: on H200 it measured the same as one
+  stream. Over an attention whose calls share scratch (FlashInfer) the groups attend on one stream: served that
+  way on H200, a clip came out differently now and then.
+- The DiT's ragged resource takes ``backend: fa4`` (``resources: {dit_attn: {backend: fa4}}``) on Blackwell.
 
 Async scheduling is on for the DiT and the decoder, the default for parallel nodes
 (``tp_async_sched: false`` turns it off); on and off measured within noise. Runtime needs:
@@ -2427,8 +2433,13 @@ Deployment knobs (``model_kwargs``; the configs set ``compile`` and ``vae_tile_b
 ``compile`` and ``row_bucket`` (the DiT's blocks, as ``minimax_h3``), ``vae_tile_batch``
 (256-px tiles per decoder call: one at a time, the reference's order, leaves the decode
 launch-bound at 9.2 s for 16 MP on a B300 against 0.45 s at 64, and the batched decode is
-bit-identical), ``vae_compile``, ``attention_backend`` (``flashinfer``, or ``sdpa``). The
-configs: ``minimax_h3_image.yaml`` (2 GPUs, the DiT alone on one), ``minimax_h3_image_sp2.yaml``
+bit-identical), ``vae_compile`` (56-58 dB from the eager decoder), ``attention_backend``
+(``flashinfer``, or ``sdpa``), and ``minimax_h3``'s ``ulysses_head_groups`` /
+``ulysses_group_streams`` and ``backend: fa4``. With ``compile`` the DiT's attention is an op of
+each block's graph (``compile_op``), not a break around it. The configs set ``vae_compile``, and
+the SP2 config 2 head groups (bit-identical; 4 or 7 measured the same at 4096² and add host time
+at 1024²). On one B300 FlashInfer, FA4 and ``sdpa`` (cuDNN there) measured within noise at 4096²
+and FlashInfer fastest at 1024². The configs: ``minimax_h3_image.yaml`` (2 GPUs, the DiT alone on one), ``minimax_h3_image_sp2.yaml``
 (the DiT Ulysses over 2 GPUs, the decoder in its SP group decoding half of the tiles per rank,
 the conditioner and the VAE encoder on rank 1) and
 ``minimax_h3_image_1gpu.yaml`` (~119 GiB in use on one H200 at 16 MP).
@@ -2456,21 +2467,21 @@ canvas, 2.14 s on M*):
      - 2048²
      - 4096²
    * - M*, 1 GPU (``minimax_h3_image_1gpu.yaml``)
-     - 0.64
-     - 2.20
-     - 11.07
+     - 0.62
+     - 2.12
+     - 10.78
    * - SGLang (main ``fc6d3b6f9``), 1 GPU
      - 0.56
      - 2.08
      - 10.71
    * - M*, SP2 (``minimax_h3_image_sp2.yaml``)
-     - 0.51
-     - 1.44
-     - 6.87
-   * - SGLang, Ulysses 2
-     - 0.37
-     - 1.26
+     - 0.49
+     - 1.30
      - 6.24
+   * - SGLang, Ulysses 2
+     - 0.38
+     - 1.26
+     - 6.26
    * - vllm-omni (main ``02d7bc47e``), USP 2
      - (2048² canvas)
      - 1.41
@@ -2480,7 +2491,9 @@ The 2-GPU default config takes 0.65 / 2.18 / 11.13 s, as one GPU at one request 
 requests, not steps); diffusers' pipeline on two H200s (encoder | rest, no HTTP) takes 1.05 /
 4.20 / 18.65 s. SGLang ran ``--performance-mode speed``; vllm-omni its H200 recipe's SP2 profile,
 whose ``extra_args.min_generation_area`` was not honoured at 1024². At SP2 and 4096², a step is
-0.94 s; the decode is split over the SP ranks' tiles. Not done: CUDA-graph capture, more than
+0.86 s (2 head groups; SGLang's 0.82); the decode is split over the SP ranks' tiles. At SP2 and
+1024² a step is host-bound: issuing its ~3,400 launches takes 68 ms against ~53 ms of GPU work,
+where SGLang's step is GPU-bound. Not done: CUDA-graph capture, more than
 one request per step, tensor parallelism, multi-reference edits through ``/v1/images/edits``.
 
 
