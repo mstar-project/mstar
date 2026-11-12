@@ -968,8 +968,6 @@ class PagedArrayHandle(ArrayHandle):
         self._views = {layer: self._kv.layer_view(i) for layer, i in self._pool_layer.items()}
         # each op with its resource, built once since `state_steps` runs on every step, replays too
         self._ops = [(resolved.resource_of[bound.key], bound) for bound in bindings]
-        # whether `check_step` needs an add, for a step that lists a row on the pages at span above 0
-        self._grows = False
 
     def begin_step(self, step) -> None:
         super().begin_step(step)
@@ -979,13 +977,15 @@ class PagedArrayHandle(ArrayHandle):
         if combined:
             self.label = next(iter(combined.values()))
 
-    def check_step(self, step) -> None:
-        super().check_step(step)
-        if not self._keep or step.ctx.replays:
-            return
-        if self._grows and not self._kept:
-            raise self._refusal("a step that keeps lists rows at span above 0 and adds nothing, so the pages "
-                                "would keep entries no add wrote; list those rows at span 0")
+    def _calls_cover(self, declared: ArrayStep, ctx) -> bool:
+        # a capture opens the handles once around `preprocess`, where `eager_add` adds run, and again around the forward
+        return bool(self._kept) or (declared.eager_add and ctx.capture)
+
+    def _uncovered(self, rows: list[int]) -> ValueError:
+        if self._region_rows:
+            return super()._uncovered(rows)
+        return self._refusal("a step that keeps lists rows at span above 0 and adds nothing, so the pages would keep "
+                             "entries no add wrote; list those rows at span 0")
 
     def _check_labels(self, labels: set[str], segments) -> None:
         runs = [label for label, _ in groupby(segment.label for segment in segments)]
@@ -998,10 +998,6 @@ class PagedArrayHandle(ArrayHandle):
                                 "combined plan holds one segment per row and label")
 
     def _check_storage(self, declared: ArrayStep, segments, ctx) -> None:
-        # a capture opens the handles once around `preprocess`, where `eager_add` adds run, and again around the forward
-        self._grows = not (declared.eager_add and ctx.capture) and any(
-            segment.span and (segment.request_id, segment.label) not in declared.placeholders for segment in segments
-        )
         # A capture's dummy rows open only the default label.
         if ctx.capture:
             return
@@ -1216,20 +1212,14 @@ class ValueHandle(ArrayHandle):
         self._written.clear()
         super().begin_step(step)
 
-    def check_step(self, step) -> None:
-        super().check_step(step)
-        if self._step_written and not step.ctx.replays:
-            self._check_written(self._segments)
+    def _calls_cover(self, declared: ArrayStep, ctx) -> bool:
+        return all(self._step_written <= self._written.get(layer, set()) for layer in self.array.layers)
 
-    def _check_written(self, segments) -> None:
-        rows = [segment.request_id for segment in segments if segment.span >= 1]
-        if not rows:
-            return
-        for layer in sorted(self.array.layers):
-            unwritten = sorted(self._step_written - self._written.get(layer, set()))
-            if unwritten:
-                raise self._refusal(f"layer {layer}'s fields {unwritten} are unwritten in a kept step for rows {rows}, "
-                                    "and no update op writes them")
+    def _uncovered(self, rows: list[int]) -> ValueError:
+        layer = min(layer for layer in self.array.layers if not self._step_written <= self._written.get(layer, set()))
+        unwritten = sorted(self._step_written - self._written.get(layer, set()))
+        return self._refusal(f"layer {layer}'s fields {unwritten} are unwritten in a kept step for rows {rows}, and no "
+                             "update op writes them")
 
     def _check_storage(self, declared: ArrayStep, segments, ctx) -> None:
         if not declared.keep:
@@ -1359,6 +1349,7 @@ class _HostCalls:
         return self._refusal(f"a host write on row {row}, label {label!r}, layer {layer}{cause}")
 
     def commit_step(self, step) -> None:
+        super().commit_step(step)
         self.host_fields.commit(self.array, step.state[self.name], step.ctx.request_ids)
 
     def _host(self, request: int, label: str, layer: int) -> Mapping[str, object]:
@@ -1378,6 +1369,10 @@ class HostValueHandle(_HostCalls, ArrayHandle):
 
     def _check_storage(self, declared: ArrayStep, segments, ctx) -> None:
         super()._check_storage(declared, segments, ctx)
+
+    def _calls_cover(self, declared: ArrayStep, ctx) -> bool:
+        """Always: a Value of host fields only has no entry for a call to give."""
+        return True
 
 
 class ValueWithHostHandle(_HostCalls, ValueHandle):

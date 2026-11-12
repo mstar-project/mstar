@@ -817,7 +817,7 @@ takes tensors of one entry's shape, made at load, and zeros stand in for a field
 ``h.write(layer, **fields)`` writes the rows' entries in place where the forward runs it, in an eager
 step or a replay, so a step refused after a write keeps it in the slots its rows already held. In a
 step, a layer's reads come before its write, a field takes one write, and each row at span 1 or more
-gets every field from the step's own write. Such a ``Value`` takes no ``keep=False`` and sits on no
+gets every field from the step's own write or from a piecewise region whose own step lists it. Such a ``Value`` takes no ``keep=False`` and sits on no
 node with prefix keys. Parakeet's transducer state and both speech codecs are the examples.
 Chatterbox's S3Gen keeps its vocoder tail and reference in ``s3gen_stream``'s tensor fields and its
 generator state in a host field: ``prepare_inputs`` draws the chunk's noise from the state ``host``
@@ -2296,8 +2296,8 @@ and each row's label comes from the step's segments, so there are no cursors:
   per layer per step, and it is the layer's last add. Scratch adds can repeat, and last until
   the next add or the end of the step. ``keep=None`` takes the step's ``keep``. The resources keep
   or drop a step's adds as a whole, so a step that keeps needs each layer to end on a kept add,
-  unless every row it lists has span 0 or is a placeholder, and a step with ``keep=False``
-  refuses ``keep=True``.
+  unless every row it lists has span 0, is a placeholder or got its adds from a piecewise region
+  whose own step lists it, and a step with ``keep=False`` refuses ``keep=True``.
 - ``read`` sees kept entries from earlier steps, plus this layer's latest add, at the
   positions its mask reaches. It runs the op the declaration names for the layer.
 - ``write`` sets the step's rows' entries in place where the forward runs it, not at the step's commit.

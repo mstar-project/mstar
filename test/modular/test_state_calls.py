@@ -1394,8 +1394,8 @@ def test_a_kept_step_that_leaves_a_field_unwritten_is_refused_naming_it():
 
 
 def test_a_step_over_a_fresh_row_and_a_written_row_counts_only_its_own_write():
-    """A region's replay writes its rows' slots with no Python, so the handle never sees it. A fresh row it leaves out
-    would then commit as written, and read zeros next rather than its start."""
+    """A row counts as written by the step's own write or by a region whose own step lists it. A fresh row that
+    neither wrote would commit as written, and read zeros next rather than its start."""
     h, pool = _plain_value()
     _commit_written(h, pool)
     step, _, _ = _value_step(h, pool, [Segment(1, "main", 1), Segment(2, "main", 1)])
