@@ -13,7 +13,6 @@ from mstar.engine.chunking import DEFAULT_MIN_CHUNK_TOKENS
 from mstar.engine.engine import Engine
 from mstar.engine.node_dtype import resolve_model_dtype, resolve_node_dtype
 from mstar.engine.resources import ResourceReqConfig
-from mstar.engine.resources.context_parallel import positions_over_sp
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.graph.base import GraphNode
 from mstar.graph.runtime.base import GraphRuntime
@@ -408,18 +407,10 @@ class EngineManager:
         # Checked by the conductor's get_sharding_config before spawn.
         moe_parallel = node_moe_parallel_configs(model_config["node_groups"])
         for name in sorted(node_names):
-            # A node on SP ranks gets the SP group for its own sequence
-            # parallelism, unless it places its KV pools' positions over them
-            # and runs replicated across them (`positions_over_sp`, which
-            # validate_deployment checks before spawn; here it is loud where
-            # that was skipped). CFG parallelism is opt-in per node. A node off
-            # SP and CFG ranks keeps its existing get_submodule call. Likewise
-            # ``moe_parallel``, only for a node group's ``ep_config``.
+            # CFG parallelism is opt-in per node (``cfg_group``), and ``moe_parallel`` only for a
+            # node group's ``ep_config``, so every other node keeps its existing get_submodule call
             extra = {}
             joint = parallel_groups.get_joint_group_for_node(name)
-            sp = joint.sp_group.world_size
-            if sp > 1 and not positions_over_sp(specs, name, sp, model.get_default_sharding_config().sp_enabled_nodes):
-                extra["sp_group"] = joint.sp_group
             if joint.cfg_group.world_size > 1:
                 extra["cfg_group"] = joint.cfg_group
             if name in moe_parallel:
@@ -462,6 +453,7 @@ class EngineManager:
             transfer_engine_info=transfer_engine_info,
             kv_cache_type=autocast_dtype,
             model=model,
+            moe_parallel=moe_parallel,
             token_ladders=walk_ladders,
             region_ladders=region_ladders,
         )

@@ -57,11 +57,12 @@ from mstar.engine.resources.base import (
     build_resource,
     head_shards,
 )
-from mstar.engine.resources.context_parallel import positions_over_sp
+from mstar.engine.resources.context_parallel import position_pools
 from mstar.engine.resources.kv.config import instance_size, opening_prefix_caches, unrestorable
 from mstar.engine.resources.kv.keys import fingerprint
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.resident import ResidentPlanner, build_planner
+from mstar.engine.resources.sequence_shard import SeqShardSpec, sequence_parallel_refusals
 from mstar.engine.resources.spec import resolve_spec_dependencies
 from mstar.engine.resources.step import (
     ADMIT_OK,
@@ -72,6 +73,7 @@ from mstar.engine.resources.step import (
     lean_subsets,
 )
 from mstar.engine.state.adapters import StateSetup, node_handles
+from mstar.engine.state.analysis import split_read_problems
 from mstar.engine.state.state_op import bind_state_ops
 from mstar.graph.runtime.base import GraphRuntime
 from mstar.model.base import keyed_labels
@@ -114,6 +116,7 @@ if TYPE_CHECKING:
     from mstar.engine.resources.admission import Refusal
     from mstar.engine.resources.kv.manager import KVManager
     from mstar.model.base import Model
+    from mstar.model.components.moe_parallel import MoeParallelConfig
 
 logger = logging.getLogger(__name__)
 
@@ -742,10 +745,13 @@ class Engine:
         model: "Model | None" = None,
         token_ladders: Mapping[str, Any] | None = None,
         region_ladders: Mapping[str, Any] | None = None,
+        moe_parallel: "Mapping[str, MoeParallelConfig] | None" = None,
     ):
         """``token_ladders`` and ``region_ladders``: the serving config's
         ``prefill_token_buckets``, node -> capture walk -> ladder and node ->
-        piecewise region label -> ladder, which the node's captures take at warmup."""
+        piecewise region label -> ladder, which the node's captures take at warmup.
+        ``moe_parallel``: each node's ``ep_config``, which a node splitting its steps over SP
+        ranks can't take."""
         self._device = device
         if self._device_capability is None or self._device_capability.device != device:
             self._device_capability = DeviceCapability.of(device)
@@ -767,13 +773,29 @@ class Engine:
         # node -> whether it runs replicated over its SP ranks, its pools placing positions over them,
         # and how many ways its heads split then: TP alone where it does
         over_sp, shards = {}, {}
-        for node in node_names:
+        # the nodes whose steps may split over their SP ranks
+        splitting = set()
+        for node in sorted(node_names):
             group = parallel_groups.get_joint_group_for_node(node)
             sp = group.sp_group.world_size
-            over_sp[node] = sp > 1 and positions_over_sp(
-                specs, node, sp, () if model is None else model.get_default_sharding_config().sp_enabled_nodes,
+            refusals = sequence_parallel_refusals(
+                specs, node, group.tp_group.world_size, sp, (moe_parallel or {}).get(node),
             )
+            if refusals:
+                raise ValueError("; ".join(refusals))
+            over_sp[node] = sp > 1 and any(position_pools(specs, node).values())
             shards[node] = head_shards(group, over_sp[node])
+            if sp > 1 and any(isinstance(spec, SeqShardSpec) and spec.splits and node in spec.nodes for spec in specs):
+                splitting.add(node)
+        if model is not None and splitting:
+            split = {
+                node: spec.labels for spec in specs if isinstance(spec, SeqShardSpec) and spec.splits
+                for node in spec.nodes & splitting
+            }
+            sdpa_reads = [read for read, binding in self._state_setup.by_read.items() if not binding.plans]
+            refusals = split_read_problems(model.declare_state(), sdpa_reads, split)
+            if refusals:
+                raise ValueError("; ".join(refusals))
 
         for spec in specs:
             relevant_nodes = spec.nodes & node_names
@@ -792,9 +814,16 @@ class Engine:
                 raise ValueError(
                     f"resource {spec.resource_key!r} serves nodes that split heads different ways "
                     f"({ {node: shards[node] for node in sorted(relevant_nodes)} }): one places its KV "
-                    "positions over its SP ranks and another runs its own sequence parallelism"
+                    "positions over its SP ranks and another keeps KV by head over them"
                 )
             joint_comm_group = parallel_groups.get_joint_group_for_node(first_node)
+            # heads over TP alone on a node whose pools place positions, and for a pool every SP rank
+            # stores whole or a resource over such pools alone (`NodeResourceSpec.storage`)
+            storages = (
+                {spec.storage} if spec.storage is not None
+                else {specs_by_key[key].storage for key in spec.depends_on()} - {None}
+            )
+            replicated = over_sp[first_node] or storages == {"copied"}
             self._resources[spec.resource_key] = build_resource(
                 spec,
                 EngineResourceInfo(
@@ -817,7 +846,7 @@ class Engine:
                     ),
                     host_allowance=self.host_allowance,
                     prefix_caches=prefix_caches,
-                    replicated_over_sp=over_sp[first_node],
+                    replicated_over_sp=replicated,
                 ),
             )
             for node in relevant_nodes:
@@ -832,6 +861,12 @@ class Engine:
                         f"resource {key!r} ({type(resource).__name__}) does not support context "
                         f"parallelism, and the pool {dep!r} it depends on sets context_parallel"
                     )
+            split_nodes = sorted(self._resource_nodes[key] & splitting)
+            if split_nodes and not resource.supports_split_steps:
+                raise ValueError(
+                    f"resource {key!r} ({type(resource).__name__}) does not support steps split over SP "
+                    f"ranks, and node {split_nodes[0]!r} splits them (SeqShardSpec)"
+                )
 
         # rid -> (node, walk) of its last step here when that step was rows-only,
         # i.e. the sampler's slot master holds the token its next step reads
@@ -875,10 +910,7 @@ class Engine:
                 region_ladders=(region_ladders or {}).get(node_name) or {},
             )
             submodule.bind_node_resources(resources)
-            handles = {} if model is None else node_handles(
-                model, node_name, resources, sp_group=parallel_groups.get_joint_group_for_node(node_name).sp_group,
-                setup=self._state_setup,
-            )
+            handles = {} if model is None else node_handles(model, node_name, resources, setup=self._state_setup)
             if handles:
                 bind_state_ops(handles)
                 submodule.bind_node_state(handles)
@@ -1093,6 +1125,10 @@ class Engine:
                 node_name, submodule_mgmt, capture_stream,
             )
         self._bind_foreign_planners()
+
+        for node_name, submodule_mgmt in self._submodules.items():
+            for resource in submodule_mgmt.resources.values():
+                resource.check_captures(node_name, ag_runners[node_name].capture_configs, piecewise[node_name])
 
         # Every runner claims its static buffers before any of them captures:
         # nodes share resources, so a build driven by a later node would move

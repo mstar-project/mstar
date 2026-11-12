@@ -532,6 +532,10 @@ them by that name:
      vit_attn:                  # a cacheless (ragged) attention resource
        max_segments_per_request: 2  # also: max_segments_per_step, max_tokens_per_request,
                                     # flashinfer_backend
+     seq_shard:                 # a node's sequence shard (SP ranks)
+       min_tokens: 2048         # steps below this run copied on every SP rank; also: exchange
+     linear_attn:               # a recurrent layer's resource (GDN, Mamba-2)
+       backend: flashinfer
      sampler:
        greedy_capture: false    # also: enable_logprobs, enable_processed_logprobs
 
@@ -563,12 +567,56 @@ a sliding window (``AttentionConfig.sliding_window``) has no prefix cache yet: i
 ``prefix_cache`` goes off (logged at info), and a serving config that sets
 ``prefix_cache: true`` on it is refused.
 
-``context_parallel: true`` splits each request's positions over the ranks that would
-otherwise hold the same KV heads: the TP ranks that share a KV head, or the node's SP ranks
-when it has them, which is how a model with no sequence parallelism of its own (such as
-Qwen3.5) runs on ``sp_size`` above 1. Raise ``max_num_pages`` by that factor to turn the
-freed memory into context. **Context parallelism** in :doc:`adding_models` covers when each mode applies and
-what it refuses.
+A node on ``sp_size`` above 1 shares each step over its SP ranks along two axes. A model that
+declares a sequence shard (a ``SeqShard``: Qwen3.5's LLM, Qwen3-Omni's Thinker and the DiTs of
+LTX-2.5, Wan2.2 and MiniMax-H3; a ``SeqShardSpec``: Cosmos3's DiT and MiniMax-H3's video
+decoder) splits a step's tokens over them; its ``min_tokens`` runs smaller steps copied on every
+rank instead (default 0: every step that can split does). A captured step decides from its
+bucket's size, not its prompt's. A node with a resource whose split steps run eagerly only (a
+ring, ``kv_gather``, a recurrent layer such as Qwen3.5's) never splits a captured step: the
+shard sets its own floor at load, for each walk it splits, one past that walk's largest captured
+bucket (from the node's capture configs, so the same on every rank). A step that fits a bucket
+runs copied in its graph, and a bigger one runs eagerly and splits; ``min_tokens`` only raises that
+floor, as a measured crossover does (Qwen3-Omni's Thinker, whose all_gather split replays in a graph).
+Separately, ``context_parallel: true`` stores a paged pool's K/V by position rather than by
+head: each request's positions split over the ranks that would otherwise hold the same KV
+heads, the TP ranks that share a KV head or the node's SP ranks, which is how a model whose
+attention takes no split steps runs on ``sp_size`` above 1. Raise ``max_num_pages`` by that
+factor to turn the freed memory into context. A node on SP ranks needs at least one of the two.
+
+The sequence shard's ``exchange`` picks how a split step reaches the node's paged attentions,
+from where their KV is stored. ``auto`` (the default; Qwen3-Omni's Thinker and Qwen3.5 default to ``none``) splits by Ulysses over KV stored by head,
+and over KV stored by position runs the node's steps copied (KV capacity alone). Over KV stored by
+position, ``all_gather`` splits them, and ``ring`` also bounds the attention phase's memory to
+this rank's tokens and runs eager only. ``ulysses`` (by head) states the default, and ``none``
+never splits. What every SP rank stores whole takes its own exchange wherever the node splits:
+a sliding-window attention over KV stored by position (whose window layers stay whole on each
+rank, so its decode needs no collective; CPU-tested only) gathers the
+step's keys (``kv_gather``); a recurrent layer's resource (``linear_attn``) takes ``ulysses`` where each TP rank's
+heads split ``sp_size`` ways, and ``state_passing`` where they don't (CPU-tested only, as
+Mamba-2's split is), picked from the model's head counts. A value the node's
+storage can't take fails at load, at any SP size, and so does ``ring`` over an attention backend
+other than ``flashinfer`` (when the engine builds it); ``ring`` beside a ``kv_gather`` attention or
+a recurrent layer fails at load on SP ranks:
+
+.. code-block:: yaml
+
+   resources:
+     kv_cache:
+       context_parallel: true   # store K/V by position over the SP ranks
+     seq_shard:
+       min_tokens: 8192
+       exchange: all_gather     # auto / none / ulysses (by head) / all_gather / ring (by position)
+
+Ragged (cacheless) attentions run Ulysses over the labels the shard lists, whatever ``exchange`` says;
+a shard that never splits (``none``, or ``auto`` over KV stored by position) stops them splitting too.
+
+A step's peak memory is its residents plus the larger of its attention and its MLP or MoE phase,
+so ring lowers it only where attention is the larger, which comes with more SP ranks (about four
+for Qwen3-Omni's Thinker, estimated from its geometry; the measured peaks are in
+:doc:`adding_models`). Chunked prefill stays off on SP ranks.
+**Sequence and context parallelism** in :doc:`adding_models` covers what each combination does,
+how to pick, and what is refused.
 
 A request waits at the head of its pool's queue until its reservation fits beside the
 reservations already admitted. A request behind it starts first when its own pages fit, output
@@ -826,8 +874,10 @@ details.
 **Sequence and guidance parallelism.** ``sp_size`` splits a node's token sequence over
 that many ranks (Ulysses: an all-to-all around attention), and ``cfg_size`` splits its
 classifier-free-guidance branches, each rank running its share of them and the noise
-predictions gathered every step. Each needs the model to declare the node SP- or
-CFG-enabled, and ``cfg_size`` must divide the node's guidance branches (two for Wan2.2).
+predictions gathered every step. ``sp_size`` needs the node to declare a sequence shard
+(``SeqShardSpec``) or place its KV positions over the SP ranks, ``cfg_size`` needs the model to
+declare the node CFG-enabled, and ``cfg_size`` must divide the node's guidance branches (two for
+Wan2.2).
 The axes compose: a group's ``ranks`` form lockstep instances of
 ``cfg_size * sp_size * tp_size`` ranks, laid out ``[cfg][sp][tp]`` (TP on adjacent ranks),
 each instance's ranks listed in ascending order, and the conductor routes each request to

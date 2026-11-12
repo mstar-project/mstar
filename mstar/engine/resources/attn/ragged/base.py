@@ -7,6 +7,7 @@ segments of one packed forward. There is nothing to page, nothing to advance,
 and nothing to carry between steps: the resource holds only planned wrappers.
 """
 
+import functools
 import itertools
 import logging
 import weakref
@@ -30,7 +31,15 @@ from mstar.engine.resources.attn.ragged.config import (
 )
 from mstar.engine.resources.attn.ragged.kernels import RAGGED_ATTENTION, cudnn_rows, kernel_rows
 from mstar.engine.resources.attn.ragged.wrappers import _RaggedPrefillBase
-from mstar.engine.resources.base import AttentionResource, CGSlotKey, EngineResourceInfo
+from mstar.engine.resources.base import AttentionResource, CGSlotKey, EngineResourceInfo, head_shards
+from mstar.engine.resources.sequence_shard import (
+    SeqShardPlan,
+    SequenceShard,
+    check_shard_plan,
+    head_slice,
+    sharded_key_merge,
+    ulysses,
+)
 from mstar.engine.resources.step import BucketKey, Segment, SlotLease, StepContext
 from mstar.kernels.registry import describe_rows
 from mstar.kernels.table import Choice, Rows
@@ -66,10 +75,16 @@ def _build_ragged(
     hand it cuDNN's one row, refused here if cuDNN can't run the geometry."""
     config = spec.config
     joint = info.joint_comm_group
-    if config.shard_over_sp or joint is None:
-        config.shard(info.head_shards)
+    # Ulysses hands each rank 1/(TP x SP) of the heads, whatever the node's KV pools store by (its own
+    # exchange, not theirs); any other ragged attention, or one whose node never splits
+    # (`SeqShardSpec.splits`, so it runs copied), splits them over TP
+    ulysses = (
+        spec.sp_exchange == "ulysses" and spec.shard_key is not None and info.dependency(spec.shard_key).splits
+    )
+    if joint is None:
+        config.shard(1)
     else:
-        config.shard(joint.tp_group.world_size)
+        config.shard(head_shards(joint) if ulysses else joint.tp_group.world_size)
     dtype = config.dtype if config.dtype is not None else info.kv_dtype
     if dtype is None:
         raise ValueError(
@@ -85,9 +100,12 @@ def _build_ragged(
         rows = kernel_rows(config.num_qo_heads, config.num_kv_heads, config.head_dim, dtype, info.device)
         if rows is not None:
             kwargs["kernel_rows"] = rows
-    return manager_cls(
+    manager = manager_cls(
         device=info.device, dtype=dtype, config=config, key=spec.resource_key, **kwargs,
     )
+    manager._shard_key = spec.shard_key
+    manager._ulysses = ulysses
+    return manager
 
 
 def _uses_kernel_table(config: RaggedAttentionConfig) -> bool:
@@ -237,6 +255,12 @@ class _RaggedManagerBase:
     extra constructor args (a workspace, a kernel backend) go in ``_build_wrapper``."""
 
     wrapper_class: type[_RaggedPrefillBase]
+    # the sequence shard over its node (`RaggedAttentionSpec.derive`), and whether this
+    # resource's heads are split over SP for Ulysses; set by `_build_ragged`
+    _shard_key: str | None = None
+    _ulysses = False
+    # the shard, when it can split (`bind_dependencies`)
+    _shard: SequenceShard | None = None
 
     def __init__(
         self,
@@ -269,6 +293,18 @@ class _RaggedManagerBase:
             num_kv_heads=config.num_kv_heads,
             head_dim=config.head_dim,
             sm_scale=config.sm_scale,
+        )
+
+    def depends_on(self) -> set[str]:
+        return set() if self._shard_key is None else {self._shard_key}
+
+    def bind_dependencies(self, resources) -> None:
+        if self._shard_key is None or not resources[self._shard_key].can_split:
+            return
+        self._shard = resources[self._shard_key]
+        logger.info(
+            "%s %r takes split steps over %d SP ranks%s", type(self).__name__, self._key,
+            self._shard.group.world_size, " (Ulysses)" if self._ulysses else "",
         )
 
     @property
@@ -394,7 +430,13 @@ class _RaggedManagerBase:
         # them off, so an undeclared label is unattendable. Clear rather than
         # update, so last step's wrapper can't be attended through by mistake.
         plan_states.clear()
-        self._plan_layouts(step, ctx, plan_states)
+        shard_plan = None
+        if self._shard_key is not None:
+            shard_plan = check_shard_plan(f"ragged attention {self._key!r}", self._shard_key, ctx)
+            if self._shard is None:
+                # one SP rank: nothing splits
+                shard_plan = None
+        self._plan_layouts(step, ctx, plan_states, shard_plan)
 
         self._preplanned = ctx.is_preplan
 
@@ -413,7 +455,16 @@ class _RaggedManagerBase:
         """Real (unpadded) segment count this step planned under ``label``."""
         return self._wrapper(label).num_segments
 
-    def _plan_layouts(self, step, ctx: StepContext, plan_states: dict[str, _RaggedPrefillBase]) -> None:
+    def _plan_layouts(
+        self, step, ctx: StepContext, plan_states: dict[str, _RaggedPrefillBase], shard_plan: SeqShardPlan | None,
+    ) -> None:
+        """Plan each label's wrapper into ``plan_states``, against ``shard_plan`` (this step's split,
+        None at one SP rank) where the node's sequence shard can split."""
+        raise NotImplementedError
+
+    def _exchange(self, label: str) -> Callable | None:
+        """The exchange ``label``'s ``run`` goes through on this step, ``(run, q, k, v)``, read off
+        the shard's current plan (as the paged ``AttentionManager.exchange`` does); None for none."""
         raise NotImplementedError
 
     def _wrapper(self, label: str | None) -> _RaggedPrefillBase:
@@ -448,9 +499,21 @@ class _RaggedManagerBase:
 
     @torch.compiler.disable
     def _run(self, q, k, v, label, return_lse=False):
+        if label is None:
+            label = self._default_label
+        wrapper = self._wrapper(label)
+        exchange = None if self._shard is None else self._exchange(label)
+        if exchange is None:
+            if return_lse:
+                return wrapper.run(q, k, v, return_lse=True)
+            return wrapper.run(q, k, v)
         if return_lse:
-            return self._wrapper(label).run(q, k, v, return_lse=True)
-        return self._wrapper(label).run(q, k, v)
+            raise ValueError(
+                f"ragged attention {self._key!r}: label {label!r} reaches its kernel through an exchange over SP "
+                "ranks this step (a split label, or any label of a Ulysses resource), which returns the "
+                "attention without its log-sum-exp"
+            )
+        return exchange(wrapper.run, q, k, v)
 
 
 def _flashinfer_wrapper(manager, label: str, slot: int, config, **graph_kwargs) -> _RaggedPrefillBase:
@@ -541,11 +604,13 @@ class _RaggedSelfManagerBase(_RaggedManagerBase, RaggedAttnManager):
                     config.num_kv_heads, config.head_dim, str(dtype).removeprefix("torch."),
                     describe_rows(kernel_rows))
 
+    supports_split_steps = True
+
     def plan(self, step: AttentionStep, ctx: StepContext):
         refuse_context_only(step, type(self).__name__)
         super().plan(step, ctx)
 
-    def _plan_layouts(self, step: AttentionStep, ctx: StepContext, plan_states) -> None:
+    def _plan_layouts(self, step: AttentionStep, ctx: StepContext, plan_states, shard_plan) -> None:
         for label, segments in self._group_segments_by_label(step.segments or ()).items():
             cu_seqlens = self._cu_seqlens(segments)
             if self._kernel_rows is None:
@@ -554,6 +619,18 @@ class _RaggedSelfManagerBase(_RaggedManagerBase, RaggedAttnManager):
                 wrapper = self._table_wrapper(ctx.slot_lease, ctx.slot, label, [seg.span for seg in segments], step)
             wrapper.plan(cu_seqlens=cu_seqlens, causal=step.causal)
             plan_states[label] = wrapper
+            if shard_plan is not None and label in shard_plan.ranges and not self._ulysses:
+                raise ValueError(
+                    f"ragged attention {self._key!r} doesn't list label {label!r}, which this step splits over "
+                    "SP ranks: list it in its spec's labels"
+                )
+
+    def _exchange(self, label: str) -> Callable | None:
+        r = self._shard.split_range(label)
+        if r is not None:
+            self._shard.check_scattered(label)
+            return functools.partial(ulysses, r=r)
+        return functools.partial(head_slice, group=self._shard.group) if self._ulysses else None
 
     def _table_wrapper(
         self, lease: SlotLease | None, slot: int, label: str, spans: list[int], step: AttentionStep,
@@ -590,8 +667,16 @@ class _RaggedCrossManagerBase(_RaggedManagerBase, RaggedCrossAttnManager):
     """Cross-attention: each ``(q_label, kv_label)`` pair of the step is one plan,
     run under ``cross_label(q_label, kv_label)``."""
 
-    def _plan_layouts(self, step: RaggedCrossAttentionStep, ctx: StepContext, plan_states) -> None:
+    supports_split_steps = True
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # plan label -> its pair's key label, a fixed fact of the label, for `_exchange`
+        self._kv_labels: dict[str, str] = {}
+
+    def _plan_layouts(self, step: RaggedCrossAttentionStep, ctx: StepContext, plan_states, shard_plan) -> None:
         by_label = self._group_segments_by_label(step.segments or ())
+        split = shard_plan is not None and shard_plan.split
         for q_label, kv_label in step.pairs:
             q_segments, kv_segments = by_label[q_label], by_label[kv_label]
             if [s.request_id for s in q_segments] != [s.request_id for s in kv_segments]:
@@ -600,6 +685,36 @@ class _RaggedCrossManagerBase(_RaggedManagerBase, RaggedCrossAttnManager):
                     "must be declared for the same requests in the same order"
                 )
             label = cross_label(q_label, kv_label)
+            self._kv_labels[label] = kv_label
+            if split:
+                # load refuses this pair for a read declared through the state contract
+                # (`split_read_problems`); a hand-written spec reaches here at its first split step
+                q_range, kv_range = shard_plan.ranges.get(q_label), shard_plan.ranges.get(kv_label)
+                if q_range is not None and kv_range is not None:
+                    raise ValueError(
+                        f"cross-attention {q_label!r} <- {kv_label!r} splits both sides, which no exchange serves"
+                    )
+                if q_range is not None:
+                    # each rank's queries over every key, each replicated; load refuses a packed
+                    # (axis 0) split, so each row keeps ``count`` of its queries
+                    q_segments = [s._replace(span=q_range.count) for s in q_segments]
+                elif kv_range is not None:
+                    kv_segments = [s._replace(span=kv_range.count) for s in kv_segments]
             wrapper = self._wrapper_for(ctx.slot_lease, ctx.slot, label)
             wrapper.plan(self._cu_seqlens(q_segments), self._cu_seqlens(kv_segments))
             plan_states[label] = wrapper
+
+    def _exchange(self, label: str) -> Callable | None:
+        # split queries attend their rank's share locally; split keys merge every rank's partial
+        # (load refuses both split)
+        kv_label = self._kv_labels[label]
+        r = self._shard.split_range(kv_label)
+        if r is None:
+            return None
+        self._shard.check_scattered(kv_label)
+        return functools.partial(_merged_over_keys, r=r)
+
+
+def _merged_over_keys(run, q, k, v, r):
+    """``sharded_key_merge`` over a ragged wrapper's ``run``, asked for its log-sum-exp."""
+    return sharded_key_merge(functools.partial(run, return_lse=True), q, k, v, r)
