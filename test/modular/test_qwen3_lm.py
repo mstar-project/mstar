@@ -229,6 +229,14 @@ def test_layer_stack_runs_one_compiled_frame_per_layer_besides_attention(dynamo_
     assert extra <= 2 * (dynamo_counts(one_layer, x).graph_calls + 1)
 
 
+def test_an_attention_on_its_array_compiles_only_the_frames_around_its_state_op(dynamo_counts):
+    """``one_layer`` compiles as two frames around `_next_step`, and the attention's forward as two around its state
+    op. Its graph and resume counts stay the same with a helper method between the two, so only the frames show it."""
+    _, one_layer = _frames_on_its_array(2)
+    compiles = dynamo_counts(one_layer, torch.randn(3, TINY["hidden_size"])).compiles
+    assert compiles <= 4, f"{compiles} frames compiled for one layer, against 4"
+
+
 def test_an_empty_layer_stack_is_the_final_norm():
     from mstar.model.components import RMSNorm
     from mstar.model.components.decoder_layer import run_layers
