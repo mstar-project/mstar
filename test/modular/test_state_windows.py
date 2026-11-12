@@ -17,10 +17,22 @@ import pytest
 import torch
 from torch._dynamo.testing import CompileCounter
 
+from mstar.communication.tensors import LocalTransferEngine
 from mstar.engine.resources.attn.config import AttentionConfig, AttentionStep, AttnBackend
 from mstar.engine.resources.base import EngineResourceInfo
-from mstar.engine.resources.kv.config import RingKVConfig, RingKVLayerConfig, RingKVStep
+from mstar.engine.resources.kv.config import (
+    KVReqConfig,
+    KVStep,
+    PagedKVConfig,
+    RetentionPolicy,
+    RingKVConfig,
+    RingKVLayerConfig,
+    RingKVStep,
+)
+from mstar.engine.resources.kv.manager import KVManager
+from mstar.engine.resources.kv.plan import kept_reach
 from mstar.engine.resources.kv.ring import RingKVManager
+from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.step import Segment, StepContext, SubmoduleStep
 from mstar.engine.state import (
     Array,
@@ -50,7 +62,7 @@ from mstar.engine.state.adapters import RingHandle, build_specs, kv_layouts, nod
 from mstar.engine.state.analysis import state_declaration_problems
 from mstar.engine.state.calls import kernel_setting
 from mstar.graph.base import GraphNode, Loop
-from mstar.model.base import KVLabel, PrefixKeys
+from mstar.model.base import KVLabel, LabelLayout, PrefixKeys
 from mstar.model.rebuild import RebuildPolicy
 from mstar.model.submodule_base import ChunkingPolicy
 
@@ -441,3 +453,161 @@ def test_a_ring_refuses_the_calls_it_cannot_run(call, message):
     _ring_step(handle, ring)
     with pytest.raises(ValueError, match=f"Array 'kv': {message}"):
         call(handle, torch.ones(1, TPF, HEADS, DIM))
+
+
+# An exact retention, and the reach of a stream's view
+
+
+def _pool(page_size=8, pages=64) -> KVManager:
+    """A CPU pool of one layer of one head of one value, whose entries can hold their log positions."""
+    cfg = PagedKVConfig(
+        num_layers=1, num_kv_heads=1, head_dim=1, max_seq_len=pages * page_size, max_num_pages=pages,
+        page_size=page_size,
+    )
+    return KVManager(
+        cfg=cfg, name="kv", joint_comm_group=None,
+        transfer_engine_info=TransferEngineInfo("h", "h", LocalTransferEngine("h")), device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+
+
+def _open_exact(pool: KVManager, rid: str, sink: int, window: int, exact=True) -> None:
+    """Ingest ``rid`` with a layout whose retention keeps ``sink`` and ``window``, through the wire's rows."""
+    layout = LabelLayout(growth=(("rollout", 1),), retention=RetentionPolicy(window, sink, exact=exact))
+    request = KVReqConfig(needed_labels=["main"])
+    request.apply_conductor_config(kv_layout={"main": layout.row()}, loop_caps={"rollout": 10_000})
+    pool.ingest_request(rid, overrides=request)
+
+
+def _write_step(pool: KVManager, rid: str, start: int, span: int, reached=None) -> None:
+    """One kept step of ``span`` entries holding their log positions. ``reached`` gets the positions the step's
+    kept-window read gathers, after its add."""
+    step = KVStep(segments=(Segment(rid, "main", span),))
+    ctx = StepContext(request_ids=(rid,), graph_walk="rollout", slot=0, capture=False)
+    assert pool.admit(step, ctx).ok
+    (view,) = pool.plan(step, ctx)["main"].views
+    pool.write_kv(*([torch.arange(start, start + span, dtype=torch.float32)[:, None, None]] * 2), layer_idx=0,
+                  label="main")
+    if reached is not None:
+        slots = kept_reach(view, pool.config.tokens_per_page)
+        reached.append(pool.layer_view(0)[slots.pages, 0, slots.offsets, 0, 0].long().tolist())
+    pool.commit(step, ctx)
+
+
+def _held(pool: KVManager, rid: str) -> list[int]:
+    """The log positions ``rid``'s stream still holds."""
+    stream, page, view = pool._streams[rid]["main"], pool.config.tokens_per_page, pool.layer_view(0)
+    return [int(view[stream.page_indices[i // page], 0, i % page, 0, 0]) for i in range(stream.stored_len)]
+
+
+def test_an_exact_retention_keeps_the_whole_window():
+    """A sink of 3 ends inside the first page of 8, which the release keeps whole. Counting the page's other entries
+    against the budget, as a plain retention does, frees the oldest of the window's 8 at 20 entries."""
+    pool = _pool()
+    _open_exact(pool, "a", sink=3, window=8)
+    for start in range(0, 40, 4):
+        _write_step(pool, "a", start, 4)
+        held = set(_held(pool, "a"))
+        written = start + 4
+        assert {0, 1, 2} <= held, "the sink should stay"
+        assert set(range(max(0, written - 8), written)) <= held, f"the window should stay whole at {written} entries"
+
+
+def test_max_pages_counts_what_an_exact_stream_holds():
+    """Prefix 1, page 128 and budget 128: the exact stream keeps its first page whole and 128 entries behind it,
+    which a commit can leave straddling two more pages."""
+    assert RetentionPolicy(128, 1, exact=True).max_pages(128) == 3
+    pool = _pool(page_size=128, pages=8)
+    _open_exact(pool, "a", sink=1, window=128)
+    peak = 0
+    for start in range(0, 1024, 64):
+        _write_step(pool, "a", start, 64)
+        peak = max(peak, len(pool._streams["a"]["main"].page_indices))
+    assert peak == 3, "the stream should peak at what max_pages counts"
+
+
+def test_an_exact_retention_waits_for_its_prefix():
+    """LingBot's first chunk at 464x832 commits 6032 entries under a 9048-entry sink. Until the sink is committed
+    nothing past it exists, and the policy can't be adopted."""
+    pool = _pool(page_size=128, pages=256)
+    _open_exact(pool, "a", sink=9048, window=12064)
+    for chunk in range(6):
+        _write_step(pool, "a", chunk * 6032, 6032)
+    assert pool._streams["a"]["main"].protected_prefix == 9048, "the policy should be adopted once the sink is in"
+
+
+def test_exact_retention_applies_from_the_layout_at_commit():
+    """The step declares no retention: the commit takes the request's from its layout."""
+    pool = _pool()
+    _open_exact(pool, "a", sink=3, window=8)
+    for start in range(0, 40, 4):
+        _write_step(pool, "a", start, 4)
+    assert pool._streams["a"]["main"].released > 0, "the layout's policy should have released the oldest pages"
+
+
+def test_the_fast_path_takes_every_row_of_a_step_with_no_exact_request():
+    """A request with an exact policy costs another request one membership test, and not the fast path."""
+    pool = _pool()
+    _open_exact(pool, "a", sink=3, window=8)
+    pool.ingest_request("b", overrides=KVReqConfig(needed_labels=["main"]))
+    arena, fast = pool._arena, []
+
+    class _Recording:
+        def __getattr__(self, name):
+            return getattr(arena, name)
+
+        def commit_rows(self, *args):
+            fast.append(args[1])
+            return arena.commit_rows(*args)
+
+    pool._arena = _Recording()
+    _write_step(pool, "b", 0, 4)
+    _write_step(pool, "a", 0, 4)
+    assert [[segment.request_id for segment in rows] for rows in fast] == [["b"]], (
+        "only the step with no exact request should take the fast path"
+    )
+
+
+def test_the_exact_flag_survives_the_wire():
+    policy = RetentionPolicy(12064, 9048, exact=True)
+    request = KVReqConfig(needed_labels=["main"])
+    request.apply_conductor_config(kv_layout={"main": LabelLayout(retention=policy).row()})
+    assert request.kv_layout["main"].retention == policy
+
+
+@pytest.mark.parametrize("page_size", [16, 128])
+def test_the_reach_maps_through_released_pages(page_size):
+    """Against the dense reference: the first ``sink`` log positions, the last ``window`` the stream kept before the
+    step, and the step's own, over 40 commits of uneven spans, while the pool releases pages behind the sink."""
+    sink, window = 2 * page_size + 5, 3 * page_size + 7
+    pool = _pool(page_size=page_size, pages=64)
+    _open_exact(pool, "a", sink=sink, window=window)
+    reached, start = [], 0
+    for step in range(40):
+        span = 1 + (7 * step) % (page_size // 2)
+        _write_step(pool, "a", start, span, reached)
+        expected = [*range(min(sink, start)), *range(max(sink, start - window), start), *range(start, start + span)]
+        assert reached[-1] == sorted(set(expected)), f"commit {step} reached other entries"
+        start += span
+
+
+def test_other_streams_carry_no_retention_on_their_views():
+    pool = _pool()
+    _open_exact(pool, "a", sink=3, window=8)
+    _open_exact(pool, "b", sink=3, window=8, exact=False)
+    pool.ingest_request("c", overrides=KVReqConfig(needed_labels=["main"]))
+    step = KVStep(segments=tuple(Segment(rid, "main", 4) for rid in "abc"))
+    ctx = StepContext(request_ids=("a", "b", "c"), graph_walk="rollout", slot=0, capture=False)
+    assert pool.admit(step, ctx).ok
+    views = pool.plan(step, ctx)["main"].views
+    assert [view.retention for view in views] == [RetentionPolicy(8, 3, exact=True), None, None]
+
+
+def test_a_removed_request_leaves_the_exact_set():
+    """A handle comes back for another request, which would inherit the policy."""
+    pool = _pool()
+    _open_exact(pool, "a", sink=3, window=8)
+    pool.reset_request("a")
+    assert "a" in pool._exact, "a reset keeps the request's layout, and so its policy"
+    pool.remove_request("a")
+    assert "a" not in pool._exact
