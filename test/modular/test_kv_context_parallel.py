@@ -332,12 +332,13 @@ def test_attention_over_a_placed_pool_that_cant_plan_it_is_refused_at_load(kv, a
 def test_a_node_that_splits_its_steps_refuses_a_resource_that_cant_take_them(kind, tmp_path, monkeypatch):
     """Qwen3.5's recurrent state holds no split strategy, nor does block-causal attention (its
     builder sets no sequence shard): a node splitting its steps over SP ranks can't own one."""
+    from mstar.engine.state.adapters import StateSetup
     from mstar.model.base import enabled_resources
 
     groups = _sp_groups(NODE)
     if kind == "recurrent_state":
         # what a deployment without a `lora:` block builds
-        specs = enabled_resources(_qwen3_5(NODE, {}, tmp_path, monkeypatch), {})
+        specs = enabled_resources(_qwen3_5(NODE, {}, tmp_path, monkeypatch), {}, StateSetup())
         apply_yaml_overrides(specs, {"resources": {KV_CACHE: {"max_num_pages": 8}, GDN_STATE: {"max_slots": 4}}})
     else:
         specs = [

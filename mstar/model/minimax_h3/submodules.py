@@ -23,7 +23,6 @@ from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.distributed.communication import CommGroup
 from mstar.engine.state import ArrayStep, Segment, SubmoduleStep
 from mstar.model.components.batched_rows import BatchedRows
 from mstar.model.components.diffusion.attention import FrameSDPA, sdpa_attention
@@ -50,6 +49,7 @@ from mstar.model.minimax_h3.components.transformer import (
 from mstar.model.minimax_h3.config import (
     AUDIO_CHANNELS,
     DIT_ROWS,
+    DIT_SHARD,
     KEYFRAME_ENCODE_SEED,
     KEYFRAME_NOISE_AUG,
     NUM_MODALITIES,
@@ -249,11 +249,7 @@ class H3DenoiseSubmodule(DenoiseLoopSubmodule):
         self.transformer = transformer
         self.config = config
         self.compiled = bool(compile_blocks)
-        sp_group = getattr(transformer, "sp_group", None)
-        # The packed rows pad up to a multiple of this, as a tail segment of their own: the
-        # compiled blocks see one shape per bucket rather than per prompt length, and the rows
-        # split evenly over the SP ranks, which keeps the exchanges on their copy-free path.
-        self.row_multiple = math.lcm(int(row_bucket), sp_group.world_size if sp_group is not None else 1)
+        self.row_bucket = int(row_bucket)
         if compile_blocks and transformer is not None:
             # around the attention and the exchanges, static per row bucket: each new bucket
             # compiles once (5-8 s), and a step then runs the same kernels, at static speed, whatever
@@ -304,7 +300,7 @@ class H3DenoiseSubmodule(DenoiseLoopSubmodule):
         compiled blocks see one shape per bucket rather than per prompt length, and the rows
         split evenly over the sequence shard's SP ranks, which keeps the exchanges on their
         copy-free path."""
-        shard = self.node_resources.get(self.shard_resource_key) if self.shard_resource_key else None
+        shard = self.node_resources.get(DIT_SHARD)
         return math.lcm(self.row_bucket, 1 if shard is None else shard.group.world_size)
 
     def padded_rows(self, bucket_key: H3Layout) -> int:
@@ -370,7 +366,7 @@ class H3DenoiseSubmodule(DenoiseLoopSubmodule):
         else:
             timesteps = torch.stack([timestep, audio_timestep, cond_timestep], dim=-1).float()
         inputs = H3Inputs(video=latents, audio=audio_latents, text=text_embeds, timesteps=timesteps)
-        video_v, audio_v = self.transformer(inputs, layout)
+        video_v, audio_v = self.transformer(inputs, layout, shard=self.node_resources.get(DIT_SHARD))
         generated = h3_step(latents[:, n:], video_v[:, n:], timestep.view(-1, 1, 1), sigma, sigma_next)
         return {
             LATENTS: torch.cat([latents[:, :n], generated], dim=1) if n else generated,

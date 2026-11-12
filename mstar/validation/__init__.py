@@ -161,11 +161,17 @@ def validate_deployment(
             # a `resources:` block check_resources refuses turns no resource on
             specs = enabled_resources(model, config if resources_readable else {**config, "resources": None}, setup)
             if resources_readable:
-                head_shards = {} if deployment is None else {
-                    node: graph.tp_size * graph.sp_size for graph in deployment.worker_graphs if graph.sp_size > 1
+                sp_nodes = set() if deployment is None else {
+                    node for graph in deployment.worker_graphs if graph.sp_size > 1
                     for node in graph.section.get_nodes()
                 }
-                problems += deployment_problems(model, config.get("resources") or {}, head_shards=head_shards)
+                split = {
+                    node: spec.labels for spec in specs if spec.splits_steps for node in spec.nodes & sp_nodes
+                }
+                sdpa_reads = [read for read, binding in setup.by_read.items() if not binding.plans]
+                problems += deployment_problems(
+                    model, config.get("resources") or {}, sdpa_reads=sdpa_reads, split=split,
+                )
     except (ValueError, OSError) as e:
         problems.append(
             f"declaring the node resources failed: {type(e).__name__}: {e}; "

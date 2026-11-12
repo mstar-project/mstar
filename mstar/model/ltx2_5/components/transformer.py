@@ -25,7 +25,6 @@ import torch
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
-from mstar.model.components.distributed.sequence_parallel import SeqParallel, sp_seq_split
 from mstar.model.components.norm import rms_norm_no_weight
 from mstar.model.ltx2_5.components.layers import (
     GatedAttention,

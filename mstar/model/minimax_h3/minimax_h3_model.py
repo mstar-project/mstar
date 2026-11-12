@@ -26,6 +26,7 @@ import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.distributed.base import ShardingConfig
+from mstar.engine.resources import NodeResourceSpec, SeqShardSpec
 from mstar.engine.state import Array, Attend, Block, Read
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Parallel, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
@@ -43,6 +44,7 @@ from mstar.model.minimax_h3.config import (
     DIT_ATTN,
     DIT_NODE,
     DIT_ROWS,
+    DIT_SHARD,
     FPS,
     H3_REPO,
     MAX_DURATION,
@@ -236,7 +238,6 @@ class H3Model(Model):
         return [
             Array(
                 DIT_ROWS, nodes={DIT_NODE}, layers=frozenset(range(t.num_layers)), entry=entry, max_len=0,
-                seq_sharded=True,
                 reads={DIT_ATTN: Read(mask=Block(), op=Attend(q_heads=heads), packed=False, segmented=True)},
             ),
             Array(
@@ -249,6 +250,19 @@ class H3Model(Model):
     def kernel_settings(self) -> dict[str, dict[str, Any]]:
         # the DiT's two segments are a request's rows and their padding
         return {DIT_ATTN: {"max_segments_per_request": 2, "workspace_mb": 128}, REFINER_ATTN: {"workspace_mb": 128}}
+
+    def get_node_resources(self) -> list[NodeResourceSpec]:
+        """The sequence shards. On SP ranks the DiT's splits the packed rows (one row a step, so ``axis`` 0), which
+        its attention exchanges for heads (Ulysses); on SDPA it can't run there. The video decoder's splits each
+        request's clips, which nothing exchanges (``exchanges=False``); every request of a decoder batch is one
+        layout, so one clip count (``axis`` 1)."""
+        return [
+            SeqShardSpec(resource_key=DIT_SHARD, nodes={DIT_NODE}, labels=(H3DenoiseSubmodule.MAIN_SPAN,), axis=0),
+            SeqShardSpec(
+                resource_key=VAE_SHARD, nodes={VAE_DECODER_NODE}, labels=(H3VideoDecoderSubmodule.CLIPS,), axis=1,
+                exchanges=False,
+            ),
+        ]
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         def text_node(*inputs: str) -> GraphNode:
@@ -624,7 +638,7 @@ class H3Model(Model):
             return H3VaeEncoderSubmodule(weight_loader.build_keyframe_encoder(config, snapshot, device))
         if node_name == DIT_NODE:
             return H3DenoiseSubmodule(
-                weight_loader.build_transformer(config, snapshot, device, comm_group=tp_group, sp_group=sp_group),
+                weight_loader.build_transformer(config, snapshot, device, comm_group=tp_group),
                 config, loop_name=DENOISE_LOOP,
                 max_batch_size=1, compile_blocks=self.compile, row_bucket=self.row_bucket,
             )

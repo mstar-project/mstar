@@ -889,10 +889,7 @@ class Engine:
                 region_ladders=(region_ladders or {}).get(node_name) or {},
             )
             submodule.bind_node_resources(resources)
-            handles = {} if model is None else node_handles(
-                model, node_name, resources, sp_group=parallel_groups.get_joint_group_for_node(node_name).sp_group,
-                setup=self._state_setup,
-            )
+            handles = {} if model is None else node_handles(model, node_name, resources, setup=self._state_setup)
             if handles:
                 bind_state_ops(handles)
                 submodule.bind_node_state(handles)

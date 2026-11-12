@@ -29,6 +29,7 @@ from mstar.model.components.batched_rows import BatchedRows
 from mstar.model.components.diffusion.compile_utils import compile_transformer_forward, with_inductor_rounding
 from mstar.model.components.diffusion.denoise_loop import DenoiseLoopSubmodule
 from mstar.model.components.diffusion.flow_match import FlowMatchSchedule, euler_step
+from mstar.model.ltx2_5.components.layers import RotaryTable
 from mstar.model.ltx2_5.components.transformer import build_rope
 from mstar.model.ltx2_5.config import (
     AUDIO,
@@ -41,6 +42,7 @@ from mstar.model.ltx2_5.config import (
     TEXT_SPAN,
     VIDEO,
     VIDEO_FOR_AUDIO,
+    VIDEO_SHARD,
     VIDEO_SPAN,
     LTX25Config,
 )
@@ -314,8 +316,7 @@ class LTXDenoiseSubmodule(DenoiseLoopSubmodule):
             video, *tables = shard.scatter(VIDEO_SPAN, latents, *rope.video, *rope.cross_video)
             rope = rope._replace(video=RotaryTable(*tables[:2]), cross_video=RotaryTable(*tables[2:]))
         velocity, audio_velocity = self.transformer(
-            latents.to(dtype), audio_latents.to(dtype), text_video, text_audio, timestep,
-            self.layout(bucket_key, latents.device),
+            video.to(dtype), audio_latents.to(dtype), text_video, text_audio, timestep, rope,
         )
         if shard is not None:
             velocity = shard.gather(VIDEO_SPAN, velocity)

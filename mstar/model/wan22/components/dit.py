@@ -41,8 +41,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from mstar.distributed.communication import CommGroup
 from mstar.model.components.diffusion.attention import attend
+from mstar.model.components.diffusion.denoise_loop import MAIN_SPAN
 from mstar.model.components.diffusion.ffn import gelu_tanh_ffn
 from mstar.model.components.diffusion.modulation import ada_layer_norm
 from mstar.model.components.diffusion.qk_norm_rope import rms_norm_rope
@@ -296,13 +296,14 @@ class Wan22DiT(nn.Module):
     ``weight_loader.build_wan22_dit`` (meta -> ``cast_serving_dtypes`` ->
     ``to_empty(device)`` -> checkpoint load).
 
-    ``sp_group`` runs it under Ulysses sequence parallelism: each rank keeps a
-    contiguous slice of the post-patchify tokens, the self-attention's array
-    exchanges them around the kernel, and the slices are gathered before unpatchify."""
+    Under sequence parallelism the node's sequence shard (``forward``'s
+    ``shard``) splits each row's post-patchify tokens: this rank's blocks run
+    on its contiguous share, the self-attention's resource trades them for
+    heads around the kernel (Ulysses), and the shares are gathered before
+    unpatchify."""
 
     def __init__(self, config: Wan22Config):
         super().__init__()
-        self.sp_group = sp_group or CommGroup.trivial()
         if config.qk_norm != "rms_norm_across_heads" or not config.cross_attn_norm:
             # These two config facts are baked into Wan22DiTAttention /
             # Wan22DiTBlock (across-heads q/k RMSNorm, affine norm2 before
@@ -351,12 +352,16 @@ class Wan22DiT(nn.Module):
         hidden_states: torch.Tensor,
         timestep: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
+        shard=None,
     ) -> torch.Tensor:
         """``hidden_states`` ``[B, C, F, H, W]`` (bf16 latents), ``timestep``
         ``[B, F // p_t]`` per post-patch frame (``expand_timesteps``: each
         token takes its frame's value), text embeds ``[B, 512, text_dim]``
         bf16. Returns ``[B, C_out, F, H, W]`` bf16. The self-attention reads the
-        array bound to it, and the cross-attention always runs SDPA."""
+        array bound to it, and the cross-attention always runs SDPA.
+        ``shard``: the node's sequence shard (``SequenceShard``), which on a
+        step it splits cuts each row's tokens (label ``MAIN_SPAN``) to this
+        rank's share; the self-attention's resource then exchanges them."""
         batch_size, _, num_frames, height, width = hidden_states.shape
         p_t, p_h, p_w = self.config.patch_size
         grid = (num_frames // p_t, height // p_h, width // p_w)
@@ -369,18 +374,12 @@ class Wan22DiT(nn.Module):
         hidden_states = self.patch_embedding(hidden_states)
         hidden_states = hidden_states.flatten(2).transpose(1, 2)
 
-        # every per-token tensor is cut to this rank's tokens (a no-op on one rank)
-        sizes = sp_seq_split(hidden_states.shape[1], self.sp_group.world_size)
-        sp = SeqParallel(self.sp_group, sizes)
-        if self.sp_group.world_size > 1:
-            # a rank's tokens need not be whole frames, so it modulates per run of
-            # tokens: the longest run that tiles a frame and every rank's share
-            per_frame = hidden_states.shape[1] // grid[0]
-            run = math.gcd(per_frame, *sizes)
-            runs = SeqParallel(self.sp_group, [n // run for n in sizes])
-            timestep = runs.scatter(timestep.repeat_interleave(per_frame // run, dim=1))
-        hidden_states = sp.scatter(hidden_states)
-        rotary_emb = tuple(sp.scatter(t, dim=0) for t in rotary_emb)  # [S, D] tables
+        # every per-token tensor is cut to this rank's tokens on a step the shard splits
+        # `can_split` is fixed at bind: at one SP rank a compiled forward traces straight through
+        if shard is not None and shard.can_split:
+            timestep = _token_runs(shard, timestep, hidden_states.shape[1] // grid[0])
+            hidden_states = shard.scatter(MAIN_SPAN, hidden_states)
+            rotary_emb = shard.scatter(MAIN_SPAN, *rotary_emb, dim=0)  # [S, D] tables
 
         temb, timestep_proj, encoder_hidden_states = self.condition_embedder(
             timestep, encoder_hidden_states

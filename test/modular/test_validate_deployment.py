@@ -329,7 +329,8 @@ def _attention(nodes=("llm",)) -> AttentionSpec:
 
 
 def _ulysses(heads: int) -> RaggedAttentionSpec:
-    return RaggedAttentionSpec("ragged", {"llm"}, RaggedAttentionConfig(heads, heads, 8), sp_exchange="ulysses")
+    # over the label the shard splits, so it attends it by Ulysses
+    return RaggedAttentionSpec("ragged", {"llm"}, RaggedAttentionConfig(heads, heads, 8), labels={"main"})
 
 
 def _cross() -> RaggedCrossAttentionSpec:
@@ -361,7 +362,8 @@ def test_a_kv_placement_the_node_cannot_take_is_refused(model, group, kv, patter
      r"node_groups\[0\]: node 'llm' splits tokens over 2 SP ranks, and KV 'kv' stores them by position "
      r"\(context_parallel\), which split steps don't support yet"),
     ([_shard(), _ulysses(heads=3)], dict(sp_size=2), {},
-     r"node_groups\[0\]: ragged attention 'ragged' declares sp_exchange 'ulysses', and its 3 query and 3 KV heads "
+     r"node_groups\[0\]: ragged attention 'ragged' attends labels its sequence shard splits \(Ulysses\), and its 3 "
+     r"query and 3 KV heads "
      r"don't split over 1 TP x 2 SP ranks"),
     # a packed split can leave a rank none of a row's queries or keys
     ([_shard(), _attention(), _cross()], dict(sp_size=2), {},

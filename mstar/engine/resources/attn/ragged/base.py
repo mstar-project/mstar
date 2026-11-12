@@ -300,7 +300,7 @@ class _RaggedManagerBase:
         self._shard = resources[self._shard_key]
         logger.info(
             "%s %r takes split steps over %d SP ranks%s", type(self).__name__, self._key,
-            self._shard.group.world_size, " (sp_exchange ulysses)" if self._ulysses else "",
+            self._shard.group.world_size, " (Ulysses)" if self._ulysses else "",
         )
 
     @property
@@ -506,7 +506,7 @@ class _RaggedManagerBase:
         if return_lse:
             raise ValueError(
                 f"ragged attention {self._key!r}: label {label!r} reaches its kernel through an exchange over SP "
-                "ranks this step (a split label, or any label of an sp_exchange resource), which returns the "
+                "ranks this step (a split label, or any label of a Ulysses resource), which returns the "
                 "attention without its log-sum-exp"
             )
         return exchange(wrapper.run, q, k, v)
@@ -617,8 +617,8 @@ class _RaggedSelfManagerBase(_RaggedManagerBase, RaggedAttnManager):
             plan_states[label] = wrapper
             if shard_plan is not None and label in shard_plan.ranges and not self._ulysses:
                 raise ValueError(
-                    f"ragged attention {self._key!r} has no sp_exchange, and this step splits its "
-                    f"label {label!r} over SP ranks: declare sp_exchange='ulysses' on its spec"
+                    f"ragged attention {self._key!r} doesn't list label {label!r}, which this step splits over "
+                    "SP ranks: list it in its spec's labels"
                 )
 
     def _exchange(self, label: str) -> Callable | None:

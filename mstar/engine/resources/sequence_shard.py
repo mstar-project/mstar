@@ -13,7 +13,7 @@ split label's tokens, or a copied label's at the node's head geometry. The excha
 functions at the bottom of this module, each wrapped around the resource's own ``run``:
 
 - ``ulysses``: one all-to-all from tokens to heads, ``run``, and one back (head-stored KV, or a
-  cacheless attention declaring ``sp_exchange="ulysses"``); a splitting node can't yet store KV
+  cacheless attention whose ``labels`` the shard lists); a splitting node can't yet store KV
   by position (``context_parallel``);
 - ``head_slice``: a copied step at a ``tp * sp`` head geometry: this rank's heads, ``run``, gather
   the heads;
@@ -527,7 +527,8 @@ def sequence_parallel_refusals(
     if shard.exchanges and not attends:
         refusals.append(
             f"node {node!r} splits tokens (SeqShardSpec {shard.resource_key!r}) but declares no attention that "
-            "can take them: a paged AttentionSpec, or a RaggedAttentionSpec with sp_exchange"
+            "can take them: a paged AttentionSpec, or a RaggedAttentionSpec over a label it splits (on the ragged "
+            "resource, not backend: sdpa)"
         )
     if not shard.exchanges and attends:
         refusals.append(

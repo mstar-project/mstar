@@ -4,7 +4,7 @@ Kept free of the manager and its kernels, like the other resources' configs, so
 a submodule can declare a step without pulling FlashInfer in behind it.
 """
 
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Literal
@@ -191,23 +191,30 @@ class _RaggedSpecBase(NodeResourceSpec):
 class RaggedAttentionSpec(_RaggedSpecBase):
     """Cacheless self-attention within each declared span (``AttentionStep``).
 
-    ``sp_exchange="ulysses"`` attends a label its node's sequence shard splits by Ulysses (one
-    all-to-all from split tokens to split heads, and back), and shards heads over every TP and SP
-    rank, slicing them on a copied step. None (the default) attends only copied labels, heads over
-    TP. A no-op on a node with no ``SeqShardSpec``. On SP ranks every label of an ``sp_exchange``
-    resource goes through an exchange, so ``run(..., return_lse=True)`` raises there."""
+    ``labels`` are the labels its plans run under that may split; the state contract fills them from the arrays it
+    reads. Where its node's sequence shard lists one of them, the resource attends a split step's label by Ulysses
+    (one all-to-all from split tokens to split heads, and back) and shards heads over every TP and SP rank, slicing
+    them on a copied step (``sp_exchange`` "ulysses", derived); otherwise it attends only copied labels, heads over
+    TP. On SP ranks every label of a Ulysses resource goes through an exchange, so ``run(..., return_lse=True)``
+    raises there."""
 
-    sp_exchange: Literal["ulysses"] | None = None
+    labels: Collection[str] = field(default=frozenset(), kw_only=True)
+    # how a split label's tokens reach the heads, from ``labels`` and the node's sequence shard (`derive`)
+    sp_exchange: Literal["ulysses"] | None = field(default=None, init=False)
 
     def __post_init__(self):
         super().__post_init__()
-        if self.sp_exchange not in (None, "ulysses"):
-            raise ValueError(f"sp_exchange must be 'ulysses' or None, not {self.sp_exchange!r}")
+        if isinstance(self.labels, str):
+            raise ValueError(f"ragged attention {self.resource_key!r}: labels is a collection, not a string")
+        self.labels = frozenset(self.labels)
 
     def derive(self, specs: Mapping[str, NodeResourceSpec]) -> list[str]:
         from mstar.engine.resources.sequence_shard import take_shard_edge
 
-        return take_shard_edge(self, specs)
+        problems = take_shard_edge(self, specs)
+        split = self.shard_key is not None and self.labels & set(specs[self.shard_key].labels)
+        self.sp_exchange = "ulysses" if split else None
+        return problems
 
     @property
     def attends_split_steps(self) -> bool:
@@ -218,8 +225,8 @@ class RaggedAttentionSpec(_RaggedSpecBase):
         q, kv = cfg._unsharded_qo_heads, cfg._unsharded_kv_heads
         if self.sp_exchange == "ulysses" and (q % (tp * sp) or kv % (tp * sp)):
             return [
-                f"ragged attention {self.resource_key!r} declares sp_exchange 'ulysses', and its {q} query and "
-                f"{kv} KV heads don't split over {tp} TP x {sp} SP ranks"
+                f"ragged attention {self.resource_key!r} attends labels its sequence shard splits (Ulysses), and "
+                f"its {q} query and {kv} KV heads don't split over {tp} TP x {sp} SP ranks"
             ]
         return []
 

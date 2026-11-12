@@ -35,6 +35,7 @@ import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.distributed.base import ShardingConfig
+from mstar.engine.resources import NodeResourceSpec, SeqShardSpec
 from mstar.engine.state import Array, Attend, Block, Read
 from mstar.graph.base import (
     GraphEdge,
@@ -49,7 +50,7 @@ from mstar.model.base import Model, WalkStep
 from mstar.model.components.diffusion.attention import dit_entry, refuse_attention_backend_kwarg
 from mstar.model.components.video_encode import encode_mp4
 from mstar.model.submodule_base import NodeSubmodule
-from mstar.model.wan22.config import DIT_TOKENS, SELF_ATTN, WAN22_VARIANT_TI2V_5B, Wan22Config
+from mstar.model.wan22.config import DIT_SHARD, DIT_TOKENS, SELF_ATTN, WAN22_VARIANT_TI2V_5B, Wan22Config
 from mstar.model.wan22.submodules import (
     DENOISE_LOOP_NAME,
     Wan22DitSubmodule,
@@ -147,15 +148,22 @@ class Wan22Model(Model):
         """
         c = self.config
         return [Array(
-            DIT_TOKENS, nodes={"dit"}, layers=frozenset(range(c.num_layers)), max_len=0, seq_sharded=True,
+            DIT_TOKENS, nodes={"dit"}, layers=frozenset(range(c.num_layers)), max_len=0,
             entry=dit_entry(c.num_attention_heads, c.attention_head_dim),
             reads={SELF_ATTN: Read(mask=Block(), op=Attend(q_heads=c.num_attention_heads), packed=False)},
         )]
 
     def kernel_settings(self) -> dict[str, dict[str, Any]]:
         # one segment per guidance branch; the DiT is compiled, not captured, so attention stays in its graph (under
-        # SP, the fragment between the all-to-all breaks)
+        # SP the op runs the exchange inside it)
         return {SELF_ATTN: {"max_segments_per_request": Wan22DitSubmodule.CFG_BRANCHES, "compile_op": True}}
+
+    def get_node_resources(self) -> list[NodeResourceSpec]:
+        """The DiT's sequence shard, which on SP ranks splits each row's tokens: the self-attention exchanges them
+        for heads (Ulysses), and the cross-attention over the text attends a rank's share of them. Every row of a
+        step is one length (a bucket's), so each row splits alike (``axis`` 1). On SDPA the self-attention can't run
+        on SP ranks."""
+        return [SeqShardSpec(resource_key=DIT_SHARD, nodes={"dit"}, labels=(Wan22DitSubmodule.MAIN_SPAN,), axis=1)]
 
     def get_default_sharding_config(self) -> ShardingConfig:
         # The dit's two guidance branches split over cfg_size ranks, which

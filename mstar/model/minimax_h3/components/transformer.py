@@ -24,12 +24,12 @@ from torch import nn
 
 from mstar.distributed.communication import CommGroup
 from mstar.model.components.diffusion.attention import attend
+from mstar.model.components.diffusion.denoise_loop import MAIN_SPAN
 from mstar.model.components.distributed.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
 )
-from mstar.model.components.distributed.sequence_parallel import gather_sequence, sp_seq_split
 from mstar.model.minimax_h3.components.qk_norm_rope import qk_norm_rope
 from mstar.model.minimax_h3.config import DIT_ROWS, NUM_MODALITIES, PROMPT_ROWS, H3TransformerConfig
 
@@ -256,21 +256,6 @@ class H3FinalLayer(nn.Module):
         return h.to(self.video_out.weight.dtype)
 
 
-class SeqParallel(NamedTuple):
-    """Ulysses over the packed rows: ``sizes`` is each rank's share of them."""
-
-    group: CommGroup
-    sizes: list[int]
-
-    @property
-    def start(self) -> int:
-        return sum(self.sizes[: self.group.rank])
-
-    @property
-    def count(self) -> int:
-        return self.sizes[self.group.rank]
-
-
 class H3Inputs(NamedTuple):
     """One step's per-request inputs, batch-leading."""
 
@@ -309,7 +294,6 @@ class H3DiT(nn.Module):
         super().__init__()
         comm_group = comm_group or CommGroup.trivial()
         self.cfg = cfg
-        self.sp_group = sp_group or CommGroup.trivial()
         self.video_patch_proj = nn.Linear(cfg.patch_dim, cfg.hidden_size)
         self.audio_patch_proj = nn.Linear(cfg.audio_latents_dim, cfg.hidden_size)
         self.time_embedder = H3TimeEmbedder(cfg)
@@ -363,13 +347,15 @@ class H3DiT(nn.Module):
         return torch.cat(pieces, dim=1)
 
     def forward(
-        self, inputs: H3Inputs, layout: H3StepLayout, row_class: torch.Tensor | None = None,
+        self, inputs: H3Inputs, layout: H3StepLayout, row_class: torch.Tensor | None = None, shard=None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """``inputs.timesteps`` is ``[B, 3]`` (video, audio, keyframe), or ``[B, 1]`` when all
         are one value: the reference then runs its AdaLN GEMMs on one row, which rounds
         differently from three. ``row_class`` (tests) indexes timesteps laid out as the
         reference's distinct values. `attend` attends within the step's segments
-        (`attention_segments`), so no request row sees a padding row."""
+        (`attention_segments`), so no request row sees a padding row. ``shard``: the node's sequence shard
+        (``SequenceShard``), which on a step it splits gives this rank a contiguous range of the packed rows (label
+        ``MAIN_SPAN``): only those are built and run, and the attention's resource exchanges them."""
         cond, pad = layout.num_condition_rows, layout.num_pad_rows
         split = None if shard is None else shard.split_range(MAIN_SPAN)
         start, count = (0, layout.num_rows) if split is None else (split.start, split.count)

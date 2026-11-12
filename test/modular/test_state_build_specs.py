@@ -377,7 +377,6 @@ def test_resolve_records_the_resource_every_op_runs_on():
 
 
 @pytest.mark.parametrize("field, refusal", [
-    ({"seq_sharded": True}, "seq_sharded takes max_len 0"),
     ({"positions": Positions()}, "positions, which only an append-only array that keeps entries holds"),
 ])
 def test_a_host_value_is_refused_what_only_another_storage_holds(field, refusal):

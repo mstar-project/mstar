@@ -121,13 +121,14 @@ def _sharded_keys(rank, world, total):
     k, v = (_full(total, batched=True, seed=seed) for seed in (1, 2))
     want = sdpa_attention(q, k, v)
     start = sum(sizes[:rank])
-    k, v = (x.narrow(1, start, sizes[rank]) for x in (k, v))
-    out = attention_over_sharded_keys(group, q, k, v, sdpa_attention)
+    out = gather_merge(
+        group, *sdpa_attention(q, k.narrow(1, start, sizes[rank]), v.narrow(1, start, sizes[rank]), return_lse=True),
+    )
     torch.testing.assert_close(out, want)
 
 
 @pytest.mark.parametrize("world,total", [(1, 7), (2, 7), (3, 11)], ids=["1", "2-uneven", "3-uneven"])
-def test_attention_over_sharded_keys_matches_one_rank(tmp_path, world, total):
+def test_gather_merge_of_sharded_keys_matches_one_rank(tmp_path, world, total):
     _run(_sharded_keys, world, tmp_path / "store", total)
 
 
@@ -430,9 +431,10 @@ def _wan_step(rank, world, grid):
 
     from mstar.engine.resources import RaggedAttentionConfig, StepRunner
     from mstar.engine.resources.base import build_resource
+    from mstar.engine.state.adapters import node_handles, node_resources
     from mstar.model.submodule_base import NodeInputs, engine_step
     from mstar.model.wan22.components.dit import Wan22DiT
-    from mstar.model.wan22.config import Wan22Config
+    from mstar.model.wan22.config import DIT_SHARD, Wan22Config
     from mstar.model.wan22.submodules import Wan22DitSubmodule, WanStepKey
     from mstar.model.wan22.wan22_model import Wan22Model
 
@@ -448,7 +450,7 @@ def _wan_step(rank, world, grid):
         torch.nn.init.normal_(param, std=0.2)
     model = Wan22Model(model_path_hf="test/wan22", skip_weight_loading=True)
     model.config = config
-    specs = resolve_spec_dependencies(model.get_node_resources())
+    specs = resolve_spec_dependencies(node_resources(model))
     for spec in specs.values():
         if isinstance(getattr(spec, "config", None), RaggedAttentionConfig):
             spec.config.dtype, spec.config.workspace_mb = torch.float32, 1
@@ -461,25 +463,30 @@ def _wan_step(rank, world, grid):
     for key, spec in specs.items():
         res[key].bind_dependencies({dep: res[dep] for dep in spec.depends_on()})
 
-    whole = Wan22DitSubmodule(dit, config)
-    split = Wan22DitSubmodule(dit, config)
-    split.bind_node_resources(res)
     frames, height, width = grid
     key = WanStepKey(frames, height, width, guidance=5.0, i2v=False)
-    step = engine_step(split, "video_gen", ["r0"], [NodeInputs(resource_step_info=key)])
-    step.set_ctx(StepContext(request_ids=["r0"], graph_walk="video_gen", slot=0, capture=False))
-    StepRunner(split.node_resources).plan(step)
-    tokens = split.num_tokens(key)
-    # each of the two CFG rows splits alike
-    assert split.node_resources[split.SEQ_SHARD].split_range("main")[1:3] == (tuple(sp_seq_split(tokens, world)), 2)
-
     gen = torch.Generator().manual_seed(1)
     args = (
         torch.randn(1, 4, frames, height, width, generator=gen), torch.rand(1, frames, generator=gen) * 1000,
         torch.randn(1, 5, 8, generator=gen), torch.randn(1, 5, 8, generator=gen), key.guidance,
     )
     with torch.no_grad():
-        torch.testing.assert_close(split._noise_prediction(*args), whole._noise_prediction(*args), rtol=1e-4, atol=1e-4)
+        # one rank: no resources and no handles bound, so the self-attention runs SDPA
+        want = Wan22DitSubmodule(dit, config)._noise_prediction(*args)
+    split = Wan22DitSubmodule(dit, config)
+    split.bind_node_resources(res)
+    split.bind_node_state(node_handles(model, "dit", res))
+    step = engine_step(split, "video_gen", ["r0"], [NodeInputs(resource_step_info=key)])
+    step.set_ctx(StepContext(request_ids=["r0"], graph_walk="video_gen", slot=0, capture=False))
+    StepRunner(res).plan(step)
+    tokens = split.num_tokens(key)
+    # each of the two CFG rows splits alike
+    assert res[DIT_SHARD].split_range("main")[1:3] == (tuple(sp_seq_split(tokens, world)), 2)
+    step.begin_calls()
+    with torch.no_grad():
+        got = split._noise_prediction(*args)
+    step.end_calls()
+    torch.testing.assert_close(got, want, rtol=1e-4, atol=1e-4)
 
 
 @pytest.mark.parametrize("grid", [(2, 4, 4), (3, 2, 6), (3, 4, 6)], ids=["even", "uneven", "runs"])
