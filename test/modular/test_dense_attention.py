@@ -404,6 +404,34 @@ def test_each_layer_gathers_the_prefix_beside_the_fresh_kv_and_holds_nothing(mon
         layer.mul_(-1)
 
 
+@pytest.mark.parametrize("wrapper, head_dim, extra_rows, fixed", [
+    ("prefixed", 128, 0, True),
+    ("prefixed", 128, 2, False),  # rows past the plan's: the fixed-length kernel would attend them
+    ("prefixed", 72, 0, False),
+    ("ragged", 128, 0, False),  # cacheless, as Cosmos3's vision tower
+], ids=["proven", "past-the-plan", "head_dim-72", "cacheless"])
+def test_one_segment_takes_the_fixed_length_kernel_only_where_proven(monkeypatch, wrapper, head_dim, extra_rows, fixed):
+    """FA3's fixed-length kernel is proven bit-equal to varlen for one segment on the prefixed wrapper at
+    head_dim 128 (Qwen-Image-2.1); every other one-segment plan stays on varlen."""
+    from mstar.engine.resources.attn.ragged import dense_wrappers
+    from mstar.engine.resources.attn.ragged.dense_wrappers import DenseRaggedPrefillWrapper
+
+    called = []
+    monkeypatch.setattr(dense_wrappers, "flash_attn_func", lambda q, *a, **kw: called.append("fixed") or q)
+    monkeypatch.setattr(dense_wrappers, "flash_attn_varlen_func", lambda q, *a, **kw: called.append("varlen") or q)
+    cls = DensePrefixedPrefillWrapper if wrapper == "prefixed" else DenseRaggedPrefillWrapper
+    w = cls(num_qo_heads=2, num_kv_heads=2, head_dim=head_dim, device=torch.device("cpu"), q_data_type=torch.float32)
+    q_len, k_len = 5, 5 if wrapper == "ragged" else 9
+    if wrapper == "prefixed":
+        w.plan(torch.tensor([0, q_len], dtype=torch.int32), torch.tensor([0, k_len], dtype=torch.int32))
+    else:
+        w.plan(torch.tensor([0, q_len], dtype=torch.int32))
+    q = torch.zeros(q_len + extra_rows, 2, head_dim)
+    k = torch.zeros(k_len + extra_rows, 2, head_dim)
+    w.run(q, k, k)
+    assert called == ["fixed" if fixed else "varlen"]
+
+
 def _wrapper_classes():
     classes = []
     if _gpu_flashinfer():
