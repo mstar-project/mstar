@@ -20,7 +20,7 @@ import torch
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.resources.sequence_shard import sequence_parallel_refusals
-from mstar.engine.resources.spec import resolve_spec_dependencies
+from mstar.engine.resources.spec import apply_yaml_overrides, resolve_spec_dependencies
 from mstar.engine.state.adapters import node_resources, state_setup
 from mstar.graph.base import GraphNode, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
@@ -123,6 +123,18 @@ def test_wan22_declares_only_dit_attention_resources():
     (refusal,) = sequence_parallel_refusals(resolve_spec_dependencies(on_sdpa).values(), "dit", 1, 2)
     assert "its steps never split" in refusal
     assert model.get_request_resource_configs([], [], {}) == {}
+
+
+def test_wan22_pipelines_its_ulysses_exchange_over_two_head_groups():
+    """The DiT's self-attention moves its SP exchange a head group at a time (``ulysses_head_groups``); a
+    deployment can set it back to 1, the NCCL exchange."""
+    model = _make_model()
+    (attn,) = [spec for spec in node_resources(model) if spec.resource_key == SELF_ATTN]
+    assert attn.config.ulysses_head_groups == 2
+    specs = node_resources(model)
+    apply_yaml_overrides(specs, {"resources": {SELF_ATTN: {"ulysses_head_groups": 1}}})
+    (attn,) = [spec for spec in specs if spec.resource_key == SELF_ATTN]
+    assert attn.config.ulysses_head_groups == 1
 
 
 def test_wan22_batch_caps():

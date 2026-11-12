@@ -164,8 +164,12 @@ class Wan22Model(Model):
 
     def kernel_settings(self) -> dict[str, dict[str, Any]]:
         # one segment per guidance branch; the DiT is compiled, not captured, so attention stays in its graph (under
-        # SP the op runs the exchange inside it)
-        return {SELF_ATTN: {"max_segments_per_request": Wan22DitSubmodule.CFG_BRANCHES, "compile_op": True}}
+        # SP the op runs the exchange inside it). On SP ranks the exchange moves on the copy engines, a head group
+        # at a time beside the previous group's attention (`ulysses_head_groups`): TI2V-5B 1280x704x81 at SP2 on
+        # two H200s, 27.83 -> 26.94 s a video, clips md5-identical. One rank never exchanges, so it costs nothing.
+        return {SELF_ATTN: {
+            "max_segments_per_request": Wan22DitSubmodule.CFG_BRANCHES, "compile_op": True, "ulysses_head_groups": 2,
+        }}
 
     def get_default_sharding_config(self) -> ShardingConfig:
         # The dit's two guidance branches split over cfg_size ranks, which
