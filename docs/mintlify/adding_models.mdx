@@ -859,7 +859,7 @@ st.mem.write(layer, state=x)              # rewritable arrays only
 - `read` sees kept entries from earlier steps, plus this layer's latest add, at the positions its mask reaches. It runs the op the declaration names for the layer.
 - `write` overwrites entries in place.
 
-These raise, naming the array and the cause: a call on an array the step doesn't list or on a layer it doesn't declare, an add after a kept add, an add after a read in the same layer, and `write` on an append-only array. The checks run in eager steps and at capture, so graph replays skip them. On an array with `max_len=0` a compiled block skips them too, since a check there would guard on the layer.
+These raise, naming the array and the cause: a call on an array the step doesn't list or on a layer it doesn't declare, an add after a kept add, a kept add after a read in the same layer, and `write` on an append-only array. The checks run in eager steps and at capture, so graph replays skip them. On an array with `max_len=0` a compiled block skips them too, since a check there would guard on the layer.
 
 The rest are free functions in `mstar.engine.state`:
 
