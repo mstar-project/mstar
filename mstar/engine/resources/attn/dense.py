@@ -320,9 +320,13 @@ class DenseAttentionManager(AttentionManager):
             f"Dense Attention Manager expected plan result from {self._kv_cache_name}"
         )
 
+        # Only the labels the step attends: a cfg rank's KV step holds every branch's label, and its attention
+        # reads only its own branches' (a combined plan label carries its streams' labels on its views).
+        attends = None if step.segments is None else {segment.label for segment in step.segments}
         self._current_plans = {
             plan_label: self._build_plan(kv_out, step.causal, EagerSlotKey(label=plan_label, slot=ctx.slot))
             for plan_label, kv_out in plan_outputs.items()
+            if attends is None or any(view.label in attends for view in kv_out.views)
         }
 
     def _build_plan(self, kv_out: KVPlanOutput, causal: bool, slot_key: EagerSlotKey) -> DensePlan:

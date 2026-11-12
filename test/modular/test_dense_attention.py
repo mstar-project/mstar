@@ -140,6 +140,22 @@ class TestDensePlan:
         assert [s.request_id for s in plan.segments] == ["r0", "r1"]
         assert plan.causal is False
 
+    def test_only_the_labels_the_step_attends_are_planned(self):
+        """A cfg rank's KV step holds both branches' labels and its attention reads only its own; a
+        combined label is planned when its views carry an attended label."""
+        manager = _manager()
+        views = {
+            "main": KVPlanOutput(cpu_indptrs=None, views=[_view("r0", [0], prefix=2, fresh=1)]),
+            "uncond": KVPlanOutput(cpu_indptrs=None, views=[_view("r0", [1], prefix=2, fresh=1)._replace(
+                label="uncond")]),
+        }
+        ctx = _ctx([])
+        ctx.plan_results["kv"] = views
+        manager.plan(AttentionStep(segments=(Segment("r0", "uncond", 1),), causal=False), ctx)
+        assert manager._current_plans.keys() == {"uncond"}
+        manager.plan(AttentionStep(causal=False), ctx)
+        assert manager._current_plans.keys() == {"main", "uncond"}
+
     def test_causal_rides_on_the_step(self):
         manager = _manager()
         manager.plan(AttentionStep(causal=True), _ctx([_view("r0", [0], prefix=1, fresh=1)]))
