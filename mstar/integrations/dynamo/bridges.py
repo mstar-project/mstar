@@ -468,8 +468,8 @@ def _submit(server: APIServer, args: SubmitArgs, prefix: str) -> str:
         )
     finally:
         # the bridges save each request's media under upload_dir, and nothing
-        # downstream deletes it once the request is read; the native routes
-        # schedule the same cleanup
+        # downstream deletes it once the request is read. The delay starts at
+        # submit, as on the Rust frontend's chat route.
         media_io.schedule_upload_cleanup(args.file_paths, server.upload_dir)
     logger.info("request %s submitted (out=%s)", rid, args.output_modalities)
     return rid
