@@ -4,6 +4,48 @@
   "entries": [
     {
       "dtype": "bfloat16",
+      "shape": {"head_dim": 128, "num_kv_heads": 12, "num_qo_heads": 12},
+      "provenance": {"device": "NVIDIA H200", "arch": "sm_90", "date": "2026-11-12", "harness": "python -m benchmark.kernels.sweep ragged_attention --dtype bfloat16 --shape num_qo_heads=12,num_kv_heads=12,head_dim=128 --buckets 128,1024,4096,8192,9240,16384,18480,32768", "torch": "2.11.0+cu128", "triton": "3.6.0", "note": "Wan2.2-TI2V-5B under Ulysses SP2 (24 heads, 12 a rank) at 1280x704x81: 2 x 18480 tokens"},
+      "rows": {
+        "128": {"impl": "cudnn"},
+        "9240": {"impl": "fa3"},
+        "16384": {"impl": "flashinfer"},
+        "18480": {"impl": "fa3"},
+        "*": {"impl": "flashinfer"}
+      },
+      "measured": {
+        "128": {"us": 8.3, "default_us": 10.44, "cudnn_us": 8.3, "fa3_us": 9.38, "flashinfer_fa2_us": 18.38, "flashinfer_cudnn_us": 25.09},
+        "1024": {"us": 40.67, "default_us": 47.95, "cudnn_us": 41.16, "fa3_us": 40.67, "flashinfer_fa2_us": 113.66, "flashinfer_cudnn_us": 67.63},
+        "4096": {"us": 410.8, "default_us": 433.57, "cudnn_us": 437.75, "fa3_us": 410.8, "flashinfer_fa2_us": 817.54, "flashinfer_cudnn_us": 519.13},
+        "8192": {"us": 1560.41, "default_us": 1712.94, "cudnn_us": 1682.99, "fa3_us": 1560.41, "flashinfer_fa2_us": 3198.38, "flashinfer_cudnn_us": 1906.96},
+        "9240": {"us": 2095.15, "default_us": 2235.36, "cudnn_us": 2460.03, "fa3_us": 2095.15, "flashinfer_fa2_us": 4193.49, "flashinfer_cudnn_us": 2472.85},
+        "16384": {"us": 6737.82, "default_us": 6737.82, "cudnn_us": 7077.94, "fa3_us": 6634.41, "flashinfer_fa2_us": 12322.9, "flashinfer_cudnn_us": 7635.48},
+        "18480": {"us": 8359.19, "default_us": 8783.94, "cudnn_us": 9904.97, "fa3_us": 8359.19, "flashinfer_fa2_us": 15607.78, "flashinfer_cudnn_us": 9884.31},
+        "32768": {"us": 27457.03, "default_us": 27457.03, "cudnn_us": 29824.9, "fa3_us": 27056.57, "flashinfer_fa2_us": 47883.99, "flashinfer_cudnn_us": 31806.73}
+      }
+    },
+    {
+      "dtype": "bfloat16",
+      "shape": {"head_dim": 128, "num_kv_heads": 20, "num_qo_heads": 20},
+      "provenance": {"device": "NVIDIA H200", "arch": "sm_90", "date": "2026-11-12", "harness": "python -m benchmark.kernels.sweep ragged_attention --dtype bfloat16 --shape num_qo_heads=20,num_kv_heads=20,head_dim=128 --buckets 128,1024,4096,8192,16384,32760,75600", "torch": "2.11.0+cu128", "triton": "3.6.0", "note": "Wan2.2-T2V-A14B under Ulysses SP2 (40 heads, 20 a rank) at 832x480x81 (32760 tokens) and 1280x720x81 (75600)"},
+      "rows": {
+        "128": {"impl": "cudnn"},
+        "4096": {"impl": "fa3"},
+        "8192": {"impl": "flashinfer"},
+        "*": {"impl": "fa3"}
+      },
+      "measured": {
+        "128": {"us": 9.51, "default_us": 12.85, "cudnn_us": 9.51, "fa3_us": 12.14, "flashinfer_fa2_us": 20.02, "flashinfer_cudnn_us": 25.94},
+        "1024": {"us": 65.92, "default_us": 79.29, "cudnn_us": 67.67, "fa3_us": 65.92, "flashinfer_fa2_us": 140.49, "flashinfer_cudnn_us": 98.29},
+        "4096": {"us": 667.83, "default_us": 705.08, "cudnn_us": 715.54, "fa3_us": 667.83, "flashinfer_fa2_us": 1329.7, "flashinfer_cudnn_us": 819.54},
+        "8192": {"us": 2801.49, "default_us": 2801.49, "cudnn_us": 2900.34, "fa3_us": 2786.42, "flashinfer_fa2_us": 5276.61, "flashinfer_cudnn_us": 3200.19},
+        "16384": {"us": 11110.48, "default_us": 11484.94, "cudnn_us": 11852.97, "fa3_us": 11110.48, "flashinfer_fa2_us": 19955.48, "flashinfer_cudnn_us": 12843.98},
+        "32760": {"us": 46127.11, "default_us": 47434.42, "cudnn_us": 53318.56, "fa3_us": 46127.11, "flashinfer_fa2_us": 79081.47, "flashinfer_cudnn_us": 53199.98},
+        "75600": {"us": 251903.51, "default_us": 257869.37, "cudnn_us": 293903.64, "fa3_us": 251903.51, "flashinfer_fa2_us": 424140.11, "flashinfer_cudnn_us": 294174.5}
+      }
+    },
+    {
+      "dtype": "bfloat16",
       "shape": {"head_dim": 128, "num_kv_heads": 24, "num_qo_heads": 24},
       "provenance": {"device": "NVIDIA H200", "arch": "sm_90", "date": "2026-11-12", "harness": "python -m benchmark.kernels.sweep ragged_attention --dtype bfloat16 --shape num_qo_heads=24,num_kv_heads=24,head_dim=128 --buckets 128,1024,4096,4608,8192,16384,18480,32768", "torch": "2.11.0+cu128", "triton": "3.6.0", "mstar": "82a4ee0a9+fa3", "note": "Wan2.2-TI2V-5B self-attention at 1280x704x81 (2 x 18480 tokens, eager) served on these rows: 49.17 against 49.91 s a video on FlashInfer's auto (1776 against 1802 ms a step, one H200), frames within a recompile of main's. Measured times are graph-mode wrappers; against FlashInfer's eager wrapper, which Wan runs, fa3 is 1.065x at 2 x 3510 tokens, 1.003x at 2 x 8190 and 1.043x at 2 x 18480 (7 interleaved rounds); 832x480 was not served"},
       "rows": {
