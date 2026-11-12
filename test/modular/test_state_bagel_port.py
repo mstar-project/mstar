@@ -234,13 +234,12 @@ def test_a_prefill_text_step_equals_the_hand_written_one(guided):
     reference = SubmoduleStep(segments=_segments(labels, {1: 4, 2: 3}), cg_key_info=guided, steps={
         "kv": KVStep(
             pre_forks=(("main", "cfg_text"),) if guided else (), fork_rids=frozenset({1, 2}) if guided else None,
-            combined_labels=COMBINED if guided else {},
         ),
         "attn": AttentionStep(causal=True),
         "rope": PositionStep(),
         "sampler": SamplerStep(prefill_tracked_tokens={1: torch.arange(4), 2: torch.arange(3)},
                                kept_rids=frozenset({1})),
-    })
+    }, combined_labels=COMBINED if guided else {})
     _assert_equal(step, reference)
 
 
@@ -249,13 +248,12 @@ def test_a_guided_batch_holds_its_unguided_rows_place_on_cfg_img():
     step = engine_step(_llm(), graph_walk="prefill_text", request_ids=[1, 2], inputs=rows,
                        per_request_info=_info({1: (True, False), 2: (False, False)}))
     reference = SubmoduleStep(segments=_segments(("main", "cfg_img"), {1: 4, 2: 3}), cg_key_info=True, steps={
-        "kv": KVStep(pre_forks=(("main", "cfg_text"),), fork_rids=frozenset({1}), sink=frozenset({(2, "cfg_img")}),
-                     combined_labels=COMBINED),
+        "kv": KVStep(pre_forks=(("main", "cfg_text"),), fork_rids=frozenset({1}), sink=frozenset({(2, "cfg_img")})),
         "attn": AttentionStep(causal=True),
         "rope": PositionStep(),
         "sampler": SamplerStep(prefill_tracked_tokens={1: torch.arange(4), 2: torch.arange(3)},
                                kept_rids=frozenset()),
-    })
+    }, combined_labels=COMBINED)
     _assert_equal(step, reference)
 
 
@@ -271,13 +269,13 @@ def test_a_guided_prompt_forks_on_its_first_chunk_and_not_on_its_second():
         return SubmoduleStep(segments=_segments(("main", "cfg_img"), {1: 4}), cg_key_info=True, steps={
             "kv": kv, "attn": AttentionStep(causal=True), "rope": PositionStep(),
             "sampler": SamplerStep(prefill_tracked_tokens={1: torch.arange(start, start + 4)}, kept_rids=frozenset()),
-        })
+        }, combined_labels=COMBINED)
 
     _assert_equal(steps[0], reference(0, KVStep(
-        pre_forks=(("main", "cfg_text"),), fork_rids=frozenset({1}), combined_labels=COMBINED,
+        pre_forks=(("main", "cfg_text"),), fork_rids=frozenset({1}),
     )))
     # Bagel named an empty set of fork rows here, which only a fork reads, and this step has none
-    _assert_equal(steps[1], reference(4, KVStep(combined_labels=COMBINED)))
+    _assert_equal(steps[1], reference(4, KVStep()))
 
 
 @pytest.mark.parametrize("guided", [False, True], ids=["unguided", "guided"])
@@ -290,12 +288,11 @@ def test_a_mixed_text_step_equals_the_hand_written_one(guided):
         # the decode row keeps its own cfg_text: only the prompt forks
         "kv": KVStep(
             pre_forks=(("main", "cfg_text"),) if guided else (), fork_rids=frozenset({2}) if guided else None,
-            combined_labels=COMBINED if guided else {},
         ),
         "attn": AttentionStep(causal=True),
         "rope": PositionStep(),
         "sampler": SamplerStep(prefill_tracked_tokens={2: torch.arange(3)}, kept_rids=frozenset({1, 2})),
-    })
+    }, combined_labels=COMBINED if guided else {})
     _assert_equal(step, reference)
 
 
@@ -306,12 +303,11 @@ def test_a_decode_step_equals_the_hand_written_one(guided):
                        per_request_info=_info({1: (guided, False), 2: (False, False)}))
     labels = ("main", "cfg_img") if guided else ("main",)
     reference = SubmoduleStep(segments=_segments(labels, {1: 1, 2: 1}), cg_key_info=guided, steps={
-        "kv": KVStep(sink=frozenset({(2, "cfg_img")}) if guided else frozenset(),
-                     combined_labels=COMBINED if guided else {}),
+        "kv": KVStep(sink=frozenset({(2, "cfg_img")}) if guided else frozenset()),
         "attn": AttentionStep(causal=True),
         "rope": PositionStep(),
         "sampler": SamplerStep(),
-    })
+    }, combined_labels=COMBINED if guided else {})
     _assert_equal(step, reference)
 
 
@@ -344,10 +340,10 @@ def test_a_denoise_step_equals_the_hand_written_one(walk, labels, plan):
     step = engine_step(_llm(), graph_walk=walk, request_ids=[1], inputs=[_image(6, guided)])
     ids = torch.cat([torch.full((6,), 10 + i, dtype=torch.int32) for i in range(len(labels))])
     reference = SubmoduleStep(segments=_segments(labels, {1: 6}), cg_key_info=guided, steps={
-        "kv": KVStep(commit=False, combined_labels={labels: plan} if plan else {}),
+        "kv": KVStep(commit=False),
         "attn": AttentionStep(causal=False),
         "rope": PositionStep(pos_ids={plan or "main": ids}, advance=(0,) * len(labels)),
-    })
+    }, combined_labels={labels: plan} if plan else {})
     _assert_equal(step, reference)
 
 
