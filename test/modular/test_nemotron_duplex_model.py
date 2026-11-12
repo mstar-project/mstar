@@ -43,6 +43,7 @@ from mstar.model.nemotron_duplex.config import (
 )
 from mstar.model.nemotron_duplex.nemotron_duplex_model import NemotronDuplexModel
 from mstar.model.registry import HF_MODELS, get_model_class
+from mstar.model.utils import kv_pages
 from mstar.streaming.chunk_policy import FixedChunkPolicy
 from mstar.streaming.topology import client_stream_limits
 from mstar.validation.client_streams import check_client_streams
@@ -179,15 +180,17 @@ def test_duplex_refuses_a_session_cap_one_per_session_resource_cannot_hold(key):
     resources = {MAMBA_STATE: {"max_slots": 49}, ENCODER_STATE: {"max_slots": 49},
                  ENCODER_FRONT: {"max_slots": 49}, CODEC_STATE: {"max_slots": 49}, TALKER_PREV: {"max_slots": 49},
                  ENCODER_KV: {"max_slots": 48},
-                 TALKER_KV: {"max_num_pages": model.talker_kv_pages(128, 48)},
-                 NANO_KV: {"max_num_pages": model.nano_kv_pages(128, 48)}}
+                 TALKER_KV: {"max_num_pages": kv_pages(model.session_positions(model.TALKER_WARMUP_POSITIONS), 128,
+                                                       2 * 48)},
+                 NANO_KV: {"max_num_pages": kv_pages(model.session_positions(model.max_prompt_tokens), 128, 48)}}
     model.validate_config_yaml({"max_concurrent_requests": 48, "resources": resources}, "c.yaml")
     del resources[key]
     with pytest.raises(ValueError, match=f"resources.{key}"):
         model.validate_config_yaml({"max_concurrent_requests": 48, "resources": resources}, "c.yaml")
 
 
-@pytest.mark.parametrize("kwargs", [{"max_session_s": 640.0}, {"max_prompt_tokens": 8192}])
+# 596 s, the longest session the talker's default window takes
+@pytest.mark.parametrize("kwargs", [{"max_session_s": 596.0}, {"max_prompt_tokens": 8192}])
 def test_duplex_kv_pools_hold_the_session_cap_at_the_calls_it_serves(kwargs):
     """A session holds its nano pages (prompt and every frame) and its talker
     pages for life, so both pools are sized from the longest call and prompt

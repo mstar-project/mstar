@@ -1496,13 +1496,13 @@ Nemotron VoiceChat (``nemotron_duplex``) notes
   (``mamba``) and the agent-text sampler (``nano_sampler``). Its decode step is
   captured as a CUDA graph for batch sizes 1 to 32.
 - Every per-session resource is sized for 32 sessions: a slot in each of
-  ``mamba_state``, ``encoder_state``, ``encoder_front`` and ``codec_state`` (``max_slots``, one
-  more than the sessions, for the sink) and in ``encoder_kv`` (``max_slots``,
+  ``mamba_state``, ``encoder_state``, ``encoder_front``, ``codec_state`` and ``talker_prev``
+  (``max_slots``, one more than the sessions, for the sink) and in ``encoder_kv`` (``max_slots``,
   no sink), and its pages in ``nano_kv`` and
   ``talker_kv`` (``max_num_pages``; both sized from ``max_session_s``, and the
   nano's from ``max_prompt_tokens`` too). The shipped configs set a
   conservative ``max_concurrent_requests: 16`` (below); raising it to 32 needs
-  no other change, and to serve more, raise the cap and all six with it. The server
+  no other change, and to serve more, raise the cap and all eight with it. The server
   refuses to start with a cap one of them cannot hold, since a session past
   any of them would wait on admit, and its frames with it, until another ends.
   The nano, the talker and the encoder each run at most 32 sessions
@@ -1580,8 +1580,11 @@ Nemotron VoiceChat (``nemotron_duplex``) notes
   any one file, past it gets a 400, as does one of more than two channels, and so
   does a live call whose appends pass it: ``audio_in`` declares the session's
   samples as its ``max_items``, which the client stream counts before the encoder
-  sees them (raise ``max_session_s``, not the stream's limit, for longer calls). A
-  call that ends with no more than 16 ms of audio, which the encoder cannot
+  sees them (raise ``max_session_s``, not the stream's limit, for longer calls).
+  The server refuses to start with a ``max_session_s`` past 596 s, where a
+  session's talker positions would pass the talker's 7500-position sliding
+  window: the talker reads every layer causally, which Gemma3's sliding layers
+  match only within it. A call that ends with no more than 16 ms of audio, which the encoder cannot
   featurize, fails with a 500 (the worker reports it without a client status).
   ``/generate/ws`` appends must be 16 kHz audio (they are neither
   resampled nor rescaled one by one, which would put a seam at every append);

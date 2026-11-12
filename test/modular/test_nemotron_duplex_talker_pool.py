@@ -305,10 +305,9 @@ def _sessions(monkeypatch, key: str, labels: tuple[str, ...], loop: str):
     layouts = kv_layouts(model.declare_state(), model.process_prompt(
         "a prompt", ["audio", "text"], ["audio", "text"], tensors={"audio_inputs": [torch.zeros(16000)]},
     ).metadata["state_layout"], {})[key]
-    pages = model.talker_kv_pages if key == TALKER_KV else model.nano_kv_pages
     kv = KVManager(
         cfg=PagedKVConfig(num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=4096,
-                          max_num_pages=pages(DEFAULT_PAGE_SIZE), page_size=DEFAULT_PAGE_SIZE),
+                          max_num_pages=model.kernel_settings()[key]["max_num_pages"], page_size=DEFAULT_PAGE_SIZE),
         name=key, joint_comm_group=None, transfer_engine_info=None,
         device=torch.device("cpu"), dtype=torch.float32,
     )

@@ -53,10 +53,7 @@ import torch.nn.functional as F
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import PartitionDefinition
-from mstar.engine.resources import NodeResourceSpec, ResourceReqConfig
-from mstar.engine.resources.kv.bounded import BoundedKVSpec
 from mstar.engine.resources.kv.config import DEFAULT_PAGE_SIZE
-from mstar.engine.resources.recurrent import RecurrentStateSpec
 from mstar.engine.state import (
     Array,
     Attend,
@@ -82,7 +79,6 @@ from mstar.model.base import (
     ProcessPromptOutput,
     Span,
     WalkStep,
-    serving_resources,
 )
 from mstar.model.components.audio_features import NemoLogMel
 from mstar.model.components.fastconformer_stream import front_entry
@@ -110,6 +106,7 @@ from mstar.model.nemotron_duplex.config import (
     session_too_long,
 )
 from mstar.model.submodule_base import NodeSubmodule
+from mstar.model.utils import check_kv_pools_fit, kv_pages
 from mstar.streaming.chunk_policy import FixedChunkPolicy
 from mstar.streaming.topology import (
     CLIENT,
@@ -237,15 +234,16 @@ class NemotronDuplexModel(Model):
     # position counter; each session holds two streams (labels ``main`` /
     # ``uncond``) and RoPE runs in torch over the full head dim with a per-layer
     # theta. It also declares each call's previous codes and codec stream state
-    # as Values (a slot per session). conformer_encoder: a bounded KV, each
-    # call's attention window, and two recurrent-state pools, its conv tails and
-    # its front end's audio / mel tails (one slot per session each).
+    # as Values (a slot per session). conformer_encoder declares its keys as an
+    # array read through a window, which a bounded KV holds, its conv tails and
+    # its front end's audio / mel tails as Values (one slot per session each),
+    # and each call's counts of samples and mel frames as host fields.
     # -------------------------------------------------------------------
 
     # Sessions resident at once (a slot each in mamba_state, ~137 MB in fp32 for
-    # Nemotron-H, and in encoder_state / encoder_front / codec_state / encoder_kv;
-    # pages in nano_kv and talker_kv). A deployment raising it raises all seven
-    # (see validate_config_yaml). 32 is the most one-shot calls that keep up with real
+    # Nemotron-H, and in encoder_state / encoder_front / codec_state / talker_prev /
+    # encoder_kv; pages in nano_kv and talker_kv). A deployment raising it raises
+    # all eight (see validate_config_yaml). 32 is the most one-shot calls that keep up with real
     # time on one H100 (a tick takes ~62 ms at 32, and 40+ miss the 80 ms budget).
     # Live calls paced over /generate/ws cost more per tick: 16 keep up on one
     # H200, and 32 sit at the edge (all finish, but audio can fall behind).
@@ -285,61 +283,32 @@ class NemotronDuplexModel(Model):
         mels = NemoLogMel.frames(self.max_session_samples, stt.hop_length, stt.reflect_edges)
         return int(stt.encoder.output_lengths(mels))
 
-    def talker_kv_pages(self, page_size: int, sessions: int | None = None) -> int:
-        """Pages for ``sessions`` (DEFAULT_SESSIONS) sessions of max_session_frames, both CFG streams."""
-        return self._session_kv_pages(self.TALKER_WARMUP_POSITIONS, 2, page_size, sessions)
-
-    def nano_kv_pages(self, page_size: int, sessions: int | None = None) -> int:
-        """Pages for ``sessions`` (DEFAULT_SESSIONS) sessions of the longest prompt and max_session_frames."""
-        return self._session_kv_pages(self.max_prompt_tokens, 1, page_size, sessions)
-
-    def _session_kv_pages(self, prefix: int, streams: int, page_size: int, sessions: int | None) -> int:
-        sessions = self.DEFAULT_SESSIONS if sessions is None else sessions
-        positions = prefix + self.max_session_frames + 1
-        # + 1 for the pool's sink page
-        return sessions * streams * -(-positions // page_size) + 1
+    def session_positions(self, prefix: int) -> int:
+        """A label's positions for a session of ``max_session_s`` after a prefix of ``prefix``: a row per frame
+        and one for the final PAD."""
+        return prefix + self.max_session_frames + 1
 
     def validate_config_yaml(self, config: dict, config_path: str) -> None:
-        """Refuse a session cap that a per-session resource cannot hold.
+        """Refuse a session longer than the talker's window, and a session cap
+        that a per-session resource cannot hold.
 
-        A session holds a slot in each recurrent pool (``mamba_state``,
-        ``encoder_state``, ``encoder_front``, ``codec_state``) and in
-        ``encoder_kv``, and its nano and talker pages from its first step to its
-        last, so a session past any of them waits on admit until
-        another ends, and its frames with it. So ``max_concurrent_requests``
-        sessions must fit each; the conductor queues the rest.
+        A session holds a slot in each Value's pool and in ``encoder_kv``, and
+        its nano and talker pages, from its first step to its last, so a
+        session past any of them waits on admit until another ends, and its
+        frames with it. So ``max_concurrent_requests`` sessions must fit each;
+        the conductor queues the rest.
         """
-        cap = config.get("max_concurrent_requests")
-        if cap is None:
-            logger.warning(
-                "%s sets no max_concurrent_requests: a session past the per-session "
-                "resources waits on admit until another ends", config_path,
+        talker, window = self.session_positions(self.TALKER_WARMUP_POSITIONS), self.config.eartts.sliding_window
+        # The talker reads every layer causally, which Gemma3's sliding layers match only within their window.
+        if talker > window:
+            raise ValueError(
+                f"{config_path}: max_session_s {self.max_session_s:g} gives a talker {talker} positions, past its "
+                f"{window}-position sliding window, which the talker reads causally"
             )
-            return
-        if not isinstance(cap, int) or isinstance(cap, bool) or cap < 1:
-            raise ValueError(f"{config_path}: max_concurrent_requests must be a positive int; got {cap!r}")
-        try:
-            specs = serving_resources(self, config)
-        except ValueError:
-            return  # a `resources:` block the validation's resource checks report
-        for spec in specs:
-            if isinstance(spec, RecurrentStateSpec):
-                held, knob = spec.config.usable_slots, "max_slots"
-            elif isinstance(spec, BoundedKVSpec):
-                held, knob = spec.config.max_slots, "max_slots"
-            elif spec.resource_key in (TALKER_KV, NANO_KV):
-                kv = spec.config
-                pages = self.talker_kv_pages if spec.resource_key == TALKER_KV else self.nano_kv_pages
-                per_session = pages(kv.tokens_per_page, sessions=1) - 1
-                held, knob = (kv.max_num_pages - 1) // per_session, "max_num_pages"
-            else:
-                continue
-            if held < cap:
-                raise ValueError(
-                    f"{config_path}: {cap} concurrent sessions (max_concurrent_requests) need as "
-                    f"many in resources.{spec.resource_key}, which holds {held}; raise its {knob} "
-                    "or lower max_concurrent_requests"
-                )
+        check_kv_pools_fit(
+            self, config, config_path, logger, request_layouts=self._state_layout(self.max_prompt_tokens),
+            loop_caps=dict.fromkeys(("decode_loop", "talker_decode_loop"), self.get_max_output_tokens()),
+        )
 
     def get_max_output_tokens(self, **model_kwargs) -> int:
         # One text token per audio frame, so the audio fixes the length, within
@@ -405,20 +374,20 @@ class NemotronDuplexModel(Model):
             ENCODER_STATE: {"max_slots": self.DEFAULT_SESSIONS + 1},
             ENCODER_FRONT: {"max_slots": self.DEFAULT_SESSIONS + 1},
             # a session holds its prompt and every frame for life (no eviction)
-            NANO_KV: {"max_num_pages": self.nano_kv_pages(DEFAULT_PAGE_SIZE)},
+            NANO_KV: {"max_num_pages": kv_pages(self.session_positions(self.max_prompt_tokens), DEFAULT_PAGE_SIZE,
+                                                self.DEFAULT_SESSIONS)},
             # + 1 for the pool's sink slot, so DEFAULT_SESSIONS sessions fit
             MAMBA_STATE: {"max_slots": self.DEFAULT_SESSIONS + 1},
-            TALKER_KV: {"max_num_pages": self.talker_kv_pages(DEFAULT_PAGE_SIZE)},
+            # both CFG streams
+            TALKER_KV: {"max_num_pages": kv_pages(self.session_positions(self.TALKER_WARMUP_POSITIONS),
+                                                  DEFAULT_PAGE_SIZE, 2 * self.DEFAULT_SESSIONS)},
             TALKER_PREV: {"max_slots": self.DEFAULT_SESSIONS + 1},
             CODEC_STATE: {"max_slots": self.DEFAULT_SESSIONS + 1},
         }
 
-    def get_node_resources(self) -> list[NodeResourceSpec]:
-        return []
-
     def get_request_resource_configs(
         self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
-    ) -> dict[str, ResourceReqConfig | SampleSettings]:
+    ) -> dict[str, SampleSettings]:
         del input_modalities, output_modalities
         model_kwargs = model_kwargs or {}
         keys = SAMPLING_KEYS
@@ -615,14 +584,15 @@ class NemotronDuplexModel(Model):
             out["has_prompt"] = [torch.tensor([1], dtype=torch.long)]
         else:
             out["text_inputs"] = [torch.tensor([-1], dtype=torch.long)]
-        # a session's first frame writes the prompt along with its own row, and the talker's first frame writes
-        # its speaker warm-up
-        prompt_len = ids.numel() if prompt else 0
-        # A loop writes a row per frame and one for the final PAD. Its cap adds LOOP_ITERS_MARGIN, and no session
-        # writes that margin.
-        frames = self.max_session_frames + 1
+        return ProcessPromptOutput(out, {"state_layout": self._state_layout(ids.numel() if prompt else 0)})
+
+    def _state_layout(self, prompt_len: int) -> dict[str, dict[str, Layout]]:
+        """A session's layouts after a system prompt of ``prompt_len`` tokens. Its first frame writes the prompt
+        along with its own row, and the talker's first frame writes its speaker warm-up."""
+        # A loop's cap adds LOOP_ITERS_MARGIN, and no session writes that margin.
+        frames = self.session_positions(0)
         nano = Layout(
-            spans=(Span("ids", "decode", prompt_len, prompt_len, "text_inputs"),) if prompt else (),
+            spans=(Span("ids", "decode", prompt_len, prompt_len, "text_inputs"),) if prompt_len else (),
             growth=(("decode_loop", 1),), max_growth=frames,
         )
         warmup = self.TALKER_WARMUP_POSITIONS
@@ -630,9 +600,7 @@ class NemotronDuplexModel(Model):
             spans=(Span("rows", "talker_decode", warmup, warmup, "audio_prompt_latents"),),
             growth=(("talker_decode_loop", 1),), max_growth=frames,
         )
-        return ProcessPromptOutput(out, {"state_layout": {
-            NANO_KV: {"main": nano}, TALKER_KV: {"main": talker, "uncond": talker},
-        }})
+        return {NANO_KV: {"main": nano}, TALKER_KV: {"main": talker, "uncond": talker}}
 
     def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
         talker = KVLabel(growth=(("talker_decode", "talker_decode_loop"),))
@@ -959,8 +927,6 @@ class NemotronDuplexModel(Model):
         pairs = [
             *((d.name, d, n) for d, n in zip(self.declare_state(), loaded.declare_state(), strict=True)),
             *((key, settings[key], needed_settings[key]) for key in settings),
-            *((d.resource_key, d, n) for d, n in zip(self.get_node_resources(), loaded.get_node_resources(),
-                                                       strict=True)),
         ]
         for key, declared, needed in pairs:
             if declared != needed:
