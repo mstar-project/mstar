@@ -5,6 +5,9 @@ transformer's q/k/v rows are interleaved per head and its ``fc1`` is ``[gate; va
 (diffusers' ``qkv_layout="interleaved"``); both are unfused into the parallel linears'
 shards. The DiT node loads the transformer minus the token refiner, which the text node
 loads with ``condition_proj``.
+
+The transformer can instead come from a diffusers-layout directory (``dit_source``: a
+distilled release such as FastVideo's FastH3), whose names ``from_diffusers`` maps back.
 """
 
 from __future__ import annotations
@@ -26,6 +29,7 @@ from mstar.model.components.diffusion.qwen3.weight_loading import (
     remap_qwen3_vl_text_key,
 )
 from mstar.model.components.diffusion.weight_loading import (
+    iter_diffusers_component,
     iter_transformers_component,
     load_native,
     materialize,
@@ -52,6 +56,31 @@ _TEXT_PREFIXES = ("token_refiner.", "condition_proj.")
 _VIDEO_HEAD = "final_layer.video_out."
 _VISION_PREFIX = "model.visual."
 
+# diffusers' MiniMaxH3Transformer3DModel names -> FL2VA's, the inverse of diffusers'
+# convert_minimax_h3_transformer_checkpoint_to_diffusers: whole prefixes (the first match),
+# then the block-level parts. q/k/v map straight to the unfused shards.
+_DIFFUSERS_PREFIXES = (
+    ("transformer_blocks.", "blocks."),
+    ("token_refiner.refiner_blocks.", "token_refiner.blocks."),
+    ("time_embedder.linear_1.", "time_embedder.proj_in."),
+    ("time_embedder.linear_2.", "time_embedder.proj_out."),
+    ("proj_in.", "video_patch_proj."),
+    ("audio_proj_in.", "audio_patch_proj."),
+    ("context_embedder.", "condition_proj."),
+    ("norm_out.norm.", "final_layer.norm."),
+    ("norm_out.linear.", "final_layer.adaln_proj.linear."),
+    ("proj_out.", "final_layer.video_out."),
+    ("audio_proj_out.", "final_layer.audio_out."),
+)
+_DIFFUSERS_BLOCK_PARTS = (
+    (".attn.to_q.", ".attn.q_proj."), (".attn.to_k.", ".attn.k_proj."), (".attn.to_v.", ".attn.v_proj."),
+    (".attn.norm_q.", ".attn.q_norm."), (".attn.norm_k.", ".attn.k_norm."), (".attn.to_out.0.", ".attn.out_proj."),
+    (".ff.net.0.proj.", ".mlp.fc1."), (".ff.net.2.", ".mlp.fc2."),
+)
+_DIFFUSERS_TEXT_PREFIXES = ("token_refiner.", "context_embedder.")
+# VSA's learned gate on its compression branch (FastH3 was distilled with VSA): dense attention reads none
+_VSA_GATE = ".attn.to_gate_compress."
+
 
 def split_fused(weights: Iterator[tuple[str, torch.Tensor]], heads: int, head_dim: int):
     """Unfuse the checkpoint's per-head-interleaved q/k/v rows and its ``[gate; value]``
@@ -72,33 +101,60 @@ def split_fused(weights: Iterator[tuple[str, torch.Tensor]], heads: int, head_di
             yield name, tensor
 
 
+def native_name(name: str) -> str:
+    """A diffusers ``MiniMaxH3Transformer3DModel`` key under FL2VA's name (``fc1`` still fused)."""
+    for diffusers, native in _DIFFUSERS_PREFIXES:
+        if name.startswith(diffusers):
+            name = native + name[len(diffusers):]
+            break
+    for diffusers, native in _DIFFUSERS_BLOCK_PARTS:
+        name = name.replace(diffusers, native)
+    return name
+
+
+def from_diffusers(weights: Iterator[tuple[str, torch.Tensor]]):
+    """A diffusers-layout transformer under the names ``split_fused`` yields: diffusers keeps q/k/v
+    apart already, and its SwiGLU input is ``[value; gate]`` where FL2VA's is ``[gate; value]``."""
+    for name, tensor in weights:
+        name = native_name(name)
+        if name.endswith(".mlp.fc1.weight"):
+            base = name[: -len("fc1.weight")]
+            value, gate = tensor.chunk(2, dim=0)
+            yield base + "gate_proj.weight", gate
+            yield base + "value_proj.weight", value
+        else:
+            yield name, tensor
+
+
 def _check_inv_freq(stored: torch.Tensor, config: H3Config) -> None:
     computed = rope_inv_freq(config.transformer)
     if not torch.equal(stored.float().cpu(), computed):
         raise RuntimeError("the checkpoint's rope.inv_freq differs from the computed table; refusing to guess")
 
 
-def build_transformer(
-    config: H3Config, snapshot: Path, device, comm_group: CommGroup | None = None,
-    dtype: torch.dtype = torch.bfloat16, partition: str = PARTITION, output_heads: str | None = None,
-) -> H3DiT:
-    """``output_heads`` names a file under ``partition`` holding the per-step video heads
-    (``video_out.weight [n, out, in]``, ``video_out.bias``), which replace the transformer's
-    own ``final_layer.video_out``."""
-    cfg = config.transformer
-    with torch.device("meta"):
-        dit = H3DiT(cfg, comm_group)
-    dit.to(dtype)
-    dit.keep_fp32()  # on meta: the fp32 modules are allocated in fp32, never rounded
-    dit.to_empty(device=device)
+def _transformer_weights(
+    config: H3Config, snapshot: Path, device, text: bool, dit_source: Path | None,
+    partition: str = PARTITION, output_heads: str | None = None,
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """The transformer's tensors under ``split_fused``'s names: the token refiner and
+    ``condition_proj`` (``text``) or the rest, the other part left on disk. FL2VA's, or the
+    diffusers-layout directory ``dit_source``'s. ``output_heads`` (not with ``text``) names a
+    file under ``partition`` holding the per-step video heads, which replace the
+    transformer's own ``final_layer.video_out``."""
+    if dit_source is not None:
+        if output_heads is not None:
+            raise ValueError("output_heads replaces FL2VA's video head; a diffusers dit_source has none to replace")
+
+        def unread(name: str) -> bool:
+            return _VSA_GATE in name or name.startswith(_DIFFUSERS_TEXT_PREFIXES) != text
+
+        return from_diffusers(iter_diffusers_component(Path(dit_source), device, skip=unread))
+
     root = Path(snapshot) / partition
 
     def unread(name: str) -> bool:
-        # the refiner's keys stay on disk, and the single head the step heads replace
-        return name.startswith(_TEXT_PREFIXES) or (output_heads is not None and name.startswith(_VIDEO_HEAD))
-
-    def skip(name: str) -> bool:
-        return name.startswith(_TEXT_PREFIXES) or name == "rope.inv_freq"
+        # the other part stays on disk, and the single head the step heads replace
+        return name.startswith(_TEXT_PREFIXES) != text or (output_heads is not None and name.startswith(_VIDEO_HEAD))
 
     def weights():
         # the stored rope table is checked, then dropped
@@ -111,25 +167,44 @@ def build_transformer(
                 for name in heads.keys():
                     yield "final_layer." + name, heads.get_tensor(name)
 
+    cfg = config.transformer
+    return split_fused(weights(), cfg.num_attention_heads, cfg.attention_head_dim)
+
+
+def build_transformer(
+    config: H3Config, snapshot: Path, device, comm_group: CommGroup | None = None,
+    dtype: torch.dtype = torch.bfloat16, partition: str = PARTITION, output_heads: str | None = None,
+    dit_source: Path | None = None,
+) -> H3DiT:
+    """``output_heads`` names a file under ``partition`` holding the per-step video heads
+    (``video_out.weight [n, out, in]``, ``video_out.bias``), which replace the transformer's
+    own ``final_layer.video_out``; ``dit_source`` a diffusers-layout transformer directory."""
+    with torch.device("meta"):
+        dit = H3DiT(config.transformer, comm_group)
+    dit.to(dtype)
+    dit.keep_fp32()  # on meta: the fp32 modules are allocated in fp32, never rounded
+    dit.to_empty(device=device)
+
+    def skip(name: str) -> bool:
+        return name.startswith(_TEXT_PREFIXES) or name == "rope.inv_freq"
+
     return load_native(
-        dit, split_fused(weights(), cfg.num_attention_heads, cfg.attention_head_dim), lambda n: n,
+        dit, _transformer_weights(config, snapshot, device, False, dit_source, partition, output_heads), lambda n: n,
         "MiniMax-H3 transformer", stacked_params=_FUSED_RULES, skip=skip,
     )
 
 
 def build_text_conditioner(config: H3Config, snapshot: Path, device, dtype: torch.dtype = torch.bfloat16,
-                           partition: str = PARTITION):
-    cfg = config.transformer
+                           partition: str = PARTITION, dit_source: Path | None = None):
     with torch.device("meta"):
-        module = H3TextConditioner(cfg)
+        module = H3TextConditioner(config.transformer)
     materialize(module, dtype, device)
 
     def skip(name: str) -> bool:
         return not name.startswith(_TEXT_PREFIXES)
 
-    weights = iter_transformers_component(Path(snapshot) / partition / "transformer", device, skip=skip)
     return load_native(
-        module, split_fused(weights, cfg.num_attention_heads, cfg.attention_head_dim), lambda n: n,
+        module, _transformer_weights(config, snapshot, device, True, dit_source, partition), lambda n: n,
         "MiniMax-H3 text conditioner", stacked_params=_FUSED_RULES, skip=skip,
     )
 

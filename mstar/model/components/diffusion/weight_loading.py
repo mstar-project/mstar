@@ -59,9 +59,12 @@ def _iter_component(
     raise FileNotFoundError(f"no safetensors checkpoint in {component_dir}")
 
 
-def iter_diffusers_component(component_dir: Path, device) -> Iterator[tuple[str, torch.Tensor]]:
+def iter_diffusers_component(
+    component_dir: Path, device, skip: Callable[[str], bool] | None = None,
+) -> Iterator[tuple[str, torch.Tensor]]:
     return _iter_component(
         component_dir, device, "diffusion_pytorch_model.safetensors.index.json", "diffusion_pytorch_model.safetensors",
+        skip=skip,
     )
 
 
