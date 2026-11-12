@@ -35,6 +35,7 @@ mod protocol;
 mod realtime;
 mod refusals;
 mod served_models;
+mod lora_admin;
 mod serving;
 mod sndfile;
 mod speech_chunking;
@@ -155,6 +156,9 @@ async fn main() {
         realtime::report_availability();
     }
     let served = Arc::new(served_models::ServedModels::from_env(&model_name));
+    if let Some(bridge) = &bridge {
+        bridge.serve_models(served.clone());
+    }
 
     let refusals = Arc::new(refusals::Refusals::default());
     let state = AppState {
@@ -216,6 +220,9 @@ async fn main() {
         .route("/health", get(health))
         .route("/metrics", get(metrics))
         .route("/v1/models", get(list_models))
+        // LoRA's runtime updates: no generation, outside the admission cap
+        .route("/v1/load_lora_adapter", post(lora_admin::load_lora_adapter))
+        .route("/v1/unload_lora_adapter", post(lora_admin::unload_lora_adapter))
         .route("/v1/audio/voices", get(audio_voices))
         // long-lived sockets: outside the admission cap, as on the Python frontend
         .route("/", any(ws::openpi::openpi_ws))
