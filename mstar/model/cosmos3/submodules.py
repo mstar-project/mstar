@@ -345,8 +345,9 @@ class GenStepInfo:
     speedup; declaring the dense one for a step that does get a slot would try
     to capture an eager-only backend, so the safe direction over-declares.
 
-    ``cfg_active`` narrows the eager single-request declaration only. It is
-    deliberately not part of ``capture_key`` — see ``cg_key_info``.
+    ``cfg_active`` narrows the eager declarations: the single-request step's,
+    and a cross-request action step's, whose rows ``can_batch`` keeps to one
+    value. It is deliberately not part of ``capture_key`` — see ``cg_key_info``.
     """
     cfg: bool                 # this request has an unconditional branch at all
     cfg_active: bool          # ...and this step is inside its guidance interval
@@ -1771,9 +1772,11 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         ``_forward_action_gen`` call this for the same step, so the declared
         attention (batched vs cond-only) matches the forward that runs.
 
-        The captured path and the cross-request batch always run both
-        branches; ``postprocess`` and ``forward_batched`` call this to keep
-        the conditional one outside the interval. See ``cg_key_info`` for why
+        The captured path and the cross-request image / video batch always
+        run both branches; ``postprocess`` and ``forward_batched`` call this
+        to keep the conditional one outside the interval. A cross-request
+        action batch runs only the branches its rows' shared value calls for
+        (``can_batch``). See ``cg_key_info`` for why
         the interval is not folded into the capture key."""
         if st["uncond"] is None:
             return False
@@ -2254,7 +2257,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         out = {}
         for (rid, st, lat, act, k), branches in zip(meta, results, strict=True):
             video_v, action_v = branches[0]
-            # The rows agree on guidance (`can_batch`); the per-row check is defensive.
+            # `can_batch` keeps the rows to one value; the per-row check is belt and braces.
             if with_cfg and self._cfg_active(st, k):
                 uncond_video, uncond_action = branches[1]
                 video_v = _guided(video_v, uncond_video, st["gs"], lat.dtype)
