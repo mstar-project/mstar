@@ -983,6 +983,18 @@ def test_a_state_is_portable_between_rings_of_different_widths():
         assert not bool(layer.kv[:, :, :, lo:hi].any())
 
 
+def test_load_state_refuses_a_state_without_its_frame_count():
+    """Its frames would position the next one, so a state that lacks them loads nothing."""
+    kv = _manager()
+    _open(kv, "a")
+    _drive(kv, "a", frames=2)
+    state = kv.get_state("a")
+    before = [layer.kv.clone() for layer in kv.layers]
+    with pytest.raises(ValueError, match="without the frames it committed"):
+        kv.load_state("a", {"layers": state["layers"]})
+    assert all(torch.equal(a, layer.kv) for a, layer in zip(before, kv.layers, strict=True))
+
+
 def test_load_state_refuses_a_geometry_that_would_broadcast():
     """The shape guard, not `copy_`, is what has to catch this. The failure it
     exists for is a state saved under one horizon loaded into another — a 360P

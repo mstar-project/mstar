@@ -189,6 +189,9 @@ class RingKVManager(AttentionResource):
         """Restore one session's contents into the existing allocation."""
 
         session_idx = self._require_session(rid, "load_state")
+        if "committed_frames" not in state:
+            raise ValueError(f"ring KV {self.name!r}: a state for request {rid!r} without the frames it committed, "
+                             "which get_state saves with the ring's contents")
         layers = state["layers"]
         if len(layers) != len(self.layers):
             raise ValueError(
