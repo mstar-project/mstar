@@ -423,7 +423,7 @@ class EarTTSTalkerSubmodule(ARNodeSubmodule):
     DECODE_CAPTURE_BATCH_SIZES = SESSION_BATCH_SIZES
 
     def __init__(self, talker: nn.Module, config: NemotronDuplexConfig, codec: AudioCodec,
-                 subword_to_char: dict | None = None, char_pad_idx: int | None = None, noise_rows: int = 1):
+                 subword_to_char: dict | None = None, char_pad_idx: int | None = None, *, noise_rows: int):
         """``noise_rows`` is the talker loop's cap plus one, the steps a session can take."""
         super().__init__()
         self.talker = talker

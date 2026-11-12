@@ -87,8 +87,9 @@ class _Talker:
         cfg = NemotronDuplexConfig()
         cfg.eartts = TINY
         self.real = tiny_codec()
+        # the forward takes its noise from the step below, so the memo is never read
         self.node = EarTTSTalkerSubmodule(make_talker(), cfg, codec=self.real, subword_to_char=S2C,
-                                          char_pad_idx=CHAR_PAD)
+                                          char_pad_idx=CHAR_PAD, noise_rows=1)
         self.node.talker.backbone_pooled = lambda x: x
         self.node.talker.generate_step = lambda hidden, **kwargs: self.codes.unsqueeze(1)
         arrays = [
