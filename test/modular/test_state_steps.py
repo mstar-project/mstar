@@ -616,6 +616,25 @@ def test_a_converted_layout_serializes_like_a_hand_written_one():
     assert converted.row() == LabelLayout(spans=(_SPAN,), growth=(("decode_loop", 1),)).row()
 
 
+def test_a_layout_s_max_growth_reaches_the_paged_pool():
+    """A talker stream at 160 s: 37 warm-up rows, then a row a frame for 2001 frames and the final pad, 2039 rows. The
+    talker loop's cap of 2017 iterations alone reserves 2054, a 17th page of 128 the stream never fills."""
+    talker = _kv(max_len=8012)
+    layout = Layout(spans=(Span("rows", "talker_decode", 37, 37, "audio_prompt_latents"),),
+                    growth=(("talker_decode_loop", 1),))
+    caps = {"talker_decode_loop": 2017}
+    pool = PagedKVConfig(num_layers=2, num_qo_heads=4, num_kv_heads=4, head_dim=8, max_seq_len=8012)
+
+    def pages(layout: Layout) -> int:
+        row = kv_layouts([talker], {"kv": {"main": layout}}, {})["kv"]["main"].row()
+        config = KVReqConfig(needed_labels=["main"])
+        config.apply_conductor_config(kv_layout={"main": row}, loop_caps=caps)
+        return config.pages(None, caps, pool)
+
+    assert pages(replace(layout, max_growth=2002)) == 16, "the stream's 2039 rows fill 16 pages"
+    assert pages(layout) == 17, "without the cap the growth reserves the loop's cap"
+
+
 @pytest.mark.parametrize("state_layout, keyed, cause", [
     ({"other": {"main": Layout()}}, {}, r"state_layout\['other'\]: it names no declared array"),
     ({"kv": {"cfg": Layout()}}, {}, r"state_layout\['kv'\]: labels \['cfg'\] aren't in Array 'kv'.labels"),
