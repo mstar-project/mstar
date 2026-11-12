@@ -372,7 +372,7 @@ class ArraySteps(StepBuilder):
 
     def add(self, handle: ArrayHandle, declared: ArrayStep, step: SubmoduleStep) -> None:
         segments = segments_of(declared, step)
-        self._storage.steps(handle, declared, self._steps)
+        self._storage.steps(handle, declared, segments, self._steps)
         for bound in handle._bindings:
             bound.binding.steps(bound.key, declared, segments, self._steps)
 
@@ -1287,8 +1287,8 @@ class Storage(ABC):
         """``array``'s handle over a node's built ``resources``."""
         return self.handle_class(array, resources, resolved.bound[array.name], resolved)
 
-    def steps(self, handle: ArrayHandle, declared: ArrayStep, steps: dict[str, Any]) -> None:
-        """Add the step of the array's own resource, under its name."""
+    def steps(self, handle: ArrayHandle, declared: ArrayStep, segments, steps: dict[str, Any]) -> None:
+        """Add the step of the array's own resource over ``segments``, under its name."""
         return
 
     def step_builder(self) -> StepBuilder:
@@ -1338,10 +1338,10 @@ class PagedStorage(Storage):
         )
         return [pool, *_op_specs(array, bound)], bound
 
-    def steps(self, handle: ArrayHandle, declared: ArrayStep, steps: dict[str, Any]) -> None:
+    def steps(self, handle: ArrayHandle, declared: ArrayStep, segments, steps: dict[str, Any]) -> None:
         pre, post, rows = _forks(handle.array, declared)
         steps[handle.name] = KVStep(
-            segments=declared.segments, commit=declared.keep, pre_forks=pre, post_forks=post, fork_rids=rows,
+            segments=segments, commit=declared.keep, pre_forks=pre, post_forks=post, fork_rids=rows,
             sink=declared.placeholders, eager_write=declared.eager_add,
         )
 
@@ -1395,9 +1395,9 @@ class ValueStorage(Storage):
         )
         return [pool, *_op_specs(array, bound)], bound
 
-    def steps(self, handle: ArrayHandle, declared: ArrayStep, steps: dict[str, Any]) -> None:
+    def steps(self, handle: ArrayHandle, declared: ArrayStep, segments, steps: dict[str, Any]) -> None:
         pre, post, rows = _forks(handle.array, declared)
-        steps[handle.name] = RecurrentStep(segments=declared.segments, pre_forks=pre, post_forks=post, fork_rids=rows)
+        steps[handle.name] = RecurrentStep(segments=segments, pre_forks=pre, post_forks=post, fork_rids=rows)
 
 
 class HostValueStorage(Storage):
