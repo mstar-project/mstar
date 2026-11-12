@@ -399,7 +399,11 @@ def state_steps(
             )
     for builder in builders.values():
         steps.update(builder.steps())
-    expanded = replace(step, steps=steps)
+    # A step's forward packs one set of labels together, which `SubmoduleStep` holds for all of its resources.
+    combined = dict(step.combined_labels)
+    for built in steps.values():
+        combined.update(built.combined_labels)
+    expanded = replace(step, steps=steps, combined_labels=combined)
     expanded.set_state_handles((*(handles[name] for name in step.state), *shards))
     return expanded
 
@@ -892,7 +896,7 @@ class PagedArrayHandle(ArrayHandle):
         # adds that run before the reads, outside the captured graph, which the reads find in the pages
         self._eager = step.state[self.name].eager_add
         # the one plan `PagedStorage.steps` names for a step over several labels
-        combined = getattr(step.steps.get(self.name), "combined_labels", None)
+        combined = step.combined_labels
         self._combined = bool(combined)
         if combined:
             self.label = next(iter(combined.values()))
