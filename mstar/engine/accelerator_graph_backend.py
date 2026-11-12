@@ -57,18 +57,6 @@ class AcceleratorGraphBackend(ABC):
     def device_type(self) -> str:
         return self.device.type
 
-    def while_refusal(self) -> str | None:
-        """Why this backend has no WHILE run (``mstar.engine.device_run``), or None."""
-        return f"{type(self).__name__} has no WHILE graph node"
-
-    def while_runtime(self) -> Any:
-        """What a WHILE run calls: a ``device_run.CudaWhile``."""
-        raise NotImplementedError(self.while_refusal())
-
-    def loop(self, child: CapturedGraph, predicate: torch.Tensor) -> CapturedGraph:
-        """WHILE(``predicate``) { ``child`` }, one launch."""
-        raise NotImplementedError(self.while_refusal())
-
     @abstractmethod
     def is_available(self) -> bool: ...
 
@@ -199,46 +187,9 @@ class CUDAGraphBackend(_TorchGraphBackend):
 
     def __init__(self, device: torch.device):
         super().__init__(device, device_type="cuda", runtime=torch.cuda)
-        self._while = None
 
     def create_graph(self, keep_graph: bool = False) -> CapturedGraph:
         return self._runtime.CUDAGraph(keep_graph=keep_graph)
-
-    def raw_stream(self) -> int:
-        """The current ``cudaStream_t``, which ``torch.Stream`` doesn't expose."""
-        return int(self._runtime.current_stream(self.device).cuda_stream)
-
-    def while_refusal(self) -> str | None:
-        if not torch.version.cuda:
-            return "this torch has no CUDA runtime"
-        if tuple(int(part) for part in torch.version.cuda.split(".")[:2]) < (12, 4):
-            return f"CUDA {torch.version.cuda} has no conditional graph node (12.4 and up)"
-        from mstar.engine.device_run import CudaWhile
-
-        try:
-            nvrtc_dir = CudaWhile.nvrtc()[1]
-        except OSError as error:
-            return f"no NVRTC to compile its stop kernel with: {error}"
-        nvjitlink, devrt = CudaWhile.link_libraries(nvrtc_dir)
-        if nvjitlink is None or devrt is None:
-            return (
-                "no one CUDA release has both libnvJitLink and libcudadevrt.a to link the stop kernel: "
-                f"looked next to torch's NVRTC ({nvrtc_dir}), its sibling wheel directories, then CUDA_HOME "
-                "and /usr/local/cuda"
-            )
-        return None
-
-    def while_runtime(self) -> Any:
-        from mstar.engine.device_run import CudaWhile
-
-        if self._while is None:
-            self._while = CudaWhile()
-        return self._while
-
-    def loop(self, child: CapturedGraph, predicate: torch.Tensor) -> CapturedGraph:
-        from mstar.engine.device_run import WhileGraph
-
-        return WhileGraph(self.while_runtime(), child, predicate, self.raw_stream)
 
 
 class XPUGraphBackend(_TorchGraphBackend):

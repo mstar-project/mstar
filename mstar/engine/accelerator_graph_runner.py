@@ -5,7 +5,6 @@ import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, field, is_dataclass, replace
 from functools import cache, partial
-from types import MappingProxyType
 from typing import Any, Callable, Collection, Iterator, Mapping, NamedTuple, Sequence
 
 import torch
@@ -29,7 +28,6 @@ from mstar.engine.accelerator_graph_config import (
     PiecewiseConfigType,
     apply_token_ladders,
 )
-from mstar.engine.device_run import RunAsk, RunState
 from mstar.engine.node_dtype import node_scope
 from mstar.engine.resources import BucketKey, CGSlotSpec, Resource, SlotLease, StepContext, StepRunner
 from mstar.engine.resources.resident import ResidentPlanner
@@ -672,13 +670,14 @@ class DummyRowPool:
 
 
 class ReplayEvents(NamedTuple):
-    """A host run as its iterations land (``Landing``): replay i's event
-    records once its stop buffers' column i is on the host."""
+    """A repeated step's replays as they land on the host while it runs:
+    replay i's event records once its stop buffers' column i is there."""
     events: Sequence[Any]
 
-    def landed(self, after: int, wait_s: float) -> int:
+    def landed(self, after: int) -> int:
         """Waits for replay ``after``, which the host launched, then counts
-        the replays that have landed."""
+        the replays that have landed. This thread's reads of their columns
+        come after it."""
         if not self.events[after].query():
             self.events[after].synchronize()
         end = after + 1
@@ -688,14 +687,13 @@ class ReplayEvents(NamedTuple):
 
 
 class HostRun:
-    """A step that repeats from the host, as ``RunState`` is one that repeats
-    on the device: each replay's stop buffers land in pinned memory,
-    ``[turns, limit, bs]`` each, then the replay's event records
-    (``[turns][limit]``). A turn a step, so the next step's replays leave this
-    one's alone: step N's are read on the host while N+1's land theirs (the
-    pipeline is one step deep; as ``HostCopies``' ring, four leave slack). On a
-    CPU device the columns are plain memory and there are no events, so the
-    step has no landing."""
+    """A step that repeats from the host: each replay's stop buffers land in
+    pinned memory, ``[turns, limit, bs]`` each, then the replay's event
+    records (``[turns][limit]``). A turn a step, so the next step's replays
+    leave this one's alone: step N's are read on the host while N+1's land
+    theirs (the pipeline is one step deep; as ``HostCopies``' ring, four leave
+    slack). On a CPU device the columns are plain memory and there are no
+    events, so the step has no landing."""
 
     TURNS = 4
 
@@ -766,9 +764,8 @@ class AcceleratorGraphSlot:
     dummy_rids: list[int]
     dummy_metadata: dict[int, CurrentForwardPassInfo]
     config_idx: int
-    # a step that repeats: a device run's state, when ``graph`` is a WHILE
-    # around the step's capture, else the host run's pinned columns
-    run: RunState | HostRun | None = None
+    # a step that repeats: its replays' pinned columns (``HostRun``)
+    run: HostRun | None = None
 
 
 @dataclass
@@ -793,9 +790,6 @@ class WarmedSpec(NamedTuple):
 
 
 class AcceleratorGraphRunner:
-    # walk -> what its device run needs (``ask_device_runs``)
-    _run_asks: Mapping[str, RunAsk] = MappingProxyType({})
-
     CAPTURE_BATCH_SIZES = DEFAULT_CAPTURE_BATCH_SIZES
     NUM_WARMUP = 2
     # None: the backend's shared capture stream (see ``Engine._capture_stream_for``)
@@ -891,8 +885,6 @@ class AcceleratorGraphRunner:
         # config_idx -> its compiled forward, shared by every bucket of that
         # config so shapes captured twice (once per slot) compile once
         self._compiled_forwards: dict[int, Any] = {}
-        # walk -> why it couldn't have a device run
-        self._run_failures: dict[str, str] = {}
         # walk -> how a step of it that repeats carries each loop-back signal
         # (output -> static input), once ``accept_repeats`` has said it may
         self._repeat_carries: dict[str, Mapping[str, str]] = {}
@@ -1311,16 +1303,11 @@ class AcceleratorGraphRunner:
             # what preparing it left cached in the allocator is out of the
             # capture pool's reach
             torch.accelerator.empty_cache()
-            run = self._capture_run(spec, warmed)
-            if run is None:
-                graph, output = capture_into_graph(
-                    warmed.run, self._memory_pool, self._device, self._autocast_dtype,
-                    node_name=self._submodule_name, stream=self._capture_stream,
-                )
-                state = None
-            else:
-                graph, output, state = run
-            slot = self._build_slot_from_capture(
+            graph, output = capture_into_graph(
+                warmed.run, self._memory_pool, self._device, self._autocast_dtype,
+                node_name=self._submodule_name, stream=self._capture_stream,
+            )
+            return self._build_slot_from_capture(
                 output=BatchedModelOutput.coerce(output),
                 graph=graph,
                 static_inputs=warmed.static_inputs,
@@ -1329,69 +1316,6 @@ class AcceleratorGraphRunner:
                 dummy_metadata=warmed.dummy_metadata,
                 config_idx=spec.config_idx,
             )
-            slot.run = state
-            return slot
-
-    def ask_device_runs(self, asks: Mapping[str, RunAsk]) -> None:
-        """Before capture: these walks' captures are the body of a WHILE."""
-        self._run_asks = dict(asks)
-
-    def device_run_refusal(self, walk: str) -> str | None:
-        """After capture: why ``walk`` can't run on the device, or None."""
-        return self._run_failures.get(walk)
-
-    def _capture_run(self, spec: CGSlotSpec, warmed: WarmedSpec) -> tuple[Any, Any, RunState] | None:
-        """``spec``'s capture as the body of a WHILE, or None where a plain
-        capture serves. A failure settles the walk, and is what load refuses."""
-        walk = spec.bucket.graph_walk
-        ask = self._run_asks.get(walk)
-        if ask is None or walk in self._run_failures:
-            return None
-        if unfit := [w for w in spec.config.replay_graph_walks if w != walk and self._run_asks.get(w) != ask]:
-            # a step of such a walk would lease this WHILE slot with no stop to run it, or the other's
-            self._run_failures[walk] = f"its capture is also replayed by {unfit}, which ask for another run"
-            return None
-        backend = self._graph_backend
-        if refusal := backend.while_refusal():
-            self._run_failures[walk] = refusal
-            return None
-        if _is_packed(spec.config):
-            self._run_failures[walk] = "its capture is packed"
-            return None
-        if self._num_slots < 2:
-            self._run_failures[walk] = "it has one capture slot, so a step could overwrite the columns of the last"
-            return None
-        cuda = backend.while_runtime()
-        state = RunState(spec.bucket.bs, ask.limit, ask.stop_ids, self._device)
-        names: list[str] = []
-
-        def body() -> Any:
-            raw = warmed.run()
-            output = BatchedModelOutput.coerce(raw)
-            buffers = output.check_stop_buffers or {}
-            token = buffers[ask.token_signal]
-            names[:] = list(buffers)
-            if any(tensor is not token for tensor in buffers.values()):
-                raise ValueError("a device run keeps only the stop token's column")
-            for source, target in ask.carries.items():
-                into = warmed.static_inputs[target]
-                into.copy_(_carried(output, source).reshape(into.shape))
-            cuda.stop(state, token.to(torch.long), backend.raw_stream())
-            return raw
-
-        try:
-            cuda.load_kernels()
-            graph, output = capture_into_graph(
-                body, self._memory_pool, self._device, self._autocast_dtype, keep_graph=True,
-                node_name=self._submodule_name, stream=self._capture_stream,
-            )
-            composed = backend.loop(graph, state.continuation)
-        except Exception as error:
-            self._run_failures[walk] = f"its capture into a WHILE body failed: {error}"
-            logger.warning("AcceleratorGraphRunner[%s]: %s", self._submodule_name, error)
-            return None
-        state.names = tuple(names)
-        return composed, output, state
 
     @contextmanager
     def _warmed(self, spec: CGSlotSpec, forwards: int) -> Iterator[WarmedSpec]:
@@ -1875,15 +1799,10 @@ class AcceleratorGraphRunner:
             profiler.range_pop()
         return slot.static_outputs
 
-    def slot_run(self, lease: SlotLease) -> RunState | None:
-        """This slot's device run, or None."""
-        run = self.slot_for(lease).run
-        return run if isinstance(run, RunState) else None
-
     def accept_repeats(self, walk: str, carries: Mapping[str, str], limit: int) -> None:
         """A step of ``walk`` may repeat up to ``limit`` times, carrying its
-        signals as ``carries``. Each slot's replays from the host land their
-        stop buffers in the slot's pinned columns."""
+        signals as ``carries``. Each slot's replays land their stop buffers in
+        the slot's pinned columns."""
         self._repeat_carries[walk] = carries
         for bucket in self._buckets.values():
             if bucket.config.capture_graph_walk != walk:
@@ -1895,37 +1814,34 @@ class AcceleratorGraphRunner:
     def repeat(self, lease: SlotLease, out: BatchedModelOutput, repeats: int) -> BatchedModelOutput:
         """``out``, the step's first launch, with the rest of its iterations:
         its stop buffers gain a column per iteration, on the host, landing as
-        each iteration ends. A device run has run them all and says how many;
-        a host run (``HostRun``) replays the graph, copying every loop-back
-        signal's output into the static input it feeds before each replay, and
-        landing each replay's columns. A walk that can't repeat returns ``out``
-        as it is for one iteration, and refuses more: every resource would
-        commit them."""
+        each iteration ends. The graph replays (``HostRun``), copying every
+        loop-back signal's output into the static input it feeds before each
+        replay, and landing each replay's columns. A walk that can't repeat
+        returns ``out`` as it is for one iteration, and refuses more: every
+        resource would commit them."""
         slot = self.slot_for(lease)
         walk = lease.bucket.graph_walk
         carries = self._repeat_carries.get(walk)
-        if slot.run is None and carries is None:
+        if carries is None:
             if repeats > 1:
                 raise ValueError(
                     f"a step of {walk!r} asks for {repeats} iterations, but the walk never accepted repeats"
                 )
             return out
         profiler.phase_record(f"repeats.{walk}#", repeats)
+        if repeats == 1:
+            return out
         run = slot.run
-        if isinstance(run, HostRun):
-            if repeats == 1:
-                return out
-            copies = [
-                (_carried(slot.static_outputs, output), slot.static_inputs[target])
-                for output, target in carries.items()
-            ]
-            run.next_turn()
-            for i in range(repeats):
-                if i:
-                    for source, target in copies:
-                        target.copy_(source.reshape(target.shape))
-                    slot.graph.replay()
-                run.land(i)
+        copies = [
+            (_carried(slot.static_outputs, output), slot.static_inputs[target]) for output, target in carries.items()
+        ]
+        run.next_turn()
+        for i in range(repeats):
+            if i:
+                for source, target in copies:
+                    target.copy_(source.reshape(target.shape))
+                slot.graph.replay()
+            run.land(i)
         buffers, landing = run.results(repeats)
         return replace(out, check_stop_buffers=buffers, landing=landing)
 

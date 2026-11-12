@@ -316,37 +316,12 @@ fn source_hash(rust_dir: std::path::PathBuf) -> PyResult<String> {
     Ok(crate::source_hash::source_hash(&rust_dir)?)
 }
 
-/// A device run's landing count (`RunState.ran`, pinned int32 at `ptr`)
-/// once it passes `after`, else as it stands after `wait_us`, waited with the
-/// GIL released. An acquire load: the device wrote the columns the count
-/// covers before it (a system-scope fence and release store), so this
-/// thread's later reads of them, `GraphRuntime::emit_prefix`'s too, read
-/// them as written, on a weakly ordered host (Grace) as well.
-#[pyfunction]
-fn wait_count(py: Python<'_>, ptr: usize, after: u32, wait_us: u64) -> u32 {
-    use std::sync::atomic::{AtomicI32, Ordering};
-    // SAFETY: `ptr` is the caller's pinned int32 count, 4-byte aligned, held
-    // for the step; the device only stores to it.
-    let ran = unsafe { &*(ptr as *const AtomicI32) };
-    py.detach(|| {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_micros(wait_us);
-        loop {
-            let now = ran.load(Ordering::Acquire).max(0) as u32;
-            if now > after || std::time::Instant::now() >= deadline {
-                return now;
-            }
-            std::thread::yield_now();
-        }
-    })
-}
-
 #[pymodule]
 fn mstar_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     // What a checkout compares with source_hash over its own rust/.
     m.add("BUILD_SOURCE_HASH", crate::BUILD_SOURCE_HASH)?;
     m.add_function(wrap_pyfunction!(source_hash, m)?)?;
-    m.add_function(wrap_pyfunction!(wait_count, m)?)?;
     m.add_class::<PyZmqCommunicator>()?;
     m.add_class::<PyShmArena>()?;
     m.add_class::<PyShmSegment>()?;

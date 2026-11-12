@@ -360,7 +360,7 @@ def test_a_repeat_feeds_each_replay_the_last_one_s_token_and_keeps_a_column_per_
     assert wide["new_token"].tolist() == [[5, 6, 7], [7, 8, 9]], "the next step landed its own columns"
 
     # a walk that never accepted repeats can't run several: every resource would commit them
-    slot.run, runner._repeat_carries = None, {}
+    runner._repeat_carries = {}
     assert runner.repeat(lease, outputs, 1) is outputs
     with pytest.raises(ValueError, match="never accepted repeats"):
         runner.repeat(lease, outputs, 3)

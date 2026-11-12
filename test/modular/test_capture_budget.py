@@ -284,8 +284,7 @@ def test_a_spec_is_warmed_up_to_size_it_and_not_again_to_capture_it(measured, mo
     the 10 s sizing added to Bagel's 66 s boot."""
     runner = _StubMeasuredRunner(torch.device("cuda", 0), {_DECODE: CaptureCost(_GIB, 2 * _GIB, 0, 2)})
     runner._memory_pool = None
-    runner._build_slot_from_capture = SimpleNamespace
-    runner._capture_run = lambda spec, warmed: None
+    runner._build_slot_from_capture = lambda **slot: slot
     runner.size_captures()
     monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
     monkeypatch.setattr(

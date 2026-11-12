@@ -17,6 +17,7 @@ whole step does.
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, fields
 from typing import TYPE_CHECKING, NamedTuple
@@ -28,9 +29,9 @@ from mstar.utils.profiler import phase_record
 if TYPE_CHECKING:
     import torch
 
+    from mstar.engine.accelerator_graph_runner import ReplayEvents
     from mstar.graph.base import GraphSection
     from mstar.graph.runtime.base import GraphRuntime, InlineColumn
-    from mstar.model.submodule_base import Landing
     from mstar.worker.speculation import Speculation
 
 logger = logging.getLogger(__name__)
@@ -44,9 +45,6 @@ class RepeatConfig:
     # Ready rows wait for a full-length run: after a step that ran once, the next
     # takes no new rows. Trades admission latency for longer runs.
     ready_waits: bool = False
-    # A step's WHILE node ends on the device once every row has stopped, in one
-    # launch, instead of the host launching each iteration.
-    device_stop: bool = False
 
     @classmethod
     def parse(cls, node: str, block: object) -> RepeatConfig:
@@ -58,7 +56,7 @@ class RepeatConfig:
         config = cls(**block)
         if type(config.max) is not int or config.max < 1:
             raise ValueError(f"step_repeats for {node!r}: max is {config.max!r}; it must be an integer of at least 1")
-        for name in ("ready_waits", "device_stop"):
+        for name in ("ready_waits",):
             if type(getattr(config, name)) is not bool:
                 raise ValueError(
                     f"step_repeats for {node!r}: {name} is {getattr(config, name)!r}; it must be a boolean"
@@ -130,7 +128,7 @@ class StepRepeats:
         for (node, walk), signals in self.loops.items():
             if signals.refusal is None:
                 config = self._configs[node]
-                asked.setdefault(node, {})[walk] = WalkAsk(signals.loop_back, config.max if config.device_stop else 0)
+                asked.setdefault(node, {})[walk] = WalkAsk(signals.loop_back)
         return asked
 
     def settle(self, refusal: Callable[[str, str], str | None]) -> None:
@@ -186,24 +184,22 @@ class StepRepeats:
         return max(1, min(self._configs[key[0]].max, loop_room()))
 
 
-# How long one look at a device run's landing count waits for it to move before
-# the host checks the step for an error; it returns as soon as the count moves.
-_RUN_LOOK_S = 1e-3
-
-
 def stream_run(
     runtime: GraphRuntime, partition: str, node: str, walk: str, rids: list[int], row_rids: Sequence[int],
-    tokens: torch.Tensor, inline: InlineColumn, landing: Landing, completion: torch.Event,
-) -> int:
+    tokens: torch.Tensor, inline: InlineColumn, landing: ReplayEvents, completion: torch.Event,
+) -> tuple[int, float]:
     """While a repeated step runs, send the client each iteration's tokens as
     it lands (``landing``, then ``GraphRuntime.emit_prefix``), until every row
-    has stopped or the step has run; returns how many iterations went out.
-    Called before the step's wait, with the rows its route takes: what it
-    sends is a prefix of what the route would, which then sends the rest."""
+    has stopped or the step has run; returns how many iterations went out,
+    and the seconds spent waiting for them to land. Called before the step's
+    wait, with the rows its route takes: what it sends is a prefix of what the
+    route would, which then sends the rest."""
     width = inline.column.shape[1]
-    taken, looks, first = 0, 0, 0
+    taken, looks, first, waited = 0, 0, 0, 0.0
     while taken < width:
-        end = min(landing.landed(taken, _RUN_LOOK_S), width)
+        started = time.perf_counter()
+        end = min(landing.landed(taken), width)
+        waited += time.perf_counter() - started
         looks += 1
         if end > taken:
             sent, stopped = runtime.emit_prefix(
@@ -220,4 +216,4 @@ def stream_run(
     # how many iterations had landed when the host first saw any: what went out at once
     phase_record(f"repeats.{walk}.first_look#", first)
     phase_record(f"repeats.{walk}.looks#", looks)
-    return taken
+    return taken, waited

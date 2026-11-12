@@ -234,7 +234,8 @@ class HostCopies:
         slot = self._host_rows_slot = (self._host_rows_slot + 1) % _HOST_ROWS_RING
         if rows:
             outputs.host_rows = HostRows(
-                tuple(outputs.row_request_ids), self._copy_to_pinned(buffers, f"host_rows{slot}"),
+                tuple(outputs.row_request_ids),
+                self._copy_to_pinned(buffers, f"host_rows{slot}"),
             )
         if outputs.output_spans:
             outputs.host_spans = self._copy_to_pinned(

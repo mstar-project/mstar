@@ -27,7 +27,6 @@ from mstar.communication.tensor_store import RustTensorBookkeeping
 from mstar.communication.wire import decode
 from mstar.distributed.base import ShardingConfig
 from mstar.engine.accelerator_graph_runner import ReplayEvents
-from mstar.engine.device_run import RunState
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources.step import StepContext
 from mstar.graph.base import GraphEdge, GraphNode, Loop
@@ -251,7 +250,7 @@ def test_a_row_with_no_host_value_routes_through_the_store(tmp_path):
     assert frames["native"] == frames["reference"] and frames["native"]
 
 
-@pytest.mark.parametrize("landing", [None, "host", "device"], ids=["at_postprocess", "host_events", "device_count"])
+@pytest.mark.parametrize("landing", [False, True], ids=["at_postprocess", "host_events"])
 def test_missing_limits_leave_the_check_to_the_model(tmp_path, landing):
     """A row with no registered limits: the runtime decides nothing (STOPS).
     Nor while a repeated step runs: the host sends nothing and stops looking
@@ -260,11 +259,11 @@ def test_missing_limits_leave_the_check_to_the_model(tmp_path, landing):
     rid = rt.add_request(
         request_id="r", partition=PART, graph_walk=WALK, partition_worker_graph_ids=[0],
         worker_graph_to_workers=ParallelList([0], [[ME]]), loop_caps={})
-    if landing is not None:
+    if landing:
         wide = torch.full((MAX_ITERS, 1), EOS, dtype=torch.int64).t()
         running = SimpleNamespace(query=lambda: pytest.fail("the host kept looking at a step it can't send"))
-        landed = _landing(landing)[0]
-        assert stream_run(rt, PART, NODE, WALK, [rid], [rid], wide, InlineColumn(SIG, wide), landed, running) == 0
+        landed = _landing()[0]
+        assert stream_run(rt, PART, NODE, WALK, [rid], [rid], wide, InlineColumn(SIG, wide), landed, running)[0] == 0
     column = torch.tensor([EOS], dtype=torch.int64)
     step = rt.begin_postprocess(PostprocessRequest(
         partition=PART, node_name=NODE, graph_walk=WALK, output_signals=[SIG],
@@ -345,32 +344,31 @@ class _Event:
             event.done = True
 
 
-def _landing(kind):
-    """How a repeated step's iterations land as the host looks (``stream_run``):
+def _landing(late=False):
+    """How a repeated step's replays land as the host looks (``stream_run``):
     the first has landed when it first looks, the next two land together, then
-    the last. A host run's replay events, or a device run's count, which moves
-    on when the host checks the step's completion; the device run is still
-    going after the third, so its postprocess sends the last."""
-    if kind == "host":
-        events = [_Event(done=True), _Event(), _Event(), _Event()]
-        events[1].lands, events[3].lands = events[1:3], events[3:]
-        return ReplayEvents(events), SimpleNamespace(query=lambda: all(e.done for e in events))
-    run = RunState(2, MAX_ITERS, {EOS}, torch.device("cpu"))
-    run.ran[0] = 1
-    done = iter([False, True])
+    the last, each as its replay's event says. ``late``: the last lands while
+    the host sends the two before it, so the host finds the step complete and
+    leaves the last to its postprocess."""
+    events = [_Event(done=True), _Event(), _Event(), _Event()]
+    events[1].lands, events[3].lands = events[1:3], events[3:]
+    looks = iter([False, True])
 
     def query():
-        run.ran[0] = 3  # the next two landed while the host sent the first
-        return next(done)
+        if not late:
+            return all(e.done for e in events)
+        complete = next(looks)
+        events[3].done = events[3].done or complete
+        return complete
 
-    return run, SimpleNamespace(query=query)
+    return ReplayEvents(events), SimpleNamespace(query=query)
 
 
 def _through_the_worker(rt, rids, wide):
     """The repeated step as the worker postprocesses it
-    (``StepExecutor.postprocess``), its replays landing as ``_landing("host")``
+    (``StepExecutor.postprocess``), its replays landing as ``_landing``
     has them: its tokens go out as they land, then its route sends the rest."""
-    landing, completion = _landing("host")
+    landing, completion = _landing()
     engine = SimpleNamespace(
         inline_signals=lambda node, walk: {SIG: "new_token"},
         device_loopback_signals=lambda node, walk: (SIG,),
@@ -407,7 +405,7 @@ def _through_the_worker(rt, rids, wide):
 
 
 @pytest.mark.parametrize(
-    "landing", [None, "host", "device", "worker"], ids=["at_postprocess", "host_events", "device_count", "worker"],
+    "landing", [None, "host", "late", "worker"], ids=["at_postprocess", "host_events", "last_late", "worker"],
 )
 def test_a_repeated_steps_client_tokens_match_one_iteration_a_step(tmp_path, landing):
     """A step that ran several iterations hands the client a token per
@@ -415,8 +413,8 @@ def test_a_repeated_steps_client_tokens_match_one_iteration_a_step(tmp_path, lan
     iteration's loop index and counted by the completion report, and nothing
     the device ran past the stop. The same when they go out while the step
     runs (``stream_run``) as the host learns each iteration landed (``host``:
-    from its replay's event; ``device``: from the run's landing count), and
-    its postprocess sends the rest, the worker's too (``worker``), which
+    from its replay's event; ``late``: the step completes before the last
+    lands, as far as the host saw), and its postprocess sends the rest, the worker's too (``worker``), which
     starts the route where the early sends left off. The reference runs the
     same tokens one iteration a step."""
     sent = {}
@@ -448,10 +446,11 @@ def test_a_repeated_steps_client_tokens_match_one_iteration_a_step(tmp_path, lan
                 continue
             start = 0
             if landing is not None:
-                start = stream_run(
-                    rt, PART, NODE, WALK, list(rids), rids, wide, InlineColumn(SIG, wide), *_landing(landing),
+                start, _ = stream_run(
+                    rt, PART, NODE, WALK, list(rids), rids, wide, InlineColumn(SIG, wide),
+                    *_landing(late=landing == "late"),
                 )
-                assert start == {"host": MAX_ITERS, "device": 3}[landing]
+                assert start == {"host": MAX_ITERS, "late": 3}[landing]
             trace = _drive(rt, PostprocessRequest(
                 partition=PART, node_name=NODE, graph_walk=WALK, output_signals=[SIG],
                 wg_ids=ParallelList(list(rids), [0, 0]), runtime_stops=True,

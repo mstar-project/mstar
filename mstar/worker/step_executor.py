@@ -30,12 +30,12 @@ from mstar.graph.runtime.base import (
     RouteTensors,
     SendInput,
 )
-from mstar.model.submodule_base import END_PARTITION, BatchedModelOutput, HostRows, Landing, chunk_loop_name
+from mstar.model.submodule_base import END_PARTITION, BatchedModelOutput, HostRows, chunk_loop_name
 from mstar.profile.worker import WorkerProfileInfo
 from mstar.utils import cpus, knobs
 from mstar.utils.containers import ParallelList
 from mstar.utils.device import DeviceCapability
-from mstar.utils.profiler import PhaseLaps, phase_record, range_pop, range_push, set_step_key
+from mstar.utils.profiler import PhaseLaps, range_pop, range_push, set_step_key
 from mstar.utils.threads import InlineExecutor, ThreadPool, pin_thread
 from mstar.worker.host_copies import HostCopies, _host_column, _LazyHostOutputs, crop_to_spans
 from mstar.worker.lockstep import Lockstep
@@ -78,6 +78,16 @@ class ModelStops(NamedTuple):
     stops: dict[int, set[str]]
     dropped: list[int]
     ended: list[int]
+
+
+class RouteRows(NamedTuple):
+    """``StepExecutor._route_rows``: the rows a step routes, each one's index
+    into ``walks`` when the step mixes walks (None for one walk), the walks,
+    and the signals they route under."""
+    rids: list[int]
+    rid_walk_idx: list[int] | None
+    walks: list[str]
+    signals: list[str]
 
 
 class GpuStepBody:
@@ -812,9 +822,9 @@ class StepExecutor:
 
         # Wait for batch N's completion event before proceeding
         # TODO: may need to refine this based on how it affects performance?
-        inline_start = 0
+        inline_start, route = 0, None
         if batch_N.batch.request_to_worker_graph:
-            inline_start = self._stream_run(batch_N, outputs)
+            inline_start, route = self._stream_run(batch_N, outputs)
             self.wait_for_step(batch_N)
 
         if self.enable_prof:
@@ -840,8 +850,6 @@ class StepExecutor:
             outputs, batch_N.node_batch.completion_event,
             request_ids=batch_N.node_batch.request_ids,
         )
-        if host_rows is not None and outputs.landing is not None:
-            self._settle_run(batch_N, host_rows, outputs.landing)
         self._rebuilds.record(batch_N.node_batch, {
             rid: self.request_state.get_fwd_info(rid, batch_N.partition) for rid in batch_N.node_batch.cached_rids
         })
@@ -864,7 +872,7 @@ class StepExecutor:
             checked = self._check_stops(batch_N, outputs, cpu_outputs, host_rows, engine).stops
             _pp_stage("check_stop")
         request = self._get_postprocess_request(
-            batch_N, host_rows, engine, runtime_stops, tokens, checked, inline_start,
+            batch_N, host_rows, engine, runtime_stops, tokens, checked, inline_start, route,
         )
         if self.enable_nvtx:
             range_pop(synchronize=False)
@@ -943,21 +951,6 @@ class StepExecutor:
         engine.after_output_copy(batch_N.node_batch)
         _pp_stage("after_output_copy")
 
-    @staticmethod
-    def _settle_run(batch_N: PendingBatch, host_rows: HostRows, landing: Landing) -> None:
-        """A run's landed width: a device run that ended short (every row
-        stopped) wrote only the columns it ran, and a host run lands every
-        replay, so its width stands. Everything after this reads the width the
-        run really had, which the step's wait has landed. Only the run's own
-        token columns are cut: a resource's host row (the log-probs of a
-        one-iteration step) is one value a row, with no columns."""
-        ran = landing.landed(0, 0)
-        phase_record(f"repeats.{batch_N.graph_walk}.ran#", ran)
-        for name, column in host_rows.buffers.items():
-            if column.dim() > 1:
-                host_rows.buffers[name] = column[:, :ran]
-        batch_N.node_batch.step_context.repeats = ran
-
     def repeat_refusal(self, node_name: str, graph_walk: str) -> str | None:
         """Why no step of this walk can stand for several iterations, or None:
         its stop runs in the runtime and everything it routes stays on the device."""
@@ -995,10 +988,8 @@ class StepExecutor:
         tokens = _host_column(host_rows, token_signal, batch_N.node_batch.step_context.repeats)
         return tokens is not None, tokens
 
-    def _route_rows(self, batch_N: PendingBatch) -> tuple[list[int], list[int] | None, list[str], list[str]]:
-        """The rows the step routes; each one's index into its walks when the
-        step mixes walks (None for one walk); the walks; the signals they
-        route under."""
+    def _route_rows(self, batch_N: PendingBatch) -> RouteRows:
+        """The rows the step routes, under which walks and signals."""
         batch = batch_N.batch
         by_walk = batch.rids_by_walk()
         walks = list(by_walk) or [batch_N.graph_walk]
@@ -1019,7 +1010,7 @@ class StepExecutor:
             signals = list(dict.fromkeys(
                 signal for walk in walks for signal in self._body.walk_signals(batch, walk)
             ))
-        return rids, rid_walk_idx, walks, signals
+        return RouteRows(rids, rid_walk_idx, walks, signals)
 
     def _inline_column(
         self, batch_N: PendingBatch, host_rows: "HostRows | None", engine, signals: list[str],
@@ -1044,45 +1035,56 @@ class StepExecutor:
         )
         return None if column is None else InlineColumn(signal, column)
 
-    def _stream_run(self, batch_N: PendingBatch, outputs: BatchedModelOutput) -> int:
+    def _stream_run(self, batch_N: PendingBatch, outputs: BatchedModelOutput) -> tuple[int, RouteRows | None]:
         """While a repeated step runs, send the client its tokens as they land
         (``stream_run``): how many iterations went out, from which the step's
-        postprocess sends the rest. Before the step's wait, over the rows its
+        postprocess sends the rest, and the route they went out over, which
+        the postprocess takes too. Before the step's wait, over the rows its
         route takes: those the worker dropped (stopped a step ago, torn down)
-        are gone from it already."""
+        are gone from it already, and none leaves after, since the runtime
+        checks the step's stops (no model ``check_stop`` fails a row)."""
         host_rows, event = outputs.host_rows, batch_N.node_batch.completion_event
         if (
             host_rows is None or event is None or outputs.landing is None
             or batch_N.node_batch.step_context.repeats < 2
         ):
-            return 0
+            return 0, None
         runtime_stops, tokens = self._runtime_stop_column(batch_N, host_rows)
         if not runtime_stops or tokens is None:
-            return 0
-        rids, rid_walk_idx, walks, signals = self._route_rows(batch_N)
+            return 0, None
+        route = self._route_rows(batch_N)
         engine = self.engine_manager.get_engine(batch_N.node_name)
-        inline = self._inline_column(batch_N, host_rows, engine, signals, rid_walk_idx)
+        inline = self._inline_column(batch_N, host_rows, engine, route.signals, route.rid_walk_idx)
         if inline is None:
-            return 0
-        with self.timer.span("worker.postprocess.stream_run"):
-            return stream_run(
-                self._graph_runtime, batch_N.partition, batch_N.node_name, walks[0], rids, host_rows.request_ids,
-                tokens, inline, outputs.landing, event,
-            )
+            return 0, route
+        started = _time.perf_counter()
+        if self.enable_nvtx:
+            range_push("worker.postprocess.stream_run", synchronize=False)
+        sent, waited = stream_run(
+            self._graph_runtime, batch_N.partition, batch_N.node_name, route.walks[0], route.rids,
+            host_rows.request_ids, tokens, inline, outputs.landing, event,
+        )
+        if self.enable_nvtx:
+            range_pop(synchronize=False)
+        # the iterations' landing is a GPU wait, as ``event_sync`` is; the rest, the sends, is work
+        self.timer.record("worker.postprocess.stream_run.wait", waited)
+        self.timer.record("worker.postprocess.stream_run", _time.perf_counter() - started - waited)
+        return sent, route
 
     def _get_postprocess_request(
         self, batch_N: PendingBatch, host_rows: "HostRows | None", engine,
         runtime_stops: bool, tokens: "torch.Tensor | None",
-        checked: dict[int, set[str]] | None, inline_start: int = 0,
+        checked: dict[int, set[str]] | None, inline_start: int = 0, route: RouteRows | None = None,
     ) -> PostprocessRequest:
         """The step's ``PostprocessRequest``: its rows, its stops known before
         the runtime's check (``checked``: the model's, when the runtime does
         not check), and the host columns the runtime reads in place.
         ``inline_start``: the iterations of the client column that went out
-        while the step ran (``_stream_run``)."""
+        while the step ran (``_stream_run``); ``route``: the step's
+        ``_route_rows``, when ``_stream_run`` took it already."""
         batch = batch_N.batch
         repeats = batch_N.node_batch.step_context.repeats
-        rids, rid_walk_idx, walks, signals = self._route_rows(batch_N)
+        rids, rid_walk_idx, walks, signals = route or self._route_rows(batch_N)
         # Stream-terminated loop: a stream-consuming node inside a loop has no
         # internal stop signal (unlike a self-EOS loop), so when it consumes
         # the terminal chunk of its stream (``final_stream_rids``: the

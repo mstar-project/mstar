@@ -141,10 +141,6 @@ class StepContext:
     # step counts for this many iterations. The worker asks, and `StepRunner`
     # narrows it to what the step's resources allow (`Resource.max_repeats`).
     repeats: int = 1
-    # the step before, in the same Loop, when this one runs every row of it one
-    # iteration on and repeats: a device run starts from that run's stops.
-    # Cleared at the forward, so no chain of contexts stays alive.
-    continues: "StepContext | None" = field(default=None, repr=False, compare=False)
     # the node's `ResidentPlanner` when this step's capture reads the resident
     # tables: a resource then stages nothing per row (see `resources/resident.py`)
     resident: Any = None

@@ -3547,8 +3547,8 @@ impl GraphRuntime {
     /// nothing past a stop goes out and postprocess, given `start` = what this
     /// returns, sends the rest. Decides nothing: no stop, count or route.
     ///
-    /// The caller knows `end` has landed (a device run: from `wait_count`, on
-    /// this thread, which orders these reads after it). Returns the end it
+    /// The caller knows `end` has landed (its replay's event, waited on this
+    /// thread, which orders these reads after it). Returns the end it
     /// sent up to, `start` when the check can't decide every row, and whether
     /// every row has stopped by then, after which nothing more of the step
     /// goes out. The columns are as `begin_postprocess` takes them; `rids`

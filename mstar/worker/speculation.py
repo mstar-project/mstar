@@ -527,18 +527,15 @@ class Speculator:
         """Ask for as many iterations as the step can have; its resources narrow
         it at admit, on the step's own context. ``owes_run``: the step is the
         run ready rows wait for, which needs no turn in the chain."""
-        batch, ctx = speculation.scheduled_batch, speculation.node_batch.step_context
+        batch = speculation.scheduled_batch
         batch.owed_run = owes_run
-        ctx.repeats = self._step_repeats.ceiling(
+        speculation.node_batch.step_context.repeats = self._step_repeats.ceiling(
             speculation, max(self._consecutive, int(owes_run)),
             lambda: self._graph_runtime.loop_room(
                 batch.node_name, batch.graph_walk, self._innermost_loop_by_node[(batch.graph_walk, batch.node_name)],
                 list(speculation.continuing_rids), pending.node_batch.step_context.repeats,
             ),
         )
-        # only a step that repeats runs every row of N one iteration on: a row N
-        # saw stop is then one this step drops (``pending_loop_stop_rids``)
-        ctx.continues = pending.node_batch.step_context if ctx.repeats > 1 else None
 
     def can_speculate(self, batch: ScheduledBatch) -> bool:
         if not self._async_schedulable(batch):

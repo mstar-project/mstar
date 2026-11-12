@@ -6,7 +6,7 @@ from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field, fields, replace
 from enum import Enum
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import torch
 
@@ -44,18 +44,6 @@ class HostRows(NamedTuple):
         # padded rows past the real ones fall off the zip
         value_of = dict(zip(self.request_ids, buffer.reshape(buffer.shape[0], -1)[:, 0].tolist(), strict=False))
         return ((rid, value) for rid in request_ids if (value := value_of.get(rid)) is not None)
-
-
-class Landing(Protocol):
-    """A repeated step's iterations as they land on the host while it runs,
-    their stop buffers' columns with them: a host run's replay events
-    (``ReplayEvents``), a device run's count (``RunState``)."""
-
-    def landed(self, after: int, wait_s: float) -> int:
-        """How many iterations have landed, once more than ``after`` have (a
-        device run waits at most ``wait_s``, then says how many it saw). This
-        thread's reads of their columns come after it."""
-        ...
 
 
 @dataclass(frozen=True)
@@ -153,7 +141,7 @@ class BatchedStopCheck(NamedTuple):
 
 if TYPE_CHECKING:
     from mstar.engine.accelerator_graph_config import AcceleratorGraphConfig, PiecewiseAcceleratorGraphConfig
-    from mstar.engine.accelerator_graph_runner import PiecewiseAcceleratorGraphRunner
+    from mstar.engine.accelerator_graph_runner import PiecewiseAcceleratorGraphRunner, ReplayEvents
     from mstar.engine.engine import ExecutingBatch
     from mstar.streaming.stream_buffer import StreamChunkInfo
 
@@ -245,16 +233,13 @@ class StopPolicy:
         max_iters = None
         if self.kind is not StopKind.EOS:
             max_iters = int(info.max_tokens if self.max_iters is None else self.max_iters(info))
-        return StopLimits(max_iters, self.request_ignores_eos(info))
-
-    def request_ignores_eos(self, info: CurrentForwardPassInfo) -> bool:
-        """``StopLimits.ignore_eos`` for one request, alone."""
+        ignore_eos = False
         if self.reads_token and self.ignores_eos is not None:
-            return bool(self.ignores_eos(info))
-        if self.reads_token and self.sampler is not None:
+            ignore_eos = bool(self.ignores_eos(info))
+        elif self.reads_token and self.sampler is not None:
             config = info.resource_configs.get(self.sampler)
-            return bool(getattr(config, "ignore_eos", False))
-        return False
+            ignore_eos = bool(getattr(config, "ignore_eos", False))
+        return StopLimits(max_iters, ignore_eos)
 
     def stops(self, count: int, token: int | None, limits: StopLimits) -> bool:
         """Whether a row with the loop at ``count`` and sampled ``token``
@@ -314,9 +299,9 @@ class BatchedModelOutput:
     # along its last dim. The worker cuts the rows to it once the step has
     # run (see ``NodeSubmodule.spanned_outputs``).
     output_spans: dict[str, torch.Tensor] | None = None
-    # A repeated step's iterations as they land on the host; None on any
-    # other step.
-    landing: Landing | None = None
+    # A repeated step's replays as they land on the host; None on any other
+    # step.
+    landing: "ReplayEvents | None" = None
     # The request each row of ``output_spans`` belongs to, stamped by the
     # engine like ``row_request_ids``.
     span_request_ids: tuple | None = None
