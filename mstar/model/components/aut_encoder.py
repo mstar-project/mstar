@@ -115,7 +115,9 @@ class AuTAttention(nn.Module):
     from ``cu_seqlens``.
     """
 
-    def __init__(self, d_model: int, num_heads: int, attn_key: str | None):
+    def __init__(
+        self, d_model: int, num_heads: int, attn_key: str | None, array: str | None = None, layer: int | None = None,
+    ):
         super().__init__()
         if d_model % num_heads:
             raise ValueError(f"d_model {d_model} is not divisible by {num_heads} heads")
@@ -123,11 +125,17 @@ class AuTAttention(nn.Module):
         self.head_dim = d_model // num_heads
         self._attn_key = attn_key
         self.ragged = None
+        # the array a node on the state contract reads through, in place of the resource
+        self.array, self.layer = array, layer
+        self.state = None
         self.qkv_proj = FusedColumnLinear(d_model, {"q": d_model, "k": d_model, "v": d_model}, bias=True)
         self.out_proj = nn.Linear(d_model, d_model, bias=True)
 
     def bind_resources(self, resources: dict) -> None:
         self.ragged = None if self._attn_key is None else resources.get(self._attn_key)
+
+    def bind_state(self, handles: dict) -> None:
+        self.state = handles.get(self.array)
 
     @staticmethod
     @torch.compiler.disable
@@ -149,7 +157,10 @@ class AuTAttention(nn.Module):
         q = q.view(n, self.num_heads, self.head_dim)
         k = k.view(n, self.num_heads, self.head_dim)
         v = v.view(n, self.num_heads, self.head_dim)
-        if self.ragged is not None:
+        if self.state is not None:
+            self.state.add(self.layer, k=k, v=v)
+            out = self.state.read(self.layer, q)
+        elif self.ragged is not None:
             out = self.ragged.run(q, k, v)
         else:
             out = self._sdpa_per_window(q, k, v, cu_seqlens)
@@ -157,10 +168,12 @@ class AuTAttention(nn.Module):
 
 
 class AuTEncoderLayer(nn.Module):
-    def __init__(self, config: AuTEncoderConfig, attn_key: str | None):
+    def __init__(
+        self, config: AuTEncoderConfig, attn_key: str | None, array: str | None = None, layer: int | None = None,
+    ):
         super().__init__()
         self.self_attn_layer_norm = nn.LayerNorm(config.d_model)
-        self.self_attn = AuTAttention(config.d_model, config.encoder_attention_heads, attn_key)
+        self.self_attn = AuTAttention(config.d_model, config.encoder_attention_heads, attn_key, array, layer)
         self.final_layer_norm = nn.LayerNorm(config.d_model)
         self.fc1 = nn.Linear(config.d_model, config.encoder_ffn_dim)
         self.fc2 = nn.Linear(config.encoder_ffn_dim, config.d_model)
@@ -199,7 +212,7 @@ class AuTLayout:
 class AuTEncoder(nn.Module):
     """Packed audio encoder; parameter paths mirror HF's ``audio_tower.*``."""
 
-    def __init__(self, config: AuTEncoderConfig, attn_key: str | None = None):
+    def __init__(self, config: AuTEncoderConfig, attn_key: str | None = None, array: str | None = None):
         super().__init__()
         self.config = config
         hidden = config.downsample_hidden_size
@@ -213,7 +226,7 @@ class AuTEncoder(nn.Module):
             persistent=False,
         )
         self.layers = nn.ModuleList(
-            [AuTEncoderLayer(config, attn_key) for _ in range(config.encoder_layers)]
+            [AuTEncoderLayer(config, attn_key, array, layer) for layer in range(config.encoder_layers)]
         )
         self.ln_post = nn.LayerNorm(config.d_model)
         self.proj1 = nn.Linear(config.d_model, config.d_model)
