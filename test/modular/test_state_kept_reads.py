@@ -44,7 +44,15 @@ from mstar.engine.state import (
     Window,
     at_last_token,
 )
-from mstar.engine.state.adapters import StateSetup, _resolve, build_handle, build_specs, node_handles, state_steps
+from mstar.engine.state.adapters import (
+    Queries,
+    StateSetup,
+    _resolve,
+    build_handle,
+    build_specs,
+    node_handles,
+    state_steps,
+)
 from mstar.engine.state.calls import ArrayHandle
 from mstar.engine.state.contract import Entry
 from mstar.model.components.distributed.attention import ParallelCrossAttention
@@ -151,6 +159,12 @@ def test_a_kept_reads_mask_picks_the_steps_flag(mask, causal):
     handle = build_handle(array, {"kv": _StubKV(), "attn": _StubSelfRead()}, _resolve([array], StateSetup()))
     step = state_steps(SubmoduleStep(segments=[Segment("a", "main", 1)], state={"kv": ArrayStep()}), {"kv": handle})
     assert step.steps["attn"].causal is causal, f"{mask} plans the other flag"
+
+
+def test_a_kept_cross_reads_query_side_holds_the_queried_array_and_no_ragged_plan():
+    queries = _resolve([_self_array(), _context_array()], StateSetup()).queries["cross"]
+    assert queries.array.name == "kv"
+    assert not isinstance(queries, Queries), "its own cross resource plans it, so a ragged plan would be a dead member"
 
 
 def test_a_kept_cross_read_plans_over_its_arrays_segments_with_no_causal_flag():

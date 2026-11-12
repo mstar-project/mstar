@@ -1046,66 +1046,21 @@ def _plan_label(array: Array, reader: Array) -> str:
     return label
 
 
-class Queries(ABC):
-    """Whose segments lay out a within-step read's queries, picked once per read at resolve: its own array's, or those
-    of the array its ``queries`` names. A paged cross read takes a `CrossQueries` for its array and its checks, and its
-    own resource plans it."""
-
-    # the spec of the resource the read plans on
-    spec_class: ClassVar[type[NodeResourceSpec]]
+class QuerySide:
+    """Whose segments lay out a read's queries, picked once per read at resolve: its own array's, or those of the array
+    its ``queries`` names."""
 
     def __init__(self, array: Array):
         # the array whose segments lay out the queries
         self.array = array
-
-    @abstractmethod
-    def plan_label(self, keys: Array) -> str:
-        """The label the read's plan runs under, where ``keys`` is the read's own array."""
-
-    @abstractmethod
-    def plan(self, steps: WithinStepSteps, handle: "WithinStepHandle", segments, step: SubmoduleStep) -> None:
-        """Lay out ``handle``'s read in ``steps``, over ``segments``, its own array's in ``step``."""
-
-    @abstractmethod
-    def step(self, segments, pairs: Sequence[tuple[str, str]], fixed: bool) -> Any:
-        """The step of a resource whose reads lay out their queries this way."""
 
     def check(self, handle: ArrayHandle, segments, step: SubmoduleStep) -> None:
         """Refuse a step whose queries don't line up with ``segments``, the read's own array's."""
         return
 
 
-class OwnQueries(Queries):
-    """A read whose queries are its own array's."""
-
-    spec_class = RaggedAttentionSpec
-
-    def plan_label(self, keys: Array) -> str:
-        return _plan_label(keys, keys)
-
-    def plan(self, steps: WithinStepSteps, handle: "WithinStepHandle", segments, step: SubmoduleStep) -> None:
-        steps._label(handle.resource_key, handle.array, segments)
-
-    def step(self, segments, pairs: Sequence[tuple[str, str]], fixed: bool) -> Any:
-        return AttentionStep(segments=segments, causal=False, fixed_layout=fixed)
-
-
-class CrossQueries(Queries):
-    """A read whose queries are another array's, which a step lists over the same requests in the same order."""
-
-    spec_class = RaggedCrossAttentionSpec
-
-    def plan_label(self, keys: Array) -> str:
-        # Both sides fix the plan's label, so it is one string for the life of the handle. See `cross_label`.
-        return cross_label(_plan_label(self.array, keys), _plan_label(keys, keys))
-
-    def plan(self, steps: WithinStepSteps, handle: "WithinStepHandle", segments, step: SubmoduleStep) -> None:
-        key = handle.resource_key
-        q_label = steps._label(key, self.array, handle.query_share(self.segments(handle, step)))
-        steps._pairs.setdefault(key, []).append((q_label, steps._label(key, handle.array, handle.key_share(segments))))
-
-    def step(self, segments, pairs: Sequence[tuple[str, str]], fixed: bool) -> Any:
-        return RaggedCrossAttentionStep(segments=tuple(segments), pairs=tuple(pairs))
+class OtherArrayQueries(QuerySide):
+    """Queries another array's segments lay out, which a step lists over the same requests in the same order."""
 
     def segments(self, handle: ArrayHandle, step: SubmoduleStep) -> Sequence[Segment]:
         """The segments that lay out ``handle``'s queries in ``step``, refused where it lists none."""
@@ -1124,6 +1079,58 @@ class CrossQueries(Queries):
         if [s.request_id for s in queries] != [s.request_id for s in segments]:
             raise handle._refusal(f"its segments and those of {self.array.name!r}, which lay out its queries, must "
                                   "name the same requests in the same order, with one segment to one")
+
+
+class Queries(QuerySide, ABC):
+    """How a read within a step plans its queries on its ragged resource."""
+
+    # the spec of the resource the read plans on
+    spec_class: ClassVar[type[NodeResourceSpec]]
+
+    @abstractmethod
+    def plan_label(self, keys: Array) -> str:
+        """The label the read's plan runs under, where ``keys`` is the read's own array."""
+
+    @abstractmethod
+    def plan(self, steps: WithinStepSteps, handle: "WithinStepHandle", segments, step: SubmoduleStep) -> None:
+        """Lay out ``handle``'s read in ``steps``, over ``segments``, its own array's in ``step``."""
+
+    @abstractmethod
+    def step(self, segments, pairs: Sequence[tuple[str, str]], fixed: bool) -> Any:
+        """The step of a resource whose reads lay out their queries this way."""
+
+
+class OwnQueries(Queries):
+    """A read whose queries are its own array's."""
+
+    spec_class = RaggedAttentionSpec
+
+    def plan_label(self, keys: Array) -> str:
+        return _plan_label(keys, keys)
+
+    def plan(self, steps: WithinStepSteps, handle: "WithinStepHandle", segments, step: SubmoduleStep) -> None:
+        steps._label(handle.resource_key, handle.array, segments)
+
+    def step(self, segments, pairs: Sequence[tuple[str, str]], fixed: bool) -> Any:
+        return AttentionStep(segments=segments, causal=False, fixed_layout=fixed)
+
+
+class CrossQueries(OtherArrayQueries, Queries):
+    """A read within a step whose queries are another array's, on a ragged cross resource."""
+
+    spec_class = RaggedCrossAttentionSpec
+
+    def plan_label(self, keys: Array) -> str:
+        # Both sides fix the plan's label, so it is one string for the life of the handle. See `cross_label`.
+        return cross_label(_plan_label(self.array, keys), _plan_label(keys, keys))
+
+    def plan(self, steps: WithinStepSteps, handle: "WithinStepHandle", segments, step: SubmoduleStep) -> None:
+        key = handle.resource_key
+        q_label = steps._label(key, self.array, handle.query_share(self.segments(handle, step)))
+        steps._pairs.setdefault(key, []).append((q_label, steps._label(key, handle.array, handle.key_share(segments))))
+
+    def step(self, segments, pairs: Sequence[tuple[str, str]], fixed: bool) -> Any:
+        return RaggedCrossAttentionStep(segments=tuple(segments), pairs=tuple(pairs))
 
 
 class WithinStepHandle(ArrayHandle):
@@ -1239,7 +1246,7 @@ class Resolved(NamedTuple):
     specs: dict[str, list[NodeResourceSpec]]
     bound: dict[str, tuple[BoundOp, ...]]
     resource_of: dict[str, str]
-    queries: dict[str, Queries]
+    queries: dict[str, QuerySide]
 
 
 class Storage(ABC):
@@ -1359,7 +1366,7 @@ class PagedCrossStorage(PagedStorage):
             if not isinstance(storage_of(queried), PagedStorage):
                 raise _no_layout(array, f"reads[{key!r}] keeps entries and reads the queries of {read.queries!r}, "
                                         "which isn't an append-only array that keeps entries")
-            resolved.queries[key] = CrossQueries(queried)
+            resolved.queries[key] = OtherArrayQueries(queried)
         return resolved
 
     def steps(self, handle: ArrayHandle, declared: ArrayStep, step: SubmoduleStep, steps: dict[str, Any]) -> None:
