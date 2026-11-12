@@ -670,15 +670,30 @@ def tiny():
 
 
 def _orpheus():
+    from mstar.engine.state.adapters import node_handles
     from mstar.model.orpheus.components.language_model import OrpheusForCausalLM
-    from mstar.model.orpheus.config import OrpheusModelConfig
+    from mstar.model.orpheus.config import ATTN, KV_CACHE, ROPE, SAMPLER, OrpheusModelConfig
     from mstar.model.orpheus.orpheus_model import OrpheusModel
     from mstar.model.orpheus.submodules import OrpheusLLMSubmodule
+
+    def stub_cores(sub, rows: _Rows):
+        """``sub`` with its handles on Orpheus's declared state bound over stubs of the kernels, which read ``rows``."""
+        resources = {KV_CACHE: _Unread(), ATTN: _AttendCore(rows), ROPE: _NoRotation(), SAMPLER: None}
+        sub.bind_node_state(node_handles(model_object(OrpheusModel, sub.config), "LLM", resources))
+        return sub
 
     def build(c, group, weights):
         lm = OrpheusForCausalLM(c, comm_group=group).to(DTYPE)
         lm.load_weights(weights.items())
-        return OrpheusLLMSubmodule(lm.requires_grad_(False).eval(), c)
+        return stub_cores(OrpheusLLMSubmodule(lm.requires_grad_(False).eval(), c), _Rows())
+
+    def run_(sub, rows):
+        lengths = _Rows([len(r) for r in rows])
+        stub_cores(sub, lengths)
+        x = sub.model.embed(torch.cat(rows))
+        with step_over(sub, lengths, (KV_CACHE,)):
+            hidden = sub.model(x, label="main")
+        return _per_row(hidden, sub.model.logits(_last(hidden, lengths.lengths)), lengths.lengths)
 
     return Stack(
         config=tiny, lora_spec=lambda c: _declared(model_object(OrpheusModel, c)), build=build,
@@ -687,9 +702,7 @@ def _orpheus():
                       "model.embed_tokens": (c.hidden_size, c.vocab_size)},
         a2=lambda c: _subset(llama_layers(c, "model."), "0.self_attn.q_proj", "0.self_attn.v_proj",
                              "1.mlp.down_proj"),
-        run=_ids_run(lambda s: s.model, lambda s, ids: s.model.embed(ids),
-                     lambda s, x: s.model(x, label="main"), lambda s, x: s.model.logits(x)),
-        declare=_declare("prefill"), inputs=_tokens(lambda c: c.vocab_size),
+        run=run_, declare=_declare("prefill"), inputs=_tokens(lambda c: c.vocab_size),
         released=lambda: (model_object(OrpheusModel, OrpheusModelConfig()),
                           lambda c, g: OrpheusForCausalLM(c, comm_group=g)),
         embedding=("model.embed_tokens",),

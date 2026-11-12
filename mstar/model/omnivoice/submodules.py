@@ -28,7 +28,7 @@ from mstar.engine.accelerator_graph_config import (
     PiecewiseCaptureShape,
     PiecewisePackedConfig,
 )
-from mstar.engine.resources import AttentionStep, Segment, SlotLease, SubmoduleStep
+from mstar.engine.state import ArrayStep, Segment, SlotLease, SubmoduleStep
 from mstar.model.omnivoice.components.backbone import (
     CanvasItem,
     OmniVoiceBackbone,
@@ -48,7 +48,8 @@ logger = logging.getLogger(__name__)
 UNMASK_LOOP_NAME = "unmask_loop"
 # Step metadata: the canvas length, in frames
 TARGET_LEN = "target_len"
-# The backbone's ragged attention resource, and its captured layer stack.
+# The backbone's tokens within a step, its ragged attention over them, and its captured layer stack.
+BACKBONE_TOKENS = "backbone_tokens"
 BACKBONE_ATTN = "backbone_attn"
 BACKBONE_LAYERS = "backbone_layers"
 
@@ -174,6 +175,9 @@ class OmniVoiceBackboneSubmodule(NodeSubmodule):
         self.backbone = backbone
         self.config = config
 
+    def bind_state(self, handles: Mapping[str, Any]) -> None:
+        self.tokens = handles[BACKBONE_TOKENS]
+
     # -- inputs -----------------------------------------------------------
 
     def prepare_inputs(
@@ -277,7 +281,7 @@ class OmniVoiceBackboneSubmodule(NodeSubmodule):
                 Segment(request_id=request_ids[i // per_id], label="main", span=n)
                 for i, n in enumerate(doc_lens)
             ],
-            steps={BACKBONE_ATTN: AttentionStep(causal=False)},
+            state={BACKBONE_TOKENS: ArrayStep()},
         )
 
     def get_piecewise_accelerator_graph_configs(
@@ -311,11 +315,12 @@ class OmniVoiceBackboneSubmodule(NodeSubmodule):
     def _capture_layers(self, inp: PiecewiseCallInputs) -> dict[str, torch.Tensor]:
         s = inp.static_inputs
         return {
-            "hidden": self.backbone.encode(
-                s["input_ids"], s["audio_mask"], s["pos_ids"],
-                self.node_resources[BACKBONE_ATTN],
-            )
+            "hidden": self.backbone.encode(s["input_ids"], s["audio_mask"], s["pos_ids"], self._attend)
         }
+
+    def _attend(self, layer: int, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        self.tokens.add(layer, k=k, v=v)
+        return self.tokens.read(layer, q)
 
     @torch.inference_mode()
     def _logits(self, engine_inputs: ModelInputsFromEngine, canvas: PackedCanvas) -> torch.Tensor:
@@ -336,7 +341,7 @@ class OmniVoiceBackboneSubmodule(NodeSubmodule):
                 real_bs=num_requests,
             ).get_view("hidden")
         else:
-            hidden = self.backbone.encode(**static_inputs, attn=engine_inputs.resources[BACKBONE_ATTN])
+            hidden = self.backbone.encode(**static_inputs, attend=self._attend)
         return self.backbone.head(hidden, canvas.tgt_index)
 
     def preprocess(
