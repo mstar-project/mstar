@@ -26,7 +26,7 @@ from mstar.engine.resources.attn.ragged.config import (
     RaggedCrossAttentionStep,
 )
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
-from mstar.engine.resources.step import Segment, StepContext, SubmoduleStep
+from mstar.engine.resources.step import ResourceStep, Segment, StepContext, SubmoduleStep
 from mstar.engine.state import Array, ArrayStep, Attend, Block, Causal, KVEntry, Read, TensorType, Value, adapters
 from mstar.engine.state.adapters import (
     SDPA,
@@ -575,6 +575,14 @@ def test_a_step_of_reads_on_sdpa_is_no_step_at_all():
     handles = node_handles(_Model(_array("a")), "dit", {}, setup=_on_sdpa("a_read"))
     step = SubmoduleStep(state={"a": ArrayStep(segments=(Segment(1, "a", 4),))})
     assert state_steps(step, handles) is None, "a step on sdpa declares no step, and its forward still runs"
+
+
+def test_a_step_of_reads_on_sdpa_keeps_another_resources_step():
+    handles = node_handles(_Model(_array("a")), "dit", {}, setup=_on_sdpa("a_read"))
+    segments = (Segment(1, "a", 4),)
+    step = SubmoduleStep(state={"a": ArrayStep(segments=segments)}, steps={"lora": ResourceStep(segments=segments)})
+    expanded = state_steps(step, handles)
+    assert expanded is not None and set(expanded.steps) == {"lora"}, "a LoRA pool's rows would get no plan"
 
 
 def test_a_read_on_sdpa_equals_sdpa_with_no_step_open():
