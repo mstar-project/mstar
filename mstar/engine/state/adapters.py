@@ -841,10 +841,10 @@ class LinearAttnBinding(OpBinding):
     geometry: ClassVar[type[RecurrentGeometry]]
 
     def check(self, array: Array, key: str, op: Op) -> None:
-        geometry = self.geometry.__name__
-        if set(array.entry.tensors) != {*op.writes, "conv"}:
-            raise _no_layout(array, f"entry must be exactly {' and '.join([*op.writes, 'conv'])}, the blocks "
-                                    f"{geometry} reads")
+        fields = [*op.writes, *CausalConv.writes]
+        if set(array.entry.tensors) != set(fields):
+            raise _no_layout(array, f"entry must be exactly {' and '.join(fields)}, the blocks "
+                                    f"{self.geometry.__name__} reads")
         for field in op.writes:
             if array.entry.tensors[field].dtype is None:
                 raise ValueError(f"Array {array.name!r}.entry.tensors[{field!r}].dtype must be declared, since the "
