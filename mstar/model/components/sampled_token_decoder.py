@@ -819,8 +819,9 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
 
     @property
     def runs_batch_postprocess(self) -> bool:
-        # only a node whose graph routes hidden rows has rows to keep or drop
-        return bool(self._hidden_walks)
+        # this class's tail has rows only where the graph routes hidden rows;
+        # a subclass's own tail always runs
+        return bool(self._hidden_walks) or type(self).batch_postprocess is not SampledTokenDecoder.batch_postprocess
 
     def batch_postprocess(
         self,

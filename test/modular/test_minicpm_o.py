@@ -297,9 +297,16 @@ def test_the_spoken_decode_hands_the_tts_each_rows_id_and_hidden(tmp_path):
     ptrs = {h.untyped_storage().data_ptr() for h in (*spoken, rows[ROW_HIDDEN])}
     assert len(ptrs) == 3 and spoken[0].untyped_storage().nbytes() == spoken[0].nbytes
 
-    # a decoder with no hidden walks runs no batch tail
+    # a decoder with no hidden walks runs no batch tail, unless a subclass adds its own
     llm._hidden_walks = frozenset()
     assert not llm.runs_batch_postprocess
+
+    class _Tailed(type(llm)):
+        def batch_postprocess(self, *args, **kwargs):
+            pass
+
+    llm.__class__ = _Tailed
+    assert llm.runs_batch_postprocess
 
 @pytest.mark.parametrize("prompt", [False, True])
 def test_a_mixed_step_without_a_prompt_row_leases_the_batched_decode_capture(tmp_path, prompt):
