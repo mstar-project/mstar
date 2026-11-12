@@ -318,11 +318,22 @@ class ParallelCrossAttention(nn.Module):
         self.context_kv = resources[key]
 
     def bind_state(self, handles: dict) -> None:
-        """The context array's handle, on a node that declares it."""
+        """The context array's handle, on the handle path, which a layer id picks."""
+        if self.layer is None:
+            return
         self.context = handles.get(self._context_kv_key)
+        if self.context is None:
+            raise self._no_context()
+
+    def _no_context(self) -> ValueError:
+        # A node with no handles never calls `bind_state`, so the handle path refuses again at its first call.
+        return ValueError(f"ParallelCrossAttention: layer {int(self.layer)} reads the array {self._context_kv_key!r}, "
+                          "which this node doesn't declare")
 
     def add_context(self, encoder_states: torch.Tensor) -> None:
         """Add this layer's K/V of the encoder output to the context array, on the walk that carries it."""
+        if self.context is None:
+            raise self._no_context()
         k, v = self.compute_kv(encoder_states)
         self.context.add(self.layer, k=k, v=v)
 
@@ -340,7 +351,9 @@ class ParallelCrossAttention(nn.Module):
         cursors; see ``Attention.forward``."""
         num_tokens = hidden_states.shape[0]
         q = self.q_proj(hidden_states).view(num_tokens, self.num_heads, self.head_dim)
-        if self.context is not None:
+        if self.layer is not None:
+            if self.context is None:
+                raise self._no_context()
             attn = self.context.read(self.layer, q)
         else:
             # nothing is written here: the context was written once at encode time

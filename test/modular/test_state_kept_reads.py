@@ -493,6 +493,21 @@ def test_a_layer_with_no_handle_key_is_refused_when_built():
         _cross_attention(layer=0)
 
 
+def test_a_layer_on_a_node_without_its_context_array_is_refused_at_bind():
+    with pytest.raises(ValueError, match="layer 0 reads the array 'context', which this node doesn't declare"):
+        _cross_attention(context_kv_key="context", layer=0).bind_state({"kv": _StubContext()})
+
+
+@torch.no_grad()
+def test_a_layer_on_a_node_with_no_handles_is_refused_at_its_first_call():
+    """The engine calls `bind_state` only on a node with handles."""
+    layer = _cross_attention(context_kv_key="context", layer=0)
+    with pytest.raises(ValueError, match="layer 0 reads the array 'context'"):
+        layer.add_context(torch.randn(5, 8))
+    with pytest.raises(ValueError, match="layer 0 reads the array 'context'"):
+        layer(torch.randn(2, 8))
+
+
 @torch.no_grad()
 def test_the_resource_path_is_unchanged_with_nothing_bound():
     class _Cross:
@@ -508,6 +523,22 @@ def test_the_resource_path_is_unchanged_with_nothing_bound():
     assert layer.context is None and layer.layer is None
     assert layer(torch.randn(2, 8)).shape == (2, 8)
     assert cross.view == "cursor"
+
+
+def test_a_layer_with_no_layer_id_stays_on_the_resource_path_beside_a_handle():
+    """Whisper names its context's resource key, and a node may also declare an array under that name."""
+    class _Cross:
+        context_cache_key = "cache"
+
+        def run(self, q, kv_cache_layer=None):
+            return q
+
+    handle = _StubContext()
+    layer = _cross_attention(cross_key="cross", context_kv_key="context")
+    layer.bind_resources({"cross": _Cross(), "context": SimpleNamespace(layer_view=lambda: "cursor")})
+    layer.bind_state({"context": handle})
+    assert layer(torch.randn(2, 8)).shape == (2, 8)
+    assert handle.read_at == [], "a layer with no id read through the handle with layer None"
 
 
 # Through real resources
