@@ -399,13 +399,32 @@ def state_steps(
             )
     for builder in builders.values():
         steps.update(builder.steps())
-    # A step's forward packs one set of labels together, which `SubmoduleStep` holds for all of its resources.
-    combined = dict(step.combined_labels)
-    for built in steps.values():
-        combined.update(built.combined_labels)
-    expanded = replace(step, steps=steps, combined_labels=combined)
+    expanded = replace(step, steps=steps, combined_labels=_combined_labels(step, steps, handles))
     expanded.set_state_handles((*(handles[name] for name in step.state), *shards))
     return expanded
+
+
+def _combined_labels(
+    step: SubmoduleStep, steps: Mapping[str, Any], handles: Mapping[str, Any],
+) -> dict[tuple[str, ...], str]:
+    """The labels ``step``'s forward packs together, which `SubmoduleStep` holds once for all of its resources.
+
+    Every array on KV pages plans them, so an array the step lists on other labels is refused.
+    """
+    paged = {name: steps[name] for name in step.state if isinstance(steps.get(name), KVStep)}
+    combined = dict(step.combined_labels)
+    for built in paged.values():
+        combined.update(built.combined_labels)
+    for name, built in paged.items():
+        packed = next((labels for labels in combined if labels not in built.combined_labels), None)
+        if packed is not None:
+            other = next((f"Array {o!r} on" for o, b in paged.items() if packed in b.combined_labels), "combines")
+            raise _no_layout(
+                handles[name].array,
+                f"a step lists it on labels {list(step_labels(built.segments))} and {other} {list(packed)}, which it "
+                "packs into one plan for every array on KV pages",
+            )
+    return combined
 
 
 def check_capture(handles: Mapping[str, ArrayHandle | SamplerHandle], walks: Collection[str]) -> None:
