@@ -201,6 +201,11 @@ class RefAudioTooLongError(ValueError):
     """A clip that opens as audio but runs past ``MAX_REF_AUDIO_SECONDS``."""
 
 
+_REF_AUDIO_TOO_LONG = (
+    f"ref_audio must be {MAX_REF_AUDIO_SECONDS:g} s or shorter; voice cloning needs a few seconds of speech"
+)
+
+
 #: The refusal of a bare-base64 ``ref_audio`` that is not audio the model decodes.
 BARE_REF_AUDIO_REFUSAL = (
     "server file paths are refused; ref_audio must be a data URL, an http(s) URL "
@@ -272,18 +277,19 @@ def _check_ref_audio_torchcodec(path: str) -> None:
     header = AudioDecoder(path).metadata
     _require_ref_audio_rate(header.sample_rate)
     _require_ref_audio_seconds(header.duration_seconds_from_header)
-    # play time counts from the stream's first timestamp, as the model's
-    # loader (torchcodec_samples_capped) counts it
-    start = max(0.0, getattr(header, "begin_stream_seconds_from_header", None) or 0.0)
     with _ref_audio_decodes:
         # Mono at a fixed rate: a small compressed upload can declare many
         # channels at a high rate, and decoding it natively takes gigabytes.
-        samples = AudioDecoder(
-            path, sample_rate=_REF_AUDIO_PROBE_RATE, num_channels=1
-        ).get_samples_played_in_range(start, start + MAX_REF_AUDIO_SECONDS + 1.0)
+        # The model's own loader caps the same decode, so the two measure the
+        # clip alike.
+        try:
+            samples = torchcodec_samples_capped(
+                path, MAX_REF_AUDIO_SECONDS, sample_rate=_REF_AUDIO_PROBE_RATE, num_channels=1,
+            )
+        except AudioTooLongError:
+            raise RefAudioTooLongError(_REF_AUDIO_TOO_LONG) from None
     if samples.duration_seconds == 0:
         raise ValueError("reference audio has no samples in its first seconds")
-    _require_ref_audio_seconds(samples.pts_seconds - start + samples.duration_seconds)
 
 
 def _check_ref_audio_soundfile(path: str) -> None:
@@ -310,9 +316,7 @@ def _require_ref_audio_rate(rate: int | None) -> None:
 
 def _require_ref_audio_seconds(seconds: float | None) -> None:
     if seconds is not None and seconds > MAX_REF_AUDIO_SECONDS:
-        raise RefAudioTooLongError(
-            f"ref_audio must be {MAX_REF_AUDIO_SECONDS:g} s or shorter; voice cloning needs a few seconds of speech"
-        )
+        raise RefAudioTooLongError(_REF_AUDIO_TOO_LONG)
 
 
 logger = logging.getLogger(__name__)

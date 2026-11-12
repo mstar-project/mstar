@@ -203,6 +203,14 @@ def test_omnivoice_refuses_audio_whose_header_opens_but_samples_do_not_decode(de
     )
 
 
+def _samples(pts_seconds, duration_seconds, rate):
+    """What a stub decoder's ``get_samples_played_in_range`` returns: ``duration_seconds`` of mono audio at ``rate``."""
+    import types
+
+    data = np.zeros((1, round(duration_seconds * rate)), dtype=np.float32)
+    return types.SimpleNamespace(pts_seconds=pts_seconds, duration_seconds=duration_seconds, data=data)
+
+
 def _stub_torchcodec(monkeypatch, decoder_cls):
     import sys
     import types
@@ -284,7 +292,7 @@ def _stub_decoder(monkeypatch, rate, decodes=True, header_seconds=0.5, seconds=0
             if not decodes:
                 raise RuntimeError("decode_av_frame failed")
             played = seconds if stop_seconds is None else min(seconds, stop_seconds)
-            return types.SimpleNamespace(pts_seconds=start_seconds, duration_seconds=played)
+            return _samples(start_seconds, played, self.kwargs.get("sample_rate", rate))
 
     _stub_torchcodec(monkeypatch, AudioDecoder)
     return decoded
@@ -386,18 +394,21 @@ def test_omnivoice_caps_the_decode_when_the_header_hides_the_length(
     assert [d["stop"] for d in decoded] == [media_io.MAX_REF_AUDIO_SECONDS + 1.0]
 
 
+@pytest.mark.parametrize("first", [30.0, 1800.0])
 @pytest.mark.parametrize("seconds, accepted", [(35.0, True), (media_io.MAX_REF_AUDIO_SECONDS + 1, False)])
-def test_the_ref_audio_check_counts_play_time_from_the_first_timestamp(seconds, accepted, tmp_path, monkeypatch):
-    """A stream whose first frame is at 1800 s (an MPEG-TS segment, a stream
+def test_the_ref_audio_check_counts_play_time_from_the_first_timestamp(
+    first, seconds, accepted, tmp_path, monkeypatch
+):
+    """A stream whose first frame is past 0 s (an MPEG-TS segment, a stream
     copy cut) is checked on its length, as the model's loader caps it, not on
     its timestamps. Stub decoder, no FFmpeg."""
     import types
 
-    first = 1800.0
     decoded = []
 
     class AudioDecoder:
         def __init__(self, source, **kwargs):
+            self.rate = kwargs.get("sample_rate", 48000)
             self.metadata = types.SimpleNamespace(
                 sample_rate=48000, duration_seconds_from_header=None, begin_stream_seconds_from_header=first,
             )
@@ -405,7 +416,7 @@ def test_the_ref_audio_check_counts_play_time_from_the_first_timestamp(seconds, 
         def get_samples_played_in_range(self, start_seconds=0.0, stop_seconds=None):
             decoded.append((start_seconds, stop_seconds))
             lo, hi = max(start_seconds, first), min(stop_seconds, first + seconds)
-            return types.SimpleNamespace(pts_seconds=lo, duration_seconds=max(0.0, hi - lo))
+            return _samples(lo, max(0.0, hi - lo), self.rate)
 
     _stub_torchcodec(monkeypatch, AudioDecoder)
     path = tmp_path / "clip.ts"
@@ -471,7 +482,7 @@ def test_ref_audio_probe_decodes_are_bounded(tmp_path, monkeypatch):
             release.wait(10)
             with lock:
                 active -= 1
-            return types.SimpleNamespace(pts_seconds=0.0, duration_seconds=1.0)
+            return _samples(0.0, 1.0, 24000)
 
     _stub_torchcodec(monkeypatch, AudioDecoder)
     paths = []
