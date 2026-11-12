@@ -297,7 +297,7 @@ def test_a_max_len_0_read_over_a_kept_array_reads_through_node_handles():
 def test_a_max_len_0_read_over_queries_on_two_labels_has_no_layout_yet():
     """A step on the second label would plan a label the handle never reads."""
     with pytest.raises(ValueError, match=r"Array 'text': no layout yet: reads\['text_attn'\] reads the queries of "
-                                         r"'kv', which has labels \['cond', 'uncond'\]"):
+                                         r"'kv', .* and 'kv' has \['cond', 'uncond'\]"):
         build_specs(_form_b(labels=frozenset({"cond", "uncond"})))
 
 

@@ -242,9 +242,7 @@ def _within_step_read(array: Array, setup: "StateSetup") -> tuple["BoundOp", int
     if len(array.reads) != 1:
         raise _no_layout(array, f"max_len 0 needs one read, the one RaggedAttentionConfig runs, and it has "
                                 f"{sorted(array.reads)}")
-    if len(array.labels) != 1:
-        raise _no_layout(array, f"max_len 0 takes one label, since a plan holds one per call, and it has "
-                                f"{sorted(array.labels)}")
+    _plan_label(array, "max_len 0 takes one label, since a plan holds one per call")
     (bound,) = _bindings(WITHIN_STEP, array, setup.by_read)
     return bound, k.shape[0], k.shape[1], k.dtype
 
@@ -649,16 +647,12 @@ class PagedCrossAttend(PagedAttend):
             raise _no_layout(array, f"reads[{key!r}].mask must be Bidirectional, the mask CrossAttentionConfig has")
         if read.walks is not None:
             raise _no_layout(array, f"reads[{key!r}].walks must be None, since CrossAttentionConfig has no walk")
-        if len(array.labels) != 1:
-            raise _no_layout(array, f"a cross read's array declares one label, CrossAttentionConfig's one "
-                                    f"context_label, and it has {sorted(array.labels)}")
 
     def specs(self, array: Array, key: str, read: Read) -> list[NodeResourceSpec]:
+        label = _plan_label(array, "a cross read's array declares one label, CrossAttentionConfig's one context_label")
         return [CrossAttentionSpec(
             resource_key=key, nodes=array.nodes,
-            config=CrossAttentionConfig(
-                kv_cache=array.name, query_kv_cache=read.queries, context_label=_plan_label(array),
-            ),
+            config=CrossAttentionConfig(kv_cache=array.name, query_kv_cache=read.queries, context_label=label),
         )]
 
     def steps(self, key: str, read: Read, declared: ArrayStep, segments, steps: dict[str, Any]) -> None:
@@ -1334,9 +1328,13 @@ class SegmentedRows(RowLayout):
         return self._frames.run(q, k, v)
 
 
-def _plan_label(array: Array) -> str:
-    """The label an array's plans run under, its one declared label, on an array with ``max_len`` 0
-    (`_within_step_read`) or with a kept cross read (`PagedCrossAttend.check`)."""
+def _plan_label(array: Array, why: str = "a plan holds one label", reader: Array | None = None) -> str:
+    """The label ``array``'s plans run under, its one declared label. Refuses another count, naming ``reader``, the
+    array whose read plans ``array``'s (``array`` itself unless given), and ``why``."""
+    if len(array.labels) != 1:
+        reader = reader or array
+        raise _no_layout(reader, f"{why}, and {'it' if reader is array else repr(array.name)} has "
+                                 f"{sorted(array.labels)}")
     (label,) = array.labels
     return label
 
@@ -1867,10 +1865,8 @@ class WithinStepStorage(Storage):
             queries = resolved.queries[key] = (OwnQueries if read.queries is None else CrossQueries)(
                 query_array(array, read, by_name),
             )
-            if len(queries.array.labels) != 1:
-                raise _no_layout(array, f"reads[{key!r}] reads the queries of {read.queries!r}, which has labels "
-                                        f"{sorted(queries.array.labels)}, and a max_len 0 read plans the queries of "
-                                        "one label")
+            _plan_label(queries.array, f"reads[{key!r}] reads the queries of {read.queries!r}, and a max_len 0 read "
+                                       "plans the queries of one label", array)
             config = RaggedAttentionConfig(
                 num_qo_heads=read.op.q_heads, num_kv_heads=heads, head_dim=head_dim, dtype=dtype,
                 shard_over_sp=narrows_heads(array, queries.array, declared),
