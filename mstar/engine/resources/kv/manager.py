@@ -4616,12 +4616,10 @@ class KVManager(AttentionResource):
             if allotment.kept and self._keeper not in self._asks:
                 self._keeper = rid
             if allotment.grown:
-                # it waits holding its allotment again, for the same shortage, and lends again what it took back
-                allotment.pages = allotment.grown_from
-                self._asks[rid], allotment.grown, allotment.kept = allotment.grown, 0, 0
+                # it waits holding its allotment again, for the same shortage
+                self._asks[rid], allotment.kept = allotment.grown, 0
                 self._stalled.add(rid)
-                remaining = max(0, allotment.pages - self._held(rid))
-                self._count(rid, allotment, remaining, allotment.taken_back - allotment.grown_took)
+                self._unallot(rid)
             else:
                 self._unreserve(rid)
             if self.journal is not None:
@@ -5177,6 +5175,17 @@ class KVManager(AttentionResource):
         allotment.pages = max(allotment.pages, self._held(rid)) + pages - taken
         self._recount(rid, took_back=taken)
         return taken
+
+    def _unallot(self, rid: str) -> None:
+        """Undo the last growth `reserve` gave ``rid``'s allotment, so it lends again what that growth took back."""
+        allotment = self._allotments[rid]
+        allotment.pages = allotment.grown_from
+        remaining = max(0, allotment.pages - self._held(rid))
+        # not `_recount`, which would read the pages given back as pages written
+        self._count(rid, allotment, remaining, allotment.taken_back - allotment.grown_took)
+        allotment.grown = allotment.grown_took = 0
+        if _DEBUG_ASSERTS:
+            self.assert_pages_conserved()
 
     def replay(self, kind: MoveKind, rid: str, count: int, victims: list[str]) -> None:
         """Make rank 0's ``kind`` move on ``rid`` in this rank's counts, or raise if the move doesn't fit them."""
