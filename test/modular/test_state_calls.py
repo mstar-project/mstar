@@ -70,7 +70,7 @@ class _StubKV:
     def layer_view(self, i):
         return self.pages[i]
 
-    def write_kv(self, k, v, layer_idx=None, label=None):
+    def write_kv(self, k, v, layer_idx=None, label=None, tokens=None):
         self.writes.append((layer_idx, label))
         self.pages[layer_idx, :k.shape[0], 0] = k
         self.pages[layer_idx, :k.shape[0], 1] = v
@@ -108,11 +108,12 @@ class _StubDense(_StubAttn):
 class _StubExchange(_StubAttn, AttentionManager):
     """Attention whose every call goes through its exchange, which hands its run the step whole."""
 
-    splits = True
-
     def __init__(self):
         super().__init__()
         self.exchanges = []
+
+    def step_exchanges(self, label=None):
+        return True
 
     def exchange(self, run, q, k, v, label=None):
         self.exchanges.append("attend" if q is not None else "write")

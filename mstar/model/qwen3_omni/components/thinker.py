@@ -244,6 +244,9 @@ class Qwen3OmniThinkerModel(MoeParallelMixin, nn.Module):
         self.lm_head = nn.Linear(tc.hidden_size, tc.vocab_size, bias=False)
 
         self.init_moe_parallel(moe_parallel)
+        # The node's sequence shard, which brackets the layer stack: its submodule's
+        # (`NodeSubmodule.sequence_shard`), set when that binds its resources.
+        self.sequence_shard = None
 
     def checkpoint_rules(self) -> CheckpointRules:
         """How the full model's checkpoint (``thinker.*``) lands here, and where LoRA
@@ -294,7 +297,18 @@ class Qwen3OmniThinkerModel(MoeParallelMixin, nn.Module):
         hidden_states = input_embeds.clone()
         layer_0_embed = input_embeds if keep_states else None
         layer_n_hidden = None
+        # over the whole step: its padding rows are its last
         token_valid = self.moe_token_valid(hidden_states, num_valid_tokens)
+        shard = self.sequence_shard
+        if shard is not None:
+            # A step split over the SP ranks runs the stack on this rank's range of its
+            # tokens; attention exchanges what it needs. Identity on a copied step.
+            cos, sin = cos_sin_3d if cos_sin_3d is not None else (None, None)
+            hidden_states, cos, sin, token_valid, *deepstack = shard.scatter(
+                "main", hidden_states, cos, sin, token_valid, *(deepstack_visual_embeds or ()),
+            )
+            cos_sin_3d = None if cos is None else (cos, sin)
+            deepstack_visual_embeds = deepstack or None
 
         residual = None
         for layer_idx, decoder_layer in enumerate(self.model.layers):
@@ -322,5 +336,8 @@ class Qwen3OmniThinkerModel(MoeParallelMixin, nn.Module):
 
         # Final layer norm
         hidden_states, _ = self.model.norm.forward_residual(hidden_states, residual)
+        if shard is not None:
+            # the head, sampling and the Talker's states read every token
+            hidden_states, layer_n_hidden = shard.gather("main", hidden_states, layer_n_hidden)
 
         return hidden_states, layer_0_embed, layer_n_hidden
