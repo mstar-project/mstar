@@ -58,10 +58,11 @@ def _context(shared: dict[int, CurrentForwardPassInfo]) -> SpeculationContext:
     )
 
 
-def _assemble(ctx, spec_target, rids, continuing):
+def _assemble(ctx, spec_target, rids, continuing, repeats=1):
     return SpeculationBuilder(ctx).assemble(
         SimpleNamespace(
             node_name="dit", graph_walk="t2i", partition=PARTITION,
+            node_batch=SimpleNamespace(step_context=SimpleNamespace(repeats=repeats)),
         ),
         spec_target,
         {rid: 0 for rid in rids},          # request_to_worker_graph
@@ -98,6 +99,13 @@ def test_a_continuing_rid_runs_one_iteration_past_the_in_flight_one():
     shared[1].dynamic_loop_iter_counts[LOOP] = 4
     assert in_flight.node_batch.per_request_info_wrapped[1].dynamic_loop_iter_counts == {LOOP: 2}
     assert view.dynamic_loop_iter_counts == {LOOP: 3}
+
+
+def test_a_continuing_rid_runs_past_every_iteration_of_a_repeated_step():
+    """The step in flight stands for 8 iterations, and the runtime moves the loop by 8."""
+    ctx = _context({1: _info(1, 2)})
+    spec = _assemble(ctx, _target(is_new_loop_iter=True), [1], [1], repeats=8)
+    assert spec.node_batch.per_request_input_metadata[1].dynamic_loop_iter_counts == {LOOP: 10}
 
 
 def test_a_fresh_rid_runs_at_its_loops_current_index():

@@ -263,7 +263,7 @@ def test_a_cache_served_row_ends_its_chunk_loop_without_publishing():
         node_name=NODE, graph_walk=WALK, request_to_worker_graph={2: 0},
         chunk_loop_walks=w.layout.chunk_loops.walks_by_node[NODE],
     )
-    assert served.loop_strides([2]) == [CHUNK_LOOP_END], "the served row's loop still ends"
+    assert served.loop_strides([2], 1) == [CHUNK_LOOP_END], "the served row's loop still ends"
     assert runtime.stopped == [1], "by its stride, not a stop"
     assert not w.reported
     assert 2 not in batch.resource_publish_info

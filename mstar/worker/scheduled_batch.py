@@ -130,6 +130,8 @@ class ScheduledBatch:
     # the step is submitted (``StepExecutor._submit_gpu_step``): the graphs say,
     # not the scheduler, and every step that runs passes through there.
     chunk_loop_walks: frozenset[str] = frozenset()
+    # this step is the run ready rows waited for (``ready_waits``)
+    owed_run: bool = False
 
 
     def walk_of(self, rid: int) -> str:
@@ -141,16 +143,19 @@ class ScheduledBatch:
             return self.request_to_worker_graph
         return {rid: wg for rid, wg in self.request_to_worker_graph.items() if rid not in self.rebuild_rids}
 
-    def loop_strides(self, rids: Iterable[int]) -> list[int] | None:
-        """``RouteInput.loop_strides`` for ``rids``, in that order: a row of a
-        chunk-Loop walk moves its Loop by its chunk (``chunk_loop_stride``),
-        and any other row its loop by one. None for a step with no row in a
-        chunk Loop, which is every decode step.
+    def loop_strides(self, rids: Iterable[int], repeats: int) -> list[int] | None:
+        """``RouteInput.loop_strides`` for ``rids``, in that order: a step that
+        stands for ``repeats`` iterations (``StepContext.repeats``) moves every
+        row's loop by that many, a row of a chunk-Loop walk moves its Loop by its
+        chunk (``chunk_loop_stride``), and any other row its loop by one. None for
+        a step with no row in a chunk Loop, which is every other decode step.
 
         Keyed on the walk having a Loop rather than on the row having a chunk
         range: a row with no range ran whole, which also ends the Loop -- a
         walk with no token budget is never measured or cut.
         """
+        if repeats > 1:
+            return [repeats] * len(rids)
         walks = self.chunk_loop_walks
         # one lookup for a single-walk step outside a chunk Loop (decode)
         if not walks or (not self.request_walks and self.graph_walk not in walks):

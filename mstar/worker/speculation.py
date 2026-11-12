@@ -343,7 +343,8 @@ class SpeculationBuilder:
             ctx.request_state, ctx.streams, node_name=spec_node, batch_partition=pending.partition,
             per_request_inputs=per_request_inputs,
             increment_loop_rids=continuing if spec_target.is_new_loop_iter else None,
-            increment_loop_name=spec_target.loop_name
+            increment_loop_name=spec_target.loop_name,
+            increment_by=pending.node_batch.step_context.repeats,
         )
         spec_node_batch = make_executing_batch(
             ctx.streams, node_name=spec_node,
@@ -488,6 +489,8 @@ class Speculator:
         self.engine_manager = services.engine_manager
         self.chunk_loops = layout.chunk_loops
         self.parallel_nodes = layout.parallel_nodes
+        self._step_repeats = layout.step_repeats
+        self._innermost_loop_by_node = layout.innermost_loop_by_node
         self.scheduler = scheduler
         self.lifecycle = lifecycle
         self.lockstep = lockstep
@@ -516,6 +519,22 @@ class Speculator:
         return any(
             self._graph_runtime.is_async_schedulable(batch.node_name, walk)
             for walk in batch.rids_by_walk()
+        )
+
+    def _stamp_repeats(
+        self, speculation: Speculation, pending: PendingBatch, owes_run: bool,
+    ) -> None:
+        """Ask for as many iterations as the step can have; its resources narrow
+        it at admit, on the step's own context. ``owes_run``: the step is the
+        run ready rows wait for, which needs no turn in the chain."""
+        batch = speculation.scheduled_batch
+        batch.owed_run = owes_run
+        speculation.node_batch.step_context.repeats = self._step_repeats.ceiling(
+            speculation, max(self._consecutive, int(owes_run)),
+            lambda: self._graph_runtime.loop_room(
+                batch.node_name, batch.graph_walk, self._innermost_loop_by_node[(batch.graph_walk, batch.node_name)],
+                list(speculation.continuing_rids), pending.node_batch.step_context.repeats,
+            ),
         )
 
     def can_speculate(self, batch: ScheduledBatch) -> bool:
@@ -606,9 +625,10 @@ class Speculator:
             return frozenset()
         return frozenset(speculation.scheduled_batch.request_to_worker_graph)
 
-    def _choose_spec_target(self, batch: ScheduledBatch) -> SpeculationTarget | None:
+    def _choose_spec_target(self, batch: ScheduledBatch, repeats: int) -> SpeculationTarget | None:
         """The (node, walk) the step after ``batch`` speculates into, with the
-        rids of ``batch`` on that walk; None when nothing can be speculated."""
+        rids of ``batch`` on that walk; None when nothing can be speculated.
+        ``repeats``: the iterations ``batch``'s step stands for."""
         # Every row, grouped by real walk: the runtime filters eligibility per
         # walk and drops a loop-back no row can take; prep_spec_rids the loop
         # completion per rid.
@@ -626,7 +646,7 @@ class Speculator:
             counts = [len(walk_rids) for walk_rids in groups.values()]
         ready_for_spec = self._graph_runtime.speculate_node(
             batch.node_name, list(groups), rows, counts,
-            batch.loop_strides(rows),
+            batch.loop_strides(rows, repeats),
         )
         if not ready_for_spec:
             return None
@@ -648,6 +668,7 @@ class Speculator:
         self,
         pending: PendingBatch,
         target: SpeculationTarget,
+        owes_run: bool = False,
     ) -> Speculation | None:
         """Build a speculative N+1 batch + node_batch, by checking which nodes
         will become ready after the current batch's outputs are ingested.
@@ -706,7 +727,7 @@ class Speculator:
         # rows waiting at its target (backlogged, or on its queues) get the
         # step here or not at all while it runs. Nothing is popped yet.
         chain = self.scheduler.pick_chain_step(
-            spec_target, candidates, mid_prefill, next_iter_of,
+            spec_target, candidates, mid_prefill, next_iter_of, continuing_only=owes_run,
         )
         laps.lap("pick_step")
         mid_prefill = chain.mid_prefill
@@ -717,7 +738,7 @@ class Speculator:
         # prep keeps the first `room` of the chain's rows, in the pick's order
         prep = self._spec_preparer.prepare(
             batch_N, spec_node_name, graph_walk, chain.pick.continuing, chain.pick.room, laps,
-            batch_N.loop_strides(chain.pick.continuing),
+            batch_N.loop_strides(chain.pick.continuing, pending.node_batch.step_context.repeats),
         )
         laps.lap("continuing_inputs")
         continuing = prep.ready_rids
@@ -1158,7 +1179,7 @@ class Speculator:
             # Keyed on the walk the chain speculates into, not the step's:
             # after a mixed step that is the combined walk, which no row has,
             # so the chain's own parked rows would count as other work.
-            target = self._choose_spec_target(pending.batch)
+            target = self._choose_spec_target(pending.batch, pending.node_batch.step_context.repeats)
             chain_key = (
                 (target.info.node_name, target.info.graph_walk) if target is not None
                 else (pending.node_name, pending.graph_walk)
@@ -1167,7 +1188,11 @@ class Speculator:
             # chunk must not keep decode rows waiting a second prompt step. A
             # walk with no token budget runs its prompts whole and keeps
             # main's order.
-            other_ready = self._peek and self.scheduler.chain_yields(
+            owes_run = self._step_repeats is not None and self._step_repeats.owes_run(
+                pending.node_name, pending.batch.rids_by_walk(), pending.node_batch.step_context.repeats,
+                pending.batch.owed_run,
+            )
+            other_ready = self._peek and not owes_run and self.scheduler.chain_yields(
                 chain_key, self._consecutive,
                 chain_key in self.chunk_loops.speculated and self.scheduler.chunks(*chain_key),
             )
@@ -1176,7 +1201,9 @@ class Speculator:
                 if self.enable_nvtx:
                     range_push("worker.speculate", synchronize=False)
                 _t0 = _time.perf_counter() if self.timer.period else 0.0
-                speculation = self._try_speculate_next(pending, target)
+                speculation = self._try_speculate_next(pending, target, owes_run)
+                if speculation is not None and not speculation.is_yield_away and self._step_repeats is not None:
+                    self._stamp_repeats(speculation, pending, owes_run)
                 if self.timer.period:
                     self.timer.record("speculate", _time.perf_counter() - _t0)
                 if self.enable_nvtx:

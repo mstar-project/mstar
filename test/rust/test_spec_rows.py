@@ -89,7 +89,7 @@ class _Scheduler:
     def backlog_splits_from(self, *a):
         return False
 
-    def pick_chain_step(self, target, continuing, mid_prefill=(), next_iter_of=None):
+    def pick_chain_step(self, target, continuing, mid_prefill=(), next_iter_of=None, continuing_only=False):
         # the chain keeps its rows up to the cap whatever loop it advances; the
         # fresh rows come from the take
         rows = list(continuing)
@@ -243,7 +243,7 @@ def _speculate(w: Worker, pending: PendingBatch, rows: bool, monkeypatch):
     # the columnar path where the worker would take it, else the per-row one
     eligible = _ROWS_ELIGIBLE if rows else (lambda *a, **k: False)
     monkeypatch.setattr(SpeculationPreparer, "rows_eligible", eligible)
-    target = w.speculator._choose_spec_target(pending.batch)
+    target = w.speculator._choose_spec_target(pending.batch, 1)
     if target is None:
         return None
     return w.speculator._try_speculate_next(pending, target)

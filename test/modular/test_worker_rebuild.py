@@ -554,7 +554,7 @@ def test_the_graph_runtime_never_sees_a_rebuild_row(site):
     elif site == "settle":
         w.speculator.settle(speculation, success=True)
     elif site == "spec target":
-        w.speculator._choose_spec_target(batch)
+        w.speculator._choose_spec_target(batch, 1)
     else:
         w.pipeline._handle_error(RuntimeError("boom"), (), None, speculation)
 

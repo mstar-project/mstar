@@ -40,7 +40,7 @@ def test_a_request_the_next_node_holds_back_is_not_continued_onto_it():
             failed_rids=set(),
             backlog_splits_from=lambda *_, **__: False,
             # an uncapped target: the chain keeps every row it brings
-            pick_chain_step=lambda target, continuing, mid_prefill=(), next_iter_of=None: ChainPick(target, StepPick(
+            pick_chain_step=lambda target, continuing, *_, **__: ChainPick(target, StepPick(
                 taken=list(continuing), continuing=list(continuing), room=None,
                 held_back=set(), ordered=False,
             ), []),
@@ -50,7 +50,8 @@ def test_a_request_the_next_node_holds_back_is_not_continued_onto_it():
     target = SpeculationTarget(SpeculationOutput(node_name="decoder", graph_walk="walk"), [1, 2, 3])
 
     batch = ScheduledBatch(node_name="audio_encoder", graph_walk="walk")
-    worker.speculator._try_speculate_next(SimpleNamespace(batch=batch), target)
+    pending = SimpleNamespace(batch=batch, node_batch=SimpleNamespace(step_context=SimpleNamespace(repeats=1)))
+    worker.speculator._try_speculate_next(pending, target)
 
     assert worker.speculator._spec_preparer.prepped == [1, 3], (
         "a request the decoder would not run was carried onto it anyway"

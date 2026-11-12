@@ -29,8 +29,8 @@ def _speculator(target, other_ready=True, speculation=None, mid_prefill_walks=fr
     scheduler = speculator.scheduler
     scheduler.chain_yields = MicroScheduler.chain_yields.__get__(scheduler)
     speculator.can_speculate = lambda batch: True
-    speculator._choose_spec_target = lambda batch: target
-    speculator._try_speculate_next = lambda pending, target: speculation
+    speculator._choose_spec_target = lambda batch, repeats: target
+    speculator._try_speculate_next = lambda pending, target, owes_run=False: speculation
     return speculator, peeked, excluded
 
 
@@ -47,7 +47,7 @@ def _chain_step():
 def _pending():
     return SimpleNamespace(
         batch=object(), node_name="LLM", graph_walk="mixed",
-        node_batch=SimpleNamespace(admit_error=None), tp_seq=-1,
+        node_batch=SimpleNamespace(admit_error=None, step_context=SimpleNamespace(repeats=1)), tp_seq=-1,
     )
 
 

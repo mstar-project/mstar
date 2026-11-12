@@ -129,7 +129,10 @@ def test_a_rebuild_over_two_steps_lands_on_the_follower_with_rank_0s(monkeypatch
     if speculated:
         lockstep.enqueue_follow(_head(lead, 2, ["v"], speculative=True, spec_from_seq=1))
         pending = SimpleNamespace(tp_seq=1, node_name=NODE, graph_walk=PREFILL, batch=n, partition="p",
-                                  node_batch=SimpleNamespace(commit_done=SimpleNamespace(is_set=lambda: True)))
+                                  node_batch=SimpleNamespace(
+                                      commit_done=SimpleNamespace(is_set=lambda: True),
+                                      step_context=SimpleNamespace(repeats=1),
+                                  ))
         n_1 = one.worker.speculator.follow(pending).scheduled_batch
         zero.post_process(_step(1))
         one.post_process(n)

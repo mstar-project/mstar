@@ -287,13 +287,14 @@ class _Engine:
 
 
 class _Scheduled:
+
     def __init__(self, walks):
         self._walks = walks
         # rid -> real walk on a mixed step only, as ScheduledBatch keeps it
         self.request_walks = dict(walks) if len(set(walks.values())) > 1 else {}
         self.incomplete_node_rids = set()  # no row mid-prefill
 
-    def loop_strides(self, rids):
+    def loop_strides(self, rids, repeats):
         return None
 
     def walk_of(self, rid):
@@ -312,7 +313,7 @@ class _Batch:
     def __init__(self, walks=None, label="decode", withheld=None):
         self.graph_walk = label
         self.batch = _Scheduled(walks or {})
-        self.node_batch = SimpleNamespace(withheld_outputs=withheld or {})
+        self.node_batch = SimpleNamespace(withheld_outputs=withheld or {}, step_context=SimpleNamespace(repeats=1))
 
 
 def _executor(runtime=_Runtime()):
@@ -403,6 +404,7 @@ def _inline_step(withheld=None):
     batch.batch.request_to_worker_graph = {7: 0}
     batch.node_batch = SimpleNamespace(
         final_stream_rids=(), partition_done_rids=(), withheld_outputs=withheld or {},
+        step_context=SimpleNamespace(repeats=1),
     )
     batch.batch.rids_by_walk = lambda: {"decode": [7]}
     return w, engine, batch

@@ -841,6 +841,16 @@ def test_only_a_rows_kept_sample_is_appended(sampled):
     assert not (kept[A].sampled or kept[B].sampled), "it kept a discarded sample"
 
 
+def test_a_step_that_repeated_keeps_each_iteration_s_sample():
+    rebuilds = _rebuilds()
+    rebuilds.record(_ran(PREFILL, _rows(R, A)))
+    batch = _batch((R, A))
+    batch.step_context.repeats = 2
+    rebuilds.keep_samples(batch, {}, HostRows((R, A), {"new_token": torch.tensor([[4, 5], [6, 7]])}))
+    kept = rebuilds._kept[NODE]
+    assert (list(kept[R].sampled), list(kept[A].sampled)) == ([4, 5], [6, 7])
+
+
 def test_a_sample_is_kept_from_the_host_outputs_the_worker_copies_on_read():
     rebuilds = _rebuilds()
     rebuilds.record(_ran(PREFILL, _rows(R)))
@@ -876,12 +886,14 @@ def test_the_vlm_scaffold_keeps_a_request_that_samples_a_pad_id_droppable():
     assert not model.rebuild_policies()[NODE].pad_ids
 
 
+@pytest.mark.parametrize("repeated", [False, True], ids=["one_iteration", "pad_in_a_repeated_step"])
 @pytest.mark.parametrize("last, forgotten", [(VISION, True), (PREFILL, False)])
 def test_a_pad_id_sampled_after_several_steps_forgets_the_log_only_when_the_last_step_read_more_than_ids(
-    last, forgotten,
+    last, forgotten, repeated,
 ):
     """The samples go in the rebuild row of a request's last prefill step. A pad there reads an encoder row only
-    when that step read an encoder's output, whatever the steps before it read."""
+    when that step read an encoder's output, whatever the steps before it read. A pad in any iteration of a step
+    that repeated counts the same."""
     pool = HostPool(1 << 10, torch.device("cpu"))
     rebuilds = Rebuilds({NODE: replace(MEDIA, pad_ids=frozenset({91}))}, _graphs(), pool, StepAllowance(), DTYPES)
     media = RowRecord({"text_inputs": [torch.tensor([1])], "embeds": [torch.zeros(1, 2)]}, {"is_prefill": True})
@@ -890,7 +902,10 @@ def test_a_pad_id_sampled_after_several_steps_forgets_the_log_only_when_the_last
         steps.reverse()
     rebuilds._kept[NODE][R] = KeptIds(tuple(LayoutRow(walk, 3) for walk, _ in steps), [r for _, r in steps])
 
-    forgot = rebuilds.keep_samples(_batch((R,)), {}, HostRows((R,), {"new_token": torch.tensor([91])}))
+    batch = _batch((R,))
+    batch.step_context.repeats = 2 if repeated else 1
+    sampled = torch.tensor([[5, 91]] if repeated else [91])
+    forgot = rebuilds.keep_samples(batch, {}, HostRows((R,), {"new_token": sampled}))
 
     assert (forgot == [R]) == forgotten and (R not in rebuilds._kept[NODE]) == forgotten, (
         "a rebuild row would give the pad an encoder row" if forgotten else "a request whose rebuild is exact was "

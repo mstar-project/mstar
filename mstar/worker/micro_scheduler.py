@@ -756,6 +756,7 @@ class MicroScheduler:
     def pick_chain_step(
         self, target: tuple[str, str], continuing: Sequence[int],
         mid_prefill: Collection[MidPrefillRow] = (), next_iter_of: str | None = None,
+        continuing_only: bool = False,
     ) -> "ChainPick":
         """Who runs the step a speculation chain speculates into at
         ``target``: its ``continuing`` rows (ready, in step order), the rows
@@ -777,12 +778,14 @@ class MicroScheduler:
         ``next_iter_of``: the loop the chain's step runs its rows one
         iteration on in, if it does; their capture group is the one they have
         there (``_chain_capture_group``).
+
+        ``continuing_only``: the rows waiting wait out this step (``ready_waits``).
         """
         self.admission.let_rows_back()
         key = self._key(*target)
         own_walk = None if self.speculation_mixes(*target) else target[1]
         backlogged = self.backlog.get(key)
-        live = [] if backlogged is None else self._backlog_candidates(
+        live = [] if backlogged is None or continuing_only else self._backlog_candidates(
             backlogged, only_walk=own_walk,
         )
         mid = [
@@ -797,7 +800,7 @@ class MicroScheduler:
             live = unpopped + live
         specs = []
         # a chain holding every request here has nothing waiting on the queues
-        if len(self.request_state.per_request_info) > len(continuing) + len(unpopped):
+        if not continuing_only and len(self.request_state.per_request_info) > len(continuing) + len(unpopped):
             # A rebuild's request also has its decode row on a queue, which the step mustn't pop.
             exclude = self.lifecycle.no_new_work(self.admission.held_until, unpopped)
             specs = [

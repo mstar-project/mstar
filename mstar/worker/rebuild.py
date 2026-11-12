@@ -488,11 +488,17 @@ class Rebuilds:
             tokens = host_rows.buffers.get(name)
             if not torch.is_tensor(tokens) or tokens.dim() == 0:
                 return []
-            if tokens.dim() > 1 and tokens[0].numel() != 1:
+            repeats = ctx.repeats
+            if tokens.dim() > 1 and tokens[0].numel() != repeats:
                 raise ValueError(self._not_one_id(node, name, tokens[0].numel()))
             # the sampler's [B] output skips the reshape, which costs more than the rest of this method
             values = tokens.tolist() if tokens.dim() == 1 else tokens.reshape(-1).tolist()
-            pairs = zip(host_rows.request_ids, values, strict=False)
+            rids = host_rows.request_ids
+            if repeats > 1:
+                # a step that repeated holds one id per replay and row, each a sample of its own, in order:
+                # a pad id in any of them forgets the log, and the ids before it go with the log
+                rids = [rid for rid in rids for _ in range(repeats)]
+            pairs = zip(rids, values, strict=False)
         else:
             pairs = []
             for rid in node_batch.request_ids:

@@ -188,7 +188,7 @@ def _run_stream(seed: int, n_rids=3, n_items=9, chunk=2):
             if pending is not None:
                 record(pending.node_batch)
             continue
-        target = w.speculator._choose_spec_target(pending.batch)
+        target = w.speculator._choose_spec_target(pending.batch, 1)
         spec = w.speculator._try_speculate_next(pending, target) if target else None
         outcome = rng.choice(["keep", "keep", "refuse", "drop"]) if spec else "none"
         if outcome in ("keep", "drop"):
