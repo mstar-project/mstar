@@ -291,6 +291,12 @@ class ShardHandle(StepHandle):
         self.label: str | None = None
         self.walk: str | None = None
 
+    @property
+    def needs_step(self) -> bool:
+        """Whether a step must plan the shard: where it can split. Elsewhere its plan is copied, and a step nothing
+        else needs skips it, the bracket then the identity."""
+        return self.resource.can_split
+
     def begin_step(self, step) -> None:
         (label,) = self.shard.labels  # analysis refuses a shard of several
         self.label = label if any(segment.label == label for segment in step.segments or ()) else None

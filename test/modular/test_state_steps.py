@@ -133,7 +133,7 @@ def _handles(*declarations, node="LLM") -> dict:
         "rope": SimpleNamespace(), "kv_pos": SimpleNamespace(), "other_pos": SimpleNamespace(),
         "other_kv": _StubKV(), "gdn": _StubPool(), "linear": SimpleNamespace(), "conv": None,
         "sampler": SimpleNamespace(), "vision_attn": SimpleNamespace(run=lambda *args, **kwargs: None),
-        "shard": SimpleNamespace(),
+        "shard": SimpleNamespace(can_split=True),
     }
     return node_handles(_StubModel(*declarations), node, resources)
 
@@ -271,6 +271,18 @@ def test_a_regions_step_leaves_the_nodes_shard_handle_open():
     region_step.begin_calls()
     region_step.end_calls()
     assert handles["shard"].label == "main", "the node's step is still running"
+
+
+@pytest.mark.parametrize("can_split", [False, True])
+def test_a_shard_holds_a_step_nothing_else_needs_only_where_it_can_split(can_split):
+    # at one SP rank the shard's plan is a constant, so the step skips its resources as on a node with no shard
+    handles = node_handles(
+        _StubModel(SeqShard("shard", nodes={"LLM"})), "LLM", {"shard": SimpleNamespace(can_split=can_split)},
+    )
+    step = state_steps(SubmoduleStep(segments=SEGMENTS), handles)
+    assert (step is not None) == can_split
+    if can_split:
+        assert step.state_handles == (handles["shard"],)
 
 
 def test_a_step_with_no_state_comes_back_as_it_was():
