@@ -38,6 +38,8 @@ logger = logging.getLogger(__name__)
 
 class SamplerResource(Resource):
     prefix_skip_safe = True
+    # samples the global step, after the layer stack gathered it
+    supports_split_steps = True
     # a rebuild row's draw never commits, so a drop has nothing here to discard
     supports_drop = True
 

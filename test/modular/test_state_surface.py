@@ -40,7 +40,6 @@ SNAPSHOT = {
         ["rewritable", "KEYWORD_ONLY", 'False'],
         ["labels", "KEYWORD_ONLY", "frozenset({'main'})"],
         ["positions", "KEYWORD_ONLY", 'None'],
-        ["seq_sharded", "KEYWORD_ONLY", 'False'],
     ],
     "ArrayStep": [
         ["segments", "KEYWORD_ONLY", 'None'],

@@ -108,15 +108,20 @@ def _reference(c: Qwen3OmniModelConfig) -> list:
                     enable_repetition_penalty=True),
         SamplerSpec(resource_key=CODE_PRED_SAMPLER, nodes={"Talker"}, vocab_size=c.code_predictor.vocab_size,
                     enable_repetition_penalty=False),
-        RaggedAttentionSpec(resource_key=AUDIO_ATTN, nodes={"audio_encoder"}, config=RaggedAttentionConfig(
-            num_qo_heads=c.audio_encoder.encoder_attention_heads, num_kv_heads=c.audio_encoder.encoder_attention_heads,
-            head_dim=c.audio_encoder.head_dim,
-            max_segments_per_request=AuTEncoderSubmodule.max_windows_per_replay(c.audio_encoder), workspace_mb=256,
-        )),
-        RaggedAttentionSpec(resource_key=VISION_ATTN, nodes={"vision_encoder"}, config=RaggedAttentionConfig(
-            num_qo_heads=c.vision.num_heads, num_kv_heads=c.vision.num_heads, head_dim=c.vision.head_dim,
-            max_segments_per_step=VisionEncoderSubmodule.BLOCK_LOOP_PATCH_BUCKETS[-1] // 256, workspace_mb=128,
-        )),
+        RaggedAttentionSpec(
+            resource_key=AUDIO_ATTN, nodes={"audio_encoder"}, labels={"main"}, config=RaggedAttentionConfig(
+                num_qo_heads=c.audio_encoder.encoder_attention_heads,
+                num_kv_heads=c.audio_encoder.encoder_attention_heads,
+                head_dim=c.audio_encoder.head_dim,
+                max_segments_per_request=AuTEncoderSubmodule.max_windows_per_replay(c.audio_encoder), workspace_mb=256,
+            ),
+        ),
+        RaggedAttentionSpec(
+            resource_key=VISION_ATTN, nodes={"vision_encoder"}, labels={"main"}, config=RaggedAttentionConfig(
+                num_qo_heads=c.vision.num_heads, num_kv_heads=c.vision.num_heads, head_dim=c.vision.head_dim,
+                max_segments_per_step=VisionEncoderSubmodule.BLOCK_LOOP_PATCH_BUCKETS[-1] // 256, workspace_mb=128,
+            ),
+        ),
     ]
 
 

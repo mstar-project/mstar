@@ -2,14 +2,14 @@
 
 import hashlib
 import json
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import fields, is_dataclass
 from itertools import product
 from typing import TYPE_CHECKING, get_origin
 
 import torch
 
-from mstar.engine.state.contract import EMPTY, Array, Block, Read, Sampler, is_value, read_layers
+from mstar.engine.state.contract import Array, Block, Read, Sampler, is_value, read_layers
 
 if TYPE_CHECKING:
     from mstar.model.base import Model
@@ -61,19 +61,6 @@ def query_array(array: Array, read: Read, arrays: Mapping[str, Array]) -> Array:
     """The array whose segments lay out the queries of ``array``'s ``read``: the one of ``arrays`` its ``queries``
     names, or else ``array``."""
     return arrays.get(read.queries, array)
-
-
-def both_sharded(array: Array, queried: Array) -> bool:
-    """Whether a read of ``array``, with ``queried`` laying out its queries, runs a Ulysses exchange under sequence
-    parallelism."""
-    return array.seq_sharded and queried.seq_sharded
-
-
-def narrows_heads(array: Array, queried: Array, arrays: Iterable[Array]) -> bool:
-    """Whether a read within a step of ``array``, with ``queried`` laying out its queries, splits its heads over the SP
-    ranks as well as TP's: where its Ulysses exchange runs over them, and on nodes where none of ``arrays`` is
-    sequence sharded."""
-    return both_sharded(array, queried) or not any(other.seq_sharded and other.nodes & array.nodes for other in arrays)
 
 
 def _name_problems(arrays: Sequence[Array], samplers: Sequence[Sampler]) -> list[str]:
@@ -213,13 +200,9 @@ def _read_problems(array: Array, walks: Mapping[str, set[str]], combined: set[st
     return problems
 
 
-def deployment_problems(
-    model: "Model", resources: Mapping[str, Mapping[str, object]], *, head_shards: Mapping[str, int] = EMPTY,
-) -> list[str]:
-    """What a deployment asks of the declarations that they can't do: its ``resources:`` block of a sampler, and
-    ``head_shards``, TP times SP per node above SP1, of a read within a step that narrows its heads by them."""
+def deployment_problems(model: "Model", resources: Mapping[str, Mapping[str, object]]) -> list[str]:
+    """What a deployment's ``resources:`` block asks of the declarations that they can't do: of a sampler."""
     declarations = model.declare_state()
-    arrays = {declared.name: declared for declared in declarations if isinstance(declared, Array)}
     problems = [
         f"Sampler {declared.name!r}.draws: enable_logprobs, and draws is {declared.draws}; log-probs take one token "
         "per step"
@@ -227,17 +210,45 @@ def deployment_problems(
         if isinstance(declared, Sampler) and declared.draws > 1
         and resources.get(declared.name, {}).get("enable_logprobs")
     ]
-    for array in arrays.values():
+    for array in declarations:
+        if not isinstance(array, Array):
+            continue
         # a pool with no state block refuses state_dtype itself
         if "state_dtype" in resources.get(array.name, {}) and "state" in written_by_step(array):
             problems.append(f"Array {array.name!r}: resources.{array.name}.state_dtype, and its step writes state "
                             "itself, where only a field an update op writes takes a stored dtype")
+    return problems
+
+
+def split_read_problems(
+    declarations: Sequence[Array | Sampler], sdpa_reads: Collection[str], split: Mapping[str, Collection[str]],
+) -> list[str]:
+    """What a read within a step asks of a node on SP ranks that no exchange serves, where ``split`` gives, per such
+    node, the labels its sequence shard lists: SDPA (``sdpa_reads``, the reads a ``backend: sdpa`` block binds) over
+    split keys, which runs outside the engine's resources and so would attend one rank's share, and a cross read whose
+    queries split as well as its keys. The engine refuses these at load and ``validate_deployment`` reports them, both
+    from the declarations, so neither waits for a step that splits."""
+    arrays = {declared.name: declared for declared in declarations if isinstance(declared, Array)}
+    problems = []
+    for array in arrays.values():
+        if array.max_len:
+            continue
+        nodes = [node for node in sorted(array.nodes) if array.labels & set(split.get(node, ()))]
+        if not nodes:
+            continue
         for key, read in array.reads.items():
-            shards = max((head_shards.get(node, 1) for node in array.nodes), default=1)
-            narrows = not array.max_len and narrows_heads(array, query_array(array, read, arrays), arrays.values())
-            if narrows and read.op.q_heads % shards:
-                problems.append(f"Array {array.name!r}.reads[{key!r}]: q_heads {read.op.q_heads} doesn't divide by "
-                                f"{shards}, TP times SP, which the read narrows its heads by")
+            queries = query_array(array, read, arrays)
+            where = f"Array {array.name!r}.reads[{key!r}]"
+            if key in sdpa_reads:
+                problems.append(f"{where}: backend sdpa over labels {sorted(array.labels)}, which the sequence shard "
+                                f"of {nodes} splits over SP ranks; SDPA would attend one rank's share: run it on the "
+                                "ragged resource (drop `backend: sdpa`)")
+                continue
+            both = [node for node in nodes if queries is not array and queries.labels & set(split[node])]
+            if both:
+                problems.append(f"{where}: its queries (Array {queries.name!r}, labels {sorted(queries.labels)}) and "
+                                f"keys (labels {sorted(array.labels)}) both split over the SP ranks of {both}, which "
+                                "no exchange serves: list only one side in the sequence shard")
     return problems
 
 

@@ -4,6 +4,7 @@
 FlashInfer wrappers live here; FA3 is in ``dense_wrappers.py``.
 """
 
+import math
 from abc import ABC, abstractmethod
 
 import torch
@@ -282,6 +283,7 @@ class _FlashInferRaggedPrefillBase(_RaggedPrefillBase):
         *,
         kv_layout: str = "NHD",
         backend: str = "auto",
+        owns_padding: bool = False,
         **kwargs,
     ):
         super().__init__(num_qo_heads, num_kv_heads, head_dim, **kwargs)
@@ -291,6 +293,7 @@ class _FlashInferRaggedPrefillBase(_RaggedPrefillBase):
         import flashinfer
 
         if not self.accelerator_graph:
+            self._owns_padding = self._kv_rows = None
             self.attn_wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
                 self._workspace.tensor, kv_layout, backend=backend
             )
@@ -304,6 +307,14 @@ class _FlashInferRaggedPrefillBase(_RaggedPrefillBase):
             kv_indptr_buf=self._kv_indptr_buf,
             backend=backend,
         )
+        # ``owns_padding``: a caller that merges this attention with another part by lse
+        # (``run(return_lse=True)``) over a bucket whose padding rows can hold anything, as
+        # a model's own layers leave them. Its lse is -inf past the plan (no keys), so a
+        # padding row merges to 0. And ``run`` zeroes the keys past the plan: FA3 reads
+        # them to its KV tile boundary and masks additively, so a NaN there would reach
+        # the last real rows.
+        self._owns_padding = owns_padding
+        self._kv_rows = torch.arange(self.max_total_kv_tokens, device=self.device) if owns_padding else None
         # FlashInfer latches max rows on the FIRST plan; prime at the
         # bucket ceiling so a small first plan can't cap it.
         self._plan(
@@ -356,7 +367,15 @@ class _FlashInferRaggedPrefillBase(_RaggedPrefillBase):
         if not self.accelerator_graph:
             out = self.attn_wrapper.run(qp, kp, vp, **lse_kwargs)
         else:
-            self._check_rows(qp.shape[0])
+            n = qp.shape[0]
+            self._check_rows(n)
+            if return_lse and self._owns_padding:
+                # in the graph on every replay, as `out` below: the kernel writes only the planned rows
+                lse_kwargs["lse"] = torch.full((n, self.num_qo_heads), -math.inf, dtype=torch.float32, device=qp.device)
+            if self._kv_rows is not None:
+                # past the plan's last key, by the plan's own device copy of it
+                planned = (self._kv_rows[: kp.shape[0]] < self._kv_indptr_buf[-1])[:, None, None]
+                kp, vp = torch.where(planned, kp, 0), torch.where(planned, vp, 0)
             out = self.attn_wrapper.run(
                 qp, kp, vp, out=torch.empty_like(qp, memory_format=torch.contiguous_format), **lse_kwargs,
             )

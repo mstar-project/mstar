@@ -12,17 +12,13 @@ from mstar.engine.resources.recurrent.pool import RecurrentStatePool
 class AttentionCallable:
     """A convenience wrapper around kv and attn that wraps the KV write and
     attention call in one pure-tensor function, with helper methods for
-    setting layer and label information.
+    setting layer and label information. ``write(k, v)`` writes the K/V alone.
 
-    Must be used for  ``ulysses_attention``, which expects such a pure tensor
-    callable. Recommended to use instance per transformer, *not* one per layer,
-    as Dynamo specializes ``ulysses_attention`` on the identity of its
-    `run_attention` argument, so a per-layer callable retraces that frame once
-    per layer and blows the recompile limit.
-
-    That sharing is why the label is one cursor for the whole stack. No model
-    varies its label per layer today; one that needs to should thread the label
-    explicitly rather than use this.
+    On a node whose steps split over its SP ranks, the call goes through the
+    attention resource's exchange (`AttentionManager.exchange`), which hands the
+    write and the attention the tokens and heads its pool's storage needs. One
+    instance can drive a whole stack, so the label is one cursor for it; a
+    model that varies its label per layer threads it explicitly instead.
 
     A cacheless (ragged) attention needs no callable: call the resource's
     ``run(q, k, v, label=...)`` with the span's label bound.
@@ -58,11 +54,33 @@ class AttentionCallable:
         self.kv.set_default_layer_idx(layer_idx)
 
     @torch.compiler.disable
-    def __call__(
-        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
-    ) -> torch.Tensor:
+    def __call__(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        return self._exchanged(q, k, v)
+
+    @torch.compiler.disable
+    def write(self, k: torch.Tensor, v: torch.Tensor) -> None:
+        """Write this step's K/V without attending (a second K over the same tokens, say), on SP
+        ranks through the exchange, so it lands on the heads this rank stores. A no-op where the
+        attention writes K/V inside its own run (``requires_kv_write`` False)."""
+        self._exchanged(None, k, v)
+
+    @property
+    def _splits(self) -> bool:
+        # a stand-in attention (Cosmos3's warmup's, the tests' fakes) is no AttentionManager; a node
+        # that never splits keeps the direct call
+        return isinstance(self.attn, AttentionManager) and self.attn.splits
+
+    def _exchanged(self, q: torch.Tensor | None, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor | None:
+        if self._splits:
+            return self.attn.exchange(self._attend, q, k, v)
+        return self._attend(q, k, v)
+
+    def _attend(self, q: torch.Tensor | None, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor | None:
+        # q None: the write alone, as the exchanges hand it on
         if self.attn.requires_kv_write:
             self.kv.write_kv(k, v)
+        if q is None:
+            return None
         return self.attn.run(q, kv_cache_layer=self.kv.layer_view(), k=k, v=v)
 
     @torch.compiler.disable
@@ -75,11 +93,16 @@ class AttentionCallable:
         rotates through its position resource instead). For a backend that
         reads K/V from the paged cache, the step's KV write rides in the
         norm/RoPE kernel (``qk_norm_rope_kv_write``) rather than a launch of its
-        own; a backend that takes fresh K/V gets them normed and rotated."""
+        own; a step that attends the fresh K/V (``reads_step_kv``) gets them
+        normed and rotated. On a node whose attention splits, the write and the
+        attention go through the exchange (the unfused branch) like ``__call__``'s."""
         from mstar.utils.attention import qk_norm_rope_inplace, qk_norm_rope_kv_write
 
         eps = _norm_eps(q_norm, k_norm)
-        if not self.attn.requires_kv_write:
+        # the fused kernel leaves k as it was, so a step that attends its k and v needs them
+        # normed and rotated in place; so does an exchange, which writes and attends the tokens and
+        # heads this rank stores
+        if self._splits or self.attn.reads_step_kv():
             qk_norm_rope_inplace(q, k, q_norm.weight, k_norm.weight, pos_ids, *eps, rope_theta)
             return self(q, k, v)
         layer, page_idx, slot_idx, n = self.kv.write_target()

@@ -41,6 +41,9 @@ ALLOWED = {
     ("mstar.engine.engine", "ExecutingBatch"): "the annotation of `NodeSubmodule.can_batch`, a base class's hook",
     ("mstar.engine.resources.lora.checkpoint", "LoraFile"): "a model's static LoRA merge at load, which holds no state",
     ("mstar.engine.resources.lora", "LoraSpec"): "the opt-in LoRA spec, written by hand: the contract declares no LoRA",
+    ("mstar.engine.resources", "SeqShardSpec"): (
+        "a node's sequence shard, written by hand: the contract declares none until #1147's SeqShard"
+    ),
 }
 # Exceptions each scoped to one function and one attribute, by file, the function's qualified name in that file, and
 # the attribute: a graph break (`disable`) or a forbidden read the function may keep.
@@ -51,6 +54,9 @@ ALLOWED_IN_FUNCTION = {
         "the depth kernel's Gluon launch, which a compiled decode can't trace; no state call sits behind it",
     ("mstar/model/qwen3_tts/submodules.py", "CodecSubmodule.batch_postprocess", "request_state"):
         "the opt-in watermark's per-stream state, until it moves to a watermark node's plain Value (issue #1447)",
+    ("mstar/model/wan22/components/dit.py", "_token_runs", "disable"):
+        "the timestep runs of a rank's share of the tokens, read off the sequence shard's plan outside the DiT's "
+        "guards; the contract has no shard call until #1147's SeqShard",
 }
 
 

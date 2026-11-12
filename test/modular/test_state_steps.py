@@ -524,7 +524,7 @@ def test_a_sampler_becomes_a_sampler_spec():
 
 def test_a_block_read_becomes_a_ragged_spec_with_the_default_compile_op():
     assert build_specs([_within()]) == [RaggedAttentionSpec(
-        resource_key="vision_attn", nodes={"vit"},
+        resource_key="vision_attn", nodes={"vit"}, labels={"main"},
         config=RaggedAttentionConfig(num_qo_heads=4, num_kv_heads=4, head_dim=8),
     )]
 
@@ -752,7 +752,10 @@ class _EngineNode(NodeSubmodule):
 
 def _load_engine(monkeypatch, node, model):
     monkeypatch.setattr(engine_module, "node_handles", lambda model, name, resources, **kwargs: {"kv": name})
-    joint = SimpleNamespace(world_size=1, tp_group=SimpleNamespace(barrier=lambda: None), sp_group=None)
+    joint = SimpleNamespace(
+        world_size=1, tp_group=SimpleNamespace(barrier=lambda: None, world_size=1),
+        sp_group=SimpleNamespace(world_size=1),
+    )
     groups = SimpleNamespace(
         get_joint_group_for_node=lambda name: joint, get_instance_world_size_for_node=lambda name: 1,
         get_instance_rank_for_node=lambda name: 0,
