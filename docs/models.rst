@@ -1949,7 +1949,13 @@ and ``cosmos3_edge_droid`` guides only inside the cookbook's interval
 runs alone, batched requests too). For a control loop use ``/generate/ws`` (one
 connection, pipelined observations): ``examples/cosmos3_action_ws_client.py``
 builds that request, runs the loop and reports chunks/s, actions/s and latency
-percentiles.
+percentiles. Both DROID configs set ``compile_vae_encode_size: [736, 544]``:
+the ``vae_encoder`` node compiles the one-frame encode at that size, in
+Inductor's deterministic mode on channels-last encoder weights, and a startup
+``warmup_requests`` entry builds it, so a RoboLab observation encodes in 4.6 ms
+instead of 9.3 ms on an H200 (Nano). Every other encode (another size, a
+video clip) runs eager, about 9% slower than on stock weights, so nothing
+compiles mid-traffic. Unset, every encode runs eager on stock weights.
 
 Cosmos3 streaming rollout (windowed video)
 ------------------------------------------

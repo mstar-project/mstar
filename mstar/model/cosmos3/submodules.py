@@ -2574,8 +2574,9 @@ class Cosmos3VAEEncoderSubmodule(NodeSubmodule):
         frames of a full-latent-shape tensor (zeros elsewhere).
     """
 
-    # One-shot per-request encode at request-specific shapes; nothing to gain
-    # from compiling the submodule wrapper.
+    # One-shot per-request encode at request-specific shapes; a deployment
+    # with a fixed observation size compiles that one encode itself
+    # (``compile_vae_encode_size``).
     disable_torch_compile = True
 
     def __init__(self, vae, config):
@@ -2587,6 +2588,16 @@ class Cosmos3VAEEncoderSubmodule(NodeSubmodule):
         self.vae = vae
         self.config = config
         self._video_processor = None
+        # the pixel shape [1, 3, 1, H, W] whose encode is compiled, and the compiled call
+        self._compiled_shape: tuple[int, ...] | None = None
+        self._compiled_encode = None
+        if config.compile_vae_encode_size is not None and vae is not None:
+            # Compiled, the encoder's norms and activations fuse around cuDNN's
+            # channels-last convs; eager, channels-last alone is slower.
+            width, height = config.compile_vae_encode_size
+            self._compiled_shape = (1, 3, 1, int(height), int(width))
+            _wan_vae().encoder_to_channels_last(vae)
+            self._compiled_encode = _wan_vae().compile_encode(vae)
 
     def _latent_t(self, num_frames: int) -> int:
         return 1 if num_frames == 1 else 1 + (num_frames - 1) // self.config.vae.scale_factor_temporal
@@ -2690,7 +2701,11 @@ class Cosmos3VAEEncoderSubmodule(NodeSubmodule):
         device = vision.device
         mean, inv_std = latent_affine(vae, dtype, device)
         with torch.autocast(device_type=device.type, enabled=False):
-            raw_mu = vae.encode(vision.to(dtype)).latent_dist.mode()
+            pixels = vision.to(dtype)
+            if self._compiled_encode is not None and tuple(pixels.shape) == self._compiled_shape:
+                raw_mu = self._compiled_encode(pixels)
+            else:
+                raw_mu = vae.encode(pixels).latent_dist.mode()
         latents = ((raw_mu - mean) * inv_std).to(torch.bfloat16)
         if condition_indexes:
             full = torch.zeros(latent_shape, device=device, dtype=latents.dtype)

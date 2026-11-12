@@ -36,6 +36,9 @@ model_kwargs:
   policy_action_chunk_size: 32
   policy_conditioning_fps: 15.0
   policy_domain_name: droid_lerobot
+  # The observation size NVIDIA's RoboLab server sends: its one-frame encode
+  # compiles once, in the warmup below; other encodes run eager.
+  compile_vae_encode_size: [736, 544]
 node_groups:
   - node_names: ["dit"]
     ranks: [0]
@@ -43,3 +46,12 @@ node_groups:
   # (the only consumer of that node) is never built.
   - node_names: ["vae_encoder", "vae_decoder"]
     ranks: [0]
+# The first policy request of a fresh server compiles the action denoise step
+# and the observation encode; this warms both at startup with an observation in
+# the 736x544 bucket NVIDIA's RoboLab server sends (this checkpoint ships no
+# example frame; the Edge model card's is used).
+warmup_requests:
+  - text: warmup
+    files: [hf://nvidia/Cosmos3-Edge/assets/example_i2v_input.jpg]
+    output_modalities: [action]
+    model_kwargs: {size: 736x544, robot_state: [0, 0, 0, 0, 0, 0, 0, 0]}
