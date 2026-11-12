@@ -115,6 +115,11 @@ class TestReviewSummary(unittest.TestCase):
                          "the model could say a question was answered when nobody commented")
         self.assertEqual(carried(review(), earlier, True, [])["risk"]["level"], "low",
                          "a maintainer's answer would leave the earlier risk standing")
+        secure = carried({**review(), "risk": {**review()["risk"], "security": False}},
+                         {"risk": {**earlier["risk"], "security": True}}, False, [])
+        self.assertTrue(secure["risk"]["security"], "a small fix commit could clear the security flag and approve")
+        self.assertTrue(read_state(render(secure, [], "0123456789", "full", []))["risk"]["security"],
+                        "the next re-review would not know the flag")
         decision = {"location": "a.py:1", "why": "new lifecycle state"}
         floored = carried(review(), {"risk": {**earlier["risk"], "look_at": [decision]}}, False, [])
         self.assertEqual(floored["risk"]["look_at"], [decision], "the checklist wouldn't name the decision kept")

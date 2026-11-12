@@ -135,12 +135,15 @@ SCHEMA = {
         "risk": {"type": "object", "properties": {
             "level": {"type": "string", "enum": ["low", "medium", "high"]},
             "reason": {"type": "string"},
+            "security": {"type": "boolean", "description": "the change touches security-relevant code (credentials, "
+                         "auth, API keys and secrets handling, redaction, the review bot workflows and sandbox): "
+                         "a person approves it, whatever the design"},
             # The design or direction decisions left to a human, when the risk isn't low: where each lives and why.
             "look_at": {"type": "array", "items": {"type": "object", "properties": {
                 "location": {"type": "string", "description": "path:line, or a function or class"},
                 "why": {"type": "string"},
             }, "required": ["location", "why"]}},
-        }, "required": ["level", "reason", "look_at"]},
+        }, "required": ["level", "reason", "security", "look_at"]},
         "live_test": {"type": "object", "properties": {
             "run": {"type": "string", "enum": ["none", "targeted", "full"]},
             "reason": {"type": "string"},
@@ -315,6 +318,8 @@ def carried(review, earlier, answered, pages):
           if f["location"] not in locations and f["location"] not in cleared]]}
     if not answered:
         old, new = earlier.get("risk"), review.get("risk")
+        if old and new:
+            review["risk"] = new = {**new, "security": bool(new.get("security") or old.get("security"))}
         if old and new and RISK_ORDER[old["level"]] > RISK_ORDER[new["level"]]:
             review["risk"] = {**new, "level": old["level"], "reason": f"Kept from the earlier review: {old['reason']}",
                               "look_at": [*new.get("look_at", []), *old.get("look_at", [])]}
@@ -405,6 +410,7 @@ def status(review, pages, head, mode, stacked):
     line = f"{icon} **{text}** on `{head[:7]}`, {mode} review"
     if review.get("risk"):
         line += f" · design risk **{review['risk']['level']}**: {review['risk']['reason']}"
+        line += " · touches security-relevant code" if review["risk"].get("security") else ""
     return line
 
 
@@ -524,7 +530,7 @@ def render(review, pages, head, mode, stacked, salvaged=False, team=False):
     kept = [{**f, "priority": min(f["priority"], cleared[f["location"]])}
             for f in raw.get("untouched") or () if f["location"] in cleared]
     state = {"head": head, "mode": mode, "skipped": raw["skipped"], "outside_diff": [*raw["outside_diff"], *kept],
-             "risk": risk and {k: risk[k] for k in ("level", "reason", "look_at") if k in risk},
+             "risk": risk and {k: risk[k] for k in ("level", "reason", "security", "look_at") if k in risk},
              "latent": raw.get("latent", []),
              "questions": raw["questions"],
              "live_test": raw.get("live_test"),

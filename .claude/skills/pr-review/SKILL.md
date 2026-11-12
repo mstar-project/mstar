@@ -558,10 +558,11 @@ It is not about correctness: findings and, in full mode, the live test own that.
 `medium` or `high`, with one sentence of reason. Touching a shared layer is not by itself `medium`
 or `high`; what counts is whether the PR decides something the team hasn't. In full mode the bot
 approves a `low` or `medium` PR (when the rest of its rule holds) and leaves a `high` one to a person.
-Security is its own rule: a change to security-relevant code (credentials, auth, API keys and secrets
-handling, redaction, and the review bot's own workflows and sandbox) is `high` whatever its design,
-since a human owns security decisions. Not every path a request takes counts: a change there is rated
-like any other.
+Security is its own rule, not a level: set `risk.security` to true for a change to security-relevant
+code (credentials, auth, API keys and secrets handling, redaction, and the review bot's own workflows
+and sandbox), since a human owns security decisions; the bot then doesn't approve, whatever the level,
+which stays about the design. Not every path a request takes counts: a change there is rated like any
+other.
 
 - **`low`:** follows the existing design and patterns: no new abstraction and no change to how a
   shared layer is structured; no new public API, config key, CLI flag, env var or wire format; no
@@ -570,8 +571,7 @@ like any other.
   model-local abstraction other models will copy, or a debatable trade-off.
 - **`high`:** holds approval for a person: a new abstraction or an architecture change in a shared layer
   (worker, scheduler, conductor, engine, resources, graph runtime, transport, API server), new public
-  surface, a commitment to a direction that is hard to undo, a "do we want this at all" question, or
-  security-relevant code (above).
+  surface, a commitment to a direction that is hard to undo, or a "do we want this at all" question.
 
 **When the risk isn't low, list the decisions.** For each: the choice the PR made, the alternatives
 (including the one Phase A derived), what the PR's choice does well, what would be better and what

@@ -921,7 +921,7 @@ class TestComment(unittest.TestCase):
 class TestApprove(unittest.TestCase):
     def approve(self, variable, verdict="pass", head="0123456789", perm="write", risk="low", files=None,
                 outside=(), above=None, extra=None, untestable="", head_repo=OWN_HEAD, inline=None, prior=(),
-                untouched=(), vendors="nvidia"):
+                untouched=(), vendors="nvidia", security=False):
         """approve on a PR that meets the rule (a docs change) with REVIEW_APPROVALS as `variable`, unless
         `verdict` or the other arguments fail it; its decision text, the outputs and the writes."""
         pr = {"head": {"sha": head, "repo": head_repo}, "base": {"sha": "abcdef", "repo": BASE_REPO},
@@ -936,7 +936,7 @@ class TestApprove(unittest.TestCase):
             (ws / "review.json").write_text(json.dumps({
                 "outside_diff": list(outside), "prior_findings": list(prior), "questions": [], "skipped": [],
                 "inline": inline or {}, "untouched": list(untouched),
-                "risk": {"level": risk, "reason": "docs only", "look_at": []},
+                "risk": {"level": risk, "reason": "docs only", "security": security, "look_at": []},
                 "live_test": {"run": "full", "reason": "r", "checks": ["correctness"], "gpus": 1,
                               "untestable": untestable}}))
             if above is not None:
@@ -951,6 +951,8 @@ class TestApprove(unittest.TestCase):
         for name, kwargs, says in (("the head moved", {"head": "fedcba9876"}, "new commits"),
                                    ("the author can't write", {"perm": "read"}, "read"),
                                    ("a high design risk", {"risk": "high"}, ""),
+                                   ("security-relevant code at a low design risk", {"security": True},
+                                    "security-relevant code"),
                                    ("a blocked file", {"files": [{"filename": ".github/workflows/ci.yml"}]}, "rules"),
                                    ("a blocked file renamed away", {"files": [blocked]}, "rules"),
                                    ("a head on a stranger's fork", {

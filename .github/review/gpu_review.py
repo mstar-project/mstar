@@ -889,6 +889,7 @@ class ApprovalFacts:
     findings_changed: tuple  # the bot's inline findings someone has deleted or retagged since it posted them
     blocked: tuple  # files that rule out any approval (the bot's rules, CI, dependencies, toolchains)
     risk_level: str
+    security: bool  # the review says the change touches security-relevant code
     to_fix_first: tuple  # what the review left open (to_fix_first)
     fixed_only_above: tuple  # its P0/P1 findings a PR above fixes (fixed_only_above)
 
@@ -912,6 +913,7 @@ def approval_facts(pr, sha, verdict, review, vendors):
         findings_changed=tuple(findings_changed(review, pr)),
         blocked=(*blocked, *gitlinks),
         risk_level=(review.get("risk") or {}).get("level", "unrated"),
+        security=bool((review.get("risk") or {}).get("security")),
         to_fix_first=tuple(to_fix_first(for_approval(review, pages), pr, "stacked-above.json")),
         fixed_only_above=tuple(fixed_only_above(review, render_summary.stacked_above("stacked-above.json"))),
     )
@@ -948,6 +950,8 @@ def decide(f):
     elif f.verdict != "pass":
         note = "; judge its 👂 rows" if f.verdict == "partial" else ""
         rule.append(f"the live test's verdict is {f.verdict}{note}")
+    if f.security:
+        rule.append("touches security-relevant code: a person approves")
     rule += f.untestable
     rule += f.findings_changed
     if f.too_many_files:
