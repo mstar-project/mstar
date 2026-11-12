@@ -101,7 +101,17 @@ class Bidirectional(Mask):
     """Sees {k : k < n}, where n is the length of q's row on this array after this layer's latest add: every entry the
     row keeps and every entry this step adds for it. For a read with ``queries``, q's row is the row paired with q's
     segment, on this array's label. It uses no query position. On an array that keeps entries; ``Block`` is the
-    within-step form."""
+    within-step form.
+
+    With ``kept_window``, the entries the row kept before this step are cut to the first ``sink`` and the last
+    ``window`` of them, sizes the request's layout gives per read in ``Layout.kept_windows``."""
+
+    _: KW_ONLY
+    kept_window: bool = False
+
+    def __post_init__(self):
+        if type(self.kept_window) is not bool:
+            raise ValueError(f"Bidirectional.kept_window must be a bool, got {self.kept_window!r}")
 
 
 class Op:
@@ -410,6 +420,21 @@ class SampleStep:
     kept_rows: frozenset[int] | None = None              # None: every row's sample is kept
 
 
+@dataclass(frozen=True)
+class KeptWindow:
+    """A kept-window read's sizes for one request and label, in entries."""
+
+    sink: int
+    _: KW_ONLY
+    window: int
+
+    def __post_init__(self):
+        for name in ("sink", "window"):
+            value = getattr(self, name)
+            if not (type(value) is int and value >= 0):
+                raise ValueError(f"KeptWindow.{name} must be an int >= 0, got {value!r}")
+
+
 @dataclass(frozen=True, kw_only=True)
 class Layout:
     """What a request writes to one label of one array, from `process_prompt`'s ``state_layout``."""
@@ -417,6 +442,7 @@ class Layout:
     spans: tuple[Span, ...] = ()
     growth: tuple[tuple[str, int], ...] = ()    # (loop, entries per iteration)
     scratch: int = 0                            # most one scratch step writes past the kept length
+    kept_windows: Mapping[str, KeptWindow] = EMPTY    # by read key, each kept-window read's sizes
 
 
 @dataclass(frozen=True, kw_only=True)

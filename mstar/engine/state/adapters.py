@@ -609,6 +609,11 @@ class PagedAttend(OpBinding):
         if not isinstance(read.mask, Causal | Window | Bidirectional):
             raise _no_layout(array, f"reads[{key!r}].mask must be Causal, Window or Bidirectional, the masks "
                                     "AttentionConfig has")
+        self._refuse_kept_window(array, key, read)
+
+    def _refuse_kept_window(self, array: Array, key: str, read: Read) -> None:
+        if isinstance(read.mask, Bidirectional) and read.mask.kept_window:
+            raise _no_layout(array, f"reads[{key!r}].mask keeps a window, which no binding runs yet")
 
     def specs(self, array: Array, key: str, read: Read) -> list[NodeResourceSpec]:
         windowed = isinstance(read.mask, Window)
@@ -646,6 +651,7 @@ class PagedCrossAttend(PagedAttend):
     def check(self, array: Array, key: str, read: Read) -> None:
         if not isinstance(read.mask, Bidirectional):
             raise _no_layout(array, f"reads[{key!r}].mask must be Bidirectional, the mask CrossAttentionConfig has")
+        self._refuse_kept_window(array, key, read)
         if read.walks is not None:
             raise _no_layout(array, f"reads[{key!r}].walks must be None, since CrossAttentionConfig has no walk")
         if len(array.labels) != 1:
@@ -1680,6 +1686,10 @@ class PagedStorage(Storage):
     def layouts(self, by_label: Mapping[str, Layout], keyed_spans: Mapping[str, int]) -> "dict[str, LabelLayout]":
         from mstar.model.base import LabelLayout
 
+        for label, layout in by_label.items():
+            if layout.kept_windows:
+                raise ValueError(f"no layout yet: label {label!r} gives kept_windows, and no binding sizes a kept "
+                                 "window yet")
         return {
             label: LabelLayout(
                 spans=layout.spans, growth=layout.growth, scratch=layout.scratch, keyed_spans=keyed_spans.get(label),

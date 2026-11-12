@@ -56,7 +56,9 @@ SNAPSHOT = {
     "Attend": [
         ["q_heads", "POSITIONAL_OR_KEYWORD", None],
     ],
-    "Bidirectional": [],
+    "Bidirectional": [
+        ["kept_window", "KEYWORD_ONLY", 'False'],
+    ],
     "Block": [],
     "Causal": [],
     "CausalConv": [
@@ -80,10 +82,15 @@ SNAPSHOT = {
         ["heads", "KEYWORD_ONLY", None],
         ["head_dim", "KEYWORD_ONLY", None],
     ],
+    "KeptWindow": [
+        ["sink", "POSITIONAL_OR_KEYWORD", None],
+        ["window", "KEYWORD_ONLY", None],
+    ],
     "Layout": [
         ["spans", "KEYWORD_ONLY", '()'],
         ["growth", "KEYWORD_ONLY", '()'],
         ["scratch", "KEYWORD_ONLY", '0'],
+        ["kept_windows", "KEYWORD_ONLY", '{}'],
     ],
     "PagedNHD": [
         ["dtypes", "KEYWORD_ONLY", 'None'],
