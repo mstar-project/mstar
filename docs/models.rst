@@ -2397,7 +2397,8 @@ each through its step's head) and ``vae_decoder`` (256-px tiles).
 .. code-block:: bash
 
    mstar serve minimax_h3_image                                            # 2 GPUs: DiT | encoder + VAE
-   mstar serve minimax_h3_image --config configs/minimax_h3_image_1gpu.yaml  # one B200 / B300
+   mstar serve minimax_h3_image --config configs/minimax_h3_image_sp2.yaml   # 2 GPUs: DiT SP2
+   mstar serve minimax_h3_image --config configs/minimax_h3_image_1gpu.yaml  # 1 GPU
 
 Request knobs (``model_kwargs``): ``height`` / ``width`` (default 2048x2048; the image comes
 back at exactly this size), ``min_generation_area`` (1024 to 16,777,216 pixels, default
@@ -2410,9 +2411,66 @@ prompt refers to them as ``<Picture 1>``, ``<Picture 2>``, ... The prompt is cut
 as the reference cuts it. A packed sequence over ``max_packed_rows`` (default 65536) is a 400.
 One request runs per denoise step.
 
-Deployment knobs (``model_kwargs``): ``compile`` and ``row_bucket`` (the DiT's blocks, as
-``minimax_h3``), ``vae_tile_batch`` (256-px tiles per decoder call; 1 is the reference's
-order), ``vae_compile``, ``attention_backend`` (``flashinfer``, or ``sdpa``).
+Deployment knobs (``model_kwargs``; the configs set ``compile`` and ``vae_tile_batch: 64``):
+``compile`` and ``row_bucket`` (the DiT's blocks, as ``minimax_h3``), ``vae_tile_batch``
+(256-px tiles per decoder call: one at a time, the reference's order, leaves the decode
+launch-bound at 9.2 s for 16 MP on a B300 against 0.45 s at 64, and the batched decode is
+bit-identical), ``vae_compile``, ``attention_backend`` (``flashinfer``, or ``sdpa``). The
+configs: ``minimax_h3_image.yaml`` (2 GPUs, the DiT alone on one), ``minimax_h3_image_sp2.yaml``
+(the DiT Ulysses over 2 GPUs, the conditioner and the VAE beside it on rank 1) and
+``minimax_h3_image_1gpu.yaml`` (~119 GiB in use on one H200 at 16 MP).
+
+At ``attention_backend: sdpa`` the nodes' modules, driven by ``test/minimax_h3_image/parity.py``
+(fp32 matmuls at "highest"), are bit-identical to diffusers' pipeline end to end on a B300 (the
+packed layout, the seeded noise, the references' latents, every step and the decoded image) for
+text-to-image at 1024², 2048² and 4096² and edits with one and four references; a server at
+``sdpa`` returns the same pixels. FlashInfer and the compiled DiT are not bit-exact: served on two
+H200s, images are 19.9-36.8 dB from diffusers', where diffusers on another SDPA kernel moves
+21.3 dB (the four-reference edit, which M* serves 1.4 dB under that) to 38.5 dB (a
+one-reference edit) from itself: the six-step sampler amplifies kernel differences.
+
+Seconds per image, one request at a time, each engine on the same H200s (M* on torch
+2.11.0+cu128 and FlashInfer 0.7.2; text-to-image, seed 42, median of 3 after 2 warmups;
+``benchmark/minimax_h3_image/bench_image.py`` sends these requests, with
+``min_generation_area=1024`` so 1024² is generated at 1024²; the default renders it on the 2048²
+canvas, 2.14 s on M*):
+
+.. list-table::
+   :header-rows: 1
+
+   * - s/image
+     - 1024²
+     - 2048²
+     - 4096²
+   * - M*, 1 GPU (``minimax_h3_image_1gpu.yaml``)
+     - 0.64
+     - 2.20
+     - 11.07
+   * - SGLang (main ``fc6d3b6f9``), 1 GPU
+     - 0.56
+     - 2.08
+     - 10.71
+   * - M*, SP2 (``minimax_h3_image_sp2.yaml``)
+     - 0.59
+     - 1.53
+     - 7.12
+   * - SGLang, Ulysses 2
+     - 0.37
+     - 1.26
+     - 6.24
+   * - vllm-omni (main ``02d7bc47e``), USP 2
+     - (2048² canvas)
+     - 1.41
+     - 6.73
+
+The 2-GPU default config takes 0.65 / 2.18 / 11.13 s, as one GPU at one request (it overlaps
+requests, not steps); diffusers' pipeline on two H200s (encoder | rest, no HTTP) takes 1.05 /
+4.20 / 18.65 s. SGLang ran ``--performance-mode speed``; vllm-omni its H200 recipe's SP2 profile,
+whose ``extra_args.min_generation_area`` was not honoured at 1024². At SP2 and 4096², a step is
+0.94 s and the decode, on one rank, 0.51 s. Not done: CUDA-graph capture, more than one request
+per step, the decode split over the SP ranks, tensor parallelism, multi-reference edits through
+``/v1/images/edits``.
+
 
 FLUX.2 [klein] (``flux2_klein`` / ``flux2_klein_9b``)
 -----------------------------------------------------
