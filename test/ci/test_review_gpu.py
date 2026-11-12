@@ -1431,7 +1431,7 @@ class TestEras(unittest.TestCase):
         @contextlib.contextmanager
         def ledger_txn():  # the watchdog dropped the entry after finished() read it
             yield {}
-        for st in ("ended", "terminated", "preempted"):  # DigitalOcean's, Lambda's
+        for st in ("ended", "terminated", "preempted", "error"):  # DigitalOcean's, Lambda's, RunPod's
             g = types.SimpleNamespace(ledger=lambda: {"digitalocean:9": {"provider": "digitalocean",
                                                                          "instance_id": "9"}},
                                       TERMINAL=gpu_review.gpu_py.TERMINAL, ledger_txn=ledger_txn,
@@ -1439,7 +1439,7 @@ class TestEras(unittest.TestCase):
             with unittest.mock.patch.object(gpu_review, "gpu_py", g):
                 self.assertEqual(gpu_review.finished(box, {}), st, "a KeyError would end the wait step, or a gone "
                                                                     "box would be waited on until the timeout")
-        for st in ("unhealthy", "error"):  # a Lambda box can recover from these: its session may be running
+        for st in ("unhealthy",):  # a Lambda box can recover from this: its session may be running
             g = types.SimpleNamespace(ledger=lambda: {"digitalocean:9": {"provider": "digitalocean",
                                                                          "instance_id": "9"}},
                                       TERMINAL=gpu_review.gpu_py.TERMINAL, ledger_txn=ledger_txn,

@@ -560,6 +560,11 @@ class TestStorageFreeProviders(unittest.TestCase):
             sent.append((command, Path(command[-2]).read_text() if "value" in command[-2:][0] else None))
             return subprocess.CompletedProcess(command, 1 if self.ssh_fails else 0, "", "boom")
 
+        def terminate(k, e):
+            ended.append(k)
+            if self.release_fails:
+                raise GPU["ApiError"](503, "x")
+
         def cmd_wait(args, cfg):
             if self.api_down:
                 raise GPU["ApiError"](503, "x")
@@ -571,15 +576,17 @@ class TestStorageFreeProviders(unittest.TestCase):
         GPU.update(runpod=runpod, STATE=state, LEDGER=state / "instances.json", cmd_wait=cmd_wait,
                    find_offer=lambda cfg, offer: {"id": "runpod:H100:dc:1", "provider": "runpod", "gpu": "H100",
                                                   "count": 1, "usd_per_hour": 3.0, "region": "dc", "storage": True},
-                   terminate=lambda k, e: ended.append(k))
+                   terminate=terminate)
         cfg = {"ssh_public_key": str(key), "run_secret_env": "BOX_KEY", "runpod": {"image": "i", "hf_home": "/h",
                                                                                        "storage": False},
                "budget": {"max_usd_per_hour": 30, "max_hours": 4, "max_running": None}}
         args = argparse.Namespace(boxes=1, offer="runpod:H100:dc:1", pr=7, hours=1, tag="t", run=str(box),
                                   input=[str(extra)], allow_over_budget=False, dry_run=False)
-        for self.ssh_fails, self.api_down in ((False, False), (True, False), (False, True)):
+        for self.ssh_fails, self.api_down, self.release_fails in ((False, False, False), (True, False, False),
+                                                                  (False, True, False), (False, True, True)):
+            code = None
             sent.clear(), ended.clear(), created.clear()
-            with self.subTest(ssh_fails=self.ssh_fails, api_down=self.api_down), \
+            with self.subTest(ssh_fails=self.ssh_fails, api_down=self.api_down, release_fails=self.release_fails), \
                     unittest.mock.patch.object(subprocess, "Popen"), \
                     unittest.mock.patch.object(subprocess, "run", fake_run), \
                     unittest.mock.patch.dict(os.environ, {"RUNPOD_API_KEY": "k", "BOX_KEY": "sk-ant-box"}), \
@@ -587,12 +594,15 @@ class TestStorageFreeProviders(unittest.TestCase):
                 GPU["save_ledger"]({})
                 try:
                     GPU["cmd_launch"](args, cfg)
-                except (SystemExit, GPU["ApiError"]):
-                    pass
+                except SystemExit as err:
+                    code = err.code
             self.assertNotIn("sk-ant-box", json.dumps(created), "the key would reach RunPod's API")
             self.assertEqual(ended, ["runpod:p1"] if self.ssh_fails or self.api_down else [],
                              "a pod without its run would bill idle, or a started one would be ended")
-            if not (self.ssh_fails or self.api_down):
+            if self.ssh_fails or self.api_down:
+                self.assertEqual(code, GPU["EXIT_RUN_NOT_STARTED"], "a failed release would escape as another exit "
+                                 "code and RunPod would not be dropped from the batch")
+            else:
                 self.assertEqual(sent[-1][0][-1].split()[:3], ["setsid", "nohup", "bash"], "the run would not start")
                 self.assertEqual(sent[-2][1], "sk-ant-box", "the box would have no Anthropic key")
                 self.assertIn(str(extra), sent[1][0], "the box would miss its inputs")

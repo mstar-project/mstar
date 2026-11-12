@@ -810,9 +810,9 @@ def has_provider(e: dict) -> bool:
     return e["provider"] in PROVIDERS
 
 
-# Statuses (lower case) of an instance that is gone or going: waiting on it is over. Not a status it can recover
-# from (Lambda's `unhealthy`): a session may still be running on it.
-TERMINAL = ("exited", "terminated", "terminating", "preempted", "ended", "releasing")
+# Statuses (lower case) of an instance that is gone or going: waiting on it is over. RunPod's `ERROR` is one; not
+# a status it can recover from (Lambda's `unhealthy`): a session may still be running on it.
+TERMINAL = ("exited", "terminated", "terminating", "preempted", "ended", "releasing", "error")
 
 
 def job_name(pr: int, tag: str) -> str:
@@ -1047,7 +1047,10 @@ def start_run_over_ssh(key: str, cfg: dict, args) -> None:
                 if r.returncode:
                     die(f"couldn't {what} on {key}: {tail_lines(r.stderr or r.stdout, 300)}")
     except BaseException as err:  # a die, an API error or an interrupt: all end the pod
-        terminate(key, entry(key))
+        try:
+            terminate(key, entry(key))
+        except Exception as release_err:  # the pod is left to the watchdog and the job's cleanup
+            print(f"gpu.py: couldn't end {key}: {release_err}; its watchdog and the job's cleanup will", file=sys.stderr)
         if not isinstance(err, (Exception, SystemExit)):
             raise
         if not isinstance(err, SystemExit):  # a die has said why
