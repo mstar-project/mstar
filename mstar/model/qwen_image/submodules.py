@@ -364,7 +364,8 @@ class QwenImageVaeDecoderSubmodule(BatchedRows, NodeSubmodule):
         return {LATENTS: latents, "grid": inputs[0].resource_step_info}
 
     def _vae_latents(self, latents: torch.Tensor, grid: tuple[int, int]) -> torch.Tensor:
-        """Packed tokens ``[B, h*w, 64]`` -> the decoder's input ``[B, C, 1, H, W]``: unpacked, ``z / (1 / std) + mean``."""
+        """Packed tokens ``[B, h*w, 64]`` -> the decoder's input ``[B, C, 1, H, W]``: unpacked,
+        ``z / (1 / std) + mean``."""
         device, dtype = self.get_device(), self.vae.dtype
         mean, inv_std = latent_affine(self.vae, dtype, device)
         return unpack(latents.to(device=device, dtype=dtype), grid)[:, :, None] / inv_std + mean
