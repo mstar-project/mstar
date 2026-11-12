@@ -13,7 +13,7 @@ import numpy as np
 import pytest
 import torch
 
-from mstar.engine.resources.context_parallel import ContextParallel
+from mstar.engine.resources.context_parallel import TPPlacement
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.manager import KVManager, KVPlanState, _SlotBuffer
 from mstar.engine.resources.kv.plan import SINK_PAGE, PagedIndptrs
@@ -105,7 +105,7 @@ def _device_unpacked(kv, indptrs) -> KVPlanState:
 
 
 # and over a context-parallel pool, partner 1 of 2's slots
-@pytest.mark.parametrize("placement", [None, ContextParallel(2, 1, None, False, (0, 1))], ids=["one_rank", "placed"])
+@pytest.mark.parametrize("placement", [None, TPPlacement(2, 1, None, (0, 1))], ids=["one_rank", "placed"])
 def test_host_addressing_matches_device_unpacking(addressing, placement):
     kv = _kv()
     kv.kv_cache.placement = placement

@@ -234,7 +234,7 @@ class PagedKVConfig(KVConfig):
         resources share. The partners are the node's SP ranks when it has more than one, and
         otherwise the block of TP ranks holding this rank's KV head (`kv_head_replicas`).
         """
-        from mstar.engine.resources.context_parallel import ContextParallel
+        from mstar.engine.resources.context_parallel import SPPlacement, TPPlacement
 
         if not self.context_parallel:
             return None
@@ -246,12 +246,10 @@ class PagedKVConfig(KVConfig):
         size = self.context_parallel_size(pool, tp_size, sp_size)
         if sp_size > 1:
             sp = joint.sp_group
-            return ContextParallel(size=size, index=sp.rank, group=sp, over_sp=True, partners=tuple(range(size)))
+            return SPPlacement(size=size, index=sp.rank, group=sp)
         tp = joint.tp_group
         first = tp.rank // size * size
-        return ContextParallel(
-            size=size, index=tp.rank % size, group=tp, over_sp=False, partners=tuple(range(first, first + size)),
-        )
+        return TPPlacement(size=size, index=tp.rank % size, group=tp, partners=tuple(range(first, first + size)))
 
     def context_parallel_size(self, pool: str, tp: int, sp: int) -> int:
         """How many ranks ``context_parallel`` stripes each page over on a node of ``tp`` x ``sp``
