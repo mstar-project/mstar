@@ -402,6 +402,15 @@ def test_a_second_decode_walk_in_the_graph_is_a_decode_walk_everywhere():
     (decode,) = [c for c in llm.get_accelerator_graph_configs(torch.device("cpu")) if c.capture_graph_walk == "decode"]
     # and a mixed step of its rows and decode's alone
     assert decode.replay_graph_walks == ["decode", "decode_other", MIXED]
+    # a mixed step of decode rows alone runs as decode; with a prompt row, as mixed
+    rows = [SimpleNamespace(graph_walk="decode"), SimpleNamespace(graph_walk="decode_other")]
+    assert llm._step_walk(MIXED, rows) == "decode"
+    assert llm._step_walk(MIXED, [*rows, SimpleNamespace(graph_walk="prefill_text")]) == MIXED
+    # under one decode walk such a step replays the packed mixed capture, and runs as mixed
+    one = object.__new__(LLMSubmodule)
+    SampledTokenDecoder.__init__(one, None, SimpleNamespace(stop_token_ids=()))
+    assert one.cg_key_info(MIXED, {0: SimpleNamespace(graph_walk="decode")}) is None
+    assert one._step_walk(MIXED, [SimpleNamespace(graph_walk="decode")] * 2) == MIXED
     # each decoder node takes its own graph's walks: one in no decode loop is refused
     with pytest.raises(ValueError, match="no walk runs Drafter"):
         model.get_submodule("Drafter")
