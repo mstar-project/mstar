@@ -77,6 +77,7 @@ from mstar.model.command_a_plus.command_a_plus_model import CommandAPlusModel
 from mstar.model.command_a_plus.submodules import CommandAPlusLLMSubmodule
 from mstar.model.components.block_loop_encoder import VISION_BLOCK_LOOP
 from mstar.model.components.request_kwargs import sampler_capabilities
+from mstar.model.components.sampled_token_decoder import DeclaredTokenDecoder
 from mstar.model.keys import MIXED, ROPE
 from mstar.model.multimodal import vision_encoder
 from mstar.model.multimodal_decoder import DeclaredDecoderModel, MultimodalDecoderModel
@@ -835,6 +836,18 @@ def test_a_qwen3_5_step_counts_the_scaffolds_draw_through_its_handle():
     step.check_calls()
     assert llm.sampler._drawn == 1, "the scaffold's forward should sample through the handle"
     step.end_calls()
+
+
+def test_the_handle_path_binds_and_steps_the_array_its_class_names():
+    class _Node(DeclaredTokenDecoder):
+        KV_CACHE = "kv"
+
+    node = _Node(None, SimpleNamespace(stop_token_ids=frozenset()))
+    kv, sampler = object(), object()
+    node.bind_state({"kv": kv, SAMPLER: sampler})
+    assert node.kv is kv and node.sampler is sampler, "the node would bind another array than its class names"
+    step = node.node_step([Segment(1, "main", 1)], {}, None)
+    assert step.state.keys() == {"kv", SAMPLER}, "the node would step another array than the one it binds"
 
 
 _FIXTURE = Path("mstar/model/command_a_plus/tests/fixtures/tiny_config.json")

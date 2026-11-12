@@ -4,6 +4,7 @@ The contract freezes that one surface, so a ported model that also imports a res
 engine's inputs, can break with no contract change, and later PRs can't move what it reached for. Nothing at run time
 would notice, so this reads each package's source. The base classes are the bridge, so they aren't read. Each exception
 says why it stands or which PR deletes it, and an exception nothing uses any more fails too, so the list only shrinks.
+A scaffold node takes its handle calls from `DeclaredTokenDecoder` rather than writing them again.
 """
 
 from __future__ import annotations
@@ -55,6 +56,14 @@ ALLOWED_IN_FUNCTION = {
         "the opt-in watermark's per-stream state, until it moves to a watermark node's plain Value (issue #1447)",
 }
 
+_HOOKS = frozenset({
+    "bind_state", "node_step", "next_position", "loopback_tokens", "last_token_hidden", "sample_tokens",
+})
+# The handle hooks a ported scaffold node still writes itself, by file, class and method.
+OWN_HOOKS = {
+    ("mstar/model/qwen3_5/submodules.py", "LLMSubmodule", "node_step"): "the GDN state's step, beside the KV cache's",
+}
+
 
 def _in_functions(node: ast.AST, prefix: str = "", function: str | None = None):
     """Each node under ``node``, with the qualified name of the function it lies in, decorators included, or None."""
@@ -98,6 +107,26 @@ def _violations(source: str, path: str = "") -> tuple[list[str], set[tuple[str, 
     return found, used
 
 
+def _hook_violations(source: str, path: str) -> tuple[list[str], set[tuple[str, str, str]]]:
+    """The handle hooks a scaffold node in ``source``, the file at ``path``, writes itself, and the exceptions used."""
+    found, used = [], set()
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.ClassDef):
+            continue
+        bases = {ast.unparse(base).rsplit(".", 1)[-1] for base in node.bases}
+        if not bases & {"SampledTokenDecoder", "DeclaredTokenDecoder"}:
+            continue
+        if "DeclaredTokenDecoder" not in bases:
+            found.append(f"{node.name} subclasses SampledTokenDecoder")
+        for item in node.body:
+            if isinstance(item, ast.FunctionDef) and item.name in _HOOKS:
+                if (path, node.name, item.name) in OWN_HOOKS:
+                    used.add((path, node.name, item.name))
+                else:
+                    found.append(f"{node.name}.{item.name} at line {item.lineno}")
+    return found, used
+
+
 def _sources() -> list[Path]:
     return [
         path for package in PORTED for path in sorted(Path(package).rglob("*.py")) if "tests" not in path.parts
@@ -108,6 +137,16 @@ def _sources() -> list[Path]:
 def test_a_ported_package_reaches_the_engine_only_through_the_contract(path):
     found, _ = _violations(path.read_text(), str(path))
     assert not found, f"{path} reaches past the contract: {found}"
+
+
+def test_a_ported_scaffold_node_writes_no_handle_hook_itself():
+    found, used = [], set()
+    for path in _sources():
+        in_file, used_in_file = _hook_violations(path.read_text(), str(path))
+        found += [f"{path}: {violation}" for violation in in_file]
+        used |= used_in_file
+    assert not found, f"these repeat DeclaredTokenDecoder's handle calls: {found}"
+    assert OWN_HOOKS.keys() <= used, f"delete these exceptions: {sorted(OWN_HOOKS.keys() - used)}"
 
 
 def test_every_exception_is_still_used():
