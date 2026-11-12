@@ -519,14 +519,62 @@ def test_the_serving_config_places_every_node_once_and_sizes_the_vocoders_slots_
     assert set(config["resources"]) <= keys
 
 
-def test_a_deployment_without_voices_is_refused(tmp_path):
+def test_a_deployment_without_voices_is_refused(tmp_path, monkeypatch):
     from mstar.model.step_audio2.step_audio2_model import _voice_files
 
     with pytest.raises(ValueError, match="voices_dir"):
         _voice_files(None)
+    # offline, an empty directory is not fetched into, and the refusal says how to fill it
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
     (tmp_path / "empty").mkdir()
-    with pytest.raises(ValueError, match="no .wav"):
+    with pytest.raises(ValueError, match="HF_HUB_OFFLINE.*curl -fLo"):
         _voice_files(str(tmp_path / "empty"))
+    assert not list((tmp_path / "empty").iterdir())
+
+
+class _Download:
+    def __init__(self, data: bytes):
+        self.data = data
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self) -> bytes:
+        return self.data
+
+
+def test_an_empty_voices_dir_gets_the_reference_voices_checked_against_their_hashes(tmp_path, monkeypatch):
+    import hashlib
+
+    from mstar.model.step_audio2 import step_audio2_model as m
+
+    monkeypatch.delenv("HF_HUB_OFFLINE", raising=False)
+    clips = {name: name.encode() * 10 for name in m._DEFAULT_VOICES}
+    monkeypatch.setattr(m, "_DEFAULT_VOICES", {name: hashlib.sha256(d).hexdigest() for name, d in clips.items()})
+    asked = []
+
+    def urlopen(url, timeout):
+        asked.append(url)
+        return _Download(clips[url.rsplit("/", 1)[1]])
+
+    monkeypatch.setattr(m.urllib.request, "urlopen", urlopen)
+    voices = m._voice_files(str(tmp_path / "voices"))
+    assert sorted(voices) == ["default_female", "default_male"]
+    assert all(m._VOICE_COMMIT in url for url in asked)
+    assert (tmp_path / "voices" / "default_male.wav").read_bytes() == clips["default_male.wav"]
+    assert not list((tmp_path / "voices").glob("*.part"))
+    # a directory that holds clips is left alone
+    asked.clear()
+    assert sorted(m._voice_files(str(tmp_path / "voices"))) == ["default_female", "default_male"]
+    assert not asked
+    # a download that doesn't match its hash is refused, and nothing is kept
+    monkeypatch.setattr(m.urllib.request, "urlopen", lambda url, timeout: _Download(b"not the clip"))
+    with pytest.raises(ValueError, match="pinned hash"):
+        m._voice_files(str(tmp_path / "other"))
+    assert not list((tmp_path / "other").glob("*.wav"))
 
 
 # --- against the reference, with the checkpoint's tokenizer ------------------------------------

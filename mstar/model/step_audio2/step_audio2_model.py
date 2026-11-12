@@ -17,12 +17,17 @@ Token2Wav in the reference client's windows (``examples-vllm-stream.py``: 28 cod
 then a last flush). Text and spoken replies decode in one step as ``decode_mixed``.
 
 Ported from the reference's ``stepaudio2.py`` and ``token2wav.py`` (Apache-2.0). Voices are
-reference clips in the serving config's ``model_kwargs.voices_dir``; cloning a voice from
-a request's own clip is not served yet.
+reference clips in the serving config's ``model_kwargs.voices_dir`` (the reference's two,
+fetched at first start into an empty one); cloning a voice from a request's own clip is not
+served yet.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
+import os
+import tempfile
+import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -137,18 +142,57 @@ def _resolve_metadata(repo_id: str, cache_dir: str | None) -> str:
     return snapshot_download(repo_id=repo_id, cache_dir=cache_dir, allow_patterns=["*.json", "*.txt"])
 
 
+# The reference repo's two voices (Apache-2.0), fetched into an empty ``voices_dir`` at first
+# start: at a pinned commit, each checked against its hash.
+_VOICE_COMMIT = "76e272b56c3917a8d7188f18bbb5a65dfc8a0845"
+_VOICE_URL = f"https://raw.githubusercontent.com/stepfun-ai/Step-Audio2/{_VOICE_COMMIT}/assets/{{}}"
+_DEFAULT_VOICES = {
+    "default_female.wav": "5fc92ddcd9bc9af10437d9630642378777a98fc260f16508a9777db12c830a41",
+    "default_male.wav": "812fedb6973d4a35441a84cf35536f29add2afa414c5e685d55b33896b290504",
+}
+
+
+def _fetch_default_voices(root: Path) -> None:
+    """Download the reference's two voices into ``root``. Each lands by rename, so processes
+    starting together can each fetch without reading a partial file."""
+    root.mkdir(parents=True, exist_ok=True)
+    for name, sha256 in _DEFAULT_VOICES.items():
+        with urllib.request.urlopen(_VOICE_URL.format(name), timeout=60) as response:
+            data = response.read()
+        if hashlib.sha256(data).hexdigest() != sha256:
+            raise ValueError(f"Step-Audio2 voice {name}: the download does not match its pinned hash")
+        fd, tmp = tempfile.mkstemp(dir=root, suffix=".part")
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        os.replace(tmp, root / name)
+    logger.info("Step-Audio2: fetched the reference's voices %s into %s", sorted(_DEFAULT_VOICES), root)
+
+
 def _voice_files(voices_dir: str | None) -> dict[str, Path]:
-    """The ``.wav`` clips in ``voices_dir``, by file stem: the names a request picks."""
+    """The ``.wav`` clips in ``voices_dir``, by file stem: the names a request picks. An empty
+    or missing directory first gets the reference's two voices, unless the hub is offline."""
     if not voices_dir:
         raise ValueError(
             "Step-Audio2 needs model_kwargs.voices_dir in the serving config: a directory of reference "
             "clips (the GitHub repo's assets/default_female.wav and default_male.wav)"
         )
     root = Path(voices_dir).expanduser()
-    voices = {p.stem: p for p in sorted(root.glob("*.wav"))}
-    if not voices:
-        raise ValueError(f"Step-Audio2's voices_dir {str(root)!r} holds no .wav clips")
-    return voices
+    if not any(root.glob("*.wav")):
+        offline = os.environ.get("HF_HUB_OFFLINE", "").lower() in ("1", "true", "yes")
+        fetch = " && ".join(f"curl -fLo {root / name} {_VOICE_URL.format(name)}" for name in _DEFAULT_VOICES)
+        if offline:
+            raise ValueError(
+                f"Step-Audio2's voices_dir {str(root)!r} holds no .wav clips, and HF_HUB_OFFLINE is set, so "
+                f"they are not fetched. Copy them in: mkdir -p {root} && {fetch}"
+            )
+        try:
+            _fetch_default_voices(root)
+        except (OSError, ValueError) as e:
+            raise ValueError(
+                f"Step-Audio2's voices_dir {str(root)!r} holds no .wav clips, and fetching the reference's "
+                f"two failed ({e}). Copy them in: mkdir -p {root} && {fetch}"
+            ) from e
+    return {p.stem: p for p in sorted(root.glob("*.wav"))}
 
 
 def _load_voice_clip(path: Path) -> tuple[torch.Tensor, torch.Tensor]:

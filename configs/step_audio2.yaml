@@ -3,7 +3,8 @@ model: "step_audio2"
 max_seq_len: 16384
 model_kwargs:
   # Reference clips a spoken reply's `voice` names, by file stem: the GitHub repo's
-  # assets/default_female.wav and default_male.wav (Apache-2.0). Nothing is fetched.
+  # assets/default_female.wav and default_male.wav (Apache-2.0), fetched at a pinned commit at
+  # first start when the directory is empty (not with HF_HUB_OFFLINE set).
   voices_dir: ~/.cache/mstar/step_audio2_voices
 # One GPU (the checkpoint is ~17 GB in bf16), two workers: the audio tower runs once per
 # request and then idles, so it shares the LLM's worker; the vocoder gets its own loop, as
