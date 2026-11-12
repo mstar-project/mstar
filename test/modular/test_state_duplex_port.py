@@ -412,7 +412,9 @@ def test_the_noise_memo_holds_the_talker_loop_s_cap_plus_one(monkeypatch):
     sub = _talker_from(monkeypatch, NemotronDuplexConfig())
     (loop,) = (section for section in _model().get_graph_walk_graphs().values()
                if getattr(section, "name", None) == "talker_decode_loop")
-    assert sub.noise_rows == loop.max_iters + 1
+    assert sub.noise_rows == loop.max_iters + 1, "the model builds the talker with the loop's cap plus one rows"
+    bound = _make_talker_sub()
+    assert bound._noise_u.shape[0] == bound._noise_eps.shape[0] == bound.noise_rows, "binding allocates that many"
 
 
 def test_the_talker_refuses_a_noise_row_past_the_loop_s_cap():
