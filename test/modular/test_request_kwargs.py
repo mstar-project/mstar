@@ -2,14 +2,21 @@
 conductor reads them, so a stray form field cannot reach a step. The API has
 already normalized the generation knobs, so the check coerces nothing. A
 declared sampler gets every field of the request's sampling config, so no knob
-falls back to its default on the way."""
-from dataclasses import fields
+falls back to its default on the way, and the same flags the model's defaults
+give a sampler on resources."""
+from dataclasses import fields, replace
 
 import pytest
 
-from mstar.engine.resources.sampler.config import SamplingReqConfig
-from mstar.engine.state import SampleSettings
-from mstar.model.components.request_kwargs import checked_request_kwargs, sample_settings
+from mstar.engine.resources.sampler.config import SamplerSpec, SamplingReqConfig
+from mstar.engine.state import Sampler, SampleSettings
+from mstar.engine.state.adapters import build_specs
+from mstar.model.components.request_kwargs import (
+    checked_request_kwargs,
+    sample_settings,
+    sampler_capabilities,
+    sampler_flags,
+)
 from mstar.utils.generation_kwargs import normalize_generation_kwargs
 
 
@@ -70,3 +77,17 @@ def test_sample_settings_and_sampling_configs_default_alike():
         assert getattr(SampleSettings(), name) == getattr(SamplingReqConfig(), name), (
             f"an unset {name} would sample differently on the state contract"
         )
+
+
+@pytest.mark.parametrize("defaults, penalty, min_p", [
+    ({"temperature": 0.0, "top_p": 1.0}, False, False),
+    ({"temperature": 0.7, "min_p": 0.0}, False, False),
+    ({"temperature": 0.7, "min_p": 0.05}, False, True),
+    ({"temperature": 0.9, "top_p": 0.95, "repetition_penalty": 1.04}, True, False),
+], ids=["greedy", "min-p-zero", "min-p", "penalty"])
+def test_a_declared_samplers_flags_are_its_defaults_capabilities(defaults, penalty, min_p):
+    (spec,) = build_specs([Sampler("sampler", nodes={"LLM"}, vocab_size=8, **sampler_flags(defaults))])
+    on_resources = SamplerSpec(resource_key="sampler", nodes={"LLM"}, vocab_size=8)
+    on_resources = replace(on_resources, **sampler_capabilities(defaults))
+    assert (spec.enable_repetition_penalty, spec.enable_min_p) == (penalty, min_p), "a request's knob would be refused"
+    assert spec == on_resources, "the declared sampler would take other flags than the same defaults give on resources"
