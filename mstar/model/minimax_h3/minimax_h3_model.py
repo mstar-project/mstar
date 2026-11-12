@@ -27,7 +27,7 @@ import torch
 from mstar.communication.tensors import NameToTensorList
 from mstar.distributed.base import ShardingConfig
 from mstar.engine.resources import SeqShardSpec
-from mstar.engine.state import Array, Attend, Block, Read
+from mstar.engine.state import Array, Attend, Block, Read, SeqShard
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Parallel, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import Model, TensorAndMetadata, WalkStep
@@ -230,9 +230,11 @@ class H3Model(Model):
         return str(self.snapshot)
 
     # ------------------------------------------------------------ structure
-    def declare_state(self) -> list[Array]:
-        """The DiT's attention over each request's packed rows, its padding a segment of its own in the same row, and
-        the token refiner's over the prompt; nothing here keeps state."""
+    def declare_state(self) -> list[Array | SeqShard]:
+        """The DiT's attention over each request's packed rows, its padding a segment of its own in the same row, the
+        token refiner's over the prompt, and the DiT's sequence shard; nothing here keeps state. On SP ranks the
+        shard splits the packed rows (one row a step, read segmented, so cut contiguously), which the attention
+        exchanges for heads (Ulysses); on SDPA it can't run there."""
         t = self.config.transformer
         heads, entry = t.num_attention_heads, dit_entry(t.num_attention_heads, t.attention_head_dim)
         return [
@@ -245,6 +247,7 @@ class H3Model(Model):
                 entry=entry, labels={TEXT_SPAN}, max_len=0,
                 reads={REFINER_ATTN: Read(mask=Block(), op=Attend(q_heads=heads), packed=False)},
             ),
+            SeqShard(DIT_SHARD, nodes={DIT_NODE}, labels={H3DenoiseSubmodule.MAIN_SPAN}),
         ]
 
     def kernel_settings(self) -> dict[str, dict[str, Any]]:
@@ -252,12 +255,10 @@ class H3Model(Model):
         return {DIT_ATTN: {"max_segments_per_request": 2, "workspace_mb": 128}, REFINER_ATTN: {"workspace_mb": 128}}
 
     def get_node_resources(self) -> list[SeqShardSpec]:
-        """The sequence shards. On SP ranks the DiT's splits the packed rows (one row a step, so ``axis`` 0), which
-        its attention exchanges for heads (Ulysses); on SDPA it can't run there. The video decoder's splits each
-        request's clips, which nothing exchanges (``exchanges=False``); every request of a decoder batch is one
-        layout, so one clip count (``axis`` 1)."""
+        """The video decoder's sequence shard, which splits each request's clips, which nothing exchanges
+        (``exchanges=False``); every request of a decoder batch is one layout, so one clip count (``axis`` 1). The
+        decoder has no arrays, so its shard is written by hand, not a `SeqShard`."""
         return [
-            SeqShardSpec(resource_key=DIT_SHARD, nodes={DIT_NODE}, labels=(H3DenoiseSubmodule.MAIN_SPAN,), axis=0),
             SeqShardSpec(
                 resource_key=VAE_SHARD, nodes={VAE_DECODER_NODE}, labels=(H3VideoDecoderSubmodule.CLIPS,), axis=1,
                 exchanges=False,

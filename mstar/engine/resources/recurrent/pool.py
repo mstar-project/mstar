@@ -143,9 +143,11 @@ class RecurrentAddressing:
 
 
 class RecurrentStatePool(Resource):
-    # it reads the KV pool only to key prefix snapshots, which are off above one rank; over a
-    # pool placed over SP ranks `head_shards` is TP's, so every SP partner holds the same state
+    # it reads the KV pool only to key prefix snapshots, which are off above one rank. Its heads
+    # shard over TP alone, so every SP replica of a slot holds the same state, which a split step
+    # leaves alike on every one (`linear_attn.base`)
     supports_context_parallel = True
+    supports_split_steps = True
     # the node's planner and this pool's table of slots, once bound
     _resident: "ResidentPlanner | None" = None
     _resident_table: "ResidentTable | None" = None

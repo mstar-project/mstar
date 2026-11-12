@@ -10,6 +10,7 @@ import logging
 from abc import abstractmethod
 from typing import TYPE_CHECKING, NamedTuple
 
+import numpy as np
 import torch
 
 from mstar.engine.resources.attn.config import AttentionSpec, AttnBackend, SpExchange
@@ -29,12 +30,15 @@ from mstar.engine.resources.context_parallel import (
 )
 from mstar.engine.resources.kv.config import KVConfig, KVGroup, PagedKVConfig, RingKVConfig
 from mstar.engine.resources.kv.keys import fingerprint
+from mstar.engine.resources.kv.plan import HostLens, PagedIndptrs
 from mstar.engine.resources.sequence_shard import (
+    SeqRange,
     SeqShardPlan,
     SequenceShard,
     all_gather,
     check_shard_plan,
     head_slice,
+    kv_gather,
     ring,
     ulysses,
 )
@@ -71,12 +75,17 @@ def resolve_attn_backend(backend: AttnBackend, device: torch.device) -> AttnBack
 
 class AttentionManager(AttentionResource):
     prefix_skip_safe = True
+    # its spec's key, set by `build`, for a refusal that names the attention to change
+    _resource_key: str | None = None
     # the sequence shard over its node (`AttentionSpec.derive`), set by `build`; and the shard
     # itself where it can split (`bind_dependencies`)
     _shard_key: str | None = None
     _shard: SequenceShard | None = None
     # how split steps reach it (`AttentionSpec.resolve_exchange`), set by `build`
     _split_exchange: SpExchange = "ulysses"
+    # the group of the pool's layers it reads (`PagedKVConfig.groups`); a placement stripes the
+    # first alone, and a window group is whole on every partner
+    _group_idx: int = 0
 
     def step_exchanges(self, label: str | None = None) -> bool:
         """Whether a call for ``label`` (the current one by default) goes through `exchange`: on a node
@@ -101,10 +110,14 @@ class AttentionManager(AttentionResource):
             return
         # stored by head, heads over every TP and SP rank: a split step's tokens trade for heads, a
         # copied step's heads are sliced. Stored by position, heads over TP: every rank attends a
-        # copied step, and a split step's tokens are gathered or passed round (`exchange`)
+        # copied step, and a split step's tokens are gathered or passed round. A window's layers,
+        # whole on every rank, heads over TP: a copied step runs as is, a split one gathers its
+        # keys (`exchange`)
         shard = self._shard = resources[self._shard_key]
         kv = resources[self._kv_cache_name]
         kv.bind_sequence_shard(shard)
+        # a placement stripes the pool's first group alone (`PlacedAttention.bind_dependencies`)
+        placed = kv.placement is not None and self._group_idx == 0
         split = self._split_exchange
         if split == "ring":
             # every rank binds the same resources in the same order
@@ -112,7 +125,7 @@ class AttentionManager(AttentionResource):
         logger.info(
             "attention over KV %r takes split steps over %d SP ranks: split labels by %s, copied ones %s",
             self._kv_cache_name, shard.group.world_size, split,
-            "by head slice" if kv.placement is None else "over the placed pool",
+            "as is" if split == "kv_gather" else "over the placed pool" if placed else "by head slice",
         )
 
     @torch.compiler.disable
@@ -133,9 +146,14 @@ class AttentionManager(AttentionResource):
             shard.exchanging = False
 
     def _exchange_over_pool(self, run, q, k, v, r):
-        """``exchange``'s ``run`` over a pool stored by head, heads over every TP and SP rank: a split
-        step's tokens (range ``r``) trade for heads, a copied step's heads are sliced."""
-        return head_slice(run, q, k, v, self._shard.group) if r is None else ulysses(run, q, k, v, r)
+        """``exchange``'s ``run`` over KV this attention doesn't read striped by position. Stored by
+        head, heads over every TP and SP rank: a split step's tokens (range ``r``) trade for heads, a
+        copied step's heads are sliced. Whole on every rank (``kv_gather``: a window's layers of a
+        pool placed by position), heads over TP: a copied step runs as is, a split one gathers its
+        keys."""
+        if self._split_exchange == "kv_gather":
+            return run(q, k, v) if r is None else kv_gather(run, q, k, v, r)
+        return head_slice(run, q, k, v, self._shard.group) if r is None else ulysses(run, q, k, v, r=r)
 
     def _check_sequence_shard(self, ctx) -> SeqShardPlan | None:
         """At plan: the step declares the node's sequence shard, whose plan this returns where the
@@ -190,6 +208,7 @@ class AttentionManager(AttentionResource):
     @classmethod
     def build(cls, spec: AttentionSpec, info: EngineResourceInfo):
         manager = cls._build_backend(spec, info)
+        manager._resource_key = spec.resource_key
         manager._shard_key = spec.shard_key
         manager._split_exchange = spec.resolve_exchange(info.dependencies)
         return manager
@@ -243,7 +262,12 @@ class AttentionManager(AttentionResource):
             # the backends whose partials' lse base the merge is known to read right
             lse_known = ("auto", "fa2", "fa3")
             unsupported = [name for name, refused in (
-                ("sliding_window", spec.config.sliding_window is not None),
+                # a window kept in its own group is whole on every partner (`PagedKVConfig.placed_groups`)
+                (
+                    "sliding_window",
+                    spec.config.sliding_window is not None
+                    and not spec.stores_whole(info.dependency(spec.config.kv_cache)),
+                ),
                 # before it degrades to FlashInfer on some hosts, so a config loads on none
                 (f"backend {backend.value!r}", backend == AttnBackend.DENSE),
                 (f"flashinfer_backend {flashinfer_backend!r}", flashinfer_backend not in lse_known),
@@ -415,7 +439,8 @@ class PlacedAttention(AttentionManager):
 
     def bind_dependencies(self, resources) -> None:
         super().bind_dependencies(resources)
-        placement = resources[self._kv_cache_name].placement
+        # a placement stripes the pool's first group alone; a window group is whole on every partner
+        placement = resources[self._kv_cache_name].placement if self._group_idx == 0 else None
         if placement is not None:
             self._placement = placement
             wrappers = {SPPlacement: SPContextParallelWrapper, TPPlacement: TPContextParallelWrapper}
@@ -512,6 +537,32 @@ class PlacedAttention(AttentionManager):
         if self._shard is not None:
             self._shard.check_bypass(label, "attention run")
         return self._current_plan_states[label].attend(q, kv_cache_layer, k, v)
+
+
+def own_queries(indptrs: PagedIndptrs, r: SeqRange, page_size: int, causal: bool) -> PagedIndptrs:
+    """A split label's plan under ``kv_gather`` over layers every rank stores whole: this rank's
+    piece of each row it holds any of (``SeqRange.row_pieces``), over the row's stored context and
+    the step's keys up to the piece's end (causal; the row's whole length otherwise),
+    bottom-right aligned, as the logical plan ``indptrs`` lays the row's pages out."""
+    qo = indptrs.qo_indptr.numpy().astype(np.int64)
+    spans = np.diff(qo)
+    stored = indptrs.kv_lens.numpy().astype(np.int64) - spans
+    pieces = r.row_pieces(spans.tolist())
+    mine = pieces[r.group.rank]
+    rows = np.flatnonzero(mine)
+    ends = (stored + (pieces[: r.group.rank + 1].sum(0) if causal else spans))[rows]
+    pages = -(-ends // page_size)
+    kv_start = indptrs.paged_kv_indptr.numpy().astype(np.int64)[rows]
+    indices = indptrs.paged_kv_indices.numpy()
+    return PagedIndptrs(
+        qo_indptr=torch.from_numpy(np.concatenate([[0], np.cumsum(mine[rows])]).astype(np.int32)),
+        paged_kv_indptr=torch.from_numpy(np.concatenate([[0], np.cumsum(pages)]).astype(np.int32)),
+        paged_kv_indices=torch.from_numpy(np.concatenate(
+            [indices[start:start + n] for start, n in zip(kv_start, pages, strict=True)],
+        ).astype(np.int32)),
+        paged_kv_last_page_len=torch.from_numpy((ends - (pages - 1) * page_size).astype(np.int32)),
+        kv_lens=torch.from_numpy(ends.astype(np.int32)).as_subclass(HostLens),
+    )
 
 
 class PlanCacheKey(NamedTuple):
