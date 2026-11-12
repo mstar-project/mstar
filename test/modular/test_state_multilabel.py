@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import sys
+from dataclasses import replace
 from types import SimpleNamespace
 
 sys.path.insert(0, ".")
@@ -19,6 +20,7 @@ import torch
 from test_kv_layout_intake import _Model as _IntakeModel
 from test_kv_layout_intake import _preprocess
 from test_state_calls import (
+    HEADS,
     TOKENS,
     _add,
     _array,
@@ -116,6 +118,20 @@ def test_a_step_over_two_labels_binds_one_plan_named_for_both():
     step.set_ctx(_ctx(rows=(1, 2)))
     h.begin_step(step)
     assert h.label == "main+uncond", "add, read and rope would plan under one label's rows"
+
+
+def test_a_step_that_packs_two_labels_on_one_array_refuses_another_array_listed_on_one():
+    """Every array on KV pages plans the labels a step packs together, so an array the step lists on one of them would
+    plan a label it has no rows on, a ``KeyError`` in the KV plan."""
+    array = replace(_array(), name="draft", reads={"draft_attn": Read(mask=Causal(), op=Attend(q_heads=HEADS))})
+    one = build_handle(array, {"draft": _StubKV(), "draft_attn": _StubAttn()}, _resolve([array], StateSetup()))
+    step = SubmoduleStep(segments=_label_major(), state={
+        "kv": ArrayStep(), "draft": ArrayStep(segments=[Segment(row, "main", TOKENS) for row in (1, 2)]),
+    })
+    _refused(
+        r"Array 'draft': no layout yet: a step lists it on labels \['main'\] and Array 'kv' on \['main', 'uncond'\]",
+        lambda: state_steps(step, {"kv": _two_label_handle(), "draft": one}, graph_walk="decode"),
+    )
 
 
 def test_a_step_over_one_label_plans_as_before():
