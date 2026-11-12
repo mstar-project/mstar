@@ -45,6 +45,7 @@ from mstar.distributed.communication import CommGroup
 from mstar.distributed.utils import divide
 from mstar.model.components.diffusion.ffn import addmm_gelu_tanh
 from mstar.model.components.diffusion.qwen import dit_kernels as kernels
+from mstar.model.components.diffusion.rope import qwen_rope_params
 from mstar.model.components.distributed.linear import ColumnParallelLinear, RowParallelLinear
 from mstar.model.components.norm import QwenRMSNorm
 
@@ -96,20 +97,14 @@ class QwenStepLayout(NamedTuple):
     target_tokens: int             # the image tokens before the references'; zero_cond_t modulates the rest at t=0
 
 
-def _rope_axis(index: torch.Tensor, dim: int, theta: float) -> torch.Tensor:
-    """``QwenEmbedRope.rope_params``: complex64 ``[len(index), dim / 2]``."""
-    freqs = torch.outer(index, 1.0 / torch.pow(theta, torch.arange(0, dim, 2).to(torch.float32).div(dim)))
-    return torch.polar(torch.ones_like(freqs), freqs)
-
-
 @functools.lru_cache(maxsize=4)
 def _rope_axes(axes_dims: tuple[int, ...], theta: float) -> tuple[list[torch.Tensor], list[torch.Tensor], torch.Tensor]:
     """Each axis's rotations at positions ``0..ROPE_POSITIONS-1`` and at the negative ones, and the positive axes
     side by side (the text's table): constants, built once."""
     pos_index = torch.arange(ROPE_POSITIONS)
     neg_index = torch.arange(ROPE_POSITIONS).flip(0) * -1 - 1
-    pos = [_rope_axis(pos_index, d, theta) for d in axes_dims]
-    neg = [_rope_axis(neg_index, d, theta) for d in axes_dims]
+    pos = [qwen_rope_params(pos_index, d, theta) for d in axes_dims]
+    neg = [qwen_rope_params(neg_index, d, theta) for d in axes_dims]
     return pos, neg, torch.cat(pos, dim=1)
 
 
