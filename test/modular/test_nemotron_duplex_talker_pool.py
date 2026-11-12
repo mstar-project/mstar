@@ -143,7 +143,7 @@ def test_each_step_emits_its_frame_and_the_last_the_calls_right_edge(final, toke
     ni = sub.prepare_inputs("talker_decode", fwd("a", 0 if first else 1), inputs, is_final_stream_chunk=final)
     frame = torch.arange(100, dtype=torch.int16).view(1, -1)
     end = torch.arange(-1, -2 * edge - 1, -1, dtype=torch.int16).view(1, -1)        # before | after
-    out = {"codec_tokens": [torch.arange(TINY.num_quantizers)], "audio_chunk": [frame], "audio_end": [end]}
+    out = {"audio_chunk": [frame], "audio_end": [end]}
     sub.postprocess("a", None, out, inputs=ni)
     if final and not token:
         assert set(out) == ({"audio_chunk"} if not first else set())

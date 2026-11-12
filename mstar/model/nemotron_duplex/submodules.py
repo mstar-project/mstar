@@ -635,7 +635,6 @@ class EarTTSTalkerSubmodule(ARNodeSubmodule):
         # One copy out of the graph per name, a row view per request. Nothing
         # for check_stop, the stream's end stops the loop.
         return BatchedModelOutput(row_outputs={
-            "codec_tokens": codes,
             "audio_chunk": pcm16(audio.final),                            # [N, wav_to_token_ratio]
             # a call's last samples, had it ended before / after this frame
             "audio_end": pcm16(torch.cat([audio.end_before, audio.end_after], dim=1)),
