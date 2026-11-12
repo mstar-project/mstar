@@ -133,6 +133,10 @@ def test_text_to_image_is_one_span_and_keys_nothing():
     # a reference resized under Qwen3-VL's min_pixels would be resized again by its processor
     ({"output_resolution": 128}, 1, "min_pixels|outside"),
     ({"negative_prompt": "<|image_pad|>", "guidance_scale": 2.0}, 0, "vision tokens"),
+    # ids_for turns a typed placeholder into an image pad; the negative prompt's tail is never laid out
+    ({"negative_prompt": "x<|placeholder|>", "guidance_scale": 2.0}, 1, "vision tokens"),
+    # a side past 2048 latents would wrap onto the rope tables' positive rows (or index past them)
+    ({"height": 32, "width": 33024}, 0, "px per side"),
 ])
 def test_refusals(kwargs, images, match):
     with pytest.raises(ValueError, match=match):
@@ -184,7 +188,12 @@ def test_the_cache_free_vae_calls_are_diffusers_encode_and_decode_to_the_bit():
     (written, never read, for one frame); a diffusers change that reads it would break parity here, as one
     to the causal conv's padding would break the padded convs `compile` swaps in."""
     vae_module = pytest.importorskip("diffusers.models.autoencoders.autoencoder_kl_qwenimage21")
-    from mstar.model.qwen_image21.submodules import QwenImage21VaeDecoderSubmodule, _decode, _encode_mode
+    from mstar.model.qwen_image21.submodules import (
+        QwenImage21VaeDecoderSubmodule,
+        _decode,
+        _encode_mode,
+        _padded_conv_class,
+    )
 
     torch.manual_seed(0)
     vae = vae_module.AutoencoderKLQwenImage21(
@@ -197,9 +206,12 @@ def test_the_cache_free_vae_calls_are_diffusers_encode_and_decode_to_the_bit():
         decoded = vae.decode(mode, return_dict=False)[0]
         assert torch.equal(_encode_mode(vae, pixels), mode)
         assert torch.equal(_decode(vae, mode), decoded)
-        # under `compile` the convs pad inside the convolution: the same function
+        # under `compile` the decode path's convs pad inside the convolution: the same function. The encoder,
+        # which shares the VAE, keeps the pipeline's convs and bits
         QwenImage21VaeDecoderSubmodule(vae, compile=True)
-        torch.testing.assert_close(_encode_mode(vae, pixels), mode)
+        assert not any(isinstance(m, _padded_conv_class()) for m in vae.encoder.modules())
+        assert any(isinstance(m, _padded_conv_class()) for m in vae.decoder.modules())
+        assert torch.equal(_encode_mode(vae, pixels), mode)
         torch.testing.assert_close(_decode(vae, mode), decoded)
 
 

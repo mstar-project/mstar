@@ -267,8 +267,9 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
        steps attends the target over it; edits of the same images reuse their prefix across
        requests. ``output_resolution`` (default 1024) sizes the references and the default output;
        CFG runs only with ``guidance_scale`` above 1 and a ``negative_prompt`` (``true_cfg_scale``
-       is refused). The eager denoise steps attend through the dense backend, which needs fa3-fwd
-       (in the ``qwen_image21`` extra; without it they fall back with a warning). ``compile: true``
+       is refused). Without capture (``accelerator_graph: false``) the denoise steps attend through
+       the dense backend, which needs fa3-fwd (in the ``qwen_image21`` extra; without it they fall
+       back with a warning); with capture they run paged. ``compile: true``
        in ``model_kwargs`` compiles the DiT's target blocks and the VAE decoder (not bit-exact; off by
        default). ``configs/qwen_image21_cfg2.yaml`` runs the two guidance branches on two GPUs
        (``cfg_size: 2``, eager steps only). Qwen Research License.

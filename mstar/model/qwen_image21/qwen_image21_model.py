@@ -57,7 +57,7 @@ from mstar.model.components.diffusion.image_io import (
     unit_pixels,
 )
 from mstar.model.media_limits import PILLOW_IMAGE_FORMATS, check_image_size, decoding_upload, open_upright_image
-from mstar.model.qwen_image21.components.transformer import ROPE_POSITIVE
+from mstar.model.qwen_image21.components.transformer import ROPE_NEGATIVE, ROPE_POSITIVE
 from mstar.model.qwen_image21.config import (
     ATTN,
     ATTN_GEN,
@@ -110,6 +110,8 @@ logger = logging.getLogger(__name__)
 # A ceiling for the loop graph; a request runs its own step count (get_loop_caps).
 MAX_INFERENCE_STEPS = 200
 IMAGE_PAD = "<|image_pad|>"
+# The stand-in ``ids_for`` expands an image's pads through, then turns back into pads, typed ones too.
+PLACEHOLDER = "<|placeholder|>"
 VISION_TOKENS = ("<|vision_start|>", IMAGE_PAD, "<|vision_end|>")
 # The prefix cache keys a reference by its file and these; the tokens after it by what the
 # preprocessing makes of the prompt.
@@ -179,6 +181,8 @@ class QwenImage21Model(Model):
         self._processor = None
         self._drop_idx: int | None = None
         self._submodule_cache: dict[str, NodeSubmodule | None] = {}
+        # one VAE for the vae_encoder and vae_decoder nodes (each runs its half), as Qwen-Image-Edit shares its own
+        self._vae: torch.nn.Module | None = None
 
     # ------------------------------------------------------------------ config
     @property
@@ -222,15 +226,16 @@ class QwenImage21Model(Model):
         if cfg_split and self.accelerator_graph:
             raise ValueError(
                 f"{config_path}: Qwen-Image-2.1 can't capture its denoise steps with the dit on cfg_size > 1 ranks; "
-                "set model_kwargs.accelerator_graph to false (the eager steps run on the dense backend) or cfg_size "
-                "to 1"
+                "set model_kwargs.accelerator_graph to false (the denoise steps then run on the dense backend) or "
+                "cfg_size to 1"
             )
 
     # ------------------------------------------------------------ structure
     def get_node_resources(self) -> list[NodeResourceSpec]:
         """The dit's paged KV (the prefix, then each denoise step's scratch target) and its attention: paged for
-        the prefix walks, which write the cache; dense for eager denoise steps, which attend the frozen prefix
-        and their own K/V and write nothing a later step reads (a captured step stays paged).
+        the prefix walks, which write the cache; dense for the denoise steps when the deployment doesn't capture,
+        since they attend the frozen prefix and their own K/V and write nothing a later step reads. A capturing
+        deployment declares no dense backend: its denoise steps run paged, an eager one at an uncaptured size too.
         No position resource: the K/V are cached after the model's own 3-axis rope."""
         cfg = self.config.transformer
         heads = cfg.num_attention_heads
@@ -421,9 +426,11 @@ class QwenImage21Model(Model):
         self._steps(kwargs)
         guided = self._guided(kwargs)
         for text in (prompt, kwargs.get("negative_prompt") if guided else None):
-            if text and any(token in text for token in VISION_TOKENS):
-                # the references' features are spliced in at image pads, so a typed one would shift them
-                raise ValueError(f"Qwen-Image-2.1 prompts can't contain Qwen's vision tokens {list(VISION_TOKENS)}")
+            if text and any(token in text for token in (*VISION_TOKENS, PLACEHOLDER)):
+                # the references' features are spliced in at image pads, so a typed one (or a typed placeholder,
+                # which ids_for turns into one) would shift them
+                raise ValueError(
+                    f"Qwen-Image-2.1 prompts can't contain Qwen's vision tokens {[*VISION_TOKENS, PLACEHOLDER]}")
         if not guided and kwargs.get("guidance_scale") is not None and float(kwargs["guidance_scale"]) > 1.0:
             logger.info("guidance_scale is ignored without a negative_prompt (classifier-free guidance stays off)")
 
@@ -442,8 +449,8 @@ class QwenImage21Model(Model):
         def ids_for(text: str) -> torch.Tensor:
             text = _template(text or " ", len(resized))  # Qwen has no bos: an empty prompt reads a space
             for t, h, w in grids:
-                text = text.replace(IMAGE_PAD, "<|placeholder|>" * (t * h * w // merge**2), 1)
-            return self._tokenize(text.replace("<|placeholder|>", IMAGE_PAD))
+                text = text.replace(IMAGE_PAD, PLACEHOLDER * (t * h * w // merge**2), 1)
+            return self._tokenize(text.replace(PLACEHOLDER, IMAGE_PAD))
 
         ids = ids_for(prompt or "")
         uncond_ids = ids_for(kwargs["negative_prompt"]) if guided else None
@@ -485,6 +492,16 @@ class QwenImage21Model(Model):
         if max(layout.frames()) >= ROPE_POSITIVE:
             raise ValueError(f"Qwen-Image-2.1's rope covers {ROPE_POSITIVE} positions; this prompt reaches "
                              f"{max(layout.frames())}")
+        # an image's height and width positions are centred on zero, and the tables hold [-ROPE_NEGATIVE, 0) below
+        # it: a longer side would index past them (a device assert) or wrap onto positive positions
+        side = 2 * ROPE_NEGATIVE
+        images = [(f"reference {s.image + 1}", (s.height, s.width)) for s in layout.spans if not s.is_text]
+        for name, (h, w) in [("the output", layout.target), *images]:
+            if max(h, w) > side:
+                raise ValueError(
+                    f"Qwen-Image-2.1 supports at most {side * VAE_SCALE} px per side (the DiT's {side} rotary "
+                    f"positions per image axis); {name} is {w * VAE_SCALE}x{h * VAE_SCALE}"
+                )
         for label, stream in kv_layout.items():
             tokens = sum(span.length for span in stream.spans) + stream.scratch
             if tokens > self.max_seq_len:
@@ -568,10 +585,12 @@ class QwenImage21Model(Model):
                 weight_loader.build_text_encoder(config, snapshot, device),
                 weight_loader.build_vision_tower(snapshot, device),
             )
-        if node_name == VAE_ENCODER_NODE:
-            return QwenImage21VaeEncoderSubmodule(weight_loader.build_vae(snapshot, device))
-        if node_name == VAE_DECODER_NODE:
-            return QwenImage21VaeDecoderSubmodule(weight_loader.build_vae(snapshot, device), compile=self.compile)
+        if node_name in (VAE_ENCODER_NODE, VAE_DECODER_NODE):
+            if self._vae is None:
+                self._vae = weight_loader.build_vae(snapshot, device)
+            if node_name == VAE_ENCODER_NODE:
+                return QwenImage21VaeEncoderSubmodule(self._vae)
+            return QwenImage21VaeDecoderSubmodule(self._vae, compile=self.compile)
         if node_name == DIT_NODE:
             return QwenImage21DenoiseSubmodule(
                 weight_loader.build_transformer(config.transformer, snapshot, device, comm_group=tp_group), config,

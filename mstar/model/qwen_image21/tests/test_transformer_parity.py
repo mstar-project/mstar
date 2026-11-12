@@ -212,7 +212,7 @@ def test_dit_node_matches_the_pipeline_with_cfg():
     scheduler.set_timesteps(sigmas=np.linspace(1.0, 1 / STEPS, STEPS), mu=calculate_shift(n, 256, 8192, 0.5, 0.9))
     scheduler.set_begin_index(0)
     generator = torch.Generator().manual_seed(5)
-    latents = sub.seed_latents(None, DitKey(*TARGET), generator)[None]
+    latents = sub.seed_latents(DitKey(*TARGET), generator)[None]
     caches = {name: QwenImage21KVCache(CFG.num_layers) for name in ("pos", "neg")}
     shapes = [[*((1, h, w) for h, w in LAYOUT[1::2]), (1, *TARGET)]]
     for i, t in enumerate(scheduler.timesteps):

@@ -150,11 +150,12 @@ def _padded_conv_class() -> type:
 
 
 def _pad_inside_convs(vae: nn.Module) -> None:
-    """Under ``compile``: each causal conv pads inside its convolution, not through an ``F.pad`` copy first
-    (zero padding either way). Compiled, that copy is one full-resolution kernel before every conv, and the
-    one before the decoder's head is stored with uncoalesced writes: a 1024^2 decode 73 -> 49 ms."""
+    """Under ``compile``: each causal conv of the decode path pads inside its convolution, not through an ``F.pad``
+    copy first (zero padding either way). Compiled, that copy is one full-resolution kernel before every conv, and
+    the one before the decoder's head is stored with uncoalesced writes: a 1024^2 decode 73 -> 49 ms. The encoder's
+    convs stay as the pipeline runs them: the vae_encoder node shares this VAE and runs eager."""
     padded = _padded_conv_class()
-    for module in vae.modules():
+    for module in (*vae.post_quant_conv.modules(), *vae.decoder.modules()):
         if isinstance(module, padded.__base__) and not isinstance(module, padded):
             pad_w, _, pad_h, _ = module._padding  # (w, w, h, h): symmetric
             module.padding, module._padding = (pad_h, pad_w), (0, 0, 0, 0)
@@ -375,7 +376,8 @@ class QwenImage21DenoiseSubmodule(DenoiseLoopSubmodule):
         return attend
 
     def target_attn_key(self) -> str:
-        """The denoise steps' attention: the dense one when the model declared it (eager steps), else paged."""
+        """The denoise steps' attention: the dense one when the model declared it (a deployment that doesn't capture),
+        else paged."""
         return ATTN_GEN if ATTN_GEN in self.node_resources else ATTN
 
     # ------------------------------------------------------------ prefix walks

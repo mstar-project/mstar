@@ -27,8 +27,9 @@ DENOISE_LOOP = "denoise_loop"
 # Resource keys and KV labels.
 KV = "kv"
 ATTN = "attn"
-# the denoise target's attention when its steps run eager: one dense varlen pass over [gathered prefix | the
-# step's own K/V] (AttnBackend.DENSE), not a K/V write into the pages and a paged kernel every step
+# the denoise target's attention when the deployment doesn't capture (accelerator_graph false): one dense varlen
+# pass over [gathered prefix | the step's own K/V] (AttnBackend.DENSE), not a K/V write into the pages and a paged
+# kernel every step. A capturing deployment runs every denoise step paged, an eager one at an uncaptured size too.
 ATTN_GEN = "attn_gen"
 MAIN = "main"
 UNCOND = "uncond"
