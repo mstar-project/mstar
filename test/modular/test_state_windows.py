@@ -49,6 +49,7 @@ from mstar.engine.state import (
     KeptWindow,
     KVEntry,
     Layout,
+    PagedNHD,
     Positions,
     Read,
     Rope,
@@ -841,6 +842,25 @@ def test_a_read_with_no_op_returns_the_reach():
         step.check_calls()
         pool.commit(step.steps["dit_kv"], step.ctx)
         step.end_calls()
+
+
+def test_add_read_through_a_read_with_no_op_returns_the_reach():
+    handle, pool = _reach_handle()
+    step = _reach_step(handle, pool, 12)
+    step.begin_calls()
+    k = torch.arange(12, dtype=torch.float32)[:, None, None]
+    reached = add_read(handle, 0, k=k, v=-k)
+    assert torch.equal(reached.fields["k"], k) and reached.row_offsets.tolist() == [0, 12]
+    step.check_calls()
+    step.end_calls()
+
+
+def test_a_fused_add_writes_the_pages_a_reach_gathers():
+    """A state op's fused kernel may write a reach-only array's pages: the reach reads the pages, as a kept-window
+    kernel does, so nothing waits for k and v at the read."""
+    handle, _ = _reach_handle()
+    op = SimpleNamespace(adds=True, formats=(PagedNHD(),))
+    assert handle.takes_fused(op)
 
 
 def test_reference_mode_builds_its_pool():

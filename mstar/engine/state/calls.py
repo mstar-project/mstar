@@ -218,7 +218,7 @@ class ArrayHandle(StepHandle):
 
     def _add_read(
         self, layer: int | torch.Tensor, q: torch.Tensor | None, *, keep: bool | None, **keywords: Any,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | Reached:
         self._check_add_read("add_read")
         fields = self.array.entry.tensors
         self.add(layer, keep=keep, **{name: keywords.pop(name) for name in fields if name in keywords})
@@ -322,13 +322,26 @@ class SamplerHandle(StepHandle):
         self._fused = False
 
 
+@overload
+def add_read(
+    h: ArrayHandle, layer: int | torch.Tensor, q: torch.Tensor, *, keep: bool | None = None, **keywords: Any,
+) -> torch.Tensor: ...
+
+
+@overload
+def add_read(
+    h: ArrayHandle, layer: int | torch.Tensor, q: None = None, *, keep: bool | None = None, **keywords: Any,
+) -> Reached: ...
+
+
 @torch.compiler.disable
 def add_read(
     h: ArrayHandle, layer: int | torch.Tensor, q: torch.Tensor | None = None, *, keep: bool | None = None,
     **keywords: Any,
-) -> torch.Tensor:
+) -> torch.Tensor | Reached:
     """`add` then `read` on ``layer`` behind one graph break, for a layer with nothing traced between them, so it
-    compiles no frame for the gap. A keyword that names an entry field goes to `add`, and any other to `read`."""
+    compiles no frame for the gap. A keyword that names an entry field goes to `add`, and any other to `read`. As
+    `read`, a read with no op takes no ``q`` and returns the entries it reaches."""
     return h._add_read(layer, q, keep=keep, **keywords)
 
 
