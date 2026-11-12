@@ -92,5 +92,5 @@ Save outputs for every functional check that produces them, so they can be revie
 ## Hardware sizing
 
 - GPU count = the largest `ranks` + 1 among the configs in the plan (respecting `rank_devices`). Most models fit on one 80 GB GPU, so 80 GB-class Hopper is the floor; ask for more VRAM only when a config needs it (e.g. `cosmos3_super` at TP2).
-- Hopper or newer only: H100 (PCIe/SXM/NVL), H200, GH200, B200, B300.
+- Hopper or newer only: H100 (PCIe/SXM/NVL), H200, GH200, B200, B300; for AMD (ROCm) paths, MI300X or newer (MI300X, MI325X, MI350X, MI355X). ROCm's torch honours `CUDA_VISIBLE_DEVICES` as well as `HIP_VISIBLE_DEVICES`.
 - When GPU count is driven by one optional row (say the 4-GPU Cosmos TP2+SP2), check whether the 2-GPU `_tp2` and `_sp2` configs cover the PR's risk. If they do, take the cheaper box and say in the report which row you substituted.
