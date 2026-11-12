@@ -342,14 +342,12 @@ def _shrink_into(h, x, a, token_order, slot_indptr, ranks, num_slices, splits, k
     )
 
 
-def _reduce(parts: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
-    """``[splits, tokens, width]`` fp32 partials summed into ``[1, tokens, width]``."""
-    h = parts.new_empty(1, *parts.shape[1:], dtype=dtype)
+def _reduce_into(h: torch.Tensor, parts: torch.Tensor):
+    """``[splits, tokens, width]`` fp32 partials summed into ``h``, ``[1, tokens, width]``."""
     block = 128
-    _lora_reduce_kernel[(triton.cdiv(h.numel(), block),)](
+    return _lora_reduce_kernel[(triton.cdiv(h.numel(), block),)](
         parts, h, h.numel(), parts.stride(0), SPLITS=parts.shape[0], BLOCK=block,
     )
-    return h
 
 
 def _expand_from(y, h, b, token_order, slot_indptr, ranks, scalings, out_slices, tiles, zeros_past_rank):
@@ -417,7 +415,8 @@ def _apply_cuda(y, x, a, b, token_order, slot_indptr, token_slot, ranks, scaling
     h = torch.empty(splits, tokens, width, dtype=torch.float32 if splits > 1 else x.dtype, device=x.device)
     _shrink_into(h, x, a, token_order, slot_indptr, ranks, num_slices, splits, k_per_split, tiles.shrink)
     if splits > 1 and r_tiles > 1:
-        h = _reduce(h, x.dtype)
+        parts, h = h, h.new_empty(1, tokens, width, dtype=x.dtype)
+        _reduce_into(h, parts)
     _expand_from(y, h, b, token_order, slot_indptr, ranks, scalings, out_slices, tiles.expand,
                  zeros_past_rank=True)
 

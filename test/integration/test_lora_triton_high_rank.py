@@ -168,19 +168,31 @@ SMEM_LIMITS = {"sm90": 232448, "sm80": 166912, "sm86": 101376, "sm75": 65536}
 
 
 def launch_both(tokens, max_rank, dtype, cfg):
-    """One shrink and one expand at ``cfg``, checked against the reference; returns the compiled
-    kernels."""
+    """Every kernel ``lora_apply_`` and the standalone ops can launch at ``cfg``, each result
+    checked against the reference: the shrink and expand over one split; the shrink into three
+    fp32 split partials, which the expand sums itself when the rank fits one tile and the reduce
+    sums first when it doesn't; and the standalone expand. Returns ``(kind, label, compiled
+    kernel)`` for each launch."""
     in_features, slices = 3072, (3072, 1024, 1024)
     a, b, scalings, ranks, token_slots, order, indptr, x, y0 = case(max_rank, in_features, slices, tokens, 9)
     want = reference(a, b, scalings, ranks, token_slots, x, y0, slices, dtype)
-    h = torch.empty(1, tokens, a.shape[1], device="cuda", dtype=dtype)
-    shrink = tb._shrink_into(h, x.to(dtype), a.to(dtype), order, indptr, ranks, len(slices), 1, in_features,
-                             cfg.shrink)
-    got = y0.to(dtype, copy=True)
-    expand = tb._expand_from(got, h, b.to(dtype), order, indptr, ranks, scalings, list(slices), cfg.expand,
-                             zeros_past_rank=True)
-    check_rows(got, y0, want, ranks.long()[token_slots] > 0, dtype, f"r{max_rank} T{tokens}")
-    return shrink, expand
+    live = ranks.long()[token_slots] > 0
+    x, a, b = x.to(dtype), a.to(dtype), b.to(dtype)
+    tiled = tb._rank_tiles(max_rank)[1] > 1
+    launched = []
+    for splits, zeros_past_rank in [(1, True), (3, True), (1, False)]:
+        name = f"{splits} split{'s' if splits > 1 else ''}" + ("" if zeros_past_rank else ", standalone expand")
+        h = torch.empty(splits, tokens, a.shape[1], device="cuda", dtype=dtype if splits == 1 else torch.float32)
+        launched.append(("shrink", name, tb._shrink_into(h, x, a, order, indptr, ranks, len(slices), splits,
+                                                        in_features // splits, cfg.shrink)))
+        if splits > 1 and tiled:
+            parts, h = h, torch.empty(1, tokens, a.shape[1], device="cuda", dtype=dtype)
+            launched.append(("reduce", name, tb._reduce_into(h, parts)))
+        got = y0.to(dtype, copy=True)
+        launched.append(("expand", name, tb._expand_from(got, h, b, order, indptr, ranks, scalings, list(slices),
+                                                         cfg.expand, zeros_past_rank=zeros_past_rank)))
+        check_rows(got, y0, want, live, dtype, f"r{max_rank} T{tokens}, {name}")
+    return launched
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32], ids=["bf16", "fp32"])
@@ -197,8 +209,8 @@ def test_launch_config_fits_shared_memory(gpu, dtype, monkeypatch):
         block_r = tb._rank_tiles(max_rank)[0]
         est = tb._shrink_smem(cfg.shrink, block_r, dtype.itemsize), tb._expand_smem(cfg.expand, block_r, dtype.itemsize)
         assert max(est) <= limit, f"{cfg} needs {est} bytes, over {limit}"
-        shrink, expand = launch_both(tokens, max_rank, dtype, cfg)
-        assert max(shrink.metadata.shared, expand.metadata.shared) <= limit
+        for kind, name, kernel in launch_both(tokens, max_rank, dtype, cfg):
+            assert kernel.metadata.shared <= limit, f"{kind} ({name}): {kernel.metadata.shared} > {limit}"
         if gpu == "sm90":  # an H200 runs the preferred configs in either dtype
             prefill = cfg.shrink.m > tb._DECODE_SHRINK[0].m
             assert cfg.shrink == (tb._PREFILL_SHRINK if prefill else tb._DECODE_SHRINK)[0]
@@ -214,11 +226,13 @@ def test_every_candidate_compiles_within_its_estimate(max_rank, dtype):
     for shrinks, expands in ((tb._DECODE_SHRINK, tb._DECODE_EXPAND), (tb._PREFILL_SHRINK, tb._PREFILL_EXPAND)):
         for i in range(max(len(shrinks), len(expands))):
             cfg = tb._Config(shrinks[min(i, len(shrinks) - 1)], expands[min(i, len(expands) - 1)])
-            shrink, expand = launch_both(40, max_rank, dtype, cfg)
-            est = tb._shrink_smem(cfg.shrink, block_r, dtype.itemsize)
-            assert shrink.metadata.shared <= est, f"shrink {cfg.shrink}: {shrink.metadata.shared} > {est}"
-            est = tb._expand_smem(cfg.expand, block_r, dtype.itemsize)
-            assert expand.metadata.shared <= est, f"expand {cfg.expand}: {expand.metadata.shared} > {est}"
+            est = {"shrink": tb._shrink_smem(cfg.shrink, block_r, dtype.itemsize),
+                   "expand": tb._expand_smem(cfg.expand, block_r, dtype.itemsize),
+                   # no config is chosen for the reduce, so it must fit the smallest device
+                   "reduce": min(SMEM_LIMITS.values())}
+            for kind, name, kernel in launch_both(40, max_rank, dtype, cfg):
+                assert kernel.metadata.shared <= est[kind], (
+                    f"{kind} ({name}) at {cfg}: {kernel.metadata.shared} > {est[kind]}")
 
 
 def test_an_fp32_pool_on_a_small_gpu_through_the_op(monkeypatch):
