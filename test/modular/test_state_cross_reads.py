@@ -1,11 +1,11 @@
-"""A read of another array's queries, and a read under sequence parallelism, plan and exchange what a model did by hand.
+"""A read of another array's queries, and a read under sequence parallelism, plan what a model did by hand.
 
-LTX-2.5 wrote each attention's plan and exchange in model code, one case per attention, so a port that gets a case wrong
-attends the wrong tokens with no error. The three cases follow from two flags: both sides sharded runs Ulysses over
-whole segments, only the queries sharded runs on the rank's share, and only the keys sharded merges the ranks' partial
-attentions. A DiT compares its output bytes exactly, so a break or a plan that moves is a regression. A segmented read
-lays a request's segments end to end in one row, as MiniMax-H3 pads its rows, and SDPA attends within each segment as
-H3's own split did.
+LTX-2.5 wrote each attention's plan in model code, one case per attention, so a port that gets a case wrong attends the
+wrong tokens with no error. Under sequence parallelism a read plans whole segments, and its resource exchanges what the
+node's sequence shard splits on the step; a self read whose label the shard lists runs Ulysses, its heads over TP x SP.
+A DiT compares its output bytes exactly, so a break or a plan that moves is a regression. A segmented read lays a
+request's segments end to end in one row, as MiniMax-H3 pads its rows, and SDPA attends within each segment as H3's own
+split did.
 """
 
 from __future__ import annotations
@@ -26,8 +26,10 @@ from mstar.engine.resources.attn.ragged.config import (
     RaggedCrossAttentionStep,
 )
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
+from mstar.engine.resources.sequence_shard import SeqShardSpec
+from mstar.engine.resources.spec import resolve_spec_dependencies
 from mstar.engine.resources.step import ResourceStep, Segment, StepContext, SubmoduleStep
-from mstar.engine.state import Array, ArrayStep, Attend, Block, Causal, KVEntry, Read, TensorType, Value, adapters
+from mstar.engine.state import Array, ArrayStep, Attend, Block, Causal, KVEntry, Read, TensorType, adapters
 from mstar.engine.state.adapters import (
     SDPA,
     WITHIN_STEP,
@@ -41,7 +43,7 @@ from mstar.engine.state.adapters import (
     state_setup,
     state_steps,
 )
-from mstar.engine.state.analysis import deployment_problems
+from mstar.engine.state.analysis import split_read_problems
 from mstar.engine.state.calls import kernel_setting
 from mstar.engine.state.contract import Entry
 from mstar.model.components.diffusion.attention import FrameSDPA, joint_attention, sdpa_attention
@@ -58,24 +60,24 @@ def _entry(heads=HEADS, dtype=None) -> Entry:
 
 
 def _array(
-    name, read=None, *, queries=None, sharded=False, label=None, heads=HEADS, nodes=("dit",), dtype=None, packed=False,
+    name, read=None, *, queries=None, label=None, heads=HEADS, nodes=("dit",), dtype=None, packed=False,
 ) -> Array:
     return Array(
-        name, nodes=set(nodes), layers={0, 1}, entry=_entry(heads, dtype), max_len=0, seq_sharded=sharded,
+        name, nodes=set(nodes), layers={0, 1}, entry=_entry(heads, dtype), max_len=0,
         labels={label or name},
         reads={read or f"{name}_read": Read(mask=Block(), op=Attend(q_heads=heads), queries=queries, packed=packed)},
     )
 
 
 def _av() -> list[Array]:
-    """The shape of LTX-2.5's declaration: two self reads and three cross reads, one stream sharded."""
+    """The shape of LTX-2.5's declaration: two self reads and three cross reads, over one stream its shard splits."""
     return [
-        _array("video", "video_self", sharded=True),
+        _array("video", "video_self"),
         _array("audio", "audio_self", heads=2),
         _array("text_v", "video_text", queries="video", label="text"),
         _array("text_a", "audio_text", queries="audio", label="text", heads=2),
         _array("audio_v", "audio_to_video", queries="video", label="audio", heads=2),
-        _array("video_a", "video_to_audio", queries="audio", label="video", sharded=True, heads=2),
+        _array("video_a", "video_to_audio", queries="audio", label="video", heads=2),
     ]
 
 
@@ -97,18 +99,9 @@ class _StubRagged:
         return q
 
 
-class _StubGroup:
-    """A sequence-parallel group's size and rank, which pick the exchange and the shares. Nothing here exchanges."""
-
-    def __init__(self, world_size=2, rank=0):
-        self.world_size, self.rank = world_size, rank
-
-
-def _within(array, ragged, queried=None, sp_group=None) -> WithinStepHandle:
+def _within(array, ragged, queried=None) -> WithinStepHandle:
     resolved = _resolve([array] if queried is None else [array, queried], StateSetup())
-    return WithinStepHandle(
-        array, {next(iter(array.reads)): ragged}, _bindings(WITHIN_STEP, array), resolved, sp_group=sp_group,
-    )
+    return WithinStepHandle(array, {next(iter(array.reads)): ragged}, _bindings(WITHIN_STEP, array), resolved)
 
 
 def _on_sdpa(*reads) -> StateSetup:
@@ -119,11 +112,9 @@ def _sdpa_config(*keys) -> dict:
     return {"resources": {key: {"backend": "sdpa"} for key in keys}}
 
 
-def _handles(arrays, *, group=None, setup=None) -> dict[str, WithinStepHandle]:
+def _handles(arrays, *, setup=None) -> dict[str, WithinStepHandle]:
     specs = build_specs(arrays)
-    return node_handles(
-        _Model(*arrays), "dit", {spec.resource_key: _StubRagged() for spec in specs}, sp_group=group, setup=setup,
-    )
+    return node_handles(_Model(*arrays), "dit", {spec.resource_key: _StubRagged() for spec in specs}, setup=setup)
 
 
 def _av_step(rows=(1,), video=9, audio=3, text=5) -> SubmoduleStep:
@@ -173,17 +164,15 @@ def test_reads_on_different_nodes_never_share_a_resource():
     assert [s.resource_key for s in specs] == ["a_read", "b_read"]
 
 
-@pytest.mark.parametrize("key, narrows", [
-    ("video_self", True), ("audio_self", False), ("video_text", False), ("audio_text", False),
+@pytest.mark.parametrize("key, exchange", [
+    ("video_self", "ulysses"), ("audio_self", None), ("video_text", None), ("audio_text", None),
 ])
-def test_heads_narrow_by_sp_only_where_both_sides_are_sharded(key, narrows):
-    specs = {spec.resource_key: spec for spec in build_specs(_av())}
-    assert specs[key].config.shard_over_sp is narrows
-
-
-def test_a_node_with_nothing_sharded_keeps_the_default_narrowing():
-    (spec,) = build_specs([_array("a")])
-    assert spec.config.shard_over_sp, "a model with no sequence parallelism leaves the default"
+def test_a_self_read_runs_ulysses_only_where_the_nodes_shard_lists_its_label(key, exchange):
+    """LTX-2.5 splits its video tokens and not its audio: the audio self-attention keeps every head on each rank."""
+    shard = SeqShardSpec(resource_key="shard", nodes={"dit"}, labels=("video",), axis=1)
+    specs = resolve_spec_dependencies([*build_specs(_av()), shard])
+    assert specs[key].sp_exchange == exchange
+    assert resolve_spec_dependencies(build_specs(_av()))["video_self"].sp_exchange is None, "a node with no shard"
 
 
 def test_a_declared_dtype_reaches_the_spec():
@@ -203,8 +192,6 @@ def test_the_new_settings_reach_the_shared_spec_from_any_of_its_reads():
 
 
 @pytest.mark.parametrize("array, cause", [
-    (Array("a", nodes={"dit"}, layers={0}, entry=KVEntry(heads=HEADS, head_dim=DIM), max_len=8, seq_sharded=True,
-           reads={"r": Read(mask=Causal(), op=Attend(q_heads=HEADS))}), "seq_sharded takes max_len 0"),
     (Array("a", nodes={"dit"}, layers={0}, entry=_entry(), max_len=0, labels={"x", "y"},
            reads={"r": Read(mask=Block(), op=Attend(q_heads=HEADS))}), "a plan runs under one label, and Array 'a'"),
     (Array("a", nodes={"dit"}, layers={0}, entry=_entry(dtype=torch.bfloat16), max_len=8,
@@ -213,14 +200,6 @@ def test_the_new_settings_reach_the_shared_spec_from_any_of_its_reads():
 def test_what_todays_specs_cant_hold_is_refused_by_name(array, cause):
     with pytest.raises(ValueError, match=f"Array 'a': no layout yet: .*{cause}"):
         build_specs([array])
-
-
-def test_a_seq_sharded_value_is_refused_by_name():
-    array = Value("v", nodes={"dit"}, layers={0}, entry=Entry({"x": TensorType((1,), dtype=None)}))
-    sharded = Array("v", nodes=array.nodes, layers=array.layers, entry=array.entry, max_len=1, rewritable=True,
-                    seq_sharded=True)
-    with pytest.raises(ValueError, match="Array 'v': no layout yet"):
-        build_specs([sharded])
 
 
 def test_each_side_resolves_the_arrays_sharing_a_resource_once(monkeypatch):
@@ -242,16 +221,18 @@ def test_each_side_resolves_the_arrays_sharing_a_resource_once(monkeypatch):
 # The steps, per rank
 
 
-@pytest.mark.parametrize("world_size, rank, share", [(1, 0, 9), (2, 0, 5), (2, 1, 4)])
-def test_each_read_plans_over_the_segments_its_kernel_sees(world_size, rank, share):
-    group = _StubGroup(world_size, rank)
-    expanded = state_steps(_av_step(rows=(1, 2)), _handles(_av(), group=group))
+def test_each_read_plans_over_whole_segments():
+    """On a split step the resource narrows a split side to the rank's share itself (or exchanges it), so the plan the
+    contract hands it is the same on every rank."""
+    expanded = state_steps(_av_step(rows=(1, 2)), _handles(_av()))
+    share = 9
+
     def segments(label, span):
         return tuple(Segment(rid, label, span) for rid in (1, 2))
 
     video_self = expanded.steps["video_self"]
     assert isinstance(video_self, AttentionStep) and not video_self.causal
-    assert tuple(video_self.segments) == segments("video", 9), "Ulysses runs over the whole sequence after the exchange"
+    assert tuple(video_self.segments) == segments("video", 9)
     assert tuple(expanded.steps["audio_self"].segments) == segments("audio", 3)
     video_cross = expanded.steps["video_text"]
     assert isinstance(video_cross, RaggedCrossAttentionStep) and video_cross.pairs == (("video", "text"),)
@@ -261,15 +242,6 @@ def test_each_read_plans_over_the_segments_its_kernel_sees(world_size, rank, sha
     assert _by_label(audio_cross) == {
         "video": segments("video", share), "audio": segments("audio", 3), "text": segments("text", 5),
     }
-
-
-def test_a_cross_read_with_both_sides_sharded_plans_over_whole_segments():
-    arrays = [_array("a", "a_self", sharded=True), _array("b", "b_cross", queries="a", sharded=True)]
-    step = SubmoduleStep(state={
-        "a": ArrayStep(segments=(Segment(1, "a", 9),)), "b": ArrayStep(segments=(Segment(1, "b", 7),)),
-    })
-    expanded = state_steps(step, _handles(arrays, group=_StubGroup()))
-    assert _by_label(expanded.steps["b_cross"]) == {"a": (Segment(1, "a", 9),), "b": (Segment(1, "b", 7),)}
 
 
 def test_arrays_sharing_a_resource_plan_each_label_once():
@@ -348,15 +320,6 @@ def test_two_reads_on_one_resource_that_set_a_kernel_setting_two_ways_are_refuse
         build_specs([_array("a"), _array("b", label="b")], kernel_settings=settings)
 
 
-def test_a_read_on_a_node_that_shards_no_array_narrows_its_heads_so_they_must_divide():
-    alone = _array("a")
-    (spec,) = build_specs([alone])
-    assert spec.config.shard_over_sp, "a read on a node with no sharded array narrows its heads"
-    assert deployment_problems(_Model(alone), {}, head_shards={"dit": 3}) == [
-        "Array 'a'.reads['a_read']: q_heads 4 doesn't divide by 3, TP times SP, which the read narrows its heads by"
-    ], "a resource whose heads narrow and don't divide fails at boot"
-
-
 def test_a_cross_read_over_other_requests_is_refused_when_it_opens():
     arrays = [_array("a"), _array("b", queries="a")]
     step = SubmoduleStep(state={
@@ -366,15 +329,6 @@ def test_a_cross_read_over_other_requests_is_refused_when_it_opens():
     expanded = state_steps(step, _handles(arrays))
     expanded.set_ctx(_ctx(rows=(1, 2)))
     with pytest.raises(ValueError, match="Array 'b': .*same requests in the same order"):
-        expanded.begin_calls()
-
-
-def test_a_ulysses_exchange_over_mixed_lengths_is_refused_when_it_opens():
-    arrays = [_array("a", sharded=True)]
-    step = SubmoduleStep(state={"a": ArrayStep(segments=(Segment(1, "a", 4), Segment(2, "a", 6)))})
-    expanded = state_steps(step, _handles(arrays, group=_StubGroup()))
-    expanded.set_ctx(_ctx(rows=(1, 2)))
-    with pytest.raises(ValueError, match="Array 'a': no layout yet: a Ulysses exchange over spans"):
         expanded.begin_calls()
 
 
@@ -435,84 +389,6 @@ def test_a_cross_read_runs_under_the_label_of_both_sides():
     h.add(0, k=_q(tokens=2), v=_q(tokens=2))
     h.read(0, _q())
     assert ragged.runs[0][0] == "video<-text"
-
-
-@pytest.mark.parametrize("sharded, queried_sharded, exchange", [
-    (True, True, "ulysses"), (True, False, "merge"), (False, True, "plain"), (False, False, "plain"),
-])
-def test_the_two_flags_pick_the_exchange(monkeypatch, sharded, queried_sharded, exchange):
-    calls = []
-    monkeypatch.setattr(adapters, "ulysses_attention", lambda *a, **k: calls.append(("ulysses", a[1], k)))
-    monkeypatch.setattr(adapters, "attention_over_sharded_keys", lambda *a, **k: calls.append(("merge", a[1], k)))
-    queried = _array("a", sharded=queried_sharded)
-    array = _array("b", queries="a", sharded=sharded)
-    h = _within(array, _StubRagged(), queried=queried, sp_group=_StubGroup())
-    step = SubmoduleStep(state={
-        "a": ArrayStep(segments=(Segment(1, "a", 9),)), "b": ArrayStep(segments=(Segment(1, "b", 9),)),
-    })
-    step.set_ctx(_ctx())
-    h.begin_step(step)
-    h.add(0, k=_q(), v=_q())
-    h.read(0, _q())
-    assert (calls[0][0] if calls else "plain") == exchange
-    if exchange == "ulysses":
-        assert h._seq_sizes == [5, 4], "rank 0 takes the odd token, as sp_seq_split does"
-        assert calls[0][2] == {"seq_dim": 1, "head_dim": 2}
-
-
-@pytest.mark.parametrize("sharded, queried_sharded", [(True, True), (True, False), (False, True)])
-def test_the_exchange_its_step_and_the_narrowed_heads_follow_one_predicate(sharded, queried_sharded):
-    """A Ulysses exchange needs a step for its sizes and a kernel built for the rank's share of the heads. A read that
-    exchanged without both would run over sizes nobody took, or over heads its kernel wasn't built for."""
-    arrays = [_array("a", "a_self", sharded=queried_sharded), _array("b", "b_cross", queries="a", sharded=sharded)]
-    (spec,) = [spec for spec in build_specs(arrays) if spec.resource_key == "b_cross"]
-    handle = _handles(arrays, group=_StubGroup(), setup=_on_sdpa("a_self", "b_cross"))["b"]
-    ulysses = sharded and queried_sharded
-    assert (handle._ulysses, handle.needs_step, spec.config.shard_over_sp) == (ulysses,) * 3
-
-
-@pytest.mark.parametrize("sharded, queried_sharded", [(True, False), (False, True)])
-def test_a_share_follows_the_reads_exchange_not_the_sharded_flags(monkeypatch, sharded, queried_sharded):
-    """With one side sharded, a read plans that side as the rank's share. If the predicate made that read run Ulysses,
-    the exchange would hand the kernel whole segments, so the plan has to lay out whole segments too."""
-    monkeypatch.setattr(adapters, "both_sharded", lambda array, queried: array.seq_sharded or queried.seq_sharded)
-    h = _within(_array("b", queries="a", sharded=sharded), _StubRagged(),
-                queried=_array("a", sharded=queried_sharded), sp_group=_StubGroup())
-    segments = (Segment(1, "a", 9),)
-    assert h._ulysses and h.query_share(segments) == h.key_share(segments) == segments, "a share of gathered rows"
-
-
-def test_no_flag_exchanges_at_sp1(monkeypatch):
-    def fail(*args, **kwargs):
-        raise AssertionError("attention_over_sharded_keys breaks the graph, so it must not run at SP1")
-
-    monkeypatch.setattr(adapters, "ulysses_attention", fail)
-    monkeypatch.setattr(adapters, "attention_over_sharded_keys", fail)
-    h = _within(_array("a", sharded=True), _StubRagged(), sp_group=_StubGroup(world_size=1))
-    _opened(h, [Segment(1, "a", 4)])
-    h.add(0, k=_q(), v=_q())
-    h.read(0, _q())
-
-
-def test_ulysses_gets_one_callable_per_array_never_one_per_layer(monkeypatch):
-    callables = []
-    monkeypatch.setattr(adapters, "ulysses_attention", lambda group, q, k, v, run, *a, **kw: callables.append(run))
-    h = _within(_array("a", sharded=True), _StubRagged(), sp_group=_StubGroup())
-    _opened(h, [Segment(1, "a", 8)])
-    for layer in (0, 1):
-        h.add(layer, k=_q(), v=_q())
-        h.read(layer, _q())
-    assert callables[0] is callables[1], "Dynamo would retrace ulysses_attention's frame once per layer"
-
-
-def test_a_step_none_of_whose_builders_has_anything_to_do_is_skipped():
-    step = SubmoduleStep(state={"a": ArrayStep(segments=(Segment(1, "a", 4),))})
-    for group, skipped in ((None, True), (_StubGroup(), False)):
-        handles = _handles([_array("a", sharded=True)], group=group, setup=_on_sdpa("a_read"))
-        builder = WITHIN_STEP.step_builder()
-        builder.add(handles["a"], step.state["a"], step)
-        assert builder.steps() == {}, "a read on SDPA plans nothing"
-        assert (state_steps(step, handles) is None) is skipped, "only a Ulysses exchange needs the step's segments"
 
 
 def test_a_read_declared_packed_false_refuses_packed_queries():
@@ -624,12 +500,28 @@ def test_sdpa_on_a_read_that_keeps_entries_is_refused_at_load():
     ] and setup.by_read == {}, "a paged read takes no SDPA"
 
 
-def test_a_read_sharded_on_both_sides_needs_heads_that_divide_by_tp_times_sp():
-    (problem,) = deployment_problems(_Model(_array("a", sharded=True, heads=HEADS)), {}, head_shards={"dit": 3})
-    assert problem.startswith("Array 'a'.reads['a_read']: q_heads 4 doesn't divide by 3")
-    assert deployment_problems(_Model(_array("a", sharded=True)), {}, head_shards={"dit": 4}) == []
-    unexchanged = _Model(_array("a", sharded=True, heads=6), _array("b", queries="a"))
-    assert deployment_problems(unexchanged, {}, head_shards={"dit": 3}) == [], "a read with no exchange keeps its heads"
+_SDPA_SPLIT = "backend sdpa over labels ['video'], which the sequence shard of ['dit'] splits over SP ranks"
+_BOTH_SPLIT = "both split over the SP ranks of ['dit'], which no exchange serves"
+
+
+@pytest.mark.parametrize("split, sdpa, problems", [
+    (("video",), "video_to_audio", [f"Array 'video_a'.reads['video_to_audio']: {_SDPA_SPLIT}"]),
+    (("video",), "video_self", [f"Array 'video'.reads['video_self']: {_SDPA_SPLIT}"]),
+    (("video",), "video_text", []),
+    ((), "video_to_audio", []),
+    (("video", "audio"), None, [
+        "Array 'audio_v'.reads['audio_to_video']: its queries (Array 'video', labels ['video']) "
+        f"and keys (labels ['audio']) {_BOTH_SPLIT}",
+        "Array 'video_a'.reads['video_to_audio']: its queries (Array 'audio', labels ['audio']) "
+        f"and keys (labels ['video']) {_BOTH_SPLIT}",
+    ]),
+], ids=["sdpa-split-keys", "sdpa-self", "sdpa-copied-keys", "one-rank", "cross-both-split"])
+def test_reads_no_exchange_serves_on_split_labels_are_refused_from_the_declarations(split, sdpa, problems):
+    """SDPA runs outside the resources, so no exchange reaches it: over split keys it would attend one rank's share.
+    Over split queries and copied keys (video to text) each rank's queries see every key, as they should. A cross read
+    with both sides split has no exchange. The engine (at load) and validate_deployment both ask this."""
+    got = split_read_problems(_av(), [sdpa] if sdpa else [], {"dit": split} if split else {})
+    assert len(got) == len(problems) and all(g.startswith(p) for g, p in zip(got, problems, strict=True)), got
 
 
 # A segmented read

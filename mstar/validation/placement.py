@@ -4,15 +4,20 @@ that pick a request's replica among them."""
 
 import math
 from collections.abc import Iterator, Mapping, Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from mstar.conductor.routing import RoutingWeights
 from mstar.distributed.base import PARALLEL_AXES, ShardingConfig, node_group_axis_sizes
 from mstar.distributed.communication import GlobalParallelConfig
+from mstar.engine.resources.context_parallel import position_pools
 from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
+from mstar.engine.resources.sequence_shard import sequence_parallel_refusals
 from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.graph.base import GraphSection, self_triggered, top_level_entities
 from mstar.model.base import Model, WorkerGraph
+
+if TYPE_CHECKING:
+    from mstar.model.components.moe_parallel import MoeParallelConfig
 
 # MAX_INPUTS in rust/src/graph/spec.rs: the Rust runtime keeps a node's
 # readiness in a u64 mask.
@@ -111,11 +116,13 @@ def check_worker_graphs(
     worker_graphs: Sequence[WorkerGraph],
     sharding_config: ShardingConfig,
     specs: Sequence[NodeResourceSpec] | None,
+    moe_parallel: "Mapping[str, MoeParallelConfig] | None" = None,
 ) -> list[str]:
     """Problems with the worker graphs ``model.get_worker_graphs`` built, and
     with the parallel groups the conductor would hand each worker. With no
-    ``specs`` (the model could not declare them) only the checks on resource
-    placement are skipped."""
+    ``specs`` (the model could not declare them) the checks on resource
+    placement, and on what a node's SP ranks do, are skipped. ``moe_parallel``
+    is each node's ``ep_config``."""
     walk_to_wgs: dict[str, list[WorkerGraph]] = {}
     for wg in worker_graphs:
         for walk in sorted(wg.graph_walks):
@@ -126,6 +133,7 @@ def check_worker_graphs(
         *_loop_successors(walk_to_wgs),
         *_sharding_groups(worker_graphs, sharding_config),
         *_worker_parallelism(worker_graphs, specs or ()),
+        *_sequence_parallel(worker_graphs, specs, moe_parallel or {}),
         *_paged_kv_on_cfg_ranks(worker_graphs, specs or ()),
     ]
 
@@ -215,6 +223,8 @@ def _node_group_shapes(model: Model, node_groups: list[dict]) -> Iterator[str]:
                 f"each lockstep instance's {instance} ranks must be ascending."
             )
         for axis, size in sizes.items():
+            if axis == "sp":  # checked with the resources, in `_sequence_parallel`
+                continue
             enabled = getattr(sharding, f"{axis}_enabled_nodes")
             unsupported = [node for node in names if node not in enabled]
             if size > 1 and unsupported:
@@ -574,4 +584,46 @@ def _worker_parallelism(
                 f"{list(lockstep)} on {', '.join(wids)}; the other ranks take rank 0's prefix hits and page "
                 "trails on the pool per node, so a shared pool can admit out of step. "
                 "Give each node a resource of its own, or place them on different workers."
+            )
+
+
+def _sequence_parallel(
+    worker_graphs: Sequence[WorkerGraph], specs: Sequence[NodeResourceSpec] | None,
+    moe_parallel: "Mapping[str, MoeParallelConfig]",
+) -> Iterator[str]:
+    """What a node group's SP ranks can't run (`sequence_parallel_refusals`, which the engine
+    checks again at load), whether each KV pool placed over a group's ranks can stripe over
+    them, and that no resource spans nodes that split heads different ways (the engine refuses
+    it at load too). Without ``specs`` (the model's resources failed to resolve, which is
+    reported apart) there is nothing to check this against."""
+    if specs is None:
+        return
+    groups: dict[int, tuple[int, int, set[str]]] = {}
+    for wg in worker_graphs:
+        groups.setdefault(wg._group_id, (wg.tp_size, wg.sp_size, set()))[2].update(wg.section.get_nodes())
+    placed_pools = [spec for spec in specs if spec.places_positions]
+    for i, (tp, sp, nodes) in sorted(groups.items()):
+        for spec in placed_pools:
+            if spec.nodes & nodes:
+                try:
+                    spec.config.context_parallel_size(spec.resource_key, tp, sp)
+                except ValueError as e:
+                    yield f"node_groups[{i}]: {e}"
+        # node -> whether it places its KV positions over its SP ranks (heads over TP alone)
+        # rather than splitting its steps (heads over TP x SP)
+        placed = {}
+        for node in sorted(nodes):
+            refusals = sequence_parallel_refusals(specs, node, tp, sp, moe_parallel.get(node))
+            for refusal in refusals:
+                yield f"node_groups[{i}]: {refusal}"
+            if sp > 1 and not refusals:
+                placed[node] = any(position_pools(specs, node).values())
+        mixed = sorted(
+            spec.resource_key for spec in specs if len({placed[node] for node in spec.nodes & placed.keys()}) > 1
+        )
+        if mixed:
+            yield (
+                f"node_groups[{i}]: {sorted(n for n, p in placed.items() if p)} place their KV positions over "
+                f"the SP ranks and {sorted(n for n, p in placed.items() if not p)} split their steps over them, "
+                f"so they split heads different ways, yet share resources {mixed}"
             )

@@ -35,7 +35,8 @@ ENCODER_NODE = "encoder"
 TRANSCRIBE_WALK = "transcribe"
 WAVEFORM = "waveform"
 TOKEN_IDS = "token_ids"
-# the encoder's varlen self-attention (a ragged attention resource)
+# the encoder's tokens within one step, and its varlen self-attention over them
+ENCODER_TOKENS = "encoder_tokens"
 ENCODER_ATTN = "encoder_attn"
 
 SIZES = ("300m", "1b", "3b", "7b")

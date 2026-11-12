@@ -257,9 +257,6 @@ class Array:
     rewritable: bool = False
     labels: frozenset[str] = frozenset({"main"})
     positions: Positions | None = None
-    # under sequence parallelism, each rank's calls carry its share of every segment, or of each request's row for a
-    # segmented read
-    seq_sharded: bool = False
 
     def __post_init__(self):
         object.__setattr__(self, "nodes", frozenset(self.nodes))

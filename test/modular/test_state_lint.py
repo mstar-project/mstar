@@ -18,11 +18,13 @@ import pytest
 
 PORTED = (
     "mstar/model/qwen3_5", "mstar/model/command_a_plus", "mstar/model/wan22", "mstar/model/flux2_klein",
-    "mstar/model/z_image", "mstar/model/ltx2_5", "mstar/model/qwen3_omni", "mstar/model/minimax_h3", "mstar/model/pi05",
-    "mstar/model/vjepa2", "mstar/model/canary", "mstar/model/components/encoder_decoder.py",
+    "mstar/model/z_image", "mstar/model/ltx2_5", "mstar/model/qwen3_omni", "mstar/model/minimax_h3",
+    "mstar/model/kokoro", "mstar/model/omnilingual_asr", "mstar/model/omnivoice", "mstar/model/orpheus",
+    "mstar/model/voxcpm2", "mstar/model/pi05", "mstar/model/vjepa2", "mstar/model/canary",
+    "mstar/model/components/encoder_decoder.py",
 )
 FORBIDDEN_ATTRIBUTES = {
-    "node_resources", "resources", "request_state", "per_request_states",
+    "node_resources", "resources", "request_state", "request_states", "per_request_states",
     # what a handle holds
     "resource", "positions", "reads", "first_read", "_kv", "_attn", "_pool", "_runners", "_views", "_blocks",
     "_bindings", "_layouts", "_update",
@@ -34,16 +36,23 @@ ALLOWED = {
     for name in (
         "AcceleratorGraphConfig", "BatchedAcceleratorGraphConfig", "DETERMINISTIC_COMPILE_MODE",
         "PackedAcceleratorGraphConfig", "PiecewiseAcceleratorGraphConfig", "PiecewiseBatchedConfig",
-        "PiecewiseCallInputs", "PiecewiseCaptureShape", "geometric_batch_sizes",
+        "PiecewiseCallInputs", "PiecewiseCaptureShape", "PiecewisePackedConfig", "geometric_batch_sizes",
     )
 } | {
     ("mstar.engine.engine", "ExecutingBatch"): "the annotation of `NodeSubmodule.can_batch`, a base class's hook",
     ("mstar.engine.resources.lora.checkpoint", "LoraFile"): "a model's static LoRA merge at load, which holds no state",
     ("mstar.engine.resources.lora", "LoraSpec"): "the opt-in LoRA spec, written by hand: the contract declares no LoRA",
+    ("mstar.engine.resources", "SeqShardSpec"): (
+        "a node's sequence shard, written by hand: the contract declares none until #1147's SeqShard"
+    ),
 }
 # Graph breaks a ported package keeps, by file and function, since no state call sits behind them.
 ALLOWED_BREAKS = {
     ("mstar/model/qwen3_omni/components/code2wav.py", "forward"): "the vocoder's transformer, which keeps no state",
+    ("mstar/model/wan22/components/dit.py", "_token_runs"): (
+        "the timestep runs of a rank's share of the tokens, read off the sequence shard's plan outside the DiT's "
+        "guards; the contract has no shard call until #1147's SeqShard"
+    ),
 }
 
 
@@ -113,6 +122,7 @@ def test_every_exception_is_still_used():
     ("def f(e): return e.resources['kv']", ".resources"),
     ("def f(self): return self.node_resources['kv']", ".node_resources"),
     ("def f(self, rid): return self.request_state(rid)", ".request_state"),
+    ("def f(self): return self.request_states", ".request_states"),
     ("def f(e): return e.per_request_states", ".per_request_states"),
     ("def f(self): return self.sampler.resource", ".resource"),
     ("def f(self): return self.kv.positions", ".positions"),
@@ -135,6 +145,10 @@ def test_the_lint_lets_a_named_function_keep_its_break_and_no_other():
     found, used = _violations(source, "mstar/model/qwen3_omni/components/code2wav.py")
     assert used == {("mstar/model/qwen3_omni/components/code2wav.py", "forward")}
     assert len(found) == 1 and "at line 3" in found[0]
+
+
+def test_the_lint_reads_the_five_speech_packages():
+    assert {path.parts[2] for path in _sources()} >= {"kokoro", "omnilingual_asr", "omnivoice", "orpheus", "voxcpm2"}
 
 
 def test_the_lint_reads_all_five_reference_packages():

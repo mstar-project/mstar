@@ -161,7 +161,7 @@ COND_LABEL = "main"
 UNCOND_LABEL = "uncond"
 
 # Combined plan key for the single plan that runs both guidance branches in
-# one forward (``KVStep.combined_labels`` in the step declaration).
+# one forward (``SubmoduleStep.combined_labels`` in the step declaration).
 CFG_BATCHED_LABEL = "_cfg_batched"
 
 # A captured denoise step's static-buffer inputs, each stacked on a leading
@@ -183,6 +183,10 @@ KV_CACHE = "kv"
 ATTN = "attn"
 ATTN_GEN = "attn_gen"
 SAMPLER = "sampler"
+# The sequence shard over the KV pool's nodes: on SP ranks it splits a
+# generation step's tokens over them (the transformer binds it by this name).
+# Every step of those nodes declares it, a prefill and the reasoner's included.
+SEQ_SHARD = "seq_shard"
 
 # Denoise state (initial noise, latents between steps, the guidance combine and
 # the scheduler step) is fp32 for image, video, sound and action requests, as
@@ -455,6 +459,12 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                     self.transformer.gen_layers_batched, **{**kwargs, "dynamic": True},
                 )
             logger.info("Cosmos3 denoise compute torch.compile enabled (%s)", config.denoise_compile_mode)
+
+    def bind_node_resources(self, resources: dict) -> None:
+        super().bind_node_resources(resources)
+        if self.transformer is not None:
+            # the transformer brackets its generation stack on the node's shard
+            self.transformer.sequence_shard = self.sequence_shard
 
     def warmup_compiles(self) -> None:
         """Build the compiled cross-request layer stack before the first
@@ -1052,13 +1062,12 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         read its own context. ``retention`` (per label) rides on the step
         for the pool to apply once the span is counted."""
         labels = (COND_LABEL, UNCOND_LABEL) if cfg else (COND_LABEL,)
-        combined = cfg and self.batched_cfg
         return SubmoduleStep(
             segments=self._segments(request_ids, labels, [spans] * len(labels)),
+            combined_labels={labels: CFG_BATCHED_LABEL} if cfg and self.batched_cfg else {},
             steps={
                 KV_CACHE: KVStep(
                     commit=True,
-                    combined_labels={labels: CFG_BATCHED_LABEL} if combined else {},
                     retention={
                         (rid, label): policy
                         for rid in request_ids
@@ -1503,6 +1512,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             labels = (COND_LABEL, UNCOND_LABEL) if cfg else (COND_LABEL,)
             return SubmoduleStep(
                 cg_key_info=cfg or None,
+                combined_labels={labels: CFG_BATCHED_LABEL} if cfg else {},
                 segments=self._segments(
                     request_ids, labels,
                     [
@@ -1511,12 +1521,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                     ],
                 ),
                 steps={
-                    KV_CACHE: KVStep(
-                        commit=True,
-                        combined_labels=(
-                            {labels: CFG_BATCHED_LABEL} if cfg else {}
-                        ),
-                    ),
+                    KV_CACHE: KVStep(commit=True),
                     ATTN: AttentionStep(causal=True),
                 },
             )
@@ -1610,16 +1615,12 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         committed, non-causal attention over [frozen prefix | fresh tokens]."""
         return SubmoduleStep(
             cg_key_info=cg_key_info,
+            combined_labels={labels: CFG_BATCHED_LABEL} if combined else {},
             segments=self._segments(
                 request_ids, labels, [spans] * len(labels)
             ),
             steps={
-                KV_CACHE: KVStep(
-                    commit=False,
-                    combined_labels=(
-                        {labels: CFG_BATCHED_LABEL} if combined else {}
-                    ),
-                ),
+                KV_CACHE: KVStep(commit=False),
                 attn_key: AttentionStep(causal=False),
             },
         )

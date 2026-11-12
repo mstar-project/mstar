@@ -13,6 +13,7 @@ import numpy as np
 import pytest
 import torch
 
+from mstar.engine.resources.context_parallel import TPPlacement
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.manager import KVManager, KVPlanState, _SlotBuffer
 from mstar.engine.resources.kv.plan import SINK_PAGE, PagedIndptrs
@@ -32,7 +33,7 @@ def addressing(request, monkeypatch):
 
 def _kv():
     kv = KVManager.__new__(KVManager)
-    kv.kv_cache = SimpleNamespace(page_size=PAGE)
+    kv.kv_cache = SimpleNamespace(page_size=PAGE, placement=None)
     kv._device = torch.device("cpu")
     kv._plan_stager = PinnedStager(torch.long)
     return kv
@@ -88,10 +89,12 @@ def _unpacked(indptrs, total):
 
 
 def _device_unpacked(kv, indptrs) -> KVPlanState:
-    """The reference, copied into a captured state with SINK_PAGE / 0 past the
-    real tokens."""
+    """The reference, at this rank's slots of a placed pool, copied into a
+    captured state with SINK_PAGE / 0 past the real tokens."""
     total = int(indptrs.qo_indptr[-1])
     pages, offsets = _unpacked(indptrs, total)
+    if kv.kv_cache.placement is not None:
+        pages, offsets = kv.kv_cache.placement.write_slots(pages, offsets)
     ref = _state()
     ref.token_to_page[:total].copy_(pages)
     ref.token_to_cache[:total].copy_(offsets)
@@ -101,8 +104,11 @@ def _device_unpacked(kv, indptrs) -> KVPlanState:
     return ref
 
 
-def test_host_addressing_matches_device_unpacking(addressing):
+# and over a context-parallel pool, partner 1 of 2's slots
+@pytest.mark.parametrize("placement", [None, TPPlacement(2, 1, None, (0, 1))], ids=["one_rank", "placed"])
+def test_host_addressing_matches_device_unpacking(addressing, placement):
     kv = _kv()
+    kv.kv_cache.placement = placement
     rng = np.random.default_rng(0)
     for _ in range(20):
         indptrs = _indptrs(rng)
