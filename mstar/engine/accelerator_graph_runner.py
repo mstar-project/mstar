@@ -1647,6 +1647,10 @@ class AcceleratorGraphRunner:
     def slot_for(self, lease: SlotLease) -> AcceleratorGraphSlot:
         return self._buckets[lease.bucket].slots[lease.slot]
 
+    @property
+    def capture_configs(self) -> list[AcceleratorGraphConfig]:
+        return self._capture_configs
+
     def config_for(self, lease: SlotLease) -> AcceleratorGraphConfig:
         return self._buckets[lease.bucket].config
 

@@ -524,7 +524,7 @@ def test_a_sampler_becomes_a_sampler_spec():
 
 def test_a_block_read_becomes_a_ragged_spec_with_the_default_compile_op():
     assert build_specs([_within()]) == [RaggedAttentionSpec(
-        resource_key="vision_attn", nodes={"vit"},
+        resource_key="vision_attn", nodes={"vit"}, labels={"main"},
         config=RaggedAttentionConfig(num_qo_heads=4, num_kv_heads=4, head_dim=8),
     )]
 

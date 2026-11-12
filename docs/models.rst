@@ -2215,7 +2215,9 @@ tokens over a pair of ranks (``cfg_size: 2, sp_size: 2``, Ulysses on the dit's
 self-attention) to cut one request's latency. Split the guidance branches
 first (``cfg_size: 2``), then add ``sp_size`` on top: on two GPUs,
 ``sp_size: 2`` alone is slower than ``cfg_size: 2``.
-``sp_size`` must divide the dit's 24 attention heads. Under concurrency, data
+``sp_size`` must divide the dit's 24 attention heads, and SP needs the
+ragged resource (``backend: sdpa`` on ``dit_self_attn`` runs outside the engine's resources, so
+it is refused on SP ranks). Under concurrency, data
 parallelism stays the throughput layout: at 1280x704x81 and 4 concurrent, four
 replicas (``wan22_dp2.yaml``'s layout over four ranks) serve 8.6 videos/min
 against 7.2 for this layout on H200s, and 11.0 against 7.4 in a separate run on
@@ -2255,13 +2257,17 @@ Outputs are an H.264 ``video`` and a 48 kHz stereo ``audio`` chunk (16-bit PCM).
 (``"audio": false`` in the body for video alone); the mux needs the ``ffmpeg`` binary
 on the server's ``PATH`` and falls back to video only without it.
 
-``ltx2_5_sp2`` shards the video tokens (Ulysses): each rank holds the whole DiT and
-half the tokens, and only the video self-attention exchanges them (one all-to-all
-each way); the cross-attentions run on each rank's own tokens, and the audio queries
-over the video merge the ranks' partial attentions. ``ltx2_5_tp2`` shards the
-weights instead and all-reduces after every block's attentions and feed-forwards.
+``ltx2_5_sp2`` splits each step's video tokens over the two ranks (the DiT's sequence
+shard): each rank holds the whole DiT and half the tokens, and only the video
+self-attention exchanges them (Ulysses, one all-to-all each way); the cross-attentions
+run on each rank's own tokens, and the audio queries over the video merge the ranks'
+partial attentions. The attention resources do the exchanges, so it needs
+the ragged resources (``backend: sdpa`` on one is refused on SP ranks where it reads split
+keys). ``ltx2_5_tp2`` shards
+the weights instead and all-reduces after every block's attentions and feed-forwards.
 
-Performance (2x H100, warm; diffusers with the same recipe and seeds):
+Performance (2x H100, warm; diffusers with the same recipe and seeds; the ``ltx2_5_sp2`` column
+was measured before the exchanges moved into the attention resources):
 
 ======================================  ================  ================  ================
                                         diffusers         ``ltx2_5_tp2``    ``ltx2_5_sp2``
@@ -2331,7 +2337,8 @@ Deployment knobs (``model_kwargs``; the SP configs set ``compile``, ``vae_tile_b
   on one H200, within 62.9 dB of eager.
 
 The attention kernel is a resource's setting: ``backend: sdpa`` on the ``dit_attn`` and
-``refiner_attn`` resources runs the reference's kernel, and FlashInfer runs without it.
+``refiner_attn`` resources runs the reference's kernel, and FlashInfer runs without it. SDPA on
+``dit_attn`` is refused on SP ranks, which every shipped config but ``minimax_h3_2gpu.yaml`` is.
 
 Async scheduling is on for the DiT and the decoder, the default for parallel nodes
 (``tp_async_sched: false`` turns it off); on and off measured within noise. Runtime needs:
@@ -2348,7 +2355,8 @@ seeds), clips are 23.7-32.8 dB (video) and 17.8-22.3 dB (audio) from diffusers',
 reference on another SDPA kernel is 23.5-33.1 and 21.6-22.3 dB from itself; per seed, the
 served clip is below that spread on one seed's video and another's audio.
 
-Seconds per clip, one request at a time, each engine on the same H200s (M* on torch
+Seconds per clip, one request at a time, each engine on the same H200s, M* measured before the
+DiT and the decoder moved onto the sequence shard (M* on torch
 2.12.1+cu132 and FlashInfer 0.7.2; text only, 1344x768, 124 frames, 49 DiT forwards, seed 0,
 median of 3 after a warmup; ``benchmark/minimax_h3/bench_video.py --seed 0`` sends these
 requests):

@@ -366,7 +366,7 @@ def _qwen3_5_vision_reference(model) -> RaggedAttentionSpec:
     vision, processor = model.vision_config, model.image_processor
     min_patches = processor.size["shortest_edge"] // processor.patch_size ** 2
     return RaggedAttentionSpec(
-        resource_key=VISION_ATTN, nodes={"vision_encoder"},
+        resource_key=VISION_ATTN, nodes={"vision_encoder"}, labels={"main"},
         config=RaggedAttentionConfig(
             num_qo_heads=vision.num_heads,
             num_kv_heads=vision.num_heads,

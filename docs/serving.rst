@@ -532,6 +532,8 @@ them by that name:
      vit_attn:                  # a cacheless (ragged) attention resource
        max_segments_per_request: 2  # also: max_segments_per_step, max_tokens_per_request,
                                     # flashinfer_backend
+     seq_shard:                 # a node's sequence shard (SP ranks)
+       min_tokens: 2048         # steps below this run copied on every SP rank
      sampler:
        greedy_capture: false    # also: enable_logprobs, enable_processed_logprobs
 
@@ -563,12 +565,18 @@ a sliding window (``AttentionConfig.sliding_window``) has no prefix cache yet: i
 ``prefix_cache`` goes off (logged at info), and a serving config that sets
 ``prefix_cache: true`` on it is refused.
 
-``context_parallel: true`` splits each request's positions over the ranks that would
-otherwise hold the same KV heads: the TP ranks that share a KV head, or the node's SP ranks
-when it has them, which is how a model with no sequence parallelism of its own (such as
-Qwen3.5) runs on ``sp_size`` above 1. Raise ``max_num_pages`` by that factor to turn the
-freed memory into context. **Context parallelism** in :doc:`adding_models` covers when each mode applies and
-what it refuses.
+A node on ``sp_size`` above 1 shares each step over its SP ranks along two axes. A model that
+declares a sequence shard (``SeqShardSpec``: the DiTs of LTX-2.5, Cosmos3, Wan2.2 and MiniMax-H3) splits a step's tokens
+over them; its ``min_tokens`` runs smaller steps copied on every rank instead (default 0: every
+step that can split does). A captured step decides from its bucket's size, not its prompt's.
+Separately, ``context_parallel: true`` stores a paged pool's K/V by position rather than by
+head: each request's positions split over the ranks that would otherwise hold the same KV
+heads, the TP ranks that share a KV head or the node's SP ranks, which is how a model with no
+sequence shard (such as Qwen3.5) runs on ``sp_size`` above 1. Raise ``max_num_pages`` by that
+factor to turn the freed memory into context. A node on SP ranks needs at least one of the two,
+and can't yet have both: a node that splits its steps stores its pools by head.
+**Sequence and context parallelism** in :doc:`adding_models` covers what each combination does
+and what is refused.
 
 A request waits at the head of its pool's queue until its reservation fits beside the
 reservations already admitted. A request behind it starts first when its own pages fit, output
@@ -826,8 +834,10 @@ details.
 **Sequence and guidance parallelism.** ``sp_size`` splits a node's token sequence over
 that many ranks (Ulysses: an all-to-all around attention), and ``cfg_size`` splits its
 classifier-free-guidance branches, each rank running its share of them and the noise
-predictions gathered every step. Each needs the model to declare the node SP- or
-CFG-enabled, and ``cfg_size`` must divide the node's guidance branches (two for Wan2.2).
+predictions gathered every step. ``sp_size`` needs the node to declare a sequence shard
+(``SeqShardSpec``) or place its KV positions over the SP ranks, ``cfg_size`` needs the model to
+declare the node CFG-enabled, and ``cfg_size`` must divide the node's guidance branches (two for
+Wan2.2).
 The axes compose: a group's ``ranks`` form lockstep instances of
 ``cfg_size * sp_size * tp_size`` ranks, laid out ``[cfg][sp][tp]`` (TP on adjacent ranks),
 each instance's ranks listed in ascending order, and the conductor routes each request to
