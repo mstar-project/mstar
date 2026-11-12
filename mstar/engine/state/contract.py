@@ -190,7 +190,9 @@ class Read:
     layers: frozenset[int] | None = None    # None: all of the array's layers
     walks: frozenset[str] | None = None     # None: all walks
     queries: str | None = None              # the array whose segments lay out the queries; None: this array
-    packed: bool = True                     # queries may come as (tokens, heads, head_dim); False: only as rows
+    # queries may come as (tokens, heads, head_dim). False: only as (rows, T, heads, head_dim), each row's span first
+    # and the rest of its T padding.
+    packed: bool = True
     segmented: bool = False                 # a request's segments lie end to end in one row
 
     def __post_init__(self):

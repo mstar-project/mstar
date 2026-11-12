@@ -787,7 +787,8 @@ only the queries sharded, and a merge of the ranks' partial attentions with only
 
 A read takes its queries packed, ``(tokens, heads, head_dim)`` over every row. A read whose layers
 pass rows of one length, ``(rows, len, heads, head_dim)``, as a DiT's do, declares
-``packed=False``, and a packed call to it is refused.
+``packed=False``, and a packed call to it is refused. A read on an array that keeps entries takes
+packed queries, since the paged kernels take no others.
 A read whose request's segments lie end to end in one row, as a DiT's packed rows and their pad
 do, declares ``segmented=True``. It takes ``Block()``, ``packed=False`` and no ``queries``, and it
 runs one request a step. Under sequence parallelism the ranks split each request's whole row by
