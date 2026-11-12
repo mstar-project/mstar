@@ -424,8 +424,9 @@ def test_batched_windows_on_pool(random_token2wav, device):
     from mstar.model.chatterbox.components.s3gen_hift import HiFTNoise
 
     model = copy.deepcopy(random_token2wav).to(device)
-    # the CUDA path's attention kernel multiplies in TF32, as served
-    tol = dict(rtol=1e-4, atol=1e-4) if device == "cpu" else dict(rtol=1e-3, atol=1e-3)
+    # The CUDA path's attention kernel multiplies in TF32, as served: the DiT's conv caches
+    # drift from the reference state by up to ~1.1e-3 absolute, near-zero entries included.
+    tol = dict(rtol=1e-4, atol=1e-4) if device == "cpu" else dict(rtol=1e-3, atol=2e-3)
     p = 50
     torch.manual_seed(1)
     voice = model.prepare_voice(VoicePrompt(
@@ -508,6 +509,46 @@ def test_batched_windows_on_pool(random_token2wav, device):
             torch.testing.assert_close(mel[i:i + 1], mels[w], **tol)
 
 
+def test_batched_relative_positions_match_the_dense_path(random_token2wav):
+    """The conformer's relative-position term on the bounded caches, at a magnitude that
+    matters: ``random_token2wav``'s small weights leave it near zero, where a band read
+    backwards (relative position ``-k`` for ``k``) still passes the test above."""
+    import copy
+
+    from mstar.model.components.token2wav.flow import RelPositionAttention
+
+    model = copy.deepcopy(random_token2wav)
+    gen = torch.Generator().manual_seed(5)
+    with torch.no_grad():
+        for mod in model.flow.encoder.modules():
+            if isinstance(mod, RelPositionAttention):
+                mod._bands.clear()
+                for t in (mod.linear_pos.weight, mod.pos_bias_u, mod.pos_bias_v):
+                    t.copy_(torch.randn(t.shape, generator=gen))
+    p = 12
+    voice = model.prepare_voice(VoicePrompt(
+        tokens=torch.randint(0, 6561, (1, p), dtype=torch.int32, generator=gen),
+        spk_emb=torch.randn(1, 192, generator=gen), mel=torch.randn(1, 2 * p, 80, generator=gen),
+    ))
+    bank = VoiceBank.build({"v": voice})
+    kv_steps = _CacheSteps(bank, 2, "cpu")
+    ref = new_state(model, voice)
+    # the token encoder's output: the DiT's small weights would hide it in the mel
+    encoded = []
+    hook = model.flow.encoder.register_forward_hook(lambda _m, _i, out: encoded.append(out.clone()))
+    try:
+        for win, last in reference_windows(torch.randint(0, 6561, (60,), generator=gen).tolist()):
+            tokens = torch.tensor([win], dtype=torch.int32)
+            flow_chunk(model, ref, voice, tokens, last)
+            state, kv, ids, commit = kv_steps.window(["r0"], len(win), last)
+            model.window_flow(state, bank, ids, tokens, kv, last)
+            commit()
+            want, got = encoded[-2:]
+            torch.testing.assert_close(got, want, rtol=1e-4, atol=1e-4)
+    finally:
+        hook.remove()
+
+
 @needs_ckpt
 def test_assets_load_completely():
     from mstar.model.components.token2wav.model import load_token2wav
@@ -561,6 +602,34 @@ def test_the_served_float16_dit_tracks_float32_on_the_checkpoint():
     for w, (want, got) in enumerate(zip(mels[None], mels[DIT_COMPUTE_DTYPE], strict=True)):
         rel = ((got - want).norm(dim=(1, 2)) / want.norm(dim=(1, 2))).max().item()
         assert rel < 2e-3, (w, rel)
+
+
+@needs_ckpt
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_batched_flow_matches_the_driver_on_the_real_weights():
+    """The served (bounded-cache) flow against the one-request driver on MiniCPM-o's own
+    weights and voice, where the conformer's relative-position term is large enough to
+    show in the mel."""
+    import soundfile as sf
+
+    from mstar.model.components.token2wav.model import load_token2wav
+
+    model = load_token2wav(f"{CKPT}/assets/token2wav", "cuda")
+    wav, _ = sf.read(f"{CKPT}/assets/HT_ref_audio.wav", dtype="float32")
+    voice = model.prepare_voice(model.voice_encoder(torch.from_numpy(wav)))
+    bank = VoiceBank.build({"v": voice})
+    kv_steps = _CacheSteps(bank, 2, "cuda")
+    ref = new_state(model, voice)
+    gen = torch.Generator().manual_seed(0)
+    with torch.inference_mode():
+        for win, last in reference_windows(torch.randint(0, 6561, (160,), generator=gen).tolist()):
+            tokens = torch.tensor([win], dtype=torch.int32, device="cuda")
+            want = flow_chunk(model, ref, voice, tokens, last)
+            state, kv, ids, commit = kv_steps.window(["r0"], len(win), last)
+            got = model.window_flow(state, bank, ids, tokens, kv, last)
+            commit()
+            # TF32 in the served attention kernel; a misplaced position term moves mels by > 1
+            assert (got.float() - want.float()).abs().max().item() < 0.15
 
 
 @pytest.mark.parametrize(("n", "stop"), [
