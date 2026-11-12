@@ -138,7 +138,7 @@ class OmnilingualASRModel(Model):
         )]
 
     def kernel_settings(self) -> dict[str, dict[str, Any]]:
-        if self.dtype not in (torch.bfloat16, torch.float16):
+        if not self.declare_state():
             return {}
         # one segment per request, and a captured step packs a whole batch into one row
         return {ENCODER_ATTN: {"max_segments_per_step": self.max_batch_size}}
