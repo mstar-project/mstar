@@ -395,10 +395,9 @@ def test_a_ring_step_sets_no_advance_or_position_ids():
             state_steps(step, {"kv": handle}, graph_walk="rollout")
 
 
-def test_a_ring_of_waypoint_s_geometry_builds_waypoint_s_specs_and_steps():
-    """The reference is Waypoint's hand-written spec and step, copied. The differences are the declaration's own: the
-    flex resource takes its first read's key, the ring holds a request to the array's ``max_len``, and a step lists its
-    rows' segments in place of each row's frame, which the ring counts itself."""
+def test_a_ring_of_waypoint_s_geometry_builds_waypoint_s_specs():
+    """The reference is Waypoint's hand-written spec, copied. The differences are the declaration's own: the flex
+    resource takes its first read's key, and the ring holds a request to the array's ``max_len``."""
     global_layers = frozenset(range(3, 24, 4))
     array = Array("kv", nodes={"dit"}, layers=frozenset(range(24)), entry=KVEntry(heads=16, head_dim=64),
                   max_len=(1 + 512) * 512, positions=Positions(), reads={
@@ -420,6 +419,10 @@ def test_a_ring_of_waypoint_s_geometry_builds_waypoint_s_specs_and_steps():
     assert (flex_spec.resource_key, flex_spec.nodes) == ("local_attn", frozenset({"dit"}))
     assert flex_spec.config == AttentionConfig(kv_cache="kv", backend=AttnBackend.FLEX)
 
+
+def test_a_ring_step_is_the_hand_written_one_with_its_rows_segments():
+    """Waypoint's hand-written steps named each row's frame. A ring step lists its rows' segments instead, and the ring
+    counts the frames itself."""
     handle, _, _ = _ring()
     rows = [Segment(rid, "main", TPF) for rid in ("a", "b")]
     step = state_steps(SubmoduleStep(segments=rows, state={"kv": ArrayStep()}), {"kv": handle}, graph_walk="prime")

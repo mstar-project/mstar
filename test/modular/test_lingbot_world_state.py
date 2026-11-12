@@ -194,7 +194,8 @@ class _Rollout:
 def test_the_specs_are_main_s_resources_but_three():
     """`main` built a rolling store and one ragged resource for both pairs. The declaration builds, in their place, a
     paged pool under the same key, a kept-window resource over it for the chunk's pair, and a second ragged resource for
-    the text pair, each with `main`'s attention geometry. Their dtype is the model's bf16, which `main` set per spec."""
+    the text pair, each with `main`'s attention geometry. `main` set each spec's dtype to bf16. Here the specs leave it
+    unset, and the build takes the model's, which is bf16."""
     model = _model()
     kv, window, text = serving_resources(model, {"resources": {}})
     assert isinstance(kv, KVSpec) and (kv.resource_key, kv.nodes) == (DIT_KV, {"dit"})
@@ -204,6 +205,7 @@ def test_the_specs_are_main_s_resources_but_three():
     assert isinstance(text, RaggedCrossAttentionSpec) and text.resource_key == TEXT_ATTN
     for spec in (window, text):
         assert spec.nodes == {"dit"}
+        assert spec.config.dtype is None
         assert replace(spec.config, dtype=MAIN_ATTN.dtype) == MAIN_ATTN, f"{spec.resource_key}: main's geometry"
     assert model.get_autocast_dtype() is torch.bfloat16
 
