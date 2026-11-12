@@ -246,8 +246,8 @@ def _kv_shape(array: Array) -> tuple[int, ...]:
 
 
 def _kv_entry(array: Array, config: str) -> tuple[int, int, torch.dtype | None]:
-    """``array``'s heads, head dim and dtype, None for the compute dtype, from an entry ``config`` holds: a `KVEntry`,
-    which may declare one dtype."""
+    """``array``'s heads, head dim and dtype, None for the compute dtype. Its entry must be a `KVEntry` with one dtype,
+    all that the resource config named ``config`` holds."""
     k = array.entry.tensors.get("k")
     if k is None or len(k.shape) != 2 or k.shard != 0 or array.entry != Entry({"k": k, "v": k}):
         raise _no_layout(array, f"entry must be a KVEntry, which may declare one dtype, all {config} holds")
@@ -746,7 +746,7 @@ class BoundedAttend(OpBinding):
     no step and no kernel setting."""
 
     def check(self, array: Array, key: str, read: Read) -> None:
-        heads, head_dim = array.entry.tensors["k"].shape
+        heads, head_dim, _ = _kv_entry(array, "BoundedKVConfig")
         if read.packed:
             raise _no_layout(array, f"reads[{key!r}] takes packed queries, and the bounded kernels take rows padded to "
                                     "the step's longest span; declare packed=False")
