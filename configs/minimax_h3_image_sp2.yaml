@@ -10,6 +10,8 @@ max_seq_len: 8192
 model_kwargs:
   compile: true
   vae_tile_batch: 64
+  # the decoder's blocks compiled per tile batch (56-58 dB from eager; -0.13 s at 2048² on 2 H200s)
+  vae_compile: true
 
 node_groups:
   - node_names: [dit, vae_decoder]
