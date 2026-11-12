@@ -24,8 +24,14 @@ from mstar.engine.resources.base import CGSlotKey  # noqa: E402
 from mstar.engine.resources.draft.ledger import VerifyLedger  # noqa: E402
 from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PagedKVConfig  # noqa: E402
 from mstar.engine.resources.kv.manager import KVManager  # noqa: E402
-from mstar.engine.resources.position.config import PositionConfig, PositionStep  # noqa: E402
-from mstar.engine.resources.position.manager import RopeManager  # noqa: E402
+from mstar.engine.resources.kv.plan import KVPlanOutput, KVPlanOutputs  # noqa: E402
+from mstar.engine.resources.position.config import (  # noqa: E402
+    LongRoPE,
+    PositionConfig,
+    PositionReqConfig,
+    PositionStep,
+)
+from mstar.engine.resources.position.manager import LongRopeManager, RopeManager  # noqa: E402
 from mstar.engine.resources.resident import ResidentPlanner  # noqa: E402
 from mstar.engine.resources.step import BucketKey, Segment, SlotLease, StepContext, SubmoduleStep  # noqa: E402
 
@@ -34,9 +40,13 @@ K = 3
 SPAN = K + 1
 WALK = "decode"
 CPU = torch.device("cpu")
+# a request whose ceiling passes 16 rotates on the long half, 512 rows on
+LONGROPE = LongRoPE(short_factor=(1.0,) * 4, long_factor=(2.0,) * 4,
+                    original_max_position_embeddings=16, max_position_embeddings=512)
+LONG = PositionReqConfig(max_position=100)
 
 
-def _resources(max_num_pages: int = 128, max_seq_len: int = 512):
+def _resources(max_num_pages: int = 128, max_seq_len: int = 512, longrope: bool = False):
     cfg = PagedKVConfig(
         num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=max_seq_len,
         max_num_pages=max_num_pages, page_size=PAGE,
@@ -46,14 +56,19 @@ def _resources(max_num_pages: int = 128, max_seq_len: int = 512):
         name="kv", joint_comm_group=None, transfer_engine_info=None, device=CPU, dtype=torch.float32,
     )
     kv._cg_max_seq_len = 64
-    rope = RopeManager(PositionConfig(kv_cache="kv"), CPU, max_seq_len=512, head_dim=8)
+    if longrope:
+        rope = LongRopeManager(
+            PositionConfig(kv_cache="kv", rotary_dim=8, longrope=LONGROPE), CPU, max_seq_len=512, head_dim=8,
+        )
+    else:
+        rope = RopeManager(PositionConfig(kv_cache="kv"), CPU, max_seq_len=512, head_dim=8)
     rope._pinned_pos_ids_buffer = lambda key, n: torch.empty(n, dtype=torch.long)
     return {"kv": kv, "rope": rope}
 
 
-def _prefill(res, rid: int, n: int) -> None:
+def _prefill(res, rid: int, n: int, rope_config: PositionReqConfig | None = None) -> None:
     res["kv"].ingest_request(rid, KVReqConfig())
-    res["rope"].ingest_request(rid, None)
+    res["rope"].ingest_request(rid, rope_config)
     segments = (Segment(rid, "main", n),)
     ctx = StepContext(request_ids=(rid,), graph_walk="prefill", slot=0, capture=False)
     kv, rope = KVStep(segments=segments), PositionStep(segments=segments)
@@ -67,8 +82,9 @@ def _prefill(res, rid: int, n: int) -> None:
 class _Node:
     """One verifying node: resources, planner, ledger, and each row's true length."""
 
-    def __init__(self, prompts: dict[int, int], synchronous: bool = False, max_bs: int = 4, max_seq_len: int = 512):
-        self.res = _resources(max_seq_len=max_seq_len)
+    def __init__(self, prompts: dict[int, int], synchronous: bool = False, max_bs: int = 4, max_seq_len: int = 512,
+                 long_rids: frozenset[int] | None = None):
+        self.res = _resources(max_seq_len=max_seq_len, longrope=long_rids is not None)
         self.planner = ResidentPlanner("n", {WALK}, self.res, CPU, max_bs=max_bs, max_span=SPAN)
         self.ledger = VerifyLedger("n", synchronous=synchronous)
         self.planner.pending = self.ledger.pending
@@ -76,7 +92,7 @@ class _Node:
         self.true_len = dict(prompts)
         self.captured: set = set()
         for rid, n in prompts.items():
-            _prefill(self.res, rid, n)
+            _prefill(self.res, rid, n, LONG if long_rids and rid in long_rids else None)
 
     def stream(self, rid):
         return self.res["kv"]._streams[rid]["main"]
@@ -122,11 +138,19 @@ class _Node:
         planner.flush(ctx.resident_plan)
         planner.gather(captured)
         state = res["kv"]._static_plan_state(slot, ("main", 0), bucket.num_tokens)
-        positions = res["rope"]._static_pos_ids[CGSlotKey(bucket=bucket, slot=slot, label="main")]
+        table_ids = None
+        if isinstance(res["rope"], LongRopeManager):
+            # LongRoPE stages positions and table ids as the two rows of one buffer
+            both = res["rope"]._static_pos_ids[CGSlotKey(bucket=bucket, slot=slot, label="main#longrope")]
+            positions, table_ids = both.view(2, -1)
+            table_ids = table_ids[: bs * SPAN].tolist()
+        else:
+            positions = res["rope"]._static_pos_ids[CGSlotKey(bucket=bucket, slot=slot, label="main")]
         out = SimpleNamespace(
             pages=state.token_to_page[: bs * SPAN].tolist(),
             offsets=state.token_to_cache[: bs * SPAN].tolist(),
             positions=positions[: bs * SPAN].tolist(),
+            table_ids=table_ids,
         )
         # what the verify writes in the graph
         captured.buffers.advance.copy_(torch.tensor([accepted[r] + 1 for r in rids] + [1] * (bs - len(rids))))
@@ -389,6 +413,61 @@ def test_a_span_a_commit_drops_counts_as_nothing_committed_for_that_row():
     assert kv.committed_spans(step, [1, 2], "main", SPAN) == [0, SPAN]
 
 
+
+
+def _step_ctx(rows):
+    ctx = StepContext(request_ids=tuple(dict.fromkeys(r for r, _, _ in rows)), graph_walk=WALK, slot=0, capture=False)
+    ctx.plan_results = {"kv": KVPlanOutputs({"main": KVPlanOutput(None, rows=rows)})}
+    return ctx
+
+
+def _plan_rows(rope, rows):
+    rope.plan(PositionStep(segments=()), _step_ctx(rows))
+    return rope.pos_ids("main").tolist(), rope._current_table_ids["main"].tolist()
+
+
+def test_a_longrope_verify_step_stages_each_row_on_its_requests_half():
+    """A verify row's table ids run over its span on the half its request was opened
+    on, and after a take-back the next decode row resumes there, as plain decode's."""
+    rope = _resources(longrope=True)["rope"]
+    rope.ingest_request(1, None)
+    rope.ingest_request(2, LONG)
+    rope._counters[1]["main"], rope._counters[2]["main"] = 5, 7
+
+    positions, table_ids = _plan_rows(rope, [(1, "main", SPAN), (2, "main", SPAN)])
+    assert positions == [5, 6, 7, 8, 7, 8, 9, 10]
+    assert table_ids == [5, 6, 7, 8, 519, 520, 521, 522]
+
+    # the step commits its span; row 1 kept 2 of its 4 tokens, row 2 all of them
+    rows = [(1, "main", SPAN), (2, "main", SPAN)]
+    rope.commit(PositionStep(segments=tuple(Segment(*row) for row in rows)), _step_ctx(rows))
+    rope.take_back([1, 2], [2, 0], "main")
+    assert _plan_rows(rope, [(1, "main", 1), (2, "main", 1)]) == ([7, 11], [7, 523])
+
+
+@pytest.mark.parametrize("synchronous", [False, True])
+def test_a_longrope_row_on_resident_tables_gathers_its_requests_half_over_the_span(synchronous):
+    """In the graph, a verify row's table ids are gathered over its span beside its
+    positions, each on its request's half, at its true length, step after step."""
+    rng = random.Random(5)
+    node = _Node({1: 5, 2: 3, 3: 10}, synchronous=synchronous, long_rids=frozenset({2}))
+    rids = [1, 2, 3]
+    held = None
+    for t in range(10):
+        accepted = {rid: rng.randint(0, K) for rid in rids}
+        out = node.step(rids, accepted, slot=t % 2, bs=4)
+        _check_step(node, out, rids)
+        for i, rid in enumerate(rids):
+            half = 512 if rid == 2 else 0
+            row = slice(i * SPAN, (i + 1) * SPAN)
+            assert out.table_ids[row] == [p + half for p in out.positions[row]], (t, rid)
+            node.true_len[rid] += accepted[rid] + 1
+        if synchronous:
+            node.record(out)
+        else:
+            if held is not None:
+                node.record(held)
+            held = out
 
 
 def test_flashinfers_resident_gather_fills_a_real_fa3_paged_wrapper_off_the_tables():
