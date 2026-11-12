@@ -1,0 +1,36 @@
+model: "wan22"
+
+# Wan2.2-T2V-A14B with LightX2V's 4-step distill LoRAs (lightx2v/Wan2.2-Distill-Loras,
+# t2v high/low-noise, rank 64), sampled as LightX2V does (sampler: step_distill):
+# timesteps 1000, 750, 500, 250 at shift 5, no CFG, the first two steps on the
+# high-noise expert. 4 DiT forwards instead of 40 x 2. Each LoRA is folded into its
+# expert at load. Requests may leave out num_inference_steps and the guidance
+# scales; another step count or guidance above 1 is a 400. Distilled output is not
+# the dense model's: compare it against LightX2V's pipeline.
+max_seq_len: 512
+
+model_kwargs:
+  variant: "t2v_a14b"
+  model_path_hf: "Wan-AI/Wan2.2-T2V-A14B-Diffusers"
+  sampler: step_distill
+  # local paths to the two safetensors (hf download lightx2v/Wan2.2-Distill-Loras)
+  lora: ["/path/to/wan2.2_t2v_A14b_high_noise_lora_rank64_lightx2v_4step_1217.safetensors"]
+  lora_2: ["/path/to/wan2.2_t2v_A14b_low_noise_lora_rank64_lightx2v_4step_1217.safetensors"]
+  compile_dit_sizes: ["1280x720x81", "832x480x81"]
+  vae_decode_fast_sizes: ["1280x720", "832x480"]
+
+node_groups:
+  - node_names:
+      - text_encoder
+    ranks:
+      - 0
+
+  - node_names:
+      - vae_decoder
+    ranks:
+      - 0
+
+  - node_names:
+      - dit
+    ranks:
+      - 0

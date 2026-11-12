@@ -612,6 +612,8 @@ Generation knobs (per request, via `model_kwargs` or the request body):
 
 `configs/wan22_a14b_cfg_parallel_2gpu.yaml` splits the guidance branches over two GPUs (`cfg_size: 2`), each rank holding both experts, and `configs/wan22_a14b_sp2.yaml` splits the tokens instead (`sp_size: 2`, 20 of the 40 heads per rank). Both compile the DiT for `1280x720x81` and `832x480x81`, each expert once per CFG setting.
 
+**Four steps (LightX2V's distill LoRAs).** `configs/wan22_a14b_distill.yaml` folds LightX2V's 4-step distill LoRAs (`lightx2v/Wan2.2-Distill-Loras`, t2v high/low-noise, rank 64) into the two experts at load (`lora` and `lora_2`: local paths, or `{path, scale}`; the original Wan layout's `blocks.N.self_attn.q` keys are mapped) and samples them as LightX2V does (`sampler: step_distill`): timesteps 1000, 750, 500, 250 at shift 5, the DiT conditioned on the shifted sigma (937.5 for 750), a flow Euler step between them, no CFG, the first two steps on the high-noise expert. 4 DiT forwards instead of 40 x 2: 11.7 s per 832x480x81 video and 43.4 s at 1280x720x81 on one H200, against 254.9 s for the dense 40-step model at 832x480. With the same noise and kernels, M*'s steps match LightX2V's loop over the diffusers experts bit for bit (`test/modular/test_wan22_step_distill_equivalence.py`). Another step count or guidance above 1 is a 400.
+
 ## LTX-2.5 (`ltx2_5`) {#ltx-2-5-ltx2-5}
 
 Text-to-audio+video on **Lightricks LTX-2.5** (`Lightricks/LTX-2.5-Diffusers`, gated): a 22B joint audio-video DiT, a Gemma-4 12B text encoder, and video/audio VAEs with a 48 kHz vocoder. The distilled checkpoint runs the model card's recipes without guidance; the full (SFT) transformer, image-to-video and the duration head are not ported yet.
