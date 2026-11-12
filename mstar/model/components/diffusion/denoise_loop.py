@@ -38,7 +38,7 @@ Conventions the base fixes:
 * A schedule and its device-resident ``sigmas`` / ``timesteps`` are a memo of the hook's
   inputs, so requests with the same settings share one on the device, and losing an
   entry costs a rebuild and changes no output. So are the seeds drawn at ingest and a
-  guidance scale's per-step fill (keyed by ``(num_steps, knobs)``).
+  guidance scale's per-step values (keyed by ``(num_steps, knobs)``).
 * Per-step per-request scalars (``STEP_SCALARS``: ``sigma``, ``sigma_next``,
   ``timestep``) are sliced out of the schedule ``schedule_for`` returns and
   travel as ``[1]`` device tensors, so a batch of requests at different steps
@@ -60,9 +60,9 @@ Conventions the base fixes:
   each branch this rank owns as a row (``key.branches``: ``my_rows`` of the
   ``cfg_group``), gathers the branches' predictions over the group and combines
   them, with the request's scales as step scalars. An unguided step runs branch 0
-  alone. A request's rows are its local branches in order. Whether a step is
-  guided is the step key's, from the request's per-step fill of scales
-  (``GUIDANCE.at``), as a step schedule's dtype is.
+  alone. A request's rows are its local branches in order. Whether a request is
+  guided is decided at intake (``Guidance.active`` of its scales) and is the step
+  key's.
 """
 
 from __future__ import annotations
@@ -220,17 +220,24 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         # on one GPU. Each rank's share of the branches, guided or not, is fixed for the life of the node.
         self.cfg_group = cfg_group or CommGroup.trivial()
         guidance = self.GUIDANCE
+        if guidance is not None:
+            arguments = {frozenset(branch) for branch in guidance.branches}
+            if len(guidance.branches) < 2 or len(arguments) != 1 or not next(iter(arguments)):
+                raise ValueError(
+                    f"{type(self).__name__}: GUIDANCE needs at least two branches, each mapping the same "
+                    f"model_output arguments (got {[sorted(branch) for branch in guidance.branches]})"
+                )
         self._branch_shares = {
             False: (0,),
             True: tuple(range(len(guidance.branches)))[my_rows(self.cfg_group, len(guidance.branches))]
             if guidance is not None else (0,),
         }
-        # The request's fill of the guidance scales, per step and on the device, memoized by the step count and the
-        # knobs' values (what the fill is a function of), as the schedule is.
-        self._staged_fills = functools.lru_cache(_MEMO_ENTRIES)(self._stage_fill)
+        # The request's guidance scales, one value per step and on the device, memoized by the step count and the
+        # knobs' values, as the schedule is.
+        self._staged_scales = functools.lru_cache(_MEMO_ENTRIES)(self._stage_scales)
         # The step scalars the base slices per step: the scheduler's, and a guided model's scales. A scale is an
         # input under its own name, beside the step scalars, the loop-back edges and the branches' request inputs;
-        # its fill is staged under ``guidance:<name>`` (``_stage_fill``), apart from the schedule's sources. Shared
+        # its values are staged under ``guidance:<name>`` (``_stage_scales``), apart from the schedule's sources. Shared
         # request inputs no branch names are the model's own: prepare_inputs checks those per row.
         scales = guidance.scales if guidance is not None else ()
         branch_inputs = {edge for branch in guidance.branches for edge in branch.values()} if guidance else set()
@@ -442,21 +449,20 @@ class DenoiseLoopSubmodule(NodeSubmodule):
 
     def step_key(self, fwd_info: CurrentForwardPassInfo, bucket_key: Hashable, step: int | None = None) -> StepKey:
         """What step ``step`` (default: ``fwd_info``'s) batches and captures on: ``bucket_key``, with the step's dtype
-        under a step schedule and whether the step is guided. ``prepare_inputs`` and ``cg_key_info`` both take it
+        under a step schedule and whether the request is guided. ``prepare_inputs`` and ``cg_key_info`` both take it
         from here, so a step's rows and its graph agree."""
         guidance = self.GUIDANCE
         guided = guidance is not None and guidance.active(fwd_info.step_metadata)
-        if self.step_dtypes is None and not guided:
-            return self._key(bucket_key, None, False)
+        if self.step_dtypes is None:
+            return self._key(bucket_key, None, guided)
         k = self.step_index(fwd_info) if step is None else step
-        dtype = None if self.step_dtypes is None else self.step_dtypes.at(k)
-        return self._key(bucket_key, dtype, guided and guidance.active(guidance.at(self._knobs(fwd_info), k)))
+        return self._key(bucket_key, self.step_dtypes.at(k), guided)
 
     def _key(self, bucket_key: Hashable, dtype: str | None, guided: bool) -> StepKey:
         return StepKey(bucket_key, dtype, guided, self._branch_shares[guided])
 
     def _knobs(self, fwd_info: CurrentForwardPassInfo) -> dict[str, float]:
-        """The request's guidance scales as it set them: what its per-step fill is a function of."""
+        """The request's guidance scales as it set them."""
         return {name: float(fwd_info.step_metadata[name]) for name in self.GUIDANCE.scales}
 
     # --------------------------------------------------------- engine contract
@@ -477,7 +483,7 @@ class DenoiseLoopSubmodule(NodeSubmodule):
             )
         staged = self._staged_schedules(*schedule_key)
         if self.GUIDANCE is not None:
-            staged = {**staged, **self._staged_fills(num_steps, tuple(self._knobs(fwd_info).items()))}
+            staged = {**staged, **self._staged_scales(num_steps, tuple(self._knobs(fwd_info).items()))}
         key = self.step_key(fwd_info, bucket_key)
         conditioning = self.request_inputs(fwd_info, inputs, key)
         shadowed = conditioning.keys() & self._staged_names
@@ -506,16 +512,13 @@ class DenoiseLoopSubmodule(NodeSubmodule):
     def _stage_schedule(self, walk: str, settings: Hashable, bucket_key: Hashable) -> dict[str, torch.Tensor]:
         return self._step_scalar_sources(self._schedules(walk, settings, bucket_key), self.get_device())
 
-    def _stage_fill(self, num_steps: int, knobs: tuple[tuple[str, float], ...]) -> dict[str, torch.Tensor]:
-        """The request's fill of each guidance scale, one value per step (``GUIDANCE.at``), on the device under its
-        step scalar's source name."""
-        guidance = self.GUIDANCE
-        fill = [guidance.at(dict(knobs), k) for k in range(num_steps)]
+    def _stage_scales(self, num_steps: int, knobs: tuple[tuple[str, float], ...]) -> dict[str, torch.Tensor]:
+        """Each of the request's guidance scales, one value per step, on the device under its step scalar's source
+        name."""
         return {
             self.step_scalars[name].source:
-                to_device_nonblocking(torch.tensor([float(at[name]) for at in fill], dtype=torch.float32),
-                                      self.get_device())
-            for name in guidance.scales
+                to_device_nonblocking(torch.full((num_steps,), value, dtype=torch.float32), self.get_device())
+            for name, value in knobs
         }
 
     def _step_scalar_sources(
@@ -632,15 +635,14 @@ class DenoiseLoopSubmodule(NodeSubmodule):
     def _step_of(self, rid, per_request_input_metadata) -> int | None:
         """The row's step from its input metadata, which the scheduler advances for a speculated step whose request
         info still holds the step in flight's; None when it has none."""
-        if (self.step_dtypes is None and self.GUIDANCE is None) or not per_request_input_metadata:
+        if self.step_dtypes is None or not per_request_input_metadata:
             return None
         metadata = per_request_input_metadata.get(rid)
         loops = metadata.dynamic_loop_iter_counts if metadata is not None else {}
         return int(loops[self.loop_name]) if self.loop_name in loops else None
 
     def split_batches_by_capture_key(self, graph_walk: str) -> bool:
-        # a step mixing dtypes, or guided and unguided rows (requests, or one request's steps), matches no capture
-        # and would run a row at a time
+        # a step mixing dtypes, or guided and unguided requests, matches no capture and would run a row at a time
         del graph_walk
         return self.step_dtypes is not None or self.GUIDANCE is not None
 
