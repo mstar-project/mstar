@@ -16,7 +16,7 @@ WAN22_VARIANT_TI2V_5B = "ti2v_5b"
 
 # The DiT's self-attention: the array over its tokens, and the read that names its resource.
 DIT_TOKENS, SELF_ATTN = "dit_tokens", "dit_self_attn"
-# On SP ranks, splits each row of the DiT's tokens over them (Wan22Model.get_node_resources).
+# On SP ranks, splits each row of the DiT's tokens over them (the SeqShard in Wan22Model.declare_state).
 DIT_SHARD = "dit_seq_shard"
 
 

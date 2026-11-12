@@ -522,16 +522,20 @@ def build_stack(weights: dict[str, torch.Tensor], comm_group: CommGroup | None =
 def _stub_cores(llm, rows: _Rows, doubles: dict | None = None):
     """``llm`` with its handles on Qwen3.5's declared state bound over stubs of the kernels, which read ``rows``.
     ``doubles`` replaces a resource under its key, such as the position resource or the sampler."""
+    from mstar.engine.resources.sequence_shard import SequenceShard
     from mstar.engine.state.adapters import node_handles
     from mstar.model.keys import ROPE
-    from mstar.model.qwen3_5.config import ATTN, GDN_STATE, KV_CACHE, LINEAR_ATTN, SAMPLER
+    from mstar.model.qwen3_5.config import ATTN, GDN_STATE, KV_CACHE, LINEAR_ATTN, LLM_SHARD, SAMPLER
     from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
 
     declaring = model_object(Qwen3_5DenseModel, llm.config, vision_config=None, sampling_defaults={})
     unread = _Unread()
     resources = {
         KV_CACHE: unread, GDN_STATE: unread, ATTN: _AttendCore(rows), LINEAR_ATTN: _DeltaCore(rows), ROPE: None,
-        SAMPLER: None, **(doubles or {}),
+        SAMPLER: None,
+        # one SP rank's shard, whose bracket traces straight through
+        LLM_SHARD: SequenceShard(("main",), 0, None, 0, CommGroup.trivial()),
+        **(doubles or {}),
     }
     llm.bind_node_state(node_handles(declaring, "LLM", resources))
     return llm
@@ -772,6 +776,7 @@ def _omni():
     ``targets:``), layer 1 a dense MLP. A row is ``per_token`` tokens per unit of the
     ``n`` it is asked for, so at ``test_lora_models.ROWS``' sizes one expert gathers
     more rows than the torch reference's 64-row chunk."""
+    from mstar.engine.resources.sequence_shard import SequenceShard
     from mstar.engine.state.adapters import node_handles
     from mstar.model.qwen3_omni.components.thinker import Qwen3OmniThinkerModel
     from mstar.model.qwen3_omni.config import (
@@ -779,6 +784,7 @@ def _omni():
         THINKER_KV,
         THINKER_POS,
         THINKER_SAMPLER,
+        THINKER_SHARD,
         Qwen3OmniModelConfig,
         ThinkerTextConfig,
     )
@@ -795,6 +801,7 @@ def _omni():
         declaring = model_object(Qwen3OmniModel, sub.config, local_dir=None)
         resources = {
             THINKER_KV: _Unread(), THINKER_ATTN: _AttendCore(rows), THINKER_POS: _NoRotation(), THINKER_SAMPLER: None,
+            THINKER_SHARD: SequenceShard(("main",), 0, None, 0, CommGroup.trivial()),
         }
         sub.bind_node_state(node_handles(declaring, "Thinker", resources))
         return sub

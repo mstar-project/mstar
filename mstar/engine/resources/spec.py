@@ -12,7 +12,7 @@ import logging
 from abc import ABC, abstractmethod
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, Protocol
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, NamedTuple, Protocol
 
 if TYPE_CHECKING:
     from mstar.engine.resources.attn.config import SpExchange
@@ -20,6 +20,9 @@ if TYPE_CHECKING:
     from mstar.engine.resources.sequence_shard import SeqShardSpec
 
 logger = logging.getLogger(__name__)
+
+# how a resource stores its per-request state over a node's ranks (`NodeResourceSpec.storage`)
+Storage = Literal["by_head", "by_position", "copied"]
 
 
 @dataclass(frozen=True)
@@ -102,7 +105,6 @@ class RoutingMirror(Protocol):
 class NodeResourceSpec(ABC):
     resource_key: str
     nodes: set[str]
-
     # Built only when the serving config's ``resources:`` block names this spec's key
     # (``mstar.model.base.serving_resources``): a resource a deployment turns on, such as
     # per-request LoRA adapters, declared beside the model's other resources.
@@ -148,22 +150,40 @@ class NodeResourceSpec(ABC):
         return False
 
     @property
-    def places_positions(self) -> bool | None:
-        """Whether this resource places its token positions over ranks that would otherwise hold
-        the same copy (``mstar.engine.resources.context_parallel``); None for one that holds no
-        positions to place. A node whose resources place them runs replicated across its SP ranks."""
+    def storage(self) -> "Storage | None":
+        """How this resource stores its per-request state over a node's ranks: ``by_head`` (each
+        rank a slice of the heads, over TP x SP), ``by_position`` (each a share of every page's
+        token positions over ranks that would otherwise hold the same heads, heads over TP:
+        ``mstar.engine.resources.context_parallel``), or ``copied`` (heads over TP, every SP rank the
+        whole state: a recurrent pool). None for one holding none. A resource
+        over pools that are all ``copied`` shards its heads over TP (``EngineResourceInfo.head_shards``),
+        and a node whose pools store by position runs copied unless its shard's exchange splits it.
+        From raw fields, as the shard's hooks."""
         return None
 
     def resolve_exchange(self, specs: Mapping[str, "NodeResourceSpec"]) -> "SpExchange":
-        """How a split step's tokens reach this attention (``sequence_shard``): ``none`` (the
+        """How a split step's tokens reach this resource (``sequence_shard``): ``none`` (the
         default) for a resource that takes none. From raw fields, so the sequence shard's
-        ``derive`` can ask in any order; a node's steps split where any of its attentions answers
-        otherwise (``SeqShardSpec.splits``)."""
+        ``derive`` can ask in any order; a node's steps split where its shard's ``node_exchange``
+        isn't ``none`` and any of its resources answers otherwise (``SeqShardSpec.splits``).
+
+        Every hook the sequence shard reads is computed from the spec's own raw fields and other
+        specs' hooks, never from a field ``derive`` sets: specs derive in key order, so such a
+        field may still hold its default when the shard derives."""
         return "none"
 
-    def split_step_refusals(self, node: str, shard: "SeqShardSpec", tp: int, sp: int) -> list[str]:
+    def splits_eagerly(self, specs: Mapping[str, "NodeResourceSpec"]) -> bool:
+        """Whether this resource's split steps run eagerly only, their plans differing by rank
+        where a graph holds one: a node with one captures no step that may split
+        (``SeqShardSpec.eager``). False (the default) for one whose split steps replay in a graph.
+        From raw fields, as ``resolve_exchange``."""
+        return False
+
+    def split_step_refusals(
+        self, node: str, shard: "SeqShardSpec", tp: int, sp: int, specs: Mapping[str, "NodeResourceSpec"],
+    ) -> list[str]:
         """What this resource can't run on ``node``, whose steps ``shard`` splits over ``sp`` SP
-        ranks (``tp`` TP ranks each); each a sentence."""
+        ranks (``tp`` TP ranks each), among ``specs`` (every spec, by key); each a sentence."""
         return []
 
     @property
