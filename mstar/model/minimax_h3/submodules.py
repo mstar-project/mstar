@@ -47,6 +47,7 @@ from mstar.model.minimax_h3.components.transformer import (
 from mstar.model.minimax_h3.config import (
     AUDIO_CHANNELS,
     DIT_ROWS,
+    DIT_SHARD,
     KEYFRAME_ENCODE_SEED,
     KEYFRAME_NOISE_AUG,
     NUM_MODALITIES,
@@ -233,6 +234,12 @@ class H3DenoiseSubmodule(DenoiseLoopSubmodule):
             # compiles once (5-8 s), and a step then runs the same kernels, at static speed, whatever
             # was served before it (dynamic-shape kernels ran 14-19% slower per step)
             compile_blocks_(transformer.blocks, dynamic=False)
+        # the node's sequence shard, which brackets the DiT (`bind_state`)
+        self.shard = None
+
+    def bind_state(self, handles) -> None:
+        """The node's sequence shard. See ``NodeSubmodule.bind_node_state``."""
+        self.shard = handles.get(DIT_SHARD)
 
     # hooks -----------------------------------------------------------------
     def bucket_key_for(self, fwd_info: CurrentForwardPassInfo) -> H3Layout:
@@ -279,8 +286,8 @@ class H3DenoiseSubmodule(DenoiseLoopSubmodule):
         compiled blocks see one shape per bucket rather than per prompt length, and the rows
         split evenly over the sequence shard's SP ranks, which keeps the exchanges on their
         copy-free path."""
-        shard = self.sequence_shard
-        return math.lcm(self.row_bucket, 1 if shard is None else shard.group.world_size)
+        shard = self.shard
+        return math.lcm(self.row_bucket, 1 if shard is None else shard.ranks)
 
     def padded_rows(self, bucket_key: H3Layout) -> int:
         return -(-bucket_key.total_rows // self.row_multiple) * self.row_multiple
@@ -348,7 +355,7 @@ class H3DenoiseSubmodule(DenoiseLoopSubmodule):
         else:
             timesteps = torch.stack([timestep, audio_timestep, cond_timestep], dim=-1).float()
         inputs = H3Inputs(video=latents, audio=audio_latents, text=text_embeds, timesteps=timesteps)
-        video_v, audio_v = self.transformer(inputs, layout, shard=self.sequence_shard)
+        video_v, audio_v = self.transformer(inputs, layout, shard=self.shard)
         generated = h3_step(latents[:, n:], video_v[:, n:], timestep.view(-1, 1, 1), sigma, sigma_next)
         return {
             LATENTS: torch.cat([latents[:, :n], generated], dim=1) if n else generated,

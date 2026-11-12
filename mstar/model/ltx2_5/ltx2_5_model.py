@@ -38,8 +38,7 @@ import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.distributed.base import ShardingConfig
-from mstar.engine.resources import SeqShardSpec
-from mstar.engine.state import Array, Attend, Block, Read
+from mstar.engine.state import Array, Attend, Block, Read, SeqShard
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Parallel, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import Model, WalkStep
@@ -199,10 +198,11 @@ class LTX25Model(Model):
         return str(self.snapshot)
 
     # ------------------------------------------------------------ structure
-    def declare_state(self) -> list[Array]:
-        """The dit's six attentions, each an array of the tokens it attends over. On a step the sequence shard splits
-        (`get_node_resources`), a rank holds its share of the video tokens: the video self-attention exchanges them,
-        the video-to-audio attention merges the ranks' attentions, and an attention from the video tokens runs on the
+    def declare_state(self) -> list[Array | SeqShard]:
+        """The dit's six attentions, each an array of the tokens it attends over, and its sequence shard. On a step
+        the shard splits, a rank holds its share of each row's video tokens, never the audio or text (every row of a
+        step is one shape, read as rows, so each splits alike): the video self-attention exchanges them, the
+        video-to-audio attention merges the ranks' attentions, and an attention from the video tokens runs on the
         rank's share."""
         t = self.config.transformer
 
@@ -222,12 +222,8 @@ class LTX25Model(Model):
             within(TEXT_FOR_AUDIO, *audio, AUDIO_TEXT, TEXT_SPAN, queries=AUDIO),
             within(AUDIO_FOR_VIDEO, *audio, AUDIO_TO_VIDEO, AUDIO_SPAN, queries=VIDEO),
             within(VIDEO_FOR_AUDIO, *audio, VIDEO_TO_AUDIO, VIDEO_SPAN, queries=AUDIO),
+            SeqShard(VIDEO_SHARD, nodes={DIT_NODE}, labels={VIDEO_SPAN}),
         ]
-
-    def get_node_resources(self) -> list[SeqShardSpec]:
-        """The DiT's sequence shard, which on SP ranks splits each row's video tokens and never the audio or text:
-        every row of a step is one shape, so each splits alike (``axis`` 1)."""
-        return [SeqShardSpec(resource_key=VIDEO_SHARD, nodes={DIT_NODE}, labels=(VIDEO_SPAN,), axis=1)]
 
     def kernel_settings(self) -> dict[str, dict[str, Any]]:
         # six labels x two slots: 6 GB at the 512 MB default. A floor; the labels whose plans want more than this grow

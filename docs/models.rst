@@ -740,6 +740,29 @@ since the LLM's 2048-token step budget (``MAX_BATCH_TOKENS``) caps both and at
 the default ``min_chunk_tokens`` no step passes it. Each bucket adds captures
 and startup time.
 
+On ``sp_size`` above 1 the LLM declares a sequence shard (``llm_shard``, its
+prefill and mixed walks; decode never splits, and its compiled frame keeps the
+bracket out). With its KV pool stored by position (``kv_cache:
+{context_parallel: true}``) and the shard's default ``exchange`` (``none``), every step
+runs copied, each rank attending its share of the stored context (more KV
+capacity, no faster prefill). Over KV stored by head the LLM on SP ranks is
+refused unless the deployment sets ``llm_shard: {exchange: ulysses}``, which
+has run on CPU only. With ``llm_shard: {exchange: all_gather}`` a
+step of at least ``llm_shard.min_tokens`` tokens splits over
+the SP ranks: each runs the layers on its part of the prompt, attention gathers
+the step's queries, keys and values, and the gated DeltaNet layers trade tokens
+for heads (``ulysses``, or ``state_passing`` where
+their heads per TP rank don't divide by ``sp_size``). The DeltaNet split runs
+eagerly only, so the LLM never splits a captured step: the shard sets its own floor for
+each of its text prefill, vision prefill and mixed walks, one past that walk's largest
+captured bucket (:doc:`serving`). A prompt that fits a bucket runs copied in its graph, a longer
+one runs eagerly and splits, and decode keeps its graphs; ``llm_shard.min_tokens``
+only raises the floor. Chunked prefill is off
+on SP ranks, so a long prompt splits whole.
+The recurrent state is held whole on every SP rank, so decode is unchanged. No
+shipped config splits yet: a TP2 x SP2 9B config lands with its GPU parity run.
+Prefix caching stays on at one rank as before; above one rank it is off.
+
 A captured decode step builds its rotary tables inside the graph from the
 planned positions, rather than staging tables built eagerly before the replay
 (that build sat on the per-step critical path: +13% output tok/s at c=32 on

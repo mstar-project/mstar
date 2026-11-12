@@ -54,7 +54,7 @@ AUDIO_FOR_VIDEO, VIDEO_FOR_AUDIO = "audio_for_video", "video_for_audio"
 VIDEO_SELF, AUDIO_SELF = "dit_attn_video", "dit_attn_audio"
 VIDEO_TEXT, AUDIO_TEXT = "dit_xattn_video", "dit_xattn_audio"
 AUDIO_TO_VIDEO, VIDEO_TO_AUDIO = "dit_xattn_audio_to_video", "dit_xattn_video_to_audio"
-# On SP ranks, splits each row's video tokens over them (LTX25Model.get_node_resources).
+# On SP ranks, splits each row's video tokens over them (the SeqShard in LTX25Model.declare_state).
 VIDEO_SHARD = "dit_video_shard"
 
 # diffusers.pipelines.ltx2.utils

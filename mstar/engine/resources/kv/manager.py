@@ -2470,9 +2470,11 @@ class KVManager(AttentionResource):
         return KVPlanState(token_to_page=empty, token_to_cache=empty, total_tokens=0)
 
     def _decode_plan_state(
-        self, views: list[SequenceView] | None, page_size: int, pages=None, offsets=None,
+        self, views: list[SequenceView] | None, page_size: int, pages=None, offsets=None, *,
+        placement: "ContextParallel | None",
     ) -> KVPlanState:
-        """Write addressing for a step appending one token per request.
+        """Write addressing for a step appending one token per request, at ``placement``'s slots
+        of a placed group (None for an unplaced one).
 
         The packed path needs the indptrs on device and ~a dozen kernels to
         unpack them per token. A decode step's slot is just the end of each
@@ -2481,8 +2483,8 @@ class KVManager(AttentionResource):
         """
         if pages is None or offsets is None:
             pages, offsets = self._decode_locations(views, page_size)
-        if self.placement is not None:
-            pages, offsets = self.placement.write_slots(pages, offsets)
+        if placement is not None:
+            pages, offsets = placement.write_slots(pages, offsets)
         n = len(pages)
         host = np.empty(2 * n, np.int64)
         host[:n], host[n:] = pages, offsets
@@ -2504,17 +2506,20 @@ class KVManager(AttentionResource):
         return pages, offsets
 
     def _stage_packed_plan_state(
-        self, indptrs: PagedIndptrs, static_state: KVPlanState, capture_len: int, page_size: int,
+        self, indptrs: PagedIndptrs, static_state: KVPlanState, capture_len: int, page_size: int, *,
+        placement: "ContextParallel | None",
     ) -> KVPlanState:
         """``_packed_addressing`` staged into the captured state."""
         total = int(indptrs.qo_indptr[-1])
         if total == 0:
             # every row reads without writing (a zero-span context label)
             return self._stage_static(static_state, (), (), 0)
-        both = self._packed_addressing(indptrs, total, page_size)
+        both = self._packed_addressing(indptrs, total, page_size, placement=placement)
         return self._stage_static(static_state, both[:total], both[total:], total)
 
-    def _packed_addressing(self, indptrs: PagedIndptrs, total: int, page_size: int) -> np.ndarray:
+    def _packed_addressing(
+        self, indptrs: PagedIndptrs, total: int, page_size: int, *, placement: "ContextParallel | None",
+    ) -> np.ndarray:
         """Each new token's page, then each one's offset in it (``2 * total``
         int64), from the plan's host indptrs: tokens are appended after each
         row's stored length. One Rust call when the extension has it."""
@@ -2525,7 +2530,7 @@ class KVManager(AttentionResource):
                 qo, indptrs.paged_kv_indptr.numpy(), indptrs.paged_kv_indices.numpy(),
                 indptrs.paged_kv_last_page_len.numpy(), page_size, both,
             )
-            return self._placed(both, total)
+            return self._placed(both, total, placement)
         kvp = indptrs.paged_kv_indptr.numpy()
         spans = np.diff(qo)
         seg = np.repeat(np.arange(len(spans)), spans)
@@ -2544,34 +2549,37 @@ class KVManager(AttentionResource):
         both = np.empty(2 * total, np.int64)
         page, both[total:] = np.divmod(pos, page_size)
         both[:total] = indptrs.paged_kv_indices.numpy()[kvp[:-1][seg] + page]
-        return self._placed(both, total)
+        return self._placed(both, total, placement)
 
-    def _placed(self, both: np.ndarray, total: int) -> np.ndarray:
-        """``both`` (``_packed_addressing``'s layout) at this rank's slots of a placed pool
+    @staticmethod
+    def _placed(both: np.ndarray, total: int, placement: "ContextParallel | None") -> np.ndarray:
+        """``both`` (``_packed_addressing``'s layout) at this rank's slots of a placed group
         (``ContextParallel.write_slots``), in place."""
-        if self.placement is not None:
-            both[:total], both[total:] = self.placement.write_slots(both[:total], both[total:])
+        if placement is not None:
+            both[:total], both[total:] = placement.write_slots(both[:total], both[total:])
         return both
 
-    def _host_plan_state(self, indptrs: PagedIndptrs, total: int, page_size: int) -> KVPlanState:
+    def _host_plan_state(
+        self, indptrs: PagedIndptrs, total: int, page_size: int, *, placement: "ContextParallel | None",
+    ) -> KVPlanState:
         """An eager write's addressing: computed on the host and uploaded in
         one page-locked copy, rather than unpacked on the device from
         uploaded indptrs (four copies and a dozen small kernels a step)."""
-        host = self._packed_addressing(indptrs, total, page_size)
+        host = self._packed_addressing(indptrs, total, page_size, placement=placement)
         both = torch.empty(2 * total, dtype=torch.long, device=self._device)
         self._plan_stager.copy_(both, host)
         return KVPlanState(token_to_page=both[:total], token_to_cache=both[total:], total_tokens=total)
 
     def _stage_decode_plan_state(
         self, views: list[SequenceView] | None, static_state: KVPlanState,
-        capture_len: int, page_size: int, pages=None, offsets=None,
+        capture_len: int, page_size: int, pages=None, offsets=None, *, placement: "ContextParallel | None",
     ) -> KVPlanState:
         """``_decode_plan_state`` staged into the captured state, with no device
         staging tensor."""
         if pages is None or offsets is None:
             pages, offsets = self._decode_locations(views, page_size)
-        if self.placement is not None:
-            pages, offsets = self.placement.write_slots(pages, offsets)
+        if placement is not None:
+            pages, offsets = placement.write_slots(pages, offsets)
         return self._stage_static(static_state, pages, offsets, len(pages))
 
     def _setup_plan_states(
@@ -2583,6 +2591,8 @@ class KVManager(AttentionResource):
             # written outside the graph (KVStep.eager_write): never staged
             lease = None
         page_size = self._groups[group].page_size
+        # the placement stripes the first group alone; a window group is whole on every partner
+        placement = self.placement if group == 0 else None
         for plan_label, indptrs in plan_output.items():
             label = (plan_label, group)
             if indptrs.is_decode and lease is not None:
@@ -2596,7 +2606,7 @@ class KVManager(AttentionResource):
                     None if located else indptrs.views,
                     self._static_plan_state(lease.slot, label, lease.bucket.num_tokens),
                     lease.bucket.num_tokens, page_size,
-                    pages=indptrs.decode_pages, offsets=indptrs.decode_offsets,
+                    pages=indptrs.decode_pages, offsets=indptrs.decode_offsets, placement=placement,
                 )
                 self._staged_outputs[(lease.slot, label)] = indptrs
                 if ctx.is_preplan:
@@ -2610,7 +2620,7 @@ class KVManager(AttentionResource):
                 plan_state = self._stage_packed_plan_state(
                     indptrs.cpu_indptrs,
                     self._static_plan_state(lease.slot, label, lease.bucket.num_tokens),
-                    lease.bucket.num_tokens, page_size,
+                    lease.bucket.num_tokens, page_size, placement=placement,
                 )
                 self._staged_outputs[(lease.slot, label)] = indptrs
                 if ctx.is_preplan:
@@ -2622,7 +2632,7 @@ class KVManager(AttentionResource):
             if indptrs.is_decode:
                 plan_state = self._decode_plan_state(
                     None if indptrs.decode_pages is not None else indptrs.views, page_size,
-                    indptrs.decode_pages, indptrs.decode_offsets,
+                    indptrs.decode_pages, indptrs.decode_offsets, placement=placement,
                 )
             elif total_tokens == 0:
                 # every segment span 0 (a decoder reading the encoder context
@@ -2630,7 +2640,7 @@ class KVManager(AttentionResource):
                 # addressing to upload and unpack
                 plan_state = self._empty_plan_state()
             else:
-                plan_state = self._host_plan_state(indptrs.cpu_indptrs, total_tokens, page_size)
+                plan_state = self._host_plan_state(indptrs.cpu_indptrs, total_tokens, page_size, placement=placement)
             # (a leased step staged above: these are eager)
             if eager_write and ctx.is_preplan and plan_state.token_to_page.is_cuda:
                 plan_state.ready = torch.cuda.Event()

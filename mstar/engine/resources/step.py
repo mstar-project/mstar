@@ -256,7 +256,7 @@ class SubmoduleStep:
     # declared array or sampler -> what this step does to it, which the engine
     # expands into ``steps`` (`mstar.engine.state.adapters.state_steps`)
     state: Mapping[str, Any] = field(default_factory=dict)
-    # the handles of what ``state`` lists, set by that expansion
+    # the handles of what ``state`` lists, and of the node's sequence shard, set by that expansion
     state_handles: tuple[StepHandle, ...] = field(default=(), init=False)
 
     def __post_init__(self):

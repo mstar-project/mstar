@@ -40,7 +40,6 @@ from transformers import AutoTokenizer
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import FINAL_PREFILL, PartitionDefinition
-from mstar.engine.resources import SeqShardSpec
 from mstar.engine.resources.lora import LoraSpec
 from mstar.engine.state import (
     Array,
@@ -55,6 +54,7 @@ from mstar.engine.state import (
     Rope,
     Sampler,
     SampleSettings,
+    SeqShard,
     Value,
 )
 from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential, TensorPointerInfo
@@ -309,7 +309,7 @@ class Qwen3OmniModel(Model):
     # -------------------------------------------------------------------
     # Model ABC: resources
     # -------------------------------------------------------------------
-    def declare_state(self) -> list[Array | Sampler]:
+    def declare_state(self) -> list[Array | Sampler | SeqShard]:
         c = self.config
         # min_p is on where the checkpoint defaults it on, so that default is not refused
         defaults = self._generation_defaults()
@@ -340,6 +340,11 @@ class Qwen3OmniModel(Model):
             Array(VISION_TOKENS, nodes={"vision_encoder"}, layers=frozenset(range(v.depth)), max_len=0,
                   entry=KVEntry(heads=v.num_heads, head_dim=v.head_dim),
                   reads={VISION_ATTN: Read(mask=Block(), op=Attend(q_heads=v.num_heads))}),
+            # every walk may split, where the deployment sets the shard's exchange: all_gather or
+            # ring over KV stored by position, ulysses over KV stored by head. A decode step never
+            # does. "none" by default, so a Thinker on SP ranks over KV stored by head is refused
+            # until a deployment opts into Ulysses, which has run on CPU only
+            SeqShard(THINKER_SHARD, nodes={"Thinker"}, exchange="none"),
         ]
 
     def _lora_spec(self) -> LoraSpec:
@@ -359,14 +364,7 @@ class Qwen3OmniModel(Model):
         )
 
     def get_node_resources(self):
-        return [
-            # every walk may split, where the deployment sets the shard's exchange: all_gather or
-            # ring over KV stored by position, ulysses over KV stored by head. A decode step never
-            # does. "none" by default, so a Thinker on SP ranks over KV stored by head is refused
-            # until a deployment opts into Ulysses, which has run on CPU only
-            SeqShardSpec(resource_key=THINKER_SHARD, nodes={"Thinker"}, labels=("main",), axis=0, exchange="none"),
-            self._lora_spec(),
-        ]
+        return [self._lora_spec()]
 
     def kernel_settings(self) -> dict[str, dict[str, Any]]:
         from mstar.model.components.aut_submodule import AuTEncoderSubmodule
