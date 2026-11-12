@@ -310,6 +310,18 @@ class H3PackedDenoise(DenoiseLoopSubmodule):
             num_pad_rows=pad,
         )
 
+    def bind_node_resources(self, resources) -> None:
+        super().bind_node_resources(resources)
+        pipeline = getattr(self.transformer, "ulysses_pipeline", None)
+        resource = self.node_resources.get(self.attn_resource_key) if self.attn_resource_key else None
+        if pipeline is not None and pipeline.group_streams and resource is not None \
+                and not getattr(resource, "concurrent_streams", False):
+            # Served on FlashInfer (H200) with group streams, clips came out differently now and then, the base
+            # tree's too; on one stream, or on FA4 with group streams, never. Every rank has the same resource.
+            logger.warning("ulysses_group_streams off: the %s attention is not run on several streams at once",
+                           type(resource).__name__)
+            pipeline.group_streams = False
+
     def attend(self, layout: H3StepLayout):
         """The step's attention within ``layout.segments``: the ragged resource's plan of
         ``attention_segments``, or SDPA over each segment."""

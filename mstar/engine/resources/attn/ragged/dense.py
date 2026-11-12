@@ -53,15 +53,19 @@ def fa4_unavailable_reason(device=None) -> str | None:
 
 class DenseRaggedManager(_RaggedSelfManagerBase):
     wrapper_class = DenseRaggedPrefillWrapper
+    concurrent_streams = True
 
 
 class DenseRaggedCrossManager(_RaggedCrossManagerBase):
     wrapper_class = DenseRaggedCrossPrefillWrapper
+    concurrent_streams = True
 
 
 class Fa4RaggedManager(_RaggedSelfManagerBase):
     wrapper_class = Fa4RaggedPrefillWrapper
+    concurrent_streams = True
 
 
 class Fa4RaggedCrossManager(_RaggedCrossManagerBase):
     wrapper_class = Fa4RaggedCrossPrefillWrapper
+    concurrent_streams = True

@@ -257,6 +257,8 @@ class _RaggedManagerBase:
     extra constructor args (a workspace, a kernel backend) go in ``_build_wrapper``."""
 
     wrapper_class: type[_RaggedPrefillBase]
+    # whether calls may run at once on several streams: no scratch shared between calls
+    concurrent_streams = False
 
     def __init__(
         self,

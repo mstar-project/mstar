@@ -603,6 +603,18 @@ class _SPStub:
         self.sp_group = CommGroup(0, 0, list(range(world)))
 
 
+@pytest.mark.parametrize(("concurrent", "streams"), [(True, True), (False, False)])
+def test_group_streams_need_an_attention_that_runs_on_several_streams_at_once(concurrent, streams):
+    """With an attention resource whose calls share scratch (FlashInfer), the head groups attend on one stream."""
+    from types import SimpleNamespace
+
+    dit = _SPStub(4)
+    dit.ulysses_pipeline = SimpleNamespace(group_streams=True)
+    node = H3DenoiseSubmodule(dit, H3Config(), loop_name=DENOISE_LOOP, attn_resource_key=DIT_ATTN)
+    node.bind_node_resources({DIT_ATTN: SimpleNamespace(concurrent_streams=concurrent)})
+    assert dit.ulysses_pipeline.group_streams is streams
+
+
 @pytest.mark.parametrize("world", [1, 2, 4, 8])
 @pytest.mark.parametrize("row_bucket", [1, 256])
 def test_the_padded_rows_split_evenly_over_the_sp_ranks_at_every_prompt_length(world, row_bucket):
