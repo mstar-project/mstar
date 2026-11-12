@@ -1083,6 +1083,10 @@ The spec types are:
      - Block-causal self-attention within each span (``AttentionStep(causal=False)``): causal
        between ``block_size``-token blocks, bidirectional within one. Same config. See
        `Block-causal attention within spans`_.
+   * - ``RaggedKeyPrefixAttentionSpec(config=RaggedAttentionConfig(...))``
+     - Self-attention within each span over a prefix of its keys
+       (``KeyPrefixAttentionStep(key_lens=...)``): every token queries, only the first
+       ``key_lens[i]`` are keys. Same config. See `Key padding within spans`_.
    * - ``BlockCausalAttentionSpec(config=AttentionConfig(kv_cache=...), block_size=...)``
      - The same mask over a paged KV cache: a row's new tokens attend its cached blocks and
        their own, and a step runs only new tokens. FlashInfer only. See `Block-causal
@@ -1457,6 +1461,17 @@ for the worst layout the bucket's token count allows.
    72, which the FlashInfer kernel — it supports only a few fixed head dimensions — forces
    us to zero-pad to 128. So that tower attends through ``VIT_TOKENS`` only when it is
    replaying a captured graph, and runs flash-attn varlen otherwise.
+
+Key padding within spans
+^^^^^^^^^^^^^^^^^^^^^^^^
+
+An encoder run over padded clips can carry a key padding mask: a span's last frames are
+padding as keys but still compute outputs, which can reach what the model keeps (Step-Audio2's
+Whisper encoder masks one or two frames a clip). Declare a ``RaggedKeyPrefixAttentionSpec``
+and step it with ``KeyPrefixAttentionStep``, one segment per span and ``key_lens`` parallel to
+the segments, each in ``1..span``. The resource gathers each span's key prefix into a key layout
+of its own and runs the cross-attention kernel against it; under a captured graph the gather
+index is a static buffer the plan restages, padded to the bucket's tokens.
 
 Block-causal attention over a KV cache
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -2044,9 +2059,9 @@ methods are:
    The Qwen3-Omni Talker and Fish S2 Pro's AR keep their EOS frame out of the codec
    stream this way; a ``TokenStop`` names such outputs in ``withhold``, left unrouted on a
    row whose token is a stop id (the Qwen3-TTS Talker).
-   Only an output that leaves by a streaming edge can be withheld (any other consumer
-   would wait for an item that never comes), and not one that a node this worker
-   speculates into reads, nor the loop-back signal. Startup refuses a
+   Only an output that leaves by a streaming edge, as a tensor or by value, can be withheld
+   (any other consumer would wait for an item that never comes), and not one that a node
+   this worker speculates into reads, nor the loop-back signal. Startup refuses a
    ``TokenStop.withhold`` that breaks this; a ``StopCheck`` from ``check_stop`` is not
    checked.
 
@@ -2509,19 +2524,28 @@ the prefill) still brings it routed, and that read puts it over the slot's.
 and a node on it that reads the routed token sets ``device_loopback = None``; Whisper and
 Qwen3-Omni's Thinker declare their own. Qwen3.5, Qwen3-ASR and Whisper read the tokens with
 ``last_sampled``, and put a row's routed token over its slot's with ``splice_loopback_ids``.
+Its ``walk`` may be a ``frozenset`` of walks when several decode walks read the token back; a
+combined step's rows each follow their own walk, and naming a combined walk is refused at
+startup.
 
 A token that also streams to another node can go down the stream by value, when the
 stream's ``Connection`` sets ``by_value=True``: its consumer then takes a window of the
-stream as one CPU int64 tensor of its items' values. A step whose node names the signal
-in ``inline_signals(walk)`` sends each row's value in the step's ``EDGE_ITEMS`` frame
-instead of a tensor, with nothing to stage, read or acknowledge. A step carries one
-inline signal, the first of those it outputs, so a client token and a different stream
-token cannot both ride inline. The step keeps its rows on the device only if every
-output is one of ``device_loopback_signals``, so the streamed signal must also be the
-loop-back signal: MiniCPM-o's TTS decode loops its code back on the device and streams
-the same code to the vocoder by value. A lockstep node's streams keep their tensors,
-and a ``by_value`` connection cannot join its items, drive its consumer's walk or come
-from the client.
+stream as one CPU int64 tensor of its items' values. A step whose node names the signal in
+``inline_signals(walk)`` sends each row's value in the step's ``EDGE_ITEMS`` frame instead
+of a tensor, with nothing to stage, read or acknowledge. A step carries one inline column:
+the first of those signals it outputs, and every other it outputs that reads the same stop
+buffer, so a client token and a stream of the same token both ride inline; a signal read
+off another buffer keeps its tensors. A row whose stop check withheld one of them
+(``StopCheck.withheld``) sends nothing for it, and its stream counts no item. The step
+keeps its rows on the device when every output is one of ``device_loopback_signals`` or
+rides the column on every edge (a client emit or a ``by_value`` stream, neither persisted,
+no non-streamed edge counted toward the conductor's output tokens, and not collected by
+an enclosing loop):
+MiniCPM-o's TTS decode loops its code back on the device and streams the same code to the
+vocoder by value. A rows-only step builds no per-request outputs and skips
+``postprocess``, so whatever a submodule's ``postprocess`` does must be about the outputs
+a stored step routes. A lockstep node's streams keep their tensors, and a ``by_value``
+connection cannot join its items, drive its consumer's walk or come from the client.
 
 On such a node a captured step writes each row's token and RNG offset back to the request's
 row inside the graph (``knobs: sampler_ingraph_scatter``, on by default). Those rows are
