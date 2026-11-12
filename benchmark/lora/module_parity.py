@@ -58,6 +58,7 @@ import re
 import sys
 import tempfile
 from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -138,6 +139,59 @@ def _stub_attention(root, lengths, rope=None) -> None:
             module.attend = _Attend(lengths)
             if rope is not None:
                 module._apply_rope = lambda q, k, label, rope=rope: rope(q, k)
+
+
+class _AttendCore:
+    """``_Attend`` as the KV array's read runs it, on the k and v its add held."""
+
+    requires_kv_write = False
+
+    def __init__(self, lengths):
+        self.attend = _Attend(lengths)
+
+    def reads_step_kv(self, label=None):
+        return True
+
+    def run(self, q, *, label, kv_cache_layer, k, v, layer_idx):
+        return self.attend(q, k, v)
+
+
+class _Positions:
+    """``rope(q, k)`` in place of the array's position resource (None leaves positions out)."""
+
+    def __init__(self, rope):
+        self.rope = rope
+
+    def apply_qk(self, q, k, *, label, rope_dtype):
+        return (q, k) if self.rope is None else self.rope(q, k)
+
+
+class _Unread:
+    """The KV pages, which the stubbed read never reads."""
+
+    def layer_view(self, i):
+        return None
+
+    def opens_label(self, rid, label):
+        return True
+
+
+@contextmanager
+def _step_over(sub, lengths, array: str):
+    """A step of one row per ``lengths`` with ``sub``'s handle on ``array`` open, as the engine opens it around a
+    forward."""
+    from mstar.engine.resources.step import Segment, StepContext, SubmoduleStep
+    from mstar.engine.state import ArrayStep
+
+    segments = [Segment(rid, "main", n) for rid, n in enumerate(lengths)]
+    step = SubmoduleStep(segments=segments, state={array: ArrayStep()})
+    step.set_state_handles((sub.state_handles[array],))
+    step.set_ctx(StepContext(tuple(range(len(lengths))), "prefill", 0, False))
+    step.begin_calls()
+    try:
+        yield
+    finally:
+        step.end_calls()
 
 
 def _last(hidden, lengths):
@@ -316,12 +370,29 @@ def _higgs() -> ModelSpec:
 
 
 def _qwen3_omni() -> ModelSpec:
+    from mstar.engine.state.adapters import node_handles
+    from mstar.model.qwen3_omni.config import THINKER_ATTN, THINKER_KV, THINKER_POS, THINKER_SAMPLER
+    from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
     from mstar.model.submodule_base import engine_step
 
+    def bind(sub, lengths, rope=None):
+        """``sub``'s handles on the Thinker's declared state, over the SDPA stub and ``rope``."""
+        declaring = object.__new__(Qwen3OmniModel)
+        declaring.config, declaring.local_dir = sub.config, None
+        sub.bind_node_state(node_handles(declaring, "Thinker", {
+            THINKER_KV: _Unread(), THINKER_ATTN: _AttendCore(lengths), THINKER_POS: _Positions(rope),
+            THINKER_SAMPLER: None,
+        }))
+
     def run(sub, ids, lengths, rope=None):
-        _stub_attention(sub.model, lengths, rope)
-        hidden, _, _ = sub.model(input_embeds=sub.model.model.embed_tokens(ids), label="main")
+        bind(sub, lengths, rope)
+        with _step_over(sub, lengths, THINKER_KV):
+            hidden, _, _ = sub.model(input_embeds=sub.model.model.embed_tokens(ids))
         return sub.model.lm_head(_last(hidden, lengths)).float()
+
+    def declare(sub, rids, ids):
+        bind(sub, [len(i) for i in ids])
+        return engine_step(sub, "prefill_text", rids, _ar_inputs(ids))
 
     def hf(model):
         import torch
@@ -346,8 +417,7 @@ def _qwen3_omni() -> ModelSpec:
         )
 
     return ModelSpec(
-        "Thinker", lambda model: _random_ids(150000), run,
-        lambda sub, rids, ids: engine_step(sub, "prefill_text", rids, _ar_inputs(ids)),
+        "Thinker", lambda model: _random_ids(150000), run, declare,
         config="configs/qwen3omni_colocated.yaml",
         request={"output_modalities": "text", "model_kwargs": {"temperature": 0.0}},
         hf=hf,
@@ -355,12 +425,43 @@ def _qwen3_omni() -> ModelSpec:
 
 
 def _qwen3_tts() -> ModelSpec:
+    import torch
+
+    from mstar.engine.state.adapters import node_handles
+    from mstar.model.qwen3_tts.config import CODE_PRED_SAMPLER, TALKER_ATTN, TALKER_KV, TALKER_SAMPLER
+    from mstar.model.qwen3_tts.qwen3_tts_model import Qwen3TTSModel
     from mstar.model.submodule_base import engine_step
 
+    class RowPositions(_Positions):
+        """``_Positions`` for layers that rotate inside their state op from the step's position ids: each row's from 0
+        with ``rope``, all 0 (no rotation) without."""
+
+        def __init__(self, rope, device):
+            super().__init__(rope)
+            self.device = device
+
+        def pos_ids(self, label):
+            positions = _POSITIONS["positions"].to(self.device)
+            return positions if self.rope is not None else torch.zeros_like(positions)
+
+    def bind(sub, lengths, rope=None):
+        """``sub``'s handles on the Talker's declared state, over the SDPA stub and ``rope``."""
+        declaring = object.__new__(Qwen3TTSModel)
+        declaring.config, declaring.codec_dtype = sub.config, torch.float32
+        sub.bind_node_state(node_handles(declaring, "Talker", {
+            TALKER_KV: _Unread(), TALKER_ATTN: _AttendCore(lengths), "talker_pos": RowPositions(rope, sub.get_device()),
+            TALKER_SAMPLER: None, CODE_PRED_SAMPLER: None,
+        }))
+
     def run(sub, ids, lengths, rope=None):
-        _stub_attention(sub.model, lengths, rope)
-        hidden = sub.model(sub.model.model.codec_embedding(ids), label="main")
+        bind(sub, lengths, rope)
+        with _step_over(sub, lengths, TALKER_KV):
+            hidden = sub.model(sub.model.model.codec_embedding(ids))
         return sub.model.codec_head(_last(hidden, lengths)).float()
+
+    def declare(sub, rids, ids):
+        bind(sub, [len(i) for i in ids])
+        return engine_step(sub, "talker_prefill", rids, _ar_inputs(ids))
 
     def hf(model):
         """transformers' Qwen3 over the Talker's checkpoint tensors (the codec embedding as
@@ -398,8 +499,7 @@ def _qwen3_tts() -> ModelSpec:
         )
 
     return ModelSpec(
-        "Talker", lambda model: _random_ids(2048), run,
-        lambda sub, rids, ids: engine_step(sub, "talker_prefill", rids, _ar_inputs(ids)),
+        "Talker", lambda model: _random_ids(2048), run, declare,
         config="configs/qwen3tts.yaml",
         # greedy on every codebook: temperature alone leaves groups 1-15 sampling, unseeded
         request={"output_modalities": "audio", "model_kwargs": {"temperature": 0.0, "subtalker_dosample": False}},

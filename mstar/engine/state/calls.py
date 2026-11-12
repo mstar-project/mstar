@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from mstar.engine.resources.sampler.utils import FUSED_DRAW_MAX_VOCAB, FusedDrawArgs
 from mstar.engine.resources.step import Segment, StepHandle
 from mstar.engine.state.contract import EMPTY, Array, ArrayStep, CausalConv, GatedDeltaNet, Op, Sampler
 
@@ -224,6 +225,12 @@ class ArrayHandle(StepHandle):
             raise self._refusal(self._write_refused)
         raise self._unsupported("write")
 
+    def set_start(self, start: Mapping[str, torch.Tensor]) -> None:
+        """What a row of this Value reads while it has nothing written, has span 0 or pads a step: ``start``'s tensor
+        for each field it names, of one entry's shape on this rank, and zeros for the rest. The tensors are made at load
+        and never written, since a captured read keeps their address."""
+        raise self._unsupported("set_start")
+
     def block(self, field: str, layer: int) -> torch.Tensor:
         """``layer``'s view of the entry field ``field``, for an update's op."""
         raise self._unsupported("block")
@@ -248,8 +255,8 @@ class ArrayHandle(StepHandle):
         return getattr(self.reads[read], field)
 
     def _update(self, kind: type[Op], layer: int) -> tuple[Any, torch.Tensor]:
-        """Record the update of type ``kind`` on the field ``kind`` writes in ``layer``, and return the resource that
-        runs the update and that field's view."""
+        """Record the update of type ``kind`` on ``layer``'s field that ``kind`` writes, and return the resource that
+        runs it and the field's view."""
         raise self._unsupported(f"an update of type {kind.__name__}")
 
     def _host(self, request: int, label: str, layer: int) -> Mapping[str, object]:
@@ -266,6 +273,7 @@ class SamplerHandle(StepHandle):
         self.rows = ()
         self._open = False
         self._drawn = 0
+        self._fused = False
 
     def _refusal(self, cause: str) -> ValueError:
         return ValueError(f"Sampler {self.name!r}: {cause}")
@@ -276,19 +284,23 @@ class SamplerHandle(StepHandle):
         self._open = True
         self.rows = step.ctx.padded_request_ids
         self._drawn = 0
+        self._fused = False
 
     def check_step(self, step) -> None:
         # a step that keeps no row's sample may skip the kernel: an eager prefill short of its last chunk
         if step.ctx.replays or (not self._drawn and step.state[self.name].kept_rows == frozenset()):
             return
         if self._drawn != self.sampler.draws:
-            raise self._refusal(f"a step listing it sampled {self._drawn} times, and draws is {self.sampler.draws}")
+            counted = (f"counted {self._drawn} draws by sample and drew" if self._fused
+                       else f"sampled {self._drawn} times")
+            raise self._refusal(f"a step listing it {counted}, and draws is {self.sampler.draws}")
 
     def commit_step(self, step) -> None:
         """Nothing: the resource holds a sampler's state."""
 
     def end_step(self, step) -> None:
         self._open = False
+        self._fused = False
 
 
 @torch.compiler.disable
@@ -359,6 +371,31 @@ def sample(s: SamplerHandle, logits: torch.Tensor) -> torch.Tensor:
     if s._drawn > s.sampler.draws:
         raise s._refusal(f"sample number {s._drawn} in one step, and draws is {s.sampler.draws}")
     return s.resource.sample(list(s.rows), logits=logits)
+
+
+@torch.compiler.disable
+def fused_draw_args(s: SamplerHandle) -> FusedDrawArgs | None:
+    """Not frozen yet, like the rest of the fused draw. Each row's sampling parameters, padding rows included, for a
+    kernel in the forward that draws as `sample` would. None when `sample` would draw any other way this step, or the
+    declared vocabulary is past what `draw_row` reproduces, and the model then calls `sample`."""
+    if not s._open:
+        raise s._refusal("fused_draw_args in a step that doesn't list the sampler")
+    args = None if s.sampler.vocab_size > FUSED_DRAW_MAX_VOCAB else s.resource.fused_draw_args()
+    s._fused = args is not None
+    return args
+
+
+@torch.compiler.disable
+def drew(s: SamplerHandle, n: int) -> None:
+    """Not frozen yet, like the rest of the fused draw. Count ``n`` draws a kernel made from `fused_draw_args`, and
+    advance each row's sampling state as ``n`` `sample` calls would. Called after the launch, so the advance is ordered
+    after the kernel's reads."""
+    if not s._fused:
+        raise s._refusal("drew, and no fused_draw_args this step returned arguments")
+    if not (type(n) is int and n >= 1 and s._drawn + n <= s.sampler.draws):
+        raise s._refusal(f"drew({n!r}) after {s._drawn} draws, and draws is {s.sampler.draws}")
+    s.resource.advance_offsets(n)
+    s._drawn += n
 
 
 # Eager as a whole, as `AttentionManager.select_last_hidden` explains.

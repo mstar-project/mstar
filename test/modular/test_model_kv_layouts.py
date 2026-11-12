@@ -410,7 +410,7 @@ def test_fish_lays_out_the_rows_its_prefill_builds(clone):
 
     output = model.process_prompt("hi", ["text", "audio"] if clone else ["text"], ["audio"], tensors, ref_text="r")
 
-    layout = output.metadata["kv_layout"]
+    layout = output.metadata["state_layout"]
     [span] = layout[AR_KV]["main"].spans
     assert span.walk == ("ar_prefill_clone" if clone else "ar_prefill")
     prefix_len, frames = output.metadata[PROMPT_LAYOUT_KEY]
@@ -589,12 +589,12 @@ def test_qwen3_tts_lays_out_the_rows_its_prefill_builds(variant, text, kwargs):
         text, ["audio", "text"] if clone else ["text"], ["audio"], tensors=tensors, **kwargs,
     )
 
-    layout, metadata = output.metadata["kv_layout"], output.metadata
+    layout, metadata = output.metadata["state_layout"], output.metadata
     [span] = layout[TALKER_KV]["main"].spans
     assert span.walk == ("talker_prefill_clone" if clone else "talker_prefill")
     frames = metadata[PROMPT_LAYOUT_KEY][4]
-    prefill = _tiny_qwen3_tts_talker()._build_prefill(
-        "r", torch.zeros_like(output.new_input_tensors["text_inputs"][0]), metadata[PROMPT_LAYOUT_KEY],
+    prefill, _ = _tiny_qwen3_tts_talker()._build_prefill(
+        torch.zeros_like(output.new_input_tensors["text_inputs"][0]), metadata[PROMPT_LAYOUT_KEY],
         speaker_id=40 if metadata[SPEAKER_ID_KEY] >= 0 else -1,
         language_id=41 if metadata[LANGUAGE_ID_KEY] >= 0 else -1,
         speaker_embed=torch.randn(16) if clone else None,

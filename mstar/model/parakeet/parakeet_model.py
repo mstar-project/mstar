@@ -11,8 +11,7 @@ frames to skip; Nemotron conditions every frame on a language prompt.
 Architecture (2 nodes, single partition):
     audio_encoder — log-mel + FastConformer, batched
     transducer    — greedy decoding, a chunk of steps per loop iteration,
-                    batched; each request's decoder state in a recurrent
-                    state slot
+                    batched; each request's decoder state in a Value
 
 Graph walk:
     transcribe — audio_encoder -> a transducer loop over the encoder output:
@@ -22,12 +21,12 @@ Graph walk:
 
 import json
 import logging
+from typing import Any
 
 import torch
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.engine.resources import NodeResourceSpec
-from mstar.engine.resources.recurrent import RecurrentStateConfig, RecurrentStateSpec
+from mstar.engine.state import Array, Value
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import Model, ProcessPromptOutput, WalkStep
@@ -87,20 +86,15 @@ class ParakeetModel(Model):
         """Encoder frames for a clip, as the encoder node counts them."""
         return int(self.config.encoder.output_lengths(num_samples // HOP_LENGTH))
 
-    def get_node_resources(self) -> list[NodeResourceSpec]:
-        # no cache and no sampler (decoding is greedy): the decoder state is all
-        return [
-            RecurrentStateSpec(
-                resource_key=TRANSDUCER_STATE, nodes={"transducer"},
-                config=RecurrentStateConfig(
-                    # the LSTM's layers are in h's and c's shape
-                    num_layers=1,
-                    blocks=self.config.transducer.state_blocks(),
-                    # + 1 for the pool's sink slot
-                    max_slots=self.MAX_CONCURRENT_REQUESTS + 1,
-                ),
-            ),
-        ]
+    def declare_state(self) -> list[Array]:
+        # Decoding is greedy, so there is no cache and no sampler. The LSTM's layers are in h's and c's shape.
+        return [Value(
+            TRANSDUCER_STATE, nodes={"transducer"}, layers=frozenset({0}), entry=self.config.transducer.state_entry(),
+        )]
+
+    def kernel_settings(self) -> dict[str, dict[str, Any]]:
+        # + 1 for the pool's sink slot
+        return {TRANSDUCER_STATE: {"max_slots": self.MAX_CONCURRENT_REQUESTS + 1}}
 
     def validate_config_yaml(self, config: dict, config_path: str) -> None:
         """Refuse a ``max_concurrent_requests`` the state pool can't hold. A

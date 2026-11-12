@@ -31,22 +31,24 @@ Prompt (the reference SDK's chat template, system turn included):
 
 import logging
 from collections.abc import Mapping
+from typing import Any
 
 import torch
 
-from mstar.engine.resources import (
-    AttentionConfig,
-    AttentionSpec,
-    KVSpec,
-    NodeResourceSpec,
-    PagedKVConfig,
-    PositionConfig,
-    PositionSpec,
-    RaggedAttentionConfig,
-    RaggedAttentionSpec,
-    ResourceReqConfig,
-    SamplerSpec,
+from mstar.engine.state import (
+    Array,
+    Attend,
+    Block,
+    Causal,
+    KVEntry,
+    Layout,
+    Positions,
+    Read,
+    Rope,
+    Sampler,
+    SampleSettings,
 )
+from mstar.model.base import ProcessPromptOutput
 from mstar.model.components.audio_features import LogMelSpectrogram
 from mstar.model.components.request_kwargs import (
     GREEDY_SAMPLING,
@@ -62,11 +64,11 @@ from mstar.model.qwen3_asr.config import (
     ASR_TEXT_TAG,
     ATTN,
     AUT_ATTN,
+    AUT_TOKENS,
     ENCODER_NODE,
     KV_CACHE,
     LANGUAGE_PREFIX,
     LLM_NODE,
-    ROPE,
     SAMPLER,
     Qwen3ASRModelConfig,
 )
@@ -145,53 +147,53 @@ class Qwen3ASRModel(MultimodalDecoderModel):
         frames = self.config.max_audio_samples // self.config.hop_length
         return -(-frames // self.config.audio.n_window_infer)
 
-    def get_node_resources(self) -> list[NodeResourceSpec]:
-        text = self.config.text
-        audio = self.config.audio
-        kv_config = PagedKVConfig(
-            num_layers=text.num_hidden_layers,
-            num_kv_heads=text.num_key_value_heads,
-            head_dim=text.head_dim,
-            max_seq_len=text.max_position_embeddings,
-            num_qo_heads=text.num_attention_heads,
-            max_num_pages=self.KV_PAGES,
-        )
+    def declare_state(self) -> list[Array | Sampler]:
+        text, audio = self.config.text, self.config.audio
+        capabilities = sampler_capabilities(self.sampling_defaults)
         return [
-            RaggedAttentionSpec(
-                resource_key=AUT_ATTN, nodes={ENCODER_NODE},
-                config=RaggedAttentionConfig(
-                    num_qo_heads=audio.encoder_attention_heads,
-                    num_kv_heads=audio.encoder_attention_heads,
-                    head_dim=audio.head_dim,
-                    # every 8 s window of a request is its own segment
-                    max_segments_per_request=self.max_windows_per_request,
-                ),
+            Array(
+                AUT_TOKENS, nodes={ENCODER_NODE}, layers=frozenset(range(audio.encoder_layers)), max_len=0,
+                entry=KVEntry(heads=audio.encoder_attention_heads, head_dim=audio.head_dim),
+                reads={AUT_ATTN: Read(mask=Block(), op=Attend(q_heads=audio.encoder_attention_heads))},
             ),
-            KVSpec(resource_key=KV_CACHE, nodes={LLM_NODE}, config=kv_config),
-            # two query heads per KV head: the CUDA-core decode kernel wins
-            AttentionSpec(
-                resource_key=ATTN, nodes={LLM_NODE},
-                config=AttentionConfig(kv_cache=KV_CACHE, decode_tensor_cores=False),
+            Array(
+                KV_CACHE, nodes={LLM_NODE}, layers=frozenset(range(text.num_hidden_layers)),
+                entry=KVEntry(heads=text.num_key_value_heads, head_dim=text.head_dim),
+                max_len=text.max_position_embeddings, positions=Positions(rope=Rope(theta=text.rope_theta)),
+                reads={ATTN: Read(mask=Causal(), op=Attend(q_heads=text.num_attention_heads))},
             ),
-            PositionSpec(
-                resource_key=ROPE, nodes={LLM_NODE},
-                config=PositionConfig(kv_cache=KV_CACHE, rope_theta=text.rope_theta),
-            ),
-            SamplerSpec(
-                resource_key=SAMPLER, nodes={LLM_NODE},
-                vocab_size=text.vocab_size,
-                **sampler_capabilities(self.sampling_defaults),
+            Sampler(
+                SAMPLER, nodes={LLM_NODE}, vocab_size=text.vocab_size,
+                penalty=capabilities["enable_repetition_penalty"], min_p=capabilities["enable_min_p"],
             ),
         ]
+
+    def kernel_settings(self) -> dict[str, dict[str, Any]]:
+        return {
+            # every 8 s window of a request is its own segment
+            AUT_ATTN: {"max_segments_per_request": self.max_windows_per_request},
+            # two query heads per KV head: the CUDA-core decode kernel wins
+            ATTN: {"decode_tensor_cores": False},
+            KV_CACHE: {"max_num_pages": self.KV_PAGES},
+        }
 
     def request_kwargs(self) -> frozenset[str]:
         return frozenset({"language", "initial_prompt", "assistant_prefix", "max_output_tokens", *SAMPLING_KEYS})
 
     def get_request_resource_configs(
         self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
-    ) -> dict[str, ResourceReqConfig]:
+    ) -> dict[str, SampleSettings]:
         del input_modalities, output_modalities
-        return {SAMPLER: sampling_config(self.sampling_defaults, model_kwargs)}
+        config = sampling_config(self.sampling_defaults, model_kwargs)
+        return {SAMPLER: SampleSettings(**{key: getattr(config, key) for key in SAMPLING_KEYS})}
+
+    def process_prompt(self, *args: Any, **kwargs: Any) -> ProcessPromptOutput:
+        out = super().process_prompt(*args, **kwargs)
+        kv = out.metadata.pop("kv_layout")[KV_CACHE]["main"]
+        out.metadata["state_layout"] = {KV_CACHE: {"main": Layout(spans=kv.spans, growth=kv.growth)}}
+        if kv.keyed_spans is not None:
+            out.metadata["keyed_spans"] = {KV_CACHE: {"main": kv.keyed_spans}}
+        return out
 
     # -------------------------------------------------------------------
     # Serving config and budget
@@ -316,7 +318,7 @@ class Qwen3ASRModel(MultimodalDecoderModel):
         from mstar.model.loader.iterators import iter_safetensors_shards
 
         with torch.device("meta"):
-            encoder = AuTEncoder(self.config.audio, attn_key=AUT_ATTN)
+            encoder = AuTEncoder(self.config.audio, array=AUT_TOKENS)
         encoder = encoder.to(dtype)
         encoder.to_empty(device=device)
         prefix = "thinker.audio_tower."
@@ -342,9 +344,7 @@ class Qwen3ASRModel(MultimodalDecoderModel):
         from mstar.model.loader.iterators import iter_safetensors_shards
 
         with torch.device("meta"):
-            llm = Qwen3DenseLM(
-                self.config.text, attn_key=ATTN, kv_key=KV_CACHE, pos_key=ROPE, comm_group=tp_group,
-            )
+            llm = Qwen3DenseLM(self.config.text, array=KV_CACHE, comm_group=tp_group)
         llm = llm.to(dtype)
         llm.to_empty(device=device)
         weights = iter_safetensors_shards(self._resolve_weights(), device=device, prefix="thinker.")

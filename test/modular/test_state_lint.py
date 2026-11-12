@@ -20,8 +20,10 @@ PORTED = (
     "mstar/model/qwen3_5", "mstar/model/command_a_plus", "mstar/model/wan22", "mstar/model/flux2_klein",
     "mstar/model/z_image", "mstar/model/ltx2_5", "mstar/model/qwen3_omni", "mstar/model/minimax_h3",
     "mstar/model/kokoro", "mstar/model/omnilingual_asr", "mstar/model/omnivoice", "mstar/model/orpheus",
-    "mstar/model/voxcpm2", "mstar/model/pi05", "mstar/model/vjepa2", "mstar/model/canary",
-    "mstar/model/components/encoder_decoder.py",
+    "mstar/model/voxcpm2",
+    "mstar/model/canary_qwen", "mstar/model/qwen3_asr", "mstar/model/parakeet", "mstar/model/fish_s2_pro",
+    "mstar/model/qwen3_tts",
+    "mstar/model/pi05", "mstar/model/vjepa2", "mstar/model/canary", "mstar/model/components/encoder_decoder.py",
 )
 FORBIDDEN_ATTRIBUTES = {
     "node_resources", "resources", "request_state", "request_states", "per_request_states",
@@ -36,7 +38,8 @@ ALLOWED = {
     for name in (
         "AcceleratorGraphConfig", "BatchedAcceleratorGraphConfig", "DETERMINISTIC_COMPILE_MODE",
         "PackedAcceleratorGraphConfig", "PiecewiseAcceleratorGraphConfig", "PiecewiseBatchedConfig",
-        "PiecewiseCallInputs", "PiecewiseCaptureShape", "PiecewisePackedConfig", "geometric_batch_sizes",
+        "PiecewiseCallInputs", "PiecewiseCaptureShape", "PiecewisePackedConfig", "decode_rows_then_prompt",
+        "geometric_batch_sizes",
     )
 } | {
     ("mstar.engine.engine", "ExecutingBatch"): "the annotation of `NodeSubmodule.can_batch`, a base class's hook",
@@ -46,27 +49,46 @@ ALLOWED = {
         "a node's sequence shard, written by hand: the contract declares none until #1147's SeqShard"
     ),
 }
-# Graph breaks a ported package keeps, by file and function, since no state call sits behind them.
-ALLOWED_BREAKS = {
-    ("mstar/model/qwen3_omni/components/code2wav.py", "forward"): "the vocoder's transformer, which keeps no state",
-    ("mstar/model/wan22/components/dit.py", "_token_runs"): (
+# Exceptions each scoped to one function and one attribute, by file, the function's qualified name in that file, and
+# the attribute: a graph break (`disable`) or a forbidden read the function may keep.
+ALLOWED_IN_FUNCTION = {
+    ("mstar/model/qwen3_omni/components/code2wav.py", "Qwen3OmniMoeCode2WavTransformerModel.forward", "disable"):
+        "the vocoder's transformer, which keeps no state",
+    ("mstar/model/qwen3_tts/components/depth_frame/frame.py", "DepthFrame.run", "disable"):
+        "the depth kernel's Gluon launch, which a compiled decode can't trace; no state call sits behind it",
+    ("mstar/model/qwen3_tts/submodules.py", "CodecSubmodule.batch_postprocess", "request_state"):
+        "the opt-in watermark's per-stream state, until it moves to a watermark node's plain Value (issue #1447)",
+    ("mstar/model/wan22/components/dit.py", "_token_runs", "disable"):
         "the timestep runs of a rank's share of the tokens, read off the sequence shard's plan outside the DiT's "
-        "guards; the contract has no shard call until #1147's SeqShard"
-    ),
+        "guards; the contract has no shard call until #1147's SeqShard",
 }
 
 
-def _violations(source: str, path: str = "") -> tuple[list[str], set[tuple[str, str]]]:
+def _in_functions(node: ast.AST, prefix: str = "", function: str | None = None):
+    """Each node under ``node``, with the qualified name of the function it lies in, decorators included, or None."""
+    for child in ast.iter_child_nodes(node):
+        if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef):
+            name = prefix + child.name
+            yield child, name
+            yield from _in_functions(child, f"{name}.<locals>.", name)
+        elif isinstance(child, ast.ClassDef):
+            yield child, function
+            yield from _in_functions(child, f"{prefix}{child.name}.", function)
+        else:
+            yield child, function
+            yield from _in_functions(child, prefix, function)
+
+
+def _violations(source: str, path: str = "") -> tuple[list[str], set[tuple[str, ...]]]:
     """What ``source``, the file at ``path``, does that the lint refuses, and the exceptions it used."""
     found, used = [], set()
-    tree = ast.parse(source)
-    allowed_breaks = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.FunctionDef) and (path, node.name) in ALLOWED_BREAKS:
-            used.add((path, node.name))
-            allowed_breaks.update(decorator.lineno for decorator in node.decorator_list)
-    for node in ast.walk(tree):
-        if isinstance(node, ast.ImportFrom) and node.module and node.module.startswith("mstar.engine"):
+    for node, function in _in_functions(ast.parse(source)):
+        breaks = isinstance(node, ast.Attribute) and ast.unparse(node).endswith("compiler.disable")
+        if (breaks or isinstance(node, ast.Attribute) and node.attr in FORBIDDEN_ATTRIBUTES) and (
+            (path, function, node.attr) in ALLOWED_IN_FUNCTION
+        ):
+            used.add((path, function, node.attr))
+        elif isinstance(node, ast.ImportFrom) and node.module and node.module.startswith("mstar.engine"):
             if node.module == "mstar.engine.state":
                 continue
             for alias in node.names:
@@ -79,10 +101,7 @@ def _violations(source: str, path: str = "") -> tuple[list[str], set[tuple[str, 
             found += [f"import {a.name}" for a in node.names if a.name.startswith("mstar.engine")]
         elif isinstance(node, ast.Attribute) and node.attr in FORBIDDEN_ATTRIBUTES:
             found.append(f".{node.attr} at line {node.lineno}")
-        elif (
-            isinstance(node, ast.Attribute) and ast.unparse(node).endswith("compiler.disable")
-            and node.lineno not in allowed_breaks
-        ):
+        elif breaks:
             found.append(f"torch.compiler.disable at line {node.lineno}, where the state calls hold the graph breaks")
     return found, used
 
@@ -111,7 +130,7 @@ def test_every_exception_is_still_used():
     used = set()
     for path in _sources():
         used |= _violations(path.read_text(), str(path))[1]
-    excepted = ALLOWED.keys() | ALLOWED_BREAKS.keys()
+    excepted = ALLOWED.keys() | ALLOWED_IN_FUNCTION.keys()
     assert excepted <= used, f"delete these exceptions: {sorted(excepted - used)}"
 
 
@@ -141,10 +160,38 @@ def test_the_lint_passes_the_contract_itself():
 
 
 def test_the_lint_lets_a_named_function_keep_its_break_and_no_other():
-    source = "@torch.compiler.disable\ndef forward(): pass\n@torch.compiler.disable\ndef other(): pass\n"
+    source = (
+        "class Qwen3OmniMoeCode2WavTransformerModel:\n"
+        "    @torch.compiler.disable\n    def forward(self): pass\n"
+        "    @torch.compiler.disable\n    def other(self): pass\n"
+    )
     found, used = _violations(source, "mstar/model/qwen3_omni/components/code2wav.py")
-    assert used == {("mstar/model/qwen3_omni/components/code2wav.py", "forward")}
-    assert len(found) == 1 and "at line 3" in found[0]
+    assert used == {("mstar/model/qwen3_omni/components/code2wav.py", "Qwen3OmniMoeCode2WavTransformerModel.forward",
+                     "disable")}
+    assert len(found) == 1 and "at line 4" in found[0]
+
+
+_TTS = "mstar/model/qwen3_tts/submodules.py"
+_WATERMARK = (_TTS, "CodecSubmodule.batch_postprocess", "request_state")
+
+
+@pytest.mark.parametrize("path, source, found, used", [
+    (_TTS, "class CodecSubmodule:\n    def batch_postprocess(self, rid):\n        return self.request_state(rid)\n",
+     [], {_WATERMARK}),
+    (_TTS, "class CodecSubmodule:\n    def postprocess(self, rid):\n        return self.request_state(rid)\n",
+     [".request_state at line 3"], set()),
+    (_TTS, "class TalkerSubmodule:\n    def batch_postprocess(self, rid):\n        return self.request_state(rid)\n",
+     [".request_state at line 3"], set()),
+    (_TTS, "class CodecSubmodule:\n    def batch_postprocess(self, rid):\n        return rid\n", [], set()),
+    (_TTS, "class CodecSubmodule:\n    def batch_postprocess(self, rid):\n        self.request_state(rid)\n"
+     "        return self.node_resources\n", [".node_resources at line 4"], {_WATERMARK}),
+    ("mstar/model/qwen3_omni/components/code2wav.py",
+     "class Qwen3OmniMoeCode2WavTransformerModel:\n    def forward(self): pass\n", [], set()),
+], ids=["the hook", "another function", "another class's hook", "the hook without it", "the hook reading more",
+        "an undecorated forward"])
+def test_an_exception_covers_only_its_own_functions_attribute(path, source, found, used):
+    """A key skips only its attribute, anywhere in its function, and is used only when it skips one."""
+    assert _violations(source, path) == (found, used)
 
 
 def test_the_lint_reads_the_five_speech_packages():

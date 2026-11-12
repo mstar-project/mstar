@@ -2,7 +2,7 @@
 encoder node is the shared ``FastConformerEncoderSubmodule``.
 
 The decode loop re-injects each request's encoder output every iteration. An
-iteration reads its rows' state from the recurrent pool, runs ``CHUNK`` greedy
+iteration reads its rows' state from their Value, runs ``CHUNK`` greedy
 steps, each projecting the frames under the cursors (with Nemotron's language
 prompt), writes the state back and emits the iteration's tokens; the stop
 check ends a request's loop once its cursor has passed its last frame.
@@ -18,9 +18,7 @@ from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.accelerator_graph_config import AcceleratorGraphConfig, BatchedAcceleratorGraphConfig
 from mstar.engine.engine import ExecutingBatch
-from mstar.engine.fp32_precision import fp32_precision_scope, node_fp32_precision
-from mstar.engine.resources import Segment, SlotLease, SubmoduleStep
-from mstar.engine.resources.recurrent import RecurrentStatePool, RecurrentStep
+from mstar.engine.state import ArrayStep, Segment, SlotLease, SubmoduleStep
 from mstar.model.components.transducer import CHUNK, TransducerHead
 from mstar.model.parakeet.config import DECODE_LOOP, NUM_FRAMES, PROMPT_ID, TRANSDUCER_STATE, WALK
 from mstar.model.submodule_base import (
@@ -48,8 +46,8 @@ def _batch_sizes(bucket: int) -> list[int]:
 
 
 class TransducerSubmodule(NodeSubmodule):
-    """Each decode iteration replays, per frame bucket, the pool's gather,
-    ``chunk`` compiled greedy steps and the scatter.
+    """Each decode iteration replays, per frame bucket, the state's read,
+    ``chunk`` compiled greedy steps and its write.
 
     The head is small (a 640-wide LSTM and joint) and its argmax decides every
     token, so it runs in fp32 outside the engine's autocast and TF32. The
@@ -78,8 +76,7 @@ class TransducerSubmodule(NodeSubmodule):
         self.encoder_dtype = encoder_dtype
         # where a fresh slot starts, and every padding row; in full fp32, as
         # the engine runs the forward
-        with fp32_precision_scope(node_fp32_precision(type(self).__name__, self)):
-            self._start = head.initial_state()
+        self._start = head.initial_state(self.float32_matmul_precision)
         # the zeros frames are padded with, sliced per row
         self._pad: torch.Tensor | None = None
         # One compile for every capture rather than each config's own, which
@@ -88,6 +85,10 @@ class TransducerSubmodule(NodeSubmodule):
         # back to eager kernels without a word.
         compile_step = compile_step and next(head.parameters()).is_cuda
         self._step = torch.compile(head.step, fullgraph=True) if compile_step else head.step
+
+    def bind_state(self, handles: Mapping[str, Any]) -> None:
+        self.state = handles[TRANSDUCER_STATE]
+        self.state.set_start(self._start)
 
     def _bucket(self, num_frames: int | None) -> int | None:
         """The narrowest capture that holds ``num_frames``; None past the widest."""
@@ -159,7 +160,7 @@ class TransducerSubmodule(NodeSubmodule):
         buckets = {inp.resource_step_info for inp in inputs}
         return SubmoduleStep(
             segments=[Segment(rid, "main", 1) for rid in request_ids],
-            steps={TRANSDUCER_STATE: RecurrentStep()},
+            state={TRANSDUCER_STATE: ArrayStep()},
             # the bucket from the frames, as cg_key_info has it from step_metadata
             cg_key_info=buckets.pop() if len(buckets) == 1 else None,
         )
@@ -218,18 +219,15 @@ class TransducerSubmodule(NodeSubmodule):
         engine_inputs: ModelInputsFromEngine,
         **kwargs,
     ) -> BatchedModelOutput:
-        return self._decode(engine_inputs, **kwargs)
+        return self._decode(**kwargs)
 
     def _decode(
-        self, engine_inputs: ModelInputsFromEngine, encoder_states: torch.Tensor, lengths: torch.Tensor,
-        prompt_ids: torch.Tensor | None = None,
+        self, encoder_states: torch.Tensor, lengths: torch.Tensor, prompt_ids: torch.Tensor | None = None,
     ) -> BatchedModelOutput:
-        pool: RecurrentStatePool = engine_inputs.resources[TRANSDUCER_STATE]
-        # a fresh slot, and a padding row on the sink, start from the start state
-        state = {name: pool.gather(name, start=start) for name, start in self._start.items()}
+        # A fresh slot and a padding row on the sink read the start state, and the steps update the copy in place.
+        state = self.state.read(0).fields
         tokens, active = self.head.advance(encoder_states, lengths, state, self.chunk, self._step, prompt_ids)
-        for name, value in state.items():
-            pool.scatter_(name, value)
+        self.state.write(0, **state)
         # tokens are -1 where a step emitted none
         return BatchedModelOutput(
             row_outputs={"tokens": tokens},

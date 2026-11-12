@@ -13,19 +13,29 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
+from typing import Any
 
 import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.resources import AttentionStep, KVStep
-from mstar.engine.resources.step import ResourceStep
+from mstar.engine.state import (
+    ArrayStep,
+    SampleStep,
+    Segment,
+    SubmoduleStep,
+    at_last_token,
+    last_sampled,
+    position,
+    sample,
+)
 from mstar.model.components.audio_features import LogMelSpectrogram
 from mstar.model.components.aut_encoder import AuTEncoder
 from mstar.model.components.aut_submodule import AuTEncoderSubmodule
 from mstar.model.components.sampled_token_decoder import SampledTokenDecoder
-from mstar.model.qwen3_asr.config import ATTN, AUT_ATTN, KV_CACHE, Qwen3ASRModelConfig
-from mstar.model.submodule_base import NodeInputs
+from mstar.model.qwen3_asr.config import AUT_TOKENS, KV_CACHE, SAMPLER, Qwen3ASRModelConfig
+from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +53,7 @@ class Qwen3ASREncoderSubmodule(AuTEncoderSubmodule):
     """
 
     def __init__(self, encoder: AuTEncoder, config: Qwen3ASRModelConfig):
-        super().__init__(encoder, attn_key=AUT_ATTN)
+        super().__init__(encoder, array=AUT_TOKENS)
         self.config = config
         # built here, after the encoder was materialized, so its filter bank
         # and window are real tensors on the encoder's device
@@ -82,7 +92,6 @@ class Qwen3ASRLLMSubmodule(SampledTokenDecoder):
     """Dense Qwen3 decoder. Prefill is captured on packed token buckets, decode
     on batch size."""
 
-    ATTN_KEY = ATTN
     # the ladders it captured before moving onto the scaffold
     DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]
     PREFILL_MEDIA_TOKEN_BUCKETS = [256, 512, 1024, 2048, 4096, 8192, 16384]
@@ -96,5 +105,26 @@ class Qwen3ASRLLMSubmodule(SampledTokenDecoder):
         # at all, as before the scaffold
         return None
 
-    def layer_steps(self) -> dict[str, ResourceStep]:
-        return {KV_CACHE: KVStep(), ATTN: AttentionStep(causal=True)}
+    def bind_state(self, handles: Mapping[str, Any]) -> None:
+        self.kv = handles[KV_CACHE]
+        self.sampler = handles[SAMPLER]
+
+    def node_step(
+        self, segments: list[Segment], prefill_tokens: Mapping[int, torch.Tensor], advance: tuple[int, ...] | None,
+    ) -> SubmoduleStep:
+        return SubmoduleStep(
+            segments=segments,
+            state={KV_CACHE: ArrayStep(advance=advance), SAMPLER: SampleStep(prompt_tokens=prefill_tokens)},
+        )
+
+    def next_position(self, rid_handle: int) -> int:
+        return position(self.kv, rid_handle, "main")
+
+    def loopback_tokens(self, engine_inputs: ModelInputsFromEngine) -> torch.Tensor:
+        return last_sampled(self.sampler)
+
+    def last_token_hidden(self, engine_inputs: ModelInputsFromEngine, hidden: torch.Tensor) -> torch.Tensor:
+        return at_last_token(self.kv, hidden)
+
+    def sample_tokens(self, engine_inputs: ModelInputsFromEngine, logits: torch.Tensor) -> torch.Tensor:
+        return sample(self.sampler, logits)

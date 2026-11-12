@@ -19,6 +19,8 @@ sys.path.insert(0, ".")
 
 from mstar.conductor.request_info import FINAL_PREFILL  # noqa: E402
 from mstar.engine.resources import KVSpec, RaggedAttentionSpec, SlotLease  # noqa: E402
+from mstar.engine.state import ArrayStep  # noqa: E402
+from mstar.engine.state.adapters import node_handles, node_resources  # noqa: E402
 from mstar.model.base import WalkStep  # noqa: E402
 from mstar.model.components.audio_features import LogMelSpectrogram  # noqa: E402
 from mstar.model.components.aut_encoder import AuTEncoder, AuTEncoderConfig  # noqa: E402
@@ -30,6 +32,7 @@ from mstar.model.multimodal_decoder import MediaIntake  # noqa: E402
 from mstar.model.qwen3_asr.config import (  # noqa: E402
     ASR_TEXT_TAG,
     AUT_ATTN,
+    AUT_TOKENS,
     ENCODER_NODE,
     KV_CACHE,
     LLM_NODE,
@@ -37,7 +40,7 @@ from mstar.model.qwen3_asr.config import (  # noqa: E402
 )
 from mstar.model.qwen3_asr.qwen3_asr_model import Qwen3ASRModel, audio_encoder  # noqa: E402
 from mstar.model.qwen3_asr.submodules import Qwen3ASREncoderSubmodule, Qwen3ASRLLMSubmodule  # noqa: E402
-from mstar.model.qwen3_omni.config import AUDIO_ATTN  # noqa: E402
+from mstar.model.qwen3_omni.config import AUDIO_TOKENS  # noqa: E402
 from mstar.model.qwen3_omni.submodules import AudioEncoderSubmodule  # noqa: E402
 from mstar.model.registry import HF_MODELS, get_model_class  # noqa: E402
 from mstar.model.submodule_base import (  # noqa: E402
@@ -227,13 +230,13 @@ def test_process_prompt_builds_features_and_prompt():
             [ids.index(AUDIO_PAD)], [n_tokens], ["audio_embeds"],
         )
         # the prefill writes every id in one row: the text around the audio run as ids, the run as rows
-        spans = out.metadata["kv_layout"][KV_CACHE]["main"].spans
+        spans = out.metadata["state_layout"][KV_CACHE]["main"].spans
         assert [(span.kind, span.walk) for span in spans] == [
             ("ids", PREFILL_WALK), ("rows", PREFILL_WALK), ("ids", PREFILL_WALK),
         ]
         pre = ids.index(AUDIO_PAD)
         assert [span.length for span in spans] == [pre, n_tokens, len(ids) - pre - n_tokens]
-        assert set(out.metadata) == {MEDIA_LAYOUT, "kv_layout"}
+        assert set(out.metadata) == {MEDIA_LAYOUT, "state_layout", "keyed_spans"}
     assert torch.equal(out.new_input_tensors["audio"][0], wave)  # samples as they are; the encoder makes the mel
 
     # the request's layout and any other attachment are ignored, as they always were
@@ -271,16 +274,14 @@ def test_postprocess_keeps_asr_text_tag_and_drops_specials():
 
 
 def _encoder_submodule(cfg):
-    encoder = AuTEncoder(cfg.audio, attn_key=AUT_ATTN)
+    encoder = AuTEncoder(cfg.audio, array=AUT_TOKENS)
     torch.manual_seed(0)
     state = {k: torch.randn_like(v) * 0.05 for k, v in encoder.state_dict().items()}
     with torch.no_grad():
         for name, param in encoder.named_parameters():
             param.copy_(state[name])
     encoder.reset_buffers()
-    # attention unbound -> SDPA per window (the CPU path)
-    for layer in encoder.layers:
-        layer.self_attn.ragged = None
+    # no handle bound: SDPA per window, the CPU path
     return Qwen3ASREncoderSubmodule(encoder, cfg).eval()
 
 
@@ -294,7 +295,7 @@ def test_encoder_submodule_declares_windows_and_packs_requests():
     assert [r.tensor_inputs["audio_features"].shape for r in rows] == [(cfg.num_mel_bins, n) for n in (230, 150, 305)]
     assert [r.input_seq_len for r in rows] == [cfg.audio.tokens_for_frames(n) for n in (230, 150, 305)]
     step = sub.declare_step(PREFILL_WALK, ["a", "b", "c"], rows)
-    assert step.steps[AUT_ATTN].causal is False
+    assert step.state == {AUT_TOKENS: ArrayStep()}, "a read with Block is bidirectional within each window"
     expected = [(rid, w) for rid, r in zip("abc", rows, strict=True) for w in cfg.audio.window_lengths(r.input_seq_len)]
     assert [(s.request_id, s.span) for s in step.segments] == expected
     assert all(s.label == "main" for s in step.segments)
@@ -313,10 +314,16 @@ def test_encoder_submodule_declares_windows_and_packs_requests():
 class _WindowedAttention:
     """The ragged attention resource's answer: each planned window attends only to itself."""
 
+    runs_sdpa = False
+
     def __init__(self, spans: list[int]):
         self.spans = spans
 
-    def run(self, q, k, v):
+    def add(self, layer, k, v):
+        self.held = k, v
+
+    def read(self, layer, q):
+        k, v = self.held
         return torch.cat([
             torch.nn.functional.scaled_dot_product_attention(*(t.transpose(0, 1) for t in qkv)).transpose(0, 1)
             for qkv in zip(q.split(self.spans), k.split(self.spans), v.split(self.spans), strict=True)
@@ -331,7 +338,7 @@ class _Replay:
 
     def run(self, static_inputs, request_ids, seq_lens, real_bs):
         self.seq_lens = seq_lens
-        self.sub.bind_node_resources({AUDIO_ATTN: _WindowedAttention(seq_lens)})
+        self.sub.bind_node_state({AUDIO_TOKENS: _WindowedAttention(seq_lens)})
         return {"embeds": self.sub.encoder.encode(static_inputs["hidden"], None)}
 
 
@@ -349,7 +356,7 @@ def test_packed_clips_split_by_the_encoder_s_own_window(leased):
         downsample_hidden_size=8, n_window=52,
     )
     hf = hf_modeling.Qwen3OmniMoeAudioEncoder._from_config(config, attn_implementation="sdpa").eval()
-    encoder = AuTEncoder(AuTEncoderConfig.from_hf(config.to_dict()), attn_key=AUDIO_ATTN).eval()
+    encoder = AuTEncoder(AuTEncoderConfig.from_hf(config.to_dict()), array=AUDIO_TOKENS).eval()
     encoder.load_weights(list(hf.state_dict().items()))
     sub = AudioEncoderSubmodule(encoder, config=None)  # Qwen3-Omni's node, fed log-mel features
 
@@ -358,7 +365,7 @@ def test_packed_clips_split_by_the_encoder_s_own_window(leased):
     clips = (torch.randn(128, 104), torch.randn(128, 60), torch.randn(128, 1000))
     rows = [sub.prepare_inputs(PREFILL_WALK, None, {"audio_features": [clip]}) for clip in clips]
     windows = [segment.span for segment in sub.declare_step(PREFILL_WALK, rids, rows).segments]
-    sub.bind_node_resources({AUDIO_ATTN: _WindowedAttention(windows)})
+    sub.bind_node_state({AUDIO_TOKENS: _WindowedAttention(windows)})
     runner = _Replay(sub)
     # the forward replays the region only on a step that leased it
     engine_inputs = _engine_inputs(rids)
@@ -413,8 +420,11 @@ def test_encoder_packs_a_step_only_up_to_its_largest_capture():
     model = _make_model()
     sub = _encoder_submodule(model.config)
     # the windows a row holds, as the model sizes its resource (a step's windows gate it too)
-    (ragged,) = (s for s in model.get_node_resources() if isinstance(s, RaggedAttentionSpec))
-    sub.node_resources = {AUT_ATTN: ragged.config}
+    (ragged,) = (s for s in node_resources(model) if isinstance(s, RaggedAttentionSpec))
+    resource = SimpleNamespace(
+        max_segments_per_request=ragged.config.max_segments_per_request, run=lambda q, k, v, label: q,
+    )
+    sub.bind_node_state(node_handles(model, "audio_encoder", {AUT_ATTN: resource}))
     top = sub.ENCODE_TOKEN_BUCKETS[-1]
 
     def rows(*lens):
@@ -549,7 +559,7 @@ def test_graph_resources_and_walk_plan():
     assert set(walks) == {PREFILL_WALK, DECODE_WALK} and model.nodes == [LLM_NODE, ENCODER_NODE]
     # no text walk to rebuild a dropped request on, so the worker starts with no rebuild policy
     Rebuilds(model.rebuild_policies(), walks)
-    specs = model.get_node_resources()
+    specs = node_resources(model)
     ragged = next(s for s in specs if isinstance(s, RaggedAttentionSpec))
     assert ragged.nodes == {ENCODER_NODE} and ragged.config.num_qo_heads == 4 and ragged.config.head_dim == 16
     cfg = model.config
@@ -706,16 +716,11 @@ def test_decode_loop_emits_its_one_signal_inline_and_loops_it_back_on_the_device
     assert row.input_ids is None and row.input_seq_len == 1
     assert sub.uniform_row_inputs(DECODE_WALK, has_loopback=True).input_seq_len == 1
     routed = sub.prepare_inputs(DECODE_WALK, None, {"text_inputs": [torch.tensor([7])]})
-    from mstar.engine.resources.sampler.resource import SamplerResource
-
-    sampler = type("S", (), {
-        "loopback_tokens": staticmethod(lambda rids: torch.tensor([11, 12, 13])),
-        "overwrite_rows": SamplerResource.overwrite_rows, "_row_stager": None,
-    })()
-    ids = sub.preprocess(DECODE_WALK, ModelInputsFromEngine(
-        request_ids=["a", "b", "c"], per_request_info={}, resources={SAMPLER: sampler},
-    ), [row, routed, row])["input_ids"]
-    assert ids.tolist() == [11, 7, 13], "a row whose last step ran elsewhere brings its token"
+    # the last token is a padding row's, past the batch's inputs
+    resource = type("S", (), {"loopback_tokens": staticmethod(lambda rids: torch.tensor([11, 12, 13, 14]))})()
+    sub.bind_state({KV_CACHE: None, SAMPLER: SimpleNamespace(_open=True, rows=("a", "b", "c", "d"), resource=resource)})
+    ids = sub.preprocess(DECODE_WALK, _engine_inputs("abc"), [row, routed, row])["input_ids"]
+    assert ids.tolist() == [11, 7, 13, 14], "a row from elsewhere brings its token, and a replay keeps its padding rows"
     # without slot masters (or MSTAR_DEVICE_LOOPBACK=0) the tensor path stays
     monkeypatch.setenv("MSTAR_DEVICE_LOOPBACK", "0")
     assert sub.device_loopback_signals(DECODE_WALK) == frozenset()
