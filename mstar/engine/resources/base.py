@@ -107,7 +107,8 @@ class EngineResourceInfo:
     def head_shards(self) -> int:
         """How many ways the node's ranks split its attention heads, which each builder sizes head
         counts by (`head_shards`). A ragged resource splits over TP only, unless it attends a label
-        its node's sequence shard splits (``RaggedAttentionSpec.sp_exchange``, derived)."""
+        its node's sequence shard splits (``RaggedAttentionSpec.sp_exchange``, derived): over TP x SP
+        then, even where the node's pools place positions."""
         return head_shards(self.joint_comm_group, self.replicated_over_sp)
 
     def dependency(self, key: str) -> NodeResourceSpec:

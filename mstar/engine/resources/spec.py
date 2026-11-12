@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, Protocol
 
 if TYPE_CHECKING:
+    from mstar.engine.resources.attn.config import SpExchange
     from mstar.engine.resources.base import Resource
     from mstar.engine.resources.sequence_shard import SeqShardSpec
 
@@ -153,17 +154,12 @@ class NodeResourceSpec(ABC):
         positions to place. A node whose resources place them runs replicated across its SP ranks."""
         return None
 
-    @property
-    def splits_steps(self) -> bool:
-        """Whether this resource splits its nodes' steps over their SP ranks
-        (``mstar.engine.resources.sequence_shard``)."""
-        return False
-
-    @property
-    def attends_split_steps(self) -> bool:
-        """Whether this is an attention that can take a split step's tokens: a node that splits
-        its steps needs one."""
-        return False
+    def resolve_exchange(self, specs: Mapping[str, "NodeResourceSpec"]) -> "SpExchange":
+        """How a split step's tokens reach this attention (``sequence_shard``): ``none`` (the
+        default) for a resource that takes none. From raw fields, so the sequence shard's
+        ``derive`` can ask in any order; a node's steps split where any of its attentions answers
+        otherwise (``SeqShardSpec.splits``)."""
+        return "none"
 
     def split_step_refusals(self, node: str, shard: "SeqShardSpec", tp: int, sp: int) -> list[str]:
         """What this resource can't run on ``node``, whose steps ``shard`` splits over ``sp`` SP

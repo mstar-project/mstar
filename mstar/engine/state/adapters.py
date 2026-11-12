@@ -715,10 +715,10 @@ class ConvOnLinearAttn(OpBinding):
 # Handles
 
 
-def _exchanges(attn: Any) -> bool:
-    """Whether a call on ``attn`` goes through its exchange (`AttentionManager.splits`); a stand-in attention, which
-    is no `AttentionManager`, keeps the direct call."""
-    return isinstance(attn, AttentionManager) and attn.splits
+def _exchanges(attn: Any, label: str) -> bool:
+    """Whether a call on ``attn`` for ``label`` goes through its exchange (`AttentionManager.step_exchanges`); a
+    stand-in attention, which is no `AttentionManager`, keeps the direct call."""
+    return isinstance(attn, AttentionManager) and attn.step_exchanges(label)
 
 
 class PagedArrayHandle(ArrayHandle):
@@ -780,14 +780,14 @@ class PagedArrayHandle(ArrayHandle):
         # held for the read, which passes them on as a layer calls attention (`requires_kv_write`): a kernel may
         # attend the step's own k and v rather than the pages (`reads_step_kv`), and an exchange writes them
         self._held, self._held_layer = (k, v), layer
-        if not _exchanges(attn):
+        if not _exchanges(attn, self.label):
             self._write(layer, k, v)
 
     def _write(self, layer: int, k: torch.Tensor, v: torch.Tensor) -> None:
         """``layer``'s write alone, where its kernel reads the pages: through the exchange where the attention
         exchanges, as `AttentionCallable.write` makes it."""
         attn = self._attn.get(layer)
-        if attn is not None and _exchanges(attn):
+        if attn is not None and _exchanges(attn, self.label):
             attn.exchange(partial(self._attend, layer), None, k, v, label=self.label)
         elif attn is None or attn.requires_kv_write:
             self._kv.write_kv(k, v, layer_idx=self._pool_layer[layer], label=self.label)
@@ -796,13 +796,13 @@ class PagedArrayHandle(ArrayHandle):
         """Write the held add of a layer the step didn't read where its write waits for the read's exchange, so
         each add is written once: when the next add or the step's check finds it still held."""
         layer = self._held_layer
-        if layer is not None and _exchanges(self._attn[layer]):
+        if layer is not None and _exchanges(self._attn[layer], self.label):
             self._write(layer, *self._take_hold(layer))
 
     def _needs_step_kv(self, attn: Any) -> bool:
         """Whether a read through ``attn`` attends the step's own k and v rather than only the pages, or goes through
         its exchange."""
-        return _exchanges(attn) or attn.reads_step_kv(self.label)
+        return _exchanges(attn, self.label) or attn.reads_step_kv(self.label)
 
     @torch.compiler.disable
     def read(self, layer: int | torch.Tensor, q: torch.Tensor | None = None, **mask_args: Any) -> torch.Tensor:
@@ -813,7 +813,7 @@ class PagedArrayHandle(ArrayHandle):
         layer = self._layer_id(layer)
         self._record_read(layer)
         attn = self._attn[layer]
-        if _exchanges(attn):
+        if _exchanges(attn, self.label):
             # the add's write and the attention as one call, on the tokens and heads this rank stores
             return attn.exchange(partial(self._attend, layer), q, *self._take_hold(layer), label=self.label)
         # a read with no add before it attends the pages alone, which a kernel that takes no writes can't
@@ -822,12 +822,15 @@ class PagedArrayHandle(ArrayHandle):
             q, label=self.label, kv_cache_layer=self._views[layer], k=k, v=v, layer_idx=self._pool_layer[layer],
         )
 
-    def _attend(self, layer: int, q: torch.Tensor | None, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor | None:
+    def _attend(
+        self, layer: int, q: torch.Tensor | None, k: torch.Tensor, v: torch.Tensor, tokens: torch.Tensor | None = None,
+    ) -> torch.Tensor | None:
         """An exchange's ``run``: this layer's write where the kernel reads the pages, then its attention (``q``
-        None: the write alone), as `AttentionCallable` makes the call."""
+        None: the write alone), as `AttentionCallable` makes the call. ``tokens``: which of the step's tokens k and v
+        are, named by the ring's exchange alone (`sequence_shard.ring`)."""
         attn, i = self._attn[layer], self._pool_layer[layer]
         if attn.requires_kv_write:
-            self._kv.write_kv(k, v, layer_idx=i, label=self.label)
+            self._kv.write_kv(k, v, layer_idx=i, label=self.label, tokens=tokens)
         if q is None:
             return None
         return attn.run(q, label=self.label, kv_cache_layer=self._views[layer], k=k, v=v, layer_idx=i)

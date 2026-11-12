@@ -36,7 +36,7 @@ from mstar.engine.resources.attn.ragged.config import (
 )
 from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
 from mstar.engine.resources.sequence_shard import SeqShardSpec, sequence_parallel_refusals
-from mstar.engine.resources.spec import NodeResourceSpec
+from mstar.engine.resources.spec import NodeResourceSpec, apply_yaml_overrides, resolve_spec_dependencies
 from mstar.graph.base import GraphEdge, GraphNode, Sequential
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import KVLabel, PrefixKeys, WorkerGraph
@@ -353,14 +353,35 @@ def test_a_kv_placement_the_node_cannot_take_is_refused(model, group, kv, patter
 
 @pytest.mark.parametrize("specs, group, resources, pattern", [
     ([_shard()], dict(sp_size=2), {},
-     r"node_groups\[0\]: node 'llm' splits tokens \(SeqShardSpec 'shard'\) but declares no attention"),
+     r"node_groups\[0\]: node 'llm' runs on 2 SP ranks, and its steps never split"),
     ([_shard(), _attention()], dict(sp_size=4), {},
      r"node_groups\[0\]: node 'llm' splits tokens over 4 SP ranks, and KV 'kv' stores 4 query and 2 KV heads by "
      r"head, which don't split 4 ways per TP rank"),
-    # split tokens over KV stored by position: not yet
-    ([_shard(), _attention()], dict(sp_size=2), {"kv": {"context_parallel": True}},
-     r"node_groups\[0\]: node 'llm' splits tokens over 2 SP ranks, and KV 'kv' stores them by position "
-     r"\(context_parallel\), which split steps don't support yet"),
+    # each row split over KV stored by position
+    ([SeqShardSpec("shard", {"llm"}, ("main",), 1), _attention()], dict(sp_size=2),
+     {"kv": {"context_parallel": True}, "shard": {"exchange": "all_gather"}},
+     r"node_groups\[0\]: node 'llm' splits each row of its steps \(axis 1\) over 2 SP ranks, and KV 'kv' stores "
+     r"them by position"),
+    # the shard's exchange against the node's storage, at any SP size
+    ([_shard(), _attention()], dict(sp_size=1), {"shard": {"exchange": "ring"}},
+     r"resources.shard: exchange 'ring' attends split steps over KV stored by position, and no KV pool on nodes "
+     r"\['llm'\] sets context_parallel: true"),
+    ([_shard(), _attention()], dict(sp_size=2), {"shard": {"exchange": "all_gather"}},
+     r"resources.shard: exchange 'all_gather' attends split steps over KV stored by position"),
+    ([_shard(), _attention()], dict(sp_size=2), {"kv": {"context_parallel": True}, "shard": {"exchange": "ulysses"}},
+     r"resources.shard: exchange 'ulysses' trades a split step's tokens for KV heads, and nodes \['llm'\] store KV "
+     r"by position"),
+    ([_shard(), _attention()], dict(sp_size=2), {"shard": {"exchange": "zigzag"}},
+     r"resources.shard: exchange must be one of auto, none, ulysses, all_gather, ring; got 'zigzag'"),
+    # never split over KV stored by head: its SP ranks would only share heads
+    ([_shard(), _attention()], dict(sp_size=2), {"shard": {"exchange": "none"}},
+     r"node_groups\[0\]: node 'llm' runs on 2 SP ranks, and its steps never split"),
+    # a ring stripes steps by stored position, which Ulysses' ragged plan doesn't read
+    ([_shard(), _attention(), _ulysses(heads=2)], dict(sp_size=2),
+     {"kv": {"context_parallel": True}, "shard": {"exchange": "ring"}},
+     r"node_groups\[0\]: ragged attention 'ragged' attends labels its sequence shard splits \(Ulysses\), whose "
+     r"plan reads a split label's tokens in step order, and node 'llm''s sequence shard stripes them by KV "
+     r"'kv''s positions"),
     ([_shard(), _ulysses(heads=3)], dict(sp_size=2), {},
      r"node_groups\[0\]: ragged attention 'ragged' attends labels its sequence shard splits \(Ulysses\), and its 3 "
      r"query and 3 KV heads "
@@ -372,8 +393,9 @@ def test_a_kv_placement_the_node_cannot_take_is_refused(model, group, kv, patter
     # the attention spans a node the shard doesn't, so it would split on one and not the other: at any SP size
     ([_shard(), _attention(nodes=("llm", "post"))], dict(sp_size=1), {},
      r"resources.attn: spans nodes \['post'\] without the sequence shard 'shard'"),
-], ids=["no_attention", "heads_by_head", "split_over_positions", "ulysses_heads", "axis0_cross",
-        "shard_misses_a_node"])
+], ids=["no_attention", "heads_by_head", "axis1_over_positions", "ring_by_head", "all_gather_by_head",
+        "ulysses_by_position", "unknown_exchange", "none_by_head", "ring_beside_ragged_ulysses", "ulysses_heads",
+        "axis0_cross", "shard_misses_a_node"])
 def test_a_node_whose_sp_ranks_cant_split_its_steps_is_refused(specs, group, resources, pattern, tmp_path):
     size = group.get("sp_size", 1)
     cfg = _cfg(tmp_path, [{"node_names": ["llm"], "ranks": list(range(size)), **group}], resources=resources)
@@ -383,9 +405,18 @@ def test_a_node_whose_sp_ranks_cant_split_its_steps_is_refused(specs, group, res
 @pytest.mark.parametrize("specs, resources", [
     ([_shard(), _attention()], {}),
     ([_attention()], {"kv": {"context_parallel": True}}),
+    ([_shard(), _attention()], {"shard": {"exchange": "ulysses"}}),
     # a strategy for split steps is a no-op on a node that never splits
     ([_ulysses(heads=3), _attention()], {"kv": {"context_parallel": True}}),
-], ids=["heads", "positions_copied", "ulysses_without_a_shard"])
+    ([_shard(), _attention()], {"kv": {"context_parallel": True}, "shard": {"exchange": "all_gather"}}),
+    ([_shard(), _attention()], {"kv": {"context_parallel": True}, "shard": {"exchange": "ring"}}),
+    # DCP alone: the node runs copied, as one without a shard
+    ([_shard(), _attention()], {"kv": {"context_parallel": True}}),
+    ([_shard(), _attention()], {"kv": {"context_parallel": True}, "shard": {"exchange": "none"}}),
+    # a model's shard over a node with no attention that takes split steps is a no-op too
+    ([_shard()], {"kv": {"context_parallel": True}}),
+], ids=["heads", "positions_copied", "ulysses", "ulysses_without_a_shard", "all_gather", "ring", "positions_auto",
+        "none", "shard_without_an_attention"])
 def test_a_node_that_splits_its_steps_or_stores_positions_on_sp_ranks_validates(specs, resources, tmp_path):
     cfg = _cfg(tmp_path, [{"node_names": ["llm"], "ranks": [0, 1], "sp_size": 2}], resources=resources)
     assert _validate(_paged_llm(*specs), cfg).worker_graphs
@@ -398,7 +429,7 @@ def test_a_node_that_splits_its_steps_or_stores_positions_on_sp_ranks_validates(
 def test_a_split_without_exchanges_beside_an_attention_is_refused(attention, pattern):
     """A split nothing exchanges can give a rank no tokens, which no attention over them can take."""
     shard = SeqShardSpec("shard", {"llm"}, ("main",), 1, exchanges=False)
-    refusals = sequence_parallel_refusals([shard, attention()], "llm", 1, 4)
+    refusals = sequence_parallel_refusals(_paged_llm(shard, attention()).get_node_resources(), "llm", 1, 4)
     assert any(re.search(pattern, refusal) for refusal in refusals), refusals
 
 
@@ -408,6 +439,10 @@ def test_expert_parallelism_on_a_node_that_splits_its_steps_is_refused():
         "node 'llm' splits tokens over SP ranks, which expert parallelism (ep_config) can't",
     ]
     assert sequence_parallel_refusals(specs, "llm", 1, 2, MoeParallelConfig()) == []
+    # a node that never splits (auto over KV stored by position) takes what one without a shard does
+    apply_yaml_overrides(specs, {"resources": {"kv": {"context_parallel": True}}})
+    resolve_spec_dependencies(specs)
+    assert sequence_parallel_refusals(specs, "llm", 1, 2, MoeParallelConfig(parallel="ep")) == []
 
 
 def test_a_resource_over_nodes_that_split_heads_differently_is_refused(tmp_path):
@@ -424,7 +459,7 @@ def test_a_resource_over_nodes_that_split_heads_differently_is_refused(tmp_path)
     cfg = _cfg(tmp_path, [{"node_names": ["a", "b"], "ranks": [0, 1], "sp_size": 2}],
                resources={"kv": {"context_parallel": True}})
     _refused(model, cfg, r"node_groups\[0\]: \['a'\] place their KV positions over the SP ranks and "
-                         r"\['b'\] split their steps over them, .* share resources \['shared'\]")
+                         r"\['b'\] keep KV by head over them, .* share resources \['shared'\]")
 
 
 def test_qwen3_5_on_sp_ranks_runs_with_its_kv_positions_placed_over_them(tmp_path, monkeypatch):
@@ -797,6 +832,25 @@ def test_a_lora_deployment_passes(tmp_path):
     _validate(_Model(_a_then_b, specs=[_lora_spec()], tp_enabled_nodes=["a"]), cfg)
 
 
+@pytest.mark.parametrize("exchange", ["all_gather", "ring", None])
+def test_lora_over_kv_stored_by_position_is_refused_where_the_steps_split(exchange, tmp_path):
+    """Storing KV by position doesn't make a node's steps run copied: the shard's exchange decides,
+    and a split step holds a shard of each row's tokens, which LoRA can't lay out."""
+    from test_lora_pool import QKV, make_spec  # skips the test without safetensors
+
+    lora = dataclasses.replace(make_spec({}), nodes={"llm"}, targets={"qkv": dataclasses.replace(QKV, node="llm")})
+    model = _paged_llm(_shard(), _attention(), lora)
+    resources = {"lora": {"max_slots": 2}, "kv": {"context_parallel": True}}
+    if exchange is not None:
+        resources["shard"] = {"exchange": exchange}
+    cfg = _cfg(tmp_path, [{"node_names": ["llm"], "ranks": [0, 1], "sp_size": 2}], resources=resources)
+    if exchange is None:
+        assert _validate(model, cfg).worker_graphs
+    else:
+        _refused(model, cfg, r"node_groups\[0\]: LoRA resource 'lora@llm' serves node 'llm', which splits tokens "
+                             r"over 2 SP ranks")
+
+
 @pytest.mark.parametrize("block, refusal", [
     ({"max_slots": 0}, r"resources\.lora: max_slots must be an integer >= 1; got 0"),
     (["sql"], r"resources\.lora: .*argument after \*\* must be a mapping, not list"),
@@ -879,3 +933,27 @@ def test_worker_graph_problems_are_reported_together(tmp_path):
     assert problems[2] == (
         "Resource spec kv nodes ['llm', 'post'] must use the same parallel shape across replicas"
     )
+
+
+class _StateModel(_Model):
+    def __init__(self, arrays, **kw):
+        super().__init__(**kw)
+        self._arrays = arrays
+
+    def declare_state(self):
+        return list(self._arrays)
+
+
+def test_an_sdpa_read_over_a_split_label_is_reported_only_where_the_node_splits(tmp_path):
+    """The decision is made from the specs after the YAML's overrides and `derive`, as the engine does."""
+    from test_state_cross_reads import _array
+
+    # other heads, so the two reads don't share one resource
+    video, audio = _array("video", "video_self", nodes=("llm",)), _array("audio", nodes=("llm",), heads=2)
+    model = _StateModel([video, audio], specs=[SeqShardSpec("shard", {"llm"}, ("video", "audio"), 0)])
+    groups = [{"node_names": ["llm"], "ranks": [0, 1], "sp_size": 2}]
+    sdpa = {"video_self": {"backend": "sdpa"}}
+    _refused(model, _cfg(tmp_path, groups, resources=sdpa), r"backend sdpa over labels \['video'\]")
+    # the YAML's exchange turns the split off, so SDPA reads the label whole; the node's other problem remains
+    copied = _problems(model, _cfg(tmp_path, groups, resources={**sdpa, "shard": {"exchange": "none"}}))
+    assert copied and not any("backend sdpa over labels" in problem for problem in copied), copied

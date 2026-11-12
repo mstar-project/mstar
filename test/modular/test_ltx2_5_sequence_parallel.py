@@ -78,7 +78,10 @@ def _resources(cfg: LTX25Config, joint: JointGroups) -> dict:
         if isinstance(getattr(spec, "config", None), RaggedAttentionConfig):
             spec.config.dtype, spec.config.workspace_mb = torch.float32, 1
     info = EngineResourceInfo(device=CPU, joint_comm_group=joint, kv_dtype=torch.float32)
-    res = {key: build_resource(spec, info) for key, spec in specs.items()}
+    res = {
+        key: build_resource(spec, dataclasses.replace(info, dependencies={k: specs[k] for k in spec.depends_on()}))
+        for key, spec in specs.items()
+    }
     for key, spec in specs.items():
         res[key].bind_dependencies({dep: res[dep] for dep in spec.depends_on()})
     return res

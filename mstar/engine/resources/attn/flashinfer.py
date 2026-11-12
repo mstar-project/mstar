@@ -25,7 +25,7 @@ from mstar.engine.resources.attn.wrappers import (
     fmha_decode_applies,
 )
 from mstar.engine.resources.base import CGSlotKey
-from mstar.engine.resources.context_parallel import KeyRows, OwnTokensKernel, SPPlacement
+from mstar.engine.resources.context_parallel import KeyRows, OwnTokensKernel, RingAttentionWrapper, SPPlacement
 from mstar.engine.resources.kv.config import PagedKVConfig
 from mstar.engine.resources.kv.keys import fingerprint
 from mstar.engine.resources.kv.plan import KVPlanOutputs
@@ -292,6 +292,24 @@ class FlashInferManager(PlacedAttention):
         )
         return wrapper if wrapper.has_kernel(config.head_dim, config.num_qo_heads) else None
 
+    def _ring_wrapper(self, label: str, slot: int):
+        """The eager ``RingAttentionWrapper`` a split step of ``label`` plans on ``slot`` under the
+        sequence shard's ``exchange: ring``: one context wrapper per partner, over the label's
+        workspace (they run one after another on one stream). FlashInfer is the one backend that takes both split
+        steps and a placed pool, which a ring needs."""
+        key = EagerSlotKey(label=label, slot=slot, ring=True)
+        wrapper = self._eager_plan_states.get(key)
+        if wrapper is None:
+            workspace = self._workspaces.get(label, slot)
+            paged = [
+                self.paged_kernel(workspace, False, dict(self._wrapper_kv_kwargs), None)
+                for _ in range(self._placement.size)
+            ]
+            wrapper = self._eager_plan_states[key] = RingAttentionWrapper(
+                self._placement, self._kv_config.tokens_per_page, self._dtype, paged, self._device,
+            )
+        return wrapper
+
     def _eager_wrapper(
         self, label: str, is_decode: bool, slot: int
     ) -> AttentionWrapper:
@@ -379,7 +397,7 @@ class FlashInferManager(PlacedAttention):
 
         plan_outputs: KVPlanOutputs = ctx.plan_results.get(self._kv_cache_name)
         assert plan_outputs is not None, f"Attention Manager expected plan result from {self._kv_cache_name}"
-        self._check_sequence_shard(ctx)
+        shard_plan = self._check_sequence_shard(ctx)
         if self._group_idx:
             plan_outputs = plan_outputs.groups[self._group_idx]
 
@@ -391,6 +409,13 @@ class FlashInferManager(PlacedAttention):
         laps = PhaseLaps(f"{ctx.plan_phase}.attn.")
         for label, kv_out in plan_outputs.items():
             indptrs = kv_out.cpu_indptrs
+            r = None if shard_plan is None else shard_plan.ranges.get(label)
+            if r is not None and self._split_exchange == "ring":
+                assert lease is None, "a striped sequence shard plans a leased step copied"
+                wrapper = self._ring_wrapper(label, ctx.slot)
+                wrapper.plan(kv_out, r.counts, causal=step.causal)
+                plan_states[label] = wrapper
+                continue
             if lease is not None:
                 num_rows = indptrs.qo_indptr.shape[0] - 1
                 wrapper = self._cg_wrapper(lease, label, num_rows, ctx.force_prefill)
@@ -474,7 +499,7 @@ class FlashInferManager(PlacedAttention):
         self, q: torch.Tensor, label: str, kv_cache_layer: torch.Tensor, layer_idx: int | None = None,
     ) -> torch.Tensor:
         if self._shard is not None:
-            self._shard.check_bypass(label, "attention run")
+            self._shard.check_bypass(label, "attention run", by_head=self._placement is None)
         if self._layers is not None:
             # an explicit layer over the cursor, checked as the cursor is
             if layer_idx is not None:

@@ -64,21 +64,26 @@ class AttentionCallable:
         attention writes K/V inside its own run (``requires_kv_write`` False)."""
         self._exchanged(None, k, v)
 
-    @property
-    def _splits(self) -> bool:
+    def _exchanges(self) -> bool:
         # a stand-in attention (Cosmos3's warmup's, the tests' fakes) is no AttentionManager; a node
         # that never splits keeps the direct call
-        return isinstance(self.attn, AttentionManager) and self.attn.splits
+        return isinstance(self.attn, AttentionManager) and self.attn.step_exchanges()
 
     def _exchanged(self, q: torch.Tensor | None, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor | None:
-        if self._splits:
+        if self._exchanges():
             return self.attn.exchange(self._attend, q, k, v)
         return self._attend(q, k, v)
 
-    def _attend(self, q: torch.Tensor | None, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor | None:
-        # q None: the write alone, as the exchanges hand it on
+    def _attend(
+        self, q: torch.Tensor | None, k: torch.Tensor, v: torch.Tensor, tokens: torch.Tensor | None = None,
+    ) -> torch.Tensor | None:
+        # q None: the write alone. `tokens`: which of the step's tokens k and v are, named only by
+        # the ring's exchange (`sequence_shard.ring`), so a stand-in KV needn't take it
         if self.attn.requires_kv_write:
-            self.kv.write_kv(k, v)
+            if tokens is None:
+                self.kv.write_kv(k, v)
+            else:
+                self.kv.write_kv(k, v, tokens=tokens)
         if q is None:
             return None
         return self.attn.run(q, kv_cache_layer=self.kv.layer_view(), k=k, v=v)
@@ -94,15 +99,16 @@ class AttentionCallable:
         reads K/V from the paged cache, the step's KV write rides in the
         norm/RoPE kernel (``qk_norm_rope_kv_write``) rather than a launch of its
         own; a step that attends the fresh K/V (``reads_step_kv``) gets them
-        normed and rotated. On a node whose attention splits, the write and the
-        attention go through the exchange (the unfused branch) like ``__call__``'s."""
+        normed and rotated. Where ``__call__`` goes through the attention's exchange (a split
+        step, or a node that splits over KV stored by head), so do the write and the attention (the
+        unfused branch); a copied decode step over KV stored by position keeps the fused write."""
         from mstar.utils.attention import qk_norm_rope_inplace, qk_norm_rope_kv_write
 
         eps = _norm_eps(q_norm, k_norm)
         # the fused kernel leaves k as it was, so a step that attends its k and v needs them
         # normed and rotated in place; so does an exchange, which writes and attends the tokens and
         # heads this rank stores
-        if self._splits or self.attn.reads_step_kv():
+        if self._exchanges() or self.attn.reads_step_kv():
             qk_norm_rope_inplace(q, k, q_norm.weight, k_norm.weight, pos_ids, *eps, rope_theta)
             return self(q, k, v)
         layer, page_idx, slot_idx, n = self.kv.write_target()
