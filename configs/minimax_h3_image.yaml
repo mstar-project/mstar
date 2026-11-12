@@ -13,6 +13,9 @@ model_kwargs:
   # tiles per decoder call: one at a time leaves the decode launch-bound (9.2 s for a 16 MP
   # image on a B300, 0.45 s at 64), and the batched decode is bit-identical
   vae_tile_batch: 64
+  # the last 16 prompts' text rows, as SGLang's conditioning cache: a repeated prompt (and
+  # references) skips the text encoder and gets the same image
+  text_cache_entries: 16
 
 node_groups:
   - node_names: [dit]
