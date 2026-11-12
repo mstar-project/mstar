@@ -6,13 +6,13 @@ on a replay, and its checks live in it.
 
 from abc import abstractmethod
 from collections.abc import Collection, Iterable, Mapping, Sequence
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, overload
 
 import torch
 
 from mstar.engine.resources.sampler.utils import FUSED_DRAW_MAX_VOCAB, FusedDrawArgs
 from mstar.engine.resources.step import Segment, StepHandle
-from mstar.engine.state.contract import EMPTY, Array, ArrayStep, CausalConv, GatedDeltaNet, Op, Sampler
+from mstar.engine.state.contract import EMPTY, Array, ArrayStep, CausalConv, GatedDeltaNet, Op, Reached, Sampler
 
 if TYPE_CHECKING:
     from mstar.engine.state.state_op import StateOp
@@ -202,9 +202,18 @@ class ArrayHandle(StepHandle):
         ``keep=True``."""
         raise self._unsupported("add")
 
-    def read(self, layer: int | torch.Tensor, q: torch.Tensor | None = None, **mask_args: Any) -> torch.Tensor:
+    @overload
+    def read(self, layer: int | torch.Tensor, q: torch.Tensor, **mask_args: Any) -> torch.Tensor: ...
+
+    @overload
+    def read(self, layer: int | torch.Tensor, q: None = None, **mask_args: Any) -> Reached: ...
+
+    def read(
+        self, layer: int | torch.Tensor, q: torch.Tensor | None = None, **mask_args: Any,
+    ) -> torch.Tensor | Reached:
         """Attend ``q`` through the read declared for ``layer``: kept entries from earlier steps, plus this layer's
-        latest add, at the positions its mask reaches."""
+        latest add, at the positions its mask reaches. A read that declares no op takes no ``q`` and returns the
+        entries it reaches."""
         raise self._unsupported("read")
 
     def _add_read(

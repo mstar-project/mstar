@@ -10,6 +10,7 @@ from dataclasses import asdict, astuple, dataclass, replace
 from itertools import groupby
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
 
+import numpy as np
 import torch
 from torch.nn.attention.flex_attention import _DEFAULT_SPARSE_BLOCK_SIZE
 
@@ -40,6 +41,7 @@ from mstar.engine.resources.kv.config import (
     RingKVLayerConfig,
     RingKVStep,
 )
+from mstar.engine.resources.kv.plan import kept_reach
 from mstar.engine.resources.linear_attn.config import (
     LinearAttnConfig,
     LinearAttnSpec,
@@ -763,6 +765,51 @@ class KeptWindowAttend(KeptWindowBinding):
 KEPT_WINDOW_ATTEND = KeptWindowAttend()
 
 
+class PagedReach(KeptWindowBinding):
+    """A read with no op through a kept window: the entries it reaches, gathered from the pages. It runs on the pool
+    itself, whose plan holds the views, so it builds no spec and no step."""
+
+    def check(self, array: Array, key: str, read: Read) -> None:
+        if not (isinstance(read.mask, Bidirectional) and read.mask.kept_window):
+            raise _no_binding(PAGED, array, f"reads[{key!r}].op", update=False)
+        super().check(array, key, read)
+
+    def resource(self, array: Array, key: str) -> str:
+        return array.name
+
+    def bind(self, array: Array, key: str, resources: Mapping[str, Any]) -> "ReachRead":
+        return ReachRead(array, resources[key])
+
+
+class ReachRead:
+    """What a read with no op runs: each row's reach on one layer, gathered from the pages as `Reached`. Every add
+    writes the pages, so the reach holds this step's adds too."""
+
+    requires_kv_write = True
+
+    def __init__(self, array: Array, kv: Any):
+        self._array = array
+        self._kv = kv
+        # the views the staged reach was computed for, once per step
+        self._views: list | None = None
+
+    def run(self, q: None, label: str, kv_cache_layer: torch.Tensor, k=None, v=None, layer_idx: int = 0) -> Reached:
+        views = self._kv.views(label)
+        if views is not self._views:
+            page_size, device = self._kv.config.tokens_per_page, kv_cache_layer.device
+            slots = [kept_reach(view, page_size) for view in views]
+            self._pages = torch.from_numpy(np.concatenate([each.pages for each in slots])).to(device)
+            self._offsets = torch.from_numpy(np.concatenate([each.offsets for each in slots])).to(device)
+            ends = np.cumsum([0, *(len(each.pages) for each in slots)])
+            self._row_offsets = torch.from_numpy(ends.astype(np.int32)).to(device)
+            self._views = views
+        reach = self._kv.kv_cache.read_tokens(layer_idx, self._pages, self._offsets)
+        return Reached({"k": reach[:, 0], "v": reach[:, 1]}, row_offsets=self._row_offsets)
+
+    def select_last_hidden(self, x: torch.Tensor, label: str = "main") -> torch.Tensor:
+        raise _no_layout(self._array, "at_last_token on an array whose read has no op, which lays out no queries")
+
+
 class PositionsBinding(OpBinding):
     """An array's `Positions`, which a position resource keeps per request under `position_key`, with the `Rope` its
     calls rotate by."""
@@ -968,6 +1015,10 @@ class PagedArrayHandle(ArrayHandle):
         }
         self._kv = resources[array.name]
         self._views = {layer: self._kv.layer_view(i) for layer, i in self._pool_layer.items()}
+        # the layers whose read has no op, which takes no q and returns `Reached`
+        self._reached = frozenset(
+            layer for read in array.reads.values() if read.op is None for layer in read_layers(array, read)
+        )
         # each op with its resource, built once since `state_steps` runs on every step, replays too
         self._ops = [(resolved.resource_of[bound.key], bound) for bound in bindings]
         # whether `check_step` needs an add, for a step that lists a row on the pages at span above 0
@@ -1007,6 +1058,8 @@ class PagedArrayHandle(ArrayHandle):
         self._grows = not (declared.eager_add and ctx.capture) and any(
             segment.span and (segment.request_id, segment.label) not in declared.placeholders for segment in segments
         )
+        if self._reached and ctx.capture:
+            raise self._no_layout("a read with no op in a captured step, whose reach changes length every step")
         # A capture's dummy rows open only the default label.
         if ctx.capture:
             return
@@ -1036,12 +1089,16 @@ class PagedArrayHandle(ArrayHandle):
         self._kv.write_kv(fields["k"], fields["v"], layer_idx=self._pool_layer[layer], label=self.label)
 
     @torch.compiler.disable
-    def read(self, layer: int | torch.Tensor, q: torch.Tensor | None = None, **mask_args: Any) -> torch.Tensor:
-        if q is None:
-            raise self._no_layout("a read with no op")
+    def read(
+        self, layer: int | torch.Tensor, q: torch.Tensor | None = None, **mask_args: Any,
+    ) -> torch.Tensor | Reached:
         if mask_args:
             raise self._no_layout(f"mask arguments {sorted(mask_args)}, which no mask defines")
         layer = self._layer_id(layer)
+        if q is None and layer not in self._reached:
+            raise self._no_layout(f"a read with no op, on layer {layer}, whose read declares one")
+        if q is not None and layer in self._reached:
+            raise self._refusal(f"a read of layer {layer} with q, whose read declares no op and returns Reached")
         self._record_read(layer)
         return self._run(layer, q)
 
@@ -1822,13 +1879,14 @@ class PagedStorage(Storage):
         if joined:
             raise _no_layout(array, f"labels {joined} hold a '+', which joins the labels of a step over several labels "
                                     "into the name of its plan")
-        q_heads = {read.op.q_heads for read in array.reads.values()}
+        # a read with no op runs no kernel, and with none the pool takes its KV heads
+        q_heads = {read.op.q_heads for read in array.reads.values() if read.op is not None}
         if len(q_heads) > 1:
             raise _no_layout(array, f"reads have q_heads {sorted(q_heads)}, and PagedKVConfig has one num_qo_heads")
         return KVSpec(
             resource_key=array.name, nodes=array.nodes, leader=_leader(array, walks),
             config=PagedKVConfig(
-                num_layers=len(array.layers), num_qo_heads=q_heads.pop(),
+                num_layers=len(array.layers), num_qo_heads=q_heads.pop() if q_heads else None,
                 num_kv_heads=heads, head_dim=head_dim, max_seq_len=array.max_len,
             ),
         )
@@ -1841,7 +1899,11 @@ class PagedStorage(Storage):
         specs: dict[str, NodeResourceSpec] = {}
         resource_of: dict[str, str] = {}
         for key, read, binding in bound:
-            (spec,) = binding.specs(array, key, read)
+            built = binding.specs(array, key, read)
+            if not built:
+                resource_of[key] = binding.resource(array, key)
+                continue
+            (spec,) = built
             resource_of[key] = next((
                 first for first, shared in specs.items() if shared.config == spec.config and not any(
                     array.reads[member].mask != read.mask and _share_a_walk(array.reads[member], read)
@@ -2163,8 +2225,9 @@ def storage_of(array: Array) -> Storage:
 # `Attend` is an `AttentionSpec` on a paged array, a `CrossAttentionSpec` on one read with another array's queries and a
 # `RaggedAttentionSpec` within a step, so a binding is per storage and op type. A field of a read's mask can still swap
 # the binding, through `OpBinding.for_mask`, as a kept window does, and the `SDPA` table below is the deployment's swap.
-BINDINGS: dict[tuple[Storage, type[Op | Positions]], OpBinding] = {
+BINDINGS: dict[tuple[Storage, type[Op | Positions | None]], OpBinding] = {
     (PAGED, Attend): PagedAttend(),
+    (PAGED, type(None)): PagedReach(),
     (PAGED, Positions): PositionsBinding(),
     (PAGED_BY_WALK, Attend): PagedAttend(),
     (PAGED_BY_WALK, Positions): PositionsBinding(),
@@ -2242,7 +2305,7 @@ def _no_binding(storage: Storage, array: Array, where: str, *, update: bool) -> 
     binds: a read's op changes no field, and an update writes one."""
     kinds = sorted(
         kind.__name__ for held, kind in BINDINGS
-        if held is storage and kind is not Positions and bool(kind.writes) == update
+        if held is storage and issubclass(kind, Op) and bool(kind.writes) == update
     )
     side = "update" if update else "read"
     if not kinds:

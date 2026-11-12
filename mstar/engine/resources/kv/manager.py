@@ -768,6 +768,9 @@ class KVManager(AttentionResource):
         self._empty_locations: torch.Tensor | None = None
         # (label, group) -> its write addressing
         self._current_plan_states: dict[tuple[str, int], KVPlanState] = {}
+        # The plan output of the step the forward runs, which a pre-plan of the next step leaves in place. Its commit
+        # drops it, so the plan goes with its last reference.
+        self._live_outputs: KVPlanOutputs | None = None
         self.reset_default_cursors()
 
         self._preplan_states: dict[tuple[str, int], KVPlanState] = {}
@@ -2781,6 +2784,8 @@ class KVManager(AttentionResource):
             for g, outputs in enumerate(res.groups):
                 self._setup_plan_states(outputs, ctx, lease, g, eager_write=step.eager_write)
         self._mark_preplanned(step, ctx, res)
+        if not ctx.is_preplan:
+            self._live_outputs = res
         return res
 
     def _drop_readonly_plans(self) -> None:
@@ -2898,6 +2903,7 @@ class KVManager(AttentionResource):
                 self._preplan_new_labels = []
                 # the promoted step runs, so no stream changed under the plans
                 self.clear_preplan(promoted=True)
+                self._live_outputs = res
                 laps.lap("promote")
                 return res
             # A different step reached the GPU thread before the one planned
@@ -2963,7 +2969,16 @@ class KVManager(AttentionResource):
         if readonly:
             self._readonly_plans[slot] = (key, epoch, res)
         self._mark_preplanned(step, ctx, res)
+        if not ctx.is_preplan:
+            self._live_outputs = res
         return res
+
+    def views(self, label: str) -> list[SequenceView]:
+        """The views of ``label`` in the step the forward runs, one per row: a pre-plan of the next step doesn't
+        replace them."""
+        if self._live_outputs is None:
+            raise RuntimeError(f"KV {self.name}: views of {label!r} outside a step's forward, where no plan is live")
+        return self._live_outputs[label].views
 
     def _mark_preplanned(self, step: KVStep, ctx: StepContext, res: "KVPlanOutputs") -> None:
         if ctx.is_preplan:
@@ -3089,6 +3104,7 @@ class KVManager(AttentionResource):
         self._recount(rid)
 
     def commit(self, step: KVStep, ctx: StepContext):
+        self._live_outputs = None
         streams = self._streams
         retention = step.retention
         exact = self._exact
