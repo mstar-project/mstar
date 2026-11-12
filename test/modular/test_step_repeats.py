@@ -5,7 +5,6 @@ from types import SimpleNamespace
 
 import pytest
 
-from mstar.engine.device_run import WalkAsk
 from mstar.graph.base import GraphEdge, GraphNode, Loop
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.submodule_base import (
@@ -91,7 +90,7 @@ def test_a_plain_ar_node_is_refused_until_it_declares_what_a_repeat_reads():
     mgmt = make_mgmt(node, resources={"sampler": sampler})
     engine = make_engine(_submodules={NODE: mgmt})
 
-    engine.enable_repeats(NODE, {WALK: WalkAsk(frozenset({"text_inputs"}))})
+    engine.enable_repeats(NODE, {WALK})
 
     assert mgmt.may_repeat
 
