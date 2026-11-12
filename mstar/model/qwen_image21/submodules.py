@@ -425,11 +425,14 @@ class QwenImage21DenoiseSubmodule(DenoiseLoopSubmodule):
                 for label in labels for rid, key in zip(request_ids, keys, strict=True)
             )
 
-        return SubmoduleStep(cg_key_info=self._uniform_key(keys), steps={
-            KV: KVStep(segments=segments(held), commit=False,
-                       combined_labels={local: CFG_LABEL} if len(local) > 1 else {}),
-            self.target_attn_key(): AttentionStep(segments=segments(local), causal=False),
-        })
+        return SubmoduleStep(
+            cg_key_info=self._uniform_key(keys),
+            combined_labels={local: CFG_LABEL} if len(local) > 1 else {},
+            steps={
+                KV: KVStep(segments=segments(held), commit=False),
+                self.target_attn_key(): AttentionStep(segments=segments(local), causal=False),
+            },
+        )
 
     def cg_key_info(self, graph_walk, per_request_info, per_request_input_metadata=None, **kwargs):
         if graph_walk in PREFIX_WALKS:
