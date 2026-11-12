@@ -704,8 +704,17 @@ def test_a_kept_window_read_is_never_captured():
     assert not attention.can_capture()
     leased = StepContext(request_ids=["a"], graph_walk="rollout", slot=0, capture=False,
                          slot_lease=SimpleNamespace(captured=True))
-    with pytest.raises(RuntimeError, match="a kept-window read is eager-only"):
+    with pytest.raises(RuntimeError, match="Array 'dit_kv': a kept-window read is eager-only"):
         attention.plan(AttentionStep(segments=[Segment("a", "main", 4)]), leased)
+
+
+def test_the_kept_window_resource_s_refusals_name_the_array():
+    attention = KeptWindowAttention(_StubInner(), "dit_kv")
+    ctx = StepContext(request_ids=["a"], graph_walk="rollout", slot=0, capture=False)
+    with pytest.raises(RuntimeError, match=r"Array 'dit_kv': no layout yet: a kept-window read over labels"):
+        attention.plan(AttentionStep(segments=[Segment("a", "main", 4), Segment("a", "uncond", 4)]), ctx)
+    with pytest.raises(ValueError, match="Array 'dit_kv': no layout yet: at_last_token"):
+        attention.select_last_hidden(torch.zeros(1))
 
 
 def _kept_and_rolling(device: torch.device, chunks=6, frame=3):

@@ -60,14 +60,15 @@ class KeptWindowAttention(AttentionManager):
     def plan(self, step: AttentionStep, ctx: StepContext) -> None:
         refuse_context_only(step, type(self).__name__)
         self.reset_default_cursors()
-        if ctx.slot_lease is not None or ctx.is_preplan:
+        if ctx.slot_lease is not None:
             raise RuntimeError(
-                "a kept-window read is eager-only: its reach changes length from step to step, so a captured "
-                "graph has nothing fixed to replay"
+                f"Array {self._kv_cache_name!r}: a kept-window read is eager-only: its reach changes length from step "
+                "to step, so a captured graph has nothing fixed to replay"
             )
         labels = {segment.label for segment in step.segments}
         if len(labels) != 1:
-            raise RuntimeError(f"no layout yet: a kept-window read over labels {sorted(labels)}, and it plans one")
+            raise RuntimeError(f"Array {self._kv_cache_name!r}: no layout yet: a kept-window read over labels "
+                               f"{sorted(labels)}, and it plans one")
         (label,) = labels
         views = ctx.plan_results[self._kv_cache_name][label].views
         self._reach = stage_reach(views, self._kv.config.tokens_per_page, self._kv.kv_cache.tensor.device)
@@ -76,7 +77,8 @@ class KeptWindowAttention(AttentionManager):
         self._inner.plan(RaggedCrossAttentionStep(segments=(*queries, *reaches), pairs=((_QUERIES, _REACH),)), ctx)
 
     def select_last_hidden(self, hidden: torch.Tensor, label: str = "main") -> torch.Tensor:
-        raise ValueError("no layout yet: at_last_token on a kept-window read, whose plan selects no last token")
+        raise ValueError(f"Array {self._kv_cache_name!r}: no layout yet: at_last_token on a kept-window read, whose "
+                         "plan selects no last token")
 
     def run(
         self, q: torch.Tensor, label: str | None = None, kv_cache_layer: torch.Tensor | None = None,
