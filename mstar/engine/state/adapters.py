@@ -985,7 +985,7 @@ class PagedByWalkHandle(PagedArrayHandle):
         super().begin_step(step)
         if not step.ctx.replays:
             self._walk = step.ctx.graph_walk
-            self._covered = self.walk_reads.covers.get(self._walk, self.walk_reads.covers[None])
+            self._covered = self.walk_reads.covers[self.walk_reads.key(self._walk)]
 
     def _run(self, layer: int, q: torch.Tensor) -> torch.Tensor:
         if layer not in self._covered:
@@ -994,7 +994,7 @@ class PagedByWalkHandle(PagedArrayHandle):
 
     def _last_token_read(self) -> Any:
         # a walk plans only the resources of its own reads
-        reads = self.walk_reads.reads.get(self._walk, self.walk_reads.reads[None])
+        reads = self.walk_reads.reads[self.walk_reads.key(self._walk)]
         if not reads:
             raise self._refusal(f"at_last_token on walk {self._walk!r}, which runs no read of this array")
         return self.reads[next(iter(reads.values()))]
@@ -1003,7 +1003,7 @@ class PagedByWalkHandle(PagedArrayHandle):
         """FlashInfer fixes the mask when it plans, so every replay would run the capture walk's."""
         reads = self.walk_reads.reads
         for resource in {resource for by_resource in reads.values() for resource in by_resource}:
-            keys = {reads.get(walk, reads[None]).get(resource) for walk in walks} - {None}
+            keys = {reads[self.walk_reads.key(walk)].get(resource) for walk in walks} - {None}
             if len({self.array.reads[key].mask for key in keys}) > 1:
                 raise self._no_layout(f"a capture replayed on walks {sorted(walks)} runs reads {sorted(keys)} on "
                                       f"{resource!r} with different masks, and a capture plans one")
@@ -1011,7 +1011,7 @@ class PagedByWalkHandle(PagedArrayHandle):
     def _step_ops(self, walk: str | None) -> Sequence[tuple[str, BoundOp]]:
         if walk is None:
             raise self._no_layout("a step with no walk, on an array whose reads differ by walk")
-        return self._walk_ops.get(walk, self._walk_ops[None])
+        return self._walk_ops[self.walk_reads.key(walk)]
 
 
 class PagedCrossHandle(PagedArrayHandle):
@@ -1537,6 +1537,10 @@ class WalkReads(NamedTuple):
     reads: dict[str | None, dict[str, str]]
     covers: dict[str | None, frozenset[int]]
 
+    def key(self, walk: str | None) -> str | None:
+        """Where ``walk``'s reads sit: under its own name, or under None for a walk no read names."""
+        return walk if walk in self.reads else None
+
 
 class Resolved(NamedTuple):
     """Arrays resolved into today's resources: each array's specs, its ops' included, and its ops with the bindings that
@@ -1710,12 +1714,13 @@ def _walk_reads(array: Array, resource_of: Mapping[str, str], combined: Mapping[
         covering = [key for key, read in array.reads.items() if runs_on_walk(read, walk)]
         reads[walk] = {resource_of[key]: key for key in covering}
         covers[walk] = frozenset().union(*(read_layers(array, array.reads[key]) for key in covering))
+    walk_reads = WalkReads(reads, covers)
     for walk, members in combined.items():
         reads[walk] = {
-            resource: key for member in sorted(members) for resource, key in reads.get(member, reads[None]).items()
+            resource: key for member in sorted(members) for resource, key in reads[walk_reads.key(member)].items()
         }
-        covers[walk] = frozenset.intersection(*(covers.get(member, covers[None]) for member in members))
-    return WalkReads(reads, covers)
+        covers[walk] = frozenset.intersection(*(covers[walk_reads.key(member)] for member in members))
+    return walk_reads
 
 
 class PagedByWalkStorage(PagedStorage):
