@@ -19,11 +19,13 @@ import pytest
 PORTED = (
     "mstar/model/qwen3_5", "mstar/model/command_a_plus", "mstar/model/wan22", "mstar/model/flux2_klein",
     "mstar/model/z_image", "mstar/model/ltx2_5", "mstar/model/qwen3_omni", "mstar/model/minimax_h3",
+    "mstar/model/kokoro", "mstar/model/omnilingual_asr", "mstar/model/omnivoice", "mstar/model/orpheus",
+    "mstar/model/voxcpm2",
     "mstar/model/canary_qwen", "mstar/model/qwen3_asr", "mstar/model/parakeet", "mstar/model/fish_s2_pro",
     "mstar/model/qwen3_tts",
 )
 FORBIDDEN_ATTRIBUTES = {
-    "node_resources", "resources", "request_state", "per_request_states",
+    "node_resources", "resources", "request_state", "request_states", "per_request_states",
     # what a handle holds
     "resource", "positions", "reads", "first_read", "_kv", "_attn", "_pool", "_runners", "_views", "_blocks",
     "_bindings", "_layouts", "_update",
@@ -35,7 +37,8 @@ ALLOWED = {
     for name in (
         "AcceleratorGraphConfig", "BatchedAcceleratorGraphConfig", "DETERMINISTIC_COMPILE_MODE",
         "PackedAcceleratorGraphConfig", "PiecewiseAcceleratorGraphConfig", "PiecewiseBatchedConfig",
-        "PiecewiseCallInputs", "PiecewiseCaptureShape", "decode_rows_then_prompt", "geometric_batch_sizes",
+        "PiecewiseCallInputs", "PiecewiseCaptureShape", "PiecewisePackedConfig", "decode_rows_then_prompt",
+        "geometric_batch_sizes",
     )
 } | {
     ("mstar.engine.engine", "ExecutingBatch"): "the annotation of `NodeSubmodule.can_batch`, a base class's hook",
@@ -129,6 +132,7 @@ def test_every_exception_is_still_used():
     ("def f(e): return e.resources['kv']", ".resources"),
     ("def f(self): return self.node_resources['kv']", ".node_resources"),
     ("def f(self, rid): return self.request_state(rid)", ".request_state"),
+    ("def f(self): return self.request_states", ".request_states"),
     ("def f(e): return e.per_request_states", ".per_request_states"),
     ("def f(self): return self.sampler.resource", ".resource"),
     ("def f(self): return self.kv.positions", ".positions"),
@@ -179,6 +183,10 @@ _WATERMARK = (_TTS, "CodecSubmodule.batch_postprocess", "request_state")
 def test_an_exception_covers_only_its_own_functions_attribute(path, source, found, used):
     """A key skips only its attribute, anywhere in its function, and is used only when it skips one."""
     assert _violations(source, path) == (found, used)
+
+
+def test_the_lint_reads_the_five_speech_packages():
+    assert {path.parts[2] for path in _sources()} >= {"kokoro", "omnilingual_asr", "omnivoice", "orpheus", "voxcpm2"}
 
 
 def test_the_lint_reads_all_five_reference_packages():
