@@ -99,6 +99,12 @@ def vendor_of(gpu: str) -> str | None:
     return next((vendor for vendor, names in SUPPORTED.items() if names.search(gpu)), None)
 
 
+# What `launch` exits with besides 0 (launched) and 1 (refused or failed), for a caller that tries other offers.
+EXIT_FULL = 4  # budget.max_running has no room, as it would have for every other offer
+EXIT_RUN_NOT_STARTED = 5  # the box was made but couldn't be given its --run, and was ended: its provider can't run it
+EXIT_UNCOUNTED = 6  # a provider's API failed while counting the running boxes: it would again for the next offer
+
+
 def die(msg: str, code: int = 1) -> None:
     print(f"gpu.py: {msg}", file=sys.stderr)
     sys.exit(code)
@@ -912,9 +918,6 @@ def check_total(cfg, committed: float, allow: bool) -> None:
             f"over budget.max_total_usd ${max_total}; ask before passing --allow-over-budget")
 
 
-COUNT_FAILED = "can't count this tool's instances for budget.max_running"  # what launch dies with, then
-
-
 def cmd_launch(args, cfg):
     if args.boxes < 1:  # fewer would let budget.max_running pass a launch past it
         die(f"--boxes is {args.boxes}; it counts this launch, so it is at least 1")
@@ -949,11 +952,11 @@ def cmd_launch(args, cfg):
                         print(f"gpu.py: {line}", file=sys.stderr)
                     up = running(cfg)
                 except ApiError as err:
-                    die(f"{COUNT_FAILED}: {err}")
+                    die(f"can't count this tool's instances for budget.max_running: {err}", code=EXIT_UNCOUNTED)
                 if len(up) + args.boxes > max_running:
                     die(f"{len(up)} of this tool's instances are up, from every session, and this launch needs room "
                         f"for {args.boxes}; budget.max_running is {max_running}. Wait for one to end, or ask before "
-                        "passing --allow-over-budget", code=4)
+                        "passing --allow-over-budget", code=EXIT_FULL)
             check_total(cfg, sum(committed_usd(e) for e in live.values()) + o["usd_per_hour"] * hours,
                         args.allow_over_budget)
         body, create = p.plan(o, name, pubkey, hours, args)
@@ -1035,9 +1038,13 @@ def start_run_over_ssh(key: str, cfg: dict, args) -> None:
                 r = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True, check=False)
                 if r.returncode:
                     die(f"couldn't {what} on {key}: {tail_lines(r.stderr or r.stdout, 300)}")
-    except BaseException:  # a die, an API error or an interrupt: all end the pod
+    except BaseException as err:  # a die, an API error or an interrupt: all end the pod
         terminate(key, entry(key))
-        raise
+        if not isinstance(err, (Exception, SystemExit)):
+            raise
+        if not isinstance(err, SystemExit):  # a die has said why
+            print(f"gpu.py: couldn't start the run on {key}: {err}", file=sys.stderr)
+        sys.exit(EXIT_RUN_NOT_STARTED)
 
 
 def arm_watchdog(key: str) -> None:

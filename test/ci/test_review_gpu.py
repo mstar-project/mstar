@@ -371,7 +371,9 @@ class TestStart(unittest.TestCase):
         config = types.SimpleNamespace(load_config=lambda: cfg, ApiError=RuntimeError,
                                        tail_lines=gpu_review.gpu_py.tail_lines,
                                        cloud_config=gpu_review.gpu_py.cloud_config,
-                                       COUNT_FAILED=gpu_review.gpu_py.COUNT_FAILED,
+                                       EXIT_FULL=gpu_review.gpu_py.EXIT_FULL,
+                                       EXIT_RUN_NOT_STARTED=gpu_review.gpu_py.EXIT_RUN_NOT_STARTED,
+                                       EXIT_UNCOUNTED=gpu_review.gpu_py.EXIT_UNCOUNTED,
                                        USER_DATA_MAX=gpu_review.gpu_py.USER_DATA_MAX)
         with workspace() as ws, unittest.mock.patch.object(gpu_review, "gpu_py", config), \
                 unittest.mock.patch.object(gpu_review, "time", self.clock), contextlib.redirect_stdout(io.StringIO()):
@@ -444,14 +446,26 @@ class TestStart(unittest.TestCase):
         self.assertIn(str(out / "pr-body.md"), launched[1], "a pod's inputs go over scp whole")
         self.assertEqual((out / "nvidia/instance").read_text(), "runpod:x:1")
 
+    def test_a_provider_whose_box_cant_take_its_run_is_not_tried_again(self):
+        offers = [{"id": f"{p}:{i}", "provider": p, "gpu": "H100", "count": 1, "usd_per_hour": usd,
+                   "availability": "available", "vendor": "nvidia"}
+                  for p, usd in (("runpod", 2.0), ("lambda", 3.0)) for i in (1, 2, 3)]
+        out, launched = self.start({"eras": {}}, offers={"nvidia": offers}, launch_code={
+            f"runpod:{i}": gpu_review.gpu_py.EXIT_RUN_NOT_STARTED for i in (1, 2, 3)})
+        self.assertEqual([x[1] for x in launched], ["runpod:1", "lambda:1"],
+                         "each RunPod offer would wait out its pod's ssh before Lambda was tried")
+        self.assertEqual((out / "nvidia/instance").read_text(), "lambda:1:1")
+
     def test_a_run_past_the_bots_cap_says_so(self):
-        out, launched = self.start({"eras": {"run_secret_id": "s"}, "budget": {"max_running": 2}}, launch_code=4)
+        out, launched = self.start({"eras": {"run_secret_id": "s"}, "budget": {"max_running": 2}},
+                                   launch_code=gpu_review.gpu_py.EXIT_FULL)
         self.assertEqual(len(launched), 1, "every other offer would be tried past the same cap")
         self.assertEqual(self.clock.slept, [], "the cap would be retried for five minutes before it was said")
         self.assertIn("would go past 2 with this run's 1", (out / "nvidia/unavailable.md").read_text(),
                       "the PR would read that there were no GPUs")
-        counting, _ = self.start({"eras": {"run_secret_id": "s"}}, launch_code=1,
-                                 launch_error=f"gpu.py: {gpu_review.gpu_py.COUNT_FAILED}: HTTP 500")
+        counting, launched = self.start({"eras": {"run_secret_id": "s"}}, launch_code=gpu_review.gpu_py.EXIT_UNCOUNTED)
+        self.assertEqual(len(launched), 11, "every offer would be tried in a pass, each with the API's retries; or "
+                                            "the next pass would not try again")
         first = (counting / "nvidia/unavailable.md").read_text().split("\n")[0]
         self.assertIn("couldn't count its running boxes", first,
                       "the PR would read that there were no GPUs, when a provider's API was down")

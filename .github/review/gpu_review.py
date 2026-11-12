@@ -348,14 +348,18 @@ def free_offers(gpus, vendor, max_usd_per_hour=None):
     return sorted(free, key=lambda o: (RANK[o["provider"]], o["usd_per_hour"])), listing
 
 
-def launch_first(offers, launch):
+def launch_first(offers, launch, dropped=()):
     """`launch(o)` (the run of gpu.py's launch) on each offer in turn until one starts, since another run can
-    take a listing first, or budget.max_running refuses it (exit 4), as it would every other offer; (the offer
-    that started, its run's output) or (None, the last run's output, None when there was no offer)."""
+    take a listing first. It stops where every other offer would meet the same: budget.max_running's refusal, or a
+    provider API that can't be counted on. A provider whose box couldn't be given its run is in `dropped` (provider
+    -> why) from then on, and its other offers are skipped. (the offer that started, its run's output) or (None,
+    the last run's output, None when there was no offer)."""
     r = None
     for o in offers:
+        if o["provider"] in dropped:
+            continue
         r = launch(o)
-        if r.returncode in (0, 4):
+        if r.returncode in (0, gpu_py.EXIT_FULL, gpu_py.EXIT_UNCOUNTED):
             break
     return (o if r and r.returncode == 0 else None), r
 
@@ -383,8 +387,9 @@ def start(out, pr, head_sha, runner_temp, tag, base, gpus, hours, run, checks, v
     has no GPUs free, none starts, and the first launch asks budget.max_running for room for them all; when a box
     then fails to start (its offer taken meanwhile), those already started go. Until every vendor has a box, a pass
     of listing and launching repeats every GPU_RETRY seconds for GPU_WAIT. budget.max_running's refusal (launch
-    exits 4) is not retried: it says now, as every pass would. Each box that doesn't run gets an unavailable.md,
-    and the step exits 3 with `unavailable` set."""
+    exits EXIT_FULL) is not retried: it says now, as every pass would. A provider whose box couldn't be given its
+    run is not tried again; one whose API can't count the running boxes is tried on the next pass. Each box that
+    doesn't run gets an unavailable.md, and the step exits 3 with `unavailable` set."""
     pr, gpus, hours, turns = int(pr), int(gpus), float(hours), int(turns)
     base, checks, vendors = branch(base), check_kinds(checks), vendor_list(vendors)
     since = commit(since) if since else ""
@@ -413,10 +418,13 @@ def start(out, pr, head_sha, runner_temp, tag, base, gpus, hours, run, checks, v
                                                     asked_checks, vendor, vendors, end_by=end_by))
     secret = os.environ.get(cfg.get("run_secret_env") or "", "")
 
+    dropped, last = {}, {}  # provider -> why its boxes can't run here; vendor -> its last launch's exit
+
     def listed(vendor):
         """(the offers of `vendor` that can start now, the listing they came from, what was left out and why)."""
         free, listing = free_offers(gpus, vendor)
-        tried = []
+        tried = [dropped[p] for p in dict.fromkeys(o["provider"] for o in free) if p in dropped]
+        free = [o for o in free if o["provider"] not in dropped]
         # The box's Anthropic key on Eras is a saved Eras secret: without it a box would be paid for and do nothing.
         if not cfg.get("eras", {}).get("run_secret_id") and any(o["provider"] == "eras" for o in free):
             tried, free = ["eras: ERAS_RUN_SECRET_ID is not set"], [o for o in free if o["provider"] != "eras"]
@@ -426,10 +434,9 @@ def start(out, pr, head_sha, runner_temp, tag, base, gpus, hours, run, checks, v
         _, listing, tried = found[vendor]
         everything = json.loads(gpu("offers", "--gpus", str(gpus), "--vendor", vendor, "--json", "--all-regions",
                                     check=False).stdout)
-        uncounted = any(gpu_py.COUNT_FAILED in t for t in tried)
         lines = [f"No {bot.VENDORS[vendor]} GPUs for the live test: it needs {gpus}, at most "
                  f"${listing['max_usd_per_hour']}/hr."]
-        if uncounted:
+        if last.get(vendor) == gpu_py.EXIT_UNCOUNTED:
             lines = [f"The live test started no {bot.VENDORS[vendor]} box: the bot couldn't count its running "
                      "boxes (a provider's API failed), so every launch was refused."]
         lines += [f"- tried {t}" for t in tried]
@@ -475,18 +482,21 @@ def start(out, pr, head_sha, runner_temp, tag, base, gpus, hours, run, checks, v
                           for x in ("--input", str(f))]
                 r = gpu("launch", o["id"], "--pr", str(pr), "--hours", str(hours), "--tag", f"{tag}-{vendor}",
                         "--run", str(BOX), *inputs, "--boxes", str(boxes), check=False)
+                last[vendor] = r.returncode
                 if r.returncode:
                     tried.append(f"{o['id']}: {gpu_py.tail_lines(r.stderr or r.stdout, 400)}")
+                if r.returncode == gpu_py.EXIT_RUN_NOT_STARTED:  # its box was ended; the next offer would be too
+                    dropped[o["provider"]] = tried[-1]
                 return r
 
-            o, r = launch_first(free, launch)
+            o, r = launch_first(free, launch, dropped)
             if o:
                 (box / "instance").write_text(r.stdout.strip().splitlines()[-1])
                 (box / "offer.json").write_text(json.dumps(o))
                 print(f"launched {vendor} on {o['id']} ({o['count']}x {o['gpu']}, ${o['usd_per_hour']}/hr)")
                 continue
             end_boxes()  # a vendor's box is paid for nothing without the others
-            return found, "full" if r and r.returncode == 4 else "taken", vendor
+            return found, "full" if r and r.returncode == gpu_py.EXIT_FULL else "taken", vendor
         return found, "started", None
 
     give_up = time.time() + GPU_WAIT
