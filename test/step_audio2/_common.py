@@ -1,9 +1,9 @@
 """Shared pieces of the Step-Audio2 parity harness: paths, the oracle, metrics, loading.
 
-The oracle is recorded once by the reference (``record_oracle.py`` for the bf16 LLM side and
-the fp32 token2wav stream, ``record_fp32.py`` for the fp32 third configuration); see
-``README`` next to those scripts. Paths default to this pod's layout and can be moved with
-``STEPAUDIO2_CKPT`` / ``STEPAUDIO2_ORACLE`` / ``STEPAUDIO2_ASSETS``.
+The oracle is recorded once from the reference by the scripts in ``reference/`` (its
+``README.md`` has the venv and the order to run them in). Point ``STEPAUDIO2_CKPT`` at the
+checkpoint, ``STEPAUDIO2_ORACLE`` at the recordings and ``STEPAUDIO2_ASSETS`` at the reference
+repo's ``assets/``; the defaults are the layout these were recorded in.
 """
 from __future__ import annotations
 
