@@ -36,10 +36,11 @@ from mstar.model.components.diffusion.denoise_loop import DenoiseLoopSubmodule, 
 from mstar.model.components.diffusion.dmd import dmd_schedule, dmd_step, step_distill_schedule, step_distill_step
 from mstar.model.components.diffusion.flow_match import FlowMatchSchedule
 from mstar.model.components.diffusion.image_io import truncate_to_uint8
+from mstar.model.components.diffusion.step_cache import BlockCache, step_cache_policy
 from mstar.model.components.diffusion.unipc import NUM_TRAIN_TIMESTEPS, make_unipc_tables
 from mstar.model.components.distributed.sequence_parallel import my_rows
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
-from mstar.model.wan22.config import DIT_TOKENS, Wan22Config
+from mstar.model.wan22.config import DIT_TOKENS, MAG_RATIOS, Wan22Config
 
 logger = logging.getLogger(__name__)
 
@@ -337,7 +338,10 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
     def __init__(
         self, transformer: nn.Module, config: Wan22Config, cfg_group=None, transformer_2: nn.Module | None = None,
     ):
-        super().__init__(loop_name=DENOISE_LOOP_NAME, max_batch_size=config.dit_max_batch_size)
+        super().__init__(
+            loop_name=DENOISE_LOOP_NAME, max_batch_size=config.dit_max_batch_size,
+            step_cache=step_cache_policy(config.step_cache, MAG_RATIOS),
+        )
         if config.is_moe and transformer is not None and transformer_2 is None:
             raise ValueError("Wan2.2 A14B needs both experts: transformer_2 is missing.")
         self.transformer = transformer
@@ -441,6 +445,15 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
         timesteps = self.schedule_of(fwd_info, bucket_key).timesteps
         return bool(timesteps[self.step_index(fwd_info)] >= self._boundary_timestep)
 
+    def step_cache_segments(self, fwd_info: CurrentForwardPassInfo, bucket_key: WanStepKey) -> tuple[int, ...]:
+        # A14B: the low-noise expert's first step, from the host timestep table. Its residual has nothing to do with
+        # the high-noise expert's, so that step computes and the skip rule starts over.
+        if not self.config.is_moe:
+            return ()
+        timesteps = self.schedule_of(fwd_info, bucket_key).timesteps
+        low = [k for k, t in enumerate(timesteps.tolist()) if t < self._boundary_timestep]
+        return (low[0],) if low and low[0] > 0 else ()
+
     def _expert_groups(
         self, engine_inputs: ModelInputsFromEngine, bucket_key: WanStepKey,
     ) -> list[tuple[nn.Module, float, list[int]]]:
@@ -508,11 +521,12 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
             temp_ts = timestep[:, None]
         pos, neg = text_embeds_pos.flatten(0, 1), text_embeds_neg.flatten(0, 1)
         groups = self._expert_groups(engine_inputs, bucket_key)
+        block_cache = self.block_cache(engine_inputs)
         if len(groups) == 1:
             transformer, guidance, _ = groups[0]
             output = self._noise_prediction(
                 model_input.to(transformer.dtype), temp_ts.squeeze(0), pos, neg, bucket_key.guidance,
-                transformer=transformer, combine_scale=guidance,
+                transformer=transformer, combine_scale=guidance, block_cache=block_cache,
             )
             return output[:, None]
         # rows on both sides of A14B's boundary: one forward per expert
@@ -522,6 +536,7 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
             part = self._noise_prediction(
                 model_input[index].to(transformer.dtype), temp_ts[index], pos[index], neg[index],
                 bucket_key.guidance, transformer=transformer, combine_scale=guidance,
+                block_cache=None if block_cache is None else block_cache.rows(rows),
             )
             if output is None:
                 output = part.new_empty((batch.shape[0], *part.shape[1:]))
@@ -537,13 +552,15 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
         guidance_scale: float,
         transformer: nn.Module | None = None,
         combine_scale: float | None = None,
+        block_cache: BlockCache | None = None,
     ) -> torch.Tensor:
         """CFG noise prediction; one forward over every row's two branches instead
         of the reference's two sequential forwards. The combine runs in the
         transformer's output dtype (bf16), like the reference. ``temp_ts`` is per
         row, ``[B, groups]``, or one row's ``[groups]``, a group being a latent
         frame or (A14B) the whole sample. ``transformer`` is the expert to run, by
-        default ``self.transformer``.
+        default ``self.transformer``. Under a step cache a row keeps its residual
+        as ``[branches, tokens, dim]`` over this rank's branches.
 
         ``guidance_scale`` above 1.0 runs the negative branch and is the combine's
         scale unless ``combine_scale`` is given: A14B's low-noise steps combine with
@@ -580,11 +597,22 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
         forward = module
         if not compiled:
             forward = next((eager for owner, eager in self._eager_forwards if owner is module), module)
+        cache = {}
+        if block_cache is not None:
+            # the forward's batch is branch-major, [branches * rows]; the cache is row-leading
+            if block_cache.reuse:
+                cache["cached_residual"] = block_cache.residual.transpose(0, 1).flatten(0, 1)
+            else:
+                cache["return_residual"] = True
         out = forward(
             hidden_states=hidden_states,
             timestep=timestep,
             encoder_hidden_states=encoder_hidden_states.to(module.dtype),
+            **cache,
         )
+        if cache.get("return_residual"):
+            out, residual = out
+            block_cache.keep(residual.unflatten(0, (branches, rows)).transpose(0, 1))
         if not do_cfg:
             return out
         out = self.cfg_group.all_gather(out.contiguous(), dim=0)

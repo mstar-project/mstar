@@ -53,10 +53,12 @@ from mstar.graph.base import (
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import Model, WalkStep
 from mstar.model.components.diffusion.attention import dit_entry, refuse_attention_backend_kwarg
+from mstar.model.components.diffusion.step_cache import step_cache_policy
 from mstar.model.components.video_encode import encode_mp4
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.wan22.config import (
     DIT_TOKENS,
+    MAG_RATIOS,
     SAMPLER_DMD,
     SAMPLER_STEP_DISTILL,
     SAMPLER_UNIPC,
@@ -120,6 +122,7 @@ class Wan22Model(Model):
         dmd_shift: float | None = None,
         lora: list | None = None,
         lora_2: list | None = None,
+        step_cache: dict | None = None,
         **kwargs,
     ):
         refuse_attention_backend_kwarg(kwargs)
@@ -133,8 +136,10 @@ class Wan22Model(Model):
             vae_decode_fast=vae_decode_fast, vae_decode_fast_sizes=vae_decode_fast_sizes,
             sampler=sampler, dmd_timesteps=dmd_timesteps, dmd_shift=dmd_shift,
             lora=tuple(lora or ()), lora_2=tuple(lora_2 or ()),
+            step_cache=step_cache,
         )
         self.config.compile_dit_grids()  # a malformed list fails at startup
+        step_cache_policy(step_cache, MAG_RATIOS)  # and so does a malformed step cache
         # LoRA adapters folded into the DiT (A14B: each expert its own) at load, a static merge
         self.loras = [LoraFile.parse(item) for item in self.config.lora]
         self.loras_2 = [LoraFile.parse(item) for item in self.config.lora_2]

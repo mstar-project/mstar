@@ -53,6 +53,16 @@ _DISTILL_DEFAULTS = {
     SAMPLER_STEP_DISTILL: ((1000, 750, 500, 250), 5.0),
 }
 
+# MagCache tables (``step_cache``): the residual magnitude ratio per step of a dense run, by name. "default" is
+# TI2V-5B at 1280x704x81, 50 UniPC steps, CFG 5: the mean of ``{method: magcache_calibrate}`` over 9 VBench prompts
+# on an H200 (the prompts' tables differ by under 0.01 per step up to step 44, 0.05 at step 48).
+MAG_RATIOS: dict[str, tuple[float, ...]] = {"default": (
+    1.0, 0.992, 0.99471, 0.99518, 0.99368, 0.9951, 0.99502, 0.99488, 0.99479, 0.99471, 0.99341, 0.99581, 0.99314,
+    0.99347, 0.99443, 0.99429, 0.99342, 0.99339, 0.99263, 0.99164, 0.99186, 0.99173, 0.99149, 0.99054, 0.98872,
+    0.9899, 0.9893, 0.98968, 0.98803, 0.98681, 0.98472, 0.98486, 0.98457, 0.9828, 0.98185, 0.98046, 0.9772, 0.97628,
+    0.97319, 0.97305, 0.96804, 0.96475, 0.96176, 0.95681, 0.95313, 0.94797, 0.94417, 0.94284, 0.94411, 0.97743,
+)}
+
 # The DiT's self-attention: the array over its tokens, and the read that names its resource.
 DIT_TOKENS, SELF_ATTN = "dit_tokens", "dit_self_attn"
 
@@ -191,6 +201,12 @@ class Wan22Config:
         """Image conditioning, which only TI2V-5B's per-frame timestep path has."""
         return self.expand_timesteps
 
+    # Opt-in step caching, lossy (``components/diffusion/step_cache.py``); None runs every step. E.g.
+    # ``{method: magcache, threshold: 0.06, max_skip_steps: 2, retention_ratio: 0.2}`` reuses the block residual on
+    # the steps MagCache picks from the calibrated table in ``MAG_RATIOS`` (or a ``mag_ratios`` list given here);
+    # ``{method: magcache_calibrate}`` logs a table from a dense run.
+    step_cache: dict | None = None
+
     def __post_init__(self):
         # A yaml "false" is a truthy string, so a non-boolean is rejected here
         # rather than read as on.
@@ -202,6 +218,9 @@ class Wan22Config:
             raise ValueError(f"Wan2.2 sampler must be one of {samplers}, got {self.sampler!r}.")
         if self.lora_2 and not self.is_moe:
             raise ValueError("Wan2.2 lora_2 is for A14B's low-noise expert; this variant has one DiT.")
+        if self.sampler in _DISTILL_DEFAULTS and self.step_cache is not None:
+            # the distilled samplers' few steps don't route their blocks through the cache
+            raise ValueError(f"Wan2.2 step_cache runs with the unipc sampler only, not {self.sampler!r}.")
         if self.sampler in _DISTILL_DEFAULTS:
             default_steps, default_shift = _DISTILL_DEFAULTS[self.sampler]
             steps = default_steps if self.dmd_timesteps is None else self.dmd_timesteps
