@@ -824,7 +824,8 @@ class StepExecutor:
         # TODO: may need to refine this based on how it affects performance?
         inline_start, route = 0, None
         if batch_N.batch.request_to_worker_graph:
-            inline_start, route = self._stream_run(batch_N, outputs)
+            if outputs.landing is not None:  # a repeated step: only it streams before the wait
+                inline_start, route = self._stream_run(batch_N, outputs)
             self.wait_for_step(batch_N)
 
         if self.enable_prof:
@@ -1044,10 +1045,7 @@ class StepExecutor:
         are gone from it already, and none leaves after, since the runtime
         checks the step's stops (no model ``check_stop`` fails a row)."""
         host_rows, event = outputs.host_rows, batch_N.node_batch.completion_event
-        if (
-            host_rows is None or event is None or outputs.landing is None
-            or batch_N.node_batch.step_context.repeats < 2
-        ):
+        if host_rows is None or event is None or batch_N.node_batch.step_context.repeats < 2:
             return 0, None
         runtime_stops, tokens = self._runtime_stop_column(batch_N, host_rows)
         if not runtime_stops or tokens is None:
