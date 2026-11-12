@@ -2458,6 +2458,13 @@ Deployment knobs (``model_kwargs``; the SP configs set ``compile``, ``vae_tile_b
 - ``vae_compile``: the decoder's blocks, static per tile batch; a canvas or clip share with
   another tile count compiles again. A 768p clip's share decodes in 2.1 s instead of 3.2 s
   on one H200, within 62.9 dB of eager.
+- ``step_cache`` (off by default; lossy): the DiT's step cache, as for Wan2.2. With the
+  table calibrated at 832x480x124 (``MAG_RATIOS["default"]``), on the 2-GPU layout at
+  that size and 50 points, ``{threshold: 0.015, max_skip_steps: 2}`` computes 30 of 49
+  steps, 46.7 s against 74.4 s, at PSNR 26.9 dB and SSIM 0.869 against the dense video
+  over 8 VBench prompts; ``{threshold: 0.03, max_skip_steps: 2}`` computes 24, 38.0 s, at
+  24.7 dB and 0.829; ``{threshold: 0.01, max_skip_steps: 1}`` computes 33, 1.45x, at
+  28.5 dB and 0.896.
 
 The attention kernel is a resource's setting: ``backend: sdpa`` on the ``dit_attn`` and
 ``refiner_attn`` resources runs the reference's kernel, and FlashInfer runs without it. SDPA on
