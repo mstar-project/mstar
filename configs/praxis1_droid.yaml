@@ -1,0 +1,52 @@
+model: "praxis1_droid"
+
+# Praxis-1 on the single-arm DROID rig (runwayml/praxis-1-droid), served the way
+# Runway's own serve_droid recipe runs it.
+#
+# A request carries two camera frames, the exterior view then the wrist view, the
+# task text, and robot_state = the arm pose as [xyz(3) quat_wxyz(4) grip(1)]. The
+# reply is [24, 10]: 24 command rows at 15 Hz, each [xyz(3) rot6d(6) grip(1)].
+#
+# The canvas, the pose frame and the rig all come from the checkpoint's config.json,
+# so none of them is a knob here. num_cameras follows the rig's views and is baked
+# into the CUDA-graph captures, as is the action horizon.
+model_kwargs:
+  model_path_hf: "runwayml/praxis-1-droid"
+  # Public components the checkpoint expects beside it. Neither ships with it.
+  vae_weights_hf: "Wan-AI/Wan2.2-TI2V-5B"
+  text_encoder_hf: "Qwen/Qwen3.5-2B"
+  # The recommended recipe of this checkpoint: two Euler steps, text guidance on
+  # the video only. A request may ask for fewer steps, never more than the loop cap.
+  num_steps: 2
+  t_shift: 12.5
+  cfg_scale: 1.0
+  cfg_video_scale: 4.0
+  max_context_chunks: 1
+
+# The openpi WebSocket at ws://<host>:<port>/, which an openpi DROID client connects
+# to unchanged: the cameras in view order, the pose as the state, all 10 action dims.
+openpi:
+  images: [observation/exterior_image_1_left, observation/wrist_image_left]
+  state: [observation/cartesian_position, observation/gripper_position]
+  action_dims: 10
+
+node_groups:
+  - node_names:
+      - text_encoder
+    ranks:
+      - 0
+
+  - node_names:
+      - vae_encoder
+    ranks:
+      - 0
+
+  # The expert reads the backbone's taps inside the loop body, so the two run in
+  # one group: a group on another rank would ship every tap across the wire once
+  # per Euler step.
+  - node_names:
+      - backbone
+      - action_expert
+      - action_head
+    ranks:
+      - 0
