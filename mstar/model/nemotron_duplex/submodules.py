@@ -36,8 +36,7 @@ from mstar.engine.accelerator_graph_config import (
     AcceleratorGraphConfig,
     BatchedAcceleratorGraphConfig,
 )
-from mstar.engine.resources import SlotLease, SubmoduleStep
-from mstar.engine.state import ArrayStep, SampleStep, Segment, at_last_token, sample
+from mstar.engine.state import ArrayStep, SampleStep, Segment, SlotLease, SubmoduleStep, at_last_token, sample
 from mstar.model.nemotron_duplex.components.audio_codec import AudioCodec, CodecStreamAudio, CodecStreamState
 from mstar.model.nemotron_duplex.config import (
     CODEC_STATE,

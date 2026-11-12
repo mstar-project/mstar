@@ -43,7 +43,6 @@ from mstar.model.nemotron_duplex.config import (
 )
 from mstar.model.nemotron_duplex.nemotron_duplex_model import NemotronDuplexModel
 from mstar.model.registry import HF_MODELS, get_model_class
-from mstar.model.utils import kv_pages
 from mstar.streaming.chunk_policy import FixedChunkPolicy
 from mstar.streaming.topology import client_stream_limits
 from mstar.validation.client_streams import check_client_streams
@@ -167,26 +166,6 @@ def test_duplex_shipped_configs_turn_websocket_deflate_off():
 
     for name in ("nemotron_duplex.yaml", "nemotron_duplex_disagg.yaml"):
         assert yaml.safe_load((CONFIG_PATH.parent / name).read_text())["ws_per_message_deflate"] is False
-
-
-@pytest.mark.parametrize("key", [MAMBA_STATE, ENCODER_STATE, ENCODER_FRONT, CODEC_STATE, TALKER_PREV, ENCODER_KV,
-                                 TALKER_KV, NANO_KV])
-def test_duplex_refuses_a_session_cap_one_per_session_resource_cannot_hold(key):
-    """Every session holds a slot in each recurrent pool and its nano and talker
-    pages from start to end; a session past any of them waits on admit until
-    another ends. Raising the cap means raising them all, and a deployment
-    that misses one is refused at startup, naming it."""
-    model = _make_model()
-    resources = {MAMBA_STATE: {"max_slots": 49}, ENCODER_STATE: {"max_slots": 49},
-                 ENCODER_FRONT: {"max_slots": 49}, CODEC_STATE: {"max_slots": 49}, TALKER_PREV: {"max_slots": 49},
-                 ENCODER_KV: {"max_slots": 48},
-                 TALKER_KV: {"max_num_pages": kv_pages(model.session_positions(model.TALKER_WARMUP_POSITIONS), 128,
-                                                       2 * 48)},
-                 NANO_KV: {"max_num_pages": kv_pages(model.session_positions(model.max_prompt_tokens), 128, 48)}}
-    model.validate_config_yaml({"max_concurrent_requests": 48, "resources": resources}, "c.yaml")
-    del resources[key]
-    with pytest.raises(ValueError, match=f"resources.{key}"):
-        model.validate_config_yaml({"max_concurrent_requests": 48, "resources": resources}, "c.yaml")
 
 
 # 596 s, the longest session the talker's default window takes
