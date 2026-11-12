@@ -22,6 +22,7 @@ from mstar.model.lingbot_world.lingbot_world_model import (  # noqa: E402
     LingBotWorldModel,
 )
 from mstar.model.lingbot_world.submodules import (  # noqa: E402
+    CHUNK_OUTPUTS,
     DECODER_CACHE,
     ENCODER_CACHE,
     ROLLOUT_LOOP_NAME,
@@ -73,6 +74,12 @@ def test_walks_run_text_then_a_chunk_loop_that_emits_frames(model):
     assert loop_backs == ["clock", ENCODER_CACHE, DECODER_CACHE]
     assert set(loop_backs) <= set(node.input_names), "each loop-back should feed the next chunk"
     assert not any(e.next_node == EMPTY_DESTINATION for e in node.outputs)
+
+
+def test_keep_chunk_outputs_adds_each_chunk_s_latents_frames_and_condition():
+    node = LingBotWorldModel(skip_weight_loading=True, keep_chunk_outputs=True).get_graph_walk_graphs()[ROLLOUT_WALK]
+    kept = [e.name for e in node.section.outputs if e.next_node == EMPTY_DESTINATION]
+    assert kept == list(CHUNK_OUTPUTS)
 
 
 def _pointer(*dims: int) -> TensorPointerInfo:
@@ -504,6 +511,13 @@ def test_a_config_must_run_one_rollout_at_a_time(model):
         with pytest.raises(ValueError, match="requires `max_concurrent_requests: 1`") as err:
             model.validate_config_yaml(config, "lingbot.yaml")
     assert "VAE caches, which go from chunk to chunk on the rollout loop's edges" in str(err.value)
+
+
+def test_a_pool_short_of_one_rollout_at_the_default_size_is_refused(model):
+    """A rollout of a 480x832 image, 464x832, at the loop's cap holds 214 pages beside the pool's sink page."""
+    model.validate_config_yaml({"max_concurrent_requests": 1, "resources": {"dit_kv": {"max_num_pages": 215}}}, "x")
+    with pytest.raises(ValueError, match="need 215 pages of resources.dit_kv"):
+        model.validate_config_yaml({"max_concurrent_requests": 1, "resources": {"dit_kv": {"max_num_pages": 214}}}, "x")
 
 
 def test_the_shipped_config_runs_one_rollout_at_a_time_over_a_pool_for_the_largest(model):
