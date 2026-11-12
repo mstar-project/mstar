@@ -2338,7 +2338,8 @@ calls, which any other format runs:
    write(self.kv, self.layer, q, k, v)      # counts as the layer's add, and breaks the graph as add does
    out = self.kv.read(self.layer, q)
 
-The engine picks the kernel or the reference at bind. ``target`` says where this step's entries go
+The engine picks the kernel or the reference at bind, and a step whose reads attend its own ``k`` and ``v``
+(a context-parallel pool's multi-token step) runs the reference. ``target`` says where this step's entries go
 on the layer. A conformance test holds each kernel to its reference on each listed format, and
 ``MSTAR_KV_DEBUG_ASSERTS=1`` checks that an eager call writes nothing outside the step's slots.
 
@@ -3122,7 +3123,8 @@ whatever ``decode_tensor_cores`` says). Any other step attends its stored contex
 and its own tokens from the ``k`` and ``v`` the layer passes ``run``, so a layer that calls
 ``attn.run`` itself passes them (``AttentionCallable`` and ``MLAAttention`` without
 ``mla_absorb`` do). A fused K/V write that leaves ``k`` unrotated asks ``reads_step_kv()`` first
-and rotates it when the step attends it (``AttentionCallable.norm_rope_attend``).
+and rotates it when the step attends it (``AttentionCallable.norm_rope_attend``); a state op's fused
+kernel doesn't run on such a step, so its reference's ``add`` hands the handle ``k`` and ``v``.
 
 .. note::
 

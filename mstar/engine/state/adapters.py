@@ -725,7 +725,6 @@ class PagedArrayHandle(ArrayHandle):
         }
         self._kv = resources[array.name]
         self._views = {layer: self._kv.layer_view(i) for layer, i in self._pool_layer.items()}
-        self._reads_once = list({id(attn): attn for attn in self._attn.values()}.values())
 
     def _check_storage(self, declared: ArrayStep, segments, ctx) -> None:
         # A capture's dummy rows open only the default label.
@@ -800,7 +799,7 @@ class PagedArrayHandle(ArrayHandle):
         # A fused op writes the pages itself and never passes k and v through `add`, so on a step whose reads attend
         # the step's own k and v (a context-parallel pool's multi-token step: `reads_step_kv`) every op runs its
         # reference. Fixed once the step is planned, so a captured bucket replays the same choice.
-        if any(map(self._needs_step_kv, self._reads_once)):
+        if any(map(self._needs_step_kv, self.reads.values())):
             return frozenset()
         return self._fused_ops
 
