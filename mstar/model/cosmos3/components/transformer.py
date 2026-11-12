@@ -546,8 +546,9 @@ class Cosmos3OmniTransformer(nn.Module):
         self._gen_attend: AttentionCallable | None = None
         self._und_attend: AttentionCallable | None = None
         # The node's sequence shard: on SP ranks it splits the generation
-        # tokens of a step over them (`_run_gen_layers`).
-        self._shard = None
+        # tokens of a step over them (`_run_gen_layers`). Its submodule's
+        # (`NodeSubmodule.sequence_shard`), set when that binds its resources.
+        self.sequence_shard = None
         self.norm = norm_cls(h, eps=config.rms_norm_eps)
         self.norm_moe_gen = norm_cls(h, eps=config.rms_norm_eps)
         # The text head, for checkpoints whose understanding tower is served
@@ -597,7 +598,6 @@ class Cosmos3OmniTransformer(nn.Module):
         self._und_attend = AttentionCallable(
             kv=resources["kv"], attn=resources["attn"]
         )
-        self._shard = resources.get("seq_shard")
 
     # ------------------------------------------------------------------
     # Pure-tensor packing/unpacking helpers (ported from diffusers).
@@ -1040,7 +1040,7 @@ class Cosmos3OmniTransformer(nn.Module):
         # the layer body on.
         attend = self._gen_attend
         attend.bind_step(attn=attn, label=label)
-        shard = self._shard
+        shard = self.sequence_shard
         if shard is not None:
             gen_seq, cos, sin = shard.scatter(label, gen_seq, cos, sin)
         for i, layer in enumerate(self.layers):
@@ -1342,7 +1342,7 @@ class Cosmos3OmniTransformer(nn.Module):
         self._gen_attend.bind_step(attn=attn, label=label)
         # the stack runs on this rank's share of the pack on a step the node's
         # sequence shard splits (norm_moe_gen is per token, so it runs inside)
-        shard = self._shard
+        shard = self.sequence_shard
         if shard is not None:
             all_gen, cos, sin = shard.scatter(label, all_gen, cos, sin)
         gen_out = self.gen_layers_batched(all_gen, cos, sin)
@@ -1447,7 +1447,7 @@ class Cosmos3OmniTransformer(nn.Module):
         self._gen_attend.bind_step(attn=attn, label=label)
         # as in denoise_step_batched: the stack runs on this rank's share of the pack on a step the
         # node's sequence shard splits
-        shard = self._shard
+        shard = self.sequence_shard
         if shard is not None:
             all_gen, cos, sin = shard.scatter(label, all_gen, cos, sin)
         gen_out = self.gen_layers_batched(all_gen, cos, sin)
