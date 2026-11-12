@@ -386,6 +386,38 @@ def test_omnivoice_caps_the_decode_when_the_header_hides_the_length(
     assert [d["stop"] for d in decoded] == [media_io.MAX_REF_AUDIO_SECONDS + 1.0]
 
 
+@pytest.mark.parametrize("seconds, accepted", [(35.0, True), (media_io.MAX_REF_AUDIO_SECONDS + 1, False)])
+def test_the_ref_audio_check_counts_play_time_from_the_first_timestamp(seconds, accepted, tmp_path, monkeypatch):
+    """A stream whose first frame is at 1800 s (an MPEG-TS segment, a stream
+    copy cut) is checked on its length, as the model's loader caps it, not on
+    its timestamps. Stub decoder, no FFmpeg."""
+    import types
+
+    first = 1800.0
+    decoded = []
+
+    class AudioDecoder:
+        def __init__(self, source, **kwargs):
+            self.metadata = types.SimpleNamespace(
+                sample_rate=48000, duration_seconds_from_header=None, begin_stream_seconds_from_header=first,
+            )
+
+        def get_samples_played_in_range(self, start_seconds=0.0, stop_seconds=None):
+            decoded.append((start_seconds, stop_seconds))
+            lo, hi = max(start_seconds, first), min(stop_seconds, first + seconds)
+            return types.SimpleNamespace(pts_seconds=lo, duration_seconds=max(0.0, hi - lo))
+
+    _stub_torchcodec(monkeypatch, AudioDecoder)
+    path = tmp_path / "clip.ts"
+    path.write_bytes(bytes(64))
+    if accepted:
+        media_io.check_ref_audio(str(path), "torchcodec")
+    else:
+        with pytest.raises(media_io.RefAudioTooLongError, match=TOO_LONG):
+            media_io.check_ref_audio(str(path), "torchcodec")
+    assert decoded == [(first, first + media_io.MAX_REF_AUDIO_SECONDS + 1.0)]
+
+
 @pytest.mark.parametrize("seconds", [59, 61])
 @pytest.mark.parametrize("adapter", [adapters.OmniVoiceAdapter, adapters.ChatterboxAdapter, adapters.Qwen3TTSAdapter])
 def test_a_wav_longer_than_the_cap_is_refused_before_decoding(adapter, seconds, dirs, monkeypatch):

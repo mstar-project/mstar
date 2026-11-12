@@ -272,15 +272,18 @@ def _check_ref_audio_torchcodec(path: str) -> None:
     header = AudioDecoder(path).metadata
     _require_ref_audio_rate(header.sample_rate)
     _require_ref_audio_seconds(header.duration_seconds_from_header)
+    # play time counts from the stream's first timestamp, as the model's
+    # loader (torchcodec_samples_capped) counts it
+    start = max(0.0, getattr(header, "begin_stream_seconds_from_header", None) or 0.0)
     with _ref_audio_decodes:
         # Mono at a fixed rate: a small compressed upload can declare many
         # channels at a high rate, and decoding it natively takes gigabytes.
         samples = AudioDecoder(
             path, sample_rate=_REF_AUDIO_PROBE_RATE, num_channels=1
-        ).get_samples_played_in_range(0.0, MAX_REF_AUDIO_SECONDS + 1.0)
+        ).get_samples_played_in_range(start, start + MAX_REF_AUDIO_SECONDS + 1.0)
     if samples.duration_seconds == 0:
         raise ValueError("reference audio has no samples in its first seconds")
-    _require_ref_audio_seconds(samples.pts_seconds + samples.duration_seconds)
+    _require_ref_audio_seconds(samples.pts_seconds - start + samples.duration_seconds)
 
 
 def _check_ref_audio_soundfile(path: str) -> None:
