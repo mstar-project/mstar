@@ -41,6 +41,8 @@ from mstar.engine.resources.kv.config import (
     KVReqConfig,
     KVSpec,
     PagedKVConfig,
+    RingKVConfig,
+    RingKVLayerConfig,
     Span,
     refuse_undeclared_labels,
 )
@@ -599,6 +601,22 @@ def test_a_pool_its_window_sizes_holds_any_cap():
         num_layers=1, num_heads=2, head_dim=8, pool_tokens=64,
     ))
     assert rolling.capacity_problem(1000, None) is None, "the rolling store's windows size its pool, not its requests"
+
+
+def test_the_pool_check_holds_the_cap_to_the_ring_sessions(caplog):
+    """A request holds its session from its first step until it is torn down, so the cap is the most that can run."""
+    ring = KVSpec(resource_key="kv", nodes={"dit"}, config=RingKVConfig(
+        num_layers=1, num_kv_heads=2, head_dim=8, tokens_per_frame=4, num_sessions=2,
+        layers=(RingKVLayerConfig(ring_frames=8, ring_buckets=8, pinned_dilation=1),),
+    ))
+    assert ring.capacity_problem(3, None) == (
+        "3 concurrent requests (max_concurrent_requests) need 3 sessions of resources.kv, which has 2; raise "
+        "num_sessions or lower max_concurrent_requests"
+    )
+    assert ring.capacity_problem(2, None) is None
+    with caplog.at_level(logging.WARNING):
+        assert ring.capacity_problem(1, None) is None, "sessions past the cap are only a warning"
+    assert "resources.kv holds 2 sessions and max_concurrent_requests is 1, so 1 of them" in caplog.text
 
 
 def test_a_paged_pool_with_no_layout_holds_one_stream_of_its_max_len_a_request():
