@@ -905,7 +905,12 @@ class PagedArrayHandle(ArrayHandle):
         # in the step's forward, before its commit: the last add, if its layer went unread
         self._write_unread()
         super().check_step(step)
-        if self._grows and not self._kept and self._keep and not step.ctx.replays:
+        if not self._keep or step.ctx.replays:
+            return
+        if self._unwritten():
+            raise self._refusal(f"the step ends with layer {self._held_layer}'s add unread, on a kernel that takes k "
+                                "and v at the read, so no page holds it")
+        if self._grows and not self._kept:
             raise self._refusal("a step that keeps lists rows at span above 0 and adds nothing, so the pages "
                                 "would keep entries no add wrote; list those rows at span 0")
 
@@ -913,6 +918,9 @@ class PagedArrayHandle(ArrayHandle):
     def add(self, layer: int | torch.Tensor, *, keep: bool | None = None, **fields: torch.Tensor) -> None:
         layer = self._layer_id(layer)
         self._record_add(layer, keep)
+        if self._held_layer != layer and self._unwritten():
+            raise self._refusal(f"an add on layer {layer} while layer {self._held_layer}'s add waits for its read, on "
+                                "a kernel that takes k and v at the read")
         self._write_unread()
         k, v = fields["k"], fields["v"]
         attn = self._attn.get(layer)
@@ -945,6 +953,11 @@ class PagedArrayHandle(ArrayHandle):
         layer = self._held_layer
         if layer is not None and _exchanges(self._attn[layer], self.label):
             self._write(layer, *self._take_hold(layer))
+
+    def _unwritten(self) -> bool:
+        """Whether no page holds the held add: its kernel takes k and v at the read, and no exchange writes them."""
+        attn = self._attn.get(self._held_layer)
+        return attn is not None and not attn.requires_kv_write and not _exchanges(attn, self.label)
 
     def _needs_step_kv(self, attn: Any) -> bool:
         """Whether a read through ``attn`` attends the step's own k and v rather than only the pages, or goes through
