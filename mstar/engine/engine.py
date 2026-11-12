@@ -516,7 +516,8 @@ class ExecutingBatch:
     failed_resource: str | None = None
 
     # Every output signal of this step stays on the device (the node's
-    # ``device_loopback_signals``): collect builds no per-request output
+    # ``device_loopback_signals``) or rides the step's inline column
+    # (``GpuStepBody.all_on_device``): collect builds no per-request output
     # dicts and the per-request ``postprocess`` is skipped; the stop check,
     # the inline emit and the speculation splice read the rows instead.
     rows_only: bool = False
