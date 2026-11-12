@@ -57,6 +57,17 @@ logger = logging.getLogger(__name__)
 _ADMIT_FENCE_WARN_S = 10.0
 
 
+def repoll_nodes(consumers: frozenset[str], node_names: frozenset[str], parallel: frozenset[str]) -> frozenset[str]:
+    """The stream consumers whose steps the loop follows with a poll of the stream
+    buffers before it picks the next step, so their rows run every step: only on a
+    worker that runs nothing but such consumers. A worker that also runs other nodes
+    (a producer beside its consumer) keeps its order of turns between them, and a
+    lockstep node is left out, since an extra poll on one rank would move when that
+    rank ingests relative to its peers."""
+    eligible = consumers - parallel
+    return eligible if node_names and node_names <= eligible else frozenset()
+
+
 class StepPipeline:
     def __init__(
         self, services: WorkerServices, layout: WorkerLayout, timer: PhaseTimer,
@@ -74,6 +85,10 @@ class StepPipeline:
         self.tensor_manager = services.tensor_manager
         self.request_state = services.request_state
         self.streams = services.streams
+        self._stream_consumer_nodes = repoll_nodes(
+            frozenset(self.streams.consumer_node.values()) if self.streams is not None else frozenset(),
+            layout.node_names, layout.parallel_nodes,
+        )
         self.communicator = services.communicator
         self.is_tp_follower = layout.is_tp_follower
         self.timer = timer
@@ -195,6 +210,7 @@ class StepPipeline:
 
         # 3. If pending: await GPU(N), submit speculated GPU(N+1) asap, then
         # post-process N overlapping with GPU(N+1).
+        finished_node = self.pending.node_name if self.pending is not None else None
         if self.pending is not None:
             self._finish_chain_step(laps)
 
@@ -206,6 +222,13 @@ class StepPipeline:
             self._set_pending(spec_pending)
             return
         self.speculator.chain_ended()
+
+        if finished_node in self._stream_consumer_nodes:
+            # The preamble polled while N ran, and refused the next chunk of each
+            # row N held. N is post-processed now, so offer those chunks again:
+            # otherwise N+1 leaves out every row of N, and a stream consumer's
+            # rows run every other step.
+            self.ingest.poll_stream_buffers()
 
         # 4. Non-speculative path: nothing pending, or speculation skipped.
         with timer.span("worker.schedule"):

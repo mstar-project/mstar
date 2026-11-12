@@ -17,7 +17,7 @@ import torch
 from mstar.communication.tensors import NameToTensorList, TensorCommunicationManager
 from mstar.graph.base import GraphEdge, GraphSection
 from mstar.graph.runtime.base import ColumnarEdgeSpecs, EdgeSpec, InputTensors
-from mstar.streaming.stream_buffer import StreamBuffer, StreamChunkInfo, StreamingEdge, collate
+from mstar.streaming.stream_buffer import InlineValue, StreamBuffer, StreamChunkInfo, StreamingEdge, collate
 from mstar.streaming.topology import Connection, PartitionTopology, ProducerWalkCtx
 from mstar.worker.node_manager_utils import RequestStateManager
 
@@ -265,15 +265,22 @@ class StreamBufferManager:
         # The chunk's items as the buffer holds them: their uuids, or none for
         # an empty chunk (producer done, nothing left). The edge carries every
         # item; ``input_tensors`` stacks them when the consuming batch is built.
-        uuids = list(chunk.data.get("data") or [])
+        items = list(chunk.data.get("data") or [])
         tm = self._tensor_manager
-        if uuids:
-            # the edge's own reference, dropped once its node consumes it
-            tm.increment_ref_batch_uniform(uuids)
-        if chunk.released:
+        if any(type(item) is InlineValue for item in items):
+            # items that came inline: the window as one stored tensor, holding
+            # the edge's reference
+            uuids = [self._pack_window(request_id, edge_name, items)]
+        else:
+            uuids = items
+            if uuids:
+                # the edge's own reference, dropped once its node consumes it
+                tm.increment_ref_batch_uniform(uuids)
+        released = [item for item in chunk.released if type(item) is not InlineValue]
+        if released:
             # the buffer's references to the items it advanced past; after
             # the increment, so an item in both stays alive
-            tm.dereference_batch_uniform(list(chunk.released))
+            tm.dereference_batch_uniform(released)
         edge = StreamingEdge(edge_name, consumer_node, uuids, chunk.info)
         self._close_if_ended(sbuf, edge, request_id)
         return edge
@@ -292,6 +299,29 @@ class StreamBufferManager:
             .stream_buffers_by_consumer[edge.next_node].values()
         ):
             open_rids.discard(request_id)
+
+    def _pack_window(self, request_id: int, edge_name: str, items: list) -> int:
+        """A window that holds inline items, as one stored CPU int64 tensor ``[n]``
+        (what stacking ``n`` scalar items gives), with one reference: the edge's.
+        A window that also holds stored items (a step that could not send its
+        values inline) copies theirs to the host."""
+        if all(type(item) is InlineValue for item in items):
+            window = torch.tensor(items, dtype=torch.int64)
+        else:
+            stored = iter(self._tensor_manager.get_tensors(
+                [item for item in items if type(item) is not InlineValue]
+            ))
+            window = torch.cat([
+                torch.tensor([item], dtype=torch.int64) if type(item) is InlineValue
+                else next(stored).reshape(-1).to("cpu", torch.int64)
+                for item in items
+            ])
+        tm = self._tensor_manager
+        (info,) = tm.store_and_return_tensor_info(
+            request_id, {edge_name: [window]}, skip_cuda_sync=True,
+        )[edge_name]
+        tm.increment_ref(info.uuid)
+        return info.uuid
 
     def poll(self) -> list[tuple[int, StreamingEdge]]:
         """Every request's ready chunks, popped. A buffer nothing has touched

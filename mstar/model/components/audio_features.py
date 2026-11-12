@@ -463,6 +463,25 @@ def load_speech_file(path: str, sample_rate: int, max_seconds: float) -> torch.T
     return _resample(waveform, rate, sample_rate)
 
 
+def speech_file_rate(path: str) -> int | None:
+    """The upload's own sample rate, from its header (libsndfile's, else FFmpeg's
+    through torchcodec), before anything decodes; None where neither reads it, which
+    `load_speech_file` then refuses. For a model whose front end depends on it."""
+    try:
+        import soundfile
+
+        return int(soundfile.info(path).samplerate)
+    except Exception:  # noqa: BLE001 — not a libsndfile container; ask FFmpeg
+        pass
+    try:
+        from torchcodec.decoders import AudioDecoder
+
+        rate = AudioDecoder(path).metadata.sample_rate
+    except Exception:  # noqa: BLE001 — undecodable: the decode reports it
+        return None
+    return None if rate is None else int(rate)
+
+
 def load_reference_clip(
     path: str, sample_rate: int, max_seconds: float, check_seconds: Callable[[float], None],
 ) -> torch.Tensor:

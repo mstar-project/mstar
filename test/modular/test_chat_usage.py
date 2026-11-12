@@ -70,6 +70,7 @@ class _Model:
         return {"text_inputs": [torch.cat([ids[:2], pads, ids[2:]])], "pixel_values": [torch.rand(4, 3)]}
 
     prompt_tokens = Model.prompt_tokens
+    prompt_lora_adapters = Model.prompt_lora_adapters
     postprocess_inline = Model.postprocess_inline
     text_output = Model.text_output
 

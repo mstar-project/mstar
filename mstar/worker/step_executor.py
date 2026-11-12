@@ -9,7 +9,7 @@ import math
 import threading
 import time
 import time as _time
-from collections.abc import Collection
+from collections.abc import Collection, Mapping
 from concurrent.futures import Future
 from dataclasses import dataclass
 from typing import Any, NamedTuple
@@ -86,6 +86,7 @@ class GpuStepBody:
         self, services: WorkerServices, timer: PhaseTimer, lockstep: Lockstep,
         lifecycle: RequestLifecycle, host_copies: HostCopies,
         device_capability: DeviceCapability, enable_nvtx: bool,
+        tensor_streams: Mapping[tuple[str, str], frozenset[str]] | None = None,
     ):
         self.worker_id = services.worker_id
         self.device = services.device
@@ -99,6 +100,8 @@ class GpuStepBody:
         self.enable_nvtx = enable_nvtx
         # (node, walk) -> the loop-back signals the node keeps on the device
         self._device_loopback: dict[tuple[str, str], frozenset[str]] = {}
+        # (node, walk) -> its streamed signals that go as tensors (``WorkerLayout``)
+        self._tensor_streams = tensor_streams or {}
 
     def __call__(
         self,
@@ -242,7 +245,8 @@ class GpuStepBody:
     def all_on_device(self, engine, node_name: str, graph_walk: str, signals) -> bool:
         """Whether every output signal of this step is one the node keeps on
         the device (cached per node and walk: it depends on the node's
-        resources, not on the step)."""
+        resources, not on the step). Not one that streams as a tensor: its
+        stream needs the tensor stored."""
         # without inline emit, a rows-only step has no path for the client's tokens
         if not signals or not self._graph_runtime.supports_inline_emit:
             return False
@@ -251,7 +255,7 @@ class GpuStepBody:
         if on_device is None:
             on_device = self._device_loopback[key] = frozenset(
                 engine.device_loopback_signals(node_name, graph_walk)
-            )
+            ) - self._tensor_streams.get(key, frozenset())
         return all(s in on_device for s in signals)
 
     def walk_signals(self, batch: ScheduledBatch, walk: str):
@@ -312,6 +316,7 @@ class StepExecutor:
         self._body = GpuStepBody(
             services=services, timer=timer, lockstep=lockstep, lifecycle=lifecycle,
             host_copies=self._host_copies, device_capability=self.device_capability, enable_nvtx=enable_nvtx,
+            tensor_streams=layout.tensor_streams,
         )
         self._gpu_pool: ThreadPool | InlineExecutor | None = None
         self._plan_pool: ThreadPool | InlineExecutor | None = None
@@ -1005,7 +1010,7 @@ class StepExecutor:
             and not batch_N.node_batch.withheld_outputs
             and self._body.all_on_device(engine, batch_N.node_name, batch_N.graph_walk, signals)
         ):
-            client = engine.inline_client_signals(batch_N.node_name, batch_N.graph_walk)
+            client = engine.inline_signals(batch_N.node_name, batch_N.graph_walk)
             signal = next((s for s in client if s in signals), None)
             column = None if signal is None else _host_column(host_rows, client[signal])
             if column is not None:
@@ -1262,6 +1267,10 @@ class StepExecutor:
                 )
                 for uuid in uuids:
                     stream_buf.put(uuid, uuid)
+        for signal, per_signal in route_output.local_stream_values_by_signal.items():
+            buffers = self.request_state.per_request_info
+            for rid, value in per_signal:
+                buffers[rid].stream_buffers[signal].put_values([value])
         laps.lap("local_streams")
 
         send_rids = [rid for rid in rids if rid not in failed_rids] if failed_rids else list(rids)
@@ -1340,7 +1349,7 @@ class StepExecutor:
         walks = list(batch_N.batch.rids_by_walk()) or [batch_N.graph_walk]
         candidates: dict[str, str] = {}
         for walk in walks:
-            for signal, buffer_name in engine.inline_client_signals(
+            for signal, buffer_name in engine.inline_signals(
                 batch_N.node_name, walk,
             ).items():
                 candidates.setdefault(signal, buffer_name)
@@ -1367,7 +1376,7 @@ class StepExecutor:
         """`_inline_emit_values` for a step of one walk: every row takes the
         value, so one comprehension, and a slice when the host rows are in
         the batch's order (the usual case)."""
-        candidates = engine.inline_client_signals(batch_N.node_name, batch_N.graph_walk)
+        candidates = engine.inline_signals(batch_N.node_name, batch_N.graph_walk)
         for signal, buffer_name in candidates.items():
             if signal not in signals:
                 continue
