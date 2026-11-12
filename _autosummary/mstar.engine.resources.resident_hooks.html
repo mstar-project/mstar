@@ -742,6 +742,7 @@
                 <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.resident_hooks.ResidentHooks"><code class="docutils literal notranslate"><span class="pre">ResidentHooks</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.resident_hooks.ResidentHooks.bind_resident"><code class="docutils literal notranslate"><span class="pre">ResidentHooks.bind_resident()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.resident_hooks.ResidentHooks.max_repeats"><code class="docutils literal notranslate"><span class="pre">ResidentHooks.max_repeats()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.resident_hooks.ResidentHooks.resident_advance"><code class="docutils literal notranslate"><span class="pre">ResidentHooks.resident_advance()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.resident_hooks.ResidentHooks.resident_commit"><code class="docutils literal notranslate"><span class="pre">ResidentHooks.resident_commit()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.resident_hooks.ResidentHooks.resident_gather"><code class="docutils literal notranslate"><span class="pre">ResidentHooks.resident_gather()</span></code></a></li>
@@ -795,6 +796,21 @@ stream (<cite>ResidentWrites.streams</cite>, <cite>CapturedResidentStep.streams<
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
 <dd class="field-even"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.resident_hooks.ResidentHooks.max_repeats">
+<span class="sig-name descname"><span class="pre">max_repeats</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">step</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">ctx</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/resident_hooks.html#ResidentHooks.max_repeats"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.resident_hooks.ResidentHooks.max_repeats" title="Link to this definition">#</a></dt>
+<dd><p>How many times this step may replay with no host work between
+replays, for a resource the step declares. One means it needs the host
+each time, which is what a resource says until it knows better:
+whatever it stages per step would go stale. Asked per step, and once at
+load, on a walk’s template step, to refuse a walk that could never repeat.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a></p>
 </dd>
 </dl>
 </dd></dl>
@@ -944,6 +960,7 @@ this can run beside a live graph.</p>
     <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.resident_hooks.ResidentHooks"><code class="docutils literal notranslate"><span class="pre">ResidentHooks</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.resident_hooks.ResidentHooks.bind_resident"><code class="docutils literal notranslate"><span class="pre">ResidentHooks.bind_resident()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.resident_hooks.ResidentHooks.max_repeats"><code class="docutils literal notranslate"><span class="pre">ResidentHooks.max_repeats()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.resident_hooks.ResidentHooks.resident_advance"><code class="docutils literal notranslate"><span class="pre">ResidentHooks.resident_advance()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.resident_hooks.ResidentHooks.resident_commit"><code class="docutils literal notranslate"><span class="pre">ResidentHooks.resident_commit()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.resident_hooks.ResidentHooks.resident_gather"><code class="docutils literal notranslate"><span class="pre">ResidentHooks.resident_gather()</span></code></a></li>

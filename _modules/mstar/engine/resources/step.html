@@ -1199,6 +1199,10 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># plan prefill attention even when every row is one token: a packed</span>
     <span class="c1"># capture's forward reads per-row token offsets</span>
     <span class="n">force_prefill</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+    <span class="c1"># How many times this step's capture replays: the host plans once and the</span>
+    <span class="c1"># step counts for this many iterations. The worker asks, and `StepRunner`</span>
+    <span class="c1"># narrows it to what the step's resources allow (`Resource.max_repeats`).</span>
+    <span class="n">repeats</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span>
     <span class="c1"># the node's `ResidentPlanner` when this step's capture reads the resident</span>
     <span class="c1"># tables: a resource then stages nothing per row (see `resources/resident.py`)</span>
     <span class="n">resident</span><span class="p">:</span> <span class="n">Any</span> <span class="o">=</span> <span class="kc">None</span>

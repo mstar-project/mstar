@@ -1640,6 +1640,29 @@ window.runMermaid = runMermaid;</script>
             <span class="bp">self</span><span class="o">.</span><span class="n">_resources</span><span class="p">[</span><span class="n">key</span><span class="p">]</span><span class="o">.</span><span class="n">clear_preplan</span><span class="p">()</span></div>
 
 
+    <span class="k">def</span><span class="w"> </span><span class="nf">_settle_repeats</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">step</span><span class="p">:</span> <span class="n">SubmoduleStep</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Narrow the step's replays to what its resources allow, before any</span>
+<span class="sd">        of them reserves for it. Every resource the step declares answers.</span>
+<span class="sd">        Called only for a step that asks for more than one."""</span>
+        <span class="n">ctx</span> <span class="o">=</span> <span class="n">step</span><span class="o">.</span><span class="n">ctx</span>
+        <span class="k">if</span> <span class="n">ctx</span><span class="o">.</span><span class="n">resident</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">ctx</span><span class="o">.</span><span class="n">repeats</span> <span class="o">=</span> <span class="mi">1</span>
+            <span class="k">return</span>
+        <span class="n">ctx</span><span class="o">.</span><span class="n">repeats</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="nb">min</span><span class="p">(</span>
+            <span class="n">ctx</span><span class="o">.</span><span class="n">repeats</span><span class="p">,</span> <span class="o">*</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_resources</span><span class="p">[</span><span class="n">key</span><span class="p">]</span><span class="o">.</span><span class="n">max_repeats</span><span class="p">(</span><span class="n">step</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">key</span><span class="p">),</span> <span class="n">ctx</span><span class="p">)</span> <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_keys_for</span><span class="p">(</span><span class="n">step</span><span class="p">)),</span>
+        <span class="p">))</span>
+
+<div class="viewcode-block" id="StepRunner.repeat_refusal">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.runner.html#mstar.engine.resources.StepRunner.repeat_refusal">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">repeat_refusal</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">step</span><span class="p">:</span> <span class="n">SubmoduleStep</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Why no step like ``step`` can ever repeat, or None: its resources</span>
+<span class="sd">        answer on the template step, with the walk's captures done."""</span>
+        <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_keys_for</span><span class="p">(</span><span class="n">step</span><span class="p">):</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_resources</span><span class="p">[</span><span class="n">key</span><span class="p">]</span><span class="o">.</span><span class="n">max_repeats</span><span class="p">(</span><span class="n">step</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">key</span><span class="p">),</span> <span class="n">step</span><span class="o">.</span><span class="n">ctx</span><span class="p">)</span> <span class="o">&lt;=</span> <span class="mi">1</span><span class="p">:</span>
+                <span class="k">return</span> <span class="sa">f</span><span class="s2">"resource </span><span class="si">{</span><span class="n">key</span><span class="si">!r}</span><span class="s2"> (</span><span class="si">{</span><span class="nb">type</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_resources</span><span class="p">[</span><span class="n">key</span><span class="p">])</span><span class="o">.</span><span class="vm">__name__</span><span class="si">}</span><span class="s2">) allows one iteration a step"</span>
+        <span class="k">return</span> <span class="kc">None</span></div>
+
+
 <div class="viewcode-block" id="StepRunner.admit">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.runner.html#mstar.engine.resources.StepRunner.admit">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">admit</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">step</span><span class="p">:</span> <span class="n">SubmoduleStep</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">FullAdmitOutcome</span><span class="p">:</span>
@@ -1660,6 +1683,8 @@ window.runMermaid = runMermaid;</script>
             <span class="n">ready</span> <span class="o">=</span> <span class="n">pre</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span>
             <span class="c1"># this admit owns the stage's reservations now, so a refusal below unwinds them once</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_pre_admitted</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="k">elif</span> <span class="n">step</span><span class="o">.</span><span class="n">ctx</span><span class="o">.</span><span class="n">repeats</span> <span class="o">!=</span> <span class="mi">1</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_settle_repeats</span><span class="p">(</span><span class="n">step</span><span class="p">)</span>
         <span class="n">admitted</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
         <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_keys_for</span><span class="p">(</span><span class="n">step</span><span class="p">):</span>
             <span class="k">if</span> <span class="n">key</span> <span class="ow">in</span> <span class="n">covered</span><span class="p">:</span>
@@ -1743,6 +1768,8 @@ window.runMermaid = runMermaid;</script>
 
 <span class="sd">        Unwound on refusal exactly as ``admit`` is.</span>
 <span class="sd">        """</span>
+        <span class="k">if</span> <span class="n">step</span><span class="o">.</span><span class="n">ctx</span><span class="o">.</span><span class="n">repeats</span> <span class="o">!=</span> <span class="mi">1</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_settle_repeats</span><span class="p">(</span><span class="n">step</span><span class="p">)</span>
         <span class="n">ready</span> <span class="o">=</span> <span class="kc">True</span>
         <span class="n">admitted</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
         <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_preplan_keys_for</span><span class="p">(</span><span class="n">step</span><span class="p">):</span>

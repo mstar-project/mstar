@@ -1035,7 +1035,7 @@ window.runMermaid = runMermaid;</script>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">ABC</span><span class="p">,</span> <span class="n">abstractmethod</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">collections</span><span class="w"> </span><span class="kn">import</span> <span class="n">defaultdict</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Callable</span><span class="p">,</span> <span class="n">Mapping</span><span class="p">,</span> <span class="n">Sequence</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Callable</span><span class="p">,</span> <span class="n">Collection</span><span class="p">,</span> <span class="n">Mapping</span><span class="p">,</span> <span class="n">Sequence</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span><span class="p">,</span> <span class="n">fields</span><span class="p">,</span> <span class="n">replace</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">enum</span><span class="w"> </span><span class="kn">import</span> <span class="n">Enum</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">types</span><span class="w"> </span><span class="kn">import</span> <span class="n">MappingProxyType</span>
@@ -2360,6 +2360,36 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="kc">None</span></div>
 
 
+<div class="viewcode-block" id="NodeSubmodule.repeat_carry">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.NodeSubmodule.repeat_carry">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">repeat_carry</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">signals</span><span class="p">:</span> <span class="n">Collection</span><span class="p">[</span><span class="nb">str</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""How each loop-back signal of this walk (``signals``, from the graph)</span>
+<span class="sd">        moves from one replay of its capture to the next, as {output buffer:</span>
+<span class="sd">        static input}; None when the walk's step can't repeat."""</span>
+        <span class="k">del</span> <span class="n">graph_walk</span><span class="p">,</span> <span class="n">signals</span>
+        <span class="k">return</span> <span class="kc">None</span></div>
+
+
+<div class="viewcode-block" id="NodeSubmodule.enable_repeats">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.NodeSubmodule.enable_repeats">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">enable_repeats</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">walks</span><span class="p">:</span> <span class="n">Collection</span><span class="p">[</span><span class="nb">str</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Before capture: the deployment asks these walks of this node to repeat</span>
+<span class="sd">        (``step_repeats:``)."""</span>
+        <span class="k">del</span> <span class="n">walks</span></div>
+
+
+<div class="viewcode-block" id="NodeSubmodule.record_tokens">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.NodeSubmodule.record_tokens">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">record_tokens</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">host_rows</span><span class="p">:</span> <span class="s2">"HostRows"</span><span class="p">,</span> <span class="n">info_of</span><span class="p">:</span> <span class="n">Callable</span><span class="p">[[</span><span class="nb">int</span><span class="p">],</span> <span class="n">CurrentForwardPassInfo</span><span class="p">],</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""A landed step's host tokens, every iteration, for a node that keeps</span>
+<span class="sd">        them on the host: when the runtime checks the stop, ``check_stop`` has</span>
+<span class="sd">        nothing to read them from. Called on every step of a worker with</span>
+<span class="sd">        ``step_repeats:``; a node reads only the walks it asked to repeat."""</span>
+        <span class="k">del</span> <span class="n">graph_walk</span><span class="p">,</span> <span class="n">host_rows</span><span class="p">,</span> <span class="n">info_of</span></div>
+
+
 <div class="viewcode-block" id="NodeSubmodule.resident_walks">
 <a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.NodeSubmodule.resident_walks">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">resident_walks</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">str</span><span class="p">]:</span>
@@ -2857,6 +2887,17 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># Set by a submodule whose decode walk reads its last sampled token back on</span>
     <span class="c1"># the device; the loop-back hooks below follow from it.</span>
     <span class="n">device_loopback</span><span class="p">:</span> <span class="n">DeviceLoopback</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="c1"># The walks a deployment asks to repeat (``step_repeats:``): their stop is</span>
+    <span class="c1"># the runtime's. Empty otherwise, so a deployment that doesn't ask runs the</span>
+    <span class="c1"># node as declared. Whether they also run on resident tables and loop their</span>
+    <span class="c1"># token back is the node's to say (``resident_walks``, ``device_loopback``).</span>
+    <span class="n">_repeat_walks</span><span class="p">:</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="nb">frozenset</span><span class="p">()</span>
+
+<div class="viewcode-block" id="ARNodeSubmodule.enable_repeats">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.ARNodeSubmodule.enable_repeats">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">enable_repeats</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">walks</span><span class="p">:</span> <span class="n">Collection</span><span class="p">[</span><span class="nb">str</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_repeat_walks</span> <span class="o">=</span> <span class="nb">frozenset</span><span class="p">(</span><span class="n">walks</span><span class="p">)</span></div>
+
 
 <div class="viewcode-block" id="ARNodeSubmodule.bind_node_state">
 <a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.ARNodeSubmodule.bind_node_state">[docs]</a>
@@ -2901,6 +2942,15 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="n">device_loopback_signals</span><span class="p">(</span><span class="n">graph_walk</span><span class="p">)</span></div>
 
 
+<div class="viewcode-block" id="ARNodeSubmodule.repeat_carry">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.ARNodeSubmodule.repeat_carry">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">repeat_carry</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">signals</span><span class="p">:</span> <span class="n">Collection</span><span class="p">[</span><span class="nb">str</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">_loops_back</span><span class="p">(</span><span class="n">graph_walk</span><span class="p">)</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">device_loopback</span><span class="o">.</span><span class="n">signal</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">signals</span><span class="p">:</span>
+            <span class="k">return</span> <span class="kc">None</span>
+        <span class="n">carried</span> <span class="o">=</span> <span class="p">{</span><span class="n">signal</span><span class="p">:</span> <span class="n">signal</span> <span class="k">for</span> <span class="n">signal</span> <span class="ow">in</span> <span class="n">signals</span> <span class="k">if</span> <span class="n">signal</span> <span class="o">!=</span> <span class="bp">self</span><span class="o">.</span><span class="n">device_loopback</span><span class="o">.</span><span class="n">signal</span><span class="p">}</span>
+        <span class="k">return</span> <span class="p">{</span><span class="bp">self</span><span class="o">.</span><span class="n">device_loopback</span><span class="o">.</span><span class="n">buffer</span><span class="p">:</span> <span class="s2">"input_ids"</span><span class="p">,</span> <span class="o">**</span><span class="n">carried</span><span class="p">}</span></div>
+
+
 <div class="viewcode-block" id="ARNodeSubmodule.inline_signals">
 <a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.ARNodeSubmodule.inline_signals">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">inline_signals</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">]:</span>
@@ -2940,7 +2990,16 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.ARNodeSubmodule.get_stop_policies">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">get_stop_policies</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">StopPolicy</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
         <span class="n">stop</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">token_stop</span>
-        <span class="k">if</span> <span class="n">stop</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="ow">not</span> <span class="n">stop</span><span class="o">.</span><span class="n">runtime_check</span> <span class="ow">or</span> <span class="n">graph_walk</span> <span class="ow">in</span> <span class="n">stop</span><span class="o">.</span><span class="n">prefill_walks</span><span class="p">:</span>
+        <span class="c1"># A walk asked to repeat that can (it runs resident and loops its token</span>
+        <span class="c1"># back) reads its stop in the runtime, unless the stop withholds a frame,</span>
+        <span class="c1"># which only check_stop does. Any other walk keeps the node's own stop.</span>
+        <span class="n">runtime</span> <span class="o">=</span> <span class="n">stop</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="p">(</span>
+            <span class="n">stop</span><span class="o">.</span><span class="n">runtime_check</span> <span class="ow">or</span> <span class="p">(</span>
+                <span class="n">graph_walk</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_repeat_walks</span> <span class="ow">and</span> <span class="n">graph_walk</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">resident_walks</span><span class="p">()</span>
+                <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">_loops_back</span><span class="p">(</span><span class="n">graph_walk</span><span class="p">)</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">stop</span><span class="o">.</span><span class="n">withhold</span>
+            <span class="p">)</span>
+        <span class="p">)</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">runtime</span> <span class="ow">or</span> <span class="n">graph_walk</span> <span class="ow">in</span> <span class="n">stop</span><span class="o">.</span><span class="n">prefill_walks</span><span class="p">:</span>
             <span class="k">return</span> <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="n">get_stop_policies</span><span class="p">(</span><span class="n">graph_walk</span><span class="p">)</span>
         <span class="k">if</span> <span class="ow">not</span> <span class="n">stop</span><span class="o">.</span><span class="n">stops_on</span><span class="p">(</span><span class="n">graph_walk</span><span class="p">):</span>
             <span class="k">return</span> <span class="p">{}</span>  <span class="c1"># as `_token_stops`: only a row of ``walk`` ends the loop</span>

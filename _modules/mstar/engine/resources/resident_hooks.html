@@ -1046,12 +1046,27 @@ window.runMermaid = runMermaid;</script>
     <span class="p">)</span>
 
 
+<span class="c1"># `max_repeats` for a resource that has no limit of its own</span>
+<span class="n">ANY_REPEATS</span> <span class="o">=</span> <span class="mi">1</span> <span class="o">&lt;&lt;</span> <span class="mi">30</span>
+
+
 <div class="viewcode-block" id="ResidentHooks">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.resident_hooks.html#mstar.engine.resources.resident_hooks.ResidentHooks">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">ResidentHooks</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">"""A captured decode step reads per-request state off tables on the device;</span>
 <span class="sd">    each owner of that state keeps its own table. A resource overrides these</span>
 <span class="sd">    only once it has one."""</span>
+
+<div class="viewcode-block" id="ResidentHooks.max_repeats">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.resident_hooks.html#mstar.engine.resources.resident_hooks.ResidentHooks.max_repeats">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">max_repeats</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">step</span><span class="p">,</span> <span class="n">ctx</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""How many times this step may replay with no host work between</span>
+<span class="sd">        replays, for a resource the step declares. One means it needs the host</span>
+<span class="sd">        each time, which is what a resource says until it knows better:</span>
+<span class="sd">        whatever it stages per step would go stale. Asked per step, and once at</span>
+<span class="sd">        load, on a walk's template step, to refuse a walk that could never repeat."""</span>
+        <span class="k">return</span> <span class="mi">1</span></div>
+
 
 <div class="viewcode-block" id="ResidentHooks.resident_refusal">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.resident_hooks.html#mstar.engine.resources.resident_hooks.ResidentHooks.resident_refusal">[docs]</a>
