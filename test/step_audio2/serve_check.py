@@ -15,9 +15,14 @@ Run a server first (Python or ``--rust-frontend``; the checks are the same), the
   the speech ids are counted (each ``<audio_N>`` is a b"" chunk) against the oracle's.
 * **text, speech in, speech out**: a sampled request of each kind, with the reference's
   sampling, through ``/generate`` and ``/v1/chat/completions``; a spoken reply's audio is
-  saved as WAV, and must be non-silent and last about as long as its speech ids say (40 ms
+  saved as WAV, and must be non-silent and last exactly as long as its speech ids say (40 ms
   a code). With ``--asr``, the WAVs are transcribed (``self``: by the served model's own ASR
   prompt; or a local Whisper) next to the reply's text (``--asr self``: the served model's own ASR).
+* **streamed and not**: a greedy text reply is the same streamed and not, on ``/generate``
+  and on ``/v1/chat/completions``.
+* **cancelled spoken replies**: ``--slots`` + 8 spoken replies dropped by the client right
+  after their first audio, and a text reply dropped mid-stream; then ``--slots`` spoken
+  replies at once must all get audio, so no cancelled reply kept a vocoder slot.
 * **edges**: ``max_output_tokens`` 1 and 2 return that many steps; a malformed field and a
   ``ref_audio`` are 400s, and the server serves normally afterwards.
 * **two identical seeded spoken requests**: whether their text and audio match (reported).
@@ -29,7 +34,9 @@ import base64
 import io
 import json
 import sys
+import time
 import wave
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -70,20 +77,52 @@ class Reply:
         return np.frombuffer(self.audio, dtype="<i2")
 
 
-def generate(base: str, text, clip, inputs, spoken, **kwargs) -> tuple[int, Reply | str]:
+def generate_form(text, clip, inputs, spoken, streaming=True, **kwargs) -> tuple[dict, list | None]:
     data = {
         "output_modalities": "text,audio" if spoken else "text",
         "input_modalities": ",".join(inputs),
-        "streaming": "true",
+        "streaming": "true" if streaming else "false",
         "model_kwargs": json.dumps(kwargs),
     }
     if text is not None:
         data["text"] = text
     files = [("files", (clip.name, clip.read_bytes()))] if clip is not None else None
-    with requests.post(f"{base}/generate", data=data, files=files, stream=True, timeout=600) as r:
+    return data, files
+
+
+def generate(base: str, text, clip, inputs, spoken, streaming=True, **kwargs) -> tuple[int, Reply | str]:
+    data, files = generate_form(text, clip, inputs, spoken, streaming, **kwargs)
+    with requests.post(f"{base}/generate", data=data, files=files, stream=streaming, timeout=600) as r:
         if r.status_code != 200:
             return r.status_code, r.text
+        if not streaming:
+            outputs = r.json()["outputs"]
+            return 200, Reply([{"modality": m, **c} for m, chunks in outputs.items() for c in chunks])
         return 200, Reply([json.loads(line) for line in r.iter_lines() if line])
+
+
+def dropped(base: str, text, clip, inputs, spoken, after: str, **kwargs) -> bool:
+    """Drop the connection right after the first chunk of modality ``after``; whether one came."""
+    data, files = generate_form(text, clip, inputs, spoken, **kwargs)
+    with requests.post(f"{base}/generate", data=data, files=files, stream=True, timeout=600) as r:
+        for line in r.iter_lines():
+            if line and json.loads(line).get("modality") == after:
+                return True
+    return False
+
+
+def chat_streamed(base: str, messages, **kwargs) -> tuple[int, str]:
+    body = {"model": "step_audio2", "messages": messages, "stream": True, **kwargs}
+    with requests.post(f"{base}/v1/chat/completions", json=body, stream=True, timeout=600) as r:
+        if r.status_code != 200:
+            return r.status_code, r.text
+        parts = []
+        for line in r.iter_lines():
+            if not line.startswith(b"data: ") or line == b"data: [DONE]":
+                continue
+            for choice in json.loads(line[6:]).get("choices", []):
+                parts.append((choice.get("delta") or {}).get("content") or "")
+        return 200, "".join(parts)
 
 
 def chat(base: str, messages, spoken: bool, **kwargs) -> tuple[int, dict | str]:
@@ -111,12 +150,22 @@ def agreement(a, b) -> int:
     return n
 
 
+def speech_ids(steps: int, stopped: bool) -> int:
+    """A spoken reply's speech ids, off the reference's interleave (one text slot, then four
+    speech ids): a ``<tts_pad>`` text slot decodes to nothing as a speech id does, so the
+    text alone can't tell them apart. A reply that ended on its own streams its stop step
+    too, which is neither."""
+    steps -= int(stopped)
+    return steps - -(-steps // 5)
+
+
 def check_audio(verdict: Verdict, name: str, pcm: np.ndarray, codes: int) -> None:
-    seconds = len(pcm) / SAMPLE_RATE
+    """The vocoder voices every speech id, 40 ms each, to the sample."""
     rms = float(np.sqrt(np.mean((pcm.astype(np.float64) / 32768.0) ** 2))) if len(pcm) else 0.0
-    want = codes * SECONDS_PER_CODE
-    verdict.check(len(pcm) > 0 and rms > 0.005 and abs(seconds - want) <= 0.25 + 0.05 * want,
-                  f"{name}: {seconds:.2f} s of audio for {codes} speech ids ({want:.2f} s), RMS {rms:.3f}")
+    want = round(codes * SECONDS_PER_CODE * SAMPLE_RATE)
+    verdict.check(len(pcm) == want and rms > 0.005,
+                  f"{name}: {len(pcm)} samples ({len(pcm) / SAMPLE_RATE:.2f} s) for {codes} speech ids "
+                  f"({want} samples), RMS {rms:.3f}")
 
 
 def main() -> None:
@@ -126,6 +175,8 @@ def main() -> None:
     ap.add_argument("--asr", default=None,
                     help="'self' to transcribe the WAVs with the server's own ASR, or a local Whisper checkpoint")
     ap.add_argument("--skip-chat", action="store_true")
+    ap.add_argument("--slots", type=int, default=32,
+                    help="spoken replies sent at once after the cancels: at least the config's vocoder slots")
     args = ap.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     base = f"http://127.0.0.1:{args.port}"
@@ -174,7 +225,8 @@ def main() -> None:
         "t2t_sampled": CASES["t2t"], "s2t_sampled": CASES["s2t"], "s2s_sampled": CASES["s2s"],
         "t2s_sampled": (CASES["t2t"][0], None, ["text"], True),
     }.items():
-        status, reply = generate(base, text, clip, inputs, spoken, seed=11, max_output_tokens=1024)
+        cap = 1024
+        status, reply = generate(base, text, clip, inputs, spoken, seed=11, max_output_tokens=cap)
         if status != 200:
             verdict.check(False, f"{name}: answered {status}: {reply}")
             continue
@@ -183,10 +235,8 @@ def main() -> None:
         if spoken:
             save_wav(args.out / f"{name}.wav", reply.audio)
             (args.out / f"{name}.txt").write_text(reply.text)
-            # A <tts_pad> text slot decodes to nothing as a speech id does, so the codes are
-            # counted off the reference's interleave (one text slot, then four speech ids).
             steps = len(reply.text_chunks)
-            check_audio(verdict, name, reply.pcm, steps - -(-steps // 5))
+            check_audio(verdict, name, reply.pcm, speech_ids(steps, stopped=steps < cap))
 
     # -- the OpenAI chat route -----------------------------------------------------------------
     if not args.skip_chat:
@@ -216,6 +266,42 @@ def main() -> None:
                             temperature=0)
         verdict.check(status == 200 and body["choices"][0]["message"]["content"].strip() != "",
                       f"chat t2t: {status} {body if status != 200 else body['choices'][0]['message']['content']!r}")
+
+    # -- streamed and not -------------------------------------------------------------------------
+    prompt = "Give me a brief introduction to the Great Wall."
+    replies = [generate(base, prompt, None, ["text"], False, streaming=streaming, max_output_tokens=64, **GREEDY)
+               for streaming in (True, False)]
+    ok = all(status == 200 for status, _ in replies) and replies[0][1].text == replies[1][1].text
+    verdict.check(ok, f"/generate greedy text is the same streamed and not: "
+                      f"{[r.text if status == 200 else r for status, r in replies]}")
+    if not args.skip_chat:
+        messages = [{"role": "user", "content": prompt}]
+        status, body = chat(base, messages, spoken=False, max_tokens=64, temperature=0, repetition_penalty=1.0)
+        streamed_status, streamed = chat_streamed(base, messages, max_tokens=64, temperature=0,
+                                                  repetition_penalty=1.0)
+        whole = body["choices"][0]["message"]["content"] if status == 200 else body
+        verdict.check(status == 200 and streamed_status == 200 and whole == streamed,
+                      f"chat greedy text is the same streamed and not: {whole!r} / {streamed!r}")
+
+    # -- cancelled spoken replies --------------------------------------------------------------------
+    cancels = args.slots + 8
+    with ThreadPoolExecutor(max_workers=cancels + 1) as pool:
+        spoken = [pool.submit(dropped, base, None, CLIP, ["audio"], True, "audio", seed=i, max_output_tokens=400)
+                  for i in range(cancels)]
+        text = pool.submit(dropped, base, prompt, None, ["text"], False, "text", max_output_tokens=400)
+        heard = sum(f.result() for f in spoken)
+        verdict.check(heard == cancels and text.result(),
+                      f"{heard} of {cancels} spoken replies got audio before the client dropped them")
+    time.sleep(2)  # the server sees the disconnects
+    start = time.monotonic()
+    with ThreadPoolExecutor(max_workers=args.slots) as pool:
+        after = list(pool.map(
+            lambda i: generate(base, None, CLIP, ["audio"], True, seed=100 + i, max_output_tokens=200),
+            range(args.slots),
+        ))
+    voiced = sum(1 for status, r in after if status == 200 and len(r.pcm) > 0)
+    verdict.check(voiced == args.slots, f"after the cancels, {voiced} of {args.slots} spoken replies at once got "
+                                        f"audio ({time.monotonic() - start:.1f} s)")
 
     # -- edges ------------------------------------------------------------------------------------
     for n in (1, 2):
