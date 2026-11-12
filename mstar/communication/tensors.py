@@ -191,7 +191,7 @@ def _mooncake_dists_owning(engine_file: str | None, dists: list[str]) -> set[str
 
 
 def _warn_if_mooncake_unpatched() -> None:
-    """Warn once per process if the installed Mooncake predates that fix.
+    """Warn once per process if the installed Mooncake predates those fixes.
 
     The extras require a patched release, so this only fires where the
     environment was built without resolving them (``--no-deps``, a prebuilt

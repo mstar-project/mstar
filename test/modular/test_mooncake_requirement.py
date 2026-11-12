@@ -46,7 +46,7 @@ def _problems(pyproject: str) -> list[str]:
         if not floors or max(floors) < patched:
             problems.append(f"[{group}] {req} allows Mooncake releases before {patched}")
         if not req.specifier.contains(tensors.MOONCAKE_PATCHED_VERSION):
-            problems.append(f"[{group}] {req} excludes {patched}, the release CI tests")
+            problems.append(f"[{group}] {req} excludes {patched}, the patched floor release")
     return problems
 
 
