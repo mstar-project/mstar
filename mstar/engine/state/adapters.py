@@ -862,14 +862,6 @@ class PagedArrayHandle(ArrayHandle):
         # whether `check_step` needs an add, for a step that lists a row on the pages at span above 0
         self._grows = False
 
-    def begin_step(self, step) -> None:
-        super().begin_step(step)
-        # the one plan `PagedStorage.steps` names for a step over several labels
-        combined = getattr(step.steps.get(self.name), "combined_labels", None)
-        self._combined = bool(combined)
-        if combined:
-            self.label = next(iter(combined.values()))
-
     def _check_labels(self, labels: set[str], segments) -> None:
         runs = [label for label, _ in groupby(segment.label for segment in segments)]
         if len(runs) > len(labels):
@@ -900,6 +892,11 @@ class PagedArrayHandle(ArrayHandle):
         super().begin_step(step)
         # adds that run before the reads, outside the captured graph, which the reads find in the pages
         self._eager = step.state[self.name].eager_add
+        # the one plan `PagedStorage.steps` names for a step over several labels
+        combined = getattr(step.steps.get(self.name), "combined_labels", None)
+        self._combined = bool(combined)
+        if combined:
+            self.label = next(iter(combined.values()))
 
     def check_step(self, step) -> None:
         # in the step's forward, before its commit: the last add, if its layer went unread
