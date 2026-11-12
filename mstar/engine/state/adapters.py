@@ -1889,7 +1889,6 @@ class ValueWithHostStorage(ValueStorage):
 
     def handle(
         self, array: Array, resources: Mapping[str, Any], setup: "StateSetup", resolved: Resolved,
-        sp_group: CommGroup | None,
     ) -> ArrayHandle:
         return ValueWithHostHandle(array, resources, resolved.bound[array.name], resolved, setup.host_fields)
 
