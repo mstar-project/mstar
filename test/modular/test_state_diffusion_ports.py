@@ -261,7 +261,8 @@ def test_klein_steps_equal_the_hand_written_one(rids):
     sub = KleinDenoiseSubmodule(None, model.config, loop_name=DENOISE_LOOP, compile_transformer=False)
     segments = [Segment(request_id=rid, label="main", span=key.total_tokens) for rid in rids]
     reference = SubmoduleStep(
-        segments=segments, steps={KLEIN_ATTN: AttentionStep(causal=False, fixed_layout=True)}, cg_key_info=_step_key(key),
+        segments=segments, steps={KLEIN_ATTN: AttentionStep(causal=False, fixed_layout=True)},
+        cg_key_info=_step_key(key),
     )
     _assert_plans_equal(_expanded(model, sub, [key] * len(rids), rids), reference, KLEIN_ATTN)
 
@@ -276,7 +277,8 @@ def test_z_image_steps_equal_the_hand_written_one(rids):
         for label, span in (("image", key.image_tokens_padded), ("caption", 32), ("main", key.total_tokens))
     ]
     reference = SubmoduleStep(
-        segments=segments, steps={Z_ATTN: AttentionStep(causal=False, fixed_layout=True)}, cg_key_info=_step_key(key),
+        segments=segments, steps={Z_ATTN: AttentionStep(causal=False, fixed_layout=True)},
+        cg_key_info=_step_key(key),
     )
     _assert_plans_equal(_expanded(model, sub, [key] * len(rids), rids), reference, Z_ATTN)
 
@@ -289,7 +291,8 @@ def test_wan22_steps_equal_the_hand_written_one(guidance, branches):
     tokens = sub.num_tokens(key)
     segments = [Segment(request_id=0, label="main", span=tokens)] * branches
     reference = SubmoduleStep(
-        segments=segments, steps={SELF_ATTN: AttentionStep(causal=False, fixed_layout=True)}, cg_key_info=_step_key(key),
+        segments=segments, steps={SELF_ATTN: AttentionStep(causal=False, fixed_layout=True)},
+        cg_key_info=_step_key(key),
     )
     _assert_plans_equal(_expanded(model, sub, [key], [0]), reference, SELF_ATTN)
 
@@ -331,7 +334,8 @@ def test_wan22_parallel_configs_plan_each_ranks_step_as_main_did(path, guidance)
         key = sub._key(WanStepKey(frames=3, height=8, width=8, i2v=False), None, guidance > 1.0)
         segments = [Segment(request_id=0, label="main", span=sub.num_tokens(key))] * branches
         reference = SubmoduleStep(
-            segments=segments, steps={SELF_ATTN: AttentionStep(causal=False, fixed_layout=True)}, cg_key_info=_step_key(key),
+            segments=segments, steps={SELF_ATTN: AttentionStep(causal=False, fixed_layout=True)},
+            cg_key_info=_step_key(key),
         )
         for sp_rank in range(axes["sp"]):
             sp_group = SimpleNamespace(world_size=axes["sp"], rank=sp_rank)
