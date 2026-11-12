@@ -2598,7 +2598,9 @@ stream's decoder state: every causal conv's last inputs, each transposed conv's
 last input, the transformer's last 249 keys and values per layer, and its step
 count. Mimi's decoder is causal throughout, so that state is all a later chunk
 needs, and a stream equals one whole-track decode (within 2.6e-6 on the released weights, fp32 on CPU),
-whatever the length and however the stream groups its frames. The state lives in
+whatever the length and however the stream groups its frames. On a GPU with TF32 the two decode shapes
+round differently: on a GH200, a 2,999-frame track differed from its whole decode by at most 1.0e-3
+(RMS 3.0e-5). The state lives in
 the ``mimi_state`` recurrent state pool, about 8 MB per stream;
 ``resources: {mimi_state: {max_slots: N}}`` sizes it for N - 1 requests, 64 by
 default, and startup refuses a ``max_concurrent_requests`` it cannot hold.
