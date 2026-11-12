@@ -941,6 +941,16 @@ def test_talker_reprepares_a_refused_step_with_the_same_index_and_noise(model):
     assert torch.equal(retry.tensor_inputs["noise"], refused.tensor_inputs["noise"])
 
 
+def test_talker_refuses_a_decode_step_with_no_prefill_committed(model):
+    """A request's fields open at their zero values, so the first decode step of a request whose prefill never
+    committed would seed the generator again and draw the prefill's noise."""
+    talker, _, _ = _talker(model)
+    _, meta = _request(model, "hello")
+    talker.progress.host_fields.open("r")
+    with pytest.raises(KeyError, match="no prefill committed"):
+        talker.prepare_inputs("talker_decode", _decode_info("r", 0, meta), {"latent_patch": [torch.zeros(4, 8)]})
+
+
 def _committed(talker, rid) -> dict:
     return dict(host(talker.progress, rid, "main", 0))
 
