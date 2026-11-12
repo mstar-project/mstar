@@ -8,7 +8,7 @@ are the model's to set: a client that planted them could name a span's keys, so 
 from __future__ import annotations
 
 import sys
-from dataclasses import replace
+from dataclasses import fields, replace
 from unittest.mock import patch
 
 sys.path.insert(0, ".")
@@ -18,10 +18,12 @@ import torch
 from test_kv_prefix_request_keys import PROMPT, _deployment, _Model, _run, _worker
 
 from mstar.conductor.conductor import Conductor
+from mstar.engine.resources.kv.config import RetentionPolicy
 from mstar.engine.resources.sampler.config import SamplingReqConfig
 from mstar.engine.state import Array, Attend, Causal, KVEntry, Layout, Read, Sampler, SampleSettings, Span
+from mstar.engine.state.adapters import kv_layouts
 from mstar.graph.base import GraphNode
-from mstar.model.base import LabelLayout, ProcessPromptOutput
+from mstar.model.base import LabelLayout, ProcessPromptOutput, state_layouts
 
 _SPAN = Span("ids", "prefill", len(PROMPT), len(PROMPT), "text_inputs")
 _ARRAY = Array("kv", nodes={"LLM"}, layers={0}, entry=KVEntry(heads=1, head_dim=8), max_len=4096,
@@ -110,6 +112,32 @@ def test_a_layout_naming_an_undeclared_array_fails_the_request():
     extra = {"state_layout": {"other": {"main": Layout()}}}
     with pytest.raises(RuntimeError, match=r"state_layout\['other'\]: it names no declared array"):
         _run(_worker(_Declaring(extra), _deployment()))
+
+
+def test_a_kv_layout_translates_to_the_state_layout_that_converts_back_to_it():
+    rows = Span("rows", "prefill", 4, 4, "text_inputs")
+    kv_layout = {"kv": {
+        "main": LabelLayout(spans=(_SPAN, rows), growth=(("decode_loop", 1),), keyed_spans=1),
+        "draft": LabelLayout(spans=(_SPAN,), scratch=3),
+    }}
+    layouts = state_layouts(kv_layout)
+    assert layouts.keyed_spans == {"kv": {"main": 1}}, "a label that sets no count would get one"
+    array = replace(_ARRAY, labels=frozenset({"main", "draft"}))
+    assert kv_layouts([array], layouts.state_layout, layouts.keyed_spans) == kv_layout, "a field was lost on the way"
+
+
+def test_every_label_layout_field_is_carried_or_refused():
+    carried = {field.name for field in fields(Layout)} | {"keyed_spans"}
+    assert set(LabelLayout._fields) == carried | {"retention", "max_growth"}, (
+        "a LabelLayout field that state_layouts neither carries nor refuses would be dropped"
+    )
+
+
+@pytest.mark.parametrize("name, value", [("retention", RetentionPolicy(context_budget=64)), ("max_growth", 8)])
+def test_a_label_layout_a_state_layout_cant_hold_is_refused_by_name(name, value):
+    layout = LabelLayout(spans=(_SPAN,), **{name: value})
+    with pytest.raises(RuntimeError, match=rf"kv_layout\['kv'\]\['main'\]\.{name} is set, and a Layout can't hold it"):
+        state_layouts({"kv": {"main": layout}})
 
 
 class _Settings:

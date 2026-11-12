@@ -79,7 +79,7 @@ from mstar.model.components.block_loop_encoder import VISION_BLOCK_LOOP
 from mstar.model.components.request_kwargs import sampler_capabilities
 from mstar.model.keys import MIXED, ROPE
 from mstar.model.multimodal import vision_encoder
-from mstar.model.multimodal_decoder import MultimodalDecoderModel
+from mstar.model.multimodal_decoder import DeclaredDecoderModel, MultimodalDecoderModel
 from mstar.model.qwen3_5.components.language_model import Qwen3_5ForCausalLM, Qwen3_5LanguageModel
 from mstar.model.qwen3_5.config import (
     ATTN,
@@ -603,6 +603,24 @@ def test_qwen3_5_hands_on_the_scaffolds_keyed_spans(monkeypatch):
     metadata = model.process_prompt("hello", ["text", "image"], ["text"]).metadata
     converted = kv_layouts(model.declare_state(), metadata["state_layout"], metadata.get("keyed_spans", {}))
     assert converted == {KV_CACHE: {"main": scaffold}}, "the leading text span would be keyed"
+
+
+@pytest.mark.parametrize("keyed", [None, 0], ids=["text", "media"])
+def test_a_decoder_model_on_the_contract_returns_its_layout_under_state_layout(monkeypatch, keyed):
+    span = Span("ids", "prefill_text", 3, 3, "text_inputs")
+    scaffold = LabelLayout(spans=(span,), growth=(("decode_loop", 1),), scratch=2, keyed_spans=keyed)
+    monkeypatch.setattr(
+        MultimodalDecoderModel, "process_prompt",
+        lambda *args, **kwargs: ProcessPromptOutput({}, {"kv_layout": {KV_CACHE: {"main": scaffold}}}),
+    )
+    metadata = object.__new__(DeclaredDecoderModel).process_prompt("hello", ["text"], ["text"]).metadata
+    assert metadata["state_layout"] == {
+        KV_CACHE: {"main": Layout(spans=(span,), growth=(("decode_loop", 1),), scratch=2)},
+    }, "the scaffold's layout would reach the data worker changed"
+    assert "kv_layout" not in metadata, "the data worker would read the scaffold's layout and not the state layout"
+    assert metadata.get("keyed_spans") == (None if keyed is None else {KV_CACHE: {"main": keyed}}), (
+        "a label that keys every span would carry a count, or one that keys none would lose it"
+    )
 
 
 def test_qwen3_5_request_settings_equal_the_hand_written_config():
