@@ -4056,8 +4056,8 @@ streams (audio and video, say): each has its own buffer and its own end.
   A stream that continues past its end (``continue_after_producer_done``, such as
   Qwen3-TTS's ``text_in``) ends nothing: its final chunk may be empty, and every later
   step runs with the input absent, so ``prepare_inputs`` must read it with ``inputs.get``
-  and test it for truth (an empty final chunk is not a reason to return None, which would
-  end the loop).
+  and test it for truth (that chunk is not ``is_final_stream_chunk``, so returning None
+  on it drops the row from the step rather than completing its node).
   Over ``/generate/ws`` a client that opens with ``end_input: false`` appends and ends
   input explicitly (see :doc:`clients`), and a ``/v1/realtime`` conversation keeps it open
   for the call's life; every other request ends the input as soon as it is submitted. Both
