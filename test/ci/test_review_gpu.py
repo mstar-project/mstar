@@ -454,6 +454,11 @@ class TestStart(unittest.TestCase):
         self.assertEqual([x[1] for x in launched], ["runpod:1", "lambda:1"],
                          "each RunPod offer would wait out its pod's ssh before Lambda was tried")
         self.assertEqual((out / "nvidia/instance").read_text(), "lambda:1:1")
+        out, _ = self.start({"eras": {}}, offers={"nvidia": [offers[0], *self.ERAS]}, launch_code={
+            "runpod:1": gpu_review.gpu_py.EXIT_RUN_NOT_STARTED})
+        said = (out / "nvidia/unavailable.md").read_text()
+        self.assertTrue("- tried runpod:1" in said and "ERAS_RUN_SECRET_ID" in said,
+                        "the PR would not read why RunPod, or why Eras, was not used")
 
     def test_a_run_past_the_bots_cap_says_so(self):
         out, launched = self.start({"eras": {"run_secret_id": "s"}, "budget": {"max_running": 2}},
@@ -468,6 +473,10 @@ class TestStart(unittest.TestCase):
         first = (counting / "nvidia/unavailable.md").read_text().split("\n")[0]
         self.assertIn("couldn't count its running boxes", first,
                       "the PR would read that there were no GPUs, when a provider's API was down")
+        gone, _ = self.start({"eras": {"run_secret_id": "s"}}, launch_code=gpu_review.gpu_py.EXIT_UNCOUNTED,
+                             later={"nvidia": []})
+        self.assertTrue((gone / "nvidia/unavailable.md").read_text().startswith("No NVIDIA GPUs"),
+                        "an earlier pass's refused launches would be blamed for GPUs that were taken since")
 
     def test_an_amd_pr_gets_a_box_per_vendor_and_eras_first_for_nvidia(self):
         do = [{"id": f"digitalocean:gpu-{g}x1", "provider": "digitalocean", "gpu": g, "count": 1, "usd_per_hour": usd,

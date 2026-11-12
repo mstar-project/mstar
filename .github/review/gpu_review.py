@@ -418,7 +418,7 @@ def start(out, pr, head_sha, runner_temp, tag, base, gpus, hours, run, checks, v
                                                     asked_checks, vendor, vendors, end_by=end_by))
     secret = os.environ.get(cfg.get("run_secret_env") or "", "")
 
-    dropped, last = {}, {}  # provider -> why its boxes can't run here; vendor -> its last launch's exit
+    dropped, last = {}, {}  # provider -> why its boxes can't run here; vendor -> its last launch's exit this pass
 
     def listed(vendor):
         """(the offers of `vendor` that can start now, the listing they came from, what was left out and why)."""
@@ -427,7 +427,7 @@ def start(out, pr, head_sha, runner_temp, tag, base, gpus, hours, run, checks, v
         free = [o for o in free if o["provider"] not in dropped]
         # The box's Anthropic key on Eras is a saved Eras secret: without it a box would be paid for and do nothing.
         if not cfg.get("eras", {}).get("run_secret_id") and any(o["provider"] == "eras" for o in free):
-            tried, free = ["eras: ERAS_RUN_SECRET_ID is not set"], [o for o in free if o["provider"] != "eras"]
+            tried, free = [*tried, "eras: ERAS_RUN_SECRET_ID is not set"], [o for o in free if o["provider"] != "eras"]
         return free, listing, tried
 
     def none_free(vendor, found):
@@ -468,6 +468,7 @@ def start(out, pr, head_sha, runner_temp, tag, base, gpus, hours, run, checks, v
         the vendor with the fewest offers first, so a failure there costs the least. Boxes that started stay for
         the next pass. (the listings, how it went: "started", "none" for a vendor with no GPUs, "taken" for a
         launch that failed, or "full" for budget.max_running's refusal, and the vendor whose launch that was)."""
+        last.clear()  # the codes of this pass only
         todo = [v for v in vendors if not (lt / v / "instance").exists()]
         found = {vendor: listed(vendor) for vendor in todo}
         if not all(found[v][0] for v in todo):
