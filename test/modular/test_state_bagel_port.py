@@ -87,10 +87,13 @@ def _reference(model: BagelModel) -> list:
     c, vit = model.config, model.config.vit_config
     nodes = set(LLM_NODES if model._has_cfg_parallel else {"LLM"})
     return [
-        RaggedAttentionSpec(resource_key="vit_attn", nodes={"vit_encoder"}, config=RaggedAttentionConfig(
-            num_qo_heads=vit.num_attention_heads, num_kv_heads=vit.num_attention_heads,
-            head_dim=vit.hidden_size // vit.num_attention_heads, max_segments_per_request=1,
-        )),
+        RaggedAttentionSpec(
+            resource_key="vit_attn", nodes={"vit_encoder"}, labels={"main"},
+            config=RaggedAttentionConfig(
+                num_qo_heads=vit.num_attention_heads, num_kv_heads=vit.num_attention_heads,
+                head_dim=vit.hidden_size // vit.num_attention_heads, max_segments_per_request=1,
+            ),
+        ),
         KVSpec(
             resource_key="kv", nodes=nodes, config=PagedKVConfig(
                 num_layers=c.num_hidden_layers, num_kv_heads=c.num_key_value_heads,
