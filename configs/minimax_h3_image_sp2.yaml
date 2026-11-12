@@ -10,6 +10,9 @@ max_seq_len: 8192
 model_kwargs:
   compile: true
   vae_tile_batch: 64
+  # the last 16 prompts' text rows, as SGLang's conditioning cache: a repeated prompt (and
+  # references) skips the text encoder and gets the same image
+  text_cache_entries: 16
   # the decoder's blocks compiled per tile batch (56-58 dB from eager; -0.13 s at 2048² on 2 H200s)
   vae_compile: true
 

@@ -15,7 +15,14 @@ from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.minimax_h3.components.layout import patchify_video
 from mstar.model.minimax_h3.components.transformer import H3DiT, H3Inputs
 from mstar.model.minimax_h3.config import DENOISE_LOOP, TEXT_TAG, VIDEO_TAG
-from mstar.model.minimax_h3.submodules import COND_LATENTS, LATENTS, TEXT_INPUTS, VISION_PIXELS
+from mstar.model.minimax_h3.submodules import (
+    COND_LATENTS,
+    LATENTS,
+    TEXT_EMBEDS,
+    TEXT_INPUTS,
+    VISION_PIXELS,
+    H3TextEncoderSubmodule,
+)
 from mstar.model.minimax_h3.tests.test_model import _Tokenizer
 from mstar.model.minimax_h3.tests.tiny_checkpoint import CFG, random_checkpoint
 from mstar.model.minimax_h3_image import weight_loader
@@ -179,6 +186,62 @@ def test_the_dits_attention_settings():
                                "ulysses_head_groups": 2}
     assert compiled[DIT_ATTN]["compile_op"] is True
     assert eager[REFINER_ATTN] == compiled[REFINER_ATTN] == {"workspace_mb": 128}
+
+
+def test_text_cache_keys_the_prompt_and_its_references():
+    """With the cache on, process_prompt keys the text node by the prompt's ids and the vision
+    tower's pixels, and the walk plan carries the key to every step; off, nothing changes."""
+    from mstar.model.base import ProcessPromptOutput
+    from mstar.model.minimax_h3.submodules import TEXT_CACHE_KEY
+
+    assert not isinstance(_model().process_prompt("a cat", ["text"], ["image"]), ProcessPromptOutput)
+    model = _model(text_cache_entries=4)
+    model._image_processor = _ImageProcessor()
+    one, again, other = (model.process_prompt(p, ["text"], ["image"]) for p in ("a cat", "a cat", "a dog"))
+    assert one.metadata[TEXT_CACHE_KEY] == again.metadata[TEXT_CACHE_KEY] != other.metadata[TEXT_CACHE_KEY]
+    image = torch.zeros(3, 1024, 1024, dtype=torch.uint8)
+    edits = [model.process_prompt("a cat", ["text", "image"], ["image"], tensors={"image_inputs": [im]})
+             for im in (image, image.clone(), torch.zeros(3, 1024, 1280, dtype=torch.uint8))]
+    keys = [e.metadata[TEXT_CACHE_KEY] for e in edits]
+    assert keys[0] == keys[1] and len({keys[0], keys[2], one.metadata[TEXT_CACHE_KEY]}) == 3
+    signals = {TEXT_INPUTS: [_info(list(one.new_input_tensors[TEXT_INPUTS][0].shape))]}
+    plan = model.walk_plan("", ["text"], ["image"], signals, one.metadata)
+    assert all(step.step_metadata[TEXT_CACHE_KEY] == one.metadata[TEXT_CACHE_KEY] for step in plan)
+    with pytest.raises(ValueError, match="text_cache_entries"):
+        _model(text_cache_entries=-1)
+
+
+def test_text_node_serves_a_cached_prompt_without_encoding():
+    """A hit returns the stored rows and runs nothing; the least recently used entry goes first."""
+    from types import SimpleNamespace
+
+    from mstar.model.minimax_h3.submodules import TEXT_CACHE_KEY, TextStep
+
+    calls = []
+
+    class Encoder(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.anchor = torch.nn.Parameter(torch.zeros(1))  # the node reads its device off a parameter
+
+        def forward(self, ids, mask, padded=False):
+            calls.append(int(ids.shape[1]))
+            return ids[..., None].float()
+
+    sub = H3TextEncoderSubmodule(Encoder(), lambda hidden: hidden * 2, cache_entries=2)
+    ids = torch.tensor([1, 2, 3])
+    info = SimpleNamespace(step_metadata={TEXT_CACHE_KEY: "k"})
+    assert sub.prepare_inputs("w", info, {TEXT_INPUTS: [ids]}).resource_step_info.cache_key == "k"
+
+    def run(key, n=3):
+        return sub.forward("w", None, torch.arange(n), TextStep(n, (), key))[TEXT_EMBEDS][0]
+
+    first = run("a")
+    assert run("a") is first and calls == [3]
+    run("b", 4), run("a"), run("c", 5)  # "b" is the least recently used when "c" arrives
+    assert list(sub._cache) == ["a", "c"] and calls == [3, 4, 5]
+    run(None), run(None)
+    assert calls == [3, 4, 5, 3, 3] and list(sub._cache) == ["a", "c"]  # no key: always computed
 
 
 def test_process_prompt_and_walk_plan_for_an_edit():
