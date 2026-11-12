@@ -29,6 +29,8 @@ DEFAULT_CONFIGS: dict[str, str] = {
     "command_a_plus": "command_a_plus_tp4.yaml",
     "cosmos3": "cosmos3_nano.yaml",
     "cosmos3_droid": "cosmos3_droid.yaml",
+    "praxis1_droid": "praxis1_droid.yaml",
+    "praxis1_yam": "praxis1_yam.yaml",
     "cosmos3_edge": "cosmos3_edge.yaml",
     "cosmos3_edge_droid": "cosmos3_edge_droid.yaml",
     "cosmos3_super": "cosmos3_super_tp2.yaml",

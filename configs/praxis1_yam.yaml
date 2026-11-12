@@ -1,0 +1,60 @@
+model: "praxis1_yam"
+
+# Every praxis1 node is stateless (no KV cache); max_seq_len only satisfies the
+# conductor's config check. The value is the backbone's widest encoder sequence:
+# 4 registers + the anchor and the window's video tokens after the (1,2,2) patch
+# + the padded task text, rounded up.
+max_seq_len: 32768
+
+
+# Praxis-1 on the bimanual YAM rig (runwayml/praxis-1-yam), served the way
+# Runway's own serve_yam recipe runs it.
+#
+# A request carries three camera frames, the top view then the two wrist views, the
+# task text, and robot_state = both arm poses, each [xyz(3) quat_wxyz(4) grip(1)]. The
+# reply is [24, 20]: 24 command rows at 15 Hz, two arms of [xyz(3) rot6d(6) grip(1)].
+#
+# The canvas, the pose frame and the rig all come from the checkpoint's config.json,
+# so none of them is a knob here. num_cameras follows the rig's views and is baked
+# into the CUDA-graph captures, as is the action horizon.
+model_kwargs:
+  model_path_hf: "runwayml/praxis-1-yam"
+  # Public components the checkpoint expects beside it. Neither ships with it.
+  vae_weights_hf: "Wan-AI/Wan2.2-TI2V-5B"
+  text_encoder_hf: "Qwen/Qwen3.5-2B"
+  # The recommended recipe of this checkpoint: two Euler steps, text guidance on
+  # the video only. A request may ask for fewer steps, never more than the loop cap.
+  num_steps: 2
+  t_shift: 12.5
+  cfg_scale: 1.0
+  cfg_video_scale: 4.0
+  max_context_chunks: 1
+
+# The openpi WebSocket at ws://<host>:<port>/, which an openpi DROID client connects
+# to unchanged: the cameras in view order, the pose as the state, all 10 action dims.
+openpi:
+  images: [observation/top_image, observation/wrist_image_left, observation/wrist_image_right]
+  state: [observation/cartesian_position_left, observation/gripper_position_left,
+          observation/cartesian_position_right, observation/gripper_position_right]
+  action_dims: 20
+
+node_groups:
+  - node_names:
+      - text_encoder
+    ranks:
+      - 0
+
+  - node_names:
+      - vae_encoder
+    ranks:
+      - 0
+
+  # The expert reads the backbone's taps inside the loop body, so the two run in
+  # one group: a group on another rank would ship every tap across the wire once
+  # per Euler step.
+  - node_names:
+      - backbone
+      - action_expert
+      - action_head
+    ranks:
+      - 0

@@ -1,5 +1,12 @@
 model: "praxis1_droid"
 
+# Every praxis1 node is stateless (no KV cache); max_seq_len only satisfies the
+# conductor's config check. The value is the backbone's widest encoder sequence:
+# 4 registers + the anchor and the window's video tokens after the (1,2,2) patch
+# + the padded task text, rounded up.
+max_seq_len: 16384
+
+
 # Praxis-1 on the single-arm DROID rig (runwayml/praxis-1-droid), served the way
 # Runway's own serve_droid recipe runs it.
 #

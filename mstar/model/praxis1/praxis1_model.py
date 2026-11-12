@@ -46,7 +46,7 @@ from mstar.model.base import (
     WalkStep,
 )
 from mstar.model.media_limits import read_image
-from mstar.model.praxis1.config import Praxis1Config
+from mstar.model.praxis1.config import Praxis1Config, Praxis1ConfigError
 
 logger = logging.getLogger(__name__)
 
@@ -115,13 +115,29 @@ class Praxis1Model(Model):
         self._repo_dir = Path(local)
         return self._repo_dir
 
+    def _rig(self) -> str:
+        """The rig this registry entry serves, from the checkpoint it names."""
+        rig = self._yaml_config_overrides.get("rig")
+        if rig:
+            return str(rig)
+        name = self.model_path_hf.rsplit("/", 1)[-1].lower()
+        for suffix, embodiment in (("yam", "bimanual"), ("droid", "single_arm")):
+            if suffix in name:
+                return embodiment
+        raise Praxis1ConfigError(
+            f"cannot tell the rig from {self.model_path_hf!r}; pass rig= in model_kwargs"
+        )
+
     def _load_config(self) -> Praxis1Config:
         """Read the checkpoint's own config.
 
-        Every width here belongs to the checkpoint, so there is no default to
-        fall back on: a wrong one would build a graph whose shapes disagree
-        with the weights it is about to load.
+        Every width belongs to the checkpoint, so a served model reads it: a
+        default would build a graph whose shapes disagree with the weights it
+        is about to load. Dummy mode has no checkpoint to read, and takes the
+        published shape of the rig instead.
         """
+        if self.skip_weight_loading:
+            return Praxis1Config.for_rig(self._rig())
         return Praxis1Config.from_checkpoint(self._ensure_repo())
 
     # ------------------------------------------------------------------

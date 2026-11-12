@@ -40,6 +40,32 @@ SUPPORTED_VAE = "Wan2.2"
 BASE_EMBODIMENT = "base"
 
 
+# The published checkpoints' own shape, for dummy mode: the startup checks and
+# the graph tests construct a model with no checkpoint to read. Serving reads
+# the real config.json, so these are never what a request runs against.
+RIG_DEFAULTS: dict[str, dict] = {
+    "single_arm": {"canvas": (224, 832), "tile": (224, 416), "action_dim": 10},
+    "bimanual": {"canvas": (256, 1248), "tile": (256, 416), "action_dim": 20},
+}
+# Shared by both checkpoints.
+_SHARED_DEFAULTS = {
+    "dim": 3072, "timestep_dim": 128, "num_registers": 4,
+    "encoder_depth": 14, "decoder_depth": 6,
+    "tap_blocks": (0, 2, 4, 6, 7, 9, 11, 13),
+    "num_heads": 24, "num_kv_heads": 8, "head_dim": 128,
+    "flex_block_size": 128, "attention_backend": "flash",
+    "num_experts": 129, "num_routed_experts": 128, "top_k": 9,
+    "expert_hidden": 1280, "dense_ffn_hidden": 11520,
+    "expert_dim": 1024, "expert_layers": 16, "expert_heads": 16,
+    "expert_head_dim": 64, "trunk_dim": 3072, "max_action_tokens": 64,
+    "expert_attention": "flex_dynamic",
+    "action_chunk": 24, "action_frames_per_token": 4, "latents_per_chunk": 6,
+    "window_frames": 93, "n_chunks": 4, "grid_hz": 15.0,
+    "latent_channels": 48, "vae_stride": (4, 16, 16), "patch_size": (1, 2, 2),
+    "text_model": "Qwen3.5-2B", "text_hidden_dim": 2048, "text_hidden_layer": -3,
+}
+
+
 class Praxis1ConfigError(ValueError):
     """A checkpoint this build does not serve."""
 
@@ -135,6 +161,30 @@ class Praxis1Config:
     @property
     def latent_width(self) -> int:
         return self.canvas_width // self.vae_stride[2]
+
+    @classmethod
+    def for_rig(cls, rig: str) -> "Praxis1Config":
+        """The published checkpoint's shape, without reading one.
+
+        Dummy mode only: the startup checks build a model with no checkpoint.
+        A served model reads the real config.json, which is the only thing a
+        request ever runs against.
+        """
+        if rig not in RIG_DEFAULTS:
+            raise Praxis1ConfigError(f"no rig defaults for {rig!r}")
+        rig_defaults = RIG_DEFAULTS[rig]
+        canvas, tile = rig_defaults["canvas"], rig_defaults["tile"]
+        action_dim = rig_defaults["action_dim"]
+        return cls(
+            embodiment=rig,
+            views=RIG_VIEWS[rig],
+            action_dim=action_dim,
+            proprio_patch_dim=action_dim,
+            action_patch_dim=action_dim * _SHARED_DEFAULTS["action_frames_per_token"],
+            canvas_height=canvas[0], canvas_width=canvas[1],
+            tile_height=tile[0], tile_width=tile[1],
+            **_SHARED_DEFAULTS,
+        )
 
     @classmethod
     def from_checkpoint(cls, path: str | Path) -> "Praxis1Config":
