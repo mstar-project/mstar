@@ -33,6 +33,13 @@ class RaggedAttnBackend(Enum):
     # layout; self-attention only, and refused at build where cuDNN can't run
     # the geometry (GQA, a dtype other than bf16 / fp16, a padded head dim)
     CUDNN = "cudnn"
+    # FlashAttention 4 (flash_attn.cute) varlen, Blackwell (sm_100 / sm_103) only;
+    # elsewhere the resource falls back to FLASHINFER
+    FA4 = "fa4"
+    # LOSSY, opt-in: FA4's FP8 kernel over equal-length segments, q / k / v cast to
+    # e4m3 with one scale per (segment, head); any other layout runs FlashInfer.
+    # Self-attention only, refused at build off datacenter Blackwell
+    FA4_FP8 = "fa4_fp8"
 
 
 @dataclass(frozen=True)

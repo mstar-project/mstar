@@ -9,8 +9,9 @@ FlashInfer's ragged prefill and FlashInfer's own ``auto`` choice, as before; an
 entry gives sizes no served model has run that with a ``"*"`` row naming ``flashinfer``.
 
 Rows name ``flashinfer``, with ``{"backend": ...}`` for one of FlashInfer's
-ragged backends, or ``cudnn``, torch's cuDNN SDPA over equal-length segments
-(``cudnn_wrappers``), which a layout of unequal ones leaves for FlashInfer.
+ragged backends, or ``cudnn`` (torch's cuDNN SDPA) or ``fa4`` (FlashAttention 4's
+dense forward) over equal-length segments (``cudnn_wrappers``), which a layout of
+unequal ones leaves for FlashInfer.
 ``python -m benchmark.kernels.sweep ragged_attention`` writes them.
 """
 
@@ -59,6 +60,31 @@ def _cudnn_unavailable(target: Target) -> str | None:
     return None
 
 
+def _fa4_unavailable(target: Target) -> str | None:
+    if target.device.type != "cuda" or not current_platform.is_cuda():
+        return "FlashAttention 4 needs an NVIDIA GPU"
+    capability = current_platform.cuda_capability(target.device)
+    if capability is None or capability[0] != 10:
+        return f"FlashAttention 4 runs on Blackwell (sm_100 / sm_103), not compute capability {capability}"
+    if target.shape["num_qo_heads"] != target.shape["num_kv_heads"]:
+        return "the FA4 wrapper runs MHA only"
+    if target.dtype not in (torch.bfloat16, torch.float16):
+        return f"FA4 takes bf16 / fp16, not {target.dtype}"
+    head_dim = target.shape["head_dim"]
+    padded = padded_head_dim(head_dim)
+    if padded != head_dim:
+        return f"head dim {head_dim} is padded to {padded} for FlashInfer, which the FA4 wrapper doesn't take"
+    return _fa4_import_error()
+
+
+def _fa4_import_error() -> str | None:
+    try:
+        import flash_attn.cute  # noqa: F401
+    except Exception as exc:  # noqa: BLE001  # a broken install raises more than ImportError
+        return f"flash-attn-4 (flash_attn.cute) is not importable: {exc!r}"
+    return None
+
+
 RAGGED_ATTENTION = register(KernelOp(
     name="ragged_attention",
     shape=("num_qo_heads", "num_kv_heads", "head_dim"),
@@ -69,6 +95,8 @@ RAGGED_ATTENTION = register(KernelOp(
              doc="FlashInfer's ragged prefill; config {'backend': 'fa2' | 'cudnn' | 'auto'}"),
         Impl("cudnn", check=_cudnn_unavailable, tolerance=Tolerance(2e-2),
              doc="torch's cuDNN SDPA over equal-length segments"),
+        Impl("fa4", check=_fa4_unavailable, tolerance=Tolerance(2e-2),
+             doc="FlashAttention 4's dense forward over equal-length segments (Blackwell)"),
     ),
     doc="cacheless self-attention's kernel by one rank's head geometry and the longest query segment",
 ))
@@ -92,15 +120,17 @@ def kernel_rows(
     return entry.rows
 
 
-def cudnn_rows(
-    key: str, num_qo_heads: int, num_kv_heads: int, head_dim: int, dtype: torch.dtype, device: torch.device,
+def named_rows(
+    key: str, choice: Choice, num_qo_heads: int, num_kv_heads: int, head_dim: int, dtype: torch.dtype,
+    device: torch.device,
 ) -> Rows:
-    """``backend: cudnn``'s rows, cuDNN at every size; raises where it can't run, so a
-    config that names it fails at build rather than at its first request."""
+    """The one row of a backend a config names (``cudnn``, ``fa4_fp8``), at every size; raises
+    where its implementation can't run, so the config fails at build rather than at its
+    first request."""
     shape = {"num_qo_heads": num_qo_heads, "num_kv_heads": num_kv_heads, "head_dim": head_dim}
-    why = RAGGED_ATTENTION.unavailable(RAGGED_ATTENTION.target(dtype, shape, device)).get("cudnn")
+    why = RAGGED_ATTENTION.unavailable(RAGGED_ATTENTION.target(dtype, shape, device)).get(choice.impl)
     if why is not None:
-        raise ValueError(f"ragged attention {key!r} names backend 'cudnn', which can't run "
+        name = choice.impl if not choice.config else f"{choice.impl}_{choice.config.get('precision', '')}"
+        raise ValueError(f"ragged attention {key!r} names backend {name!r}, which can't run "
                          f"{RAGGED_ATTENTION.format_shape(shape)} {str(dtype).removeprefix('torch.')} here: {why}")
-    return ((None, Choice("cudnn")),)
-
+    return ((None, choice),)
