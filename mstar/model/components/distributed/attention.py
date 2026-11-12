@@ -155,6 +155,9 @@ class ParallelAttention(nn.Module):
         return (q, k) if self._pos_key is None else rope(self.state, q, k)
 
     def _attend_state(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        # This still rotates in a frame of its own, which `forward` avoids. Its one caller is Command A+'s fused path,
+        # which passes q and k as views of one projection with no QK norm, and is safe only because the model sets
+        # `disable_torch_compile`.
         q, k = self._rotate_state(q, k)
         self.state.add(self.layer, k=k, v=v)
         return self.state.read(self.layer, q)
