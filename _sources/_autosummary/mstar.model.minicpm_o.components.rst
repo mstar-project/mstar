@@ -28,10 +28,6 @@ mstar.model.minicpm\_o.components
    :recursive:
 
    audio
-   token2wav
-   token2wav_flow
-   token2wav_kernels
    tts
    vision
-   voice_prompt
 

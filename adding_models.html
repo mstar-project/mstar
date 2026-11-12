@@ -757,6 +757,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#cacheless-attention-encoder-towers">Cacheless attention (encoder towers)</a><ul class="nav section-nav flex-column">
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#cross-attention-between-spans">Cross-attention between spans</a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#block-causal-attention-within-spans">Block-causal attention within spans</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#key-padding-within-spans">Key padding within spans</a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#block-causal-attention-over-a-kv-cache">Block-causal attention over a KV cache</a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#bounded-sink-window-caches">Bounded (sink + window) caches</a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#rolling-compacted-caches">Rolling (compacted) caches</a></li>
@@ -1795,12 +1796,17 @@ between spans</a>.</p></td>
 between <code class="docutils literal notranslate"><span class="pre">block_size</span></code>-token blocks, bidirectional within one. Same config. See
 <a class="reference internal" href="#block-causal-attention-within-spans">Block-causal attention within spans</a>.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">BlockCausalAttentionSpec(config=AttentionConfig(kv_cache=...),</span> <span class="pre">block_size=...)</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">RaggedKeyPrefixAttentionSpec(config=RaggedAttentionConfig(...))</span></code></p></td>
+<td><p>Self-attention within each span over a prefix of its keys
+(<code class="docutils literal notranslate"><span class="pre">KeyPrefixAttentionStep(key_lens=...)</span></code>): every token queries, only the first
+<code class="docutils literal notranslate"><span class="pre">key_lens[i]</span></code> are keys. Same config. See <a class="reference internal" href="#key-padding-within-spans">Key padding within spans</a>.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">BlockCausalAttentionSpec(config=AttentionConfig(kv_cache=...),</span> <span class="pre">block_size=...)</span></code></p></td>
 <td><p>The same mask over a paged KV cache: a row’s new tokens attend its cached blocks and
 their own, and a step runs only new tokens. FlashInfer only. See <a class="reference internal" href="#block-causal-attention-over-a-kv-cache">Block-causal
 attention over a KV cache</a>.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">PositionSpec(config=PositionConfig(kv_cache=...))</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">PositionSpec(config=PositionConfig(kv_cache=...))</span></code></p></td>
 <td><p>Position tracking and RoPE. <code class="docutils literal notranslate"><span class="pre">scheme</span></code> is <code class="docutils literal notranslate"><span class="pre">PosScheme.SEQUENTIAL</span></code> or
 <code class="docutils literal notranslate"><span class="pre">PosScheme.BLOCK</span></code>. The RoPE parameters are set here: <code class="docutils literal notranslate"><span class="pre">rope_theta</span></code>,
 <code class="docutils literal notranslate"><span class="pre">rope_scale</span></code>, and the Llama-3.1 parameters <code class="docutils literal notranslate"><span class="pre">low_freq_factor</span></code>,
@@ -1826,7 +1832,7 @@ row keeps its table id’s offset beside its position’s, both fixed between ho
 steps. A cos/sin table on CUDA needs a <code class="docutils literal notranslate"><span class="pre">rotary_dim</span></code> that is a multiple of 32 with NeoX
 pairing, of 16 with GPT-J pairing (<code class="docutils literal notranslate"><span class="pre">interleave</span></code>).</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">SamplerSpec(vocab_size=...,</span> <span class="pre">enable_repetition_penalty=...)</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">SamplerSpec(vocab_size=...,</span> <span class="pre">enable_repetition_penalty=...)</span></code></p></td>
 <td><p>A sampler with its own per-request parameter buffers, philox stream, and optional
 seen-token mask. <code class="docutils literal notranslate"><span class="pre">enable_repetition_penalty</span></code> declares a capability, not an
 intention. It selects which kernel variant is recorded into the captured graph.
@@ -1838,7 +1844,7 @@ Whether the penalty runs on a given step is decided from the
 decode loop keeps on the device beside its last sampled token. See
 <a class="reference internal" href="#device-loop-back">Device loop-back</a>.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">RecurrentStateSpec(config=RecurrentStateConfig(...))</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">RecurrentStateSpec(config=RecurrentStateConfig(...))</span></code></p></td>
 <td><p>Fixed-size per-request state that carries between steps (an LSTM’s <code class="docutils literal notranslate"><span class="pre">h</span></code> and
 <code class="docutils literal notranslate"><span class="pre">c</span></code>, a cursor, a conv tail, a Mamba or gated-DeltaNet layer’s conv window and SSM
 state, a streaming encoder’s caches): one slot per request and label, <code class="docutils literal notranslate"><span class="pre">labels</span></code>
@@ -1856,7 +1862,7 @@ no saved state (a request’s first step, or a padding row) reads <code class="d
 when none is given. <code class="docutils literal notranslate"><span class="pre">gather</span></code> / <code class="docutils literal notranslate"><span class="pre">scatter_</span></code> need the sink, so leave
 <code class="docutils literal notranslate"><span class="pre">disable_sink_slot</span></code> unset. Parakeet’s transducer decode is the example.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">SeqShardSpec(labels=...,</span> <span class="pre">axis=...,</span> <span class="pre">walks=None)</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">SeqShardSpec(labels=...,</span> <span class="pre">axis=...,</span> <span class="pre">walks=None)</span></code></p></td>
 <td><p>Whether a step’s tokens split over the node’s sequence-parallel ranks, and each
 listed label’s per-rank ranges. Its step is the node’s segments (declared by the
 model, as for every resource), and the model brackets its layer stack with the resource’s
@@ -1864,7 +1870,7 @@ model, as for every resource), and the model brackets its layer stack with the r
 instead, from which the engine builds this spec (<a class="reference internal" href="#step-2a-declare-your-state">Step 2a — Declare your state</a>). See
 <strong>Sequence and context parallelism</strong> under <a class="reference internal" href="#tuning-resources-per-deployment">Tuning resources per deployment</a>.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">LinearAttnSpec(config=LinearAttnConfig(recurrent_state=...,</span> <span class="pre">variant=...))</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">LinearAttnSpec(config=LinearAttnConfig(recurrent_state=...,</span> <span class="pre">variant=...))</span></code></p></td>
 <td><p>Linear attention planned against a <code class="docutils literal notranslate"><span class="pre">RecurrentStateSpec</span></code> pool that holds its
 state: gated DeltaNet (<code class="docutils literal notranslate"><span class="pre">LinearAttnVariant.GDN</span></code>), Kimi delta attention (<code class="docutils literal notranslate"><span class="pre">KDA</span></code>:
 fused Triton kernels on CUDA, a torch reference elsewhere) or Mamba-2. A layer
@@ -1884,7 +1890,7 @@ ValueError at load. The torch reference’s prefill can’t be captured
 (<code class="docutils literal notranslate"><span class="pre">KDAManager.prefill_capturable</span></code> is False), so the resource refuses a prefill
 bucket on it and the model leaves those buckets out.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">LoraSpec</span></code> (built by <code class="docutils literal notranslate"><span class="pre">module_lora_spec</span></code>)</p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">LoraSpec</span></code> (built by <code class="docutils literal notranslate"><span class="pre">module_lora_spec</span></code>)</p></td>
 <td><p>Per-request LoRA adapters on the node’s LoRA-capable linears: a pool of device
 slots, a pinned host tier, and the per-step addressing a LoRA kernel reads.
 Opt-in (<code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.opt_in</span></code>): declared in this list, built only when
@@ -2199,6 +2205,16 @@ for the worst layout the bucket’s token count allows.</p>
 us to zero-pad to 128. So that tower attends through the resource only when it is
 replaying a captured graph, and runs flash-attn varlen otherwise.</p>
 </div>
+</section>
+<section id="key-padding-within-spans">
+<h4>Key padding within spans<a class="headerlink" href="#key-padding-within-spans" title="Link to this heading">#</a></h4>
+<p>An encoder run over padded clips can carry a key padding mask: a span’s last frames are
+padding as keys but still compute outputs, which can reach what the model keeps (Step-Audio2’s
+Whisper encoder masks one or two frames a clip). Declare a <code class="docutils literal notranslate"><span class="pre">RaggedKeyPrefixAttentionSpec</span></code>
+and step it with <code class="docutils literal notranslate"><span class="pre">KeyPrefixAttentionStep</span></code>, one segment per span and <code class="docutils literal notranslate"><span class="pre">key_lens</span></code> parallel to
+the segments, each in <code class="docutils literal notranslate"><span class="pre">1..span</span></code>. The resource gathers each span’s key prefix into a key layout
+of its own and runs the cross-attention kernel against it; under a captured graph the gather
+index is a static buffer the plan restages, padded to the bucket’s tokens.</p>
 </section>
 <section id="block-causal-attention-over-a-kv-cache">
 <h4>Block-causal attention over a KV cache<a class="headerlink" href="#block-causal-attention-over-a-kv-cache" title="Link to this heading">#</a></h4>
@@ -2756,9 +2772,9 @@ a device read. <code class="docutils literal notranslate"><span class="pre">chec
 The Qwen3-Omni Talker and Fish S2 Pro’s AR keep their EOS frame out of the codec
 stream this way; a <code class="docutils literal notranslate"><span class="pre">TokenStop</span></code> names such outputs in <code class="docutils literal notranslate"><span class="pre">withhold</span></code>, left unrouted on a
 row whose token is a stop id (the Qwen3-TTS Talker).
-Only an output that leaves by a streaming edge can be withheld (any other consumer
-would wait for an item that never comes), and not one that a node this worker
-speculates into reads, nor the loop-back signal. Startup refuses a
+Only an output that leaves by a streaming edge, as a tensor or by value, can be withheld
+(any other consumer would wait for an item that never comes), and not one that a node
+this worker speculates into reads, nor the loop-back signal. Startup refuses a
 <code class="docutils literal notranslate"><span class="pre">TokenStop.withhold</span></code> that breaks this; a <code class="docutils literal notranslate"><span class="pre">StopCheck</span></code> from <code class="docutils literal notranslate"><span class="pre">check_stop</span></code> is not
 checked.</p>
 </dd>
@@ -3152,19 +3168,28 @@ row whose last step did not keep its value on the device (its first decode step,
 the prefill) still brings it routed, and that read puts it over the slot’s.
 <code class="docutils literal notranslate"><span class="pre">SampledTokenDecoder</span></code> declares it for Qwen3.5, Muse Glimmer, Higgs Audio, Qwen3-ASR and the Cosmos3 reasoner,
 and a node on it that reads the routed token sets <code class="docutils literal notranslate"><span class="pre">device_loopback</span> <span class="pre">=</span> <span class="pre">None</span></code>; Whisper and
-Qwen3-Omni’s Thinker declare their own. Qwen3.5 reads the tokens with <code class="docutils literal notranslate"><span class="pre">last_sampled</span></code>.</p>
+Qwen3-Omni’s Thinker declare their own. Qwen3.5 reads the tokens with <code class="docutils literal notranslate"><span class="pre">last_sampled</span></code>.
+Its <code class="docutils literal notranslate"><span class="pre">walk</span></code> may be a <code class="docutils literal notranslate"><span class="pre">frozenset</span></code> of walks when several decode walks read the token back; a
+combined step’s rows each follow their own walk, and naming a combined walk is refused at
+startup.</p>
 <p>A token that also streams to another node can go down the stream by value, when the
 stream’s <code class="docutils literal notranslate"><span class="pre">Connection</span></code> sets <code class="docutils literal notranslate"><span class="pre">by_value=True</span></code>: its consumer then takes a window of the
-stream as one CPU int64 tensor of its items’ values. A step whose node names the signal
-in <code class="docutils literal notranslate"><span class="pre">inline_signals(walk)</span></code> sends each row’s value in the step’s <code class="docutils literal notranslate"><span class="pre">EDGE_ITEMS</span></code> frame
-instead of a tensor, with nothing to stage, read or acknowledge. A step carries one
-inline signal, the first of those it outputs, so a client token and a different stream
-token cannot both ride inline. The step keeps its rows on the device only if every
-output is one of <code class="docutils literal notranslate"><span class="pre">device_loopback_signals</span></code>, so the streamed signal must also be the
-loop-back signal: MiniCPM-o’s TTS decode loops its code back on the device and streams
-the same code to the vocoder by value. A lockstep node’s streams keep their tensors,
-and a <code class="docutils literal notranslate"><span class="pre">by_value</span></code> connection cannot join its items, drive its consumer’s walk or come
-from the client.</p>
+stream as one CPU int64 tensor of its items’ values. A step whose node names the signal in
+<code class="docutils literal notranslate"><span class="pre">inline_signals(walk)</span></code> sends each row’s value in the step’s <code class="docutils literal notranslate"><span class="pre">EDGE_ITEMS</span></code> frame instead
+of a tensor, with nothing to stage, read or acknowledge. A step carries one inline column:
+the first of those signals it outputs, and every other it outputs that reads the same stop
+buffer, so a client token and a stream of the same token both ride inline; a signal read
+off another buffer keeps its tensors. A row whose stop check withheld one of them
+(<code class="docutils literal notranslate"><span class="pre">StopCheck.withheld</span></code>) sends nothing for it, and its stream counts no item. The step
+keeps its rows on the device when every output is one of <code class="docutils literal notranslate"><span class="pre">device_loopback_signals</span></code> or
+rides the column on every edge (a client emit or a <code class="docutils literal notranslate"><span class="pre">by_value</span></code> stream, neither persisted,
+no non-streamed edge counted toward the conductor’s output tokens, and not collected by
+an enclosing loop):
+MiniCPM-o’s TTS decode loops its code back on the device and streams the same code to the
+vocoder by value. A rows-only step builds no per-request outputs and skips
+<code class="docutils literal notranslate"><span class="pre">postprocess</span></code>, so whatever a submodule’s <code class="docutils literal notranslate"><span class="pre">postprocess</span></code> does must be about the outputs
+a stored step routes. A lockstep node’s streams keep their tensors, and a <code class="docutils literal notranslate"><span class="pre">by_value</span></code>
+connection cannot join its items, drive its consumer’s walk or come from the client.</p>
 <p>On such a node a captured step writes each row’s token and RNG offset back to the request’s
 row inside the graph (<code class="docutils literal notranslate"><span class="pre">knobs:</span> <span class="pre">sampler_ingraph_scatter</span></code>, on by default). Those rows are
 allocated once, <code class="docutils literal notranslate"><span class="pre">knobs:</span> <span class="pre">sampler_slots</span></code> of them, so a request takes its row when the runner
@@ -5200,6 +5225,7 @@ for a full omni-modal model.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#cacheless-attention-encoder-towers">Cacheless attention (encoder towers)</a><ul class="nav section-nav flex-column">
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#cross-attention-between-spans">Cross-attention between spans</a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#block-causal-attention-within-spans">Block-causal attention within spans</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#key-padding-within-spans">Key padding within spans</a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#block-causal-attention-over-a-kv-cache">Block-causal attention over a KV cache</a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#bounded-sink-window-caches">Bounded (sink + window) caches</a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#rolling-compacted-caches">Rolling (compacted) caches</a></li>

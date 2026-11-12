@@ -1094,6 +1094,20 @@ window.runMermaid = runMermaid;</script>
 
 
 
+<div class="viewcode-block" id="KeyPrefixAttentionStep">
+<a class="viewcode-back" href="../../../../../../_autosummary/mstar.engine.resources.attn.ragged.config.html#mstar.engine.resources.KeyPrefixAttentionStep">[docs]</a>
+<span class="nd">@dataclass</span><span class="p">(</span><span class="n">frozen</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">KeyPrefixAttentionStep</span><span class="p">(</span><span class="n">ResourceStep</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""A step of ``RaggedKeyPrefixAttentionSpec``: every token of each segment is a</span>
+<span class="sd">    query, and attends the first ``key_lens[i]`` tokens of its own segment, where</span>
+<span class="sd">    ``key_lens`` runs parallel to ``segments`` (``0 &lt; key_lens[i] &lt;= span``, or 0</span>
+<span class="sd">    for an empty segment). Never causal.</span>
+<span class="sd">    """</span>
+
+    <span class="n">key_lens</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span> <span class="o">=</span> <span class="p">()</span></div>
+
+
+
 <div class="viewcode-block" id="RaggedAttentionConfig">
 <a class="viewcode-back" href="../../../../../../_autosummary/mstar.engine.resources.attn.ragged.config.html#mstar.engine.resources.RaggedAttentionConfig">[docs]</a>
 <span class="nd">@dataclass</span>
@@ -1390,6 +1404,26 @@ window.runMermaid = runMermaid;</script>
         <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.attn.ragged.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">RaggedBlockCausalAttnManager</span>
 
         <span class="k">return</span> <span class="n">RaggedBlockCausalAttnManager</span></div>
+
+
+
+<div class="viewcode-block" id="RaggedKeyPrefixAttentionSpec">
+<a class="viewcode-back" href="../../../../../../_autosummary/mstar.engine.resources.attn.ragged.config.html#mstar.engine.resources.RaggedKeyPrefixAttentionSpec">[docs]</a>
+<span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">RaggedKeyPrefixAttentionSpec</span><span class="p">(</span><span class="n">_RaggedSpecBase</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""Cacheless self-attention within each span where only a prefix of the span is</span>
+<span class="sd">    attendable (``KeyPrefixAttentionStep``): a key padding mask, as a batch of padded</span>
+<span class="sd">    clips through a Whisper-style encoder carries, whose padded frames still query.</span>
+
+<span class="sd">    Its own kind, not a flag on ``RaggedAttentionSpec``: its keys are a layout of their</span>
+<span class="sd">    own, which the resource gathers K and V into before the kernel runs.</span>
+<span class="sd">    """</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">resource_class</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">"type[Resource]"</span><span class="p">:</span>
+        <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.attn.ragged.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">RaggedKeyPrefixAttnManager</span>
+
+        <span class="k">return</span> <span class="n">RaggedKeyPrefixAttnManager</span></div>
 
 </pre></div>
 

@@ -23,12 +23,14 @@ mstar.engine.resources.attn.ragged.config
 
    .. autosummary::
    
+      KeyPrefixAttentionStep
       RaggedAttentionConfig
       RaggedAttentionSpec
       RaggedAttnBackend
       RaggedBlockCausalAttentionSpec
       RaggedCrossAttentionSpec
       RaggedCrossAttentionStep
+      RaggedKeyPrefixAttentionSpec
    
    
 

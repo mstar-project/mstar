@@ -742,6 +742,10 @@
             </div>
             <nav aria-label="Page">
                 <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.ragged.config.KeyPrefixAttentionStep"><code class="docutils literal notranslate"><span class="pre">KeyPrefixAttentionStep</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.ragged.config.KeyPrefixAttentionStep.key_lens"><code class="docutils literal notranslate"><span class="pre">KeyPrefixAttentionStep.key_lens</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.ragged.config.RaggedAttentionConfig"><code class="docutils literal notranslate"><span class="pre">RaggedAttentionConfig</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.ragged.config.RaggedAttentionConfig.backend"><code class="docutils literal notranslate"><span class="pre">RaggedAttentionConfig.backend</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.ragged.config.RaggedAttentionConfig.compile_op"><code class="docutils literal notranslate"><span class="pre">RaggedAttentionConfig.compile_op</span></code></a></li>
@@ -791,6 +795,10 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.ragged.config.RaggedCrossAttentionStep.pairs"><code class="docutils literal notranslate"><span class="pre">RaggedCrossAttentionStep.pairs</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.ragged.config.RaggedKeyPrefixAttentionSpec"><code class="docutils literal notranslate"><span class="pre">RaggedKeyPrefixAttentionSpec</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.ragged.config.RaggedKeyPrefixAttentionSpec.resource_class"><code class="docutils literal notranslate"><span class="pre">RaggedKeyPrefixAttentionSpec.resource_class</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.ragged.config.cross_label"><code class="docutils literal notranslate"><span class="pre">cross_label()</span></code></a></li>
 </ul>
             </nav>
@@ -820,27 +828,57 @@ a submodule can declare a step without pulling FlashInfer in behind it.</p>
 <p class="rubric">Classes</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.attn.ragged.config.RaggedAttentionConfig" title="mstar.engine.resources.attn.ragged.config.RaggedAttentionConfig"><code class="xref py py-obj docutils literal notranslate"><span class="pre">RaggedAttentionConfig</span></code></a>(num_qo_heads, ...[, ...])</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.attn.ragged.config.KeyPrefixAttentionStep" title="mstar.engine.resources.attn.ragged.config.KeyPrefixAttentionStep"><code class="xref py py-obj docutils literal notranslate"><span class="pre">KeyPrefixAttentionStep</span></code></a>([segments, key_lens, ...])</p></td>
+<td><p>A step of <code class="docutils literal notranslate"><span class="pre">RaggedKeyPrefixAttentionSpec</span></code>: every token of each segment is a query, and attends the first <code class="docutils literal notranslate"><span class="pre">key_lens[i]</span></code> tokens of its own segment, where <code class="docutils literal notranslate"><span class="pre">key_lens</span></code> runs parallel to <code class="docutils literal notranslate"><span class="pre">segments</span></code> (<code class="docutils literal notranslate"><span class="pre">0</span> <span class="pre">&lt;</span> <span class="pre">key_lens[i]</span> <span class="pre">&lt;=</span> <span class="pre">span</span></code>, or 0 for an empty segment).</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.attn.ragged.config.RaggedAttentionConfig" title="mstar.engine.resources.attn.ragged.config.RaggedAttentionConfig"><code class="xref py py-obj docutils literal notranslate"><span class="pre">RaggedAttentionConfig</span></code></a>(num_qo_heads, ...[, ...])</p></td>
 <td><p>Varlen attention over segments packed into one forward, with no KV cache: the whole layout is this step's, and nothing carries to the next.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.attn.ragged.config.RaggedAttentionSpec" title="mstar.engine.resources.attn.ragged.config.RaggedAttentionSpec"><code class="xref py py-obj docutils literal notranslate"><span class="pre">RaggedAttentionSpec</span></code></a>(resource_key, nodes, ...)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.attn.ragged.config.RaggedAttentionSpec" title="mstar.engine.resources.attn.ragged.config.RaggedAttentionSpec"><code class="xref py py-obj docutils literal notranslate"><span class="pre">RaggedAttentionSpec</span></code></a>(resource_key, nodes, ...)</p></td>
 <td><p>Cacheless self-attention within each declared span (<code class="docutils literal notranslate"><span class="pre">AttentionStep</span></code>).</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.attn.ragged.config.RaggedAttnBackend" title="mstar.engine.resources.attn.ragged.config.RaggedAttnBackend"><code class="xref py py-obj docutils literal notranslate"><span class="pre">RaggedAttnBackend</span></code></a>(*values)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.attn.ragged.config.RaggedAttnBackend" title="mstar.engine.resources.attn.ragged.config.RaggedAttnBackend"><code class="xref py py-obj docutils literal notranslate"><span class="pre">RaggedAttnBackend</span></code></a>(*values)</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.attn.ragged.config.RaggedBlockCausalAttentionSpec" title="mstar.engine.resources.attn.ragged.config.RaggedBlockCausalAttentionSpec"><code class="xref py py-obj docutils literal notranslate"><span class="pre">RaggedBlockCausalAttentionSpec</span></code></a>(resource_key, ...)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.attn.ragged.config.RaggedBlockCausalAttentionSpec" title="mstar.engine.resources.attn.ragged.config.RaggedBlockCausalAttentionSpec"><code class="xref py py-obj docutils literal notranslate"><span class="pre">RaggedBlockCausalAttentionSpec</span></code></a>(resource_key, ...)</p></td>
 <td><p>Cacheless block-causal self-attention within each declared span: a token in block <code class="docutils literal notranslate"><span class="pre">b</span></code> of its span (<code class="docutils literal notranslate"><span class="pre">block_size</span></code> tokens a block, from the span's start) attends every key of blocks <code class="docutils literal notranslate"><span class="pre">0..b</span></code>.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.attn.ragged.config.RaggedCrossAttentionSpec" title="mstar.engine.resources.attn.ragged.config.RaggedCrossAttentionSpec"><code class="xref py py-obj docutils literal notranslate"><span class="pre">RaggedCrossAttentionSpec</span></code></a>(resource_key, ...)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.attn.ragged.config.RaggedCrossAttentionSpec" title="mstar.engine.resources.attn.ragged.config.RaggedCrossAttentionSpec"><code class="xref py py-obj docutils literal notranslate"><span class="pre">RaggedCrossAttentionSpec</span></code></a>(resource_key, ...)</p></td>
 <td><p>Cacheless cross-attention between two spans of each request: a forward's <code class="docutils literal notranslate"><span class="pre">(q_label,</span> <span class="pre">kv_label)</span></code> pairs (<code class="docutils literal notranslate"><span class="pre">RaggedCrossAttentionStep</span></code>), each run through <code class="docutils literal notranslate"><span class="pre">resource.run(q,</span> <span class="pre">k,</span> <span class="pre">v,</span> <span class="pre">label=cross_label(q_label,</span> <span class="pre">kv_label))</span></code>.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.attn.ragged.config.RaggedCrossAttentionStep" title="mstar.engine.resources.attn.ragged.config.RaggedCrossAttentionStep"><code class="xref py py-obj docutils literal notranslate"><span class="pre">RaggedCrossAttentionStep</span></code></a>([segments, pairs, ...])</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.attn.ragged.config.RaggedCrossAttentionStep" title="mstar.engine.resources.attn.ragged.config.RaggedCrossAttentionStep"><code class="xref py py-obj docutils literal notranslate"><span class="pre">RaggedCrossAttentionStep</span></code></a>([segments, pairs, ...])</p></td>
 <td><p>A ragged cross-attention step: which spans attend which.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.attn.ragged.config.RaggedKeyPrefixAttentionSpec" title="mstar.engine.resources.attn.ragged.config.RaggedKeyPrefixAttentionSpec"><code class="xref py py-obj docutils literal notranslate"><span class="pre">RaggedKeyPrefixAttentionSpec</span></code></a>(resource_key, ...)</p></td>
+<td><p>Cacheless self-attention within each span where only a prefix of the span is attendable (<code class="docutils literal notranslate"><span class="pre">KeyPrefixAttentionStep</span></code>): a key padding mask, as a batch of padded clips through a Whisper-style encoder carries, whose padded frames still query.</p></td>
 </tr>
 </tbody>
 </table>
 </div>
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.engine.resources.attn.ragged.config.KeyPrefixAttentionStep">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.attn.ragged.config.</span></span><span class="sig-name descname"><span class="pre">KeyPrefixAttentionStep</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">segments</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">key_lens</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">()</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">*</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">combined_labels</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">&lt;factory&gt;</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/attn/ragged/config.html#KeyPrefixAttentionStep"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.attn.ragged.config.KeyPrefixAttentionStep" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference internal" href="mstar.engine.resources.step.html#mstar.engine.resources.step.ResourceStep" title="mstar.engine.resources.step.ResourceStep"><code class="xref py py-class docutils literal notranslate"><span class="pre">ResourceStep</span></code></a></p>
+<p>A step of <code class="docutils literal notranslate"><span class="pre">RaggedKeyPrefixAttentionSpec</span></code>: every token of each segment is a
+query, and attends the first <code class="docutils literal notranslate"><span class="pre">key_lens[i]</span></code> tokens of its own segment, where
+<code class="docutils literal notranslate"><span class="pre">key_lens</span></code> runs parallel to <code class="docutils literal notranslate"><span class="pre">segments</span></code> (<code class="docutils literal notranslate"><span class="pre">0</span> <span class="pre">&lt;</span> <span class="pre">key_lens[i]</span> <span class="pre">&lt;=</span> <span class="pre">span</span></code>, or 0
+for an empty segment). Never causal.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>segments</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><em>tuple</em></a><em>[</em><a class="reference internal" href="mstar.engine.resources.step.html#mstar.engine.resources.step.Segment" title="mstar.engine.resources.step.Segment"><em>Segment</em></a><em>, </em><em>...</em><em>] </em><em>| </em><em>None</em>)</p></li>
+<li><p><strong>key_lens</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><em>tuple</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>, </em><em>...</em><em>]</em>)</p></li>
+<li><p><strong>combined_labels</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><em>tuple</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><em>...</em><em>]</em><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>]</em>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.attn.ragged.config.KeyPrefixAttentionStep.key_lens">
+<span class="sig-name descname"><span class="pre">key_lens</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><span class="pre">tuple</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="p"><span class="pre">...</span></span><span class="p"><span class="pre">]</span></span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">()</span></span><a class="headerlink" href="#mstar.engine.resources.attn.ragged.config.KeyPrefixAttentionStep.key_lens" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+</dd></dl>
+
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.engine.resources.attn.ragged.config.RaggedAttentionConfig">
 <span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.attn.ragged.config.</span></span><span class="sig-name descname"><span class="pre">RaggedAttentionConfig</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">num_qo_heads</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_kv_heads</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">head_dim</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">sm_scale</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">max_segments_per_request</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">1</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">max_segments_per_step</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">max_tokens_per_request</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">backend</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">RaggedAttnBackend.AUTO</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">flashinfer_backend</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">compile_op</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">dtype</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">workspace_mb</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/attn/ragged/config.html#RaggedAttentionConfig"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.attn.ragged.config.RaggedAttentionConfig" title="Link to this definition">#</a></dt>
@@ -1227,6 +1265,35 @@ declared for the same requests in the same order. Never causal.</p>
 
 </dd></dl>
 
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.engine.resources.attn.ragged.config.RaggedKeyPrefixAttentionSpec">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.attn.ragged.config.</span></span><span class="sig-name descname"><span class="pre">RaggedKeyPrefixAttentionSpec</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">resource_key</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">nodes</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">config</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/attn/ragged/config.html#RaggedKeyPrefixAttentionSpec"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.attn.ragged.config.RaggedKeyPrefixAttentionSpec" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <code class="xref py py-class docutils literal notranslate"><span class="pre">_RaggedSpecBase</span></code></p>
+<p>Cacheless self-attention within each span where only a prefix of the span is
+attendable (<code class="docutils literal notranslate"><span class="pre">KeyPrefixAttentionStep</span></code>): a key padding mask, as a batch of padded
+clips through a Whisper-style encoder carries, whose padded frames still query.</p>
+<p>Its own kind, not a flag on <code class="docutils literal notranslate"><span class="pre">RaggedAttentionSpec</span></code>: its keys are a layout of their
+own, which the resource gathers K and V into before the kernel runs.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>resource_key</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>nodes</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#set" title="(in Python v3.12)"><em>set</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>]</em>)</p></li>
+<li><p><strong>config</strong> (<a class="reference internal" href="#mstar.engine.resources.attn.ragged.config.RaggedAttentionConfig" title="mstar.engine.resources.attn.ragged.config.RaggedAttentionConfig"><em>RaggedAttentionConfig</em></a>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py property">
+<dt class="sig sig-object py" id="mstar.engine.resources.attn.ragged.config.RaggedKeyPrefixAttentionSpec.resource_class">
+<span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">resource_class</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#type" title="(in Python v3.12)"><span class="pre">type</span></a><span class="p"><span class="pre">[</span></span><a class="reference internal" href="mstar.engine.resources.html#mstar.engine.resources.Resource" title="mstar.engine.resources.Resource"><span class="pre">Resource</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.engine.resources.attn.ragged.config.RaggedKeyPrefixAttentionSpec.resource_class" title="Link to this definition">#</a></dt>
+<dd><p>What builds this spec. Imported inside the property, so declaring a
+resource stays free of the manager and its kernels.</p>
+<p>The builder, not necessarily the class built: an attention spec names
+<cite>AttentionManager</cite>, whose <cite>build</cite> picks a backend subclass.</p>
+</dd></dl>
+
+</dd></dl>
+
 <dl class="py function">
 <dt class="sig sig-object py" id="mstar.engine.resources.attn.ragged.config.cross_label">
 <span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.attn.ragged.config.</span></span><span class="sig-name descname"><span class="pre">cross_label</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">q_label</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">kv_label</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/attn/ragged/config.html#cross_label"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.attn.ragged.config.cross_label" title="Link to this definition">#</a></dt>
@@ -1294,6 +1361,10 @@ declared for the same requests in the same order. Never causal.</p>
   </div>
   <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.ragged.config.KeyPrefixAttentionStep"><code class="docutils literal notranslate"><span class="pre">KeyPrefixAttentionStep</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.ragged.config.KeyPrefixAttentionStep.key_lens"><code class="docutils literal notranslate"><span class="pre">KeyPrefixAttentionStep.key_lens</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.ragged.config.RaggedAttentionConfig"><code class="docutils literal notranslate"><span class="pre">RaggedAttentionConfig</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.ragged.config.RaggedAttentionConfig.backend"><code class="docutils literal notranslate"><span class="pre">RaggedAttentionConfig.backend</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.ragged.config.RaggedAttentionConfig.compile_op"><code class="docutils literal notranslate"><span class="pre">RaggedAttentionConfig.compile_op</span></code></a></li>
@@ -1341,6 +1412,10 @@ declared for the same requests in the same order. Never causal.</p>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.ragged.config.RaggedCrossAttentionStep"><code class="docutils literal notranslate"><span class="pre">RaggedCrossAttentionStep</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.ragged.config.RaggedCrossAttentionStep.pairs"><code class="docutils literal notranslate"><span class="pre">RaggedCrossAttentionStep.pairs</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.ragged.config.RaggedKeyPrefixAttentionSpec"><code class="docutils literal notranslate"><span class="pre">RaggedKeyPrefixAttentionSpec</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.ragged.config.RaggedKeyPrefixAttentionSpec.resource_class"><code class="docutils literal notranslate"><span class="pre">RaggedKeyPrefixAttentionSpec.resource_class</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.ragged.config.cross_label"><code class="docutils literal notranslate"><span class="pre">cross_label()</span></code></a></li>

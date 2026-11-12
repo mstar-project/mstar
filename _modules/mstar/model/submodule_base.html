@@ -1157,13 +1157,23 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">    tokens on the host would pay for nothing.</span>
 <span class="sd">    """</span>
 
-    <span class="n">walk</span><span class="p">:</span> <span class="nb">str</span>
+    <span class="c1"># the walk, or walks, whose token loops back (a combined walk's rows</span>
+    <span class="c1"># follow their own walk's)</span>
+    <span class="n">walk</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span>
     <span class="c1"># the input signal the walk's token loops back to</span>
     <span class="n">signal</span><span class="p">:</span> <span class="nb">str</span>
     <span class="c1"># resource key of the sampler keeping the slot masters</span>
     <span class="n">sampler</span><span class="p">:</span> <span class="nb">str</span>
     <span class="c1"># the row-addressed output (``check_stop_buffers`` entry) holding the token</span>
-    <span class="n">buffer</span><span class="p">:</span> <span class="nb">str</span></div>
+    <span class="n">buffer</span><span class="p">:</span> <span class="nb">str</span>
+
+<div class="viewcode-block" id="DeviceLoopback.covers">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.DeviceLoopback.covers">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">covers</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Whether ``graph_walk``'s token loops back on the device."""</span>
+        <span class="n">walk</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">walk</span>
+        <span class="k">return</span> <span class="n">graph_walk</span> <span class="o">==</span> <span class="n">walk</span> <span class="ow">or</span> <span class="p">(</span><span class="nb">isinstance</span><span class="p">(</span><span class="n">walk</span><span class="p">,</span> <span class="nb">frozenset</span><span class="p">)</span> <span class="ow">and</span> <span class="n">graph_walk</span> <span class="ow">in</span> <span class="n">walk</span><span class="p">)</span></div>
+</div>
 
 
 
@@ -2488,11 +2498,14 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        row-addressed stop buffer holding it. The worker then sends those values</span>
 <span class="sd">        inline, one frame per step, instead of one tensor per request: to the</span>
 <span class="sd">        client on an emit edge that is not persisted, and down a stream whose</span>
-<span class="sd">        ``Connection`` goes ``by_value``. A step carries one inline signal, the</span>
-<span class="sd">        first of these it outputs. Its rows stay on the device only if every</span>
-<span class="sd">        output is a ``device_loopback_signals`` one, so a stream's signal sent</span>
-<span class="sd">        inline lets the step run rows-only when it is also the loop-back</span>
-<span class="sd">        signal."""</span>
+<span class="sd">        ``Connection`` goes ``by_value``. A step carries one column of these:</span>
+<span class="sd">        the first it outputs, and every other it outputs that reads the same</span>
+<span class="sd">        buffer. A row whose stop check withheld one of them sends nothing for</span>
+<span class="sd">        it. The step keeps its rows on the device (rows-only) when every</span>
+<span class="sd">        output is a ``device_loopback_signals`` one or rides the column on</span>
+<span class="sd">        every edge: a client emit, or a ``by_value`` stream. A rows-only step</span>
+<span class="sd">        builds no per-request outputs and skips ``postprocess``, so anything</span>
+<span class="sd">        ``postprocess`` does must be about outputs the step stores."""</span>
         <span class="k">del</span> <span class="n">graph_walk</span>
         <span class="k">return</span> <span class="p">{}</span></div>
 
@@ -2924,7 +2937,7 @@ window.runMermaid = runMermaid;</script>
     <span class="k">def</span><span class="w"> </span><span class="nf">_loops_back</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""Whether this walk's token loops back on the device."""</span>
         <span class="n">loopback</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">device_loopback</span>
-        <span class="k">return</span> <span class="n">loopback</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">graph_walk</span> <span class="o">==</span> <span class="n">loopback</span><span class="o">.</span><span class="n">walk</span>
+        <span class="k">return</span> <span class="n">loopback</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">loopback</span><span class="o">.</span><span class="n">covers</span><span class="p">(</span><span class="n">graph_walk</span><span class="p">)</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_reads_loopback</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""Whether this walk's rows read their token off the slot masters: a</span>
