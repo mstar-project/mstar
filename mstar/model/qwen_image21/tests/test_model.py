@@ -256,6 +256,24 @@ def test_config_reads_the_pixel_bounds_from_either_processor_layout(tmp_path, la
     assert (config.min_pixels, config.max_pixels) == (1234, 99999) and config.sample_sigmas == (1.0, 0.5)
 
 
+@pytest.mark.parametrize("accelerator_graph", [False, True])
+def test_captured_denoise_steps_on_cfg_ranks_are_refused_at_load(accelerator_graph):
+    """A cfg rank's guided step holds both labels' K/V while its capture is sized for its one branch."""
+    from pathlib import Path
+
+    import yaml
+
+    from mstar.model.qwen_image21.qwen_image21_model import QwenImage21Model
+
+    config = yaml.safe_load((Path(__file__).parents[4] / "configs" / "qwen_image21_cfg2.yaml").read_text())
+    model = QwenImage21Model(skip_weight_loading=True, accelerator_graph=accelerator_graph)
+    if accelerator_graph:
+        with pytest.raises(ValueError, match="can't capture its denoise steps with the dit on cfg_size > 1"):
+            model.validate_config_yaml(config, "cfg2.yaml")
+    else:
+        model.validate_config_yaml(config, "cfg2.yaml")
+
+
 def test_a_guided_denoise_capture_holds_both_labels_kv():
     """A guided capture's template rows clone (as the engine clones them), and its bucket holds the K/V
     slots its step declares: the target on ``main`` and on ``uncond`` per row."""

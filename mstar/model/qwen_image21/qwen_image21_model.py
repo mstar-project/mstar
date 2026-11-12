@@ -207,6 +207,19 @@ class QwenImage21Model(Model):
         dtype = config.get("autocast_dtype", "bfloat16")
         if str(dtype).removeprefix("torch.") not in ("bfloat16", "bf16"):
             raise ValueError(f"{config_path}: Qwen-Image-2.1 caches its prefix K/V in bf16; got autocast_dtype={dtype}")
+        # A cfg rank's guided step holds both labels' K/V (the ranks take the same pages) while its key runs one
+        # branch, so a captured bucket would be sized for half the tokens its step declares. Nothing has proven
+        # that capture on cfg ranks, so it is refused.
+        cfg_split = any(
+            DIT_NODE in (group.get("node_names") or ()) and int(group.get("cfg_size", 1)) > 1
+            for group in config.get("node_groups") or ()
+        )
+        if cfg_split and self.accelerator_graph:
+            raise ValueError(
+                f"{config_path}: Qwen-Image-2.1 can't capture its denoise steps with the dit on cfg_size > 1 ranks; "
+                "set model_kwargs.accelerator_graph to false (the eager steps run on the dense backend) or cfg_size "
+                "to 1"
+            )
 
     # ------------------------------------------------------------ structure
     def get_node_resources(self) -> list[NodeResourceSpec]:
