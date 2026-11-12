@@ -492,7 +492,8 @@ def test_a_keyed_node_refuses_a_pool_whose_backend_writes_no_snapshots(variant):
     assert problems and "'state' cannot serve a request" in problems[0], problems
 
 
-@pytest.mark.parametrize("depends_on", [set(), {"kv"}])
+# an undeclared dependency is reported by `spec_dependency_problems`, and mustn't crash this check
+@pytest.mark.parametrize("depends_on", [set(), {"kv"}, {"undeclared"}])
 def test_a_keyed_node_still_refuses_a_resource_that_cant_skip_a_prefix(depends_on):
     class _Unskippable(NodeResourceSpec):
         @property

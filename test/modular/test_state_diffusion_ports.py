@@ -30,7 +30,7 @@ from mstar.engine.resources.attn.ragged.config import (
 from mstar.engine.resources.sequence_shard import SeqShardSpec, SequenceShard, sequence_parallel_refusals
 from mstar.engine.resources.spec import apply_yaml_overrides, resolve_spec_dependencies
 from mstar.engine.resources.step import ResourceStep, Segment, StepContext, SubmoduleStep
-from mstar.engine.state import Array, ArrayStep, Attend, Block, Read
+from mstar.engine.state import Array, ArrayStep, Attend, Block, Read, SeqShard
 from mstar.engine.state.adapters import (
     StateSetup,
     _resolve,
@@ -113,6 +113,14 @@ def _h3(**kwargs) -> H3Model:
     return model
 
 
+def _one_rank_shards(model) -> dict:
+    """``model``'s declared sequence shards as one rank holds them, which split nothing."""
+    return {
+        declared.name: SequenceShard(tuple(declared.labels), 0, None, 0, SimpleNamespace(world_size=1))
+        for declared in model.declare_state() if isinstance(declared, SeqShard)
+    }
+
+
 def _on_sdpa(model) -> StateSetup:
     """SDPA on every attention resource ``model`` declares (its sequence shards aren't)."""
     on_sdpa = {
@@ -187,15 +195,15 @@ def test_sdpa_builds_no_spec_as_the_hand_written_model_did(name):
 
 
 @pytest.mark.parametrize("name", MODELS)
-def test_a_port_writes_no_spec_by_hand_but_its_shard_and_has_no_layout_to_convert(name):
+def test_a_port_writes_no_spec_by_hand_and_has_no_layout_to_convert(name):
     model = MODELS[name][0]()
-    assert all(isinstance(spec, SeqShardSpec) for spec in model.get_node_resources()) and model.kv_labels() == {}, (
+    assert model.get_node_resources() == [] and model.kv_labels() == {}, (
         "a DiT keeps nothing between steps"
     )
 
 
-def test_ltx_writes_no_spec_by_hand_but_its_shard_and_has_no_layout_to_convert():
-    assert all(isinstance(spec, SeqShardSpec) for spec in _ltx().get_node_resources()) and _ltx().kv_labels() == {}
+def test_ltx_writes_no_spec_by_hand_and_has_no_layout_to_convert():
+    assert _ltx().get_node_resources() == [] and _ltx().kv_labels() == {}
 
 
 @pytest.mark.parametrize("name", ["klein", "z_image"])
@@ -339,7 +347,7 @@ def test_wan22_parallel_configs_plan_each_ranks_step_as_main_did(path, guidance)
         reference = SubmoduleStep(
             segments=segments, steps={SELF_ATTN: AttentionStep(causal=False, fixed_layout=True)}, cg_key_info=key,
         )
-        handles = node_handles(model, "dit", {SELF_ATTN: _StubRagged()})
+        handles = node_handles(model, "dit", {**_one_rank_shards(model), SELF_ATTN: _StubRagged()})
         step = state_steps(sub.declare_step("gen", [0], [_inputs(key)]), handles)
         _assert_plans_equal(step, reference, SELF_ATTN)
 
@@ -572,7 +580,7 @@ def test_ltx_on_sdpa_at_sp1_declares_no_step_as_main_did():
     model = _ltx()
     sub = LTXDenoiseSubmodule(None, model.config, loop_name=DENOISE_LOOP)
     shape = LTXShape(frames=1, height=5, width=5, audio_frames=5, fps=24.0, text_len=16)
-    handles = node_handles(model, "dit", {}, setup=_on_sdpa(model))
+    handles = node_handles(model, "dit", _one_rank_shards(model), setup=_on_sdpa(model))
     assert state_steps(sub.declare_step("generate_av", [0], [_inputs(shape)]), handles) is None
 
 
@@ -628,7 +636,7 @@ def _h3_layout() -> H3Layout:
 def _h3_dit(world: int) -> H3DenoiseSubmodule:
     """The DiT's submodule bound to a sequence shard over ``world`` SP ranks, whose size pads its rows."""
     sub = H3DenoiseSubmodule(SimpleNamespace(), H3Config(), loop_name=DENOISE_LOOP)
-    sub.bind_node_resources({DIT_SHARD: SequenceShard(("main",), 0, None, 0, SimpleNamespace(world_size=world))})
+    sub.bind_node_state({DIT_SHARD: SimpleNamespace(ranks=world)})
     return sub
 
 
@@ -643,7 +651,7 @@ def test_h3_steps_equal_the_hand_written_one_on_every_rank(world):
     reference = SubmoduleStep(
         segments=segments, steps={H3_ATTN: AttentionStep(causal=False, fixed_layout=True)}, cg_key_info=layout,
     )
-    handles = node_handles(model, "dit", {H3_ATTN: _StubRagged()})
+    handles = node_handles(model, "dit", {**_one_rank_shards(model), H3_ATTN: _StubRagged()})
     _assert_plans_equal(state_steps(sub.declare_step("gen", [0], [_inputs(layout)]), handles), reference, H3_ATTN)
 
 
