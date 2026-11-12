@@ -573,3 +573,17 @@ def test_written_counts_the_committed_entries():
     assert mgr.written(1) == 3
     mgr.remove_request(1)
     assert mgr.written(1) == 0, "a torn-down request reads 0, as one never admitted does"
+
+
+def test_a_bounded_pool_holds_as_many_requests_as_its_slots():
+    """The manager keeps no sink slot, so every one of ``max_slots`` holds a request."""
+    from mstar.engine.resources.kv.bounded.config import BoundedKVConfig, BoundedKVSpec
+
+    config = BoundedKVConfig(num_layers=1, num_heads=1, head_dim=16, rows_per_request=1, max_source_len=0,
+                             retention=SinkWindow(0, 4), max_slots=4)
+    spec = BoundedKVSpec(resource_key="enc", nodes={"enc"}, config=config)
+    assert spec.capacity_problem(4, None) is None
+    assert spec.capacity_problem(5, None) == (
+        "5 concurrent requests (max_concurrent_requests) need 5 slots of resources.enc, which holds 4; raise "
+        "max_slots or lower max_concurrent_requests"
+    )
