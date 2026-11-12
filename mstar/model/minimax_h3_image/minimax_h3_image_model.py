@@ -32,6 +32,7 @@ from mstar.model.components.diffusion.image_io import OUTPUT_FORMAT_KWARGS, enco
 from mstar.model.media_limits import PILLOW_IMAGE_FORMATS, check_image_size, decoding_upload, open_upright_image
 from mstar.model.minimax_h3.config import (
     DENOISE_LOOP,
+    DIT_ATTN,
     DIT_NODE,
     TEXT_ENCODER_NODE,
     VAE_DECODER_NODE,
@@ -165,7 +166,14 @@ class H3ImageModel(Model):
         return dit_state(self.config.transformer)
 
     def kernel_settings(self) -> dict[str, dict[str, object]]:
-        return {key: dict(settings) for key, settings in DIT_KERNEL_SETTINGS.items()}
+        settings = {key: dict(value) for key, value in DIT_KERNEL_SETTINGS.items()}
+        # Compiled, the DiT's attention is an op of the block's graph rather than a break in it: a
+        # 1024x1024 step on one B300 issued in 36 ms, not 52. On SP ranks the Ulysses exchange
+        # moves on the copy engines, a head group at a time beside the previous group's attention
+        # (bit-identical; 2x H200 SP2 6.86 -> 6.25 s at 4096²; 4 or 7 groups add host time at
+        # 1024²). One rank never exchanges, so the groups cost nothing there.
+        settings[DIT_ATTN].update(compile_op=self.compile, ulysses_head_groups=2)
+        return settings
 
     def get_node_resources(self) -> list[SeqShardSpec]:
         """The decoder's sequence shard, which splits each request's tiles, which nothing
