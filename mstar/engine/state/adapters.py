@@ -916,10 +916,11 @@ class ValueHandle(ArrayHandle):
             self.block(field, layer)
             self._pool.scatter_(field, self._layouts[field].stored(value), self._pool_layer[layer], label=self.label)
 
-    def _update(self, kind: type[Op], field: str, layer: int) -> tuple[Any, torch.Tensor]:
+    def _update(self, kind: type[Op], layer: int) -> tuple[Any, torch.Tensor]:
         runner = self._runners.get(kind)
         if runner is None:
             raise self._refusal(f"an update of type {kind.__name__}, which the array doesn't declare")
+        (field,) = kind.writes
         view = self.block(field, layer)
         self._record_update(field, layer)
         return runner, view
