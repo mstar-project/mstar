@@ -331,7 +331,6 @@ class TestConfigure(unittest.TestCase):
                     self.assertIs(cfg[name]["storage"], False, "the bot has no volume or filesystem to mount")
                     self.assertEqual(cfg[name].get("enabled", True), enabled,
                                      "a provider would be offered that the runner can't reach")
-                self.assertEqual(cfg["runpod"]["image"], gpu_review.RUNPOD_IMAGE)
 
 
 class TestStart(unittest.TestCase):

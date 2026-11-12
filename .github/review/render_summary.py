@@ -435,10 +435,10 @@ def latent(bug):
 
 def checklist(review, pages, stacked, extra=()):
     """The "What's left for you" list: what the review leaves to a person (the bot approves over its questions and
-    a medium design risk), most important first, one line each with its place: open P0/P1, findings a PR above fixes (merge together), then `extra`
-    (what the live-test job's rule found), the design decisions, questions, open P2s and skipped files. P3s
-    and latent bugs aren't decisions. Past ten lines the rest fold away, so a question or decision, whose
-    only home this is, is never lost."""
+    a medium design risk), most important first, one line each with its place: open P0/P1, findings a PR above
+    fixes (merge together), then `extra` (what the live-test job's rule found), the design decisions, questions,
+    open P2s and skipped files. P3s and latent bugs aren't decisions. Past ten lines the rest fold away, so a
+    question or decision, whose only home this is, is never lost."""
     found = open_findings(review, pages, stacked)
     review = inert(judged(review, stacked))
 

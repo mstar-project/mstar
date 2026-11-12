@@ -50,7 +50,8 @@ releases this tool's instances past their ledger deadline, or past budget.max_ho
 from their creation when this machine's ledger doesn't have them. Lambda lists no creation time, so a launch
 tags its instance with one (`live-pr-created`); a Lambda instance made another way is never reaped.
 
-`launch` exits 4 when budget.max_running refuses it, 1 on any other error.
+`launch` exits 4 when budget.max_running refuses it, 5 when the box was made but its --run couldn't be started
+and it was ended, 6 when a provider's API failed while counting the running boxes, 1 on any other error.
 
 Keys come from RUNPOD_API_KEY / LAMBDA_API_KEY / ERAS_API_KEY / DIGITALOCEAN_TOKEN. Settings from config.local.json
 next to the skill (see config.example.json). Stdlib only, so it runs from any python3.
