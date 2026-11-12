@@ -378,6 +378,14 @@ def test_the_reference_numerics_attend_what_the_kept_window_read_attends(monkeyp
             torch.testing.assert_close(theirs, ours, msg=f"chunk {chunk}, pass {i}")
 
 
+def test_a_node_without_the_text_array_fails_at_bind():
+    """Off reference numerics both attentions bind their arrays, so a node that lacks one fails at load rather than
+    attending the text with the reference's kernel."""
+    rollout = _Rollout(_tiny())
+    with pytest.raises(KeyError, match="text"):
+        rollout.sub.bind_node_state({name: handle for name, handle in rollout.handles.items() if name != TEXT})
+
+
 # The draws and the caches
 
 

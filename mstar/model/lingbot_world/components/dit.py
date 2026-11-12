@@ -196,7 +196,7 @@ class CrossAttention(nn.Module):
     """Cross-attention to the 512-token text stream, whose K/V each pass adds to ``TEXT`` for its read. Under
     ``reference_numerics`` no array holds them, and the reference's FA2 attends them."""
 
-    def __init__(self, dim: int, num_heads: int, eps: float, layer: int):
+    def __init__(self, dim: int, num_heads: int, eps: float, layer: int, reference: bool):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
@@ -207,10 +207,12 @@ class CrossAttention(nn.Module):
         self.norm_q = WanRMSNorm(dim, eps=eps)
         self.norm_k = WanRMSNorm(dim, eps=eps)
         self.layer = torch.tensor(layer, device="cpu")
+        self.reference = reference
         self.text = None
 
     def bind_state(self, handles: Mapping[str, Any]) -> None:
-        self.text = handles.get(TEXT)
+        if not self.reference:
+            self.text = handles[TEXT]
 
     def text_kv(self, context: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         b, n, d = context.size(0), self.num_heads, self.head_dim
@@ -219,7 +221,7 @@ class CrossAttention(nn.Module):
     def forward(self, x: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
         b, n, d = x.size(0), self.num_heads, self.head_dim
         q = self.norm_q(self.q(x)).view(b, -1, n, d)
-        if self.text is None:
+        if self.reference:
             return self.o(_flash_attention(q, k, v).flatten(2))
         self.text.add(self.layer, keep=False, k=k, v=v)
         return self.o(self.text.read(self.layer, q).flatten(2))
@@ -231,7 +233,7 @@ class CausalBlock(nn.Module):
         self.norm1 = WanLayerNorm(dim, eps)
         self.self_attn = CausalSelfAttention(dim, num_heads, eps, layer, reference)
         self.norm3 = WanLayerNorm(dim, eps, elementwise_affine=True)
-        self.cross_attn = CrossAttention(dim, num_heads, eps, layer)
+        self.cross_attn = CrossAttention(dim, num_heads, eps, layer, reference)
         self.norm2 = WanLayerNorm(dim, eps)
         self.ffn = nn.Sequential(nn.Linear(dim, ffn_dim), nn.GELU(approximate="tanh"), nn.Linear(ffn_dim, dim))
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
