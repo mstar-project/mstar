@@ -42,6 +42,12 @@ _A14B = {
 _VARIANTS = {WAN22_VARIANT_TI2V_5B: {}, WAN22_VARIANT_T2V_A14B: _A14B}
 
 
+# The dit's samplers: the checkpoint's UniPC, or a DMD-distilled checkpoint's few fixed steps.
+SAMPLER_UNIPC, SAMPLER_DMD = "unipc", "dmd"
+# Each distilled recipe's timesteps and shift: FastWan2.2-TI2V-5B's (its README's
+# --dmd-denoising-steps; FastVideo's DMD_TRAINING_NOISE_SHIFT).
+_DISTILL_DEFAULTS = {SAMPLER_DMD: ((1000, 757, 522), 8.0)}
+
 # The DiT's self-attention: the array over its tokens, and the read that names its resource.
 DIT_TOKENS, SELF_ATTN = "dit_tokens", "dit_self_attn"
 
@@ -94,6 +100,15 @@ class Wan22Config:
     # UniPC. The solver order and train-timestep count are NOT knobs: the inline
     # port hardcodes their math, and a checkpoint that drifts from them hard-fails.
     flow_shift: float = 5.0
+
+    # "dmd" samples a DMD-distilled checkpoint (FastWan2.2-TI2V-5B) on ``dmd_timesteps``
+    # with no CFG (components/diffusion/dmd.py): one forward per timestep. A checkpoint
+    # choice, so a server setting, not a request one.
+    sampler: str = SAMPLER_UNIPC
+    # None is the sampler's recipe (_DISTILL_DEFAULTS)
+    dmd_timesteps: tuple[int, ...] | None = None
+    # the shift of the sigma table the timesteps map through; None is the recipe's
+    dmd_shift: float | None = None
 
     # Generation defaults, each overridable per request via model_kwargs. The
     # sampling knobs match the diffusers WanPipeline defaults; the size defaults to
@@ -172,6 +187,27 @@ class Wan22Config:
         if not isinstance(self.vae_decode_fast, bool):
             raise ValueError(f"Wan2.2 vae_decode_fast must be true or false, got {self.vae_decode_fast!r}.")
         self.fast_decode_sizes()
+        samplers = (SAMPLER_UNIPC, *_DISTILL_DEFAULTS)
+        if self.sampler not in samplers:
+            raise ValueError(f"Wan2.2 sampler must be one of {samplers}, got {self.sampler!r}.")
+        if self.sampler in _DISTILL_DEFAULTS:
+            default_steps, default_shift = _DISTILL_DEFAULTS[self.sampler]
+            steps = default_steps if self.dmd_timesteps is None else self.dmd_timesteps
+            if (
+                isinstance(steps, str) or not isinstance(steps, (list, tuple)) or not steps
+                or any(isinstance(t, bool) or not isinstance(t, int) or not 0 < t <= 1000 for t in steps)
+                or any(a <= b for a, b in zip(steps, steps[1:], strict=False))
+            ):
+                raise ValueError(
+                    f"Wan2.2 dmd_timesteps must be decreasing integers in (0, 1000], got {steps!r}."
+                )
+            self.dmd_timesteps = tuple(steps)
+            shift = self.dmd_shift = default_shift if self.dmd_shift is None else self.dmd_shift
+            if isinstance(shift, bool) or not isinstance(shift, (int, float)) or not 0 < shift < float("inf"):
+                raise ValueError(f"Wan2.2 dmd_shift must be a positive number, got {shift!r}.")
+            # the recipe fixes both: one forward per timestep, and no CFG
+            self.default_num_inference_steps = len(steps)
+            self.guidance_scale = 1.0
 
     def fast_decode_sizes(self) -> frozenset[tuple[int, int]]:
         """``vae_decode_fast_sizes`` as (width, height) pixel pairs."""

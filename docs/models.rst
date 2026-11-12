@@ -2224,6 +2224,18 @@ replicas (``wan22_dp2.yaml``'s layout over four ranks) serve 8.6 videos/min
 against 7.2 for this layout on H200s, and 11.0 against 7.4 in a separate run on
 H100s.
 
+**Few-step distilled (FastWan).** ``configs/wan22_fastwan.yaml`` serves FastVideo's
+``FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers``, TI2V-5B distilled with DMD to 3
+unguided steps (``sampler: dmd``, timesteps 1000, 757, 522): 3 DiT forwards instead of
+50 x CFG. The sampler is FastVideo's (each step predicts the clean latent and re-noises it
+with fresh noise from the request's CPU generator); with the same noise, M*'s steps match
+FastVideo's loop over the diffusers transformer bit for bit in eager mode (``test/modular/test_wan22_dmd_equivalence.py``). On one H200 at 1280x704x81 a
+video takes 4.7 s against 49.5 s for the dense 50-step model and 7.0 s for SGLang serving
+the same checkpoint. Its output is a different model's, not the dense model's: compare it
+against FastVideo's pipeline. Requests may leave out ``num_inference_steps`` and
+``guidance_scale``; another step count, guidance above 1 or an image is a 400. A
+``WanDMDPipeline`` checkpoint is refused under the default UniPC sampler.
+
 T2V-A14B
 ~~~~~~~~
 

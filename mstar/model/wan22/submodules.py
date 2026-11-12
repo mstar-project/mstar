@@ -3,6 +3,7 @@
     text_encoder -> Wan22TextEncoderSubmodule (UMT5-XXL, thin HF wrapper)
     vae_encoder  -> Wan22VaeEncoderSubmodule  (Wan2.2-VAE encode, TI2V-5B I2V only)
     dit          -> Wan22DitSubmodule         (native DiT, or A14B's two experts, + the scaffold's UniPC)
+                    Wan22DmdDitSubmodule      (the same DiT on a DMD-distilled checkpoint's few steps)
     vae_decoder  -> Wan22VaeDecoderSubmodule  (Wan2.2-VAE decode; the Wan2.1 VAE on A14B)
 
 All four set ``disable_torch_compile``, so the engine never wraps their forwards: the
@@ -30,7 +31,8 @@ from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.communication import CommGroup
 from mstar.model.components.diffusion.decode_utils import latent_affine, wan_vae_decode_dtype
-from mstar.model.components.diffusion.denoise_loop import UniPCDenoiseLoopSubmodule
+from mstar.model.components.diffusion.denoise_loop import DenoiseLoopSubmodule, UniPCDenoiseLoopSubmodule
+from mstar.model.components.diffusion.dmd import dmd_schedule, dmd_step
 from mstar.model.components.diffusion.flow_match import FlowMatchSchedule
 from mstar.model.components.diffusion.image_io import truncate_to_uint8
 from mstar.model.components.diffusion.unipc import NUM_TRAIN_TIMESTEPS, make_unipc_tables
@@ -272,6 +274,10 @@ class Wan22VaeEncoderSubmodule(_Fp32IslandMixin, NodeSubmodule):
 # ---------------------------------------------------------------------------
 # dit
 # ---------------------------------------------------------------------------
+
+# The DMD sampler's loop-back edge beside the latents: every re-noise, drawn at ingest.
+DMD_NOISE = "dmd_noise"
+
 
 class WanStepKey(NamedTuple):
     """What has to match for two rows to share a dit forward."""
@@ -584,6 +590,61 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
         noise_cond, noise_uncond = out[:rows], out[rows:]
         scale = guidance_scale if combine_scale is None else combine_scale
         return noise_uncond + scale * (noise_cond - noise_uncond)
+
+
+class Wan22DmdDitSubmodule(Wan22DitSubmodule):
+    """The DiT sampled by a DMD-distilled checkpoint's recipe (``config.sampler == "dmd"``,
+    FastWan2.2-TI2V-5B): one forward per timestep of ``config.dmd_timesteps``, without
+    CFG, each predicting the clean sample and re-noising it to the next timestep
+    (``components/diffusion/dmd.py``). T2V only.
+
+    Loop-carried edges:
+
+        latents    current sample, float32 ``[1, C, T, H, W]`` (bf16 values after step 0,
+                   as the reference's)
+        dmd_noise  every re-noise, ``[n - 1, C, T, H, W]`` in the flow's dtype; step k
+                   mixes in row k
+
+    The re-noise is drawn with the initial latents, at ingest, so no step draws on the
+    GPU thread; it is FastVideo's draw (CPU generator, ``[T, C, H, W]`` layout, the
+    latents in float32 then one bf16 draw per later step from the same generator).
+    """
+
+    SOLVER_STATE = (DMD_NOISE,)
+    STEP_SCALARS = DenoiseLoopSubmodule.STEP_SCALARS
+    PREFETCH_SEEDS = True
+
+    def schedule_settings(self, fwd_info: CurrentForwardPassInfo) -> None:
+        # the recipe fixes the schedule; the model refuses any other step count
+        return None
+
+    def schedule_for(self, walk: str, settings: None, bucket_key: WanStepKey) -> FlowMatchSchedule:
+        return dmd_schedule(self.config.dmd_timesteps, self.config.dmd_shift)
+
+    def seed_loop_back(self, bucket_key: WanStepKey, generator: torch.Generator) -> dict[str, torch.Tensor]:
+        if bucket_key.i2v:
+            raise ValueError("Wan2.2's DMD sampler is text-to-video only.")
+        shape = (1, bucket_key.frames, self.config.in_channels, bucket_key.height, bucket_key.width)
+        latents = torch.randn(shape, generator=generator, dtype=torch.float32)
+        dtype = torch.bfloat16 if self.transformer is None else self.transformer.dtype
+        noise = [torch.randn(shape, generator=generator, dtype=dtype) for _ in self.config.dmd_timesteps[1:]]
+        noise = torch.cat(noise) if noise else torch.empty((0, *shape[1:]), dtype=dtype)
+        return {self.LATENTS: latents.transpose(1, 2).contiguous(), DMD_NOISE: noise.transpose(1, 2).contiguous()}
+
+    def denoise(
+        self, engine_inputs: ModelInputsFromEngine, bucket_key: WanStepKey, latents: torch.Tensor,
+        timestep: torch.Tensor, sigma: torch.Tensor, sigma_next: torch.Tensor, dmd_noise: torch.Tensor,
+        **cond: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        with _inference_ctx():
+            flow = self.model_output(engine_inputs, bucket_key, latents, timestep, **cond)
+            samples = []
+            for i, rid in enumerate(engine_inputs.request_ids):
+                k = self.step_index(engine_inputs.per_request_info[rid])
+                noise = dmd_noise[i, k, None] if k < dmd_noise.shape[1] else None
+                # float32 so rows at different steps stack; the bf16 values carry exactly
+                samples.append(dmd_step(latents[i], flow[i], sigma[i], sigma_next[i], noise).float())
+        return {self.LATENTS: torch.stack(samples), DMD_NOISE: dmd_noise}
 
 
 # ---------------------------------------------------------------------------
