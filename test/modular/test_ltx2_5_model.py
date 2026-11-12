@@ -15,7 +15,7 @@ sys.path.insert(0, ".")
 import pytest
 import torch
 
-from mstar.engine.resources import RaggedCrossAttentionSpec
+from mstar.engine.resources import RaggedCrossAttentionSpec, SeqShardSpec
 from mstar.engine.resources.sequence_shard import sequence_parallel_refusals
 from mstar.engine.resources.spec import resolve_spec_dependencies
 from mstar.engine.state.adapters import node_resources, state_setup
@@ -180,7 +180,7 @@ def test_generate_walk_structure(walk, decoders):
 
 
 def test_resources_follow_the_attention_backend():
-    specs = {s.resource_key: s for s in node_resources(_make_model()) if not s.splits_steps}
+    specs = {s.resource_key: s for s in node_resources(_make_model()) if not isinstance(s, SeqShardSpec)}
     assert set(specs) == {VIDEO_SELF, AUDIO_SELF, VIDEO_TEXT, AUDIO_TEXT}
     assert {k for k, s in specs.items() if isinstance(s, RaggedCrossAttentionSpec)} == {VIDEO_TEXT, AUDIO_TEXT}
     assert (specs[VIDEO_TEXT].config.head_dim, specs[AUDIO_TEXT].config.head_dim) == (128, 64)

@@ -362,16 +362,22 @@ def test_a_node_that_splits_its_steps_refuses_a_resource_that_cant_take_them(kin
 
 def test_a_read_no_exchange_serves_on_a_node_that_splits_its_steps_is_refused_at_load(monkeypatch):
     """SDPA over keys the sequence shard splits would attend one rank's share. The engine refuses it from the
-    declarations, before any step splits (`split_read_problems`)."""
+    declarations, before any step splits (`split_read_problems`). The node splits by its other read, on the ragged
+    resource (a node whose every read is on SDPA never splits)."""
     from test_state_cross_reads import _array, _on_sdpa
 
-    video = _array("video", "video_self", nodes=(NODE,))
-    model = types.SimpleNamespace(checkpoint_path=lambda: None, declare_state=lambda: [video])
+    from mstar.engine.state.adapters import build_specs
+
+    # other heads, so the two reads don't share one resource
+    video, audio = _array("video", "video_self", nodes=(NODE,)), _array("audio", nodes=(NODE,), heads=2)
+    model = types.SimpleNamespace(checkpoint_path=lambda: None, declare_state=lambda: [video, audio])
     monkeypatch.setattr(engine_mod, "sequence_parallel_refusals", lambda *args: [])
-    engine = Engine(graph_runtime=None, state_setup=_on_sdpa("video_self"))
+    setup = _on_sdpa("video_self")
+    engine = Engine(graph_runtime=None, state_setup=setup)
+    specs = [*build_specs([video, audio], setup=setup), SeqShardSpec("shard", {NODE}, ("video", "audio"), 0)]
     with pytest.raises(ValueError, match=r"backend sdpa over labels \['video'\]"):
         engine.load_model(
-            {NODE: _Submodule()}, specs=[SeqShardSpec("shard", {NODE}, ("video",), 0)],
+            {NODE: _Submodule()}, specs=specs,
             parallel_groups=_sp_groups(NODE), device=CPU, transfer_engine_info=None, model=model,
         )
 

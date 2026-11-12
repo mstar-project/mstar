@@ -12,6 +12,7 @@ from typing import Any, NamedTuple
 
 from mstar.distributed.base import ShardingConfig
 from mstar.engine.resources.lora.serving import refuse_unresolved_lora_adapters
+from mstar.engine.resources.sequence_shard import SeqShardSpec
 from mstar.engine.state.adapters import StateSetup, spec_overrides, state_setup
 from mstar.engine.state.analysis import deployment_problems, split_read_problems, state_declaration_problems
 from mstar.model.base import (
@@ -166,7 +167,8 @@ def validate_deployment(
                     for node in graph.section.get_nodes()
                 }
                 split = {
-                    node: spec.labels for spec in specs if spec.splits_steps for node in spec.nodes & sp_nodes
+                    node: spec.labels for spec in specs if isinstance(spec, SeqShardSpec) and spec.splits
+                    for node in spec.nodes & sp_nodes
                 }
                 sdpa_reads = [read for read, binding in setup.by_read.items() if not binding.plans]
                 problems += deployment_problems(model, config.get("resources") or {})

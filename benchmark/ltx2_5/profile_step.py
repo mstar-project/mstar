@@ -27,7 +27,7 @@ def denoise_step(config, dit, shape, batch, device, joint, attention):
     """The dit's denoise submodule over its own resources and state (the model's declarations, sharded over ``joint``
     as the engine shards them), with one step at ``shape`` planned by hand as the runner would: the served kernels, the
     sequence shard's split and exchanges included. Returns the submodule and the step to open around each call."""
-    from mstar.engine.resources import StepContext, StepRunner
+    from mstar.engine.resources import SeqShardSpec, StepContext, StepRunner
     from mstar.engine.resources.base import EngineResourceInfo, build_resource
     from mstar.engine.resources.spec import resolve_spec_dependencies
     from mstar.engine.state.adapters import node_handles, node_resources, state_setup
@@ -38,7 +38,7 @@ def denoise_step(config, dit, shape, batch, device, joint, attention):
     model = LTX25Model(skip_weight_loading=True)
     model.set_config(config)
     # every attention resource; the sequence shard isn't one
-    on_sdpa = [spec.resource_key for spec in node_resources(model) if not spec.splits_steps]
+    on_sdpa = [spec.resource_key for spec in node_resources(model) if not isinstance(spec, SeqShardSpec)]
     sdpa = {key: {"backend": "sdpa"} for key in on_sdpa} if attention == "sdpa" else {}
     setup, _ = state_setup({"resources": sdpa}, model.declare_state())
     specs = resolve_spec_dependencies(node_resources(model, setup=setup))
