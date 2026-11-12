@@ -574,6 +574,8 @@ class OpBinding:
     read_back: ClassVar[frozenset[str]] = frozenset()
     # whether a read bound here takes queries; one that doesn't returns the entries it reaches
     takes_queries: ClassVar[bool] = True
+    # whether `retention` gives a policy, so a request's layout sizes the pages under the read
+    keeps_window: ClassVar[bool] = False
 
     @property
     def kept_window_binding(self) -> "OpBinding | None":
@@ -726,6 +728,8 @@ class FlexAttend(OpBinding):
 class KeptWindowBinding(OpBinding):
     """A read through a kept window on a paged array. The pool releases what the window no longer reaches, so the read
     is its array's only one, and each request's layout sizes it."""
+
+    keeps_window = True
 
     def check(self, array: Array, key: str, read: Read) -> None:
         others = sorted(set(array.reads) - {key})
@@ -1954,20 +1958,27 @@ class PagedStorage(Storage):
     def layouts(
         self, array: Array, by_label: Mapping[str, Layout], keyed_spans: Mapping[str, int],
     ) -> "dict[str, LabelLayout]":
-        """Each read's binding gives the retention its pages keep."""
+        """Each read's binding gives the retention its pages keep. The bindings' checks ran when the specs were built,
+        so each read's binding is looked up, not checked again, on every request."""
         from mstar.model.base import LabelLayout
 
-        reads = [each for each in _checked_bindings(self, array) if each.key in array.reads]
+        kept = [
+            (key, binding) for key, read in array.reads.items()
+            if (binding := BINDINGS[self, type(read.op)].for_mask(read.mask)).keeps_window
+        ]
         layouts = {}
         for label, layout in by_label.items():
-            policies = {key: binding.retention(key, layout) for key, _, binding in reads}
-            unread = sorted(layout.kept_windows.keys() - {key for key, policy in policies.items() if policy})
-            if unread:
-                raise RuntimeError(f"state_layout[{array.name!r}][{label!r}].kept_windows: {unread} name no "
-                                   "kept-window read of the array")
+            retention = None
+            if kept or layout.kept_windows:
+                policies = {key: binding.retention(key, layout) for key, binding in kept}
+                unread = sorted(layout.kept_windows.keys() - policies.keys())
+                if unread:
+                    raise RuntimeError(f"state_layout[{array.name!r}][{label!r}].kept_windows: {unread} name no "
+                                       "kept-window read of the array")
+                retention = next(iter(policies.values()), None)
             layouts[label] = LabelLayout(
                 spans=layout.spans, growth=layout.growth, scratch=layout.scratch, keyed_spans=keyed_spans.get(label),
-                retention=next((policy for policy in policies.values() if policy is not None), None),
+                retention=retention,
             )
         return layouts
 
@@ -2311,13 +2322,6 @@ def _bindings(
     for each in bound:
         each.binding.check(array, each.key, each.declared)
     return tuple(bound)
-
-
-@functools.cache
-def _checked_bindings(storage: Storage, array: Array) -> tuple[BoundOp, ...]:
-    """`_bindings` with the default bindings, once per array, for what a request asks of them: a declaration is
-    frozen, and each request would otherwise run every binding's check again."""
-    return _bindings(storage, array)
 
 
 def _no_binding(storage: Storage, array: Array, where: str, *, update: bool) -> ValueError:
