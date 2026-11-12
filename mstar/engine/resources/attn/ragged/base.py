@@ -31,7 +31,7 @@ from mstar.engine.resources.attn.ragged.config import (
 )
 from mstar.engine.resources.attn.ragged.kernels import RAGGED_ATTENTION, cudnn_rows, kernel_rows
 from mstar.engine.resources.attn.ragged.wrappers import _RaggedPrefillBase
-from mstar.engine.resources.base import AttentionResource, CGSlotKey, EngineResourceInfo
+from mstar.engine.resources.base import AttentionResource, CGSlotKey, EngineResourceInfo, head_shards
 from mstar.engine.resources.sequence_shard import (
     SeqShardPlan,
     SequenceShard,
@@ -75,12 +75,16 @@ def _build_ragged(
     hand it cuDNN's one row, refused here if cuDNN can't run the geometry."""
     config = spec.config
     joint = info.joint_comm_group
-    # Ulysses hands each rank 1/P of the heads; any other ragged attention splits them over TP
-    ulysses = spec.sp_exchange == "ulysses" and spec.shard_key is not None
+    # Ulysses hands each rank 1/(TP x SP) of the heads, whatever the node's KV pools store by (its own
+    # exchange, not theirs); any other ragged attention, or one whose node never splits
+    # (`SeqShardSpec.splits`, so it runs copied), splits them over TP
+    ulysses = (
+        spec.sp_exchange == "ulysses" and spec.shard_key is not None and info.dependency(spec.shard_key).splits
+    )
     if joint is None:
         config.shard(1)
     else:
-        config.shard(info.head_shards if ulysses else joint.tp_group.world_size)
+        config.shard(head_shards(joint) if ulysses else joint.tp_group.world_size)
     dtype = config.dtype if config.dtype is not None else info.kv_dtype
     if dtype is None:
         raise ValueError(
@@ -683,11 +687,13 @@ class _RaggedCrossManagerBase(_RaggedManagerBase, RaggedCrossAttnManager):
             label = cross_label(q_label, kv_label)
             self._kv_labels[label] = kv_label
             if split:
-                # a pair with both sides split is refused at load (`split_read_problems`)
+                # load refuses this pair for a read declared through the state contract
+                # (`split_read_problems`); a hand-written spec reaches here at its first split step
                 q_range, kv_range = shard_plan.ranges.get(q_label), shard_plan.ranges.get(kv_label)
-                assert q_range is None or kv_range is None, (
-                    f"cross-attention {q_label!r} <- {kv_label!r} splits both sides, which no exchange serves"
-                )
+                if q_range is not None and kv_range is not None:
+                    raise ValueError(
+                        f"cross-attention {q_label!r} <- {kv_label!r} splits both sides, which no exchange serves"
+                    )
                 if q_range is not None:
                     # each rank's queries over every key, each replicated; load refuses a packed
                     # (axis 0) split, so each row keeps ``count`` of its queries

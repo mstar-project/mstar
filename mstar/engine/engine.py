@@ -62,7 +62,7 @@ from mstar.engine.resources.kv.config import instance_size, opening_prefix_cache
 from mstar.engine.resources.kv.keys import fingerprint
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.resident import ResidentPlanner, build_planner
-from mstar.engine.resources.sequence_shard import sequence_parallel_refusals
+from mstar.engine.resources.sequence_shard import SeqShardSpec, sequence_parallel_refusals
 from mstar.engine.resources.spec import resolve_spec_dependencies
 from mstar.engine.resources.step import (
     ADMIT_OK,
@@ -786,10 +786,13 @@ class Engine:
                 raise ValueError("; ".join(refusals))
             over_sp[node] = sp > 1 and any(position_pools(specs, node).values())
             shards[node] = head_shards(group, over_sp[node])
-            if sp > 1 and any(spec.splits_steps and node in spec.nodes for spec in specs):
+            if sp > 1 and any(isinstance(spec, SeqShardSpec) and spec.splits and node in spec.nodes for spec in specs):
                 splitting.add(node)
         if model is not None and splitting:
-            split = {node: spec.labels for spec in specs if spec.splits_steps for node in spec.nodes & splitting}
+            split = {
+                node: spec.labels for spec in specs if isinstance(spec, SeqShardSpec) and spec.splits
+                for node in spec.nodes & splitting
+            }
             sdpa_reads = [read for read, binding in self._state_setup.by_read.items() if not binding.plans]
             refusals = split_read_problems(model.declare_state(), sdpa_reads, split)
             if refusals:
@@ -812,7 +815,7 @@ class Engine:
                 raise ValueError(
                     f"resource {spec.resource_key!r} serves nodes that split heads different ways "
                     f"({ {node: shards[node] for node in sorted(relevant_nodes)} }): one places its KV "
-                    "positions over its SP ranks and another splits its steps over them (SeqShardSpec)"
+                    "positions over its SP ranks and another keeps KV by head over them"
                 )
             joint_comm_group = parallel_groups.get_joint_group_for_node(first_node)
             self._resources[spec.resource_key] = build_resource(

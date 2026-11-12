@@ -418,11 +418,10 @@ class RopeManager(PositionManager):
                 if r is None:
                     continue
                 ids = self._rotation_ids(plan_label, ctx.is_preplan)
-                # a view, so a captured graph reads the slot's buffer. A packed replay's range
-                # covers its bucket's padding too, which the buffer holds
+                # a view of a contiguous range, so a captured graph reads the slot's buffer. A packed
+                # replay's range covers its bucket's padding too, which the buffer holds
                 split_out[plan_label] = (
-                    ids.narrow(0, r.start, r.count) if r.rows is None
-                    else ids[: r.rows * sum(r.counts)].view(r.rows, -1).narrow(1, r.start, r.count)
+                    r.local(ids) if r.rows is None else r.local(ids[: r.rows * sum(r.counts)].view(r.rows, -1), 1)
                 )
         self._preplanned = ctx.is_preplan
         return pos_ids_out
