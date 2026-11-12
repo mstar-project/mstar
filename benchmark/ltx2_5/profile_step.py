@@ -18,41 +18,45 @@ import time
 import torch
 import torch.distributed as dist
 
-from mstar.model.components.diffusion.attention import sdpa_attention
-from mstar.model.ltx2_5.components.transformer import LTX2Attends, build_rope
 from mstar.model.ltx2_5.config import LTX25_REPO, SNAPSHOT_PATTERNS, LTX25Config
 from mstar.model.ltx2_5.weight_loader import build_transformer
 from mstar.utils.hf_snapshot import resolve_snapshot_dir
 
 
-def ragged_denoise(config, dit, shape, batch, device, joint):
-    """The dit's denoise step over its own resources (the model's declaration, sharded over
-    ``joint`` as the engine shards it), planned by hand for one step at ``shape`` as the runner
-    would: the served kernels, the sequence shard's split and exchanges included."""
+def denoise_step(config, dit, shape, batch, device, joint, attention):
+    """The dit's denoise submodule over its own resources and state (the model's declarations, sharded over ``joint``
+    as the engine shards them), with one step at ``shape`` planned by hand as the runner would: the served kernels, the
+    sequence shard's split and exchanges included. Returns the submodule and the step to open around each call."""
     from mstar.engine.resources import StepContext, StepRunner
     from mstar.engine.resources.base import EngineResourceInfo, build_resource
     from mstar.engine.resources.spec import resolve_spec_dependencies
+    from mstar.engine.state.adapters import node_handles, node_resources, state_setup
     from mstar.model.ltx2_5 import submodules as S
     from mstar.model.ltx2_5.ltx2_5_model import LTX25Model
     from mstar.model.submodule_base import NodeInputs, engine_step
 
     model = LTX25Model(skip_weight_loading=True)
     model.set_config(config)
-    specs = resolve_spec_dependencies(model.get_node_resources())
-    info = EngineResourceInfo(device=device, joint_comm_group=joint, kv_dtype=torch.bfloat16)
+    # every attention resource; the sequence shard isn't one
+    on_sdpa = [spec.resource_key for spec in node_resources(model) if not spec.splits_steps]
+    sdpa = {key: {"backend": "sdpa"} for key in on_sdpa} if attention == "sdpa" else {}
+    setup, _ = state_setup({"resources": sdpa}, model.declare_state())
+    specs = resolve_spec_dependencies(node_resources(model, setup=setup))
+    info = EngineResourceInfo(device=device, kv_dtype=torch.bfloat16, joint_comm_group=joint)
     res = {
         key: build_resource(spec, dataclasses.replace(info, dependencies={k: specs[k] for k in spec.depends_on()}))
         for key, spec in specs.items()
     }
     for key, spec in specs.items():
         res[key].bind_dependencies({dep: res[dep] for dep in spec.depends_on()})
-    sub = S.LTXDenoiseSubmodule(dit, config, loop_name="x", use_ragged_attention=True)
+    sub = S.LTXDenoiseSubmodule(dit, config, loop_name="x")
     sub.bind_node_resources(res)
+    sub.bind_node_state(node_handles(model, "dit", res, setup=setup))
     rids = list(range(batch))
     step = engine_step(sub, "g", rids, [NodeInputs(resource_step_info=shape)] * batch)
     step.set_ctx(StepContext(request_ids=rids, graph_walk="g", slot=0, capture=False))
     StepRunner(res).plan(step)
-    return sub
+    return sub, step
 
 
 def classify(name: str) -> str:
@@ -106,19 +110,16 @@ def main():
         torch.randn(b, shape.text_len, t.audio_cross_attention_dim, device=device, dtype=torch.bfloat16),
     )
     timestep = torch.full((b,), 900.0, device=device)
-    if args.attention == "sdpa":
-        rope = build_rope(config.transformer, shape.frames, shape.height, shape.width, shape.fps,
-                          shape.audio_frames, device)
-        attends = LTX2Attends(*([sdpa_attention] * 6))
+    sub, opened = denoise_step(config, dit, shape, b, device, joint, args.attention)
+    sigma = torch.full((b, 1, 1), 0.9, device=device)
 
-        def step():
-            dit(video, audio, text, audio_text, timestep, rope, attends)
-    else:
-        sub = ragged_denoise(config, dit, shape, b, device, joint)
-        sigma = torch.full((b, 1, 1), 0.9, device=device)
-
-        def step():
+    def step():
+        opened.begin_calls()
+        try:
             sub.denoise(None, shape, video, timestep, sigma, sigma * 0.5, audio, text, audio_text)
+        finally:
+            opened.end_calls()
+
     with torch.inference_mode():
         for _ in range(3):
             step()

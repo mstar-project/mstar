@@ -12,7 +12,8 @@ from typing import Any, NamedTuple
 
 from mstar.distributed.base import ShardingConfig
 from mstar.engine.resources.lora.serving import refuse_unresolved_lora_adapters
-from mstar.engine.state.analysis import deployment_problems, state_declaration_problems
+from mstar.engine.state.adapters import StateSetup, spec_overrides, state_setup
+from mstar.engine.state.analysis import deployment_problems, split_read_problems, state_declaration_problems
 from mstar.model.base import (
     Model,
     WorkerGraph,
@@ -153,10 +154,23 @@ def validate_deployment(
         if declaration_problems:
             problems.append("the `resources:` checks, which need the declarations, were skipped")
         else:
+            setup = StateSetup()
+            if not malformed and resources_readable:
+                setup, setup_problems = state_setup(config, model.declare_state())
+                problems += setup_problems
             # a `resources:` block check_resources refuses turns no resource on
-            specs = enabled_resources(model, config if resources_readable else {**config, "resources": None})
+            specs = enabled_resources(model, config if resources_readable else {**config, "resources": None}, setup)
             if resources_readable:
+                sp_nodes = set() if deployment is None else {
+                    node for graph in deployment.worker_graphs if graph.sp_size > 1
+                    for node in graph.section.get_nodes()
+                }
+                split = {
+                    node: spec.labels for spec in specs if spec.splits_steps for node in spec.nodes & sp_nodes
+                }
+                sdpa_reads = [read for read, binding in setup.by_read.items() if not binding.plans]
                 problems += deployment_problems(model, config.get("resources") or {})
+                problems += split_read_problems(model.declare_state(), sdpa_reads, split)
     except (ValueError, OSError) as e:
         problems.append(
             f"declaring the node resources failed: {type(e).__name__}: {e}; "
@@ -164,8 +178,9 @@ def validate_deployment(
         )
     except _UNREADABLE as e:
         problems.append(_unreadable("declaring the node resources", e))
+    checked_config = spec_overrides(config) if resources_readable else config
     if specs is not None:
-        problems += _checked("checking the node resources", check_resources, model, specs, config)
+        problems += _checked("checking the node resources", check_resources, model, specs, checked_config)
         # the placement checks see what the workers build of them
         try:
             specs = built_resources(specs)

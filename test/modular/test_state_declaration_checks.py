@@ -38,6 +38,7 @@ from mstar.engine.state import (
 from mstar.engine.state.analysis import declaration_digest, state_declaration_problems
 from mstar.engine.state.contract import Mask
 from mstar.graph.base import GraphNode
+from mstar.model.base import KVLabel, PrefixKeys
 
 _ATTEND = Attend(q_heads=8)
 
@@ -285,6 +286,44 @@ def _empty_value() -> Array:
     return Value("gdn", nodes={"LLM"}, layers=set(), entry=entry, updates={"delta": GatedDeltaNet()})
 
 
+def _within(name, **overrides) -> Array:
+    return Array(name, **{"nodes": {"LLM"}, "layers": {0, 1}, "entry": KVEntry(heads=4, head_dim=8), "max_len": 0,
+                          "reads": {f"{name}_attn": Read(mask=Block(), op=_ATTEND)}, **overrides})
+
+
+def _cross(name="text", queries="video", **overrides) -> Array:
+    return _within(name, reads={f"{name}_attn": Read(mask=Block(), op=_ATTEND, queries=queries)}, **overrides)
+
+
+def test_a_cross_read_over_an_array_on_its_node_has_no_problems():
+    assert state_declaration_problems(_StubModel(_within("video"), _cross())) == []
+
+
+@pytest.mark.parametrize("arrays, where, cause", [
+    ((_cross(queries="nothing"),), "reads['text_attn'].queries", "'nothing' is not a declared array"),
+    ((_within("video", nodes={"vision"}), _cross()), "reads['text_attn'].queries", "isn't on nodes ['LLM']"),
+    ((_array("video", reads={"r": _read()}), _cross()), "reads['text_attn'].queries", "keeps entries"),
+])
+def test_a_cross_read_is_refused_naming_its_array_and_the_cause(arrays, where, cause):
+    problem = _one_problem(*arrays)
+    assert problem.startswith("Array 'text'.") and where in problem and cause in problem
+
+
+def _flag() -> Array:
+    return Value("flags", nodes={"LLM"}, layers={0}, entry=Entry({}, host={"sent": bool}))
+
+
+def test_a_value_of_host_fields_has_no_problems_on_a_node_without_prefix_keys():
+    labels = {"kv": {"main": KVLabel()}}
+    assert state_declaration_problems(_StubModel(_array(reads={"r": _read()}), _flag(), kv_labels=labels)) == []
+
+
+def test_host_fields_are_refused_on_a_node_with_prefix_keys():
+    labels = {"kv": {"main": KVLabel(keys=PrefixKeys("text_inputs", ("prefill",)))}}
+    problem = _one_problem(_array(reads={"r": _read()}), _flag(), kv_labels=labels)
+    assert problem.startswith("Array 'flags'.entry.host") and "prefix keys" in problem
+
+
 def test_a_value_with_no_layers_has_no_problems():
     assert state_declaration_problems(_StubModel(_array(), _empty_value())) == []
 
@@ -349,11 +388,11 @@ _FIELD_CHANGES = {
     "tensor shard": _array(entry=Entry({"k": TensorType((4, 8), dtype=None), "v": _T}),
                            reads={"r": Read(mask=Causal())}),
     "tensor name": _array(entry=Entry({"k": _T, "w": _T}), reads={"r": Read(mask=Causal())}),
-    "host field": _array(entry=Entry({"k": _T, "v": _T}, host={"done": bool}), reads={"r": _READ}),
-    "host type": _array(entry=Entry({"k": _T, "v": _T}, host={"done": tuple[bool, ...]}), reads={"r": _READ}),
-    "typing host type": _array(entry=Entry({"k": _T, "v": _T}, host={"done": Tuple[int, ...]}), reads={"r": _READ}),
     "labels": _array(labels={"main", "cfg"}, reads={"r": _READ}),
     "a block read": _array(max_len=0, reads={"r": Read(mask=Block(), op=_ATTEND)}),
+    "an unpacked block read": _array(max_len=0, reads={"r": Read(mask=Block(), op=_ATTEND, packed=False)}),
+    "a segmented read": _array(max_len=0, reads={"r": Read(mask=Block(), op=_ATTEND, packed=False, segmented=True)}),
+    "a cross read": _array(max_len=0, reads={"r": Read(mask=Block(), op=_ATTEND, queries="video")}),
     "a counter": _array(positions=Positions(), reads={"r": _READ}),
     "a rope": _array(positions=Positions(rope=Rope()), reads={"r": _READ}),
     **{
@@ -372,6 +411,16 @@ def test_every_field_change_moves_the_digest():
     digests = {name: declaration_digest([array]) for name, array in _FIELD_CHANGES.items()}
     assert all(digest != base for digest in digests.values()), [n for n, d in digests.items() if d == base]
     assert len(set(digests.values())) == len(digests), "two changes landed on one digest"
+
+
+@pytest.mark.parametrize("host", [{"done": bool}, {"done": int}, {"sent": bool}, {"done": tuple[bool, ...]},
+                                  {"done": Tuple[int, ...]}])
+def test_a_host_field_change_moves_the_digest(host):
+    def value(fields):
+        return Value("v", nodes={"LLM"}, layers={0}, entry=Entry({}, host=fields))
+
+    assert declaration_digest([value({})]) != declaration_digest([value(host)])
+    assert declaration_digest([value(host)]) == declaration_digest([value(dict(host))])
 
 
 def _sampler(**overrides) -> Sampler:

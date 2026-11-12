@@ -543,6 +543,10 @@ that the model does not declare, or sets a key that the resource does not accept
 fails. A misspelled setting is never silently ignored. A top-level ``kv_cache:`` block is
 no longer read. It raises an error with a message describing the migration.
 
+``backend: sdpa`` on the resource of a declared read within a step runs each read on it
+through torch's SDPA, as a DiT's reference pipeline does, and builds no resource, so its block
+takes no other key. A read whose queries come packed can't run on SDPA, and loading refuses it.
+
 ``greedy_capture: false`` on a sampler stops all-greedy steps from taking each row's
 argmax, and the engine from capturing a twin of each batched bucket for them. A sampler
 whose vocabulary is past 4096 has them by default (see ``SamplerSpec`` in
@@ -589,7 +593,7 @@ never splits. A value the node's storage can't take fails at load, at any SP siz
        min_tokens: 8192
        exchange: all_gather     # auto / none / ulysses (by head) / all_gather / ring (by position)
 
-Ragged (cacheless) attentions keep the model's own ``sp_exchange``, whatever ``exchange`` says;
+Ragged (cacheless) attentions run Ulysses over the labels the shard lists, whatever ``exchange`` says;
 a shard that never splits (``none``, or ``auto`` over KV stored by position) stops them splitting too.
 
 A step's peak memory is its residents plus the larger of its attention and its MLP or MoE phase,

@@ -335,12 +335,13 @@ def test_attention_over_a_placed_pool_that_cant_plan_it_is_refused_at_load(kv, a
 def test_a_node_that_splits_its_steps_refuses_a_resource_that_cant_take_them(kind, tmp_path, monkeypatch):
     """Qwen3.5's recurrent state holds no split strategy, nor does block-causal attention (its
     builder sets no sequence shard): a node splitting its steps over SP ranks can't own one."""
+    from mstar.engine.state.adapters import StateSetup
     from mstar.model.base import enabled_resources
 
     groups = _sp_groups(NODE)
     if kind == "recurrent_state":
         # what a deployment without a `lora:` block builds
-        specs = enabled_resources(_qwen3_5(NODE, {}, tmp_path, monkeypatch), {})
+        specs = enabled_resources(_qwen3_5(NODE, {}, tmp_path, monkeypatch), {}, StateSetup())
         apply_yaml_overrides(specs, {"resources": {KV_CACHE: {"max_num_pages": 8}, GDN_STATE: {"max_slots": 4}}})
     else:
         specs = [
@@ -356,6 +357,22 @@ def test_a_node_that_splits_its_steps_refuses_a_resource_that_cant_take_them(kin
     with pytest.raises(ValueError, match="does not support steps split over SP ranks"):
         Engine(graph_runtime=None).load_model(
             {NODE: _Submodule()}, specs=specs, parallel_groups=groups, device=CPU, transfer_engine_info=None,
+        )
+
+
+def test_a_read_no_exchange_serves_on_a_node_that_splits_its_steps_is_refused_at_load(monkeypatch):
+    """SDPA over keys the sequence shard splits would attend one rank's share. The engine refuses it from the
+    declarations, before any step splits (`split_read_problems`)."""
+    from test_state_cross_reads import _array, _on_sdpa
+
+    video = _array("video", "video_self", nodes=(NODE,))
+    model = types.SimpleNamespace(checkpoint_path=lambda: None, declare_state=lambda: [video])
+    monkeypatch.setattr(engine_mod, "sequence_parallel_refusals", lambda *args: [])
+    engine = Engine(graph_runtime=None, state_setup=_on_sdpa("video_self"))
+    with pytest.raises(ValueError, match=r"backend sdpa over labels \['video'\]"):
+        engine.load_model(
+            {NODE: _Submodule()}, specs=[SeqShardSpec("shard", {NODE}, ("video",), 0)],
+            parallel_groups=_sp_groups(NODE), device=CPU, transfer_engine_info=None, model=model,
         )
 
 
@@ -911,7 +928,7 @@ class _OneRank:
 def _layer_over_ranks(rank, world, store):
     """One rank of an SP placement running a Qwen3.5 attention layer through its KV handle on a
     prefill, against the same layer attending every key on one rank."""
-    from mstar.engine.state.adapters import build_handle
+    from mstar.engine.state.adapters import StateSetup, _resolve, build_handle
     from mstar.engine.state.analysis import position_key
     from mstar.engine.state.contract import ArrayStep
     from mstar.model.qwen3_5.components.language_model import Qwen3_5Attention, RopeCache
@@ -949,7 +966,8 @@ def _layer_over_ranks(rank, world, store):
         pool = types.SimpleNamespace(
             layer_view=lambda i: cache, write_kv=lambda *args, **kwargs: None, opens_label=lambda *args: True,
         )
-        handle = build_handle(array, {KV_CACHE: pool, ATTN: attn, position_key(array): None})
+        resources = {KV_CACHE: pool, ATTN: attn, position_key(array): None}
+        handle = build_handle(array, resources, _resolve([array], StateSetup()))
         step = types.SimpleNamespace(
             state={KV_CACHE: ArrayStep()}, segments=tuple(
                 Segment(view.request_id, "main", new) for view, (_, new) in zip(case.views, case.rows, strict=True)

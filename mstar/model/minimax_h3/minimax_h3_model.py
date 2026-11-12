@@ -19,17 +19,19 @@ from __future__ import annotations
 import functools
 import logging
 import math
-from typing import NamedTuple
+from typing import Any
 
 import numpy as np
 import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.distributed.base import ShardingConfig
-from mstar.engine.resources import NodeResourceSpec, RaggedAttentionConfig, RaggedAttentionSpec, SeqShardSpec
+from mstar.engine.resources import SeqShardSpec
+from mstar.engine.state import Array, Attend, Block, Read
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Parallel, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import Model, TensorAndMetadata, WalkStep
+from mstar.model.components.diffusion.attention import dit_entry, refuse_attention_backend_kwarg
 from mstar.model.components.video_encode import encode_mp4
 from mstar.model.media_limits import PILLOW_IMAGE_FORMATS, check_image_size
 from mstar.model.minimax_h3.components.layout import H3Layout
@@ -41,12 +43,14 @@ from mstar.model.minimax_h3.config import (
     DENOISE_LOOP,
     DIT_ATTN,
     DIT_NODE,
+    DIT_ROWS,
     DIT_SHARD,
     FPS,
     H3_REPO,
     MAX_DURATION,
     MIN_DURATION,
     PARTITION,
+    PROMPT_ROWS,
     REFINER_ATTN,
     SNAPSHOT_PATTERNS,
     TEXT_ENCODER_NODE,
@@ -60,7 +64,7 @@ from mstar.model.minimax_h3.config import (
     video_latent_num_frames,
 )
 from mstar.model.minimax_h3.keyframes import ANCHORS, fit_keyframes, presentation, vision_spans
-from mstar.model.minimax_h3.schedule import h3_schedule
+from mstar.model.minimax_h3.schedule import ScheduleArgs, h3_schedule
 from mstar.model.minimax_h3.submodules import (
     AUDIO_LATENTS,
     AUDIO_OUTPUT,
@@ -69,6 +73,7 @@ from mstar.model.minimax_h3.submodules import (
     LATENTS,
     TEXT_EMBEDS,
     TEXT_INPUTS,
+    TEXT_SPAN,
     VIDEO_OUTPUT,
     VISION_PIXELS,
     H3AudioDecoderSubmodule,
@@ -149,16 +154,9 @@ def import_image_processor():
 
 
 MAX_KEYFRAMES = 2
-ATTENTION_BACKENDS = ("flashinfer", "sdpa")
 # A ceiling for the loop graph; a request runs its own step count (get_loop_caps).
 MAX_INFERENCE_STEPS = 200
 CANVAS_MULTIPLE = 32  # the VAE's 16 times the transformer's 2-wide patch
-
-
-class ScheduleArgs(NamedTuple):
-    steps: int
-    video_shift: float
-    audio_shift: float
 
 
 class H3Model(Model):
@@ -169,7 +167,6 @@ class H3Model(Model):
         model_path_hf: str = H3_REPO,
         cache_dir: str | None = None,
         skip_weight_loading: bool = False,
-        attention_backend: str = "flashinfer",
         max_batch_size: int = 1,
         max_packed_rows: int = 131_072,
         max_prompt_tokens: int | None = None,
@@ -178,14 +175,16 @@ class H3Model(Model):
         row_bucket: int | None = None,
         vae_tile_batch: int = 1,
         vae_compile: bool = False,
+        **kwargs,
     ):
-        if attention_backend not in ATTENTION_BACKENDS:
-            raise ValueError(f"attention_backend must be one of {ATTENTION_BACKENDS}, got {attention_backend!r}")
+        refuse_attention_backend_kwarg(kwargs)
+        if kwargs:
+            # **kwargs is here for the refusal above, so any other key is a misspelling that has to fail the load
+            raise TypeError(f"H3Model got unexpected model_kwargs {sorted(kwargs)}")
         self.model_path_hf = model_path_hf
         self.cache_dir = cache_dir
         # dummy mode: get_submodule returns None for every node (CPU tests)
         self.skip_weight_loading = skip_weight_loading
-        self.attention_backend = attention_backend
         # a batch's rows would have to agree on the step's first-step decisions (keyframe
         # noising, a one-timestep embedding)
         if int(max_batch_size) != 1:
@@ -231,38 +230,38 @@ class H3Model(Model):
         return str(self.snapshot)
 
     # ------------------------------------------------------------ structure
-    def get_node_resources(self) -> list[NodeResourceSpec]:
-        """The DiT's attention over the packed sequence and the token refiner's over the
-        prompt, and the DiT's sequence shard, which on SP ranks splits the packed rows (one
-        row a step, so ``axis`` 0): the DiT's attention exchanges them for heads (Ulysses).
-        ``"sdpa"`` declares none of these, so its DiT can't run on SP ranks. On either, the
-        video decoder's shard splits each request's clips, which nothing exchanges."""
-        # every request of a decoder batch one layout, so one clip count: axis 1
-        decoder = SeqShardSpec(
-            resource_key=VAE_SHARD, nodes={VAE_DECODER_NODE}, labels=(H3VideoDecoderSubmodule.CLIPS,), axis=1,
-            exchanges=False,
-        )
-        if self.attention_backend != "flashinfer":
-            return [decoder]
-        cfg = self.config.transformer
-
-        def spec(key, node, segments, **kwargs):
-            return RaggedAttentionSpec(
-                resource_key=key, nodes={node},
-                config=RaggedAttentionConfig(
-                    num_qo_heads=cfg.num_attention_heads, num_kv_heads=cfg.num_attention_heads,
-                    head_dim=cfg.attention_head_dim, max_segments_per_request=segments, dtype=torch.bfloat16,
-                    workspace_mb=128,
-                ),
-                **kwargs,
-            )
-
+    def declare_state(self) -> list[Array]:
+        """The DiT's attention over each request's packed rows, its padding a segment of its own in the same row, and
+        the token refiner's over the prompt; nothing here keeps state."""
+        t = self.config.transformer
+        heads, entry = t.num_attention_heads, dit_entry(t.num_attention_heads, t.attention_head_dim)
         return [
-            decoder,
+            Array(
+                DIT_ROWS, nodes={DIT_NODE}, layers=frozenset(range(t.num_layers)), entry=entry, max_len=0,
+                reads={DIT_ATTN: Read(mask=Block(), op=Attend(q_heads=heads), packed=False, segmented=True)},
+            ),
+            Array(
+                PROMPT_ROWS, nodes={TEXT_ENCODER_NODE}, layers=frozenset(range(t.token_refiner_num_layers)),
+                entry=entry, labels={TEXT_SPAN}, max_len=0,
+                reads={REFINER_ATTN: Read(mask=Block(), op=Attend(q_heads=heads), packed=False)},
+            ),
+        ]
+
+    def kernel_settings(self) -> dict[str, dict[str, Any]]:
+        # the DiT's two segments are a request's rows and their padding
+        return {DIT_ATTN: {"max_segments_per_request": 2, "workspace_mb": 128}, REFINER_ATTN: {"workspace_mb": 128}}
+
+    def get_node_resources(self) -> list[SeqShardSpec]:
+        """The sequence shards. On SP ranks the DiT's splits the packed rows (one row a step, so ``axis`` 0), which
+        its attention exchanges for heads (Ulysses); on SDPA it can't run there. The video decoder's splits each
+        request's clips, which nothing exchanges (``exchanges=False``); every request of a decoder batch is one
+        layout, so one clip count (``axis`` 1)."""
+        return [
             SeqShardSpec(resource_key=DIT_SHARD, nodes={DIT_NODE}, labels=(H3DenoiseSubmodule.MAIN_SPAN,), axis=0),
-            # the DiT's padding rows are a second segment of each request
-            spec(DIT_ATTN, DIT_NODE, 2, sp_exchange="ulysses"),
-            spec(REFINER_ATTN, TEXT_ENCODER_NODE, 1),
+            SeqShardSpec(
+                resource_key=VAE_SHARD, nodes={VAE_DECODER_NODE}, labels=(H3VideoDecoderSubmodule.CLIPS,), axis=1,
+                exchanges=False,
+            ),
         ]
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
@@ -628,13 +627,11 @@ class H3Model(Model):
             return None
         from mstar.model.minimax_h3 import weight_loader
 
-        ragged = self.attention_backend == "flashinfer"
         snapshot, config = self.snapshot, self.config
         if node_name == TEXT_ENCODER_NODE:
             return H3TextEncoderSubmodule(
                 weight_loader.build_text_encoder(config, snapshot, device),
                 weight_loader.build_text_conditioner(config, snapshot, device),
-                attn_resource_key=REFINER_ATTN if ragged else None,
                 vision=weight_loader.build_vision_tower(snapshot, device), config=config,
             )
         if node_name == VAE_ENCODER_NODE:
@@ -642,14 +639,12 @@ class H3Model(Model):
         if node_name == DIT_NODE:
             return H3DenoiseSubmodule(
                 weight_loader.build_transformer(config, snapshot, device, comm_group=tp_group),
-                config, loop_name=DENOISE_LOOP, attn_resource_key=DIT_ATTN if ragged else None,
-                shard_resource_key=DIT_SHARD if ragged else None,
+                config, loop_name=DENOISE_LOOP,
                 max_batch_size=1, compile_blocks=self.compile, row_bucket=self.row_bucket,
             )
         if node_name == VAE_DECODER_NODE:
             return H3VideoDecoderSubmodule(weight_loader.build_video_decoder(config, snapshot, device), config,
-                                           tile_batch=self.vae_tile_batch, compile_blocks=self.vae_compile,
-                                           shard_resource_key=VAE_SHARD)
+                                           tile_batch=self.vae_tile_batch, compile_blocks=self.vae_compile)
         if node_name == AUDIO_DECODER_NODE:
             return H3AudioDecoderSubmodule(weight_loader.build_audio_vae(config, snapshot, device), config)
         logger.warning("MiniMax-H3 has no submodule for node %r; running it dummy", node_name)

@@ -147,10 +147,9 @@ def test_cfg_ranks_keep_every_head(tp, sp, ulysses, heads):
     spec = RaggedAttentionSpec(
         resource_key="by_hand", nodes={"dit"},
         config=RaggedAttentionConfig(num_qo_heads=8, num_kv_heads=8, head_dim=64),
-        **({"sp_exchange": "ulysses"} if ulysses else {}),
     )
-    # the node's sequence shard, which `RaggedAttentionSpec.derive` would find
-    spec.shard_key = "shard" if ulysses else None
+    # what `RaggedAttentionSpec.derive` sets over a node whose sequence shard splits a label the spec lists
+    spec.shard_key, spec.sp_exchange = ("shard", "ulysses") if ulysses else (None, "none")
     mgr = build_resource(spec, EngineResourceInfo(
         device=torch.device("cpu"), kv_dtype=torch.bfloat16, joint_comm_group=joint,
         dependencies={"shard": SeqShardSpec("shard", {"dit"}, ("main",), 0)} if ulysses else {},

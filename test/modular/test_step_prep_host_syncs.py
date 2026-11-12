@@ -171,7 +171,6 @@ def _wan22_steps(sub, walk, steps, latents, image_latent):
     from the loop counter and the solver state over the loop-back edges."""
     device = latents.device
     sub.get_device = lambda: device
-    sub.request_states.pop("r", None)
     ring, last = torch.zeros((2, *latents.shape), device=device), torch.zeros_like(latents)
     inputs = {
         "text_embeds_pos": [torch.full((1, 8, 16), 1.0, device=device, dtype=torch.bfloat16)],
@@ -715,7 +714,7 @@ class _ScalarWrites(TorchFunctionMode):
 
 
 def _qwen3_omni_thinker(device: torch.device):
-    from mstar.model.qwen3_omni.config import THINKER_POS, Qwen3OmniModelConfig
+    from mstar.model.qwen3_omni.config import Qwen3OmniModelConfig
     from mstar.model.qwen3_omni.submodules import ThinkerSubmodule
 
     config = Qwen3OmniModelConfig()
@@ -729,7 +728,7 @@ def _qwen3_omni_thinker(device: torch.device):
     thinker.model = SimpleNamespace(model=SimpleNamespace(embed_tokens=embed))
     thinker._vision_bos_embed = thinker._vision_eos_embed = None
     thinker.__dict__["_cached_device"] = device
-    thinker.node_resources = {THINKER_POS: SimpleNamespace(position=lambda rid, label: 5)}
+    thinker.kv = SimpleNamespace(positions=SimpleNamespace(position=lambda rid, label: 5))
     return thinker
 
 

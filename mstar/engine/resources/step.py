@@ -141,6 +141,10 @@ class StepContext:
     # plan prefill attention even when every row is one token: a packed
     # capture's forward reads per-row token offsets
     force_prefill: bool = False
+    # How many times this step's capture replays: the host plans once and the
+    # step counts for this many iterations. The worker asks, and `StepRunner`
+    # narrows it to what the step's resources allow (`Resource.max_repeats`).
+    repeats: int = 1
     # the node's `ResidentPlanner` when this step's capture reads the resident
     # tables: a resource then stages nothing per row (see `resources/resident.py`)
     resident: Any = None
@@ -226,6 +230,10 @@ class StepHandle(ABC):
     def end_step(self, step: "SubmoduleStep") -> None:
         """Close the handle, on any path out of the step."""
 
+    @abstractmethod
+    def commit_step(self, step: "SubmoduleStep") -> None:
+        """Apply what the handle itself holds of a step the resources just committed."""
+
 
 @dataclass(frozen=True)
 class SubmoduleStep:
@@ -293,6 +301,10 @@ class SubmoduleStep:
     def check_calls(self) -> None:
         for handle in self.state_handles:
             handle.check_step(self)
+
+    def commit_calls(self) -> None:
+        for handle in self.state_handles:
+            handle.commit_step(self)
 
     def end_calls(self) -> None:
         for handle in self.state_handles:

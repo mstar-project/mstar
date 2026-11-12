@@ -21,10 +21,10 @@ from mstar.engine.state.adapters import PagedArrayHandle, ValueHandle, WithinSte
 from mstar.engine.state.calls import ArrayHandle
 
 # Today's types the surface re-exports, and a NamedTuple, whose fields stay positional.
-_POSITIONAL = {"Reached", "Segment", "SlotLease", "Span"}
+_POSITIONAL = {"PagedNHDTarget", "Reached", "Segment", "SlotLease", "Span"}
 # The calls take the handle first, then what every call names, and only then keywords.
 _CALLS = {
-    "at_last_token", "causal_conv", "gated_delta_net", "last_sampled", "position", "positions",
+    "at_last_token", "causal_conv", "gated_delta_net", "host", "last_sampled", "position", "positions",
     "rope", "sample",
 }
 # Each public name's parameters as ``[name, kind, default]``. A dataclass's parameters are its fields.
@@ -47,8 +47,10 @@ SNAPSHOT = {
         ["forks", "KEYWORD_ONLY", '()'],
         ["placeholders", "KEYWORD_ONLY", 'frozenset()'],
         ["eager_add", "KEYWORD_ONLY", 'False'],
+        ["fixed_layout", "KEYWORD_ONLY", 'False'],
         ["advance", "KEYWORD_ONLY", 'None'],
         ["position_ids", "KEYWORD_ONLY", 'None'],
+        ["host", "KEYWORD_ONLY", '{}'],
     ],
     "Attend": [
         ["q_heads", "POSITIONAL_OR_KEYWORD", None],
@@ -81,6 +83,16 @@ SNAPSHOT = {
         ["growth", "KEYWORD_ONLY", '()'],
         ["scratch", "KEYWORD_ONLY", '0'],
     ],
+    "PagedNHD": [
+        ["dtypes", "KEYWORD_ONLY", 'None'],
+        ["devices", "KEYWORD_ONLY", 'None'],
+    ],
+    "PagedNHDTarget": [
+        ["cache", "POSITIONAL_OR_KEYWORD", None],
+        ["page_of_token", "POSITIONAL_OR_KEYWORD", None],
+        ["slot_of_token", "POSITIONAL_OR_KEYWORD", None],
+        ["count", "POSITIONAL_OR_KEYWORD", None],
+    ],
     "Positions": [
         ["rope", "KEYWORD_ONLY", 'None'],
     ],
@@ -93,6 +105,9 @@ SNAPSHOT = {
         ["op", "KEYWORD_ONLY", 'None'],
         ["layers", "KEYWORD_ONLY", 'None'],
         ["walks", "KEYWORD_ONLY", 'None'],
+        ["queries", "KEYWORD_ONLY", 'None'],
+        ["packed", "KEYWORD_ONLY", 'True'],
+        ["segmented", "KEYWORD_ONLY", 'False'],
     ],
     "Rope": [
         ["theta", "KEYWORD_ONLY", '10000.0'],
@@ -191,6 +206,12 @@ SNAPSHOT = {
         ["a_log", "POSITIONAL_OR_KEYWORD", None],
         ["dt_bias", "POSITIONAL_OR_KEYWORD", None],
     ],
+    "host": [
+        ["h", "POSITIONAL_OR_KEYWORD", None],
+        ["request", "POSITIONAL_OR_KEYWORD", None],
+        ["label", "POSITIONAL_OR_KEYWORD", None],
+        ["layer", "POSITIONAL_OR_KEYWORD", None],
+    ],
     "last_sampled": [
         ["s", "POSITIONAL_OR_KEYWORD", None],
     ],
@@ -206,6 +227,14 @@ SNAPSHOT = {
         ["h", "POSITIONAL_OR_KEYWORD", None],
         ["q", "POSITIONAL_OR_KEYWORD", None],
         ["k", "POSITIONAL_OR_KEYWORD", None],
+    ],
+    "state_op": [
+        ["adds", "KEYWORD_ONLY", "()"],
+        ["writes", "KEYWORD_ONLY", "()"],
+        ["reads", "KEYWORD_ONLY", "()"],
+        ["mutates", "KEYWORD_ONLY", "()"],
+        ["formats", "KEYWORD_ONLY", None],
+        ["reference", "KEYWORD_ONLY", None],
     ],
     "sample": [
         ["s", "POSITIONAL_OR_KEYWORD", None],

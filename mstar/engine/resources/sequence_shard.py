@@ -15,7 +15,7 @@ The exchanges are the functions at the bottom of this module, each wrapped aroun
 own ``run``:
 
 - ``ulysses``: one all-to-all from tokens to heads, ``run``, and one back (head-stored KV, or a
-  cacheless attention declaring ``sp_exchange="ulysses"``);
+  cacheless attention planning a label the shard lists, ``RaggedAttentionSpec.labels``);
 - ``all_gather``: every rank's q, k and v gathered, ``run`` as on a copied step, this rank's share
   of the output (KV stored by position, ``context_parallel``);
 - ``ring``: a striped label's own tokens, whose K/V this rank stores, ``run`` on them with their
@@ -43,6 +43,7 @@ import torch
 from mstar.distributed.communication import CommGroup, gather_sequence, sp_seq_split
 from mstar.engine.resources.base import EngineResourceInfo, Resource
 from mstar.engine.resources.context_parallel import gather_merge, position_pools, stripe_owners
+from mstar.engine.resources.resident_hooks import ANY_REPEATS
 from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.engine.resources.step import ResourceStep, StepContext
 from mstar.utils.h2d import to_device_nonblocking
@@ -75,8 +76,9 @@ class SeqShardSpec(NodeResourceSpec):
       stored position): split;
     - ``none``: never split.
 
-    A ragged attention's own ``sp_exchange`` is the model's, which ``exchange`` doesn't change;
-    a shard that never splits stops it splitting too.
+    A ragged attention takes a split label by Ulysses wherever it plans one this shard lists
+    (``RaggedAttentionSpec.labels``), which ``exchange`` doesn't change; a shard that never splits
+    stops it splitting too.
 
     ``exchanges=False`` declares that no op on the node mixes a listed label's units (a video
     decoder's independent clips): nothing exchanges them, so the node needs no attention, and a
@@ -176,7 +178,7 @@ class SeqShardSpec(NodeResourceSpec):
         self._check_overrides()
 
 
-def _shards_over(spec: NodeResourceSpec, specs: Mapping[str, NodeResourceSpec]) -> list[SeqShardSpec]:
+def shards_over(spec: NodeResourceSpec, specs: Mapping[str, NodeResourceSpec]) -> list[SeqShardSpec]:
     return [other for other in specs.values() if isinstance(other, SeqShardSpec) and other.nodes & spec.nodes]
 
 
@@ -184,7 +186,7 @@ def shard_exchange(spec: NodeResourceSpec, specs: Mapping[str, NodeResourceSpec]
     """How a split step reaches ``spec``, an attention over KV stored by position or by head: its
     node's ``SeqShardSpec.exchange``, from raw fields; ``none`` without one shard (two are refused,
     ``take_shard_edge``)."""
-    shards = _shards_over(spec, specs)
+    shards = shards_over(spec, specs)
     return shards[0].exchange_over(by_position) if len(shards) == 1 else "none"
 
 
@@ -192,7 +194,7 @@ def take_shard_edge(spec: NodeResourceSpec, specs: Mapping[str, NodeResourceSpec
     """Set ``spec.shard_key`` to the ``SeqShardSpec`` over its nodes, if any (a ``derive``).
     A shard sharing only some of ``spec``'s nodes is a problem: the spec would split on some of
     its nodes and not others."""
-    shards = _shards_over(spec, specs)
+    shards = shards_over(spec, specs)
     spec.shard_key = None
     if not shards:
         return []
@@ -276,8 +278,8 @@ class SequenceShard(Resource):
     ``prefix_skip_safe`` (it plans from the step a prefix hit already trimmed), ``supports_preplan``
     (its dependents pre-plan), ``supports_context_parallel`` (a striped shard reads a placed pool's
     plan), ``resident_refusal`` (None: a one-token-a-row step, what resident planning replays, is
-    never split); it keeps ``can_capture`` True and ``force_double_buffer`` False (a leased step,
-    the only kind a pre-plan stages, never stripes)."""
+    never split) and so ``max_repeats`` (any); it keeps ``can_capture`` True and ``force_double_buffer``
+    False (a leased step, the only kind a pre-plan stages, never stripes)."""
 
     prefix_skip_safe = True
     supports_split_steps = True
@@ -289,6 +291,10 @@ class SequenceShard(Resource):
 
     def resident_refusal(self) -> str | None:
         return None
+
+    def max_repeats(self, step, ctx) -> int:
+        # a replay is a batched decode, which plans copied (`_decide`), so no plan goes stale between replays
+        return ANY_REPEATS
 
     def __init__(
         self, labels: tuple[str, ...], axis: int, walks: frozenset[str] | None, min_tokens: int,
@@ -727,7 +733,8 @@ def sequence_parallel_refusals(
             )
             return [
                 f"node {node!r} runs on {sp} SP ranks, and its steps never split (its sequence shard's exchange "
-                "none, or no attention there takes split steps: a ragged one without sp_exchange 'ulysses'), so "
+                "none, or no attention there takes split steps: a ragged one over no label it lists, or a read on "
+                "backend: sdpa), so "
                 f"its SP ranks would only share heads: store its KV by position (context_parallel){opt_in} or run "
                 "it on TP ranks"
             ]

@@ -32,24 +32,27 @@ from __future__ import annotations
 
 import logging
 import math
+from typing import Any
 
 import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.distributed.base import ShardingConfig
-from mstar.engine.resources import (
-    NodeResourceSpec,
-    RaggedAttentionConfig,
-    RaggedAttentionSpec,
-    RaggedCrossAttentionSpec,
-    SeqShardSpec,
-)
+from mstar.engine.resources import SeqShardSpec
+from mstar.engine.state import Array, Attend, Block, Read
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Parallel, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import Model, WalkStep
+from mstar.model.components.diffusion.attention import dit_entry, refuse_attention_backend_kwarg
 from mstar.model.components.video_encode import encode_mp4
 from mstar.model.ltx2_5.config import (
+    AUDIO,
     AUDIO_DECODER_NODE,
+    AUDIO_FOR_VIDEO,
+    AUDIO_SELF,
+    AUDIO_SPAN,
+    AUDIO_TEXT,
+    AUDIO_TO_VIDEO,
     DENOISE_LOOP,
     DISTILLED_SIGMA_VALUES,
     DIT_NODE,
@@ -57,26 +60,30 @@ from mstar.model.ltx2_5.config import (
     SNAPSHOT_PATTERNS,
     STAGE_2_DISTILLED_SIGMA_VALUES,
     TEXT_ENCODER_NODE,
+    TEXT_FOR_AUDIO,
+    TEXT_FOR_VIDEO,
+    TEXT_SPAN,
     UPSAMPLER_NODE,
     VAE_DECODER_NODE,
+    VIDEO,
+    VIDEO_FOR_AUDIO,
+    VIDEO_SELF,
+    VIDEO_SHARD,
+    VIDEO_SPAN,
+    VIDEO_TEXT,
+    VIDEO_TO_AUDIO,
     LTX25Config,
 )
 from mstar.model.ltx2_5.submodules import (
-    AUDIO_ATTN,
     AUDIO_LATENTS,
     AUDIO_OUTPUT,
-    AUDIO_XATTN,
     LATENTS,
     REFINE_AUDIO,
     REFINE_LATENTS,
     TEXT_AUDIO,
     TEXT_INPUTS,
     TEXT_VIDEO,
-    VIDEO_ATTN,
     VIDEO_OUTPUT,
-    VIDEO_SHARD,
-    VIDEO_SPAN,
-    VIDEO_XATTN,
     LTXAudioDecoderSubmodule,
     LTXDenoiseSubmodule,
     LTXLatentUpsamplerSubmodule,
@@ -111,7 +118,6 @@ REFINE_WALKS = {
     frozenset({"audio"}): REFINE_AUDIO_WALK,
 }
 RECIPES = ("single", "two_stage")
-ATTENTION_BACKENDS = ("flashinfer", "sdpa")
 
 
 class LTX25Model(Model):
@@ -122,7 +128,6 @@ class LTX25Model(Model):
         model_path_hf: str = LTX25_REPO,
         cache_dir: str | None = None,
         skip_weight_loading: bool = False,
-        attention_backend: str = "flashinfer",
         compile: bool = True,
         compile_eager_rounding: bool = True,
         accelerator_graph: bool = True,
@@ -136,13 +141,11 @@ class LTX25Model(Model):
         async_scheduling: bool = True,
         **kwargs,
     ):
-        if attention_backend not in ATTENTION_BACKENDS:
-            raise ValueError(f"attention_backend must be one of {ATTENTION_BACKENDS}, got {attention_backend!r}")
+        refuse_attention_backend_kwarg(kwargs)
         self.model_path_hf = model_path_hf
         self.cache_dir = cache_dir
         # Dummy mode: get_submodule returns None for every node (CPU tests).
         self.skip_weight_loading = skip_weight_loading
-        self.attention_backend = attention_backend
         self.compile_transformer = bool(compile)
         self.compile_eager_rounding = bool(compile_eager_rounding)
         self.accelerator_graph = bool(accelerator_graph)
@@ -196,39 +199,40 @@ class LTX25Model(Model):
         return str(self.snapshot)
 
     # ------------------------------------------------------------ structure
-    def get_node_resources(self) -> list[NodeResourceSpec]:
-        """The dit's ragged attentions, one resource per (kind, head geometry): self-
-        and cross-attention over the video stream's heads, and over the audio stream's
-        (which both cross-modal attentions use); and its sequence shard, which on SP ranks
-        splits each row's video tokens: the video self-attention exchanges them for heads,
-        and the cross-attentions attend a rank's share of them. Nothing here is cached;
-        ``"sdpa"`` declares nothing, so it can't run on SP ranks."""
-        if self.attention_backend != "flashinfer":
-            return []
-        cfg = self.config.transformer
-        attention = [
-            spec_cls(
-                resource_key=key, nodes={DIT_NODE},
-                config=RaggedAttentionConfig(
-                    num_qo_heads=heads, num_kv_heads=heads, head_dim=head_dim,
-                    # one span per label (or per pair) per request
-                    max_segments_per_request=1,
-                    dtype=torch.bfloat16,
-                    # six labels x two slots: 6 GB at the 512 MB default. A floor; the
-                    # labels whose plans want more than this grow to what they ask for
-                    workspace_mb=128,
-                ),
-                **({"sp_exchange": "ulysses"} if key == VIDEO_ATTN else {}),
+    def declare_state(self) -> list[Array]:
+        """The dit's six attentions, each an array of the tokens it attends over. On a step the sequence shard splits
+        (`get_node_resources`), a rank holds its share of the video tokens: the video self-attention exchanges them,
+        the video-to-audio attention merges the ranks' attentions, and an attention from the video tokens runs on the
+        rank's share."""
+        t = self.config.transformer
+
+        def within(name, heads, head_dim, read, label, queries=None):
+            return Array(
+                name, nodes={DIT_NODE}, layers=frozenset(range(t.num_layers)), entry=dit_entry(heads, head_dim),
+                labels={label}, max_len=0,
+                reads={read: Read(mask=Block(), op=Attend(q_heads=heads), queries=queries, packed=False)},
             )
-            for spec_cls, key, heads, head_dim in (
-                (RaggedAttentionSpec, VIDEO_ATTN, cfg.num_attention_heads, cfg.attention_head_dim),
-                (RaggedAttentionSpec, AUDIO_ATTN, cfg.audio_num_attention_heads, cfg.audio_attention_head_dim),
-                (RaggedCrossAttentionSpec, VIDEO_XATTN, cfg.num_attention_heads, cfg.attention_head_dim),
-                (RaggedCrossAttentionSpec, AUDIO_XATTN, cfg.audio_num_attention_heads,
-                 cfg.audio_attention_head_dim),
-            )
+
+        video = (t.num_attention_heads, t.attention_head_dim)
+        audio = (t.audio_num_attention_heads, t.audio_attention_head_dim)
+        return [
+            within(VIDEO, *video, VIDEO_SELF, VIDEO_SPAN),
+            within(AUDIO, *audio, AUDIO_SELF, AUDIO_SPAN),
+            within(TEXT_FOR_VIDEO, *video, VIDEO_TEXT, TEXT_SPAN, queries=VIDEO),
+            within(TEXT_FOR_AUDIO, *audio, AUDIO_TEXT, TEXT_SPAN, queries=AUDIO),
+            within(AUDIO_FOR_VIDEO, *audio, AUDIO_TO_VIDEO, AUDIO_SPAN, queries=VIDEO),
+            within(VIDEO_FOR_AUDIO, *audio, VIDEO_TO_AUDIO, VIDEO_SPAN, queries=AUDIO),
         ]
-        return [SeqShardSpec(resource_key=VIDEO_SHARD, nodes={DIT_NODE}, labels=(VIDEO_SPAN,), axis=1), *attention]
+
+    def get_node_resources(self) -> list[SeqShardSpec]:
+        """The DiT's sequence shard, which on SP ranks splits each row's video tokens and never the audio or text:
+        every row of a step is one shape, so each splits alike (``axis`` 1)."""
+        return [SeqShardSpec(resource_key=VIDEO_SHARD, nodes={DIT_NODE}, labels=(VIDEO_SPAN,), axis=1)]
+
+    def kernel_settings(self) -> dict[str, dict[str, Any]]:
+        # six labels x two slots: 6 GB at the 512 MB default. A floor; the labels whose plans want more than this grow
+        # to what they ask for.
+        return {read: {"workspace_mb": 128} for read in (VIDEO_SELF, AUDIO_SELF, VIDEO_TEXT, AUDIO_TEXT)}
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         encode_text = GraphNode(
@@ -522,7 +526,7 @@ class LTX25Model(Model):
             return LTXDenoiseSubmodule(
                 weight_loader.build_transformer(self.config, snapshot, device, comm_group=tp_group),
                 self.config,
-                loop_name=DENOISE_LOOP, use_ragged_attention=self.attention_backend == "flashinfer",
+                loop_name=DENOISE_LOOP,
                 refine_walks=frozenset(REFINE_WALKS.values()),
                 compile_transformer=self.compile_transformer, compile_eager_rounding=self.compile_eager_rounding,
                 max_batch_size=self.max_batch_size, capture_buckets=self.capture_buckets(),

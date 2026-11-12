@@ -19,9 +19,12 @@ import pytest
 import torch
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.engine.resources.sequence_shard import sequence_parallel_refusals
+from mstar.engine.resources.spec import resolve_spec_dependencies
+from mstar.engine.state.adapters import node_resources, state_setup
 from mstar.graph.base import GraphNode, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.wan22.config import WAN22_VARIANT_TI2V_5B, Wan22Config
+from mstar.model.wan22.config import DIT_SHARD, DIT_TOKENS, SELF_ATTN, WAN22_VARIANT_TI2V_5B, Wan22Config
 from mstar.model.wan22.submodules import (
     _DECODE_TILING_ENV,
     _DECODE_UNTILED_SAFETY_MARGIN,
@@ -108,13 +111,17 @@ def test_wan22_declares_expected_nodes():
 
 def test_wan22_declares_only_dit_attention_resources():
     """Nothing here is cached across steps: the only resources are the dit's
-    sequence shard and cacheless self-attention, and the sdpa backend declares none."""
+    cacheless self-attention and its sequence shard, and the sdpa backend builds
+    no attention, so the shard can't split its steps on SP ranks."""
     model = _make_model()
-    specs = model.get_node_resources()
-    assert [spec.resource_key for spec in specs] == [Wan22DitSubmodule.SEQ_SHARD, Wan22DitSubmodule.SELF_ATTN]
+    specs = node_resources(model)
+    assert [spec.resource_key for spec in specs] == [SELF_ATTN, DIT_SHARD]
     assert all(spec.nodes == {"dit"} for spec in specs)
-    model.config = Wan22Config(attention_backend="sdpa")
-    assert model.get_node_resources() == []
+    setup, _ = state_setup({"resources": {SELF_ATTN: {"backend": "sdpa"}}}, model.declare_state())
+    on_sdpa = node_resources(model, setup=setup)
+    assert [spec.resource_key for spec in on_sdpa] == [DIT_SHARD]
+    (refusal,) = sequence_parallel_refusals(resolve_spec_dependencies(on_sdpa).values(), "dit", 1, 2)
+    assert "its steps never split" in refusal
     assert model.get_request_resource_configs([], [], {}) == {}
 
 
@@ -846,14 +853,15 @@ def test_wan22_dit_attends_one_segment_per_branch_on_its_rank(world_size, guidan
         with pytest.raises(ValueError, match="evenly"):
             submodule.attention_segments(key)
         return
-    assert submodule.attention_segments(key) == ((submodule.MAIN_SPAN, submodule.num_tokens(key)),) * branches
+    segments = ((submodule.MAIN_SPAN, submodule.num_tokens(key)),) * branches
+    assert submodule.attention_segments(key) == {DIT_TOKENS: segments}
 
 
 class _BranchEcho(torch.nn.Module):
     """A dit stand-in whose prediction is each row's text embedding, broadcast."""
     dtype = torch.float32
 
-    def forward(self, hidden_states, timestep, encoder_hidden_states, self_attn_fn, shard=None):
+    def forward(self, hidden_states, timestep, encoder_hidden_states, shard=None):
         return encoder_hidden_states[:, :1, :1, None, None].expand_as(hidden_states).clone()
 
 
@@ -881,7 +889,7 @@ def test_wan22_cfg_parallel_rank_runs_its_branch_and_matches_one_gpu(rows, rank,
     neg = -torch.arange(1.0, 1.0 + rows)[:, None, None].expand(rows, 8, 16)
     one_gpu = Wan22DitSubmodule(transformer=_BranchEcho(), config=Wan22Config(compile_dit=False))
     expected = one_gpu._noise_prediction(latents, ts, pos, neg, guidance)
-    full = _BranchEcho()(latents.repeat(2, 1, 1, 1, 1), None, torch.cat([pos, neg]), None)
+    full = _BranchEcho()(latents.repeat(2, 1, 1, 1, 1), None, torch.cat([pos, neg]))
     group = _TwoRankGroup(rank, full, rows)
     pair = Wan22DitSubmodule(transformer=_BranchEcho(), config=Wan22Config(compile_dit=False), cfg_group=group)
     assert torch.equal(pair._noise_prediction(latents, ts, pos, neg, guidance), expected)
@@ -905,12 +913,10 @@ def test_wan22_refuses_a_dit_instance_it_cannot_split_cfg_over(cfg_size, ok):
         assert len(problems) == 1 and "does not divide the 2 guidance branches" in problems[0], problems
 
 
-def test_wan22_dit_declares_its_attention_on_the_ragged_resource():
+def test_wan22_dit_declares_its_attention_on_its_array():
     submodule = _dit()
     node_inputs = submodule.prepare_inputs(
         graph_walk=Wan22Model.VIDEO_GEN_WALK, fwd_info=_dit_info(5.0), inputs=_dit_loop_inputs(),
     )
     step = submodule.declare_step(Wan22Model.VIDEO_GEN_WALK, ["r0"], [node_inputs])
-    assert set(step.steps) == {Wan22DitSubmodule.SELF_ATTN}
-    sdpa = Wan22DitSubmodule(transformer=None, config=Wan22Config(attention_backend="sdpa"))
-    assert sdpa.declare_step(Wan22Model.VIDEO_GEN_WALK, ["r0"], [node_inputs]) is None
+    assert set(step.state) == {DIT_TOKENS}
