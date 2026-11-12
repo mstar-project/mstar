@@ -423,10 +423,10 @@ class H3Model(Model):
                 f"MiniMax-H3 generates {MIN_DURATION:g} to {MAX_DURATION:g} s at {FPS} fps: num_frames {requested} "
                 f"(snapped up to {num_frames}, the 17n+5 the VAE decodes) is {duration:.2f} s"
             )
-        steps, video_shift, audio_shift = self.resolve_schedule(model_kwargs)
+        schedule = self.resolve_schedule(model_kwargs)
         request = {
-            "height": height, "width": width, "num_frames": num_frames, "num_inference_steps": steps,
-            "video_shift": video_shift, "audio_shift": audio_shift,
+            "height": height, "width": width, "num_frames": num_frames, "num_inference_steps": schedule.steps,
+            "video_shift": schedule.video_shift, "audio_shift": schedule.audio_shift,
         }
         rows = self.request_layout(request, text_rows, ANCHORS[:keyframes]).total_rows
         if rows > self.max_packed_rows:

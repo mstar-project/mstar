@@ -316,12 +316,12 @@ def run(args, report: dict, failures: list[str]) -> None:
             """``reference_shapes``: the step's timesteps laid out as the reference lays them
             (its distinct values, sorted, and each row's index into them), so the time MLP and
             the AdaLN GEMMs run at the reference's shapes. Serving runs a fixed (video, audio,
-            keyframe) triple, or one timestep at step 0 without keyframes
-            (``H3DenoiseSubmodule.request_inputs``)."""
+            keyframe) triple, or one timestep at a step 0 that starts both modalities at t = 0
+            without keyframes (``H3DenoiseSubmodule.request_inputs``)."""
             if reference_shapes:
                 unique, indices = plans[k]
                 t, row_class = unique[None].to(dev), indices.to(dev)
-            elif k == 0 and not layout.num_condition_rows:
+            elif k == 0 and not layout.num_condition_rows and sched.timesteps[0] == sched.audio_timesteps[0]:
                 t, row_class = sched.timesteps[:1][None].to(dev), None
             else:
                 t = torch.stack([sched.timesteps[k], sched.audio_timesteps[k], sched.cond_timesteps[k]])[None].to(dev)

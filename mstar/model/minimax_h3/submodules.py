@@ -72,8 +72,9 @@ logger = logging.getLogger(__name__)
 TEXT_INPUTS, TEXT_EMBEDS = "text_inputs", "text_embeds"
 LATENTS, AUDIO_LATENTS = "latents", "audio_latents"
 VIDEO_OUTPUT, AUDIO_OUTPUT = "video_output", "audio_output"
-# a denoise step input, not an edge: whether this is a request's first step (host-side)
-FIRST_STEP = "first_step"
+# denoise step inputs, not edges (host-side): whether this is a request's first step, and whether
+# every row of it is on one timestep (video and audio both start at t = 0, no keyframe rows)
+FIRST_STEP, ONE_TIMESTEP = "first_step", "one_timestep"
 # FL2VA: the keyframes as the Qwen3-VL image processor lays them out (``[patches, 1536]``),
 # the keyframes' uint8 pixels for the VAE encoder, and their normalized latent rows
 VISION_PIXELS, KEYFRAME_PIXELS, COND_LATENTS = "vision_pixels", "keyframe_pixels", "cond_latents"
@@ -424,7 +425,13 @@ class H3DenoiseSubmodule(H3PackedDenoise):
 
     def request_inputs(self, fwd_info, inputs: NameToTensorList, bucket_key: H3Layout) -> dict[str, torch.Tensor]:
         # host-side, so what depends on the first step is decided without a sync
-        tensors = {TEXT_EMBEDS: inputs[TEXT_EMBEDS][0], FIRST_STEP: torch.tensor(self.step_index(fwd_info) == 0)}
+        first = self.step_index(fwd_info) == 0
+        # the linspace grid starts both modalities at sigma 1; a distilled checkpoint's first rung
+        # (999) puts them at two timesteps, which the reference embeds as two
+        schedule = self.schedule_of(fwd_info, bucket_key) if first else None
+        one = first and not bucket_key.num_condition_rows and bool(schedule.timesteps[0] == schedule.audio_timesteps[0])
+        tensors = {TEXT_EMBEDS: inputs[TEXT_EMBEDS][0], FIRST_STEP: torch.tensor(first),
+                   ONE_TIMESTEP: torch.tensor(one)}
         if bucket_key.num_condition_rows:
             tensors[COND_LATENTS] = inputs[COND_LATENTS][0]
         return tensors
@@ -437,7 +444,7 @@ class H3DenoiseSubmodule(H3PackedDenoise):
             AUDIO_LATENTS: torch.zeros(bucket_key.num_audio_rows, cfg.audio_latents_dim, device=device),
             TEXT_EMBEDS: torch.zeros(bucket_key.text_len, cfg.hidden_size, dtype=self.transformer.dtype,
                                      device=device),
-            FIRST_STEP: torch.tensor(False),
+            FIRST_STEP: torch.tensor(False), ONE_TIMESTEP: torch.tensor(False),
             **({COND_LATENTS: torch.zeros(bucket_key.num_condition_rows, cfg.patch_dim, device=device)}
                if bucket_key.num_condition_rows else {}),
         }
@@ -449,7 +456,7 @@ class H3DenoiseSubmodule(H3PackedDenoise):
     def denoise(
         self, engine_inputs, bucket_key: H3Layout, latents, timestep, sigma, sigma_next,
         audio_latents, audio_timestep, audio_sigma, audio_sigma_next, cond_timestep, text_embeds,
-        first_step, cond_latents=None, **cond,
+        first_step, one_timestep, cond_latents=None, **cond,
     ):
         layout = self.layout(bucket_key, latents.device)
         n = layout.num_condition_rows
@@ -459,7 +466,7 @@ class H3DenoiseSubmodule(H3PackedDenoise):
             # here and carried unchanged after
             t = torch.full((), KEYFRAME_NOISE_AUG, dtype=torch.float32, device=latents.device)
             latents = torch.cat([t * cond_latents + (1.0 - t) * latents[:, :n], latents[:, n:]], dim=1)
-        if first and not n and not self.compiled:
+        if bool(one_timestep.all()) and not self.compiled:
             # video and audio both at t = 0: one timestep, as the reference embeds it. Compiled
             # (not bit-exact anyway) step 0 keeps the three-entry table, the same values, so a
             # row bucket compiles one graph rather than a second for step 0
