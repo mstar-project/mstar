@@ -246,8 +246,8 @@ class ArrayHandle(StepHandle):
         return getattr(self.reads[read], field)
 
     def _update(self, kind: type[Op], layer: int) -> tuple[Any, torch.Tensor]:
-        """Record the update of type ``kind`` on ``layer``'s field it writes, and return the resource that runs it and
-        the field's view."""
+        """Record the update of type ``kind`` on the field ``kind`` writes in ``layer``, and return the resource that
+        runs the update and that field's view."""
         raise self._unsupported(f"an update of type {kind.__name__}")
 
     def _host(self, request: int, label: str, layer: int) -> Mapping[str, object]:
