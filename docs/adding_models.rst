@@ -705,6 +705,9 @@ deployment YAML tunes them under ``resources:`` (see :ref:`Step 6 <config-yaml>`
   global, before sharding. ``dtype=None`` is the engine's compute dtype, and ``shard`` is
   the axis split across TP ranks, ``None`` when every GPU holds all of it.
   ``KVEntry(heads=, head_dim=)`` builds an entry of ``k`` and ``v`` sharded on their heads.
+  A paged array's pool is held in the model's ``get_autocast_dtype``. A model that runs
+  without the engine's autocast returns its K/V dtype there and sets ``disable_autocast`` on
+  each node, as Waypoint and LingBot-World do.
 - ``Read(mask=, op=, layers=, walks=)``: how a layer reads the array. Each row reads through
   the one read declared for its layer and walk, and loading refuses two reads over one
   layer and walk. ``Causal()`` sees every entry up to the query's own, ``Window(size)`` the
