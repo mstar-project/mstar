@@ -67,7 +67,8 @@ def test_batched_denoise_is_compiled_only_when_asked(batched):
 def test_only_the_batched_layer_stack_compiles_and_its_length_is_dynamic(monkeypatch):
     """The cross-request step compiles nothing a batch's composition shapes:
     the per-request parts stay eager, and the layer stack's pack length is
-    dynamic, so one compile serves every batch size and mix of sizes."""
+    dynamic, so one compile serves every batch size and mix of sizes. It is
+    automatic dynamic, so the head dim stays static."""
     calls = {}
 
     def fake_compile(fn, **kwargs):
@@ -78,7 +79,7 @@ def test_only_the_batched_layer_stack_compiles_and_its_length_is_dynamic(monkeyp
     Cosmos3DiTSubmodule(_Transformer(), Cosmos3Config())
     want = denoise_compile_kwargs("deterministic")
     assert calls["denoise_step"] == want and calls["denoise_step_batched_cfg"] == want
-    assert calls["gen_layers_batched"] == {**want, "dynamic": True}
+    assert calls["gen_layers_batched"] == {**want, "dynamic": None}
     assert "denoise_step_batched" not in calls
 
 
@@ -89,11 +90,12 @@ def test_no_compile_leaves_every_forward_eager():
 
 
 def test_warmup_compiles_runs_the_real_step_and_a_served_row_reuses_its_compile(monkeypatch):
-    """The warmup runs one two-request step through the real step at the
-    default size with the layer stack compiled, so no request pays for it: a
+    """The warmup runs a two- and a three-request step through the real step
+    at the default size with the layer stack compiled, so no request pays for it: a
     row of another size, and an action row with and without guidance, against
     the attention a served step binds, run what the warmup built."""
-    # 13 frames: a warm-up pack as long as the hidden size, as Nano's default 1024x1024 is
+    # 13 frames: a warm-up pack as long as the hidden size, as Nano's default 1024x1024 is, which a
+    # served row of another length must not recompile from
     sub, model, cfg, res = _tiny(compile_denoise=True, video_size_default=(64, 64), num_frames_video=13)
     step, calls = model.denoise_step_batched, []
 
@@ -105,11 +107,12 @@ def test_warmup_compiles_runs_the_real_step_and_a_served_row_reuses_its_compile(
     monkeypatch.setattr(model, "denoise_step_batched", recording_step)
     with torch.no_grad():  # as the engine calls it
         sub.warmup_compiles()
-    [(requests, label, results)] = calls
     latent_size = sub._latent_shape(64, 64, 13)
-    assert len(requests) == 2 and label == CFG_BATCHED_LABEL and requests[0]["latents"].shape == latent_size
-    assert 4 * requests[0]["rotary_cond"][0].shape[0] == cfg.hidden_size
-    assert [v.shape for branches in results for v in branches] == [latent_size] * 4
+    assert [len(requests) for requests, _, _ in calls] == [2, 3]
+    for requests, label, results in calls:
+        assert label == CFG_BATCHED_LABEL and requests[0]["latents"].shape == latent_size
+        assert 4 * requests[0]["rotary_cond"][0].shape[0] == cfg.hidden_size
+        assert [v.shape for branches in results for v in branches] == [latent_size] * 2 * len(requests)
 
     static = sub._build_static(list(range(5)), 32, 64, 5, 24.0, False, "cpu")
     latents = torch.randn(sub._latent_shape(32, 64, 5))

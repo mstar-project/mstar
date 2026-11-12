@@ -54,7 +54,6 @@ from dataclasses import dataclass
 from typing import Any, NamedTuple
 
 import torch
-from torch.fx.experimental import _config as fx_config
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.accelerator_graph_config import (
@@ -451,12 +450,14 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             )
             if config.compile_denoise_batched:
                 # Only the cross-request step's layer stack, with the pack
-                # length dynamic: one compile, built by `warmup_compiles`
-                # before the first request, serves every batch size and mix of
-                # resolutions. The per-request patchify, rotary and unpatchify
-                # around it run eager.
+                # length dynamic: built by `warmup_compiles` before the first
+                # request, it serves every batch size and mix of resolutions.
+                # The per-request patchify, rotary and unpatchify around it run
+                # eager. Automatic dynamic rather than dynamic=True, so only
+                # the pack length is symbolic: with the head dim symbolic too,
+                # the QK-norm + RoPE kernel ran 5x slower.
                 self.transformer.gen_layers_batched = torch.compile(
-                    self.transformer.gen_layers_batched, **{**kwargs, "dynamic": True},
+                    self.transformer.gen_layers_batched, **{**kwargs, "dynamic": None},
                 )
             logger.info("Cosmos3 denoise compute torch.compile enabled (%s)", config.denoise_compile_mode)
 
@@ -468,11 +469,14 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
 
     def warmup_compiles(self) -> None:
         """Build the compiled cross-request layer stack before the first
-        request: one two-request step at the default size, through
+        request: a two- and a three-request step at the default size, through
         ``denoise_step_batched`` with a stand-in attention, since no request
-        has planned one yet. The attention call is a graph break, so what the
-        stand-in returns never enters a compiled graph, and the graph does not
-        depend on the size it was built at."""
+        has planned one yet. The layers' code is shared with the single-request
+        step, so where a capture compiled it first, the first length already
+        builds the dynamic graph; otherwise that one compiles static, and the
+        second length is the one that makes the pack length symbolic. The
+        attention call is a graph break, so what the stand-in returns never
+        enters a compiled graph."""
         if not (self.config.compile_denoise and self.config.compile_denoise_batched) or self.transformer is None:
             return
         cfg = self.config
@@ -493,13 +497,12 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             static["rotary"],
         )
         t0 = time.perf_counter()
-        # as `forward_batched` runs it: native dtype, no autocast. Without duck sizing, which would
-        # tie a pack as long as the hidden size (Nano's default, 4096) to that static size and
-        # compile again at the first other length.
-        with torch.autocast(device_type=device.type, enabled=False), fx_config.patch(use_duck_shape=False):
-            self.transformer.denoise_step_batched([row, row], CFG_BATCHED_LABEL, _WarmupAttention())
+        # as `forward_batched` runs it: native dtype, no autocast
+        with torch.autocast(device_type=device.type, enabled=False):
+            for rows in (2, 3):
+                self.transformer.denoise_step_batched([row] * rows, CFG_BATCHED_LABEL, _WarmupAttention())
         logger.info(
-            "Cosmos3 cross-request layer stack compiled in %.1f s (%dx%dx%d, two requests)",
+            "Cosmos3 cross-request layer stack compiled in %.1f s (%dx%dx%d, two and three requests)",
             time.perf_counter() - t0, width, height, frames,
         )
 

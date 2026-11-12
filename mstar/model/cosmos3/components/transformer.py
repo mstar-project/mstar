@@ -1053,7 +1053,7 @@ class Cosmos3OmniTransformer(nn.Module):
         of ``denoise_step_batched`` or ``denoise_step_action_batched``, against
         the attention the step bound. Apart from those methods, so the submodule
         can compile it alone: only the pack's length depends on the batch, so
-        with that length dynamic one compile serves every batch size and mix of
+        with that length dynamic one graph serves every batch size and mix of
         resolutions, while the per-request parts around it run eager."""
         attend = self._gen_attend
         for i, layer in enumerate(self.layers):

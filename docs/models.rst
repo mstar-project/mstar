@@ -1953,7 +1953,7 @@ is faster for a single frame. False decodes everything with the compiled stock
 Two or more requests at the same denoise step run one cross-request forward
 (``max_gen_batch_size``, default 8) for video, image, sound and action. With
 ``compile_denoise_batched`` (default on) the layer stack these steps share is
-compiled with the same mode, once, while the server starts, with the packed
+compiled with the same mode while the server starts, with only the packed
 length dynamic: no batch size or mix of resolutions compiles mid-traffic. The
 per-request patchify, rotary tables and unpatchify around it run eager.
 Compiled, a batched action step's outputs differ from the eager stack's at the

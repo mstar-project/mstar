@@ -540,8 +540,8 @@ class Cosmos3Config:
     # forward) too, with the same mode: the video, image, sound and action
     # steps share one compiled layer stack. Eager, the norms, rotary and
     # residuals cost about 80 ms of GPU per extra row at
-    # 832x480x121 on a B300. Only its layer stack compiles, once, at startup,
-    # with the pack length dynamic, so no batch size or mix of resolutions
+    # 832x480x121 on a B300. Only its layer stack compiles, at startup, with
+    # only the pack length dynamic, so no batch size or mix of resolutions
     # compiles mid-traffic; the per-request patchify, rotary tables and
     # unpatchify run eager.
     compile_denoise_batched: bool = True
