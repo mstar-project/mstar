@@ -1471,7 +1471,8 @@ async fn images_edits(State(st): State<AppState>, mut mp: Multipart) -> Response
     // Multipart (image file + prompt + passthrough fields), parsed manually so
     // arbitrary model knobs (e.g. cfg_*_scale) flow through as model_kwargs.
     // `size` is kept: the adapter maps "WxH" onto the model's width / height
-    let known = ["model"];
+    // a text field named like the image list is dropped, as the Python frontend drops it
+    let known = ["model", "image", "image[]"];
     // every image, in upload order, with its filename. The Python frontend refuses the same requests, in the same
     // order and with the same text (`images_edits` in mstar/api_server/openai/router.py).
     let mut images: Vec<(Vec<u8>, Option<String>)> = Vec::new();
@@ -1503,7 +1504,7 @@ async fn images_edits(State(st): State<AppState>, mut mp: Multipart) -> Response
             let msg = format!("images/edits does not take a '{name}' upload; the whole image is edited");
             return error(400, &msg, "invalid_request_error");
         }
-        if name == "image" || name == "image[]" {
+        if has_file && (name == "image" || name == "image[]") {
             // refused before it is read, so no request writes more than this many files
             if images.len() == most {
                 let msg = format!("images/edits takes at most {most} images (MSTAR_MAX_MEDIA_FILES)");
@@ -2478,6 +2479,8 @@ mod tests {
             (vec![("image", Some("a.png")), ("response_format", None)], "response_format 'url' is not served; results are returned as b64_json"),
             // the Python frontend's answers to the same two (test_openai_router.py)
             (vec![("image", Some("a.png")), ("image[]", Some("empty.png"))], "images/edits: image 2 is empty"),
+            // a text field named `image` is no image
+            (vec![("image", None), ("image[]", Some("empty.png"))], "images/edits: image 1 is empty"),
             (vec![("image", Some("a.png")); 17], "images/edits takes at most 16 images (MSTAR_MAX_MEDIA_FILES)"),
         ] {
             let parts: Vec<(&str, Option<&str>, &[u8])> = fields

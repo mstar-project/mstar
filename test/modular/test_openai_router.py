@@ -863,15 +863,19 @@ def test_images_edits_takes_every_reference_image_in_order(client_and_stub):
     assert [Path(p).read_bytes() for p in stub.last_submit["file_paths"]["image"]] == uploads
 
 
-@pytest.mark.parametrize("uploads,message", [
-    ([b"\x89PNGone", b""], "images/edits: image 2 is empty"),
-    ([b"\x89PNGone"] * 17, "images/edits takes at most 16 images (MSTAR_MAX_MEDIA_FILES)"),
-], ids=["empty", "past-the-file-cap"])
-def test_images_edits_refuses_an_empty_image_or_too_many_as_the_rust_frontend_does(client_and_stub, uploads, message):
+@pytest.mark.parametrize("uploads,fields,message", [
+    ([b"\x89PNGone", b""], {}, "images/edits: image 2 is empty"),
+    ([b""], {"image": "x"}, "images/edits: image 1 is empty"),  # a text field named image is no image
+    ([b"\x89PNGone"] * 17, {}, "images/edits takes at most 16 images (MSTAR_MAX_MEDIA_FILES)"),
+], ids=["empty", "text-image-field", "past-the-file-cap"])
+def test_images_edits_refuses_an_empty_image_or_too_many_as_the_rust_frontend_does(
+    client_and_stub, uploads, fields, message,
+):
     """The same 400 text as ``an_edit_refuses_what_it_would_drop`` in rust/server/src/main.rs."""
     client, stub = client_and_stub
     stub.model_name = "flux2_klein"
-    resp = client.post("/v1/images/edits", files=[("image[]", ("in.png", u)) for u in uploads], data={"prompt": "x"})
+    resp = client.post("/v1/images/edits", files=[("image[]", ("in.png", u)) for u in uploads],
+                       data={"prompt": "x", **fields})
     assert (resp.status_code, resp.json()["error"]["message"]) == (400, message)
     assert stub.last_submit is None and not any(stub.upload_dir.iterdir())
 
