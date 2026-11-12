@@ -3803,7 +3803,7 @@ impl GraphRuntime {
         })?;
         // The graph is resolved per walk in the loop below: a completion that
         // spans a combined walk has no single `c.wg`.
-        let mut emit_inline = std::mem::take(&mut c.emit_inline);
+        let emit_inline = std::mem::take(&mut c.emit_inline);
         let stream_inline = std::mem::take(&mut c.stream_inline);
         let mut plan = SendPlan {
             partition: c.partition.clone(),
@@ -3853,12 +3853,16 @@ impl GraphRuntime {
                 let name = self.interner.name(e.name).to_string();
                 match e.dest {
                     Dest::EmitToClient => match emit_inline.get(&rid) {
-                        Some((sig, _, _)) if *sig == e.name => {
-                            let (_, modality, run) = emit_inline.remove(&rid).unwrap_or_default();
-                            let modality = self.interner.name(modality).to_string();
+                        Some(&(sig, modality, ref run)) if sig == e.name => {
                             // one row of the frame per iteration, in order
                             for (j, &value) in run.values().iter().enumerate() {
-                                plan.emit_inline.push((rid, name.clone(), modality.clone(), value, run.first() + j as u32));
+                                plan.emit_inline.push((
+                                    rid,
+                                    name.clone(),
+                                    self.interner.name(modality).to_string(),
+                                    value,
+                                    run.first() + j as u32,
+                                ));
                             }
                         }
                         _ => plan.emit.push((
@@ -4105,15 +4109,20 @@ impl GraphRuntime {
             let mut row_logprobs: Vec<Option<f64>> = Vec::new();
             for (rid, value, iteration) in items {
                 let request_id = self.rid_name(rid)?;
-                let idx = nested.get(&rid).map(|(order, indices, fwd)| {
-                    // the iteration of the innermost loop this value is
-                    let inner = order.last().copied();
-                    let indices = indices
-                        .iter()
-                        .map(|&(name, at)| (name, if Some(name) == inner { at + iteration } else { at }))
-                        .collect();
-                    (order.clone(), indices, *fwd)
-                });
+                // the step's loop context, advanced to the innermost loop's
+                // iteration this value is (a repeated step's)
+                let idx = if iteration == 0 {
+                    nested.get(&rid).cloned()
+                } else {
+                    nested.get(&rid).map(|(order, indices, fwd)| {
+                        let inner = order.last().copied();
+                        let indices = indices
+                            .iter()
+                            .map(|&(name, at)| (name, if Some(name) == inner { at + iteration } else { at }))
+                            .collect();
+                        (order.clone(), indices, *fwd)
+                    })
+                };
                 if let Some(info) = self.requests[rid as usize].as_mut() {
                     info.pending.output_signals.push(sig);
                 }

@@ -89,10 +89,11 @@ impl TokenColumn {
             return None;
         }
         let run = |rid: u32, row: usize| {
-            let end = kept.get(&rid).map_or(self.width, |&k| (k as usize).min(self.width));
-            if (self.start, end) == (0, 1) {
+            // a step that ran once: its one value, whatever its stop
+            if (self.start, self.width) == (0, 1) {
                 return InlineRun::One(self.read_at(row, 0));
             }
+            let end = kept.get(&rid).map_or(self.width, |&k| (k as usize).min(self.width));
             InlineRun::Run { first: self.start as u32, values: (self.start..end).map(|j| self.read_at(row, j)).collect() }
         };
         if row_rids.len() >= rids.len() && row_rids[..rids.len()] == rids[..] {
