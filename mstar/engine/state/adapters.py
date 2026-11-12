@@ -6,11 +6,12 @@ import functools
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, astuple, dataclass, replace
+from functools import partial
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
 
 import torch
 
-from mstar.distributed.communication import CommGroup
+from mstar.engine.resources.attn.base import AttentionManager
 from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec, AttentionStep
 from mstar.engine.resources.attn.ragged.config import (
     RaggedAttentionConfig,
@@ -37,7 +38,7 @@ from mstar.engine.resources.recurrent.config import (
 from mstar.engine.resources.sampler.config import SamplerSpec, SamplerStep, SamplingReqConfig
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
 from mstar.engine.resources.step import Segment, SubmoduleStep
-from mstar.engine.state.analysis import both_sharded, narrows_heads, position_key, query_array
+from mstar.engine.state.analysis import position_key, query_array
 from mstar.engine.state.calls import ArrayHandle, SamplerHandle, pool_layers, segments_of
 from mstar.engine.state.contract import (
     EMPTY,
@@ -65,11 +66,6 @@ from mstar.engine.state.contract import (
 )
 from mstar.engine.state.host_fields import HostFields, is_host_value
 from mstar.model.components.diffusion.attention import FrameSDPA, joint_attention, sdpa_attention
-from mstar.model.components.distributed.sequence_parallel import (
-    attention_over_sharded_keys,
-    sp_seq_split,
-    ulysses_attention,
-)
 
 if TYPE_CHECKING:
     from mstar.engine.state.state_op import StateOp
@@ -108,9 +104,6 @@ def _resolve(arrays: Sequence[Array], setup: "StateSetup") -> "Resolved":
     by_storage: dict[Storage, list[Array]] = {}
     for array in arrays:
         storage = storage_of(array)
-        if array.seq_sharded and not storage.takes_seq_sharded:
-            raise _no_layout(array, "seq_sharded takes max_len 0, and an array that keeps entries keeps them whole on "
-                                    "each rank")
         by_storage.setdefault(storage, []).append(array)
     specs: dict[str, list[NodeResourceSpec]] = {}
     bound: dict[str, tuple[BoundOp, ...]] = {}
@@ -275,28 +268,27 @@ def _apply_kernel_settings(
 
 
 def node_handles(
-    model: "Model", node: str, resources: Mapping[str, Any], *, sp_group: CommGroup | None = None,
-    setup: "StateSetup | None" = None,
+    model: "Model", node: str, resources: Mapping[str, Any], *, setup: "StateSetup | None" = None,
 ) -> dict[str, ArrayHandle | SamplerHandle]:
     """``node``'s handles, by declared name, over its built ``resources``, each read bound as ``setup`` binds it."""
     setup = setup or StateSetup()
     declarations = model.declare_state()
     resolved = _resolve([declared for declared in declarations if isinstance(declared, Array)], setup)
     return {
-        declared.name: build_handle(declared, resources, resolved, setup, sp_group)
+        declared.name: build_handle(declared, resources, resolved, setup)
         for declared in declarations if node in declared.nodes
     }
 
 
 def build_handle(
     declared: Array | Sampler, resources: Mapping[str, Any], resolved: "Resolved",
-    setup: "StateSetup | None" = None, sp_group: CommGroup | None = None,
+    setup: "StateSetup | None" = None,
 ) -> ArrayHandle | SamplerHandle:
     """``declared``'s handle over the built ``resources``, with each of its ops bound to the resource ``resolved``
     gives it."""
     if isinstance(declared, Sampler):
         return SamplerHandle(declared, resources[declared.name])
-    return storage_of(declared).handle(declared, resources, setup or StateSetup(), resolved, sp_group)
+    return storage_of(declared).handle(declared, resources, setup or StateSetup(), resolved)
 
 
 def state_steps(step: SubmoduleStep | None, handles: Mapping[str, ArrayHandle | SamplerHandle]) -> SubmoduleStep | None:
@@ -393,8 +385,8 @@ class WithinStepSteps(StepBuilder):
         self._fixed: dict[str, bool] = {}
 
     def add(self, handle: "WithinStepHandle", declared: ArrayStep, step: SubmoduleStep) -> None:
-        """Plan ``handle``'s read over the segments its kernel sees. A Ulysses read runs over whole segments after the
-        exchange, and any other over this rank's share of a sharded side."""
+        """Plan ``handle``'s read over the step's whole segments: on a step the node's sequence shard splits, the
+        resource narrows a split side to this rank's share itself."""
         if not handle._plans:
             return
         key = handle.resource_key
@@ -709,6 +701,12 @@ class ConvOnLinearAttn(OpBinding):
 # Handles
 
 
+def _exchanges(attn: Any) -> bool:
+    """Whether a call on ``attn`` goes through its exchange (`AttentionManager.splits`); a stand-in attention, which
+    is no `AttentionManager`, keeps the direct call."""
+    return isinstance(attn, AttentionManager) and attn.splits
+
+
 class PagedArrayHandle(ArrayHandle):
     """Adds and reads through the KV pages of an array that keeps entries."""
 
@@ -740,19 +738,57 @@ class PagedArrayHandle(ArrayHandle):
                 raise self._refusal(f"a step touches label {segment.label!r} of request {segment.request_id}, "
                                     "which it didn't open")
 
-    def _holds(self, layer: int) -> bool:
-        """Whether this layer's add waits for its read: the kernel takes k and v there rather than from the pages."""
-        attn = self._attn.get(layer)
-        return attn is not None and not attn.requires_kv_write
+    def begin_step(self, step) -> None:
+        super().begin_step(step)
+        # adds that run before the reads, outside the captured graph, which the reads find in the pages
+        self._eager = step.state[self.name].eager_add
+
+    def check_step(self, step) -> None:
+        # in the step's forward, before its commit: the last add, if its layer went unread
+        self._write_unread()
+        super().check_step(step)
 
     @torch.compiler.disable
     def add(self, layer: int | torch.Tensor, *, keep: bool | None = None, **fields: torch.Tensor) -> None:
         layer = self._layer_id(layer)
         self._record_add(layer, keep)
-        if self._holds(layer):
-            self._held, self._held_layer = (fields["k"], fields["v"]), layer
+        self._write_unread()
+        k, v = fields["k"], fields["v"]
+        attn = self._attn.get(layer)
+        if self._eager and attn is not None and self._needs_step_kv(attn):
+            raise self._refusal(
+                f"an eager_add step adds layer {layer} outside the graph and keeps nothing for its read, and that read "
+                "needs the step's own k and v (an exchange, a context-parallel pool on a multi-token step, or the "
+                "dense backend)")
+        if attn is None or self._eager:
+            self._write(layer, k, v)
             return
-        self._kv.write_kv(fields["k"], fields["v"], layer_idx=self._pool_layer[layer], label=self.label)
+        # held for the read, which passes them on as a layer calls attention (`requires_kv_write`): a kernel may
+        # attend the step's own k and v rather than the pages (`reads_step_kv`), and an exchange writes them
+        self._held, self._held_layer = (k, v), layer
+        if not _exchanges(attn):
+            self._write(layer, k, v)
+
+    def _write(self, layer: int, k: torch.Tensor, v: torch.Tensor) -> None:
+        """``layer``'s write alone, where its kernel reads the pages: through the exchange where the attention
+        exchanges, as `AttentionCallable.write` makes it."""
+        attn = self._attn.get(layer)
+        if attn is not None and _exchanges(attn):
+            attn.exchange(partial(self._attend, layer), None, k, v, label=self.label)
+        elif attn is None or attn.requires_kv_write:
+            self._kv.write_kv(k, v, layer_idx=self._pool_layer[layer], label=self.label)
+
+    def _write_unread(self) -> None:
+        """Write the held add of a layer the step didn't read where its write waits for the read's exchange, so
+        each add is written once: when the next add or the step's check finds it still held."""
+        layer = self._held_layer
+        if layer is not None and _exchanges(self._attn[layer]):
+            self._write(layer, *self._take_hold(layer))
+
+    def _needs_step_kv(self, attn: Any) -> bool:
+        """Whether a read through ``attn`` attends the step's own k and v rather than only the pages, or goes through
+        its exchange."""
+        return _exchanges(attn) or attn.reads_step_kv(self.label)
 
     @torch.compiler.disable
     def read(self, layer: int | torch.Tensor, q: torch.Tensor | None = None, **mask_args: Any) -> torch.Tensor:
@@ -762,10 +798,25 @@ class PagedArrayHandle(ArrayHandle):
             raise self._no_layout(f"mask arguments {sorted(mask_args)}, which no mask defines")
         layer = self._layer_id(layer)
         self._record_read(layer)
-        k, v = self._take_hold(layer) if self._holds(layer) else (None, None)
-        return self._attn[layer].run(
+        attn = self._attn[layer]
+        if _exchanges(attn):
+            # the add's write and the attention as one call, on the tokens and heads this rank stores
+            return attn.exchange(partial(self._attend, layer), q, *self._take_hold(layer), label=self.label)
+        # a read with no add before it attends the pages alone, which a kernel that takes no writes can't
+        k, v = self._take_hold(layer) if self._held is not None or not attn.requires_kv_write else (None, None)
+        return attn.run(
             q, label=self.label, kv_cache_layer=self._views[layer], k=k, v=v, layer_idx=self._pool_layer[layer],
         )
+
+    def _attend(self, layer: int, q: torch.Tensor | None, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor | None:
+        """An exchange's ``run``: this layer's write where the kernel reads the pages, then its attention (``q``
+        None: the write alone), as `AttentionCallable` makes the call."""
+        attn, i = self._attn[layer], self._pool_layer[layer]
+        if attn.requires_kv_write:
+            self._kv.write_kv(k, v, layer_idx=i, label=self.label)
+        if q is None:
+            return None
+        return attn.run(q, label=self.label, kv_cache_layer=self._views[layer], k=k, v=v, layer_idx=i)
 
     def at_last_token(self, x: torch.Tensor) -> torch.Tensor:
         self._check_open("at_last_token")
@@ -773,13 +824,28 @@ class PagedArrayHandle(ArrayHandle):
 
     def takes_fused(self, op: "StateOp") -> bool:
         """An op that adds to the array, on a pool in one of its formats, while no layer's read takes k and v at its
-        kernel, which would never see the pages the op writes."""
+        kernel, which would never see the pages the op writes. A step whose reads attend its own k and v also runs
+        the reference (``fused_ops``)."""
         cache = self._kv.kv_cache
         dtype, device = cache.dtype, cache.device.type
-        return bool(op.adds) and cache.layout is KVLayout.NHD and not any(map(self._holds, self.array.layers)) and any(
+        dense = any(not attn.requires_kv_write for attn in self._attn.values())
+        return bool(op.adds) and cache.layout is KVLayout.NHD and not dense and any(
             (fmt.dtypes is None or dtype in fmt.dtypes) and (fmt.devices is None or device in fmt.devices)
             for fmt in op.formats
         )
+
+    @property
+    def fused_ops(self) -> frozenset[str]:
+        # A fused op writes the pages itself and never passes k and v through `add`, so on a step whose reads attend
+        # the step's own k and v (a context-parallel pool's multi-token step: `reads_step_kv`) every op runs its
+        # reference. Fixed once the step is planned, so a captured bucket replays the same choice.
+        if any(map(self._needs_step_kv, self.reads.values())):
+            return frozenset()
+        return self._fused_ops
+
+    @fused_ops.setter
+    def fused_ops(self, ops: frozenset[str]) -> None:
+        self._fused_ops = ops
 
     def fused_target(self, layer: int) -> PagedNHDTarget:
         """Record ``layer``'s add, which a fused op makes, and give where it writes the step's entries."""
@@ -882,45 +948,25 @@ class HostValueHandle(ArrayHandle):
         return fields
 
 
-class RowLayout(ABC):
-    """How a within-step read's rows hold a step's segments. Its handle picks one at bind, from the read."""
+class RowLayout:
+    """How a within-step read's rows hold a step's segments: here a row a segment, all of one span, which keeps
+    nothing of its step. Its handle picks one at bind, from the read."""
 
     # whether a step that lists the array opens, whatever the read's binding
-    must_open: ClassVar[bool]
+    must_open: ClassVar[bool] = False
 
     def __init__(self, handle: "WithinStepHandle"):
         self._handle = handle
 
-    @abstractmethod
-    def begin(self, segments: Sequence[Segment], world_size: int | None) -> list[int] | None:
-        """Take a step's ``segments``, and give each rank's share of a row under a Ulysses exchange over
-        ``world_size`` ranks, None with no exchange."""
+    def begin(self, segments: Sequence[Segment]) -> None:
+        """Take a step's ``segments``."""
 
-    @abstractmethod
     def end(self) -> None:
         """Drop what the step's segments gave."""
 
     def sdpa(self, run: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]:
         """The SDPA a read on these rows runs, given ``run`` over whole rows."""
         return run
-
-
-class SpanRows(RowLayout):
-    """A row a segment, all of one span."""
-
-    must_open = False
-
-    def begin(self, segments: Sequence[Segment], world_size: int | None) -> list[int] | None:
-        if world_size is None:
-            return None
-        spans = {s.span for s in segments}
-        if len(spans) > 1:
-            raise self._handle._no_layout(f"a Ulysses exchange over spans {sorted(spans)}, and mixed lengths need a "
-                                          "permutation in the unpack")
-        return sp_seq_split(spans.pop(), world_size) if spans else None
-
-    def end(self) -> None:
-        """A span row keeps nothing of its step."""
 
 
 class SegmentedRows(RowLayout):
@@ -936,14 +982,11 @@ class SegmentedRows(RowLayout):
         # guards, so its blocks don't retrace per layout.
         self._split = functools.partial(joint_attention, ragged=torch.compiler.disable(self._run))
 
-    def begin(self, segments: Sequence[Segment], world_size: int | None) -> list[int] | None:
+    def begin(self, segments: Sequence[Segment]) -> None:
         if len({s.request_id for s in segments}) > 1:
             raise self._handle._no_layout("a segmented read in a step of several requests, whose rows need a split "
                                           "each")
         self._frames.lengths = [s.span for s in segments]
-        if world_size is None or not segments:
-            return None
-        return sp_seq_split(sum(self._frames.lengths), world_size)
 
     def end(self) -> None:
         self._frames.lengths = None
@@ -1025,8 +1068,8 @@ class CrossQueries(Queries):
         if query_segments is None:
             raise ValueError(f"Array {name!r}: a step lists it with no segments, its own or the step's")
         key = handle.resource_key
-        q_label = steps._label(key, self.array, handle.query_share(query_segments))
-        steps._pairs.setdefault(key, []).append((q_label, steps._label(key, handle.array, handle.key_share(segments))))
+        q_label = steps._label(key, self.array, query_segments)
+        steps._pairs.setdefault(key, []).append((q_label, steps._label(key, handle.array, segments)))
 
     def step(self, segments, pairs: Sequence[tuple[str, str]], fixed: bool) -> Any:
         return RaggedCrossAttentionStep(segments=tuple(segments), pairs=tuple(pairs))
@@ -1043,14 +1086,13 @@ class WithinStepHandle(ArrayHandle):
     stays in that graph through ``mstar::ragged_attention``. A check here runs only while not compiling: it would guard
     on the layer, and the block would retrace per layer.
 
-    ``queries`` says whose segments lay out the read's queries. Under sequence parallelism the two flags pick the
-    exchange: Ulysses when both sides are sharded, none when only the queries are, and a merge of the
-    ranks' partial attentions when only the keys are. The read's binding supplies the attention each exchange runs.
+    ``queries`` says whose segments lay out the read's queries. Under sequence parallelism the read's resource picks
+    the exchange per step from the node's sequence shard, which says whether the step splits the array's label: the
+    handle hands it whole segments and calls its ``run``, and exchanges nothing itself.
     """
 
     def __init__(
-        self, array: Array, resources: Mapping[str, Any], bindings: tuple[BoundOp, ...], resolved: "Resolved", *,
-        sp_group: CommGroup | None = None,
+        self, array: Array, resources: Mapping[str, Any], bindings: tuple[BoundOp, ...], resolved: "Resolved",
     ):
         super().__init__(array, resources)
         self._bindings = bindings
@@ -1062,18 +1104,10 @@ class WithinStepHandle(ArrayHandle):
         self._packed = read.packed
         # a plain attribute, which a compiled caller's trace reads as a constant
         self._plans = self._binding.plans
-        self._sp = sp_group
-        sharded = sp_group is not None and sp_group.world_size > 1
-        self._keys_sharded = sharded and array.seq_sharded
-        self._queries_sharded = sharded and queries.array.seq_sharded
-        self._ulysses = sharded and both_sharded(array, queries.array)
-        self._rows = (SegmentedRows if read.segmented else SpanRows)(self)
-        # A read on SDPA plans nothing, so a step needs to run for it only to learn a Ulysses exchange's rank sizes.
-        self.needs_step = self._plans or self._rows.must_open or self._ulysses
-        self._seq_sizes: list[int] | None = None
+        self._rows = (SegmentedRows if read.segmented else RowLayout)(self)
+        self.needs_step = self._plans or self._rows.must_open
         self._plan_label = queries.plan_label(array)
-        # One callable per array, not per layer: Dynamo specializes `ulysses_attention` on the identity of the callable
-        # it runs, so a callable per layer would retrace that frame per layer.
+        # One callable per array, not per layer: a callable per layer would retrace a compiled caller per layer.
         self._attend = self._binding.attend(self.first_read, self._plan_label, self._rows)
 
     def begin_step(self, step) -> None:
@@ -1082,7 +1116,7 @@ class WithinStepHandle(ArrayHandle):
             return
         segments = segments_of(step.state[self.name], step) or ()
         self.queries.check(self, segments, step)
-        self._seq_sizes = self._rows.begin(segments, self._sp.world_size if self._ulysses else None)
+        self._rows.begin(segments)
 
     def end_step(self, step) -> None:
         super().end_step(step)
@@ -1095,18 +1129,6 @@ class WithinStepHandle(ArrayHandle):
         super()._check_storage(declared, segments, ctx)
         if declared.forks:
             raise self._refusal("a step forks an array with max_len 0, which keeps nothing to fork")
-
-    def query_share(self, segments: Sequence[Segment]) -> tuple[Segment, ...]:
-        """The query layout this read's plan sees of ``segments``, the query array's in this step."""
-        return self._share(segments) if self._queries_sharded and not self._ulysses else tuple(segments)
-
-    def key_share(self, segments: Sequence[Segment]) -> tuple[Segment, ...]:
-        """The key layout this read's plan sees of ``segments``, this array's in this step."""
-        return self._share(segments) if self._keys_sharded and not self._ulysses else tuple(segments)
-
-    def _share(self, segments: Sequence[Segment]) -> tuple[Segment, ...]:
-        world_size, rank = self._sp.world_size, self._sp.rank
-        return tuple(s._replace(span=sp_seq_split(s.span, world_size)[rank]) for s in segments)
 
     def add(self, layer: int | torch.Tensor, *, keep: bool | None = None, **fields: torch.Tensor) -> None:
         """Hold k and v for this layer's read. Every add here is scratch."""
@@ -1133,10 +1155,6 @@ class WithinStepHandle(ArrayHandle):
             if not self._packed:
                 raise self._refusal("packed queries on a read declared packed=False")
             return self.first_read.run(q, k, v, label=self._plan_label)
-        if self._ulysses:
-            return ulysses_attention(self._sp, q, k, v, self._attend, self._seq_sizes, seq_dim=1, head_dim=2)
-        if self._keys_sharded:
-            return attention_over_sharded_keys(self._sp, q, k, v, self._attend)
         return self._attend(q, k, v)
 
 
@@ -1160,9 +1178,6 @@ class Storage(ABC):
     handle_class: ClassVar[type[ArrayHandle]]
     # the pool sizes `kernel_settings` may set under the array's name, until the engine sizes its pools itself
     kernel_settings: ClassVar[frozenset[str]] = frozenset()
-    # whether an array here may be seq_sharded, so its calls carry a rank's share of a step's tokens
-    takes_seq_sharded: ClassVar[bool] = False
-
     def __init__(self):
         # `state_steps` reaches a handle's storage, for its step builder, through the handle's class
         self.handle_class.storage = self
@@ -1174,7 +1189,6 @@ class Storage(ABC):
 
     def handle(
         self, array: Array, resources: Mapping[str, Any], setup: "StateSetup", resolved: Resolved,
-        sp_group: CommGroup | None,
     ) -> ArrayHandle:
         """``array``'s handle over a node's built ``resources``."""
         return self.handle_class(array, resources, resolved.bound[array.name], resolved)
@@ -1301,7 +1315,6 @@ class HostValueStorage(Storage):
 
     def handle(
         self, array: Array, resources: Mapping[str, Any], setup: "StateSetup", resolved: Resolved,
-        sp_group: CommGroup | None,
     ) -> ArrayHandle:
         return HostValueHandle(array, setup.host_fields)
 
@@ -1310,7 +1323,6 @@ class WithinStepStorage(Storage):
     """An array with ``max_len`` 0, whose adds last only the step, so it has no pool."""
 
     handle_class = WithinStepHandle
-    takes_seq_sharded = True
 
     def step_builder(self) -> StepBuilder:
         return WithinStepSteps()
@@ -1331,19 +1343,20 @@ class WithinStepStorage(Storage):
             )
             config = RaggedAttentionConfig(
                 num_qo_heads=read.op.q_heads, num_kv_heads=heads, head_dim=head_dim, dtype=dtype,
-                shard_over_sp=narrows_heads(array, queries.array, declared),
             )
             spec = queries.spec_class(resource_key=key, nodes=array.nodes, config=config)
             spec = shared.setdefault((queries.spec_class, array.nodes, astuple(config)), spec)
             resolved.resource_of[key] = spec.resource_key
+            if bound.binding.plans and isinstance(spec, RaggedAttentionSpec):
+                # the labels the node's sequence shard may split (`RaggedAttentionSpec.derive`)
+                spec.labels = spec.labels | {_plan_label(array)}
             resolved.specs[array.name] = [spec] if bound.binding.plans and spec.resource_key == key else []
         return resolved
 
     def handle(
         self, array: Array, resources: Mapping[str, Any], setup: "StateSetup", resolved: Resolved,
-        sp_group: CommGroup | None,
     ) -> ArrayHandle:
-        return WithinStepHandle(array, resources, resolved.bound[array.name], resolved, sp_group=sp_group)
+        return WithinStepHandle(array, resources, resolved.bound[array.name], resolved)
 
 
 PAGED = PagedStorage()

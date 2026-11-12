@@ -50,12 +50,12 @@ class _Model(StubModel):
         return _NODES[node_name]()
 
 
-def _build(model) -> EngineManager:
+def _build(model, parallel_groups: WorkerParallelGroups | None = None) -> EngineManager:
     return EngineManager.build(
         node_names=set(_NODES),
         device=torch.device("cpu"),
         model_config={"node_groups": [{"node_names": sorted(_NODES), "ranks": [0]}]},
-        parallel_groups=WorkerParallelGroups(num_workers=1, global_rank=0),
+        parallel_groups=parallel_groups or WorkerParallelGroups(num_workers=1, global_rank=0),
         transfer_engine_info=TransferEngineInfo(
             my_entity_id="test", my_session_id="test", transfer_engine=None,
         ),

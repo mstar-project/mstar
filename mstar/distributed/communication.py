@@ -1,3 +1,4 @@
+import functools
 import socket
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -282,6 +283,22 @@ class CommGroup:
         dist.broadcast(tensor, self.group_members[src], self._device_pg())
         return tensor
 
+    def to_partners(self, blocks: torch.Tensor, partners: Sequence[int]) -> torch.Tensor:
+        """``blocks[j]`` to group rank ``partners[j]`` (ascending, this rank among them), and back
+        the block each partner sent this rank, in the same order: one all-to-all over the whole
+        group with nothing sent to or from the ranks outside ``partners``. Every member calls it,
+        with partner sets that pair up (a lists b exactly when b lists a). Replays from a CUDA
+        graph."""
+        if self.world_size == 1:
+            return blocks
+        blocks = blocks.contiguous()
+        splits = [0] * self.world_size
+        for partner in partners:
+            splits[partner] = blocks[0].numel()
+        recv = torch.empty_like(blocks)
+        _all_to_all_single(self._device_pg(), blocks.view(-1), recv.view(-1), splits, splits)
+        return recv
+
     # Eager as a whole, the boundary where the per-rank sizes become the collective's host split
     # lists: traced, its branches on them would compile per sequence length, and a traced variant
     # that kept them symbolic measured no faster on Cosmos3 SP.
@@ -380,6 +397,44 @@ class CommGroup:
             for piece, shape in zip(recv.split(numels), shapes, strict=True)
         ]
         return torch.cat(pieces, dim=gather_dim)
+
+
+def sp_seq_split(total: int, world_size: int) -> list[int]:
+    """Even per-rank token counts summing to ``total``, earlier ranks taking the remainder: how a
+    sequence splits over a group's ranks, contiguous in rank order. Arithmetic only, so a
+    compiled caller traces it without a graph break, a dynamic ``total`` staying symbolic."""
+    return [(total + world_size - 1 - r) // world_size for r in range(world_size)]
+
+
+def gather_sequence(group: CommGroup, x_shard: torch.Tensor, seq_sizes: Sequence[int], dim: int = 0) -> torch.Tensor:
+    """Every rank's share along ``dim`` (``seq_sizes``, per rank) back as the whole tensor, in rank
+    order. Each share is padded to the largest, so every rank gathers the same shape, then trimmed.
+    Without a branch on the sizes, so a compiled caller keeps them symbolic and compiles once for
+    every sequence length."""
+    world_size = group.world_size
+    if world_size == 1:
+        return x_shard
+    dim %= x_shard.dim()  # positive: unflatten below adds a dim, which would shift a negative one
+    max_sz = functools.reduce(torch.sym_max, seq_sizes)
+    shape = list(x_shard.shape)
+    shape[dim] = max_sz
+    local = x_shard.new_empty(shape)
+    local.narrow(dim, 0, x_shard.size(dim)).copy_(x_shard)
+    chunks = group.all_gather(local, dim=dim).unflatten(dim, (world_size, max_sz)).unbind(dim)
+    return torch.cat([chunk.narrow(dim, 0, n) for chunk, n in zip(chunks, seq_sizes, strict=True)], dim=dim)
+
+
+def my_rows(group: CommGroup, batch: int) -> slice:
+    """This rank's even share of ``batch`` leading rows, for a comm group that
+    splits a batch rather than the sequence (e.g. CFG branches over the cfg
+    group). No communication; ``group.all_gather(x, dim=0)`` reassembles the
+    batch, and a trivial group keeps every row. A batch the group cannot
+    split evenly is refused: every rank holds the same ``batch`` and group, so
+    all of them raise."""
+    share, rem = divmod(batch, group.world_size)
+    if rem or not share:
+        raise ValueError(f"cannot split {batch} rows evenly over a {group.world_size}-rank group")
+    return slice(group.rank * share, (group.rank + 1) * share)
 
 
 @dataclass

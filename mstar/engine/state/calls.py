@@ -186,7 +186,7 @@ class ArrayHandle(StepHandle):
         held = self._held
         if held is None:
             raise self._refusal(f"a read on layer {layer} with no add before it")
-        self._held = None
+        self._held = self._held_layer = None
         return held
 
     def add(self, layer: int | torch.Tensor, *, keep: bool | None = None, **fields: torch.Tensor) -> None:

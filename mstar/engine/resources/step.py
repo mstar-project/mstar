@@ -32,6 +32,10 @@ class Segment(NamedTuple):
 class ResourceStep:
     # Work for one resource, for one step
     segments: tuple[Segment, ...] | None = None
+    # source labels -> the plan label one forward packs them under (batched CFG, say); the
+    # resources that plan the step's layout (KV, the sequence shard) read it. Out of the hash, so a
+    # step without other unhashable fields stays hashable
+    combined_labels: dict[tuple[str, ...], str] = field(default_factory=dict, kw_only=True, hash=False)
 
 @dataclass(frozen=True)
 class BucketKey:
@@ -137,6 +141,10 @@ class StepContext:
     # plan prefill attention even when every row is one token: a packed
     # capture's forward reads per-row token offsets
     force_prefill: bool = False
+    # How many times this step's capture replays: the host plans once and the
+    # step counts for this many iterations. The worker asks, and `StepRunner`
+    # narrows it to what the step's resources allow (`Resource.max_repeats`).
+    repeats: int = 1
     # the node's `ResidentPlanner` when this step's capture reads the resident
     # tables: a resource then stages nothing per row (see `resources/resident.py`)
     resident: Any = None
@@ -235,6 +243,10 @@ class SubmoduleStep:
     # used for convenience only: if a ResourceStep does not specify segments,
     # it gets this list
     segments: list[Segment] | None = None
+    # the labels this step's forward packs together, declared once here: every ResourceStep
+    # that doesn't set its own gets it, and a ResourceStep that sets any other (or any, when this is empty)
+    # is refused, so the KV plan and the sequence shard agree
+    combined_labels: dict[tuple[str, ...], str] = field(default_factory=dict, kw_only=True)
 
     # Matches additional_key_info in CudaGraphConfig
     cg_key_info: Any | None = None
@@ -248,11 +260,27 @@ class SubmoduleStep:
     state_handles: tuple[StepHandle, ...] = field(default=(), init=False)
 
     def __post_init__(self):
-        if self.segments is None:
-            return
-        for step in self.steps.values():
-            if step.segments is None:
+        if not self.combined_labels:
+            for key, step in self.steps.items():
+                if step.combined_labels:
+                    raise ValueError(
+                        f"step {key!r} declares combined_labels {step.combined_labels}, its submodule step none: "
+                        "declare them once, on the SubmoduleStep"
+                    )
+            if self.segments is None:
+                return
+        for key, step in self.steps.items():
+            if step.segments is None and self.segments is not None:
                 object.__setattr__(step, "segments", self.segments)
+            if not self.combined_labels:
+                continue
+            if not step.combined_labels:
+                object.__setattr__(step, "combined_labels", self.combined_labels)
+            elif step.combined_labels != self.combined_labels:
+                raise ValueError(
+                    f"step {key!r} declares combined_labels {step.combined_labels}, its submodule step "
+                    f"{self.combined_labels}: declare them once, on the SubmoduleStep"
+                )
 
     @property
     def ctx(self):

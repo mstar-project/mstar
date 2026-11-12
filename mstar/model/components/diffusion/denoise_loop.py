@@ -534,7 +534,7 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         return SubmoduleStep(
             segments=[
                 Segment(request_id=rid, label=label, span=span)
-                for rid, arrays in rows for spans in arrays.values() for label, span in spans
+                for rid, arrays in rows for spans in _by_label(arrays).values() for label, span in spans
             ],
             state={
                 name: ArrayStep(segments=tuple(
@@ -648,3 +648,19 @@ class UniPCDenoiseLoopSubmodule(DenoiseLoopSubmodule):
 # wiring, tests). A subclass overrides the class attributes, not these.
 LATENTS = DenoiseLoopSubmodule.LATENTS
 MAIN_SPAN = DenoiseLoopSubmodule.MAIN_SPAN
+
+
+def _by_label(arrays: Mapping[str, Sequence[tuple[str, int]]]) -> dict[str, list[tuple[str, int]]]:
+    """One request's ``(label, span)`` segments, each label's once: the node's step (which the sequence shard and the
+    LoRA pools plan from) holds a request's tokens once, however many arrays its layers attend them through. Two arrays
+    of one label lay out the same tokens, so they must give it the same segments."""
+    by_label: dict[str, list[tuple[str, int]]] = {}
+    for name, spans in arrays.items():
+        mine: dict[str, list[tuple[str, int]]] = {}
+        for label, span in spans:
+            mine.setdefault(label, []).append((label, span))
+        for label, segments in mine.items():
+            if by_label.setdefault(label, segments) != segments:
+                raise ValueError(f"array {name!r} lays out label {label!r} as {segments}, and another array as "
+                                 f"{by_label[label]}: arrays of one label hold the same tokens")
+    return by_label

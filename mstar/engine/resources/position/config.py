@@ -6,7 +6,7 @@ without pulling FlashInfer in behind it.
 
 import math
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any
 
@@ -152,9 +152,19 @@ class PositionConfig:
 @dataclass
 class PositionSpec(NodeResourceSpec):
     config: PositionConfig
+    # the sequence shard over its nodes, if any (`derive`): a split label's positions are its range's
+    shard_key: str | None = field(default=None, init=False, repr=False)
 
     def depends_on(self) -> set[str]:
-        return {self.config.kv_cache}
+        keys = {self.config.kv_cache}
+        if self.shard_key is not None:
+            keys.add(self.shard_key)
+        return keys
+
+    def derive(self, specs: Mapping[str, NodeResourceSpec]) -> list[str]:
+        from mstar.engine.resources.sequence_shard import take_shard_edge
+
+        return take_shard_edge(self, specs)
 
     def request_config(self, model_kwargs: dict | None) -> "PositionReqConfig | None":
         """Under LongRoPE, the length the request's table is chosen by, from
@@ -187,5 +197,4 @@ class PositionStep(ResourceStep):
     # label -> ids for one step
     pos_ids: "dict[str, torch.Tensor] | torch.Tensor | None" = None
     advance: tuple[int, ...] | None = None  # `advance=None` means own rule
-    # no combined_labels: positions take the packing off KV's plan output,
-    # so the step declares the grouping once, on KVStep
+    # positions take their packing off KV's plan output, not off `combined_labels`

@@ -219,9 +219,8 @@ class OmnilingualASRModel(Model):
         device: str = "cpu",
         tp_group=None,
         autocast_dtype: torch.dtype | None = None,
-        sp_group=None,
     ) -> NodeSubmodule:
-        del tp_group, autocast_dtype, sp_group
+        del tp_group, autocast_dtype
         if node_name != ENCODER_NODE:
             raise ValueError(f"Unknown Omnilingual ASR node: {node_name!r}")
         if node_name not in self._submodule_cache:
