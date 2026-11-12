@@ -10,7 +10,6 @@ from mstar.conductor.routing import RoutingWeights
 from mstar.distributed.base import PARALLEL_AXES, ShardingConfig, node_group_axis_sizes
 from mstar.distributed.communication import GlobalParallelConfig
 from mstar.engine.resources.context_parallel import position_pools
-from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
 from mstar.engine.resources.sequence_shard import sequence_parallel_refusals
 from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.graph.base import GraphSection, self_triggered, top_level_entities
@@ -134,7 +133,6 @@ def check_worker_graphs(
         *_sharding_groups(worker_graphs, sharding_config),
         *_worker_parallelism(worker_graphs, specs or ()),
         *_sequence_parallel(worker_graphs, specs, moe_parallel or {}),
-        *_paged_kv_on_cfg_ranks(worker_graphs, specs or ()),
     ]
 
 
@@ -465,28 +463,6 @@ def _sharding_groups(
                 )
 
 
-def _paged_kv_on_cfg_ranks(
-    worker_graphs: Sequence[WorkerGraph], specs: Sequence[NodeResourceSpec],
-) -> Iterator[str]:
-    """A paged KV cache on a node with ``cfg_size > 1``: the pool's rank math
-    (prefix publishing, transfer slices) takes every instance rank for a head
-    shard, which a CFG rank isn't."""
-    for spec in specs:
-        if not (isinstance(spec, KVSpec) and isinstance(spec.config, PagedKVConfig)):
-            continue
-        wg = next((
-            wg for wg in worker_graphs
-            if wg.cfg_size > 1 and spec.nodes & wg.section.get_nodes().keys()
-        ), None)
-        if wg is not None:
-            yield (
-                f"KV {spec.resource_key}: a node with cfg_size > 1 can't hold a paged KV "
-                f"cache, since its CFG ranks run different branches ({_describe(wg)} has "
-                f"cfg_size {wg.cfg_size}). Make each branch its own node in a graph Parallel, "
-                "on a node group with cfg_size 1, as BAGEL's LLM_cfg_text and LLM_cfg_img are."
-            )
-
-
 def _placement(groups, node: str) -> str:
     """``node``'s ranks on each mesh axis on a worker, leaving out an axis of one rank."""
     axes = ((axis, groups.axis_groups[axis].get(node)) for axis in PARALLEL_AXES)
@@ -560,6 +536,21 @@ def _worker_parallelism(
             yield (
                 f"Resource spec {spec.resource_key} nodes {sorted(spec.nodes)} "
                 "must use the same parallel shape across replicas"
+            )
+        # Every cfg rank of an instance holds a full copy of a resource rank 0 decides for, but a transfer to
+        # another instance (`PublishedKVInfo`) pairs ranks by instance rank, as head shards. The resource's class is
+        # asked last: importing it imports its manager and kernels, which a one-instance deployment never needs here.
+        cfg = next((
+            wg for wg in worker_graphs if wg.cfg_size > 1 and spec.nodes & wg.section.get_nodes().keys()
+        ), None)
+        if (
+            cfg is not None and any_worker.resource_needs_remote_transfer(spec.nodes, set())
+            and spec.resource_class.journals_resident_moves()
+        ):
+            yield (
+                f"Resource {spec.resource_key}: its nodes span more than one lockstep instance, and "
+                f"{_describe(cfg)} has cfg_size {cfg.cfg_size}. A resource that rank 0 decides for (a paged KV "
+                "cache) must stay on one instance on cfg ranks: serve its nodes from one node group with one replica."
             )
         shared: dict[tuple[str, ...], list[str]] = {}
         for wid, nodes in deployed.items():

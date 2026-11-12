@@ -83,6 +83,8 @@ DEFAULT_CONFIGS: dict[str, str] = {
     "ripple_65b": "ripple_65b_tp4.yaml",
     "flux2_klein_9b": "flux2_klein_9b.yaml",
     "z_image_turbo": "z_image_turbo.yaml",
+    "qwen_image21": "qwen_image21.yaml",
+    "qwen_image21_turbo": "qwen_image21_turbo.yaml",
     "glm52": "glm52_tp8.yaml",
     "glm5_next": "glm5_next_tp8.yaml",
 }

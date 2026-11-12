@@ -1,0 +1,19 @@
+model: "qwen_image21"
+
+# Qwen-Image-2.1 with its DiT tensor-parallel over two GPUs: heads (and so the KV cache) shard,
+# the modulation, input projections and output head stay replicated. The encoders and the VAE
+# on rank 0. The prefix cache stays shut above one rank unless prefix_cache_tp is set.
+max_seq_len: 65536
+
+model_kwargs:
+  # the KV pool: 512 pages of 128 tokens, 32 GB; and the most one request may hold
+  max_num_pages: 512
+  max_seq_len: 65536
+  max_batch_size: 4
+
+node_groups:
+  - node_names: [text_encoder, vae_encoder, vae_decoder]
+    ranks: [0]
+  - node_names: [dit]
+    ranks: [0, 1]
+    tp_size: 2

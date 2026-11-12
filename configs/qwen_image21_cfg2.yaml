@@ -1,0 +1,27 @@
+model: "qwen_image21"
+
+# Qwen-Image-2.1 CFG-parallel on two GPUs: each rank runs one guidance branch (the prompt or the
+# negative prompt) of every guided row and the predictions are all-gathered each step, so a guided
+# step costs one branch's forward. Both ranks run every prefix walk and hold both labels' prefixes, so
+# each rank's KV pool is a full copy and the prefix cache serves both (rank 0 decides each hit).
+# The encoders and the VAE run on rank 0. An unguided request runs its one branch on both ranks.
+# The denoise steps run eager (dense attention): accelerator_graph is refused on cfg ranks.
+max_seq_len: 65536
+
+model_kwargs:
+  # the KV pool: 512 pages of 128 tokens, 32 GB; and the most one request may hold
+  max_num_pages: 512
+  max_seq_len: 65536
+  max_batch_size: 4
+
+resources:
+  kv:
+    prefix_cache_tp: true
+
+node_groups:
+  - node_names: [text_encoder, vae_encoder, vae_decoder]
+    ranks: [0]
+  - node_names: [dit]
+    ranks: [0, 1]
+    # one classifier-free-guidance branch per rank
+    cfg_size: 2

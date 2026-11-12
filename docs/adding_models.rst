@@ -918,7 +918,7 @@ The spec types are:
        Leave it at ``AUTO`` unless the model needs a specific kernel. FlashInfer, dense
        and MLA attention require a ``PagedKVConfig``; FlexAttention requires a
        ``RingKVConfig``. ``DENSE`` runs one varlen pass over each stream's frozen
-       prefix (gathered from the pages once) and the step's fresh K/V, eager only:
+       prefix (gathered from the pages by each layer, every step) and the step's fresh K/V, eager only:
        FA3 (AITER on ROCm), or FlashInfer's ragged prefill where FA3 has no kernel for
        the GPU, the same choice the ragged resources make (``dense_or_flashinfer``), with
        ``flashinfer_backend`` picking its kernel. The engine plans and runs a tiny layout on
@@ -3657,11 +3657,14 @@ receives ``cfg_group`` from ``get_submodule``. The base's ``guided_output``
 predictions over the group and combines them. Every rank then runs the same guidance
 combine and solver step on replicated latents. CFG ranks keep every attention
 head; only TP and SP ranks split them. The ranks run in lockstep on the same requests, so
-any per-request resource the node declares must stay the same shape on every rank, and a
-node with ``cfg_size > 1`` can't hold a paged KV cache (placement refuses one before
-any worker starts): branches that hold different KV are separate nodes in a graph ``Parallel``
-instead, on a node group with ``cfg_size: 1``, as BAGEL's ``LLM_cfg_text`` and ``LLM_cfg_img`` are.
-Wan2.2 and Qwen-Image are the references.
+any per-request resource the node declares must stay the same shape on every rank. A paged KV
+cache on such a node is a full copy on every cfg rank: declare its steps over every branch, not
+over the rank's share (``key.branches``), so that every rank takes the same pages. The pool keeps
+a page trail on cfg ranks, and a follower whose pages part from rank 0's stops its worker at the
+next step. The node then stays on one lockstep instance, since placement refuses replicas of it. Branches that should hold
+their KV apart are separate nodes in a graph ``Parallel`` instead, on a node group with
+``cfg_size: 1``, as BAGEL's ``LLM_cfg_text`` and ``LLM_cfg_img`` are. Wan2.2 and Qwen-Image are
+the references, and ``QwenImage21DenoiseSubmodule`` the one with a paged KV.
 
 .. _Expert parallelism (MoE):
 

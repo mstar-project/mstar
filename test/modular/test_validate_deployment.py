@@ -587,15 +587,23 @@ def test_a_cfg_instance_is_one_lockstep_group(tmp_path):
     assert (group.nodes, group.tp_size) == ({"llm"}, 2)
 
 
-def test_a_paged_kv_cache_on_a_cfg_parallel_node_is_refused(tmp_path):
-    """Its rank math takes every instance rank for a head shard, and a CFG rank
-    runs another branch on every head. Refused before any worker loads weights."""
+@pytest.mark.parametrize("ranks", [[0, 1], [0, 1, 2, 3]], ids=["one_instance", "replicas"])
+def test_a_paged_kv_cache_on_cfg_ranks_stays_on_one_instance(tmp_path, ranks, monkeypatch):
+    """Every cfg rank of one instance holds a full copy of the pool. A transfer between instances
+    pairs ranks as head shards, so replicas of a cfg node with a paged KV are refused before any
+    worker loads weights."""
     kv = KVSpec(resource_key="kv", nodes={"llm"}, config=PagedKVConfig(
         num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=64, max_num_pages=4, page_size=16,
     ))
     model = _CfgModel(specs=[kv], kv_labels={"kv": {"main": KVLabel()}})
-    cfg = _cfg(tmp_path, [{"node_names": ["llm"], "ranks": [0, 1], "cfg_size": 2}])
-    _refused(model, cfg, r"KV kv: a node with cfg_size > 1 can't hold a paged KV cache")
+    cfg = _cfg(tmp_path, [{"node_names": ["llm"], "ranks": ranks, "cfg_size": 2}])
+    if len(ranks) == 2:
+        # one instance needs no transfer, so the check never imports the manager (nor its kernels, whose
+        # registry refuses a second import)
+        monkeypatch.setattr(KVSpec, "resource_class", property(lambda spec: pytest.fail("imported the manager")))
+        _validate(model, cfg)
+    else:
+        _refused(model, cfg, r"Resource kv: its nodes span more than one lockstep instance, and .* has cfg_size 2")
 
 
 class _WideModel(_Model):

@@ -604,3 +604,158 @@ def _write(kv: KVManager, rid: str, length: int, walk: str) -> None:
     assert kv.admit(step, ctx).ok
     kv.plan(step, ctx)
     kv.commit(step, ctx)
+
+
+def _q21_config(layout, ids: torch.Tensor, steps: int):
+    """What the preprocess worker sends Qwen-Image-2.1's pool for ``layout``: both labels' spans, and
+    ``main``'s keys through the last image."""
+    from mstar.api_server.data_worker import PreprocessWorkerThread
+    from mstar.engine.resources.kv.config import KVReqConfig
+    from mstar.model.qwen_image21.config import KV, MAIN, UNCOND
+    from mstar.model.qwen_image21.layout import PREFIX_IDS
+    from mstar.model.qwen_image21.qwen_image21_model import QwenImage21Model
+
+    labels = layout.kv_layout(512)
+    worker = SimpleNamespace(
+        _keyed_labels={KV: {MAIN: QwenImage21Model.kv_labels(None)[KV][MAIN]}}, _prefix_page_sizes={KV: PAGE_SIZE},
+        model=None, _digest=lambda span, file_paths, file_states: bytes([span.source[1]]) * 32,
+        _page_layout=lambda *args: PreprocessWorkerThread._page_layout(None, *args),
+    )
+    tensors = {PREFIX_IDS: [ids[s.rows:s.rows + s.length] for s in layout.spans[:-1] if s.is_text]}
+    rows = {KV: {label: stream.row() for label, stream in labels.items()}}
+    sent = PreprocessWorkerThread._prefix_keys(worker, tensors, {KV: labels}, rows, None, {})
+    config = KVReqConfig(needed_labels=[MAIN, UNCOND])
+    config.apply_conductor_config(
+        kv_layout=rows[KV], loop_caps={"denoise_loop": steps}, **{name: by[KV] for name, by in sent.items()},
+    )
+    return config
+
+
+@pytest.mark.parametrize("own_share", [False, True], ids=["every_branch", "own_share"])
+def test_cfg_ranks_of_qwen_image21_take_the_same_pages_and_share_a_cached_prefix(own_share):
+    """Two ranks of Qwen-Image-2.1's cfg2 dit, each declaring its own steps (rank 0 runs the prompt's branch,
+    rank 1 the negative's): a guided edit's prefix walks and fork, its denoise, its release, then a second
+    edit on the same references, which rank 0's lease serves and rank 1 adopts. Rank 0 admits each edit and
+    journals its moves, which rank 1 replays. Every head finds the follower's page trail and counts on rank
+    0's, as the follower checks them. The pool is small, so the second edit takes pages the first one freed,
+    in the order each rank freed them.
+
+    ``own_share``: a rank whose KV step names only its own branch's label (an override that read
+    ``key.branches``) takes other pages than rank 0, and the trail, on for every pool on cfg ranks, parts."""
+    from mstar.conductor.request_info import CurrentForwardPassInfo
+    from mstar.model.components.diffusion.denoise_loop import LATENTS
+    from mstar.model.qwen_image21.config import MAIN
+    from mstar.model.qwen_image21.layout import PREFIX_IMAGE_WALK, PREFIX_TEXT_WALK, RequestLayout
+    from mstar.model.qwen_image21.submodules import KV, QwenImage21DenoiseSubmodule
+    from mstar.model.qwen_image21.tests.paged_stub import CFG, DIT_CONFIG, STEPS, dit_node, dit_request
+
+    dtype = torch.bfloat16
+    dit = SimpleNamespace(dtype=dtype, config=CFG)
+    _, _, plan, embeds, latents = dit_node(dit, dtype)
+    ids = dit_request(dtype)[0]
+    layout = RequestLayout.from_metadata(plan[-1].step_metadata["layout"])
+    subs = [
+        QwenImage21DenoiseSubmodule(dit, DIT_CONFIG, loop_name="denoise_loop",
+                                    cfg_group=SimpleNamespace(rank=rank, world_size=2))
+        for rank in (0, 1)
+    ]
+    for sub in subs:
+        sub.get_device = lambda: torch.device("cpu")
+    ranks = []
+    for rank in (0, 1):
+        kv = KVManager(
+            cfg=PagedKVConfig(num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=4096, num_qo_heads=2,
+                              max_num_pages=14, page_size=PAGE_SIZE, prefix_cache_tp=True),
+            name=KV, joint_comm_group=SimpleNamespace(rank=rank, world_size=2,
+                                                      cfg_group=SimpleNamespace(world_size=2)),
+            transfer_engine_info=None, device=torch.device("cpu"), dtype=torch.float32,
+        )
+        kv.enable_prefix_cache(ROOT, {MAIN: KeyedWalks((PREFIX_TEXT_WALK, PREFIX_IMAGE_WALK), ())})
+        ranks.append(kv)
+    leader, follower = ranks
+    moves = []
+    leader.journal = lambda kind, rid, count=0, victims=(): moves.append((kind, rid, count, list(victims)))
+    runner = StepRunner({KV: leader}, node_resources={"dit": [KV]})
+
+    def head(rid, walk):
+        """What rank 0 sends with a step (its moves, its trail and its lease on a keyed walk), and what rank 1
+        replays, checks and adopts of it."""
+        while moves:
+            follower.replay(*moves.pop(0))
+        assert follower.page_trail() is not None, "no trail on a pool that cfg ranks hold"
+        assert follower.page_trail() == leader.page_trail(), f"{rid} {walk}: the ranks took different pages"
+        assert follower._unused == leader._unused, f"{rid} {walk}: the ranks count other allotments"
+        lease = leader.lease_cached_prefix(rid, "dit", walk) if walk != "image_gen" else None
+        if lease is not None:
+            assert follower.adopt_cached_prefix(rid, "dit", walk, lease, caught_up=True)
+        return lease.pages if lease is not None else []
+
+    def run(rid, walk, declared):
+        """Each rank's declared step on its pool."""
+        for kv, submodule_step in zip(ranks, declared, strict=True):
+            step = submodule_step.steps[KV]
+            if own_share:
+                step = replace(step, segments=submodule_step.steps[subs[0].target_attn_key()].segments)
+            ctx = StepContext(request_ids=(rid,), graph_walk=walk, slot=0, capture=False)
+            assert kv.admit(step, ctx).ok
+            kv.plan(step, ctx)
+            kv.commit(step, ctx)
+
+    def edit(rid):
+        """``rid``'s plan on both ranks; the pages rank 0 leased it."""
+        for kv in ranks:
+            kv.ingest_request(rid, _q21_config(layout, ids, STEPS))
+        leased = []
+        for planned in plan:
+            walk = planned.walk
+            if walk.startswith("encode"):
+                continue
+            # rank 0 admits the request at its first step on the dit
+            assert runner.admit_retrieve(rid, "dit", walk).ready
+            fwd = CurrentForwardPassInfo(
+                request_id=rid, graph_walk=walk, fwd_index=0, random_seed=5, max_tokens=1, rid_handle=ord(rid),
+                step_metadata=dict(planned.step_metadata),
+            )
+            if walk == "image_gen":
+                for k in range(STEPS):
+                    head(rid, walk)
+                    fwd.dynamic_loop_iter_counts = {"denoise_loop": k}
+                    inputs = [sub.prepare_inputs(walk, fwd, {} if k == 0 else {LATENTS: [torch.zeros(16, 8)]})
+                              for sub in subs]
+                    run(rid, walk, [sub.declare_step(walk, [rid], [row], per_request_info={rid: fwd})
+                                    for sub, row in zip(subs, inputs, strict=True)])
+                continue
+            leased += head(rid, walk)
+            inputs = {"text_embeds": [embeds]} if walk == PREFIX_TEXT_WALK else {"ref_latents": [latents]}
+            inp = subs[0].prepare_inputs(walk, fwd, inputs)
+            served = []
+            for kv in ranks:
+                prefix = kv.resolve_cached_prefix(rid, "dit", walk, inp)
+                kv.apply_cached_prefix(rid, "dit", walk, inp, prefix)
+                served.append(0 if prefix is None else prefix.tokens)
+            assert served[0] == served[1], f"{rid} {walk}: the ranks served {served}"
+            if served[0] == inp.input_seq_len:
+                for kv in ranks:
+                    kv.complete_cached_walk(rid, "dit", walk)
+                continue
+            if served[0]:
+                inp = subs[0].split_inputs(walk, fwd, inp, served[0], inp.input_seq_len)
+            run(rid, walk, [sub.declare_step(walk, [rid], [inp], per_request_info={rid: fwd}) for sub in subs])
+        return leased
+
+    def remove(rid):
+        runner.remove_request(rid)
+        follower.remove_request(rid)
+
+    def serve():
+        assert not edit("a")
+        remove("a")
+        assert edit("b"), "the second edit found nothing cached"
+        remove("b")
+        head("b", "done")
+
+    if own_share:
+        with pytest.raises(AssertionError, match="took different pages"):
+            serve()
+    else:
+        serve()

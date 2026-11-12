@@ -122,14 +122,17 @@ def _decode(data: bytes) -> torch.Tensor:
 
     from PIL import Image
 
-    return torch.from_numpy(np.array(Image.open(io.BytesIO(data)).convert("RGB"))).permute(2, 0, 1)
+    with Image.open(io.BytesIO(data)) as decoded:
+        return torch.from_numpy(np.array(decoded.convert(decoded.mode if decoded.mode == "RGBA" else "RGB"))
+                                ).permute(2, 0, 1)
 
 
+@pytest.mark.parametrize("channels", [3, 4])
 @pytest.mark.parametrize("kwargs", [{}, {"compress_level": 0}, {"compress_level": 3, "workers": 1},
                                     {"adaptive_filters": True}, {"workers": 3}])
-def test_png_writers_round_trip_exactly(kwargs):
+def test_png_writers_round_trip_exactly(kwargs, channels):
     torch.manual_seed(0)
-    image = torch.randint(0, 256, (3, 96, 160), dtype=torch.uint8)
+    image = torch.randint(0, 256, (channels, 96, 160), dtype=torch.uint8)
     image[:, :20] = 7  # a flat region the deflate blocks share
     data = uint8_to_png(image, **kwargs)
     assert data[:8] == b"\x89PNG\r\n\x1a\n"
@@ -161,6 +164,12 @@ def test_encode_image_honours_the_openai_output_knobs():
     assert webp[:4] == b"RIFF" and _decode(webp).shape == image.shape
     with pytest.raises(ValueError, match="output_format"):
         encode_image(image, {"output_format": "gif"})
+    # RGBA keeps its alpha in WebP; JPEG has none to keep
+    rgba = torch.randint(0, 256, (4, 64, 64), dtype=torch.uint8)
+    torch.testing.assert_close(_decode(encode_image(rgba, {"output_format": "webp", "output_compression": 100})
+                                       )[3], rgba[3], rtol=0, atol=0)
+    with pytest.raises(ValueError, match="alpha"):
+        encode_image(rgba, {"output_format": "jpeg"})
 
 
 @pytest.mark.parametrize("fmt, knob, value, served", [

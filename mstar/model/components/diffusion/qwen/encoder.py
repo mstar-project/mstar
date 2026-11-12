@@ -3,7 +3,8 @@
 FLUX.2 [klein] and Z-Image condition their DiTs on intermediate hidden states of
 a Qwen3 language model (klein: layers 9/18/27 of Qwen3-4B/8B concatenated), not on
 its logits; MiniMax-H3 on a Qwen3-VL language model's layer 50; Qwen-Image on a
-Qwen2.5-VL language model's normed last hidden state. This module is that encoder
+Qwen2.5-VL language model's normed last hidden state; Qwen-Image-2.1 on a Qwen3-VL language
+model's last layer before the final norm. This module is that encoder
 built from M*'s transformer components: ``DecoderLayer`` + ``GatedMLP`` + an HF-order
 RMSNorm with a GQA attention (per-head q/k RMSNorm for Qwen3, biased q/k/v for Qwen2),
 run only through the deepest tapped layer. The checkpoint facts, the VL ones included
@@ -83,8 +84,10 @@ class QwenEncoderConfig:
     rope_theta: float = 1_000_000.0
     pad_token_id: int = 151643
     # Pipeline recipe (Flux2KleinPipeline.encode_prompt defaults). A tap is HF's
-    # hidden_states[k]: layer k's output, and at k == num_hidden_layers the normed last one.
+    # hidden_states[k]: layer k's output, and at k == num_hidden_layers the normed last one
+    # unless tie_last_hidden_states is off (HF's config field of that name).
     hidden_state_layers: tuple[int, ...] = (9, 18, 27)
+    tie_last_hidden_states: bool = True
     max_sequence_length: int = 512
     # One q/k/v GEMM, or three as transformers runs them. cuBLAS may pick another kernel
     # for the fused shape, and then k and v differ from the reference's in the last bit
@@ -117,8 +120,10 @@ class QwenEncoderConfig:
 
     @property
     def taps_final_norm(self) -> bool:
-        """Whether a tap is HF's ``hidden_states[num_hidden_layers]``, the normed last hidden state."""
-        return self.num_hidden_layers in self.hidden_state_layers
+        """Whether a tap is the normed last hidden state: HF's ``hidden_states[num_hidden_layers]`` with
+        ``tie_last_hidden_states`` on. Off, that tap is the last layer's output before the norm
+        (Qwen-Image-2.1's condition)."""
+        return self.tie_last_hidden_states and self.num_hidden_layers in self.hidden_state_layers
 
     @property
     def output_dim(self) -> int:
@@ -252,7 +257,7 @@ class QwenEncoderAttention(nn.Module):
 
 class QwenHiddenStateEncoder(nn.Module):
     """Embeddings + the first ``max(taps)`` decoder layers of a Qwen LM (and its final norm
-    when a tap is the last layer); returns the hidden states of each tapped layer,
+    when a tap is the normed last layer); returns the hidden states of each tapped layer,
     concatenated along the feature dim (``hidden_states[k]`` in HF indexing)."""
 
     def __init__(self, config: QwenEncoderConfig):
@@ -318,8 +323,9 @@ class QwenHiddenStateEncoder(nn.Module):
             layer.self_attn.attn_mask = mask
             hidden = layer(hidden)
             if layer_idx in self.tap_layers:
-                # HF records a layer's output before the deepstack add, and the last one normed
-                taps.append(self.norm(hidden) if layer_idx == self.config.num_hidden_layers else hidden)
+                # HF records a layer's output before the deepstack add, and the last one normed when tied
+                taps.append(self.norm(hidden) if self.norm is not None and layer_idx == self.config.num_hidden_layers
+                            else hidden)
             if deepstack is not None and layer_idx <= len(deepstack[1]):
                 rows, features = deepstack
                 hidden = hidden.clone()

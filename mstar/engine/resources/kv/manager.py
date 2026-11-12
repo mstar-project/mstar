@@ -747,7 +747,10 @@ class KVManager(AttentionResource):
         self._hosted: set[str] = set()
         self._ran_short: dict[str, ShortGrant] = {}
         self._stalled: set[str] = set()
-        if _DEBUG_ASSERTS and tp_cache:
+        # Every cfg rank holds a full copy of the pool, and a step that declares only its rank's branch share takes
+        # other pages there than rank 0. The trail makes the follower's check of each head raise on that.
+        cfg_group = getattr(joint_comm_group, "cfg_group", None)
+        if (_DEBUG_ASSERTS and tp_cache) or (cfg_group is not None and cfg_group.world_size > 1):
             self._arena.trail = (0, 0)
         self._device = device
         self._lock = threading.RLock()
@@ -3388,9 +3391,9 @@ class KVManager(AttentionResource):
         filled tail page are never freed, so the realized release can fall
         short of ``num_tokens`` by up to a page — callers re-offer the
         shortfall next time (see ``WindowedKVSession``). ``stored_len`` drops
-        by exactly the freed count and ``generation`` moves, so a prefix a
-        backend gathered out of these pages is re-read (the dense backend keys
-        its gathered prefix on it). Positions are not touched: the tokens that
+        by exactly the freed count and ``generation`` moves (each dense layer
+        gathers its prefix from the pages every step, so none holds a stale one).
+        Positions are not touched: the tokens that
         remain keep the absolute positions their K/V was written with.
 
         Refused under an admitted step (its plan addresses these pages) and

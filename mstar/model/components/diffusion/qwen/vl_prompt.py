@@ -5,7 +5,8 @@ into the token embeddings at the ``<|image_pad|>`` rows and position the prompt 
 MRoPE (``get_rope_index``: text advances all three grids, an image holds T and sweeps H and
 W and moves the cursor by ``max(h', w')``); Qwen3-VL also adds the tower's deepstack features
 at the image rows after the first decoder layers. The encoder does all three from the tower's
-output (``VisionTokens``); this module holds that output's type and the positions.
+output (``VisionTokens``); this module holds that output's type, the positions, and the
+Qwen3-VL tower call that makes it.
 """
 
 from __future__ import annotations
@@ -15,7 +16,11 @@ from typing import NamedTuple
 
 import torch
 
+from mstar.model.components.diffusion.attention import FrameSDPA
 from mstar.model.components.mrope import image_position_advance, image_position_ids, text_position_ids
+from mstar.model.components.qwen3_vit import vision_interpolation, vision_position_ids, vision_seq_lengths
+from mstar.model.components.qwen_vision import QwenVisionModel
+from mstar.utils.h2d import to_device_nonblocking
 
 
 class VisionTokens(NamedTuple):
@@ -25,6 +30,23 @@ class VisionTokens(NamedTuple):
     merge: int                              # the tower's spatial merge size
     embeds: torch.Tensor                    # [N, hidden] merged tokens
     deepstack: Sequence[torch.Tensor] = ()  # [N, hidden] per deepstack layer (Qwen3-VL), else none
+
+
+def qwen3_vl_tokens(
+    tower: QwenVisionModel, frames: FrameSDPA, pixels: torch.Tensor, grids: Sequence[tuple[int, int, int]],
+) -> VisionTokens:
+    """One prompt's images through a Qwen3-VL tower whose blocks attend through ``frames``:
+    ``pixels [total_patches, patch_numel]`` (the processor's ``pixel_values``, on the tower's
+    device) -> the merged tokens and deepstack features."""
+    grids, device = list(grids), pixels.device
+    merge = tower.config.spatial_merge_size
+    frames.lengths = vision_seq_lengths(grids)
+    indices, weights = vision_interpolation(grids, tower.config.num_grid_per_side, merge)
+    merged, deepstack = tower(
+        pixels, to_device_nonblocking(indices, device),
+        to_device_nonblocking(weights, device), to_device_nonblocking(vision_position_ids(grids, merge), device),
+    )
+    return VisionTokens(grids, merge, merged, deepstack)
 
 
 def vl_positions(

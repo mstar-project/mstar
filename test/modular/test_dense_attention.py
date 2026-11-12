@@ -40,6 +40,7 @@ from mstar.engine.resources.attn.ragged.dense_wrappers import DensePrefixedPrefi
 from mstar.engine.resources.attn.ragged.wrappers import FlashInferPrefixedPrefillWrapper
 from mstar.engine.resources.base import EngineResourceInfo
 from mstar.engine.resources.kv.plan import KVPlanOutput, SequenceView
+from mstar.platforms import resolve_platform
 
 PAGE_SIZE = 4
 NUM_KV_HEADS = 2
@@ -82,14 +83,13 @@ def _ctx(views: list[SequenceView], slot: int = 0, **kwargs) -> StepContext:
     )
 
 
-def _view(rid: str, pages: list[int], prefix: int, fresh: int, generation: int = 0):
+def _view(rid: str, pages: list[int], prefix: int, fresh: int):
     return SequenceView(
         request_id=rid,
         label="main",
         page_idxs=pages,
         length=prefix + fresh,
         to_compute=fresh,
-        generation=generation,
     )
 
 
@@ -100,11 +100,6 @@ def _layer_tensor(fill: float = 0.0) -> torch.Tensor:
     return (torch.arange(n, dtype=torch.float32) + fill).reshape(
         MAX_PAGES, 2, PAGE_SIZE, NUM_KV_HEADS, HEAD_DIM
     )
-
-
-def _expected_prefix(layer: torch.Tensor, pages: list[int], prefix_len: int, kv: int):
-    rows = layer[pages][:, kv].reshape(-1, NUM_KV_HEADS, HEAD_DIM)
-    return rows[:prefix_len]
 
 
 class TestDensePlan:
@@ -140,6 +135,22 @@ class TestDensePlan:
         assert [s.request_id for s in plan.segments] == ["r0", "r1"]
         assert plan.causal is False
 
+    def test_only_the_labels_the_step_attends_are_planned(self):
+        """A cfg rank's KV step holds both branches' labels and its attention reads only its own; a
+        combined label is planned when its views carry an attended label."""
+        manager = _manager()
+        views = {
+            "main": KVPlanOutput(cpu_indptrs=None, views=[_view("r0", [0], prefix=2, fresh=1)]),
+            "uncond": KVPlanOutput(cpu_indptrs=None, views=[_view("r0", [1], prefix=2, fresh=1)._replace(
+                label="uncond")]),
+        }
+        ctx = _ctx([])
+        ctx.plan_results["kv"] = views
+        manager.plan(AttentionStep(segments=(Segment("r0", "uncond", 1),), causal=False), ctx)
+        assert manager._current_plans.keys() == {"uncond"}
+        manager.plan(AttentionStep(causal=False), ctx)
+        assert manager._current_plans.keys() == {"main", "uncond"}
+
     def test_causal_rides_on_the_step(self):
         manager = _manager()
         manager.plan(AttentionStep(causal=True), _ctx([_view("r0", [0], prefix=1, fresh=1)]))
@@ -167,69 +178,6 @@ class TestPrefixGather:
     def _planned(self, manager, views):
         manager.plan(AttentionStep(causal=False), _ctx(views))
         return manager._current_plans["main"].segments
-
-    def test_gather_reads_the_prefix_rows_and_stops_at_its_length(self):
-        manager = _manager()
-        layer = _layer_tensor()
-        (segment,) = self._planned(manager, [_view("r0", [5, 6], prefix=6, fresh=2)])
-
-        k, v = manager._prefix_kv(segment, 0, layer)
-        assert k.shape == (6, NUM_KV_HEADS, HEAD_DIM)
-        assert torch.equal(k, _expected_prefix(layer, [5, 6], 6, 0))
-        assert torch.equal(v, _expected_prefix(layer, [5, 6], 6, 1))
-
-    def test_gather_is_reused_across_steps_and_layers(self):
-        manager = _manager()
-        layer = _layer_tensor()
-        (segment,) = self._planned(manager, [_view("r0", [0], prefix=3, fresh=2)])
-        first_k, _ = manager._prefix_kv(segment, 0, layer)
-
-        # each layer is its own gather off its own layer view...
-        other_k, _ = manager._prefix_kv(segment, 1, _layer_tensor(fill=1000.0))
-        assert torch.equal(other_k, first_k + 1000.0)
-
-        # ...but the same (stream, layer) is served from the cache, which is
-        # the point: the pages are read once, not once per denoise step
-        layer.mul_(-1)
-        (again,) = self._planned(manager, [_view("r0", [0], prefix=3, fresh=2)])
-        cached_k, _ = manager._prefix_kv(again, 0, layer)
-        assert cached_k is first_k
-
-    def test_a_bumped_generation_invalidates_the_gather(self):
-        """The stream epoch is the whole invalidation story: same request,
-        same label, same length, same pages — different contents."""
-        manager = _manager()
-        layer = _layer_tensor()
-        (segment,) = self._planned(manager, [_view("r0", [0], prefix=3, fresh=2)])
-        stale, _ = manager._prefix_kv(segment, 0, layer)
-
-        layer.mul_(-1)
-        (moved,) = self._planned(
-            manager, [_view("r0", [0], prefix=3, fresh=2, generation=1)]
-        )
-        fresh, _ = manager._prefix_kv(moved, 0, layer)
-        assert not torch.equal(fresh, stale)
-        assert torch.equal(fresh, _expected_prefix(layer, [0], 3, 0))
-
-    def test_a_grown_prefix_invalidates_the_gather(self):
-        manager = _manager()
-        layer = _layer_tensor()
-        (segment,) = self._planned(manager, [_view("r0", [0, 1], prefix=3, fresh=1)])
-        manager._prefix_kv(segment, 0, layer)
-
-        (grown,) = self._planned(manager, [_view("r0", [0, 1], prefix=5, fresh=1)])
-        k, _ = manager._prefix_kv(grown, 0, layer)
-        assert torch.equal(k, _expected_prefix(layer, [0, 1], 5, 0))
-
-    def test_request_lifecycle_drops_the_gather(self):
-        manager = _manager()
-        layer = _layer_tensor()
-        (segment,) = self._planned(manager, [_view("r0", [0], prefix=3, fresh=1)])
-        manager._prefix_kv(segment, 0, layer)
-        assert manager._prefix_cache
-
-        manager.remove_request("r0")
-        assert not manager._prefix_cache
 
     def test_run_without_the_fresh_kv_is_an_error(self):
         manager = _manager()
@@ -425,6 +373,81 @@ def test_flashinfer_backend_the_gpu_cannot_run_fails_at_build(backend):
         )
 
 
+@pytest.mark.parametrize("head_dim, offset", [(128, 0), (128, 1), (3, 0)], ids=["int64", "unaligned", "odd-dim"])
+@pytest.mark.parametrize("contiguous", [True, False], ids=["one-block", "strided-layer"])
+def test_each_layer_gathers_the_prefix_beside_the_fresh_kv_and_holds_nothing(monkeypatch, head_dim, offset, contiguous):
+    """Every run assembles [prefix | fresh] per segment straight from the pages: the bytes of the prefix rows and
+    the fresh rows concatenated, with a strided V (a slice of a fused QKV row) and a layer that isn't one block.
+    Nothing is held between steps (a copy of every layer's prefix held for a whole denoise was GiBs per request),
+    so a step after the pages changed reads the new pages."""
+    page, hkv = 4, 2
+    cfg = PagedKVConfig(
+        num_layers=1, num_kv_heads=hkv, head_dim=head_dim, max_seq_len=64, max_num_pages=8, page_size=page,
+    )
+    manager = DenseAttentionManager(
+        kv_cache="kv", device=torch.device("cpu"), dtype=torch.bfloat16, kv_config=cfg,
+        wrapper_class=DensePrefixedPrefillWrapper,
+    )
+    seen = []
+    monkeypatch.setattr(
+        DensePrefixedPrefillWrapper, "run", lambda self, q, k, v, return_lse=False: seen.append((k, v)) or q,
+    )
+    layer = torch.randn(8, 2, page, hkv, head_dim + (not contiguous), dtype=torch.bfloat16)[..., :head_dim]
+    segs = [("r0", [5, 2], 6, 3), ("r1", [], 0, 2), ("r2", [7], 3, 4)]  # rid, prefix pages, prefix, fresh
+    total = sum(fr for *_, fr in segs)
+    width = hkv * head_dim
+    qkv = torch.randn(total, 3 * width + offset, dtype=torch.bfloat16)
+    k = qkv[:, offset:offset + width].reshape(total, hkv, head_dim)
+    v = qkv[:, offset + 2 * width:offset + 3 * width].reshape(total, hkv, head_dim)
+    for _ in range(2):
+        manager.plan(AttentionStep(causal=False), _ctx([
+            _view(rid, pages + [0], prefix=pre, fresh=fr) for rid, pages, pre, fr in segs
+        ]))
+        manager.run(torch.zeros(total, 2, head_dim), "main", layer, k=k, v=v, layer_idx=0)
+        key, val = seen.pop()
+        off, want_k, want_v = 0, [], []
+        for _, pages, pre, fr in segs:
+            rows = layer[pages]
+            want_k += [rows[:, 0].reshape(-1, hkv, head_dim)[:pre], k[off:off + fr]]
+            want_v += [rows[:, 1].reshape(-1, hkv, head_dim)[:pre], v[off:off + fr]]
+            off += fr
+        assert torch.equal(key, torch.cat(want_k)) and torch.equal(val, torch.cat(want_v))
+        layer.mul_(-1)
+
+
+@pytest.mark.parametrize("wrapper, head_dim, extra_rows, capability, fixed", [
+    ("prefixed", 128, 0, (9, 0), True),
+    ("prefixed", 128, 2, (9, 0), False),  # rows past the plan's: the fixed-length kernel would attend them
+    ("prefixed", 72, 0, (9, 0), False),
+    ("ragged", 128, 0, (9, 0), False),  # cacheless, as Cosmos3's vision tower
+    ("prefixed", 128, 0, (10, 0), False),  # proven on sm_90 only
+    ("prefixed", 128, 0, None, False),  # no NVIDIA GPU
+], ids=["proven", "past-the-plan", "head_dim-72", "cacheless", "sm_100", "no-gpu"])
+def test_one_segment_takes_the_fixed_length_kernel_only_where_proven(
+    monkeypatch, wrapper, head_dim, extra_rows, capability, fixed,
+):
+    """FA3's fixed-length kernel is proven bit-equal to varlen for one segment on the prefixed wrapper at
+    head_dim 128 (Qwen-Image-2.1) on sm_90; every other one-segment plan stays on varlen."""
+    from mstar.engine.resources.attn.ragged import dense_wrappers
+    from mstar.engine.resources.attn.ragged.dense_wrappers import DenseRaggedPrefillWrapper
+
+    called = []
+    monkeypatch.setattr(resolve_platform(), "cuda_capability", lambda device=None: capability)
+    monkeypatch.setattr(dense_wrappers, "flash_attn_func", lambda q, *a, **kw: called.append("fixed") or q)
+    monkeypatch.setattr(dense_wrappers, "flash_attn_varlen_func", lambda q, *a, **kw: called.append("varlen") or q)
+    cls = DensePrefixedPrefillWrapper if wrapper == "prefixed" else DenseRaggedPrefillWrapper
+    w = cls(num_qo_heads=2, num_kv_heads=2, head_dim=head_dim, device=torch.device("cpu"), q_data_type=torch.float32)
+    q_len, k_len = 5, 5 if wrapper == "ragged" else 9
+    if wrapper == "prefixed":
+        w.plan(torch.tensor([0, q_len], dtype=torch.int32), torch.tensor([0, k_len], dtype=torch.int32))
+    else:
+        w.plan(torch.tensor([0, q_len], dtype=torch.int32))
+    q = torch.zeros(q_len + extra_rows, 2, head_dim)
+    k = torch.zeros(k_len + extra_rows, 2, head_dim)
+    w.run(q, k, k)
+    assert called == ["fixed" if fixed else "varlen"]
+
+
 def _wrapper_classes():
     classes = []
     if _gpu_flashinfer():
@@ -436,10 +459,15 @@ def _wrapper_classes():
 
 @pytest.mark.parametrize("wrapper_class", _wrapper_classes())
 @pytest.mark.parametrize("causal", [False, True], ids=["full", "causal"])
-def test_dense_matches_sdpa_over_prefix_and_fresh(wrapper_class, causal):
-    """Two segments with different frozen prefixes and GQA: each query block
+@pytest.mark.parametrize("segs", [
+    [("r0", [3, 4], 20, 37), ("r1", [7], 9, 50)],  # rid, prefix pages, prefix, fresh
+    [("r0", [3, 4], 20, 37)],
+], ids=["two", "one"])
+def test_dense_matches_sdpa_over_prefix_and_fresh(wrapper_class, causal, segs):
+    """Segments with different frozen prefixes and GQA: each query block
     attends its own [prefix | fresh] keys, and a causal plan aligns the block
-    to the end of them, on either kernel."""
+    to the end of them, on either kernel. One segment on FA3 takes its
+    fixed-length kernel, with the varlen kernel's bits."""
     dev = torch.device("cuda")
     page, hq, hkv, d = 16, 4, 2, 128
     cfg = PagedKVConfig(
@@ -451,7 +479,6 @@ def test_dense_matches_sdpa_over_prefix_and_fresh(wrapper_class, causal):
     )
     torch.manual_seed(0)
     layer = torch.randn(16, 2, page, hkv, d, device=dev, dtype=torch.bfloat16)
-    segs = [("r0", [3, 4], 20, 37), ("r1", [7], 9, 50)]  # rid, prefix pages, prefix, fresh
     views = [_view(rid, pages + [15], prefix=pre, fresh=fr) for rid, pages, pre, fr in segs]
     manager.plan(AttentionStep(causal=causal), _ctx(views))
     total = sum(fr for *_, fr in segs)
@@ -459,6 +486,16 @@ def test_dense_matches_sdpa_over_prefix_and_fresh(wrapper_class, causal):
     k = torch.randn(total, hkv, d, device=dev, dtype=torch.bfloat16)
     v = torch.randn(total, hkv, d, device=dev, dtype=torch.bfloat16)
     out = manager.run(q, "main", layer, k=k, v=v, layer_idx=0)
+    if wrapper_class is DensePrefixedPrefillWrapper and len(segs) == 1:
+        (_, pages, pre, fr), = segs
+        rows = layer[pages]
+        kk = torch.cat([rows[:, 0].reshape(-1, hkv, d)[:pre], k])
+        vv = torch.cat([rows[:, 1].reshape(-1, hkv, d)[:pre], v])
+        cu_q = torch.tensor([0, fr], dtype=torch.int32, device=dev)
+        cu_k = torch.tensor([0, pre + fr], dtype=torch.int32, device=dev)
+        varlen = dense_module.flash_attn_varlen_func(q, kk, vv, cu_q, cu_k, fr, pre + fr, causal=causal,
+                                        softmax_scale=d ** -0.5)
+        assert torch.equal(out, varlen[0] if isinstance(varlen, tuple) else varlen)
 
     off = 0
     for _, pages, pre, fr in segs:
@@ -500,8 +537,8 @@ def kv_manager(monkeypatch):
 
 
 class TestStreamGeneration:
-    """`CacheStream.generation` exists for exactly one reader, so its contract
-    is worth pinning here: it moves when the resident bytes may have moved
+    """`CacheStream.generation` is read through `SequenceView.generation` (and by the
+    offload claim check), so its contract is worth pinning here: it moves when the resident bytes may have moved
     under that reader, and stands still when they cannot have."""
 
     def _plan_views(self, kv, segments, **step_kwargs):
@@ -520,8 +557,9 @@ class TestStreamGeneration:
         # commit=False: each denoise step recomputes its fresh K/V in place
         # rather than appending. commit is what moves the epoch (it is how an
         # in-place page write blocks an offload), so a commit=False step within
-        # the pages already held leaves the resident prefix — and a gather of
-        # it — good across steps.
+        # the pages already held leaves the epoch where it was, so the offload
+        # claim check, its other reader, sees no write behind it. (Each layer
+        # gathers the prefix from the pages every step regardless.)
         kv = kv_manager
         kv.ingest_request("r0")
         # commit the frozen prefix once, then read the epoch the denoise steps
@@ -572,3 +610,69 @@ class TestStreamGeneration:
         kv.reset_request("r0")
         out, _, _ = self._plan_views(kv, [Segment("r0", "main", 4)])
         assert out["main"].views[0].generation > before
+
+
+@pytest.mark.parametrize("batched", [True, False], ids=["batched-cfg", "plan-per-branch"])
+def test_cosmos3s_eager_denoise_attends_each_branch_prefix_from_the_pages(kv_manager, monkeypatch, batched):
+    """Cosmos3's eager denoise on the dense backend (``attention_backend="dense_gen"``): its own step declaration
+    (cond and uncond in one combined plan, or a plan each), planned by the KV manager over committed text
+    prefixes, attends every branch's [prefix | fresh] as the prefix commit wrote it, at every step."""
+    from mstar.model.cosmos3.submodules import (
+        CFG_BATCHED_LABEL,
+        COND_LABEL,
+        KV_CACHE,
+        UNCOND_LABEL,
+        Cosmos3DiTSubmodule,
+    )
+
+    kv, rids, fresh = kv_manager, ("r0", "r1"), 2
+    prefix = {COND_LABEL: 5, UNCOND_LABEL: 2}
+    for rid in rids:
+        kv.ingest_request(rid)
+    out, _, _ = TestStreamGeneration()._plan_views(
+        kv, [Segment(rid, label, n) for label, n in prefix.items() for rid in rids],
+    )
+    # the prefix's K/V as its layers would have written it: a distinct value per (request, label, token)
+    tensor, written = kv.kv_cache.tensor, {}
+    for label, plan in out.items():
+        for view in plan.views:
+            for t in range(prefix[label]):
+                value = 100 * rids.index(view.request_id) + 10 * (label == UNCOND_LABEL) + t + 1
+                page, slot = view.page_idxs[t // PAGE_SIZE], t % PAGE_SIZE
+                tensor[0, page, 0, slot], tensor[0, page, 1, slot] = value, -value
+                written[view.request_id, label, t] = value
+
+    manager = DenseAttentionManager(
+        kv_cache="kv", device=torch.device("cpu"), dtype=torch.float32, kv_config=_kv_config(),
+        wrapper_class=DensePrefixedPrefillWrapper,
+    )
+    seen = []
+    monkeypatch.setattr(
+        DensePrefixedPrefillWrapper, "run", lambda self, q, k, v, return_lse=False: seen.append((k, v)) or q,
+    )
+    step = Cosmos3DiTSubmodule._gen_step(
+        Cosmos3DiTSubmodule, list(rids), (fresh,) * len(rids), (COND_LABEL, UNCOND_LABEL), combined=batched,
+        attn_key="attn",
+    )
+    kv_step = step.steps[KV_CACHE]
+    for _ in range(2):
+        ctx = StepContext(request_ids=rids, graph_walk="gen", slot=0, capture=False)
+        assert kv.admit(kv_step, ctx).ok
+        ctx.plan_results["kv"] = kv.plan(kv_step, ctx)
+        kv.commit(kv_step, ctx)
+        manager.plan(step.steps["attn"], ctx)
+        # label-major, as a combined plan concatenates its sources and Cosmos3 packs its rows
+        branches = {label: [(rid, label) for rid in rids] for label in prefix}
+        assert {label: [(s.request_id, s.label) for s in plan.segments]
+                for label, plan in manager._current_plans.items()} == (
+            {CFG_BATCHED_LABEL: [*branches[COND_LABEL], *branches[UNCOND_LABEL]]} if batched else branches)
+        for label, plan in manager._current_plans.items():
+            n = sum(s.q_len for s in plan.segments)
+            k = torch.full((n, NUM_KV_HEADS, HEAD_DIM), 0.5)
+            manager.run(torch.zeros(n, 2, HEAD_DIM), label, tensor[0], k=k, v=-k, layer_idx=0)
+            key, val = seen.pop()
+            want = []
+            for segment in plan.segments:
+                want += [written[segment.request_id, segment.label, t] for t in range(prefix[segment.label])]
+                want += [0.5] * fresh
+            assert key[:, 0, 0].tolist() == want and val[:, 0, 0].tolist() == [-w for w in want]

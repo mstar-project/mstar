@@ -43,6 +43,8 @@ MODEL_REGISTRY: dict[str, tuple[str, str]] = {
     "qwen_image_edit": ("mstar.model.qwen_image.qwen_image_model", "QwenImageModel"),
     "pi05": ("mstar.model.pi05.pi05_model", "Pi05Model"),
     "qwen3_omni": ("mstar.model.qwen3_omni.qwen3_omni_model", "Qwen3OmniModel"),
+    "qwen_image21": ("mstar.model.qwen_image21.qwen_image21_model", "QwenImage21Model"),
+    "qwen_image21_turbo": ("mstar.model.qwen_image21.qwen_image21_model", "QwenImage21Model"),
     "qwen3_asr": ("mstar.model.qwen3_asr.qwen3_asr_model", "Qwen3ASRModel"),
     "qwen3_asr_realtime": ("mstar.model.qwen3_asr.qwen3_asr_model", "Qwen3ASRModel"),
     "qwen3_tts": ("mstar.model.qwen3_tts.qwen3_tts_model", "Qwen3TTSModel"),
@@ -169,6 +171,11 @@ HF_MODELS: dict[str, dict] = {
     # state-dict remap inside Pi05Model.get_submodule().
     "pi05": {"model_path_hf": "lerobot/pi05_base"},
     "qwen3_omni": {"model_path_hf": "Qwen/Qwen3-Omni-30B-A3B-Instruct"},
+    # Qwen-Image-2.1: 7B single-stream DiT conditioned on a block-causal prefix of Qwen3-VL-8B
+    # hidden states and up to 10 reference images' latents, RGBA in and out. Turbo is its 8-step
+    # distillation (fixed sigmas, same class). Qwen Research License.
+    "qwen_image21": {"model_path_hf": "Qwen/Qwen-Image-2.1"},
+    "qwen_image21_turbo": {"model_path_hf": "Qwen/Qwen-Image-2.1-Turbo"},
     # Qwen3-ASR: AuT audio encoder + dense Qwen3 decoder. ``qwen3_asr`` is
     # the 1.7B transcription model, ``qwen3_asr_realtime`` the 0.6B variant
     # trained for chunked streaming, served by the same class.

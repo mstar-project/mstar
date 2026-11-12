@@ -19,6 +19,7 @@ from mstar.distributed.communication import CommGroup
 from mstar.model.components.bigvgan import fold_weight_norm
 from mstar.model.components.diffusion.qwen.encoder import QwenHiddenStateEncoder
 from mstar.model.components.diffusion.qwen.weight_loading import (
+    build_qwen3_vl_tower,
     qkv_rules,
     remap_text_encoder_key,
     text_encoder_skip,
@@ -28,9 +29,8 @@ from mstar.model.components.diffusion.weight_loading import (
     load_native,
     materialize,
 )
-from mstar.model.components.qwen3_vit import VisionRotaryEmbedding
-from mstar.model.components.qwen_vision import QwenVisionConfig, QwenVisionModel
-from mstar.model.loader.base import StackedParamRule, load_weights_into
+from mstar.model.components.qwen_vision import QwenVisionModel
+from mstar.model.loader.base import StackedParamRule
 from mstar.model.minimax_h3.components.audio_vae import H3AudioDecoder
 from mstar.model.minimax_h3.components.transformer import H3DiT, H3TextConditioner, rope_inv_freq
 from mstar.model.minimax_h3.components.video_encoder import H3KeyframeEncoder
@@ -47,7 +47,6 @@ _FUSED_RULES = [
     StackedParamRule(".mlp.fc1", ".mlp.value_proj", 1),
 ]
 _TEXT_PREFIXES = ("token_refiner.", "condition_proj.")
-_VISION_PREFIX = "model.visual."
 
 
 def split_fused(weights: Iterator[tuple[str, torch.Tensor]], heads: int, head_dim: int):
@@ -138,22 +137,8 @@ def build_text_encoder(config: H3Config, snapshot: Path, device, dtype: torch.dt
 
 def build_vision_tower(snapshot: Path, device, dtype: torch.dtype = torch.bfloat16) -> QwenVisionModel:
     """Qwen3-VL-32B's vision tower with its deepstack mergers (FL2VA keyframes), from the
-    text encoder's shards (``model.visual.``). Its rotary ``inv_freq`` is derived, fp32 as
-    the reference keeps it, so completeness is over the persistent state."""
-    source = Path(snapshot) / PARTITION / "text_encoder"
-    config = QwenVisionConfig.from_hf(source)
-    with torch.device("meta"):
-        tower = QwenVisionModel(config)
-    materialize(tower, dtype, device)
-    tower.rotary_pos_emb.register_buffer(
-        "inv_freq", VisionRotaryEmbedding(config).inv_freq.to(device), persistent=False,
-    )
-    weights = iter_transformers_component(source, device, skip=lambda n: not n.startswith(_VISION_PREFIX))
-    loaded = load_weights_into(tower, weights, name_remapper=lambda n: n[len(_VISION_PREFIX):])
-    missing = sorted(set(tower.state_dict()) - loaded)
-    if missing:
-        raise RuntimeError(f"MiniMax-H3 vision tower: {len(missing)} unloaded parameters {missing[:5]}")
-    return tower.eval()
+    text encoder's shards."""
+    return build_qwen3_vl_tower(Path(snapshot) / PARTITION / "text_encoder", device, "MiniMax-H3 vision tower", dtype)
 
 
 def build_video_decoder(config: H3Config, snapshot: Path, device, dtype: torch.dtype = torch.bfloat16

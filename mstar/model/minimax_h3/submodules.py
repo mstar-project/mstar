@@ -28,8 +28,7 @@ from mstar.model.components.batched_rows import BatchedRows
 from mstar.model.components.diffusion.attention import FrameSDPA, sdpa_attention
 from mstar.model.components.diffusion.compile_utils import compile_blocks as compile_blocks_
 from mstar.model.components.diffusion.denoise_loop import DenoiseLoopSubmodule, StepKey, StepScalar
-from mstar.model.components.diffusion.qwen.vl_prompt import VisionTokens
-from mstar.model.components.qwen3_vit import vision_interpolation, vision_position_ids, vision_seq_lengths
+from mstar.model.components.diffusion.qwen.vl_prompt import qwen3_vl_tokens
 from mstar.model.components.qwen_vision import VISION_ATTN, QwenVisionModel
 from mstar.model.minimax_h3.components.layout import (
     H3Layout,
@@ -59,7 +58,6 @@ from mstar.model.minimax_h3.config import (
 )
 from mstar.model.minimax_h3.schedule import H3Schedule, ScheduleArgs, h3_schedule, h3_step
 from mstar.model.submodule_base import NodeInputs, NodeSubmodule
-from mstar.utils.h2d import to_device_nonblocking
 
 logger = logging.getLogger(__name__)
 
@@ -148,17 +146,8 @@ class H3TextEncoderSubmodule(NodeSubmodule):
         return {TEXT_EMBEDS: [self.conditioner(hidden)[0]]}
 
     def _encode_with_images(self, ids: torch.Tensor, pixels: torch.Tensor, grids: list) -> torch.Tensor:
-        vision, device = self.vision, ids.device
-        merge = vision.config.spatial_merge_size
-        self._frames.lengths = vision_seq_lengths(grids)
-        indices, weights = vision_interpolation(grids, vision.config.num_grid_per_side, merge)
-        positions = vision_position_ids(grids, merge)
-        merged, deepstack = vision(
-            pixels, to_device_nonblocking(indices, device), to_device_nonblocking(weights, device),
-            to_device_nonblocking(positions, device),
-        )
-        ones = torch.ones_like(ids[None])
-        return self.encoder(ids[None], ones, padded=False, images=VisionTokens(grids, merge, merged, deepstack))
+        images = qwen3_vl_tokens(self.vision, self._frames, pixels, grids)
+        return self.encoder(ids[None], torch.ones_like(ids[None]), padded=False, images=images)
 
     def declare_step(self, graph_walk, request_ids, inputs: list[NodeInputs], slot_lease=None, piecewise_leases=None,
                      **kwargs) -> SubmoduleStep:
