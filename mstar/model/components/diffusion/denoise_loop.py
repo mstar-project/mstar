@@ -37,7 +37,8 @@ Conventions the base fixes:
   worker before each batch — no host sync per step.
 * A schedule and its device-resident ``sigmas`` / ``timesteps`` are a memo of the hook's
   inputs, so requests with the same settings share one on the device, and losing an
-  entry costs a rebuild and changes no output. So are the seeds drawn at ingest.
+  entry costs a rebuild and changes no output. So are the seeds drawn at ingest and a
+  guidance scale's per-step fill (keyed by ``(num_steps, knobs)``).
 * Per-step per-request scalars (``STEP_SCALARS``: ``sigma``, ``sigma_next``,
   ``timestep``) are sliced out of the schedule ``schedule_for`` returns and
   travel as ``[1]`` device tensors, so a batch of requests at different steps

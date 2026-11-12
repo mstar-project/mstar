@@ -2404,7 +2404,8 @@ Deployment knobs (``configs/qwen_image_edit.yaml``): the ``dit_attn`` resource's
 ``sdpa``, the reference kernel) and ``compile`` (experimental: each transformer block, static but for the text
 length, and the VAE's encoder and decoder, dynamic; it failed the fp32 yardstick on one prompt, served slower than
 eager and recompiled the DiT on its first batched step, so it is off). ``qwen_image_edit_tp2.yaml`` splits the DiT over two GPUs, and
-``qwen_image_edit_cfg2.yaml`` the guidance branches. Not done: CUDA-graph capture (a step is
+``qwen_image_edit_cfg2.yaml`` the guidance branches. The DiT runs one request a step (its attention is a segmented read, which the engine
+keeps to one request). Not done: CUDA-graph capture (a step is
 GPU-bound), sequence parallelism, the text-to-image and layered Qwen-Image pipelines.
 
 FLUX.2 [klein] (``flux2_klein`` / ``flux2_klein_9b``)
