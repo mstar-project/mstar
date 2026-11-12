@@ -3,8 +3,8 @@
 A full-duplex speech-to-speech model with three nodes:
 
     conformer_encoder — 16 kHz speech → per-frame LLM embeds (the shared streaming
-                        FastConformer); resources encoder_kv / encoder_state /
-                        encoder_front
+                        FastConformer); state encoder_kv / encoder_state /
+                        encoder_front / encoder_stream
     nano_llm          — Nemotron-H hybrid Mamba-2/attn/MLP backbone (9B);
                         state nano_kv (4 attention layers), mamba_state (27
                         Mamba-2 layers), nano_sampler
@@ -32,9 +32,7 @@ The M* serving path is the walk graphs below: three async partitions
 decode loop consuming one encoder frame per step. The user's audio is a client
 stream into the Encoder, so a call can stream live over ``/generate/ws`` or
 ``/v1/realtime``; a one-shot upload is a stream of one chunk. ``declare_state`` declares
-the nano's and the talker's state, and ``get_node_resources`` the encoder's
-bounded KV (each call's attention window) and two recurrent-state pools (its
-conv tails, and its audio / mel tails). Both decode steps are
+every node's state. Both decode steps are
 CUDA graphs (the talker's with its codec decode), and so is the encoder's live
 step (piecewise).
 
@@ -371,12 +369,12 @@ class NemotronDuplexModel(Model):
     def kernel_settings(self) -> dict[str, dict[str, int]]:
         return {
             ENCODER_KV: {"max_slots": self.DEFAULT_SESSIONS},
+            # + 1 for each Value pool's sink slot, so DEFAULT_SESSIONS sessions fit
             ENCODER_STATE: {"max_slots": self.DEFAULT_SESSIONS + 1},
             ENCODER_FRONT: {"max_slots": self.DEFAULT_SESSIONS + 1},
             # a session holds its prompt and every frame for life (no eviction)
             NANO_KV: {"max_num_pages": kv_pages(self.session_positions(self.max_prompt_tokens), DEFAULT_PAGE_SIZE,
                                                 self.DEFAULT_SESSIONS)},
-            # + 1 for the pool's sink slot, so DEFAULT_SESSIONS sessions fit
             MAMBA_STATE: {"max_slots": self.DEFAULT_SESSIONS + 1},
             # both CFG streams
             TALKER_KV: {"max_num_pages": kv_pages(self.session_positions(self.TALKER_WARMUP_POSITIONS),
@@ -918,8 +916,8 @@ class NemotronDuplexModel(Model):
         return self._json_config_cache
 
     def _refuse_resources_sized_otherwise(self, cfg: NemotronDuplexConfig) -> None:
-        """The resources are declared from the dataclass defaults, before the
-        checkpoint is read: refuse a config.json that sizes one otherwise,
+        """The state is declared from the dataclass defaults, before the
+        checkpoint is read: refuse a config.json that sizes it otherwise,
         rather than run its modules against pools of another shape."""
         loaded = copy.copy(self)
         loaded.config = cfg

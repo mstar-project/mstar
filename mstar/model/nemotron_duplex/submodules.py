@@ -1,11 +1,11 @@
 """NodeSubmodules for NVIDIA NemotronLabs VoiceChat-11B (full duplex).
 
-Nodes, and the state or resources each declares:
+Nodes, and the state each declares:
 
     conformer_encoder  encoder_kv,                16 kHz speech -> per-frame LLM embeds; per session,
-                       encoder_state,             its attention window, its layers' conv state and its
-                       encoder_front              audio / mel tails (the shared
-                                                  ``FastConformerStreamSubmodule``)
+                       encoder_state,             its attention window, its layers' conv state, its
+                       encoder_front,             audio / mel tails and its counts of samples and mel
+                       encoder_stream             frames (the shared ``FastConformerStreamSubmodule``)
     nano_llm           nano_kv, mamba_state,      Nemotron-H hybrid Mamba-2 / attention / MLP (9B):
                        nano_sampler               the KV of the 4 attention layers, the conv and SSM
                                                   state of the 27 Mamba-2 layers, the text sampler
@@ -17,8 +17,7 @@ Nodes, and the state or resources each declares:
 
 Both autoregressive nodes keep their whole state in declared state and capture
 their decode step as a CUDA graph (the talker's with its codec decode). The
-encoder keeps a call's state in its bounded KV and two pools, and a live step
-(or its layer stack) replays a piecewise CUDA graph.
+encoder's live step (or its layer stack) replays a piecewise CUDA graph.
 """
 from __future__ import annotations
 
