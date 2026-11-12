@@ -54,6 +54,8 @@ from mstar.engine.state.adapters import (
     PAGED,
     VALUE,
     WITHIN_STEP,
+    StateSetup,
+    _resolve,
     build_handle,
     kv_layouts,
     node_handles,
@@ -197,6 +199,9 @@ class _StubResource:
     def block(self, name, i):
         return torch.empty(0)
 
+    def run(self, q, k=None, v=None, label=None):
+        return q
+
 
 def _bind(node, model, node_name="LLM"):
     resources = {spec.resource_key: _StubResource() for spec in node_resources(model)}
@@ -251,7 +256,7 @@ def test_the_published_configs_are_found():
 @pytest.mark.parametrize("size", QWEN3_5)
 def test_qwen3_5_specs_equal_the_hand_written_ones(size):
     model = _qwen3_5(**QWEN3_5[size])
-    _assert_equal_per_key(enabled_resources(model, {}), _qwen3_5_reference(model.config))
+    _assert_equal_per_key(enabled_resources(model, {}, StateSetup()), _qwen3_5_reference(model.config))
 
 
 # The `resources:` blocks of configs/qwen3_5_9b.yaml, with its commented-out state_dtype on.
@@ -291,7 +296,7 @@ def test_qwen3_5_stored_dtype_equals_the_hand_written_rule(ssm_dtype, head_k_dim
         **QWEN3_5["9B"], "mamba_ssm_dtype": ssm_dtype, "linear_key_head_dim": head_k_dim,
         "linear_value_head_dim": head_v_dim,
     })
-    _assert_equal_per_key(enabled_resources(model, {}), _qwen3_5_reference(model.config))
+    _assert_equal_per_key(enabled_resources(model, {}, StateSetup()), _qwen3_5_reference(model.config))
 
 
 def test_qwen3_5_conv_follows_the_engine_dtype_and_its_state_does_not():
@@ -311,7 +316,7 @@ _ALL_FULL_SHAPES = pytest.mark.parametrize(
 @_ALL_FULL_SHAPES
 def test_qwen3_5_all_full_specs_equal_the_hand_written_ones(overrides):
     model = _qwen3_5(**{**_ALL_FULL, **overrides})
-    specs = enabled_resources(model, {})
+    specs = enabled_resources(model, {}, StateSetup())
     _assert_equal_per_key(specs, _qwen3_5_reference(model.config))
     assert {spec.resource_key: spec for spec in specs}[GDN_STATE].config.num_layers == 0, "not the all-full shape"
 
@@ -374,7 +379,7 @@ def _qwen3_5_vision_reference(model) -> RaggedAttentionSpec:
 def test_qwen3_5_vision_spec_equals_the_hand_written_one(monkeypatch):
     model = _qwen3_5_vision(monkeypatch)
     reference = [*_qwen3_5_reference(model.config), _qwen3_5_vision_reference(model)]
-    _assert_equal_per_key(enabled_resources(model, {}), reference)
+    _assert_equal_per_key(enabled_resources(model, {}, StateSetup()), reference)
     assert state_declaration_problems(model) == []
 
 
@@ -684,8 +689,9 @@ def _qwen3_5_stack(blocks: int = 2):
     stack.config, stack.vision_config = config, None
     declared = {d.name: d for d in stack.declare_state()}
     kv_array, gdn_array = declared[KV_CACHE], declared[GDN_STATE]
-    kv = build_handle(kv_array, {KV_CACHE: _QwenKV(kv_array), ATTN: _QwenAttn(), ROPE: None})
-    gdn = build_handle(gdn_array, {GDN_STATE: _QwenPool(gdn_array), CONV: None, LINEAR_ATTN: _QwenLinear()})
+    resolved = _resolve([kv_array, gdn_array], StateSetup())
+    kv = build_handle(kv_array, {KV_CACHE: _QwenKV(kv_array), ATTN: _QwenAttn(), ROPE: None}, resolved)
+    gdn = build_handle(gdn_array, {GDN_STATE: _QwenPool(gdn_array), LINEAR_ATTN: _QwenLinear()}, resolved)
     for module in model.modules():
         if hasattr(module, "bind_state"):
             module.bind_state({KV_CACHE: kv, GDN_STATE: gdn})

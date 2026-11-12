@@ -822,7 +822,9 @@ Worker scheduling
        pages, and each commit against its request's layout. A recurrent snapshot's key is
        checked against the KV chain's key at its boundary. Logs a label left under its
        footprint at removal. Above one rank, each follower stops if the reservations it
-       admits a step from differ from rank 0's. Tests and debugging only.
+       admits a step from differ from rank 0's. Around each state op that runs its fused
+       kernel in an eager step, checks that the array changed only at the step's slots,
+       through a host copy of the array. Tests and debugging only.
 
 Compilation
 -----------

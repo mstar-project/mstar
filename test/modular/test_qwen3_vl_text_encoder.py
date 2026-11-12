@@ -20,6 +20,7 @@ transformers = pytest.importorskip("transformers")
 if not hasattr(transformers, "Qwen3VLForConditionalGeneration"):
     pytest.skip("this transformers has no Qwen3-VL", allow_module_level=True)
 
+from mstar.model.components.diffusion.attention import FrameSDPA  # noqa: E402
 from mstar.model.components.diffusion.qwen3.encoder import Qwen3EncoderConfig, qwen3_inv_freq  # noqa: E402
 from mstar.model.components.diffusion.qwen3.vl_prompt import qwen3_vl_prompt  # noqa: E402
 from mstar.model.components.diffusion.qwen3.weight_loading import (  # noqa: E402
@@ -40,7 +41,6 @@ from mstar.model.components.qwen3_vit import (  # noqa: E402
 )
 from mstar.model.components.qwen_vision import (  # noqa: E402
     VISION_ATTN,
-    FrameSDPA,
     QwenVisionConfig,
     QwenVisionModel,
 )

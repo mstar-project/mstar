@@ -16,7 +16,7 @@ import torch
 
 from mstar.engine.resources.base import CGSlotKey, CGSlotSpec, Resource
 from mstar.engine.resources.linear_attn.base import LinearAttnManager
-from mstar.engine.resources.linear_attn.config import LinearAttnConfig, LinearAttnStep
+from mstar.engine.resources.linear_attn.config import LinearAttnConfig, LinearAttnStep, bf16_gdn_state_fits
 from mstar.engine.resources.linear_attn.gdn_stage import gdn_stage_applies
 from mstar.engine.resources.linear_attn.wrappers import (
     GDNDecodeWrapper,
@@ -133,8 +133,8 @@ class GDNManager(LinearAttnManager):
                 f"gdn state dtype {state_dtype} is not supported: FlashInfer's "
                 "pool decode paths are fp32 and bf16."
             )
-        # The bf16 decode kernel is pool-only and K=V=128 only.
-        if geometry.head_k_dim != 128 or geometry.head_v_dim != 128:
+        # The bf16 decode kernel is pool-only.
+        if not bf16_gdn_state_fits(geometry.head_k_dim, geometry.head_v_dim):
             raise NotImplementedError(
                 f"a bf16 gdn state needs K=V=128, got K={geometry.head_k_dim} "
                 f"V={geometry.head_v_dim}; declare an fp32 pool instead."
