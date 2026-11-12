@@ -1700,7 +1700,7 @@ def _leader(array: Array, walks: "Walks") -> str | None:
 
 
 def _share_a_walk(a: Read, b: Read) -> bool:
-    return a.walks is None or b.walks is None or not a.walks.isdisjoint(b.walks)
+    return any(runs_on_walk(a, walk) and runs_on_walk(b, walk) for walk in (None, *(a.walks or ()), *(b.walks or ())))
 
 
 def _walk_reads(array: Array, resource_of: Mapping[str, str], combined: Mapping[str, Collection[str]]) -> WalkReads:
