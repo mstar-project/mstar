@@ -384,9 +384,10 @@ def start(out, pr, head_sha, runner_temp, tag, base, gpus, hours, run, checks, v
     commits, carry's call and the box's vendor), the review's notes (findings.json) and the PR's title and
     description (pr-body.md) as data, and an Anthropic key (an Eras box's own spend-capped one; every other box
     gets the review's own ANTHROPIC_API_KEY, in its user_data or over scp). Every vendor's box or none: when one
-    has no GPUs free, none starts, and the first launch asks budget.max_running for room for them all; when a box
-    then fails to start (its offer taken meanwhile), those already started go. Until every vendor has a box, a pass
-    of listing and launching repeats every GPU_RETRY seconds for GPU_WAIT. budget.max_running's refusal (launch
+    has no GPUs free, none starts, and the first launch asks budget.max_running for room for the boxes still to
+    start. Until every vendor has a box, a pass of listing and launching, for the vendors without one, repeats
+    every GPU_RETRY seconds for GPU_WAIT; the boxes that started stay up between passes, and go if the time runs
+    out. budget.max_running's refusal (launch
     exits EXIT_FULL) is not retried: it says now, as every pass would. A provider whose box couldn't be given its
     run is not tried again; one whose API can't count the running boxes is tried on the next pass. Each box that
     doesn't run gets an unavailable.md, and the step exits 3 with `unavailable` set."""
@@ -464,18 +465,20 @@ def start(out, pr, head_sha, runner_temp, tag, base, gpus, hours, run, checks, v
         sys.exit(3)
 
     def attempt():
-        """One pass: list every vendor's GPUs, and when each has some, launch a box each. (the listings, how it
-        went: "started", "none" for a vendor with no GPUs, "taken" for a launch that failed, or "full" for
-        budget.max_running's refusal, and the vendor whose launch that was)."""
-        found = {vendor: listed(vendor) for vendor in vendors}
-        if not all(found[v][0] for v in vendors):
+        """One pass: list the GPUs of every vendor still without a box, and when each has some, launch a box each,
+        the vendor with the fewest offers first, so a failure there costs the least. Boxes that started stay for
+        the next pass. (the listings, how it went: "started", "none" for a vendor with no GPUs, "taken" for a
+        launch that failed, or "full" for budget.max_running's refusal, and the vendor whose launch that was)."""
+        todo = [v for v in vendors if not (lt / v / "instance").exists()]
+        found = {vendor: listed(vendor) for vendor in todo}
+        if not all(found[v][0] for v in todo):
             return found, "none", None
-        for i, vendor in enumerate(vendors):
+        for i, vendor in enumerate(sorted(todo, key=lambda v: len(found[v][0]))):
             box = lt / vendor
             free, _, tried = found[vendor]
 
-            # The first launch checks budget.max_running has room for every box this run needs.
-            def launch(o, vendor=vendor, box=box, tried=tried, boxes=len(vendors) if i == 0 else 1):
+            # The first launch checks budget.max_running has room for every box this pass still needs.
+            def launch(o, vendor=vendor, box=box, tried=tried, boxes=len(todo) if i == 0 else 1):
                 data = fit_user_data(lt, box, len(secret)) if o["provider"] in USER_DATA \
                     else [lt / "findings.json", lt / "pr-body.md"]
                 inputs = [x for f in (box / "brief.md", *data, lt / "run.json", BOX_COMMON)
@@ -495,7 +498,6 @@ def start(out, pr, head_sha, runner_temp, tag, base, gpus, hours, run, checks, v
                 (box / "offer.json").write_text(json.dumps(o))
                 print(f"launched {vendor} on {o['id']} ({o['count']}x {o['gpu']}, ${o['usd_per_hour']}/hr)")
                 continue
-            end_boxes()  # a vendor's box is paid for nothing without the others
             return found, "full" if r and r.returncode == gpu_py.EXIT_FULL else "taken", vendor
         return found, "started", None
 
@@ -512,7 +514,7 @@ def start(out, pr, head_sha, runner_temp, tag, base, gpus, hours, run, checks, v
         if time.time() >= give_up:
             break
         time.sleep(GPU_RETRY)
-    for vendor in vendors:
+    for vendor in found:
         if not found[vendor][0] or vendor == failed:  # no GPUs, or its offers were taken since the listing
             none_free(vendor, found)
     stop()

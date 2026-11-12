@@ -477,25 +477,29 @@ class TestStart(unittest.TestCase):
         offers = {"nvidia": [do[0], *self.ERAS], "amd": [do[1]]}
         out, launched = self.start({"eras": {"run_secret_id": "s"}}, offers=offers, vendors="nvidia,amd")
         self.assertEqual([(x[1], x[x.index("--tag") + 1]) for x in launched],
-                         [("eras:l1", "1-1-nvidia"), ("digitalocean:gpu-mi300xx1", "1-1-amd")],
-                         "NVIDIA would leave Eras for a cheaper DigitalOcean box, or AMD would get none")
+                         [("digitalocean:gpu-mi300xx1", "1-1-amd"), ("eras:l1", "1-1-nvidia")],
+                         "NVIDIA would leave Eras for a cheaper DigitalOcean box, AMD would get none, or the "
+                         "vendor with fewer offers wouldn't start first")
         self.assertIn("AMD's (ROCm", (out / "amd/brief.md").read_text(), "the AMD session wouldn't know its GPUs")
-        self.assertIn(str(out / "amd/brief.md"), launched[1])
+        self.assertIn(str(out / "amd/brief.md"), launched[0])
         self.assertEqual([(out / v / "instance").read_text() for v in ("nvidia", "amd")],
                          ["eras:l1:1", "digitalocean:gpu-mi300xx1:1"])
         out, launched = self.start({"eras": {}}, offers=offers, vendors="nvidia,amd",
                                    launch_code={"digitalocean:gpu-mi300xx1": 1})
-        self.assertEqual([x[:2] for x in launched[:3]],
-                         [["launch", "digitalocean:gpu-h100x1"], ["launch", "digitalocean:gpu-mi300xx1"],
+        self.assertEqual([x[:2] for x in launched],
+                         [["launch", "digitalocean:gpu-h100x1"], *[["launch", "digitalocean:gpu-mi300xx1"]] * 11,
                           ["terminate", "digitalocean:gpu-h100x1:1"]],
-                         "an Eras offer the bot has no key for would block DigitalOcean's, or the NVIDIA box would "
+                         "an Eras offer the bot has no key for would block DigitalOcean's, a pass that failed would "
+                         "end a started box only to launch it again under the same name, or the NVIDIA box would "
                          "run for hours on a PR its AMD box can't let pass")
-        self.assertEqual([x[:2] for x in launched], [x[:2] for x in launched[:3]] * 11,
-                         "a pass that failed would leave its NVIDIA box up for the next pass to start another")
-        self.assertEqual(self.listings, {"nvidia": 11, "amd": 11})
+        self.assertEqual(self.listings, {"nvidia": 1, "amd": 11})
         self.assertFalse((out / "nvidia/instance").exists(), "wait would wait on a box that is gone")
         self.assertIn("another vendor's couldn't start", (out / "nvidia/unavailable.md").read_text())
         self.assertIn("No AMD GPUs", (out / "amd/unavailable.md").read_text())
+        _, launched = self.start({"eras": {"run_secret_id": "s"}}, offers=offers, vendors="nvidia,amd",
+                                 launch_code={"digitalocean:gpu-mi300xx1": 1})
+        self.assertEqual({x[1] for x in launched}, {"digitalocean:gpu-mi300xx1"},
+                         "an NVIDIA box would be paid for while the scarcer AMD vendor kept failing")
         with self.assertRaises(ValueError, msg="a vendor set the workflow never makes would reach the box"):
             self.start({}, vendors="amd")
 
@@ -506,7 +510,7 @@ class TestStart(unittest.TestCase):
         earlier = os.urandom(50_000).hex()
         out, launched = self.start({"eras": {"run_secret_id": "s"}}, offers={"nvidia": self.ERAS, "amd": [mi300x]},
                                    vendors="nvidia,amd", run="targeted", since="f" * 40, earlier=earlier)
-        nvidia, amd = (x[x.index("--run") + 2:x.index("--boxes")][1::2] for x in launched)
+        amd, nvidia = (x[x.index("--run") + 2:x.index("--boxes")][1::2] for x in launched)
         self.assertEqual(nvidia[1:3], [str(out / "findings.json"), str(out / "pr-body.md")],
                          "an Eras box, which has no such limit, would get the cut copies")
         self.assertEqual(amd[1:3], [str(out / "amd/findings.json"), str(out / "amd/pr-body.md")])
