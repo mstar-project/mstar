@@ -305,8 +305,8 @@ def build_handle(
 
 def state_steps(step: SubmoduleStep | None, handles: Mapping[str, ArrayHandle | SamplerHandle]) -> SubmoduleStep | None:
     """``step`` as a new step, with what its ``state`` declares expanded into today's step objects by each storage's
-    builder, built afresh for each step because `SubmoduleStep` writes the segments onto them. None when no array or
-    sampler it lists needs it, so the step skips its resources' admit, plan and commit."""
+    builder, afresh for each step, since each carries the step's segments. None when no array or sampler it lists
+    needs it, so the step skips its resources' admit, plan and commit."""
     if step is None or not step.state:
         return step
     if not any(getattr(handles.get(name), "needs_step", True) for name in step.state):

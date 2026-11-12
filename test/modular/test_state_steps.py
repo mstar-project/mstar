@@ -251,7 +251,7 @@ def test_each_step_gets_fresh_step_objects():
     handles = _handles(_kv())
     first = state_steps(SubmoduleStep(segments=[Segment(1, "main", 1)], state={"kv": ArrayStep()}), handles)
     second = state_steps(SubmoduleStep(segments=[Segment(2, "main", 2)], state={"kv": ArrayStep()}), handles)
-    assert first.steps["kv"].segments == [Segment(1, "main", 1)], "SubmoduleStep writes segments onto its step objects"
+    assert first.steps["kv"].segments == [Segment(1, "main", 1)], "a step's KVStep carries that step's segments"
     assert second.steps["kv"].segments == [Segment(2, "main", 2)]
 
 
