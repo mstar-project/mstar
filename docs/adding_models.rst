@@ -3191,7 +3191,7 @@ Splitting is declared in four places:
   through ``write_target`` or calls ``attn.run`` itself raises on a split label, since it would
   treat this rank's share as the whole step, and on any step over KV stored by head, since it would
   pass the TP heads where the pool holds this rank's slice. A state op that fuses the K/V write
-  into its norm/RoPE kernel (Qwen3-Omni's ``qk_norm_rope_table_kv_write``) runs its reference,
+  into its norm/RoPE kernel (Qwen3-Omni's ``qk_norm_rope_table_attend``) runs its reference,
   through ``add`` and the exchange, wherever the step's read exchanges
   (``AttentionManager.step_exchanges(label)``): a label the step splits, and every step over KV
   stored by head, copied steps too (each rank's head slice). A cacheless self-attention over a
