@@ -24,11 +24,8 @@ class CanaryDecoderSubmodule(EncoderDecoderNode):
     MAX_PREFILL_BATCH_SIZE = 32
     # off: with torch.compile, Canary's throughput was 6-15% lower at c=1-64 (H100 A/B)
     disable_torch_compile = True
-    # the decode ladder and token path Canary had before the scaffold: decode
-    # reads its ids from the routed token and emits a tensor a request; the
-    # device loop-back is a measured change of its own
+    # the decode ladder Canary had before the scaffold
     DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]
-    device_loopback = None
 
     def layer_steps(self) -> dict[str, ResourceStep]:
         return {KV_CACHE: KVStep(), ATTN: AttentionStep(causal=True)}
