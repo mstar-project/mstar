@@ -1058,10 +1058,14 @@ class StepExecutor:
         if inline is None:
             return 0, route
         started = _time.perf_counter()
+        if self.enable_nvtx:
+            range_push("worker.postprocess.stream_run", synchronize=False)
         sent, waited = stream_run(
             self._graph_runtime, batch_N.partition, batch_N.node_name, route.walks[0], route.rids,
             host_rows.request_ids, tokens, inline, outputs.landing, event,
         )
+        if self.enable_nvtx:
+            range_pop(synchronize=False)
         # the iterations' landing is a GPU wait, as ``event_sync`` is; the rest, the sends, is work
         self.timer.record("worker.postprocess.stream_run.wait", waited)
         self.timer.record("worker.postprocess.stream_run", _time.perf_counter() - started - waited)
