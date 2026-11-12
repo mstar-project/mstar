@@ -197,7 +197,10 @@ def test_loading_a_model_runs_the_host_field_check(monkeypatch):
     graph = SimpleNamespace(get_nodes=lambda: {"talker": None})
     model = make_model(declare_state=lambda: [_flags()], get_graph_walk_graphs=lambda: {"decode": graph},
                        checkpoint_path=lambda: None)
-    joint = SimpleNamespace(world_size=1, tp_group=SimpleNamespace(barrier=lambda: None), sp_group=None)
+    joint = SimpleNamespace(
+        world_size=1, tp_group=SimpleNamespace(barrier=lambda: None, world_size=1),
+        sp_group=SimpleNamespace(world_size=1),
+    )
     groups = SimpleNamespace(
         get_joint_group_for_node=lambda name: joint, get_instance_world_size_for_node=lambda name: 1,
         get_instance_rank_for_node=lambda name: 0,
