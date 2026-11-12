@@ -40,6 +40,7 @@ from mstar.engine.resources.attn.ragged.dense_wrappers import DensePrefixedPrefi
 from mstar.engine.resources.attn.ragged.wrappers import FlashInferPrefixedPrefillWrapper
 from mstar.engine.resources.base import EngineResourceInfo
 from mstar.engine.resources.kv.plan import KVPlanOutput, SequenceView
+from mstar.platforms import resolve_platform
 
 PAGE_SIZE = 4
 NUM_KV_HEADS = 2
@@ -82,14 +83,13 @@ def _ctx(views: list[SequenceView], slot: int = 0, **kwargs) -> StepContext:
     )
 
 
-def _view(rid: str, pages: list[int], prefix: int, fresh: int, generation: int = 0):
+def _view(rid: str, pages: list[int], prefix: int, fresh: int):
     return SequenceView(
         request_id=rid,
         label="main",
         page_idxs=pages,
         length=prefix + fresh,
         to_compute=fresh,
-        generation=generation,
     )
 
 
@@ -100,11 +100,6 @@ def _layer_tensor(fill: float = 0.0) -> torch.Tensor:
     return (torch.arange(n, dtype=torch.float32) + fill).reshape(
         MAX_PAGES, 2, PAGE_SIZE, NUM_KV_HEADS, HEAD_DIM
     )
-
-
-def _expected_prefix(layer: torch.Tensor, pages: list[int], prefix_len: int, kv: int):
-    rows = layer[pages][:, kv].reshape(-1, NUM_KV_HEADS, HEAD_DIM)
-    return rows[:prefix_len]
 
 
 class TestDensePlan:
@@ -420,19 +415,24 @@ def test_each_layer_gathers_the_prefix_beside_the_fresh_kv_and_holds_nothing(mon
         layer.mul_(-1)
 
 
-@pytest.mark.parametrize("wrapper, head_dim, extra_rows, fixed", [
-    ("prefixed", 128, 0, True),
-    ("prefixed", 128, 2, False),  # rows past the plan's: the fixed-length kernel would attend them
-    ("prefixed", 72, 0, False),
-    ("ragged", 128, 0, False),  # cacheless, as Cosmos3's vision tower
-], ids=["proven", "past-the-plan", "head_dim-72", "cacheless"])
-def test_one_segment_takes_the_fixed_length_kernel_only_where_proven(monkeypatch, wrapper, head_dim, extra_rows, fixed):
+@pytest.mark.parametrize("wrapper, head_dim, extra_rows, capability, fixed", [
+    ("prefixed", 128, 0, (9, 0), True),
+    ("prefixed", 128, 2, (9, 0), False),  # rows past the plan's: the fixed-length kernel would attend them
+    ("prefixed", 72, 0, (9, 0), False),
+    ("ragged", 128, 0, (9, 0), False),  # cacheless, as Cosmos3's vision tower
+    ("prefixed", 128, 0, (10, 0), False),  # proven on sm_90 only
+    ("prefixed", 128, 0, None, False),  # no NVIDIA GPU
+], ids=["proven", "past-the-plan", "head_dim-72", "cacheless", "sm_100", "no-gpu"])
+def test_one_segment_takes_the_fixed_length_kernel_only_where_proven(
+    monkeypatch, wrapper, head_dim, extra_rows, capability, fixed,
+):
     """FA3's fixed-length kernel is proven bit-equal to varlen for one segment on the prefixed wrapper at
-    head_dim 128 (Qwen-Image-2.1); every other one-segment plan stays on varlen."""
+    head_dim 128 (Qwen-Image-2.1) on sm_90; every other one-segment plan stays on varlen."""
     from mstar.engine.resources.attn.ragged import dense_wrappers
     from mstar.engine.resources.attn.ragged.dense_wrappers import DenseRaggedPrefillWrapper
 
     called = []
+    monkeypatch.setattr(resolve_platform(), "cuda_capability", lambda device=None: capability)
     monkeypatch.setattr(dense_wrappers, "flash_attn_func", lambda q, *a, **kw: called.append("fixed") or q)
     monkeypatch.setattr(dense_wrappers, "flash_attn_varlen_func", lambda q, *a, **kw: called.append("varlen") or q)
     cls = DensePrefixedPrefillWrapper if wrapper == "prefixed" else DenseRaggedPrefillWrapper
@@ -537,8 +537,8 @@ def kv_manager(monkeypatch):
 
 
 class TestStreamGeneration:
-    """`CacheStream.generation` exists for exactly one reader, so its contract
-    is worth pinning here: it moves when the resident bytes may have moved
+    """`CacheStream.generation` is read through `SequenceView.generation` (and by the
+    offload claim check), so its contract is worth pinning here: it moves when the resident bytes may have moved
     under that reader, and stands still when they cannot have."""
 
     def _plan_views(self, kv, segments, **step_kwargs):
@@ -557,8 +557,9 @@ class TestStreamGeneration:
         # commit=False: each denoise step recomputes its fresh K/V in place
         # rather than appending. commit is what moves the epoch (it is how an
         # in-place page write blocks an offload), so a commit=False step within
-        # the pages already held leaves the resident prefix — and a gather of
-        # it — good across steps.
+        # the pages already held leaves the epoch where it was, so the offload
+        # claim check, its other reader, sees no write behind it. (Each layer
+        # gathers the prefix from the pages every step regardless.)
         kv = kv_manager
         kv.ingest_request("r0")
         # commit the frozen prefix once, then read the epoch the denoise steps

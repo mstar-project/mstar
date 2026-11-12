@@ -31,7 +31,7 @@ class _DenseRaggedPrefillBase(_RaggedPrefillBase):
     the prefixed wrapper at head_dim 128, an eager plan of one segment calls
     FA3's fixed-length kernel instead: the same bits without the varlen
     bookkeeping (~0.5 ms per Qwen-Image-2.1 1024^2 step of 32 layers). That is
-    the case proven bit-equal; other head dims and the cacheless wrappers
+    the case proven bit-equal, on sm_90 only; other head dims and the cacheless wrappers
     (Cosmos3's vision tower, head_dim 72) stay on varlen.
     """
 
@@ -64,6 +64,7 @@ class _DenseRaggedPrefillBase(_RaggedPrefillBase):
             return
         self._one_segment = (
             self._fixed_length and self.head_dim == 128 and flash_attn_func is not None
+            and current_platform.cuda_capability(self.device) == (9, 0)
             and cu.numel() == 2 and kv_cu.numel() == 2
         )
         self._cu_q = cu.to(self.device, non_blocking=True)
