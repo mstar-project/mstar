@@ -55,14 +55,15 @@ class CGSlotKey:
     label: str
 
 
-def head_shards(group: JointGroups | None, places_positions: bool = False) -> int:
+def head_shards(group: JointGroups | None, tp_only: bool = False) -> int:
     """How many ways a node's ranks split its attention heads: its TP and SP ranks (CFG ranks run
-    whole branches, every head), or TP alone when its pools place positions over the SP ranks
-    (``PagedKVConfig.context_parallel``)."""
+    whole branches, every head), or TP alone (``tp_only``) where its pools place positions over the
+    SP ranks (``PagedKVConfig.context_parallel``), or for a resource over pools every SP rank
+    stores whole (``NodeResourceSpec.storage``)."""
     if group is None:
         return 1
     tp = group.tp_group.world_size
-    return tp if places_positions else tp * group.sp_group.world_size
+    return tp if tp_only else tp * group.sp_group.world_size
 
 
 @dataclass(frozen=True)
@@ -96,9 +97,9 @@ class EngineResourceInfo:
     # the prefix caches this engine opens (`opening_prefix_caches`), decided
     # before any resource is built, for one that sizes itself by its own
     prefix_caches: frozenset[str] = frozenset()
-    # whether the resource's nodes run replicated over their SP ranks, because their pools place
-    # positions over them (``PagedKVConfig.context_parallel``), rather than splitting their steps
-    # over them (``SeqShardSpec``)
+    # whether every SP rank holds this resource's heads whole, so they split over TP alone: its
+    # nodes' pools place positions over the SP ranks (``PagedKVConfig.context_parallel``), or it is
+    # a pool stored ``copied`` or a resource over such pools alone (``NodeResourceSpec.storage``)
     replicated_over_sp: bool = False
     # what each step may still copy to the host once its outputs are sent, or on a pass that runs no step
     host_allowance: StepAllowance | None = None
@@ -107,7 +108,8 @@ class EngineResourceInfo:
     def head_shards(self) -> int:
         """How many ways the node's ranks split its attention heads, which each builder sizes head
         counts by (`head_shards`). A ragged resource splits over TP only, unless it attends a label
-        its node's sequence shard splits (``RaggedAttentionSpec.sp_exchange``, derived)."""
+        its node's sequence shard splits (``RaggedAttentionSpec.sp_exchange``, derived): over TP x SP
+        then, even where the node's pools place positions."""
         return head_shards(self.joint_comm_group, self.replicated_over_sp)
 
     def dependency(self, key: str) -> NodeResourceSpec:

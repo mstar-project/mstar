@@ -4,7 +4,7 @@ storage and op type, and a handle per storage. It builds the specs, steps and la
 import dataclasses
 import functools
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import asdict, astuple, dataclass, replace
 from functools import partial
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
@@ -36,10 +36,11 @@ from mstar.engine.resources.recurrent.config import (
     RecurrentStep,
 )
 from mstar.engine.resources.sampler.config import SamplerSpec, SamplerStep, SamplingReqConfig
+from mstar.engine.resources.sequence_shard import SeqShardSpec
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
 from mstar.engine.resources.step import Segment, SubmoduleStep
-from mstar.engine.state.analysis import position_key, query_array
-from mstar.engine.state.calls import ArrayHandle, SamplerHandle, pool_layers, segments_of
+from mstar.engine.state.analysis import position_key, query_array, shard_axis
+from mstar.engine.state.calls import ArrayHandle, SamplerHandle, ShardHandle, pool_layers, segments_of
 from mstar.engine.state.contract import (
     EMPTY,
     Array,
@@ -59,6 +60,7 @@ from mstar.engine.state.contract import (
     Sampler,
     SampleSettings,
     SampleStep,
+    SeqShard,
     TensorType,
     Window,
     is_value,
@@ -74,16 +76,20 @@ if TYPE_CHECKING:
 
 def node_resources(model: "Model", *, setup: "StateSetup | None" = None) -> list[NodeResourceSpec]:
     """The specs ``model`` declares through `declare_state`, then the ones it writes by hand."""
-    specs = build_specs(model.declare_state(), kernel_settings=model.kernel_settings(), setup=setup)
+    specs = build_specs(
+        model.declare_state(), kernel_settings=model.kernel_settings(), setup=setup,
+        combined_walks=model.get_combined_graph_walks(),
+    )
     return specs + list(model.get_node_resources() or [])
 
 
 def build_specs(
-    declarations: Sequence[Array | Sampler], *, kernel_settings: Mapping[str, Mapping[str, Any]] = EMPTY,
-    setup: "StateSetup | None" = None,
+    declarations: Sequence[Array | Sampler | SeqShard], *, kernel_settings: Mapping[str, Mapping[str, Any]] = EMPTY,
+    setup: "StateSetup | None" = None, combined_walks: Mapping[str, Mapping[str, Collection[str]]] = EMPTY,
 ) -> list[NodeResourceSpec]:
     """Each array's specs, from its storage and its ops' bindings, under the names the declarations give, then a
-    `SamplerSpec` per sampler. A read that ``setup`` binds takes that binding.
+    `SamplerSpec` per sampler and a `SeqShardSpec` per sequence shard, which also lists the combined walks
+    (``combined_walks``, the model's) that combine a listed walk. A read that ``setup`` binds takes that binding.
 
     Raises ``ValueError`` on an array today's specs can't hold, naming what they lack. That includes a second update of
     one type on an array, a temporary limit: an update call finds its op by type, which today's resources need and the
@@ -95,6 +101,9 @@ def build_specs(
     for array in arrays:
         specs += resolved.specs[array.name]
     specs += [_sampler_spec(declared) for declared in declarations if isinstance(declared, Sampler)]
+    specs += [
+        _shard_spec(declared, combined_walks, arrays) for declared in declarations if isinstance(declared, SeqShard)
+    ]
     _apply_kernel_settings(specs, arrays, resolved, kernel_settings)
     return specs
 
@@ -233,6 +242,21 @@ def _sampler_spec(sampler: Sampler) -> SamplerSpec:
     )
 
 
+def _shard_spec(
+    shard: SeqShard, combined_walks: Mapping[str, Mapping[str, Collection[str]]], arrays: Sequence[Array],
+) -> SeqShardSpec:
+    walks = shard.walks
+    if walks is not None:
+        walks = walks | {
+            combined for node in shard.nodes for combined, rows in combined_walks.get(node, {}).items()
+            if walks & set(rows)
+        }
+    return SeqShardSpec(
+        shard.name, shard.nodes, labels=tuple(sorted(shard.labels)), axis=shard_axis(shard, arrays), walks=walks,
+        exchange=shard.exchange,
+    )
+
+
 def _apply_kernel_settings(
     specs: Sequence[NodeResourceSpec], arrays: Sequence[Array], resolved: "Resolved",
     kernel_settings: Mapping[str, Mapping[str, Any]],
@@ -266,36 +290,45 @@ def _apply_kernel_settings(
 
 def node_handles(
     model: "Model", node: str, resources: Mapping[str, Any], *, setup: "StateSetup | None" = None,
-) -> dict[str, ArrayHandle | SamplerHandle]:
+) -> dict[str, ArrayHandle | SamplerHandle | ShardHandle]:
     """``node``'s handles, by declared name, over its built ``resources``, each read bound as ``setup`` binds it."""
     setup = setup or StateSetup()
     declarations = model.declare_state()
     resolved = _resolve([declared for declared in declarations if isinstance(declared, Array)], setup)
     return {
         declared.name: build_handle(declared, resources, resolved, setup)
-        for declared in declarations if node in declared.nodes
+        for declared in declarations
+        if node in declared.nodes
     }
 
 
 def build_handle(
-    declared: Array | Sampler, resources: Mapping[str, Any], resolved: "Resolved",
+    declared: Array | Sampler | SeqShard, resources: Mapping[str, Any], resolved: "Resolved",
     setup: "StateSetup | None" = None,
-) -> ArrayHandle | SamplerHandle:
+) -> ArrayHandle | SamplerHandle | ShardHandle:
     """``declared``'s handle over the built ``resources``, with each of its ops bound to the resource ``resolved``
     gives it."""
     if isinstance(declared, Sampler):
         return SamplerHandle(declared, resources[declared.name])
+    if isinstance(declared, SeqShard):
+        return ShardHandle(declared, resources[declared.name])
     return storage_of(declared).handle(declared, resources, setup or StateSetup(), resolved)
 
 
-def state_steps(step: SubmoduleStep | None, handles: Mapping[str, ArrayHandle | SamplerHandle]) -> SubmoduleStep | None:
+def state_steps(
+    step: SubmoduleStep | None, handles: Mapping[str, ArrayHandle | SamplerHandle | ShardHandle],
+) -> SubmoduleStep | None:
     """``step`` as a new step, with what its ``state`` declares expanded into today's step objects by each storage's
-    builder, built afresh for each step because `SubmoduleStep` writes the segments onto them. None when no array or
-    sampler it lists needs it and it holds no other resource's step, so the step skips its resources' admit, plan and
-    commit."""
-    if step is None or not step.state:
+    builder, built afresh for each step because `SubmoduleStep` writes the segments onto them. The handles it opens
+    are those of what ``state`` lists, then the node's sequence shard's, whose step is the node's segments. None when
+    no array or sampler it lists needs it, nor a shard that can split, and it holds no other resource's step, so the
+    step skips its resources' admit, plan and commit."""
+    shards = tuple(handle for handle in handles.values() if isinstance(handle, ShardHandle))
+    if step is None or not (step.state or shards):
         return step
-    if not step.steps and not any(getattr(handles.get(name), "needs_step", True) for name in step.state):
+    if not step.steps and not any(
+        getattr(handles.get(name), "needs_step", True) for name in step.state
+    ) and not any(shard.needs_step for shard in shards):
         return None
     steps = dict(step.steps)
     builders: dict[Storage, StepBuilder] = {}
@@ -318,12 +351,12 @@ def state_steps(step: SubmoduleStep | None, handles: Mapping[str, ArrayHandle | 
             raise ValueError(
                 f"a step's state[{name!r}] is a {type(declared).__name__}, and on this node {name!r} is "
                 f"{'not declared' if handle is None else type(handle).__name__}, which take an ArrayStep for an array "
-                "and a SampleStep for a sampler"
+                "and a SampleStep for a sampler, and a sequence shard takes none"
             )
     for builder in builders.values():
         steps.update(builder.steps())
     expanded = replace(step, steps=steps)
-    expanded.set_state_handles(tuple(handles[name] for name in step.state))
+    expanded.set_state_handles((*(handles[name] for name in step.state), *shards))
     return expanded
 
 
@@ -417,7 +450,7 @@ class WithinStepSteps(StepBuilder):
 
 
 def kv_layouts(
-    declarations: Sequence[Array | Sampler],
+    declarations: Sequence[Array | Sampler | SeqShard],
     state_layout: Mapping[str, Mapping[str, Layout]],
     keyed_spans: Mapping[str, Mapping[str, int]],
 ) -> "dict[str, dict[str, LabelLayout]]":
@@ -448,7 +481,7 @@ def kv_layouts(
 
 
 def sampling_configs(
-    configs: Mapping[str, ResourceReqConfig | SampleSettings], declarations: Sequence[Array | Sampler],
+    configs: Mapping[str, ResourceReqConfig | SampleSettings], declarations: Sequence[Array | Sampler | SeqShard],
 ) -> dict[str, ResourceReqConfig]:
     """``configs`` with each `SampleSettings` as today's `SamplingReqConfig`. A name no sampler declares fails the
     request, and so do log-probs on a sampler with ``draws`` above 1, which take one token per step."""
@@ -698,10 +731,10 @@ class ConvOnLinearAttn(OpBinding):
 # Handles
 
 
-def _exchanges(attn: Any) -> bool:
-    """Whether a call on ``attn`` goes through its exchange (`AttentionManager.splits`); a stand-in attention, which
-    is no `AttentionManager`, keeps the direct call."""
-    return isinstance(attn, AttentionManager) and attn.splits
+def _exchanges(attn: Any, label: str) -> bool:
+    """Whether a call on ``attn`` for ``label`` goes through its exchange (`AttentionManager.step_exchanges`); a
+    stand-in attention, which is no `AttentionManager`, keeps the direct call."""
+    return isinstance(attn, AttentionManager) and attn.step_exchanges(label)
 
 
 class PagedArrayHandle(ArrayHandle):
@@ -763,14 +796,14 @@ class PagedArrayHandle(ArrayHandle):
         # held for the read, which passes them on as a layer calls attention (`requires_kv_write`): a kernel may
         # attend the step's own k and v rather than the pages (`reads_step_kv`), and an exchange writes them
         self._held, self._held_layer = (k, v), layer
-        if not _exchanges(attn):
+        if not _exchanges(attn, self.label):
             self._write(layer, k, v)
 
     def _write(self, layer: int, k: torch.Tensor, v: torch.Tensor) -> None:
         """``layer``'s write alone, where its kernel reads the pages: through the exchange where the attention
         exchanges, as `AttentionCallable.write` makes it."""
         attn = self._attn.get(layer)
-        if attn is not None and _exchanges(attn):
+        if attn is not None and _exchanges(attn, self.label):
             attn.exchange(partial(self._attend, layer), None, k, v, label=self.label)
         elif attn is None or attn.requires_kv_write:
             self._kv.write_kv(k, v, layer_idx=self._pool_layer[layer], label=self.label)
@@ -779,13 +812,13 @@ class PagedArrayHandle(ArrayHandle):
         """Write the held add of a layer the step didn't read where its write waits for the read's exchange, so
         each add is written once: when the next add or the step's check finds it still held."""
         layer = self._held_layer
-        if layer is not None and _exchanges(self._attn[layer]):
+        if layer is not None and _exchanges(self._attn[layer], self.label):
             self._write(layer, *self._take_hold(layer))
 
     def _needs_step_kv(self, attn: Any) -> bool:
         """Whether a read through ``attn`` attends the step's own k and v rather than only the pages, or goes through
         its exchange."""
-        return _exchanges(attn) or attn.reads_step_kv(self.label)
+        return _exchanges(attn, self.label) or attn.reads_step_kv(self.label)
 
     @torch.compiler.disable
     def read(self, layer: int | torch.Tensor, q: torch.Tensor | None = None, **mask_args: Any) -> torch.Tensor:
@@ -796,7 +829,7 @@ class PagedArrayHandle(ArrayHandle):
         layer = self._layer_id(layer)
         self._record_read(layer)
         attn = self._attn[layer]
-        if _exchanges(attn):
+        if _exchanges(attn, self.label):
             # the add's write and the attention as one call, on the tokens and heads this rank stores
             return attn.exchange(partial(self._attend, layer), q, *self._take_hold(layer), label=self.label)
         # a read with no add before it attends the pages alone, which a kernel that takes no writes can't
@@ -805,12 +838,15 @@ class PagedArrayHandle(ArrayHandle):
             q, label=self.label, kv_cache_layer=self._views[layer], k=k, v=v, layer_idx=self._pool_layer[layer],
         )
 
-    def _attend(self, layer: int, q: torch.Tensor | None, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor | None:
+    def _attend(
+        self, layer: int, q: torch.Tensor | None, k: torch.Tensor, v: torch.Tensor, tokens: torch.Tensor | None = None,
+    ) -> torch.Tensor | None:
         """An exchange's ``run``: this layer's write where the kernel reads the pages, then its attention (``q``
-        None: the write alone), as `AttentionCallable` makes the call."""
+        None: the write alone), as `AttentionCallable` makes the call. ``tokens``: which of the step's tokens k and v
+        are, named by the ring's exchange alone (`sequence_shard.ring`)."""
         attn, i = self._attn[layer], self._pool_layer[layer]
         if attn.requires_kv_write:
-            self._kv.write_kv(k, v, layer_idx=i, label=self.label)
+            self._kv.write_kv(k, v, layer_idx=i, label=self.label, tokens=tokens)
         if q is None:
             return None
         return attn.run(q, label=self.label, kv_cache_layer=self._views[layer], k=k, v=v, layer_idx=i)

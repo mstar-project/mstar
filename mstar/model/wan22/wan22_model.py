@@ -35,8 +35,7 @@ import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.distributed.base import ShardingConfig
-from mstar.engine.resources import SeqShardSpec
-from mstar.engine.state import Array, Attend, Block, Read
+from mstar.engine.state import Array, Attend, Block, Read, SeqShard
 from mstar.graph.base import (
     GraphEdge,
     GraphNode,
@@ -132,8 +131,8 @@ class Wan22Model(Model):
     # Model ABC: structure
     # ------------------------------------------------------------------
 
-    def declare_state(self) -> list[Array]:
-        """The DiT's self-attention over its tokens; nothing here keeps state.
+    def declare_state(self) -> list[Array | SeqShard]:
+        """The DiT's self-attention over its tokens, and its sequence shard; nothing here keeps state.
 
         Nothing in this model reads K/V back across steps. The text encoder
         and both VAE passes are one-shot forwards, and the DiT recomputes
@@ -145,30 +144,30 @@ class Wan22Model(Model):
         SDPA (cuDNN), which measured faster than FlashInfer's ragged kernel at
         that shape (0.46 vs 0.59 ms per layer at 1280x704x81 on an H200), while
         FA3 beats it on the self-attention (12.4 vs 14.8 ms).
+
+        On SP ranks the shard splits each row's tokens: the self-attention exchanges them for heads (Ulysses), and
+        the cross-attention over the text attends a rank's share of them. Every row of a step is one length (a
+        bucket's), read as rows, so each row splits alike. On SDPA the self-attention can't run on SP ranks.
         """
         c = self.config
-        return [Array(
-            DIT_TOKENS, nodes={"dit"}, layers=frozenset(range(c.num_layers)), max_len=0,
-            entry=dit_entry(c.num_attention_heads, c.attention_head_dim),
-            reads={SELF_ATTN: Read(mask=Block(), op=Attend(q_heads=c.num_attention_heads), packed=False)},
-        )]
+        return [
+            Array(
+                DIT_TOKENS, nodes={"dit"}, layers=frozenset(range(c.num_layers)), max_len=0,
+                entry=dit_entry(c.num_attention_heads, c.attention_head_dim),
+                reads={SELF_ATTN: Read(mask=Block(), op=Attend(q_heads=c.num_attention_heads), packed=False)},
+            ),
+            SeqShard(DIT_SHARD, nodes={"dit"}, labels={Wan22DitSubmodule.MAIN_SPAN}),
+        ]
 
     def kernel_settings(self) -> dict[str, dict[str, Any]]:
         # one segment per guidance branch; the DiT is compiled, not captured, so attention stays in its graph (under
         # SP the op runs the exchange inside it)
         return {SELF_ATTN: {"max_segments_per_request": len(Wan22DitSubmodule.GUIDANCE.branches), "compile_op": True}}
 
-    def get_node_resources(self) -> list[SeqShardSpec]:
-        """The DiT's sequence shard, which on SP ranks splits each row's tokens: the self-attention exchanges them
-        for heads (Ulysses), and the cross-attention over the text attends a rank's share of them. Every row of a
-        step is one length (a bucket's), so each row splits alike (``axis`` 1). On SDPA the self-attention can't run
-        on SP ranks."""
-        return [SeqShardSpec(resource_key=DIT_SHARD, nodes={"dit"}, labels=(Wan22DitSubmodule.MAIN_SPAN,), axis=1)]
-
     def get_default_sharding_config(self) -> ShardingConfig:
         # The dit's two guidance branches split over cfg_size ranks, which
         # all-gather the noise predictions (see Wan22DitSubmodule), and its
-        # tokens over sp_size (its sequence shard, see get_node_resources).
+        # tokens over sp_size (its sequence shard, see declare_state).
         # Signals stay replicated: no shard_dim entries.
         return ShardingConfig(
             groups=[], tp_enabled_nodes=set(), shard_dim={},

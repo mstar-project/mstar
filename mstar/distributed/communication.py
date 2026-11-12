@@ -1,4 +1,5 @@
 import functools
+import math
 import socket
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -283,21 +284,34 @@ class CommGroup:
         dist.broadcast(tensor, self.group_members[src], self._device_pg())
         return tensor
 
-    def to_partners(self, blocks: torch.Tensor, partners: Sequence[int]) -> torch.Tensor:
-        """``blocks[j]`` to group rank ``partners[j]`` (ascending, this rank among them), and back
-        the block each partner sent this rank, in the same order: one all-to-all over the whole
-        group with nothing sent to or from the ranks outside ``partners``. Every member calls it,
-        with partner sets that pair up (a lists b exactly when b lists a). Replays from a CUDA
-        graph."""
+    def all_to_all_rows(self, x: torch.Tensor, send_rows: Sequence[int], recv_rows: Sequence[int]) -> torch.Tensor:
+        """``x``'s rows (its first dim) to the group's ranks, ``send_rows[i]`` of them to group
+        rank ``i``, in rank order; back come the rows each rank sent this one, ``recv_rows[i]``
+        from rank ``i``, in rank order. One all-to-all over the whole group. The counts are
+        group-relative, and every member calls it with counts that pair up (what a sends b is what
+        b receives from a). Replays from a CUDA graph."""
         if self.world_size == 1:
-            return blocks
-        blocks = blocks.contiguous()
-        splits = [0] * self.world_size
-        for partner in partners:
-            splits[partner] = blocks[0].numel()
-        recv = torch.empty_like(blocks)
-        _all_to_all_single(self._device_pg(), blocks.view(-1), recv.view(-1), splits, splits)
+            return x
+        x = x.contiguous()
+        row = math.prod(x.shape[1:])
+        recv = x.new_empty(sum(recv_rows), *x.shape[1:])
+        _all_to_all_single(
+            self._device_pg(), x.view(-1), recv.view(-1), [n * row for n in recv_rows], [n * row for n in send_rows],
+        )
         return recv
+
+    def connect_pairs(self, device: torch.device) -> None:
+        """One one-element exchange per rank offset, so every pair of ranks has exchanged once:
+        NCCL connects a pair on its first exchange, which for a ring's point-to-point hops would
+        come in its first request, after warmup and the capture plan read free memory, and a
+        routing fault would hang there rather than at startup. Collective: every member calls it
+        at the same point."""
+        one = torch.zeros(1, device=device)
+        for offset in range(1, self.world_size):
+            send, recv = [0] * self.world_size, [0] * self.world_size
+            send[(self.rank + offset) % self.world_size] = recv[(self.rank - offset) % self.world_size] = 1
+            self.all_to_all_rows(one, send, recv)
+
 
     # Eager as a whole, the boundary where the per-rank sizes become the collective's host split
     # lists: traced, its branches on them would compile per sequence length, and a traced variant
@@ -326,14 +340,16 @@ class CommGroup:
         group size); when ``None`` the respective dimension is split evenly
         (and ``scatter_dim`` must then be divisible by ``world_size``).
 
-        ``input_`` may be several tensors that differ only in the extent of
-        ``scatter_dim``, split evenly (q, k and v with their own head counts):
+        ``input_`` may be several tensors of one dtype and one extent along
+        ``gather_dim``, each split evenly (q, k and v with their own head counts):
         they go in one exchange and come back as a tuple. Each exchange is one
         ``all_to_all_single`` over a buffer packed in a single copy, which
         replays from a CUDA graph. It runs outside torch.compile, so a compiled
         caller breaks around this call.
         """
         tensors = (input_,) if isinstance(input_, torch.Tensor) else tuple(input_)
+        # packed into one buffer of the first's dtype, which would silently convert the others
+        assert len({x.dtype for x in tensors}) == 1, f"all_to_all packs one dtype, got {[x.dtype for x in tensors]}"
         if self.world_size == 1:
             return input_ if isinstance(input_, torch.Tensor) else tensors
         world_size = self.world_size

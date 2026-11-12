@@ -4,6 +4,7 @@ Kept free of the manager and its kernels so a submodule can declare a step
 without pulling FlashInfer in behind it.
 """
 
+import copy
 import math
 from abc import ABC, abstractmethod
 from collections.abc import Collection, Iterable, Mapping, Sequence
@@ -19,6 +20,7 @@ if TYPE_CHECKING:
     from mstar.engine.resources.base import Resource
     from mstar.engine.resources.context_parallel import ContextParallel
     from mstar.engine.resources.sequence_shard import SeqShardSpec
+    from mstar.engine.resources.spec import Storage
 
 
 class KVLayout(Enum):
@@ -132,6 +134,8 @@ class PagedKVConfig(KVConfig):
     # is kept for first (`keep_window`, which `derive_kv_groups` calls as the specs resolve,
     # before anything builds or sizes from the pool). One group of every layer until then.
     groups: tuple["KVGroup", ...] = field(default=(), init=False, repr=False, compare=False)
+    # the groups as `keep_window` derived them, which a placement re-pages (`placed_groups`)
+    _kept_groups: tuple["KVGroup", ...] = field(default=(), init=False, repr=False, compare=False)
 
     def __post_init__(self):
         self._check_sizes()
@@ -182,7 +186,7 @@ class PagedKVConfig(KVConfig):
             page = tokens * len(full) // len(layers)
             # the window in whole pages: a stream releases its front pages past it at commit
             groups += (KVGroup(tuple(layers), page, RetentionPolicy(context_budget=-(-window // page) * page)),)
-        self.groups = groups
+        self.groups = self._kept_groups = groups
 
     @property
     def tokens_per_page(self) -> int:
@@ -239,18 +243,43 @@ class PagedKVConfig(KVConfig):
 
         if not self.context_parallel:
             return None
-        if len(self.groups) > 1:
-            # a page of a group's layers holds another page size, which the placed storage doesn't stripe
-            raise ValueError(f"KV {pool!r}: context_parallel is unsupported over a pool that keeps a sliding window")
         tp_size, sp_size = (1, 1) if joint is None else (joint.tp_group.world_size, joint.sp_group.world_size)
         # raises on one rank alone, so past here there is a joint group
         size = self.context_parallel_size(pool, tp_size, sp_size)
+        self.groups = self.placed_groups(pool, size)
         if sp_size > 1:
             sp = joint.sp_group
             return SPPlacement(size=size, index=sp.rank, group=sp)
         tp = joint.tp_group
         first = tp.rank // size * size
         return TPPlacement(size=size, index=tp.rank % size, group=tp, partners=tuple(range(first, first + size)))
+
+    def paged_for(self, pool: str, tp: int, sp: int) -> "PagedKVConfig":
+        """This config as a rank of a node of ``tp`` x ``sp`` ranks pages it (`place`): a copy with
+        the groups placed when ``context_parallel`` is on, else this config. What the conductor
+        counts a request's pages with, so its count is the worker's."""
+        if not self.context_parallel:
+            return self
+        placed = copy.copy(self)
+        placed.groups = self.placed_groups(pool, self.context_parallel_size(pool, tp, sp))
+        return placed
+
+    def placed_groups(self, pool: str, size: int) -> "tuple[KVGroup, ...]":
+        """The pool's groups (`keep_window`) with its positions placed over ``size`` partners: the
+        first group's slots stripe over them, and each window group stays whole on every partner,
+        so a decode step attends it with no collective. An arena page then holds ``1/size`` of a
+        first-group page's slots a rank, so a window group's page is ``1/size`` of its unplaced
+        tokens; its retention (whole unplaced pages) still keeps the window. From the groups
+        ``keep_window`` derived, so it can run again."""
+        kept = self._kept_groups
+        for group in kept[1:]:
+            if group.page_size % size:
+                raise ValueError(
+                    f"KV {pool!r}: context_parallel keeps its sliding-window layers whole on each of its {size} "
+                    f"partners in {group.page_size}-token pages, which a partner's 1/{size} of an arena page "
+                    f"doesn't hold whole: use a page_size giving them pages of a multiple of {size} tokens"
+                )
+        return (kept[0], *(replace(group, page_size=group.page_size // size) for group in kept[1:]))
 
     def context_parallel_size(self, pool: str, tp: int, sp: int) -> int:
         """How many ranks ``context_parallel`` stripes each page over on a node of ``tp`` x ``sp``
@@ -716,11 +745,15 @@ def unrestorable(specs: Mapping[str, NodeResourceSpec], opened: Collection[str])
     """The resources that can't restore what a hit skips while ``opened`` open:
     those that set `NodeResourceSpec.restores_prefix` and keep no open cache of
     their own, unless they are over open caches that restore. Each keeps every
-    cache on its nodes shut."""
+    cache on its nodes shut. A dependency that plans from the step a hit trimmed
+    (``prefix_skip_safe``, a sequence shard's say) holds nothing to restore."""
+    def held(spec: NodeResourceSpec) -> set[str]:
+        return {dep for dep in spec.depends_on() if not specs[dep].resource_class.prefix_skip_safe}
+
     return [
         spec for spec in specs.values()
         if spec.restores_prefix and spec.resource_key not in opened and not (
-            spec.depends_on() and all(dep in opened and specs[dep].restores_prefix for dep in spec.depends_on())
+            (deps := held(spec)) and all(dep in opened and specs[dep].restores_prefix for dep in deps)
         )
     ]
 
@@ -798,20 +831,29 @@ class KVSpec(NodeResourceSpec):
         return KVManager
 
     @property
-    def places_positions(self) -> bool | None:
+    def storage(self) -> "Storage | None":
         # a paged pool's (`PagedKVConfig.context_parallel`); a ring keeps every position on each rank
-        return self.config.context_parallel if isinstance(self.config, PagedKVConfig) else None
+        cfg = self.config
+        if not isinstance(cfg, PagedKVConfig):
+            return None
+        return "by_position" if cfg.context_parallel else "by_head"
 
-    def split_step_refusals(self, node: str, shard: "SeqShardSpec", tp: int, sp: int) -> list[str]:
-        # stored by head, a split step's tokens trade for heads over every TP and SP rank (Ulysses)
+    def split_step_refusals(
+        self, node: str, shard: "SeqShardSpec", tp: int, sp: int, specs: Mapping[str, "NodeResourceSpec"],
+    ) -> list[str]:
+        # stored by position, a split step's packed tokens are gathered or passed round; stored by
+        # head, they trade for heads over every TP and SP rank (Ulysses)
         cfg = self.config
         if not isinstance(cfg, PagedKVConfig):
             return []
         if cfg.context_parallel:
-            return [
-                f"node {node!r} splits tokens over {sp} SP ranks, and KV {self.resource_key!r} stores them by "
-                "position (context_parallel), which split steps don't support yet: store it by head"
-            ]
+            if shard.axis == 1:
+                return [
+                    f"node {node!r} splits each row of its steps (axis 1) over {sp} SP ranks, and KV "
+                    f"{self.resource_key!r} stores them by position (context_parallel), which takes a packed "
+                    "split (axis 0) only"
+                ]
+            return []
         q, kv = cfg._unsharded_qo_heads, cfg._unsharded_kv_heads
         if q % tp or kv % tp or (q // tp) % sp or (kv // tp) % sp:
             return [

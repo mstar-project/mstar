@@ -25,6 +25,7 @@ from mstar.engine.resources.kv.config import KVSpec, KVStep, PagedKVConfig
 from mstar.engine.resources.lora.config import LORA_RESOURCE_KEY
 from mstar.engine.resources.position.config import PositionConfig, PositionSpec, PositionStep
 from mstar.engine.resources.sampler.config import SamplerSpec, SamplerStep, SamplingReqConfig
+from mstar.engine.resources.sequence_shard import SeqShardSpec
 from mstar.engine.resources.spec import apply_yaml_overrides
 from mstar.engine.resources.step import Segment, StepContext, SubmoduleStep
 from mstar.engine.state import host
@@ -50,6 +51,7 @@ from mstar.model.qwen3_omni.config import (
     THINKER_KV,
     THINKER_POS,
     THINKER_SAMPLER,
+    THINKER_SHARD,
     VISION_ATTN,
     VISION_TOKENS,
     Qwen3OmniModelConfig,
@@ -105,6 +107,7 @@ def _reference(c: Qwen3OmniModelConfig) -> list:
         )),
         SamplerSpec(resource_key=THINKER_SAMPLER, nodes={"Thinker"}, vocab_size=tt.vocab_size,
                     enable_repetition_penalty=True),
+        SeqShardSpec(resource_key=THINKER_SHARD, nodes={"Thinker"}, labels=("main",), axis=0, exchange="none"),
         SamplerSpec(resource_key=TALKER_SAMPLER, nodes={"Talker"}, vocab_size=kt.vocab_size,
                     enable_repetition_penalty=True),
         SamplerSpec(resource_key=CODE_PRED_SAMPLER, nodes={"Talker"}, vocab_size=c.code_predictor.vocab_size,

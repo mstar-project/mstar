@@ -601,16 +601,16 @@ def _sequence_parallel(
     groups: dict[int, tuple[int, int, set[str]]] = {}
     for wg in worker_graphs:
         groups.setdefault(wg._group_id, (wg.tp_size, wg.sp_size, set()))[2].update(wg.section.get_nodes())
-    placed_pools = [spec for spec in specs if spec.places_positions]
+    placed_pools = [spec for spec in specs if spec.storage == "by_position"]
     for i, (tp, sp, nodes) in sorted(groups.items()):
         for spec in placed_pools:
             if spec.nodes & nodes:
                 try:
-                    spec.config.context_parallel_size(spec.resource_key, tp, sp)
+                    spec.config.paged_for(spec.resource_key, tp, sp)
                 except ValueError as e:
                     yield f"node_groups[{i}]: {e}"
         # node -> whether it places its KV positions over its SP ranks (heads over TP alone)
-        # rather than splitting its steps (heads over TP x SP)
+        # rather than keeping KV by head while its steps split (heads over TP x SP)
         placed = {}
         for node in sorted(nodes):
             refusals = sequence_parallel_refusals(specs, node, tp, sp, moe_parallel.get(node))
@@ -624,6 +624,6 @@ def _sequence_parallel(
         if mixed:
             yield (
                 f"node_groups[{i}]: {sorted(n for n, p in placed.items() if p)} place their KV positions over "
-                f"the SP ranks and {sorted(n for n, p in placed.items() if not p)} split their steps over them, "
+                f"the SP ranks and {sorted(n for n, p in placed.items() if not p)} keep KV by head over them, "
                 f"so they split heads different ways, yet share resources {mixed}"
             )

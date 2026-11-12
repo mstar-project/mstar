@@ -35,7 +35,7 @@ from mstar.model.components.diffusion.guidance import Guidance, cfg
 from mstar.model.components.diffusion.image_io import truncate_to_uint8
 from mstar.model.components.diffusion.unipc import make_unipc_tables
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
-from mstar.model.wan22.config import DIT_TOKENS, Wan22Config
+from mstar.model.wan22.config import DIT_SHARD, DIT_TOKENS, Wan22Config
 
 logger = logging.getLogger(__name__)
 
@@ -323,6 +323,8 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
         self.transformer = transformer
         self.config = config
         self._record_fp32_islands()
+        # the node's sequence shard, which brackets the DiT (`bind_state`)
+        self.shard = None
         # The WHOLE forward cannot be one compiled region: Inductor would fuse the
         # UniPC step's `sample - sigma * output` and pass the 0-dim CPU-resident sigma
         # as a device pointer, which fails on the first call. Moving sigma to CUDA
@@ -351,6 +353,10 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
                 "shapes and the UniPC solver run eager.",
                 sorted(self._compile_grids),
             )
+
+    def bind_state(self, handles) -> None:
+        """The node's sequence shard. See ``NodeSubmodule.bind_node_state``."""
+        self.shard = handles.get(DIT_SHARD)
 
     def bucket_key_for(self, fwd_info: CurrentForwardPassInfo) -> WanStepKey:
         meta = fwd_info.step_metadata
@@ -457,7 +463,7 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
             hidden_states=hidden_states,
             timestep=timestep,
             encoder_hidden_states=encoder_hidden_states.to(self.transformer.dtype),
-            shard=self.sequence_shard,
+            shard=self.shard,
         )
 
 

@@ -165,14 +165,14 @@ def test_reads_on_different_nodes_never_share_a_resource():
 
 
 @pytest.mark.parametrize("key, exchange", [
-    ("video_self", "ulysses"), ("audio_self", None), ("video_text", None), ("audio_text", None),
+    ("video_self", "ulysses"), ("audio_self", "none"), ("video_text", "none"), ("audio_text", "none"),
 ])
 def test_a_self_read_runs_ulysses_only_where_the_nodes_shard_lists_its_label(key, exchange):
     """LTX-2.5 splits its video tokens and not its audio: the audio self-attention keeps every head on each rank."""
     shard = SeqShardSpec(resource_key="shard", nodes={"dit"}, labels=("video",), axis=1)
     specs = resolve_spec_dependencies([*build_specs(_av()), shard])
     assert specs[key].sp_exchange == exchange
-    assert resolve_spec_dependencies(build_specs(_av()))["video_self"].sp_exchange is None, "a node with no shard"
+    assert resolve_spec_dependencies(build_specs(_av()))["video_self"].sp_exchange == "none", "a node with no shard"
 
 
 def test_a_declared_dtype_reaches_the_spec():
