@@ -1460,7 +1460,7 @@ class WithinStepStorage(Storage):
             queries = resolved.queries[key] = (OwnQueries if read.queries is None else CrossQueries)(
                 query_array(array, read, by_name),
             )
-            # refuses either side's second label here, at load, rather than when the handle is built
+            # refuses either side's second label at resolve, which validation and `build_specs` run before any handle
             queries.plan_label(array)
             config = RaggedAttentionConfig(
                 num_qo_heads=read.op.q_heads, num_kv_heads=heads, head_dim=head_dim, dtype=dtype,
