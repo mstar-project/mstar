@@ -28,11 +28,14 @@
 mod adapters;
 mod auth;
 mod bridge;
+mod client_errors;
 mod generation_kwargs;
 mod media;
 mod protocol;
+mod realtime;
 mod refusals;
 mod served_models;
+mod lora_admin;
 mod serving;
 mod sndfile;
 mod speech_chunking;
@@ -40,6 +43,9 @@ mod tokenizer;
 mod transcription;
 mod unicode_marks;
 mod utf8;
+mod ws;
+
+use client_errors::scrub_paths;
 
 use std::collections::BTreeMap;
 use std::convert::Infallible;
@@ -54,7 +60,7 @@ use axum::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Response,
     },
-    routing::{get, post},
+    routing::{any, get, post},
     Json, Router,
 };
 use futures::StreamExt;
@@ -146,7 +152,13 @@ async fn main() {
     }
 
     sndfile::init();
+    if adapters::from_python(&python_adapter).is_some_and(|a| a.supports_realtime_transcription()) {
+        realtime::report_availability();
+    }
     let served = Arc::new(served_models::ServedModels::from_env(&model_name));
+    if let Some(bridge) = &bridge {
+        bridge.serve_models(served.clone());
+    }
 
     let refusals = Arc::new(refusals::Refusals::default());
     let state = AppState {
@@ -208,7 +220,15 @@ async fn main() {
         .route("/health", get(health))
         .route("/metrics", get(metrics))
         .route("/v1/models", get(list_models))
+        // LoRA's runtime updates: no generation, outside the admission cap
+        .route("/v1/load_lora_adapter", post(lora_admin::load_lora_adapter))
+        .route("/v1/unload_lora_adapter", post(lora_admin::unload_lora_adapter))
         .route("/v1/audio/voices", get(audio_voices))
+        // long-lived sockets: outside the admission cap, as on the Python frontend
+        .route("/", any(ws::openpi::openpi_ws))
+        .route("/healthz", get(ws::openpi::healthz))
+        .route("/generate/ws", any(ws::generate::generate_ws))
+        .route("/v1/realtime", any(realtime::realtime))
         .merge(api)
         .layer(DefaultBodyLimit::max(body_limit_mb << 20))
         .layer(axum::middleware::from_fn_with_state(
@@ -317,6 +337,7 @@ enum Surface {
     Images,
     Videos,
     Transcriptions,
+    RealtimeTranscription,
 }
 
 /// The OpenAI error `type` for a status: a 4xx is the client's
@@ -478,6 +499,18 @@ fn check_request_id(id: &str) -> Result<(), String> {
 /// Resolve the loaded model's adapter and check it serves `surface`; otherwise
 /// an OpenAI-shaped error response (404), matching router.py `_resolve`.
 fn resolve(st: &AppState, surface: Surface) -> Result<&'static dyn OpenAIAdapter, Response> {
+    let unknown = adapters::from_python(&st.python_adapter).is_none();
+    resolve_message(st, surface).map_err(|message| {
+        if unknown {
+            error(404, &message, "model_not_found")
+        } else {
+            error(404, &message, "invalid_request_error")
+        }
+    })
+}
+
+/// The adapter that serves `surface`, or why none does (`router._resolve`'s message).
+fn resolve_message(st: &AppState, surface: Surface) -> Result<&'static dyn OpenAIAdapter, String> {
     let message = if st.python_adapter.is_empty() {
         format!("Model '{}' has no OpenAI-compatible adapter; use POST /generate", st.model_name)
     } else {
@@ -487,21 +520,17 @@ fn resolve(st: &AppState, surface: Surface) -> Result<&'static dyn OpenAIAdapter
             st.model_name, st.python_adapter
         )
     };
-    let adapter = adapters::from_python(&st.python_adapter)
-        .ok_or_else(|| error(404, &message, "model_not_found"))?;
+    let adapter = adapters::from_python(&st.python_adapter).ok_or(message)?;
     let ok = match surface {
         Surface::Chat => adapter.supports_chat(),
         Surface::Speech => adapter.supports_speech(),
         Surface::Images => adapter.supports_images(),
         Surface::Videos => adapter.supports_videos(),
         Surface::Transcriptions => adapter.supports_transcriptions(),
+        Surface::RealtimeTranscription => adapter.supports_realtime_transcription(),
     };
     if !ok {
-        return Err(error(
-            404,
-            &format!("Model '{}' does not support this endpoint", st.model_name),
-            "invalid_request_error",
-        ));
+        return Err(format!("Model '{}' does not support this endpoint", st.model_name));
     }
     Ok(adapter)
 }
@@ -693,7 +722,7 @@ async fn chat_completions(
 /// A client that leaves meanwhile drops this future, and the stream's guard aborts.
 async fn open_stream(mut base: OutStream) -> Result<OutStream, (u16, String)> {
     match base.next().await {
-        Some(Out::Error { status, message }) => Err((status, message)),
+        Some(Out::Error { status, message, .. }) => Err((status, message)),
         first => Ok(Box::pin(futures::stream::iter(first).chain(base))),
     }
 }
@@ -761,7 +790,7 @@ fn chat_sse_payloads(
             // Terminal mid-stream failure: an OpenAI error event, and suppress
             // the normal stop/[DONE] tail (mstar's generator exception drops the
             // connection; the explicit error event is strictly more informative).
-            Out::Error { status, message } => {
+            Out::Error { status, message, .. } => {
                 errored.store(true, std::sync::atomic::Ordering::SeqCst);
                 Some(sse_error_json(status, &message))
             }
@@ -1141,7 +1170,7 @@ async fn audio_speech(
                                 return Some((SpeechOut::Audio(c.data), Some((cur, pending, submitted))));
                             }
                             Some(Out::Chunk(_)) => {}
-                            Some(Out::Error { status, message }) => {
+                            Some(Out::Error { status, message, .. }) => {
                                 return Some((SpeechOut::Failure { status, message }, None));
                             }
                             None => {
@@ -1401,7 +1430,7 @@ fn video_ndjson(base: OutStream) -> impl futures::Stream<Item = Result<Bytes, In
                     st.0 += 1;
                     ndjson_line(&c)
                 }
-                Out::Error { status, message } => {
+                Out::Error { status, message, .. } => {
                     st.1 = true;
                     ndjson_line(&ResultChunk {
                         modality: "error".to_string(),
@@ -1902,7 +1931,7 @@ async fn generate_finish(
         output_modalities,
         model_kwargs,
         parts,
-        report_usage: false,
+        ..SubmitArgs::default()
     };
 
     schedule_upload_cleanup(&st.upload_dir, &args);
@@ -1923,7 +1952,7 @@ async fn generate_finish(
                 Out::Chunk(c) => c,
                 // After the 200 the status travels in-band, as the error chunk
                 // Python's `errors_in_band` ends the stream with.
-                Out::Error { status, message } => ResultChunk {
+                Out::Error { status, message, .. } => ResultChunk {
                     modality: "error".to_string(),
                     data: message.into_bytes(),
                     metadata: json!({"status": status}),

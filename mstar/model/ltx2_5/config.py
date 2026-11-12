@@ -45,8 +45,15 @@ VAE_DECODER_NODE = "vae_decoder"
 AUDIO_DECODER_NODE = "audio_decoder"
 # One loop name for both denoising stages: each stage's walk sets its own max_iters.
 DENOISE_LOOP = "denoise_loop"
-# Resource key of the dit's ragged self-attention.
-DIT_ATTN = "dit_attn"
+# The dit's six attentions, each an array with max_len 0 and one read. A label names the stream a segment holds, so one
+# resource can hold several plans. A read that shares a resource needs only its own name.
+VIDEO_SPAN, AUDIO_SPAN, TEXT_SPAN = "video", "audio", "text"
+VIDEO, AUDIO = "video_tokens", "audio_tokens"
+TEXT_FOR_VIDEO, TEXT_FOR_AUDIO = "text_for_video", "text_for_audio"
+AUDIO_FOR_VIDEO, VIDEO_FOR_AUDIO = "audio_for_video", "video_for_audio"
+VIDEO_SELF, AUDIO_SELF = "dit_attn_video", "dit_attn_audio"
+VIDEO_TEXT, AUDIO_TEXT = "dit_xattn_video", "dit_xattn_audio"
+AUDIO_TO_VIDEO, VIDEO_TO_AUDIO = "dit_xattn_audio_to_video", "dit_xattn_video_to_audio"
 
 # diffusers.pipelines.ltx2.utils
 DISTILLED_SIGMA_VALUES = (1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875)

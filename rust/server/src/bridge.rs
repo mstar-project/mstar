@@ -22,6 +22,7 @@
 //!                        | {t:"check_ref_audio", rid, sub, path, decoder, bare}
 //!                        | {t:"voices", rid, sub}
 //!                        | {t:"windows", rid, sub, op, plan, ...}
+//!                        | {t:"live", rid, sub, op, call, ...}
 //!   conductor -> frontend: {t:"chunk", rid, sub, modality, data(bin), metadata}
 //!                        | {t:"chunks", subs, modalities, payloads(bin), metadatas}
 //!                        | {t:"done",  rid, sub}
@@ -30,6 +31,7 @@
 //!                        | {t:"checked", rid, sub, error?, status?}
 //!                        | {t:"voices", rid, sub, metadata:{voices?}}
 //!                        | {t:"windows", rid, sub, metadata:{duration, single, windows} | {error}}
+//!                        | {t:"live", rid, sub, metadata:{taking | accepted | rejected | error, status}}
 //!
 //! A `metrics` request carries this frontend's cumulative refusal counts
 //! (`refusals.rs`) as three parallel lists, for the API server to export. Its
@@ -81,8 +83,9 @@ pub enum StreamItem {
     Chunk(ResultChunk),
     /// The backend failed this request (worker exception, bad input);
     /// terminal — the route is removed. `status` is the HTTP status the
-    /// frontend should return (from the error chunk's `metadata.status`).
-    Error { status: u16, message: String },
+    /// frontend should return (from the error chunk's `metadata.status`);
+    /// `refused`: `submit_request` refused it, so it never had a request id.
+    Error { status: u16, message: String, refused: bool },
     Done,
 }
 
@@ -114,6 +117,14 @@ struct SubmitMsg<'a> {
     /// `submit_request`'s `report_usage`; left out when false.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     report_usage: bool,
+    /// `submit_request`'s `raw_inputs`, `end_input` and `file_streams`, each
+    /// left out when unset.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    raw_inputs: &'a BTreeMap<String, Vec<crate::adapters::RawArray>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    end_input: Option<&'a Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    file_streams: Option<&'a Value>,
 }
 
 fn no_parts(parts: &&[Part]) -> bool {
@@ -131,9 +142,21 @@ struct ProbeMsg<'a> {
     refusals: Option<&'a Snapshot>,
     #[serde(flatten)]
     check: Option<&'a RefAudioCheck>,
-    /// A `windows` request's operation and its arguments.
+    /// A `windows` or `live` request's operation and its arguments.
     #[serde(flatten)]
     windows: Option<&'a serde_json::Map<String, Value>>,
+    /// An `end_of_turn` request's or a conversation append's audio, float32 little-endian.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    audio: Option<&'a serde_bytes::Bytes>,
+}
+
+/// What a probe carries besides its kind.
+#[derive(Default, Clone, Copy)]
+struct Extras<'a> {
+    refusals: Option<&'a Snapshot>,
+    check: Option<&'a RefAudioCheck>,
+    op: Option<&'a serde_json::Map<String, Value>>,
+    audio: Option<&'a [u8]>,
 }
 
 /// Inbound message; `t` selects chunk / err / done. `data` is msgpack binary.
@@ -164,6 +187,9 @@ struct Inbound {
     payloads: Vec<serde_bytes::ByteBuf>,
     #[serde(default)]
     metadatas: Vec<Value>,
+    // t == "served": the API server's served LoRA adapters, after a change
+    #[serde(default)]
+    adapters: Option<Vec<String>>,
 }
 
 struct Route {
@@ -247,6 +273,8 @@ pub struct Bridge {
     mbox: Arc<RawZmqCommunicator>,
     routes: Arc<Routes>,
     next_sub: AtomicU64,
+    /// Where the API server's `served` pushes land (`Bridge::serve_models`).
+    served: Arc<std::sync::OnceLock<Arc<crate::served_models::ServedModels>>>,
 }
 
 impl Bridge {
@@ -260,12 +288,25 @@ impl Bridge {
 
         let mbox_r = mbox.clone();
         let routes_r = routes.clone();
-        std::thread::spawn(move || Self::demux_loop(mbox_r, routes_r));
+        let served = Arc::new(std::sync::OnceLock::new());
+        let served_r = served.clone();
+        std::thread::spawn(move || Self::demux_loop(mbox_r, routes_r, served_r));
 
-        Ok(Self { mbox, routes, next_sub: AtomicU64::new(1) })
+        Ok(Self { mbox, routes, next_sub: AtomicU64::new(1), served })
     }
 
-    fn demux_loop(mbox: Arc<RawZmqCommunicator>, routes: Arc<Routes>) {
+    /// Keep `served` up to date with the API server's served LoRA adapters, which
+    /// it pushes after every change: a runtime load or unload, and a conductor's
+    /// answer that arrived after its request timed out.
+    pub fn serve_models(&self, served: Arc<crate::served_models::ServedModels>) {
+        let _ = self.served.set(served);
+    }
+
+    fn demux_loop(
+        mbox: Arc<RawZmqCommunicator>,
+        routes: Arc<Routes>,
+        served: Arc<std::sync::OnceLock<Arc<crate::served_models::ServedModels>>>,
+    ) {
         loop {
             let Some(payload) = mbox.recv_timeout(Duration::from_millis(500)) else {
                 continue;
@@ -283,6 +324,12 @@ impl Bridge {
                     continue;
                 }
             };
+            if msg.t == "served" {
+                if let (Some(adapters), Some(served)) = (msg.adapters, served.get()) {
+                    served.set_adapters(adapters);
+                }
+                continue;
+            }
             deliver(&routes, msg);
         }
     }
@@ -338,6 +385,9 @@ impl Bridge {
             prompt_parts: &args.parts,
             streaming,
             report_usage: args.report_usage,
+            raw_inputs: &args.raw_inputs,
+            end_input: args.end_input.as_ref(),
+            file_streams: args.file_streams.as_ref(),
         };
         let payload = rmp_serde::to_vec_named(&msg).expect("encode submit");
         if self.mbox.send("bridge", &payload).is_err() {
@@ -347,6 +397,7 @@ impl Bridge {
             let _ = tx.send(StreamItem::Error {
                 status: 500,
                 message: "backend unreachable (bridge send failed)".to_string(),
+                refused: false,
             });
             self.routes.lock().expect("routes lock").remove(sub);
         }
@@ -356,19 +407,20 @@ impl Bridge {
     /// Send `{t}` to the bridge loop and wait for its one reply (routed like
     /// a completed request). None on timeout: the bridge loop or the backend
     /// behind it is gone.
-    async fn round_trip(
-        &self,
-        t: &str,
-        refusals: Option<&Snapshot>,
-        check: Option<&RefAudioCheck>,
-        windows: Option<&serde_json::Map<String, Value>>,
-        timeout: Duration,
-    ) -> Option<StreamItem> {
+    async fn round_trip(&self, t: &str, extras: Extras<'_>, timeout: Duration) -> Option<StreamItem> {
         let rid = format!("{t}-{}", uuid::Uuid::new_v4());
         let (tx, mut rx) = unbounded_channel();
         let sub = self.next_sub.fetch_add(1, Ordering::Relaxed);
         self.routes.lock().expect("routes lock").routes.insert(sub, Route { tx, rid: None });
-        let msg = ProbeMsg { t, rid: &rid, sub, refusals, check, windows };
+        let msg = ProbeMsg {
+            t,
+            rid: &rid,
+            sub,
+            refusals: extras.refusals,
+            check: extras.check,
+            windows: extras.op,
+            audio: extras.audio.map(serde_bytes::Bytes::new),
+        };
         if let Ok(payload) = rmp_serde::to_vec_named(&msg) {
             let _ = self.mbox.send("bridge", &payload);
         }
@@ -380,14 +432,14 @@ impl Bridge {
     /// Liveness round-trip for the deep health check: send `{t:"ping"}` and
     /// wait for the backend's pong. False on timeout.
     pub async fn ping(&self, timeout: Duration) -> bool {
-        self.round_trip("ping", None, None, None, timeout).await.is_some()
+        self.round_trip("ping", Extras::default(), timeout).await.is_some()
     }
 
     /// The API server's `/metrics` reply, asked with this frontend's refusal
     /// counts: the rendered text in `data` and, when metrics are on, its
     /// `content_type` in `metadata`. None on timeout.
     pub async fn metrics(&self, refusals: &Snapshot, timeout: Duration) -> Option<ResultChunk> {
-        match self.round_trip("metrics", Some(refusals), None, None, timeout).await? {
+        match self.round_trip("metrics", Extras { refusals: Some(refusals), ..Extras::default() }, timeout).await? {
             StreamItem::Chunk(chunk) => Some(chunk),
             _ => None,
         }
@@ -397,9 +449,33 @@ impl Bridge {
     /// Python route asks it (a model's list can change while it serves): `Ok(None)`
     /// when the model publishes no list, `Err` on timeout or a failure there.
     pub async fn voices(&self, timeout: Duration) -> Result<Option<Value>, (u16, String)> {
-        match self.round_trip("voices", None, None, None, timeout).await {
+        match self.round_trip("voices", Extras::default(), timeout).await {
             Some(StreamItem::Chunk(mut chunk)) => Ok(chunk.metadata.get_mut("voices").map(Value::take)),
-            Some(StreamItem::Error { status, message }) => Err((status, message)),
+            Some(StreamItem::Error { status, message, .. }) => Err((status, message)),
+            _ => Err((503, "backend bridge unreachable".to_string())),
+        }
+    }
+
+    /// `/v1/load_lora_adapter` (`op` "load", with `lora_path`) or
+    /// `/v1/unload_lora_adapter` ("unload"): the API server's `LoraAdmin` call,
+    /// its text or the `(status, message)` the Python route answers with.
+    pub async fn lora(&self, op: &str, name: &Value, path: Option<&Value>, timeout: Duration) -> Result<String, (u16, String)> {
+        let mut args = serde_json::Map::new();
+        args.insert("op".into(), Value::from(op));
+        args.insert("lora_name".into(), name.clone());
+        if let Some(path) = path {
+            args.insert("lora_path".into(), path.clone());
+        }
+        match self.round_trip("lora", Extras { op: Some(&args), ..Extras::default() }, timeout).await {
+            Some(StreamItem::Chunk(chunk)) => match (chunk.metadata.get("text"), chunk.metadata.get("error")) {
+                (Some(Value::String(text)), _) => Ok(text.clone()),
+                (_, Some(error)) => Err((
+                    error.get("status").and_then(Value::as_u64).unwrap_or(500) as u16,
+                    error.get("message").and_then(Value::as_str).unwrap_or_default().to_string(),
+                )),
+                _ => Err((500, "the API server's LoRA admin gave no answer".to_string())),
+            },
+            Some(StreamItem::Error { status, message, .. }) => Err((status, message)),
             _ => Err((503, "backend bridge unreachable".to_string())),
         }
     }
@@ -409,10 +485,64 @@ impl Bridge {
     /// `single` and the `windows` it cut, or the `error` it raised. None on
     /// timeout.
     pub async fn windows(&self, op: &Value, timeout: Duration) -> Option<ResultChunk> {
-        match self.round_trip("windows", None, None, op.as_object(), timeout).await? {
+        match self.round_trip("windows", Extras { op: op.as_object(), ..Extras::default() }, timeout).await? {
             StreamItem::Chunk(chunk) => Some(chunk),
             _ => None,
         }
+    }
+
+    /// One operation on a live call, the submission `call`: `taking`
+    /// (`taking_input`), `append` (`stream_input`) or `reject`
+    /// (`reject_input`), with its arguments. The reply's `metadata`, or `None`
+    /// on timeout.
+    pub async fn live(&self, call: u64, op: &str, args: serde_json::Map<String, Value>, timeout: Duration) -> Option<Value> {
+        self.live_op(call, op, args, None, timeout).await
+    }
+
+    /// A `/v1/realtime` conversation's append: `samples` for the `ClientAudio`
+    /// stream `stream`, at its rate, as `stream_input(samples=...)` takes them.
+    pub async fn live_audio(&self, call: u64, stream: &str, samples: &[f32], timeout: Duration) -> Option<Value> {
+        let bytes: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
+        let mut args = serde_json::Map::new();
+        args.insert("stream".into(), Value::from(stream));
+        self.live_op(call, "append", args, Some(&bytes), timeout).await
+    }
+
+    async fn live_op(&self, call: u64, op: &str, mut args: serde_json::Map<String, Value>, audio: Option<&[u8]>, timeout: Duration) -> Option<Value> {
+        args.insert("op".into(), Value::from(op));
+        args.insert("call".into(), Value::from(call));
+        match self.round_trip("live", Extras { op: Some(&args), audio, ..Extras::default() }, timeout).await? {
+            StreamItem::Chunk(chunk) => Some(chunk.metadata),
+            _ => None,
+        }
+    }
+
+    /// `semantic_vad`'s end-of-turn probability of a turn's last audio, from the
+    /// API server's Smart Turn (`realtime_vad.smart_turn`): the int8 model moves
+    /// by tenths when its input features move by 1e-5, so only the reference's
+    /// own feature extractor makes the same turns.
+    pub async fn end_of_turn(&self, audio: &[f32], timeout: Duration) -> Result<f64, String> {
+        let bytes: Vec<u8> = audio.iter().flat_map(|f| f.to_le_bytes()).collect();
+        match self.round_trip("end_of_turn", Extras { audio: Some(&bytes), ..Extras::default() }, timeout).await {
+            Some(StreamItem::Chunk(c)) => match c.metadata.get("p").and_then(Value::as_f64) {
+                Some(p) => Ok(p),
+                None => Err(c.metadata.get("error").and_then(Value::as_str).unwrap_or("no probability").to_string()),
+            },
+            _ => Err("the API server did not answer".to_string()),
+        }
+    }
+
+    /// A route for a socket's notices (an append the model found late), open
+    /// until [`Bridge::close_notices`].
+    pub fn notices(&self) -> (u64, UnboundedReceiver<StreamItem>) {
+        let (tx, rx) = unbounded_channel();
+        let sub = self.next_sub.fetch_add(1, Ordering::Relaxed);
+        self.routes.lock().expect("routes lock").routes.insert(sub, Route { tx, rid: None });
+        (sub, rx)
+    }
+
+    pub fn close_notices(&self, sub: u64) {
+        self.routes.lock().expect("routes lock").remove(sub);
     }
 
     /// Have the planner of `plan` delete the upload and its windows; the upload
@@ -430,9 +560,9 @@ impl Bridge {
     /// deleted there.
     pub async fn check_ref_audio(&self, check: &RefAudioCheck, timeout: Duration) -> Result<(), (u16, String)> {
         let start = std::time::Instant::now();
-        match self.round_trip("check_ref_audio", None, Some(check), None, timeout).await {
+        match self.round_trip("check_ref_audio", Extras { check: Some(check), ..Extras::default() }, timeout).await {
             Some(StreamItem::Done) => Ok(()),
-            Some(StreamItem::Error { status, message }) => Err((status, message)),
+            Some(StreamItem::Error { status, message, .. }) => Err((status, message)),
             // the request's budget ran out, as the Python frontend's request would
             None if start.elapsed() >= timeout => Err((500, "Request timed out".to_string())),
             _ => Err((500, "the server could not check ref_audio".to_string())),
@@ -475,8 +605,9 @@ fn deliver(routes: &Routes, msg: Inbound) {
                 .get("status")
                 .and_then(Value::as_u64)
                 .unwrap_or(500) as u16;
+            let refused = msg.metadata.get("refused").and_then(Value::as_bool).unwrap_or(false);
             let message = String::from_utf8_lossy(&msg.data.into_vec()).into_owned();
-            (Some(StreamItem::Error { status, message }), true)
+            (Some(StreamItem::Error { status, message, refused }), true)
         }
         "chunk" => (
             Some(StreamItem::Chunk(ResultChunk {
@@ -489,17 +620,17 @@ fn deliver(routes: &Routes, msg: Inbound) {
         // Legacy out-of-band error (the bridge relay caught an exception
         // and sent `t="err"`); no status carried, default to 500.
         "err" => (
-            Some(StreamItem::Error { status: 500, message: msg.msg }),
+            Some(StreamItem::Error { status: 500, message: msg.msg, refused: false }),
             true,
         ),
         "done" => (Some(StreamItem::Done), true),
         // Liveness reply: completes the ping's route like a request.
         "pong" => (Some(StreamItem::Done), true),
         "checked" => match msg.error {
-            Some(message) => (Some(StreamItem::Error { status: msg.status.unwrap_or(400), message }), true),
+            Some(message) => (Some(StreamItem::Error { status: msg.status.unwrap_or(400), message, refused: false }), true),
             None => (Some(StreamItem::Done), true),
         },
-        "metrics" | "voices" | "windows" => (
+        "metrics" | "voices" | "windows" | "live" | "end_of_turn" | "lora" => (
             Some(StreamItem::Chunk(ResultChunk {
                 modality: msg.t,
                 data: msg.data.into_vec(),
@@ -551,6 +682,7 @@ mod tests {
     fn encoded_with(parts: &[Part], report_usage: bool) -> Value {
         let file_paths = BTreeMap::new();
         let model_kwargs = serde_json::Map::new();
+        let raw_inputs = BTreeMap::new();
         let msg = SubmitMsg {
             t: "submit",
             rid: "r",
@@ -566,8 +698,19 @@ mod tests {
             prompt_parts: parts,
             streaming: true,
             report_usage,
+            raw_inputs: &raw_inputs,
+            end_input: None,
+            file_streams: None,
         };
         rmp_serde::from_slice(&rmp_serde::to_vec_named(&msg).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn a_submit_without_raw_inputs_or_streams_leaves_those_keys_out() {
+        let sent = encoded(&[]);
+        for key in ["raw_inputs", "end_input", "file_streams"] {
+            assert!(sent.get(key).is_none(), "{key}");
+        }
     }
 
     #[test]
@@ -755,17 +898,17 @@ mod tests {
         };
         let snap = Snapshot { route: vec!["/generate".into()], status: vec![401], count: vec![3] };
         assert_eq!(
-            encode(&ProbeMsg { t: "metrics", rid: "m", sub: 4, refusals: Some(&snap), check: None, windows: None }),
+            encode(&ProbeMsg { t: "metrics", rid: "m", sub: 4, refusals: Some(&snap), check: None, windows: None, audio: None }),
             json!({"t": "metrics", "rid": "m", "sub": 4,
                    "refusals": {"route": ["/generate"], "status": [401], "count": [3]}})
         );
         assert_eq!(
-            encode(&ProbeMsg { t: "ping", rid: "p", sub: 5, refusals: None, check: None, windows: None }),
+            encode(&ProbeMsg { t: "ping", rid: "p", sub: 5, refusals: None, check: None, windows: None, audio: None }),
             json!({"t": "ping", "rid": "p", "sub": 5})
         );
         let check = RefAudioCheck { path: "/u/a.wav".into(), decoder: "soundfile", bare: true };
         assert_eq!(
-            encode(&ProbeMsg { t: "check_ref_audio", rid: "c", sub: 6, refusals: None, check: Some(&check), windows: None }),
+            encode(&ProbeMsg { t: "check_ref_audio", rid: "c", sub: 6, refusals: None, check: Some(&check), windows: None, audio: None }),
             json!({"t": "check_ref_audio", "rid": "c", "sub": 6, "path": "/u/a.wav", "decoder": "soundfile", "bare": true})
         );
     }

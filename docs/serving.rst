@@ -324,7 +324,8 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        55-90% as binary PCM, and digital silence to 1-2%, but compressing every frame
        costs the event loop: about 8% of it at 32 live Nemotron VoiceChat calls on
        ``/generate/ws``, whose configs turn it off. Turn it off where the server's
-       event loop, not the network, is the bottleneck.
+       event loop, not the network, is the bottleneck. The Rust frontend
+       (``--rust-frontend``) offers no deflate, whatever this says.
    * - ``ws_max_message_mb``
      - *(optional)* The largest WebSocket message the server reads, in MiB, on every
        WebSocket route; by default the HTTP body limit, ``MSTAR_MAX_BODY_MB``. A larger one
@@ -524,7 +525,8 @@ them by that name:
    resources:
      kv_cache:
        max_num_pages: 1024      # also: page_size, max_seq_len, cpu_offload_pages,
-                                # prefix_cache, prefix_cache_salt, prefix_cache_tp
+                                # prefix_cache, prefix_cache_salt, prefix_cache_tp,
+                                # context_parallel
      talker_attn:
        flashinfer_backend: fa2  # also: backend (flashinfer / dense), decode_tensor_cores, decode_fmha
      vit_attn:                  # a cacheless (ragged) attention resource
@@ -538,6 +540,10 @@ its encoder context, can therefore size each one separately. If a block names a 
 that the model does not declare, or sets a key that the resource does not accept, loading
 fails. A misspelled setting is never silently ignored. A top-level ``kv_cache:`` block is
 no longer read. It raises an error with a message describing the migration.
+
+``backend: sdpa`` on the resource of a declared read within a step runs each read on it
+through torch's SDPA, as a DiT's reference pipeline does, and builds no resource, so its block
+takes no other key. A read whose queries come packed can't run on SDPA, and loading refuses it.
 
 ``greedy_capture: false`` on a sampler stops all-greedy steps from taking each row's
 argmax, and the engine from capturing a twin of each batched bucket for them. A sampler
@@ -556,6 +562,13 @@ ranks. Loading fails otherwise. A cache that keeps
 a sliding window (``AttentionConfig.sliding_window``) has no prefix cache yet: its
 ``prefix_cache`` goes off (logged at info), and a serving config that sets
 ``prefix_cache: true`` on it is refused.
+
+``context_parallel: true`` splits each request's positions over the ranks that would
+otherwise hold the same KV heads: the TP ranks that share a KV head, or the node's SP ranks
+when it has them, which is how a model with no sequence parallelism of its own (such as
+Qwen3.5) runs on ``sp_size`` above 1. Raise ``max_num_pages`` by that factor to turn the
+freed memory into context. **Context parallelism** in :doc:`adding_models` covers when each mode applies and
+what it refuses.
 
 A request waits at the head of its pool's queue until its reservation fits beside the
 reservations already admitted. A request behind it starts first when its own pages fit, output

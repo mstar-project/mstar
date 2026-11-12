@@ -1,6 +1,7 @@
 import logging
 from collections.abc import Collection, Mapping
 from dataclasses import dataclass, field
+from typing import NamedTuple
 
 import torch
 
@@ -12,10 +13,17 @@ from mstar.engine.chunking import DEFAULT_MIN_CHUNK_TOKENS
 from mstar.engine.engine import Engine
 from mstar.engine.node_dtype import resolve_model_dtype, resolve_node_dtype
 from mstar.engine.resources import ResourceReqConfig
+from mstar.engine.resources.context_parallel import positions_over_sp
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.graph.base import GraphNode
 from mstar.graph.runtime.base import GraphRuntime
-from mstar.model.base import Model, node_moe_parallel_configs, parse_autocast_dtype, serving_resources
+from mstar.model.base import (
+    Model,
+    deployment_setup,
+    node_moe_parallel_configs,
+    parse_autocast_dtype,
+    serving_resources,
+)
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.utils.device import DeviceCapability
 from mstar.utils.streams import reset_device_scheduling
@@ -182,6 +190,46 @@ def _refuse_unroutable_withholds(submodules: dict, model: Model) -> None:
                     )
 
 
+class InlineStreams(NamedTuple):
+    """Which streamed signals go as values (``_inline_streams``)."""
+    # (node, signal) pairs whose streamed items the route sends as values
+    keys: frozenset[tuple[str, str]]
+    # (node, walk) -> its streamed signals that go as tensors there: a step keeps
+    # such a signal's rows on the device only if nothing streams it
+    tensor_streams: dict[tuple[str, str], frozenset[str]]
+
+
+def _inline_streams(
+    submodules: dict, model: Model, parallel_groups: WorkerParallelGroups | None = None,
+) -> InlineStreams:
+    """The streams whose items the route sends as values: a ``by_value``
+    connection's, for the graph runtime. On a walk, such a stream goes by value
+    only when its signal is the step's one inline signal, the first of the
+    node's ``inline_signals`` it outputs; every other stream, and a lockstep
+    node's (whose replicated stream's consumer counts items from every rank,
+    which a value cannot say), keeps its tensors."""
+    topology = model.get_partition_topology()
+    by_value = {c.edge_name for c in (topology.connections if topology else []) if c.by_value}
+    keys = set()
+    tensor_streams: dict[tuple[str, str], set[str]] = {}
+    for walk, section in model.get_graph_walk_graphs().items():
+        for name, node in section.get_nodes().items():
+            submodule = submodules.get(name)
+            lockstep = parallel_groups is not None and parallel_groups.get_instance_world_size_for_node(name) > 1
+            outputs = {edge.name for edge in node.outputs}
+            inline = submodule.inline_signals(walk) if submodule is not None else {}
+            sent_inline = next((signal for signal in inline if signal in outputs), None)
+            for edge in node.outputs:
+                if not edge.is_streaming:
+                    continue
+                if edge.name in by_value and not lockstep:
+                    keys.add((name, edge.name))
+                    if edge.name == sent_inline:
+                        continue
+                tensor_streams.setdefault((name, walk), set()).add(edge.name)
+    return InlineStreams(frozenset(keys), {k: frozenset(v) for k, v in tensor_streams.items()})
+
+
 def side_stream_nodes(node_groups: list[dict]) -> frozenset[str]:
     """The nodes whose node groups set ``side_stream: true``. A node listed by
     several groups, one per graph walk, must get the same answer from each."""
@@ -307,6 +355,8 @@ class EngineManager:
     # (node, walk) keys that run beside the chain, as ``build`` decided from
     # the config's ``side_stream`` (see ``_side_lane_keys``)
     side_keys: tuple[tuple[str, str], ...] = ()
+    # which streamed signals go as values (``_inline_streams``)
+    inline_streams: InlineStreams = InlineStreams(frozenset(), {})
 
     @classmethod
     def build(
@@ -325,8 +375,8 @@ class EngineManager:
         """Build the engine and load this worker's nodes into it.
 
         The model supplies each node's submodule via ``get_submodule`` and its
-        resources via ``get_node_resources``; the KV cache's shape rides on
-        the latter, so there is no separate cache config. The conductor's
+        resources via ``declare_state`` and ``get_node_resources``; the KV cache's
+        shape rides on those, so there is no separate cache config. The conductor's
         ``validate_deployment`` has already checked the specs and overrides.
         """
         # the per-node settings read only the config: refuse a bad one before any weights load
@@ -342,7 +392,8 @@ class EngineManager:
             if unknown:
                 raise ValueError(f"{key} names nodes {unknown} that no node group serves")
         walk_ladders, region_ladders = _split_token_ladders(ladders, model)
-        specs = serving_resources(model, model_config)
+        setup = deployment_setup(model, model_config)
+        specs = serving_resources(model, model_config, setup)
 
         # YAML autocast_dtype over the model's own, but never re-enabling
         # autocast for a model that pinned its numerics (see node_dtype)
@@ -357,16 +408,20 @@ class EngineManager:
         # Checked by the conductor's get_sharding_config before spawn.
         moe_parallel = node_moe_parallel_configs(model_config["node_groups"])
         for name in sorted(node_names):
-            # Sequence and CFG parallelism are opt-in per node; only forward
-            # their groups when this node actually participates in one, so
-            # models that support neither keep their existing get_submodule
-            # call. Likewise ``moe_parallel``, only for a node group's
-            # ``ep_config``.
+            # A node on SP ranks gets the SP group for its own sequence
+            # parallelism, unless it places its KV pools' positions over them
+            # and runs replicated across them (`positions_over_sp`, which
+            # validate_deployment checks before spawn; here it is loud where
+            # that was skipped). CFG parallelism is opt-in per node. A node off
+            # SP and CFG ranks keeps its existing get_submodule call. Likewise
+            # ``moe_parallel``, only for a node group's ``ep_config``.
             extra = {}
             joint = parallel_groups.get_joint_group_for_node(name)
-            for key, group in (("sp_group", joint.sp_group), ("cfg_group", joint.cfg_group)):
-                if group.world_size > 1:
-                    extra[key] = group
+            sp = joint.sp_group.world_size
+            if sp > 1 and not positions_over_sp(specs, name, sp, model.get_default_sharding_config().sp_enabled_nodes):
+                extra["sp_group"] = joint.sp_group
+            if joint.cfg_group.world_size > 1:
+                extra["cfg_group"] = joint.cfg_group
             if name in moe_parallel:
                 extra["moe_parallel"] = moe_parallel[name]
             submodule = model.get_submodule(
@@ -382,6 +437,7 @@ class EngineManager:
         _refuse_split_combined_walks(submodules, model)
         _refuse_speculated_spans(submodules, model)
         _refuse_unroutable_withholds(submodules, model)
+        inline_streams = _inline_streams(submodules, model, parallel_groups)
         side_keys = _side_lane_keys(
             submodules, specs, model, node_names, side_stream_nodes(model_config["node_groups"]),
             parallel_groups, (device_capability or DeviceCapability.of(device)).is_accelerator,
@@ -396,6 +452,7 @@ class EngineManager:
             gpu_memory_fraction=model_config.get("gpu_memory_fraction"),
             device_capability=device_capability,
             side_stream_nodes={name for name, _ in side_keys},
+            state_setup=setup,
         )
         engine.load_model(
             submodules,
@@ -420,7 +477,10 @@ class EngineManager:
         )
         logger.info("Engine loaded on device %s for nodes %s", device, sorted(node_names))
 
-        return cls(engine=engine, node_names=set(node_names), side_keys=side_keys)
+        return cls(
+            engine=engine, node_names=set(node_names), side_keys=side_keys,
+            inline_streams=inline_streams,
+        )
 
     def warmup_all(self) -> None:
         """CUDA graph capture, for the whole forward and any piecewise region."""

@@ -75,43 +75,20 @@ class AttentionCallable:
         rotates through its position resource instead). For a backend that
         reads K/V from the paged cache, the step's KV write rides in the
         norm/RoPE kernel (``qk_norm_rope_kv_write``) rather than a launch of its
-        own; a backend that takes fresh K/V gets them normed and rotated."""
+        own; a step that attends the fresh K/V (``reads_step_kv``) gets them
+        normed and rotated."""
         from mstar.utils.attention import qk_norm_rope_inplace, qk_norm_rope_kv_write
 
         eps = _norm_eps(q_norm, k_norm)
-        if not self.attn.requires_kv_write:
+        # the fused kernel leaves k as it was, so a step that attends its k and v needs them
+        # normed and rotated in place
+        if self.attn.reads_step_kv():
             qk_norm_rope_inplace(q, k, q_norm.weight, k_norm.weight, pos_ids, *eps, rope_theta)
             return self(q, k, v)
         layer, page_idx, slot_idx, n = self.kv.write_target()
         qk_norm_rope_kv_write(
             q, k, v, q_norm.weight, k_norm.weight, pos_ids, layer, page_idx, slot_idx, min(n, q.shape[0]),
             *eps, rope_theta,
-        )
-        return self.attn.run(q, kv_cache_layer=self.kv.layer_view())
-
-    @torch.compiler.disable
-    def norm_rope_table_attend(
-        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, q_norm: torch.nn.Module, k_norm: torch.nn.Module,
-        cos_sin: tuple[torch.Tensor, torch.Tensor],
-    ) -> torch.Tensor:
-        """``norm_rope_attend`` rotating by each token's rotate-half ``cos_sin``
-        rows (both halves equal), for a multimodal RoPE whose position grids one
-        position can't express. The KV write rides in the kernel
-        (``qk_norm_rope_table_kv_write``) on CUDA with a paged backend; anywhere
-        else the norm and rotation run unfused."""
-        from mstar.utils.attention import qk_norm_rope_table_kv_write
-
-        eps = _norm_eps(q_norm, k_norm)
-        if not (q.is_cuda and self.attn.requires_kv_write):
-            cos, sin = (t[: q.shape[0], None] for t in cos_sin)
-            q, k = (
-                _rotate_half_rope(norm(x.reshape(-1, x.shape[-1])).view(x.shape), cos, sin)
-                for x, norm in ((q, q_norm), (k, k_norm))
-            )
-            return self(q, k, v)
-        layer, page_idx, slot_idx, n = self.kv.write_target()
-        qk_norm_rope_table_kv_write(
-            q, k, v, q_norm.weight, k_norm.weight, *cos_sin, layer, page_idx, slot_idx, min(n, q.shape[0]), *eps,
         )
         return self.attn.run(q, kv_cache_layer=self.kv.layer_view())
 
@@ -124,73 +101,6 @@ def _norm_eps(q_norm: torch.nn.Module, k_norm: torch.nn.Module) -> tuple[float, 
     return float(q_norm.variance_epsilon), float(k_norm.variance_epsilon)
 
 
-def _rotate_half_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    """``x * cos + rotate_half(x) * sin``, the unfused rotation by rotate-half tables."""
-    half = x.shape[-1] // 2
-    return x * cos + torch.cat((-x[..., half:], x[..., :half]), dim=-1) * sin
-
-
-class LinearAttnCallable:
-    """A recurrent state pool plus the resource running kernels against it,
-    mirroring :class:`AttentionCallable`.
-
-    The layer calls ``conv`` then the instance; this hands the pool's per-layer
-    blocks over as plain tensors, so neither the layer nor the manager holds
-    the pool.
-    """
-
-    def __init__(self, pool: RecurrentStatePool, attn: LinearAttnManager | None = None):
-        self.pool = pool
-        self.attn = attn
-        self._layer_idx = 0
-
-    @torch.compiler.disable
-    def bind_step(self, label: str, attn: LinearAttnManager | None = None) -> None:
-        if attn is not None:
-            self.attn = attn
-        assert self.attn is not None, (
-            "no linear attention resource: pass `attn` here or at construction"
-        )
-        self.attn.set_default_label(label)
-
-    @property
-    def label(self) -> str:
-        return self.attn.default_label
-
-    @torch.compiler.disable
-    def set_layer_idx(self, layer_idx: int) -> None:
-        """The layer's index among the *recurrent* layers, not the stack's."""
-        self._layer_idx = layer_idx
-        self.attn.set_default_layer_idx(layer_idx)
-
-    @torch.compiler.disable
-    def conv(
-        self, x: torch.Tensor, weight: torch.Tensor,
-        bias: torch.Tensor | None = None, activation: str | None = "silu",
-    ) -> torch.Tensor:
-        return self.attn.run_conv(
-            x,
-            conv_layer=self.pool.block("conv", self._layer_idx),
-            weight=weight,
-            bias=bias,
-            activation=activation,
-        )
-
-    @torch.compiler.disable
-    def __call__(
-        self,
-        q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
-        a: torch.Tensor, b: torch.Tensor,
-        a_log: torch.Tensor, dt_bias: torch.Tensor,
-    ) -> torch.Tensor:
-        return self.attn.run(
-            q, k, v, a, b,
-            state_layer=self.pool.block("state", self._layer_idx),
-            a_log=a_log,
-            dt_bias=dt_bias,
-        )
-
-
 class _KDALayerBlocks(NamedTuple):
     conv: torch.Tensor
     state: torch.Tensor
@@ -198,7 +108,7 @@ class _KDALayerBlocks(NamedTuple):
 
 
 class KDACallable:
-    """:class:`LinearAttnCallable` for Kimi delta attention. The layer passes its
+    """A recurrent state pool plus the resource running Kimi delta attention against it. The layer passes its
     projections and ``KDAParams``; this resolves the layer's conv, state and, for a
     verify step, speculative blocks, so neither the layer nor the manager holds the
     pool. The same cursor protocol, counting KDA layers only; a ``layer_idx``
@@ -274,8 +184,10 @@ class KDACallable:
         prefix_len, side = self.pool.block("spec_len"), self.pool.block("spec_side")
         prefix_len.index_copy_(0, slots, count)
         side.index_copy_(0, slots, 1 - side.index_select(0, slots))
+
+
 class Mamba2Callable:
-    """``LinearAttnCallable`` for a Mamba-2 layer: the conv, then the SSD
+    """A recurrent state pool plus the resource running a Mamba-2 layer's kernels against it: the conv, then the SSD
     recurrence, each handed this layer's block of the pool as a plain tensor.
 
     Same cursor protocol (``bind_step`` once per stack, ``set_layer_idx`` per

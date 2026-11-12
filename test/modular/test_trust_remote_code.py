@@ -4,9 +4,10 @@ Qwen3-Omni, OmniVoice and the Nemotron duplex tokenizer passed
 ``trust_remote_code=True``. None of their checkpoints needs repo code:
 Qwen3-Omni and Nemotron-H are native in transformers, and ``omnivoice`` is
 registered with AutoConfig by the installed package. MiniCPM-o's tokenizer is
-Qwen2's, and its processor is ported. The mocked tests pin the
-flag at each call site; the Nemotron ones run the real AutoTokenizer against a
-directory whose repo code would leave a marker file if it ran.
+Qwen2's, in the server and in its benchmark entry, and its processor is
+ported. The mocked tests pin the flag at each call site; the Nemotron and
+MiniCPM-o ones load from a directory whose repo code would leave a marker file
+if it ran.
 """
 
 import importlib.util
@@ -166,6 +167,7 @@ MINICPM_O_CONFIG = {
         "d_model": 32, "encoder_layers": 1, "encoder_attention_heads": 2, "encoder_ffn_dim": 64,
         "num_mel_bins": 80, "max_source_positions": 1500, "activation_function": "gelu",
     },
+    "tts_config": {"backbone_model": "llama", "condition_type": "hidden_text_merge"},
 }
 
 
@@ -192,4 +194,23 @@ def test_minicpm_o_loads_without_its_repo_code(tmp_path):
     )
     MiniCPMOModel(str(tmp_path))
 
+    assert not marker.exists()
+
+
+def test_minicpm_o_benchmark_tokenizer_without_its_repo_code(monkeypatch, tmp_path):
+    """``benchmark.runner --model minicpmo45`` re-tokenizes text chunks with this tokenizer."""
+    from benchmark.base import MiniCPMO45
+
+    marker = _tokenizer_dir(
+        tmp_path,
+        {
+            "tokenizer_class": "MiniCPMOTokenizerFast",
+            "auto_map": {"AutoTokenizer": ["tokenization_minicpmo_fast.MiniCPMOTokenizerFast", None]},
+        },
+        {"tokenization_minicpmo_fast.py": "import pathlib\npathlib.Path(MARKER).write_text('ran')\n"},
+    )
+    model = MiniCPMO45()
+    monkeypatch.setattr(model, "get_hf_url", lambda: str(tmp_path))
+
+    assert model.get_tokenizer() is not None
     assert not marker.exists()
