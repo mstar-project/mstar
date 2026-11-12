@@ -10,6 +10,8 @@ model_kwargs:
   # tiles per decoder call: one at a time leaves the decode launch-bound (9.2 s for a 16 MP
   # image on a B300, 0.45 s at 64), and the batched decode is bit-identical
   vae_tile_batch: 64
+  # the decoder's blocks compiled per tile batch (56-58 dB from eager)
+  vae_compile: true
 
 node_groups:
   - node_names: [dit, text_encoder, vae_encoder, vae_decoder]
