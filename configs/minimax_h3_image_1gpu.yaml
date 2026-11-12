@@ -1,0 +1,13 @@
+model: "minimax_h3_image"
+
+# See minimax_h3_image.yaml.
+max_seq_len: 8192
+
+# MiniMax-H3-Image on one GPU with room for both: the DiT, the conditioner and the VAE
+# (~130 GiB loaded, plus the DiT's activations; a B200 / B300, or an H200 at 4 MP).
+model_kwargs:
+  attention_backend: flashinfer
+
+node_groups:
+  - node_names: [dit, text_encoder, vae_encoder, vae_decoder]
+    ranks: [0]

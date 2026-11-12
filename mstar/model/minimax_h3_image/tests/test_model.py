@@ -1,0 +1,240 @@
+"""MiniMax-H3-Image in dummy mode, on a pinned config: no weights, GPU or network."""
+
+from __future__ import annotations
+
+import dataclasses
+import io
+
+import numpy as np
+import pytest
+import torch
+from safetensors.torch import save_file
+
+from mstar.graph.base import GraphNode, Loop, Parallel, Sequential, TensorPointerInfo
+from mstar.graph.special_destinations import EMIT_TO_CLIENT
+from mstar.model.components.diffusion.attention import sdpa_attention
+from mstar.model.minimax_h3.components.layout import patchify_video
+from mstar.model.minimax_h3.components.transformer import H3DiT, H3Inputs
+from mstar.model.minimax_h3.config import DENOISE_LOOP, TEXT_TAG, VIDEO_TAG
+from mstar.model.minimax_h3.submodules import COND_LATENTS, LATENTS, TEXT_INPUTS, VISION_PIXELS
+from mstar.model.minimax_h3.tests.test_model import _Tokenizer
+from mstar.model.minimax_h3.tests.tiny_checkpoint import CFG, random_checkpoint
+from mstar.model.minimax_h3_image import weight_loader
+from mstar.model.minimax_h3_image.config import SIGMAS, H3ImageConfig, bound_short_edge, canvas_size
+from mstar.model.minimax_h3_image.layout import (
+    T_GENERATED,
+    T_REFERENCE,
+    H3ImageLayout,
+    modality_tags,
+    position_ids,
+    timestep_classes,
+)
+from mstar.model.minimax_h3_image.minimax_h3_image_model import (
+    ENCODE_REFERENCES_WALK,
+    ENCODE_TEXT_WALK,
+    GENERATE_EDIT_WALK,
+    GENERATE_WALK,
+    H3ImageModel,
+)
+from mstar.model.minimax_h3_image.submodules import (
+    REFERENCE_PIXELS,
+    H3ImageDenoiseSubmodule,
+    H3ImageSchedule,
+    h3_image_schedule,
+    layout_from_metadata,
+)
+
+TINY = H3ImageConfig(transformer=dataclasses.replace(CFG, audio_enabled=False, num_output_heads=3),
+                     sigmas=(1.0, 0.75, 0.5, 0.0))
+
+
+def _model(**kwargs) -> H3ImageModel:
+    model = H3ImageModel(model_path_hf="test/minimax_h3_image", skip_weight_loading=True, **kwargs)
+    model.set_config(H3ImageConfig())
+    model.tokenizer = _Tokenizer()
+    return model
+
+
+def _info(dims: list[int]) -> TensorPointerInfo:
+    return TensorPointerInfo(
+        dims=dims, dtype="torch.int64", nbytes=8, address=0, stride=[1] * len(dims),
+        uuid="uuid", source_session_id="test:0", source_entity="test",
+    )
+
+
+class _ImageProcessor:
+    """Qwen3-VL's processor as far as the model reads it: 16-px patches, merged 2x2."""
+
+    merge_size = 2
+
+    def __call__(self, images, return_tensors="pt"):
+        grids = torch.tensor([[1, image.size[1] // 16, image.size[0] // 16] for image in images])
+        rows = int(sum(int(g.prod()) for g in grids))
+        return {"pixel_values": torch.arange(rows * 4, dtype=torch.float32).view(rows, 4), "image_grid_thw": grids}
+
+
+def test_graph_walks():
+    walks = _model().get_graph_walk_graphs()
+    assert set(walks) == {ENCODE_TEXT_WALK, ENCODE_REFERENCES_WALK, GENERATE_WALK, GENERATE_EDIT_WALK}
+    references = walks[ENCODE_REFERENCES_WALK]
+    assert isinstance(references, Parallel)
+    assert {n.name: set(n.input_names) for n in references.sections} == {
+        "text_encoder": {TEXT_INPUTS, VISION_PIXELS}, "vae_encoder": {REFERENCE_PIXELS}}
+    assert isinstance(walks[ENCODE_TEXT_WALK], GraphNode)
+    for walk, edit in ((GENERATE_WALK, False), (GENERATE_EDIT_WALK, True)):
+        loop, decoder = walks[walk].sections
+        assert isinstance(walks[walk], Sequential) and isinstance(loop, Loop) and loop.name == DENOISE_LOOP
+        assert (COND_LATENTS in loop.section.input_names) == edit
+        assert [(e.next_node, e.output_modality) for e in decoder.outputs] == [(EMIT_TO_CLIENT, "image")]
+
+
+def test_canvas_and_reference_sizes():
+    # below the default 4 MP generation area a request renders on a larger canvas, same aspect
+    assert canvas_size(1024, 1024, 2048 * 2048) == (2048, 2048)
+    assert canvas_size(1024, 1024, 1024) == (1024, 1024)
+    assert canvas_size(3552, 4736, 2048 * 2048) == (3552, 4736)
+    assert canvas_size(720, 1280, 2048 * 2048) == (1536, 2720)
+    # a short edge inside the bounds keeps the original pixels, else it lands on the nearer bound
+    assert bound_short_edge(1500, 1100, 1024, 2048) == (1500, 1100)
+    assert bound_short_edge(800, 600, 1024, 2048) == (1376, 1024)
+    assert bound_short_edge(4000, 3000, 1024, 1024) == (1376, 1024)
+
+
+def test_layout_rows_positions_and_tags():
+    layout = H3ImageLayout(text_len=3, latent_height=4, latent_width=4, references=((4, 8),),
+                           text_image_spans=((1, 2),))
+    assert (layout.num_condition_rows, layout.num_video_rows, layout.total_rows) == (8, 4, 15)
+    pos = position_ids(layout)
+    assert pos[:3].tolist() == [[0, 0, 0], [1, 0, 0], [2, 0, 0]]
+    # every image is one slot on the rotary clock after the text: the reference, then the target
+    assert pos[3:11, 0].unique().tolist() == [3.0] and pos[11:, 0].unique().tolist() == [4.0]
+    # a square grid spans [0, 32) per axis; a 1:2 one is centred on the same unit square
+    assert pos[11:, 1:].tolist() == [[0, 0], [0, 16], [16, 0], [16, 16]]
+    width_axis = (np.linspace(-(2 ** 0.5 - 1) / 2, 1 + (2 ** 0.5 - 1) / 2, 4, endpoint=False) * 32).tolist()
+    assert pos[3:7, 2].tolist() == pytest.approx(width_axis, abs=1e-12)
+    assert modality_tags(layout).tolist() == [TEXT_TAG, VIDEO_TAG, VIDEO_TAG] + [VIDEO_TAG] * 12
+    assert timestep_classes(layout).tolist() == [T_GENERATED] * 3 + [T_REFERENCE] * 8 + [T_GENERATED] * 4
+
+
+def test_schedule_is_the_released_grid():
+    sched = h3_image_schedule(SIGMAS)
+    assert isinstance(sched, H3ImageSchedule) and sched.num_steps == 6
+    timesteps = torch.tensor([1.0 - s for s in SIGMAS[:-1]], dtype=torch.float32)
+    assert torch.equal(sched.timesteps, timesteps)
+    # the sigmas the update steps on are the fp32 round trip, not the config's
+    assert torch.equal(sched.sigmas, torch.cat([1.0 - timesteps, torch.zeros(1)]))
+    assert sched.heads.tolist() == list(range(6)) and sched.reference_timesteps.unique().tolist() == [
+        pytest.approx(0.999)]
+
+
+def test_seed_draws_follow_the_reference_order():
+    """posterior samples (drawn by the vae_encoder on the same seed), the target's noise,
+    then each reference's, all from one CPU generator."""
+    meta = {"text_len": 2, "latent_height": 4, "latent_width": 6, "reference_latent_grids": [[5, 7]]}
+    layout = layout_from_metadata(meta)
+    assert layout.references == ((4, 6),)  # cropped to whole patches
+    sub = H3ImageDenoiseSubmodule.__new__(H3ImageDenoiseSubmodule)
+    sub.config = H3ImageConfig()
+    info = type("Info", (), {"step_metadata": meta})()
+    rows = sub.seed_loop_back(info, layout, torch.Generator().manual_seed(7))[LATENTS]
+    gen = torch.Generator().manual_seed(7)
+    torch.randn((1, 24, 5, 7), generator=gen)
+    target = torch.randn((1, 24, 1, 4, 6), generator=gen)
+    reference = torch.randn((1, 24, 4, 6), generator=gen)
+    want = torch.cat([patchify_video(reference[:, :, None][0], (2, 2)), patchify_video(target[0], (2, 2))])
+    assert torch.equal(rows, want)
+
+
+def test_dit_without_audio_runs_the_step_head():
+    torch.manual_seed(0)
+    cfg = TINY.transformer
+    dit = H3DiT(cfg).float()
+    for p in dit.parameters():
+        torch.nn.init.normal_(p, std=0.1)
+    assert dit.audio_patch_proj is None and dit.final_layer.audio_out is None
+    layout = H3ImageLayout(text_len=3, latent_height=4, latent_width=4, references=((2, 4),))
+    sub = H3ImageDenoiseSubmodule(dit, TINY, loop_name="denoise_loop", attn_resource_key=None)
+    step = sub.build_layout(layout, "cpu")
+    video = torch.randn(1, layout.num_condition_rows + layout.num_video_rows, cfg.patch_dim)
+    inputs = H3Inputs(video=video, audio=None, text=torch.randn(1, 3, cfg.hidden_size),
+                      timesteps=torch.tensor([[0.25, 0.999]]))
+    with torch.no_grad():
+        outs = [dit(inputs, step, sdpa_attention, head=torch.tensor([k]))[0] for k in range(3)]
+    assert outs[0].shape == video.shape
+    # head k is the plain linear of its own weights
+    heads = dit.final_layer.video_out
+    with torch.no_grad():
+        swapped = heads.weight.data[[1, 0, 2]].clone(), heads.bias.data[[1, 0, 2]].clone()
+        heads.weight.data, heads.bias.data = swapped
+        again = dit(inputs, step, sdpa_attention, head=torch.tensor([0]))[0]
+    assert torch.equal(again, outs[1]) and not torch.equal(outs[0], outs[1])
+
+
+def test_process_prompt_and_walk_plan_for_an_edit():
+    model = _model()
+    model._image_processor = _ImageProcessor()
+    small = torch.zeros(3, 600, 800, dtype=torch.uint8)  # short edge below 1024: scaled up for both copies
+    kept = torch.zeros(3, 1100, 1500, dtype=torch.uint8)  # kept for the VAE, cropped to whole cells
+    out = model.process_prompt("make it so", ["text", "image"], ["image"],
+                               tensors={"image_inputs": [small, kept]}, height=1024, width=1024)
+    assert [tuple(p.shape) for p in out[REFERENCE_PIXELS]] == [(3, 1024, 1376), (3, 1088, 1488)]
+    # the text encoder's copies sit at a 1024 short edge; one [h, w, patch] view each
+    assert [tuple(p.shape[:2]) for p in out[VISION_PIXELS]] == [(64, 86), (64, 88)]
+    ids = out[TEXT_INPUTS][0]
+    tokens = [64 * 86 // 4, 64 * 88 // 4]
+    label = [ord(c) % 800 for c in "Picture 1: "]
+    assert ids[:len(label)].tolist() == label and ids[len(label)] == 900
+    assert len(ids) == 2 * len(label) + sum(tokens) + 4 + len("make it so")
+    signals = {name: [_info(list(t.shape)) for t in out[name]] for name in (TEXT_INPUTS, VISION_PIXELS,
+                                                                             REFERENCE_PIXELS)}
+    plan = model.walk_plan("", ["text", "image"], ["image"], signals, {"height": 1024, "width": 1024})
+    assert [step.walk for step in plan] == [ENCODE_REFERENCES_WALK, GENERATE_EDIT_WALK]
+    meta = plan[1].step_metadata
+    assert (meta["canvas_height"], meta["canvas_width"]) == (2048, 2048)
+    assert meta["reference_latent_grids"] == [[64, 86], [68, 93]]
+    assert meta["keyframe_grids"] == [[1, 64, 86], [1, 64, 88]]
+    layout = layout_from_metadata(meta)
+    assert layout.references == ((64, 86), (68, 92))
+    assert layout.text_image_spans == ((len(label), tokens[0] + 2), (2 * len(label) + tokens[0] + 2, tokens[1] + 2))
+    assert layout.total_rows == len(ids) + 32 * 43 + 34 * 46 + 64 * 64
+
+
+def test_requests_refused_at_the_seam():
+    model = _model(max_packed_rows=5000)
+    with pytest.raises(ValueError, match="max_packed_rows"):
+        model.process_prompt("a cat", ["text"], ["image"], height=4096, width=4096)
+    with pytest.raises(ValueError, match="min_generation_area"):
+        model.process_prompt("a cat", ["text"], ["image"], min_generation_area=512)
+    with pytest.raises(ValueError, match="together"):
+        model.process_prompt("a cat", ["text"], ["image"], height=1024)
+    with pytest.raises(ValueError, match="only generates images"):
+        model.process_prompt("a cat", ["text"], ["video"])
+    with pytest.raises(ValueError, match="32 pixels"):
+        model.process_prompt("a cat", ["text", "image"], ["image"],
+                             tensors={"image_inputs": [torch.zeros(3, 16, 64, dtype=torch.uint8)]})
+
+
+def test_postprocess_resizes_the_canvas_to_the_request():
+    from PIL import Image
+
+    canvas = torch.randint(0, 256, (3, 64, 64), dtype=torch.uint8)
+    png = _model().postprocess(canvas, "image", {"height": 32, "width": 48, "min_generation_area": 1024})
+    image = Image.open(io.BytesIO(png))
+    want = Image.fromarray(canvas.permute(1, 2, 0).numpy()).resize((48, 32), Image.Resampling.LANCZOS)
+    assert image.size == (48, 32) and np.array_equal(np.asarray(image.convert("RGB")), np.asarray(want))
+
+
+def test_transformer_loads_the_step_heads(tmp_path):
+    state = {k: v for k, v in random_checkpoint(CFG).items() if "audio" not in k}
+    (tmp_path / "transformer").mkdir()
+    save_file(state, str(tmp_path / "transformer" / "model.safetensors"))
+    heads = {"video_out.weight": torch.randn(3, CFG.patch_dim, CFG.hidden_size),
+             "video_out.bias": torch.randn(3, CFG.patch_dim)}
+    save_file(heads, str(tmp_path / "pdd_fused_heads.safetensors"))
+    dit = weight_loader.build_transformer(TINY, tmp_path, "cpu", dtype=torch.float32)
+    assert torch.equal(dit.final_layer.video_out.weight, heads["video_out.weight"])
+    # the transformer's own single head is not what serves
+    assert not hasattr(dit.final_layer.video_out, "in_features")
+    save_file({"video_out.weight": heads["video_out.weight"]}, str(tmp_path / "pdd_fused_heads.safetensors"))
+    with pytest.raises(RuntimeError, match="unloaded"):
+        weight_loader.build_transformer(TINY, tmp_path, "cpu", dtype=torch.float32)

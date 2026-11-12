@@ -254,6 +254,12 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
        Qwen3-VL-32B conditioner (keyframes through its vision tower) and a ViT video VAE,
        emitting an H.264 video at 24 fps with 32 kHz stereo audio (one mp4 with AAC on
        ``/v1/videos/generations``). MiniMax H3 Community License Agreement.
+   * - ``minimax_h3_image`` *(Beta)*
+     - ``MiniMaxAI/MiniMax-H3-Image``
+     - MiniMax-H3-Image text-to-image and editing with up to 16 reference images, up to 16 MP:
+       MiniMax-H3's DiT without audio, distilled to a fixed 6-step grid with one output head
+       per step and no guidance, the same Qwen3-VL-32B conditioner (references through its
+       vision tower), and an image VAE. MiniMax-H3-Image Community License Agreement.
    * - ``z_image_turbo``
      - ``Tongyi-MAI/Z-Image-Turbo``
      - Z-Image-Turbo: 8-step distilled single-stream flow DiT (6B) with a Qwen3-4B caption
@@ -2371,6 +2377,42 @@ SGLang ran ``--performance-mode speed`` at Ulysses 4 / 8, without compile or ste
 vllm-omni USP 4 / 8 with the text encoder and VAE split as wide. The DiT's 49 steps are
 ~74 s of the SP4 clip. Not done: CUDA-graph capture, more than one request per step, tensor
 parallelism, ``Ref2VA``.
+
+MiniMax-H3-Image (``minimax_h3_image``)
+---------------------------------------
+
+Text-to-image and reference-image editing on **MiniMax-H3-Image**
+(``MiniMaxAI/MiniMax-H3-Image``; MiniMax-H3-Image Community License Agreement): MiniMax-H3's
+33B packed-sequence DiT without its audio stream, distilled twice over (guidance baked in,
+and a fixed six-step grid with one output head per step), the same Qwen3-VL-32B conditioner
+as ``minimax_h3`` (byte-identical shards), and an image VAE (H3's video encoder on one frame,
+a 2D ViT decoder). The model shares ``minimax_h3``'s DiT, conditioner node and loaders.
+Not ported: the H3-Image-Context-IR prompt rewriter.
+
+Nodes: ``text_encoder`` (``minimax_h3``'s: Qwen3-VL to layer 50, the references through its
+vision tower, then ``condition_proj`` and the token refiner; once per request),
+``vae_encoder`` (the references), ``dit`` (the DiT scaffold's denoise loop, six iterations,
+each through its step's head) and ``vae_decoder`` (256-px tiles).
+
+.. code-block:: bash
+
+   mstar serve minimax_h3_image                                            # 2 GPUs: DiT | encoder + VAE
+   mstar serve minimax_h3_image --config configs/minimax_h3_image_1gpu.yaml  # one B200 / B300
+
+Request knobs (``model_kwargs``): ``height`` / ``width`` (default 2048x2048; the image comes
+back at exactly this size), ``min_generation_area`` (1024 to 16,777,216 pixels, default
+4,194,304: a smaller size is generated on a canvas of this area at the same aspect, both sides
+rounded to 32, and resized back with LANCZOS; 1024 generates at the asked size), ``seed``,
+and the OpenAI image output knobs. With images (``POST /generate`` with up to 16 images, or
+``/v1/images/edits`` with one), each reference keeps its own size: resized for the VAE to a
+short edge in [1024, 2048] and for the text encoder to 1024, as the reference does, and the
+prompt refers to them as ``<Picture 1>``, ``<Picture 2>``, ... The prompt is cut to 4096 tokens,
+as the reference cuts it. A packed sequence over ``max_packed_rows`` (default 65536) is a 400.
+One request runs per denoise step.
+
+Deployment knobs (``model_kwargs``): ``compile`` and ``row_bucket`` (the DiT's blocks, as
+``minimax_h3``), ``vae_tile_batch`` (256-px tiles per decoder call; 1 is the reference's
+order), ``vae_compile``, ``attention_backend`` (``flashinfer``, or ``sdpa``).
 
 FLUX.2 [klein] (``flux2_klein`` / ``flux2_klein_9b``)
 -----------------------------------------------------
