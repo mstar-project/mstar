@@ -21,7 +21,6 @@ from pathlib import Path
 from typing import NamedTuple
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 
 from mstar.model.components.mlp import GatedMLP
@@ -118,23 +117,6 @@ class VisionPatchMerger(nn.Module):
         else:
             x = self.norm(x).view(-1, self.merged_size)
         return self.linear_fc2(self.act_fn(self.linear_fc1(x)))
-
-
-class FrameSDPA:
-    """Stands in for the ragged resource where none is declared (a model's SDPA mode, the
-    reference's own kernel): SDPA within each frame of ``lengths`` (``vision_seq_lengths``),
-    set before each tower call."""
-
-    def __init__(self, lengths=()):
-        self.lengths = list(lengths)
-
-    def run(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, label: str | None = None) -> torch.Tensor:
-        # [1, heads, frame, head_dim] per frame, the call transformers makes (and so its kernel)
-        out = [
-            F.scaled_dot_product_attention(*(t.transpose(0, 1)[None] for t in segment))[0].transpose(0, 1)
-            for segment in zip(q.split(self.lengths), k.split(self.lengths), v.split(self.lengths), strict=True)
-        ]
-        return torch.cat(out)
 
 
 class ConvPatchEmbed(VisionPatchEmbed):

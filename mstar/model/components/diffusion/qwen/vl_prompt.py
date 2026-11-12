@@ -18,7 +18,8 @@ import torch
 
 from mstar.model.components.mrope import image_position_advance, image_position_ids, text_position_ids
 from mstar.model.components.qwen3_vit import vision_interpolation, vision_position_ids, vision_seq_lengths
-from mstar.model.components.qwen_vision import FrameSDPA, QwenVisionModel
+from mstar.model.components.diffusion.attention import FrameSDPA
+from mstar.model.components.qwen_vision import QwenVisionModel
 from mstar.utils.h2d import to_device_nonblocking
 
 

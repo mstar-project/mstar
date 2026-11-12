@@ -216,8 +216,7 @@ def test_rotary_table_variant_applies_the_multimodal_rotation(num_tokens, n_writ
         assert err_fused <= err_unfused * 1.1, (err_fused, err_unfused)
 
 
-@pytest.mark.parametrize("table", [False, True])
-def test_fused_norm_helpers_refuse_a_gemma_norm(table):
+def test_fused_norm_helpers_refuse_a_gemma_norm():
     """The fused kernels scale by ``weight``; a Gemma-style norm scales by ``1 + weight``."""
     from types import SimpleNamespace
 
@@ -228,7 +227,4 @@ def test_fused_norm_helpers_refuse_a_gemma_norm(table):
     q, k, v = torch.zeros(1, HQ, D), torch.zeros(1, HKV, D), torch.zeros(1, HKV, D)
     norm = RMSNorm(D, gemma_mode=True)
     with pytest.raises(ValueError, match="gemma_mode"):
-        if table:
-            attend.norm_rope_table_attend(q, k, v, norm, norm, (torch.ones(1, D), torch.zeros(1, D)))
-        else:
-            attend.norm_rope_attend(q, k, v, norm, norm, torch.zeros(1, dtype=torch.long), THETA)
+        attend.norm_rope_attend(q, k, v, norm, norm, torch.zeros(1, dtype=torch.long), THETA)

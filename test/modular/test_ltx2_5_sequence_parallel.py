@@ -16,9 +16,14 @@ import torch.multiprocessing as mp
 sys.path.insert(0, ".")
 
 from mstar.distributed.communication import CommGroup  # noqa: E402
-from mstar.model.components.diffusion.attention import sdpa_attention  # noqa: E402
-from mstar.model.ltx2_5.components.transformer import LTX2Attends, LTX2DiT, build_rope  # noqa: E402
+from mstar.engine.resources.step import StepContext  # noqa: E402
+from mstar.engine.state.adapters import node_handles, node_resources, state_setup, state_steps  # noqa: E402
+from mstar.model.components.diffusion.denoise_loop import StepKey  # noqa: E402
+from mstar.model.ltx2_5.components.transformer import LTX2DiT, build_rope  # noqa: E402
 from mstar.model.ltx2_5.config import LTX25Config  # noqa: E402
+from mstar.model.ltx2_5.ltx2_5_model import LTX25Model  # noqa: E402
+from mstar.model.ltx2_5.submodules import LTXDenoiseSubmodule, LTXShape  # noqa: E402
+from mstar.model.submodule_base import NodeInputs  # noqa: E402
 
 WORLD = 2
 
@@ -52,6 +57,24 @@ def _toy_config():
     )
 
 
+def _opened_on_sdpa(dit, cfg, group, shape, rows):
+    """``dit`` with its handles bound and open for one step on SDPA, as the engine would on a node set to it."""
+    config = dataclasses.replace(LTX25Config(), transformer=cfg)
+    model = LTX25Model(skip_weight_loading=True)
+    model.set_config(config)
+    on_sdpa = {spec.resource_key: {"backend": "sdpa"} for spec in node_resources(model)}
+    setup, _ = state_setup({"resources": on_sdpa}, model.declare_state())
+    handles = node_handles(model, "dit", {}, sp_group=group, setup=setup)
+    for module in dit.modules():
+        if hasattr(module, "bind_state"):
+            module.bind_state(handles)
+    sub = LTXDenoiseSubmodule(None, config, loop_name="denoise_loop")
+    inputs = [NodeInputs(resource_step_info=StepKey(shape))] * len(rows)
+    step = state_steps(sub.declare_step("gen", rows, inputs), handles)
+    step.set_ctx(StepContext(request_ids=rows, graph_walk="gen", slot=0, capture=False))
+    step.begin_calls()
+
+
 @torch.inference_mode()
 def _dit(rank, frames, height, width):
     cfg = _toy_config()
@@ -63,12 +86,12 @@ def _dit(rank, frames, height, width):
     sharded.load_state_dict(single.state_dict())
     tokens = frames * height * width
     rope = build_rope(cfg, frames, height, width, 24.0, 5, "cpu")
-    attends = LTX2Attends(*([sdpa_attention] * 6))
+    _opened_on_sdpa(sharded, cfg, _group(rank), LTXShape(frames, height, width, 5, 24.0, 7), [0, 1])
     g = torch.Generator().manual_seed(1)
     inputs = (
         torch.randn(2, tokens, 8, generator=g), torch.randn(2, 5, 8, generator=g),
         torch.randn(2, 7, 64, generator=g), torch.randn(2, 7, 32, generator=g),
-        torch.tensor([1000.0, 500.0]), rope, attends,
+        torch.tensor([1000.0, 500.0]), rope,
     )
     want_video, want_audio = single(*inputs)
     video, audio = sharded(*inputs)

@@ -33,6 +33,7 @@ from mstar.engine.resources.position.rope import (
     rope_apply_qk_inplace,  # noqa: F401  (registers mstar::rope_apply_qk_inplace)
 )
 from mstar.engine.resources.resident import gather_column
+from mstar.engine.resources.resident_hooks import ANY_REPEATS
 from mstar.engine.resources.step import ADMIT_OK, AdmitOutcome, StepContext
 
 # a LongRoPE plan label's table ids, keyed beside its positions
@@ -108,6 +109,9 @@ class PositionManager(Resource):
 
 class RopeManager(PositionManager):
     """rotary position on top flashinfer in-place kernels"""
+
+    # reads the KV plan's rows (request, label, tokens) and its own counters, never a page
+    supports_context_parallel = True
 
     def __init__(
         self,
@@ -411,6 +415,9 @@ class RopeManager(PositionManager):
     # Resident planning: a stream's position runs ahead of its stored length by a
     # fixed amount between host-planned steps, so a row keeps that offset
 
+    def max_repeats(self, step: PositionStep, ctx: StepContext) -> int:
+        return ANY_REPEATS  # a resident row's position is its length plus a fixed offset
+
     def resident_refusal(self) -> str | None:
         if self._config.scheme != PosScheme.SEQUENTIAL:
             return f"position scheme {self._config.scheme} doesn't advance with the stream"
@@ -448,7 +455,7 @@ class RopeManager(PositionManager):
         )
 
     def commit(self, step: PositionStep, ctx: StepContext):
-        all_counters = self._counters
+        all_counters, repeats = self._counters, ctx.repeats
         for segment, advance in zip(
             step.segments, self._advances(step), strict=True
         ):
@@ -456,7 +463,7 @@ class RopeManager(PositionManager):
                 counters = all_counters.get(segment.request_id)
                 if counters is None:
                     counters = all_counters[segment.request_id] = {}
-                counters[segment.label] = counters.get(segment.label, 0) + advance
+                counters[segment.label] = counters.get(segment.label, 0) + advance * repeats
 
         # post-forks copy the source after this step advanced it, matching
         # where KV applies them

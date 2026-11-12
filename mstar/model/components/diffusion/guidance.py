@@ -72,10 +72,10 @@ cfg = Cfg()
 cfg_renorm = CfgRenorm()
 
 
-def every_step(step_metadata: Mapping, step: int) -> Mapping:
+def every_step(knobs: Mapping, step: int) -> Mapping:
     """The default fill (``Guidance.at``): the request's knobs at every step."""
     del step
-    return step_metadata
+    return knobs
 
 
 class Guidance(NamedTuple):
@@ -89,11 +89,12 @@ class Guidance(NamedTuple):
     # the input's name here, ``branches[b][argument]``.
     branches: tuple[Mapping[str, str], ...]
     combine: GuidanceCombine
-    # The request's fill: ``(step_metadata, step) -> mapping``, holding by name the scales a denoise step runs at. Its
-    # step scalars are staged from it, and the step is guided when ``active`` of it is (in a request that is active
-    # at all). A schedule of scales (guidance on an interval of steps, a truncation) is a fill. It is a host
-    # function of the metadata and the step, as a step schedule's dtype is, since the scheduler asks it for a step
-    # before that step's inputs are prepared.
+    # The request's fill: ``(knobs, step) -> mapping``, holding by name the scales a denoise step runs at. ``knobs``
+    # is the request's value for each of ``scales``, by name, and nothing else of it, since the base memoizes the fill
+    # across requests by those values. Its step scalars are staged from it, and the step is guided when ``active`` of
+    # it is (in a request that is active at all). A schedule of scales (guidance on an interval of steps, a
+    # truncation) is a fill. It is a host function of the knobs and the step, as a step schedule's dtype is, since
+    # the scheduler asks it for a step before that step's inputs are prepared.
     at: Callable[[Mapping, int], Mapping] = every_step
 
     @property

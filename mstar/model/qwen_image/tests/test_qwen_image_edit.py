@@ -15,13 +15,16 @@ import torch.nn.functional as F
 diffusers = pytest.importorskip("diffusers")
 
 from mstar.conductor.request_info import CurrentForwardPassInfo  # noqa: E402
+from mstar.engine.resources.step import StepContext  # noqa: E402
+from mstar.engine.state.adapters import node_handles, state_setup  # noqa: E402
 from mstar.graph.base import TensorPointerInfo  # noqa: E402
 from mstar.model.components.diffusion.denoise_loop import LATENTS  # noqa: E402
 from mstar.model.qwen_image.components.transformer import (  # noqa: E402
+    JOINT_TOKENS,
     QwenImageTransformer,
     QwenImageTransformerConfig,
 )
-from mstar.model.qwen_image.config import DENOISE_LOOP, QwenImageConfig  # noqa: E402
+from mstar.model.qwen_image.config import DENOISE_LOOP, DIT_ATTN, QwenImageConfig  # noqa: E402
 from mstar.model.qwen_image.qwen_image_model import (  # noqa: E402
     ENCODE_EDIT_WALK,
     ENCODE_REFS_WALK,
@@ -41,7 +44,7 @@ from mstar.model.qwen_image.submodules import (  # noqa: E402
     QwenImageVaeDecoderSubmodule,
     QwenImageVaeEncoderSubmodule,
 )
-from mstar.model.submodule_base import ModelInputsFromEngine  # noqa: E402
+from mstar.model.submodule_base import ModelInputsFromEngine, engine_step  # noqa: E402
 
 TINY = dict(in_channels=64, out_channels=16, num_layers=2, attention_head_dim=16, num_attention_heads=2,
             joint_attention_dim=24, axes_dims_rope=(4, 6, 6), patch_size=2)
@@ -87,6 +90,20 @@ def _info(rid, meta):
     )
 
 
+def _on_sdpa(node):
+    """``node`` with its joint attention bound to SDPA over each segment, as a config that sets ``backend: sdpa`` on
+    the resource binds it (no handle at all would attend over the whole row, left padding included)."""
+    model = QwenImageModel(skip_weight_loading=True)
+    model.set_config(node.config)
+    setup, problems = state_setup({"resources": {DIT_ATTN: {"backend": "sdpa"}}}, model.declare_state())
+    assert not problems, problems
+    node.bind_node_state(node_handles(model, "dit", {}, setup=setup))
+
+
+def _schedule(node, info):
+    return node.schedule_of(info, node.bucket_key_for(info))
+
+
 def _guided(node, requests, meta):
     """``guided_output`` for one stacked step over ``requests`` of (latents, refs, pos, neg)."""
     rids = [f"r{i}" for i in range(len(requests))]
@@ -97,13 +114,19 @@ def _guided(node, requests, meta):
         for rid, (lat, refs, pos, neg) in zip(rids, requests, strict=True)
     ]
     engine_inputs = ModelInputsFromEngine(request_ids=rids, per_request_info={})
+    _on_sdpa(node)
+    step = engine_step(node, IMAGE_EDIT_WALK, rids, inputs)
+    step.set_ctx(StepContext(request_ids=rids, graph_walk=IMAGE_EDIT_WALK, slot=0, capture=False))
+    step.begin_calls()
     kwargs = node.preprocess(IMAGE_EDIT_WALK, engine_inputs, inputs)
     key = kwargs.pop("step_key")
     latents, timestep = kwargs.pop(LATENTS), kwargs.pop("timestep")
     for name in ("sigma", "sigma_next"):
         kwargs.pop(name)
     with torch.no_grad():
-        return key, node.guided_output(engine_inputs, key, latents, timestep, **kwargs)
+        out = node.guided_output(engine_inputs, key, latents, timestep, **kwargs)
+    step.end_calls()
+    return key, out
 
 
 def _branch(reference, timestep, grid, ref_grids):
@@ -132,9 +155,10 @@ def _request(g, ref_grids, lengths):
 @pytest.mark.parametrize("zero_cond_t", [True, False])
 @pytest.mark.parametrize("ref_grids", [((4, 6),), ((4, 6), (2, 4))], ids=["one-ref", "two-refs"])
 def test_a_step_matches_diffusers(zero_cond_t, ref_grids):
-    """One request unguided is diffusers' forward bit for bit (SDPA within each segment). Two guided requests in
-    one forward, their branches as rows and each negative prompt left-padded, match diffusers' per-branch forwards
-    and the pipeline's norm-rescaled CFG to the GEMM noise of batching rows (the GEMMs' shapes change)."""
+    """One request unguided is diffusers' forward bit for bit (SDPA within each segment). A guided request's
+    two branches as rows of one forward, the negative prompt left-padded, match diffusers' per-branch forwards and
+    the pipeline's norm-rescaled CFG to the GEMM noise of batching rows (the GEMMs' shapes change). The dit runs one
+    request a step (its read is segmented)."""
     reference, ours = _transformers(zero_cond_t)
     config = QwenImageConfig(transformer=ours.config)
     lengths = (9, 5)
@@ -144,20 +168,20 @@ def test_a_step_matches_diffusers(zero_cond_t, ref_grids):
     requests = [_request(g, ref_grids, lengths) for _ in range(2)]
 
     def node():
-        sub = QwenImageDenoiseSubmodule(ours, config, loop_name=DENOISE_LOOP, attn_resource_key=None)
+        sub = QwenImageDenoiseSubmodule(ours, config, loop_name=DENOISE_LOOP)
         sub.get_device = lambda: torch.device("cpu")
         return sub
 
     alone = node()
     key, pred = _guided(alone, requests[:1], {**meta, "guidance_scale": 1.0})
-    timestep = alone.request_state(_info("r0", meta).rid_handle)["timesteps"][1:2]
+    timestep = _schedule(alone, _info("r0", meta)).timesteps[1:2]
     branch = _branch(reference, timestep, (4, 4), ref_grids)
     with torch.no_grad():
         assert not key.guided and torch.equal(pred[0], branch(*requests[0][:3]))
 
-        key, pred = _guided(node(), requests, {**meta, "guidance_scale": 4.0})
+        key, pred = _guided(node(), requests[:1], {**meta, "guidance_scale": 4.0})
         want = torch.stack([_renorm_cfg(branch(lat, refs, pos), branch(lat, refs, neg), 4.0)
-                            for lat, refs, pos, neg in requests])
+                            for lat, refs, pos, neg in requests[:1]])
     assert key.guided and key.branches == (0, 1)
     # batching two rows moved a branch's prediction by up to 4e-6 here (fp32, CPU); the combine weighs the two
     # branches 4 and 3, so up to 7x that, with a 1.5x margin
@@ -174,18 +198,19 @@ def test_a_cfg_rank_runs_its_branch_unpadded(rank):
     meta = {"height": 64, "width": 64, "num_inference_steps": 4, "guidance_scale": 4.0, "ref_grids": ref_grids,
             PROMPT_LENGTHS: [n + DROP for n in lengths]}
     latents, refs, pos, neg = request = _request(torch.Generator().manual_seed(2), ref_grids, lengths)
-    probe = QwenImageDenoiseSubmodule(ours, config, loop_name=DENOISE_LOOP, attn_resource_key=None)
+    probe = QwenImageDenoiseSubmodule(ours, config, loop_name=DENOISE_LOOP)
     probe.get_device = lambda: torch.device("cpu")
     probe.prepare_inputs(IMAGE_EDIT_WALK, _info("r0", meta), {LATENTS: [latents], REF_LATENTS: [refs],
                                                              TEXT_EMBEDS_POS: [pos], TEXT_EMBEDS_NEG: [neg]})
-    branch = _branch(reference, probe.request_state(_info("r0", meta).rid_handle)["timesteps"][1:2], (4, 4), ref_grids)
+    branch = _branch(reference, _schedule(probe, _info("r0", meta)).timesteps[1:2], (4, 4), ref_grids)
     with torch.no_grad():
         cond, uncond = branch(latents, refs, pos), branch(latents, refs, neg)
-    node = QwenImageDenoiseSubmodule(ours, config, loop_name=DENOISE_LOOP, attn_resource_key=None,
+    node = QwenImageDenoiseSubmodule(ours, config, loop_name=DENOISE_LOOP,
                                      cfg_group=_Group(rank, torch.stack([cond, uncond])[None]))
     node.get_device = lambda: torch.device("cpu")
     key, pred = _guided(node, [request], meta)
-    assert key.branches == (rank,) and node.attention_segments(key) == (("main", lengths[rank] + 16 + 24),)
+    assert key.branches == (rank,) and node.attention_segments(key) == {
+        JOINT_TOKENS: (("main", lengths[rank] + 16 + 24),)}
     assert torch.equal(pred[0], _renorm_cfg(cond, uncond, 4.0))
 
 
@@ -214,7 +239,6 @@ def test_the_fused_kernels_round_as_the_eager_ops(zero_cond_t, monkeypatch):
     forward is the forward with the eager elementwise ops bit for bit (the MLP's GELU epilogue, the one fusion that
     is not exact, runs in both: the next test's). The copy-free GEMMs are held to bf16 rounding of the plain path.
     The kernels alone: ``test/modular/test_diffusion_dit_kernels.py``."""
-    from mstar.model.components.diffusion.attention import joint_attention
     from mstar.model.components.diffusion.qwen import dit_kernels as kernels
     from mstar.model.qwen_image.components import transformer
     from mstar.model.qwen_image.components.transformer import QwenStepLayout, _GeluProj, qwen_rope_tables
@@ -239,7 +263,7 @@ def test_the_fused_kernels_round_as_the_eager_ops(zero_cond_t, monkeypatch):
 
     def forward():
         with torch.no_grad():
-            return dit(img, txt, timestep, layout, joint_attention)
+            return dit(img, txt, timestep, layout)
 
     fused = forward()
     # the fused kernels ran: the self-check passed on this device, so this is not eager against eager

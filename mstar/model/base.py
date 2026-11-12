@@ -144,6 +144,7 @@ if TYPE_CHECKING:
 
 if TYPE_CHECKING:
     from mstar.engine.state import Array, Sampler, SampleSettings
+    from mstar.engine.state.adapters import StateSetup
     from mstar.worker.scheduling_policy import WalkPriority
 
 DECODE = "decode"
@@ -548,7 +549,7 @@ def streamed_inputs(model: "Model", graph_walk: str, graph: GraphSection) -> set
     }
 
 
-def enabled_resources(model: "Model", model_config: dict) -> list[NodeResourceSpec]:
+def enabled_resources(model: "Model", model_config: dict, setup: "StateSetup") -> list[NodeResourceSpec]:
     """The resource specs a deployment's YAML turns on, before its ``resources:``
     overrides: the model's declaration, less the opt-in specs (``NodeResourceSpec.opt_in``)
     its ``resources:`` block does not name. Raises the first problem with the declaration,
@@ -561,19 +562,22 @@ def enabled_resources(model: "Model", model_config: dict) -> list[NodeResourceSp
         raise ValueError(problems[0])
     named = (model_config.get("resources") or {}).keys()
     return [
-        spec for spec in node_resources(model)
+        spec for spec in node_resources(model, setup=setup)
         if not spec.opt_in or spec.resource_key in named
     ]
 
 
-def declared_resources(model: "Model", model_config: dict) -> list[NodeResourceSpec]:
+def declared_resources(
+    model: "Model", model_config: dict, setup: "StateSetup | None" = None,
+) -> list[NodeResourceSpec]:
     """The resource specs a deployment declares: ``enabled_resources`` with the YAML's
     overrides applied. A ``per_node`` spec is whole here, as the API server checks
     requests and adapters against it; ``serving_resources`` splits it."""
     from mstar.engine.resources.spec import apply_yaml_overrides
+    from mstar.engine.state.adapters import spec_overrides
 
-    specs = enabled_resources(model, model_config)
-    apply_yaml_overrides(specs, model_config)
+    specs = enabled_resources(model, model_config, setup or deployment_setup(model, model_config))
+    apply_yaml_overrides(specs, spec_overrides(model_config))
     return specs
 
 
@@ -601,7 +605,20 @@ def parse_autocast_dtype(value) -> torch.dtype | None:
     return dtype
 
 
-def serving_resources(model: "Model", model_config: dict) -> list[NodeResourceSpec]:
+def deployment_setup(model: "Model", model_config: dict) -> "StateSetup":
+    """The `StateSetup` ``model_config`` asks for, raising its first problem, for callers that skip
+    ``validate_deployment``, which reports them all."""
+    from mstar.engine.state.adapters import state_setup
+
+    setup, problems = state_setup(model_config, model.declare_state())
+    if problems:
+        raise ValueError(problems[0])
+    return setup
+
+
+def serving_resources(
+    model: "Model", model_config: dict, setup: "StateSetup | None" = None,
+) -> list[NodeResourceSpec]:
     """The resource specs a deployment builds: ``declared_resources``, as
     ``built_resources``.
 
@@ -610,7 +627,7 @@ def serving_resources(model: "Model", model_config: dict) -> list[NodeResourceSp
     ``validate_deployment`` takes the same steps, reporting every problem rather than
     the first.
     """
-    return built_resources(declared_resources(model, model_config))
+    return built_resources(declared_resources(model, model_config, setup))
 
 
 class Model(ABC):

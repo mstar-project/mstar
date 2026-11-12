@@ -12,7 +12,6 @@ Numerics follow the checkpoint dtypes (bf16) and the reference pipeline's op ord
 
 from __future__ import annotations
 
-import functools
 import logging
 from typing import NamedTuple
 
@@ -22,7 +21,7 @@ from torch import nn
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.model.components.batched_rows import BatchedRows
-from mstar.model.components.diffusion.attention import joint_attention
+from mstar.model.components.diffusion.attention import FrameSDPA
 from mstar.model.components.diffusion.compile_utils import compile_blocks
 from mstar.model.components.diffusion.decode_utils import latent_affine, latent_std
 from mstar.model.components.diffusion.denoise_loop import LATENTS, DenoiseLoopSubmodule, StepKey
@@ -37,9 +36,9 @@ from mstar.model.components.diffusion.image_io import (
     vae_pixels,
 )
 from mstar.model.components.diffusion.qwen.vl_prompt import VisionTokens
-from mstar.model.components.qwen_vision import VISION_ATTN, FrameSDPA, qwen25_tower_inputs
+from mstar.model.components.qwen_vision import VISION_ATTN, qwen25_tower_inputs
 from mstar.model.keys import VISION_FULL
-from mstar.model.qwen_image.components.transformer import QwenStepLayout, qwen_rope_tables
+from mstar.model.qwen_image.components.transformer import JOINT_TOKENS, QwenStepLayout, qwen_rope_tables
 from mstar.model.qwen_image.config import QwenImageConfig
 from mstar.model.submodule_base import NodeInputs, NodeSubmodule
 from mstar.utils.h2d import to_device_nonblocking
@@ -231,14 +230,14 @@ class QwenImageDenoiseSubmodule(DenoiseLoopSubmodule):
     PREFETCH_SEEDS = True
 
     def __init__(
-        self, transformer: nn.Module, config: QwenImageConfig, *, loop_name: str, attn_resource_key: str | None,
-        compile_transformer: bool = False, cfg_group=None,
+        self, transformer: nn.Module, config: QwenImageConfig, *, loop_name: str, compile_transformer: bool = False,
+        cfg_group=None,
     ):
-        super().__init__(loop_name=loop_name, attn_resource_key=attn_resource_key, cfg_group=cfg_group)
+        # a row holds a branch's pad and prompt segments end to end (a segmented read), which the engine lays out
+        # for one request a step
+        super().__init__(loop_name=loop_name, max_batch_size=1, cfg_group=cfg_group)
         self.transformer = transformer
         self.config = config
-        # SDPA within each segment where no ragged resource is bound (the reference's own kernel)
-        self._sdpa = FrameSDPA()
         self._compiled = bool(compile_transformer) and transformer is not None
         if self._compiled:
             # per block, static except the text axis: a new image shape compiles the one block graph once, and any
@@ -256,11 +255,10 @@ class QwenImageDenoiseSubmodule(DenoiseLoopSubmodule):
             text_lengths=(lengths[0], lengths[1] if len(lengths) > 1 else 0),
         )
 
-    def schedule_for(self, fwd_info, bucket_key: QwenEditKey) -> FlowMatchSchedule:
-        steps = int(fwd_info.step_metadata["num_inference_steps"])
-        return FlowMatchSchedule.build(self.config.scheduler, steps, bucket_key.image_tokens)
+    def schedule_for(self, walk: str, num_steps: int, bucket_key: QwenEditKey) -> FlowMatchSchedule:
+        return FlowMatchSchedule.build(self.config.scheduler, int(num_steps), bucket_key.image_tokens)
 
-    def seed_latents(self, fwd_info, bucket_key: QwenEditKey, generator: torch.Generator) -> torch.Tensor:
+    def seed_latents(self, bucket_key: QwenEditKey, generator: torch.Generator) -> torch.Tensor:
         # randn_tensor parity: (1, 1, C, H, W) in the transformer's dtype on the CPU generator, then packed; C is
         # the VAE's latent channels, which the transformer outputs
         h, w = bucket_key.grid
@@ -279,7 +277,7 @@ class QwenImageDenoiseSubmodule(DenoiseLoopSubmodule):
     def num_tokens(self, key: StepKey) -> int:
         return text_rows(key) + key.bucket.joint_image_tokens
 
-    def attention_segments(self, key: StepKey):
+    def attention_segments(self, key: StepKey) -> dict[str, tuple[tuple[str, int], ...]]:
         rows, image = text_rows(key), key.bucket.joint_image_tokens
         segments = []
         for b in key.branches:
@@ -287,7 +285,7 @@ class QwenImageDenoiseSubmodule(DenoiseLoopSubmodule):
             if rows > length:
                 segments.append((self.MAIN_SPAN, rows - length))
             segments.append((self.MAIN_SPAN, length + image))
-        return tuple(segments)
+        return {JOINT_TOKENS: tuple(segments)}
 
     def capture_request_inputs(self, key: StepKey, device) -> dict[str, torch.Tensor]:
         raise NotImplementedError("the Qwen-Image dit is not captured: a step is GPU-bound at this size")
@@ -302,22 +300,13 @@ class QwenImageDenoiseSubmodule(DenoiseLoopSubmodule):
 
     def model_output(self, engine_inputs, key: StepKey, latents, timestep, text_embeds, ref_latents, **cond):
         layout = self.layout(key, latents.device)
-        attend = self._attend(key, latents.shape[0])
         # the reference hands the transformer t.to(latents.dtype) / 1000, rounded through bf16
         timestep_in = timestep.to(latents.dtype) / 1000
         out = self.transformer(
             torch.cat([latents, ref_latents.to(latents.dtype)], dim=1), text_embeds.to(self.transformer.dtype),
-            timestep_in, layout, attend,
+            timestep_in, layout,
         )
         return out[:, :latents.shape[1]]
-
-    def _attend(self, key: StepKey, rows: int):
-        ragged = self.ragged_for(self.MAIN_SPAN)
-        if ragged is None:
-            spans = [span for _, span in self.attention_segments(key)]
-            self._sdpa.lengths = spans * (rows // len(key.branches))
-            ragged = self._sdpa.run
-        return functools.partial(joint_attention, ragged=ragged)
 
 
 # ---------------------------------------------------------------------------

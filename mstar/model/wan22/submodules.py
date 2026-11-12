@@ -1,4 +1,4 @@
-"""Wan2.2-TI2V-5B node submodules (nothing is cached; the dit declares a ragged attention resource).
+"""Wan2.2-TI2V-5B node submodules (nothing is cached; the dit declares the array its self-attention reads).
 
     text_encoder -> Wan22TextEncoderSubmodule (UMT5-XXL, thin HF wrapper)
     vae_encoder  -> Wan22VaeEncoderSubmodule  (Wan2.2-VAE encode, I2V only)
@@ -35,7 +35,7 @@ from mstar.model.components.diffusion.guidance import Guidance, cfg
 from mstar.model.components.diffusion.image_io import truncate_to_uint8
 from mstar.model.components.diffusion.unipc import make_unipc_tables
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
-from mstar.model.wan22.config import Wan22Config
+from mstar.model.wan22.config import DIT_TOKENS, Wan22Config
 
 logger = logging.getLogger(__name__)
 
@@ -312,8 +312,6 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
     # circular import.
     _I2V_WALK = "video_gen_i2v"
 
-    # The ragged self-attention resource (Wan22Model.get_node_resources).
-    SELF_ATTN = "dit_self_attn"
     # Under cfg_size 2 each rank forwards one branch of every row and the scaffold gathers the predictions, so a
     # step costs one branch's forward plus a latent-sized gather; without guidance both ranks run the whole step.
     GUIDANCE = Guidance(
@@ -321,11 +319,7 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
     )
 
     def __init__(self, transformer: nn.Module, config: Wan22Config, cfg_group=None):
-        super().__init__(
-            loop_name=DENOISE_LOOP_NAME, max_batch_size=config.dit_max_batch_size,
-            attn_resource_key=self.SELF_ATTN if config.attention_backend == "flashinfer" else None,
-            cfg_group=cfg_group,
-        )
+        super().__init__(loop_name=DENOISE_LOOP_NAME, max_batch_size=config.dit_max_batch_size, cfg_group=cfg_group)
         self.transformer = transformer
         self.config = config
         self._record_fp32_islands()
@@ -362,15 +356,15 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
         meta = fwd_info.step_metadata
         return WanStepKey(*_latent_grid(self.config, meta), i2v=fwd_info.graph_walk == self._I2V_WALK)
 
-    def schedule_for(self, fwd_info: CurrentForwardPassInfo, bucket_key: WanStepKey) -> FlowMatchSchedule:
-        sigmas, timesteps = make_unipc_tables(
-            int(fwd_info.step_metadata["num_inference_steps"]), self.config.flow_shift,
-        )
+    def schedule_for(self, walk: str, num_steps: int, bucket_key: WanStepKey) -> FlowMatchSchedule:
+        sigmas, timesteps = make_unipc_tables(int(num_steps), self.config.flow_shift)
         return FlowMatchSchedule(sigmas=sigmas, timesteps=timesteps, mu=None)
 
-    def seed_latents(
-        self, fwd_info: CurrentForwardPassInfo, bucket_key: WanStepKey, generator: torch.Generator,
-    ) -> torch.Tensor:
+    def attention_segments(self, key: StepKey):
+        # one segment per guidance branch this rank computes, all the same span
+        return {DIT_TOKENS: ((self.MAIN_SPAN, self.num_tokens(key)),) * len(key.branches)}
+
+    def seed_latents(self, bucket_key: WanStepKey, generator: torch.Generator) -> torch.Tensor:
         shape = (1, self.config.in_channels, bucket_key.frames, bucket_key.height, bucket_key.width)
         # randn_tensor parity: CPU generator, CPU randn, then move.
         return torch.randn(shape, generator=generator, dtype=torch.float32)
@@ -409,8 +403,7 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
                 infos = (engine_inputs.per_request_info[rid] for rid in engine_inputs.request_ids)
                 out[self.LATENTS] = torch.stack([
                     (1 - mask) * image_latent + mask * sample
-                    if self.step_index(info) + 1 >= self.request_state(info.rid_handle)["schedule"].num_steps
-                    else sample
+                    if self.step_index(info) + 1 >= self.schedule_of(info, key.bucket).num_steps else sample
                     for info, image_latent, sample in zip(infos, kwargs["image_latent"], out[self.LATENTS], strict=True)
                 ])
         return out
@@ -464,7 +457,6 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
             hidden_states=hidden_states,
             timestep=timestep,
             encoder_hidden_states=encoder_hidden_states.to(self.transformer.dtype),
-            self_attn_fn=self._ragged(),
         )
 
 

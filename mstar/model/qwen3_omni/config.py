@@ -32,6 +32,9 @@ TALKER_ATTN = "talker_attn"
 AUDIO_ATTN = "audio_attn"
 # the shared ViT node (`PackedBlockLoopEncoder`) reads `keys`' one
 VISION_ATTN = keys.VISION_ATTN
+# What each encoder's attention reads, and what the Talker keeps per request.
+AUDIO_TOKENS, VISION_TOKENS = "audio_tokens", "vision_tokens"
+TALKER_TEXT = "talker_text"
 
 THINKER_POS = "thinker_pos"
 TALKER_POS = "talker_pos"

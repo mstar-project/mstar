@@ -18,6 +18,7 @@ import torch
 sys.path.insert(0, ".")
 
 from mstar.conductor.conductor import Conductor  # noqa: E402
+from mstar.engine.state.adapters import node_resources, state_setup  # noqa: E402
 from mstar.graph.base import GraphNode, Loop, Sequential, TensorPointerInfo  # noqa: E402
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION  # noqa: E402
 from mstar.model.flux2_klein.config import DENOISE_LOOP, DIT_ATTN, Flux2KleinConfig  # noqa: E402
@@ -100,13 +101,18 @@ def test_denoise_walk_structure(walk, edit):
 
 
 def test_resources_follow_the_attention_backend():
-    flashinfer = _make_model(attention_backend="flashinfer").get_node_resources()
+    flashinfer = node_resources(_make_model())
     assert len(flashinfer) == 1 and flashinfer[0].resource_key == DIT_ATTN and flashinfer[0].nodes == {"dit"}
     cfg = flashinfer[0].config
     assert cfg.num_qo_heads == 24 and cfg.head_dim == 128 and cfg.max_segments_per_request == 1
-    assert _make_model(attention_backend="sdpa").get_node_resources() == []
-    with pytest.raises(ValueError):
-        _make_model(attention_backend="flash")
+    model = _make_model()
+    setup, _ = state_setup({"resources": {DIT_ATTN: {"backend": "sdpa"}}}, model.declare_state())
+    assert node_resources(model, setup=setup) == []
+
+
+def test_the_old_attention_backend_kwarg_is_refused():
+    with pytest.raises(ValueError, match="attention_backend is a resource's setting"):
+        _make_model(attention_backend="sdpa")
 
 
 def test_worker_graphs_from_yaml():
@@ -760,7 +766,7 @@ def test_the_compiled_dit_runs_a_step(monkeypatch):
         def forward(self, model_input, text_embeds, timestep, rope, ragged=None):
             return model_input * 2
 
-    dit = submodules.KleinDenoiseSubmodule(Transformer(), config, loop_name=DENOISE_LOOP, attn_resource_key=None)
+    dit = submodules.KleinDenoiseSubmodule(Transformer(), config, loop_name=DENOISE_LOOP)
     assert dit._compile
     key = StepKey(KleinShape(grid=(2, 2), text_len=3))
     latents = torch.ones(1, 4, config.transformer.in_channels)

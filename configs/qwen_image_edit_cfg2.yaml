@@ -6,7 +6,6 @@ max_seq_len: 8192
 # positive or the negative prompt) of every row and the predictions are all-gathered each step,
 # so a guided step costs one branch's forward. The text encoder and the VAE run on rank 0.
 model_kwargs:
-  attention_backend: flashinfer
   compile: false
 
 node_groups:

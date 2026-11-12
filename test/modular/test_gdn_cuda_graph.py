@@ -40,8 +40,20 @@ from mstar.engine.resources.recurrent import (
     RecurrentStep,
 )
 from mstar.engine.resources.step import BucketKey, Segment, SlotLease, StepContext, SubmoduleStep
-from mstar.engine.state import ArrayStep, CausalConv, Entry, GatedDeltaNet, TensorType, Value
-from mstar.engine.state.adapters import build_handle
+from mstar.engine.state import (
+    Array,
+    ArrayStep,
+    Attend,
+    Causal,
+    CausalConv,
+    Entry,
+    GatedDeltaNet,
+    KVEntry,
+    Read,
+    TensorType,
+    Value,
+)
+from mstar.engine.state.adapters import StateSetup, _resolve, build_handle
 from mstar.engine.state.calls import causal_conv, gated_delta_net
 from mstar.model.components.distributed import (
     ColumnParallelLinear,
@@ -140,11 +152,13 @@ class Stack(torch.nn.Module):
             "state": TensorType((g.num_v_heads, g.head_k_dim, g.head_v_dim), dtype=torch.float32),
             "conv": TensorType((g.conv_dim, g.conv_kernel_size - 1), dtype=None),
         })
-        self.state = build_handle(
-            Value(GDN_STATE, nodes={"llm"}, layers=range(depth), entry=entry,
-                  updates={"conv": CausalConv(), LINEAR_ATTN: GatedDeltaNet()}),
-            {GDN_STATE: pool, "conv": None, LINEAR_ATTN: manager},
-        )
+        array = Value(GDN_STATE, nodes={"llm"}, layers=range(depth), entry=entry,
+                      updates={"conv": CausalConv(), LINEAR_ATTN: GatedDeltaNet()})
+        # a Value resolves beside the paged array its pool links to
+        holder = Array("kv", nodes={"llm"}, layers=frozenset(range(depth)), entry=KVEntry(heads=1, head_dim=8),
+                       max_len=1, reads={"attn": Read(mask=Causal(), op=Attend(q_heads=1))})
+        resolved = _resolve([holder, array], StateSetup())
+        self.state = build_handle(array, {GDN_STATE: pool, LINEAR_ATTN: manager}, resolved)
         for layer in self.layers:
             layer.bind_state({GDN_STATE: self.state})
 
