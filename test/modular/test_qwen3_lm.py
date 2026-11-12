@@ -240,6 +240,23 @@ def test_an_attention_on_its_array_compiles_only_the_frames_around_its_state_op(
     assert compiles <= 4, f"{compiles} frames compiled for one layer, against 4"
 
 
+def test_an_attention_that_stays_out_of_the_op_compiles_only_the_frames_around_add_read(dynamo_counts):
+    """A rope the kernel doesn't compute leaves the layer on ``ParallelAttention.forward``. ``one_layer`` compiles as
+    two frames around `_next_step`, the layer's forward as one that hands over to the stock forward, and the stock
+    forward as two around `add_read`. An `add` and a `read` there would break once each, and compile a sixth frame."""
+    rope = Rope(theta=1e4, rotary_dim=TINY["head_dim"], interleave=True, table_dtype=torch.bfloat16)
+    _, ours, handle, pos = _on_state(rope)
+    # the stand-in counts its rotations on itself, which a compiled frame would guard on and recompile for
+    pos.apply_qk = lambda q, k, label, rope_dtype: (q, k)
+
+    def one_layer(h):
+        _next_step(handle, 3)
+        return ours.layers[0].self_attn(h)
+
+    compiles = dynamo_counts(one_layer, torch.randn(3, TINY["hidden_size"])).compiles
+    assert compiles <= 5, f"{compiles} frames compiled for one layer, against 5"
+
+
 def test_an_empty_layer_stack_is_the_final_norm():
     from mstar.model.components import RMSNorm
     from mstar.model.components.decoder_layer import run_layers
