@@ -761,9 +761,9 @@
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.ragged.config.RaggedAttentionSpec"><code class="docutils literal notranslate"><span class="pre">RaggedAttentionSpec</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.ragged.config.RaggedAttentionSpec.attends_split_steps"><code class="docutils literal notranslate"><span class="pre">RaggedAttentionSpec.attends_split_steps</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.ragged.config.RaggedAttentionSpec.derive"><code class="docutils literal notranslate"><span class="pre">RaggedAttentionSpec.derive()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.ragged.config.RaggedAttentionSpec.labels"><code class="docutils literal notranslate"><span class="pre">RaggedAttentionSpec.labels</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.ragged.config.RaggedAttentionSpec.resolve_exchange"><code class="docutils literal notranslate"><span class="pre">RaggedAttentionSpec.resolve_exchange()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.ragged.config.RaggedAttentionSpec.resource_class"><code class="docutils literal notranslate"><span class="pre">RaggedAttentionSpec.resource_class</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.ragged.config.RaggedAttentionSpec.sp_exchange"><code class="docutils literal notranslate"><span class="pre">RaggedAttentionSpec.sp_exchange</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.ragged.config.RaggedAttentionSpec.split_step_refusals"><code class="docutils literal notranslate"><span class="pre">RaggedAttentionSpec.split_step_refusals()</span></code></a></li>
@@ -979,10 +979,11 @@ slice at build, as it does for a <code class="docutils literal notranslate"><spa
 <p>Cacheless self-attention within each declared span (<code class="docutils literal notranslate"><span class="pre">AttentionStep</span></code>).</p>
 <p><code class="docutils literal notranslate"><span class="pre">labels</span></code> are the labels its plans run under that may split; the state contract fills them from the arrays it
 reads. Where its node’s sequence shard lists one of them, the resource attends a split step’s label by Ulysses
-(one all-to-all from split tokens to split heads, and back) and shards heads over every TP and SP rank, slicing
-them on a copied step (<code class="docutils literal notranslate"><span class="pre">sp_exchange</span></code> “ulysses”, derived); otherwise it attends only copied labels, heads over
-TP. On SP ranks every label of a Ulysses resource goes through an exchange, so <code class="docutils literal notranslate"><span class="pre">run(...,</span> <span class="pre">return_lse=True)</span></code>
-raises there.</p>
+(one all-to-all from split tokens to split heads, and back; <code class="docutils literal notranslate"><span class="pre">sp_exchange</span></code> “ulysses”, derived), whatever the
+shard’s <code class="docutils literal notranslate"><span class="pre">exchange</span></code> for the node’s paged attentions. On a node whose shard splits (<code class="docutils literal notranslate"><span class="pre">SeqShardSpec.splits</span></code>) it
+then shards heads over every TP and SP rank, even where the node’s pools store KV by position, slicing them on a
+copied step; on SP ranks of such a node every label goes through an exchange, so <code class="docutils literal notranslate"><span class="pre">run(...,</span> <span class="pre">return_lse=True)</span></code>
+raises there. Otherwise (<code class="docutils literal notranslate"><span class="pre">sp_exchange</span></code> “none”) it attends only copied labels, heads over TP.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
@@ -993,18 +994,6 @@ raises there.</p>
 </ul>
 </dd>
 </dl>
-<dl class="py property">
-<dt class="sig sig-object py" id="mstar.engine.resources.attn.ragged.config.RaggedAttentionSpec.attends_split_steps">
-<span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">attends_split_steps</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><a class="headerlink" href="#mstar.engine.resources.attn.ragged.config.RaggedAttentionSpec.attends_split_steps" title="Link to this definition">#</a></dt>
-<dd><p>a node that splits
-its steps needs one.</p>
-<dl class="field-list simple">
-<dt class="field-odd">Type<span class="colon">:</span></dt>
-<dd class="field-odd"><p>Whether this is an attention that can take a split step’s tokens</p>
-</dd>
-</dl>
-</dd></dl>
-
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.attn.ragged.config.RaggedAttentionSpec.derive">
 <span class="sig-name descname"><span class="pre">derive</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">specs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/attn/ragged/config.html#RaggedAttentionSpec.derive"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.attn.ragged.config.RaggedAttentionSpec.derive" title="Link to this definition">#</a></dt>
@@ -1026,6 +1015,21 @@ Idempotent: it runs wherever the specs resolve (<cite>resolve_spec_dependencies<
 <span class="sig-name descname"><span class="pre">labels</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Collection" title="(in Python v3.12)"><span class="pre">Collection</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">]</span></span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">frozenset({})</span></span><a class="headerlink" href="#mstar.engine.resources.attn.ragged.config.RaggedAttentionSpec.labels" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.attn.ragged.config.RaggedAttentionSpec.resolve_exchange">
+<span class="sig-name descname"><span class="pre">resolve_exchange</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">specs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/attn/ragged/config.html#RaggedAttentionSpec.resolve_exchange"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.attn.ragged.config.RaggedAttentionSpec.resolve_exchange" title="Link to this definition">#</a></dt>
+<dd><p>Ulysses where its node’s one sequence shard lists a label it plans; from raw fields, so
+the shard’s <code class="docutils literal notranslate"><span class="pre">derive</span></code> can ask before this spec’s own.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>specs</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Mapping" title="(in Python v3.12)"><em>Mapping</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference internal" href="mstar.engine.resources.spec.html#mstar.engine.resources.spec.NodeResourceSpec" title="mstar.engine.resources.spec.NodeResourceSpec"><em>NodeResourceSpec</em></a><em>]</em>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Literal" title="(in Python v3.12)"><em>Literal</em></a>[‘none’, ‘ulysses’]</p>
+</dd>
+</dl>
+</dd></dl>
+
 <dl class="py property">
 <dt class="sig sig-object py" id="mstar.engine.resources.attn.ragged.config.RaggedAttentionSpec.resource_class">
 <span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">resource_class</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#type" title="(in Python v3.12)"><span class="pre">type</span></a><span class="p"><span class="pre">[</span></span><a class="reference internal" href="mstar.engine.resources.html#mstar.engine.resources.Resource" title="mstar.engine.resources.Resource"><span class="pre">Resource</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.engine.resources.attn.ragged.config.RaggedAttentionSpec.resource_class" title="Link to this definition">#</a></dt>
@@ -1037,7 +1041,7 @@ resource stays free of the manager and its kernels.</p>
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.engine.resources.attn.ragged.config.RaggedAttentionSpec.sp_exchange">
-<span class="sig-name descname"><span class="pre">sp_exchange</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Literal" title="(in Python v3.12)"><span class="pre">Literal</span></a><span class="p"><span class="pre">[</span></span><span class="s"><span class="pre">'ulysses'</span></span><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.engine.resources.attn.ragged.config.RaggedAttentionSpec.sp_exchange" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">sp_exchange</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Literal" title="(in Python v3.12)"><span class="pre">Literal</span></a><span class="p"><span class="pre">[</span></span><span class="s"><span class="pre">'none'</span></span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="s"><span class="pre">'ulysses'</span></span><span class="p"><span class="pre">]</span></span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'none'</span></span><a class="headerlink" href="#mstar.engine.resources.attn.ragged.config.RaggedAttentionSpec.sp_exchange" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py method">
@@ -1135,8 +1139,9 @@ resource stays free of the manager and its kernels.</p>
 a model with both declares one of each per head geometry.</p>
 <p>On a node whose sequence shard splits a step, each pair’s exchange follows from which side
 is split: split queries over copied keys attend locally, copied queries over split keys merge
-every rank’s partial (<code class="docutils literal notranslate"><span class="pre">sharded_key_merge</span></code>), and both split is refused at load
-(<code class="docutils literal notranslate"><span class="pre">mstar.engine.state.analysis.split_read_problems</span></code>). The shard must split
+every rank’s partial (<code class="docutils literal notranslate"><span class="pre">sharded_key_merge</span></code>), and both split is refused at load for a read
+declared through the state contract (<code class="docutils literal notranslate"><span class="pre">mstar.engine.state.analysis.split_read_problems</span></code>) and at
+the first split step for a hand-written spec. The shard must split
 each row (<code class="docutils literal notranslate"><span class="pre">axis=1</span></code>) with exchanges: a packed split (<code class="docutils literal notranslate"><span class="pre">axis=0</span></code>) or one with <code class="docutils literal notranslate"><span class="pre">exchanges=False</span></code>
 can leave a rank none of a row.</p>
 <dl class="field-list simple">
@@ -1306,9 +1311,9 @@ declared for the same requests in the same order. Never causal.</p>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.ragged.config.RaggedAttentionSpec"><code class="docutils literal notranslate"><span class="pre">RaggedAttentionSpec</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.ragged.config.RaggedAttentionSpec.attends_split_steps"><code class="docutils literal notranslate"><span class="pre">RaggedAttentionSpec.attends_split_steps</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.ragged.config.RaggedAttentionSpec.derive"><code class="docutils literal notranslate"><span class="pre">RaggedAttentionSpec.derive()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.ragged.config.RaggedAttentionSpec.labels"><code class="docutils literal notranslate"><span class="pre">RaggedAttentionSpec.labels</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.ragged.config.RaggedAttentionSpec.resolve_exchange"><code class="docutils literal notranslate"><span class="pre">RaggedAttentionSpec.resolve_exchange()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.ragged.config.RaggedAttentionSpec.resource_class"><code class="docutils literal notranslate"><span class="pre">RaggedAttentionSpec.resource_class</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.ragged.config.RaggedAttentionSpec.sp_exchange"><code class="docutils literal notranslate"><span class="pre">RaggedAttentionSpec.sp_exchange</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.ragged.config.RaggedAttentionSpec.split_step_refusals"><code class="docutils literal notranslate"><span class="pre">RaggedAttentionSpec.split_step_refusals()</span></code></a></li>

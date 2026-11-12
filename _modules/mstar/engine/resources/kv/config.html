@@ -1956,15 +1956,19 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="KVSpec.split_step_refusals">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.KVSpec.split_step_refusals">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">split_step_refusals</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">node</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">shard</span><span class="p">:</span> <span class="s2">"SeqShardSpec"</span><span class="p">,</span> <span class="n">tp</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">sp</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]:</span>
-        <span class="c1"># stored by head, a split step's tokens trade for heads over every TP and SP rank (Ulysses)</span>
+        <span class="c1"># stored by position, a split step's packed tokens are gathered or passed round; stored by</span>
+        <span class="c1"># head, they trade for heads over every TP and SP rank (Ulysses)</span>
         <span class="n">cfg</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span>
         <span class="k">if</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">cfg</span><span class="p">,</span> <span class="n">PagedKVConfig</span><span class="p">):</span>
             <span class="k">return</span> <span class="p">[]</span>
         <span class="k">if</span> <span class="n">cfg</span><span class="o">.</span><span class="n">context_parallel</span><span class="p">:</span>
-            <span class="k">return</span> <span class="p">[</span>
-                <span class="sa">f</span><span class="s2">"node </span><span class="si">{</span><span class="n">node</span><span class="si">!r}</span><span class="s2"> splits tokens over </span><span class="si">{</span><span class="n">sp</span><span class="si">}</span><span class="s2"> SP ranks, and KV </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">resource_key</span><span class="si">!r}</span><span class="s2"> stores them by "</span>
-                <span class="s2">"position (context_parallel), which split steps don't support yet: store it by head"</span>
-            <span class="p">]</span>
+            <span class="k">if</span> <span class="n">shard</span><span class="o">.</span><span class="n">axis</span> <span class="o">==</span> <span class="mi">1</span><span class="p">:</span>
+                <span class="k">return</span> <span class="p">[</span>
+                    <span class="sa">f</span><span class="s2">"node </span><span class="si">{</span><span class="n">node</span><span class="si">!r}</span><span class="s2"> splits each row of its steps (axis 1) over </span><span class="si">{</span><span class="n">sp</span><span class="si">}</span><span class="s2"> SP ranks, and KV "</span>
+                    <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">resource_key</span><span class="si">!r}</span><span class="s2"> stores them by position (context_parallel), which takes a packed "</span>
+                    <span class="s2">"split (axis 0) only"</span>
+                <span class="p">]</span>
+            <span class="k">return</span> <span class="p">[]</span>
         <span class="n">q</span><span class="p">,</span> <span class="n">kv</span> <span class="o">=</span> <span class="n">cfg</span><span class="o">.</span><span class="n">_unsharded_qo_heads</span><span class="p">,</span> <span class="n">cfg</span><span class="o">.</span><span class="n">_unsharded_kv_heads</span>
         <span class="k">if</span> <span class="n">q</span> <span class="o">%</span> <span class="n">tp</span> <span class="ow">or</span> <span class="n">kv</span> <span class="o">%</span> <span class="n">tp</span> <span class="ow">or</span> <span class="p">(</span><span class="n">q</span> <span class="o">//</span> <span class="n">tp</span><span class="p">)</span> <span class="o">%</span> <span class="n">sp</span> <span class="ow">or</span> <span class="p">(</span><span class="n">kv</span> <span class="o">//</span> <span class="n">tp</span><span class="p">)</span> <span class="o">%</span> <span class="n">sp</span><span class="p">:</span>
             <span class="k">return</span> <span class="p">[</span>

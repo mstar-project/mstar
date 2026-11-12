@@ -1243,7 +1243,8 @@ TypeError rather than something silently swallowed by a <code class="docutils li
 <span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">head_shards</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.engine.resources.base.EngineResourceInfo.head_shards" title="Link to this definition">#</a></dt>
 <dd><p>How many ways the node’s ranks split its attention heads, which each builder sizes head
 counts by (<cite>head_shards</cite>). A ragged resource splits over TP only, unless it attends a label
-its node’s sequence shard splits (<code class="docutils literal notranslate"><span class="pre">RaggedAttentionSpec.sp_exchange</span></code>, derived).</p>
+its node’s sequence shard splits (<code class="docutils literal notranslate"><span class="pre">RaggedAttentionSpec.sp_exchange</span></code>, derived): over TP x SP
+then, even where the node’s pools place positions.</p>
 </dd></dl>
 
 <dl class="py attribute">

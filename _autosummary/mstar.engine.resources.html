@@ -781,11 +781,11 @@
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.AttentionSpec"><code class="docutils literal notranslate"><span class="pre">AttentionSpec</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.AttentionSpec.apply_yaml_overrides"><code class="docutils literal notranslate"><span class="pre">AttentionSpec.apply_yaml_overrides()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.AttentionSpec.attends_split_steps"><code class="docutils literal notranslate"><span class="pre">AttentionSpec.attends_split_steps</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.AttentionSpec.combined_splits"><code class="docutils literal notranslate"><span class="pre">AttentionSpec.combined_splits()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.AttentionSpec.config"><code class="docutils literal notranslate"><span class="pre">AttentionSpec.config</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.AttentionSpec.depends_on"><code class="docutils literal notranslate"><span class="pre">AttentionSpec.depends_on()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.AttentionSpec.derive"><code class="docutils literal notranslate"><span class="pre">AttentionSpec.derive()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.AttentionSpec.resolve_exchange"><code class="docutils literal notranslate"><span class="pre">AttentionSpec.resolve_exchange()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.AttentionSpec.resource_class"><code class="docutils literal notranslate"><span class="pre">AttentionSpec.resource_class</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.AttentionSpec.shard_key"><code class="docutils literal notranslate"><span class="pre">AttentionSpec.shard_key</span></code></a></li>
 </ul>
@@ -936,7 +936,6 @@
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.NodeResourceSpec"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.NodeResourceSpec.apply_yaml_overrides"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.apply_yaml_overrides()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.NodeResourceSpec.attends_split_steps"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.attends_split_steps</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.NodeResourceSpec.combined_splits"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.combined_splits()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.NodeResourceSpec.depends_on"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.depends_on()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.NodeResourceSpec.derive"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.derive()</span></code></a></li>
@@ -948,12 +947,12 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.NodeResourceSpec.places_positions"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.places_positions</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.NodeResourceSpec.prefix_variant"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.prefix_variant()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.NodeResourceSpec.request_config"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.request_config()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.NodeResourceSpec.resolve_exchange"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.resolve_exchange()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.NodeResourceSpec.resource_class"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.resource_class</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.NodeResourceSpec.resource_key"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.resource_key</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.NodeResourceSpec.restores_prefix"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.restores_prefix</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.NodeResourceSpec.routing_mirror"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.routing_mirror()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.NodeResourceSpec.split_step_refusals"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.split_step_refusals()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.NodeResourceSpec.splits_steps"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.splits_steps</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.NodeResourceSpec.writes_prefix_snapshots"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.writes_prefix_snapshots</span></code></a></li>
 </ul>
 </li>
@@ -1052,9 +1051,9 @@
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.RaggedAttentionSpec"><code class="docutils literal notranslate"><span class="pre">RaggedAttentionSpec</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.RaggedAttentionSpec.attends_split_steps"><code class="docutils literal notranslate"><span class="pre">RaggedAttentionSpec.attends_split_steps</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.RaggedAttentionSpec.derive"><code class="docutils literal notranslate"><span class="pre">RaggedAttentionSpec.derive()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.RaggedAttentionSpec.labels"><code class="docutils literal notranslate"><span class="pre">RaggedAttentionSpec.labels</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.RaggedAttentionSpec.resolve_exchange"><code class="docutils literal notranslate"><span class="pre">RaggedAttentionSpec.resolve_exchange()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.RaggedAttentionSpec.resource_class"><code class="docutils literal notranslate"><span class="pre">RaggedAttentionSpec.resource_class</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.RaggedAttentionSpec.sp_exchange"><code class="docutils literal notranslate"><span class="pre">RaggedAttentionSpec.sp_exchange</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.RaggedAttentionSpec.split_step_refusals"><code class="docutils literal notranslate"><span class="pre">RaggedAttentionSpec.split_step_refusals()</span></code></a></li>
@@ -1252,11 +1251,16 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SeqShardSpec"><code class="docutils literal notranslate"><span class="pre">SeqShardSpec</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SeqShardSpec.apply_yaml_overrides"><code class="docutils literal notranslate"><span class="pre">SeqShardSpec.apply_yaml_overrides()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SeqShardSpec.axis"><code class="docutils literal notranslate"><span class="pre">SeqShardSpec.axis</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SeqShardSpec.depends_on"><code class="docutils literal notranslate"><span class="pre">SeqShardSpec.depends_on()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SeqShardSpec.derive"><code class="docutils literal notranslate"><span class="pre">SeqShardSpec.derive()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SeqShardSpec.exchange"><code class="docutils literal notranslate"><span class="pre">SeqShardSpec.exchange</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SeqShardSpec.exchange_over"><code class="docutils literal notranslate"><span class="pre">SeqShardSpec.exchange_over()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SeqShardSpec.exchanges"><code class="docutils literal notranslate"><span class="pre">SeqShardSpec.exchanges</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SeqShardSpec.labels"><code class="docutils literal notranslate"><span class="pre">SeqShardSpec.labels</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SeqShardSpec.min_tokens"><code class="docutils literal notranslate"><span class="pre">SeqShardSpec.min_tokens</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SeqShardSpec.resource_class"><code class="docutils literal notranslate"><span class="pre">SeqShardSpec.resource_class</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SeqShardSpec.splits_steps"><code class="docutils literal notranslate"><span class="pre">SeqShardSpec.splits_steps</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SeqShardSpec.splits"><code class="docutils literal notranslate"><span class="pre">SeqShardSpec.splits</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SeqShardSpec.stripe_pool"><code class="docutils literal notranslate"><span class="pre">SeqShardSpec.stripe_pool</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SeqShardSpec.walks"><code class="docutils literal notranslate"><span class="pre">SeqShardSpec.walks</span></code></a></li>
 </ul>
 </li>
@@ -1615,18 +1619,6 @@ this spec depends on, and is tuned under that resource’s own block.</p>
 </dl>
 </dd></dl>
 
-<dl class="py property">
-<dt class="sig sig-object py" id="mstar.engine.resources.AttentionSpec.attends_split_steps">
-<span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">attends_split_steps</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><a class="headerlink" href="#mstar.engine.resources.AttentionSpec.attends_split_steps" title="Link to this definition">#</a></dt>
-<dd><p>a node that splits
-its steps needs one.</p>
-<dl class="field-list simple">
-<dt class="field-odd">Type<span class="colon">:</span></dt>
-<dd class="field-odd"><p>Whether this is an attention that can take a split step’s tokens</p>
-</dd>
-</dl>
-</dd></dl>
-
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.AttentionSpec.combined_splits">
 <span class="sig-name descname"><span class="pre">combined_splits</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/attn/config.html#AttentionSpec.combined_splits"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.AttentionSpec.combined_splits" title="Link to this definition">#</a></dt>
@@ -1667,6 +1659,20 @@ Idempotent: it runs wherever the specs resolve (<cite>resolve_spec_dependencies<
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
 <dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)">list</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a>]</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.AttentionSpec.resolve_exchange">
+<span class="sig-name descname"><span class="pre">resolve_exchange</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">specs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/attn/config.html#AttentionSpec.resolve_exchange"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.AttentionSpec.resolve_exchange" title="Link to this definition">#</a></dt>
+<dd><p>Its node’s sequence shard’s <code class="docutils literal notranslate"><span class="pre">exchange</span></code> over its pool’s storage.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>specs</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Mapping" title="(in Python v3.12)"><em>Mapping</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference internal" href="mstar.engine.resources.spec.html#mstar.engine.resources.spec.NodeResourceSpec" title="mstar.engine.resources.spec.NodeResourceSpec"><em>NodeResourceSpec</em></a><em>]</em>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Literal" title="(in Python v3.12)"><em>Literal</em></a>[‘none’, ‘ulysses’, ‘all_gather’, ‘ring’]</p>
 </dd>
 </dl>
 </dd></dl>
@@ -2701,18 +2707,6 @@ implementations, at the cost of silently accepting anything named
 alike.</p>
 </dd></dl>
 
-<dl class="py property">
-<dt class="sig sig-object py" id="mstar.engine.resources.NodeResourceSpec.attends_split_steps">
-<span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">attends_split_steps</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><a class="headerlink" href="#mstar.engine.resources.NodeResourceSpec.attends_split_steps" title="Link to this definition">#</a></dt>
-<dd><p>a node that splits
-its steps needs one.</p>
-<dl class="field-list simple">
-<dt class="field-odd">Type<span class="colon">:</span></dt>
-<dd class="field-odd"><p>Whether this is an attention that can take a split step’s tokens</p>
-</dd>
-</dl>
-</dd></dl>
-
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.NodeResourceSpec.combined_splits">
 <span class="sig-name descname"><span class="pre">combined_splits</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/spec.html#NodeResourceSpec.combined_splits"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.NodeResourceSpec.combined_splits" title="Link to this definition">#</a></dt>
@@ -2845,6 +2839,23 @@ settings.</p>
 </dl>
 </dd></dl>
 
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.NodeResourceSpec.resolve_exchange">
+<span class="sig-name descname"><span class="pre">resolve_exchange</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">specs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/spec.html#NodeResourceSpec.resolve_exchange"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.NodeResourceSpec.resolve_exchange" title="Link to this definition">#</a></dt>
+<dd><p>How a split step’s tokens reach this attention (<code class="docutils literal notranslate"><span class="pre">sequence_shard</span></code>): <code class="docutils literal notranslate"><span class="pre">none</span></code> (the
+default) for a resource that takes none. From raw fields, so the sequence shard’s
+<code class="docutils literal notranslate"><span class="pre">derive</span></code> can ask in any order; a node’s steps split where any of its attentions answers
+otherwise (<code class="docutils literal notranslate"><span class="pre">SeqShardSpec.splits</span></code>).</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>specs</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Mapping" title="(in Python v3.12)"><em>Mapping</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference internal" href="#mstar.engine.resources.NodeResourceSpec" title="mstar.engine.resources.NodeResourceSpec"><em>NodeResourceSpec</em></a><em>]</em>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>SpExchange</p>
+</dd>
+</dl>
+</dd></dl>
+
 <dl class="py property">
 <dt class="sig sig-object py" id="mstar.engine.resources.NodeResourceSpec.resource_class">
 <span class="property"><span class="k"><span class="pre">abstract</span></span><span class="w"> </span><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">resource_class</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#type" title="(in Python v3.12)"><span class="pre">type</span></a><span class="p"><span class="pre">[</span></span><a class="reference internal" href="#mstar.engine.resources.Resource" title="mstar.engine.resources.Resource"><span class="pre">Resource</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.engine.resources.NodeResourceSpec.resource_class" title="Link to this definition">#</a></dt>
@@ -2900,13 +2911,6 @@ ranks (<code class="docutils literal notranslate"><span class="pre">tp</span></c
 <dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)">list</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a>]</p>
 </dd>
 </dl>
-</dd></dl>
-
-<dl class="py property">
-<dt class="sig sig-object py" id="mstar.engine.resources.NodeResourceSpec.splits_steps">
-<span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">splits_steps</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><a class="headerlink" href="#mstar.engine.resources.NodeResourceSpec.splits_steps" title="Link to this definition">#</a></dt>
-<dd><p>Whether this resource splits its nodes’ steps over their SP ranks
-(<code class="docutils literal notranslate"><span class="pre">mstar.engine.resources.sequence_shard</span></code>).</p>
 </dd></dl>
 
 <dl class="py property">
@@ -3628,10 +3632,11 @@ slice at build, as it does for a <code class="docutils literal notranslate"><spa
 <p>Cacheless self-attention within each declared span (<code class="docutils literal notranslate"><span class="pre">AttentionStep</span></code>).</p>
 <p><code class="docutils literal notranslate"><span class="pre">labels</span></code> are the labels its plans run under that may split; the state contract fills them from the arrays it
 reads. Where its node’s sequence shard lists one of them, the resource attends a split step’s label by Ulysses
-(one all-to-all from split tokens to split heads, and back) and shards heads over every TP and SP rank, slicing
-them on a copied step (<code class="docutils literal notranslate"><span class="pre">sp_exchange</span></code> “ulysses”, derived); otherwise it attends only copied labels, heads over
-TP. On SP ranks every label of a Ulysses resource goes through an exchange, so <code class="docutils literal notranslate"><span class="pre">run(...,</span> <span class="pre">return_lse=True)</span></code>
-raises there.</p>
+(one all-to-all from split tokens to split heads, and back; <code class="docutils literal notranslate"><span class="pre">sp_exchange</span></code> “ulysses”, derived), whatever the
+shard’s <code class="docutils literal notranslate"><span class="pre">exchange</span></code> for the node’s paged attentions. On a node whose shard splits (<code class="docutils literal notranslate"><span class="pre">SeqShardSpec.splits</span></code>) it
+then shards heads over every TP and SP rank, even where the node’s pools store KV by position, slicing them on a
+copied step; on SP ranks of such a node every label goes through an exchange, so <code class="docutils literal notranslate"><span class="pre">run(...,</span> <span class="pre">return_lse=True)</span></code>
+raises there. Otherwise (<code class="docutils literal notranslate"><span class="pre">sp_exchange</span></code> “none”) it attends only copied labels, heads over TP.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
@@ -3642,18 +3647,6 @@ raises there.</p>
 </ul>
 </dd>
 </dl>
-<dl class="py property">
-<dt class="sig sig-object py" id="mstar.engine.resources.RaggedAttentionSpec.attends_split_steps">
-<span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">attends_split_steps</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><a class="headerlink" href="#mstar.engine.resources.RaggedAttentionSpec.attends_split_steps" title="Link to this definition">#</a></dt>
-<dd><p>a node that splits
-its steps needs one.</p>
-<dl class="field-list simple">
-<dt class="field-odd">Type<span class="colon">:</span></dt>
-<dd class="field-odd"><p>Whether this is an attention that can take a split step’s tokens</p>
-</dd>
-</dl>
-</dd></dl>
-
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.RaggedAttentionSpec.derive">
 <span class="sig-name descname"><span class="pre">derive</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">specs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/attn/ragged/config.html#RaggedAttentionSpec.derive"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.RaggedAttentionSpec.derive" title="Link to this definition">#</a></dt>
@@ -3675,6 +3668,21 @@ Idempotent: it runs wherever the specs resolve (<cite>resolve_spec_dependencies<
 <span class="sig-name descname"><span class="pre">labels</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Collection" title="(in Python v3.12)"><span class="pre">Collection</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">]</span></span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">frozenset({})</span></span><a class="headerlink" href="#mstar.engine.resources.RaggedAttentionSpec.labels" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.RaggedAttentionSpec.resolve_exchange">
+<span class="sig-name descname"><span class="pre">resolve_exchange</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">specs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/attn/ragged/config.html#RaggedAttentionSpec.resolve_exchange"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.RaggedAttentionSpec.resolve_exchange" title="Link to this definition">#</a></dt>
+<dd><p>Ulysses where its node’s one sequence shard lists a label it plans; from raw fields, so
+the shard’s <code class="docutils literal notranslate"><span class="pre">derive</span></code> can ask before this spec’s own.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>specs</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Mapping" title="(in Python v3.12)"><em>Mapping</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference internal" href="mstar.engine.resources.spec.html#mstar.engine.resources.spec.NodeResourceSpec" title="mstar.engine.resources.spec.NodeResourceSpec"><em>NodeResourceSpec</em></a><em>]</em>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Literal" title="(in Python v3.12)"><em>Literal</em></a>[‘none’, ‘ulysses’]</p>
+</dd>
+</dl>
+</dd></dl>
+
 <dl class="py property">
 <dt class="sig sig-object py" id="mstar.engine.resources.RaggedAttentionSpec.resource_class">
 <span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">resource_class</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#type" title="(in Python v3.12)"><span class="pre">type</span></a><span class="p"><span class="pre">[</span></span><a class="reference internal" href="#mstar.engine.resources.Resource" title="mstar.engine.resources.Resource"><span class="pre">Resource</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.engine.resources.RaggedAttentionSpec.resource_class" title="Link to this definition">#</a></dt>
@@ -3686,7 +3694,7 @@ resource stays free of the manager and its kernels.</p>
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.engine.resources.RaggedAttentionSpec.sp_exchange">
-<span class="sig-name descname"><span class="pre">sp_exchange</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Literal" title="(in Python v3.12)"><span class="pre">Literal</span></a><span class="p"><span class="pre">[</span></span><span class="s"><span class="pre">'ulysses'</span></span><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.engine.resources.RaggedAttentionSpec.sp_exchange" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">sp_exchange</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Literal" title="(in Python v3.12)"><span class="pre">Literal</span></a><span class="p"><span class="pre">[</span></span><span class="s"><span class="pre">'none'</span></span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="s"><span class="pre">'ulysses'</span></span><span class="p"><span class="pre">]</span></span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'none'</span></span><a class="headerlink" href="#mstar.engine.resources.RaggedAttentionSpec.sp_exchange" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py method">
@@ -3784,8 +3792,9 @@ resource stays free of the manager and its kernels.</p>
 a model with both declares one of each per head geometry.</p>
 <p>On a node whose sequence shard splits a step, each pair’s exchange follows from which side
 is split: split queries over copied keys attend locally, copied queries over split keys merge
-every rank’s partial (<code class="docutils literal notranslate"><span class="pre">sharded_key_merge</span></code>), and both split is refused at load
-(<code class="docutils literal notranslate"><span class="pre">mstar.engine.state.analysis.split_read_problems</span></code>). The shard must split
+every rank’s partial (<code class="docutils literal notranslate"><span class="pre">sharded_key_merge</span></code>), and both split is refused at load for a read
+declared through the state contract (<code class="docutils literal notranslate"><span class="pre">mstar.engine.state.analysis.split_read_problems</span></code>) and at
+the first split step for a hand-written spec. The shard must split
 each row (<code class="docutils literal notranslate"><span class="pre">axis=1</span></code>) with exchanges: a packed split (<code class="docutils literal notranslate"><span class="pre">axis=0</span></code>) or one with <code class="docutils literal notranslate"><span class="pre">exchanges=False</span></code>
 can leave a rank none of a row.</p>
 <dl class="field-list simple">
@@ -5478,7 +5487,7 @@ __init__ is the expensive way to do that.</p>
 
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.engine.resources.SeqShardSpec">
-<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.</span></span><span class="sig-name descname"><span class="pre">SeqShardSpec</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">resource_key</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">nodes</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">labels</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">axis</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">walks</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="keyword-only-separator o"><abbr title="Keyword-only parameters separator (PEP 3102)"><span class="pre">*</span></abbr></span></em>, <em class="sig-param"><span class="n"><span class="pre">min_tokens</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">exchanges</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">True</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/sequence_shard.html#SeqShardSpec"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.SeqShardSpec" title="Link to this definition">#</a></dt>
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.</span></span><span class="sig-name descname"><span class="pre">SeqShardSpec</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">resource_key</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">nodes</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">labels</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">axis</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">walks</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="keyword-only-separator o"><abbr title="Keyword-only parameters separator (PEP 3102)"><span class="pre">*</span></abbr></span></em>, <em class="sig-param"><span class="n"><span class="pre">min_tokens</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">exchange</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'auto'</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">exchanges</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">True</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/sequence_shard.html#SeqShardSpec"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.SeqShardSpec" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference internal" href="mstar.engine.resources.spec.html#mstar.engine.resources.spec.NodeResourceSpec" title="mstar.engine.resources.spec.NodeResourceSpec"><code class="xref py py-class docutils literal notranslate"><span class="pre">NodeResourceSpec</span></code></a></p>
 <p>A node’s steps split over its SP ranks, or copied.</p>
 <p><code class="docutils literal notranslate"><span class="pre">labels</span></code> are the step labels whose tokens split. <code class="docutils literal notranslate"><span class="pre">axis</span></code> 0 splits a label’s packed tokens
@@ -5487,6 +5496,18 @@ of a label one length). <code class="docutils literal notranslate"><span class="
 others plan copied. A step splits only when it is not one token a row, its listed tokens are
 at least <code class="docutils literal notranslate"><span class="pre">max(sp,</span> <span class="pre">min_tokens)</span></code>, and every listed label has at least <code class="docutils literal notranslate"><span class="pre">sp</span></code> tokens (a row,
 for <code class="docutils literal notranslate"><span class="pre">axis</span></code> 1), so no rank gets an empty range. <code class="docutils literal notranslate"><span class="pre">min_tokens</span></code> is a <code class="docutils literal notranslate"><span class="pre">resources:</span></code> override.</p>
+<p><code class="docutils literal notranslate"><span class="pre">exchange</span></code>, also a <code class="docutils literal notranslate"><span class="pre">resources:</span></code> override, is how a split step’s tokens reach the node’s
+paged attentions, from the storage of their KV:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">auto</span></code> (the default): Ulysses over KV stored by head; over KV stored by position
+(<code class="docutils literal notranslate"><span class="pre">context_parallel</span></code>) the node runs copied, so splitting there is the deployment’s to opt into;</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">ulysses</span></code> (by head), <code class="docutils literal notranslate"><span class="pre">all_gather</span></code> or <code class="docutils literal notranslate"><span class="pre">ring</span></code> (by position; the ring stripes each step by
+stored position): split;</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">none</span></code>: never split.</p></li>
+</ul>
+<p>A ragged attention takes a split label by Ulysses wherever it plans one this shard lists
+(<code class="docutils literal notranslate"><span class="pre">RaggedAttentionSpec.labels</span></code>), which <code class="docutils literal notranslate"><span class="pre">exchange</span></code> doesn’t change; a shard that never splits
+stops it splitting too.</p>
 <p><code class="docutils literal notranslate"><span class="pre">exchanges=False</span></code> declares that no op on the node mixes a listed label’s units (a video
 decoder’s independent clips): nothing exchanges them, so the node needs no attention, and a
 rank may get an empty range (fewer units than ranks still splits; <code class="docutils literal notranslate"><span class="pre">gather</span></code> takes it).</p>
@@ -5494,6 +5515,10 @@ rank may get an empty range (fewer units than ranks still splits; <code class="d
 <code class="docutils literal notranslate"><span class="pre">derive</span></code>. A model declares no step for it: its step is the node’s segments and
 <code class="docutils literal notranslate"><span class="pre">combined_labels</span></code> (<code class="docutils literal notranslate"><span class="pre">Resource.steps_from_segments</span></code>), so a combined plan label gets a range
 over its sources too; at one SP rank it plans copied at no cost.</p>
+<p>Two fields are derived from <code class="docutils literal notranslate"><span class="pre">exchange</span></code> and the resources on its nodes (<code class="docutils literal notranslate"><span class="pre">derive</span></code>):
+<code class="docutils literal notranslate"><span class="pre">splits</span></code>, whether the node’s steps may split (not where <code class="docutils literal notranslate"><span class="pre">exchange</span></code> resolves to <code class="docutils literal notranslate"><span class="pre">none</span></code>,
+or where no attention there takes split steps and <code class="docutils literal notranslate"><span class="pre">exchanges</span></code> is True), and <code class="docutils literal notranslate"><span class="pre">stripe_pool</span></code>, the pool a ring
+attention reads, by whose stored positions each step is striped.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
@@ -5501,20 +5526,25 @@ over its sources too; at one SP rank it plans copied at no cost.</p>
 <li><p><strong>nodes</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#set" title="(in Python v3.12)"><em>set</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>]</em>)</p></li>
 <li><p><strong>labels</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><em>tuple</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><em>...</em><em>]</em>)</p></li>
 <li><p><strong>axis</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
-<li><p><strong>walks</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Collection" title="(in Python v3.12)"><em>Collection</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>] </em><em>| </em><em>None</em>)</p></li>
+<li><p><strong>walks</strong> (<em>Collection</em><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>] </em><em>| </em><em>None</em>)</p></li>
 <li><p><strong>min_tokens</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>exchange</strong> (<em>SpExchange</em><em> | </em><em>Literal</em><em>[</em><em>'auto'</em><em>]</em>)</p></li>
 <li><p><strong>exchanges</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
 </ul>
 </dd>
 </dl>
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.SeqShardSpec.apply_yaml_overrides">
-<span class="sig-name descname"><span class="pre">apply_yaml_overrides</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">min_tokens</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/sequence_shard.html#SeqShardSpec.apply_yaml_overrides"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.SeqShardSpec.apply_yaml_overrides" title="Link to this definition">#</a></dt>
-<dd><p>The step size below which a node runs copied: a deployment’s trade between the
-exchanges’ cost and the token-local layers’ saving.</p>
+<span class="sig-name descname"><span class="pre">apply_yaml_overrides</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">min_tokens</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">exchange</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/sequence_shard.html#SeqShardSpec.apply_yaml_overrides"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.SeqShardSpec.apply_yaml_overrides" title="Link to this definition">#</a></dt>
+<dd><p>The step size below which a node runs copied (<code class="docutils literal notranslate"><span class="pre">min_tokens</span></code>), a deployment’s trade
+between the exchanges’ cost and the token-local layers’ saving; and how a split step
+reaches its attentions (<code class="docutils literal notranslate"><span class="pre">exchange</span></code>).</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><p><strong>min_tokens</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><em>None</em>)</p>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>min_tokens</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>exchange</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p></li>
+</ul>
 </dd>
 </dl>
 </dd></dl>
@@ -5523,6 +5553,53 @@ exchanges’ cost and the token-local layers’ saving.</p>
 <dt class="sig sig-object py" id="mstar.engine.resources.SeqShardSpec.axis">
 <span class="sig-name descname"><span class="pre">axis</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.engine.resources.SeqShardSpec.axis" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.SeqShardSpec.depends_on">
+<span class="sig-name descname"><span class="pre">depends_on</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/sequence_shard.html#SeqShardSpec.depends_on"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.SeqShardSpec.depends_on" title="Link to this definition">#</a></dt>
+<dd><p>Keys whose specs this one builds against; the engine resolves them
+into <code class="docutils literal notranslate"><span class="pre">EngineResourceInfo.dependencies</span></code>.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#set" title="(in Python v3.12)">set</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a>]</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.SeqShardSpec.derive">
+<span class="sig-name descname"><span class="pre">derive</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">specs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/sequence_shard.html#SeqShardSpec.derive"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.SeqShardSpec.derive" title="Link to this definition">#</a></dt>
+<dd><p>Set what this spec takes from the specs that read it (a KV pool keeps the window its
+attentions declare), after a deployment’s overrides; return what is wrong with it.
+Idempotent: it runs wherever the specs resolve (<cite>resolve_spec_dependencies</cite>).</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>specs</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Mapping" title="(in Python v3.12)"><em>Mapping</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference internal" href="mstar.engine.resources.spec.html#mstar.engine.resources.spec.NodeResourceSpec" title="mstar.engine.resources.spec.NodeResourceSpec"><em>NodeResourceSpec</em></a><em>]</em>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)">list</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a>]</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.SeqShardSpec.exchange">
+<span class="sig-name descname"><span class="pre">exchange</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">SpExchange</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">Literal</span><span class="p"><span class="pre">[</span></span><span class="s"><span class="pre">'auto'</span></span><span class="p"><span class="pre">]</span></span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'auto'</span></span><a class="headerlink" href="#mstar.engine.resources.SeqShardSpec.exchange" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.SeqShardSpec.exchange_over">
+<span class="sig-name descname"><span class="pre">exchange_over</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">by_position</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/sequence_shard.html#SeqShardSpec.exchange_over"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.SeqShardSpec.exchange_over" title="Link to this definition">#</a></dt>
+<dd><p><code class="docutils literal notranslate"><span class="pre">exchange</span></code> for KV stored by position or by head, <code class="docutils literal notranslate"><span class="pre">auto</span></code> resolved.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>by_position</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>SpExchange</p>
+</dd>
+</dl>
+</dd></dl>
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.engine.resources.SeqShardSpec.exchanges">
@@ -5548,16 +5625,19 @@ resource stays free of the manager and its kernels.</p>
 <cite>AttentionManager</cite>, whose <cite>build</cite> picks a backend subclass.</p>
 </dd></dl>
 
-<dl class="py property">
-<dt class="sig sig-object py" id="mstar.engine.resources.SeqShardSpec.splits_steps">
-<span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">splits_steps</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><a class="headerlink" href="#mstar.engine.resources.SeqShardSpec.splits_steps" title="Link to this definition">#</a></dt>
-<dd><p>Whether this resource splits its nodes’ steps over their SP ranks
-(<code class="docutils literal notranslate"><span class="pre">mstar.engine.resources.sequence_shard</span></code>).</p>
-</dd></dl>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.SeqShardSpec.splits">
+<span class="sig-name descname"><span class="pre">splits</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">True</span></span><a class="headerlink" href="#mstar.engine.resources.SeqShardSpec.splits" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.SeqShardSpec.stripe_pool">
+<span class="sig-name descname"><span class="pre">stripe_pool</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.engine.resources.SeqShardSpec.stripe_pool" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.engine.resources.SeqShardSpec.walks">
-<span class="sig-name descname"><span class="pre">walks</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Collection" title="(in Python v3.12)"><span class="pre">Collection</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.engine.resources.SeqShardSpec.walks" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">walks</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">Collection</span><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.engine.resources.SeqShardSpec.walks" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 </dd></dl>
@@ -6814,11 +6894,11 @@ conductor validates a deployment.</p>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.AttentionSpec"><code class="docutils literal notranslate"><span class="pre">AttentionSpec</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.AttentionSpec.apply_yaml_overrides"><code class="docutils literal notranslate"><span class="pre">AttentionSpec.apply_yaml_overrides()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.AttentionSpec.attends_split_steps"><code class="docutils literal notranslate"><span class="pre">AttentionSpec.attends_split_steps</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.AttentionSpec.combined_splits"><code class="docutils literal notranslate"><span class="pre">AttentionSpec.combined_splits()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.AttentionSpec.config"><code class="docutils literal notranslate"><span class="pre">AttentionSpec.config</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.AttentionSpec.depends_on"><code class="docutils literal notranslate"><span class="pre">AttentionSpec.depends_on()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.AttentionSpec.derive"><code class="docutils literal notranslate"><span class="pre">AttentionSpec.derive()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.AttentionSpec.resolve_exchange"><code class="docutils literal notranslate"><span class="pre">AttentionSpec.resolve_exchange()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.AttentionSpec.resource_class"><code class="docutils literal notranslate"><span class="pre">AttentionSpec.resource_class</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.AttentionSpec.shard_key"><code class="docutils literal notranslate"><span class="pre">AttentionSpec.shard_key</span></code></a></li>
 </ul>
@@ -6969,7 +7049,6 @@ conductor validates a deployment.</p>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.NodeResourceSpec"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.NodeResourceSpec.apply_yaml_overrides"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.apply_yaml_overrides()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.NodeResourceSpec.attends_split_steps"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.attends_split_steps</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.NodeResourceSpec.combined_splits"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.combined_splits()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.NodeResourceSpec.depends_on"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.depends_on()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.NodeResourceSpec.derive"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.derive()</span></code></a></li>
@@ -6981,12 +7060,12 @@ conductor validates a deployment.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.NodeResourceSpec.places_positions"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.places_positions</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.NodeResourceSpec.prefix_variant"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.prefix_variant()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.NodeResourceSpec.request_config"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.request_config()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.NodeResourceSpec.resolve_exchange"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.resolve_exchange()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.NodeResourceSpec.resource_class"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.resource_class</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.NodeResourceSpec.resource_key"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.resource_key</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.NodeResourceSpec.restores_prefix"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.restores_prefix</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.NodeResourceSpec.routing_mirror"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.routing_mirror()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.NodeResourceSpec.split_step_refusals"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.split_step_refusals()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.NodeResourceSpec.splits_steps"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.splits_steps</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.NodeResourceSpec.writes_prefix_snapshots"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.writes_prefix_snapshots</span></code></a></li>
 </ul>
 </li>
@@ -7085,9 +7164,9 @@ conductor validates a deployment.</p>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.RaggedAttentionSpec"><code class="docutils literal notranslate"><span class="pre">RaggedAttentionSpec</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.RaggedAttentionSpec.attends_split_steps"><code class="docutils literal notranslate"><span class="pre">RaggedAttentionSpec.attends_split_steps</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.RaggedAttentionSpec.derive"><code class="docutils literal notranslate"><span class="pre">RaggedAttentionSpec.derive()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.RaggedAttentionSpec.labels"><code class="docutils literal notranslate"><span class="pre">RaggedAttentionSpec.labels</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.RaggedAttentionSpec.resolve_exchange"><code class="docutils literal notranslate"><span class="pre">RaggedAttentionSpec.resolve_exchange()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.RaggedAttentionSpec.resource_class"><code class="docutils literal notranslate"><span class="pre">RaggedAttentionSpec.resource_class</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.RaggedAttentionSpec.sp_exchange"><code class="docutils literal notranslate"><span class="pre">RaggedAttentionSpec.sp_exchange</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.RaggedAttentionSpec.split_step_refusals"><code class="docutils literal notranslate"><span class="pre">RaggedAttentionSpec.split_step_refusals()</span></code></a></li>
@@ -7285,11 +7364,16 @@ conductor validates a deployment.</p>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SeqShardSpec"><code class="docutils literal notranslate"><span class="pre">SeqShardSpec</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SeqShardSpec.apply_yaml_overrides"><code class="docutils literal notranslate"><span class="pre">SeqShardSpec.apply_yaml_overrides()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SeqShardSpec.axis"><code class="docutils literal notranslate"><span class="pre">SeqShardSpec.axis</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SeqShardSpec.depends_on"><code class="docutils literal notranslate"><span class="pre">SeqShardSpec.depends_on()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SeqShardSpec.derive"><code class="docutils literal notranslate"><span class="pre">SeqShardSpec.derive()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SeqShardSpec.exchange"><code class="docutils literal notranslate"><span class="pre">SeqShardSpec.exchange</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SeqShardSpec.exchange_over"><code class="docutils literal notranslate"><span class="pre">SeqShardSpec.exchange_over()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SeqShardSpec.exchanges"><code class="docutils literal notranslate"><span class="pre">SeqShardSpec.exchanges</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SeqShardSpec.labels"><code class="docutils literal notranslate"><span class="pre">SeqShardSpec.labels</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SeqShardSpec.min_tokens"><code class="docutils literal notranslate"><span class="pre">SeqShardSpec.min_tokens</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SeqShardSpec.resource_class"><code class="docutils literal notranslate"><span class="pre">SeqShardSpec.resource_class</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SeqShardSpec.splits_steps"><code class="docutils literal notranslate"><span class="pre">SeqShardSpec.splits_steps</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SeqShardSpec.splits"><code class="docutils literal notranslate"><span class="pre">SeqShardSpec.splits</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SeqShardSpec.stripe_pool"><code class="docutils literal notranslate"><span class="pre">SeqShardSpec.stripe_pool</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SeqShardSpec.walks"><code class="docutils literal notranslate"><span class="pre">SeqShardSpec.walks</span></code></a></li>
 </ul>
 </li>

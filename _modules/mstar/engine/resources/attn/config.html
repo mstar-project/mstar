@@ -1043,7 +1043,7 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Mapping</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">enum</span><span class="w"> </span><span class="kn">import</span> <span class="n">Enum</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">TYPE_CHECKING</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">TYPE_CHECKING</span><span class="p">,</span> <span class="n">Literal</span><span class="p">,</span> <span class="n">get_args</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.kv.config</span><span class="w"> </span><span class="kn">import</span> <span class="n">KVConfig</span><span class="p">,</span> <span class="n">KVLayout</span><span class="p">,</span> <span class="n">PagedKVConfig</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.spec</span><span class="w"> </span><span class="kn">import</span> <span class="n">CombinedSplit</span><span class="p">,</span> <span class="n">NodeResourceSpec</span>
@@ -1118,6 +1118,10 @@ window.runMermaid = runMermaid;</script>
 
 
 
+<span class="n">SpExchange</span> <span class="o">=</span> <span class="n">Literal</span><span class="p">[</span><span class="s2">"none"</span><span class="p">,</span> <span class="s2">"ulysses"</span><span class="p">,</span> <span class="s2">"all_gather"</span><span class="p">,</span> <span class="s2">"ring"</span><span class="p">]</span>
+<span class="n">SP_EXCHANGES</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="n">SpExchange</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span> <span class="o">=</span> <span class="n">get_args</span><span class="p">(</span><span class="n">SpExchange</span><span class="p">)</span>
+
+
 <div class="viewcode-block" id="AttentionSpec">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.attn.config.html#mstar.engine.resources.AttentionSpec">[docs]</a>
 <span class="nd">@dataclass</span>
@@ -1145,10 +1149,14 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="n">take_shard_edge</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">specs</span><span class="p">)</span></div>
 
 
-    <span class="nd">@property</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">attends_split_steps</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
-        <span class="c1"># its exchange follows from its pool's storage</span>
-        <span class="k">return</span> <span class="kc">True</span>
+<div class="viewcode-block" id="AttentionSpec.resolve_exchange">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.attn.config.html#mstar.engine.resources.AttentionSpec.resolve_exchange">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">resolve_exchange</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">specs</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">NodeResourceSpec</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="n">SpExchange</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Its node's sequence shard's ``exchange`` over its pool's storage."""</span>
+        <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.sequence_shard</span><span class="w"> </span><span class="kn">import</span> <span class="n">shard_exchange</span>
+
+        <span class="k">return</span> <span class="n">shard_exchange</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">specs</span><span class="p">,</span> <span class="nb">bool</span><span class="p">(</span><span class="n">specs</span><span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">kv_cache</span><span class="p">]</span><span class="o">.</span><span class="n">places_positions</span><span class="p">))</span></div>
+
 
 <div class="viewcode-block" id="AttentionSpec.combined_splits">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.attn.config.html#mstar.engine.resources.AttentionSpec.combined_splits">[docs]</a>

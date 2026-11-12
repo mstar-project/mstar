@@ -1037,19 +1037,25 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">reaches the tokens it needs when they do.</span>
 
 <span class="sd">A node's SP ranks share each step one of two ways. Its tokens are **split** (each rank runs the</span>
-<span class="sd">token-local layers on its contiguous share) or **copied** (every rank runs them all). The sequence</span>
-<span class="sd">shard resource (``SeqShardSpec``) decides which, per step, from the step the model declares, and</span>
-<span class="sd">gives each listed label its per-rank ranges. A model brackets its layer stack with</span>
-<span class="sd">``scatter`` / ``gather`` on that resource; nothing else in model code changes.</span>
+<span class="sd">token-local layers on its share) or **copied** (every rank runs them all). The sequence shard</span>
+<span class="sd">resource (``SeqShardSpec``) decides which, per step, from the step the model declares, and gives</span>
+<span class="sd">each listed label its per-rank ranges (``SeqRange``): contiguous, or on a node whose attention</span>
+<span class="sd">runs the ring, striped by KV position. A model brackets its layer stack with ``scatter`` /</span>
+<span class="sd">``gather`` on that resource; nothing else in model code changes.</span>
 
 <span class="sd">The attention resources over the node depend on it (``shard_key``, taken in their specs'</span>
-<span class="sd">``derive``) and pick an exchange per label from its plan: what their storage needs to attend a</span>
-<span class="sd">split label's tokens, or a copied label's at the node's head geometry. The exchanges are the</span>
-<span class="sd">functions at the bottom of this module, each wrapped around the resource's own ``run``:</span>
+<span class="sd">``derive``) and pick an exchange per label from its plan: for a split label, the shard's</span>
+<span class="sd">``exchange`` over their storage; for a copied one, what attends it at the node's head geometry.</span>
+<span class="sd">The exchanges are the functions at the bottom of this module, each wrapped around the resource's</span>
+<span class="sd">own ``run``:</span>
 
 <span class="sd">- ``ulysses``: one all-to-all from tokens to heads, ``run``, and one back (head-stored KV, or a</span>
-<span class="sd">  cacheless attention whose ``labels`` the shard lists); a splitting node can't yet store KV</span>
-<span class="sd">  by position (``context_parallel``);</span>
+<span class="sd">  cacheless attention planning a label the shard lists, ``RaggedAttentionSpec.labels``);</span>
+<span class="sd">- ``all_gather``: every rank's q, k and v gathered, ``run`` as on a copied step, this rank's share</span>
+<span class="sd">  of the output (KV stored by position, ``context_parallel``);</span>
+<span class="sd">- ``ring``: a striped label's own tokens, whose K/V this rank stores, ``run`` on them with their</span>
+<span class="sd">  indices in the step; the plan passes queries round the partners (KV stored by position,</span>
+<span class="sd">  ``RingAttentionWrapper``);</span>
 <span class="sd">- ``head_slice``: a copied step at a ``tp * sp`` head geometry: this rank's heads, ``run``, gather</span>
 <span class="sd">  the heads;</span>
 <span class="sd">- ``sharded_key_merge``: copied queries over split keys (cacheless cross-attention): each rank's</span>
@@ -1061,20 +1067,24 @@ window.runMermaid = runMermaid;</script>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">__future__</span><span class="w"> </span><span class="kn">import</span> <span class="n">annotations</span>
 
+<span class="kn">import</span><span class="w"> </span><span class="nn">math</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Callable</span><span class="p">,</span> <span class="n">Collection</span><span class="p">,</span> <span class="n">Iterable</span><span class="p">,</span> <span class="n">Mapping</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">TYPE_CHECKING</span><span class="p">,</span> <span class="n">NamedTuple</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">TYPE_CHECKING</span><span class="p">,</span> <span class="n">Literal</span><span class="p">,</span> <span class="n">NamedTuple</span>
 
+<span class="kn">import</span><span class="w"> </span><span class="nn">numpy</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">np</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.distributed.communication</span><span class="w"> </span><span class="kn">import</span> <span class="n">CommGroup</span><span class="p">,</span> <span class="n">gather_sequence</span><span class="p">,</span> <span class="n">sp_seq_split</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">EngineResourceInfo</span><span class="p">,</span> <span class="n">Resource</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.context_parallel</span><span class="w"> </span><span class="kn">import</span> <span class="n">gather_merge</span><span class="p">,</span> <span class="n">position_pools</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.context_parallel</span><span class="w"> </span><span class="kn">import</span> <span class="n">gather_merge</span><span class="p">,</span> <span class="n">position_pools</span><span class="p">,</span> <span class="n">stripe_owners</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.resident_hooks</span><span class="w"> </span><span class="kn">import</span> <span class="n">ANY_REPEATS</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.spec</span><span class="w"> </span><span class="kn">import</span> <span class="n">NodeResourceSpec</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.step</span><span class="w"> </span><span class="kn">import</span> <span class="n">ResourceStep</span><span class="p">,</span> <span class="n">StepContext</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.utils.h2d</span><span class="w"> </span><span class="kn">import</span> <span class="n">to_device_nonblocking</span>
 
 <span class="k">if</span> <span class="n">TYPE_CHECKING</span><span class="p">:</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.attn.config</span><span class="w"> </span><span class="kn">import</span> <span class="n">SpExchange</span>
     <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.components.moe_parallel</span><span class="w"> </span><span class="kn">import</span> <span class="n">MoeParallelConfig</span>
 
 
@@ -1094,6 +1104,19 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">    at least ``max(sp, min_tokens)``, and every listed label has at least ``sp`` tokens (a row,</span>
 <span class="sd">    for ``axis`` 1), so no rank gets an empty range. ``min_tokens`` is a ``resources:`` override.</span>
 
+<span class="sd">    ``exchange``, also a ``resources:`` override, is how a split step's tokens reach the node's</span>
+<span class="sd">    paged attentions, from the storage of their KV:</span>
+
+<span class="sd">    - ``auto`` (the default): Ulysses over KV stored by head; over KV stored by position</span>
+<span class="sd">      (``context_parallel``) the node runs copied, so splitting there is the deployment's to opt into;</span>
+<span class="sd">    - ``ulysses`` (by head), ``all_gather`` or ``ring`` (by position; the ring stripes each step by</span>
+<span class="sd">      stored position): split;</span>
+<span class="sd">    - ``none``: never split.</span>
+
+<span class="sd">    A ragged attention takes a split label by Ulysses wherever it plans one this shard lists</span>
+<span class="sd">    (``RaggedAttentionSpec.labels``), which ``exchange`` doesn't change; a shard that never splits</span>
+<span class="sd">    stops it splitting too.</span>
+
 <span class="sd">    ``exchanges=False`` declares that no op on the node mixes a listed label's units (a video</span>
 <span class="sd">    decoder's independent clips): nothing exchanges them, so the node needs no attention, and a</span>
 <span class="sd">    rank may get an empty range (fewer units than ranks still splits; ``gather`` takes it).</span>
@@ -1101,12 +1124,20 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">    The attention and position resources on the node take this as a dependency in their own</span>
 <span class="sd">    ``derive``. A model declares no step for it: its step is the node's segments and</span>
 <span class="sd">    ``combined_labels`` (``Resource.steps_from_segments``), so a combined plan label gets a range</span>
-<span class="sd">    over its sources too; at one SP rank it plans copied at no cost."""</span>
+<span class="sd">    over its sources too; at one SP rank it plans copied at no cost.</span>
+
+<span class="sd">    Two fields are derived from ``exchange`` and the resources on its nodes (``derive``):</span>
+<span class="sd">    ``splits``, whether the node's steps may split (not where ``exchange`` resolves to ``none``,</span>
+<span class="sd">    or where no attention there takes split steps and ``exchanges`` is True), and ``stripe_pool``, the pool a ring</span>
+<span class="sd">    attention reads, by whose stored positions each step is striped."""</span>
 
     <span class="n">labels</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span>
     <span class="n">axis</span><span class="p">:</span> <span class="nb">int</span>
     <span class="n">walks</span><span class="p">:</span> <span class="n">Collection</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="n">min_tokens</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span> <span class="n">kw_only</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+    <span class="n">exchange</span><span class="p">:</span> <span class="n">SpExchange</span> <span class="o">|</span> <span class="n">Literal</span><span class="p">[</span><span class="s2">"auto"</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="s2">"auto"</span><span class="p">,</span> <span class="n">kw_only</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+    <span class="n">splits</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="nb">repr</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+    <span class="n">stripe_pool</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="nb">repr</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
     <span class="n">exchanges</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">kw_only</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">__post_init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
@@ -1121,29 +1152,97 @@ window.runMermaid = runMermaid;</script>
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"sequence shard </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">resource_key</span><span class="si">!r}</span><span class="s2">: axis must be 0 or 1, not </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">axis</span><span class="si">!r}</span><span class="s2">"</span><span class="p">)</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">walks</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">walks</span> <span class="o">=</span> <span class="nb">frozenset</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">walks</span><span class="p">)</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_check_min_tokens</span><span class="p">()</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_check_overrides</span><span class="p">()</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">_check_min_tokens</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_check_overrides</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.attn.config</span><span class="w"> </span><span class="kn">import</span> <span class="n">SP_EXCHANGES</span>
+
         <span class="k">if</span> <span class="nb">type</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">min_tokens</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="nb">int</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">min_tokens</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">:</span>
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"min_tokens must be a non-negative integer, got </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">min_tokens</span><span class="si">!r}</span><span class="s2">"</span><span class="p">)</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">exchange</span> <span class="ow">not</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">"auto"</span><span class="p">,</span> <span class="o">*</span><span class="n">SP_EXCHANGES</span><span class="p">):</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"exchange must be one of auto, </span><span class="si">{</span><span class="s1">', '</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">SP_EXCHANGES</span><span class="p">)</span><span class="si">}</span><span class="s2">; got </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">exchange</span><span class="si">!r}</span><span class="s2">"</span><span class="p">)</span>
 
     <span class="nd">@property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">resource_class</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">type</span><span class="p">[</span><span class="n">Resource</span><span class="p">]:</span>
         <span class="k">return</span> <span class="n">SequenceShard</span>
 
-    <span class="nd">@property</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">splits_steps</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
-        <span class="k">return</span> <span class="kc">True</span>
+<div class="viewcode-block" id="SeqShardSpec.depends_on">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.sequence_shard.html#mstar.engine.resources.SeqShardSpec.depends_on">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">depends_on</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">set</span><span class="p">[</span><span class="nb">str</span><span class="p">]:</span>
+        <span class="c1"># a striped step plans from each row's stored length, which the pool's plan holds. A</span>
+        <span class="c1"># dependency of the shard, not of the pool, so the pool's prefix cache stays open</span>
+        <span class="c1"># (`opening_prefix_caches` reads a cache keeper's own dependencies alone)</span>
+        <span class="k">return</span> <span class="nb">set</span><span class="p">()</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">stripe_pool</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="p">{</span><span class="bp">self</span><span class="o">.</span><span class="n">stripe_pool</span><span class="p">}</span></div>
+
+
+<div class="viewcode-block" id="SeqShardSpec.exchange_over">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.sequence_shard.html#mstar.engine.resources.SeqShardSpec.exchange_over">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">exchange_over</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">by_position</span><span class="p">:</span> <span class="nb">bool</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">SpExchange</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""``exchange`` for KV stored by position or by head, ``auto`` resolved."""</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">exchange</span> <span class="o">!=</span> <span class="s2">"auto"</span><span class="p">:</span>
+            <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">exchange</span>
+        <span class="k">return</span> <span class="s2">"none"</span> <span class="k">if</span> <span class="n">by_position</span> <span class="k">else</span> <span class="s2">"ulysses"</span></div>
+
+
+<div class="viewcode-block" id="SeqShardSpec.derive">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.sequence_shard.html#mstar.engine.resources.SeqShardSpec.derive">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">derive</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">specs</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">NodeResourceSpec</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]:</span>
+        <span class="c1"># from raw fields alone, so it doesn't matter which spec derives first</span>
+        <span class="n">ours</span> <span class="o">=</span> <span class="p">[</span><span class="n">spec</span> <span class="k">for</span> <span class="n">spec</span> <span class="ow">in</span> <span class="n">specs</span><span class="o">.</span><span class="n">values</span><span class="p">()</span> <span class="k">if</span> <span class="n">spec</span><span class="o">.</span><span class="n">nodes</span> <span class="o">&amp;</span> <span class="bp">self</span><span class="o">.</span><span class="n">nodes</span><span class="p">]</span>
+        <span class="n">by_position</span> <span class="o">=</span> <span class="nb">any</span><span class="p">(</span><span class="n">spec</span><span class="o">.</span><span class="n">places_positions</span> <span class="k">for</span> <span class="n">spec</span> <span class="ow">in</span> <span class="n">ours</span><span class="p">)</span>
+        <span class="n">exchanges</span> <span class="o">=</span> <span class="p">[(</span><span class="n">spec</span><span class="p">,</span> <span class="n">spec</span><span class="o">.</span><span class="n">resolve_exchange</span><span class="p">(</span><span class="n">specs</span><span class="p">))</span> <span class="k">for</span> <span class="n">spec</span> <span class="ow">in</span> <span class="n">ours</span><span class="p">]</span>
+        <span class="c1"># a split nothing exchanges (`exchanges`) needs no attention to take it</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">splits</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">exchange_over</span><span class="p">(</span><span class="n">by_position</span><span class="p">)</span> <span class="o">!=</span> <span class="s2">"none"</span> <span class="ow">and</span> <span class="p">(</span>
+            <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">exchanges</span> <span class="ow">or</span> <span class="nb">any</span><span class="p">(</span><span class="n">e</span> <span class="o">!=</span> <span class="s2">"none"</span> <span class="k">for</span> <span class="n">_</span><span class="p">,</span> <span class="n">e</span> <span class="ow">in</span> <span class="n">exchanges</span><span class="p">)</span>
+        <span class="p">)</span>
+        <span class="n">pools</span> <span class="o">=</span> <span class="nb">sorted</span><span class="p">({</span><span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">kv_cache</span> <span class="k">for</span> <span class="n">spec</span><span class="p">,</span> <span class="n">exchange</span> <span class="ow">in</span> <span class="n">exchanges</span> <span class="k">if</span> <span class="n">exchange</span> <span class="o">==</span> <span class="s2">"ring"</span><span class="p">})</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">stripe_pool</span> <span class="o">=</span> <span class="n">pools</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">pools</span><span class="p">)</span> <span class="o">==</span> <span class="mi">1</span> <span class="k">else</span> <span class="kc">None</span>
+        <span class="n">nodes</span> <span class="o">=</span> <span class="nb">sorted</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">nodes</span><span class="p">)</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">exchange</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">"all_gather"</span><span class="p">,</span> <span class="s2">"ring"</span><span class="p">)</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">by_position</span><span class="p">:</span>
+            <span class="k">return</span> <span class="p">[</span>
+                <span class="sa">f</span><span class="s2">"exchange </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">exchange</span><span class="si">!r}</span><span class="s2"> attends split steps over KV stored by position, and no KV pool on "</span>
+                <span class="sa">f</span><span class="s2">"nodes </span><span class="si">{</span><span class="n">nodes</span><span class="si">}</span><span class="s2"> sets context_parallel: true; over KV stored by head, split by ulysses (or auto)"</span>
+            <span class="p">]</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">exchange</span> <span class="o">==</span> <span class="s2">"ulysses"</span> <span class="ow">and</span> <span class="n">by_position</span><span class="p">:</span>
+            <span class="k">return</span> <span class="p">[</span>
+                <span class="sa">f</span><span class="s2">"exchange 'ulysses' trades a split step's tokens for KV heads, and nodes </span><span class="si">{</span><span class="n">nodes</span><span class="si">}</span><span class="s2"> store KV by "</span>
+                <span class="s2">"position (context_parallel: true): split by all_gather or ring (auto runs copied)"</span>
+            <span class="p">]</span>
+        <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">pools</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
+            <span class="k">return</span> <span class="p">[</span><span class="sa">f</span><span class="s2">"its ring attentions read KV pools </span><span class="si">{</span><span class="n">pools</span><span class="si">}</span><span class="s2">, whose stored positions would stripe a step two ways"</span><span class="p">]</span>
+        <span class="k">return</span> <span class="p">[]</span></div>
+
 
 <div class="viewcode-block" id="SeqShardSpec.apply_yaml_overrides">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.sequence_shard.html#mstar.engine.resources.SeqShardSpec.apply_yaml_overrides">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">apply_yaml_overrides</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">min_tokens</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
-<span class="w">        </span><span class="sd">"""The step size below which a node runs copied: a deployment's trade between the</span>
-<span class="sd">        exchanges' cost and the token-local layers' saving."""</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">apply_yaml_overrides</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">min_tokens</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span> <span class="n">exchange</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">"""The step size below which a node runs copied (``min_tokens``), a deployment's trade</span>
+<span class="sd">        between the exchanges' cost and the token-local layers' saving; and how a split step</span>
+<span class="sd">        reaches its attentions (``exchange``)."""</span>
         <span class="k">if</span> <span class="n">min_tokens</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">min_tokens</span> <span class="o">=</span> <span class="n">min_tokens</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_check_min_tokens</span><span class="p">()</span></div>
+        <span class="k">if</span> <span class="n">exchange</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">exchange</span> <span class="o">=</span> <span class="n">exchange</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_check_overrides</span><span class="p">()</span></div>
 </div>
+
+
+
+<div class="viewcode-block" id="shards_over">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.sequence_shard.html#mstar.engine.resources.shards_over">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">shards_over</span><span class="p">(</span><span class="n">spec</span><span class="p">:</span> <span class="n">NodeResourceSpec</span><span class="p">,</span> <span class="n">specs</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">NodeResourceSpec</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="n">SeqShardSpec</span><span class="p">]:</span>
+    <span class="k">return</span> <span class="p">[</span><span class="n">other</span> <span class="k">for</span> <span class="n">other</span> <span class="ow">in</span> <span class="n">specs</span><span class="o">.</span><span class="n">values</span><span class="p">()</span> <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">other</span><span class="p">,</span> <span class="n">SeqShardSpec</span><span class="p">)</span> <span class="ow">and</span> <span class="n">other</span><span class="o">.</span><span class="n">nodes</span> <span class="o">&amp;</span> <span class="n">spec</span><span class="o">.</span><span class="n">nodes</span><span class="p">]</span></div>
+
+
+
+<div class="viewcode-block" id="shard_exchange">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.sequence_shard.html#mstar.engine.resources.shard_exchange">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">shard_exchange</span><span class="p">(</span><span class="n">spec</span><span class="p">:</span> <span class="n">NodeResourceSpec</span><span class="p">,</span> <span class="n">specs</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">NodeResourceSpec</span><span class="p">],</span> <span class="n">by_position</span><span class="p">:</span> <span class="nb">bool</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">SpExchange</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""How a split step reaches ``spec``, an attention over KV stored by position or by head: its</span>
+<span class="sd">    node's ``SeqShardSpec.exchange``, from raw fields; ``none`` without one shard (two are refused,</span>
+<span class="sd">    ``take_shard_edge``)."""</span>
+    <span class="n">shards</span> <span class="o">=</span> <span class="n">shards_over</span><span class="p">(</span><span class="n">spec</span><span class="p">,</span> <span class="n">specs</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">shards</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">exchange_over</span><span class="p">(</span><span class="n">by_position</span><span class="p">)</span> <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">shards</span><span class="p">)</span> <span class="o">==</span> <span class="mi">1</span> <span class="k">else</span> <span class="s2">"none"</span></div>
 
 
 
@@ -1153,7 +1252,7 @@ window.runMermaid = runMermaid;</script>
 <span class="w">    </span><span class="sd">"""Set ``spec.shard_key`` to the ``SeqShardSpec`` over its nodes, if any (a ``derive``).</span>
 <span class="sd">    A shard sharing only some of ``spec``'s nodes is a problem: the spec would split on some of</span>
 <span class="sd">    its nodes and not others."""</span>
-    <span class="n">shards</span> <span class="o">=</span> <span class="p">[</span><span class="n">other</span> <span class="k">for</span> <span class="n">other</span> <span class="ow">in</span> <span class="n">specs</span><span class="o">.</span><span class="n">values</span><span class="p">()</span> <span class="k">if</span> <span class="n">other</span><span class="o">.</span><span class="n">splits_steps</span> <span class="ow">and</span> <span class="n">other</span><span class="o">.</span><span class="n">nodes</span> <span class="o">&amp;</span> <span class="n">spec</span><span class="o">.</span><span class="n">nodes</span><span class="p">]</span>
+    <span class="n">shards</span> <span class="o">=</span> <span class="n">shards_over</span><span class="p">(</span><span class="n">spec</span><span class="p">,</span> <span class="n">specs</span><span class="p">)</span>
     <span class="n">spec</span><span class="o">.</span><span class="n">shard_key</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="k">if</span> <span class="ow">not</span> <span class="n">shards</span><span class="p">:</span>
         <span class="k">return</span> <span class="p">[]</span>
@@ -1177,15 +1276,20 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.sequence_shard.html#mstar.engine.resources.SeqRange">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">SeqRange</span><span class="p">(</span><span class="n">NamedTuple</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">"""One label's split over the SP ranks: each rank's count of its tokens (of each row's, for a</span>
-<span class="sd">    ``[B, S, ...]`` layout), contiguous in rank order."""</span>
+<span class="sd">    ``[B, S, ...]`` layout), and which they are: contiguous in rank order, or ``order``."""</span>
 
     <span class="n">group</span><span class="p">:</span> <span class="n">CommGroup</span>
     <span class="n">counts</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span>
     <span class="c1"># B of a [B, S, ...] layout split along S (axis 1); None for a packed label (axis 0)</span>
     <span class="n">rows</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span>
+    <span class="c1"># striped (`SeqShardSpec.stripe_pool`): the step's token indices, rank 0's then rank 1's and</span>
+    <span class="c1"># on, each rank's in step order, on the device; None for contiguous ranges</span>
+    <span class="n">order</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
 
     <span class="nd">@property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">start</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Where this rank's share begins among the label's tokens (of each row's), contiguous</span>
+<span class="sd">        ranges in rank order; a striped one's are ``index``."""</span>
         <span class="k">return</span> <span class="nb">sum</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">counts</span><span class="p">[:</span> <span class="bp">self</span><span class="o">.</span><span class="n">group</span><span class="o">.</span><span class="n">rank</span><span class="p">])</span>
 
     <span class="nd">@property</span>
@@ -1195,7 +1299,32 @@ window.runMermaid = runMermaid;</script>
     <span class="nd">@property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">local_tokens</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""The tokens this rank holds of the label, as a packed tensor's first dim."""</span>
-        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">count</span> <span class="o">*</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">rows</span> <span class="ow">or</span> <span class="mi">1</span><span class="p">)</span></div>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">count</span> <span class="o">*</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">rows</span> <span class="ow">or</span> <span class="mi">1</span><span class="p">)</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">index</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Striped: this rank's tokens' indices in the step."""</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">order</span><span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">start</span><span class="p">:</span><span class="bp">self</span><span class="o">.</span><span class="n">start</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">count</span><span class="p">]</span>
+
+<div class="viewcode-block" id="SeqRange.local">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.sequence_shard.html#mstar.engine.resources.SeqRange.local">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">local</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">x</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">dim</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""This rank's share of ``x`` (the whole label) along ``dim``: a view of a contiguous range,</span>
+<span class="sd">        which a captured graph reads in place; a copy of a striped one, as a kernel takes it."""</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">order</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">return</span> <span class="n">x</span><span class="o">.</span><span class="n">narrow</span><span class="p">(</span><span class="n">dim</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">start</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">count</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">x</span><span class="o">.</span><span class="n">index_select</span><span class="p">(</span><span class="n">dim</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">index</span><span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="SeqRange.whole">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.sequence_shard.html#mstar.engine.resources.SeqRange.whole">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">whole</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">x</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">dim</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""``local``'s inverse: every rank's share of ``x`` gathered, in step order."""</span>
+        <span class="n">out</span> <span class="o">=</span> <span class="n">gather_sequence</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">group</span><span class="p">,</span> <span class="n">x</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">counts</span><span class="p">,</span> <span class="n">dim</span><span class="p">)</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">order</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">return</span> <span class="n">out</span>
+        <span class="k">return</span> <span class="n">torch</span><span class="o">.</span><span class="n">empty_like</span><span class="p">(</span><span class="n">out</span><span class="p">)</span><span class="o">.</span><span class="n">index_copy_</span><span class="p">(</span><span class="n">dim</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">order</span><span class="p">,</span> <span class="n">out</span><span class="p">)</span></div>
+</div>
 
 
 
@@ -1217,14 +1346,17 @@ window.runMermaid = runMermaid;</script>
 <span class="k">class</span><span class="w"> </span><span class="nc">SequenceShard</span><span class="p">(</span><span class="n">Resource</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">"""Plans each step split or copied (``SeqShardSpec``) and brackets the layer stack with</span>
 <span class="sd">    ``scatter`` / ``gather``. Holds no per-request state and no device buffers: its plan is</span>
-<span class="sd">    host-only, from the declared step and the lease, the same on every rank. Off its defaults:</span>
+<span class="sd">    from the declared step, the lease and (striped) the pool's plan, the same on every rank; a</span>
+<span class="sd">    striped step's ``order`` is copied to the device with it. Off its defaults:</span>
 <span class="sd">    ``prefix_skip_safe`` (it plans from the step a prefix hit already trimmed), ``supports_preplan``</span>
-<span class="sd">    (its dependents pre-plan), ``resident_refusal`` (None: a one-token-a-row step, what resident</span>
-<span class="sd">    planning replays, is never split) and so ``max_repeats`` (any); it keeps ``supports_context_parallel``</span>
-<span class="sd">    False (it depends on no pool), ``can_capture`` True and ``force_double_buffer`` False (nothing staged)."""</span>
+<span class="sd">    (its dependents pre-plan), ``supports_context_parallel`` (a striped shard reads a placed pool's</span>
+<span class="sd">    plan), ``resident_refusal`` (None: a one-token-a-row step, what resident planning replays, is</span>
+<span class="sd">    never split) and so ``max_repeats`` (any); it keeps ``can_capture`` True and ``force_double_buffer``</span>
+<span class="sd">    False (a leased step, the only kind a pre-plan stages, never stripes)."""</span>
 
     <span class="n">prefix_skip_safe</span> <span class="o">=</span> <span class="kc">True</span>
     <span class="n">supports_split_steps</span> <span class="o">=</span> <span class="kc">True</span>
+    <span class="n">supports_context_parallel</span> <span class="o">=</span> <span class="kc">True</span>
     <span class="c1"># its step is the node's segments and combined labels</span>
     <span class="n">steps_from_segments</span> <span class="o">=</span> <span class="kc">True</span>
     <span class="c1"># holds no per-request state, so a dropped request leaves nothing behind</span>
@@ -1245,7 +1377,8 @@ window.runMermaid = runMermaid;</script>
 
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span> <span class="n">labels</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="o">...</span><span class="p">],</span> <span class="n">axis</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">walks</span><span class="p">:</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span> <span class="n">min_tokens</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
-        <span class="n">group</span><span class="p">:</span> <span class="n">CommGroup</span><span class="p">,</span> <span class="n">exchanges</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span><span class="p">,</span>
+        <span class="n">group</span><span class="p">:</span> <span class="n">CommGroup</span><span class="p">,</span> <span class="n">splits</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span><span class="p">,</span> <span class="n">stripe_pool</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">device</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">(</span><span class="s2">"cpu"</span><span class="p">),</span> <span class="n">exchanges</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span><span class="p">,</span>
     <span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">labels</span> <span class="o">=</span> <span class="n">labels</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">axis</span> <span class="o">=</span> <span class="n">axis</span>
@@ -1253,11 +1386,15 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="o">.</span><span class="n">walks</span> <span class="o">=</span> <span class="n">walks</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">min_tokens</span> <span class="o">=</span> <span class="n">min_tokens</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">group</span> <span class="o">=</span> <span class="n">group</span>
+        <span class="c1"># `SeqShardSpec.stripe_pool`</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">stripe_pool</span> <span class="o">=</span> <span class="n">stripe_pool</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_device</span> <span class="o">=</span> <span class="n">device</span>
         <span class="c1"># whether a resource exchanges the split labels' units, so each rank needs some</span>
         <span class="c1"># (`SeqShardSpec.exchanges`)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">exchanges</span> <span class="o">=</span> <span class="n">exchanges</span>
-        <span class="c1"># fixed at bind, so a compiled frame at one SP rank traces the bracket straight through</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">can_split</span> <span class="o">=</span> <span class="n">group</span><span class="o">.</span><span class="n">world_size</span> <span class="o">&gt;</span> <span class="mi">1</span>
+        <span class="c1"># fixed at bind, so a compiled frame at one SP rank (or on a node whose attentions take no</span>
+        <span class="c1"># split steps) traces the bracket straight through</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">can_split</span> <span class="o">=</span> <span class="n">group</span><span class="o">.</span><span class="n">world_size</span> <span class="o">&gt;</span> <span class="mi">1</span> <span class="ow">and</span> <span class="n">splits</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_current</span><span class="p">:</span> <span class="n">SeqShardPlan</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_pending</span><span class="p">:</span> <span class="n">SeqShardPlan</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_preplanned</span> <span class="o">=</span> <span class="kc">False</span>
@@ -1273,7 +1410,16 @@ window.runMermaid = runMermaid;</script>
         <span class="n">joint</span> <span class="o">=</span> <span class="n">info</span><span class="o">.</span><span class="n">joint_comm_group</span>
         <span class="n">group</span> <span class="o">=</span> <span class="n">joint</span><span class="o">.</span><span class="n">sp_group</span> <span class="k">if</span> <span class="n">joint</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">CommGroup</span><span class="o">.</span><span class="n">trivial</span><span class="p">()</span>
         <span class="n">walks</span> <span class="o">=</span> <span class="kc">None</span> <span class="k">if</span> <span class="n">spec</span><span class="o">.</span><span class="n">walks</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="nb">frozenset</span><span class="p">(</span><span class="n">spec</span><span class="o">.</span><span class="n">walks</span><span class="p">)</span>
-        <span class="k">return</span> <span class="bp">cls</span><span class="p">(</span><span class="n">spec</span><span class="o">.</span><span class="n">labels</span><span class="p">,</span> <span class="n">spec</span><span class="o">.</span><span class="n">axis</span><span class="p">,</span> <span class="n">walks</span><span class="p">,</span> <span class="n">spec</span><span class="o">.</span><span class="n">min_tokens</span><span class="p">,</span> <span class="n">group</span><span class="p">,</span> <span class="n">exchanges</span><span class="o">=</span><span class="n">spec</span><span class="o">.</span><span class="n">exchanges</span><span class="p">)</span></div>
+        <span class="k">return</span> <span class="bp">cls</span><span class="p">(</span>
+            <span class="n">spec</span><span class="o">.</span><span class="n">labels</span><span class="p">,</span> <span class="n">spec</span><span class="o">.</span><span class="n">axis</span><span class="p">,</span> <span class="n">walks</span><span class="p">,</span> <span class="n">spec</span><span class="o">.</span><span class="n">min_tokens</span><span class="p">,</span> <span class="n">group</span><span class="p">,</span> <span class="n">spec</span><span class="o">.</span><span class="n">splits</span><span class="p">,</span> <span class="n">spec</span><span class="o">.</span><span class="n">stripe_pool</span><span class="p">,</span> <span class="n">info</span><span class="o">.</span><span class="n">device</span><span class="p">,</span>
+            <span class="n">exchanges</span><span class="o">=</span><span class="n">spec</span><span class="o">.</span><span class="n">exchanges</span><span class="p">,</span>
+        <span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="SequenceShard.depends_on">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.sequence_shard.html#mstar.engine.resources.SequenceShard.depends_on">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">depends_on</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">set</span><span class="p">[</span><span class="nb">str</span><span class="p">]:</span>
+        <span class="k">return</span> <span class="nb">set</span><span class="p">()</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">stripe_pool</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="p">{</span><span class="bp">self</span><span class="o">.</span><span class="n">stripe_pool</span><span class="p">}</span></div>
 
 
     <span class="nd">@property</span>
@@ -1365,6 +1511,10 @@ window.runMermaid = runMermaid;</script>
         <span class="k">if</span> <span class="n">bucket</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">ctx</span><span class="o">.</span><span class="n">force_prefill</span> <span class="ow">and</span> <span class="n">bucket</span><span class="o">.</span><span class="n">bs</span> <span class="o">==</span> <span class="n">bucket</span><span class="o">.</span><span class="n">num_tokens</span><span class="p">:</span>
             <span class="c1"># a batched decode replay, which declares its bucket: copied in O(1)</span>
             <span class="k">return</span> <span class="n">COPIED</span>
+        <span class="k">if</span> <span class="n">bucket</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">stripe_pool</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="c1"># the ring runs eager only; the lease is the instance's capture decision, so every</span>
+            <span class="c1"># rank plans the step copied alike</span>
+            <span class="k">return</span> <span class="n">COPIED</span>
         <span class="n">sp</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">group</span><span class="o">.</span><span class="n">world_size</span>
         <span class="n">segments</span> <span class="o">=</span> <span class="n">step</span><span class="o">.</span><span class="n">segments</span> <span class="ow">or</span> <span class="p">()</span>
         <span class="n">tokens</span> <span class="o">=</span> <span class="nb">sum</span><span class="p">(</span><span class="n">segment</span><span class="o">.</span><span class="n">span</span> <span class="k">for</span> <span class="n">segment</span> <span class="ow">in</span> <span class="n">segments</span><span class="p">)</span>
@@ -1401,6 +1551,8 @@ window.runMermaid = runMermaid;</script>
                 <span class="p">)</span>
             <span class="k">if</span> <span class="p">(</span><span class="nb">min</span><span class="p">(</span><span class="n">label_spans</span><span class="p">)</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">axis</span> <span class="o">==</span> <span class="mi">1</span> <span class="k">else</span> <span class="nb">sum</span><span class="p">(</span><span class="n">label_spans</span><span class="p">))</span> <span class="o">&lt;</span> <span class="n">least</span><span class="p">:</span>
                 <span class="k">return</span> <span class="n">COPIED</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">stripe_pool</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_striped</span><span class="p">(</span><span class="n">spans</span><span class="p">,</span> <span class="n">step</span><span class="p">,</span> <span class="n">ctx</span><span class="p">)</span>
         <span class="n">ranges</span> <span class="o">=</span> <span class="p">{</span><span class="n">label</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">_range</span><span class="p">(</span><span class="n">label_spans</span><span class="p">)</span> <span class="k">for</span> <span class="n">label</span><span class="p">,</span> <span class="n">label_spans</span> <span class="ow">in</span> <span class="n">spans</span><span class="o">.</span><span class="n">items</span><span class="p">()}</span>
         <span class="k">for</span> <span class="n">sources</span><span class="p">,</span> <span class="n">plan_label</span> <span class="ow">in</span> <span class="n">step</span><span class="o">.</span><span class="n">combined_labels</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
             <span class="n">listed</span> <span class="o">=</span> <span class="p">[</span><span class="n">source</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">labels</span> <span class="k">for</span> <span class="n">source</span> <span class="ow">in</span> <span class="n">sources</span><span class="p">]</span>
@@ -1417,6 +1569,42 @@ window.runMermaid = runMermaid;</script>
                 <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">axis</span> <span class="o">==</span> <span class="mi">1</span> <span class="ow">and</span> <span class="nb">len</span><span class="p">(</span><span class="nb">set</span><span class="p">(</span><span class="n">combined</span><span class="p">))</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
                     <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"combined label </span><span class="si">{</span><span class="n">plan_label</span><span class="si">!r}</span><span class="s2">'s rows must be one length; got </span><span class="si">{</span><span class="n">combined</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
                 <span class="n">ranges</span><span class="p">[</span><span class="n">plan_label</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_range</span><span class="p">(</span><span class="n">combined</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">SeqShardPlan</span><span class="p">(</span><span class="kc">True</span><span class="p">,</span> <span class="n">ranges</span><span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_striped</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">spans</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]],</span> <span class="n">step</span><span class="p">:</span> <span class="n">ResourceStep</span><span class="p">,</span> <span class="n">ctx</span><span class="p">:</span> <span class="n">StepContext</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">SeqShardPlan</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Each listed label's tokens to the rank storing their KV position (`stripe_owners`), from</span>
+<span class="sd">        each row's stored length in the pool's plan; copied if a rank would get none of a label.</span>
+<span class="sd">        Every input is the instance's own (the step and the pool's plan), so every rank decides</span>
+<span class="sd">        alike."""</span>
+        <span class="k">if</span> <span class="nb">any</span><span class="p">(</span><span class="n">source</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">labels</span> <span class="k">for</span> <span class="n">sources</span> <span class="ow">in</span> <span class="n">step</span><span class="o">.</span><span class="n">combined_labels</span> <span class="k">for</span> <span class="n">source</span> <span class="ow">in</span> <span class="n">sources</span><span class="p">):</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">"sequence shard </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">labels</span><span class="si">}</span><span class="s2"> stripes by KV </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">stripe_pool</span><span class="si">!r}</span><span class="s2">'s stored positions, which a "</span>
+                <span class="sa">f</span><span class="s2">"combined label's rows (</span><span class="si">{</span><span class="nb">sorted</span><span class="p">(</span><span class="n">step</span><span class="o">.</span><span class="n">combined_labels</span><span class="o">.</span><span class="n">values</span><span class="p">())</span><span class="si">}</span><span class="s2">) don't have"</span>
+            <span class="p">)</span>
+        <span class="n">pool</span> <span class="o">=</span> <span class="n">ctx</span><span class="o">.</span><span class="n">plan_results</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">stripe_pool</span><span class="p">)</span> <span class="ow">or</span> <span class="p">{}</span>
+        <span class="n">world</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">group</span><span class="o">.</span><span class="n">world_size</span>
+        <span class="n">ranges</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="k">for</span> <span class="n">label</span><span class="p">,</span> <span class="n">label_spans</span> <span class="ow">in</span> <span class="n">spans</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+            <span class="n">plan</span> <span class="o">=</span> <span class="n">pool</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">label</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">plan</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                    <span class="sa">f</span><span class="s2">"sequence shard </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">labels</span><span class="si">}</span><span class="s2"> stripes </span><span class="si">{</span><span class="n">label</span><span class="si">!r}</span><span class="s2"> by KV </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">stripe_pool</span><span class="si">!r}</span><span class="s2">'s stored positions, "</span>
+                    <span class="s2">"and this step plans no such label there"</span>
+                <span class="p">)</span>
+            <span class="n">indptrs</span> <span class="o">=</span> <span class="n">plan</span><span class="o">.</span><span class="n">cpu_indptrs</span>
+            <span class="n">qo</span> <span class="o">=</span> <span class="n">indptrs</span><span class="o">.</span><span class="n">qo_indptr</span><span class="o">.</span><span class="n">numpy</span><span class="p">()</span>
+            <span class="n">lens</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">diff</span><span class="p">(</span><span class="n">qo</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">lens</span><span class="o">.</span><span class="n">tolist</span><span class="p">()</span> <span class="o">!=</span> <span class="n">label_spans</span><span class="p">:</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                    <span class="sa">f</span><span class="s2">"label </span><span class="si">{</span><span class="n">label</span><span class="si">!r}</span><span class="s2">'s rows are </span><span class="si">{</span><span class="n">label_spans</span><span class="si">}</span><span class="s2"> in the step and </span><span class="si">{</span><span class="n">lens</span><span class="o">.</span><span class="n">tolist</span><span class="p">()</span><span class="si">}</span><span class="s2"> in KV "</span>
+                    <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">stripe_pool</span><span class="si">!r}</span><span class="s2">'s plan"</span>
+                <span class="p">)</span>
+            <span class="n">owners</span> <span class="o">=</span> <span class="n">stripe_owners</span><span class="p">(</span><span class="n">qo</span><span class="p">,</span> <span class="n">indptrs</span><span class="o">.</span><span class="n">kv_lens</span><span class="o">.</span><span class="n">numpy</span><span class="p">()</span> <span class="o">-</span> <span class="n">lens</span><span class="p">,</span> <span class="n">world</span><span class="p">)</span>
+            <span class="n">counts</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">bincount</span><span class="p">(</span><span class="n">owners</span><span class="p">,</span> <span class="n">minlength</span><span class="o">=</span><span class="n">world</span><span class="p">)</span>
+            <span class="k">if</span> <span class="ow">not</span> <span class="n">counts</span><span class="o">.</span><span class="n">all</span><span class="p">():</span>
+                <span class="k">return</span> <span class="n">COPIED</span>
+            <span class="n">order</span> <span class="o">=</span> <span class="n">to_device_nonblocking</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">argsort</span><span class="p">(</span><span class="n">owners</span><span class="p">,</span> <span class="n">kind</span><span class="o">=</span><span class="s2">"stable"</span><span class="p">),</span> <span class="bp">self</span><span class="o">.</span><span class="n">_device</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">int64</span><span class="p">)</span>
+            <span class="n">ranges</span><span class="p">[</span><span class="n">label</span><span class="p">]</span> <span class="o">=</span> <span class="n">SeqRange</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">group</span><span class="p">,</span> <span class="nb">tuple</span><span class="p">(</span><span class="n">counts</span><span class="o">.</span><span class="n">tolist</span><span class="p">()),</span> <span class="kc">None</span><span class="p">,</span> <span class="n">order</span><span class="o">=</span><span class="n">order</span><span class="p">)</span>
         <span class="k">return</span> <span class="n">SeqShardPlan</span><span class="p">(</span><span class="kc">True</span><span class="p">,</span> <span class="n">ranges</span><span class="p">)</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_range</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">spans</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="n">SeqRange</span><span class="p">:</span>
@@ -1441,8 +1629,8 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.sequence_shard.html#mstar.engine.resources.SequenceShard.scatter">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">scatter</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">label</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="o">*</span><span class="n">xs</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span> <span class="n">dim</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
 <span class="w">        </span><span class="sd">"""This rank's share of each of ``xs`` (whole on every rank) along ``dim`` (the spec's</span>
-<span class="sd">        axis by default), contiguous, when this step splits ``label``; the inputs unchanged</span>
-<span class="sd">        otherwise. One tensor in, one out; several in, a tuple out. None passes through.</span>
+<span class="sd">        axis by default), when this step splits ``label`` (``SeqRange.local``), contiguous; the inputs</span>
+<span class="sd">        unchanged otherwise. One tensor in, one out; several in, a tuple out. None passes through.</span>
 
 <span class="sd">        Contiguous because eager pointwise ops keep their first input's layout: a view of a</span>
 <span class="sd">        channel-major stream (Wan2.2's patchified latents) would carry that layout through every</span>
@@ -1476,10 +1664,10 @@ window.runMermaid = runMermaid;</script>
         <span class="n">dim</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">axis</span> <span class="k">if</span> <span class="n">dim</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">dim</span>
         <span class="k">if</span> <span class="n">scatter</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_scattered</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="n">label</span><span class="p">)</span>
-            <span class="n">out</span> <span class="o">=</span> <span class="nb">tuple</span><span class="p">(</span><span class="kc">None</span> <span class="k">if</span> <span class="n">x</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">x</span><span class="o">.</span><span class="n">narrow</span><span class="p">(</span><span class="n">dim</span><span class="p">,</span> <span class="n">r</span><span class="o">.</span><span class="n">start</span><span class="p">,</span> <span class="n">r</span><span class="o">.</span><span class="n">count</span><span class="p">)</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span> <span class="k">for</span> <span class="n">x</span> <span class="ow">in</span> <span class="n">xs</span><span class="p">)</span>
+            <span class="n">out</span> <span class="o">=</span> <span class="nb">tuple</span><span class="p">(</span><span class="kc">None</span> <span class="k">if</span> <span class="n">x</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">r</span><span class="o">.</span><span class="n">local</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">dim</span><span class="p">)</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span> <span class="k">for</span> <span class="n">x</span> <span class="ow">in</span> <span class="n">xs</span><span class="p">)</span>
         <span class="k">else</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_scattered</span><span class="o">.</span><span class="n">discard</span><span class="p">(</span><span class="n">label</span><span class="p">)</span>
-            <span class="n">out</span> <span class="o">=</span> <span class="nb">tuple</span><span class="p">(</span><span class="kc">None</span> <span class="k">if</span> <span class="n">x</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">gather_sequence</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">group</span><span class="p">,</span> <span class="n">x</span><span class="p">,</span> <span class="n">r</span><span class="o">.</span><span class="n">counts</span><span class="p">,</span> <span class="n">dim</span><span class="p">)</span> <span class="k">for</span> <span class="n">x</span> <span class="ow">in</span> <span class="n">xs</span><span class="p">)</span>
+            <span class="n">out</span> <span class="o">=</span> <span class="nb">tuple</span><span class="p">(</span><span class="kc">None</span> <span class="k">if</span> <span class="n">x</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">r</span><span class="o">.</span><span class="n">whole</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">dim</span><span class="p">)</span> <span class="k">for</span> <span class="n">x</span> <span class="ow">in</span> <span class="n">xs</span><span class="p">)</span>
         <span class="k">return</span> <span class="n">out</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">out</span><span class="p">)</span> <span class="o">==</span> <span class="mi">1</span> <span class="k">else</span> <span class="n">out</span>
 
 <div class="viewcode-block" id="SequenceShard.check_scattered">
@@ -1498,14 +1686,24 @@ window.runMermaid = runMermaid;</script>
 
 <div class="viewcode-block" id="SequenceShard.check_bypass">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.sequence_shard.html#mstar.engine.resources.SequenceShard.check_bypass">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">check_bypass</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">label</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">what</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">"""Refuse a paged ``what`` (run or a KV write) of a split label reached outside an</span>
-<span class="sd">        exchange: it would see this rank's share of the tokens as the whole step."""</span>
-        <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">exchanging</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">split_range</span><span class="p">(</span><span class="n">label</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
-                <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">what</span><span class="si">}</span><span class="s2"> reached label </span><span class="si">{</span><span class="n">label</span><span class="si">!r}</span><span class="s2">, which this step splits over SP ranks, outside an "</span>
-                <span class="s2">"exchange: call the attention through AttentionCallable (or the resource's exchange)"</span>
-            <span class="p">)</span></div>
+    <span class="k">def</span><span class="w"> </span><span class="nf">check_bypass</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">label</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">what</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">by_head</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Refuse a paged ``what`` (run or a KV write) reached outside an exchange: of a split label</span>
+<span class="sd">        it would see this rank's share of the tokens as the whole step, and over a pool stored by</span>
+<span class="sd">        head (``by_head``) any step's q, k and v at the node's TP heads where the pool holds this</span>
+<span class="sd">        rank's ``tp * sp`` slice."""</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">exchanging</span><span class="p">:</span>
+            <span class="k">return</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">split_range</span><span class="p">(</span><span class="n">label</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">why</span> <span class="o">=</span> <span class="s2">"which this step splits over SP ranks"</span>
+        <span class="k">elif</span> <span class="n">by_head</span><span class="p">:</span>
+            <span class="n">why</span> <span class="o">=</span> <span class="s2">"whose KV this rank stores a head slice of"</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="k">return</span>
+        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+            <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">what</span><span class="si">}</span><span class="s2"> reached label </span><span class="si">{</span><span class="n">label</span><span class="si">!r}</span><span class="s2">, </span><span class="si">{</span><span class="n">why</span><span class="si">}</span><span class="s2">, outside an exchange: call the attention through "</span>
+            <span class="s2">"AttentionCallable (or the resource's exchange); a state-contract model reaches it through the "</span>
+            <span class="s2">"array handle's `add` and `read`"</span>
+        <span class="p">)</span></div>
 </div>
 
 
@@ -1527,8 +1725,9 @@ window.runMermaid = runMermaid;</script>
 <span class="c1"># --- exchanges ---------------------------------------------------------------------------------</span>
 
 <span class="c1"># ``run(q, k, v)`` attends (and for a paged resource writes K/V) on the tensors it is handed, each</span>
-<span class="c1"># packed ``[N, H, D]``; ``q=None`` writes alone. A ``[B, S, ...]`` label (``SeqRange.rows``) is</span>
-<span class="c1"># exchanged along S, viewed from the packed tensor.</span>
+<span class="c1"># packed ``[N, H, D]``; ``q=None`` writes alone; ``tokens=`` names which of the step's tokens they</span>
+<span class="c1"># are, by index, where not all of them in order (the ring's). A ``[B, S, ...]`` label</span>
+<span class="c1"># (``SeqRange.rows``) is exchanged along S, viewed from the packed tensor.</span>
 
 
 <span class="k">def</span><span class="w"> </span><span class="nf">_check_entry</span><span class="p">(</span><span class="n">r</span><span class="p">:</span> <span class="n">SeqRange</span><span class="p">,</span> <span class="o">*</span><span class="n">xs</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">|</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
@@ -1574,6 +1773,38 @@ window.runMermaid = runMermaid;</script>
 
 
 
+<div class="viewcode-block" id="all_gather">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.sequence_shard.html#mstar.engine.resources.all_gather">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">all_gather</span><span class="p">(</span><span class="n">run</span><span class="p">:</span> <span class="n">Callable</span><span class="p">,</span> <span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">,</span> <span class="n">r</span><span class="p">:</span> <span class="n">SeqRange</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""Every rank's q, k and v gathered whole in one collective, in the step's order whatever the</span>
+<span class="sd">    label's layout, ``run`` on them as on a copied step, then this rank's share of the output.</span>
+<span class="sd">    ``q`` None: k and v alone, for the write."""</span>
+    <span class="n">_check_entry</span><span class="p">(</span><span class="n">r</span><span class="p">,</span> <span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">)</span>
+    <span class="n">parts</span> <span class="o">=</span> <span class="p">[</span><span class="n">x</span> <span class="k">for</span> <span class="n">x</span> <span class="ow">in</span> <span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">)</span> <span class="k">if</span> <span class="n">x</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">]</span>
+    <span class="k">assert</span> <span class="n">r</span><span class="o">.</span><span class="n">rows</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">and</span> <span class="nb">len</span><span class="p">({</span><span class="n">x</span><span class="o">.</span><span class="n">dtype</span> <span class="k">for</span> <span class="n">x</span> <span class="ow">in</span> <span class="n">parts</span><span class="p">})</span> <span class="o">==</span> <span class="mi">1</span><span class="p">,</span> <span class="p">(</span>
+        <span class="s2">"all_gather takes a packed label's q, k and v of one dtype"</span>
+    <span class="p">)</span>
+    <span class="n">whole</span> <span class="o">=</span> <span class="n">r</span><span class="o">.</span><span class="n">whole</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">([</span><span class="n">x</span><span class="o">.</span><span class="n">flatten</span><span class="p">(</span><span class="mi">1</span><span class="p">)</span> <span class="k">for</span> <span class="n">x</span> <span class="ow">in</span> <span class="n">parts</span><span class="p">],</span> <span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">))</span>
+    <span class="n">pieces</span> <span class="o">=</span> <span class="n">whole</span><span class="o">.</span><span class="n">split</span><span class="p">([</span><span class="n">math</span><span class="o">.</span><span class="n">prod</span><span class="p">(</span><span class="n">x</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">:])</span> <span class="k">for</span> <span class="n">x</span> <span class="ow">in</span> <span class="n">parts</span><span class="p">],</span> <span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span>
+    <span class="n">gathered</span> <span class="o">=</span> <span class="p">[</span><span class="n">piece</span><span class="o">.</span><span class="n">unflatten</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="n">x</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">:])</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span> <span class="k">for</span> <span class="n">piece</span><span class="p">,</span> <span class="n">x</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span><span class="n">pieces</span><span class="p">,</span> <span class="n">parts</span><span class="p">,</span> <span class="n">strict</span><span class="o">=</span><span class="kc">True</span><span class="p">)]</span>
+    <span class="k">if</span> <span class="n">q</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="n">run</span><span class="p">(</span><span class="kc">None</span><span class="p">,</span> <span class="o">*</span><span class="n">gathered</span><span class="p">)</span>
+        <span class="k">return</span> <span class="kc">None</span>
+    <span class="k">return</span> <span class="n">r</span><span class="o">.</span><span class="n">local</span><span class="p">(</span><span class="n">run</span><span class="p">(</span><span class="o">*</span><span class="n">gathered</span><span class="p">))</span></div>
+
+
+
+<div class="viewcode-block" id="ring">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.sequence_shard.html#mstar.engine.resources.ring">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">ring</span><span class="p">(</span><span class="n">run</span><span class="p">:</span> <span class="n">Callable</span><span class="p">,</span> <span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">,</span> <span class="n">r</span><span class="p">:</span> <span class="n">SeqRange</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""A striped label (``SeqRange.order``): this rank holds the tokens whose K/V it stores, so</span>
+<span class="sd">    nothing moves here. ``run`` writes them into its own slots and attends its queries, which the</span>
+<span class="sd">    plan passes round the partners (``RingAttentionWrapper``)."""</span>
+    <span class="n">_check_entry</span><span class="p">(</span><span class="n">r</span><span class="p">,</span> <span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">run</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">,</span> <span class="n">tokens</span><span class="o">=</span><span class="n">r</span><span class="o">.</span><span class="n">index</span><span class="p">)</span></div>
+
+
+
 <div class="viewcode-block" id="head_slice">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.sequence_shard.html#mstar.engine.resources.head_slice">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">head_slice</span><span class="p">(</span><span class="n">run</span><span class="p">:</span> <span class="n">Callable</span><span class="p">,</span> <span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">,</span> <span class="n">group</span><span class="p">:</span> <span class="n">CommGroup</span><span class="p">):</span>
@@ -1614,44 +1845,54 @@ window.runMermaid = runMermaid;</script>
     <span class="n">moe_parallel</span><span class="p">:</span> <span class="n">MoeParallelConfig</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
 <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]:</span>
 <span class="w">    </span><span class="sd">"""What ``node``, on ``tp`` TP and ``sp`` SP ranks, declares that its SP ranks can't run; each</span>
-<span class="sd">    a sentence. Nothing at one SP rank. Each resource answers for itself</span>
-<span class="sd">    (``NodeResourceSpec.split_step_refusals``); the checks on built objects</span>
-<span class="sd">    (``supports_split_steps``, ``check_captures``) are the engine's."""</span>
+<span class="sd">    a sentence. Each resource answers for itself (``NodeResourceSpec.split_step_refusals``); the</span>
+<span class="sd">    checks on built objects (``supports_split_steps``, ``check_captures``) are the engine's."""</span>
     <span class="k">if</span> <span class="n">sp</span> <span class="o">==</span> <span class="mi">1</span><span class="p">:</span>
         <span class="k">return</span> <span class="p">[]</span>
-    <span class="n">specs</span> <span class="o">=</span> <span class="p">[</span><span class="n">spec</span> <span class="k">for</span> <span class="n">spec</span> <span class="ow">in</span> <span class="n">specs</span> <span class="k">if</span> <span class="n">node</span> <span class="ow">in</span> <span class="n">spec</span><span class="o">.</span><span class="n">nodes</span><span class="p">]</span>
+    <span class="n">all_specs</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="n">specs</span><span class="p">)</span>
+    <span class="n">specs</span> <span class="o">=</span> <span class="p">[</span><span class="n">spec</span> <span class="k">for</span> <span class="n">spec</span> <span class="ow">in</span> <span class="n">all_specs</span> <span class="k">if</span> <span class="n">node</span> <span class="ow">in</span> <span class="n">spec</span><span class="o">.</span><span class="n">nodes</span><span class="p">]</span>
+    <span class="n">shard</span> <span class="o">=</span> <span class="nb">next</span><span class="p">((</span><span class="n">spec</span> <span class="k">for</span> <span class="n">spec</span> <span class="ow">in</span> <span class="n">specs</span> <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">spec</span><span class="p">,</span> <span class="n">SeqShardSpec</span><span class="p">)),</span> <span class="kc">None</span><span class="p">)</span>
     <span class="k">try</span><span class="p">:</span>
         <span class="n">placed</span> <span class="o">=</span> <span class="nb">any</span><span class="p">(</span><span class="n">position_pools</span><span class="p">(</span><span class="n">specs</span><span class="p">,</span> <span class="n">node</span><span class="p">)</span><span class="o">.</span><span class="n">values</span><span class="p">())</span>
     <span class="k">except</span> <span class="ne">ValueError</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>
         <span class="k">return</span> <span class="p">[</span><span class="nb">str</span><span class="p">(</span><span class="n">e</span><span class="p">)]</span>
-    <span class="n">shard</span> <span class="o">=</span> <span class="nb">next</span><span class="p">((</span><span class="n">spec</span> <span class="k">for</span> <span class="n">spec</span> <span class="ow">in</span> <span class="n">specs</span> <span class="k">if</span> <span class="n">spec</span><span class="o">.</span><span class="n">splits_steps</span><span class="p">),</span> <span class="kc">None</span><span class="p">)</span>
-    <span class="k">if</span> <span class="n">shard</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="k">if</span> <span class="n">shard</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="ow">not</span> <span class="n">shard</span><span class="o">.</span><span class="n">splits</span><span class="p">:</span>
+        <span class="c1"># as a node without a shard: its steps run copied (`SeqShardSpec.splits`), so a model's</span>
+        <span class="c1"># shard is a no-op where they never split</span>
         <span class="k">if</span> <span class="n">placed</span><span class="p">:</span>
             <span class="k">return</span> <span class="p">[]</span>
+        <span class="k">if</span> <span class="n">shard</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="c1"># a model may default its shard to none (Qwen3-Omni's Thinker), leaving Ulysses over its</span>
+            <span class="c1"># pools stored by head the deployment's opt-in</span>
+            <span class="n">opt_in</span> <span class="o">=</span> <span class="p">(</span>
+                <span class="sa">f</span><span class="s2">", split its steps by Ulysses (resources: </span><span class="si">{</span><span class="n">shard</span><span class="o">.</span><span class="n">resource_key</span><span class="si">}</span><span class="s2">: exchange: ulysses)"</span>
+                <span class="k">if</span> <span class="n">shard</span><span class="o">.</span><span class="n">exchange</span> <span class="o">==</span> <span class="s2">"none"</span> <span class="ow">and</span> <span class="nb">any</span><span class="p">(</span><span class="n">spec</span><span class="o">.</span><span class="n">places_positions</span> <span class="ow">is</span> <span class="kc">False</span> <span class="k">for</span> <span class="n">spec</span> <span class="ow">in</span> <span class="n">specs</span><span class="p">)</span> <span class="k">else</span> <span class="s2">""</span>
+            <span class="p">)</span>
+            <span class="k">return</span> <span class="p">[</span>
+                <span class="sa">f</span><span class="s2">"node </span><span class="si">{</span><span class="n">node</span><span class="si">!r}</span><span class="s2"> runs on </span><span class="si">{</span><span class="n">sp</span><span class="si">}</span><span class="s2"> SP ranks, and its steps never split (its sequence shard's exchange "</span>
+                <span class="s2">"none, or no attention there takes split steps: a ragged one over no label it lists, or a read on "</span>
+                <span class="s2">"backend: sdpa), so "</span>
+                <span class="sa">f</span><span class="s2">"its SP ranks would only share heads: store its KV by position (context_parallel)</span><span class="si">{</span><span class="n">opt_in</span><span class="si">}</span><span class="s2"> or run "</span>
+                <span class="s2">"it on TP ranks"</span>
+            <span class="p">]</span>
         <span class="k">return</span> <span class="p">[</span>
             <span class="sa">f</span><span class="s2">"node </span><span class="si">{</span><span class="n">node</span><span class="si">!r}</span><span class="s2"> runs on </span><span class="si">{</span><span class="n">sp</span><span class="si">}</span><span class="s2"> SP ranks but neither splits tokens (a SeqShardSpec) nor stores "</span>
             <span class="s2">"KV by position (context_parallel on its paged KV pools); an attention run outside the "</span>
-            <span class="s2">"engine's resources (attention_backend: sdpa) declares neither"</span>
+            <span class="s2">"engine's resources (backend: sdpa on a read's resource) declares neither"</span><span class="p">,</span>
         <span class="p">]</span>
     <span class="n">refusals</span> <span class="o">=</span> <span class="p">[]</span>
-    <span class="n">attends</span> <span class="o">=</span> <span class="nb">any</span><span class="p">(</span><span class="n">spec</span><span class="o">.</span><span class="n">attends_split_steps</span> <span class="k">for</span> <span class="n">spec</span> <span class="ow">in</span> <span class="n">specs</span><span class="p">)</span>
-    <span class="k">if</span> <span class="n">shard</span><span class="o">.</span><span class="n">exchanges</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">attends</span><span class="p">:</span>
-        <span class="n">refusals</span><span class="o">.</span><span class="n">append</span><span class="p">(</span>
-            <span class="sa">f</span><span class="s2">"node </span><span class="si">{</span><span class="n">node</span><span class="si">!r}</span><span class="s2"> splits tokens (SeqShardSpec </span><span class="si">{</span><span class="n">shard</span><span class="o">.</span><span class="n">resource_key</span><span class="si">!r}</span><span class="s2">) but declares no attention that "</span>
-            <span class="s2">"can take them: a paged AttentionSpec, or a RaggedAttentionSpec over a label it splits (on the ragged "</span>
-            <span class="s2">"resource, not backend: sdpa)"</span>
-        <span class="p">)</span>
-    <span class="k">if</span> <span class="ow">not</span> <span class="n">shard</span><span class="o">.</span><span class="n">exchanges</span> <span class="ow">and</span> <span class="n">attends</span><span class="p">:</span>
-        <span class="n">refusals</span><span class="o">.</span><span class="n">append</span><span class="p">(</span>
-            <span class="sa">f</span><span class="s2">"node </span><span class="si">{</span><span class="n">node</span><span class="si">!r}</span><span class="s2"> declares SeqShardSpec </span><span class="si">{</span><span class="n">shard</span><span class="o">.</span><span class="n">resource_key</span><span class="si">!r}</span><span class="s2"> with exchanges=False, which can hand a "</span>
-            <span class="s2">"rank no tokens, beside an attention that exchanges split tokens"</span>
-        <span class="p">)</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">shard</span><span class="o">.</span><span class="n">exchanges</span><span class="p">:</span>
+        <span class="n">by_key</span> <span class="o">=</span> <span class="p">{</span><span class="n">spec</span><span class="o">.</span><span class="n">resource_key</span><span class="p">:</span> <span class="n">spec</span> <span class="k">for</span> <span class="n">spec</span> <span class="ow">in</span> <span class="n">all_specs</span><span class="p">}</span>
+        <span class="k">if</span> <span class="nb">any</span><span class="p">(</span><span class="n">spec</span><span class="o">.</span><span class="n">resolve_exchange</span><span class="p">(</span><span class="n">by_key</span><span class="p">)</span> <span class="o">!=</span> <span class="s2">"none"</span> <span class="k">for</span> <span class="n">spec</span> <span class="ow">in</span> <span class="n">specs</span><span class="p">):</span>
+            <span class="n">refusals</span><span class="o">.</span><span class="n">append</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">"node </span><span class="si">{</span><span class="n">node</span><span class="si">!r}</span><span class="s2"> declares SeqShardSpec </span><span class="si">{</span><span class="n">shard</span><span class="o">.</span><span class="n">resource_key</span><span class="si">!r}</span><span class="s2"> with exchanges=False, which can hand "</span>
+                <span class="s2">"a rank no tokens, beside an attention that exchanges split tokens"</span>
+            <span class="p">)</span>
     <span class="k">for</span> <span class="n">spec</span> <span class="ow">in</span> <span class="n">specs</span><span class="p">:</span>
         <span class="n">refusals</span> <span class="o">+=</span> <span class="n">spec</span><span class="o">.</span><span class="n">split_step_refusals</span><span class="p">(</span><span class="n">node</span><span class="p">,</span> <span class="n">shard</span><span class="p">,</span> <span class="n">tp</span><span class="p">,</span> <span class="n">sp</span><span class="p">)</span>
     <span class="k">if</span> <span class="n">moe_parallel</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">moe_parallel</span><span class="o">.</span><span class="n">parallel</span> <span class="o">==</span> <span class="s2">"ep"</span><span class="p">:</span>
         <span class="n">refusals</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="sa">f</span><span class="s2">"node </span><span class="si">{</span><span class="n">node</span><span class="si">!r}</span><span class="s2"> splits tokens over SP ranks, which expert parallelism (ep_config) can't"</span><span class="p">)</span>
     <span class="k">return</span> <span class="n">refusals</span></div>
-
 
 </pre></div>
 

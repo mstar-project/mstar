@@ -1376,7 +1376,7 @@ them by that name:</p>
 <span class="w">    </span><span class="nt">max_segments_per_request</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">2</span><span class="w">  </span><span class="c1"># also: max_segments_per_step, max_tokens_per_request,</span>
 <span class="w">                                 </span><span class="c1"># flashinfer_backend</span>
 <span class="w">  </span><span class="nt">seq_shard</span><span class="p">:</span><span class="w">                 </span><span class="c1"># a node's sequence shard (SP ranks)</span>
-<span class="w">    </span><span class="nt">min_tokens</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">2048</span><span class="w">         </span><span class="c1"># steps below this run copied on every SP rank</span>
+<span class="w">    </span><span class="nt">min_tokens</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">2048</span><span class="w">         </span><span class="c1"># steps below this run copied on every SP rank; also: exchange</span>
 <span class="w">  </span><span class="nt">sampler</span><span class="p">:</span>
 <span class="w">    </span><span class="nt">greedy_capture</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">false</span><span class="w">    </span><span class="c1"># also: enable_logprobs, enable_processed_logprobs</span>
 </pre></div>
@@ -1406,17 +1406,38 @@ a sliding window (<code class="docutils literal notranslate"><span class="pre">A
 <code class="docutils literal notranslate"><span class="pre">prefix_cache</span></code> goes off (logged at info), and a serving config that sets
 <code class="docutils literal notranslate"><span class="pre">prefix_cache:</span> <span class="pre">true</span></code> on it is refused.</p>
 <p>A node on <code class="docutils literal notranslate"><span class="pre">sp_size</span></code> above 1 shares each step over its SP ranks along two axes. A model that
-declares a sequence shard (<code class="docutils literal notranslate"><span class="pre">SeqShardSpec</span></code>: the DiTs of LTX-2.5, Cosmos3, Wan2.2 and MiniMax-H3) splits a step’s tokens
+declares a sequence shard (<code class="docutils literal notranslate"><span class="pre">SeqShardSpec</span></code>: the DiTs of LTX-2.5, Cosmos3, Wan2.2 and MiniMax-H3, and
+Qwen3-Omni’s Thinker) splits a step’s tokens
 over them; its <code class="docutils literal notranslate"><span class="pre">min_tokens</span></code> runs smaller steps copied on every rank instead (default 0: every
 step that can split does). A captured step decides from its bucket’s size, not its prompt’s.
 Separately, <code class="docutils literal notranslate"><span class="pre">context_parallel:</span> <span class="pre">true</span></code> stores a paged pool’s K/V by position rather than by
 head: each request’s positions split over the ranks that would otherwise hold the same KV
 heads, the TP ranks that share a KV head or the node’s SP ranks, which is how a model with no
 sequence shard (such as Qwen3.5) runs on <code class="docutils literal notranslate"><span class="pre">sp_size</span></code> above 1. Raise <code class="docutils literal notranslate"><span class="pre">max_num_pages</span></code> by that
-factor to turn the freed memory into context. A node on SP ranks needs at least one of the two,
-and can’t yet have both: a node that splits its steps stores its pools by head.
-<strong>Sequence and context parallelism</strong> in <a class="reference internal" href="adding_models.html"><span class="doc">Adding a New Model</span></a> covers what each combination does
-and what is refused.</p>
+factor to turn the freed memory into context. A node on SP ranks needs at least one of the two.</p>
+<p>The sequence shard’s <code class="docutils literal notranslate"><span class="pre">exchange</span></code> picks how a split step reaches the node’s paged attentions,
+from where their KV is stored. <code class="docutils literal notranslate"><span class="pre">auto</span></code> (the default) splits by Ulysses over KV stored by head,
+and over KV stored by position runs the node’s steps copied (KV capacity alone). Over KV stored by
+position, <code class="docutils literal notranslate"><span class="pre">all_gather</span></code> splits them, and <code class="docutils literal notranslate"><span class="pre">ring</span></code> also bounds the attention phase’s memory to
+this rank’s tokens and runs eager only. <code class="docutils literal notranslate"><span class="pre">ulysses</span></code> (by head) states the default, and <code class="docutils literal notranslate"><span class="pre">none</span></code>
+never splits. A value the node’s storage can’t take fails at load, at any SP size, and so does
+<code class="docutils literal notranslate"><span class="pre">ring</span></code> over an attention backend other than <code class="docutils literal notranslate"><span class="pre">flashinfer</span></code> (when the engine builds it):</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">resources</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">kv_cache</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">context_parallel</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span><span class="w">   </span><span class="c1"># store K/V by position over the SP ranks</span>
+<span class="w">  </span><span class="nt">seq_shard</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">min_tokens</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">8192</span>
+<span class="w">    </span><span class="nt">exchange</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">all_gather</span><span class="w">     </span><span class="c1"># auto / none / ulysses (by head) / all_gather / ring (by position)</span>
+</pre></div>
+</div>
+<p>Ragged (cacheless) attentions run Ulysses over the labels the shard lists, whatever <code class="docutils literal notranslate"><span class="pre">exchange</span></code> says;
+a shard that never splits (<code class="docutils literal notranslate"><span class="pre">none</span></code>, or <code class="docutils literal notranslate"><span class="pre">auto</span></code> over KV stored by position) stops them splitting too.</p>
+<p>A step’s peak memory is its residents plus the larger of its attention and its MLP or MoE phase,
+so ring lowers it only where attention is the larger, which comes with more SP ranks (about four
+for Qwen3-Omni’s Thinker, estimated from its geometry; the measured peaks are in
+<a class="reference internal" href="adding_models.html"><span class="doc">Adding a New Model</span></a>). Chunked prefill stays off on SP ranks.
+<strong>Sequence and context parallelism</strong> in <a class="reference internal" href="adding_models.html"><span class="doc">Adding a New Model</span></a> covers what each combination does,
+how to pick, and what is refused.</p>
 <p>A request waits at the head of its pool’s queue until its reservation fits beside the
 reservations already admitted. A request behind it starts first when its own pages fit, output
 included, less the cached part of its prompt that running requests keep from eviction and, on a

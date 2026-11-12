@@ -1099,10 +1099,26 @@ Qwen3-Omni notes
   ``codec_chunk_schedule: []`` under the deployment YAML's ``model_kwargs`` to
   start with a 25-frame chunk instead: first audio comes later, and the
   Talker needs only about 1.0 to 1.3x real time.
+- ``configs/qwen3omni_thinker_tp4_sp2.yaml`` (GPU-tested before its last merge of main; a rerun is pending) runs the
+  Thinker on 8 GPUs as 4 TP ranks by 2 SP ranks, for long prompts. Its KV pool
+  is stored by position over each SP pair (``context_parallel``). A prefill of
+  at least ``min_tokens`` tokens (on the ``thinker_shard`` resource) splits over
+  the pair: each rank runs the layers on its half of the tokens, and attention
+  gathers the step's queries, keys and values (``exchange: all_gather`` on
+  ``thinker_shard``; with the Thinker's default, ``none``, it runs every step copied, and over KV
+  stored by head a Thinker on SP ranks is refused unless the deployment sets ``exchange: ulysses``,
+  which has run on CPU only). Decode and
+  shorter prefills run copied on both ranks, each attending its half of the
+  stored context, and the two partials are merged. A captured prefill decides on its bucket's size.
+  ``min_tokens`` is 16384: on 8 H100s all-gather prefilled faster than
+  the copied path from 16K-token prompts and slower at 4K to 8K. The config serves prompts up to the
+  model's own 65536 positions (greedy outputs were checked to 60K; the 64K and 128K rows measured time and
+  memory only). Chunked prefill is off on SP ranks, so a prompt prefills in one step.
 - Numerics: the Thinker's q/k RMSNorm and multimodal RoPE run in one kernel
   with the KV write, in fp32 throughout and rounded once, where the unfused ops
   (and Hugging Face) round to bf16 after the norm and after each step of the
-  rotation: no less accurate, but not bit-exact. The code predictor (shared
+  rotation: no less accurate, but not bit-exact. (A Thinker step that splits
+  over SP ranks runs unfused, through the exchange, and so does a copied prefill; a decode step keeps the fused kernel.) The code predictor (shared
   with Qwen3-TTS, see its notes) runs each projection with its RMSNorm folded
   in and its residual add in the same Triton kernel (``cp_linear``), and its
   attention as another (``cp_attend``), neither bit-exact with the unfused
@@ -2351,7 +2367,8 @@ On SDPA the nodes' modules, driven by ``test/minimax_h3/parity.py`` (fp32 matmul
 "highest"), were bit-identical to diffusers' MiniMax-H3 pipeline end to end (latents, frames,
 waveform), measured at ``f6260f2677``; with ``--exact`` the script exits nonzero when one isn't.
 FA3 and the compiled DiT are not bit-exact. Served at 768p (50 steps, SP2 on H200, three
-seeds), clips are 23.7-32.8 dB (video) and 17.8-22.3 dB (audio) from diffusers', where the
+seeds), measured on main's earlier SP path, before the DiT and the decoder moved onto the sequence
+shard, clips are 23.7-32.8 dB (video) and 17.8-22.3 dB (audio) from diffusers', where the
 reference on another SDPA kernel is 23.5-33.1 and 21.6-22.3 dB from itself; per seed, the
 served clip is below that spread on one seed's video and another's audio.
 

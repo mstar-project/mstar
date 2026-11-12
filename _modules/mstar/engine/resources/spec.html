@@ -1050,6 +1050,7 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">TYPE_CHECKING</span><span class="p">,</span> <span class="n">Any</span><span class="p">,</span> <span class="n">ClassVar</span><span class="p">,</span> <span class="n">NamedTuple</span><span class="p">,</span> <span class="n">Protocol</span>
 
 <span class="k">if</span> <span class="n">TYPE_CHECKING</span><span class="p">:</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.attn.config</span><span class="w"> </span><span class="kn">import</span> <span class="n">SpExchange</span>
     <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">Resource</span>
     <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.sequence_shard</span><span class="w"> </span><span class="kn">import</span> <span class="n">SeqShardSpec</span>
 
@@ -1223,17 +1224,15 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        positions to place. A node whose resources place them runs replicated across its SP ranks."""</span>
         <span class="k">return</span> <span class="kc">None</span>
 
-    <span class="nd">@property</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">splits_steps</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">"""Whether this resource splits its nodes' steps over their SP ranks</span>
-<span class="sd">        (``mstar.engine.resources.sequence_shard``)."""</span>
-        <span class="k">return</span> <span class="kc">False</span>
+<div class="viewcode-block" id="NodeResourceSpec.resolve_exchange">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.spec.html#mstar.engine.resources.NodeResourceSpec.resolve_exchange">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">resolve_exchange</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">specs</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="s2">"NodeResourceSpec"</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="s2">"SpExchange"</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""How a split step's tokens reach this attention (``sequence_shard``): ``none`` (the</span>
+<span class="sd">        default) for a resource that takes none. From raw fields, so the sequence shard's</span>
+<span class="sd">        ``derive`` can ask in any order; a node's steps split where any of its attentions answers</span>
+<span class="sd">        otherwise (``SeqShardSpec.splits``)."""</span>
+        <span class="k">return</span> <span class="s2">"none"</span></div>
 
-    <span class="nd">@property</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">attends_split_steps</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">"""Whether this is an attention that can take a split step's tokens: a node that splits</span>
-<span class="sd">        its steps needs one."""</span>
-        <span class="k">return</span> <span class="kc">False</span>
 
 <div class="viewcode-block" id="NodeResourceSpec.split_step_refusals">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.spec.html#mstar.engine.resources.NodeResourceSpec.split_step_refusals">[docs]</a>

@@ -1746,17 +1746,18 @@ for a <code class="docutils literal notranslate"><span class="pre">one_row_per_s
 cuDNN SDPA over equal-length segments (see <a class="reference internal" href="#cacheless-attention-encoder-towers">Cacheless attention (encoder towers)</a>).
 <code class="docutils literal notranslate"><span class="pre">DENSE</span></code> runs FA3
 <code class="docutils literal notranslate"><span class="pre">flash_attn_varlen</span></code> (AITER on ROCm) and falls back to FlashInfer if that kernel is
-missing. The heads are split across the node’s TP ranks.
+missing. The heads are split across the node’s TP ranks (TP × SP over
+a label the node’s shard lists, on a node whose shard splits, below).
 <code class="docutils literal notranslate"><span class="pre">workspace_mb</span></code> is the floor of each label’s FlashInfer workspace per slot (default
 <code class="docutils literal notranslate"><span class="pre">MSTAR_WORKSPACE_BUFFER_MB</span></code>, 512, which doesn’t apply once it is declared): a plan that
 asks for more at startup grows it. A node with many labels can declare less, since a
 ragged prefill only uses it for split-KV partials. The spec’s <code class="docutils literal notranslate"><span class="pre">labels</span></code> are
 the labels its plans run under that may split (a within-step array’s read fills
 them from its label): where the node’s sequence shard lists one, the resource
-attends it by Ulysses, splitting the heads over TP × SP (see <strong>Sequence and
-context parallelism</strong>). <code class="docutils literal notranslate"><span class="pre">compile_op</span></code>, <code class="docutils literal notranslate"><span class="pre">workspace_mb</span></code> and <code class="docutils literal notranslate"><span class="pre">labels</span></code> are the
-model’s declaration; the serving config’s <code class="docutils literal notranslate"><span class="pre">resources:</span></code> overrides take only the
-backends and the ceilings.
+attends it by Ulysses, splitting the heads over TP × SP on a node whose shard
+splits (<code class="docutils literal notranslate"><span class="pre">SeqShardSpec.splits</span></code>; see <strong>Sequence and context parallelism</strong>).
+<code class="docutils literal notranslate"><span class="pre">compile_op</span></code>, <code class="docutils literal notranslate"><span class="pre">workspace_mb</span></code> and <code class="docutils literal notranslate"><span class="pre">labels</span></code> are the model’s declaration; the
+serving config’s <code class="docutils literal notranslate"><span class="pre">resources:</span></code> overrides take only the backends and the ceilings.
 See <a class="reference internal" href="#cacheless-attention-encoder-towers">Cacheless attention (encoder towers)</a> for <code class="docutils literal notranslate"><span class="pre">compile_op</span></code>.</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">RaggedCrossAttentionSpec(config=RaggedAttentionConfig(...))</span></code></p></td>
@@ -2148,9 +2149,10 @@ LTX-2.5 is the reference (<code class="docutils literal notranslate"><span class
 FlashInfer backend also returns each query row’s log-sum-exp (<code class="docutils literal notranslate"><span class="pre">[total_tokens,</span> <span class="pre">H]</span></code>, fp32,
 natural log) from the same plan, which is what merging attentions over disjoint key sets
 needs; a compiled caller breaks there even with <code class="docutils literal notranslate"><span class="pre">compile_op</span></code>. A label exchanged over SP ranks
-on its step can’t return one, and on SP ranks every label of a Ulysses resource (one over a label
-its shard lists) is, copied steps included: on a split step the resource merges the partials itself (LTX-2.5’s audio queries
-over each rank’s share of the video tokens, merged by <code class="docutils literal notranslate"><span class="pre">gather_merge</span></code>).</p>
+on its step can’t return one: on SP ranks of a node whose shard splits, that is every label of a
+Ulysses resource (one over a label its shard lists; copied steps included), and a cross-attention
+pair whose keys split on the step. Where keys split, the resource merges the partials itself
+(LTX-2.5’s audio queries over each rank’s share of the video tokens, merged by <code class="docutils literal notranslate"><span class="pre">gather_merge</span></code>).</p>
 </section>
 <section id="block-causal-attention-within-spans">
 <h4>Block-causal attention within spans<a class="headerlink" href="#block-causal-attention-within-spans" title="Link to this heading">#</a></h4>
@@ -2501,9 +2503,10 @@ meanwhile.</p>
 <p>A node that splits its steps over its SP ranks (a <code class="docutils literal notranslate"><span class="pre">SeqShardSpec</span></code>, SP &gt; 1) or runs CFG
 parallelism (cfg_size &gt; 1) cannot serve LoRA yet: the pool lays rows out per request over the
 whole batch, while each SP rank holds a shard of the tokens and each CFG rank one guidance
-branch’s rows, so the deployment is refused before spawn (SP) or when the pool is built (CFG). A
-node whose KV pools place positions over its SP ranks instead (context parallelism) runs every
-row on every SP rank, so it serves LoRA.</p>
+branch’s rows, so the deployment is refused before spawn (SP) or when the pool is built (CFG).
+That includes a node whose KV pools place positions over its SP ranks and whose sequence shard
+splits its steps (<code class="docutils literal notranslate"><span class="pre">exchange</span></code> <code class="docutils literal notranslate"><span class="pre">all_gather</span></code> or <code class="docutils literal notranslate"><span class="pre">ring</span></code>). One whose steps run copied (positions
+placed, <code class="docutils literal notranslate"><span class="pre">exchange</span></code> <code class="docutils literal notranslate"><span class="pre">auto</span></code> or <code class="docutils literal notranslate"><span class="pre">none</span></code>) runs every row on every SP rank, so it serves LoRA.</p>
 <p>Adapters loaded and unloaded at runtime (<code class="docutils literal notranslate"><span class="pre">/v1/load_lora_adapter</span></code>) reach each worker as
 a control message from the conductor, which each rank applies whenever it arrives rather
 than at a step the instance agrees on. <code class="docutils literal notranslate"><span class="pre">LoraAdapterPool.load_adapter_async</span></code> only reads the
@@ -3733,7 +3736,8 @@ buckets, which is a memory-against-coverage trade the deployment makes, not the 
 A resource sized per step refuses <code class="docutils literal notranslate"><span class="pre">max_segments_per_request</span></code>, which it would ignore.</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">SeqShardSpec</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">min_tokens</span></code> (see <strong>Sequence and context parallelism</strong> below)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">min_tokens</span></code>, <code class="docutils literal notranslate"><span class="pre">exchange</span></code> (<code class="docutils literal notranslate"><span class="pre">auto</span></code> / <code class="docutils literal notranslate"><span class="pre">none</span></code> / <code class="docutils literal notranslate"><span class="pre">ulysses</span></code> / <code class="docutils literal notranslate"><span class="pre">all_gather</span></code> /
+<code class="docutils literal notranslate"><span class="pre">ring</span></code>; see <strong>Sequence and context parallelism</strong> below)</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">LoraSpec</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">max_slots</span></code> (adapters resident on the device at once, beside the zero adapter),
@@ -3761,12 +3765,14 @@ example, <code class="docutils literal notranslate"><span class="pre">configs/qw
 two axes:</p>
 <ol class="arabic simple">
 <li><p><strong>Per step, the tokens are split or copied.</strong> A <code class="docutils literal notranslate"><span class="pre">SeqShardSpec</span></code> on the node decides, every step:
-split, each rank runs the token-local layers (norms, MLPs, projections) on its contiguous share
-of each listed label; or copied, every rank runs them all. Without one, every step is copied.</p></li>
+split, each rank runs the token-local layers (norms, MLPs, projections) on its share of each
+listed label (contiguous, or on a ring node striped by KV position); or copied, every rank runs
+them all. Without one, every step is copied.</p></li>
 <li><p><strong>Per paged KV pool, stored K/V is split by head or by position.</strong> By head (the default) over the
 node’s <code class="docutils literal notranslate"><span class="pre">tp</span> <span class="pre">*</span> <span class="pre">sp</span></code> ranks; by position with <code class="docutils literal notranslate"><span class="pre">context_parallel:</span> <span class="pre">true</span></code> (below), heads over TP.</p></li>
 </ol>
-<p>Each attention resource derives what it does from the two, and the model writes no exchange:</p>
+<p>Each attention resource derives what it does from the two and the shard’s <code class="docutils literal notranslate"><span class="pre">exchange</span></code> (below);
+the model writes no exchange (a ragged attention’s Ulysses follows from the labels it plans):</p>
 <div class="pst-scrollable-table-container"><table class="table">
 <colgroup>
 <col style="width: 22.0%" />
@@ -3785,12 +3791,14 @@ node’s <code class="docutils literal notranslate"><span class="pre">tp</span> 
 <tr class="row-even"><td><p>Copied</p></td>
 <td><p>head slice: this rank’s heads of q, k and v, write and attend, gather the heads</p></td>
 <td><p>each rank attends its slots, partials merged (below)</p></td>
-<td><p>heads over TP; over a label the shard lists, a head slice</p></td>
+<td><p>heads over TP; over a label the shard lists on a splitting node, a head slice</p></td>
 </tr>
 <tr class="row-odd"><td><p>Split</p></td>
 <td><p>Ulysses: one all-to-all from split tokens to split heads, write and attend, one back</p></td>
-<td><p>refused at load for now</p></td>
-<td><p>Ulysses over a label the spec’s <code class="docutils literal notranslate"><span class="pre">labels</span></code> list; any other split label refused at load</p></td>
+<td><p>by the shard’s <code class="docutils literal notranslate"><span class="pre">exchange</span></code> (below): <code class="docutils literal notranslate"><span class="pre">all_gather</span></code>, one gather of every rank’s q, k and
+v, attend as a copied step, keep this rank’s rows; or <code class="docutils literal notranslate"><span class="pre">ring</span></code>. With <code class="docutils literal notranslate"><span class="pre">auto</span></code>, the node’s
+steps run copied</p></td>
+<td><p>Ulysses over a label the spec’s <code class="docutils literal notranslate"><span class="pre">labels</span></code> list; any other split label refused at its first split step (hand-written spec)</p></td>
 </tr>
 <tr class="row-even"><td><p>Cross, split queries</p></td>
 <td><p>n/a</p></td>
@@ -3805,7 +3813,7 @@ node’s <code class="docutils literal notranslate"><span class="pre">tp</span> 
 <tr class="row-even"><td><p>Cross, both split</p></td>
 <td><p>n/a</p></td>
 <td><p>n/a</p></td>
-<td><p>refused at load</p></td>
+<td><p>refused at load for array reads; a hand-written spec, at its first split step</p></td>
 </tr>
 </tbody>
 </table>
@@ -3818,12 +3826,14 @@ of a <code class="docutils literal notranslate"><span class="pre">[B,</span> <sp
 to those walks; the others plan copied. A step splits only when it isn’t one token a row, its
 listed tokens reach <code class="docutils literal notranslate"><span class="pre">max(sp_size,</span> <span class="pre">min_tokens)</span></code>, and every listed label has at least
 <code class="docutils literal notranslate"><span class="pre">sp_size</span></code> tokens (a row, on axis 1). <code class="docutils literal notranslate"><span class="pre">min_tokens</span></code> (default 0) is a <code class="docutils literal notranslate"><span class="pre">resources:</span></code> override,
-a deployment’s trade between the exchanges’ cost and the split layers’ saving. A captured step
+a deployment’s trade between the exchanges’ cost and the split layers’ saving, as is
+<code class="docutils literal notranslate"><span class="pre">exchange</span></code> (below), how a split step reaches the node’s paged attentions. A captured step
 decides from its bucket’s size, not its prompt’s, so capture and replay split alike. Declare
 the spec over every node of the attention resources that depend on it: a resource spanning
-nodes the shard doesn’t cover is refused. <code class="docutils literal notranslate"><span class="pre">exchanges=False</span></code> declares that no op on the node
-mixes the label’s units, so nothing exchanges them: the node needs no attention, and a rank may
-get none of them (fewer units than ranks still splits). MiniMax-H3’s video decoder splits each
+nodes the shard doesn’t cover is refused, as is a KV pool whose attentions depend on two specs.
+<code class="docutils literal notranslate"><span class="pre">exchanges=False</span></code> declares that no op on the node mixes the label’s units, so nothing
+exchanges them: the node needs no attention, and a rank may get none of them (fewer units
+than ranks still splits). MiniMax-H3’s video decoder splits each
 request’s clips this way, reading <code class="docutils literal notranslate"><span class="pre">shard.split_range(label)</span></code> for its range and gathering the
 decoded clips with <code class="docutils literal notranslate"><span class="pre">shard.gather</span></code> (<code class="docutils literal notranslate"><span class="pre">mstar/model/minimax_h3/submodules.py</span></code>); such a shard
 is refused beside an attention that takes split steps.</p></li>
@@ -3845,28 +3855,124 @@ brackets the generation layer stack after its whole-sequence prologue
 (<code class="docutils literal notranslate"><span class="pre">mstar/model/cosmos3/components/transformer.py</span></code>).</p></li>
 <li><p>The attention is reached through the resource: a paged attention through <code class="docutils literal notranslate"><span class="pre">AttentionCallable</span></code>
 (<code class="docutils literal notranslate"><span class="pre">attend.write(k,</span> <span class="pre">v)</span></code> writes K/V alone; a no-op where the attention writes K/V inside its own
-run, <code class="docutils literal notranslate"><span class="pre">requires_kv_write</span></code> False), a ragged one through its <code class="docutils literal notranslate"><span class="pre">run</span></code>. A layer that
-writes through <code class="docutils literal notranslate"><span class="pre">write_target</span></code> or calls <code class="docutils literal notranslate"><span class="pre">attn.run</span></code> itself on a split label raises, since it
-would treat this rank’s share as the whole step. A cacheless self-attention over a label the
-shard lists runs Ulysses: an array declares nothing for it (its read’s resource lists its label),
-and a hand-written <code class="docutils literal notranslate"><span class="pre">RaggedAttentionSpec</span></code> lists the label in <code class="docutils literal notranslate"><span class="pre">labels</span></code>. Both are no-ops on a
-node with no <code class="docutils literal notranslate"><span class="pre">SeqShardSpec</span></code>, so one declaration serves every deployment shape. A read bound to
+run, <code class="docutils literal notranslate"><span class="pre">requires_kv_write</span></code> False), a ragged one through its <code class="docutils literal notranslate"><span class="pre">run</span></code>. A layer that writes
+through <code class="docutils literal notranslate"><span class="pre">write_target</span></code> or calls <code class="docutils literal notranslate"><span class="pre">attn.run</span></code> itself raises on a split label, since it would
+treat this rank’s share as the whole step, and on any step over KV stored by head, since it would
+pass the TP heads where the pool holds this rank’s slice. A state op that fuses the K/V write
+into its norm/RoPE kernel (Qwen3-Omni’s <code class="docutils literal notranslate"><span class="pre">qk_norm_rope_table_kv_write</span></code>) runs its reference,
+through <code class="docutils literal notranslate"><span class="pre">add</span></code> and the exchange, wherever the step’s read exchanges
+(<code class="docutils literal notranslate"><span class="pre">AttentionManager.step_exchanges(label)</span></code>): a label the step splits, and every step over KV
+stored by head, copied steps too (each rank’s head slice). A cacheless self-attention over a
+label the shard lists runs Ulysses: an array declares nothing for it (its read’s resource lists
+its label), and a hand-written <code class="docutils literal notranslate"><span class="pre">RaggedAttentionSpec</span></code> lists the label in <code class="docutils literal notranslate"><span class="pre">labels</span></code>. Both are
+no-ops on a node with no <code class="docutils literal notranslate"><span class="pre">SeqShardSpec</span></code>, or one whose sequence shard never splits
+(<code class="docutils literal notranslate"><span class="pre">SeqShardSpec.splits</span></code>), so one declaration serves every deployment shape. A read bound to
 SDPA (<code class="docutils literal notranslate"><span class="pre">backend:</span> <span class="pre">sdpa</span></code>) runs outside the resources and is refused over keys the shard splits.</p></li>
 </ul>
 <p>Every resource of a splitting node must support split steps (<code class="docutils literal notranslate"><span class="pre">Resource.supports_split_steps</span></code>:
 the KV pool, paged FlashInfer and dense attention, ragged self and cross attention, positions, the
-sampler); recurrent state doesn’t, so a splitting node can’t own any. The conductor
-refuses, before a worker starts (and the engine again at load): a node on SP ranks that neither declares a <code class="docutils literal notranslate"><span class="pre">SeqShardSpec</span></code>
-nor places its pools by position; a shard with no attention that can take split tokens (unless
-<code class="docutils literal notranslate"><span class="pre">exchanges=False</span></code>); a
-pool stored by position (<code class="docutils literal notranslate"><span class="pre">context_parallel</span></code>) on a node that splits its steps, not yet supported; a
-head-stored pool whose query and KV heads per TP rank don’t divide by <code class="docutils literal notranslate"><span class="pre">sp_size</span></code>; a ragged
-Ulysses attention whose heads don’t divide by <code class="docutils literal notranslate"><span class="pre">tp</span> <span class="pre">*</span> <span class="pre">sp</span></code>; an SDPA read over keys the shard splits; a ragged cross-attention under a shard on
-axis 0 (a packed split can leave a rank none of a row); and expert
-parallelism. The engine alone refuses a resource without <code class="docutils literal notranslate"><span class="pre">supports_split_steps</span></code> at load, and, at
-warmup (after the weights load and the compiles), piecewise captures, a capture replayed under
-listed and unlisted walks, and a packed capture of a listed walk unless the shard lists one label
-on axis 0 (its padding joins that label). Each attention resource of a splitting node logs at load how it takes split steps.</p>
+sampler); recurrent state doesn’t, so a splitting node can’t own any. The conductor refuses,
+before a worker starts (and the engine again at load): a node on SP ranks that neither splits its steps (a
+<code class="docutils literal notranslate"><span class="pre">SeqShardSpec</span></code> whose <code class="docutils literal notranslate"><span class="pre">exchange</span></code> isn’t <code class="docutils literal notranslate"><span class="pre">none</span></code>, with an attention that takes split steps or
+<code class="docutils literal notranslate"><span class="pre">exchanges=False</span></code>) nor places its pools by position; a shard on axis 1 over a pool stored by
+position; a head-stored pool whose query and KV heads per TP rank don’t divide by <code class="docutils literal notranslate"><span class="pre">sp_size</span></code>; a ragged
+Ulysses attention whose heads don’t divide by <code class="docutils literal notranslate"><span class="pre">tp</span> <span class="pre">*</span> <span class="pre">sp</span></code>, or beside a ring; an SDPA read over keys the
+shard splits; a ragged cross-attention under a shard on axis 0 or with <code class="docutils literal notranslate"><span class="pre">exchanges=False</span></code> (either can leave a rank
+none of a row); and expert parallelism. The engine alone refuses a resource without
+<code class="docutils literal notranslate"><span class="pre">supports_split_steps</span></code> at load, and, at warmup (after the weights load and the compiles),
+piecewise captures, a capture replayed under listed and unlisted walks, and a packed capture of a
+listed walk unless the shard lists one label on axis 0 (its padding joins that label). Each
+attention resource of a splitting node logs at load how it takes split steps.</p>
+<p><strong>Choosing the exchange.</strong> <code class="docutils literal notranslate"><span class="pre">exchange</span></code> on the node’s <code class="docutils literal notranslate"><span class="pre">SeqShardSpec</span></code> <code class="docutils literal notranslate"><span class="pre">resources:</span></code> block picks
+how its split steps’ tokens reach its paged attentions, from where their KV is stored. <code class="docutils literal notranslate"><span class="pre">auto</span></code>
+(the default) runs Ulysses over KV stored by head, and over KV stored by position runs the node’s
+steps copied, so a node whose pools store KV by position splits its steps only where the
+deployment opts in with <code class="docutils literal notranslate"><span class="pre">all_gather</span></code> or <code class="docutils literal notranslate"><span class="pre">ring</span></code>. A value the node’s storage can’t take fails at
+load, at any SP size. It only picks the split exchange: copied steps keep the storage’s own path.
+A ragged attention runs Ulysses over a label it plans that the shard lists (above), on a shard that splits.
+Each row assumes the node declares a <code class="docutils literal notranslate"><span class="pre">SeqShardSpec</span></code> and runs on <code class="docutils literal notranslate"><span class="pre">sp_size</span></code> above 1:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<colgroup>
+<col style="width: 14.0%" />
+<col style="width: 18.0%" />
+<col style="width: 24.0%" />
+<col style="width: 16.0%" />
+<col style="width: 28.0%" />
+</colgroup>
+<thead>
+<tr class="row-odd"><th class="head"><p><code class="docutils literal notranslate"><span class="pre">exchange</span></code></p></th>
+<th class="head"><p>KV stored</p></th>
+<th class="head"><p>Split steps</p></th>
+<th class="head"><p>Copied steps</p></th>
+<th class="head"><p>Pick it when</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">auto</span></code> / <code class="docutils literal notranslate"><span class="pre">ulysses</span></code></p></td>
+<td><p>by head</p></td>
+<td><p>Ulysses all-to-all</p></td>
+<td><p>head slice</p></td>
+<td><p>q and KV heads per TP rank divide by <code class="docutils literal notranslate"><span class="pre">sp_size</span></code> (Cosmos3; LTX-2.5, Wan2.2 and MiniMax-H3’s
+DiT, which have no paged pool, by their ragged attentions over the labels their shards list)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">auto</span></code> / <code class="docutils literal notranslate"><span class="pre">none</span></code></p></td>
+<td><p>by position (<code class="docutils literal notranslate"><span class="pre">context_parallel</span></code>)</p></td>
+<td><p>never: the node runs copied, as one without a shard</p></td>
+<td><p>partials merged</p></td>
+<td><p>KV capacity alone (DCP), no token split</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">all_gather</span></code></p></td>
+<td><p>by position</p></td>
+<td><p>gather q, k and v, attend as copied, keep own rows</p></td>
+<td><p>partials merged</p></td>
+<td><p>long prompts where one KV head per TP rank can’t split by head (Qwen3-Omni’s Thinker on
+TP4 x SP2)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">ring</span></code></p></td>
+<td><p>by position</p></td>
+<td><p>striped pass-Q ring, eager only</p></td>
+<td><p>partials merged</p></td>
+<td><p>attention is the step’s peak memory: past a per-model crossover (below)</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">none</span></code></p></td>
+<td><p>by head</p></td>
+<td><p>refused at load: the SP ranks would only share heads</p></td>
+<td><p>n/a</p></td>
+<td><p>never; use TP</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">ulysses</span></code> over KV stored by position, and <code class="docutils literal notranslate"><span class="pre">all_gather</span></code> or <code class="docutils literal notranslate"><span class="pre">ring</span></code> over KV stored by head, are
+refused. A shard that never splits (<code class="docutils literal notranslate"><span class="pre">none</span></code>, or <code class="docutils literal notranslate"><span class="pre">auto</span></code> over KV stored by position) makes the
+node plan every step copied, from the config alone, so it takes what a node without a shard takes
+(expert parallelism, say).</p>
+<p><strong>Ring</strong> (<code class="docutils literal notranslate"><span class="pre">exchange:</span> <span class="pre">ring</span></code>) stripes each split step’s tokens over the SP ranks by KV position: a row whose pool
+already stores <code class="docutils literal notranslate"><span class="pre">c</span></code> tokens gives rank <code class="docutils literal notranslate"><span class="pre">r</span></code> its tokens at positions <code class="docutils literal notranslate"><span class="pre">x</span></code> with <code class="docutils literal notranslate"><span class="pre">x</span> <span class="pre">%</span> <span class="pre">P</span> <span class="pre">==</span> <span class="pre">r</span></code>,
+exactly the ones whose K/V it stores, so it writes its own K/V and nothing moves. Each layer
+then runs <code class="docutils literal notranslate"><span class="pre">P</span></code> rounds: rank <code class="docutils literal notranslate"><span class="pre">r</span></code> sends its queries to rank <code class="docutils literal notranslate"><span class="pre">r</span> <span class="pre">+</span> <span class="pre">i</span></code>, attends rank <code class="docutils literal notranslate"><span class="pre">r</span> <span class="pre">-</span> <span class="pre">i</span></code>’s
+over its own slots (stored context and the step’s tokens together, one call, causal or not as the
+step declares), sends the partial back, and merges what it gets in fp32. Its hops are
+synchronous for now, and only the <code class="docutils literal notranslate"><span class="pre">flashinfer</span></code> backend plans it. Another is refused when the
+engine builds the attention, at any SP size like the storage checks, but after the validation that
+runs before a worker starts. A captured step
+runs copied on a ring node (ring is eager only), so prefill buckets above <code class="docutils literal notranslate"><span class="pre">min_tokens</span></code> that
+all-gather would split run copied there. A step that combines listed labels into one plan
+(<code class="docutils literal notranslate"><span class="pre">combined_labels</span></code>, Cosmos3’s batched CFG) is refused when it plans on a ring node, not at load
+(a step declares its combined labels): the stripe reads each listed label’s rows from the pool’s
+plan, which holds the combined label’s instead. A step’s peak memory is its resident tensors plus the
+larger of its attention and its MLP (or MoE) phase. All-gather’s attention phase holds the
+whole step’s q, k and v and <code class="docutils literal notranslate"><span class="pre">P</span></code> partials per query; ring’s holds this rank’s tokens alone, and
+two fp32 copies of their result while a round merges. So ring lowers the peak only once attention
+outgrows the MLP phase. Estimated from allocation sites: for the Thinker’s geometry from about
+<code class="docutils literal notranslate"><span class="pre">P</span> <span class="pre">=</span> <span class="pre">4</span></code> (at <code class="docutils literal notranslate"><span class="pre">P</span> <span class="pre">=</span> <span class="pre">2</span></code> the MoE phase is larger and the peaks equal), and sooner for dense
+models, whose MLP phase lacks the top-k expansion (not measured). The Thinker at 128K tokens on
+8 H100s, measured before this code’s last merge of main (a rerun is pending), peaked at 58.8 GB per
+GPU under ring and 57.9 GB under all-gather at TP4 x SP2, and at 66.8 GB and 70.5 GB at
+TP2 x SP4; ring prefilled faster in both (2.52 against 2.79 s, and 2.69 against 3.26 s). Ring
+merges <code class="docutils literal notranslate"><span class="pre">P</span></code> bf16 partials per query, and on 2 H200s at TP1 x SP2 changed 15 of 48 long greedy
+summaries against the copied path, where all-gather changed none.
+Chunked prefill stays off on SP ranks either way, so a long prompt prefills in one step.</p>
 <p><strong>Context parallelism.</strong> <code class="docutils literal notranslate"><span class="pre">context_parallel:</span> <span class="pre">true</span></code> on a paged KV pool stripes each page’s slots
 over the ranks that would otherwise store the same KV heads: slot <code class="docutils literal notranslate"><span class="pre">s</span></code> lives on partner
 <code class="docutils literal notranslate"><span class="pre">s</span> <span class="pre">%</span> <span class="pre">P</span></code>, page ids stay the same on every rank, and each rank holds <code class="docutils literal notranslate"><span class="pre">page_size</span> <span class="pre">/</span> <span class="pre">P</span></code> slots a
@@ -3882,8 +3988,11 @@ except for a plan label of an eager step that isn’t one token a row and has no
 on any row, which attends its own tokens alone.</p></li>
 <li><p><strong>SP mode.</strong> The partners are the node’s SP ranks, <code class="docutils literal notranslate"><span class="pre">P</span> <span class="pre">=</span> <span class="pre">sp_size</span></code>. Heads shard over TP alone.
 Without a <code class="docutils literal notranslate"><span class="pre">SeqShardSpec</span></code> every layer but attention runs copied across SP; prefer TP mode
-where it applies. Every paged pool of the node must set the key. Each layer all-gathers the
-partials; under the same exception it attends no slots and gathers its own tokens’ shares alone.
+where it applies. With one whose <code class="docutils literal notranslate"><span class="pre">exchange</span></code> is <code class="docutils literal notranslate"><span class="pre">all_gather</span></code> or <code class="docutils literal notranslate"><span class="pre">ring</span></code>, long steps split
+their tokens too (above).
+Every paged pool of the node must set the key. Each layer all-gathers the partials of a step
+copied or split by <code class="docutils literal notranslate"><span class="pre">all_gather</span></code>. Under the same exception such a step attends no slots and
+gathers its own tokens’ shares alone; a ring step never does.
 Chunked prefill stays off on SP ranks (<code class="docutils literal notranslate"><span class="pre">_unchunkable_nodes</span></code>), so SP mode prefills a prompt in
 one step; chunking an SP-placed pool’s prompts is not supported yet. TP mode chunks prompts as
 without placement.</p></li>

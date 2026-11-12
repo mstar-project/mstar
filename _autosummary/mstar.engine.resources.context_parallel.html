@@ -779,6 +779,13 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.context_parallel.OwnTokensKernel.whole_rows_only"><code class="docutils literal notranslate"><span class="pre">OwnTokensKernel.whole_rows_only</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.context_parallel.RingAttentionWrapper"><code class="docutils literal notranslate"><span class="pre">RingAttentionWrapper</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.context_parallel.RingAttentionWrapper.attend"><code class="docutils literal notranslate"><span class="pre">RingAttentionWrapper.attend()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.context_parallel.RingAttentionWrapper.forget_plan"><code class="docutils literal notranslate"><span class="pre">RingAttentionWrapper.forget_plan()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.context_parallel.RingAttentionWrapper.plan"><code class="docutils literal notranslate"><span class="pre">RingAttentionWrapper.plan()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.context_parallel.RingAttentionWrapper.reads_step_kv"><code class="docutils literal notranslate"><span class="pre">RingAttentionWrapper.reads_step_kv</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.context_parallel.SPContextParallelWrapper"><code class="docutils literal notranslate"><span class="pre">SPContextParallelWrapper</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.context_parallel.SPContextParallelWrapper.new"><code class="docutils literal notranslate"><span class="pre">SPContextParallelWrapper.new</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.context_parallel.SPContextParallelWrapper.own_tokens"><code class="docutils literal notranslate"><span class="pre">SPContextParallelWrapper.own_tokens()</span></code></a></li>
@@ -812,6 +819,8 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.context_parallel.merge"><code class="docutils literal notranslate"><span class="pre">merge()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.context_parallel.merge_lse"><code class="docutils literal notranslate"><span class="pre">merge_lse()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.context_parallel.position_pools"><code class="docutils literal notranslate"><span class="pre">position_pools()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.context_parallel.ring_hop"><code class="docutils literal notranslate"><span class="pre">ring_hop()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.context_parallel.stripe_owners"><code class="docutils literal notranslate"><span class="pre">stripe_owners()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.context_parallel.zigzag_capture"><code class="docutils literal notranslate"><span class="pre">zigzag_capture()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.context_parallel.zigzag_rows"><code class="docutils literal notranslate"><span class="pre">zigzag_rows()</span></code></a></li>
 </ul>
@@ -836,6 +845,9 @@ partner <code class="docutils literal notranslate"><span class="pre">s</span> <s
 <p>Attention over such a pool (<code class="docutils literal notranslate"><span class="pre">ContextParallelWrapper</span></code>) runs on each rank over its own slots and
 returns the partial with its log-sum-exp; the partners exchange partials and <code class="docutils literal notranslate"><span class="pre">merge</span></code> them,
 exactly.</p>
+<p>A step split over SP partners by stored position (<code class="docutils literal notranslate"><span class="pre">stripe_owners</span></code>) attends by passing queries
+round the partners instead (<code class="docutils literal notranslate"><span class="pre">RingAttentionWrapper</span></code>): each rank attends every partner’s queries
+over its own slots, and the partials go back to their queries’ rank.</p>
 <p class="rubric">Functions</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
@@ -853,6 +865,12 @@ exactly.</p>
 </tr>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.context_parallel.position_pools" title="mstar.engine.resources.context_parallel.position_pools"><code class="xref py py-obj docutils literal notranslate"><span class="pre">position_pools</span></code></a>(specs, node)</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">node</span></code>'s resources that hold token positions, each to whether it places them (<code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.places_positions</span></code>).</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.context_parallel.ring_hop" title="mstar.engine.resources.context_parallel.ring_hop"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ring_hop</span></code></a>(size, rank, offset, send, recv)</p></td>
+<td><p>A ring hop's <code class="docutils literal notranslate"><span class="pre">all_to_all_rows</span></code> counts at <code class="docutils literal notranslate"><span class="pre">offset</span></code>: <code class="docutils literal notranslate"><span class="pre">send</span></code> rows to rank <code class="docutils literal notranslate"><span class="pre">rank</span> <span class="pre">+</span> <span class="pre">offset</span></code>, <code class="docutils literal notranslate"><span class="pre">recv</span></code> back from rank <code class="docutils literal notranslate"><span class="pre">rank</span> <span class="pre">-</span> <span class="pre">offset</span></code>, of <code class="docutils literal notranslate"><span class="pre">size</span></code>.</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.context_parallel.stripe_owners" title="mstar.engine.resources.context_parallel.stripe_owners"><code class="xref py py-obj docutils literal notranslate"><span class="pre">stripe_owners</span></code></a>(qo_indptr, stored, size)</p></td>
+<td><p>Which of <code class="docutils literal notranslate"><span class="pre">size</span></code> partners stores each of a step's tokens: a row's token <code class="docutils literal notranslate"><span class="pre">t</span></code> goes to KV position <code class="docutils literal notranslate"><span class="pre">stored</span> <span class="pre">+</span> <span class="pre">t</span></code> (<code class="docutils literal notranslate"><span class="pre">stored</span></code> per row, the row's KV before the step), whose slot partner <code class="docutils literal notranslate"><span class="pre">(stored</span> <span class="pre">+</span> <span class="pre">t)</span> <span class="pre">%</span> <span class="pre">size</span></code> holds, as <code class="docutils literal notranslate"><span class="pre">size</span></code> divides the page.</p></td>
 </tr>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.context_parallel.zigzag_capture" title="mstar.engine.resources.context_parallel.zigzag_capture"><code class="xref py py-obj docutils literal notranslate"><span class="pre">zigzag_capture</span></code></a>(size, rows, tokens)</p></td>
 <td><p>A zigzag share's kernel captured for a bucket of <code class="docutils literal notranslate"><span class="pre">rows</span></code> rows and <code class="docutils literal notranslate"><span class="pre">tokens</span></code> tokens: its fixed rows (at most 2 chunks a row, and one more for the padding queries) and queries (at most <code class="docutils literal notranslate"><span class="pre">ceil(T</span> <span class="pre">/</span> <span class="pre">2P)</span></code> a chunk).</p></td>
@@ -881,22 +899,25 @@ exactly.</p>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.context_parallel.OwnTokensKernel" title="mstar.engine.resources.context_parallel.OwnTokensKernel"><code class="xref py py-obj docutils literal notranslate"><span class="pre">OwnTokensKernel</span></code></a>()</p></td>
 <td><p>Attention of rows of a step's own queries over lists of its own tokens as keys (<code class="docutils literal notranslate"><span class="pre">KeyRows</span></code>), from the keys the layer passes <code class="docutils literal notranslate"><span class="pre">run</span></code>: a placed pool's own-token part, TP's whole rows and SP's zigzag share alike (<code class="docutils literal notranslate"><span class="pre">PlacedAttention.own_tokens_kernel</span></code> supplies it).</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.context_parallel.SPContextParallelWrapper" title="mstar.engine.resources.context_parallel.SPContextParallelWrapper"><code class="xref py py-obj docutils literal notranslate"><span class="pre">SPContextParallelWrapper</span></code></a>(placement, ...[, ...])</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.context_parallel.RingAttentionWrapper" title="mstar.engine.resources.context_parallel.RingAttentionWrapper"><code class="xref py py-obj docutils literal notranslate"><span class="pre">RingAttentionWrapper</span></code></a>(placement, page_size, ...)</p></td>
+<td><p>A split step's attention over an SP-placed pool by striped pass-Q.</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.context_parallel.SPContextParallelWrapper" title="mstar.engine.resources.context_parallel.SPContextParallelWrapper"><code class="xref py py-obj docutils literal notranslate"><span class="pre">SPContextParallelWrapper</span></code></a>(placement, ...[, ...])</p></td>
 <td><p>Attention over an <code class="docutils literal notranslate"><span class="pre">SPPlacement</span></code>: the partners hold the same heads, so each attends its own slots and its zigzag share of the own tokens (<code class="docutils literal notranslate"><span class="pre">ZigzagWrapper</span></code>) for its own queries, merges the two, and one gather merges every partner's.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.context_parallel.SPPlacement" title="mstar.engine.resources.context_parallel.SPPlacement"><code class="xref py py-obj docutils literal notranslate"><span class="pre">SPPlacement</span></code></a>(size, index, group)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.context_parallel.SPPlacement" title="mstar.engine.resources.context_parallel.SPPlacement"><code class="xref py py-obj docutils literal notranslate"><span class="pre">SPPlacement</span></code></a>(size, index, group)</p></td>
 <td><p>Placed over the node's SP group, whose ranks hold the same heads: the partners are the whole group, in rank order (<code class="docutils literal notranslate"><span class="pre">SPContextParallelWrapper</span></code>).</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.context_parallel.ShareCapture" title="mstar.engine.resources.context_parallel.ShareCapture"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ShareCapture</span></code></a>(rows, queries, tokens)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.context_parallel.ShareCapture" title="mstar.engine.resources.context_parallel.ShareCapture"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ShareCapture</span></code></a>(rows, queries, tokens)</p></td>
 <td><p>What the kernel of a captured step's own tokens is sized for.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.context_parallel.TPContextParallelWrapper" title="mstar.engine.resources.context_parallel.TPContextParallelWrapper"><code class="xref py py-obj docutils literal notranslate"><span class="pre">TPContextParallelWrapper</span></code></a>(placement, ...[, ...])</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.context_parallel.TPContextParallelWrapper" title="mstar.engine.resources.context_parallel.TPContextParallelWrapper"><code class="xref py py-obj docutils literal notranslate"><span class="pre">TPContextParallelWrapper</span></code></a>(placement, ...[, ...])</p></td>
 <td><p>Attention over a <code class="docutils literal notranslate"><span class="pre">TPPlacement</span></code>: the partners hold different query heads of one KV head, so each attends its slots for every partner's heads (<code class="docutils literal notranslate"><span class="pre">_exchange_queries</span></code>), sends each partner its heads' partial back (<code class="docutils literal notranslate"><span class="pre">_exchange_partials</span></code>), and merges them with the own tokens, which it attends whole for its own heads.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.context_parallel.TPPlacement" title="mstar.engine.resources.context_parallel.TPPlacement"><code class="xref py py-obj docutils literal notranslate"><span class="pre">TPPlacement</span></code></a>(size, index, group, partners)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.context_parallel.TPPlacement" title="mstar.engine.resources.context_parallel.TPPlacement"><code class="xref py py-obj docutils literal notranslate"><span class="pre">TPPlacement</span></code></a>(size, index, group, partners)</p></td>
 <td><p>Placed over the block of the node's TP ranks that hold one KV head, each with different query heads of it (<code class="docutils literal notranslate"><span class="pre">TPContextParallelWrapper</span></code>).</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.context_parallel.ZigzagWrapper" title="mstar.engine.resources.context_parallel.ZigzagWrapper"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ZigzagWrapper</span></code></a>(placement, kernel, device)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.context_parallel.ZigzagWrapper" title="mstar.engine.resources.context_parallel.ZigzagWrapper"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ZigzagWrapper</span></code></a>(placement, kernel, device)</p></td>
 <td><p>A step's own tokens under SP placement, attended for this rank's zigzag chunks alone on <code class="docutils literal notranslate"><span class="pre">kernel</span></code>, out 0 and lse -inf off them.</p></td>
 </tr>
 </tbody>
@@ -1255,6 +1276,100 @@ captured bucket’s padding) holds whatever the kernel left, which reaches no re
 </dd></dl>
 
 <dl class="py class">
+<dt class="sig sig-object py" id="mstar.engine.resources.context_parallel.RingAttentionWrapper">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.context_parallel.</span></span><span class="sig-name descname"><span class="pre">RingAttentionWrapper</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">placement</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">page_size</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">dtype</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">paged</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">device</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/context_parallel.html#RingAttentionWrapper"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.context_parallel.RingAttentionWrapper" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
+<p>A split step’s attention over an SP-placed pool by striped pass-Q. The step’s tokens are
+striped over the partners by KV position (<code class="docutils literal notranslate"><span class="pre">stripe_owners</span></code>), so each rank holds the queries
+whose K/V it writes into its own slots. In round <code class="docutils literal notranslate"><span class="pre">i</span></code> a rank attends partner <code class="docutils literal notranslate"><span class="pre">(r</span> <span class="pre">-</span> <span class="pre">i)</span> <span class="pre">%</span> <span class="pre">P</span></code>’s
+queries over its slots, the stored context and the step’s own tokens together, with one call
+(<code class="docutils literal notranslate"><span class="pre">_ring_rows</span></code>); the partial goes back to that partner, which merges it into its running
+result (<code class="docutils literal notranslate"><span class="pre">merge_lse</span></code>).</p>
+<p>One causal call is exact because a partner’s queries in a row sit at KV positions <code class="docutils literal notranslate"><span class="pre">p0</span> <span class="pre">+</span> <span class="pre">aP</span></code>,
+and this rank’s keys at or below <code class="docutils literal notranslate"><span class="pre">p</span></code> number <code class="docutils literal notranslate"><span class="pre">(p</span> <span class="pre">-</span> <span class="pre">r)</span> <span class="pre">//</span> <span class="pre">P</span> <span class="pre">+</span> <span class="pre">1</span></code>: one more per query, so the
+kernel’s bottom-right causal mask over the local length to the row’s last query is the right
+one. Only a row’s first query can see no key here (<code class="docutils literal notranslate"><span class="pre">p0</span> <span class="pre">&lt;</span> <span class="pre">r</span></code>); it plans as a row of its own
+over one sink slot, masked out of the merge (<code class="docutils literal notranslate"><span class="pre">_masked</span></code>), and its own rank always holds a key
+of it. Not causal, each row’s queries see its whole length, and a row with no slot here is
+masked the same way. A row this partner holds no query of is left out of its plan.</p>
+<p><code class="docutils literal notranslate"><span class="pre">paged</span></code> is one eager kernel over this rank’s slots per partner, all planned per step.
+Eager only: a striped shard plans a leased step copied. The partner plans differ by rank and
+no admission bounds them: FlashInfer’s paged manager, the one backend that takes a placed pool
+(<code class="docutils literal notranslate"><span class="pre">PlacedAttention</span></code>), so the one that plans a ring, bounds no plan at admission, as no refusal
+of its planner on lengths is known. A backend whose planner may refuse on lengths (MLA’s FA
+planner) would have to bound every rank’s partner plans at admission before it could plan a
+ring, or one rank alone could refuse a lockstep step.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>placement</strong> (<a class="reference internal" href="#mstar.engine.resources.context_parallel.SPPlacement" title="mstar.engine.resources.context_parallel.SPPlacement"><em>SPPlacement</em></a>)</p></li>
+<li><p><strong>page_size</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>dtype</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensor_attributes.html#torch.dtype" title="(in PyTorch v2.15)"><em>dtype</em></a>)</p></li>
+<li><p><strong>paged</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><em>PagedKernel</em><em>]</em>)</p></li>
+<li><p><strong>device</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensor_attributes.html#torch.device" title="(in PyTorch v2.15)"><em>device</em></a>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.context_parallel.RingAttentionWrapper.attend">
+<span class="sig-name descname"><span class="pre">attend</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">q</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">kv_cache_layer</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">k</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">v</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/context_parallel.html#RingAttentionWrapper.attend"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.context_parallel.RingAttentionWrapper.attend" title="Link to this definition">#</a></dt>
+<dd><p>This rank’s queries’ attention over the whole pool, in their dtype, as
+<code class="docutils literal notranslate"><span class="pre">ContextParallelWrapper.attend</span></code> takes them; the step’s own tokens are already written,
+so <code class="docutils literal notranslate"><span class="pre">k</span></code> and <code class="docutils literal notranslate"><span class="pre">v</span></code> are unread. <code class="docutils literal notranslate"><span class="pre">2(P</span> <span class="pre">-</span> <span class="pre">1)</span></code> exchanges, the same on every rank, each awaited
+before its result is read.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>q</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
+<li><p><strong>kv_cache_layer</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
+<li><p><strong>k</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>v</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a><em> | </em><em>None</em>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.context_parallel.RingAttentionWrapper.forget_plan">
+<span class="sig-name descname"><span class="pre">forget_plan</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/context_parallel.html#RingAttentionWrapper.forget_plan"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.context_parallel.RingAttentionWrapper.forget_plan" title="Link to this definition">#</a></dt>
+<dd><p>Every <code class="docutils literal notranslate"><span class="pre">plan</span></code> plans every kernel, so there is nothing to forget.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.context_parallel.RingAttentionWrapper.plan">
+<span class="sig-name descname"><span class="pre">plan</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">kv_out</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">counts</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">causal</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">True</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/context_parallel.html#RingAttentionWrapper.plan"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.context_parallel.RingAttentionWrapper.plan" title="Link to this definition">#</a></dt>
+<dd><p><code class="docutils literal notranslate"><span class="pre">kv_out</span></code>: the step’s logical <code class="docutils literal notranslate"><span class="pre">KVPlanOutput</span></code> for the label; <code class="docutils literal notranslate"><span class="pre">counts</span></code>: each partner’s
+queries, as the sequence shard striped them from the same plan (<code class="docutils literal notranslate"><span class="pre">SeqRange.counts</span></code>);
+<code class="docutils literal notranslate"><span class="pre">causal</span></code>: the step’s.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>counts</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><em>tuple</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>, </em><em>...</em><em>]</em>)</p></li>
+<li><p><strong>causal</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.context_parallel.RingAttentionWrapper.reads_step_kv">
+<span class="sig-name descname"><span class="pre">reads_step_kv</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></span><a class="headerlink" href="#mstar.engine.resources.context_parallel.RingAttentionWrapper.reads_step_kv" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
 <dt class="sig sig-object py" id="mstar.engine.resources.context_parallel.SPContextParallelWrapper">
 <span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.context_parallel.</span></span><span class="sig-name descname"><span class="pre">SPContextParallelWrapper</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">placement</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">page_size</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">dtype</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">context</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">new</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">device</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">batch_size</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">max_total_tokens</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/context_parallel.html#SPContextParallelWrapper"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.context_parallel.SPContextParallelWrapper" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference internal" href="#mstar.engine.resources.context_parallel.ContextParallelWrapper" title="mstar.engine.resources.context_parallel.ContextParallelWrapper"><code class="xref py py-class docutils literal notranslate"><span class="pre">ContextParallelWrapper</span></code></a></p>
@@ -1580,6 +1695,47 @@ fp32.</p>
 </dd></dl>
 
 <dl class="py function">
+<dt class="sig sig-object py" id="mstar.engine.resources.context_parallel.ring_hop">
+<span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.context_parallel.</span></span><span class="sig-name descname"><span class="pre">ring_hop</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">size</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rank</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">offset</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">send</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">recv</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/context_parallel.html#ring_hop"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.context_parallel.ring_hop" title="Link to this definition">#</a></dt>
+<dd><p>A ring hop’s <code class="docutils literal notranslate"><span class="pre">all_to_all_rows</span></code> counts at <code class="docutils literal notranslate"><span class="pre">offset</span></code>: <code class="docutils literal notranslate"><span class="pre">send</span></code> rows to rank <code class="docutils literal notranslate"><span class="pre">rank</span> <span class="pre">+</span> <span class="pre">offset</span></code>,
+<code class="docutils literal notranslate"><span class="pre">recv</span></code> back from rank <code class="docutils literal notranslate"><span class="pre">rank</span> <span class="pre">-</span> <span class="pre">offset</span></code>, of <code class="docutils literal notranslate"><span class="pre">size</span></code>.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>size</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>rank</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>offset</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>send</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>recv</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)">tuple</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)">list</a>[<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a>], <a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)">list</a>[<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a>]]</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.engine.resources.context_parallel.stripe_owners">
+<span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.context_parallel.</span></span><span class="sig-name descname"><span class="pre">stripe_owners</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">qo_indptr</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">stored</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">size</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/context_parallel.html#stripe_owners"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.context_parallel.stripe_owners" title="Link to this definition">#</a></dt>
+<dd><p>Which of <code class="docutils literal notranslate"><span class="pre">size</span></code> partners stores each of a step’s tokens: a row’s token <code class="docutils literal notranslate"><span class="pre">t</span></code> goes to KV
+position <code class="docutils literal notranslate"><span class="pre">stored</span> <span class="pre">+</span> <span class="pre">t</span></code> (<code class="docutils literal notranslate"><span class="pre">stored</span></code> per row, the row’s KV before the step), whose slot partner
+<code class="docutils literal notranslate"><span class="pre">(stored</span> <span class="pre">+</span> <span class="pre">t)</span> <span class="pre">%</span> <span class="pre">size</span></code> holds, as <code class="docutils literal notranslate"><span class="pre">size</span></code> divides the page.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>qo_indptr</strong> (<em>ndarray</em>)</p></li>
+<li><p><strong>stored</strong> (<em>ndarray</em>)</p></li>
+<li><p><strong>size</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><em>ndarray</em></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
 <dt class="sig sig-object py" id="mstar.engine.resources.context_parallel.zigzag_capture">
 <span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.context_parallel.</span></span><span class="sig-name descname"><span class="pre">zigzag_capture</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">size</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rows</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">tokens</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/context_parallel.html#zigzag_capture"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.context_parallel.zigzag_capture" title="Link to this definition">#</a></dt>
 <dd><p>A zigzag share’s kernel captured for a bucket of <code class="docutils literal notranslate"><span class="pre">rows</span></code> rows and <code class="docutils literal notranslate"><span class="pre">tokens</span></code> tokens: its
@@ -1707,6 +1863,13 @@ chunk’s last (or the row’s, not causal).</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.context_parallel.OwnTokensKernel.whole_rows_only"><code class="docutils literal notranslate"><span class="pre">OwnTokensKernel.whole_rows_only</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.context_parallel.RingAttentionWrapper"><code class="docutils literal notranslate"><span class="pre">RingAttentionWrapper</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.context_parallel.RingAttentionWrapper.attend"><code class="docutils literal notranslate"><span class="pre">RingAttentionWrapper.attend()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.context_parallel.RingAttentionWrapper.forget_plan"><code class="docutils literal notranslate"><span class="pre">RingAttentionWrapper.forget_plan()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.context_parallel.RingAttentionWrapper.plan"><code class="docutils literal notranslate"><span class="pre">RingAttentionWrapper.plan()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.context_parallel.RingAttentionWrapper.reads_step_kv"><code class="docutils literal notranslate"><span class="pre">RingAttentionWrapper.reads_step_kv</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.context_parallel.SPContextParallelWrapper"><code class="docutils literal notranslate"><span class="pre">SPContextParallelWrapper</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.context_parallel.SPContextParallelWrapper.new"><code class="docutils literal notranslate"><span class="pre">SPContextParallelWrapper.new</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.context_parallel.SPContextParallelWrapper.own_tokens"><code class="docutils literal notranslate"><span class="pre">SPContextParallelWrapper.own_tokens()</span></code></a></li>
@@ -1740,6 +1903,8 @@ chunk’s last (or the row’s, not causal).</p>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.context_parallel.merge"><code class="docutils literal notranslate"><span class="pre">merge()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.context_parallel.merge_lse"><code class="docutils literal notranslate"><span class="pre">merge_lse()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.context_parallel.position_pools"><code class="docutils literal notranslate"><span class="pre">position_pools()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.context_parallel.ring_hop"><code class="docutils literal notranslate"><span class="pre">ring_hop()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.context_parallel.stripe_owners"><code class="docutils literal notranslate"><span class="pre">stripe_owners()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.context_parallel.zigzag_capture"><code class="docutils literal notranslate"><span class="pre">zigzag_capture()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.context_parallel.zigzag_rows"><code class="docutils literal notranslate"><span class="pre">zigzag_rows()</span></code></a></li>
 </ul>
