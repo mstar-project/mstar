@@ -91,6 +91,11 @@ class BoundedKVManager(Resource):
         """One layer's slots, ``[max_slots, rows, H, cap, 2D]``."""
         return self._cache[layer_idx]
 
+    def written(self, rid: str) -> int:
+        """The entries committed for ``rid``: 0 for a rid that holds no slot, never admitted or torn down."""
+        req = self._requests.get(rid)
+        return 0 if req is None else req.written
+
     @property
     def current(self) -> BoundedPlan:
         if self._current is None:

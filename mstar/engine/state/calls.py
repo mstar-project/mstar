@@ -119,6 +119,9 @@ class ArrayHandle(StepHandle):
         if self._kept and self._kept != self.array.layers:
             raise self._refusal(f"layers {sorted(self.array.layers - self._kept)} have no add in a step that keeps "
                                 "adds on others, and every layer stays the same length")
+        if self._held is not None:
+            raise self._refusal(f"the step ends with layer {self._held_layer}'s add unread, on a kernel that takes k "
+                                "and v at the read, so nothing keeps it")
 
     def commit_step(self, step) -> None:
         """Nothing: the resources hold what a step keeps of the array."""

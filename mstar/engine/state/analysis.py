@@ -119,13 +119,13 @@ def _array_problems(array: Array) -> list[str]:
     where = f"Array {array.name!r}"
     problems: list[str] = []
     for key, read in array.reads.items():
-        if isinstance(read.mask, Block) and array.max_len:
+        if isinstance(read.mask, Block) and array.max_len != 0:
             problems.append(f"{where}.reads[{key!r}].mask: Block needs max_len 0, and max_len is {array.max_len}")
-        elif not isinstance(read.mask, Block) and not array.max_len:
+        elif not isinstance(read.mask, Block) and array.max_len == 0:
             problems.append(f"{where}.reads[{key!r}].mask: every read of an array with max_len 0 is a Block read, "
                             f"and this one is {type(read.mask).__name__}")
     if array.positions is not None:
-        if array.rewritable or not array.max_len:
+        if array.rewritable or array.max_len == 0:
             problems.append(f"{where}.positions: positions sit only on an append-only array that keeps entries")
         rope = array.positions.rope
         llama31 = () if rope is None else (rope.low_freq_factor, rope.high_freq_factor, rope.old_context_len)
@@ -322,7 +322,7 @@ def deployment_problems(
                             "itself, where only a field an update op writes takes a stored dtype")
         for key, read in array.reads.items():
             shards = max((head_shards.get(node, 1) for node in array.nodes), default=1)
-            narrows = not array.max_len and narrows_heads(array, query_array(array, read, arrays), arrays.values())
+            narrows = array.max_len == 0 and narrows_heads(array, query_array(array, read, arrays), arrays.values())
             if narrows and read.op.q_heads % shards:
                 problems.append(f"Array {array.name!r}.reads[{key!r}]: q_heads {read.op.q_heads} doesn't divide by "
                                 f"{shards}, TP times SP, which the read narrows its heads by")

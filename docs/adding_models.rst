@@ -671,8 +671,8 @@ and of ``kernel_settings()`` against the conductor's at startup, and a mismatch 
 server, naming what differs.
 
 An **array** holds, per request, per label and per declared layer, entries at log positions
-``0`` to ``n - 1``, with ``n <= max_len``. An entry's index is its log position, never its
-RoPE position or a ring slot.
+``0`` to ``n - 1``, with ``n <= max_len``, or with no bound when ``max_len`` is None. An entry's
+index is its log position, never its RoPE position or a ring slot.
 
 .. code-block:: python
 
@@ -730,6 +730,12 @@ deployment YAML tunes them under ``resources:`` (see :ref:`Step 6 <config-yaml>`
 - ``max_len=0``: the array keeps nothing between steps, for attention within this step only.
   Its one read uses ``Block()``, which sees only the entries of the token's own segment. See
   `Cacheless attention (encoder towers)`_.
+- ``max_len=None``: the log has no bound, and the engine keeps what the reads can still reach.
+  Today such an array takes one label and one ``Window`` read through ``Attend``, with
+  ``packed=False`` and as many query heads as the entry, over every layer. A bounded KV holds it,
+  one slot per request (`Bounded (sink + window) caches`_). Its read takes ``distance_bias``,
+  ``(rows, q_heads, T, size)``, whose entry ``d`` adds to the score of the key at distance ``d``,
+  and ``Positions()`` is each request's count of committed entries.
 - ``Positions(rope=)``: a position counter per request and label, on an append-only array
   that keeps entries. ``rope=None`` is a counter only. ``Rope`` carries ``theta``,
   ``rotary_dim``, ``interleave``, ``scale``, the Llama 3.1 factors (all three or none), the
@@ -775,7 +781,7 @@ segments in this step, and each request's k-th segment on one pairs with its k-t
 It takes a mask that uses no query position: ``Block()`` on an array with ``max_len=0``, and
 ``Bidirectional()`` on one that keeps entries, whose context is added on the walk that carries it
 and listed at span 0 afterwards. A cross read on an array that keeps entries is that array's one
-read, over one label, and its queries come from an append-only array that keeps entries. A
+read, over one label, and its queries come from an append-only array that keeps entries in pages. A
 ``max_len=0`` cross read's queries come from an array of one label, and ``queries`` never names the
 read's own array. Separate token sets are separate arrays, and arrays of one kind and geometry on one node share one resource,
 each under its own label.
@@ -787,8 +793,9 @@ only the queries sharded, and a merge of the ranks' partial attentions with only
 
 A read takes its queries packed, ``(tokens, heads, head_dim)`` over every row. A read whose layers
 pass rows of one length, ``(rows, len, heads, head_dim)``, as a DiT's do, declares
-``packed=False``, and a packed call to it is refused. A read on an array that keeps entries takes
-packed queries, since the paged kernels take no others.
+``packed=False``, and a packed call to it is refused. A read on an array with a ``max_len`` above 0
+takes packed queries, since the paged kernels take no others. A read on an unbounded array takes
+rows, each row's span first and the rest of its length padding.
 A read whose request's segments lie end to end in one row, as a DiT's packed rows and their pad
 do, declares ``segmented=True``. It takes ``Block()``, ``packed=False`` and no ``queries``, and it
 runs one request a step. Under sequence parallelism the ranks split each request's whole row by
@@ -818,10 +825,10 @@ returns, and the step declares the next one in ``ArrayStep(host=)``, so a step p
 a refused admit draws the same noise.
 
 ``kernel_settings(self)`` is a temporary hook for what the engine doesn't pick itself yet:
-``splits``, ``decode_fmha`` and ``decode_tensor_cores`` on a read of an array that keeps entries,
+``splits``, ``decode_fmha`` and ``decode_tensor_cores`` on a read of a paged array,
 ``splits`` on a ``GatedDeltaNet``, and ``max_segments_per_request``, ``max_segments_per_step``,
 ``compile_op`` and ``workspace_mb`` on a ``Block`` read. Under an array's name it sets the default size of the array's pool, ``max_num_pages``
-on a paged array and ``max_slots`` on a ``Value`` with tensor fields, which a deployment's
+on a paged array and ``max_slots`` on a ``Value`` with tensor fields or an unbounded array, which a deployment's
 ``resources:`` block overrides. A cross read on an array that keeps entries takes
 ``decode_tensor_cores`` alone, and two reads that share a resource can't set one field to two
 values. It refuses anything else.
@@ -1416,7 +1423,8 @@ Bounded (sink + window) caches
 
 A streaming decoder that keeps a fixed amount of context per request (a prompt or voice
 prefix plus the last N steps, as StreamingLLM-style sinks or a streaming vocoder's chunk
-caches do) declares a ``BoundedKVSpec``. A request takes a slot when it first runs and
+caches do) declares a ``BoundedKVSpec``, or on the state contract an ``Array`` with
+``max_len=None``. A request takes a slot when it first runs and
 keeps it; the window is a ring overwritten in place, so a step reserves and releases
 nothing. A step's layout is at most five key ranges and three write ranges per row,
 computed on the host from the position the step declares, which is also what lets rows at

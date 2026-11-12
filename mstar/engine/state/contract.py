@@ -86,7 +86,8 @@ class Causal(Mask):
 
 @dataclass(frozen=True)
 class Window(Mask):
-    """Sees {k : q - size < k <= q}."""
+    """Sees {k : q - size < k <= q}. A read through `Attend` may pass ``distance_bias``, (rows, q_heads, T, size), whose
+    entry d is added to the score of the key at distance d before the op's scale."""
 
     size: int
 
@@ -244,6 +245,7 @@ class Array:
     ``updates`` are kernels that replace a Value's entry with its next version. The version they overwrite is gone,
     so prefix caching and undo save a copy before one runs.
     With ``max_len`` 0 an array keeps nothing between steps, so every add is scratch.
+    With ``max_len`` None the log has no bound, and the engine keeps what the reads can still reach.
     """
 
     name: str
@@ -251,7 +253,7 @@ class Array:
     nodes: frozenset[str]
     layers: frozenset[int]
     entry: Entry
-    max_len: int
+    max_len: int | None
     reads: Mapping[str, Read] = EMPTY    # empty: read whole
     updates: Mapping[str, Op] = EMPTY
     rewritable: bool = False
@@ -276,8 +278,8 @@ class Array:
             raise ValueError(f"{where}.layers is empty, and only a Value may declare no layers")
         if not self.labels:
             raise ValueError(f"{where}.labels must be non-empty")
-        if not (type(self.max_len) is int and self.max_len >= 0):
-            raise ValueError(f"{where}.max_len must be an int >= 0, got {self.max_len!r}")
+        if not (self.max_len is None or type(self.max_len) is int and self.max_len >= 0):
+            raise ValueError(f"{where}.max_len must be None or an int >= 0, got {self.max_len!r}")
         self._check_entry()
         for key, read in self.reads.items():
             self._check_read(key, read)
