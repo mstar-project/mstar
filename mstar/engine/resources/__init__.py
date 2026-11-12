@@ -21,12 +21,14 @@ from mstar.engine.resources.attn.config import (
     CrossAttentionSpec,
 )
 from mstar.engine.resources.attn.ragged.config import (
+    KeyPrefixAttentionStep,
     RaggedAttentionConfig,
     RaggedAttentionSpec,
     RaggedAttnBackend,
     RaggedBlockCausalAttentionSpec,
     RaggedCrossAttentionSpec,
     RaggedCrossAttentionStep,
+    RaggedKeyPrefixAttentionSpec,
     cross_label,
 )
 from mstar.engine.resources.base import CGSlotSpec, PublishedInfo, Rebuild, Residency, Resource, StepAllowance
@@ -116,6 +118,8 @@ __all__ = [
     "RaggedBlockCausalAttentionSpec",
     "RaggedCrossAttentionSpec",
     "RaggedCrossAttentionStep",
+    "RaggedKeyPrefixAttentionSpec",
+    "KeyPrefixAttentionStep",
     "Rebuild",
     "Residency",
     "Resource",
