@@ -84,13 +84,28 @@ class _DenseRaggedPrefillBase(_RaggedPrefillBase):
         )
 
 
+# eager non-causal plans with at most this many segments run FA4 dense, a call per segment
+_FA4_DENSE_MAX_SEGMENTS = 8
+
+
 class _Fa4RaggedPrefillBase(_DenseRaggedPrefillBase):
-    """FlashAttention 4 varlen (``flash_attn.cute``): the same plan and graph-mode
-    tail handling as FA3, another kernel call."""
+    """FlashAttention 4 (``flash_attn.cute``): the same plan and graph-mode tail handling as FA3, another kernel
+    call. An eager non-causal plan of a few segments runs one dense call per segment, each writing its rows of the
+    packed output: FA4 schedules a dense non-causal call statically persistent, which varlen can't, and the result
+    is varlen's bit for bit (MiniMax-H3's 2-head calls over 38K rows: 6% faster on B300; 1 head: 11%)."""
+
+    def _plan_kernel(self, cu: torch.Tensor, kv_cu: torch.Tensor, total_tokens: int, causal: bool) -> None:
+        super()._plan_kernel(cu, kv_cu, total_tokens, causal)
+        self._segments = None
+        if not self.accelerator_graph and not causal and cu.numel() - 1 <= _FA4_DENSE_MAX_SEGMENTS:
+            q_cu, k_cu = cu.cpu().tolist(), kv_cu.cpu().tolist()
+            self._segments = [(q_cu[i], q_cu[i + 1], k_cu[i], k_cu[i + 1]) for i in range(len(q_cu) - 1)]
 
     _strided = False
 
     def _varlen(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
+        if self._segments is not None:
+            return self._dense(q, k, v)
         from flash_attn.cute import flash_attn_varlen_func as fa4_varlen
 
         return fa4_varlen(
@@ -98,6 +113,25 @@ class _Fa4RaggedPrefillBase(_DenseRaggedPrefillBase):
             max_seqlen_q=self._max_q, max_seqlen_k=self._max_k,
             causal=self._causal, softmax_scale=self.sm_scale,
         )
+
+    def _dense(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        out = torch.empty_like(q)
+        for q0, q1, k0, k1 in self._segments:
+            if q1 > q0:
+                _fa4_dense_into(q[q0:q1][None], k[k0:k1][None], v[k0:k1][None], out[q0:q1][None], self.sm_scale)
+        return out
+
+
+def _fa4_dense_into(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, out: torch.Tensor, scale: float) -> None:
+    """``out`` = FA4 dense non-causal attention of ``[1, S, H, D]`` q/k/v: in place through the forward the public
+    ``flash_attn_func`` wraps, or (if that private signature moves) through ``flash_attn_func`` and a copy."""
+    from flash_attn.cute import interface
+
+    try:
+        interface._flash_attn_fwd(q, k, v, softmax_scale=scale, causal=False, out=out)
+    except TypeError:
+        result = interface.flash_attn_func(q, k, v, softmax_scale=scale, causal=False)
+        out.copy_(result[0] if isinstance(result, tuple) else result)
 
 
 class DenseRaggedPrefillWrapper(_DenseRaggedPrefillBase, RaggedPrefillWrapper):
