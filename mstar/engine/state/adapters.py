@@ -109,7 +109,7 @@ def _with_walks(model: "Model", declarations: Sequence[Array | Sampler], setup: 
     an array whose reads differ by walk."""
     held = [(storage_of(declared), declared) for declared in declarations if isinstance(declared, Array)]
     nodes = EMPTY
-    if any(storage.takes_leader and len(array.nodes) > 1 for storage, array in held):
+    if any(storage.takes_leader(array) for storage, array in held):
         nodes = {walk: frozenset(graph.get_nodes()) for walk, graph in model.get_graph_walk_graphs().items()}
     combined = model.get_combined_graph_walks() if any(storage.takes_combined_walks for storage, _ in held) else EMPTY
     return replace(setup, walks=Walks(nodes, combined))
@@ -1562,8 +1562,6 @@ class Storage(ABC):
     kernel_settings: ClassVar[frozenset[str]] = frozenset()
     # whether an array here may be seq_sharded, so its calls carry a rank's share of a step's tokens
     takes_seq_sharded: ClassVar[bool] = False
-    # whether a pool here on several nodes takes its leader from the nodes each walk runs
-    takes_leader: ClassVar[bool] = False
     # whether an array here reads by walk, so a combined walk takes its reads from the walks it batches
     takes_combined_walks: ClassVar[bool] = False
     # whether an array here holds each row's own entries, whose pages a Value's update snapshots are keyed by
@@ -1589,6 +1587,10 @@ class Storage(ABC):
         """Add the step of the array's own resource, under its name, for ``declared`` in ``step``."""
         return
 
+    def takes_leader(self, array: Array) -> bool:
+        """Whether ``array``'s pool takes a leader, the node that admits each request, from the nodes each walk runs."""
+        return False
+
     def step_builder(self) -> StepBuilder:
         """What gathers the steps of this storage's arrays in one step."""
         return ArraySteps(self)
@@ -1613,7 +1615,6 @@ class PagedStorage(Storage):
 
     handle_class = PagedArrayHandle
     kernel_settings = frozenset({"max_num_pages"})
-    takes_leader = True
     holds_row_entries = True
 
     def resolve(self, arrays: Sequence[Array], declared: Sequence[Array], setup: "StateSetup") -> Resolved:
@@ -1627,6 +1628,9 @@ class PagedStorage(Storage):
             resolved.resource_of.update(resource_of | _resources_of(array, others))
         return resolved
 
+    def takes_leader(self, array: Array) -> bool:
+        return len(array.nodes) > 1
+
     def _pool(self, array: Array, walks: "Walks") -> KVSpec:
         heads, head_dim = _kv_shape(array)
         if not array.reads:
@@ -1639,7 +1643,8 @@ class PagedStorage(Storage):
         if len(q_heads) > 1:
             raise _no_layout(array, f"reads have q_heads {sorted(q_heads)}, and PagedKVConfig has one num_qo_heads")
         return KVSpec(
-            resource_key=array.name, nodes=array.nodes, leader=_leader(array, walks),
+            resource_key=array.name, nodes=array.nodes,
+            leader=_leader(array, walks) if self.takes_leader(array) else None,
             config=PagedKVConfig(
                 num_layers=len(array.layers), num_qo_heads=q_heads.pop(),
                 num_kv_heads=heads, head_dim=head_dim, max_seq_len=array.max_len,
@@ -1695,8 +1700,8 @@ class PagedStorage(Storage):
 
 def _leader(array: Array, walks: "Walks") -> str | None:
     """The node of ``array``'s pool that admits each request: the one node that runs every walk any of its nodes runs.
-    None on one node, and where no node or several do, so each node admits for itself."""
-    if not walks.nodes or len(array.nodes) == 1:
+    None where no node or several do, so each node admits for itself."""
+    if not walks.nodes:
         return None
     running = [nodes for nodes in walks.nodes.values() if not array.nodes.isdisjoint(nodes)]
     leaders = [node for node in sorted(array.nodes) if all(node in nodes for nodes in running)]

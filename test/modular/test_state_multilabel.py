@@ -504,7 +504,10 @@ def test_a_pool_where_no_node_runs_every_walk_has_no_leader():
 
 
 def test_a_pool_on_one_node_has_no_leader():
-    assert _leader(_pool("LLM"), Walks(nodes=BAGEL_WALKS)) is None
+    """Another array on several nodes fills the walks' nodes, and this pool's one node admits for itself."""
+    setup = StateSetup(walks=Walks(nodes=BAGEL_WALKS))
+    (kv,) = [spec for spec in build_specs([_pool("LLM")], setup=setup) if isinstance(spec, KVSpec)]
+    assert kv.leader is None
 
 
 def test_a_kept_arrays_handle_is_the_same_whichever_of_its_nodes_builds_it():
