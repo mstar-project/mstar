@@ -9,8 +9,9 @@ FlashInfer's ragged prefill and FlashInfer's own ``auto`` choice, as before; an
 entry gives sizes no served model has run that with a ``"*"`` row naming ``flashinfer``.
 
 Rows name ``flashinfer``, with ``{"backend": ...}`` for one of FlashInfer's
-ragged backends, or ``cudnn``, torch's cuDNN SDPA over equal-length segments
-(``cudnn_wrappers``), which a layout of unequal ones leaves for FlashInfer.
+ragged backends, ``cudnn``, torch's cuDNN SDPA over equal-length segments
+(``cudnn_wrappers``), or ``fa3``, Dao's FlashAttention-3 over them on Hopper
+(``fa3_wrappers``); a layout of unequal segments leaves the last two for FlashInfer.
 ``python -m benchmark.kernels.sweep ragged_attention`` writes them.
 """
 
@@ -38,15 +39,12 @@ def _flashinfer_unavailable(target: Target) -> str | None:
     return None
 
 
-def _cudnn_unavailable(target: Target) -> str | None:
-    if target.device.type != "cuda" or not current_platform.is_cuda():
-        return "torch's cuDNN attention needs an NVIDIA GPU"
-    if not torch.backends.cudnn.is_available():
-        return "torch has no cuDNN"
+def _uniform_unavailable(target: Target, kernel: str) -> str | None:
+    """What a ``UniformSegmentsWrapper`` can't take, whatever its kernel."""
     if target.shape["num_qo_heads"] != target.shape["num_kv_heads"]:
-        return "the cuDNN wrapper runs MHA only"
+        return f"the {kernel} wrapper runs MHA only"
     if target.dtype not in (torch.bfloat16, torch.float16):
-        return f"cuDNN attention takes bf16 / fp16, not {target.dtype}"
+        return f"{kernel} attention takes bf16 / fp16, not {target.dtype}"
     head_dim = target.shape["head_dim"]
     try:
         padded = padded_head_dim(head_dim)
@@ -54,8 +52,33 @@ def _cudnn_unavailable(target: Target) -> str | None:
         return str(exc)
     if padded != head_dim:
         # a compiled caller pads q / k / v to FlashInfer's head dim before the op
-        # (`compile_op`), and the cuDNN wrapper views them at the unpadded one
-        return f"head dim {head_dim} is padded to {padded} for FlashInfer, which the cuDNN wrapper doesn't take"
+        # (`compile_op`), and the wrapper views them at the unpadded one
+        return f"head dim {head_dim} is padded to {padded} for FlashInfer, which the {kernel} wrapper doesn't take"
+    return None
+
+
+def _cudnn_unavailable(target: Target) -> str | None:
+    if target.device.type != "cuda" or not current_platform.is_cuda():
+        return "torch's cuDNN attention needs an NVIDIA GPU"
+    if not torch.backends.cudnn.is_available():
+        return "torch has no cuDNN"
+    return _uniform_unavailable(target, "cuDNN")
+
+
+def _fa3_unavailable(target: Target) -> str | None:
+    if target.device.type != "cuda" or not current_platform.is_cuda():
+        return "FlashAttention-3 needs an NVIDIA GPU"
+    arch = current_platform.arch(target.device)
+    if arch != "sm_90":
+        return f"FlashAttention-3 runs on Hopper (sm_90) only, not {arch}"
+    why = _uniform_unavailable(target, "FA3")
+    if why is not None:
+        return why
+    try:
+        import flash_attn_interface  # noqa: F401
+    except Exception as exc:  # noqa: BLE001
+        return (f"flash_attn_3 doesn't import ({type(exc).__name__}: {exc}); it installs from the PyTorch "
+                "wheel index of torch's CUDA build, e.g. https://download.pytorch.org/whl/cu128")
     return None
 
 
@@ -69,6 +92,8 @@ RAGGED_ATTENTION = register(KernelOp(
              doc="FlashInfer's ragged prefill; config {'backend': 'fa2' | 'cudnn' | 'auto'}"),
         Impl("cudnn", check=_cudnn_unavailable, tolerance=Tolerance(2e-2),
              doc="torch's cuDNN SDPA over equal-length segments"),
+        Impl("fa3", check=_fa3_unavailable, tolerance=Tolerance(2e-2),
+             doc="Dao's FlashAttention-3 (flash_attn_3) over equal-length segments, Hopper only"),
     ),
     doc="cacheless self-attention's kernel by one rank's head geometry and the longest query segment",
 ))

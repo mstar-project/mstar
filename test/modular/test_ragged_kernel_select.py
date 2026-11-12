@@ -1,12 +1,13 @@
 """Which kernel a cacheless self-attention runs: the ``ragged_attention`` table
 by GPU architecture and head geometry, the backends a config names over it,
-and the cuDNN wrapper's layout rules. CPU only: the GPU is a stand-in.
+and the cuDNN and FA3 wrappers' layout rules. CPU only: the GPU is a stand-in.
 """
 
 from __future__ import annotations
 
 import logging
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
@@ -26,6 +27,7 @@ from mstar.engine.resources import (
 )
 from mstar.engine.resources.attn.ragged import kernels as kernels_module
 from mstar.engine.resources.attn.ragged.cudnn_wrappers import CudnnRaggedPrefillWrapper, uniform_segments
+from mstar.engine.resources.attn.ragged.fa3_wrappers import FlashAttn3RaggedPrefillWrapper
 from mstar.engine.resources.attn.ragged.flashinfer import FlashInferRaggedCrossManager, FlashInferRaggedManager
 from mstar.engine.resources.base import EngineResourceInfo, build_resource
 from mstar.engine.state import Array, Attend, Block, Read
@@ -42,24 +44,32 @@ GPU = torch.device("cuda", 0)  # a stand-in: nothing here touches it
 B300 = DeviceKey("NVIDIA B300 SXM6 AC", "sm_103")
 GB300 = DeviceKey("NVIDIA GB300", "sm_103")
 H100 = DeviceKey("NVIDIA H100 80GB HBM3", "sm_90")
+H200 = DeviceKey("NVIDIA H200", "sm_90")
 # (heads, head_dim) of klein 4B, Z-Image Turbo and klein 9B's dit attention
 DIT_GEOMETRIES = ((24, 128), (30, 128), (32, 128))
 
 
 class _FakeCuda:
+    key: DeviceKey | None = None
+
     def is_cuda(self):
         return True
+
+    def arch(self, device=None):
+        return None if self.key is None else self.key.arch
 
 
 @pytest.fixture
 def gpu(monkeypatch):
     """Point the table lookups at a stand-in GPU; call with the device key."""
-    monkeypatch.setattr(kernels_module, "current_platform", _FakeCuda())
+    fake = _FakeCuda()
+    monkeypatch.setattr(kernels_module, "current_platform", fake)
     monkeypatch.setattr(torch.backends.cudnn, "is_available", lambda: True)
     monkeypatch.setattr(kernels_module, "_flashinfer_unavailable", lambda target: None)
     reset_lookups()
 
     def use(key: DeviceKey):
+        fake.key = key
         monkeypatch.setattr(registry_module, "device_key", lambda device=None: key)
         reset_lookups()
 
@@ -109,7 +119,75 @@ def test_sm_103_picks_cudnn_for_the_dit_sizes(gpu, heads, head_dim, seq_len):
     assert kernels_module.RAGGED_ATTENTION.row_for(manager._kernel_rows, seq_len) == Choice("cudnn")
 
 
-@pytest.mark.parametrize("key", [H100, DeviceKey("NVIDIA B200", "sm_100")], ids=["sm_90", "sm_100"])
+@pytest.fixture
+def flash_attn_3(monkeypatch):
+    """``flash_attn_3`` importable (a stand-in module), and FlashInfer, which the sm_90 rows also name
+    (the check imports it; a CPU job may not have it)."""
+    monkeypatch.setitem(sys.modules, "flash_attn_interface", ModuleType("flash_attn_interface"))
+    if "flashinfer" not in sys.modules:
+        try:
+            import flashinfer  # noqa: F401
+        except Exception:  # noqa: BLE001
+            monkeypatch.setitem(sys.modules, "flashinfer", ModuleType("flashinfer"))
+
+
+# (heads, segment length) of Wan2.2-TI2V-5B (24 heads) at 832x480x81 and 1280x704x81, and Wan2.2-A14B (40)
+# at 832x480x81 and 1280x720x81, two segments with CFG and one without (or per rank under CFG parallel)
+WAN_SIZES = ((24, 8190), (24, 18480), (40, 32760), (40, 75600))
+
+
+@pytest.mark.parametrize(("heads", "seq"), WAN_SIZES)
+def test_sm_90_table_names_fa3_at_the_wan_sizes(heads, seq):
+    shape = (("head_dim", 128), ("num_kv_heads", heads), ("num_qo_heads", heads))
+    for key in (H200, H100):
+        entry = next(find_entries("ragged_attention", key, "bfloat16", shape))
+        assert entry.source.endswith("ragged_attention/sm_90.json")
+        assert kernels_module.RAGGED_ATTENTION.row_for(entry.rows, seq) == Choice("fa3")
+    # what it was chosen over, by the harness that wrote it: FlashInfer's own choice at the buckets fa3 takes
+    for bucket, m in entry.measured.items():
+        if kernels_module.RAGGED_ATTENTION.row_for(entry.rows, bucket) == Choice("fa3"):
+            assert m["fa3_us"] < m["default_us"]
+
+
+@pytest.mark.parametrize(("heads", "seq"), WAN_SIZES)
+def test_h200_runs_fa3_at_the_wan_sizes_every_eager_step(gpu, flash_attn_3, stub_flashinfer, heads, seq):
+    """Wan's DiT runs eager (compiled, not captured): each step plans, and each picks the fa3 row,
+    with CFG's two segments and without; unequal segments leave it for FlashInfer."""
+    gpu(H200)
+    manager = manager_with(build(spec(heads))._kernel_rows, heads)
+    with_cfg = planned(manager, seq, seq)
+    assert type(with_cfg) is FlashAttn3RaggedPrefillWrapper and with_cfg._layout == (2, seq, False)
+    assert planned(manager, seq, seq) is with_cfg
+    assert type(planned(manager, seq)) is FlashAttn3RaggedPrefillWrapper
+    assert type(planned(manager, seq, seq - 16)) is _StubFlashInfer
+
+
+def test_without_flash_attn_3_an_h200_keeps_flashinfer(gpu, monkeypatch, caplog):
+    gpu(H200)
+    monkeypatch.setitem(sys.modules, "flash_attn_interface", None)
+    with caplog.at_level(logging.WARNING, logger=kernels_module.logger.name):
+        assert build(spec())._kernel_rows is None
+    assert "keeping FlashInfer" in caplog.text and "flash_attn_3 doesn't import" in caplog.text
+
+
+@pytest.mark.parametrize(("key", "why"), [(B300, "sm_90) only, not sm_103"), (H200, "MHA only")],
+                         ids=["sm_103", "gqa"])
+def test_fa3_cant_run_off_hopper_or_gqa(gpu, flash_attn_3, key, why):
+    gpu(key)
+    heads = 24 if key is B300 else 8
+    target = kernels_module.RAGGED_ATTENTION.target(
+        torch.bfloat16, {"num_qo_heads": 24, "num_kv_heads": heads, "head_dim": 128}, GPU)
+    assert why in kernels_module.RAGGED_ATTENTION.unavailable(target)["fa3"]
+
+
+def test_fa3_cant_run_off_gpu():
+    target = kernels_module.RAGGED_ATTENTION.target(
+        torch.bfloat16, {"num_qo_heads": 24, "num_kv_heads": 24, "head_dim": 128}, torch.device("cpu"))
+    assert "needs an NVIDIA GPU" in kernels_module.RAGGED_ATTENTION.unavailable(target)["fa3"]
+
+
+@pytest.mark.parametrize("key", [DeviceKey("NVIDIA L40S", "sm_89"), DeviceKey("NVIDIA B200", "sm_100")],
+                         ids=["sm_89", "sm_100"])
 def test_a_gpu_without_a_table_keeps_flashinfer(gpu, key):
     gpu(key)
     manager = build(spec())
@@ -224,8 +302,8 @@ def stub_flashinfer(monkeypatch):
     monkeypatch.setattr(FlashInferRaggedManager, "wrapper_class", _StubFlashInfer)
 
 
-def manager_with(rows):
-    config = RaggedAttentionConfig(num_qo_heads=24, num_kv_heads=24, head_dim=128)
+def manager_with(rows, heads=24):
+    config = RaggedAttentionConfig(num_qo_heads=heads, num_kv_heads=heads, head_dim=128)
     return FlashInferRaggedManager(device=torch.device("cpu"), dtype=torch.bfloat16, key="dit_attn", config=config,
                                    kernel_rows=rows)
 
@@ -322,14 +400,19 @@ def test_a_captured_wrapper_is_sized_like_the_flashinfer_one(stub_flashinfer):
     assert w.accelerator_graph and w.max_total_tokens == 4608 and w.max_num_segments == 1
 
 
-def test_a_step_without_a_fixed_layout_keeps_a_captured_bucket_on_flashinfer(stub_flashinfer):
-    """A captured cuDNN wrapper bakes its layout in, so only a step that fixes its bucket's
-    layout captures one; any other step's bucket stays on FlashInfer, and runs cuDNN eagerly."""
-    m = manager_with(CUDNN_ROWS)
+@pytest.mark.parametrize(("impl", "cls"), [("cudnn", CudnnRaggedPrefillWrapper),
+                                           ("fa3", FlashAttn3RaggedPrefillWrapper)])
+def test_a_step_without_a_fixed_layout_keeps_a_captured_bucket_on_flashinfer(stub_flashinfer, impl, cls):
+    """A captured cuDNN or FA3 wrapper bakes its layout in, so only a step that fixes its bucket's
+    layout captures one; any other step's bucket stays on FlashInfer, and runs the row's kernel eagerly."""
+    m = manager_with(((None, Choice(impl)),))
     assert type(planned(m, 4608, 4608, lease=lease(2, 2 * 4608), fixed_layout=False)) is _StubFlashInfer
-    assert type(planned(m, 4608, 4608, fixed_layout=False)) is CudnnRaggedPrefillWrapper
+    assert type(planned(m, 4608, 4608, fixed_layout=False)) is cls
     other_slot = lease(2, 2 * 4608, slot=0)
-    assert type(planned(m, 4608, 4608, lease=other_slot, fixed_layout=True)) is CudnnRaggedPrefillWrapper
+    captured = planned(m, 4608, 4608, lease=other_slot, fixed_layout=True)
+    assert type(captured) is cls
+    with pytest.raises(ValueError, match="replays the 2 segments of 4608 tokens"):
+        planned(m, 4608, lease=other_slot)
 
 
 class _Dit(DenoiseLoopSubmodule):
@@ -383,7 +466,7 @@ def test_the_image_dits_leave_their_kernel_to_the_table(model):
     assert resource.config.backend is RaggedAttnBackend.AUTO and resource.config.flashinfer_backend is None
 
 
-# --- the cuDNN wrapper's layouts ---------------------------------------------------------------
+# --- the cuDNN and FA3 wrappers' layouts --------------------------------------------------------
 
 
 @pytest.mark.parametrize(("lens", "want"), [
@@ -398,14 +481,18 @@ def test_uniform_segments(lens, want):
     assert uniform_segments(cu(*lens)) == want
 
 
-def graph_cudnn(max_segments=2, max_tokens=2 * 4608):
-    return CudnnRaggedPrefillWrapper(num_qo_heads=24, num_kv_heads=24, head_dim=128, device=torch.device("cpu"),
-                                     accelerator_graph=True, max_num_segments=max_segments,
-                                     max_total_tokens=max_tokens)
+UNIFORM_WRAPPERS = pytest.mark.parametrize("cls", [CudnnRaggedPrefillWrapper, FlashAttn3RaggedPrefillWrapper],
+                                           ids=["cudnn", "fa3"])
 
 
-def test_a_captured_cudnn_wrapper_replays_only_its_layout():
-    w = graph_cudnn()
+def graph_wrapper(cls, max_segments=2, max_tokens=2 * 4608):
+    return cls(num_qo_heads=24, num_kv_heads=24, head_dim=128, device=torch.device("cpu"),
+               accelerator_graph=True, max_num_segments=max_segments, max_total_tokens=max_tokens)
+
+
+@UNIFORM_WRAPPERS
+def test_a_captured_wrapper_replays_only_its_layout(cls):
+    w = graph_wrapper(cls)
     w.plan(cu(4608, 4608))
     w.plan(cu(4608, 4608))  # the same layout: nothing to do
     with pytest.raises(ValueError, match="replays the 2 segments of 4608 tokens"):
@@ -414,14 +501,16 @@ def test_a_captured_cudnn_wrapper_replays_only_its_layout():
         w.plan(cu(4608, 4608), causal=True)
 
 
+@UNIFORM_WRAPPERS
 @pytest.mark.parametrize("graph", [True, False], ids=["captured", "eager"])
-def test_the_cudnn_wrapper_needs_equal_segments(graph):
-    w = graph_cudnn() if graph else CudnnRaggedPrefillWrapper(num_qo_heads=24, num_kv_heads=24, head_dim=128,
-                                                              device=torch.device("cpu"))
+def test_the_wrapper_needs_equal_segments(cls, graph):
+    w = graph_wrapper(cls) if graph else cls(num_qo_heads=24, num_kv_heads=24, head_dim=128,
+                                             device=torch.device("cpu"))
     with pytest.raises(ValueError, match="needs equal-length segments"):
         w.plan(cu(4608, 1024))
 
 
-def test_the_cudnn_wrapper_runs_mha_only():
+@UNIFORM_WRAPPERS
+def test_the_wrapper_runs_mha_only(cls):
     with pytest.raises(ValueError, match="MHA only"):
-        CudnnRaggedPrefillWrapper(num_qo_heads=24, num_kv_heads=8, head_dim=128, device=torch.device("cpu"))
+        cls(num_qo_heads=24, num_kv_heads=8, head_dim=128, device=torch.device("cpu"))

@@ -1,9 +1,12 @@
 """The cacheless self-attention kernels against an fp32 reference at the image
-DiTs' sizes (klein 4B / 9B, Z-Image Turbo at 1024x1024), eager and replayed
-from a CUDA graph, and the resource running the kernel its table picks.
+DiTs' sizes (klein 4B / 9B, Z-Image Turbo at 1024x1024) and Wan2.2's, eager and
+replayed from a CUDA graph, and the resource running the kernel its table picks.
+FA3 runs where ``flash_attn_3`` imports on an sm_90 GPU.
 """
 
 from __future__ import annotations
+
+import importlib.util
 
 import pytest
 import torch
@@ -21,12 +24,16 @@ from mstar.engine.resources import (
     StepContext,
 )
 from mstar.engine.resources.attn.ragged.cudnn_wrappers import CudnnRaggedPrefillWrapper
+from mstar.engine.resources.attn.ragged.fa3_wrappers import FlashAttn3RaggedPrefillWrapper
 from mstar.engine.resources.attn.ragged.wrappers import FlashInferRaggedPrefillWrapper
 from mstar.engine.resources.attn.workspace import Workspace
 from mstar.engine.resources.base import EngineResourceInfo, build_resource
 from mstar.platforms import current_platform
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA GPU")
+ON_HOPPER_WITH_FA3 = (torch.cuda.is_available() and current_platform.arch() == "sm_90"
+                      and importlib.util.find_spec("flash_attn_interface") is not None)
+needs_fa3 = pytest.mark.skipif(not ON_HOPPER_WITH_FA3, reason="needs flash_attn_3 on an sm_90 GPU")
 
 DEVICE = torch.device("cuda", 0)
 DTYPE = torch.bfloat16
@@ -34,8 +41,8 @@ D = 128
 # heads, segment length: klein 4B / 9B joint attention (512 text + 4096 image tokens), Z-Image's
 # main, image and caption spans (its captions are padded to a multiple of 32), and Wan2.2-TI2V-5B's
 # self-attention at 832x480x33, a third model the sm_103 table reaches, by its geometry (24 heads,
-# klein 4B's entry)
-SIZES = [(24, 4608), (32, 4608), (30, 4192), (30, 4096), (30, 96), (24, 3510)]
+# klein 4B's entry), and at 832x480x81, which the sm_90 table runs on fa3
+SIZES = [(24, 4608), (32, 4608), (30, 4192), (30, 4096), (30, 96), (24, 3510), (24, 8190)]
 # bf16 kernels sit at ~0.23% rel L2 from fp32 here; the fp32 reference rounded to bf16 is 0.17%
 REL_L2 = 5e-3
 
@@ -77,6 +84,8 @@ def make(kernel: str, heads: int, n: int, seq: int, graph: bool, rows: int | Non
         kw.update(accelerator_graph=True, max_num_segments=n, max_total_tokens=rows or n * seq)
     if kernel == "cudnn":
         return CudnnRaggedPrefillWrapper(**kw)
+    if kernel == "fa3":
+        return FlashAttn3RaggedPrefillWrapper(**kw)
     ws = Workspace(torch.empty(256 << 20, dtype=torch.uint8, device=DEVICE), "test")
     return FlashInferRaggedPrefillWrapper(ws, backend=kernel.removeprefix("flashinfer_"), **kw)
 
@@ -96,7 +105,8 @@ def replay(fn):
     return out
 
 
-KERNELS = ["cudnn", "flashinfer_fa2", "flashinfer_cudnn"]
+KERNELS = ["cudnn", pytest.param("fa3", marks=needs_fa3), "flashinfer_fa2", "flashinfer_cudnn"]
+UNIFORM = ["cudnn", pytest.param("fa3", marks=needs_fa3)]
 
 
 @pytest.mark.parametrize("kernel", KERNELS)
@@ -113,10 +123,11 @@ def test_kernel_matches_fp32_at_the_dit_sizes(kernel, heads, seq, n):
     assert rel_l2(replay(lambda: captured.run(q, k, v)), want) < REL_L2
 
 
-def test_cudnn_lse_matches_the_reference():
+@pytest.mark.parametrize("kernel", UNIFORM)
+def test_lse_matches_the_reference(kernel):
     q, k, v = qkv(2 * 4608, 24)
     want, want_lse = reference(q, k, v, cu(2, 4608), lse=True)
-    w = make("cudnn", 24, 2, 4608, graph=True)
+    w = make(kernel, 24, 2, 4608, graph=True)
     w.plan(cu(2, 4608))
     out, lse = replay(lambda: w.run(q, k, v, return_lse=True))
     assert rel_l2(out, want) < REL_L2
@@ -124,14 +135,15 @@ def test_cudnn_lse_matches_the_reference():
     torch.testing.assert_close(lse, want_lse, atol=2e-2, rtol=0)
 
 
-def test_cudnn_rows_past_the_layout_read_zero():
+@pytest.mark.parametrize("kernel", UNIFORM)
+def test_rows_past_the_layout_read_zero(kernel):
     """A graph wrapper sized for more rows than its layout fills: the tail reads back zero
     whatever the inputs hold there."""
     heads, seq = 24, 512
     q, k, v = qkv(3 * seq, heads)
     for t in (q, k, v):
         t[2 * seq:] = float("nan")
-    w = make("cudnn", heads, 2, seq, graph=True, rows=3 * seq)
+    w = make(kernel, heads, 2, seq, graph=True, rows=3 * seq)
     w.plan(cu(2, seq))
     out = replay(lambda: w.run(q, k, v))
     assert out.shape == q.shape
@@ -139,12 +151,13 @@ def test_cudnn_rows_past_the_layout_read_zero():
     assert bool((out[2 * seq:] == 0).all())
 
 
-def test_cudnn_takes_strided_views():
+@pytest.mark.parametrize("kernel", UNIFORM)
+def test_takes_strided_views(kernel):
     """q / k / v sliced out of a fused projection."""
     heads, seq = 30, 4192
     qkv_fused = torch.randn(seq, 3, heads, D, device=DEVICE, dtype=DTYPE)
     q, k, v = qkv_fused.unbind(1)
-    w = make("cudnn", heads, 1, seq, graph=False)
+    w = make(kernel, heads, 1, seq, graph=False)
     w.plan(cu(1, seq))
     assert rel_l2(w.run(q, k, v), reference(q, k, v, cu(1, seq))) < REL_L2
 
@@ -183,6 +196,27 @@ def test_the_resource_runs_the_tables_kernel(heads, seq, captured):
                                    is_preplan=False, slot_lease=lease))
     wrapper = manager._current_plan_states["main"]
     assert type(wrapper) is CudnnRaggedPrefillWrapper and wrapper.accelerator_graph is captured
+    q, k, v = qkv(2 * seq, heads)
+    out = replay(lambda: manager.run(q, k, v, label="main")) if captured else manager.run(q, k, v, label="main")
+    assert rel_l2(out, reference(q, k, v, cu(2, seq))) < REL_L2
+
+
+@needs_fa3
+@pytest.mark.parametrize("captured", [False, True], ids=["eager", "captured"])
+@pytest.mark.parametrize(("heads", "seq"), [(24, 8190), (40, 8192)])
+def test_sm_90_runs_fa3_from_its_table(heads, seq, captured):
+    """Wan2.2-TI2V-5B's (24 heads) and A14B's (40) entries: eager, as Wan's compiled DiT plans every
+    step, and captured, from a step that fixes its layout."""
+    spec = RaggedAttentionSpec(resource_key="dit_attn", nodes={"dit"}, config=RaggedAttentionConfig(
+        num_qo_heads=heads, num_kv_heads=heads, head_dim=D, dtype=DTYPE))
+    manager = build_resource(spec, EngineResourceInfo(device=DEVICE, kv_dtype=DTYPE))
+    step = AttentionStep(segments=tuple(Segment(request_id=f"r{i}", label="main", span=seq) for i in range(2)),
+                         causal=False, fixed_layout=True)
+    lease = SlotLease(slot=0, bucket=BucketKey(graph_walk="video_gen", bs=2, num_tokens=2 * seq)) if captured else None
+    manager.plan(step, StepContext(request_ids=["r0", "r1"], graph_walk="video_gen", slot=0, capture=False,
+                                   is_preplan=False, slot_lease=lease))
+    wrapper = manager._current_plan_states["main"]
+    assert type(wrapper) is FlashAttn3RaggedPrefillWrapper and wrapper.accelerator_graph is captured
     q, k, v = qkv(2 * seq, heads)
     out = replay(lambda: manager.run(q, k, v, label="main")) if captured else manager.run(q, k, v, label="main")
     assert rel_l2(out, reference(q, k, v, cu(2, seq))) < REL_L2

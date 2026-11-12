@@ -7,6 +7,9 @@ bucket's length, so its layout is ``n`` segments of ``S`` tokens: the packed
 dense cuDNN kernel takes without a copy. torch's varlen cuDNN path fails under
 stream capture (torch 2.12), so this is the cuDNN kernel a captured graph can
 replay.
+
+``UniformSegmentsWrapper`` holds the layout rules, which FA3's wrapper
+(``fa3_wrappers``) shares.
 """
 
 import torch
@@ -26,9 +29,9 @@ def uniform_segments(cu_seqlens: torch.Tensor) -> tuple[int, int] | None:
     return n, int(lens[0])
 
 
-class CudnnRaggedPrefillWrapper(RaggedPrefillWrapper):
-    """Self-attention within each of ``n`` equal-length segments, through
-    ``aten._scaled_dot_product_cudnn_attention`` over the ``[n, H, S, D]`` view.
+class UniformSegmentsWrapper(RaggedPrefillWrapper):
+    """Self-attention within each of ``n`` equal-length segments, through a dense
+    kernel over the ``[n, S, H, D]`` view (``_attend``).
 
     A captured graph bakes ``n`` and ``S`` in, so a graph-mode wrapper replays
     only the layout it was first planned with and refuses any other. An eager
@@ -64,6 +67,13 @@ class CudnnRaggedPrefillWrapper(RaggedPrefillWrapper):
     def _describe(cu: torch.Tensor) -> str:
         return f"segments {torch.diff(cu.cpu()).tolist()}"
 
+    def _attend(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, causal: bool, return_lse: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """``[n, S, H, D]`` q / k / v -> the ``[n, S, H, D]`` output and, with
+        ``return_lse``, the log-sum-exp ``[n, H, S]``."""
+        raise NotImplementedError
+
     @torch.compiler.disable
     def run(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, return_lse: bool = False,
@@ -73,13 +83,9 @@ class CudnnRaggedPrefillWrapper(RaggedPrefillWrapper):
         rows = n * seq
         if self.accelerator_graph:
             self._check_rows(q.shape[0])
-        q4, k4, v4 = (
-            t[:rows].to(self.q_data_type).view(n, seq, t.shape[1], t.shape[2]).transpose(1, 2) for t in (q, k, v)
-        )
-        out, lse = torch.ops.aten._scaled_dot_product_cudnn_attention(
-            q4, k4, v4, None, return_lse, 0.0, causal, False, scale=self.sm_scale,
-        )[:2]
-        out = out.transpose(1, 2).reshape(rows, self.num_qo_heads, self.head_dim)
+        q4, k4, v4 = (t[:rows].to(self.q_data_type).view(n, seq, t.shape[1], t.shape[2]) for t in (q, k, v))
+        out, lse = self._attend(q4, k4, v4, causal, return_lse)
+        out = out.reshape(rows, self.num_qo_heads, self.head_dim)
         if rows < q.shape[0]:
             # rows past the layout read back zero, as on the other backends
             out = torch.cat([out, out.new_zeros(q.shape[0] - rows, *out.shape[1:])])
@@ -89,3 +95,15 @@ class CudnnRaggedPrefillWrapper(RaggedPrefillWrapper):
         if rows < q.shape[0]:
             lse = torch.cat([lse, lse.new_zeros(q.shape[0] - rows, lse.shape[1])])
         return out, lse
+
+
+class CudnnRaggedPrefillWrapper(UniformSegmentsWrapper):
+    """Equal-length segments through ``aten._scaled_dot_product_cudnn_attention``
+    over the ``[n, H, S, D]`` view."""
+
+    def _attend(self, q, k, v, causal, return_lse):
+        out, lse = torch.ops.aten._scaled_dot_product_cudnn_attention(
+            q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), None, return_lse, 0.0, causal, False,
+            scale=self.sm_scale,
+        )[:2]
+        return out.transpose(1, 2), lse

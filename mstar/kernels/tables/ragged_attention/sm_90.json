@@ -1,0 +1,48 @@
+{
+  "format": 2,
+  "op": "ragged_attention",
+  "entries": [
+    {
+      "dtype": "bfloat16",
+      "shape": {"head_dim": 128, "num_kv_heads": 24, "num_qo_heads": 24},
+      "provenance": {"device": "NVIDIA H200", "arch": "sm_90", "date": "2026-11-12", "harness": "python -m benchmark.kernels.sweep ragged_attention --dtype bfloat16 --shape num_qo_heads=24,num_kv_heads=24,head_dim=128 --buckets 128,1024,4096,4608,8192,16384,18480,32768", "torch": "2.11.0+cu128", "triton": "3.6.0", "mstar": "82a4ee0a9+fa3", "note": "Wan2.2-TI2V-5B self-attention at 1280x704x81 (2 x 18480 tokens, eager) served on these rows: 49.17 against 49.91 s a video on FlashInfer's auto (1776 against 1802 ms a step, one H200), frames within a recompile of main's. Measured times are graph-mode wrappers; against FlashInfer's eager wrapper, which Wan runs, fa3 is 1.065x at 2 x 3510 tokens, 1.003x at 2 x 8190 and 1.043x at 2 x 18480 (7 interleaved rounds); 832x480 was not served"},
+      "rows": {
+        "128": {"impl": "cudnn"},
+        "8192": {"impl": "fa3"},
+        "16384": {"impl": "flashinfer"},
+        "*": {"impl": "fa3"}
+      },
+      "measured": {
+        "128": {"us": 10.68, "default_us": 13.06, "cudnn_us": 10.68, "fa3_us": 11.43, "flashinfer_fa2_us": 21.14, "flashinfer_cudnn_us": 26.64},
+        "1024": {"us": 72.46, "default_us": 87.22, "cudnn_us": 74.35, "fa3_us": 72.46, "flashinfer_fa2_us": 157.65, "flashinfer_cudnn_us": 106.82},
+        "4096": {"us": 824.44, "default_us": 856.09, "cudnn_us": 859.57, "fa3_us": 824.44, "flashinfer_fa2_us": 1733.31, "flashinfer_cudnn_us": 973.9},
+        "4608": {"us": 1072.35, "default_us": 1098.19, "cudnn_us": 1107.47, "fa3_us": 1072.35, "flashinfer_fa2_us": 2224.7, "flashinfer_cudnn_us": 1251.89},
+        "8192": {"us": 3420.04, "default_us": 3508.76, "cudnn_us": 3563.91, "fa3_us": 3420.04, "flashinfer_fa2_us": 6400.99, "flashinfer_cudnn_us": 3858.39},
+        "16384": {"us": 13791.04, "default_us": 13791.04, "cudnn_us": 14665.68, "fa3_us": 13601.56, "flashinfer_fa2_us": 24093.47, "flashinfer_cudnn_us": 15421.9},
+        "18480": {"us": 17254.4, "default_us": 18362.53, "cudnn_us": 20437.91, "fa3_us": 17254.4, "flashinfer_fa2_us": 30752.97, "flashinfer_cudnn_us": 20383.92},
+        "32768": {"us": 54946.52, "default_us": 57770.29, "cudnn_us": 61178.98, "fa3_us": 54946.52, "flashinfer_fa2_us": 96498.13, "flashinfer_cudnn_us": 64963.61}
+      }
+    },
+    {
+      "dtype": "bfloat16",
+      "shape": {"head_dim": 128, "num_kv_heads": 40, "num_qo_heads": 40},
+      "provenance": {"device": "NVIDIA H200", "arch": "sm_90", "date": "2026-11-12", "harness": "python -m benchmark.kernels.sweep ragged_attention --dtype bfloat16 --shape num_qo_heads=40,num_kv_heads=40,head_dim=128 --buckets 128,1024,4096,4608,8192,16384,32760,75600", "torch": "2.11.0+cu128", "triton": "3.6.0", "mstar": "82a4ee0a9+fa3", "note": "Wan2.2-A14B self-attention (40 heads; not served on main) at 832x480x81 (32760 tokens) and 1280x720x81 (75600): kernel-level only, not served; eager, fa3 is 1.042x FlashInfer's at 2 x 32760 and 1.019x at 75600. The 75600 bucket may have shared the GPU with another job for part of its run"},
+      "rows": {
+        "128": {"impl": "cudnn"},
+        "4096": {"impl": "fa3"},
+        "4608": {"impl": "flashinfer"},
+        "*": {"impl": "fa3"}
+      },
+      "measured": {
+        "128": {"us": 11.13, "default_us": 15.41, "cudnn_us": 11.13, "fa3_us": 12.9, "flashinfer_fa2_us": 27.34, "flashinfer_cudnn_us": 29.49},
+        "1024": {"us": 109.95, "default_us": 135.38, "cudnn_us": 114.48, "fa3_us": 109.95, "flashinfer_fa2_us": 246.55, "flashinfer_cudnn_us": 153.47},
+        "4096": {"us": 1370.08, "default_us": 1507.68, "cudnn_us": 1447.47, "fa3_us": 1370.08, "flashinfer_fa2_us": 2873.19, "flashinfer_cudnn_us": 1620.33},
+        "4608": {"us": 1798.36, "default_us": 1798.36, "cudnn_us": 1800.95, "fa3_us": 1830.71, "flashinfer_fa2_us": 3483.75, "flashinfer_cudnn_us": 1985.11},
+        "8192": {"us": 5584.15, "default_us": 5847.58, "cudnn_us": 5995.93, "fa3_us": 5584.15, "flashinfer_fa2_us": 10960.09, "flashinfer_cudnn_us": 6450.3},
+        "16384": {"us": 22878.64, "default_us": 23693.68, "cudnn_us": 24994.26, "fa3_us": 22878.64, "flashinfer_fa2_us": 40242.17, "flashinfer_cudnn_us": 26873.31},
+        "32760": {"us": 92779.09, "default_us": 95971.62, "cudnn_us": 110944.79, "fa3_us": 92779.09, "flashinfer_fa2_us": 161328.96, "flashinfer_cudnn_us": 107973.96},
+        "75600": {"us": 511685.48, "default_us": 525790.01, "cudnn_us": 595049.99, "fa3_us": 511685.48, "flashinfer_fa2_us": 859956.23}
+      }
+    }
+  ]
+}

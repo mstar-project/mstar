@@ -349,6 +349,9 @@ wan22 = [
     # frame conversion threads in video_encode.encode_mp4.
     "av>=19",
     # The DiT's default self-attention runs on the engine's FlashInfer ragged resource.
+    # On Hopper the sm_90 kernel table runs it on FlashAttention-3 where flash_attn_3
+    # imports. It isn't listed: PyPI's flash_attn_3 is a 0.0.0 placeholder, and the
+    # wheels are on PyTorch's index (docs/models.rst).
     "flashinfer-python==0.7.2",
 ]
 

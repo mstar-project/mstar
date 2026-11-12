@@ -2213,7 +2213,9 @@ each row count compiling its own graph.
 (``compile_dit``); its self-attention runs on the engine's ragged attention
 resource (FlashInfer, FA3 on Hopper; on a B300 the ``ragged_attention`` kernel table
 picks torch's cuDNN SDPA, the kernel ``backend: sdpa`` runs, and the two
-configs give the same videos at the same step time) as an opaque op inside the compiled graph,
+configs give the same videos at the same step time; on an H100 / H200 it picks Dao's
+FlashAttention-3 where ``flash_attn_3`` imports, 49.2 against 49.9 s a 1280x704x81
+video on one H200, frames as close to FlashInfer's as a recompile of the DiT is) as an opaque op inside the compiled graph,
 6% off a 1280x704x81 denoise step on an H200 against cuDNN SDPA, measured on
 an earlier version of the DiT block, before the adaLN was computed in one pass
 and the q/k norm and RoPE were fused
@@ -2235,6 +2237,11 @@ tiles only when free VRAM at decode time is short of the untiled estimate
 (the ``auto`` policy; ``WAN22_VAE_DECODE_TILING`` forces a path), which keeps the untiled conv3d from OOMing a
 32 GiB card. No CUDA-graph capture, no continuous batching (one request per
 step) and no component offload.
+
+``flash_attn_3`` is not an M* dependency (PyPI's is a placeholder). PyTorch's index
+carries a stable-ABI wheel per CUDA build: for torch 2.11+cu128,
+``pip install flash_attn_3==3.0.1 --no-deps --index-url https://download.pytorch.org/whl/cu128``.
+Without it the server logs that the table's ``fa3`` rows can't run and keeps FlashInfer.
 
 **Two GPUs.** ``configs/wan22_cfg_parallel_2gpu.yaml`` is CFG-parallel: it runs
 the dit over two ranks (``cfg_size: 2``) that split the classifier-free guidance
@@ -2454,8 +2461,9 @@ conditioning tokens, in order).
 ``backend: sdpa`` on the ``dit_attn`` resource, as the shipped configs set it, runs the
 reference kernel: torch's SDPA called by the model, cuDNN on an H100 and a B300. Without it the
 DiT's joint attention runs on the engine's ragged attention resource, whose kernel the GPU's
-``ragged_attention`` table picks: torch's cuDNN SDPA on ``sm_103`` (B300), FlashInfer's ragged
-prefill (FA3 on Hopper) where no table covers the GPU. ``backend: flashinfer`` keeps
+``ragged_attention`` table picks: torch's cuDNN SDPA on ``sm_103`` (B300), Dao's FlashAttention-3
+on ``sm_90`` for klein 4B's 24 heads where ``flash_attn_3`` imports (Wan2.2-TI2V-5B's entry), FlashInfer's
+ragged prefill (FA3 on Hopper) where no table covers the GPU. ``backend: flashinfer`` keeps
 FlashInfer. Both are CUDA-graph replayable. Z-Image takes the same block.
 
 Deployment knobs live under ``model_kwargs`` in ``configs/flux2_klein.yaml``:

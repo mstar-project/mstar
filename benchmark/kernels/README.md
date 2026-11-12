@@ -85,11 +85,13 @@ gets faster on a GPU without a change to model code.
   measured end to end, its provenance naming how.
 - `ragged_attention`: a cacheless self-attention's kernel by one rank's head geometry
   (`--shape num_qo_heads=...,num_kv_heads=...,head_dim=...`), rows by the longest query segment:
-  torch's cuDNN SDPA (`cudnn`) or a FlashInfer ragged backend (`flashinfer`, `{"backend": ...}`),
+  torch's cuDNN SDPA (`cudnn`), FlashAttention-3 on Hopper (`fa3`, timed where `flash_attn_3`
+  imports) or a FlashInfer ragged backend (`flashinfer`, `{"backend": ...}`),
   each timed through the resource's graph-mode wrapper at 1 and 8 segments of the bucket's length.
   `python -m benchmark.kernels.ragged_attention --heads 24 --seq 4608` prints a wider table at
-  one size, with kernels the resource can't replay (FlashInfer cutlass, torch's FA2). The sm_103
-  table was written with `--arch`, which names the file for the architecture, not the GPU model.
+  one size, with kernels the resource can't replay (FlashInfer cutlass, torch's FA2, FA3 varlen).
+  The sm_103 and sm_90 tables were written with `--arch`, which names the file for the
+  architecture, not the GPU model.
   Each entry's provenance note says which sizes a served model ran on its rows (the image DiTs
   up to 4608 tokens, LTX-2.5's video self-attention at 8160, Wan2.2 at 3510 and 18480) and which
   `measured` times are kernel-level only. An entry whose larger sizes no served model has run bounds them with a
