@@ -428,6 +428,40 @@ def test_host_fields_are_refused_on_a_node_with_prefix_keys():
     assert problem.startswith("Array 'flags'.entry.host") and "prefix keys" in problem
 
 
+def _plain_value(layers=frozenset({0})) -> Value:
+    return Value("plain", nodes={"LLM"}, layers=layers, entry=Entry({"x": TensorType((2,), dtype=torch.float32)}))
+
+
+def test_a_plain_value_has_no_problems_on_a_node_without_prefix_keys():
+    labels = {"kv": {"main": KVLabel()}}
+    assert state_declaration_problems(_StubModel(_array(reads={"r": _read()}), _plain_value(), kv_labels=labels)) == []
+
+
+def test_a_plain_value_is_refused_on_a_node_with_prefix_keys():
+    labels = {"kv": {"main": KVLabel(keys=PrefixKeys("text_inputs", ("prefill",)))}}
+    problem = _one_problem(_array(reads={"r": _read()}), _plain_value(), kv_labels=labels)
+    assert problem.startswith("Array 'plain': nodes ['LLM'] have prefix keys")
+    assert "wouldn't restore its entry" in problem, "a plain field has no kernel to write mid-prefill snapshots"
+
+
+def test_a_gated_delta_net_with_no_causal_conv_is_refused_on_a_node_with_prefix_keys():
+    """The rule comes from what the ops write, not the Value's kind: with no CausalConv the step writes conv itself, and
+    a prefix hit would bring conv back as zeros."""
+    labels = {"kv": {"main": KVLabel(keys=PrefixKeys("text_inputs", ("prefill",)))}}
+    entry = Entry({
+        "state": TensorType((2, 8, 8), dtype=torch.float32, shard=0),
+        "conv": TensorType((48, 3), dtype=None, shard=0),
+    })
+    gated = Value("gdn", nodes={"LLM"}, layers={0}, entry=entry, updates={"d": GatedDeltaNet()})
+    problem = _one_problem(_array(reads={"r": _read()}), gated, kv_labels=labels)
+    assert problem.startswith("Array 'gdn': nodes ['LLM'] have prefix keys"), "a snapshot holds no field a step writes"
+
+
+def test_a_plain_value_with_no_layers_is_refused():
+    problem = _one_problem(_plain_value(layers=frozenset()))
+    assert problem.startswith("Array 'plain'.layers is empty"), "nothing could read or write its fields"
+
+
 def test_a_value_with_no_layers_has_no_problems():
     assert state_declaration_problems(_StubModel(_array(), _empty_value())) == []
 

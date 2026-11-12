@@ -21,11 +21,11 @@ from mstar.engine.state.adapters import PagedArrayHandle, ValueHandle, WithinSte
 from mstar.engine.state.calls import ArrayHandle
 
 # Today's types the surface re-exports, and a NamedTuple, whose fields stay positional.
-_POSITIONAL = {"PagedNHDTarget", "Reached", "Segment", "SlotLease", "Span"}
+_POSITIONAL = {"PagedNHDTarget", "Segment", "SlotLease", "Span"}
 # The calls take the handle first, then what every call names, and only then keywords.
 _CALLS = {
-    "at_last_token", "causal_conv", "gated_delta_net", "host", "last_sampled", "position", "positions",
-    "rope", "sample",
+    "at_last_token", "causal_conv", "gated_delta_net", "host", "last_sampled", "position", "positions", "rope",
+    "sample",
 }
 # Each public name's parameters as ``[name, kind, default]``. A dataclass's parameters are its fields.
 SNAPSHOT = {
@@ -99,7 +99,7 @@ SNAPSHOT = {
     ],
     "Reached": [
         ["fields", "POSITIONAL_OR_KEYWORD", None],
-        ["row_offsets", "POSITIONAL_OR_KEYWORD", None],
+        ["row_offsets", "KEYWORD_ONLY", None],
     ],
     "Read": [
         ["mask", "KEYWORD_ONLY", None],
@@ -298,6 +298,13 @@ def test_a_handles_calls_equal_the_snapshot(handle):
         for name in HANDLE_SNAPSHOT
     }
     assert surface == HANDLE_SNAPSHOT, "`add`, `read` and `write` are the surface a layer calls"
+
+
+def test_set_start_equals_the_snapshot():
+    surface = [[p.name, p.kind.name, _default(p)] for p in inspect.signature(ArrayHandle.set_start).parameters.values()]
+    assert surface == [
+        ["self", "POSITIONAL_OR_KEYWORD", None], ["start", "POSITIONAL_OR_KEYWORD", None],
+    ], "`set_start` is the call a submodule makes at bind for a Value's start state"
 
 
 def test_every_field_after_the_first_is_keyword_only():

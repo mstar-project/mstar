@@ -44,7 +44,7 @@ from mstar.engine.resources.recurrent.config import (
 from mstar.engine.resources.sampler.config import SamplerSpec, SamplerStep, SamplingReqConfig
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
 from mstar.engine.resources.step import Segment, SubmoduleStep
-from mstar.engine.state.analysis import position_key, query_array
+from mstar.engine.state.analysis import position_key, query_array, written_by_step
 from mstar.engine.state.calls import ArrayHandle, SamplerHandle, pool_layers, segments_of
 from mstar.engine.state.contract import (
     EMPTY,
@@ -62,6 +62,7 @@ from mstar.engine.state.contract import (
     Op,
     PagedNHDTarget,
     Positions,
+    Reached,
     Read,
     Sampler,
     SampleSettings,
@@ -368,7 +369,7 @@ class ArraySteps(StepBuilder):
 
     def add(self, handle: ArrayHandle, declared: ArrayStep, step: SubmoduleStep) -> None:
         segments = segments_of(declared, step)
-        self._storage.steps(handle, declared, step, self._steps)
+        self._storage.steps(handle, declared, step, segments, self._steps)
         for bound in handle._bindings:
             bound.binding.steps(bound.key, bound.declared, declared, segments, self._steps)
 
@@ -514,6 +515,10 @@ class OpBinding:
         """``value`` in the layout `block` gives its field in the pool."""
         return value
 
+    def from_stored(self, stored: torch.Tensor) -> torch.Tensor:
+        """``stored``, read from the pool, in the layout the op declares its field in."""
+        return stored
+
     def resource(self, array: Array, key: str) -> str:
         """The key of the resource the op under ``key`` runs on."""
         return key
@@ -535,7 +540,7 @@ class OpBinding:
 class PagedAttend(OpBinding):
     """`Attend` on a paged array: an `AttentionSpec` over the array's pool."""
 
-    kernel_settings = frozenset({"splits", "decode_fmha"})
+    kernel_settings = frozenset({"splits", "decode_fmha", "decode_tensor_cores"})
 
     def check(self, array: Array, key: str, read: Read) -> None:
         if not isinstance(read.mask, Causal | Window | Bidirectional):
@@ -584,6 +589,13 @@ class PagedCrossAttend(OpBinding):
 
     def steps(self, key: str, read: Read, declared: ArrayStep, segments, steps: dict[str, Any]) -> None:
         steps[key] = AttentionStep(segments=segments, causal=False)
+
+    def apply(self, spec: NodeResourceSpec | None, settings: Mapping[str, Any]) -> None:
+        """The decode keys go through the spec's own YAML path and its checks, as they do under `resources:`."""
+        decode = {field: settings[field] for field in settings.keys() & {"decode_tensor_cores", "decode_fmha"}}
+        super().apply(spec, {field: settings[field] for field in settings.keys() - decode.keys()})
+        if decode:
+            spec.apply_yaml_overrides(**decode)
 
     def attach(self, handle: "PagedArrayHandle", key: str, run: Any) -> None:
         handle.reads[key] = run
@@ -701,8 +713,11 @@ class GDN(LinearAttnBinding):
         return _block(TensorType((h_v, d_v, d_k), dtype=dtype, shard=shard))
 
     def stored(self, value: torch.Tensor) -> torch.Tensor:
-        """The swap of the last two axes, which is its own inverse."""
+        """The swap of the last two axes, which `from_stored` swaps back."""
         return value.transpose(-1, -2)
+
+    def from_stored(self, stored: torch.Tensor) -> torch.Tensor:
+        return stored.transpose(-1, -2)
 
 
 class ConvOnLinearAttn(OpBinding):
@@ -940,7 +955,8 @@ class PagedCrossHandle(PagedArrayHandle):
 
 
 class ValueHandle(ArrayHandle):
-    """The calls on a Value: its updates, which run in place on one layer's block, and writes of whole fields."""
+    """The calls on a Value: its updates, which run in place on one layer's block, and reads and writes of whole
+    fields."""
 
     def __init__(
         self, array: Array, resources: Mapping[str, Any], bindings: tuple[BoundOp, ...], resolved: "Resolved",
@@ -957,11 +973,37 @@ class ValueHandle(ArrayHandle):
             for bound in bindings
         }
         self._layouts = _field_layouts(array, bindings)
+        # `_step_written` holds the fields a kept step writes itself, and `_written` those each layer's write set.
+        # `_start` holds each layer's start state from `set_start`, in the pool's layout, fixed from the first step on.
+        self._step_written = written_by_step(array)
+        self._written: dict[int, set[str]] = {}
+        self._start: dict[int, dict[str, torch.Tensor]] = {}
+        self._stepped = False
+
+    def begin_step(self, step) -> None:
+        self._stepped = True
+        self._written.clear()
+        super().begin_step(step)
+
+    def check_step(self, step) -> None:
+        super().check_step(step)
+        if self._step_written and not step.ctx.replays:
+            self._check_written(segments_of(step.state[self.name], step))
+
+    def _check_written(self, segments) -> None:
+        rows = [segment.request_id for segment in segments if segment.span >= 1]
+        if not rows:
+            return
+        for layer in sorted(self.array.layers):
+            unwritten = sorted(self._step_written - self._written.get(layer, set()))
+            if unwritten:
+                raise self._refusal(f"layer {layer}'s fields {unwritten} are unwritten in a kept step for rows {rows}, "
+                                    "and no update op writes them")
 
     def _check_storage(self, declared: ArrayStep, segments, ctx) -> None:
         if not declared.keep:
-            raise self._refusal("keep=False on an array with updates, whose kernels write in place, until saved "
-                                "copies exist")
+            raise self._refusal("keep=False on a Value with tensor fields, whose entry has no saved copy to return to, "
+                                "until saved copies exist")
         super()._check_storage(declared, segments, ctx)
 
     def block(self, field: str, layer: int) -> torch.Tensor:
@@ -971,23 +1013,91 @@ class ValueHandle(ArrayHandle):
         return blocks[layer]
 
     @torch.compiler.disable
+    def read(self, layer: int | torch.Tensor, q: torch.Tensor | None = None, **mask_args: Any) -> Reached:
+        """The step's rows' entries, as `Reached`. A Value takes no ``q``. A row with nothing written yet, with span 0
+        or that pads the step reads the start `set_start` gave, zeros for a field it doesn't name."""
+        layer = self._layer_id(layer)
+        if q is not None or mask_args:
+            given = sorted({*mask_args, *(("q",) if q is not None else ())})
+            raise self._refusal(f"a Value's read takes no q and no keyword, and got {given}")
+        self._record_read(layer)
+        if layer in self._written or any(updated == layer for _, updated in self._updated):
+            raise self._refusal(f"a read of layer {layer} after its write or update in this step")
+        start = self._start.get(layer, EMPTY)
+        fields = {}
+        for field in self.array.entry.tensors:
+            read = self._pool.gather(field, self._pool_layer[layer], label=self.label, start=start.get(field))
+            fields[field] = self._declared(field, read)
+        return _OneEntryPerRow(fields)
+
+    def set_start(self, start: Mapping[str, torch.Tensor]) -> None:
+        if self._stepped:
+            raise self._refusal("set_start after the handle's first step, whose captured reads keep the start "
+                                "they read")
+        undeclared = start.keys() - self.array.entry.tensors.keys()
+        if undeclared:
+            raise self._refusal(f"start names fields {sorted(undeclared)}, of {sorted(self.array.entry.tensors)}")
+        self._start = {
+            layer: {field: self._stored(field, layer, value, value.shape, "start") for field, value in start.items()}
+            for layer in self.array.layers
+        }
+
+    def _stored(self, field: str, layer: int, value: torch.Tensor, shape: torch.Size, what: str) -> torch.Tensor:
+        """``value``, whose entries are of ``shape``, in the layout and dtype the pool stores ``field`` in."""
+        block = self.block(field, layer)
+        layout = self._layouts[field]
+        expected = layout.from_stored(block).shape[1:]
+        dtype = self.array.entry.tensors[field].dtype or block.dtype
+        if tuple(shape) != tuple(expected) or value.dtype != dtype:
+            raise self._refusal(f"{what} of field {field!r} on layer {layer} is {tuple(shape)} of {value.dtype}, and "
+                                f"the field is {tuple(expected)} of {dtype} on this rank")
+        return layout.stored(value).to(block.dtype)
+
+    def _declared(self, field: str, stored: torch.Tensor) -> torch.Tensor:
+        """``stored``, read from the pool, in ``field``'s declared layout and dtype."""
+        value = self._layouts[field].from_stored(stored)
+        return value.to(self.array.entry.tensors[field].dtype or value.dtype)
+
+    @torch.compiler.disable
     def write(self, layer: int | torch.Tensor, *, at: torch.Tensor | None = None, **fields: torch.Tensor) -> None:
-        """Overwrite each row's ``fields`` in place."""
+        """Write each row's ``fields`` into its slot in place. The scatter changes the slots where the forward runs
+        it, in an eager step or a replay, so a step refused after a field's write keeps it in the slots its rows
+        already held."""
         if at is not None:
             raise self._no_layout("write at positions, on anything but a Value")
         layer = self._layer_id(layer)
         self._check_open("write")
+        written = self._written.setdefault(layer, set())
         for field, value in fields.items():
-            self.block(field, layer)
-            self._pool.scatter_(field, self._layouts[field].stored(value), self._pool_layer[layer], label=self.label)
+            if field in written:
+                raise self._refusal(f"a second write of field {field!r} on layer {layer} in one step")
+            if value.ndim == 0:
+                raise self._refusal(f"field {field!r} written with no row axis")
+            written.add(field)
+            stored = self._stored(field, layer, value, value.shape[1:], "write")
+            self._pool.scatter_(field, stored, self._pool_layer[layer], label=self.label)
 
-    def _update(self, kind: type[Op], field: str, layer: int) -> tuple[Any, torch.Tensor]:
+    def _update(self, kind: type[Op], layer: int) -> tuple[Any, torch.Tensor]:
         runner = self._runners.get(kind)
         if runner is None:
             raise self._refusal(f"an update of type {kind.__name__}, which the array doesn't declare")
+        (field,) = kind.writes
         view = self.block(field, layer)
         self._record_update(field, layer)
         return runner, view
+
+
+class _OneEntryPerRow(Reached):
+    """A Value read's `Reached`. Its ``row_offsets`` is built only when asked for, so a read that doesn't ask launches
+    no kernel for it, and a captured read records none."""
+
+    def __init__(self, fields: Mapping[str, torch.Tensor]):
+        object.__setattr__(self, "fields", fields)
+
+    @functools.cached_property
+    def row_offsets(self) -> torch.Tensor:
+        rows = next(iter(self.fields.values()))
+        return torch.arange(rows.shape[0] + 1, dtype=torch.int32, device=rows.device)
 
 
 class HostValueHandle(ArrayHandle):
@@ -1300,8 +1410,10 @@ class Storage(ABC):
         """``array``'s handle over a node's built ``resources``."""
         return self.handle_class(array, resources, resolved.bound[array.name], resolved)
 
-    def steps(self, handle: ArrayHandle, declared: ArrayStep, step: SubmoduleStep, steps: dict[str, Any]) -> None:
-        """Add the step of the array's own resource, under its name, for ``declared`` in ``step``."""
+    def steps(
+        self, handle: ArrayHandle, declared: ArrayStep, step: SubmoduleStep, segments, steps: dict[str, Any],
+    ) -> None:
+        """Add the step of the array's own resource, under its name, for ``declared`` in ``step`` over ``segments``."""
         return
 
     def step_builder(self) -> StepBuilder:
@@ -1351,10 +1463,12 @@ class PagedStorage(Storage):
         )
         return [pool, *_op_specs(array, bound)], bound
 
-    def steps(self, handle: ArrayHandle, declared: ArrayStep, step: SubmoduleStep, steps: dict[str, Any]) -> None:
+    def steps(
+        self, handle: ArrayHandle, declared: ArrayStep, step: SubmoduleStep, segments, steps: dict[str, Any],
+    ) -> None:
         pre, post, rows = _forks(handle.array, declared)
         steps[handle.name] = KVStep(
-            segments=declared.segments, commit=declared.keep, pre_forks=pre, post_forks=post, fork_rids=rows,
+            segments=segments, commit=declared.keep, pre_forks=pre, post_forks=post, fork_rids=rows,
             sink=declared.placeholders, eager_write=declared.eager_add,
         )
 
@@ -1392,13 +1506,15 @@ class PagedCrossStorage(PagedStorage):
             resolved.queries[key] = OtherArrayQueries(queried)
         return resolved
 
-    def steps(self, handle: ArrayHandle, declared: ArrayStep, step: SubmoduleStep, steps: dict[str, Any]) -> None:
+    def steps(
+        self, handle: ArrayHandle, declared: ArrayStep, step: SubmoduleStep, segments, steps: dict[str, Any],
+    ) -> None:
         handle.queries.segments(handle, step)
-        super().steps(handle, declared, step, steps)
+        super().steps(handle, declared, step, segments, steps)
 
 
 class ValueStorage(Storage):
-    """A rewritable array of one entry, in a recurrent state pool that links to the paged array on its nodes."""
+    """A rewritable array of one entry, in a recurrent state pool."""
 
     handle_class = ValueHandle
     kernel_settings = frozenset({"max_slots"})
@@ -1415,27 +1531,32 @@ class ValueStorage(Storage):
         if array.entry.host:
             raise _no_layout(array, f"entry has host fields {sorted(array.entry.host)}, and RecurrentStateConfig has "
                                     "no block for one")
-        if not array.updates:
-            raise _no_layout(array, f"updates is empty, and today's resources hold a Value only for a linear attention "
-                                    f"update ({LinearAttnBinding.kinds()})")
-        holders = [other for other in arrays if storage_of(other) is PAGED and other.nodes & array.nodes]
-        if len(holders) != 1 or not array.nodes <= holders[0].nodes:
-            raise _no_layout(array, f"its nodes must hold one append-only array, the one RecurrentStateConfig.kv_cache "
-                                    f"links to, and they hold {[other.name for other in holders]}")
+        kv_cache = None
+        if bound:
+            # the snapshots its update kernels take are keyed by the pages of the one paged array on its nodes
+            holders = [other for other in arrays if storage_of(other) is PAGED and other.nodes & array.nodes]
+            if len(holders) != 1 or not array.nodes <= holders[0].nodes:
+                raise _no_layout(array, f"its nodes must hold one append-only array, the one "
+                                        f"RecurrentStateConfig.kv_cache links to, and they hold "
+                                        f"{[other.name for other in holders]}")
+            kv_cache = holders[0].name
         layouts = _field_layouts(array, bound)
         pool = RecurrentStateSpec(
             resource_key=array.name, nodes=array.nodes,
             config=RecurrentStateConfig(
                 num_layers=len(array.layers),
                 blocks={field: layouts[field].block(tensor) for field, tensor in array.entry.tensors.items()},
-                kv_cache=holders[0].name,
+                kv_cache=kv_cache,
+                labels=tuple(sorted(array.labels)),
             ),
         )
         return [pool, *_op_specs(array, bound)], bound
 
-    def steps(self, handle: ArrayHandle, declared: ArrayStep, step: SubmoduleStep, steps: dict[str, Any]) -> None:
+    def steps(
+        self, handle: ArrayHandle, declared: ArrayStep, step: SubmoduleStep, segments, steps: dict[str, Any],
+    ) -> None:
         pre, post, rows = _forks(handle.array, declared)
-        steps[handle.name] = RecurrentStep(segments=declared.segments, pre_forks=pre, post_forks=post, fork_rids=rows)
+        steps[handle.name] = RecurrentStep(segments=segments, pre_forks=pre, post_forks=post, fork_rids=rows)
 
 
 class HostValueStorage(Storage):

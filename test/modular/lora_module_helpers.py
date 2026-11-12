@@ -297,6 +297,9 @@ class _AttendCore:
     def __init__(self, rows: _Rows):
         self.attend = CausalAttend(rows)
 
+    def reads_step_kv(self, label=None):
+        return True
+
     def run(self, q, *, label, kv_cache_layer, k, v, layer_idx):
         return self.attend(q, k, v)
 
@@ -862,9 +865,14 @@ def _omni():
 
 
 def _qwen3_tts():
+    from mstar.engine.state.adapters import node_handles
     from mstar.model.components.code_predictor_kernels import ResidualCodePredictor
     from mstar.model.qwen3_tts.components.talker import Qwen3TTSTalkerModel
     from mstar.model.qwen3_tts.config import (
+        CODE_PRED_SAMPLER,
+        TALKER_ATTN,
+        TALKER_KV,
+        TALKER_SAMPLER,
         Qwen3TTSCodePredictorConfig,
         Qwen3TTSModelConfig,
         Qwen3TTSTalkerConfig,
@@ -874,6 +882,34 @@ def _qwen3_tts():
 
     dims = dict(num_attention_heads=4, num_key_value_heads=2, hidden_size=16, intermediate_size=32,
                 head_dim=4, vocab_size=64)
+
+    class AtZero:
+        """The step's tokens at position 0, which the layers' fused RoPE leaves unrotated."""
+
+        def __init__(self, rows: _Rows):
+            self.rows = rows
+
+        def pos_ids(self, label):
+            return torch.zeros(sum(self.rows.lengths), dtype=torch.long)
+
+    def stub_cores(sub, rows: _Rows):
+        """``sub`` with its handles on the Talker's declared state bound over stubs of the kernels, which read
+        ``rows``."""
+        declaring = model_object(Qwen3TTSModel, sub.config, codec_dtype=torch.float32)
+        resources = {
+            TALKER_KV: _Unread(), TALKER_ATTN: _AttendCore(rows), "talker_pos": AtZero(rows), TALKER_SAMPLER: None,
+            CODE_PRED_SAMPLER: None,
+        }
+        sub.bind_node_state(node_handles(declaring, "Talker", resources))
+        return sub
+
+    def run_(sub, rows):
+        lengths = _Rows([len(r) for r in rows])
+        stub_cores(sub, lengths)
+        x = sub.model.model.codec_embedding(torch.cat(rows))
+        with step_over(sub, lengths, (TALKER_KV,)):
+            hidden = sub.model(x)
+        return _per_row(hidden, sub.model.codec_head(_last(hidden, lengths.lengths)), lengths.lengths)
 
     def weights(c):
         tc = c.talker
@@ -892,15 +928,14 @@ def _qwen3_tts():
         )),
         lora_spec=lambda c: _declared(model_object(Qwen3TTSModel, c, codec_dtype=torch.float32)),
         # the code predictor sits beside the Talker, with relative paths of the same shape
-        build=lambda c, group, w: TalkerSubmodule(
+        build=lambda c, group, w: stub_cores(TalkerSubmodule(
             _loaded(Qwen3TTSTalkerModel(c, comm_group=group).to(DTYPE), w),
             ResidualCodePredictor(c.code_predictor, c.talker.hidden_size, TalkerSubmodule.MAX_BATCH_SIZE,
-                                  embed_sum_dtype=None).to(DTYPE), c),
+                                  embed_sum_dtype=None).to(DTYPE), c), _Rows()),
         weights=weights,
         a1=lambda c: {**llama_layers(c.talker, "model."), "codec_head": (c.talker.vocab_size, c.talker.hidden_size)},
         a2=lambda c: _subset(llama_layers(c.talker, "model."), "q_proj", "gate_proj"),
-        run=_ids_run(lambda s: s.model, lambda s, ids: s.model.model.codec_embedding(ids),
-                     lambda s, x: s.model(x, label="main"), lambda s, x: s.model.codec_head(x)),
+        run=run_,
         declare=_declare("talker_prefill"), inputs=_tokens(lambda c: c.talker.vocab_size),
         released=lambda: (model_object(Qwen3TTSModel, Qwen3TTSModelConfig(), codec_dtype=torch.float32),
                           lambda c, g: Qwen3TTSTalkerModel(c, comm_group=g)),

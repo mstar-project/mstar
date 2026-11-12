@@ -7,6 +7,7 @@ cause, in eager steps and at capture. A replay runs no Python, so it skips all o
 
 from __future__ import annotations
 
+import subprocess
 import sys
 from dataclasses import replace
 from functools import partial
@@ -19,7 +20,10 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from mstar.engine import state
 from mstar.engine.resources.attn.base import AttentionManager
+from mstar.engine.resources.recurrent.config import RecurrentStep
+from mstar.engine.resources.recurrent.pool import RecurrentStatePool
 from mstar.engine.resources.sampler import utils as sampler_utils
 from mstar.engine.resources.sampler.config import SamplerStep
 from mstar.engine.resources.sampler.resource import SamplerResource
@@ -44,6 +48,8 @@ from mstar.engine.state import (
     Value,
     at_last_token,
     causal_conv,
+    drew,
+    fused_draw_args,
     gated_delta_net,
     kernel_setting,
     last_sampled,
@@ -52,8 +58,9 @@ from mstar.engine.state import (
     rope,
     sample,
 )
-from mstar.engine.state.adapters import GDN, StateSetup, WithinStepHandle, _resolve, build_handle
+from mstar.engine.state.adapters import GDN, StateSetup, WithinStepHandle, _resolve, build_handle, build_specs
 from mstar.engine.state.calls import ArrayHandle, SamplerHandle
+from mstar.engine.state.host_fields import HostFields
 
 LAYERS, SLOTS, HEADS, DIM = 4, 64, 2, 8
 TOKENS = 3
@@ -218,13 +225,13 @@ def _kv_handle(array=None, kv=None, attn=None) -> ArrayHandle:
 
 def _value_handle(labels=frozenset({"main"})) -> ArrayHandle:
     entry = Entry({
-        "state": TensorType((HEADS, DIM, DIM), dtype=torch.float32, shard=0),
+        "state": TensorType((HEADS, DIM, DIM + 1), dtype=torch.float32, shard=0),
         "conv": TensorType((3 * HEADS * DIM, 3), dtype=None, shard=0),
     })
     updates = {"c": CausalConv(), "d": GatedDeltaNet()}
     array = replace(Value("gdn", nodes={"LLM"}, layers={1, 5}, entry=entry, updates=updates), labels=frozenset(labels))
     pool = _StubPool({
-        "state": torch.zeros(2, SLOTS, HEADS, DIM, DIM),
+        "state": torch.zeros(2, SLOTS, HEADS, DIM + 1, DIM),
         "conv": torch.zeros(2, SLOTS, 3 * HEADS * DIM, 3),
     })
     return build_handle(array, {"gdn": pool, "d": _StubLinear()}, _resolve([_array(), array], StateSetup()))
@@ -613,10 +620,9 @@ def test_a_second_update_of_a_field_in_a_layer_raises():
 
 @pytest.mark.parametrize("call, name", [
     (lambda h, q, k, v: h.add(1, k=k, v=v), "add"),
-    (lambda h, q, k, v: h.read(1, q), "read"),
     (lambda h, q, k, v: at_last_token(h, q), "at_last_token"),
     (lambda h, q, k, v: kernel_setting(h, "d", "splits"), "kernel_setting of 'd'"),
-], ids=["add", "read", "at_last_token", "kernel_setting"])
+], ids=["add", "at_last_token", "kernel_setting"])
 def test_a_call_a_value_does_not_run_has_no_layout_yet(call, name):
     h = _value_handle()
     _begin(h)
@@ -747,7 +753,7 @@ def test_a_placeholder_row_may_touch_a_label_its_request_did_not_open():
 
 def test_keep_false_on_a_value_with_updates_raises():
     h = _value_handle()
-    _refused(r"Array 'gdn': keep=False on an array with updates", lambda: _begin(h, gdn=ArrayStep(keep=False)))
+    _refused(r"Array 'gdn': keep=False on a Value with tensor fields", lambda: _begin(h, gdn=ArrayStep(keep=False)))
 
 
 def test_a_replay_skips_every_step_check():
@@ -1069,3 +1075,458 @@ def test_a_step_that_keeps_a_rows_sample_still_needs_its_draw():
     h.begin_step(step)
     with pytest.raises(ValueError, match="sampled 0 times, and draws is 1"):
         h.check_step(step)
+
+
+# A plain Value, over a real pool: a fp32 matrix `x`, a 0-d int64 count `n`, row 1 fresh and row 2 written
+def _plain_value() -> tuple[ArrayHandle, RecurrentStatePool]:
+    entry = Entry({"x": TensorType((2, 3), dtype=torch.float32), "n": TensorType((), dtype=torch.int64)})
+    array = Value("state", nodes={"LLM"}, layers={0}, entry=entry)
+    (spec,) = build_specs([array], kernel_settings={"state": {"max_slots": 4}})
+    pool = RecurrentStatePool(torch.device("cpu"), spec.config)
+    for rid in (1, 2):
+        pool.ingest_request(rid)
+    return build_handle(array, {"state": pool}, _resolve([array], StateSetup())), pool
+
+
+def _plan(pool, segments, capture=False):
+    plan = RecurrentStep(segments=tuple(segments))
+    rows = [segment.request_id for segment in segments]
+    ctx = StepContext(request_ids=rows, graph_walk="decode", slot=0, capture=capture)
+    assert pool.admit(plan, ctx).ok, "the pool holds a slot for every row"
+    pool.plan(plan, ctx)
+    return plan, ctx
+
+
+def _value_step(h, pool, segments) -> tuple[SubmoduleStep, RecurrentStep, StepContext]:
+    plan, ctx = _plan(pool, segments)
+    step = _begin(h, segments=list(segments), ctx=ctx)
+    return step, plan, ctx
+
+
+def _commit_written(h, pool, rid=2, x=4.0, n=9) -> None:
+    """A kept step that leaves row ``rid`` written."""
+    step, plan, ctx = _value_step(h, pool, [Segment(rid, "main", 1)])
+    h.write(0, x=torch.full((1, 2, 3), x), n=torch.tensor([n]))
+    h.check_step(step)
+    pool.commit(plan, ctx)
+    h.end_step(step)
+
+
+def test_a_values_read_and_write_are_the_pools_gather_and_scatter():
+    h, pool = _plain_value()
+    _commit_written(h, pool)
+    step, _, _ = _value_step(h, pool, [Segment(2, "main", 1)])
+    reached = h.read(0)
+    assert torch.equal(reached.fields["x"], pool.gather("x")), "a read returns what the pool holds"
+    assert reached.fields["n"].tolist() == [9], "a 0-d field reads one scalar per row"
+    assert reached.fields["x"].dtype is torch.float32 and reached.fields["n"].dtype is torch.int64
+    h.end_step(step)
+
+
+def test_row_offsets_count_one_entry_per_row():
+    h, pool = _plain_value()
+    step, _, _ = _value_step(h, pool, [Segment(1, "main", 1), Segment(2, "main", 1)])
+    offsets = h.read(0).row_offsets
+    assert offsets.tolist() == [0, 1, 2] and offsets.dtype is torch.int32, "row r holds its one entry at index r"
+    h.end_step(step)
+
+
+def test_fresh_and_span_zero_rows_read_start_per_field_and_zeros_for_the_rest():
+    h, pool = _plain_value()
+    h.set_start({"x": torch.full((2, 3), 7.0)})
+    _commit_written(h, pool)
+    step, _, _ = _value_step(h, pool, [Segment(1, "main", 1), Segment(2, "main", 0)])
+    reached = h.read(0)
+    assert reached.fields["x"].equal(torch.full((2, 2, 3), 7.0)), "row 2 holds state, and span 0 still reads the start"
+    assert reached.fields["n"].tolist() == [0, 0], "a field start doesn't name reads zeros"
+    h.end_step(step)
+
+
+def test_a_written_row_reads_its_entry_and_not_start():
+    h, pool = _plain_value()
+    start = {"x": torch.full((2, 3), 7.0)}
+    h.set_start(start)
+    _commit_written(h, pool)
+    step, _, _ = _value_step(h, pool, [Segment(1, "main", 1), Segment(2, "main", 1)])
+    x = h.read(0).fields["x"]
+    assert x[0].equal(start["x"]) and x[1].equal(torch.full((2, 3), 4.0)), "a written row kept its entry"
+    h.end_step(step)
+
+
+def test_writing_what_a_read_returned_changes_no_state():
+    h, pool = _plain_value()
+    _commit_written(h, pool)
+    step, _, _ = _value_step(h, pool, [Segment(2, "main", 1)])
+    reached = h.read(0)
+    reached.fields["x"].add_(100.0)
+    reached.fields["n"].add_(100)
+    assert h.read(0).fields["n"].tolist() == [9], "the read's tensors are the caller's"
+    h.end_step(step)
+
+
+def test_a_write_is_visible_to_the_next_steps_read():
+    h, pool = _plain_value()
+    _commit_written(h, pool)
+    _commit_written(h, pool, x=5.0, n=10)
+    step, _, _ = _value_step(h, pool, [Segment(2, "main", 1)])
+    assert h.read(0).fields["n"].tolist() == [10], "a committed step's write is the entry the next step reads"
+    h.end_step(step)
+
+
+def _gdn_over_a_pool(array: Array) -> tuple[RecurrentStatePool, ArrayHandle]:
+    specs = {spec.resource_key: spec for spec in build_specs([_array(), array])}
+    pool = RecurrentStatePool(torch.device("cpu"), specs["gdn"].config, kv_dtype=torch.float32)
+    pool.ingest_request(1)
+    return pool, build_handle(array, {"gdn": pool, "d": _StubLinear()}, _resolve([_array(), array], StateSetup()))
+
+
+def test_a_gated_delta_nets_state_reads_declared_and_stores_k_last():
+    entry = Entry({
+        "state": TensorType((HEADS, DIM, DIM + 1), dtype=torch.bfloat16, shard=0),
+        "conv": TensorType((3 * HEADS * DIM, 3), dtype=None, shard=0),
+    })
+    array = Value("gdn", nodes={"LLM"}, layers={0}, entry=entry, updates={"d": GatedDeltaNet()})
+    pool, h = _gdn_over_a_pool(array)
+    step, _, _ = _value_step(h, pool, [Segment(1, "main", 1)])
+    state = torch.ones(1, HEADS, DIM, DIM + 1, dtype=torch.bfloat16)
+    h.write(0, state=state)
+    assert pool.block("state", 0).shape[1:] == (HEADS, DIM + 1, DIM), "the stored layout is K-last"
+    h._written.clear()
+    assert h.read(0).fields["state"].shape == (1, HEADS, DIM, DIM + 1), "a read returns the declared layout"
+    assert h.read(0).fields["state"].dtype is torch.bfloat16, "a read returns the declared dtype"
+    h.end_step(step)
+
+
+def test_a_second_write_of_a_field_is_refused():
+    h, pool = _plain_value()
+    step, _, _ = _value_step(h, pool, [Segment(1, "main", 1)])
+    h.write(0, x=torch.ones(1, 2, 3))
+    _refused(r"Array 'state': a second write of field 'x' on layer 0", lambda: h.write(0, x=torch.ones(1, 2, 3)))
+    h.end_step(step)
+
+
+def test_a_value_field_written_with_no_row_axis_is_refused_by_name():
+    h, pool = _plain_value()
+    step, _, _ = _value_step(h, pool, [Segment(1, "main", 1)])
+    _refused(r"Array 'state': field 'x' written with no row axis", lambda: h.write(0, x=torch.tensor(1.0)))
+    h.end_step(step)
+
+
+def test_a_read_after_a_write_of_the_layer_is_refused():
+    h, pool = _plain_value()
+    step, _, _ = _value_step(h, pool, [Segment(1, "main", 1)])
+    h.write(0, x=torch.ones(1, 2, 3))
+    _refused(r"Array 'state': a read of layer 0 after its write or update", lambda: h.read(0))
+    h.end_step(step)
+
+
+def test_a_read_after_an_update_of_the_layer_is_refused():
+    entry = Entry({
+        "state": TensorType((HEADS, DIM, DIM + 1), dtype=torch.float32, shard=0),
+        "conv": TensorType((3 * HEADS * DIM, 3), dtype=None, shard=0),
+    })
+    array = Value("gdn", nodes={"LLM"}, layers={0}, entry=entry, updates={"c": CausalConv(), "d": GatedDeltaNet()})
+    pool, h = _gdn_over_a_pool(array)
+    step, _, _ = _value_step(h, pool, [Segment(1, "main", 1)])
+    causal_conv(h, 0, torch.randn(1, 3 * HEADS * DIM), weight=torch.ones(3 * HEADS * DIM, 4))
+    _refused(r"Array 'gdn': a read of layer 0 after its write or update", lambda: h.read(0))
+    h.end_step(step)
+
+
+@pytest.mark.parametrize("call, cause", [
+    (lambda h: h.read(0, torch.ones(1)), r"a Value's read takes no q and no keyword, and got \['q'\]"),
+    (lambda h: h.read(0, bias=1), r"a Value's read takes no q and no keyword, and got \['bias'\]"),
+    (lambda h: h.read(1), r"read on layer 1, which the array doesn't declare"),
+    (lambda h: h.write(0, y=torch.ones(1)), r"no field 'y' on layer 0"),
+    (lambda h: h.write(0, x=torch.ones(1, 2, 4)), r"write of field 'x' on layer 0 is \(2, 4\)"),
+    (lambda h: h.write(0, n=torch.ones(1).long().float()), r"write of field 'n' on layer 0 is \(\) of torch.float32"),
+], ids=["q", "a mask keyword", "an undeclared layer", "an undeclared write", "a write's shape", "a write's dtype"])
+def test_a_values_calls_refuse_what_the_field_cant_hold(call, cause):
+    h, pool = _plain_value()
+    step, _, _ = _value_step(h, pool, [Segment(1, "main", 1)])
+    _refused(rf"Array 'state': {cause}", lambda: call(h))
+    h.end_step(step)
+
+
+def test_a_read_outside_a_step_is_refused():
+    h, _ = _plain_value()
+    _refused(r"Array 'state': read in a step that doesn't list the array", lambda: h.read(0))
+
+
+def test_a_read_on_a_value_with_only_host_fields_is_refused():
+    array = Value("host", nodes={"LLM"}, layers={0}, entry=Entry({}, host={"n": int}))
+    setup = StateSetup(host_fields=HostFields())
+    h = build_handle(array, {}, _resolve([array], setup), setup)
+    _refused(r"Array 'host': no layout yet: read on a HostValueHandle", lambda: h.read(0))
+
+
+def test_set_start_on_an_array_that_isnt_a_value_is_refused():
+    _refused(r"Array 'kv': no layout yet: set_start on a PagedArrayHandle",
+             lambda: _kv_handle().set_start({"k": torch.ones(1)}))
+
+
+def test_set_start_after_the_first_step_is_refused():
+    """A captured read keeps the start tensors it read, so a start set later would differ from that read's replay."""
+    h, pool = _plain_value()
+    step, _, _ = _value_step(h, pool, [Segment(1, "main", 1)])
+    h.end_step(step)
+    _refused(r"Array 'state': set_start after the handle's first step", lambda: h.set_start({"x": torch.zeros(2, 3)}))
+
+
+@pytest.mark.parametrize("start, cause", [
+    ({"y": torch.ones(1)}, r"start names fields \['y'\], of \['n', 'x'\]"),
+    ({"x": torch.ones(2, 4)}, r"start of field 'x' on layer 0 is \(2, 4\)"),
+    ({"x": torch.ones(2, 3).double()}, r"start of field 'x' on layer 0 is .*float64"),
+], ids=["an undeclared field", "a shape", "a dtype"])
+def test_set_start_refuses_what_the_field_cant_hold(start, cause):
+    h, _ = _plain_value()
+    _refused(rf"Array 'state': {cause}", lambda: h.set_start(start))
+
+
+def test_keep_false_on_a_plain_value_is_refused():
+    h, pool = _plain_value()
+    _, ctx = _plan(pool, [Segment(1, "main", 1)])
+    _refused(r"Array 'state': keep=False on a Value with tensor fields",
+             lambda: _begin(h, state=ArrayStep(keep=False), ctx=ctx))
+
+
+def test_a_kept_step_that_leaves_a_field_unwritten_is_refused_naming_it():
+    h, pool = _plain_value()
+    step, _, _ = _value_step(h, pool, [Segment(1, "main", 1)])
+    h.write(0, x=torch.ones(1, 2, 3))
+    _refused(r"Array 'state': layer 0's fields \['n'\] are unwritten", lambda: h.check_step(step))
+    h.end_step(step)
+
+
+def test_a_step_over_a_fresh_row_and_a_written_row_counts_only_its_own_write():
+    """A region's replay writes its rows' slots with no Python, so the handle never sees it. A fresh row it leaves out
+    would then commit as written, and read zeros next rather than its start."""
+    h, pool = _plain_value()
+    _commit_written(h, pool)
+    step, _, _ = _value_step(h, pool, [Segment(1, "main", 1), Segment(2, "main", 1)])
+    slot = pool.addressing("main").host_slot_indices[1]
+    pool.block("x", 0)[slot] = 5.0
+    pool.block("n", 0)[slot] = 10
+    _refused(r"Array 'state': layer 0's fields \['n', 'x'\] are unwritten in a kept step for rows \[1, 2\]",
+             lambda: h.check_step(step))
+    with pytest.raises(ValueError, match="1 rows for a step that declared 2"):
+        h.write(0, x=torch.ones(1, 2, 3))
+    h.end_step(step)
+
+
+def _gdn_entry() -> Entry:
+    return Entry({
+        "state": TensorType((HEADS, DIM, DIM), dtype=torch.float32, shard=0),
+        "conv": TensorType((3 * HEADS * DIM, 3), dtype=None, shard=0),
+    })
+
+
+@pytest.mark.parametrize("updates, unwritten", [
+    ({"c": CausalConv(), "d": GatedDeltaNet()}, None),
+    ({"d": GatedDeltaNet()}, r"\['conv'\]"),
+], ids=["both updates", "no causal conv"])
+def test_a_kept_step_writes_exactly_the_fields_no_update_op_writes(updates, unwritten):
+    """The fields a step writes itself are the entry's minus those its update ops write, whatever kind of Value it
+    is. A GatedDeltaNet and its CausalConv write state and conv in place. A GatedDeltaNet alone leaves conv to the
+    step, which would otherwise keep zeros."""
+    pool, h = _gdn_over_a_pool(Value("gdn", nodes={"LLM"}, layers={0}, entry=_gdn_entry(), updates=updates))
+    step, _, _ = _value_step(h, pool, [Segment(1, "main", 1)])
+    if unwritten is None:
+        h.check_step(step)
+    else:
+        _refused(rf"Array 'gdn': layer 0's fields {unwritten} are unwritten in a kept step for rows \[1\], and no "
+                 "update op writes them", lambda: h.check_step(step))
+    h.end_step(step)
+
+
+def test_nothing_but_gdn_turns_the_state_k_last(monkeypatch):
+    """GDN holds the K-last layout and both of its conversions. With them as the identity, a written state lands in
+    the pool as declared and reads back unchanged, so nothing else transposes it."""
+    monkeypatch.setattr(GDN, "stored", lambda self, value: value)
+    monkeypatch.setattr(GDN, "from_stored", lambda self, stored: stored)
+    updates = {"c": CausalConv(), "d": GatedDeltaNet()}
+    pool, h = _gdn_over_a_pool(Value("gdn", nodes={"LLM"}, layers={0}, entry=_gdn_entry(), updates=updates))
+    state = torch.randn(1, HEADS, DIM, DIM)
+    step, plan, ctx = _value_step(h, pool, [Segment(1, "main", 1)])
+    h.write(0, state=state)
+    slot = pool.addressing("main").host_slot_indices[0]
+    assert torch.equal(pool.block("state", 0)[slot], state[0]), "the write transposed the state outside GDN"
+    pool.commit(plan, ctx)
+    h.end_step(step)
+    step, _, _ = _value_step(h, pool, [Segment(1, "main", 1)])
+    assert torch.equal(h.read(0).fields["state"], state), "the read transposed the state outside GDN"
+    h.end_step(step)
+
+
+def test_a_value_read_that_never_asks_for_row_offsets_builds_none(monkeypatch):
+    """No model reads a Value's row offsets, so building them would cost every eager read a launch and every captured
+    read a recorded kernel."""
+    h, pool = _plain_value()
+    step, _, _ = _value_step(h, pool, [Segment(1, "main", 1), Segment(2, "main", 1)])
+    with monkeypatch.context() as patched:
+        patched.setattr(torch, "arange", Mock(side_effect=AssertionError("the read built row_offsets")))
+        reached = h.read(0)
+    assert reached.row_offsets.tolist() == [0, 1, 2], "asked for, they still count one entry per row"
+    h.end_step(step)
+
+
+def test_a_step_with_every_row_at_span_zero_needs_no_write():
+    h, pool = _plain_value()
+    step, _, _ = _value_step(h, pool, [Segment(1, "main", 0)])
+    h.check_step(step)
+    h.end_step(step)
+
+
+def test_a_replay_skips_the_write_check():
+    h, _ = _plain_value()
+    step = _begin(h, segments=[Segment(1, "main", 1)], ctx=_ctx(leased=True))
+    h.check_step(step)
+    h.end_step(step)
+
+
+class _StubDrawing:
+    """Answers `fused_draw_args` and counts the offsets' advance, as a leased graph sampler does."""
+
+    def __init__(self, args="args"):
+        self.args = args
+        self.advanced = []
+
+    def fused_draw_args(self):
+        return self.args
+
+    def advance_offsets(self, n):
+        self.advanced.append(n)
+
+    def sample(self, rows, logits):
+        self.advanced.append("sample")
+        return logits
+
+
+def _drawing(resource=None, vocab_size=2048, draws=15) -> SamplerHandle:
+    sampler = Sampler("draws", nodes={"LLM"}, vocab_size=vocab_size, draws=draws)
+    return SamplerHandle(sampler, resource or _StubDrawing())
+
+
+def test_fused_draw_args_hands_out_the_samplers_answer():
+    s = _drawing()
+    _begin(s)
+    assert fused_draw_args(s) == "args"
+
+
+def test_no_arguments_from_the_sampler_means_the_model_samples():
+    s = _drawing(_StubDrawing(args=None))
+    _begin(s)
+    assert fused_draw_args(s) is None, "an eager step or a penalty draws through `sample`"
+
+
+@pytest.mark.parametrize("vocab_size, fused", [(2048, True), (2049, False), (3072, False), (4096, False)])
+def test_fused_draws_stop_where_fused_sample_leaves_the_layout_draw_row_assumes(vocab_size, fused, monkeypatch):
+    launched = {}
+    monkeypatch.setattr(sampler_utils, "_fused_sample_kernel", {(1,): lambda *args, **kw: launched.update(kw)})
+    logits = torch.zeros(1, vocab_size)
+    no_draw = (torch.zeros(1), torch.zeros(1, dtype=torch.int32), torch.ones(1), torch.zeros(1, dtype=torch.int64),
+               torch.zeros(1, dtype=torch.int64))
+    sampler_utils.fused_sample(logits, *no_draw)
+    s = _drawing(vocab_size=vocab_size)
+    _begin(s)
+    assert (fused_draw_args(s) is not None) == fused
+    assert (launched["num_warps"] == sampler_utils.FUSED_DRAW_WARPS) == fused, \
+        "draw_row's layout takes FUSED_DRAW_WARPS warps, so the cap has to follow the launch"
+
+
+def test_a_vocabulary_above_the_cap_draws_through_sample():
+    s = _drawing(vocab_size=2049, draws=1)
+    _begin(s)
+    assert fused_draw_args(s) is None
+    _refused(r"Sampler 'draws': drew, and no fused_draw_args this step returned arguments", lambda: drew(s, 1))
+    sample(s, torch.zeros(1, 2049))
+    s.check_step(_step(s))
+
+
+def test_drew_advances_the_offsets_after_the_launch_and_counts_toward_draws():
+    s = _drawing()
+    step = _begin(s)
+    assert fused_draw_args(s) == "args"
+    assert s.resource.advanced == [], "handing out arguments must not move the offsets the kernel is about to read"
+    drew(s, 15)
+    assert s.resource.advanced == [15], "the advance is one per draw, what 15 sample calls would move"
+    s.check_step(step)
+
+
+def test_sample_and_drew_mix_in_one_step_in_order():
+    s = _drawing()
+    step = _begin(s)
+    fused_draw_args(s)
+    drew(s, 14)
+    sample(s, torch.zeros(1, 2048))
+    assert s.resource.advanced == [14, "sample"]
+    s.check_step(step)
+
+
+def test_a_forgotten_drew_fails_the_step():
+    s = _drawing()
+    step = _begin(s)
+    fused_draw_args(s)
+    _refused(r"Sampler 'draws': a step listing it counted 0 draws by sample and drew, and draws is 15",
+             lambda: s.check_step(step))
+
+
+@pytest.mark.parametrize("n", [0, -1, 16, 1.0, True])
+def test_drew_refuses_a_count_outside_the_steps_draws(n):
+    s = _drawing()
+    _begin(s)
+    fused_draw_args(s)
+    _refused(rf"Sampler 'draws': drew\({n!r}\) after 0 draws, and draws is 15", lambda: drew(s, n))
+
+
+def test_drew_refuses_past_the_steps_draws_after_a_sample():
+    s = _drawing()
+    _begin(s)
+    fused_draw_args(s)
+    sample(s, torch.zeros(1, 2048))
+    _refused(r"Sampler 'draws': drew\(15\) after 1 draws", lambda: drew(s, 15))
+
+
+def test_drew_with_no_arguments_handed_out_is_refused():
+    s = _drawing()
+    _begin(s)
+    _refused(r"Sampler 'draws': drew, and no fused_draw_args", lambda: drew(s, 1))
+
+
+def test_arguments_from_one_step_dont_carry_to_the_next():
+    s = _drawing()
+    step = _begin(s)
+    fused_draw_args(s)
+    s.end_step(step)
+    _begin(s)
+    _refused(r"Sampler 'draws': drew, and no fused_draw_args", lambda: drew(s, 1))
+
+
+def test_fused_draw_args_in_a_step_that_doesnt_list_the_sampler_is_refused():
+    _refused(r"Sampler 'draws': fused_draw_args in a step that doesn't list the sampler",
+             lambda: fused_draw_args(_drawing()))
+
+
+def test_the_sampler_imports_nothing_from_the_state_contract():
+    """A resource's launch settings and types live in the resource, and the contract imports them, never the other
+    way round."""
+    script = (
+        "import sys, mstar.engine.resources.sampler.resource; "
+        "sys.exit(any(name.startswith('mstar.engine.state') for name in sys.modules))"
+    )
+    imported = subprocess.run([sys.executable, "-c", script], check=False).returncode
+    assert imported == 0, "the sampler imports the contract"
+
+
+def test_importing_the_contract_leaves_gluon_unimported():
+    script = "import sys, mstar.engine.state; sys.exit('triton.experimental.gluon' in sys.modules)"
+    assert subprocess.run([sys.executable, "-c", script], check=False).returncode == 0, "the contract imported Gluon"
+
+
+def test_the_contract_exports_the_fused_draw_outside_its_surface():
+    from mstar.engine.resources.sampler import fused_draw
+    from mstar.engine.state import draw_row, draw_row_layout
+
+    assert draw_row is fused_draw.draw_row and draw_row_layout is fused_draw.layout
+    names = {"FusedDrawArgs", "fused_draw_args", "drew", "draw_row", "draw_row_layout"}
+    assert names.isdisjoint(state.__all__), "the fused draw can change until a second model draws in place"

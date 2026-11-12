@@ -6,8 +6,7 @@ import triton
 from triton.experimental.gluon import language as gl
 from triton.experimental.gluon.nvidia.hopper import TensorDescriptor
 
-from mstar.engine.resources.sampler import fused_draw
-from mstar.engine.resources.sampler.utils import FusedDrawArgs
+from mstar.engine.state import FusedDrawArgs, draw_row_layout
 from mstar.model.qwen3_tts.components.depth_frame import attend, kernel, linear, schedule
 from mstar.model.qwen3_tts.components.depth_frame.schedule import NPAGES, TB
 
@@ -83,7 +82,7 @@ class DepthFrame:
         self.xd = [TensorDescriptor.from_tensor(t, [MAX_ROWS, 128], sl) for t in (self.X, self.ATT, self.ACT)]
         # frame-local scratch the submodule hands back to `run`: every slot a frame reads, it wrote first
         self.kv_cache = torch.zeros(layers, MAX_ROWS, 2, GROUPS, attn.num_kv_heads, self.head_dim, device=dev, dtype=bf)
-        self.positions = torch.arange(GROUPS, dtype=torch.int32, device=dev)[:, None, None].expand(
+        self.depth_positions = torch.arange(GROUPS, dtype=torch.int32, device=dev)[:, None, None].expand(
             GROUPS, MAX_ROWS, 1).contiguous()
         self.partials = torch.zeros(MAX_ROWS, MAX_ROWS, device=dev, dtype=torch.float32)
         self.rope = attend.rope_table(GROUPS, float(attn.rope_theta), self.head_dim, dev)
@@ -169,7 +168,7 @@ class DepthFrame:
             BLK_1D=self.b1, L1=self.attn_layouts[0], L3=self.attn_layouts[1], K3=self.attn_layouts[2],
             V3=self.attn_layouts[3], E1=gl.BlockedLayout([8], [32], [4], [0]),
             E2=gl.BlockedLayout([1, 4], [1, 32], [2, 2], [1, 0]), SAMPLE=sampled,
-            SLAY=fused_draw.layout(),
+            SLAY=draw_row_layout(),
         )
 
     def _compile(self, args: dict):

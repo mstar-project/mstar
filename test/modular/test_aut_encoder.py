@@ -170,6 +170,41 @@ def test_encode_runs_through_a_bound_ragged_resource():
     assert out.shape == (layout.total_tokens, TINY["output_dim"])
 
 
+def test_encode_attends_through_a_bound_handle():
+    """With a handle bound, attention goes through its ``add`` and ``read``, and the layout must have been planned by
+    the caller; the unbound path is SDPA."""
+    hf, ours = _pair()
+    calls = []
+
+    class _Recorder:
+        def add(self, layer, k, v):
+            self.held = k, v
+
+        def read(self, layer, q):
+            calls.append((layer, q.shape))
+            k, v = self.held
+            # dense attention over the whole packed batch stands in for the
+            # planned kernel, only the call is under test
+            o = torch.nn.functional.scaled_dot_product_attention(
+                q.transpose(0, 1), k.transpose(0, 1), v.transpose(0, 1),
+            )
+            return o.transpose(0, 1)
+
+    rec = _Recorder()
+    ours.layers[0].self_attn.bind_state({"tokens": rec})
+    assert ours.layers[0].self_attn.state is None, "an encoder built alone names no array, so nothing binds"
+    bound = AuTEncoder(AuTEncoderConfig.from_hf(TINY), array="tokens")
+    bound.load_weights(list(hf.state_dict().items()))
+    for layer in bound.layers:
+        layer.self_attn.bind_state({"tokens": rec})
+    feats = torch.randn(TINY["num_mel_bins"], 120)
+    with torch.no_grad():
+        out, layout = bound([feats])
+    assert [layer for layer, _ in calls] == list(range(TINY["encoder_layers"])), "each layer names itself"
+    assert calls[0][1] == (layout.total_tokens, 4, 16)
+    assert out.shape == (layout.total_tokens, TINY["output_dim"])
+
+
 def test_a_float16_layer_keeps_its_residual_stream_finite():
     """As HF's encoder layer does, an fp16 layer clamps its residual stream
     short of the dtype's max, so a long clip's embeddings never overflow to inf."""
@@ -185,3 +220,4 @@ def test_a_float16_layer_keeps_its_residual_stream_finite():
         out = layer(torch.full((4, TINY["d_model"]), 40.0, dtype=torch.float16), [0, 4])
     assert torch.isfinite(out).all()
     assert out.max() == torch.finfo(torch.float16).max - 1000
+

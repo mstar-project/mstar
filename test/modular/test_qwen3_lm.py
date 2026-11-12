@@ -1,13 +1,15 @@
 """The shared dense Qwen3 LM against HF's ``Qwen3ForCausalLM`` on CPU, and the
 frames ``run_layers`` compiles (Qwen3.5's stack included).
 
-The engine's KV / attention / position resources are stood in for by dense
-fakes (causal SDPA over the accumulated K/V with GQA, and textbook RoPE), so
-one prefill plus a few decode steps are compared logit for logit.
+The engine's KV / attention / position resources, or the array behind the
+layers' handle, are stood in for by dense fakes (causal SDPA over the
+accumulated K/V with GQA, and textbook RoPE), so one prefill plus a few decode
+steps are compared logit for logit, on either path.
 """
 
 import sys
 import types
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -19,6 +21,22 @@ from transformers import Qwen3Config, Qwen3ForCausalLM  # noqa: E402
 
 from mstar.distributed.communication import CommGroup  # noqa: E402
 from mstar.engine.resources.convenience import AttentionCallable  # noqa: E402
+from mstar.engine.resources.step import Segment, StepContext, SubmoduleStep  # noqa: E402
+from mstar.engine.state import (  # noqa: E402
+    Array,
+    ArrayStep,
+    Attend,
+    Causal,
+    KVEntry,
+    Positions,
+    Read,
+    Rope,
+)
+from mstar.engine.state.adapters import StateSetup, _resolve, build_handle  # noqa: E402
+from mstar.engine.state.analysis import position_key  # noqa: E402
+from mstar.engine.state.calls import ArrayHandle  # noqa: E402
+from mstar.engine.state.state_op import STATE_OPS  # noqa: E402
+from mstar.model.components import qwen3_lm  # noqa: E402
 from mstar.model.components.qwen3_lm import Qwen3DenseLM, Qwen3LMConfig  # noqa: E402
 
 ATTN, KV, POS = "attn", "kv", "rope"
@@ -176,26 +194,50 @@ def test_prefill_and_decode_logits_match_hf():
         rope.next_pos += 1
 
 
-def test_layer_stack_runs_one_compiled_frame_per_layer_besides_attention(dynamo_counts):
+def _frames_on_resources(num_layers: int):
+    """A stack on fake resources: its forward, and its first layer's attention."""
+    torch.manual_seed(0)
+    config = Qwen3LMConfig.from_hf(dict(TINY, num_hidden_layers=num_layers))
+    ours = Qwen3DenseLM(config, attn_key=ATTN, kv_key=KV, pos_key=POS).eval()
+    fake, rope = _FakeKVAttention(), _FakeRope()
+    for module in ours.modules():
+        if hasattr(module, "bind_resources") and module is not ours:
+            module.bind_resources({ATTN: fake, KV: fake, POS: rope})
+    return (lambda h: ours(h, label="main")), ours.layers[0].self_attn
+
+
+def _frames_on_its_array(num_layers: int):
+    """A stack on a handle: its forward, and its first layer's attention, each in a step of its own."""
+    _, ours, handle, _ = _on_state(num_layers=num_layers)
+
+    def step(h):
+        _next_step(handle, 3)
+        return ours(h)
+
+    def one_layer(h):
+        _next_step(handle, 3)
+        return ours.layers[0].self_attn(h)
+
+    return step, one_layer
+
+
+@pytest.mark.parametrize("stack", [_frames_on_resources, _frames_on_its_array], ids=["resources", "array"])
+def test_layer_stack_runs_one_compiled_frame_per_layer_besides_attention(dynamo_counts, stack):
     """``run_layers`` runs eager (its loop breaks at the layer cursor), so each
     compiled frame it calls per layer is dispatched on every uncaptured forward:
     the norms and the MLP must be one frame."""
-
-    def lm(num_layers):
-        torch.manual_seed(0)
-        config = Qwen3LMConfig.from_hf(dict(TINY, num_hidden_layers=num_layers))
-        ours = Qwen3DenseLM(config, attn_key=ATTN, kv_key=KV, pos_key=POS).eval()
-        fake, rope = _FakeKVAttention(), _FakeRope()
-        for module in ours.modules():
-            if hasattr(module, "bind_resources") and module is not ours:
-                module.bind_resources({ATTN: fake, KV: fake, POS: rope})
-        return ours
-
     x = torch.randn(3, TINY["hidden_size"])
-    two, four = lm(2), lm(4)
-    extra = (dynamo_counts(lambda h: four(h, label="main"), x).graph_calls
-             - dynamo_counts(lambda h: two(h, label="main"), x).graph_calls)
-    assert extra <= 2 * (dynamo_counts(two.layers[0].self_attn, x).graph_calls + 1)
+    (two, one_layer), (four, _) = stack(2), stack(4)
+    extra = dynamo_counts(four, x).graph_calls - dynamo_counts(two, x).graph_calls
+    assert extra <= 2 * (dynamo_counts(one_layer, x).graph_calls + 1)
+
+
+def test_an_attention_on_its_array_compiles_only_the_frames_around_its_state_op(dynamo_counts):
+    """``one_layer`` compiles as two frames around `_next_step`, and the attention's forward as two around its state
+    op. Its graph and resume counts stay the same with a helper method between the two, so only the frames show it."""
+    _, one_layer = _frames_on_its_array(2)
+    compiles = dynamo_counts(one_layer, torch.randn(3, TINY["hidden_size"])).compiles
+    assert compiles <= 4, f"{compiles} frames compiled for one layer, against 4"
 
 
 def test_an_empty_layer_stack_is_the_final_norm():
@@ -270,6 +312,221 @@ def test_the_position_resource_says_when_a_layer_may_fuse_its_rope(overrides, he
         device=torch.device("cpu"), head_dim=head_dim,
     )
     assert rope.fusable_rope_theta(head_dim) == (1e6 if fusable else None)
+
+
+class _FakePages(_FakeKVAttention):
+    """The same pages through a handle's calls, which name the layer and the label."""
+
+    def layer_view(self, i=0):
+        return i
+
+    def opens_label(self, rid, label):
+        return True
+
+    def reads_step_kv(self, label=None):
+        return False
+
+    def write_kv(self, k, v, layer_idx=None, label=None):
+        self._pending = (k, v)
+
+    def run(self, q, label=None, kv_cache_layer=None, k=None, v=None, layer_idx=None):
+        return super().run(q, kv_cache_layer)
+
+
+class _FakePositions:
+    """Each step's planned ids, past its tokens as a bucket's buffer runs, and a rotation that says it ran."""
+
+    def __init__(self):
+        self.ids = torch.arange(64, dtype=torch.int32)
+        self.rotated = 0
+
+    def pos_ids(self, label):
+        return self.ids
+
+    def advance(self, tokens):
+        self.ids += tokens
+
+    def apply_qk(self, q, k, label, rope_dtype):
+        self.rotated += 1
+        return q, k
+
+
+def _declared(rope: Rope | None = None, num_layers: int = TINY["num_hidden_layers"]) -> Array:
+    return Array(
+        KV, nodes={"LLM"}, layers=frozenset(range(num_layers)), max_len=128,
+        entry=KVEntry(heads=TINY["num_key_value_heads"], head_dim=TINY["head_dim"]),
+        positions=Positions(rope=Rope(theta=TINY["rope_theta"]) if rope is None else rope),
+        reads={ATTN: Read(mask=Causal(), op=Attend(q_heads=TINY["num_attention_heads"]))},
+    )
+
+
+def _on_state(rope: Rope | None = None, num_layers: int = TINY["num_hidden_layers"]):
+    """A stack bound to a handle on fake pages, with no fused ops bound, as on any device but CUDA."""
+    values = dict(TINY, num_hidden_layers=num_layers)
+    torch.manual_seed(0)
+    hf = Qwen3ForCausalLM(Qwen3Config(**values, attn_implementation="eager")).eval()
+    ours = Qwen3DenseLM(Qwen3LMConfig.from_hf(values), array=KV).eval()
+    ours.load_weights([(k.removeprefix("model."), v) for k, v in hf.state_dict().items()])
+    pages, pos = _FakePages(), _FakePositions()
+    array = _declared(rope, num_layers)
+    handle = build_handle(array, {KV: pages, ATTN: pages, position_key(array): pos}, _resolve([array], StateSetup()))
+    for module in ours.modules():
+        if hasattr(module, "bind_state"):
+            module.bind_state({KV: handle})
+    return hf, ours, handle, pos
+
+
+@torch.compiler.disable
+def _next_step(handle: ArrayHandle, tokens: int) -> None:
+    step = SubmoduleStep(segments=[Segment(1, "main", tokens)], state={KV: ArrayStep()})
+    step.set_ctx(StepContext((1,), "decode", 0, False))
+    handle.end_step(step)
+    handle.begin_step(step)
+
+
+def test_prefill_and_decode_logits_match_hf_through_the_ops_reference():
+    """No fused kernel off CUDA, so this holds the reference to the textbook rotation the kernel is held to."""
+    hf, ours, handle, pos = _on_state()
+    torch.manual_seed(3)
+    prompt = torch.randint(0, TINY["vocab_size"], (7,))
+    with torch.no_grad():
+        expected = hf(prompt[None]).logits[0]
+        _next_step(handle, 7)
+        embeds = ours.embed(prompt)
+        before = embeds.clone()
+        actual = ours.logits(ours(embeds))
+    assert torch.allclose(actual, expected, atol=1e-4), (actual - expected).abs().max()
+    assert pos.rotated == 0, "off CUDA the op's reference runs, not a second path through rope()"
+    # the residual stream is run_layers' own copy: a caller's static input survives
+    assert torch.equal(embeds, before)
+
+    # two greedy decode steps: the fake pages carry the prompt's K/V forward
+    pos.advance(prompt.numel())
+    seq = prompt.clone()
+    for _ in range(2):
+        nxt = expected[-1].argmax().view(1)
+        seq = torch.cat([seq, nxt])
+        with torch.no_grad():
+            expected = hf(seq[None]).logits[0]
+            _next_step(handle, 1)
+            step = ours.logits(ours(ours.embed(nxt)))
+        assert torch.allclose(step[0], expected[-1], atol=1e-4), (step[0] - expected[-1]).abs().max()
+        pos.advance(1)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_the_ops_reference_is_plain_rope_after_rmsnorm_and_leaves_k_alone(dtype):
+    tokens, heads, kv_heads, dim, theta = 5, 4, 2, 8, 1e6
+    torch.manual_seed(0)
+    q = torch.randn(tokens, heads, dim, dtype=dtype)
+    k, v = torch.randn(tokens, kv_heads, dim, dtype=dtype), torch.randn(tokens, kv_heads, dim, dtype=dtype)
+    q_weight, k_weight = torch.randn(dim, dtype=dtype), torch.randn(dim, dtype=dtype)
+    pos_ids = torch.tensor([0, 1, 2, 7, 100, 999, 999], dtype=torch.int32)
+    calls = []
+
+    def read(layer, q):
+        calls.append(("read", layer, q.clone()))
+        return q * 2
+
+    def textbook(x, weight):
+        x = x.float()
+        normed = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + 1e-6) * weight.float()
+        inv_freq = 1.0 / theta ** (torch.arange(0, dim, 2).float() / dim)
+        z = torch.complex(normed[..., : dim // 2], normed[..., dim // 2:])
+        rotated = z * torch.polar(torch.ones(tokens, dim // 2), pos_ids[:tokens].float()[:, None] * inv_freq)[:, None]
+        return torch.cat((rotated.real, rotated.imag), -1)
+
+    want_q, want_k, k_before = textbook(q, q_weight), textbook(k, k_weight), k.clone()
+    kv = SimpleNamespace(add=lambda layer, k, v: calls.append(("add", layer, k, v)), read=read)
+    out = qwen3_lm._norm_rope_attend(kv, 3, q, k, v, q_weight, k_weight, pos_ids, theta, 1e-6, 1e-6)
+    tolerance = 1e-5 if dtype is torch.float32 else 2e-2
+    assert [call[0] for call in calls] == ["add", "read"], "the read comes after the add"
+    (_, layer, added_k, added_v), (_, read_layer, read_q) = calls
+    assert torch.allclose(q.float(), want_q, atol=tolerance), "q is rotated in place, as the kernel does"
+    assert torch.allclose(added_k.float(), want_k, atol=tolerance), "the stored k is normed and rotated"
+    assert torch.equal(k, k_before), "the kernel leaves its k argument as it was"
+    assert added_v is v and layer == 3
+    assert added_k.dtype is dtype, "a backend that takes K/V at its read refuses a k of another dtype than its v"
+    assert read_layer == 3 and torch.equal(read_q, q) and torch.equal(out, q * 2), "the read takes the rotated q"
+
+
+def test_the_state_op_takes_its_reference_without_a_fused_kernel():
+    assert "qk_norm_rope_attend" in STATE_OPS
+    assert qwen3_lm.qk_norm_rope_attend.op.reference is qwen3_lm._norm_rope_attend
+    assert {fmt.devices for fmt in qwen3_lm.qk_norm_rope_attend.op.formats} == {frozenset({"cuda"})}
+
+
+@pytest.mark.parametrize("overrides, head_dim, fused", [
+    ({}, 128, True),
+    ({"rotary_dim": 128}, 128, True),
+    ({"rotary_dim": 64}, 128, False),
+    ({"interleave": True}, 128, False),
+    ({"scale": 2.0}, 128, False),
+    ({"dtype": torch.float32}, 128, False),
+    ({"low_freq_factor": 1.0, "high_freq_factor": 4.0, "old_context_len": 8192}, 128, False),
+    ({"table_dtype": torch.bfloat16}, 128, False),
+])
+def test_a_declared_rope_the_kernel_doesnt_compute_stays_out_of_it(overrides, head_dim, fused):
+    assert qwen3_lm._plain_theta(Rope(theta=1e6, **overrides), head_dim) == (1e6 if fused else None)
+
+
+def test_no_declared_rope_stays_out_of_the_kernel():
+    assert qwen3_lm._plain_theta(None, 128) is None
+
+
+def test_a_layer_takes_the_op_only_for_a_plain_rope_with_q_and_k_norms():
+    _, plain, _, _ = _on_state()
+    assert plain.layers[0].self_attn._fuse, "plain RoPE and per-head norms, on any device: the format picks the kernel"
+    _, table, handle, pos = _on_state(Rope(theta=1e4, rotary_dim=TINY["head_dim"], interleave=True,
+                                           table_dtype=torch.bfloat16))
+    assert not table.layers[0].self_attn._fuse, "fusing an interleaved rope would corrupt the outputs with no error"
+    _next_step(handle, 3)
+    with torch.no_grad():
+        table(table.embed(torch.tensor([1, 2, 3])))
+    assert pos.rotated == TINY["num_hidden_layers"], "a rope the kernel doesn't compute rotates through the array"
+
+
+def _capture_frames(num_layers: int) -> int:
+    torch._dynamo.reset()
+    _, ours, handle, _ = _on_state(num_layers=num_layers)
+    frames = []
+
+    def backend(graph_module, inputs):
+        frames.append(graph_module)
+        return graph_module.forward
+
+    _next_step(handle, 3)
+    torch._dynamo.optimize(backend, dynamic=False)(ours)(ours.embed(torch.tensor([1, 2, 3])))
+    return len(frames)
+
+
+@torch.no_grad()
+def test_a_stack_compiled_as_a_capture_compiles_no_frame_per_layer():
+    """A capture compiles with `dynamic=False`, where a module's int specializes per layer and hits the recompile limit,
+    and the frames then run uncompiled."""
+    assert _capture_frames(num_layers=4) == _capture_frames(num_layers=2) > 1
+
+
+@torch.no_grad()
+def test_a_second_compiled_step_compiles_nothing_new():
+    torch._dynamo.reset()
+    _, ours, handle, pos = _on_state()
+    frames = []
+
+    def backend(graph_module, inputs):
+        frames.append(graph_module)
+        return graph_module.forward
+
+    compiled = torch._dynamo.optimize(backend, dynamic=False)(ours)
+    embeds = ours.embed(torch.tensor([1, 2, 3]))
+    _next_step(handle, 3)
+    compiled(embeds)
+    first_call = len(frames)
+    pos.advance(3)
+    _next_step(handle, 3)
+    with torch.compiler.set_stance("fail_on_recompile"):
+        compiled(embeds)
+    assert len(frames) == first_call, "a capture's stance raises on any new compile"
 
 
 @pytest.mark.parametrize("splits", [False, True])

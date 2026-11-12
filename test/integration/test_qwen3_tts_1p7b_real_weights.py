@@ -195,8 +195,7 @@ def test_base_reference_clip_becomes_xvector_frames_and_clone_prefill(loaded):
     # role(3) + [think, think_bos, lang?, think_eos, x-vector, pad] + in-context span (streaming text default)
     assert prefill.input_embeds.shape[1] == model.config.talker.hidden_size
     assert prefill.input_seq_len > 3 + 5 + frames
-    state = talker.request_state("clone-prefill")
-    assert torch.equal(state["reference_frames"], codes)
+    assert torch.equal(prefill.kwargs["lead_frames"], codes[-model.config.codec.clone_lead_frames:])
     model._submodule_cache.pop("RefEncoder", None)
     del ref_encoder
     torch.cuda.empty_cache()

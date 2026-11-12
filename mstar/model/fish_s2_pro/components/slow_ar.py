@@ -18,7 +18,7 @@ import torch
 from torch import nn
 
 from mstar.model.components.qwen3_lm import Qwen3DenseLM
-from mstar.model.fish_s2_pro.config import AR_ATTN, AR_KV, AR_POS, FishS2ProConfig
+from mstar.model.fish_s2_pro.config import AR_KV, FishS2ProConfig
 
 SLOW_AR_PREFIX = "text_model.model."
 
@@ -73,12 +73,7 @@ class FishSlowAR(nn.Module):
     def __init__(self, config: FishS2ProConfig):
         super().__init__()
         self.config = config
-        self.lm = Qwen3DenseLM(
-            config.slow_ar.qwen3_lm_config(),
-            attn_key=AR_ATTN,
-            kv_key=AR_KV,
-            pos_key=AR_POS,
-        )
+        self.lm = Qwen3DenseLM(config.slow_ar.qwen3_lm_config(), array=AR_KV)
         # Never used: ``semantic_head`` replaces the tied 155,776-row head.
         self.lm.lm_head = nn.Identity()
         self.register_buffer(
@@ -116,9 +111,9 @@ class FishSlowAR(nn.Module):
     def embed(self, token_ids: torch.Tensor) -> torch.Tensor:
         return self.lm.embed(token_ids)
 
-    def forward(self, input_embeds: torch.Tensor, *, label: str) -> torch.Tensor:
+    def forward(self, input_embeds: torch.Tensor) -> torch.Tensor:
         """``(tokens, D)`` -> final-normed hidden states."""
-        return self.lm(input_embeds, label=label)
+        return self.lm(input_embeds)
 
     def semantic_logits(self, hidden: torch.Tensor) -> torch.Tensor:
         """``[B, D]`` -> ``[B, 4097]``: codes 0..4095, then ``<|im_end|>``."""

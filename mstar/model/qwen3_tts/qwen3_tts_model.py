@@ -43,20 +43,22 @@ from transformers import AutoTokenizer
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import PartitionDefinition
-from mstar.engine.resources import (
-    AttentionConfig,
-    AttentionSpec,
-    KVSpec,
-    NodeResourceSpec,
-    PagedKVConfig,
-    PositionConfig,
-    PositionSpec,
-    ResourceReqConfig,
-    SamplerSpec,
-    SamplingReqConfig,
-)
 from mstar.engine.resources.lora import LoraSpec
-from mstar.engine.resources.recurrent import RecurrentStateConfig, RecurrentStateSpec
+from mstar.engine.state import (
+    Array,
+    Attend,
+    Causal,
+    Entry,
+    KVEntry,
+    Layout,
+    Positions,
+    Read,
+    Rope,
+    Sampler,
+    SampleSettings,
+    Span,
+    Value,
+)
 from mstar.graph.base import (
     GraphEdge,
     GraphNode,
@@ -70,10 +72,8 @@ from mstar.model.audio_watermark import AudioSealWatermarker, AudioWatermarkConf
 from mstar.model.base import (
     ClientChunk,
     KVLabel,
-    LabelLayout,
     Model,
     ProcessPromptOutput,
-    Span,
     TensorAndMetadata,
     WalkStep,
 )
@@ -89,8 +89,8 @@ from mstar.model.qwen3_tts.config import (
     TALKER_ATTN,
     TALKER_KV,
     TALKER_MIXED,
-    TALKER_POS,
     TALKER_SAMPLER,
+    TALKER_TEXT,
     Qwen3TTSModelConfig,
 )
 from mstar.model.submodule_base import NodeSubmodule
@@ -516,6 +516,40 @@ class Qwen3TTSModel(Model):
     # Model ABC: resources
     # -----------------------------------------------------------------------
 
+    def declare_state(self) -> list[Array | Sampler]:
+        """Talker paged KV with its read and positions, whether TTS EOS was fed, its two samplers, and the Codec's
+        per-stream decoder state.
+
+        The CodePredictor's frame-local KV scratch is its ``DepthKV``'s (overwritten every step)."""
+        from mstar.model.qwen3_tts.components.incremental_codec import codec_state_entry
+
+        talker = self.config.talker
+        # min_p is on where the checkpoint defaults it on, so that default is not refused
+        defaults = self._generation_defaults()
+        return [
+            Array(
+                TALKER_KV, nodes={"Talker"}, layers=frozenset(range(talker.num_hidden_layers)),
+                entry=KVEntry(heads=talker.num_key_value_heads, head_dim=talker.head_dim),
+                max_len=talker.max_position_embeddings, positions=Positions(rope=Rope(theta=talker.rope_theta)),
+                reads={TALKER_ATTN: Read(mask=Causal(), op=Attend(q_heads=talker.num_attention_heads))},
+            ),
+            Sampler(
+                TALKER_SAMPLER, nodes={"Talker"}, vocab_size=talker.vocab_size, penalty=True,
+                min_p=bool(defaults.get("min_p")),
+            ),
+            # groups 1-15 of each frame, the depth loop's draws
+            Sampler(
+                CODE_PRED_SAMPLER, nodes={"Talker"}, vocab_size=talker.code_predictor.vocab_size, penalty=False,
+                min_p=bool(defaults.get("code_predictor_min_p")),
+                draws=self.config.num_code_groups - 1,
+            ),
+            Value(TALKER_TEXT, nodes={"Talker"}, layers=frozenset({0}), entry=Entry({}, host={"eos_fed": bool})),
+            Value(
+                CODEC_STATE, nodes={"Codec"}, layers=frozenset({0}),
+                entry=codec_state_entry(self.config.codec, self.codec_dtype),
+            ),
+        ]
+
     def _lora_spec(self) -> LoraSpec:
         """Per-request adapters on the Talker: every linear of its stack and the
         codec-group-0 head (one row per request: the last token's), named as the
@@ -531,61 +565,17 @@ class Qwen3TTSModel(Model):
             exclude={"text_projection": "the prefill projects it in prepare_inputs, outside the planned step"},
         )
 
-    def get_node_resources(self) -> list[NodeResourceSpec]:
-        """Talker paged KV + attention/position/sampler resources, and the
-        Codec's per-stream decoder state.
+    def get_node_resources(self):
+        return [self._lora_spec()]
 
-        The CodePredictor's frame-local KV scratch is not a resource; its
-        ``DepthKV`` owns it (overwritten every step)."""
-        from mstar.model.qwen3_tts.components.incremental_codec import codec_state_blocks
-
-        talker = self.config.talker
-        cp = talker.code_predictor
-        # min_p is on where the checkpoint defaults it on, so that default is not refused
-        defaults = self._generation_defaults()
-        talker_kv = PagedKVConfig(
-            num_layers=talker.num_hidden_layers,
-            num_kv_heads=talker.num_key_value_heads,
-            head_dim=talker.head_dim,
-            max_seq_len=talker.max_position_embeddings,
-            num_qo_heads=talker.num_attention_heads,
-        )
-        return [
-            KVSpec(resource_key=TALKER_KV, nodes={"Talker"}, config=talker_kv),
+    def kernel_settings(self) -> dict[str, dict[str, Any]]:
+        return {
             # Every checkpoint has two query heads per KV head: the CUDA-core
             # decode kernel wins, since the tensor-core one pads them to a tile
-            AttentionSpec(
-                resource_key=TALKER_ATTN, nodes={"Talker"},
-                config=AttentionConfig(kv_cache=TALKER_KV, decode_tensor_cores=False),
-            ),
-            PositionSpec(
-                resource_key=TALKER_POS, nodes={"Talker"},
-                config=PositionConfig(kv_cache=TALKER_KV, rope_theta=talker.rope_theta),
-            ),
-            SamplerSpec(
-                resource_key=TALKER_SAMPLER, nodes={"Talker"},
-                vocab_size=talker.vocab_size,
-                enable_repetition_penalty=True,
-                enable_min_p=bool(defaults.get("min_p")),
-            ),
-            SamplerSpec(
-                resource_key=CODE_PRED_SAMPLER, nodes={"Talker"},
-                vocab_size=cp.vocab_size,
-                enable_repetition_penalty=False,
-                enable_min_p=bool(defaults.get("code_predictor_min_p")),
-            ),
-            RecurrentStateSpec(
-                resource_key=CODEC_STATE, nodes={"Codec"},
-                config=RecurrentStateConfig(
-                    # the transformer's layers are named blocks
-                    num_layers=1,
-                    blocks=codec_state_blocks(self.config.codec, self.codec_dtype),
-                    # streams being decoded at once, + 1 for the pool's sink slot
-                    max_slots=self.MAX_CODEC_STREAMS + 1,
-                ),
-            ),
-            self._lora_spec(),
-        ]
+            TALKER_ATTN: {"decode_tensor_cores": False},
+            # streams being decoded at once, + 1 for the pool's sink slot
+            CODEC_STATE: {"max_slots": self.MAX_CODEC_STREAMS + 1},
+        }
 
     # -----------------------------------------------------------------------
     # Model ABC: walk graph declaration
@@ -995,7 +985,7 @@ class Qwen3TTSModel(Model):
         # a clone's x-vector takes the speaker row
         clone = "audio" in input_modalities
         rows = prefill_rows(metadata[PROMPT_LAYOUT_KEY], language_id, speaker_id >= 0 or clone)
-        metadata["kv_layout"] = {TALKER_KV: {"main": LabelLayout(
+        metadata["state_layout"] = {TALKER_KV: {"main": Layout(
             spans=(Span("rows", "talker_prefill_clone" if clone else "talker_prefill", rows, rows, "text_inputs"),),
             growth=(("talker_decode_loop", 1),),
         )}}
@@ -1079,7 +1069,7 @@ class Qwen3TTSModel(Model):
 
     def get_request_resource_configs(
         self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
-    ) -> dict[str, ResourceReqConfig]:
+    ) -> dict[str, SampleSettings]:
         """Per-request sampling: Talker head (group 0) + CodePredictor (1-15).
 
         Plain keys target the Talker; ``talker_<knob>`` wins over a plain one.
@@ -1109,10 +1099,10 @@ class Qwen3TTSModel(Model):
             elif key in defaults:
                 code_pred[knob] = defaults[key]
         return {
-            TALKER_SAMPLER: SamplingReqConfig(
+            TALKER_SAMPLER: SampleSettings(
                 **talker, ignore_eos=model_kwargs.get("ignore_eos", False),
             ),
-            CODE_PRED_SAMPLER: SamplingReqConfig(**code_pred),
+            CODE_PRED_SAMPLER: SampleSettings(**code_pred),
         }
 
     def _generation_defaults(self) -> dict:
@@ -1260,6 +1250,7 @@ class Qwen3TTSModel(Model):
         )
         # the depth loop reads the loaded weights folded and stacked
         code_predictor.consolidate_stacked_weights()
+        code_predictor.depth.make(next(code_predictor.parameters()).dtype, device)
         code_predictor.eval()
         return TalkerSubmodule(talker, code_predictor, self.config, depth_kernel=self.depth_kernel)
 

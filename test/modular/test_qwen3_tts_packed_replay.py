@@ -16,6 +16,7 @@ from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner, autoca
 from mstar.engine.resources import StepContext, StepRunner, apply_yaml_overrides, resolve_spec_dependencies
 from mstar.engine.resources.base import EngineResourceInfo, build_resource
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
+from mstar.engine.state.adapters import node_handles, node_resources, sampling_configs
 from mstar.model.components.code_predictor_kernels import ResidualCodePredictor
 from mstar.model.qwen3_tts.components.talker import Qwen3TTSTalkerModel
 from mstar.model.qwen3_tts.config import (
@@ -26,7 +27,7 @@ from mstar.model.qwen3_tts.config import (
 )
 from mstar.model.qwen3_tts.qwen3_tts_model import Qwen3TTSModel
 from mstar.model.qwen3_tts.submodules import TalkerSubmodule
-from mstar.model.submodule_base import ARNodeInputs, ModelInputsFromEngine
+from mstar.model.submodule_base import ARNodeInputs, ModelInputsFromEngine, engine_step
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph capture needs a GPU")
 
@@ -67,6 +68,7 @@ def _submodule(config: Qwen3TTSModelConfig) -> TalkerSubmodule:
                 torch.nn.init.zeros_(param)
         module.to(device=DEVICE, dtype=DTYPE).eval().requires_grad_(False)
     code_predictor.consolidate_stacked_weights()
+    code_predictor.depth.make(DTYPE, DEVICE)
     return TalkerSubmodule(talker, code_predictor, config)
 
 
@@ -79,7 +81,7 @@ class _Node:
         model = Qwen3TTSModel.__new__(Qwen3TTSModel)
         model.config = config
         model.codec_dtype = torch.float32
-        specs = [spec for spec in model.get_node_resources() if NODE in spec.nodes]
+        specs = [spec for spec in node_resources(model) if NODE in spec.nodes]
         apply_yaml_overrides(specs, {"resources": {TALKER_KV: {"max_num_pages": 64, "page_size": 16}}})
         by_key = resolve_spec_dependencies(specs)
         groups = JointGroups(tp_group=CommGroup.trivial(), sp_group=CommGroup.trivial(), instance=CommGroup.trivial())
@@ -95,9 +97,12 @@ class _Node:
             for spec in specs
         }
         self.runner = StepRunner(self.resources, node_resources={NODE: list(self.resources)})
-        self.overrides = model.get_request_resource_configs([], [], model_kwargs={"do_sample": False})
+        self.overrides = sampling_configs(
+            model.get_request_resource_configs([], [], model_kwargs={"do_sample": False}), model.declare_state(),
+        )
         self.sub = _submodule(config)
         self.sub.bind_node_resources(self.resources)
+        self.sub.bind_node_state(node_handles(model, NODE, self.resources))
         self.hidden: torch.Tensor | None = None
         self.sub.model.register_forward_hook(self._keep_hidden)
         self.cg = None
@@ -144,7 +149,7 @@ class _Node:
             meta = self.cg.step_metadata(lease, rids, infos)
         ctx = StepContext(request_ids=tuple(rids), graph_walk=WALK, slot=0, capture=False, slot_lease=lease)
         ctx.set_padded_rids(step_ids)
-        step = self.sub.declare_step(WALK, list(step_ids), inputs, slot_lease=lease)
+        step = engine_step(self.sub, WALK, list(step_ids), inputs, slot_lease=lease)
         step.set_ctx(ctx)
         try:
             with torch.no_grad(), autocast_scope(DTYPE, device_type=DEVICE.type):
@@ -155,10 +160,13 @@ class _Node:
                     captured=lease is not None,
                 )
                 pre = self.sub.preprocess(WALK, engine_inputs, inputs)
+                step.begin_calls()
                 if lease is None:
                     self.sub.forward_batched(WALK, engine_inputs, **pre)
                 else:
                     self.cg.run_forward(lease, pre)
+                step.check_calls()
+                step.end_calls()
                 self.runner.commit(step)
         finally:
             if lease is not None:

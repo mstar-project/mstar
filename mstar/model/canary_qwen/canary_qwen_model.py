@@ -23,38 +23,33 @@ import json
 import logging
 import re
 from collections.abc import Iterable, Iterator, Mapping
+from typing import Any
 
 import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import FINAL_PREFILL
-from mstar.engine.resources import (
-    AttentionConfig,
-    AttentionSpec,
-    KVSpec,
-    NodeResourceSpec,
-    PagedKVConfig,
-    PositionConfig,
-    PositionSpec,
-    ResourceReqConfig,
-    SamplerSpec,
+from mstar.engine.state import (
+    Array,
+    Attend,
+    Causal,
+    KVEntry,
+    Layout,
+    Positions,
+    Read,
+    Rope,
+    Sampler,
+    SampleSettings,
+    Span,
 )
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import (
-    KVLabel,
-    LabelLayout,
-    Model,
-    ProcessPromptOutput,
-    Span,
-    WalkStep,
-)
+from mstar.model.base import KVLabel, Model, ProcessPromptOutput, WalkStep
 from mstar.model.canary_qwen.config import (
     ATTN,
     DECODE_LOOP,
     DECODE_WALK,
     KV_CACHE,
-    ROPE,
     SAMPLER,
     CanaryQwenModelConfig,
 )
@@ -176,40 +171,35 @@ class CanaryQwenModel(Model):
     # resources
     # -------------------------------------------------------------------
 
-    def get_node_resources(self) -> list[NodeResourceSpec]:
+    def declare_state(self) -> list[Array | Sampler]:
         llm = self.config.llm
-        kv_config = PagedKVConfig(
-            num_layers=llm.num_hidden_layers,
-            num_kv_heads=llm.num_key_value_heads,
-            head_dim=llm.head_dim,
-            max_seq_len=self.MAX_SEQ_LEN,
-            num_qo_heads=llm.num_attention_heads,
-            page_size=128,
-            # the request cap at MAX_SEQ_LEN, 16 pages each; at Qwen3-1.7B's
-            # 112 KiB per token in bf16 that is about 15 GB
-            max_num_pages=kv_pages(self.MAX_SEQ_LEN, 128, self.MAX_CONCURRENT_REQUESTS),
-        )
+        capabilities = sampler_capabilities(self.sampling_defaults)
         return [
-            KVSpec(resource_key=KV_CACHE, nodes={"llm"}, config=kv_config),
-            AttentionSpec(resource_key=ATTN, nodes={"llm"}, config=AttentionConfig(kv_cache=KV_CACHE)),
-            PositionSpec(
-                resource_key=ROPE, nodes={"llm"},
-                config=PositionConfig(kv_cache=KV_CACHE, rope_theta=llm.rope_theta),
+            Array(
+                KV_CACHE, nodes={"llm"}, layers=frozenset(range(llm.num_hidden_layers)),
+                entry=KVEntry(heads=llm.num_key_value_heads, head_dim=llm.head_dim), max_len=self.MAX_SEQ_LEN,
+                positions=Positions(rope=Rope(theta=llm.rope_theta)),
+                reads={ATTN: Read(mask=Causal(), op=Attend(q_heads=llm.num_attention_heads))},
             ),
-            SamplerSpec(
-                resource_key=SAMPLER, nodes={"llm"}, vocab_size=llm.vocab_size,
-                **sampler_capabilities(self.sampling_defaults),
+            Sampler(
+                SAMPLER, nodes={"llm"}, vocab_size=llm.vocab_size,
+                penalty=capabilities["enable_repetition_penalty"], min_p=capabilities["enable_min_p"],
             ),
         ]
+
+    def kernel_settings(self) -> dict[str, dict[str, Any]]:
+        # the request cap at MAX_SEQ_LEN, 16 pages each; at Qwen3-1.7B's 112 KiB per token in bf16 that is about 15 GB
+        return {KV_CACHE: {"max_num_pages": kv_pages(self.MAX_SEQ_LEN, 128, self.MAX_CONCURRENT_REQUESTS)}}
 
     def validate_config_yaml(self, config: dict, config_path: str) -> None:
         check_kv_pools_fit(self, config, config_path, logger)
 
     def get_request_resource_configs(
         self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
-    ) -> dict[str, ResourceReqConfig]:
+    ) -> dict[str, SampleSettings]:
         del input_modalities, output_modalities
-        return {SAMPLER: sampling_config(self.sampling_defaults, model_kwargs)}
+        config = sampling_config(self.sampling_defaults, model_kwargs)
+        return {SAMPLER: SampleSettings(**{key: getattr(config, key) for key in SAMPLING_KEYS})}
 
     def request_kwargs(self) -> frozenset[str]:
         return frozenset({"instruction", "language", "max_output_tokens", *SAMPLING_KEYS})
@@ -317,13 +307,13 @@ class CanaryQwenModel(Model):
         )
         length = int(pads.ids.numel())
         # rows, not ids: the audio placeholders are the same for every clip of a length
-        kv_layout = {KV_CACHE: {"main": LabelLayout(
+        state_layout = {KV_CACHE: {"main": Layout(
             spans=(Span("rows", PREFILL_WALK, length, length, "text_inputs"),),
             growth=((DECODE_LOOP, 1),),
         )}}
         layout = media_layout(pads)
         return ProcessPromptOutput(
-            {"audio": [samples], "text_inputs": [pads.ids]}, {MEDIA_LAYOUT: layout, "kv_layout": kv_layout},
+            {"audio": [samples], "text_inputs": [pads.ids]}, {MEDIA_LAYOUT: layout, "state_layout": state_layout},
         )
 
     def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
@@ -373,7 +363,7 @@ class CanaryQwenModel(Model):
             from mstar.model.components.qwen3_lm import Qwen3DenseLM
 
             with torch.device("meta"):
-                llm = Qwen3DenseLM(self.config.llm, attn_key=ATTN, kv_key=KV_CACHE, pos_key=ROPE)
+                llm = Qwen3DenseLM(self.config.llm, array=KV_CACHE)
             if autocast_dtype is not None:
                 llm = llm.to(autocast_dtype)
             llm = llm.to_empty(device=device)
