@@ -1016,8 +1016,12 @@ def approve(out, pr, head_sha, runner_temp, verdict, vendors="nvidia"):
         print("not approved: " + bot.log_value("; ".join(outcome.why)))  # the model's text and file names
         decision.write_text(left_for_you(pr, review, outcome) + "\n")
         return
+    questions, decisions = len(review["questions"]), len((review.get("risk") or {}).get("look_at") or ())
+    left = [f"{n} {what}{'' if n == 1 else 's'}" for n, what in ((questions, "open question"),
+                                                                   (decisions, "design decision")) if n]
     body = (f"Approved by the review bot on `{head_sha[:7]}`: no open P0–P2 finding, and the live test passed on "
-            "it. It covers this commit only: a push leaves it visible, but a merge then needs a new "
+            "it. " + (f"{' and '.join(left)} remain on the summary's checklist for a person. " if left else "")
+            + "It covers this commit only: a push leaves it visible, but a merge then needs a new "
             "`/review` or a person's approval.")
     bot.gh("api", "-X", "POST", f"repos/{REPO}/pulls/{pr}/reviews", "--input", "-",
            input=json.dumps({"commit_id": head_sha, "event": "APPROVE", "body": body}))

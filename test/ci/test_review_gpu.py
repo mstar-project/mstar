@@ -921,7 +921,7 @@ class TestComment(unittest.TestCase):
 class TestApprove(unittest.TestCase):
     def approve(self, variable, verdict="pass", head="0123456789", perm="write", risk="low", files=None,
                 outside=(), above=None, extra=None, untestable="", head_repo=OWN_HEAD, inline=None, prior=(),
-                untouched=(), vendors="nvidia", security=False):
+                untouched=(), vendors="nvidia", security=False, questions=(), look_at=()):
         """approve on a PR that meets the rule (a docs change) with REVIEW_APPROVALS as `variable`, unless
         `verdict` or the other arguments fail it; its decision text, the outputs and the writes."""
         pr = {"head": {"sha": head, "repo": head_repo}, "base": {"sha": "abcdef", "repo": BASE_REPO},
@@ -934,9 +934,9 @@ class TestApprove(unittest.TestCase):
                   **(extra or {})}
         with tempfile.TemporaryDirectory() as temp, workspace() as ws:
             (ws / "review.json").write_text(json.dumps({
-                "outside_diff": list(outside), "prior_findings": list(prior), "questions": [], "skipped": [],
-                "inline": inline or {}, "untouched": list(untouched),
-                "risk": {"level": risk, "reason": "docs only", "security": security, "look_at": []},
+                "outside_diff": list(outside), "prior_findings": list(prior), "questions": list(questions),
+                "skipped": [], "inline": inline or {}, "untouched": list(untouched),
+                "risk": {"level": risk, "reason": "docs only", "security": security, "look_at": list(look_at)},
                 "live_test": {"run": "full", "reason": "r", "checks": ["correctness"], "gpus": 1,
                               "untestable": untestable}}))
             if above is not None:
@@ -1125,6 +1125,10 @@ class TestApprove(unittest.TestCase):
                              "the approval would land on another commit, or not count as an approval")
             self.assertIn("**Approved** on `0123456`", text)
             self.assertNotIn("low design risk", posted[-1]["body"], "a medium-risk approval would say it was low")
+        self.approve({"value": "on"}, risk="medium", extra=capture, questions=[{"location": "", "text": "q"}],
+                     look_at=[{"location": "a.py:1", "why": "w"}])
+        self.assertIn("1 open question and 1 design decision", posted[-1]["body"],
+                      "the approval would read as if nothing were left for a person")
         for variable, what in (({"value": "off"}, "off"), (Fail("HTTP 404"), "unset"),
                                (Fail("HTTP 403"), "unreadable")):
             text, out, writes = self.approve(variable)
