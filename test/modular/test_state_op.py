@@ -34,7 +34,7 @@ from mstar.engine.state import (
     Value,
     state_op,
 )
-from mstar.engine.state.adapters import PAGED, Resolved, StateSetup, _bindings, _resolve, build_handle
+from mstar.engine.state.adapters import Resolved, StateSetup, _resolve, build_handle
 from mstar.engine.state.calls import ArrayHandle
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.testing_utils.model import make_model
@@ -308,16 +308,6 @@ def test_no_fused_op_runs_on_an_array_where_one_layers_read_takes_k_and_v_at_its
     h = build_handle(array, resources, _resolve([array], StateSetup()))
     state_op_module.bind_state_ops({"kv": h})
     assert h.fused_ops == frozenset(), "layer 1's read would refuse a read with no add before it"
-
-
-def test_a_state_op_on_a_seq_sharded_array_is_refused():
-    array = _kv_array(seq_sharded=True)
-    # resolve refuses a seq_sharded paged array, so its bound read and that read's resource are given here
-    resolved = Resolved({}, {array.name: _bindings(PAGED, array)}, {"attn": "attn"}, {})
-    h = build_handle(array, {array.name: _StubKV(), "attn": _StubAttn()}, resolved)
-    _open(h)
-    with pytest.raises(ValueError, match="no layout yet: state op 'write_q' on a seq_sharded array"):
-        _fused_op()(h, 0, *_tensors())
 
 
 def test_a_compiled_caller_breaks_at_a_state_op(monkeypatch):

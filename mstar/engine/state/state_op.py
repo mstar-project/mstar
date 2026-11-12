@@ -117,8 +117,6 @@ def _check_call(op: StateOp, args: Sequence[Any]) -> None:
     for name, at in op.handle_at.items():
         handle: ArrayHandle = args[at]
         handle._check_open(f"state op {op.name!r}")
-        if handle.array.seq_sharded:
-            raise handle._no_layout(f"state op {op.name!r} on a seq_sharded array, whose calls carry a rank's share")
         if name in op.reads:
             handle._check_add_read(f"state op {op.name!r} reads {name}")
 
