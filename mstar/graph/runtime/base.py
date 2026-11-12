@@ -620,6 +620,9 @@ class PostprocessRequest(NamedTuple):
     python_send: bool = False
     # wg_ids.keys[i]'s ``RouteInput.loop_strides``; None, 1 each
     loop_strides: list[int] | None = None
+    # values per row of ``tokens`` and ``inline``: one per iteration of a
+    # repeated step, side by side
+    token_width: int = 1
 
 
 class RouteTensors(NamedTuple):
@@ -1357,6 +1360,13 @@ class GraphRuntime(PhasedPostprocess, ABC):
         """``(counts, caps)``: row i's ``loop_names[i]`` (as ``set_loop_caps``),
         its count so far and the count it ends at; -1 for both for a row this
         worker does not hold."""
+        pass
+
+    @abstractmethod
+    def loop_room(self, node_name: str, graph_walk: str, loop_name: str, rids: list[int], stride: int) -> int:
+        """How many more iterations of ``loop_name`` every one of ``rids`` can
+        take, after the ``stride`` each has in flight; 0 for a row this worker
+        does not hold."""
         pass
 
     @abstractmethod
