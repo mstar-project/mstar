@@ -9,7 +9,17 @@ from typing import TYPE_CHECKING, get_origin
 
 import torch
 
-from mstar.engine.state.contract import EMPTY, Array, Bidirectional, Block, Read, Sampler, is_value, read_layers
+from mstar.engine.state.contract import (
+    EMPTY,
+    Array,
+    Bidirectional,
+    Block,
+    FrameWindow,
+    Read,
+    Sampler,
+    is_value,
+    read_layers,
+)
 
 if TYPE_CHECKING:
     from mstar.model.base import Model
@@ -171,7 +181,7 @@ def _regrouping_problems(model: "Model", arrays: Sequence[Array], graphs: Mappin
     # worker keys its spans (`PreprocessWorkerThread._check_whole_steps`).
     whole = [
         (array, key, read) for array in arrays for key, read in array.reads.items()
-        if isinstance(read.mask, Block | Bidirectional)
+        if isinstance(read.mask, Block | Bidirectional | FrameWindow)
     ]
     regrouped = [
         *((node, walk, "a chunking policy splits across steps", "leave it out of the policy")
@@ -203,8 +213,9 @@ def _regrouping_problems(model: "Model", arrays: Sequence[Array], graphs: Mappin
     ]
     # once per array, which several of its nodes may report
     return list(dict.fromkeys(
-        f"Array {array.name!r}.reads[{key!r}]: {type(read.mask).__name__} on walk {walk!r}, which {cause}. A Block or "
-        f"Bidirectional read sees each step's adds as a whole, so {fix}"
+        f"Array {array.name!r}.reads[{key!r}]: {type(read.mask).__name__} on walk {walk!r}, which {cause}. "
+        + ("A step boundary inside a frame cuts what the frame's queries see" if isinstance(read.mask, FrameWindow)
+           else "A Block or Bidirectional read sees each step's adds as a whole") + f", so {fix}"
         for sources, reads in ((regrouped, whole), (replaced, kept))
         for node, walk, cause, fix in sources
         for array, key, read in reads if node in array.nodes and runs_on_walk(read, walk)

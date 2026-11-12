@@ -74,6 +74,11 @@ SNAPSHOT = {
         ["at", "KEYWORD_ONLY", None],
         ["rows", "KEYWORD_ONLY", 'None'],
     ],
+    "FrameWindow": [
+        ["tokens", "POSITIONAL_OR_KEYWORD", None],
+        ["frames", "KEYWORD_ONLY", None],
+        ["stride", "KEYWORD_ONLY", '1'],
+    ],
     "GatedDeltaNet": [
         ["qk_l2norm", "KEYWORD_ONLY", 'True'],
         ["scale", "KEYWORD_ONLY", 'None'],

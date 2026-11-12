@@ -114,6 +114,24 @@ class Bidirectional(Mask):
             raise ValueError(f"Bidirectional.kept_window must be a bool, got {self.kept_window!r}")
 
 
+@dataclass(frozen=True)
+class FrameWindow(Mask):
+    """Frames are runs of ``tokens`` entries, and q is in frame f = q // ``tokens``. Sees every entry of frame f, and of
+    each earlier frame g with f - g < ``frames`` and g a multiple of ``stride``."""
+
+    tokens: int
+    _: KW_ONLY
+    frames: int
+    stride: int = 1
+
+    def __post_init__(self):
+        for name in ("tokens", "frames", "stride"):
+            if not _is_positive(getattr(self, name)):
+                raise ValueError(f"FrameWindow.{name} must be a positive int, got {getattr(self, name)!r}")
+        if self.frames % self.stride:
+            raise ValueError(f"FrameWindow.frames must be a multiple of stride {self.stride}, got {self.frames}")
+
+
 class Op:
     """A kernel the engine plans before the step and runs on an array's entries.
 
