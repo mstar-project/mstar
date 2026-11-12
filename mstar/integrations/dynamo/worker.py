@@ -33,7 +33,6 @@ from mstar.integrations.dynamo.bridges import (
     TensorBridge,
     get_tensor_spec,
 )
-from mstar.utils import cpus, knobs
 from mstar.utils.socket_prefix import per_launch_socket_prefix
 
 if TYPE_CHECKING:
@@ -80,17 +79,12 @@ def build_server(args) -> tuple[APIServer, mp.process.BaseProcess, str]:
         APIServer,
         _conductor_process_target,
         _set_preprocess_threads,
-        deployment_cpu_plan,
+        install_deployment_cpus,
     )
     from mstar.communication.communicator import CommProtocol
 
     # before the workers exist: under ``auto`` this takes the GPUs' locks
-    try:
-        cpus.install(deployment_cpu_plan(config))
-    except cpus.CpuPlanError as e:
-        raise SystemExit(f"mstar: {e}") from None
-    if knobs.idle_hold() == "qos":
-        logger.info(cpus.hold_idle())
+    install_deployment_cpus(config)
     _set_preprocess_threads(model, config)
     # the deployment config, as the native server passes it: prefix-cache keys,
     # LoRA adapters and request limits all come from it
