@@ -2215,9 +2215,9 @@ tokens over a pair of ranks (``cfg_size: 2, sp_size: 2``, Ulysses on the dit's
 self-attention) to cut one request's latency. Split the guidance branches
 first (``cfg_size: 2``), then add ``sp_size`` on top: on two GPUs,
 ``sp_size: 2`` alone is slower than ``cfg_size: 2``.
-``sp_size`` must divide the dit's 24 attention heads, and SP needs
-``attention_backend: flashinfer`` (``sdpa`` runs outside the engine's resources, so it is
-refused on SP ranks). Under concurrency, data
+``sp_size`` must divide the dit's 24 attention heads, and SP needs the
+ragged resource (``backend: sdpa`` on ``dit_self_attn`` runs outside the engine's resources, so
+it is refused on SP ranks). Under concurrency, data
 parallelism stays the throughput layout: at 1280x704x81 and 4 concurrent, four
 replicas (``wan22_dp2.yaml``'s layout over four ranks) serve 8.6 videos/min
 against 7.2 for this layout on H200s, and 11.0 against 7.4 in a separate run on
@@ -2262,7 +2262,8 @@ shard): each rank holds the whole DiT and half the tokens, and only the video
 self-attention exchanges them (Ulysses, one all-to-all each way); the cross-attentions
 run on each rank's own tokens, and the audio queries over the video merge the ranks'
 partial attentions. The attention resources do the exchanges, so it needs
-``attention_backend: flashinfer`` (``sdpa`` is refused on SP ranks). ``ltx2_5_tp2`` shards
+the ragged resources (``backend: sdpa`` on one is refused on SP ranks where it reads split
+keys). ``ltx2_5_tp2`` shards
 the weights instead and all-reduces after every block's attentions and feed-forwards.
 
 Performance (2x H100, warm; diffusers with the same recipe and seeds; the ``ltx2_5_sp2`` column

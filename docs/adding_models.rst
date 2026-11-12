@@ -773,18 +773,21 @@ It takes ``Block()``, since no query position decides what it sees. Separate tok
 separate arrays, and arrays of one kind and geometry on one node share one resource, each under
 its own label.
 
-An array whose calls carry each rank's share of its tokens under sequence parallelism declares
-``seq_sharded=True``. Segments always cover the whole sequence, so ``declare_step`` is the same
-on every rank, and the two flags pick the exchange: Ulysses with both sides sharded, none with
-only the queries sharded, and a merge of the ranks' partial attentions with only the keys.
+Under sequence parallelism an array declares nothing: the node's sequence shard
+(``SeqShardSpec``, in ``get_node_resources``) lists the labels whose tokens split, and an array
+is split on a step when the shard lists its label and splits that step. Segments always cover
+the whole sequence, so ``declare_step`` is the same on every rank, and the read's resource picks
+the exchange per step: Ulysses with both sides split, none with only the queries split, and a
+merge of the ranks' partial attentions with only the keys. A read on SDPA (``backend: sdpa``)
+over split keys is refused.
 
 A read takes its queries packed, ``(tokens, heads, head_dim)`` over every row. A read whose layers
 pass rows of one length, ``(rows, len, heads, head_dim)``, as a DiT's do, declares
 ``packed=False``, and a packed call to it is refused.
 A read whose request's segments lie end to end in one row, as a DiT's packed rows and their pad
 do, declares ``segmented=True``. It takes ``Block()``, ``packed=False`` and no ``queries``, and it
-runs one request a step. Under sequence parallelism the ranks split each request's whole row by
-``sp_seq_split``, not each segment.
+runs one request a step. Under sequence parallelism its shard splits the whole row (``axis=0``),
+not each segment.
 
 A ``Value`` may hold only host fields, small values a step changes, as
 ``Entry({}, host={"eos_sent": bool})``. Each starts at its type's zero value. ``host(h, request,
@@ -984,10 +987,11 @@ The spec types are:
        ``workspace_mb`` is the floor of each label's FlashInfer workspace per slot (default
        ``MSTAR_WORKSPACE_BUFFER_MB``, 512, which doesn't apply once it is declared): a plan that
        asks for more at startup grows it. A node with many labels can declare less, since a
-       ragged prefill only uses it for split-KV partials. The spec's
-       ``sp_exchange="ulysses"`` attends a label the node's sequence shard splits by
-       Ulysses, splitting the heads over TP × SP (see **Sequence and context
-       parallelism**). ``compile_op``, ``workspace_mb`` and ``sp_exchange`` are the
+       ragged prefill only uses it for split-KV partials. The spec's ``labels`` are
+       the labels its plans run under that may split (a within-step array's read fills
+       them from its label): where the node's sequence shard lists one, the resource
+       attends it by Ulysses, splitting the heads over TP × SP (see **Sequence and
+       context parallelism**). ``compile_op``, ``workspace_mb`` and ``labels`` are the
        model's declaration; the serving config's ``resources:`` overrides take only the
        backends and the ceilings.
        See `Cacheless attention (encoder towers)`_ for ``compile_op``.
@@ -1389,8 +1393,8 @@ Called with ``return_lse=True``, a ragged or ragged cross-attention resource's `
 FlashInfer backend also returns each query row's log-sum-exp (``[total_tokens, H]``, fp32,
 natural log) from the same plan, which is what merging attentions over disjoint key sets
 needs; a compiled caller breaks there even with ``compile_op``. A label exchanged over SP ranks
-on its step can't return one, and on SP ranks every label of an ``sp_exchange`` resource is, copied
-steps included: on a split step the resource merges the partials itself (LTX-2.5's audio queries
+on its step can't return one, and on SP ranks every label of a Ulysses resource (one over a label
+its shard lists) is, copied steps included: on a split step the resource merges the partials itself (LTX-2.5's audio queries
 over each rank's share of the video tokens, merged by ``gather_merge``).
 
 Block-causal attention within spans
@@ -3110,11 +3114,11 @@ Each attention resource derives what it does from the two, and the model writes 
    * - Copied
      - head slice: this rank's heads of q, k and v, write and attend, gather the heads
      - each rank attends its slots, partials merged (below)
-     - heads over TP; with ``sp_exchange``, a head slice
+     - heads over TP; over a label the shard lists, a head slice
    * - Split
      - Ulysses: one all-to-all from split tokens to split heads, write and attend, one back
      - refused at load for now
-     - ``sp_exchange="ulysses"``: Ulysses; without it, refused at plan
+     - Ulysses over a label the spec's ``labels`` list; any other split label refused at plan
    * - Cross, split queries
      - n/a
      - n/a
@@ -3149,8 +3153,8 @@ Splitting is declared in four places:
   ``combined_labels`` (``SubmoduleStep``, as ``Resource.steps_from_segments`` says), added at any
   SP size (at one rank its plan is a constant), so a combined plan label gets a range too. A step
   that declares no segments has no shard plan, and the attention resources refuse it, so it fails
-  on one GPU. A step whose segments differ from the node's (LTX-2.5's video alone) sets
-  them on the ``SubmoduleStep`` and gives the other resources' steps their own.
+  on one GPU. The diffusion scaffold's step holds each label's segments once, however many
+  arrays attend them (LTX-2.5's video tokens are the keys of two).
 - The forward **brackets** its layer stack: ``shard.scatter(label, *xs, dim=None)`` before it
   (this rank's share of each tensor, ``dim`` the spec's axis by default; ``None`` passes through),
   ``shard.gather(label, x)`` after it. Both are the identity on a copied step, at one SP rank, and
@@ -3164,9 +3168,11 @@ Splitting is declared in four places:
   (``attend.write(k, v)`` writes K/V alone; a no-op where the attention writes K/V inside its own
   run, ``requires_kv_write`` False), a ragged one through its ``run``. A layer that
   writes through ``write_target`` or calls ``attn.run`` itself on a split label raises, since it
-  would treat this rank's share as the whole step. A cacheless self-attention that may see split tokens declares
-  ``RaggedAttentionSpec(..., sp_exchange="ulysses")``; it is a no-op on a node with no
-  ``SeqShardSpec``, so one declaration serves every deployment shape.
+  would treat this rank's share as the whole step. A cacheless self-attention over a label the
+  shard lists runs Ulysses: an array declares nothing for it (its read's resource lists its label),
+  and a hand-written ``RaggedAttentionSpec`` lists the label in ``labels``. Both are no-ops on a
+  node with no ``SeqShardSpec``, so one declaration serves every deployment shape. A read bound to
+  SDPA (``backend: sdpa``) runs outside the resources and is refused over keys the shard splits.
 
 Every resource of a splitting node must support split steps (``Resource.supports_split_steps``:
 the KV pool, paged FlashInfer and dense attention, ragged self and cross attention, positions, the
@@ -3176,7 +3182,7 @@ nor places its pools by position; a shard with no attention that can take split 
 ``exchanges=False``); a
 pool stored by position (``context_parallel``) on a node that splits its steps, not yet supported; a
 head-stored pool whose query and KV heads per TP rank don't divide by ``sp_size``; a ragged
-``sp_exchange`` whose heads don't divide by ``tp * sp``; a ragged cross-attention under a shard on
+Ulysses attention whose heads don't divide by ``tp * sp``; an SDPA read over keys the shard splits; a ragged cross-attention under a shard on
 axis 0 (a packed split can leave a rank none of a row); and expert
 parallelism. The engine alone refuses a resource without ``supports_split_steps`` at load, and, at
 warmup (after the weights load and the compiles), piecewise captures, a capture replayed under
