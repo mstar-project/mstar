@@ -93,7 +93,7 @@ from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import KVLabel, LabelLayout, Model, ProcessPromptOutput, Span, WalkStep
 from mstar.model.components.diffusion.unipc import SOLVER_STATE
 from mstar.model.components.mrope import layout_extent
-from mstar.model.components.video_encode import encode_mp4
+from mstar.model.components.video_encode import encode_mp4, encode_mp4_chunked
 from mstar.model.cosmos3 import constants
 from mstar.model.cosmos3.components.packing import (
     ACTION_MODE_FORWARD_DYNAMICS,
@@ -1341,26 +1341,19 @@ class Cosmos3Model(Model):
             fps = float((request_kwargs or {}).get("fps", self.config.fps))
             preset = os.environ.get("COSMOS3_X264_PRESET", "ultrafast")
             try:
-                # Preferred: torchcodec (torchvision >= 0.27 removed write_video).
-                from torchcodec.encoders import VideoEncoder
-
-                encoded = VideoEncoder(frames, frame_rate=fps).to_tensor(
-                    "mp4",
-                    codec="libx264",
-                    crf=18,
-                    preset=preset,
-                    extra_options={"threads": "0"},
-                )
-                data = encoded.numpy().tobytes()
+                # Preferred: torchcodec (torchvision >= 0.27 removed write_video),
+                # the clip's frames in parallel pieces, a keyframe at each.
+                data = encode_mp4_chunked(frames, fps, crf=18, preset=preset)
             except Exception as exc:  # noqa: BLE001 — torchcodec raises RuntimeError/OSError without FFmpeg
                 # Fallback for environments without a loadable torchcodec (no
                 # FFmpeg shared libraries on the host, or the older
-                # decode-only build that lacks VideoEncoder): PyAV, whose
-                # wheel bundles FFmpeg with libx264, at the same CRF/preset.
+                # decode-only build that lacks VideoEncoder), or a failed
+                # chunked encode: PyAV, whose wheel bundles FFmpeg with
+                # libx264, at the same CRF/preset, in one piece.
                 if not isinstance(exc, ImportError):
                     logger.warning(
-                        "Cosmos3 video encode: torchcodec unavailable (%s); encoding with PyAV",
-                        str(exc).splitlines()[0][:160],
+                        "Cosmos3 video encode: the torchcodec encode failed (%s: %s); encoding with PyAV",
+                        type(exc).__name__, str(exc).splitlines()[0][:160] if str(exc) else "",
                     )
                 # NTSC rates exactly (encode_mp4's denominator is 1001)
                 data = encode_mp4(

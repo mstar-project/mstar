@@ -224,6 +224,18 @@ class CpuPlan:
         return min(8, self.left)
 
     @property
+    def video_chunks(self) -> int:
+        """Pieces one H.264 clip encodes in parallel (``video_encode.encode_mp4_chunked``)."""
+        return min(8, self.left)
+
+    @property
+    def video_encode_threads(self) -> int:
+        """Workers of the pool every chunked clip of the process shares: enough
+        for ``encode_workers`` clips finishing together to encode all their
+        pieces at once, as ``deflate_threads`` is for PNGs."""
+        return min(self.left, self.encode_workers * self.video_chunks)
+
+    @property
     def encode_workers(self) -> int:
         """Outputs the data worker encodes at once. A PNG deflates
         ``png_threads`` blocks at once, so the pool times that stays within the

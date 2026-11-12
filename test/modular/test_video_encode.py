@@ -180,3 +180,77 @@ def test_cosmos3_pyav_path_writes_an_exact_ntsc_rate(monkeypatch, height, width)
     clip = _clip(9, height, width)
     data = model.postprocess(torch.from_numpy(clip).permute(0, 3, 1, 2), "video", {"fps": NTSC})
     assert data == _plain(clip, NTSC, ULTRAFAST, pad_even=True)
+
+
+def _torchcodec_encoder():
+    try:
+        from torchcodec.encoders import VideoEncoder
+        VideoEncoder(torch.zeros(2, 3, 16, 16, dtype=torch.uint8), frame_rate=1.0).to_tensor("mp4", codec="libx264")
+    except Exception as exc:  # noqa: BLE001 - no FFmpeg libraries, or a decode-only build
+        pytest.skip(f"torchcodec can't encode here: {exc}")
+    return VideoEncoder
+
+
+def _decoded(data: bytes):
+    with av.open(io.BytesIO(data)) as container:
+        stream = container.streams.video[0]
+        frames = list(container.decode(stream))
+        return frames, stream.average_rate
+
+
+@pytest.mark.parametrize("fps", [16.0, NTSC])
+def test_a_chunked_encode_is_its_pieces_encoded_alone(fps):
+    """The pieces join into one stream: every frame, in order, as its piece encodes
+    alone, a keyframe at each piece, at the clip's exact rate."""
+    VideoEncoder = _torchcodec_encoder()
+    clip = torch.from_numpy(_clip(50, 48, 64)).permute(0, 3, 1, 2).contiguous()
+    data = video_encode.encode_mp4_chunked(clip, fps, crf=18, preset="ultrafast", pieces=4)
+    frames, rate = _decoded(data)  # 50 frames: 4 pieces of 12-13
+    assert len(frames) == 50
+    assert rate == Fraction(fps).limit_denominator(1001)
+    assert [i for i, f in enumerate(frames) if f.key_frame] == [0, 13, 26, 38]
+    alone = [
+        f
+        for piece in clip.tensor_split(4)
+        for f in _decoded(VideoEncoder(piece, frame_rate=float(fps)).to_tensor(
+            "mp4", codec="libx264", crf=18, preset="ultrafast").numpy().tobytes())[0]
+    ]
+    assert all(np.array_equal(a.to_ndarray(format="rgb24"), b.to_ndarray(format="rgb24"))
+               for a, b in zip(frames, alone, strict=True))
+
+
+def test_a_short_clip_encodes_in_one_piece():
+    _torchcodec_encoder()
+    frames_needed = video_encode.MIN_PIECES * video_encode.MIN_PIECE_FRAMES
+    clip = torch.from_numpy(_clip(frames_needed - 1, 48, 64)).permute(0, 3, 1, 2).contiguous()
+    frames, _ = _decoded(video_encode.encode_mp4_chunked(clip, 16.0, crf=18, preset="ultrafast", pieces=8))
+    assert len(frames) == len(clip) and sum(f.key_frame for f in frames) == 1
+
+
+@pytest.mark.parametrize("preset", ["veryfast", "medium"])
+def test_pieces_keep_display_order_under_a_b_frame_preset(preset):
+    """Raw H.264 carries no timestamps, so the pieces encode without B-frames and
+    every frame's timestamp is its index, whatever the preset."""
+    _torchcodec_encoder()
+    clip = torch.from_numpy(_clip(50, 48, 64)).permute(0, 3, 1, 2).contiguous()
+    data = video_encode.encode_mp4_chunked(clip, 16.0, crf=18, preset=preset, pieces=4)
+    with av.open(io.BytesIO(data)) as container:
+        stream = container.streams.video[0]
+        pts = [f.pts for f in container.decode(stream)]
+        step = int(1 / (stream.time_base * stream.average_rate))
+    assert pts == [i * step for i in range(50)]
+
+
+def test_cosmos3_postprocess_encodes_a_long_clip_in_pieces(monkeypatch):
+    """Through the model: a clip long enough to split comes back as one mp4 of
+    every frame, a keyframe per piece."""
+    _torchcodec_encoder()
+    from mstar.model.cosmos3.cosmos3_model import Cosmos3Model
+    from mstar.utils import cpus
+
+    monkeypatch.delenv("COSMOS3_X264_PRESET", raising=False)
+    monkeypatch.setattr(cpus.CpuPlan, "video_chunks", property(lambda self: 4))
+    model = Cosmos3Model(model_path_hf="unused", skip_weight_loading=True)
+    clip = torch.from_numpy(_clip(60, 48, 64)).permute(0, 3, 1, 2).contiguous()
+    frames, rate = _decoded(model.postprocess(clip, "video", {"fps": 16.0}))
+    assert len(frames) == 60 and rate == 16 and sum(f.key_frame for f in frames) == 4
