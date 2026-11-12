@@ -22,6 +22,7 @@ import torch
 from torch._dynamo.utils import counters
 
 from mstar.engine import state
+from mstar.engine.resources.kv.bounded.manager import BoundedKVManager
 from mstar.engine.resources.recurrent.config import RecurrentStep
 from mstar.engine.resources.recurrent.pool import RecurrentStatePool
 from mstar.engine.resources.sampler import utils as sampler_utils
@@ -47,6 +48,7 @@ from mstar.engine.state import (
     SampleStep,
     TensorType,
     Value,
+    Window,
     add_read,
     at_last_token,
     causal_conv,
@@ -61,7 +63,15 @@ from mstar.engine.state import (
     rope,
     sample,
 )
-from mstar.engine.state.adapters import GDN, StateSetup, WithinStepHandle, _resolve, build_handle, build_specs
+from mstar.engine.state.adapters import (
+    GDN,
+    StateSetup,
+    WithinStepHandle,
+    _resolve,
+    build_handle,
+    build_specs,
+    state_steps,
+)
 from mstar.engine.state.calls import ArrayHandle, SamplerHandle
 from mstar.engine.state.host_fields import HostFields
 
@@ -1614,3 +1624,166 @@ def test_the_contract_exports_the_fused_draw_outside_its_surface():
     assert draw_row is fused_draw.draw_row and draw_row_layout is fused_draw.layout
     names = {"FusedDrawArgs", "fused_draw_args", "drew", "draw_row", "draw_row_layout"}
     assert names.isdisjoint(state.__all__), "the fused draw can change until a second model draws in place"
+
+
+# An unbounded array: a bounded KV keeps each row's newest entries, and its attention stores the step's keys.
+
+BOUNDED_DIM, WINDOW = 16, 4
+
+
+def _unbounded(**overrides) -> Array:
+    return Array("enc_kv", **{
+        "nodes": {"LLM"}, "layers": {3, 6}, "entry": KVEntry(heads=HEADS, head_dim=BOUNDED_DIM), "max_len": None,
+        "reads": {"enc": Read(mask=Window(WINDOW), op=Attend(q_heads=HEADS), packed=False)}, **overrides,
+    })
+
+
+def _bounded(array=None, dtype=torch.float32) -> tuple[ArrayHandle, BoundedKVManager]:
+    array = array or _unbounded()
+    (spec,) = build_specs([array])
+    kv = BoundedKVManager(spec.config, torch.device("cpu"), dtype)
+    return build_handle(array, {array.name: kv}, _resolve([array], StateSetup())), kv
+
+
+def _bounded_step(h, kv, spans=(2,), **declared) -> SubmoduleStep:
+    """A step that lists rows 1, 2, ... at ``spans``, expanded, admitted, planned and begun as the engine runs it."""
+    segments = [Segment(rid, "main", span) for rid, span in enumerate(spans, start=1)]
+    step = state_steps(_step(h, segments=segments, ctx=_ctx(rows=tuple(range(1, len(spans) + 1))), **declared),
+                       {h.name: h})
+    assert kv.admit(step.steps[h.name], step.ctx).ok
+    kv.plan(step.steps[h.name], step.ctx)
+    h.begin_step(step)
+    return step
+
+
+def _frames(rows=1, t=2, dtype=torch.float32):
+    q, k, v = (torch.randn(rows, t, HEADS, BOUNDED_DIM, dtype=dtype) for _ in range(3))
+    return q, k, v, torch.randn(rows, HEADS, t, WINDOW, dtype=dtype)
+
+
+def test_a_bounded_read_equals_the_manager_s_own_attend():
+    """Layer 6 is the pool's layer 1, so the read passes the pool's index, not the model's."""
+    h, kv = _bounded()
+    other, direct = _bounded()
+    _bounded_step(h, kv)
+    _bounded_step(other, direct)
+    q, k, v, bias = _frames()
+    h.add(6, k=k, v=v)
+    out = h.read(6, q, distance_bias=bias)
+    expected = direct.attend(1, q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), rel_bias=bias)
+    assert out.shape == (1, 2, HEADS, BOUNDED_DIM), "a read returns (rows, T, heads, head_dim)"
+    assert torch.equal(out, expected), "the binding converts only the input layout"
+    assert torch.equal(kv.layer(1), direct.layer(1)) and not kv.layer(0).any(), "the read stored layer 6's keys"
+
+
+def test_a_bounded_read_casts_q_to_the_kv_dtype():
+    """Under bf16 autocast a parameter added to q leaves it fp32, and the kernel takes one dtype."""
+    h, kv = _bounded(dtype=torch.bfloat16)
+    _bounded_step(h, kv)
+    q, k, v, _ = _frames(dtype=torch.bfloat16)
+    h.add(3, k=k, v=v)
+    assert h.read(3, q.float()).dtype is torch.bfloat16, "q reaches the kernel in k's dtype"
+
+
+def test_position_on_a_bounded_array_is_its_committed_count():
+    h, kv = _bounded(_unbounded(positions=Positions()))
+    step = _bounded_step(h, kv, spans=(3,))
+    assert position(h, 1, "main") == 0
+    q, k, v, _ = _frames(t=3)
+    for layer in (3, 6):
+        h.add(layer, k=k, v=v)
+        h.read(layer, q)
+    h.check_step(step)
+    kv.commit(step.steps[h.name], step.ctx)
+    h.end_step(step)
+    assert position(h, 1, "main") == 3 == kv.written(1), "one record of a row's position: the manager's count"
+    assert state_steps(_step(h, segments=[Segment(1, "main", 1)]), {h.name: h}).steps[h.name].positions[1].written == 3
+
+
+def test_a_region_s_commit_inside_a_step_leaves_the_count_advanced_once():
+    """Both steps declare the count they were built at, and a commit sets the count from it."""
+    h, kv = _bounded()
+    outer = _bounded_step(h, kv, spans=(1,))
+    region = state_steps(_step(h, segments=[Segment(1, "main", 1)]), {h.name: h})
+    assert region.steps[h.name].positions[1].written == 0, "the region's step is built before either commit"
+    kv.commit(region.steps[h.name], region.ctx)
+    kv.commit(outer.steps[h.name], outer.ctx)
+    assert kv.written(1) == 1, "two commits of one frame advance the count by one"
+
+
+def test_a_bounded_array_answers_position_only_where_declared():
+    h, _ = _bounded()
+    _refused(r"Array 'enc_kv': the array declares no positions", lambda: position(h, 1, "main"))
+
+
+def test_a_bounded_array_refuses_position_ids_and_rope():
+    h, kv = _bounded(_unbounded(positions=Positions()))
+    _bounded_step(h, kv)
+    q, k, _, _ = _frames()
+    _refused(r"no layout yet: positions\(\) on an unbounded array", lambda: positions(h))
+    _refused(r"no layout yet: rope\(\) on an unbounded array", lambda: rope(h, q, k))
+
+
+def test_a_bounded_step_sets_no_advance_or_position_ids():
+    h, kv = _bounded(_unbounded(positions=Positions()))
+    for field in ({"advance": (1,)}, {"position_ids": torch.arange(2)}):
+        with pytest.raises(ValueError, match=r"Array 'enc_kv': no layout yet: a step sets advance or position_ids"):
+            state_steps(_step(h, enc_kv=ArrayStep(**field)), {h.name: h})
+
+
+@pytest.mark.parametrize("declared, refusal", [
+    (ArrayStep(keep=False), "no layout yet: keep=False on an unbounded array"),
+    (ArrayStep(forks=(Fork(src="main", dst="main", at="start"),)), "no layout yet: a fork of an unbounded array"),
+    (ArrayStep(placeholders=frozenset({(1, "main")})), "a step sets placeholders or eager_add"),
+    (ArrayStep(eager_add=True), "a step sets placeholders or eager_add"),
+], ids=["keep=False", "fork", "placeholders", "eager_add"])
+def test_a_bounded_step_keeps_its_adds_and_forks_nothing(declared, refusal):
+    h, _ = _bounded()
+    _refused(rf"Array 'enc_kv': {refusal}", lambda: _begin(h, enc_kv=declared))
+
+
+def test_a_bounded_add_is_kept_since_its_read_stores_it():
+    h, kv = _bounded()
+    _bounded_step(h, kv)
+    _, k, v, _ = _frames()
+    _refused(r"Array 'enc_kv': no layout yet: keep=False on layer 3 of an unbounded array",
+             lambda: h.add(3, keep=False, k=k, v=v))
+
+
+def test_a_bounded_add_left_unread_is_refused():
+    """The kernel stores an add as it attends, so an add with no read would leave a committed entry unwritten."""
+    h, kv = _bounded()
+    step = _bounded_step(h, kv)
+    q, k, v, _ = _frames()
+    h.add(3, k=k, v=v)
+    h.read(3, q)
+    h.add(6, k=k, v=v)
+    _refused(r"Array 'enc_kv': the step ends with layer 6's add unread", lambda: h.check_step(step))
+
+
+def test_a_bounded_read_takes_only_its_window_s_keyword():
+    h, kv = _bounded()
+    _bounded_step(h, kv)
+    q, k, v, _ = _frames()
+    h.add(3, k=k, v=v)
+    _refused(r"Array 'enc_kv': no layout yet: a read with no op", lambda: h.read(3))
+    _refused(r"Array 'enc_kv': no layout yet: mask arguments \['scale'\], which no mask defines",
+             lambda: h.read(3, q, scale=1.0))
+
+
+def test_a_bounded_add_and_read_take_two_calls():
+    """The encoder adds and reads in two calls, and the bounded handle runs no read in one break with its add."""
+    h, kv = _bounded()
+    _bounded_step(h, kv)
+    q, k, v, _ = _frames()
+    _refused(r"Array 'enc_kv': no layout yet: add_read on a BoundedHandle", lambda: add_read(h, 3, q, k=k, v=v))
+
+
+@pytest.mark.parametrize("handle, where", [(_kv_handle, "on a paged read"), (_within_handle, "within a step")],
+                         ids=["paged", "within a step"])
+def test_distance_bias_has_no_layout_on_paged_or_within_step_reads(handle, where):
+    h = handle()
+    _begin(h)
+    q, k, v = _tensors()
+    h.add(0, k=k, v=v)
+    _refused(rf"no layout yet: distance_bias {where}", lambda: h.read(0, q, distance_bias=q))

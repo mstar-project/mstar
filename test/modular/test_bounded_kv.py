@@ -560,3 +560,16 @@ def test_max_slots_override_is_checked():
     spec = BoundedKVSpec(resource_key="kv", nodes={"node"}, config=config)
     with pytest.raises(ValueError):
         spec.apply_yaml_overrides(max_slots=0)
+
+
+def test_written_counts_the_committed_entries():
+    mgr = _manager(4, True, torch.float32, "cpu", heads=1, head_dim=4)
+    assert mgr.written(1) == 0, "a request with no slot has written nothing"
+    step, ctx = _step([1], [0], [3])
+    assert mgr.admit(step, ctx).ok
+    mgr.plan(step, ctx)
+    assert mgr.written(1) == 0, "an admitted step counts nothing until it commits"
+    mgr.commit(step, ctx)
+    assert mgr.written(1) == 3
+    mgr.remove_request(1)
+    assert mgr.written(1) == 0, "a torn-down request reads 0, as one never admitted does"

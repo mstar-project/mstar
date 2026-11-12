@@ -17,7 +17,7 @@ sys.path.insert(0, ".")
 import pytest
 
 from mstar.engine import state
-from mstar.engine.state.adapters import PagedArrayHandle, ValueHandle, WithinStepHandle
+from mstar.engine.state.adapters import BoundedHandle, PagedArrayHandle, ValueHandle, WithinStepHandle
 from mstar.engine.state.calls import ArrayHandle
 
 # Today's types the surface re-exports, and a NamedTuple, whose fields stay positional.
@@ -314,7 +314,7 @@ def test_the_surface_equals_the_snapshot():
     assert _surface() == SNAPSHOT, "an addition updates SNAPSHOT, and a change in meaning comes as a new name"
 
 
-@pytest.mark.parametrize("handle", [ArrayHandle, PagedArrayHandle, ValueHandle, WithinStepHandle])
+@pytest.mark.parametrize("handle", [ArrayHandle, PagedArrayHandle, ValueHandle, WithinStepHandle, BoundedHandle])
 def test_a_handles_calls_equal_the_snapshot(handle):
     surface = {
         name: [[p.name, p.kind.name, _default(p)] for p in inspect.signature(getattr(handle, name)).parameters.values()]

@@ -334,3 +334,10 @@ def test_a_mamba2_time_step_limit_is_an_increasing_range(limit):
         f"Array 'gdn'.updates['ssm'].time_step_limit must be a tuple (low, high) with 0 <= low < high, got {limit!r}",
     )):
         _value(entry=_SSM, updates={"ssm": Mamba2(time_step_limit=limit)})
+
+
+@pytest.mark.parametrize("max_len", [-1, 1.5, True, "8"])
+def test_max_len_is_none_or_a_non_negative_int(max_len):
+    assert _array(max_len=None).max_len is None, "None declares an unbounded log"
+    with pytest.raises(ValueError, match=re.escape(f"Array 'kv'.max_len must be None or an int >= 0, got {max_len!r}")):
+        _array(max_len=max_len)

@@ -21,6 +21,7 @@ from test_startup_graph_validation import _prefill_decode, _ToyModel, _validate
 from test_state_ports import QWEN3_5, _qwen3_5
 
 from mstar.engine.resources.attn.config import AttentionSpec
+from mstar.engine.resources.kv.bounded.config import BoundedKVSpec, SinkWindow
 from mstar.engine.resources.kv.config import KVSpec
 from mstar.engine.resources.linear_attn.config import LinearAttnSpec, LinearAttnVariant
 from mstar.engine.resources.recurrent.config import RecurrentBlockConfig, RecurrentStateSpec
@@ -40,19 +41,24 @@ from mstar.engine.state import (
     Mamba2,
     Positions,
     Read,
+    Rope,
     Sampler,
     TensorType,
     Value,
     Window,
+    position,
 )
 from mstar.engine.state.adapters import (
     BINDINGS,
     VALUE,
+    BoundedHandle,
     LinearAttnBinding,
     StateSetup,
     _resolve,
     build_specs,
+    node_handles,
     node_resources,
+    state_setup,
 )
 from mstar.engine.state.contract import Mask, Op
 from mstar.model.base import Model, enabled_resources, serving_resources
@@ -890,3 +896,127 @@ def test_a_paged_read_takes_packed_queries(arrays, key):
         f"no layout yet: reads[{key!r}].packed is False, and the paged kernels take packed queries",
     )):
         build_specs(arrays())
+
+
+# Unbounded arrays
+
+
+def _window(**overrides) -> Read:
+    return Read(**{"mask": Window(5), "op": Attend(q_heads=4), "packed": False, **overrides})
+
+
+def _unbounded(**overrides) -> Array:
+    return Array("enc", **{
+        "nodes": {"llm"}, "layers": {0, 1}, "entry": KVEntry(heads=4, head_dim=16), "max_len": None,
+        "reads": {"enc_attn": _window()}, **overrides,
+    })
+
+
+def _no_layout(refusal: str, *arrays, **kwargs) -> None:
+    with pytest.raises(ValueError, match=re.escape(f"Array 'enc': no layout yet: {refusal}")):
+        build_specs(arrays, **kwargs)
+
+
+def test_an_unbounded_array_is_one_bounded_kv_holding_its_window():
+    (spec,) = build_specs([_unbounded()])
+    config = spec.config
+    assert isinstance(spec, BoundedKVSpec) and spec.resource_key == "enc" and spec.nodes == {"llm"}
+    assert (config.num_layers, config.num_heads, config.head_dim, config.dtype) == (2, 4, 16, None)
+    assert (config.rows_per_request, config.max_source_len) == (1, 0), "one row per request, with no source"
+    assert config.retention == SinkWindow(0, 4) and config.query_window == 4, "Window(5) reaches distances 0 to 4"
+
+
+@pytest.mark.parametrize("reads, masks", [
+    ({"enc_attn": _window(mask=Causal())}, ["Causal"]),
+    ({"enc_attn": _window(layers={0}), "more": _window(layers={1})}, ["Window", "Window"]),
+    ({}, []),
+], ids=["causal", "two reads", "no read"])
+def test_an_unbounded_array_reads_through_one_window(reads, masks):
+    _no_layout(f"an unbounded array reads through one Window read, whose window the bounded KV keeps, and its reads "
+               f"have masks {masks}", _unbounded(reads=reads))
+
+
+def test_an_unbounded_array_has_no_reach_read_yet():
+    _no_layout("reads['enc_attn'].op must be Attend, the reads today's resources run on this array",
+               _unbounded(reads={"enc_attn": Read(mask=Window(5), packed=False)}))
+
+
+@pytest.mark.parametrize("read, refusal", [
+    (_window(packed=True), "reads['enc_attn'] takes packed queries, and the bounded kernels take rows padded"),
+    (_window(walks={"decode"}), "reads['enc_attn'].walks must be None"),
+    (_window(layers={0}), "reads['enc_attn'].layers must be the array's"),
+], ids=["packed", "walks", "some layers"])
+def test_a_bounded_read_takes_padded_rows_and_no_walks(read, refusal):
+    _no_layout(refusal, _unbounded(reads={"enc_attn": read}))
+
+
+def test_a_bounded_read_has_as_many_query_heads_as_its_entry():
+    _no_layout("reads['enc_attn'].op.q_heads is 8, and the bounded kernels run one query head per head of the "
+               "entry's 4", _unbounded(reads={"enc_attn": _window(op=Attend(q_heads=8))}))
+
+
+def test_a_bounded_read_takes_a_head_dim_the_kernels_tile():
+    _no_layout("entry head_dim 72, and the bounded kernels tile a power of two of at least 16",
+               _unbounded(entry=KVEntry(heads=4, head_dim=72)))
+
+
+@pytest.mark.parametrize("field, refusal", [
+    ({"labels": {"main", "cfg"}}, "an unbounded array takes one label, the bounded KV's one row per request, and it "
+                                  "has ['cfg', 'main']"),
+    ({"seq_sharded": True}, "seq_sharded takes max_len 0"),
+], ids=["two labels", "seq_sharded"])
+def test_a_bounded_array_has_one_label_and_no_seq_sharding(field, refusal):
+    _no_layout(refusal, _unbounded(**field))
+
+
+def test_a_bounded_array_takes_no_rope():
+    assert len(build_specs([_unbounded(positions=Positions())])) == 1, "a count of entries builds no position spec"
+    _no_layout("positions.rope, since the bounded KV keeps a count and no ids to rotate at",
+               _unbounded(positions=Positions(rope=Rope())))
+
+
+def test_the_bounded_read_takes_no_kernel_settings():
+    with pytest.raises(ValueError, match=re.escape(
+        "kernel_settings['enc_attn'] names no read or update of the declarations that takes kernel settings, and no "
+        "array, of ['enc']",
+    )):
+        build_specs([_unbounded()], kernel_settings={"enc_attn": {"max_slots": 4}})
+
+
+def test_kernel_settings_size_the_bounded_array():
+    (spec,) = build_specs([_unbounded()], kernel_settings={"enc": {"max_slots": 7}})
+    assert spec.config.max_slots == 7, "max_slots under the array's name sizes its bounded KV"
+    with pytest.raises(ValueError, match=re.escape("kernel_settings['enc'] sets ['max_num_pages']; it may set only "
+                                                   "['max_slots']")):
+        build_specs([_unbounded()], kernel_settings={"enc": {"max_num_pages": 7}})
+
+
+def test_a_bounded_read_runs_on_no_sdpa():
+    """The read runs on the array's own resource, so a deployment names that."""
+    _, problems = state_setup({"resources": {"enc": {"backend": "sdpa"}}}, [_unbounded()])
+    assert problems == ["resources.enc: backend sdpa runs only an Attend read within a step, and Array "
+                        "'enc'.reads['enc_attn'] isn't one"]
+
+
+def test_a_cross_read_of_an_unbounded_array_s_queries_is_refused():
+    context = Array("ctx", nodes={"llm"}, layers={0, 1}, entry=KVEntry(heads=4, head_dim=16), max_len=64,
+                    reads={"x": _read(mask=Bidirectional(), op=Attend(q_heads=4), queries="enc")})
+    with pytest.raises(ValueError, match=re.escape(
+        "Array 'ctx': no layout yet: reads['x'] keeps entries and reads the queries of 'enc', which isn't an "
+        "append-only array that keeps entries in pages",
+    )):
+        build_specs([_unbounded(), context])
+
+
+class _StubBounded:
+    """Counts as the bounded KV does, without a cache."""
+
+    def written(self, rid):
+        return {1: 9}.get(rid, 0)
+
+
+def test_node_handles_build_a_bounded_handle():
+    (h,) = node_handles(_Declaring(_unbounded(positions=Positions())), "llm", {"enc": _StubBounded()}).values()
+    assert isinstance(h, BoundedHandle) and list(h.reads) == ["enc_attn"], "the handle takes its read by its key"
+    assert [bound.key for bound in h._bindings] == ["enc_attn", "rope"], "the read, then the positions entry"
+    assert position(h, 1, "main") == 9 and h.written(1) == 9, "position() and the step builder read one count"

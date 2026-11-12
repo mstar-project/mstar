@@ -735,3 +735,28 @@ def test_a_rebuild_leaves_a_whole_step_read_on_a_walk_that_takes_no_ids():
     assert state_declaration_problems(_StubModel(array, rebuild=rebuild)) == [], (
         "a walk whose rebuild rows take no sampled ids was refused"
     )
+
+
+def test_a_block_read_needs_max_len_zero_also_when_unbounded():
+    problem = _one_problem(_array(max_len=None, reads={"r": _read(mask=Block())}))
+    assert problem.startswith("Array 'kv'.reads['r'].mask") and "max_len is None" in problem, problem
+
+
+def test_positions_are_allowed_on_an_unbounded_array():
+    unbounded = _array(max_len=None, positions=Positions(), reads={"r": _read(mask=Window(4), packed=False)})
+    assert state_declaration_problems(_StubModel(unbounded)) == [], "an unbounded array keeps entries and counts them"
+
+
+def test_an_unbounded_array_digests_alike_in_two_processes():
+    """A None that read as 0, or digested by its id, would stop every server at the digest check."""
+    script = (
+        "import sys; sys.path.insert(0, 'test/modular'); "
+        "from test_state_declaration_checks import _unbounded_digests; print(_unbounded_digests())"
+    )
+    other = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, check=True).stdout.strip()
+    assert other == str(_unbounded_digests()), "two processes digest one unbounded array differently"
+    assert _unbounded_digests() != declaration_digests([_array(max_len=0)]), "None and 0 digest alike"
+
+
+def _unbounded_digests() -> dict[str, str]:
+    return declaration_digests([_array(max_len=None, reads={"r": _read(mask=Window(4), packed=False)})])
