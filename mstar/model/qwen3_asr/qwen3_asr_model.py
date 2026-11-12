@@ -54,6 +54,7 @@ from mstar.model.components.request_kwargs import (
     GREEDY_SAMPLING,
     SAMPLING_KEYS,
     checked_request_kwargs,
+    sample_settings,
     sampler_capabilities,
     sampling_config,
     sampling_defaults,
@@ -184,8 +185,7 @@ class Qwen3ASRModel(MultimodalDecoderModel):
         self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
     ) -> dict[str, SampleSettings]:
         del input_modalities, output_modalities
-        config = sampling_config(self.sampling_defaults, model_kwargs)
-        return {SAMPLER: SampleSettings(**{key: getattr(config, key) for key in SAMPLING_KEYS})}
+        return {SAMPLER: sample_settings(sampling_config(self.sampling_defaults, model_kwargs))}
 
     def process_prompt(self, *args: Any, **kwargs: Any) -> ProcessPromptOutput:
         out = super().process_prompt(*args, **kwargs)

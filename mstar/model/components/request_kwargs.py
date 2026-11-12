@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Mapping
+from dataclasses import fields
 from pathlib import Path
 from types import MappingProxyType
 
@@ -23,6 +24,7 @@ from mstar.engine.resources.sampler.config import (
     check_int_knob,
     check_real_knob,
 )
+from mstar.engine.state import SampleSettings
 from mstar.model.utils import load_generation_defaults
 from mstar.utils.generation_kwargs import check_seed
 
@@ -82,6 +84,11 @@ def sampling_config(defaults: Mapping[str, object], kwargs: dict | None) -> Samp
     """The request's sampler config: ``defaults`` under the knobs it sets."""
     kw = checked_request_kwargs(kwargs)
     return SamplingReqConfig(**{**defaults, **{k: kw[k] for k in SAMPLING_KEYS if k in kw}})
+
+
+def sample_settings(config: SamplingReqConfig) -> SampleSettings:
+    """``config`` as the settings a declared sampler takes, every field `SampleSettings` declares."""
+    return SampleSettings(**{field.name: getattr(config, field.name) for field in fields(SampleSettings)})
 
 
 def checked_request_kwargs(kwargs: dict | None) -> dict:

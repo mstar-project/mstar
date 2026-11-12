@@ -24,6 +24,7 @@ from mstar.engine.state import (
 )
 from mstar.model.base import ProcessPromptOutput, TensorAndMetadata
 from mstar.model.components.mrope import image_position_advance
+from mstar.model.components.request_kwargs import sample_settings
 from mstar.model.keys import MIXED
 from mstar.model.media_limits import read_image
 from mstar.model.multimodal import (
@@ -35,7 +36,6 @@ from mstar.model.multimodal import (
 )
 from mstar.model.multimodal_decoder import (
     MIXED_SPLIT,
-    SAMPLING_KEYS,
     MediaIntake,
     MultimodalDecoderModel,
     PreparedMedia,
@@ -185,7 +185,7 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
         self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
     ) -> dict[str, SampleSettings]:
         config = super().get_request_resource_configs(input_modalities, output_modalities, model_kwargs)[SAMPLER]
-        return {SAMPLER: SampleSettings(**{k: getattr(config, k) for k in SAMPLING_KEYS})}
+        return {SAMPLER: sample_settings(config)}
 
     # -----------------------------------------------------------------------
     # Chunked prefill

@@ -19,7 +19,6 @@ from mstar.engine.state import (
     Read,
     Rope,
     Sampler,
-    SampleSettings,
     Span,
     Window,
 )
@@ -36,6 +35,7 @@ from mstar.model.command_a_plus.config import (
 )
 from mstar.model.components.request_kwargs import (
     SAMPLING_KEYS,
+    sample_settings,
     sampler_capabilities,
     sampling_config,
     sampling_defaults,
@@ -151,8 +151,7 @@ class CommandAPlusModel(Model):
         ]
 
     def get_request_resource_configs(self, input_modalities, output_modalities, model_kwargs):
-        config = sampling_config(self.sampling_defaults, model_kwargs)
-        return {SAMPLER: SampleSettings(**{key: getattr(config, key) for key in SAMPLING_KEYS})}
+        return {SAMPLER: sample_settings(sampling_config(self.sampling_defaults, model_kwargs))}
 
     def request_kwargs(self):
         return frozenset({"messages", "max_output_tokens", *SAMPLING_KEYS})
