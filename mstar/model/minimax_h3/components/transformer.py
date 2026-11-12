@@ -369,8 +369,8 @@ class H3DiT(nn.Module):
 
     def forward(
         self, inputs: H3Inputs, layout: H3StepLayout, row_class: torch.Tensor | None = None, shard=None,
-        head: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        head: torch.Tensor | None = None, cached_residual: torch.Tensor | None = None, return_residual: bool = False,
+    ) -> tuple[torch.Tensor, ...]:
         """``inputs.timesteps`` is ``[B, n]``: one timestep per class ``layout.row_class``
         indexes (H3: video, audio, keyframe), or ``[B, 1]`` when all are one value: the
         reference then runs its AdaLN GEMMs on one row, which rounds differently from three.
@@ -380,7 +380,11 @@ class H3DiT(nn.Module):
         splits gives this rank a contiguous range of the packed rows: only those are built and
         run, and the attention's resource exchanges them. ``head`` (``[1]``) picks the step's
         video head when the model has one per step. The audio velocity is None for a model
-        without audio."""
+        without audio.
+
+        Step caching (``step_cache.py``): with ``cached_residual`` (fp32, ``[B, S, hidden]`` over this rank's rows) the
+        blocks are skipped and their output is the stream plus it; ``return_residual`` also returns what the blocks
+        added, in that layout, as a third value."""
         cond, pad = layout.num_condition_rows, layout.num_pad_rows
         split = None if shard is None else split_range(shard)
         start, count = (0, layout.num_rows) if split is None else (split.start, split.count)
@@ -397,8 +401,13 @@ class H3DiT(nn.Module):
             rope = rope.rows(start, count)
             row_index, row_class = scatter(shard, row_index, row_class, dim=0)
         temb = self.time_embedding(inputs.timesteps)
-        for block in self.blocks:
-            x = block(x, temb, row_index, rope)
+        before = x
+        if cached_residual is not None:
+            x = (x.float() + cached_residual).to(x.dtype)
+        else:
+            for block in self.blocks:
+                x = block(x, temb, row_index, rope)
+        residual = x.float() - before.float() if return_residual else None
         h = self.final_layer(x, temb, row_class)
         final = self.final_layer
         video_out = final.video_out(h) if head is None else final.video_out(h, head)
@@ -409,9 +418,10 @@ class H3DiT(nn.Module):
         text, audio_rows, end = layout.text_len, layout.num_audio_rows, layout.num_rows - pad
         patch_dim = self.cfg.patch_dim
         if final.audio_out is None:
-            return out[:, text:end], None
-        video_v = torch.cat(
-            [out[:, text:text + cond, :patch_dim], out[:, text + cond + audio_rows:end, :patch_dim]], dim=1,
-        )
-        audio_v = out[:, text + cond:text + cond + audio_rows, patch_dim:]
-        return video_v, audio_v
+            video_v, audio_v = out[:, text:end], None
+        else:
+            video_v = torch.cat(
+                [out[:, text:text + cond, :patch_dim], out[:, text + cond + audio_rows:end, :patch_dim]], dim=1,
+            )
+            audio_v = out[:, text + cond:text + cond + audio_rows, patch_dim:]
+        return (video_v, audio_v, residual) if return_residual else (video_v, audio_v)
