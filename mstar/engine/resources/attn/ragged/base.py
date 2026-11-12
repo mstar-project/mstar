@@ -304,7 +304,7 @@ class _RaggedManagerBase:
         self._shard = resources[self._shard_key]
         logger.info(
             "%s %r takes split steps over %d SP ranks%s", type(self).__name__, self._key,
-            self._shard.group.world_size, " (sp_exchange ulysses)" if self._ulysses else "",
+            self._shard.group.world_size, " (Ulysses)" if self._ulysses else "",
         )
 
     @property
@@ -510,7 +510,7 @@ class _RaggedManagerBase:
         if return_lse:
             raise ValueError(
                 f"ragged attention {self._key!r}: label {label!r} reaches its kernel through an exchange over SP "
-                "ranks this step (a split label, or any label of an sp_exchange resource), which returns the "
+                "ranks this step (a split label, or any label of a Ulysses resource), which returns the "
                 "attention without its log-sum-exp"
             )
         return exchange(wrapper.run, q, k, v)
@@ -621,8 +621,8 @@ class _RaggedSelfManagerBase(_RaggedManagerBase, RaggedAttnManager):
             plan_states[label] = wrapper
             if shard_plan is not None and label in shard_plan.ranges and not self._ulysses:
                 raise ValueError(
-                    f"ragged attention {self._key!r} has no sp_exchange, and this step splits its "
-                    f"label {label!r} over SP ranks: declare sp_exchange='ulysses' on its spec"
+                    f"ragged attention {self._key!r} doesn't list label {label!r}, which this step splits over "
+                    "SP ranks: list it in its spec's labels"
                 )
 
     def _exchange(self, label: str) -> Callable | None:
@@ -687,12 +687,11 @@ class _RaggedCrossManagerBase(_RaggedManagerBase, RaggedCrossAttnManager):
             label = cross_label(q_label, kv_label)
             self._kv_labels[label] = kv_label
             if split:
-                owner = f"ragged cross-attention {self._key!r}"
+                # a pair with both sides split is refused at load (`split_read_problems`)
                 q_range, kv_range = shard_plan.ranges.get(q_label), shard_plan.ranges.get(kv_label)
-                if q_range is not None and kv_range is not None:
-                    raise ValueError(
-                        f"{owner}: {label!r} attends split queries over split keys, which no exchange serves"
-                    )
+                assert q_range is None or kv_range is None, (
+                    f"cross-attention {q_label!r} <- {kv_label!r} splits both sides, which no exchange serves"
+                )
                 if q_range is not None:
                     # each rank's queries over every key, each replicated; load refuses a packed
                     # (axis 0) split, so each row keeps ``count`` of its queries
@@ -705,7 +704,7 @@ class _RaggedCrossManagerBase(_RaggedManagerBase, RaggedCrossAttnManager):
 
     def _exchange(self, label: str) -> Callable | None:
         # split queries attend their rank's share locally; split keys merge every rank's partial
-        # (plan refuses both split)
+        # (load refuses both split)
         kv_label = self._kv_labels[label]
         r = self._shard.split_range(kv_label)
         if r is None:

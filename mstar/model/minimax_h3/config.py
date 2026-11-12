@@ -24,8 +24,9 @@ VAE_DECODER_NODE = "vae_decoder"
 VAE_ENCODER_NODE = "vae_encoder"  # FL2VA keyframes
 AUDIO_DECODER_NODE = "audio_decoder"
 DENOISE_LOOP = "denoise_loop"
-# Resource keys: the DiT's attention over the packed sequence, the token refiner's over
-# the prompt.
+# The DiT's packed rows and the token refiner's prompt rows, and the resource keys of the
+# attentions over them.
+DIT_ROWS, PROMPT_ROWS = "dit_rows", "prompt_rows"
 DIT_ATTN = "dit_attn"
 # on SP ranks, splits the dit's packed rows over them
 DIT_SHARD = "dit_shard"

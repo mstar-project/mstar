@@ -787,9 +787,39 @@ Qwen3.5's declaration shows both kinds of state, its sequence shard and its ViT:
 A declaration today's engine can't hold fails at load, with ``no layout yet`` and what is
 missing. Every refusal names the declaration and the field.
 
+A read with ``queries=ARRAY`` is cross-attention: its queries are laid out by that array's
+segments in this step, and each request's k-th segment on one pairs with its k-th on the other.
+It takes ``Block()``, since no query position decides what it sees. Separate token sets are
+separate arrays, and arrays of one kind and geometry on one node share one resource, each under
+its own label.
+
+Under sequence parallelism an array declares nothing: the node's sequence shard
+(``SeqShardSpec``, in ``get_node_resources``) lists the labels whose tokens split, and an array
+is split on a step when the shard lists its label and splits that step. Segments always cover
+the whole sequence, so ``declare_step`` is the same on every rank, and the read's resource picks
+the exchange per step: Ulysses for a self read over split tokens; for a cross read, none with
+only the queries split and a merge of the ranks' partial attentions with only the keys. A cross
+read with both sides split, and a read on SDPA (``backend: sdpa``) over split keys, are
+refused at load.
+
+A read takes its queries packed, ``(tokens, heads, head_dim)`` over every row. A read whose layers
+pass rows of one length, ``(rows, len, heads, head_dim)``, as a DiT's do, declares
+``packed=False``, and a packed call to it is refused.
+A read whose request's segments lie end to end in one row, as a DiT's packed rows and their pad
+do, declares ``segmented=True``. It takes ``Block()``, ``packed=False`` and no ``queries``, and it
+runs one request a step. Under sequence parallelism its shard splits the whole row (``axis=0``),
+not each segment.
+
+A ``Value`` may hold only host fields, small values a step changes, as
+``Entry({}, host={"eos_sent": bool})``. Each starts at its type's zero value. ``host(h, request,
+label, layer)`` reads them, and ``ArrayStep(host={(row, label, layer): {field: value}})`` writes
+them when the step commits, so the next step's ``prepare_inputs`` sees the write and a step that
+never ran changes nothing.
+
 ``kernel_settings(self)`` is a temporary hook for what the engine doesn't pick itself yet:
 ``splits`` and ``decode_fmha`` on a read, ``splits`` on a ``GatedDeltaNet``, and
-``max_segments_per_step`` and ``compile_op`` on a ``Block`` read. It refuses anything else.
+``max_segments_per_request``, ``max_segments_per_step``, ``compile_op`` and ``workspace_mb`` on a
+``Block`` read. It refuses anything else.
 
 Resource specs
 ~~~~~~~~~~~~~~
@@ -975,18 +1005,18 @@ The spec types are:
        cuDNN SDPA over equal-length segments (see `Cacheless attention (encoder towers)`_).
        ``DENSE`` runs FA3
        ``flash_attn_varlen`` (AITER on ROCm) and falls back to FlashInfer if that kernel is
-       missing. The heads are split across the node's TP ranks (TP × SP for
-       ``sp_exchange="ulysses"`` on a node whose shard splits, below).
+       missing. The heads are split across the node's TP ranks (TP × SP over
+       a label the node's shard lists, on a node whose shard splits, below).
        ``workspace_mb`` is the floor of each label's FlashInfer workspace per slot (default
        ``MSTAR_WORKSPACE_BUFFER_MB``, 512, which doesn't apply once it is declared): a plan that
        asks for more at startup grows it. A node with many labels can declare less, since a
-       ragged prefill only uses it for split-KV partials. The spec's
-       ``sp_exchange="ulysses"`` attends a label the node's sequence shard splits by
-       Ulysses, splitting the heads over TP × SP on a node whose shard splits
-       (``SeqShardSpec.splits``; see **Sequence and context parallelism**).
-       ``compile_op``, ``workspace_mb`` and ``sp_exchange`` are the model's declaration;
-       the serving config's ``resources:`` overrides take only the backends and the
-       ceilings.
+       ragged prefill only uses it for split-KV partials. The spec's ``labels`` are
+       the labels its plans run under that may split (a within-step array's read fills
+       them from its label): where the node's sequence shard lists one, the resource
+       attends it by Ulysses, splitting the heads over TP × SP on a node whose shard
+       splits (``SeqShardSpec.splits``; see **Sequence and context parallelism**).
+       ``compile_op``, ``workspace_mb`` and ``labels`` are the model's declaration; the
+       serving config's ``resources:`` overrides take only the backends and the ceilings.
        See `Cacheless attention (encoder towers)`_ for ``compile_op``.
    * - ``RaggedCrossAttentionSpec(config=RaggedAttentionConfig(...))``
      - The cross-attention counterpart: one span of each request attends another
@@ -1291,9 +1321,10 @@ default. A GPU of the architecture reads the file
 whichever model it is, and the build-time log names the GPU the row was swept on. The cuDNN wrapper runs a layout of equal-length
 segments, a DiT batch's, as one dense ``[segments, S, H, D]`` call. A captured one replays only
 the layout it was planned with, so a captured bucket takes it only when the step that plans it
-declares ``AttentionStep(fixed_layout=True)``, and stays on FlashInfer otherwise. The DiT
-scaffold's denoise step declares it (``DenoiseLoopSubmodule.attention_step``): every row of a
-denoise bucket, padding rows included, spans the bucket's tokens. An eager layout of unequal
+declares ``AttentionStep(fixed_layout=True)`` (``ArrayStep(fixed_layout=True)`` on a declared
+array), and stays on FlashInfer otherwise. The DiT scaffold's denoise step declares it on each
+of its arrays: every row of a denoise bucket, padding rows included, spans the bucket's tokens.
+An eager layout of unequal
 segments runs FlashInfer. It is self-attention only. A config that names ``backend: cudnn``
 fails at build where cuDNN can't run it: on a cross-attention or block-causal resource, under
 GQA, in a dtype other than bf16 / fp16, or at a head dim FlashInfer pads. Where no table has the
@@ -1387,9 +1418,9 @@ FlashInfer backend also returns each query row's log-sum-exp (``[total_tokens, H
 natural log) from the same plan, which is what merging attentions over disjoint key sets
 needs; a compiled caller breaks there even with ``compile_op``. A label exchanged over SP ranks
 on its step can't return one: on SP ranks of a node whose shard splits, that is every label of a
-``"ulysses"`` resource (copied steps included), and a cross-attention pair whose keys split on
-the step. Where keys split, the resource merges the partials itself (LTX-2.5's audio queries over
-each rank's share of the video tokens, merged by ``gather_merge``).
+Ulysses resource (one over a label its shard lists; copied steps included), and a cross-attention
+pair whose keys split on the step. Where keys split, the resource merges the partials itself
+(LTX-2.5's audio queries over each rank's share of the video tokens, merged by ``gather_merge``).
 
 Block-causal attention within spans
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -2177,7 +2208,7 @@ step does to each array and sampler it touches. The engine expands ``state`` int
   branches through one attention call. Every ``ResourceStep`` gets the mapping, so the KV
   plan and a sequence shard read the same grouping; positions take their packing from the
   KV plan, and ``PositionStep`` keys its ``pos_ids`` by the combined label.
-- ``ArrayStep(segments=, keep=, forks=, placeholders=, eager_add=, advance=, position_ids=)``.
+- ``ArrayStep(segments=, keep=, forks=, placeholders=, eager_add=, fixed_layout=, advance=, position_ids=)``.
   A step lists every array it touches, and a call on one it doesn't list raises. ``segments``
   gives one array its own spans, ``None`` being the step's. ``keep=False`` makes every add
   this step scratch. ``advance`` moves each row's position counter by something other than
@@ -2258,6 +2289,9 @@ handled as special cases. BAGEL and Whisper use today's forms of them:
   its few prompt tokens. The reads of such a step attend the pages alone, so one that needs the
   step's own k and v (an attention through an exchange, a context-parallel pool on a multi-token
   step, the dense backend) is refused at the first add.
+- ``fixed_layout=True`` (``fixed_layout``): every replay of the step's capture bucket lays its
+  rows out as the capture did, so a ragged self-attention may capture a kernel that bakes the
+  layout in (cuDNN). A resource's step takes it only if every read on the resource declares it.
 
 ``combined_labels`` is declared once, on the ``SubmoduleStep``. Only a model off the contract can
 combine labels today: an array's handle refuses a step that touches more than one of its labels
@@ -2268,8 +2302,8 @@ of its own, rather than through ``write_kv``, asks the KV resource where the ste
 ``kv.write_target(layer_idx, label)`` returns ``(layer cache, page of each token, slot in
 page of each token, number of tokens to write)`` for the current plan (NHD layout only).
 Tokens past that number are the plan's padding and must not be written. The fused q/k
-norm, RoPE and KV-write kernels that Qwen3-ASR and Qwen3-Omni's Thinker call through
-``AttentionCallable.norm_rope_attend`` and ``norm_rope_table_attend`` are the example.
+norm, RoPE and KV-write kernel that Qwen3-ASR calls through
+``AttentionCallable.norm_rope_attend`` is the example.
 
 **Testing.** ``declare_step`` performs only host-side bookkeeping, so you can unit-test it
 on CPU without model weights. ``test/modular/test_state_ports.py`` compares both ports' steps
@@ -2345,6 +2379,30 @@ plain attribute, not a buffer. An eager caller can pass the int.
 
 ``kernel_setting(h, read, field)`` reads a ``kernel_settings`` field in effect, YAML
 included. It is temporary, with that hook.
+
+A kernel that writes state itself, in one launch with the math before it, is a state op. It
+names what it touches, the formats its kernel can address, and a reference over the contract's
+calls, which any other format runs:
+
+.. code-block:: python
+
+   @state_op(adds=("kv",), mutates=("q",), formats=(PagedNHD(devices={"cuda"}),), reference=_reference)
+   def write(kv, layer, q, k, v, *, target: PagedNHDTarget): ...
+
+   write(self.kv, self.layer, q, k, v)      # counts as the layer's add, and breaks the graph as add does
+   out = self.kv.read(self.layer, q)
+
+The engine picks the kernel or the reference at bind, and a step whose reads attend its own ``k`` and ``v``
+(a context-parallel pool's multi-token step) runs the reference. ``target`` says where this step's entries go
+on the layer. A conformance test holds each kernel to its reference on each listed format, and
+``MSTAR_KV_DEBUG_ASSERTS=1`` checks that an eager call writes nothing outside the step's slots.
+
+Between steps, a model may keep a memo of a pure function of request inputs, whose loss costs time
+and changes no output, and scratch buffers that it makes at load and that no step reads before
+writing. Anything else it keeps between steps is declared state or an edge. This rests on the
+engine running a node's forwards one at a time, in stream order. The diffusion loop's schedule and
+prefetched seeds are memos, its latents and solver state are loop-back edges, and a code
+predictor's frame-local KV is scratch.
 
 A model on the contract reads no ``node_resources``, ``engine_inputs.resources``,
 ``request_state`` or ``per_request_states``, imports the engine only through
@@ -3082,7 +3140,7 @@ two axes:
    node's ``tp * sp`` ranks; by position with ``context_parallel: true`` (below), heads over TP.
 
 Each attention resource derives what it does from the two and the shard's ``exchange`` (below);
-the model writes no exchange but a ragged attention's ``sp_exchange``:
+the model writes no exchange (a ragged attention's Ulysses follows from the labels it plans):
 
 .. list-table::
    :header-rows: 1
@@ -3095,13 +3153,13 @@ the model writes no exchange but a ragged attention's ``sp_exchange``:
    * - Copied
      - head slice: this rank's heads of q, k and v, write and attend, gather the heads
      - each rank attends its slots, partials merged (below)
-     - heads over TP; with ``sp_exchange`` on a splitting node, a head slice
+     - heads over TP; over a label the shard lists on a splitting node, a head slice
    * - Split
      - Ulysses: one all-to-all from split tokens to split heads, write and attend, one back
      - by the shard's ``exchange`` (below): ``all_gather``, one gather of every rank's q, k and
        v, attend as a copied step, keep this rank's rows; or ``ring``. With ``auto``, the node's
        steps run copied
-     - ``sp_exchange="ulysses"``: Ulysses; without it, refused at plan
+     - Ulysses over a label the spec's ``labels`` list; any other split label refused at load
    * - Cross, split queries
      - n/a
      - n/a
@@ -3113,7 +3171,7 @@ the model writes no exchange but a ragged attention's ``sp_exchange``:
    * - Cross, both split
      - n/a
      - n/a
-     - refused at plan
+     - refused at load
 
 Splitting is declared in four places:
 
@@ -3142,11 +3200,12 @@ Splitting is declared in four places:
   ``combined_labels`` (``SubmoduleStep``, as ``Resource.steps_from_segments`` says), added at any
   SP size (at one rank its plan is a constant), so a combined plan label gets a range too. A step
   that declares no segments has no shard plan, and the attention resources refuse it, so it fails
-  on one GPU. A step whose segments differ from the node's (LTX-2.5's video alone) sets
-  them on the ``SubmoduleStep`` and gives the other resources' steps their own.
+  on one GPU. The diffusion scaffold's step holds each label's segments once, however many
+  arrays attend them (LTX-2.5's video tokens are the keys of two).
 - The forward **brackets** its layer stack (on the state contract, with ``scatter(shard, *xs)``
   and ``gather(shard, x)`` on the shard's handle, as Qwen3.5 does in
-  ``mstar/model/qwen3_5/components/language_model.py``): ``shard.scatter(label, *xs, dim=None)``
+  ``mstar/model/qwen3_5/components/language_model.py``; otherwise on the submodule's
+  ``sequence_shard``, bound with its resources): ``shard.scatter(label, *xs, dim=None)``
   before it (this rank's share of each tensor, ``dim`` the spec's axis by default; ``None`` passes
   through), ``shard.gather(label, x)`` after it. Both are the identity on a copied step, at one SP rank, and
   outside a step (a warmup compile); at one rank they trace straight through a compiled frame,
@@ -3161,15 +3220,16 @@ Splitting is declared in four places:
   run, ``requires_kv_write`` False), a ragged one through its ``run``. A layer that writes
   through ``write_target`` or calls ``attn.run`` itself raises on a split label, since it would
   treat this rank's share as the whole step, and on any step over KV stored by head, since it would
-  pass the TP heads where the pool holds this rank's slice. ``AttentionCallable.norm_rope_attend``
-  and ``norm_rope_table_attend``, which fuse the K/V write into the norm/RoPE kernel, skip the fused
-  write and go through the exchange wherever the call exchanges
+  pass the TP heads where the pool holds this rank's slice. A state op that fuses the K/V write
+  into its norm/RoPE kernel (Qwen3-Omni's ``qk_norm_rope_table_kv_write``) runs its reference,
+  through ``add`` and the exchange, wherever the step's read exchanges
   (``AttentionManager.step_exchanges(label)``): a label the step splits, and every step over KV
-  stored by head, copied steps too (each rank's head slice). A cacheless self-attention
-  that may see split tokens declares
-  ``RaggedAttentionSpec(..., sp_exchange="ulysses")`` (the default is ``"none"``); it is a no-op
-  on a node with no ``SeqShardSpec``, or one whose sequence shard never splits
-  (``SeqShardSpec.splits``), so one declaration serves every deployment shape.
+  stored by head, copied steps too (each rank's head slice). A cacheless self-attention over a
+  label the shard lists runs Ulysses: an array declares nothing for it (its read's resource lists
+  its label), and a hand-written ``RaggedAttentionSpec`` lists the label in ``labels``. Both are
+  no-ops on a node with no ``SeqShardSpec``, or one whose sequence shard never splits
+  (``SeqShardSpec.splits``), so one declaration serves every deployment shape. A read bound to
+  SDPA (``backend: sdpa``) runs outside the resources and is refused over keys the shard splits.
 
 **Recurrent and sliding-window layers.** They take split steps through their own resources
 too, and the model writes nothing more than the bracket. Each resource's state is stored one of
@@ -3207,12 +3267,12 @@ before a worker starts (and the engine again at load): a node on SP ranks that n
 ``SeqShardSpec`` whose ``exchange`` isn't ``none``, with a resource that takes split steps or
 ``exchanges=False``) nor places its pools by position; a shard on axis 1 over a pool stored by
 position; a head-stored pool whose query and KV heads per TP rank don't divide by ``sp_size``; a
-ragged ``sp_exchange`` whose heads don't divide by ``tp * sp``, or beside a ring; a ragged
-cross-attention under a shard on axis 0 or with ``exchanges=False`` (either can leave a rank none of
-a row); a linear layer (not Mamba-2) whose heads per TP rank don't divide by ``sp_size`` (so it takes
-``state_passing``) and whose key and value head dims differ, at ``sp_size`` 3 or
-more; a linear layer under a shard on axis 1 or a ring's; a ``kv_gather`` attention under a ring's
-(it plans contiguous pieces); a window page that doesn't split ``sp_size`` ways; expert
+ragged Ulysses attention whose heads don't divide by ``tp * sp``, or beside a ring; an SDPA read over
+keys the shard splits; a ragged cross-attention under a shard on axis 0 or with ``exchanges=False``
+(either can leave a rank none of a row); a linear layer (not Mamba-2) whose heads per TP rank don't
+divide by ``sp_size`` (so it takes ``state_passing``) and whose key and value head dims differ, at
+``sp_size`` 3 or more; a linear layer under a shard on axis 1 or a ring's; a ``kv_gather`` attention
+under a ring's (it plans contiguous pieces); a window page that doesn't split ``sp_size`` ways; expert
 parallelism. The engine alone refuses a resource without ``supports_split_steps`` at load, and, at
 warmup (after the weights load and the compiles), piecewise captures, a capture replayed under listed
 and unlisted walks, and a packed capture of a listed walk unless the shard lists one label on axis 0
@@ -3225,9 +3285,9 @@ how its split steps' tokens reach its paged attentions, from where their KV is s
 steps copied, so a node whose pools store KV by position splits its steps only where the
 deployment opts in with ``all_gather`` or ``ring``. A value the node's storage can't take fails at
 load, at any SP size. It only picks the split exchange: copied steps keep the storage's own path.
-A ragged attention's exchange is the model's ``sp_exchange`` (above), and a copied resource's its
-own (the list above), on a shard that splits. Each row assumes the node declares a
-``SeqShardSpec`` and runs on ``sp_size`` above 1:
+A ragged attention runs Ulysses over a label it plans that the shard lists (above), and a copied
+resource takes its own exchange (the list above), on a shard that splits. Each row assumes the node
+declares a ``SeqShardSpec`` and runs on ``sp_size`` above 1:
 
 .. list-table::
    :header-rows: 1
@@ -3243,7 +3303,7 @@ own (the list above), on a shard that splits. Each row assumes the node declares
      - Ulysses all-to-all
      - head slice
      - q and KV heads per TP rank divide by ``sp_size`` (Cosmos3; LTX-2.5, Wan2.2 and MiniMax-H3's
-       DiT, which have no paged pool, by their ragged attentions' own ``sp_exchange``)
+       DiT, which have no paged pool, by their ragged attentions over the labels their shards list)
    * - ``auto`` / ``none``
      - by position (``context_parallel``)
      - never: the node runs copied, as one without a shard
@@ -3371,7 +3431,9 @@ whatever ``decode_tensor_cores`` says). Any other step attends its stored contex
 and its own tokens from the ``k`` and ``v`` the layer passes ``run``, so a layer that calls
 ``attn.run`` itself passes them (``AttentionCallable`` and ``MLAAttention`` without
 ``mla_absorb`` do). A fused K/V write that leaves ``k`` unrotated asks ``reads_step_kv()`` first
-and rotates it when the step attends it (``AttentionCallable.norm_rope_attend``). In SP mode, rank ``r`` attends only the step's
+and rotates it when the step attends it (``AttentionCallable.norm_rope_attend``); a state op's fused
+kernel doesn't run on such a step, so its reference's ``add`` hands the handle ``k`` and ``v``.
+In SP mode, rank ``r`` attends only the step's
 own tokens in *zigzag* chunks ``r`` and ``2P - 1 - r`` of each row's ``2P`` (``zigzag_rows``),
 which shares the causal work about evenly on rows of ``2P`` tokens or more; it merges them into
 its context partial before the gather.
@@ -3979,9 +4041,9 @@ iteration. The step index is the engine's loop counter
 (``fwd_info.dynamic_loop_iter_counts``), so there is no host sync per step.
 
 The ``dit`` node subclasses ``DenoiseLoopSubmodule`` (``denoise_loop.py``), which owns
-the engine contract — seeded initial noise, per-request schedules, equal-key request
-batching (``can_batch``), stacked ``forward_batched``, the ragged-attention
-``declare_step`` and one CUDA-graph bucket per ``bucket_key`` with the Euler update inside
+the engine contract — seeded initial noise, memoized schedules, equal-key request
+batching (``can_batch``), stacked ``forward_batched``, the ``declare_step`` over the arrays
+it attends through and one CUDA-graph bucket per ``bucket_key`` with the Euler update inside
 the graph — and asks the model for the hooks below. The loop ends on its iteration count:
 a model whose request picks its step count returns it from ``get_loop_caps``
 (``{"denoise_loop": steps}``), resolved exactly as ``schedule_for`` resolves it, and a
@@ -3992,14 +4054,16 @@ iteration past the schedule. The hooks:
 
     class MyDenoise(DenoiseLoopSubmodule):
         def bucket_key_for(self, fwd_info): ...       # hashable: latent grid, text length, ...
-        def schedule_for(self, fwd_info, key): ...    # FlowMatchSchedule (flow_match.py)
-        def seed_latents(self, fwd_info, key, gen): ...  # [L, C] initial noise, seeded
+        def schedule_for(self, walk, settings, key): ...  # FlowMatchSchedule (flow_match.py), memoized
+        # optional: what the request sets of its schedule; its step count by default
+        def schedule_settings(self, fwd_info): ...
+        def seed_latents(self, key, gen): ...         # [L, C] initial noise, seeded
         def request_inputs(self, fwd_info, inputs, key): ...  # per-row conditioning tensors
         def num_tokens(self, key): ...                # image tokens for the attention step
         def capture_request_inputs(self, key, device): ...   # dummy rows for graph capture
         def denoise(self, engine_inputs, key, latents, timestep, sigma, sigma_next, **cond): ...
         # optional: extra attention spans (a refiner over the image tokens alone, ...)
-        def attention_segments(self, key): return (("main", self.num_tokens(key)),)
+        def attention_segments(self, key): return {TOKENS: (("main", self.num_tokens(key)),)}
 
 ``bucket_key`` is whatever has to match for two rows to share a forward, and it is also
 the CUDA-graph bucket key — shape, but equally a knob like whether CFG is on.
@@ -4022,13 +4086,14 @@ when the request reaches the worker, on a thread of its own, and iteration 0 onl
 it to the device. Otherwise the CPU draw runs on the GPU thread at iteration 0, once per
 joining row.
 
-Every span a layer attends over must be declared with its own label (default: one
-``"main"`` segment per request); ``ragged_for(label)`` hands that span's kernel to the
-layers, which fall back to SDPA when no ragged resource is bound.
+Every span a layer attends over is a segment of a declared array with ``max_len`` 0, listed
+in ``attention_segments`` per request. A layer calls ``attend(self.state, self.layer, q, k, v)``
+from ``attention.py``, which adds and reads through its array, and runs SDPA on a layer no
+engine bound a handle to. Arrays of one geometry share one resource, each under its own label.
 
 Shared pieces to build the components from: ``flow_match.py`` (shift schedules and the
 exact Euler step), ``rope.py`` (multi-axis rotary embeddings), ``attention.py`` (joint
-attention over packed tokens: SDPA eagerly, the ragged FlashInfer resource under graphs),
+attention over packed tokens: SDPA, or the ragged FlashInfer resource through a read),
 ``text_encoder.py`` (native Qwen3 hidden-state taps), ``autoencoder_kl.py`` (the KL VAE
 family), ``image_io.py`` (latent packing, PNG) and ``lora.py`` (static LoRA merge at load,
 also into fused ``q``/``k``/``v`` shards via ``FusedColumnLinear.shard_slice``; the checkpoint

@@ -23,10 +23,11 @@ from mstar.distributed.communication import CommGroup, JointGroups, sp_seq_split
 from mstar.engine.resources import RaggedAttentionConfig, StepContext, StepRunner  # noqa: E402
 from mstar.engine.resources.base import EngineResourceInfo, build_resource  # noqa: E402
 from mstar.engine.resources.spec import resolve_spec_dependencies  # noqa: E402
+from mstar.engine.state.adapters import node_handles, node_resources  # noqa: E402
 from mstar.model.ltx2_5.components.transformer import LTX2DiT  # noqa: E402
-from mstar.model.ltx2_5.config import DENOISE_LOOP, LTX25Config  # noqa: E402
+from mstar.model.ltx2_5.config import DENOISE_LOOP, VIDEO_SHARD, LTX25Config  # noqa: E402
 from mstar.model.ltx2_5.ltx2_5_model import LTX25Model  # noqa: E402
-from mstar.model.ltx2_5.submodules import VIDEO_SHARD, LTXDenoiseSubmodule, LTXShape  # noqa: E402
+from mstar.model.ltx2_5.submodules import LTXDenoiseSubmodule, LTXShape  # noqa: E402
 from mstar.model.submodule_base import NodeInputs, engine_step  # noqa: E402
 
 WORLD = 2
@@ -64,11 +65,15 @@ def _toy_config() -> LTX25Config:
     return dataclasses.replace(cfg, transformer=toy)
 
 
-def _resources(cfg: LTX25Config, joint: JointGroups) -> dict:
-    """The dit's resources from the model's own declaration, built and bound as the engine does."""
+def _model(cfg: LTX25Config) -> LTX25Model:
     model = LTX25Model(model_path_hf="test/ltx2_5", skip_weight_loading=True)
     model.set_config(cfg)
-    specs = resolve_spec_dependencies(model.get_node_resources())
+    return model
+
+
+def _resources(cfg: LTX25Config, joint: JointGroups) -> dict:
+    """The dit's resources from the model's own declarations, built and bound as the engine does."""
+    specs = resolve_spec_dependencies(node_resources(_model(cfg)))
     for spec in specs.values():
         if isinstance(getattr(spec, "config", None), RaggedAttentionConfig):
             spec.config.dtype, spec.config.workspace_mb = torch.float32, 1
@@ -91,19 +96,8 @@ def _denoise(rank, frames, height, width):
     for p in dit.parameters():
         torch.nn.init.normal_(p, std=0.05)
     shape = LTXShape(frames=frames, height=height, width=width, audio_frames=5, fps=24.0, text_len=7)
-    # one rank: no resources, so every attention runs SDPA
-    whole = LTXDenoiseSubmodule(dit, cfg, loop_name=DENOISE_LOOP, use_ragged_attention=True)
-    split = LTXDenoiseSubmodule(dit, cfg, loop_name=DENOISE_LOOP, use_ragged_attention=True)
-    sp = _group(rank)
-    split.bind_node_resources(_resources(cfg, JointGroups(tp_group=CommGroup.trivial(), sp_group=sp, instance=sp)))
-    rids = ["r0", "r1"]
-    step = engine_step(split, "generate_av", rids, [NodeInputs(resource_step_info=shape)] * len(rids))
-    step.set_ctx(StepContext(request_ids=rids, graph_walk="generate_av", slot=0, capture=False))
-    StepRunner(split.node_resources).plan(step)
-    tokens = frames * height * width
-    assert split.node_resources[VIDEO_SHARD].split_range("video").counts == tuple(sp_seq_split(tokens, WORLD))
-
     t = cfg.transformer
+    tokens = frames * height * width
     g = torch.Generator().manual_seed(1)
     sigma = torch.tensor([0.9, 0.5]).view(-1, 1, 1)
     inputs = dict(
@@ -112,8 +106,23 @@ def _denoise(rank, frames, height, width):
         text_video=torch.randn(2, 7, t.cross_attention_dim, generator=g),
         text_audio=torch.randn(2, 7, t.audio_cross_attention_dim, generator=g),
     )
-    want = whole.denoise(None, shape, **inputs)
+    # one rank: no resources and no handles bound, so every attention runs SDPA
+    want = LTXDenoiseSubmodule(dit, cfg, loop_name=DENOISE_LOOP).denoise(None, shape, **inputs)
+
+    split = LTXDenoiseSubmodule(dit, cfg, loop_name=DENOISE_LOOP)
+    sp = _group(rank)
+    res = _resources(cfg, JointGroups(tp_group=CommGroup.trivial(), sp_group=sp, instance=sp))
+    split.bind_node_resources(res)
+    split.bind_node_state(node_handles(_model(cfg), "dit", res))
+    rids = ["r0", "r1"]
+    step = engine_step(split, "generate_av", rids, [NodeInputs(resource_step_info=shape)] * len(rids))
+    step.set_ctx(StepContext(request_ids=rids, graph_walk="generate_av", slot=0, capture=False))
+    StepRunner(res).plan(step)
+    split_range = res[VIDEO_SHARD].split_range("video")
+    assert split_range.counts == tuple(sp_seq_split(tokens, WORLD)) and split_range.rows == len(rids)
+    step.begin_calls()
     got = split.denoise(None, shape, **inputs)
+    step.end_calls()
     for key in want:
         assert got[key].shape == want[key].shape, key
         torch.testing.assert_close(got[key], want[key], rtol=1e-4, atol=1e-4)

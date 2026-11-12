@@ -460,6 +460,12 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                 )
             logger.info("Cosmos3 denoise compute torch.compile enabled (%s)", config.denoise_compile_mode)
 
+    def bind_node_resources(self, resources: dict) -> None:
+        super().bind_node_resources(resources)
+        if self.transformer is not None:
+            # the transformer brackets its generation stack on the node's shard
+            self.transformer.sequence_shard = self.sequence_shard
+
     def warmup_compiles(self) -> None:
         """Build the compiled cross-request layer stack before the first
         request: one two-request step at the default size, through

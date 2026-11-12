@@ -336,11 +336,12 @@ def test_a_node_that_splits_its_steps_owns_its_recurrent_layers_and_refuses_what
     """Qwen3.5's recurrent state and layers take split steps, their heads over TP alone (the pool
     is copied over SP ranks) where its KV's are over TP x SP; a resource holding no split strategy
     is refused."""
+    from mstar.engine.state.adapters import StateSetup
     from mstar.model.base import enabled_resources
 
     groups = _sp_groups(NODE)
     # what a deployment without a `lora:` block builds
-    specs = enabled_resources(_qwen3_5(NODE, {}, tmp_path, monkeypatch), {})
+    specs = enabled_resources(_qwen3_5(NODE, {}, tmp_path, monkeypatch), {}, StateSetup())
     # by-head Ulysses is the deployment's opt-in on Qwen3.5
     apply_yaml_overrides(specs, {"resources": {
         KV_CACHE: {"max_num_pages": 8}, GDN_STATE: {"max_slots": 4}, LLM_SHARD: {"exchange": "ulysses"},
@@ -376,6 +377,28 @@ def test_a_node_that_splits_its_steps_refuses_block_causal_attention():
         Engine(graph_runtime=None).load_model(
             {NODE: _Submodule()}, specs=specs, parallel_groups=_sp_groups(NODE), device=CPU,
             transfer_engine_info=None,
+        )
+
+
+def test_a_read_no_exchange_serves_on_a_node_that_splits_its_steps_is_refused_at_load(monkeypatch):
+    """SDPA over keys the sequence shard splits would attend one rank's share. The engine refuses it from the
+    declarations, before any step splits (`split_read_problems`). The node splits by its other read, on the ragged
+    resource (a node whose every read is on SDPA never splits)."""
+    from test_state_cross_reads import _array, _on_sdpa
+
+    from mstar.engine.state.adapters import build_specs
+
+    # other heads, so the two reads don't share one resource
+    video, audio = _array("video", "video_self", nodes=(NODE,)), _array("audio", nodes=(NODE,), heads=2)
+    model = types.SimpleNamespace(checkpoint_path=lambda: None, declare_state=lambda: [video, audio])
+    monkeypatch.setattr(engine_mod, "sequence_parallel_refusals", lambda *args: [])
+    setup = _on_sdpa("video_self")
+    engine = Engine(graph_runtime=None, state_setup=setup)
+    specs = [*build_specs([video, audio], setup=setup), SeqShardSpec("shard", {NODE}, ("video", "audio"), 0)]
+    with pytest.raises(ValueError, match=r"backend sdpa over labels \['video'\]"):
+        engine.load_model(
+            {NODE: _Submodule()}, specs=specs,
+            parallel_groups=_sp_groups(NODE), device=CPU, transfer_engine_info=None, model=model,
         )
 
 
@@ -1031,7 +1054,7 @@ def _layer_over_ranks(rank, world, store, split=None):
     handle's write and attention one call. The pool's step slots hold NaN until the step writes
     them, as each case checks."""
     from mstar.engine.state import SeqShard, gather, scatter
-    from mstar.engine.state.adapters import build_handle, build_specs
+    from mstar.engine.state.adapters import StateSetup, _resolve, build_handle, build_specs
     from mstar.engine.state.analysis import position_key
     from mstar.engine.state.contract import ArrayStep
     from mstar.model.keys import PREFILL_TEXT
@@ -1093,8 +1116,9 @@ def _layer_over_ranks(rank, world, store, split=None):
         (pool,) = built
         _plan(attn, case, shard=shard, walk=PREFILL_TEXT)
         assert (shard.split_range("main") is not None) == (split is not None)
-        handle = build_handle(array, {KV_CACHE: pool, ATTN: attn, position_key(array): None})
-        bracket = build_handle(declared_shard, {LLM_SHARD: shard})
+        resolved = _resolve([array], StateSetup())
+        handle = build_handle(array, {KV_CACHE: pool, ATTN: attn, position_key(array): None}, resolved)
+        bracket = build_handle(declared_shard, {LLM_SHARD: shard}, resolved)
         step = types.SimpleNamespace(
             state={KV_CACHE: ArrayStep()}, segments=tuple(
                 Segment(view.request_id, "main", new) for view, (_, new) in zip(case.views, case.rows, strict=True)
@@ -1847,15 +1871,27 @@ THINKER_STORAGE = pytest.mark.parametrize("placed, exchange", [
 def _thinker_over_ranks(rank, world, store, placed, exchange):
     """One SP rank of a small Qwen3-Omni Thinker (its real layers: a dense one, MoE ones masking the
     step's last rows as padding, deepstack, the Talker's layer-N states) over the model's own Thinker
-    declarations, built as the engine builds them. Two steps (a first prefill, then one over stored
-    context with a fresh row and a riding decode row) run split, eager and compiled, and give what
-    they give copied; a split prefill samples each row's last token."""
+    declarations, built and bound as the engine builds them. Three steps (a first prefill, one over
+    stored context with a fresh row and a riding decode row, then a decode) run split where they can,
+    eager and compiled, and give what they give copied; a split prefill samples each row's last token.
+    The fused norm/RoPE/KV write is the copied decode's over KV stored by position alone."""
     from mstar.engine.resources.sequence_shard import sequence_parallel_refusals
     from mstar.engine.resources.step import SubmoduleStep
+    from mstar.engine.state import ArrayStep
+    from mstar.engine.state.adapters import node_handles, node_resources, state_steps
     from mstar.model.components import MoeParallelConfig
+    from mstar.model.qwen3_omni.components.attention import qk_norm_rope_table_kv_write
     from mstar.model.qwen3_omni.components.thinker import Qwen3OmniThinkerModel
-    from mstar.model.qwen3_omni.config import THINKER_ATTN, THINKER_KV, THINKER_SHARD, Qwen3OmniModelConfig
+    from mstar.model.qwen3_omni.config import (
+        THINKER_ATTN,
+        THINKER_KV,
+        THINKER_POS,
+        THINKER_SAMPLER,
+        THINKER_SHARD,
+        Qwen3OmniModelConfig,
+    )
     from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
+    from mstar.model.qwen3_omni.submodules import ThinkerSubmodule
 
     dist.init_process_group("gloo", init_method=f"file://{store}", rank=rank, world_size=world)
     torch.set_num_threads(1)
@@ -1881,8 +1917,8 @@ def _thinker_over_ranks(rank, world, store, placed, exchange):
 
         omni = object.__new__(Qwen3OmniModel)
         omni.config = cfg
-        keys = (THINKER_KV, THINKER_ATTN, THINKER_SHARD)
-        specs = [spec for spec in omni.get_node_resources() if spec.resource_key in keys]
+        keys = (THINKER_KV, THINKER_ATTN, THINKER_POS, THINKER_SHARD)
+        specs = [spec for spec in node_resources(omni) if spec.resource_key in keys]
         overrides = {
             THINKER_KV: dict(max_num_pages=32, page_size=CP_PAGE, max_seq_len=64, context_parallel=placed),
             **({THINKER_SHARD: dict(exchange=exchange)} if exchange else {}),
@@ -1894,8 +1930,8 @@ def _thinker_over_ranks(rank, world, store, placed, exchange):
         joint = JointGroups(tp_group=CommGroup.trivial(), sp_group=group, instance=group)
 
         # (rid, tokens) per step: two first prefills, then their next tokens beside a fresh prompt,
-        # one row a decode; 13 tokens, the last 2 the MoE's padding
-        steps = [(("r0", 5), ("r1", 6)), (("r0", 2), ("r1", 1), ("r2", 10))]
+        # one row a decode; 13 tokens, the last 2 the MoE's padding; then a decode, never split
+        steps = [(("r0", 5), ("r1", 6)), (("r0", 2), ("r1", 1), ("r2", 10)), (("r0", 1), ("r1", 1), ("r2", 1))]
         inputs = []
         for rows in steps:
             n = sum(span for _, span in rows)
@@ -1925,9 +1961,13 @@ def _thinker_over_ranks(rank, world, store, placed, exchange):
             make_engine(_submodules={"Thinker": node})._check_rebuild_policies(
                 make_model(rebuild_policies=omni.rebuild_policies, combined_walk_of=dict)
             )
+            handles = node_handles(omni, "Thinker", {**res, THINKER_SAMPLER: None})
             for module in thinker.modules():
-                if hasattr(module, "bind_resources"):
-                    module.bind_resources(res)
+                if hasattr(module, "bind_state"):
+                    module.bind_state(handles)
+            # the submodule hands the model its node's shard
+            ThinkerSubmodule(thinker, cfg).bind_node_resources(res)
+            assert thinker.sequence_shard is res[THINKER_SHARD]
             res[THINKER_SHARD].min_tokens = 0 if split else 1 << 20
             runner = StepRunner(res)
             for rid in ("r0", "r1", "r2"):
@@ -1936,19 +1976,31 @@ def _thinker_over_ranks(rank, world, store, placed, exchange):
             forward = torch.compile(thinker, backend="eager") if compiled else thinker
             out = []
             for rows, step_inputs in zip(steps, inputs, strict=True):
-                step = with_segment_steps(SubmoduleStep(
-                    segments=[Segment(rid, "main", span) for rid, span in rows],
-                    steps={THINKER_KV: KVStep(), THINKER_ATTN: AttentionStep(causal=True)},
-                ), [THINKER_SHARD])
+                decode = all(span == 1 for _, span in rows)
+                step = state_steps(with_segment_steps(SubmoduleStep(
+                    segments=[Segment(rid, "main", span) for rid, span in rows], state={THINKER_KV: ArrayStep()},
+                ), [THINKER_SHARD]), handles)
                 step.set_ctx(StepContext(request_ids=tuple(rid for rid, _ in rows), graph_walk="prefill_text",
                                          slot=0, capture=False))
                 assert runner.admit(step).ok
                 runner.plan(step)
-                assert (res[THINKER_SHARD].split_range("main") is not None) == split
-                # a copied step over KV stored by head still slices its heads, so no fused write
-                assert res[THINKER_ATTN].step_exchanges() == (split or not placed)
+                splits = split and not decode
+                assert (res[THINKER_SHARD].split_range("main") is not None) == splits
+                # a copied step over KV stored by head still slices its heads
+                assert res[THINKER_ATTN].step_exchanges() == (splits or not placed)
+                step.begin_calls()
+                # on CUDA the state op fuses the write (CPU always takes its reference): never on a step that
+                # exchanges, and on the copied decode over KV stored by position, which reads only the pages
+                kv = handles[THINKER_KV]
+                kv.fused_ops = frozenset({qk_norm_rope_table_kv_write.op.name})
+                if decode and placed and not splits:
+                    assert kv.fused_ops
+                else:
+                    assert not kv.fused_ops
+                kv.fused_ops = frozenset()
                 with torch.no_grad():
                     hidden, layer_0, layer_n = forward(**step_inputs)
+                step.end_calls()
                 # what the Thinker samples a prefill from: each row's last token of the whole step
                 ends = torch.tensor([span for _, span in rows]).cumsum(0) - 1
                 torch.testing.assert_close(res[THINKER_ATTN].select_last_hidden(hidden), hidden[ends])

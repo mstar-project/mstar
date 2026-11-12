@@ -360,12 +360,13 @@ def test_the_thinkers_cache_stays_open_under_a_sequence_shard(size, exchange):
     instance alike."""
     from mstar.engine.resources.sequence_shard import SeqShardSpec
     from mstar.engine.resources.spec import resolve_spec_dependencies
+    from mstar.engine.state.adapters import node_resources
     from mstar.model.qwen3_omni.config import THINKER_KV, THINKER_SHARD, Qwen3OmniModelConfig
     from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
 
     model = Qwen3OmniModel.__new__(Qwen3OmniModel)
     model.config = Qwen3OmniModelConfig()
-    specs = model.get_node_resources()
+    specs = node_resources(model)
     apply_yaml_overrides(specs, {"resources": {
         THINKER_KV: {"context_parallel": True, "prefix_cache_tp": True}, THINKER_SHARD: {"exchange": exchange},
     }})

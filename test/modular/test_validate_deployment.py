@@ -331,7 +331,8 @@ def _attention(nodes=("llm",)) -> AttentionSpec:
 
 
 def _ulysses(heads: int) -> RaggedAttentionSpec:
-    return RaggedAttentionSpec("ragged", {"llm"}, RaggedAttentionConfig(heads, heads, 8), sp_exchange="ulysses")
+    # over the label the shard splits, so it attends it by Ulysses
+    return RaggedAttentionSpec("ragged", {"llm"}, RaggedAttentionConfig(heads, heads, 8), labels={"main"})
 
 
 def _cross() -> RaggedCrossAttentionSpec:
@@ -402,10 +403,12 @@ def test_a_kv_placement_the_node_cannot_take_is_refused(model, group, kv, patter
     # a ring stripes steps by stored position, which Ulysses' ragged plan doesn't read
     ([_shard(), _attention(), _ulysses(heads=2)], dict(sp_size=2),
      {"kv": {"context_parallel": True}, "shard": {"exchange": "ring"}},
-     r"node_groups\[0\]: ragged attention 'ragged' declares sp_exchange 'ulysses', whose plan reads a split "
-     r"label's tokens in step order, and node 'llm''s sequence shard stripes them by KV 'kv''s positions"),
+     r"node_groups\[0\]: ragged attention 'ragged' attends labels its sequence shard splits \(Ulysses\), whose "
+     r"plan reads a split label's tokens in step order, and node 'llm''s sequence shard stripes them by KV "
+     r"'kv''s positions"),
     ([_shard(), _ulysses(heads=3)], dict(sp_size=2), {},
-     r"node_groups\[0\]: ragged attention 'ragged' declares sp_exchange 'ulysses', and its 3 query and 3 KV heads "
+     r"node_groups\[0\]: ragged attention 'ragged' attends labels its sequence shard splits \(Ulysses\), and its 3 "
+     r"query and 3 KV heads "
      r"don't split over 1 TP x 2 SP ranks"),
     # a packed split can leave a rank none of a row's queries or keys
     ([_shard(), _attention(), _cross()], dict(sp_size=2), {},
@@ -1024,3 +1027,27 @@ def test_worker_graph_problems_are_reported_together(tmp_path):
     assert problems[2] == (
         "Resource spec kv nodes ['llm', 'post'] must use the same parallel shape across replicas"
     )
+
+
+class _StateModel(_Model):
+    def __init__(self, arrays, **kw):
+        super().__init__(**kw)
+        self._arrays = arrays
+
+    def declare_state(self):
+        return list(self._arrays)
+
+
+def test_an_sdpa_read_over_a_split_label_is_reported_only_where_the_node_splits(tmp_path):
+    """The decision is made from the specs after the YAML's overrides and `derive`, as the engine does."""
+    from test_state_cross_reads import _array
+
+    # other heads, so the two reads don't share one resource
+    video, audio = _array("video", "video_self", nodes=("llm",)), _array("audio", nodes=("llm",), heads=2)
+    model = _StateModel([video, audio], specs=[SeqShardSpec("shard", {"llm"}, ("video", "audio"), 0)])
+    groups = [{"node_names": ["llm"], "ranks": [0, 1], "sp_size": 2}]
+    sdpa = {"video_self": {"backend": "sdpa"}}
+    _refused(model, _cfg(tmp_path, groups, resources=sdpa), r"backend sdpa over labels \['video'\]")
+    # the YAML's exchange turns the split off, so SDPA reads the label whole; the node's other problem remains
+    copied = _problems(model, _cfg(tmp_path, groups, resources={**sdpa, "shard": {"exchange": "none"}}))
+    assert copied and not any("backend sdpa over labels" in problem for problem in copied), copied

@@ -286,3 +286,26 @@ def test_each_rows_loop_stride_advances_its_loop(tmp_path, drop):
     assert iters["native"] == iters["reference"]
     # the dropped row does not move; the last row's 3 + 1 reaches MAX_ITERS and resets
     assert iters["native"] == ([[2, 0, 3], [3, 0]] if drop else [[2, 1, 3], [3, 2, 0]])
+
+
+def test_a_repeated_step_stops_a_row_at_its_iteration_and_emits_up_to_it(tmp_path):
+    """A step that ran three iterations hands over a token per iteration: a row
+    stops at the first that stops it, and the client gets its tokens up to that
+    one, in order; what the device ran past the stop goes nowhere."""
+    box = ZmqCommunicator("api_server", str(tmp_path))
+    rt = _runtime(rust_runtime.RustGraphRuntime, str(tmp_path))
+    rids = _start(rt, 2)
+    assert rt.pop_rids(NODE, WALK, rids) is not None
+    wide = torch.tensor([[1, 2, 3], [4, EOS, 5]], dtype=torch.int64)
+    trace = _drive(rt, PostprocessRequest(
+        partition=PART, node_name=NODE, graph_walk=WALK, output_signals=[SIG],
+        wg_ids=ParallelList(list(rids), [0, 0]), runtime_stops=True,
+        tokens=wide[:, 0], row_rids=rids, inline=InlineColumn(SIG, wide[:, 0]),
+        loop_strides=[3, 3], token_width=3,
+    ), {}, model_stops={})
+    assert trace[-1][2] == [rids[1]]
+    sent = {}
+    for frame in _collect(box):
+        for rid, value in zip(frame.body.request_ids, frame.body.values, strict=True):
+            sent.setdefault(rid, []).append(value)
+    assert sent == {"r0": [1, 2, 3], "r1": [4, EOS]}

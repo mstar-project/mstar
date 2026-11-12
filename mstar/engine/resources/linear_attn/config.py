@@ -19,6 +19,11 @@ if TYPE_CHECKING:
     from mstar.engine.resources.sequence_shard import SeqShardSpec
 
 
+def bf16_gdn_state_fits(head_k_dim: int, head_v_dim: int) -> bool:
+    """Whether FlashInfer's bf16 GDN decode kernel takes a state of these head dims: K = V = 128 only."""
+    return head_k_dim == head_v_dim == 128
+
+
 class LinearAttnVariant(Enum):
     # gated delta rule: scalar decay per head. Qwen3.5, Qwen3-Next.
     GDN = "gdn"

@@ -23,7 +23,7 @@ from mstar.engine.resources.linear_attn.base import (
     gather_rows,
     scatter_rows,
 )
-from mstar.engine.resources.linear_attn.config import LinearAttnConfig, LinearAttnStep
+from mstar.engine.resources.linear_attn.config import LinearAttnConfig, LinearAttnStep, bf16_gdn_state_fits
 from mstar.engine.resources.linear_attn.gdn_stage import gdn_stage_applies
 from mstar.engine.resources.linear_attn.wrappers import (
     GDNDecodeWrapper,
@@ -40,6 +40,7 @@ from mstar.engine.resources.recurrent.pool import (
     RecurrentStatePool,
     checkpoint_rows,
 )
+from mstar.engine.resources.resident_hooks import ANY_REPEATS
 from mstar.engine.resources.sequence_shard import state_passing, ulysses
 from mstar.engine.resources.spec import CombinedSplit
 from mstar.engine.resources.step import Segment, SlotLease, StepContext
@@ -144,8 +145,8 @@ class GDNManager(LinearAttnManager):
                 f"gdn state dtype {state_dtype} is not supported: FlashInfer's "
                 "pool decode paths are fp32 and bf16."
             )
-        # The bf16 decode kernel is pool-only and K=V=128 only.
-        if geometry.head_k_dim != 128 or geometry.head_v_dim != 128:
+        # The bf16 decode kernel is pool-only.
+        if not bf16_gdn_state_fits(geometry.head_k_dim, geometry.head_v_dim):
             raise NotImplementedError(
                 f"a bf16 gdn state needs K=V=128, got K={geometry.head_k_dim} "
                 f"V={geometry.head_v_dim}; declare an fp32 pool instead."
@@ -165,6 +166,9 @@ class GDNManager(LinearAttnManager):
                 "kernel writes padding rows to slot 0 rather than skipping "
                 "them. Unset RecurrentStateConfig.disable_sink_slot."
             )
+
+    def max_repeats(self, step, ctx) -> int:
+        return ANY_REPEATS  # decode addresses the pool by slot alone
 
     def resident_refusal(self) -> str | None:
         # decode addresses the pool by slot alone, which the pool's table holds. Resident decode on a

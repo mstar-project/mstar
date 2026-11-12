@@ -4,7 +4,7 @@ Kept free of the manager and its kernels, like the other resources' configs, so
 a submodule can declare a step without pulling FlashInfer in behind it.
 """
 
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Literal
@@ -146,8 +146,8 @@ class _RaggedSpecBase(NodeResourceSpec):
     config: RaggedAttentionConfig
     # the sequence shard over its nodes, if any (`derive`, on the kinds that take split steps)
     shard_key: str | None = field(default=None, init=False, repr=False)
-    # how a split label's tokens reach the heads: declared on self-attention (`RaggedAttentionSpec`),
-    # derived per pair on cross-attention
+    # how a split label's tokens reach the heads: derived from the spec's `labels` and the node's
+    # shard (`derive`)
     sp_exchange = "none"
 
     def depends_on(self) -> set[str]:
@@ -191,29 +191,38 @@ class _RaggedSpecBase(NodeResourceSpec):
 class RaggedAttentionSpec(_RaggedSpecBase):
     """Cacheless self-attention within each declared span (``AttentionStep``).
 
-    ``sp_exchange="ulysses"`` attends a label its node's sequence shard splits by Ulysses (one
-    all-to-all from split tokens to split heads, and back). On a node whose shard splits
-    (``SeqShardSpec.splits``) it shards heads over every TP and SP rank, slicing them on a copied
-    step. On SP ranks of such a node every label goes through an exchange, so
-    ``run(..., return_lse=True)`` raises there.
-    ``"none"`` (the default) attends only copied labels, heads over TP. ``ulysses`` is a no-op on a
-    node with no ``SeqShardSpec``, or one whose sequence shard never splits."""
+    ``labels`` are the labels its plans run under that may split; the state contract fills them from the arrays it
+    reads. Where its node's sequence shard lists one of them, the resource attends a split step's label by Ulysses
+    (one all-to-all from split tokens to split heads, and back; ``sp_exchange`` "ulysses", derived), whatever the
+    shard's ``exchange`` for the node's paged attentions. On a node whose shard splits (``SeqShardSpec.splits``) it
+    then shards heads over every TP and SP rank, even where the node's pools store KV by position, slicing them on a
+    copied step; on SP ranks of such a node every label goes through an exchange, so ``run(..., return_lse=True)``
+    raises there. Otherwise (``sp_exchange`` "none") it attends only copied labels, heads over TP."""
 
-    # the model's declaration, not a deployment's (no deployment sets it)
-    sp_exchange: Literal["none", "ulysses"] = field(default="none", kw_only=True)
+    labels: Collection[str] = field(default=frozenset(), kw_only=True)
+    # how a split label's tokens reach the heads, from ``labels`` and the node's sequence shard (`derive`)
+    sp_exchange: Literal["none", "ulysses"] = field(default="none", init=False)
 
     def __post_init__(self):
         super().__post_init__()
-        if self.sp_exchange not in ("none", "ulysses"):
-            raise ValueError(f"sp_exchange must be 'none' or 'ulysses', not {self.sp_exchange!r}")
+        if isinstance(self.labels, str):
+            raise ValueError(f"ragged attention {self.resource_key!r}: labels is a collection, not a string")
+        self.labels = frozenset(self.labels)
 
     def derive(self, specs: Mapping[str, NodeResourceSpec]) -> list[str]:
         from mstar.engine.resources.sequence_shard import take_shard_edge
 
-        return take_shard_edge(self, specs)
+        problems = take_shard_edge(self, specs)
+        self.sp_exchange = self.resolve_exchange(specs)
+        return problems
 
     def resolve_exchange(self, specs: Mapping[str, NodeResourceSpec]) -> Literal["none", "ulysses"]:
-        return self.sp_exchange
+        """Ulysses where its node's one sequence shard lists a label it plans; from raw fields, so
+        the shard's ``derive`` can ask before this spec's own."""
+        from mstar.engine.resources.sequence_shard import shards_over
+
+        shards = shards_over(self, specs)
+        return "ulysses" if len(shards) == 1 and self.labels & set(shards[0].labels) else "none"
 
     def split_step_refusals(
         self, node: str, shard: "SeqShardSpec", tp: int, sp: int, specs: Mapping[str, "NodeResourceSpec"],
@@ -224,14 +233,14 @@ class RaggedAttentionSpec(_RaggedSpecBase):
             return []
         if shard.stripe_pool is not None:
             return [
-                f"ragged attention {self.resource_key!r} declares sp_exchange 'ulysses', whose plan reads a split "
-                f"label's tokens in step order, and node {node!r}'s sequence shard stripes them by KV "
-                f"{shard.stripe_pool!r}'s positions (its exchange ring)"
+                f"ragged attention {self.resource_key!r} attends labels its sequence shard splits (Ulysses), whose "
+                f"plan reads a split label's tokens in step order, and node {node!r}'s sequence shard stripes them "
+                f"by KV {shard.stripe_pool!r}'s positions (its exchange ring)"
             ]
         if q % (tp * sp) or kv % (tp * sp):
             return [
-                f"ragged attention {self.resource_key!r} declares sp_exchange 'ulysses', and its {q} query and "
-                f"{kv} KV heads don't split over {tp} TP x {sp} SP ranks"
+                f"ragged attention {self.resource_key!r} attends labels its sequence shard splits (Ulysses), and "
+                f"its {q} query and {kv} KV heads don't split over {tp} TP x {sp} SP ranks"
             ]
         return []
 
@@ -253,7 +262,8 @@ class RaggedCrossAttentionSpec(_RaggedSpecBase):
 
     On a node whose sequence shard splits a step, each pair's exchange follows from which side
     is split: split queries over copied keys attend locally, copied queries over split keys merge
-    every rank's partial (``sharded_key_merge``), and both split is refused. The shard must split
+    every rank's partial (``sharded_key_merge``), and both split is refused at load
+    (``mstar.engine.state.analysis.split_read_problems``). The shard must split
     each row (``axis=1``) with exchanges: a packed split (``axis=0``) or one with ``exchanges=False``
     can leave a rank none of a row.
     """

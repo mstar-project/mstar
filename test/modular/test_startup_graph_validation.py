@@ -982,10 +982,11 @@ def test_qwen3_5s_prefix_caches_open_beside_its_sequence_shard(tmp_path, monkeyp
     otherwise)."""
     from mstar.engine.resources.kv.config import opening_prefix_caches
     from mstar.engine.resources.spec import apply_yaml_overrides, resolve_spec_dependencies
+    from mstar.engine.state.adapters import StateSetup
     from mstar.model.base import enabled_resources
     from mstar.model.qwen3_5.config import GDN_STATE, KV_CACHE, LINEAR_ATTN, LLM_SHARD
 
-    specs = enabled_resources(_qwen3_5("qwen3_5_9b", {}, tmp_path, monkeypatch), {})
+    specs = enabled_resources(_qwen3_5("qwen3_5_9b", {}, tmp_path, monkeypatch), {}, StateSetup())
     apply_yaml_overrides(specs, {"resources": {GDN_STATE: {"prefix_slots": 8}}})
     assert LLM_SHARD in resolve_spec_dependencies(specs)[LINEAR_ATTN].depends_on()
     assert {KV_CACHE, GDN_STATE} <= opening_prefix_caches(specs, {"LLM": 1}, checkpoint_named=True)

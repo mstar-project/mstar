@@ -30,6 +30,7 @@ from mstar.engine.resources.context_parallel import KeyRows, OwnTokensKernel, Ri
 from mstar.engine.resources.kv.config import PagedKVConfig
 from mstar.engine.resources.kv.keys import fingerprint
 from mstar.engine.resources.kv.plan import KVPlanOutputs
+from mstar.engine.resources.resident_hooks import ANY_REPEATS
 from mstar.engine.resources.spec import CombinedSplit
 from mstar.engine.resources.step import SlotLease, StepContext
 from mstar.platforms import current_platform
@@ -104,6 +105,8 @@ class FlashInferManager(PlacedAttention):
         # a split label's whole step's qo_indptr, for `select_last_hidden` (`kv_gather` plans this
         # rank's queries alone)
         self._step_qo: dict[str, torch.Tensor] = {}
+        # walk -> whether its captured decode kernels see a row's length per replay
+        self._repeat_walks: dict[str, bool] = {}
 
     def bind_dependencies(self, resources) -> None:
         # the pool, built, has paged its groups for its placement (`PagedKVConfig.placed_groups`)
@@ -165,6 +168,16 @@ class FlashInferManager(PlacedAttention):
             device=self._device, backend=self._wrapper_kv_kwargs["backend"], q_data_type=self._dtype,
             sm_scale=self._sm_scale,
         )
+
+    def max_repeats(self, step, ctx) -> int:
+        """Whether every wrapper of the walk's captures sees each replay's lengths
+        (`supports_repeats`)."""
+        walk = ctx.graph_walk
+        allowed = self._repeat_walks.get(walk)
+        if allowed is None:
+            wrappers = [w for key, w in self._cg_plan_states.items() if key.bucket.graph_walk == walk]
+            allowed = self._repeat_walks[walk] = bool(wrappers) and all(w.supports_repeats for w in wrappers)
+        return ANY_REPEATS if allowed else 1
 
     def resident_refusal(self) -> str | None:
         if self._window_left >= 0:

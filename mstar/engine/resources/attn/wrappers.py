@@ -180,6 +180,8 @@ class FlashInferPrefillWrapper(PagedKernel):
     # planned on the host: a resident step fills nothing of it in its graph
     plans_in_graph = False
     supports_gather_resident = False
+    # a replay's lengths are fixed by the host plan
+    supports_repeats = False
 
     def __init__(
         self,
@@ -504,6 +506,13 @@ class FlashInferDecodeWrapper(PagedKernel):
     # the host still plans FlashInfer's schedule (`supports_gather_resident`)
     plans_in_graph = False
 
+    @property
+    def supports_repeats(self) -> bool:
+        """Whether the captured kernels see each replay's lengths: the tensor-core
+        kernel with paged arrays its graph builds, its schedule planned for the
+        step's last replay (`resident_gather`)."""
+        return self.supports_gather_resident and self.lengths_move
+
     def __init__(
         self,
         workspace_buffer: Workspace,
@@ -642,6 +651,15 @@ class FlashInferDecodeWrapper(PagedKernel):
         self.dtype = dtype
         if self.accelerator_graph and kv_lens is not None:
             self._planner_args = self._direct_planner_args(n_req)
+
+    @property
+    def lengths_move(self) -> bool:
+        """Whether a plan for longer rows still serves shorter ones, the lengths
+        moving between replays: the tensor-core kernel takes a row's length off
+        ``last_page_len`` at run time and clamps each planned chunk to it. A plan
+        fixes only pages and chunks. The CUDA-core kernel's chunk size underflows
+        on a chunk past the row's end."""
+        return _decode_direct_variant(self.attn_wrapper) == _TENSOR_CORE_DECODE
 
     def _direct_planner_args(self, n_req: int) -> list | None:
         """FlashInfer's planner arguments for this wrapper, fixed but for the
@@ -816,6 +834,8 @@ class FmhaDecodeWrapper:
     # host plan at all; `supports_gather_resident` is the paged wrappers' half-way case
     plans_in_graph = True
     supports_gather_resident = False
+    # its graph plans it whole, so a replay sees its own lengths
+    supports_repeats = True
 
     def __init__(
         self,
@@ -984,6 +1004,8 @@ class FlashInferMixedWrapper:
     # planned on the host: a resident step fills nothing of it in its graph
     plans_in_graph = False
     supports_gather_resident = False
+    # a replay's lengths are fixed by the host plan
+    supports_repeats = False
 
     def __init__(
         self,
