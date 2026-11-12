@@ -671,8 +671,9 @@ def test_keyed_spans_on_a_value_fail_the_request():
 # Request settings
 
 
-def test_sample_settings_have_todays_request_fields_less_the_seed():
-    today = {f.name: f.default for f in fields(SamplingReqConfig) if f.name != "_seed"}
+def test_sample_settings_have_todays_request_fields_less_the_seed_and_grammar():
+    # the conductor sets both: the seed, and the grammar from the request (SamplerSpec.request_config)
+    today = {f.name: f.default for f in fields(SamplingReqConfig) if f.name not in ("_seed", "grammar")}
     settings = {f.name: f.default for f in fields(SampleSettings)}
     assert settings == today
 
@@ -702,10 +703,11 @@ def test_log_probs_on_several_draws_fail_the_request():
         sampling_configs({"s": SampleSettings(return_logprobs=True)}, [sampler])
 
 
-def test_log_probs_on_several_draws_are_refused_at_load():
+@pytest.mark.parametrize("key", ["enable_logprobs", "enable_grammar"])
+def test_one_draw_options_on_several_draws_are_refused_at_load(key):
     model = _StubModel(Sampler("s", nodes={"LLM"}, vocab_size=8, draws=2))
-    problems = deployment_problems(model, {"s": {"enable_logprobs": True}})
-    assert len(problems) == 1 and problems[0].startswith("Sampler 's'.draws") and "log-probs" in problems[0]
+    problems = deployment_problems(model, {"s": {key: True}})
+    assert len(problems) == 1 and problems[0].startswith(f"Sampler 's'.draws: {key}, and draws is 2")
 
 
 def test_log_probs_on_one_draw_are_allowed_at_load():

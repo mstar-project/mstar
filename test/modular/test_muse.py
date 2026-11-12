@@ -776,3 +776,20 @@ def test_a_mistyped_template_switch_is_a_400(model_dir, bad):
 
     with pytest.raises(ValueError, match=next(iter(bad))):
         MuseGlimmerModel(str(model_dir)).render_prompt([], **bad)
+
+
+def test_a_reply_grammar_holds_from_the_answer_after_the_reasoning(model_dir):
+    """Every turn reasons first: its reasoning message, the answer's header, then
+    the answer, which alone the grammar holds."""
+    xgr = pytest.importorskip("xgrammar")
+    from test_qwen3_5_metadata import _prepared_kwargs
+
+    from mstar.engine.resources.sampler.grammar import grammar_request
+    from mstar.model.muse.glimmer_model import MuseGlimmerModel
+
+    kwargs = _prepared_kwargs(MuseGlimmerModel(str(model_dir)), {"json": {"type": "object"}})
+    compiled = xgr.GrammarCompiler(xgr.TokenizerInfo([])).compile_grammar(
+        grammar_request(kwargs["structured_outputs"]).grammar())
+    matcher = xgr.GrammarMatcher(compiled, terminate_without_stop_token=True)
+    reply = ' to=self<|message|>The user wants JSON.<|eom|><|start|>assistant to=user<|message|>{"a": 1}'
+    assert matcher.accept_string(reply) and matcher.is_terminated()

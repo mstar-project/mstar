@@ -11,6 +11,7 @@ from mstar.distributed.base import PARALLEL_AXES, ShardingConfig, node_group_axi
 from mstar.distributed.communication import GlobalParallelConfig
 from mstar.engine.resources.context_parallel import position_pools
 from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
+from mstar.engine.resources.sampler.config import SamplerSpec
 from mstar.engine.resources.sequence_shard import sequence_parallel_refusals
 from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.graph.base import GraphSection, self_triggered, top_level_entities
@@ -135,6 +136,7 @@ def check_worker_graphs(
         *_worker_parallelism(worker_graphs, specs or ()),
         *_sequence_parallel(worker_graphs, specs, moe_parallel or {}),
         *_paged_kv_on_cfg_ranks(worker_graphs, specs or ()),
+        *_grammar_samplers(worker_graphs, specs or ()),
     ]
 
 
@@ -484,6 +486,27 @@ def _paged_kv_on_cfg_ranks(
                 f"cache, since its CFG ranks run different branches ({_describe(wg)} has "
                 f"cfg_size {wg.cfg_size}). Make each branch its own node in a graph Parallel, "
                 "on a node group with cfg_size 1, as BAGEL's LLM_cfg_text and LLM_cfg_img are."
+            )
+
+
+def _grammar_samplers(
+    worker_graphs: Sequence[WorkerGraph], specs: Sequence[NodeResourceSpec],
+) -> Iterator[str]:
+    """``enable_grammar`` on more than one sampler, or on one whose node runs its
+    walks on different ranks (a prefill/decode split): the grammar lives with
+    one worker's sampler, and a draw on another would never reach it."""
+    grammar = [spec for spec in specs if isinstance(spec, SamplerSpec) and spec.enable_grammar]
+    if len(grammar) > 1:
+        yield (
+            f"enable_grammar is on samplers {sorted(spec.resource_key for spec in grammar)}; "
+            "it belongs on the text sampler alone"
+        )
+    for spec in grammar:
+        split = [wg for wg in worker_graphs if spec.nodes & wg.section.get_nodes().keys()]
+        if len({tuple(wg.ranks) for wg in split}) > 1:
+            yield (
+                f"sampler {spec.resource_key}: enable_grammar is not served on a node whose walks run "
+                f"on different ranks ({'; '.join(_describe(wg) for wg in split)})"
             )
 
 

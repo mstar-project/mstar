@@ -70,6 +70,7 @@ logger = logging.getLogger(__name__)
 # TODO: implement MoE variants
 class Qwen3_5DenseModel(MultimodalDecoderModel):
     NAME = "Qwen3.5"
+    REASONING_END = "</think>"
     METADATA_FILES = (
         "config.json",
         "preprocessor_config.json",

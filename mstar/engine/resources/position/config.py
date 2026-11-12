@@ -166,7 +166,7 @@ class PositionSpec(NodeResourceSpec):
 
         return take_shard_edge(self, specs)
 
-    def request_config(self, model_kwargs: dict | None) -> "PositionReqConfig | None":
+    def request_config(self, model_kwargs: dict | None, current=None) -> "PositionReqConfig | None":
         """Under LongRoPE, the length the request's table is chosen by, from
         ``MAX_POSITION_KWARG``, which a model sets in ``process_prompt`` (the data worker
         drops a client's); without it, the short table."""

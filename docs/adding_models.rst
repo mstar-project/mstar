@@ -3116,7 +3116,8 @@ that a misspelled setting is never silently ignored:
      - ``enable_logprobs``, ``enable_processed_logprobs`` (see ``SamplingReqConfig``),
        ``greedy_capture`` (``true`` / ``false``; by default a sampler past the one-kernel
        draw takes each row's argmax in a step whose rows all sample greedily, in a twin of
-       each batched capture)
+       each batched capture), ``enable_grammar`` and ``grammar_cache_mb`` (see **Structured
+       output** in models.rst)
    * - ``RecurrentStateSpec``
      - ``max_slots``, ``state_dtype``, ``prefix_slots`` (see **Cross-request prefix reuse**).
        ``max_slots`` counts the sink unless ``disable_sink_slot``; a value that leaves no

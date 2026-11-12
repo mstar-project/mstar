@@ -9,9 +9,13 @@ import torch
 
 from mstar.engine.accelerator_graph_backend import (
     AcceleratorGraphBackend,
+    AcceleratorGraphPool,
     CUDAGraphBackend,
+    GraphCapture,
+    SplitGraph,
     XPUGraphBackend,
     get_accelerator_graph_backend,
+    split_capture,
 )
 from mstar.engine.accelerator_graph_runner import (
     capture_into_graph,
@@ -78,7 +82,9 @@ def test_runner_retains_failed_graphs_only_for_xpu(monkeypatch, device_type):
     stream = object()
     monkeypatch.setattr(backend, "create_graph", create_graph)
     monkeypatch.setattr(backend, "current_stream", lambda: stream)
-    monkeypatch.setattr(backend, "capture", lambda *args, **kwargs: nullcontext())
+    monkeypatch.setattr(
+        backend, "capture", lambda graph, **kwargs: nullcontext(GraphCapture(backend, [graph], False)),
+    )
     monkeypatch.setattr(backend, "synchronize", lambda: None)
     recovery = Mock()
     monkeypatch.setattr(backend, "recover_failed_capture", recovery)
@@ -103,6 +109,87 @@ def test_runner_retains_failed_graphs_only_for_xpu(monkeypatch, device_type):
     assert graphs[-2]() is None
     assert graphs[-1]() is graph
     assert output == 7
+
+
+class _LoggedGraph:
+    """A graph that logs its capture and replay."""
+
+    def __init__(self, log, name):
+        self.log, self.name = log, name
+
+    def capture_begin(self, *pool):
+        self.log.append(f"begin {self.name}")
+
+    def capture_end(self):
+        self.log.append(f"end {self.name}")
+
+    def replay(self):
+        self.log.append(self.name)
+
+    def pool(self):
+        return "pool"
+
+
+def _logged_backend(monkeypatch, device_type, log):
+    """A real backend's capture, over graphs that log and a stream that always captures."""
+    backend = get_accelerator_graph_backend(torch.device(device_type, 0))
+    names = iter("AB")
+    monkeypatch.setattr(backend, "create_graph", lambda keep_graph=False: _LoggedGraph(log, next(names)))
+    for name, value in [
+        ("synchronize", None), ("current_stream", None), ("new_stream", None), ("set_device", None),
+        ("is_current_stream_capturing", True), ("stream_context", nullcontext()),
+    ]:
+        monkeypatch.setattr(backend, name, lambda *args, value=value: value)
+    monkeypatch.setattr(backend, "recover_failed_capture", Mock())
+    monkeypatch.setattr(DeviceCapability, "of", lambda device: SimpleNamespace(graph_backend=backend))
+    return backend
+
+
+def test_a_split_capture_replays_its_host_call_between_its_graphs(monkeypatch):
+    log = []
+    _logged_backend(monkeypatch, "cuda", log)
+
+    def run():
+        log.append("forward")
+        split_capture(lambda: log.append("fill"))
+        log.append("draw")
+        return 7
+
+    graph, output = capture_into_graph(run, AcceleratorGraphPool(object()), torch.device("cuda", 0), None)
+    assert output == 7 and isinstance(graph, SplitGraph)
+    assert log == ["begin A", "forward", "end A", "begin B", "draw", "end B"]
+    log.clear()
+    graph.replay()
+    assert log == ["A", "fill", "B"]
+    # a host call that raises: the second graph (and any collective in it) still replays
+    log.clear()
+    graph.fn = lambda: 1 / 0
+    with pytest.raises(ZeroDivisionError):
+        graph.replay()
+    assert log == ["A", "B"]
+
+
+@pytest.mark.parametrize("device_type", ["cuda", "xpu"])
+def test_a_capture_splits_once_and_hands_every_piece_to_its_failure(monkeypatch, device_type):
+    """Two splits in one forward would replay a host call that its graph's second
+    piece never waits for; the capture fails, and XPU's pool holds both pieces."""
+    with pytest.raises(ValueError, match="only inside a graph capture"):
+        split_capture(lambda: None)
+    log = []
+    backend = _logged_backend(monkeypatch, device_type, log)
+    monkeypatch.setattr(backend._runtime, "graph_pool_handle", object, raising=False)
+    pool = backend.graph_pool_handle()
+
+    def run():
+        split_capture(lambda: None)
+        split_capture(lambda: None)
+
+    with pytest.raises(ValueError, match="splits once"):
+        capture_into_graph(run, pool, backend.device, None)
+    assert log == ["begin A", "end A", "begin B", "end B"]
+    backend.recover_failed_capture.assert_called_once()
+    if device_type == "xpu":
+        assert [graph.name for graph in pool.failed_graph.graphs] == ["A", "B"]
 
 
 @pytest.mark.parametrize("backend_type", [CUDAGraphBackend, XPUGraphBackend])

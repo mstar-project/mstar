@@ -338,7 +338,7 @@ class CommandAPlusModel(Model):
         for token in output.reshape(-1).tolist():
             if token in (self.config.bos_token_id, self.config.eos_token_id, self.config.pad_token_id):
                 continue
-            if token in self._detokenizer.special_ids:
+            if token in self._detokenizer.dropped_ids:
                 # Preserve reasoning markers instead of filtering all specials.
                 chunks.append(tokenizer.convert_ids_to_tokens(token).encode("utf-8"))
             else:

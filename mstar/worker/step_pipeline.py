@@ -610,8 +610,8 @@ class StepPipeline:
         page move in the window between a step's broadcast and its admit lands
         in the NEXT step's resident delta, so the follower applies it after
         admitting this step while the leader admitted with it already applied.
-        The event is set at the step's first launch, after every row has
-        admitted, or when the step ends without launching
+        The event is set at the step's last launch (just before a split replay's
+        second graph), after every row has admitted, or when the step ends without launching
         (``_submit_gpu_step``). On the per-request path later rows plan after
         it lifts; their plans read only their own in-flight rows.
 
