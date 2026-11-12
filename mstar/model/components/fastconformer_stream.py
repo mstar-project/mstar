@@ -254,6 +254,10 @@ class FastConformerStreamSubmodule(NodeSubmodule):
         # widest region capture every stream of the step would run eagerly.
         return self.capture_batch_sizes[-1]
 
+    def _region_owns_step(self, leases, steady: list[bool]) -> bool:
+        """Whether the whole-step region replays every stream of the step, under the lease it holds."""
+        return self.STEP_REGION in (leases or {}) and all(steady)
+
     def _region_step(self, request_ids, keys) -> SubmoduleStep:
         """A region's streams each add one frame. A region declares no count, since
         its outer step declares every stream's."""
@@ -271,7 +275,7 @@ class FastConformerStreamSubmodule(NodeSubmodule):
         # own step owns every array but the counts. Each such stream already
         # holds its slots, from a first step declared below.
         segments = [Segment(request_id=rid, label="main", span=1) for rid in request_ids]
-        if self.STEP_REGION in (piecewise_leases or {}) and all(inp.kwargs["steady"] for inp in inputs):
+        if self._region_owns_step(piecewise_leases, [inp.kwargs["steady"] for inp in inputs]):
             return SubmoduleStep(segments=segments, state={self.stream_key: ArrayStep(host=counts)})
         # Otherwise this step reserves and plans every stream's slots and new
         # frames, and the eager path reads that plan. A region the forward still
@@ -468,7 +472,7 @@ class FastConformerStreamSubmodule(NodeSubmodule):
             return (bool(new) and max(n[i] for i in new) == 1 and layers_runner is not None
                     and layers_runner.can_run(len(new)))
 
-        if self.STEP_REGION in engine_inputs.piecewise_leases and all(steady):
+        if self._region_owns_step(engine_inputs.piecewise_leases, steady):
             # declare_step left every array but the counts to the region, which its lease says can replay the batch
             steady = list(range(len(rids)))
         else:
