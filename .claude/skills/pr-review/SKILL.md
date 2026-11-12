@@ -519,13 +519,14 @@ doesn't state, say so in `checked`.
 
 ### Questions (all modes; light: only those that could become P0 or P1)
 
-A question doesn't hold the bot's approval; a finding does. So a suspected defect that the code can't
-settle and that would rank P2 or above is filed as a finding, marked suspected, with its "how to
-confirm" line, not only asked as a question. Ask a question for direction and scope, and for what only
-a person can answer: intended behaviour on a path the PR doesn't mention, whether a human checked
-generated audio or images, why a design departs from the pattern `AGENTS.md` describes. Say what the
-answer would change. Don't ask the author to "verify", "double-check" or "consider", and don't ask what
-the code does; read it.
+A question doesn't hold the bot's approval; a finding does, and an open P0–P2 finding keeps the live test
+from starting. So a suspected defect that the live test can settle is a question and a `live_test.focus`
+item (§7), so the live test checks it and a pass settles it. Only one that neither the code nor the live
+test can settle and that would rank P2 or above is filed as a finding, marked suspected, with its "how to
+confirm" line. Otherwise ask questions for direction and scope and for what only a person can answer:
+intended behaviour on a path the PR doesn't mention, whether a human checked generated audio or images,
+why a design departs from the pattern `AGENTS.md` describes. Say what the answer would change. Don't ask
+the author to "verify", "double-check" or "consider", and don't ask what the code does; read it.
 
 ## 5. Evidence
 
@@ -533,7 +534,7 @@ the code does; read it.
   outcome) or measured by the live test; a design finding is verified when the pain is shown as the
   lines the next model or feature would copy or special-case. **Suspected** means a step is
   inferred; say which. Say what was measured and what was read. An untraced mechanism is a
-  hypothesis: drop it, or, when it would rank P2 or above, file it marked suspected (see Questions).
+  hypothesis: drop it, ask it as a question, or file it marked suspected (see Questions).
 - **Set priority from the traced path, not the first look.** Follow the realistic workload: does it
   grow per frame or per request (a leak, not a nit)? Is it reachable from an accepted config or a
   client field (P2 at least)? Does one rank see it and not another (lockstep, P1)? (On #595 an
