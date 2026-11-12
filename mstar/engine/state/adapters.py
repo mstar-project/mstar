@@ -1112,7 +1112,7 @@ class ValueHandle(ArrayHandle):
     @torch.compiler.disable
     def read(self, layer: int | torch.Tensor, q: torch.Tensor | None = None, **mask_args: Any) -> Reached:
         """The step's rows' entries, as `Reached`. A Value takes no ``q``. A row with nothing written yet, with span 0
-        or that pads the step reads the start `set_start` gave, zeros for a field it doesn't name."""
+        or that pads the step reads the start `set_start` describes."""
         layer = self._layer_id(layer)
         if q is not None or mask_args:
             given = sorted({*mask_args, *(("q",) if q is not None else ())})

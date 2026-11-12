@@ -320,9 +320,10 @@ class RecurrentStatePool(Resource):
         forward read the same slots. A row with no saved state (a request's
         first step, or a padding row on the sink) reads ``start``, zeros when
         none is given. A row must declare span >= 1 to reach its own slot; a
-        zero-span row addresses the sink, so it reads ``start``. A pool without
-        a sink refuses (``_need_sink``). A block that is not per layer takes
-        ``layer_idx=None``."""
+        zero-span row addresses the sink, so it reads ``start``. A resident
+        step's graph reads every row's slot instead (`resident_gather`). A pool
+        without a sink refuses (``_need_sink``). A block that is not per layer
+        takes ``layer_idx=None``."""
         if self.config.disable_sink_slot:
             self._need_sink("gather")
         rows = self.addressing(label)

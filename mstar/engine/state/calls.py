@@ -230,8 +230,9 @@ class ArrayHandle(StepHandle):
 
     def set_start(self, start: Mapping[str, torch.Tensor]) -> None:
         """What a row of this Value reads while it has nothing written, has span 0 or pads a step: ``start``'s tensor
-        for each field it names, of one entry's shape on this rank, and zeros for the rest. The tensors are made at load
-        and never written, since a captured read keeps their address."""
+        for each field it names, of one entry's shape on this rank, and zeros for the rest. A step of a resident walk
+        (`NodeSubmodule.resident_walks`) reads each row's slot instead, which holds zeros until the row's first write.
+        The tensors are made at load and never written, since a captured read keeps their address."""
         raise self._unsupported("set_start")
 
     def block(self, field: str, layer: int) -> torch.Tensor:
