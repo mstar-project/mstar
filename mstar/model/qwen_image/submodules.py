@@ -153,7 +153,8 @@ def _decode(vae: nn.Module, z: torch.Tensor) -> torch.Tensor:
 
 
 class QwenImageVaeEncoderSubmodule(NodeSubmodule):
-    """Reference images, uint8 ``[3, H, W]`` at the VAE's size each -> one packed sequence of normalized latent
+    """Reference images, float ``[3, H, W]`` in ``[0, 1]`` at the VAE's size each (:func:`unit_pixels`, in
+    ``process_prompt``) -> one packed sequence of normalized latent
     tokens ``[sum(h*w), 64]``, the references in order: the posterior's mode, ``(z - mean) / std`` in the
     VAE's dtype, as the pipeline encodes, from pixels laid out as its image processor hands them
     (:func:`vae_pixels`). Images differ in size, so each runs alone."""
@@ -169,7 +170,7 @@ class QwenImageVaeEncoderSubmodule(NodeSubmodule):
         if not self._compile:
             return {}
         # laid out as forward's input (vae_pixels' NHWC strides): Dynamo guards on strides
-        image = torch.zeros(3, *_WARM_PIXELS, dtype=torch.uint8)
+        image = torch.zeros(3, *_WARM_PIXELS)
         return {"vae.encoder": [(vae_pixels(image).to(device=self.get_device(), dtype=self.vae.dtype),)]}
 
     def max_batch_size(self, graph_walk: str):

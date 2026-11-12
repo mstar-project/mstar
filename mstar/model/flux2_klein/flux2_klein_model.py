@@ -45,7 +45,12 @@ from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequentia
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import Model, TensorAndMetadata, WalkStep
 from mstar.model.components.diffusion.attention import dit_entry, refuse_attention_backend_kwarg
-from mstar.model.components.diffusion.image_io import OUTPUT_FORMAT_KWARGS, encode_image, image_output_format
+from mstar.model.components.diffusion.image_io import (
+    OUTPUT_FORMAT_KWARGS,
+    encode_image,
+    image_output_format,
+    unit_pixels,
+)
 from mstar.model.components.diffusion.qwen.submodule import (
     TEXT_EMBEDS,
     TEXT_INPUTS,
@@ -257,7 +262,8 @@ class Flux2KleinModel(Model):
     def load_image(self, filepath: str, device: str) -> TensorAndMetadata:
         """Reference image with the pipeline's preprocessing: validity checks, LANCZOS
         shrink to at most ``ref_image_max_area`` pixels, floor of both sides to the 16-px
-        token grid, center crop, RGB; returned as uint8 ``[3, H, W]``, upright by its EXIF
+        token grid, center crop, RGB; returned as float ``[3, H, W]`` in ``[0, 1]`` (divided here, on the host:
+        :func:`unit_pixels`), upright by its EXIF
         orientation as diffusers' ``load_image`` reads it."""
         from PIL import Image
 
@@ -283,7 +289,7 @@ class Flux2KleinModel(Model):
             # image and then dropping the alpha differs from resampling its RGB conversion
             image = image.convert("RGB")
         tensor = torch.from_numpy(np.array(image)).permute(2, 0, 1).contiguous()
-        return TensorAndMetadata(tensor.to(device))
+        return TensorAndMetadata(unit_pixels(tensor).to(device))
 
     def _resolve_size(self, model_kwargs: dict, ref_dims: list[tuple[int, int]]) -> tuple[int, int]:
         """(height, width) of the output: request kwargs, else the first reference image's

@@ -36,7 +36,12 @@ from mstar.model.base import Model, ProcessPromptOutput, TensorAndMetadata, Walk
 from mstar.model.components.diffusion.attention import dit_entry, refuse_attention_backend_kwarg
 from mstar.model.components.diffusion.denoise_loop import LATENTS
 from mstar.model.components.diffusion.guidance import GUIDANCE_SCALE
-from mstar.model.components.diffusion.image_io import OUTPUT_FORMAT_KWARGS, encode_image, image_output_format
+from mstar.model.components.diffusion.image_io import (
+    OUTPUT_FORMAT_KWARGS,
+    encode_image,
+    image_output_format,
+    unit_pixels,
+)
 from mstar.model.media_limits import PILLOW_IMAGE_FORMATS, check_image_size, decoding_upload, open_upright_image
 from mstar.model.qwen_image.components.transformer import JOINT_TOKENS, ROPE_POSITIONS
 from mstar.model.qwen_image.config import (
@@ -268,7 +273,8 @@ class QwenImageModel(Model):
             ratio = pil.width / pil.height
             condition.append(pil.resize(calculate_dimensions(recipe.condition_area, ratio), Image.Resampling.LANCZOS))
             resized = pil.resize(calculate_dimensions(recipe.vae_area, ratio), Image.Resampling.LANCZOS)
-            vae_images.append(torch.from_numpy(np.array(resized)).permute(2, 0, 1).contiguous())
+            # divided here, on the host (unit_pixels), so the VAE encoder never copies an image back from the GPU
+            vae_images.append(unit_pixels(torch.from_numpy(np.array(resized)).permute(2, 0, 1).contiguous()))
         size = self._resolve_size(kwargs, tuple(vae_images[-1].shape[-2:]))
         prefix = "".join(PICTURE_PREFIX.format(i + 1) for i in range(len(images)))
         processor = self._processor_for()

@@ -96,7 +96,7 @@ class KleinVaeEncoderSubmodule(NodeSubmodule):
     ``[1, R, 128]`` (all references concatenated, in request order).
 
     Consumes ``image_inputs``: ``[3, H, W]`` tensors already sized to the pipeline's
-    rule (``Flux2KleinModel.load_image``), uint8, laid out for the VAE as the reference's image
+    rule (``Flux2KleinModel.load_image``), float in ``[0, 1]``, laid out for the VAE as the reference's image
     processor hands them (:func:`vae_pixels`). Images can differ in
     size, so each is encoded on its own; requests do not batch here.
     """
