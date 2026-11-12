@@ -2333,8 +2333,8 @@ and each row's label comes from the step's segments, so there are no cursors:
 - ``write`` sets the step's rows' entries in place where the forward runs it, not at the step's commit.
 
 These raise, naming the array and the cause: a call on an array the step doesn't list or on
-a layer it doesn't declare, an add after a kept add, an add after a read in the same layer,
-and ``write`` on an append-only array. The checks run in eager steps and at capture, so
+a layer it doesn't declare, an add after a kept add, a kept add after a read in the same
+layer, and ``write`` on an append-only array. The checks run in eager steps and at capture, so
 graph replays skip them. On an array with ``max_len=0`` a compiled block skips them too, since a
 check there would guard on the layer.
 
