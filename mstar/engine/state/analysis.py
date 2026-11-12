@@ -218,8 +218,9 @@ def split_read_problems(
                 continue
             both = [node for node in nodes if queries is not array and queries.labels & set(split[node])]
             if both:
-                problems.append(f"{where}: its queries (Array {queries.name!r}) and keys both split over the SP ranks "
-                                f"of {both}, which no exchange serves: list only one side in the sequence shard")
+                problems.append(f"{where}: its queries (Array {queries.name!r}, labels {sorted(queries.labels)}) and "
+                                f"keys (labels {sorted(array.labels)}) both split over the SP ranks of {both}, which "
+                                "no exchange serves: list only one side in the sequence shard")
     return problems
 
 

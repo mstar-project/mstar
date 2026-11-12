@@ -501,7 +501,7 @@ def test_sdpa_on_a_read_that_keeps_entries_is_refused_at_load():
 
 
 _SDPA_SPLIT = "backend sdpa over labels ['video'], which the sequence shard of ['dit'] splits over SP ranks"
-_BOTH_SPLIT = "and keys both split over the SP ranks of ['dit'], which no exchange serves"
+_BOTH_SPLIT = "both split over the SP ranks of ['dit'], which no exchange serves"
 
 
 @pytest.mark.parametrize("split, sdpa, problems", [
@@ -509,8 +509,12 @@ _BOTH_SPLIT = "and keys both split over the SP ranks of ['dit'], which no exchan
     (("video",), "video_self", [f"Array 'video'.reads['video_self']: {_SDPA_SPLIT}"]),
     (("video",), "video_text", []),
     ((), "video_to_audio", []),
-    (("video", "audio"), None, [f"Array 'audio_v'.reads['audio_to_video']: its queries (Array 'video') {_BOTH_SPLIT}",
-                                f"Array 'video_a'.reads['video_to_audio']: its queries (Array 'audio') {_BOTH_SPLIT}"]),
+    (("video", "audio"), None, [
+        "Array 'audio_v'.reads['audio_to_video']: its queries (Array 'video', labels ['video']) "
+        f"and keys (labels ['audio']) {_BOTH_SPLIT}",
+        "Array 'video_a'.reads['video_to_audio']: its queries (Array 'audio', labels ['audio']) "
+        f"and keys (labels ['video']) {_BOTH_SPLIT}",
+    ]),
 ], ids=["sdpa-split-keys", "sdpa-self", "sdpa-copied-keys", "one-rank", "cross-both-split"])
 def test_reads_no_exchange_serves_on_split_labels_are_refused_from_the_declarations(split, sdpa, problems):
     """SDPA runs outside the resources, so no exchange reaches it: over split keys it would attend one rank's share.

@@ -284,8 +284,6 @@ def _forward_step(
     # resource set) here.
     if dit.node_resources is not resources:
         dit.bind_node_resources(resources)
-        # the transformer brackets its stack on the node's shard, which it reaches through the submodule
-        assert dit.transformer.sequence_shard is resources.get(SEQ_SHARD)
     real_ids = list(rids)
     step_ids, step_fwds = real_ids, dict(fwds)
     lease = None

@@ -357,6 +357,22 @@ def test_a_node_that_splits_its_steps_refuses_a_resource_that_cant_take_them(kin
         )
 
 
+def test_a_read_no_exchange_serves_on_a_node_that_splits_its_steps_is_refused_at_load(monkeypatch):
+    """SDPA over keys the sequence shard splits would attend one rank's share. The engine refuses it from the
+    declarations, before any step splits (`split_read_problems`)."""
+    from test_state_cross_reads import _array, _on_sdpa
+
+    video = _array("video", "video_self", nodes=(NODE,))
+    model = types.SimpleNamespace(checkpoint_path=lambda: None, declare_state=lambda: [video])
+    monkeypatch.setattr(engine_mod, "sequence_parallel_refusals", lambda *args: [])
+    engine = Engine(graph_runtime=None, state_setup=_on_sdpa("video_self"))
+    with pytest.raises(ValueError, match=r"backend sdpa over labels \['video'\]"):
+        engine.load_model(
+            {NODE: _Submodule()}, specs=[SeqShardSpec("shard", {NODE}, ("video",), 0)],
+            parallel_groups=_sp_groups(NODE), device=CPU, transfer_engine_info=None, model=model,
+        )
+
+
 @dataclass
 class _SharedSpec(_DependentSpec):
     def depends_on(self):

@@ -299,10 +299,16 @@ def test_a_split_step_refuses_what_it_cant_range():
     assert shard.scatter("other", x) is x
 
 
-def test_a_decode_step_on_a_node_with_a_shard_may_repeat():
+def test_a_resident_step_on_a_node_with_a_shard_is_not_refused_a_repeat():
     """A resident replay is a batched decode, which the shard plans copied, so it holds no node to
     one iteration a step (`step_repeats`)."""
-    assert _shard().max_repeats(None, None) > 1
+    from mstar.engine.resources.runner import StepRunner
+    from mstar.engine.resources.step import ResourceStep
+
+    runner = StepRunner({"shard": _shard()}, {"n": ["shard"]})
+    ctx = StepContext(request_ids=["r"], graph_walk="decode", slot=0, capture=False, resident=object())
+    step = SubmoduleStep(steps={"shard": ResourceStep(segments=(Segment("r", "main", 1),))}, _ctx=ctx)
+    assert runner.repeat_refusal(step) is None
 
 
 def test_a_rows_share_comes_back_row_major():

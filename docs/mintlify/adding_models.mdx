@@ -1256,10 +1256,10 @@ Each attention resource derives what it does from the two, and the model writes 
 | Tokens / storage | By head | By position (`context_parallel`) | Cacheless (ragged) |
 |----|----|----|----|
 | Copied | head slice: this rank's heads of q, k and v, write and attend, gather the heads | each rank attends its slots, partials merged (below) | heads over TP; over a label the shard lists, a head slice |
-| Split | Ulysses: one all-to-all from split tokens to split heads, write and attend, one back | refused at load for now | Ulysses over a label the spec's `labels` list; any other split label refused at plan |
+| Split | Ulysses: one all-to-all from split tokens to split heads, write and attend, one back | refused at load for now | Ulysses over a label the spec's `labels` list; any other split label refused at load |
 | Cross, split queries | n/a | n/a | each rank's queries over every key |
 | Cross, split keys | n/a | n/a | each rank's partial over its keys, merged by log-sum-exp (`gather_merge`) |
-| Cross, both split | n/a | n/a | refused at plan |
+| Cross, both split | n/a | n/a | refused at load |
 
 Splitting is declared in four places:
 

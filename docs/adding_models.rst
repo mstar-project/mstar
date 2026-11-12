@@ -3119,7 +3119,7 @@ Each attention resource derives what it does from the two, and the model writes 
    * - Split
      - Ulysses: one all-to-all from split tokens to split heads, write and attend, one back
      - refused at load for now
-     - Ulysses over a label the spec's ``labels`` list; any other split label refused at plan
+     - Ulysses over a label the spec's ``labels`` list; any other split label refused at load
    * - Cross, split queries
      - n/a
      - n/a
@@ -3131,7 +3131,7 @@ Each attention resource derives what it does from the two, and the model writes 
    * - Cross, both split
      - n/a
      - n/a
-     - refused at plan
+     - refused at load
 
 Splitting is declared in four places:
 
