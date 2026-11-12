@@ -23,6 +23,12 @@ ROW_HEAD = 3
 ROW_INTS = ROW_HEAD + 2 * NUM_READS + 3 * NUM_WRITES
 
 
+def tiles_head_dim(head_dim: int) -> bool:
+    """Whether the kernels can tile ``head_dim``: a power of two, since both lay a head out as `tl.arange`, and at
+    least 16, which the attention kernel's `tl.dot` takes."""
+    return head_dim >= 16 and not head_dim & (head_dim - 1)
+
+
 class RowLayout(NamedTuple):
     reads: tuple[tuple[int, int], ...]
     writes: tuple[tuple[int, int, int], ...]

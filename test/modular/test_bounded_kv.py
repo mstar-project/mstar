@@ -476,6 +476,12 @@ def test_kernel_refuses_a_head_dim_it_cannot_tile():
         bounded_attention(q, q, q, cache, None, torch.zeros(1, ROW_INTS, dtype=torch.int32))
 
 
+def test_the_kernels_tile_a_head_dim_that_is_a_power_of_two_from_16():
+    from mstar.engine.resources.kv.bounded.layout import tiles_head_dim
+
+    assert [d for d in range(1, 300) if tiles_head_dim(d)] == [16, 32, 64, 128, 256]
+
+
 def test_per_query_window_config():
     from mstar.engine.resources.kv.bounded.config import BoundedKVConfig
 
