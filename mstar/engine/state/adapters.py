@@ -1865,6 +1865,7 @@ class PagedStorage(Storage):
         return {
             label: LabelLayout(
                 spans=layout.spans, growth=layout.growth, scratch=layout.scratch, keyed_spans=keyed_spans.get(label),
+                max_growth=layout.max_growth,
             )
             for label, layout in by_label.items()
         }

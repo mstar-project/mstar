@@ -84,6 +84,7 @@ SNAPSHOT = {
         ["spans", "KEYWORD_ONLY", '()'],
         ["growth", "KEYWORD_ONLY", '()'],
         ["scratch", "KEYWORD_ONLY", '0'],
+        ["max_growth", "KEYWORD_ONLY", 'None'],
     ],
     "Mamba2": [
         ["time_step_limit", "KEYWORD_ONLY", '(0.0, inf)'],

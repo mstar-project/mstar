@@ -418,7 +418,7 @@ doesn't name, it opens the labels ``kv_labels()`` lists for it, or ``main`` wher
 none, and a paged array needs a layout for each label it opens, so leaving one out fails the
 request: lay out every paged array. A layout may be empty where an opened label is never
 written. A Value's layout is ``Layout()``, because a Value takes one slot per label. A layout
-has three fields:
+has four fields:
 
 - ``spans``: the committed writes known at intake, in walk order. A ``Span`` has a
   ``kind``: ``"ids"`` for token ids from the tensor ``source`` names, ``"digest"`` for KV
@@ -440,6 +440,8 @@ has three fields:
   slots, as a window's denoise steps do.
 - ``growth``: ``(loop, entries)`` pairs, ``entries`` per iteration of ``loop``.
 - ``scratch``: the most entries one non-committing step writes past the kept length.
+- ``max_growth``: the most entries the growth reserves, below what the loops' caps give, for a
+  label whose loops stop sooner than their caps say. None takes the caps.
 
 ``process_prompt`` may also return ``keyed_spans``, keyed by array and then label: how many
 leading spans the label's keys cover, by default every span before the first ``rows`` span.
@@ -447,7 +449,7 @@ A prompt on a walk the keys don't name sets 0, because the data worker refuses a
 from any other walk. This key is temporary, with ``kv_labels``.
 A name either key doesn't declare fails the request.
 
-The footprint adds the spans, the growth at each loop's iterations (up to a ``LabelLayout``'s
+The footprint adds the spans, the growth at each loop's iterations (up to the layout's
 ``max_growth``) and the scratch, and rounds up to whole pages per label. A span's own scratch counts only with the spans before
 it, so a window's denoise steps and its commit count once. Under a ``RetentionPolicy`` it
 takes the window's peak instead. ``KVReqConfig.validate`` refuses a request whose footprint

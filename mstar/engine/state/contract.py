@@ -439,6 +439,7 @@ class Layout:
     spans: tuple[Span, ...] = ()
     growth: tuple[tuple[str, int], ...] = ()    # (loop, entries per iteration)
     scratch: int = 0                            # most one scratch step writes past the kept length
+    max_growth: int | None = None               # most entries the growth reserves; None: the loops' caps
 
 
 @dataclass(frozen=True, kw_only=True)
