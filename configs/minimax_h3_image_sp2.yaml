@@ -11,6 +11,11 @@ model_kwargs:
   attention_backend: flashinfer
   compile: true
   vae_tile_batch: 64
+  # the decoder's blocks compiled per tile batch (56-58 dB from eager; -0.13 s at 2048² on 2 H200s)
+  vae_compile: true
+  # the Ulysses exchange on the copy engines, pipelined over 2 head groups (bit-identical; 6.86 -> 6.25 s
+  # at 4096² with vae_compile; 4 or 7 groups add host time at 1024²)
+  ulysses_head_groups: 2
 
 node_groups:
   - node_names: [dit, vae_decoder]
