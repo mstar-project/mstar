@@ -809,7 +809,7 @@ class _OneRank:
 def _layer_over_ranks(rank, world, store):
     """One rank of an SP placement running a Qwen3.5 attention layer through its KV handle on a
     prefill, against the same layer attending every key on one rank."""
-    from mstar.engine.state.adapters import build_handle
+    from mstar.engine.state.adapters import StateSetup, _resolve, build_handle
     from mstar.engine.state.analysis import position_key
     from mstar.engine.state.contract import ArrayStep
     from mstar.model.qwen3_5.components.language_model import Qwen3_5Attention, RopeCache
@@ -847,7 +847,8 @@ def _layer_over_ranks(rank, world, store):
         pool = types.SimpleNamespace(
             layer_view=lambda i: cache, write_kv=lambda *args, **kwargs: None, opens_label=lambda *args: True,
         )
-        handle = build_handle(array, {KV_CACHE: pool, ATTN: attn, position_key(array): None})
+        resources = {KV_CACHE: pool, ATTN: attn, position_key(array): None}
+        handle = build_handle(array, resources, _resolve([array], StateSetup()))
         step = types.SimpleNamespace(
             state={KV_CACHE: ArrayStep()}, segments=tuple(
                 Segment(view.request_id, "main", new) for view, (_, new) in zip(case.views, case.rows, strict=True)
