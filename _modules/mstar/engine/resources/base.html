@@ -613,6 +613,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.resources.admission.html">mstar.engine.resources.admission</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.resources.attn.html">mstar.engine.resources.attn</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.resources.base.html">mstar.engine.resources.base</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.resources.context_parallel.html">mstar.engine.resources.context_parallel</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.resources.dsa.html">mstar.engine.resources.dsa</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.resources.kv.html">mstar.engine.resources.kv</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.resources.lora.html">mstar.engine.resources.lora</a></li>
@@ -1057,6 +1058,7 @@ window.runMermaid = runMermaid;</script>
         <span class="n">PiecewiseConfigType</span><span class="p">,</span>
     <span class="p">)</span>
     <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.attn.workspace</span><span class="w"> </span><span class="kn">import</span> <span class="n">WorkspacePool</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.context_parallel</span><span class="w"> </span><span class="kn">import</span> <span class="n">ContextParallel</span>
     <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.kv.transfer</span><span class="w"> </span><span class="kn">import</span> <span class="n">TransferEngineInfo</span>
 
 
@@ -1093,6 +1095,19 @@ window.runMermaid = runMermaid;</script>
 
 
 
+<div class="viewcode-block" id="head_shards">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.head_shards">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">head_shards</span><span class="p">(</span><span class="n">group</span><span class="p">:</span> <span class="n">JointGroups</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span> <span class="n">positions_over_sp</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""How many ways a node's ranks split its attention heads: its TP and SP ranks (CFG ranks run</span>
+<span class="sd">    whole branches, every head), or TP alone when its pools place positions over the SP ranks</span>
+<span class="sd">    (``context_parallel.positions_over_sp``)."""</span>
+    <span class="k">if</span> <span class="n">group</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">return</span> <span class="mi">1</span>
+    <span class="n">tp</span> <span class="o">=</span> <span class="n">group</span><span class="o">.</span><span class="n">tp_group</span><span class="o">.</span><span class="n">world_size</span>
+    <span class="k">return</span> <span class="n">tp</span> <span class="k">if</span> <span class="n">positions_over_sp</span> <span class="k">else</span> <span class="n">tp</span> <span class="o">*</span> <span class="n">group</span><span class="o">.</span><span class="n">sp_group</span><span class="o">.</span><span class="n">world_size</span></div>
+
+
+
 <div class="viewcode-block" id="EngineResourceInfo">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.EngineResourceInfo">[docs]</a>
 <span class="nd">@dataclass</span><span class="p">(</span><span class="n">frozen</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
@@ -1126,17 +1141,18 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># the prefix caches this engine opens (`opening_prefix_caches`), decided</span>
     <span class="c1"># before any resource is built, for one that sizes itself by its own</span>
     <span class="n">prefix_caches</span><span class="p">:</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="nb">frozenset</span><span class="p">()</span>
+    <span class="c1"># whether the resource's nodes run replicated over their SP ranks, because their pools place</span>
+    <span class="c1"># positions over them (`context_parallel.positions_over_sp`), rather than running their own SP</span>
+    <span class="n">replicated_over_sp</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
     <span class="c1"># what each step may still copy to the host once its outputs are sent, or on a pass that runs no step</span>
     <span class="n">host_allowance</span><span class="p">:</span> <span class="n">StepAllowance</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
 
     <span class="nd">@property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">head_shards</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">"""How many ways the node's ranks split its attention heads, which each</span>
-<span class="sd">        builder sizes head counts by: its TP × SP ranks (CFG ranks run whole</span>
-<span class="sd">        branches, every head). A ragged resource declaring</span>
+<span class="w">        </span><span class="sd">"""How many ways the node's ranks split its attention heads, which each builder sizes head</span>
+<span class="sd">        counts by (`head_shards`). A ragged resource declaring</span>
 <span class="sd">        ``RaggedAttentionConfig.shard_over_sp=False`` splits over TP only."""</span>
-        <span class="n">group</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">joint_comm_group</span>
-        <span class="k">return</span> <span class="mi">1</span> <span class="k">if</span> <span class="n">group</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">group</span><span class="o">.</span><span class="n">tp_group</span><span class="o">.</span><span class="n">world_size</span> <span class="o">*</span> <span class="n">group</span><span class="o">.</span><span class="n">sp_group</span><span class="o">.</span><span class="n">world_size</span>
+        <span class="k">return</span> <span class="n">head_shards</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">joint_comm_group</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">replicated_over_sp</span><span class="p">)</span>
 
 <div class="viewcode-block" id="EngineResourceInfo.dependency">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.EngineResourceInfo.dependency">[docs]</a>
@@ -1333,6 +1349,14 @@ window.runMermaid = runMermaid;</script>
 
     <span class="c1"># stays correct when a hit skips the front of a request; required of every resource on a keyed node</span>
     <span class="n">prefix_skip_safe</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+    <span class="c1"># stays correct when a pool it depends on has a `placement`; the engine refuses to load it otherwise</span>
+    <span class="n">supports_context_parallel</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">placement</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">"ContextParallel | None"</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""How this resource places token positions over ranks (`PagedKVConfig.context_parallel`);</span>
+<span class="sd">        None for one that doesn't."""</span>
+        <span class="k">return</span> <span class="kc">None</span>
 
 <div class="viewcode-block" id="Resource.enable_prefix_cache">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.Resource.enable_prefix_cache">[docs]</a>

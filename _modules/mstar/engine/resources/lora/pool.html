@@ -613,6 +613,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.admission.html">mstar.engine.resources.admission</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.attn.html">mstar.engine.resources.attn</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.base.html">mstar.engine.resources.base</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.context_parallel.html">mstar.engine.resources.context_parallel</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.dsa.html">mstar.engine.resources.dsa</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.kv.html">mstar.engine.resources.kv</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.lora.html">mstar.engine.resources.lora</a></li>
@@ -1416,9 +1417,13 @@ window.runMermaid = runMermaid;</script>
         <span class="n">joint</span> <span class="o">=</span> <span class="n">info</span><span class="o">.</span><span class="n">joint_comm_group</span>
         <span class="k">if</span> <span class="n">joint</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="c1"># its rows are laid out per request over the whole batch; every axis but TP</span>
-            <span class="c1"># (cfg branches, sp token shards) hands each rank only part of it</span>
+            <span class="c1"># (cfg branches, sp token shards) hands each rank only part of it, except SP</span>
+            <span class="c1"># under a node whose pools place positions over its SP ranks, which runs</span>
+            <span class="c1"># replicated over them</span>
             <span class="k">for</span> <span class="n">axis</span> <span class="ow">in</span> <span class="n">PARALLEL_AXES</span><span class="p">:</span>
-                <span class="k">if</span> <span class="n">axis</span> <span class="o">!=</span> <span class="s2">"tp"</span> <span class="ow">and</span> <span class="p">(</span><span class="n">size</span> <span class="o">:=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">joint</span><span class="p">,</span> <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">axis</span><span class="si">}</span><span class="s2">_group"</span><span class="p">)</span><span class="o">.</span><span class="n">world_size</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
+                <span class="k">if</span> <span class="n">axis</span> <span class="o">==</span> <span class="s2">"tp"</span> <span class="ow">or</span> <span class="p">(</span><span class="n">axis</span> <span class="o">==</span> <span class="s2">"sp"</span> <span class="ow">and</span> <span class="n">info</span><span class="o">.</span><span class="n">replicated_over_sp</span><span class="p">):</span>
+                    <span class="k">continue</span>
+                <span class="k">if</span> <span class="p">(</span><span class="n">size</span> <span class="o">:=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">joint</span><span class="p">,</span> <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">axis</span><span class="si">}</span><span class="s2">_group"</span><span class="p">)</span><span class="o">.</span><span class="n">world_size</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
                     <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
                         <span class="sa">f</span><span class="s2">"LoRA resource </span><span class="si">{</span><span class="n">spec</span><span class="o">.</span><span class="n">resource_key</span><span class="si">!r}</span><span class="s2"> serves a node at </span><span class="si">{</span><span class="n">axis</span><span class="si">}</span><span class="s2">_size </span><span class="si">{</span><span class="n">size</span><span class="si">}</span><span class="s2">, "</span>
                         <span class="s2">"which LoRA does not support: its rows are laid out per request over the "</span>

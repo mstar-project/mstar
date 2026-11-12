@@ -613,6 +613,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.admission.html">mstar.engine.resources.admission</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.attn.html">mstar.engine.resources.attn</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.base.html">mstar.engine.resources.base</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.context_parallel.html">mstar.engine.resources.context_parallel</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.dsa.html">mstar.engine.resources.dsa</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.kv.html">mstar.engine.resources.kv</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.lora.html">mstar.engine.resources.lora</a></li>
@@ -1425,8 +1426,6 @@ window.runMermaid = runMermaid;</script>
       </ul></li>
       <li><a href="_autosummary/mstar.engine.resources.lora.backend.html#mstar.engine.resources.lora.backend.LoraBackend.apply_">apply_() (mstar.engine.resources.lora.backend.LoraBackend method)</a>
 </li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.base.Resource.apply_cached_prefix">apply_cached_prefix() (mstar.engine.resources.base.Resource method)</a>
 
       <ul>
@@ -1437,6 +1436,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.engine.resources.html#mstar.engine.resources.StepRunner.apply_cached_prefix">(mstar.engine.resources.StepRunner method)</a>
 </li>
       </ul></li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.kv.config.KVReqConfig.apply_conductor_config">apply_conductor_config() (mstar.engine.resources.kv.config.KVReqConfig method)</a>
 
       <ul>
@@ -1639,9 +1640,11 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.engine.state.contract.html#mstar.engine.state.contract.Attend">(class in mstar.engine.state.contract)</a>
 </li>
       </ul></li>
-      <li><a href="_autosummary/mstar.engine.resources.dsa.manager.html#mstar.engine.resources.dsa.manager.DSAManager.attend">attend() (mstar.engine.resources.dsa.manager.DSAManager method)</a>
+      <li><a href="_autosummary/mstar.engine.resources.context_parallel.html#mstar.engine.resources.context_parallel.ContextParallelWrapper.attend">attend() (mstar.engine.resources.context_parallel.ContextParallelWrapper method)</a>
 
       <ul>
+        <li><a href="_autosummary/mstar.engine.resources.dsa.manager.html#mstar.engine.resources.dsa.manager.DSAManager.attend">(mstar.engine.resources.dsa.manager.DSAManager method)</a>
+</li>
         <li><a href="_autosummary/mstar.engine.resources.kv.bounded.manager.html#mstar.engine.resources.kv.bounded.manager.BoundedKVManager.attend">(mstar.engine.resources.kv.bounded.manager.BoundedKVManager method)</a>
 </li>
         <li><a href="_autosummary/mstar.model.minicpm_o.components.token2wav_flow.html#mstar.model.minicpm_o.components.token2wav_flow.BoundedLayerKV.attend">(mstar.model.minicpm_o.components.token2wav_flow.BoundedLayerKV method)</a>
@@ -2773,8 +2776,6 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.api_server.openai.serving_realtime.html#mstar.api_server.openai.serving_realtime.AudioFormat.codec">codec (mstar.api_server.openai.serving_realtime.AudioFormat attribute)</a>
 </li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.BatchedModelOutput.coerce">coerce() (mstar.model.submodule_base.BatchedModelOutput class method)</a>
 </li>
       <li><a href="_autosummary/mstar.streaming.stream_buffer.html#mstar.streaming.stream_buffer.collate">collate() (in module mstar.streaming.stream_buffer)</a>
@@ -2783,6 +2784,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.ARNodeInputs.collate">(mstar.model.submodule_base.ARNodeInputs class method)</a>
 </li>
       </ul></li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.communication.tensor_store.html#mstar.communication.tensor_store.ColumnarTensorInfo">ColumnarTensorInfo (class in mstar.communication.tensor_store)</a>
 </li>
       <li><a href="_autosummary/mstar.engine.resources.kv.plan.html#mstar.engine.resources.kv.plan.KVPlanOutput.columns">columns (mstar.engine.resources.kv.plan.KVPlanOutput attribute)</a>
@@ -3083,7 +3086,23 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.engine.resources.attn.config.html#mstar.engine.resources.attn.config.AttentionStep.context_only">(mstar.engine.resources.attn.config.AttentionStep attribute)</a>
 </li>
       </ul></li>
-      <li><a href="_autosummary/mstar.engine.resources.kv.plan.html#mstar.engine.resources.kv.plan.context_only_views">context_only_views() (in module mstar.engine.resources.kv.plan)</a>
+      <li><a href="_autosummary/mstar.engine.resources.kv.plan.html#mstar.engine.resources.kv.plan.PagedIndptrs.context_only">context_only() (mstar.engine.resources.kv.plan.PagedIndptrs method)</a>
+</li>
+      <li><a href="_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.kv.config.PagedKVConfig.context_parallel">context_parallel (mstar.engine.resources.kv.config.PagedKVConfig attribute)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.engine.resources.html#mstar.engine.resources.PagedKVConfig.context_parallel">(mstar.engine.resources.PagedKVConfig attribute)</a>
+</li>
+      </ul></li>
+      <li><a href="_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.kv.config.PagedKVConfig.context_parallel_size">context_parallel_size() (mstar.engine.resources.kv.config.PagedKVConfig method)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.engine.resources.html#mstar.engine.resources.PagedKVConfig.context_parallel_size">(mstar.engine.resources.PagedKVConfig method)</a>
+</li>
+      </ul></li>
+      <li><a href="_autosummary/mstar.engine.resources.context_parallel.html#mstar.engine.resources.context_parallel.ContextParallel">ContextParallel (class in mstar.engine.resources.context_parallel)</a>
+</li>
+      <li><a href="_autosummary/mstar.engine.resources.context_parallel.html#mstar.engine.resources.context_parallel.ContextParallelWrapper">ContextParallelWrapper (class in mstar.engine.resources.context_parallel)</a>
 </li>
       <li><a href="_autosummary/mstar.streaming.chunk_policy.html#mstar.streaming.chunk_policy.ChunkPolicy.continue_after_producer_done">continue_after_producer_done() (mstar.streaming.chunk_policy.ChunkPolicy method)</a>
 
@@ -4619,6 +4638,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.model.glm5_next.config.html#mstar.model.glm5_next.config.Glm5NextModelConfig.first_k_dense_replace">(mstar.model.glm5_next.config.Glm5NextModelConfig attribute)</a>
 </li>
       </ul></li>
+      <li><a href="_autosummary/mstar.engine.resources.kv.plan.html#mstar.engine.resources.kv.plan.first_pages">first_pages() (in module mstar.engine.resources.kv.plan)</a>
+</li>
       <li><a href="_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.ModelInputsFromEngine.first_request_info">first_request_info (mstar.model.submodule_base.ModelInputsFromEngine property)</a>
 </li>
       <li><a href="_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.HostRows.first_values">first_values() (mstar.model.submodule_base.HostRows method)</a>
@@ -4805,6 +4826,8 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.worker.rebuild.html#mstar.worker.rebuild.Rebuilds.forget">forget() (mstar.worker.rebuild.Rebuilds method)</a>
 </li>
+      <li><a href="_autosummary/mstar.engine.resources.context_parallel.html#mstar.engine.resources.context_parallel.ContextParallelWrapper.forget_plan">forget_plan() (mstar.engine.resources.context_parallel.ContextParallelWrapper method)</a>
+</li>
       <li><a href="_autosummary/mstar.engine.chunking.html#mstar.engine.chunking.ChunkingManagement.forget_request">forget_request() (mstar.engine.chunking.ChunkingManagement method)</a>
 </li>
       <li><a href="_autosummary/mstar.communication.tensor_store.html#mstar.communication.tensor_store.PythonTensorBookkeeping.forget_tensor">forget_tensor() (mstar.communication.tensor_store.PythonTensorBookkeeping method)</a>
@@ -4815,14 +4838,14 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.communication.tensor_store.html#mstar.communication.tensor_store.TensorBookkeeping.forget_tensor">(mstar.communication.tensor_store.TensorBookkeeping method)</a>
 </li>
       </ul></li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.engine.state.html#mstar.engine.state.Fork">Fork (class in mstar.engine.state)</a>
 
       <ul>
         <li><a href="_autosummary/mstar.engine.state.contract.html#mstar.engine.state.contract.Fork">(class in mstar.engine.state.contract)</a>
 </li>
       </ul></li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.kv.config.KVStep.fork_rids">fork_rids (mstar.engine.resources.kv.config.KVStep attribute)</a>
 
       <ul>
@@ -5203,6 +5226,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.engine.state.contract.html#mstar.engine.state.contract.GatedDeltaNet">(class in mstar.engine.state.contract)</a>
 </li>
       </ul></li>
+      <li><a href="_autosummary/mstar.engine.resources.context_parallel.html#mstar.engine.resources.context_parallel.gather_merge">gather_merge() (in module mstar.engine.resources.context_parallel)</a>
+</li>
       <li><a href="_autosummary/mstar.engine.resources.lora.backend.html#mstar.engine.resources.lora.backend.LoraBackend.gather_shrink">gather_shrink() (mstar.engine.resources.lora.backend.LoraBackend method)</a>
 
       <ul>
@@ -5623,6 +5648,8 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.model.vjepa2.config.html#mstar.model.vjepa2.config.VJepa2Config.grid_size">grid_size (mstar.model.vjepa2.config.VJepa2Config property)</a>
 </li>
+      <li><a href="_autosummary/mstar.engine.resources.context_parallel.html#mstar.engine.resources.context_parallel.ContextParallel.group">group (mstar.engine.resources.context_parallel.ContextParallel attribute)</a>
+</li>
       <li><a href="_autosummary/mstar.engine.resources.kv.plan.html#mstar.engine.resources.kv.plan.group_by_plan_label">group_by_plan_label() (in module mstar.engine.resources.kv.plan)</a>
 </li>
       <li><a href="_autosummary/mstar.model.qwen3_5.video.html#mstar.model.qwen3_5.video.group_timestamps">group_timestamps() (in module mstar.model.qwen3_5.video)</a>
@@ -5770,6 +5797,8 @@ window.runMermaid = runMermaid;</script>
 </li>
       </ul></li>
       <li><a href="_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.base.EngineResourceInfo.head_shards">head_shards (mstar.engine.resources.base.EngineResourceInfo property)</a>
+</li>
+      <li><a href="_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.base.head_shards">head_shards() (in module mstar.engine.resources.base)</a>
 </li>
       <li><a href="_autosummary/mstar.model.cosyvoice3.config.html#mstar.model.cosyvoice3.config.DiTConfig.heads">heads (mstar.model.cosyvoice3.config.DiTConfig attribute)</a>
 </li>
@@ -6104,6 +6133,8 @@ window.runMermaid = runMermaid;</script>
       <li><a href="_autosummary/mstar.communication.edge_items.html#mstar.communication.edge_items.StreamRow.index">index (mstar.communication.edge_items.StreamRow attribute)</a>
 
       <ul>
+        <li><a href="_autosummary/mstar.engine.resources.context_parallel.html#mstar.engine.resources.context_parallel.ContextParallel.index">(mstar.engine.resources.context_parallel.ContextParallel attribute)</a>
+</li>
         <li><a href="_autosummary/mstar.engine.resources.lora.pool.html#mstar.engine.resources.lora.pool.SlotState.index">(mstar.engine.resources.lora.pool.SlotState attribute)</a>
 </li>
         <li><a href="_autosummary/mstar.engine.windowing.html#mstar.engine.windowing.WindowPlan.index">(mstar.engine.windowing.WindowPlan attribute)</a>
@@ -7159,10 +7190,10 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.api_server.openai.serving_speech.html#mstar.api_server.openai.serving_speech.list_voices">list_voices() (in module mstar.api_server.openai.serving_speech)</a>
 </li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.model.cosmos3.sessions.html#mstar.model.cosmos3.sessions.SessionStore.live">live() (mstar.model.cosmos3.sessions.SessionStore method)</a>
 </li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.api_server.rust_frontend.html#mstar.api_server.rust_frontend.LiveOp">LiveOp (class in mstar.api_server.rust_frontend)</a>
 </li>
       <li><a href="_autosummary/mstar.engine.resources.position.config.html#mstar.engine.resources.position.config.PositionConfig.llama31_params">llama31_params (mstar.engine.resources.position.config.PositionConfig property)</a>
@@ -7277,6 +7308,10 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.model.cosmos3.html#mstar.model.cosmos3.Cosmos3Config.local_dir">(mstar.model.cosmos3.Cosmos3Config attribute)</a>
 </li>
       </ul></li>
+      <li><a href="_autosummary/mstar.engine.resources.context_parallel.html#mstar.engine.resources.context_parallel.ContextParallelWrapper.local_geometry">local_geometry() (mstar.engine.resources.context_parallel.ContextParallelWrapper static method)</a>
+</li>
+      <li><a href="_autosummary/mstar.engine.resources.context_parallel.html#mstar.engine.resources.context_parallel.ContextParallelWrapper.local_indptrs">local_indptrs() (mstar.engine.resources.context_parallel.ContextParallelWrapper static method)</a>
+</li>
       <li><a href="_autosummary/mstar.communication.tensors.html#mstar.communication.tensors.TransferReadInfo.local_ptr">local_ptr (mstar.communication.tensors.TransferReadInfo attribute)</a>
 </li>
       <li><a href="_autosummary/mstar.engine.resources.lora.config.html#mstar.engine.resources.lora.config.LoraTarget.local_width">local_width() (mstar.engine.resources.lora.config.LoraTarget method)</a>
@@ -7971,9 +8006,11 @@ window.runMermaid = runMermaid;</script>
       </ul></li>
       <li><a href="_autosummary/mstar.communication.tensors.html#mstar.communication.tensors.MemoryRegistrationError">MemoryRegistrationError</a>
 </li>
-      <li><a href="_autosummary/mstar.observability.recorders.html#mstar.observability.recorders.merge">merge() (in module mstar.observability.recorders)</a>
+      <li><a href="_autosummary/mstar.engine.resources.context_parallel.html#mstar.engine.resources.context_parallel.merge">merge() (in module mstar.engine.resources.context_parallel)</a>
 
       <ul>
+        <li><a href="_autosummary/mstar.observability.recorders.html#mstar.observability.recorders.merge">(in module mstar.observability.recorders)</a>
+</li>
         <li><a href="_autosummary/mstar.worker.scheduled_batch.html#mstar.worker.scheduled_batch.ScheduledBatch.merge">(mstar.worker.scheduled_batch.ScheduledBatch method)</a>
 </li>
       </ul></li>
@@ -8332,6 +8369,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.engine.resources.attn.workspace.html#module-mstar.engine.resources.attn.workspace">mstar.engine.resources.attn.workspace</a>
 </li>
         <li><a href="_autosummary/mstar.engine.resources.base.html#module-mstar.engine.resources.base">mstar.engine.resources.base</a>
+</li>
+        <li><a href="_autosummary/mstar.engine.resources.context_parallel.html#module-mstar.engine.resources.context_parallel">mstar.engine.resources.context_parallel</a>
 </li>
         <li><a href="_autosummary/mstar.engine.resources.dsa.html#module-mstar.engine.resources.dsa">mstar.engine.resources.dsa</a>
 </li>
@@ -9202,6 +9241,13 @@ window.runMermaid = runMermaid;</script>
 
       <ul>
         <li><a href="_autosummary/mstar.engine.resources.base.html#module-mstar.engine.resources.base">module</a>
+</li>
+      </ul></li>
+      <li>
+    mstar.engine.resources.context_parallel
+
+      <ul>
+        <li><a href="_autosummary/mstar.engine.resources.context_parallel.html#module-mstar.engine.resources.context_parallel">module</a>
 </li>
       </ul></li>
       <li>
@@ -11999,6 +12045,8 @@ window.runMermaid = runMermaid;</script>
       </ul></li>
       <li><a href="_autosummary/mstar.engine.resources.step.html#mstar.engine.resources.step.PerReqSetting.over">over() (mstar.engine.resources.step.PerReqSetting class method)</a>
 </li>
+      <li><a href="_autosummary/mstar.engine.resources.context_parallel.html#mstar.engine.resources.context_parallel.ContextParallel.over_sp">over_sp (mstar.engine.resources.context_parallel.ContextParallel attribute)</a>
+</li>
       <li><a href="_autosummary/mstar.model.cosmos3.config.html#mstar.model.cosmos3.config.Cosmos3Config.overlap_frames_default">overlap_frames_default (mstar.model.cosmos3.config.Cosmos3Config attribute)</a>
 
       <ul>
@@ -12247,6 +12295,8 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.streaming.topology.html#mstar.streaming.topology.PartitionTopology">PartitionTopology (class in mstar.streaming.topology)</a>
 </li>
+      <li><a href="_autosummary/mstar.engine.resources.context_parallel.html#mstar.engine.resources.context_parallel.ContextParallel.partners">partners (mstar.engine.resources.context_parallel.ContextParallel attribute)</a>
+</li>
       <li><a href="_autosummary/mstar.model.multimodal.html#mstar.model.multimodal.Turn.parts">parts (mstar.model.multimodal.Turn attribute)</a>
 </li>
       <li><a href="_autosummary/mstar.model.multimodal.html#mstar.model.multimodal.parts_from_modalities">parts_from_modalities() (in module mstar.model.multimodal)</a>
@@ -12469,10 +12519,32 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.model.qwen3_5.video.html#mstar.model.qwen3_5.video.ProcessedVideo.pixel_values">pixel_values (mstar.model.qwen3_5.video.ProcessedVideo attribute)</a>
 </li>
+      <li><a href="_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.kv.config.PagedKVConfig.place">place() (mstar.engine.resources.kv.config.PagedKVConfig method)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.engine.resources.html#mstar.engine.resources.PagedKVConfig.place">(mstar.engine.resources.PagedKVConfig method)</a>
+</li>
+      </ul></li>
       <li><a href="_autosummary/mstar.engine.state.html#mstar.engine.state.ArrayStep.placeholders">placeholders (mstar.engine.state.ArrayStep attribute)</a>
 
       <ul>
         <li><a href="_autosummary/mstar.engine.state.contract.html#mstar.engine.state.contract.ArrayStep.placeholders">(mstar.engine.state.contract.ArrayStep attribute)</a>
+</li>
+      </ul></li>
+      <li><a href="_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.base.Resource.placement">placement (mstar.engine.resources.base.Resource property)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.engine.resources.html#mstar.engine.resources.Resource.placement">(mstar.engine.resources.Resource property)</a>
+</li>
+      </ul></li>
+      <li><a href="_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.kv.config.KVSpec.places_positions">places_positions (mstar.engine.resources.kv.config.KVSpec property)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.engine.resources.html#mstar.engine.resources.KVSpec.places_positions">(mstar.engine.resources.KVSpec property)</a>
+</li>
+        <li><a href="_autosummary/mstar.engine.resources.html#mstar.engine.resources.NodeResourceSpec.places_positions">(mstar.engine.resources.NodeResourceSpec property)</a>
+</li>
+        <li><a href="_autosummary/mstar.engine.resources.spec.html#mstar.engine.resources.spec.NodeResourceSpec.places_positions">(mstar.engine.resources.spec.NodeResourceSpec property)</a>
 </li>
       </ul></li>
       <li><a href="_autosummary/mstar.api_server.rust_frontend.html#mstar.api_server.rust_frontend.WindowOp.PLAN">PLAN (mstar.api_server.rust_frontend.WindowOp attribute)</a>
@@ -12485,6 +12557,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.engine.resources.attn.workspace.html#mstar.engine.resources.attn.workspace.Workspace.plan">(mstar.engine.resources.attn.workspace.Workspace method)</a>
 </li>
         <li><a href="_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.base.Resource.plan">(mstar.engine.resources.base.Resource method)</a>
+</li>
+        <li><a href="_autosummary/mstar.engine.resources.context_parallel.html#mstar.engine.resources.context_parallel.ContextParallelWrapper.plan">(mstar.engine.resources.context_parallel.ContextParallelWrapper method)</a>
 </li>
         <li><a href="_autosummary/mstar.engine.resources.dsa.manager.html#mstar.engine.resources.dsa.manager.DSAManager.plan">(mstar.engine.resources.dsa.manager.DSAManager method)</a>
 </li>
@@ -12567,6 +12641,8 @@ window.runMermaid = runMermaid;</script>
       </ul></li>
       <li><a href="_autosummary/mstar.engine.accelerator_graph_backend.html#mstar.engine.accelerator_graph_backend.CapturedGraph.pool">pool() (mstar.engine.accelerator_graph_backend.CapturedGraph method)</a>
 </li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.engine.state.calls.html#mstar.engine.state.calls.pool_layers">pool_layers() (in module mstar.engine.state.calls)</a>
 </li>
       <li><a href="_autosummary/mstar.engine.resources.kv.rolling.config.html#mstar.engine.resources.kv.rolling.config.RollingKVConfig.pool_tokens">pool_tokens (mstar.engine.resources.kv.rolling.config.RollingKVConfig attribute)</a>
@@ -12577,8 +12653,6 @@ window.runMermaid = runMermaid;</script>
       </ul></li>
       <li><a href="_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.OffloadDelta.pools">pools (mstar.utils.ipc_format.OffloadDelta attribute)</a>
 </li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.BatchedModelOutput.pop">pop() (mstar.model.submodule_base.BatchedModelOutput method)</a>
 </li>
       <li><a href="_autosummary/mstar.streaming.stream_buffer.html#mstar.streaming.stream_buffer.StreamBuffer.pop_chunk">pop_chunk() (mstar.streaming.stream_buffer.StreamBuffer method)</a>
@@ -12669,6 +12743,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.kv.config.StreamLayout.positions">(mstar.engine.resources.kv.config.StreamLayout method)</a>
 </li>
       </ul></li>
+      <li><a href="_autosummary/mstar.engine.resources.context_parallel.html#mstar.engine.resources.context_parallel.positions_over_sp">positions_over_sp() (in module mstar.engine.resources.context_parallel)</a>
+</li>
       <li><a href="_autosummary/mstar.engine.resources.html#mstar.engine.resources.PositionSpec">PositionSpec (class in mstar.engine.resources)</a>
 
       <ul>
@@ -13489,6 +13565,8 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.engine.resources.kv.bounded.manager.html#mstar.engine.resources.kv.bounded.manager.BoundedPlan.reads_source">reads_source (mstar.engine.resources.kv.bounded.manager.BoundedPlan attribute)</a>
 </li>
+      <li><a href="_autosummary/mstar.engine.resources.context_parallel.html#mstar.engine.resources.context_parallel.ContextParallelWrapper.reads_step_kv">reads_step_kv (mstar.engine.resources.context_parallel.ContextParallelWrapper property)</a>
+</li>
       <li><a href="_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.StopPolicy.reads_token">reads_token (mstar.model.submodule_base.StopPolicy property)</a>
 </li>
       <li><a href="_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.ReadsDone">ReadsDone (class in mstar.utils.ipc_format)</a>
@@ -13979,6 +14057,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.engine.resources.html#mstar.engine.resources.StepContext.replays">(mstar.engine.resources.StepContext property)</a>
 </li>
       </ul></li>
+      <li><a href="_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.base.EngineResourceInfo.replicated_over_sp">replicated_over_sp (mstar.engine.resources.base.EngineResourceInfo attribute)</a>
+</li>
       <li><a href="_autosummary/mstar.model.omnilingual_asr.config.html#mstar.model.omnilingual_asr.config.HubCheckpoint.repo_id">repo_id (mstar.model.omnilingual_asr.config.HubCheckpoint attribute)</a>
 </li>
       <li><a href="_autosummary/mstar.api_server.openai.realtime_vad.html#mstar.api_server.openai.realtime_vad.report_availability">report_availability() (in module mstar.api_server.openai.realtime_vad)</a>
@@ -14167,10 +14247,10 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.model.kokoro.config.html#mstar.model.kokoro.config.KokoroISTFTNetConfig.resblock_kernel_sizes">(mstar.model.kokoro.config.KokoroISTFTNetConfig attribute)</a>
 </li>
       </ul></li>
-      <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.WorkerGraphStateRegistry.reseed_streaming_ready">reseed_streaming_ready() (mstar.graph.base.WorkerGraphStateRegistry method)</a>
-</li>
   </ul></td>
   <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.WorkerGraphStateRegistry.reseed_streaming_ready">reseed_streaming_ready() (mstar.graph.base.WorkerGraphStateRegistry method)</a>
+</li>
       <li><a href="_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.base.MoveKind.RESERVE">RESERVE (mstar.engine.resources.base.MoveKind attribute)</a>
 </li>
       <li><a href="_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.base.Resource.reserve">reserve() (mstar.engine.resources.base.Resource method)</a>
@@ -15808,6 +15888,8 @@ window.runMermaid = runMermaid;</script>
       <ul>
         <li><a href="_autosummary/mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.VideoGenerationRequest.size">(mstar.api_server.openai.protocol.VideoGenerationRequest attribute)</a>
 </li>
+        <li><a href="_autosummary/mstar.engine.resources.context_parallel.html#mstar.engine.resources.context_parallel.ContextParallel.size">(mstar.engine.resources.context_parallel.ContextParallel attribute)</a>
+</li>
         <li><a href="_autosummary/mstar.engine.state.contract.html#mstar.engine.state.contract.Window.size">(mstar.engine.state.contract.Window attribute)</a>
 </li>
         <li><a href="_autosummary/mstar.engine.state.html#mstar.engine.state.Window.size">(mstar.engine.state.Window attribute)</a>
@@ -15903,14 +15985,14 @@ window.runMermaid = runMermaid;</script>
       </ul></li>
       <li><a href="_autosummary/mstar.engine.resources.lora.pool.html#mstar.engine.resources.lora.pool.LoraAddressing.slot_indptr">slot_indptr (mstar.engine.resources.lora.pool.LoraAddressing attribute)</a>
 </li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.engine.resources.step.html#mstar.engine.resources.step.StepContext.slot_lease">slot_lease (mstar.engine.resources.step.StepContext attribute)</a>
 
       <ul>
         <li><a href="_autosummary/mstar.engine.resources.html#mstar.engine.resources.StepContext.slot_lease">(mstar.engine.resources.StepContext attribute)</a>
 </li>
       </ul></li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.engine.resources.lora.pool.html#mstar.engine.resources.lora.pool.LoraAdapterPool.slot_of">slot_of() (mstar.engine.resources.lora.pool.LoraAdapterPool method)</a>
 </li>
       <li><a href="_autosummary/mstar.engine.state.contract.html#mstar.engine.state.contract.PagedNHDTarget.slot_of_token">slot_of_token (mstar.engine.state.contract.PagedNHDTarget attribute)</a>
@@ -15919,6 +16001,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.engine.state.html#mstar.engine.state.PagedNHDTarget.slot_of_token">(mstar.engine.state.PagedNHDTarget attribute)</a>
 </li>
       </ul></li>
+      <li><a href="_autosummary/mstar.engine.resources.context_parallel.html#mstar.engine.resources.context_parallel.ContextParallel.slot_range">slot_range() (mstar.engine.resources.context_parallel.ContextParallel method)</a>
+</li>
       <li><a href="_autosummary/mstar.engine.resources.lora.pool.html#mstar.engine.resources.lora.pool.LoraAdapterPool.slot_state">slot_state() (mstar.engine.resources.lora.pool.LoraAdapterPool method)</a>
 </li>
       <li><a href="_autosummary/mstar.engine.resources.kv.bounded.html#mstar.engine.resources.kv.bounded.BoundedKVConfig.slot_tokens">slot_tokens (mstar.engine.resources.kv.bounded.BoundedKVConfig property)</a>
@@ -16697,6 +16781,12 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.observability.recorders.html#mstar.observability.recorders.MetricSnapshot.sums">sums (mstar.observability.recorders.MetricSnapshot attribute)</a>
 </li>
+      <li><a href="_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.base.Resource.supports_context_parallel">supports_context_parallel (mstar.engine.resources.base.Resource attribute)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.engine.resources.html#mstar.engine.resources.Resource.supports_context_parallel">(mstar.engine.resources.Resource attribute)</a>
+</li>
+      </ul></li>
       <li><a href="_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.base.Resource.supports_drop">supports_drop (mstar.engine.resources.base.Resource attribute)</a>
 
       <ul>
@@ -18307,6 +18397,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.model.minicpm_o.components.token2wav_flow.html#mstar.model.minicpm_o.components.token2wav_flow.DenseKV.write">(mstar.model.minicpm_o.components.token2wav_flow.DenseKV method)</a>
 </li>
       </ul></li>
+      <li><a href="_autosummary/mstar.engine.resources.context_parallel.html#mstar.engine.resources.context_parallel.ContextParallel.write_slots">write_slots() (mstar.engine.resources.context_parallel.ContextParallel method)</a>
+</li>
       <li><a href="_autosummary/mstar.engine.resources.kv.rolling.manager.html#mstar.engine.resources.kv.rolling.manager.RollingRow.write_start">write_start (mstar.engine.resources.kv.rolling.manager.RollingRow attribute)</a>
 </li>
       <li><a href="_autosummary/mstar.engine.resources.kv.rolling.manager.html#mstar.engine.resources.kv.rolling.manager.RollingRow.write_stop">write_stop (mstar.engine.resources.kv.rolling.manager.RollingRow attribute)</a>

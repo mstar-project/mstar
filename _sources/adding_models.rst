@@ -1381,9 +1381,8 @@ Called with ``return_lse=True``, a ragged or ragged cross-attention resource's `
 FlashInfer backend also returns each query row's log-sum-exp (``[total_tokens, H]``, fp32,
 natural log) from the same plan, which is what merging attentions over disjoint key sets
 needs; a compiled caller breaks there even with ``compile_op``. Under sequence parallelism
-LTX-2.5's audio queries attend each rank's share of the video tokens, and
-``attention_over_sharded_keys`` (``mstar/model/components/distributed/sequence_parallel.py``)
-merges them.
+LTX-2.5's audio queries attend each rank's share of the video tokens, and ``gather_merge``
+(``mstar/engine/resources/context_parallel.py``, the merge context parallelism uses) merges them.
 
 Block-causal attention within spans
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -1746,10 +1745,12 @@ ingest can leave a follower without a copy rank 0 kept. Neither the wait nor the
 agreement holds the pool's lock, so the main thread's ingests and removes go on
 meanwhile.
 
-A node that runs sequence parallelism (SP > 1) or CFG parallelism (cfg_size > 1) cannot
-serve LoRA yet: the pool lays rows out per request over the whole batch, while each SP rank
-holds a shard of the tokens and each CFG rank one guidance branch's rows, so building the
-pool refuses the deployment.
+A node that runs its own sequence parallelism (in ``sp_enabled_nodes``, SP > 1) or CFG
+parallelism (cfg_size > 1) cannot serve LoRA yet: the pool lays rows out per request over the
+whole batch, while each SP rank holds a shard of the tokens and each CFG rank one guidance
+branch's rows, so building the pool refuses the deployment. A node whose KV pools place
+positions over its SP ranks instead (context parallelism) runs every row on every SP rank, so
+it serves LoRA.
 
 Adapters loaded and unloaded at runtime (``/v1/load_lora_adapter``) reach each worker as
 a control message from the conductor, which each rank applies whenever it arrives rather
@@ -2239,7 +2240,9 @@ handled as special cases. BAGEL and Whisper use today's forms of them:
   example in ``preprocess`` before the replay. Their addressing stays an ordinary plan rather
   than the slot's static buffers, which are sized for the bucket's in-graph tokens. Whisper's
   prefill uses it to write its 1500-token encoder context while replaying a graph sized by
-  its few prompt tokens.
+  its few prompt tokens. The reads of such a step attend the pages alone, so one that needs the
+  step's own k and v (an attention through an exchange, a context-parallel pool on a multi-token
+  step, the dense backend) is refused at the first add.
 - ``fixed_layout=True`` (``fixed_layout``): every replay of the step's capture bucket lays its
   rows out as the capture did, so a ragged self-attention may capture a kernel that bakes the
   layout in (cuDNN). A resource's step takes it only if every read on the resource declares it.
@@ -2335,7 +2338,8 @@ calls, which any other format runs:
    write(self.kv, self.layer, q, k, v)      # counts as the layer's add, and breaks the graph as add does
    out = self.kv.read(self.layer, q)
 
-The engine picks the kernel or the reference at bind. ``target`` says where this step's entries go
+The engine picks the kernel or the reference at bind, and a step whose reads attend its own ``k`` and ``v``
+(a context-parallel pool's multi-token step) runs the reference. ``target`` says where this step's entries go
 on the layer. A conformance test holds each kernel to its reference on each listed format, and
 ``MSTAR_KV_DEBUG_ASSERTS=1`` checks that an eager call writes nothing outside the step's slots.
 
@@ -3025,7 +3029,7 @@ that a misspelled setting is never silently ignored:
      - Accepts
    * - ``KVSpec`` with ``PagedKVConfig``
      - ``max_num_pages``, ``page_size``, ``max_seq_len``, ``cpu_offload_pages``,
-       ``prefix_cache``, ``prefix_cache_salt``
+       ``prefix_cache``, ``prefix_cache_salt``, ``context_parallel`` (see below)
    * - ``KVSpec`` with ``RingKVConfig``
      - ``num_sessions``
    * - ``BoundedKVSpec``
@@ -3075,6 +3079,52 @@ Tune the cache shape on the KV resource, not on the attention resource that read
 example, ``configs/qwen3tts.yaml`` selects FA2 under ``talker_attn``,
 ``configs/cosmos3_nano.yaml`` sets the page count under its paged KV key, and
 ``configs/waypoint.yaml`` sets the resident world count under its ring KV key.
+
+**Context parallelism.** ``context_parallel: true`` on a paged KV pool stripes each page's slots
+over the ranks that would otherwise store the same KV heads: slot ``s`` lives on partner
+``s % P``, page ids stay the same on every rank, and each rank holds ``page_size / P`` slots a
+page. Attention runs on each rank's slots and merges the partials across the partners exactly
+(``mstar/engine/resources/context_parallel.py``). The model declares nothing.
+
+- **TP mode (no SP ranks).** The partners are the TP ranks sharing a KV head,
+  ``P = tp / num_kv_heads``, so TP must be a larger multiple of the KV heads. They are the contiguous blocks ``kv_head_replicas``
+  (``mstar/distributed/utils.py``) gives, as ``QKVParallelLinear`` loads them; a model that
+  shards K and V itself must match. Each layer exchanges queries and partials over the TP group,
+  except for a plan label of an eager step that isn't one token a row and has no stored context
+  on any row, which attends its own tokens alone.
+- **SP mode.** The partners are the node's SP ranks, ``P = sp_size``. Heads shard over TP alone
+  and the node loads without its SP group, so every layer but attention runs replicated across
+  SP; prefer TP mode where it applies. Every paged pool of the node must set the key, and the
+  node must not be in the model's ``sp_enabled_nodes``. Each layer all-gathers the partials,
+  with the same exception.
+  Chunked prefill stays off on SP ranks (``_unchunkable_nodes``), as for the model's own SP, so
+  SP mode prefills a prompt in one step; chunking an SP-placed pool's prompts is not supported yet.
+  TP mode chunks prompts as without placement.
+
+A page's tokens (``page_size``, 128 when it is unset) must be divisible by ``P``; the conductor
+checks these rules against ``node_groups`` before it starts a worker. ``max_num_pages`` counts
+logical pages, so raise it by ``P`` to use the memory placement frees (the pool logs its bytes per
+rank). Every resource over the pool must support it, or loading fails naming the one that doesn't.
+FlashInfer attention (``flashinfer``) with ``flashinfer_backend`` ``auto``, ``fa2`` or ``fa3``
+(``auto`` runs as ``fa2`` from SM100; after an unexplained one-off lockstep hang in an ``fa2``
+prefill over an SP-placed pool (#1363), an SP-placed pool that prefills on ``fa2`` warns at
+startup: an explicit ``fa2`` on any architecture, and ``auto`` where FlashInfer has no ``fa3``
+(below SM90 and from SM100), while ``auto`` on SM90 prefills on ``fa3``), RoPE positions and the recurrent state pool (GDN, KDA;
+the same state on every SP partner) do; dense, flex, XPU, block-causal and MLA (``flashinfer_mla``)
+attention,
+cross-attention, DSA and ``sliding_window`` don't, and a ring or bounded KV pool can't set the key.
+A decode/prefill ``splits`` and ``decode_fmha`` are ignored over a placed pool, and a node over
+one plans on the host rather than resident (``resident_planning``). A node that captures a step
+combining labels into one plan (``KVStep.combined_labels``, as classifier-free guidance does) at a
+batch size above 1 is refused at load: a replay's padding rows would sit between its real ones.
+
+A step of one token a row attends the pages after its KV write (in TP mode on tensor cores
+whatever ``decode_tensor_cores`` says). Any other step attends its stored context on the pages
+and its own tokens from the ``k`` and ``v`` the layer passes ``run``, so a layer that calls
+``attn.run`` itself passes them (``AttentionCallable`` and ``MLAAttention`` without
+``mla_absorb`` do). A fused K/V write that leaves ``k`` unrotated asks ``reads_step_kv()`` first
+and rotates it when the step attends it (``AttentionCallable.norm_rope_attend``); a state op's fused
+kernel doesn't run on such a step, so its reference's ``add`` hands the handle ``k`` and ``v``.
 
 .. note::
 

@@ -259,6 +259,7 @@
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.admission.html">mstar.engine.resources.admission</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.attn.html">mstar.engine.resources.attn</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.base.html">mstar.engine.resources.base</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.context_parallel.html">mstar.engine.resources.context_parallel</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.dsa.html">mstar.engine.resources.dsa</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.kv.html">mstar.engine.resources.kv</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.lora.html">mstar.engine.resources.lora</a></li>
@@ -2132,9 +2133,8 @@ LTX-2.5 is the reference (<code class="docutils literal notranslate"><span class
 FlashInfer backend also returns each query row’s log-sum-exp (<code class="docutils literal notranslate"><span class="pre">[total_tokens,</span> <span class="pre">H]</span></code>, fp32,
 natural log) from the same plan, which is what merging attentions over disjoint key sets
 needs; a compiled caller breaks there even with <code class="docutils literal notranslate"><span class="pre">compile_op</span></code>. Under sequence parallelism
-LTX-2.5’s audio queries attend each rank’s share of the video tokens, and
-<code class="docutils literal notranslate"><span class="pre">attention_over_sharded_keys</span></code> (<code class="docutils literal notranslate"><span class="pre">mstar/model/components/distributed/sequence_parallel.py</span></code>)
-merges them.</p>
+LTX-2.5’s audio queries attend each rank’s share of the video tokens, and <code class="docutils literal notranslate"><span class="pre">gather_merge</span></code>
+(<code class="docutils literal notranslate"><span class="pre">mstar/engine/resources/context_parallel.py</span></code>, the merge context parallelism uses) merges them.</p>
 </section>
 <section id="block-causal-attention-within-spans">
 <h4>Block-causal attention within spans<a class="headerlink" href="#block-causal-attention-within-spans" title="Link to this heading">#</a></h4>
@@ -2482,10 +2482,12 @@ takes removes from rank 0 and ingests from the conductor, and a remove that race
 ingest can leave a follower without a copy rank 0 kept. Neither the wait nor the
 agreement holds the pool’s lock, so the main thread’s ingests and removes go on
 meanwhile.</p>
-<p>A node that runs sequence parallelism (SP &gt; 1) or CFG parallelism (cfg_size &gt; 1) cannot
-serve LoRA yet: the pool lays rows out per request over the whole batch, while each SP rank
-holds a shard of the tokens and each CFG rank one guidance branch’s rows, so building the
-pool refuses the deployment.</p>
+<p>A node that runs its own sequence parallelism (in <code class="docutils literal notranslate"><span class="pre">sp_enabled_nodes</span></code>, SP &gt; 1) or CFG
+parallelism (cfg_size &gt; 1) cannot serve LoRA yet: the pool lays rows out per request over the
+whole batch, while each SP rank holds a shard of the tokens and each CFG rank one guidance
+branch’s rows, so building the pool refuses the deployment. A node whose KV pools place
+positions over its SP ranks instead (context parallelism) runs every row on every SP rank, so
+it serves LoRA.</p>
 <p>Adapters loaded and unloaded at runtime (<code class="docutils literal notranslate"><span class="pre">/v1/load_lora_adapter</span></code>) reach each worker as
 a control message from the conductor, which each rank applies whenever it arrives rather
 than at a step the instance agrees on. <code class="docutils literal notranslate"><span class="pre">LoraAdapterPool.load_adapter_async</span></code> only reads the
@@ -2938,7 +2940,9 @@ nothing.</p></li>
 example in <code class="docutils literal notranslate"><span class="pre">preprocess</span></code> before the replay. Their addressing stays an ordinary plan rather
 than the slot’s static buffers, which are sized for the bucket’s in-graph tokens. Whisper’s
 prefill uses it to write its 1500-token encoder context while replaying a graph sized by
-its few prompt tokens.</p></li>
+its few prompt tokens. The reads of such a step attend the pages alone, so one that needs the
+step’s own k and v (an attention through an exchange, a context-parallel pool on a multi-token
+step, the dense backend) is refused at the first add.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">fixed_layout=True</span></code> (<code class="docutils literal notranslate"><span class="pre">fixed_layout</span></code>): every replay of the step’s capture bucket lays its
 rows out as the capture did, so a ragged self-attention may capture a kernel that bakes the
 layout in (cuDNN). A resource’s step takes it only if every read on the resource declares it.</p></li>
@@ -3019,7 +3023,8 @@ calls, which any other format runs:</p>
 <span class="n">out</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv</span><span class="o">.</span><span class="n">read</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">layer</span><span class="p">,</span> <span class="n">q</span><span class="p">)</span>
 </pre></div>
 </div>
-<p>The engine picks the kernel or the reference at bind. <code class="docutils literal notranslate"><span class="pre">target</span></code> says where this step’s entries go
+<p>The engine picks the kernel or the reference at bind, and a step whose reads attend its own <code class="docutils literal notranslate"><span class="pre">k</span></code> and <code class="docutils literal notranslate"><span class="pre">v</span></code>
+(a context-parallel pool’s multi-token step) runs the reference. <code class="docutils literal notranslate"><span class="pre">target</span></code> says where this step’s entries go
 on the layer. A conformance test holds each kernel to its reference on each listed format, and
 <code class="docutils literal notranslate"><span class="pre">MSTAR_KV_DEBUG_ASSERTS=1</span></code> checks that an eager call writes nothing outside the step’s slots.</p>
 <p>Between steps, a model may keep a memo of a pure function of request inputs, whose loss costs time
@@ -3674,7 +3679,7 @@ that a misspelled setting is never silently ignored:</p>
 <tbody>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">KVSpec</span></code> with <code class="docutils literal notranslate"><span class="pre">PagedKVConfig</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">max_num_pages</span></code>, <code class="docutils literal notranslate"><span class="pre">page_size</span></code>, <code class="docutils literal notranslate"><span class="pre">max_seq_len</span></code>, <code class="docutils literal notranslate"><span class="pre">cpu_offload_pages</span></code>,
-<code class="docutils literal notranslate"><span class="pre">prefix_cache</span></code>, <code class="docutils literal notranslate"><span class="pre">prefix_cache_salt</span></code></p></td>
+<code class="docutils literal notranslate"><span class="pre">prefix_cache</span></code>, <code class="docutils literal notranslate"><span class="pre">prefix_cache_salt</span></code>, <code class="docutils literal notranslate"><span class="pre">context_parallel</span></code> (see below)</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">KVSpec</span></code> with <code class="docutils literal notranslate"><span class="pre">RingKVConfig</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">num_sessions</span></code></p></td>
@@ -3736,6 +3741,50 @@ pool of every node the model’s spec reaches</p></td>
 example, <code class="docutils literal notranslate"><span class="pre">configs/qwen3tts.yaml</span></code> selects FA2 under <code class="docutils literal notranslate"><span class="pre">talker_attn</span></code>,
 <code class="docutils literal notranslate"><span class="pre">configs/cosmos3_nano.yaml</span></code> sets the page count under its paged KV key, and
 <code class="docutils literal notranslate"><span class="pre">configs/waypoint.yaml</span></code> sets the resident world count under its ring KV key.</p>
+<p><strong>Context parallelism.</strong> <code class="docutils literal notranslate"><span class="pre">context_parallel:</span> <span class="pre">true</span></code> on a paged KV pool stripes each page’s slots
+over the ranks that would otherwise store the same KV heads: slot <code class="docutils literal notranslate"><span class="pre">s</span></code> lives on partner
+<code class="docutils literal notranslate"><span class="pre">s</span> <span class="pre">%</span> <span class="pre">P</span></code>, page ids stay the same on every rank, and each rank holds <code class="docutils literal notranslate"><span class="pre">page_size</span> <span class="pre">/</span> <span class="pre">P</span></code> slots a
+page. Attention runs on each rank’s slots and merges the partials across the partners exactly
+(<code class="docutils literal notranslate"><span class="pre">mstar/engine/resources/context_parallel.py</span></code>). The model declares nothing.</p>
+<ul class="simple">
+<li><p><strong>TP mode (no SP ranks).</strong> The partners are the TP ranks sharing a KV head,
+<code class="docutils literal notranslate"><span class="pre">P</span> <span class="pre">=</span> <span class="pre">tp</span> <span class="pre">/</span> <span class="pre">num_kv_heads</span></code>, so TP must be a larger multiple of the KV heads. They are the contiguous blocks <code class="docutils literal notranslate"><span class="pre">kv_head_replicas</span></code>
+(<code class="docutils literal notranslate"><span class="pre">mstar/distributed/utils.py</span></code>) gives, as <code class="docutils literal notranslate"><span class="pre">QKVParallelLinear</span></code> loads them; a model that
+shards K and V itself must match. Each layer exchanges queries and partials over the TP group,
+except for a plan label of an eager step that isn’t one token a row and has no stored context
+on any row, which attends its own tokens alone.</p></li>
+<li><p><strong>SP mode.</strong> The partners are the node’s SP ranks, <code class="docutils literal notranslate"><span class="pre">P</span> <span class="pre">=</span> <span class="pre">sp_size</span></code>. Heads shard over TP alone
+and the node loads without its SP group, so every layer but attention runs replicated across
+SP; prefer TP mode where it applies. Every paged pool of the node must set the key, and the
+node must not be in the model’s <code class="docutils literal notranslate"><span class="pre">sp_enabled_nodes</span></code>. Each layer all-gathers the partials,
+with the same exception.
+Chunked prefill stays off on SP ranks (<code class="docutils literal notranslate"><span class="pre">_unchunkable_nodes</span></code>), as for the model’s own SP, so
+SP mode prefills a prompt in one step; chunking an SP-placed pool’s prompts is not supported yet.
+TP mode chunks prompts as without placement.</p></li>
+</ul>
+<p>A page’s tokens (<code class="docutils literal notranslate"><span class="pre">page_size</span></code>, 128 when it is unset) must be divisible by <code class="docutils literal notranslate"><span class="pre">P</span></code>; the conductor
+checks these rules against <code class="docutils literal notranslate"><span class="pre">node_groups</span></code> before it starts a worker. <code class="docutils literal notranslate"><span class="pre">max_num_pages</span></code> counts
+logical pages, so raise it by <code class="docutils literal notranslate"><span class="pre">P</span></code> to use the memory placement frees (the pool logs its bytes per
+rank). Every resource over the pool must support it, or loading fails naming the one that doesn’t.
+FlashInfer attention (<code class="docutils literal notranslate"><span class="pre">flashinfer</span></code>) with <code class="docutils literal notranslate"><span class="pre">flashinfer_backend</span></code> <code class="docutils literal notranslate"><span class="pre">auto</span></code>, <code class="docutils literal notranslate"><span class="pre">fa2</span></code> or <code class="docutils literal notranslate"><span class="pre">fa3</span></code>
+(<code class="docutils literal notranslate"><span class="pre">auto</span></code> runs as <code class="docutils literal notranslate"><span class="pre">fa2</span></code> from SM100; after an unexplained one-off lockstep hang in an <code class="docutils literal notranslate"><span class="pre">fa2</span></code>
+prefill over an SP-placed pool (#1363), an SP-placed pool that prefills on <code class="docutils literal notranslate"><span class="pre">fa2</span></code> warns at
+startup: an explicit <code class="docutils literal notranslate"><span class="pre">fa2</span></code> on any architecture, and <code class="docutils literal notranslate"><span class="pre">auto</span></code> where FlashInfer has no <code class="docutils literal notranslate"><span class="pre">fa3</span></code>
+(below SM90 and from SM100), while <code class="docutils literal notranslate"><span class="pre">auto</span></code> on SM90 prefills on <code class="docutils literal notranslate"><span class="pre">fa3</span></code>), RoPE positions and the recurrent state pool (GDN, KDA;
+the same state on every SP partner) do; dense, flex, XPU, block-causal and MLA (<code class="docutils literal notranslate"><span class="pre">flashinfer_mla</span></code>)
+attention,
+cross-attention, DSA and <code class="docutils literal notranslate"><span class="pre">sliding_window</span></code> don’t, and a ring or bounded KV pool can’t set the key.
+A decode/prefill <code class="docutils literal notranslate"><span class="pre">splits</span></code> and <code class="docutils literal notranslate"><span class="pre">decode_fmha</span></code> are ignored over a placed pool, and a node over
+one plans on the host rather than resident (<code class="docutils literal notranslate"><span class="pre">resident_planning</span></code>). A node that captures a step
+combining labels into one plan (<code class="docutils literal notranslate"><span class="pre">KVStep.combined_labels</span></code>, as classifier-free guidance does) at a
+batch size above 1 is refused at load: a replay’s padding rows would sit between its real ones.</p>
+<p>A step of one token a row attends the pages after its KV write (in TP mode on tensor cores
+whatever <code class="docutils literal notranslate"><span class="pre">decode_tensor_cores</span></code> says). Any other step attends its stored context on the pages
+and its own tokens from the <code class="docutils literal notranslate"><span class="pre">k</span></code> and <code class="docutils literal notranslate"><span class="pre">v</span></code> the layer passes <code class="docutils literal notranslate"><span class="pre">run</span></code>, so a layer that calls
+<code class="docutils literal notranslate"><span class="pre">attn.run</span></code> itself passes them (<code class="docutils literal notranslate"><span class="pre">AttentionCallable</span></code> and <code class="docutils literal notranslate"><span class="pre">MLAAttention</span></code> without
+<code class="docutils literal notranslate"><span class="pre">mla_absorb</span></code> do). A fused K/V write that leaves <code class="docutils literal notranslate"><span class="pre">k</span></code> unrotated asks <code class="docutils literal notranslate"><span class="pre">reads_step_kv()</span></code> first
+and rotates it when the step attends it (<code class="docutils literal notranslate"><span class="pre">AttentionCallable.norm_rope_attend</span></code>); a state op’s fused
+kernel doesn’t run on such a step, so its reference’s <code class="docutils literal notranslate"><span class="pre">add</span></code> hands the handle <code class="docutils literal notranslate"><span class="pre">k</span></code> and <code class="docutils literal notranslate"><span class="pre">v</span></code>.</p>
 <div class="admonition note">
 <p class="admonition-title">Note</p>
 <p>A top-level <code class="docutils literal notranslate"><span class="pre">kv_cache:</span></code> block is no longer read. It raises an error at load time,

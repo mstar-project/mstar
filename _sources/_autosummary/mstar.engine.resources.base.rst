@@ -14,6 +14,7 @@ mstar.engine.resources.base
    .. autosummary::
    
       build_resource
+      head_shards
    
    
 

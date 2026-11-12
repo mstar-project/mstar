@@ -30,6 +30,7 @@ mstar.engine.resources
    admission
    attn
    base
+   context_parallel
    convenience
    dsa
    kv

@@ -613,6 +613,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.admission.html">mstar.engine.resources.admission</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.attn.html">mstar.engine.resources.attn</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.base.html">mstar.engine.resources.base</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.context_parallel.html">mstar.engine.resources.context_parallel</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.dsa.html">mstar.engine.resources.dsa</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.kv.html">mstar.engine.resources.kv</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.lora.html">mstar.engine.resources.lora</a></li>
@@ -1048,7 +1049,9 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.step</span><span class="w"> </span><span class="kn">import</span> <span class="n">ResourceStep</span>
 
 <span class="k">if</span> <span class="n">TYPE_CHECKING</span><span class="p">:</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.distributed.communication</span><span class="w"> </span><span class="kn">import</span> <span class="n">JointGroups</span>
     <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">Resource</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.context_parallel</span><span class="w"> </span><span class="kn">import</span> <span class="n">ContextParallel</span>
 
 
 <div class="viewcode-block" id="KVLayout">
@@ -1093,24 +1096,32 @@ window.runMermaid = runMermaid;</script>
             <span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_unsharded_kv_heads</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_kv_heads</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_unsharded_qo_heads</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_qo_heads</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_head_shards</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
 
 <div class="viewcode-block" id="KVConfig.shard">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.KVConfig.shard">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">shard</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">num_shards</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">"""Narrow the head counts to one rank's slice.</span>
+<span class="w">        </span><span class="sd">"""Narrow the head counts to one rank's slice of ``num_shards`` (``EngineResourceInfo.head_shards``).</span>
 
 <span class="sd">        Idempotent because one KVConfig is shared by the KV resource and the</span>
-<span class="sd">        attention resources planned against it, and each shards on construction.</span>
-<span class="sd">        ``num_shards`` is the instance session size (tp * sp): Ulysses SP</span>
-<span class="sd">        all-to-alls heads, so attention runs at head-degree tp*sp.</span>
+<span class="sd">        attention resources planned against it, and each shards on construction;</span>
+<span class="sd">        a second count is an error, since the cache was sized by the first.</span>
 <span class="sd">        """</span>
-        <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.distributed.utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">divide</span>
+        <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.distributed.utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">divide</span><span class="p">,</span> <span class="n">kv_head_replicas</span>
 
-        <span class="k">if</span> <span class="n">num_shards</span> <span class="o">&gt;=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_unsharded_kv_heads</span><span class="p">:</span>
-            <span class="c1"># fewer KV heads than ranks — every rank holds a replicated head</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">num_kv_heads</span> <span class="o">=</span> <span class="mi">1</span>
-        <span class="k">else</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">num_kv_heads</span> <span class="o">=</span> <span class="n">divide</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_unsharded_kv_heads</span><span class="p">,</span> <span class="n">num_shards</span><span class="p">)</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_head_shards</span> <span class="ow">not</span> <span class="ow">in</span> <span class="p">(</span><span class="kc">None</span><span class="p">,</span> <span class="n">num_shards</span><span class="p">):</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">"KV heads already sharded </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">_head_shards</span><span class="si">}</span><span class="s2"> ways, and a resource over the pool "</span>
+                <span class="sa">f</span><span class="s2">"shards them </span><span class="si">{</span><span class="n">num_shards</span><span class="si">}</span><span class="s2"> ways: its builders disagree on the node's head shards"</span>
+            <span class="p">)</span>
+        <span class="n">kv</span><span class="p">,</span> <span class="n">qo</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_unsharded_kv_heads</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_unsharded_qo_heads</span>
+        <span class="k">if</span> <span class="p">(</span><span class="n">num_shards</span> <span class="o">%</span> <span class="n">kv</span> <span class="k">if</span> <span class="n">num_shards</span> <span class="o">&gt;=</span> <span class="n">kv</span> <span class="k">else</span> <span class="n">kv</span> <span class="o">%</span> <span class="n">num_shards</span><span class="p">)</span> <span class="ow">or</span> <span class="n">qo</span> <span class="o">%</span> <span class="n">num_shards</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">kv</span><span class="si">}</span><span class="s2"> KV and </span><span class="si">{</span><span class="n">qo</span><span class="si">}</span><span class="s2"> query heads don't split </span><span class="si">{</span><span class="n">num_shards</span><span class="si">}</span><span class="s2"> ways: the node's head shards "</span>
+                <span class="s2">"must divide the query heads, and divide or be a multiple of the KV heads"</span>
+            <span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_head_shards</span> <span class="o">=</span> <span class="n">num_shards</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">num_kv_heads</span> <span class="o">=</span> <span class="n">kv_head_replicas</span><span class="p">(</span><span class="n">kv</span><span class="p">,</span> <span class="n">num_shards</span><span class="p">)[</span><span class="mi">0</span><span class="p">]</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">num_qo_heads</span> <span class="o">=</span> <span class="n">divide</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_unsharded_qo_heads</span><span class="p">,</span> <span class="n">num_shards</span><span class="p">)</span></div>
 
 
@@ -1154,6 +1165,8 @@ window.runMermaid = runMermaid;</script>
     <span class="n">prefix_cache_salt</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">""</span>
     <span class="n">prefix_cache</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
     <span class="n">prefix_cache_tp</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+    <span class="c1"># place token positions over the ranks that would otherwise hold the same KV heads; see `place`</span>
+    <span class="n">context_parallel</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
     <span class="c1"># MLA only: the latent is ``[ckv (kv_lora_rank) | kpe (qk_rope_head_dim)]``</span>
     <span class="n">kv_lora_rank</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="n">qk_rope_head_dim</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
@@ -1274,6 +1287,65 @@ window.runMermaid = runMermaid;</script>
         <span class="p">)</span></div>
 
 
+<div class="viewcode-block" id="PagedKVConfig.place">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.PagedKVConfig.place">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">place</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">joint</span><span class="p">:</span> <span class="s2">"JointGroups | None"</span><span class="p">,</span> <span class="n">pool</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">"ContextParallel | None"</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""This rank's placement of the pool, resolved from ``context_parallel``; None when it is off.</span>
+
+<span class="sd">        The KV cache holds it (``KVCache.placement``), not this config, which every rank's</span>
+<span class="sd">        resources share. The partners are the node's SP ranks when it has more than one, and</span>
+<span class="sd">        otherwise the block of TP ranks holding this rank's KV head (`kv_head_replicas`).</span>
+<span class="sd">        """</span>
+        <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.context_parallel</span><span class="w"> </span><span class="kn">import</span> <span class="n">ContextParallel</span>
+
+        <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">context_parallel</span><span class="p">:</span>
+            <span class="k">return</span> <span class="kc">None</span>
+        <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">groups</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
+            <span class="c1"># a page of a group's layers holds another page size, which the placed storage doesn't stripe</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"KV </span><span class="si">{</span><span class="n">pool</span><span class="si">!r}</span><span class="s2">: context_parallel is unsupported over a pool that keeps a sliding window"</span><span class="p">)</span>
+        <span class="n">tp_size</span><span class="p">,</span> <span class="n">sp_size</span> <span class="o">=</span> <span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span> <span class="k">if</span> <span class="n">joint</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="p">(</span><span class="n">joint</span><span class="o">.</span><span class="n">tp_group</span><span class="o">.</span><span class="n">world_size</span><span class="p">,</span> <span class="n">joint</span><span class="o">.</span><span class="n">sp_group</span><span class="o">.</span><span class="n">world_size</span><span class="p">)</span>
+        <span class="c1"># raises on one rank alone, so past here there is a joint group</span>
+        <span class="n">size</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">context_parallel_size</span><span class="p">(</span><span class="n">pool</span><span class="p">,</span> <span class="n">tp_size</span><span class="p">,</span> <span class="n">sp_size</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">sp_size</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
+            <span class="n">sp</span> <span class="o">=</span> <span class="n">joint</span><span class="o">.</span><span class="n">sp_group</span>
+            <span class="k">return</span> <span class="n">ContextParallel</span><span class="p">(</span><span class="n">size</span><span class="o">=</span><span class="n">size</span><span class="p">,</span> <span class="n">index</span><span class="o">=</span><span class="n">sp</span><span class="o">.</span><span class="n">rank</span><span class="p">,</span> <span class="n">group</span><span class="o">=</span><span class="n">sp</span><span class="p">,</span> <span class="n">over_sp</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">partners</span><span class="o">=</span><span class="nb">tuple</span><span class="p">(</span><span class="nb">range</span><span class="p">(</span><span class="n">size</span><span class="p">)))</span>
+        <span class="n">tp</span> <span class="o">=</span> <span class="n">joint</span><span class="o">.</span><span class="n">tp_group</span>
+        <span class="n">first</span> <span class="o">=</span> <span class="n">tp</span><span class="o">.</span><span class="n">rank</span> <span class="o">//</span> <span class="n">size</span> <span class="o">*</span> <span class="n">size</span>
+        <span class="k">return</span> <span class="n">ContextParallel</span><span class="p">(</span>
+            <span class="n">size</span><span class="o">=</span><span class="n">size</span><span class="p">,</span> <span class="n">index</span><span class="o">=</span><span class="n">tp</span><span class="o">.</span><span class="n">rank</span> <span class="o">%</span> <span class="n">size</span><span class="p">,</span> <span class="n">group</span><span class="o">=</span><span class="n">tp</span><span class="p">,</span> <span class="n">over_sp</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">partners</span><span class="o">=</span><span class="nb">tuple</span><span class="p">(</span><span class="nb">range</span><span class="p">(</span><span class="n">first</span><span class="p">,</span> <span class="n">first</span> <span class="o">+</span> <span class="n">size</span><span class="p">)),</span>
+        <span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="PagedKVConfig.context_parallel_size">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.PagedKVConfig.context_parallel_size">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">context_parallel_size</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">pool</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">tp</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">sp</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""How many ranks ``context_parallel`` stripes each page over on a node of ``tp`` x ``sp``</span>
+<span class="sd">        ranks: its SP ranks when it has more than one, else the TP ranks sharing a KV head.</span>
+<span class="sd">        Raises ``ValueError`` when they can't; ``validate_deployment`` checks it from</span>
+<span class="sd">        ``node_groups`` before any worker starts."""</span>
+        <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.distributed.utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">kv_head_replicas</span>
+
+        <span class="k">if</span> <span class="n">sp</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
+            <span class="n">size</span> <span class="o">=</span> <span class="n">sp</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="n">heads</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_unsharded_kv_heads</span>
+            <span class="k">if</span> <span class="n">heads</span> <span class="o">&gt;=</span> <span class="n">tp</span> <span class="ow">or</span> <span class="n">tp</span> <span class="o">%</span> <span class="n">heads</span><span class="p">:</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                    <span class="sa">f</span><span class="s2">"KV </span><span class="si">{</span><span class="n">pool</span><span class="si">!r}</span><span class="s2">: context_parallel places positions over the TP ranks that share a "</span>
+                    <span class="sa">f</span><span class="s2">"KV head, and </span><span class="si">{</span><span class="n">heads</span><span class="si">}</span><span class="s2"> KV head(s) over </span><span class="si">{</span><span class="n">tp</span><span class="si">}</span><span class="s2"> TP rank(s) "</span>
+                    <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="s1">'leave none sharing one'</span><span class="w"> </span><span class="k">if</span><span class="w"> </span><span class="n">heads</span><span class="w"> </span><span class="o">&gt;=</span><span class="w"> </span><span class="n">tp</span><span class="w"> </span><span class="k">else</span><span class="w"> </span><span class="s1">'do not divide evenly'</span><span class="si">}</span><span class="s2">. Make TP a "</span>
+                    <span class="s2">"larger multiple of the KV heads, give the node SP ranks, or turn "</span>
+                    <span class="s2">"context_parallel off."</span>
+                <span class="p">)</span>
+            <span class="n">size</span> <span class="o">=</span> <span class="n">kv_head_replicas</span><span class="p">(</span><span class="n">heads</span><span class="p">,</span> <span class="n">tp</span><span class="p">)[</span><span class="mi">1</span><span class="p">]</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">tokens_per_page</span> <span class="o">%</span> <span class="n">size</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">"KV </span><span class="si">{</span><span class="n">pool</span><span class="si">!r}</span><span class="s2">: context_parallel stripes each page over </span><span class="si">{</span><span class="n">size</span><span class="si">}</span><span class="s2"> ranks, "</span>
+                <span class="sa">f</span><span class="s2">"which doesn't divide page_size </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">tokens_per_page</span><span class="si">}</span><span class="s2">"</span>
+            <span class="p">)</span>
+        <span class="k">return</span> <span class="n">size</span></div>
+
+
     <span class="nd">@property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">request_pages</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""Arena pages requests can hold: all but the sink page the KV manager takes at build."""</span>
@@ -1307,6 +1379,7 @@ window.runMermaid = runMermaid;</script>
         <span class="n">prefix_cache_salt</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">prefix_cache</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">prefix_cache_tp</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">context_parallel</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""How much cache this deployment gets, and how it is cut up."""</span>
         <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">value</span> <span class="ow">in</span> <span class="p">(</span>
@@ -1317,6 +1390,7 @@ window.runMermaid = runMermaid;</script>
             <span class="p">(</span><span class="s2">"prefix_cache_salt"</span><span class="p">,</span> <span class="n">prefix_cache_salt</span><span class="p">),</span>
             <span class="p">(</span><span class="s2">"prefix_cache"</span><span class="p">,</span> <span class="n">prefix_cache</span><span class="p">),</span>
             <span class="p">(</span><span class="s2">"prefix_cache_tp"</span><span class="p">,</span> <span class="n">prefix_cache_tp</span><span class="p">),</span>
+            <span class="p">(</span><span class="s2">"context_parallel"</span><span class="p">,</span> <span class="n">context_parallel</span><span class="p">),</span>
         <span class="p">):</span>
             <span class="k">if</span> <span class="n">value</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
                 <span class="nb">setattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">name</span><span class="p">,</span> <span class="n">value</span><span class="p">)</span>
@@ -1873,6 +1947,11 @@ window.runMermaid = runMermaid;</script>
         <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.kv.manager</span><span class="w"> </span><span class="kn">import</span> <span class="n">KVManager</span>
 
         <span class="k">return</span> <span class="n">KVManager</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">places_positions</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="c1"># a paged pool's (`PagedKVConfig.context_parallel`); a ring keeps every position on each rank</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">context_parallel</span> <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="p">,</span> <span class="n">PagedKVConfig</span><span class="p">)</span> <span class="k">else</span> <span class="kc">None</span>
 
 <div class="viewcode-block" id="KVSpec.apply_yaml_overrides">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.KVSpec.apply_yaml_overrides">[docs]</a>

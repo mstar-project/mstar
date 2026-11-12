@@ -260,6 +260,7 @@
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.admission.html">mstar.engine.resources.admission</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.attn.html">mstar.engine.resources.attn</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.base.html">mstar.engine.resources.base</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.context_parallel.html">mstar.engine.resources.context_parallel</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.dsa.html">mstar.engine.resources.dsa</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.kv.html">mstar.engine.resources.kv</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.lora.html">mstar.engine.resources.lora</a></li>
@@ -1366,7 +1367,8 @@ them by that name:</p>
 <div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">resources</span><span class="p">:</span>
 <span class="w">  </span><span class="nt">kv_cache</span><span class="p">:</span>
 <span class="w">    </span><span class="nt">max_num_pages</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1024</span><span class="w">      </span><span class="c1"># also: page_size, max_seq_len, cpu_offload_pages,</span>
-<span class="w">                             </span><span class="c1"># prefix_cache, prefix_cache_salt, prefix_cache_tp</span>
+<span class="w">                             </span><span class="c1"># prefix_cache, prefix_cache_salt, prefix_cache_tp,</span>
+<span class="w">                             </span><span class="c1"># context_parallel</span>
 <span class="w">  </span><span class="nt">talker_attn</span><span class="p">:</span>
 <span class="w">    </span><span class="nt">flashinfer_backend</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">fa2</span><span class="w">  </span><span class="c1"># also: backend (flashinfer / dense), decode_tensor_cores, decode_fmha</span>
 <span class="w">  </span><span class="nt">vit_attn</span><span class="p">:</span><span class="w">                  </span><span class="c1"># a cacheless (ragged) attention resource</span>
@@ -1400,6 +1402,12 @@ ranks. Loading fails otherwise. A cache that keeps
 a sliding window (<code class="docutils literal notranslate"><span class="pre">AttentionConfig.sliding_window</span></code>) has no prefix cache yet: its
 <code class="docutils literal notranslate"><span class="pre">prefix_cache</span></code> goes off (logged at info), and a serving config that sets
 <code class="docutils literal notranslate"><span class="pre">prefix_cache:</span> <span class="pre">true</span></code> on it is refused.</p>
+<p><code class="docutils literal notranslate"><span class="pre">context_parallel:</span> <span class="pre">true</span></code> splits each request’s positions over the ranks that would
+otherwise hold the same KV heads: the TP ranks that share a KV head, or the node’s SP ranks
+when it has them, which is how a model with no sequence parallelism of its own (such as
+Qwen3.5) runs on <code class="docutils literal notranslate"><span class="pre">sp_size</span></code> above 1. Raise <code class="docutils literal notranslate"><span class="pre">max_num_pages</span></code> by that factor to turn the
+freed memory into context. <strong>Context parallelism</strong> in <a class="reference internal" href="adding_models.html"><span class="doc">Adding a New Model</span></a> covers when each mode applies and
+what it refuses.</p>
 <p>A request waits at the head of its pool’s queue until its reservation fits beside the
 reservations already admitted. A request behind it starts first when its own pages fit, output
 included, less the cached part of its prompt that running requests keep from eviction and, on a

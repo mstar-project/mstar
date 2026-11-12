@@ -613,6 +613,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.admission.html">mstar.engine.resources.admission</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.attn.html">mstar.engine.resources.attn</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.base.html">mstar.engine.resources.base</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.context_parallel.html">mstar.engine.resources.context_parallel</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.dsa.html">mstar.engine.resources.dsa</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.kv.html">mstar.engine.resources.kv</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.lora.html">mstar.engine.resources.lora</a></li>
@@ -1050,6 +1051,7 @@ window.runMermaid = runMermaid;</script>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
 
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.distributed.utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">kv_head_replicas</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.spec</span><span class="w"> </span><span class="kn">import</span> <span class="n">NodeResourceSpec</span><span class="p">,</span> <span class="n">ResourceReqConfig</span><span class="p">,</span> <span class="n">check_sizes</span><span class="p">,</span> <span class="n">instance_key</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.utils.client_errors</span><span class="w"> </span><span class="kn">import</span> <span class="n">scrub_paths</span>
 
@@ -1333,8 +1335,8 @@ window.runMermaid = runMermaid;</script>
             <span class="k">return</span> <span class="mi">0</span><span class="p">,</span> <span class="n">rows</span>
         <span class="n">units</span> <span class="o">=</span> <span class="n">rows</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">slice_units</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="bp">self</span><span class="o">.</span><span class="n">slice_units</span><span class="p">[</span><span class="n">slice_idx</span><span class="p">]</span>
         <span class="k">if</span> <span class="n">units</span> <span class="o">&lt;</span> <span class="n">world_size</span><span class="p">:</span>
-            <span class="c1"># replicated: each group of `world_size // units` ranks holds one unit</span>
-            <span class="n">replicas</span> <span class="o">=</span> <span class="n">_divide</span><span class="p">(</span><span class="n">world_size</span><span class="p">,</span> <span class="n">units</span><span class="p">)</span>
+            <span class="c1"># replicated: each group of consecutive ranks holds one unit, as the base loads it</span>
+            <span class="n">_</span><span class="p">,</span> <span class="n">replicas</span> <span class="o">=</span> <span class="n">kv_head_replicas</span><span class="p">(</span><span class="n">units</span><span class="p">,</span> <span class="n">world_size</span><span class="p">)</span>
             <span class="n">size</span> <span class="o">=</span> <span class="n">rows</span> <span class="o">//</span> <span class="n">units</span>
             <span class="k">return</span> <span class="p">(</span><span class="n">rank</span> <span class="o">//</span> <span class="n">replicas</span><span class="p">)</span> <span class="o">*</span> <span class="n">size</span><span class="p">,</span> <span class="n">size</span>
         <span class="n">size</span> <span class="o">=</span> <span class="n">_divide</span><span class="p">(</span><span class="n">rows</span><span class="p">,</span> <span class="n">world_size</span><span class="p">)</span>

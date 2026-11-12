@@ -260,6 +260,7 @@
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.admission.html">mstar.engine.resources.admission</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.attn.html">mstar.engine.resources.attn</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.base.html">mstar.engine.resources.base</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.context_parallel.html">mstar.engine.resources.context_parallel</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.dsa.html">mstar.engine.resources.dsa</a></li>
 <li class="toctree-l4 current active"><a class="reference internal" href="mstar.engine.resources.kv.html">mstar.engine.resources.kv</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.lora.html">mstar.engine.resources.lora</a></li>
@@ -761,6 +762,7 @@
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.plan.PagedIndptrs"><code class="docutils literal notranslate"><span class="pre">PagedIndptrs</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.plan.PagedIndptrs.context_only"><code class="docutils literal notranslate"><span class="pre">PagedIndptrs.context_only()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.plan.PagedIndptrs.kv_lens"><code class="docutils literal notranslate"><span class="pre">PagedIndptrs.kv_lens</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.plan.PagedIndptrs.paged_kv_indices"><code class="docutils literal notranslate"><span class="pre">PagedIndptrs.paged_kv_indices</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.plan.PagedIndptrs.paged_kv_indptr"><code class="docutils literal notranslate"><span class="pre">PagedIndptrs.paged_kv_indptr</span></code></a></li>
@@ -786,7 +788,7 @@
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.plan.build_paged_indptrs"><code class="docutils literal notranslate"><span class="pre">build_paged_indptrs()</span></code></a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.plan.context_only_views"><code class="docutils literal notranslate"><span class="pre">context_only_views()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.plan.first_pages"><code class="docutils literal notranslate"><span class="pre">first_pages()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.plan.group_by_plan_label"><code class="docutils literal notranslate"><span class="pre">group_by_plan_label()</span></code></a></li>
 </ul>
             </nav>
@@ -812,8 +814,8 @@ consumer depends on the contract rather than on the cache.</p>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.plan.build_paged_indptrs" title="mstar.engine.resources.kv.plan.build_paged_indptrs"><code class="xref py py-obj docutils literal notranslate"><span class="pre">build_paged_indptrs</span></code></a>(segments, page_size[, ring])</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.plan.context_only_views" title="mstar.engine.resources.kv.plan.context_only_views"><code class="xref py py-obj docutils literal notranslate"><span class="pre">context_only_views</span></code></a>(views, query_spans, page_size)</p></td>
-<td><p>The views of a step's streams without the tokens the step appends: <code class="docutils literal notranslate"><span class="pre">length</span></code> shrinks by <code class="docutils literal notranslate"><span class="pre">to_compute</span></code> (the pages beyond it dropped) and <code class="docutils literal notranslate"><span class="pre">to_compute</span></code> becomes the row's query count.</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.plan.first_pages" title="mstar.engine.resources.kv.plan.first_pages"><code class="xref py py-obj docutils literal notranslate"><span class="pre">first_pages</span></code></a>(paged_kv_indptr, ...[, fill])</p></td>
+<td><p>Each row's first <code class="docutils literal notranslate"><span class="pre">keep</span></code> pages of a plan's paged <code class="docutils literal notranslate"><span class="pre">(indptr,</span> <span class="pre">indices)</span></code>, as a new pair (int64 indptr, int32 indices).</p></td>
 </tr>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.plan.group_by_plan_label" title="mstar.engine.resources.kv.plan.group_by_plan_label"><code class="xref py py-obj docutils literal notranslate"><span class="pre">group_by_plan_label</span></code></a>(segments, combined_labels)</p></td>
 <td><p>Segments per plan label in order of packed forward view</p></td>
@@ -990,6 +992,26 @@ no-op — see <code class="docutils literal notranslate"><span class="pre">Flash
 </ul>
 </dd>
 </dl>
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.plan.PagedIndptrs.context_only">
+<span class="sig-name descname"><span class="pre">context_only</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">page_size</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">qo_indptr</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/plan.html#PagedIndptrs.context_only"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.plan.PagedIndptrs.context_only" title="Link to this definition">#</a></dt>
+<dd><p>Each row’s KV cut to its stored context (its KV before the tokens the step appends at the
+row’s end), the pages past it dropped, for attention over the stored context alone
+(<code class="docutils literal notranslate"><span class="pre">AttentionStep.context_only</span></code>). <code class="docutils literal notranslate"><span class="pre">qo_indptr</span></code>: the rows’ query counts, by default the
+step’s own.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>page_size</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>qo_indptr</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a><em> | </em><em>None</em>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference internal" href="#mstar.engine.resources.kv.plan.PagedIndptrs" title="mstar.engine.resources.kv.plan.PagedIndptrs"><em>PagedIndptrs</em></a></p>
+</dd>
+</dl>
+</dd></dl>
+
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.plan.PagedIndptrs.kv_lens">
 <span class="sig-name descname"><span class="pre">kv_lens</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><span class="pre">Tensor</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><a class="headerlink" href="#mstar.engine.resources.kv.plan.PagedIndptrs.kv_lens" title="Link to this definition">#</a></dt>
@@ -1169,21 +1191,21 @@ it is built per segment per step and never mutated.</p>
 </dd></dl>
 
 <dl class="py function">
-<dt class="sig sig-object py" id="mstar.engine.resources.kv.plan.context_only_views">
-<span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.kv.plan.</span></span><span class="sig-name descname"><span class="pre">context_only_views</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">views</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">query_spans</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">page_size</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/plan.html#context_only_views"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.plan.context_only_views" title="Link to this definition">#</a></dt>
-<dd><p>The views of a step’s streams without the tokens the step appends: <code class="docutils literal notranslate"><span class="pre">length</span></code> shrinks by
-<code class="docutils literal notranslate"><span class="pre">to_compute</span></code> (the pages beyond it dropped) and <code class="docutils literal notranslate"><span class="pre">to_compute</span></code> becomes the row’s query count.
-For attention over the stored context alone (<code class="docutils literal notranslate"><span class="pre">AttentionStep.context_only</span></code>).</p>
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.plan.first_pages">
+<span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.kv.plan.</span></span><span class="sig-name descname"><span class="pre">first_pages</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">paged_kv_indptr</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">paged_kv_indices</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">keep</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">fill</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/plan.html#first_pages"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.plan.first_pages" title="Link to this definition">#</a></dt>
+<dd><p>Each row’s first <code class="docutils literal notranslate"><span class="pre">keep</span></code> pages of a plan’s paged <code class="docutils literal notranslate"><span class="pre">(indptr,</span> <span class="pre">indices)</span></code>, as a new pair
+(int64 indptr, int32 indices). With <code class="docutils literal notranslate"><span class="pre">fill</span></code>, a row that keeps none holds one page <code class="docutils literal notranslate"><span class="pre">fill</span></code>.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
-<li><p><strong>views</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference internal" href="#mstar.engine.resources.kv.plan.SequenceView" title="mstar.engine.resources.kv.plan.SequenceView"><em>SequenceView</em></a><em>]</em>)</p></li>
-<li><p><strong>query_spans</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
-<li><p><strong>page_size</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>paged_kv_indptr</strong> (<em>ndarray</em>)</p></li>
+<li><p><strong>paged_kv_indices</strong> (<em>ndarray</em>)</p></li>
+<li><p><strong>keep</strong> (<em>ndarray</em>)</p></li>
+<li><p><strong>fill</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><em>None</em>)</p></li>
 </ul>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
-<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)">list</a>[<a class="reference internal" href="#mstar.engine.resources.kv.plan.SequenceView" title="mstar.engine.resources.kv.plan.SequenceView"><em>SequenceView</em></a>]</p>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)">tuple</a>[<em>ndarray</em>, <em>ndarray</em>]</p>
 </dd>
 </dl>
 </dd></dl>
@@ -1279,6 +1301,7 @@ will read <cite>plan</cite> output of KV</p>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.plan.PagedIndptrs"><code class="docutils literal notranslate"><span class="pre">PagedIndptrs</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.plan.PagedIndptrs.context_only"><code class="docutils literal notranslate"><span class="pre">PagedIndptrs.context_only()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.plan.PagedIndptrs.kv_lens"><code class="docutils literal notranslate"><span class="pre">PagedIndptrs.kv_lens</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.plan.PagedIndptrs.paged_kv_indices"><code class="docutils literal notranslate"><span class="pre">PagedIndptrs.paged_kv_indices</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.plan.PagedIndptrs.paged_kv_indptr"><code class="docutils literal notranslate"><span class="pre">PagedIndptrs.paged_kv_indptr</span></code></a></li>
@@ -1304,7 +1327,7 @@ will read <cite>plan</cite> output of KV</p>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.plan.build_paged_indptrs"><code class="docutils literal notranslate"><span class="pre">build_paged_indptrs()</span></code></a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.plan.context_only_views"><code class="docutils literal notranslate"><span class="pre">context_only_views()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.plan.first_pages"><code class="docutils literal notranslate"><span class="pre">first_pages()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.plan.group_by_plan_label"><code class="docutils literal notranslate"><span class="pre">group_by_plan_label()</span></code></a></li>
 </ul>
   </nav></div>
