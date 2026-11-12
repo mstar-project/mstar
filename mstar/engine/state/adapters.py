@@ -247,6 +247,7 @@ def _apply_kernel_settings(
 ) -> None:
     """Set the kernel choices, capture sizes and default pool sizes the contract leaves to the engine, and refuse any
     other, so this hook can't carry other physical choices until the engine picks kernels and sizes its pools itself."""
+    # each key's owner and the resource its settings go on: an array's pool is under its name
     owners = {array.name: (array, storage_of(array), array.name) for array in arrays} | {
         bound.key: (array, bound.binding, resolved.resource_of[bound.key])
         for array in arrays for bound in resolved.bound[array.name] if bound.binding.kernel_settings
@@ -1301,7 +1302,7 @@ class Storage(ABC):
         """Today's `LabelLayout` per label, or None where the array's pool takes no layout."""
         return None
 
-    def apply(self, spec: NodeResourceSpec, settings: Mapping[str, Any]) -> None:
+    def apply(self, spec: NodeResourceSpec | None, settings: Mapping[str, Any]) -> None:
         """Size the array's pool ``spec`` through its own YAML path, so a value here means what the same key under
         `resources:` means."""
         if settings:

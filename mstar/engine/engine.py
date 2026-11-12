@@ -64,6 +64,8 @@ from mstar.engine.resources.step import (
     lean_subsets,
 )
 from mstar.engine.state.adapters import StateSetup, node_handles
+from mstar.engine.state.analysis import host_field_holders
+from mstar.engine.state.contract import Array
 from mstar.engine.state.state_op import bind_state_ops
 from mstar.graph.runtime.base import GraphRuntime
 from mstar.model.base import keyed_labels
@@ -847,6 +849,7 @@ class Engine:
         share_slot_rotations(self._submodules.values())
         if model is not None:
             self._check_rebuild_policies(model)
+            self._check_host_fields(model)
 
     def _check_rebuild_policies(self, model: "Model") -> None:
         """Raise for a node here whose rebuild policy a rebuild row couldn't run under."""
@@ -868,6 +871,28 @@ class Engine:
                     f"{type(model).__name__}: {node!r} declares a rebuild policy, but splits steps of {split} by "
                     "capture key, which the scheduler reads from a request's forward-pass info, and that names "
                     "the decode walk while the request is rebuilt"
+                )
+
+    def _check_host_fields(self, model: "Model") -> None:
+        """Raise for a node here that holds host fields and reports `step_is_input_free` for one of its walks."""
+        held: dict[str, list[str]] = {}
+        for array in host_field_holders(declared for declared in model.declare_state() if isinstance(declared, Array)):
+            for node in array.nodes & self._submodules.keys():
+                held.setdefault(node, []).append(array.name)
+        if not held:
+            return
+        walks = {walk: graph.get_nodes() for walk, graph in model.get_graph_walk_graphs().items()}
+        combined = model.get_combined_graph_walks()
+        for node, names in held.items():
+            own = [walk for walk, nodes in walks.items() if node in nodes] + list(combined.get(node, ()))
+            free = sorted(walk for walk in own if self._submodules[node].submodule.step_is_input_free(walk))
+            if free:
+                raise ValueError(
+                    f"{type(model).__name__}: {node!r} holds the host fields of {sorted(names)} and reports "
+                    f"step_is_input_free for {free}. `_pre_plan_for_batch` hands exec the step it declared in two "
+                    "cases: over the prepared rows, when the batch has its inputs, and over the bucket's template "
+                    "rows, for an input-free walk. A step over the template rows would take its host writes from the "
+                    "template, not from the requests."
                 )
 
     def node_dtype(self, node_name: str) -> torch.dtype | None:

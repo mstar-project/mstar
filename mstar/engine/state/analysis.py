@@ -57,6 +57,11 @@ def written_by_step(array: Array) -> frozenset[str]:
     return frozenset(array.entry.tensors.keys() - {field for op in array.updates.values() for field in op.writes})
 
 
+def host_field_holders(arrays: Iterable[Array]) -> list[Array]:
+    """The arrays of ``arrays`` that hold host fields."""
+    return [array for array in arrays if array.entry.host]
+
+
 def query_array(array: Array, read: Read, arrays: Mapping[str, Array]) -> Array:
     """The array whose segments lay out the queries of ``array``'s ``read``: the one of ``arrays`` its ``queries``
     names, or else ``array``."""
@@ -155,7 +160,8 @@ def _value_problems(arrays: Sequence[Array], kv_labels: Mapping[str, Mapping[str
     """What a Value's entry can't hold yet. A prefix hit restores a Value's snapshot, and a snapshot carries neither its
     host fields nor a field its step writes itself, which no kernel writes mid-prefill."""
     plain = [array for array in arrays if written_by_step(array)]
-    if not plain and not any(array.entry.host for array in arrays):
+    holders = host_field_holders(arrays)
+    if not plain and not holders:
         return []
     keyed = {
         node for array in arrays if any(label.keys is not None for label in kv_labels.get(array.name, {}).values())
@@ -168,7 +174,7 @@ def _value_problems(arrays: Sequence[Array], kv_labels: Mapping[str, Mapping[str
     problems += [
         f"Array {array.name!r}.entry.host: nodes {sorted(array.nodes & keyed)} have prefix keys, and a prefix hit "
         "wouldn't restore host fields"
-        for array in arrays if array.entry.host and array.nodes & keyed
+        for array in holders if array.nodes & keyed
     ]
     problems += [
         f"Array {array.name!r}: nodes {sorted(array.nodes & keyed)} have prefix keys, and a prefix hit wouldn't "
