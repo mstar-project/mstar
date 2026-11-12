@@ -71,3 +71,20 @@ def test_fa4_eager_matches_sdpa(seg_lens):
         want[start:end] = F.scaled_dot_product_attention(qs, ks, vs).squeeze(0).transpose(0, 1).to(q.dtype)
     err = (got.float() - want.float()).abs().max().item()
     assert err < 3e-2, f"max_abs_err={err}"
+
+
+@pytest.mark.skipif(_GPU_REASON is not None, reason=f"FA4 varlen unavailable: {_GPU_REASON}")
+def test_fa4_eager_dense_segments_are_varlen_bit_for_bit():
+    """An eager non-causal plan runs a dense call per segment; the result is the varlen call's bit for bit."""
+    device, heads, dim, seg_lens = torch.device("cuda", 0), 2, 128, [3000, 159]
+    cu = torch.tensor([0, *torch.tensor(seg_lens).cumsum(0).tolist()], dtype=torch.int32)
+    gen = torch.Generator(device=device).manual_seed(1)
+    q, k, v = (torch.randn(sum(seg_lens), heads, dim, dtype=torch.bfloat16, device=device, generator=gen)
+               for _ in range(3))
+    w = Fa4RaggedPrefillWrapper(num_qo_heads=heads, num_kv_heads=heads, head_dim=dim, device=device,
+                                q_data_type=torch.bfloat16)
+    w.plan(cu)
+    assert w._segments is not None
+    dense = w.run(q, k, v)
+    w._segments = None  # the varlen call
+    assert torch.equal(dense, w.run(q, k, v))
