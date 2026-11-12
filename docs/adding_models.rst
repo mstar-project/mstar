@@ -1030,6 +1030,10 @@ The spec types are:
      - Block-causal self-attention within each span (``AttentionStep(causal=False)``): causal
        between ``block_size``-token blocks, bidirectional within one. Same config. See
        `Block-causal attention within spans`_.
+   * - ``RaggedKeyPrefixAttentionSpec(config=RaggedAttentionConfig(...))``
+     - Self-attention within each span over a prefix of its keys
+       (``KeyPrefixAttentionStep(key_lens=...)``): every token queries, only the first
+       ``key_lens[i]`` are keys. Same config. See `Key padding within spans`_.
    * - ``BlockCausalAttentionSpec(config=AttentionConfig(kv_cache=...), block_size=...)``
      - The same mask over a paged KV cache: a row's new tokens attend its cached blocks and
        their own, and a step runs only new tokens. FlashInfer only. See `Block-causal
@@ -1447,6 +1451,17 @@ for the worst layout the bucket's token count allows.
    72, which the FlashInfer kernel — it supports only a few fixed head dimensions — forces
    us to zero-pad to 128. So that tower attends through the resource only when it is
    replaying a captured graph, and runs flash-attn varlen otherwise.
+
+Key padding within spans
+^^^^^^^^^^^^^^^^^^^^^^^^
+
+An encoder run over padded clips can carry a key padding mask: a span's last frames are
+padding as keys but still compute outputs, which can reach what the model keeps (Step-Audio2's
+Whisper encoder masks one or two frames a clip). Declare a ``RaggedKeyPrefixAttentionSpec``
+and step it with ``KeyPrefixAttentionStep``, one segment per span and ``key_lens`` parallel to
+the segments, each in ``1..span``. The resource gathers each span's key prefix into a key layout
+of its own and runs the cross-attention kernel against it; under a captured graph the gather
+index is a static buffer the plan restages, padded to the bucket's tokens.
 
 Block-causal attention over a KV cache
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
