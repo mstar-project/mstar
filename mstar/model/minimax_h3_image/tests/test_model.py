@@ -169,6 +169,18 @@ def test_dit_without_audio_runs_the_step_head():
     assert torch.equal(again, outs[1]) and not torch.equal(outs[0], outs[1])
 
 
+def test_the_dits_attention_settings():
+    """The DiT's read pipelines its Ulysses exchange over 2 head groups and, compiled, traces as
+    the resource's op; the eager refiner's read keeps the defaults."""
+    from mstar.model.minimax_h3.config import DIT_ATTN, REFINER_ATTN
+
+    eager, compiled = _model().kernel_settings(), _model(compile=True).kernel_settings()
+    assert eager[DIT_ATTN] == {"max_segments_per_request": 2, "workspace_mb": 128, "compile_op": False,
+                               "ulysses_head_groups": 2}
+    assert compiled[DIT_ATTN]["compile_op"] is True
+    assert eager[REFINER_ATTN] == compiled[REFINER_ATTN] == {"workspace_mb": 128}
+
+
 def test_process_prompt_and_walk_plan_for_an_edit():
     model = _model()
     model._image_processor = _ImageProcessor()
