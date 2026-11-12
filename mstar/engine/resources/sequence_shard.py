@@ -742,7 +742,7 @@ def sequence_parallel_refusals(
         return [
             f"node {node!r} runs on {sp} SP ranks but neither splits tokens (a SeqShardSpec) nor stores "
             "KV by position (context_parallel on its paged KV pools); an attention run outside the "
-            "engine's resources (attention_backend: sdpa) declares neither",
+            "engine's resources (backend: sdpa on a read's resource) declares neither",
         ]
     refusals = []
     if not shard.exchanges:

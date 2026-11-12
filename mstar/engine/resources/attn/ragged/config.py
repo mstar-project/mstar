@@ -260,8 +260,9 @@ class RaggedCrossAttentionSpec(_RaggedSpecBase):
 
     On a node whose sequence shard splits a step, each pair's exchange follows from which side
     is split: split queries over copied keys attend locally, copied queries over split keys merge
-    every rank's partial (``sharded_key_merge``), and both split is refused at load
-    (``mstar.engine.state.analysis.split_read_problems``). The shard must split
+    every rank's partial (``sharded_key_merge``), and both split is refused at load for a read
+    declared through the state contract (``mstar.engine.state.analysis.split_read_problems``) and at
+    the first split step for a hand-written spec. The shard must split
     each row (``axis=1``) with exchanges: a packed split (``axis=0``) or one with ``exchanges=False``
     can leave a rank none of a row.
     """
