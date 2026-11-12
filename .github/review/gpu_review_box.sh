@@ -9,7 +9,7 @@
 # to do), findings.json (the review's notes for the run: model text, which the brief calls untrusted
 # data) and pr-body.md (the PR's title and description, untrusted data too). The Anthropic key is at
 # /run/live-pr-key/value: an Eras secret, or elsewhere the review's own key. Nothing here holds a
-# GitHub token or a cloud key.
+# GitHub token or the bot's cloud keys (a RunPod pod has RunPod's own pod-scoped key in its environment).
 set -uo pipefail
 
 W=/workspace/live-pr IN=/run/live-pr

@@ -54,7 +54,7 @@ name: Claude Review
 # in gpu_review.py holds. A box gets the PR's public code, a fixed brief, the
 # review's notes and the PR's title and description (pr-body.md) as data, and an
 # Anthropic key (on Eras a key of its own, an Eras secret; elsewhere the
-# review's own), never a GitHub token or a cloud key. An Eras box's GPUs go when
+# review's own), never a GitHub token or the bot's cloud keys (a RunPod pod has RunPod's own pod-scoped key). An Eras box's GPUs go when
 # its session ends (or at the Pod's deadline), whether or not this job is still
 # running; any other box goes when this job deletes it, or failing that at the review
 # monitor's hourly reap (review-monitor.yml).

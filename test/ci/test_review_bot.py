@@ -593,6 +593,13 @@ class TestInterdiff(unittest.TestCase):
         self.assertIn(bot.DROPPED, bot.interdiff(self.REVIEWED + other, self.REVIEWED))
 
 
+class TestRedact(unittest.TestCase):
+    def test_a_runpod_pods_own_key_is_removed(self):
+        # RunPod puts a pod-scoped RUNPOD_API_KEY in every pod's environment, where the PR's code runs
+        self.assertEqual(bot.redact("RUNPOD_API_KEY=rpa_" + "A1b2C3d4" * 6 + " set"), "RUNPOD_API_KEY=[REDACTED] set",
+                         "a pod's key could reach the comment or the log")
+
+
 class TestDispatcher(unittest.TestCase):
     def test_a_step_that_exits_still_writes_its_outputs_with_env_as_parameters(self):
         seen = {}
