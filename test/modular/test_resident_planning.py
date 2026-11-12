@@ -275,6 +275,17 @@ def test_padding_rows_read_the_trash_row_and_leave_it_alone():
     assert int(live["pool"]._resident_table.view[TRASH_SLOT, 0]) == SINK_SLOT
 
 
+def test_a_resident_step_reads_its_rows_state_not_their_start():
+    """A replay leaves `has_state` as the capture marked it, every row without state, so `gather` would read starts."""
+    live, ref, planner = _setup({1: 3})
+    del ref
+    pool = live["pool"]
+    pool.block("state", 0)[pool._slots[1]["main"].index] = torch.tensor([7.0, 7.0])
+    for t in range(3):
+        _captured_step(live, planner, [1], slot=t % 2, bs=2)
+        assert pool.gather("state", 0, start=torch.ones(2))[0].tolist() == [7.0, 7.0], "the row would read its start"
+
+
 def test_a_mixed_step_leaves_the_next_decode_step_a_ready_row():
     live, ref, planner = _setup({1: 3})
     for t in range(3):

@@ -1279,6 +1279,10 @@ class RecurrentStatePool(Resource):
         table = self._resident_table
         # a padding row reads the trash row's zero, which is SINK_SLOT
         gather_column(self._resident.store, step.slots, table.stride, table.col, self._cg_addressing[key].slot_indices)
+        # A replay never writes `has_state`, which the capture left False on every row. A resident row reads its own
+        # slot, which holds zeros until its first write, as the default start does, so the capture's `gather` selects
+        # no start.
+        self._current[stream.label] = replace(self._current[stream.label], every_row_has_state=True)
 
     # Engine lifecycle
 
