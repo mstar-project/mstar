@@ -201,6 +201,16 @@ def test_a_bad_mask_or_op_is_refused_when_the_read_is_built(build, where):
     assert str(refused.value).startswith(where), f"the refusal should open with {where}: {refused.value}"
 
 
+@pytest.mark.parametrize("mask, uses_query_position, sees_step_whole", [
+    (Causal(), True, False), (Window(4), True, False), (Block(), False, True), (Bidirectional(), False, True),
+])
+def test_each_mask_says_whether_it_uses_the_query_position_and_sees_a_step_whole(
+    mask, uses_query_position, sees_step_whole,
+):
+    """`queries` takes a mask that uses no query position, and a regrouped walk refuses one that sees a step whole."""
+    assert (mask.uses_query_position, mask.sees_step_whole) == (uses_query_position, sees_step_whole)
+
+
 @dataclass(frozen=True)
 class _Decay(Op):
     """An update kernel the contract doesn't define yet, on a state of rank 3."""

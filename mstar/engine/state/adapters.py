@@ -565,7 +565,7 @@ class PagedAttend(OpBinding):
         )]
 
     def steps(self, key: str, read: Read, declared: ArrayStep, segments, steps: dict[str, Any]) -> None:
-        steps[key] = AttentionStep(segments=segments, causal=not isinstance(read.mask, Bidirectional))
+        steps[key] = AttentionStep(segments=segments, causal=read.mask.uses_query_position)
 
     def attach(self, handle: "PagedArrayHandle", key: str, run: Any) -> None:
         handle.reads[key] = run

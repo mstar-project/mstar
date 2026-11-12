@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, get_origin
 
 import torch
 
-from mstar.engine.state.contract import EMPTY, Array, Bidirectional, Block, Read, Sampler, read_layers
+from mstar.engine.state.contract import EMPTY, Array, Block, Read, Sampler, read_layers
 
 if TYPE_CHECKING:
     from mstar.model.base import Model
@@ -156,12 +156,12 @@ def _regrouping_problems(model: "Model", arrays: Sequence[Array]) -> list[str]:
           for node, policy in model.rebuild_policies().items() for walk in policy.walks),
     ]
     return [
-        f"Array {array.name!r}.reads[{key!r}]: {type(read.mask).__name__} on walk {walk!r}, which {cause}. A Block or "
-        f"Bidirectional read sees each step's adds as a whole, so {fix}"
+        f"Array {array.name!r}.reads[{key!r}]: {type(read.mask).__name__} on walk {walk!r}, which {cause}. "
+        f"{type(read.mask).__name__} sees each step's adds as a whole, so {fix}"
         for node, walk, cause, fix in regrouped
         for array in arrays if node in array.nodes
         for key, read in array.reads.items()
-        if isinstance(read.mask, Block | Bidirectional) and (read.walks is None or walk in read.walks)
+        if read.mask.sees_step_whole and (read.walks is None or walk in read.walks)
     ]
 
 
