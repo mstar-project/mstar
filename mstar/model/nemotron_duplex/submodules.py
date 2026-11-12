@@ -9,12 +9,13 @@ Nodes, and the state or resources each declares:
     nano_llm           nano_kv, mamba_state,      Nemotron-H hybrid Mamba-2 / attention / MLP (9B):
                        nano_sampler               the KV of the 4 attention layers, the conv and SSM
                                                   state of the 27 Mamba-2 layers, the text sampler
-    eartts_talker      talker_kv, talker_attn,    Gemma3 talker -> 31 RVQ codes per frame (two KV
-                       talker_pos, codec_state    labels per session, cond / uncond, in one plan),
-                                                  decoded in the same step to 80 ms of 22.05 kHz
-                                                  PCM against the call's codec stream state
+    eartts_talker      talker_kv, talker_prev,    Gemma3 talker -> 31 RVQ codes per frame (two KV
+                       codec_state                labels per session, cond / uncond, in one plan),
+                                                  from the previous frame's codes, decoded in the
+                                                  same step to 80 ms of 22.05 kHz PCM against the
+                                                  call's codec stream state
 
-Both autoregressive nodes keep their whole state in engine resources and capture
+Both autoregressive nodes keep their whole state in declared state and capture
 their decode step as a CUDA graph (the talker's with its codec decode). The
 encoder keeps a call's state in its bounded KV and two pools, and a live step
 (or its layer stack) replays a piecewise CUDA graph.
@@ -35,16 +36,8 @@ from mstar.engine.accelerator_graph_config import (
     AcceleratorGraphConfig,
     BatchedAcceleratorGraphConfig,
 )
-from mstar.engine.resources import (
-    AttentionStep,
-    KVStep,
-    PositionStep,
-    Segment,
-    SlotLease,
-    SubmoduleStep,
-)
-from mstar.engine.resources.recurrent import RecurrentStep
-from mstar.engine.state import ArrayStep, SampleStep, sample
+from mstar.engine.resources import SlotLease, SubmoduleStep
+from mstar.engine.state import ArrayStep, SampleStep, Segment, at_last_token, sample
 from mstar.model.nemotron_duplex.components.audio_codec import AudioCodec, CodecStreamAudio, CodecStreamState
 from mstar.model.nemotron_duplex.config import (
     CODEC_STATE,
@@ -52,10 +45,8 @@ from mstar.model.nemotron_duplex.config import (
     NANO_KV,
     NANO_SAMPLER,
     SESSION_BATCH_SIZES,
-    TALKER_ATTN,
-    TALKER_CFG_LABEL,
     TALKER_KV,
-    TALKER_POS,
+    TALKER_PREV,
     NemotronDuplexConfig,
 )
 from mstar.model.submodule_base import (
@@ -64,6 +55,7 @@ from mstar.model.submodule_base import (
     BatchedModelOutput,
     ModelInputsFromEngine,
 )
+from mstar.utils.h2d import to_device_nonblocking
 
 logger = logging.getLogger(__name__)
 
@@ -405,17 +397,17 @@ class EarTTSTalkerSubmodule(ARNodeSubmodule):
     """Gemma3 talker: one agent text token -> ``num_quantizers`` RVQ codes per
     session per frame, all live sessions in one backbone pass.
 
-    The talker's KV lives in the engine's paged KV pool under two labels per
-    request: ``main`` (text-conditioned stream) and ``uncond`` (null-conditioned
-    stream for classifier-free guidance), combined into one attention plan
-    whose rows are ``[cond rows; uncond rows]`` -- the order ``mog_head.infer``
-    expects. A session's first step prefills the 37 speaker warm-up positions
-    together with its first frame (38 tokens per label); every later step is
-    one token per label. The MoG / MaskGIT sampling is internal (not the
-    engine's categorical sampler); its noise is drawn per row, with the row's
-    own seeded generator, in ``preprocess`` -- so a session's speech does not
-    depend on its batch mates and the whole step is a CUDA graph replay for
-    all-decode batches.
+    The talker's KV is the ``TALKER_KV`` array under two labels per request:
+    ``main`` (text-conditioned stream) and ``uncond`` (null-conditioned stream
+    for classifier-free guidance), which a step over both plans as one
+    combined label whose rows are ``[cond rows; uncond rows]`` -- the order
+    ``mog_head.infer`` expects. A session's first step prefills the 37 speaker
+    warm-up positions together with its first frame (38 tokens per label);
+    every later step is one token per label. The MoG / MaskGIT sampling is
+    internal (not the engine's categorical sampler). Its noise at a session's
+    k-th step is row k of a memo that one generator, seeded as every session's
+    is, fills in step order, so a session's speech does not depend on its batch
+    mates and the whole step is a CUDA graph replay for all-decode batches.
 
     The same step decodes each session's new codes to its 80 ms of PCM
     (``codec_step``): the codec is causal, so the call's decoder stream state in
@@ -427,14 +419,13 @@ class EarTTSTalkerSubmodule(ARNodeSubmodule):
 
     disable_torch_compile = True
 
-    PREV_CODES_KEY = "talker_prev_codes"
-    GEN_KEY = "talker_gen"
     DECODE_KEY = "decode"            # the steady-state capture's bucket key (cg_key_info)
     SPEAKER = "Aria"
     DECODE_CAPTURE_BATCH_SIZES = SESSION_BATCH_SIZES
 
     def __init__(self, talker: nn.Module, config: NemotronDuplexConfig, codec: AudioCodec,
-                 subword_to_char: dict | None = None, char_pad_idx: int | None = None):
+                 subword_to_char: dict | None = None, char_pad_idx: int | None = None, noise_rows: int = 1):
+        """``noise_rows`` is the talker loop's cap plus one, the steps a session can take."""
         super().__init__()
         self.talker = talker
         self.codec = codec
@@ -442,6 +433,7 @@ class EarTTSTalkerSubmodule(ARNodeSubmodule):
         self._s2c = subword_to_char
         self._char_pad = char_pad_idx
         self._warmup: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
+        self.noise_rows = noise_rows
 
     # -- per-speaker constants -------------------------------------------
 
@@ -466,32 +458,43 @@ class EarTTSTalkerSubmodule(ARNodeSubmodule):
     def warmup_len(self) -> int:
         return self.talker.audio_prompt_latents[self.SPEAKER].shape[1]
 
-    def _generator(self, rid: str, device: torch.device) -> torch.Generator:
-        st = self.request_state(rid)
-        gen = st.get(self.GEN_KEY)
-        if gen is None:
-            gen = torch.Generator(device=device).manual_seed(self.config.eartts.inference_seed)
-            st.add(self.GEN_KEY, gen)
-        return gen
+    # -- state -----------------------------------------------------------
 
-    def _noise(self, gens: list[torch.Generator], device: torch.device) -> dict[str, torch.Tensor]:
-        """The step's sampling noise for N rows, drawn per row from each row's
-        generator: ``u`` for the Gumbel mixture pick and ``eps`` for the latent
-        noise, for every MaskGIT iteration at once (two draws per row, so a
-        64-session step costs 128 launches rather than ~900). A row's noise
-        depends only on its own generator, never on the batch around it.
-        Rows first: the engine's static-input buffers are narrowed along the
-        leading (batch) dim when a smaller batch replays a capture."""
+    def bind_state(self, handles: Mapping[str, Any]) -> None:
+        """Take the talker's handles, start every session's previous codes at the warm-up's, and allocate the noise
+        memo on the talker's device."""
+        self.talker_kv, self.prev, self.codec_state = handles[TALKER_KV], handles[TALKER_PREV], handles[CODEC_STATE]
+        self.prev.set_start({"codes": self.warmup()[2]})
         e = self.config.eartts
-        it = e.inference_num_iter
-        u = torch.stack([torch.rand((it, 1, e.mog_num_predictions), device=device, generator=g) for g in gens])
-        eps = torch.stack([torch.randn((it, 1, e.code_dim), device=device, generator=g) for g in gens])
-        return {"noise_u": u, "noise_eps": eps}
+        device = self.talker.embed_code.weight.device
+        self._noise_gen = torch.Generator(device=device).manual_seed(e.inference_seed)
+        self._noise_u = torch.empty(self.noise_rows, e.inference_num_iter, 1, e.mog_num_predictions, device=device)
+        self._noise_eps = torch.empty(self.noise_rows, e.inference_num_iter, 1, e.code_dim, device=device)
+        self._noise_filled = 0
+        logger.info("talker noise memo: %d rows, %d bytes", self.noise_rows,
+                    self._noise_u.nbytes + self._noise_eps.nbytes)
+
+    def _noise(self, steps: list[int], device: torch.device) -> dict[str, torch.Tensor]:
+        """Each row's sampling noise at its talker step ``steps[i]``: ``u`` for the
+        Gumbel mixture pick and ``eps`` for the latent noise, for every MaskGIT
+        iteration at once. Row k of the memo is what a session's own generator
+        draws at its k-th step, so the memo fills to the last step asked for, in
+        step order. Rows first: the engine's static-input buffers are narrowed
+        along the leading (batch) dim when a smaller batch replays a capture."""
+        last = max(steps)
+        if last >= self.noise_rows:
+            raise ValueError(f"talker step {last} has no noise row: the memo holds {self.noise_rows}, the talker "
+                             f"loop's cap of {self.noise_rows - 1} plus one")
+        e = self.config.eartts
+        it, gen = e.inference_num_iter, self._noise_gen
+        for k in range(self._noise_filled, last + 1):
+            self._noise_u[k] = torch.rand((it, 1, e.mog_num_predictions), device=device, generator=gen)
+            self._noise_eps[k] = torch.randn((it, 1, e.code_dim), device=device, generator=gen)
+        self._noise_filled = max(self._noise_filled, last + 1)
+        rows = to_device_nonblocking(steps, device)
+        return {"noise_u": self._noise_u.index_select(0, rows), "noise_eps": self._noise_eps.index_select(0, rows)}
 
     # -- engine contract -------------------------------------------------
-
-    def _is_first_step(self, rid: str) -> bool:
-        return self.request_state(rid).get(self.PREV_CODES_KEY) is None
 
     def cg_key_info(
         self, graph_walk: str, per_request_info: Mapping[str, Any], **kwargs: Any
@@ -500,9 +503,11 @@ class EarTTSTalkerSubmodule(ARNodeSubmodule):
         (``DECODE_KEY``) when every session is past its first step, None (run
         eager) when any session prefills its warm-up this step. The engine
         leases the slot before ``prepare_inputs`` runs, so this answers from
-        the request state, like ``declare_step`` does."""
+        the talker loop's count, as ``declare_step`` does."""
         del graph_walk
-        return None if any(self._is_first_step(rid) for rid in per_request_info) else self.DECODE_KEY
+        if any(not info.dynamic_loop_iter_counts.get("talker_decode_loop", 0) for info in per_request_info.values()):
+            return None
+        return self.DECODE_KEY
 
     def prepare_inputs(self, graph_walk, fwd_info, inputs, is_final_stream_chunk=False, **kwargs) -> ARNodeInputs:
         # The LLM streams the sampled agent text token under "new_token". A
@@ -517,11 +522,12 @@ class EarTTSTalkerSubmodule(ARNodeSubmodule):
             # the call's ``audio_end`` (see postprocess).
             dev = self.talker.embed_code.weight.device
             tok = torch.tensor([self.config.text_pad_id], dtype=torch.long, device=dev)
-        first = self._is_first_step(fwd_info.rid_handle)
+        step = fwd_info.dynamic_loop_iter_counts.get("talker_decode_loop", 0)
+        first = step == 0
         span = self.warmup_len + 1 if first else 1
         final = bool(is_final_stream_chunk)
         return ARNodeInputs(input_ids=tok, input_seq_len=span,
-                            kwargs={"first": first, "final": final, "ends_loop": final and not chunk})
+                            kwargs={"first": first, "final": final, "ends_loop": final and not chunk, "step": step})
 
     def declare_step(
         self,
@@ -539,18 +545,17 @@ class EarTTSTalkerSubmodule(ARNodeSubmodule):
             for label in ("main", "uncond")
             for rid, inp in zip(request_ids, inputs, strict=True)
         ]
+        # one frame of codes per session, a slot each
+        frames = tuple(Segment(request_id=rid, label="main", span=1) for rid in request_ids)
         return SubmoduleStep(
             segments=segments,
             # the same answer as cg_key_info(): a warm-up prefill in the batch
             # keeps the step off the fixed-shape decode capture
             cg_key_info=None if any(inp.kwargs.get("first") for inp in inputs) else self.DECODE_KEY,
-            steps={
-                TALKER_KV: KVStep(combined_labels={("main", "uncond"): TALKER_CFG_LABEL}),
-                TALKER_ATTN: AttentionStep(causal=True),
-                TALKER_POS: PositionStep(),
-                # one decoded frame per session, a slot each
-                CODEC_STATE: RecurrentStep(segments=tuple(
-                    Segment(request_id=rid, label="main", span=1) for rid in request_ids)),
+            state={
+                TALKER_KV: ArrayStep(),
+                TALKER_PREV: ArrayStep(segments=frames),
+                CODEC_STATE: ArrayStep(segments=frames),
             },
         )
 
@@ -569,7 +574,7 @@ class EarTTSTalkerSubmodule(ARNodeSubmodule):
                 capture_graph_walk="talker_decode",
                 single_request_inputs=ARNodeInputs(
                     input_ids=torch.tensor([self.config.text_pad_id], dtype=torch.long, device=device),
-                    input_seq_len=1, kwargs={"first": False},
+                    input_seq_len=1, kwargs={"first": False, "step": 0},
                 ),
                 capture_batch_sizes=self.DECODE_CAPTURE_BATCH_SIZES,
                 # each request commits one token on each of its two labels
@@ -582,7 +587,6 @@ class EarTTSTalkerSubmodule(ARNodeSubmodule):
     def preprocess(self, graph_walk, engine_inputs, inputs):
         cfg, talker = self.config, self.talker
         dev = talker.embed_code.weight.device
-        rids = list(engine_inputs.request_ids)
         ids = torch.cat([inp.input_ids.reshape(-1)[:1] for inp in inputs]).to(dev)
         # One D2H read per step for the host-built char conditioning. It waits for
         # the queued kernels, but the alternatives were worse: a side-stream read
@@ -591,12 +595,9 @@ class EarTTSTalkerSubmodule(ARNodeSubmodule):
         # turn-taking on some clips.
         tokens = ids.tolist()
         firsts = [bool(inp.kwargs.get("first", False)) for inp in inputs]
-        warm_c, warm_u, warm_prev = self.warmup()
-        prev_codes = torch.stack([
-            warm_prev if first or self.request_state(rid).get(self.PREV_CODES_KEY) is None
-            else self.request_state(rid)[self.PREV_CODES_KEY].reshape(-1)
-            for rid, first in zip(rids, firsts, strict=True)
-        ])                                                              # [N, Q]
+        warm_c, warm_u, _ = self.warmup()
+        # a session's first step reads the warm-up's codes, the start `bind_state` sets
+        prev_codes = self.prev.read(0).fields["codes"]                   # [N, Q]
         conds = talker.text_conditioning_from_ids(tokens, self._s2c, self._char_pad)   # [N, 1, H]
         frame_c, frame_u = talker.frame_inputs(prev_codes, conds, ids, cfg.text_eos_id)  # [N, H] each
         if any(firsts):
@@ -606,31 +607,31 @@ class EarTTSTalkerSubmodule(ARNodeSubmodule):
             x = torch.cat(rows_c + rows_u)                              # [total_tokens, H], label-major
         else:
             x = torch.cat([frame_c, frame_u])                           # [2N, H]
-        gens = [self._generator(rid, dev) for rid in rids]
-        return {"x": x, "spans": [inp.input_seq_len for inp in inputs], **self._noise(gens, dev)}
+        noise = self._noise([inp.kwargs["step"] for inp in inputs], dev)
+        return {"x": x, "spans": [inp.input_seq_len for inp in inputs], **noise}
 
     def forward_batched(self, graph_walk, engine_inputs, x=None, spans=None, noise_u=None, noise_eps=None,
                         **kwargs) -> BatchedModelOutput:
         e = self.config.eartts
-        rids = list(engine_inputs.request_ids)
-        n = len(rids)
-        hidden = self.talker.backbone_pooled(x, TALKER_CFG_LABEL)         # [total_tokens, H]
+        n = len(engine_inputs.request_ids)
+        hidden = self.talker.backbone_pooled(x)                           # [total_tokens, H]
         if all(s == 1 for s in spans):
             last = hidden                                                 # [2N, H]: cond rows, uncond rows
         else:
-            last = engine_inputs.resources[TALKER_ATTN].select_last_hidden(hidden, label=TALKER_CFG_LABEL)
+            last = at_last_token(self.talker_kv, hidden)
         noise = [(noise_u[:, i], noise_eps[:, i]) for i in range(e.inference_num_iter)]
         codes = self.talker.generate_step(
             last[:n].unsqueeze(1), hidden_uncond=last[n:].unsqueeze(1),
             num_iter=e.inference_num_iter, guidance_scale=e.inference_guidance_scale,
             noise_scale=e.inference_noise_scale, top_p=e.inference_top_p, noise=noise,
         ).squeeze(1)                                                      # [N, Q]
-        pool = engine_inputs.resources[CODEC_STATE]
-        audio = codec_step(self.codec, pool, codes.unsqueeze(1))
+        # the next frame's prev_codes
+        self.prev.write(0, codes=codes)
+        audio = codec_step(self.codec, self.codec_state, codes.unsqueeze(1))
         # One copy out of the graph per name, a row view per request. Nothing
         # for check_stop, the stream's end stops the loop.
         return BatchedModelOutput(row_outputs={
-            "codec_tokens": codes,                                        # the next frame's prev_codes
+            "codec_tokens": codes,
             "audio_chunk": pcm16(audio.final),                            # [N, wav_to_token_ratio]
             # a call's last samples, had it ended before / after this frame
             "audio_end": pcm16(torch.cat([audio.end_before, audio.end_after], dim=1)),
@@ -652,10 +653,6 @@ class EarTTSTalkerSubmodule(ARNodeSubmodule):
             if end and not flags.get("first"):
                 outputs["audio_chunk"] = [end[0][..., :self.codec.stream_edge]]
             return
-        # This frame's codes are the next frame's ``prev_codes`` (metadata only:
-        # the tensor is already a copy out of the graph's output buffer).
-        if "codec_tokens" in outputs:
-            self.request_state(request_id).add(self.PREV_CODES_KEY, outputs["codec_tokens"][0])
         if "audio_chunk" in outputs and (flags.get("first") or flags.get("final")):
             # the full decode trims the overlap-add's left edge, and ends on the
             # samples after the last frame's final ones
@@ -667,24 +664,25 @@ class EarTTSTalkerSubmodule(ARNodeSubmodule):
             outputs["audio_chunk"] = [pcm]
 
 
-def codec_step(codec: AudioCodec, pool, codes: torch.Tensor) -> CodecStreamAudio:
+def codec_step(codec: AudioCodec, state: Any, codes: torch.Tensor) -> CodecStreamAudio:
     """Decode each row's next code frames ``[B, T, num_quantizers]`` against its
-    stream state in ``pool`` (``CODEC_STATE``, at the step's rows):
-    gather the state, decode only the new frames, scatter the state back. A
-    fresh slot is zeros, the decoder's causal padding, so a call's first frame
-    needs nothing else. Fixed-shape, so a graph captures it."""
+    stream state, the ``CODEC_STATE`` Value under the handle ``state``: read the
+    entry, decode only the new frames, write the entry back. A fresh slot is
+    zeros, the decoder's causal padding, so a call's first frame needs nothing
+    else. Fixed-shape, so a graph captures it."""
     blocks = codec.config.num_blocks
     stages = len(codec.config.channels)
     with torch.autocast(device_type=codes.device.type, enabled=False):
-        state = CodecStreamState(
-            tails=[t for i in range(stages) for t in pool.gather(f"stage{i}").unbind(1)],
-            overlap=pool.gather("overlap"),
+        entry = state.read(0).fields
+        stream = CodecStreamState(
+            tails=[t for i in range(stages) for t in entry[f"stage{i}"].unbind(1)],
+            overlap=entry["overlap"],
         )
-        audio, state = codec.decode_stream(codes, state)
-        for i in range(stages):
-            tails = torch.stack(state.tails[i * blocks:(i + 1) * blocks], dim=1)
-            pool.scatter_(f"stage{i}", tails.to(pool.block(f"stage{i}", 0).dtype))
-        pool.scatter_("overlap", state.overlap)
+        audio, stream = codec.decode_stream(codes, stream)
+        state.write(0, overlap=stream.overlap, **{
+            f"stage{i}": torch.stack(stream.tails[i * blocks:(i + 1) * blocks], dim=1).to(entry[f"stage{i}"].dtype)
+            for i in range(stages)
+        })
     return audio
 
 

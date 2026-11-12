@@ -38,7 +38,7 @@ from mstar.model.nemotron_duplex.config import (
     NANO_SAMPLER,
     TALKER_ATTN,
     TALKER_KV,
-    TALKER_POS,
+    TALKER_PREV,
     NemotronDuplexConfig,
 )
 from mstar.model.nemotron_duplex.nemotron_duplex_model import NemotronDuplexModel
@@ -48,6 +48,7 @@ from mstar.streaming.topology import client_stream_limits
 from mstar.validation.client_streams import check_client_streams
 
 CONFIG_PATH = Path(__file__).resolve().parents[2] / "configs" / "nemotron_duplex.yaml"
+TALKER_POS = "talker_pos"   # the key `position_key` gives the talker KV's positions
 
 WALKS = {"encode", "decode", "talker_decode"}
 NODES = {"conformer_encoder", "nano_llm", "eartts_talker"}
@@ -85,7 +86,7 @@ def test_duplex_node_resources():
     by_key = resolve_spec_dependencies(specs)          # unique keys, dependencies satisfied
     assert set(by_key) == {CODEC_STATE, ENCODER_FRONT, ENCODER_STATE, ENCODER_KV, NANO_KV, NANO_ATTN,
                            MAMBA_STATE, MAMBA,
-                           NANO_SAMPLER, TALKER_KV, TALKER_ATTN, TALKER_POS}
+                           NANO_SAMPLER, TALKER_KV, TALKER_ATTN, TALKER_POS, TALKER_PREV}
     nano_keys = {NANO_KV, NANO_ATTN, MAMBA_STATE, MAMBA, NANO_SAMPLER}
     node = {**dict.fromkeys((ENCODER_STATE, ENCODER_FRONT, ENCODER_KV), {"conformer_encoder"}),
             **dict.fromkeys(nano_keys, {"nano_llm"})}
@@ -167,8 +168,8 @@ def test_duplex_shipped_configs_turn_websocket_deflate_off():
         assert yaml.safe_load((CONFIG_PATH.parent / name).read_text())["ws_per_message_deflate"] is False
 
 
-@pytest.mark.parametrize("key", [MAMBA_STATE, ENCODER_STATE, ENCODER_FRONT, CODEC_STATE, ENCODER_KV, TALKER_KV,
-                                 NANO_KV])
+@pytest.mark.parametrize("key", [MAMBA_STATE, ENCODER_STATE, ENCODER_FRONT, CODEC_STATE, TALKER_PREV, ENCODER_KV,
+                                 TALKER_KV, NANO_KV])
 def test_duplex_refuses_a_session_cap_one_per_session_resource_cannot_hold(key):
     """Every session holds a slot in each recurrent pool and its nano and talker
     pages from start to end; a session past any of them waits on admit until
@@ -176,7 +177,7 @@ def test_duplex_refuses_a_session_cap_one_per_session_resource_cannot_hold(key):
     that misses one is refused at startup, naming it."""
     model = _make_model()
     resources = {MAMBA_STATE: {"max_slots": 49}, ENCODER_STATE: {"max_slots": 49},
-                 ENCODER_FRONT: {"max_slots": 49}, CODEC_STATE: {"max_slots": 49},
+                 ENCODER_FRONT: {"max_slots": 49}, CODEC_STATE: {"max_slots": 49}, TALKER_PREV: {"max_slots": 49},
                  ENCODER_KV: {"max_slots": 48},
                  TALKER_KV: {"max_num_pages": model.talker_kv_pages(128, 48)},
                  NANO_KV: {"max_num_pages": model.nano_kv_pages(128, 48)}}
@@ -332,14 +333,9 @@ def test_duplex_refuses_a_featurizer_it_does_not_run(tmp_path, key, value):
         NemotronDuplexConfig.from_pretrained(str(tmp_path))
 
 
-def test_duplex_talker_builds_its_codec_from_the_checkpoint(monkeypatch):
-    """The talker decodes its own codes, with the checkpoint's codec (its
-    codebooks per frame, here) and the checkpoint's talker config, which emits
-    that many."""
+def _talker_from(monkeypatch, ckpt: NemotronDuplexConfig):
     import mstar.model.nemotron_duplex.components.eartts_talker as et
 
-    ckpt = NemotronDuplexConfig()
-    ckpt.eartts.num_quantizers = ckpt.codec.num_quantizers = 8
     _stub_checkpoint(monkeypatch, ckpt)
     model = _make_model()
     model.model_path_hf, model.cache_dir = "unused", None
@@ -347,8 +343,25 @@ def test_duplex_talker_builds_its_codec_from_the_checkpoint(monkeypatch):
     monkeypatch.setattr(NemotronDuplexModel, "_talker_tokenizer", lambda self: None)
     monkeypatch.setattr(et, "build_char_vocab", lambda tok: [])
     monkeypatch.setattr(et, "subword_to_char_ids", lambda tok, cv: ({}, None))
-    talker = model.get_submodule("eartts_talker", device="cpu")
-    assert talker.config.eartts.num_quantizers == 8 and len(talker.codec.prvq.mus_list) == 8
+    return model.get_submodule("eartts_talker", device="cpu")
+
+
+def test_duplex_talker_builds_its_codec_from_the_checkpoint(monkeypatch):
+    """The talker decodes its own codes, with the checkpoint's codec (its
+    codebooks' size, here) and the checkpoint's talker config, which samples
+    from that many entries."""
+    ckpt = NemotronDuplexConfig()
+    ckpt.eartts.codebook_size = ckpt.codec.codebook_size = 512
+    talker = _talker_from(monkeypatch, ckpt)
+    assert talker.config.eartts.codebook_size == 512 and talker.codec.prvq.mus_list[0].shape[0] == 512
+
+
+def test_a_checkpoint_whose_talker_emits_other_codebooks_is_refused(monkeypatch):
+    """The talker's previous codes are declared state, one per codebook, sized before the checkpoint is read."""
+    ckpt = NemotronDuplexConfig()
+    ckpt.eartts.num_quantizers = ckpt.codec.num_quantizers = 8
+    with pytest.raises(ValueError, match=f"config.json sizes resources.{TALKER_PREV}"):
+        _talker_from(monkeypatch, ckpt)
 
 
 def test_duplex_request_resource_configs():

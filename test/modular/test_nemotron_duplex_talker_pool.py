@@ -1,8 +1,8 @@
 """The talker on the engine's KV pool: the step declares both streams of every
 session as segments of one combined plan, a session's first step prefills the
-speaker warm-up with its first frame, the sampling noise is drawn per row ahead
-of the (captured) forward and reproduces the generator-driven sampling, and the
-MaskGIT schedule is computed on the host. Tiny random weights, CPU."""
+speaker warm-up with its first frame, the sampling noise is gathered per row
+ahead of the (captured) forward and reproduces the generator-driven sampling,
+and the MaskGIT schedule is computed on the host. Tiny random weights, CPU."""
 from types import SimpleNamespace
 
 import pytest
@@ -11,20 +11,19 @@ from test_kv_prefix_lease import _StubTransfer
 from test_nemotron_duplex_codec import tiny_codec
 from test_nemotron_duplex_talker_batch import CHAR_PAD, S2C, TINY, make_talker
 
-from mstar.engine.resources import AttentionStep, KVStep, PositionStep, StepRunner
+from mstar.engine.resources import StepRunner
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.config import DEFAULT_PAGE_SIZE, KVReqConfig, PagedKVConfig
 from mstar.engine.resources.kv.manager import KVManager
-from mstar.engine.resources.recurrent import RecurrentStep
+from mstar.engine.state import ArrayStep, Segment
 from mstar.engine.state.adapters import kv_layouts
+from mstar.model.nemotron_duplex import submodules
 from mstar.model.nemotron_duplex.components.eartts_talker import _rand_rows, maskgit_schedule
 from mstar.model.nemotron_duplex.config import (
     CODEC_STATE,
     NANO_KV,
-    TALKER_ATTN,
-    TALKER_CFG_LABEL,
     TALKER_KV,
-    TALKER_POS,
+    TALKER_PREV,
     NemotronDuplexConfig,
 )
 from mstar.model.nemotron_duplex.nemotron_duplex_model import NemotronDuplexModel
@@ -33,15 +32,36 @@ from mstar.model.nemotron_duplex.submodules import EarTTSTalkerSubmodule
 P = 37   # speaker warm-up positions
 
 
-def fwd(handle: str) -> SimpleNamespace:
-    """The engine keys request state by the worker-local handle, not the wire id."""
-    return SimpleNamespace(rid_handle=handle, request_id=f"wire-{handle}")
+def fwd(handle: str, step: int = 0) -> SimpleNamespace:
+    """A row at its talker loop's ``step``. The engine keys request state by the worker-local handle, not the wire
+    id."""
+    return SimpleNamespace(rid_handle=handle, request_id=f"wire-{handle}",
+                           dynamic_loop_iter_counts={"talker_decode_loop": step})
+
+
+class _StubPrev:
+    """A TALKER_PREV handle whose rows read the start, as rows with nothing written do, and that keeps a write."""
+
+    def __init__(self):
+        self.rows, self.written = 1, None
+
+    def set_start(self, start):
+        self.start = start["codes"]
+
+    def read(self, layer):
+        return SimpleNamespace(fields={"codes": self.start.expand(self.rows, -1)})
+
+    def write(self, layer, codes):
+        self.written = codes
 
 
 def make_sub() -> EarTTSTalkerSubmodule:
     cfg = NemotronDuplexConfig()
     cfg.eartts = TINY
-    return EarTTSTalkerSubmodule(make_talker(), cfg, codec=tiny_codec(), subword_to_char=S2C, char_pad_idx=CHAR_PAD)
+    sub = EarTTSTalkerSubmodule(make_talker(), cfg, codec=tiny_codec(), subword_to_char=S2C, char_pad_idx=CHAR_PAD,
+                                noise_rows=8)
+    sub.bind_state({TALKER_KV: None, TALKER_PREV: _StubPrev(), CODEC_STATE: None})
+    return sub
 
 
 def test_maskgit_schedule_matches_the_reference_formula():
@@ -119,10 +139,8 @@ def test_each_step_emits_its_frame_and_the_last_the_calls_right_edge(final, toke
     after it."""
     sub = make_sub()
     edge = sub.codec.stream_edge
-    if not first:
-        sub.request_state("a").add(sub.PREV_CODES_KEY, torch.zeros(TINY.num_quantizers, dtype=torch.long))
     inputs = {"new_token": [torch.tensor([5])] if token else []}
-    ni = sub.prepare_inputs("talker_decode", fwd("a"), inputs, is_final_stream_chunk=final)
+    ni = sub.prepare_inputs("talker_decode", fwd("a", 0 if first else 1), inputs, is_final_stream_chunk=final)
     frame = torch.arange(100, dtype=torch.int16).view(1, -1)
     end = torch.arange(-1, -2 * edge - 1, -1, dtype=torch.int16).view(1, -1)        # before | after
     out = {"codec_tokens": [torch.arange(TINY.num_quantizers)], "audio_chunk": [frame], "audio_end": [end]}
@@ -144,33 +162,27 @@ def test_step_declares_both_streams_in_one_combined_plan():
     sub = make_sub()
     # first step of "a" (warm-up + frame), steady state for "b"
     first = sub.prepare_inputs("talker_decode", fwd("a"), {"new_token": [torch.tensor([5])]})
-    sub.request_state("b").add(sub.PREV_CODES_KEY, torch.zeros(TINY.num_quantizers, dtype=torch.long))
-    later = sub.prepare_inputs("talker_decode", fwd("b"), {"new_token": [torch.tensor([7])]})
+    later = sub.prepare_inputs("talker_decode", fwd("b", 3), {"new_token": [torch.tensor([7])]})
     assert first.input_seq_len == P + 1 and first.kwargs["first"] is True
     assert later.input_seq_len == 1 and later.kwargs["first"] is False
     step = sub.declare_step("talker_decode", ["a", "b"], [first, later])
-    assert set(step.keys()) == {TALKER_KV, TALKER_ATTN, TALKER_POS, CODEC_STATE}
-    # one decoded frame per session, in its own codec stream slot
-    codec = step.get(CODEC_STATE)
-    assert isinstance(codec, RecurrentStep)
-    assert [(s.request_id, s.label, s.span) for s in codec.segments] == [("a", "main", 1), ("b", "main", 1)]
-    kv = step.get(TALKER_KV)
-    assert isinstance(kv, KVStep) and kv.combined_labels == {("main", "uncond"): TALKER_CFG_LABEL}
-    assert isinstance(step.get(TALKER_ATTN), AttentionStep) and step.get(TALKER_ATTN).causal
-    assert isinstance(step.get(TALKER_POS), PositionStep)
+    # one frame of codes and one decoded frame per session, each in its own slot
+    frames = (Segment("a", "main", 1), Segment("b", "main", 1))
+    assert step.state == {TALKER_KV: ArrayStep(), TALKER_PREV: ArrayStep(segments=frames),
+                          CODEC_STATE: ArrayStep(segments=frames)}
     # label-major: every request's cond segment, then every request's uncond segment
     assert [(s.request_id, s.label, s.span) for s in step.segments] == [
         ("a", "main", P + 1), ("b", "main", 1), ("a", "uncond", P + 1), ("b", "uncond", 1),
     ]
 
 
-def test_preprocess_packs_rows_label_major_and_draws_noise_per_row():
+def test_preprocess_packs_rows_label_major_and_gathers_noise_per_row():
     sub = make_sub()
     e = TINY
-    sub.request_state("b").add(sub.PREV_CODES_KEY, torch.zeros(e.num_quantizers, dtype=torch.long))
+    sub.prev.rows = 2
     inputs = [
         sub.prepare_inputs("talker_decode", fwd("a"), {"new_token": [torch.tensor([5])]}),
-        sub.prepare_inputs("talker_decode", fwd("b"), {"new_token": [torch.tensor([7])]}),
+        sub.prepare_inputs("talker_decode", fwd("b", 3), {"new_token": [torch.tensor([7])]}),
     ]
     eng = SimpleNamespace(request_ids=["a", "b"], resources={}, per_request_states=None)
     pre = sub.preprocess("talker_decode", eng, inputs)
@@ -180,7 +192,8 @@ def test_preprocess_packs_rows_label_major_and_draws_noise_per_row():
     assert pre["noise_u"].shape == (2, e.inference_num_iter, 1, e.mog_num_predictions)   # rows first
     assert pre["noise_eps"].shape == (2, e.inference_num_iter, 1, e.code_dim)
     # a steady-state batch is exactly two rows per session
-    inputs2 = [sub.prepare_inputs("talker_decode", fwd("b"), {"new_token": [torch.tensor([7])]})]
+    sub.prev.rows = 1
+    inputs2 = [sub.prepare_inputs("talker_decode", fwd("b", 4), {"new_token": [torch.tensor([7])]})]
     pre2 = sub.preprocess("talker_decode", SimpleNamespace(request_ids=["b"], resources={}, per_request_states=None),
                           inputs2)
     assert pre2["x"].shape == (2, e.hidden_size) and pre2["spans"] == [1]
@@ -193,24 +206,34 @@ def test_decode_capture_config_commits_two_labels_per_row():
     assert cfgs[0].total_tokens_multiplier == 2 and cfgs[0].compile is False
     assert cfgs[0].single_request_inputs.input_seq_len == 1
     assert cfgs[0].single_request_inputs.kwargs["first"] is False
+    assert cfgs[0].single_request_inputs.kwargs["step"] == 0, "a capture's template rows take the memo's row 0"
 
 
-def test_postprocess_carries_the_codes_into_the_next_frame():
+def test_the_forward_writes_the_codes_the_next_frame_reads(monkeypatch):
+    """The codes a step samples are its row's next ``prev_codes``, written to TALKER_PREV in the forward, which a
+    capture replays with the step."""
     sub = make_sub()
-    codes = torch.arange(TINY.num_quantizers)
-    sub.postprocess("a", None, {"codec_tokens": [codes]})
-    torch.testing.assert_close(sub.request_state("a")[sub.PREV_CODES_KEY], codes)
+    e, codes = TINY, torch.arange(TINY.num_quantizers).view(1, -1)
+    sub.talker.backbone_pooled = lambda x: x
+    sub.talker.generate_step = lambda hidden, **kwargs: codes.unsqueeze(1)
+    pcm = torch.zeros(1, 4)
+    monkeypatch.setattr(submodules, "codec_step", lambda codec, state, frames: SimpleNamespace(
+        final=pcm, end_before=pcm, end_after=pcm))
+    sub.forward_batched("talker_decode", SimpleNamespace(request_ids=["a"]), x=torch.zeros(2, e.hidden_size),
+                        spans=[1], noise_u=torch.zeros(1, e.inference_num_iter, 1, e.mog_num_predictions),
+                        noise_eps=torch.zeros(1, e.inference_num_iter, 1, e.code_dim))
+    assert torch.equal(sub.prev.written, codes), "the step's codes reach the next frame through TALKER_PREV"
 
 
 class _DenseAttend:
-    """Stands in for the engine's planned attention over this step's packed
-    tokens: one causal sequence, FlashInfer's default scale (the declared head
-    dim ** -0.5). Records what the layer handed it."""
+    """Stands in for the talker's KV handle: an add and a read over this step's
+    packed tokens, one causal sequence, FlashInfer's default scale (the
+    declared head dim ** -0.5). Records what the layer handed it."""
 
     def __init__(self):
         self.seen = None
 
-    def __call__(self, q, k, v):
+    def _add_read(self, layer, q, *, keep, k, v):
         self.seen = (q, k, v)
         n, d = q.shape[0], q.shape[-1]
         s = torch.einsum("qhd,khd->hqk", q.float(), k.float()) * d ** -0.5
@@ -228,17 +251,17 @@ def test_forward_pooled_pads_qkv_to_the_kv_head_dim_exactly(kv_head_dim):
 
     torch.manual_seed(0)
     cfg = dataclasses.replace(TINY, kv_head_dim=kv_head_dim)
-    attn = _Attn(cfg, qk_norm=True)
+    attn = _Attn(cfg, qk_norm=True, layer=0)
     for p in attn.parameters():
         p.data.normal_(0, 0.3)
-    attn.attend = _DenseAttend()
+    attn.state = _DenseAttend()
     n = 5
     x = torch.randn(n, cfg.hidden_size)
     cos, sin = _rope_cos_sin(torch.arange(n), cfg.rope_theta_local, cfg.head_dim)
 
     pooled = attn.forward_pooled(x, cos, sin)
 
-    q, k, v = attn.attend.seen
+    q, k, v = attn.state.seen
     assert q.shape == k.shape == v.shape == (n, cfg.num_attention_heads, kv_head_dim)
     for t in (q, k, v):
         assert torch.equal(t[..., cfg.head_dim:], torch.zeros_like(t[..., cfg.head_dim:]))
@@ -252,8 +275,7 @@ def test_warmup_steps_run_eager_and_steady_state_steps_hit_the_decode_capture():
     eager. cg_key_info() (asked before prepare_inputs) and declare_step() must
     agree, and both must name the key the capture config was captured under."""
     sub = make_sub()
-    sub.request_state("b").add(sub.PREV_CODES_KEY, torch.zeros(TINY.num_quantizers, dtype=torch.long))
-    infos = {"a": fwd("a"), "b": fwd("b")}
+    infos = {"a": fwd("a"), "b": fwd("b", 1)}
     first = sub.prepare_inputs("talker_decode", infos["a"], {"new_token": [torch.tensor([5])]})
     later = sub.prepare_inputs("talker_decode", infos["b"], {"new_token": [torch.tensor([7])]})
 

@@ -1509,16 +1509,18 @@ Nemotron VoiceChat (``nemotron_duplex``) notes
   a step, their widest CUDA graph; more are split over several steps rather
   than run eagerly.
 - ``eartts_talker`` advances every live session in one backbone pass per frame
-  through the engine's paged KV (``talker_kv`` / ``talker_attn`` /
-  ``talker_pos``): each session owns two streams, the conditional and the
+  through the engine's paged KV (``talker_kv``): each session owns two
+  streams, the conditional and the
   unconditional CFG context, planned together under one combined label, so a
   step is one packed batch of two tokens per session (a session's first step
   prefills its 38-token speaker/text warm-up instead). The pool's head dim is
   128: FlashInfer computes 64/128/256 exactly and returns wrong values for the
   talker's 72, so q/k/v are zero-padded (exact) and RoPE is applied in torch
-  from the positions the position resource planned. Sampling noise is drawn
-  per row from the request's seeded generator before the step, so a session's
-  speech does not depend on which other sessions share it. The per-frame step
+  from the step's positions. A session's sampling noise at its k-th talker
+  step is row k of a memo that one generator, seeded as every session's is,
+  fills in step order, so a session's speech does not depend on which other
+  sessions share it. The memo holds a row per step of the talker loop's cap,
+  about 0.61 MB per second of ``max_session_s`` (99 MB at 160 s). The per-frame step
   is captured as a CUDA graph for 1 to 32 sessions; a session's first step
   (its 38-token speaker warm-up) runs eager. The talker KV pool is 1025 pages
   of 128 positions (28 GiB): 32 sessions x 2 streams x 16 pages plus a sink
@@ -1632,7 +1634,7 @@ Nemotron VoiceChat (``nemotron_duplex``) notes
   talker (with its codec) on two ranks. Launch with ``--tensor-comm-protocol SHM`` on a
   single node. Text samples at ``temperature: 0.7, top_p: 0.9`` by default;
   send ``temperature: 0`` for greedy. The talker's mixture-of-Gaussians sampling
-  is stochastic by design and seeded per request.
+  is stochastic by design, and every session draws the same seeded noise.
 - Known limitation of the checkpoint: it often answers speech that is not
   addressed to it, such as a side conversation or background speech, where it
   should keep its turn (about half of such pairs on Full-Duplex-Bench v1.5).

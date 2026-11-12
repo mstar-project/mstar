@@ -6,14 +6,15 @@ A full-duplex speech-to-speech model with three nodes:
                         FastConformer); resources encoder_kv / encoder_state /
                         encoder_front
     nano_llm          — Nemotron-H hybrid Mamba-2/attn/MLP backbone (9B);
-                        resources nano_kv / nano_attn (4 attention layers),
-                        mamba_state / mamba (27 Mamba-2 layers), nano_sampler
+                        state nano_kv (4 attention layers), mamba_state (27
+                        Mamba-2 layers), nano_sampler
     eartts_talker     — Gemma3 talker → 31-codebook RVQ codes, decoded in the
-                        same step by the RVQ codec → 22.05 kHz PCM; resources
-                        talker_kv / talker_attn / talker_pos (two KV labels per
-                        session: the text-conditioned and the null-conditioned
-                        stream of classifier-free guidance), codec_state (each
-                        call's codec stream state)
+                        same step by the RVQ codec → 22.05 kHz PCM; state
+                        talker_kv (two KV labels per session: the
+                        text-conditioned and the null-conditioned stream of
+                        classifier-free guidance), talker_prev (each call's
+                        previous codes), codec_state (each call's codec stream
+                        state)
 
 Full-duplex: the model consumes user speech continuously and emits agent text +
 agent speech as it generates, frame-synchronously in one backbone, so it handles
@@ -30,11 +31,10 @@ The M* serving path is the walk graphs below: three async partitions
 (Encoder → LLM → Talker) joined by ``StreamingGraphEdge``s, with the nano
 decode loop consuming one encoder frame per step. The user's audio is a client
 stream into the Encoder, so a call can stream live over ``/generate/ws`` or
-``/v1/realtime``; a one-shot upload is a stream of one chunk. ``get_node_resources`` declares
-the encoder's bounded KV (each call's attention window) and two recurrent-state
-pools (its conv tails, and its audio / mel tails), the nano's paged KV cache, attention, recurrent-state pool (Mamba-2
-conv + SSM slots), the Mamba-2 resource and the sampler, and the talker's paged
-KV cache, attention, positions and codec stream state. Both decode steps are
+``/v1/realtime``; a one-shot upload is a stream of one chunk. ``declare_state`` declares
+the nano's and the talker's state, and ``get_node_resources`` the encoder's
+bounded KV (each call's attention window) and two recurrent-state pools (its
+conv tails, and its audio / mel tails). Both decode steps are
 CUDA graphs (the talker's with its codec decode), and so is the encoder's live
 step (piecewise).
 
@@ -56,7 +56,7 @@ from mstar.conductor.request_info import PartitionDefinition
 from mstar.engine.resources import NodeResourceSpec, ResourceReqConfig
 from mstar.engine.resources.kv.bounded import BoundedKVSpec
 from mstar.engine.resources.kv.config import DEFAULT_PAGE_SIZE
-from mstar.engine.resources.recurrent import RecurrentStateConfig, RecurrentStateSpec
+from mstar.engine.resources.recurrent import RecurrentStateSpec
 from mstar.engine.state import (
     Array,
     Attend,
@@ -86,7 +86,7 @@ from mstar.model.base import (
 from mstar.model.components.audio_features import NemoLogMel
 from mstar.model.components.fastconformer_stream import stream_node_resources
 from mstar.model.multimodal import PromptPart
-from mstar.model.nemotron_duplex.components.audio_codec import codec_state_blocks
+from mstar.model.nemotron_duplex.components.audio_codec import codec_entry
 from mstar.model.nemotron_duplex.config import (
     AUDIO_IN,
     CODEC_STATE,
@@ -102,6 +102,7 @@ from mstar.model.nemotron_duplex.config import (
     SESSION_BATCH_SIZES,
     TALKER_ATTN,
     TALKER_KV,
+    TALKER_PREV,
     NemotronDuplexConfig,
     session_too_long,
 )
@@ -229,14 +230,13 @@ class NemotronDuplexModel(Model):
     # State and resources. nano_llm declares the KV of its attention layers,
     # every Mamba-2 layer's conv window and SSM state as one Value (a slot per
     # session), and the agent-text sampler (NoPE: no positions).
-    # eartts_talker: a paged KV over its 28 Gemma3 layers with attention and
-    # positions; each session holds two streams (labels ``main`` / ``uncond``)
-    # and RoPE runs over the full head dim with a per-layer theta the layer
-    # passes at call time. conformer_encoder: a bounded KV, each call's
-    # attention window, and two recurrent-state pools, its conv tails and its
-    # front end's audio / mel tails (one slot per session each). The talker also
-    # holds each call's codec stream state in a recurrent-state pool, codec_state
-    # (one slot per session).
+    # eartts_talker declares a paged KV over its 28 Gemma3 layers with a
+    # position counter; each session holds two streams (labels ``main`` /
+    # ``uncond``) and RoPE runs in torch over the full head dim with a per-layer
+    # theta. It also declares each call's previous codes and codec stream state
+    # as Values (a slot per session). conformer_encoder: a bounded KV, each
+    # call's attention window, and two recurrent-state pools, its conv tails and
+    # its front end's audio / mel tails (one slot per session each).
     # -------------------------------------------------------------------
 
     # Sessions resident at once (a slot each in mamba_state, ~137 MB in fp32 for
@@ -376,6 +376,9 @@ class NemotronDuplexModel(Model):
                 max_len=eartts.sliding_window + 512, labels=frozenset({"main", "uncond"}), positions=Positions(),
                 reads={TALKER_ATTN: Read(mask=Causal(), op=Attend(q_heads=eartts.num_attention_heads))},
             ),
+            Value(TALKER_PREV, nodes={"eartts_talker"}, layers={0},
+                  entry=Entry({"codes": TensorType((eartts.num_quantizers,), dtype=torch.long)})),
+            Value(CODEC_STATE, nodes={"eartts_talker"}, layers={0}, entry=codec_entry(self.config.codec)),
         ]
 
     def kernel_settings(self) -> dict[str, dict[str, int]]:
@@ -385,6 +388,8 @@ class NemotronDuplexModel(Model):
             # + 1 for the pool's sink slot, so DEFAULT_SESSIONS sessions fit
             MAMBA_STATE: {"max_slots": self.DEFAULT_SESSIONS + 1},
             TALKER_KV: {"max_num_pages": self.talker_kv_pages(DEFAULT_PAGE_SIZE)},
+            TALKER_PREV: {"max_slots": self.DEFAULT_SESSIONS + 1},
+            CODEC_STATE: {"max_slots": self.DEFAULT_SESSIONS + 1},
         }
 
     def get_node_resources(self) -> list[NodeResourceSpec]:
@@ -392,13 +397,6 @@ class NemotronDuplexModel(Model):
             *stream_node_resources(
                 self.config.stt.encoder, self.config.stt.hop_length, "conformer_encoder", self.DEFAULT_SESSIONS,
                 kv_key=ENCODER_KV, conv_key=ENCODER_STATE, front_key=ENCODER_FRONT,
-            ),
-            RecurrentStateSpec(
-                resource_key=CODEC_STATE, nodes={"eartts_talker"},
-                config=RecurrentStateConfig(
-                    num_layers=1, blocks=codec_state_blocks(self.config.codec),
-                    max_slots=self.DEFAULT_SESSIONS + 1,
-                ),
             ),
         ]
 
@@ -478,9 +476,8 @@ class NemotronDuplexModel(Model):
         # Talker: each streamed agent token -> RVQ codes -> that frame's PCM, to
         # the client. The codec decodes in the talker's step (no stream hop, no
         # step of its own), against each call's stream state in codec_state.
-        # No speculative scheduling here. The talker keeps the previous frame's
-        # codes in per-request state written by postprocess, so a step built
-        # while the previous one is still running would read the wrong frame.
+        # No speculative scheduling here: whether a speculated talker step pays
+        # is unmeasured.
         talker_decode = Loop(
             name="talker_decode_loop",
             section=GraphNode(
@@ -1027,6 +1024,7 @@ class NemotronDuplexModel(Model):
         # checkpoint config, so the talker samples with its inference_* knobs
         submodule = EarTTSTalkerSubmodule(
             talker=talker, config=cfg, codec=codec, subword_to_char=s2c, char_pad_idx=len(cv),
+            noise_rows=self.get_max_output_tokens() + 1,
         )
         assert submodule.warmup_len == self.TALKER_WARMUP_POSITIONS, (
             f"the checkpoint's speaker warm-up is {submodule.warmup_len} positions, "
