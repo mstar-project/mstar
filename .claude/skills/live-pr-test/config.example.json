@@ -32,5 +32,9 @@
     "shm": "64Gi",
     "run_secret_id": "",
     "cache_volume_ids": []
+  },
+  "digitalocean": {
+    "hf_home": "/workspace/hf",
+    "run_secret_env": ""
   }
 }
