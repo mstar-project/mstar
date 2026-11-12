@@ -169,13 +169,13 @@ def test_vae_pixels_are_the_image_processors_to_the_bit_and_layout():
     image_processor = pytest.importorskip("diffusers.image_processor")
     from PIL import Image
 
-    from mstar.model.components.diffusion.image_io import vae_pixels
+    from mstar.model.components.diffusion.image_io import unit_pixels, vae_pixels
 
     rgba = _image(96, 64)
     pil = Image.fromarray(rgba.permute(1, 2, 0).numpy(), mode="RGBA")
     ref = image_processor.VaeImageProcessor(vae_scale_factor=16, vae_latent_channels=64).preprocess(
         pil, height=64, width=96).unsqueeze(2)
-    ours = vae_pixels(rgba)
+    ours = vae_pixels(unit_pixels(rgba))
     assert torch.equal(ours, ref) and ours.stride() == ref.stride()
 
 

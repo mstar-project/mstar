@@ -8,10 +8,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
-# What a download without allow_patterns skips: weights in formats mstar never loads (mstar loads
-# safetensors), and training state. Every small file (README, processor files, assets) is kept: an offline
-# snapshot_download refuses a cached snapshot missing any file its patterns select, so a narrow allow list
-# breaks later loads that ask for more.
+# What a download without allow_patterns skips, by file name, not size: weights in formats mstar never loads
+# (mstar loads safetensors), and training state. Every file not matching these patterns is kept (README,
+# processor files, assets): an offline snapshot_download refuses a cached snapshot missing any file its patterns
+# select, so a narrow allow list breaks later loads that ask for more. A model whose assets match one (a .pt
+# speaker embedding, say) passes allow_patterns.
 UNSERVED_FILES = ["*.bin", "*.pt", "*.pth", "*.msgpack", "*.h5", "*.ot", "*.onnx_data", "optimizer*"]
 
 

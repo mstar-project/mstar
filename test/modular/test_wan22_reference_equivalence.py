@@ -43,6 +43,7 @@ import torch
 sys.path.insert(0, ".")
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.model.components.diffusion.guidance import GUIDANCE_SCALE, cfg
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeSubmodule
 from mstar.model.wan22.submodules import (
     DENOISE_LOOP_NAME,
@@ -439,18 +440,16 @@ def test_unipc_port_matches_reference_scheduler_bitwise(t2v_trajectory):
 # ---------------------------------------------------------------------------
 
 
-def _sequential_noise_prediction(self, model_input, temp_ts, text_embeds_pos, text_embeds_neg, guidance_scale):
-    """Reference CFG semantics: two batch-1 forwards + the same combine."""
-    timestep = temp_ts.unsqueeze(0).expand(1, -1)
-    cond = self.transformer(
-        hidden_states=model_input, timestep=timestep,
-        encoder_hidden_states=text_embeds_pos.to(self.transformer.dtype),
-    )
-    uncond = self.transformer(
-        hidden_states=model_input, timestep=timestep,
-        encoder_hidden_states=text_embeds_neg.to(self.transformer.dtype),
-    )
-    return uncond + guidance_scale * (cond - uncond)
+def _sequential_noise_prediction(self, hidden_states, timestep, encoder_hidden_states):
+    """Reference CFG semantics: one batch-1 forward per row (each request's cond and uncond rows), under
+    the scaffold's own combine."""
+    return torch.cat([
+        self.transformer(
+            hidden_states=hidden_states[i:i + 1], timestep=timestep[i:i + 1],
+            encoder_hidden_states=encoder_hidden_states[i:i + 1].to(self.transformer.dtype),
+        )
+        for i in range(hidden_states.shape[0])
+    ])
 
 
 def _sequential_trajectory_diffs(oracle_meta, text_embeds, dit_submodule) -> list[float]:
@@ -558,7 +557,9 @@ def test_cfg_batched_matches_sequential(oracle_meta, text_embeds, dit_submodule)
             timestep=temp_ts.unsqueeze(0).expand(2, -1),
             encoder_hidden_states=torch.cat([pos, neg], dim=0).to(transformer.dtype),
         )
-        batched = dit_submodule._noise_prediction(model_input, temp_ts, pos, neg, guidance)
+        # the scaffold's combine over the batch-2 forward's rows (cond, uncond)
+        guidance_scale = torch.tensor(guidance, dtype=torch.float32, device=DEVICE)
+        batched = cfg([batched_raw[0:1], batched_raw[1:2]], {GUIDANCE_SCALE: guidance_scale})
         timestep = temp_ts.unsqueeze(0).expand(1, -1)
         cond = transformer(
             hidden_states=model_input, timestep=timestep,

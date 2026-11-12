@@ -50,7 +50,12 @@ from mstar.model.base import (
 )
 from mstar.model.components.diffusion.denoise_loop import LATENTS
 from mstar.model.components.diffusion.guidance import GUIDANCE_SCALE
-from mstar.model.components.diffusion.image_io import OUTPUT_FORMAT_KWARGS, encode_image, image_output_format
+from mstar.model.components.diffusion.image_io import (
+    OUTPUT_FORMAT_KWARGS,
+    encode_image,
+    image_output_format,
+    unit_pixels,
+)
 from mstar.model.media_limits import PILLOW_IMAGE_FORMATS, check_image_size, decoding_upload, open_upright_image
 from mstar.model.qwen_image21.components.transformer import ROPE_POSITIVE
 from mstar.model.qwen_image21.config import (
@@ -461,7 +466,8 @@ class QwenImage21Model(Model):
         }
         if resized:
             out[VISION_PIXELS] = [pixel_values]
-            out[REF_PIXELS] = [torch.from_numpy(np.asarray(image).copy()).permute(2, 0, 1).contiguous()
+            # divided here, on the host (unit_pixels), so the VAE encoder never copies an image back from the GPU
+            out[REF_PIXELS] = [unit_pixels(torch.from_numpy(np.asarray(image).copy()).permute(2, 0, 1).contiguous())
                                for image in resized]
         metadata = {
             "kv_layout": {KV: kv_layout},

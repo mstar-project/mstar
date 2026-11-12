@@ -19,6 +19,7 @@ from mstar.engine.resources.step import StepContext  # noqa: E402
 from mstar.engine.state.adapters import node_handles, state_setup  # noqa: E402
 from mstar.graph.base import TensorPointerInfo  # noqa: E402
 from mstar.model.components.diffusion.denoise_loop import LATENTS  # noqa: E402
+from mstar.model.components.diffusion.image_io import unit_pixels  # noqa: E402
 from mstar.model.qwen_image.components.transformer import (  # noqa: E402
     JOINT_TOKENS,
     QwenImageTransformer,
@@ -339,7 +340,7 @@ def test_the_vae_nodes_match_the_pipelines_math():
     encoder = QwenImageVaeEncoderSubmodule(wan)
     encoder.get_device = lambda: torch.device("cpu")
     with torch.no_grad():
-        ours = encoder.forward(IMAGE_INPUTS, None, image_0=image)[REF_LATENTS][0]
+        ours = encoder.forward(IMAGE_INPUTS, None, image_0=unit_pixels(image))[REF_LATENTS][0]
         z = qwen.encode(pixels).latent_dist.mode()
         mean = torch.tensor(qwen.config.latents_mean).view(1, 16, 1, 1, 1)
         std = torch.tensor(qwen.config.latents_std).view(1, 16, 1, 1, 1)
@@ -375,7 +376,7 @@ def test_the_compiled_vae_regions_serve_other_sizes_without_recompiling():
     try:  # sizes above the warm-up's: on CPU (not CUDA) the conv backend switches below a size, a guard of its own
         with torch._dynamo.config.patch(error_on_recompile=True), torch.no_grad():
             for (h, w), batch in (((464, 336), 1), ((480, 480), 3)):
-                encoder.forward(IMAGE_INPUTS, None, image_0=torch.zeros(3, h, w, dtype=torch.uint8))
+                encoder.forward(IMAGE_INPUTS, None, image_0=torch.zeros(3, h, w))
                 grid = (h // 16, w // 16)
                 decoder.run_batch(torch.randn(batch, grid[0] * grid[1], 64), grid)
     finally:
@@ -480,5 +481,4 @@ def test_prompts_match_the_pipelines_processor_call():
     assert out.metadata[VL_GRIDS] == want[0]["image_grid_thw"].tolist()
     for tensor, pil in zip(tensors[IMAGE_INPUTS], pils, strict=True):
         w, h = calculate_dimensions(1024 * 1024, pil.width / pil.height)
-        expect = (resizer.preprocess(pil, h, w)[0] + 1.0) / 2.0 * 255.0
-        assert torch.equal(tensor.float(), expect.round())
+        assert torch.equal(2.0 * tensor - 1.0, resizer.preprocess(pil, h, w)[0])  # divided as the processor does

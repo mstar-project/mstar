@@ -7,22 +7,18 @@ ranks, gathers the predictions and combines them, with the request's scales (the
 ``scales``: ``guidance_scale`` for :data:`cfg`) as per-row step scalars. A model writes the prediction
 (``model_output``), never the branches.
 
-Whether guidance is on is decided per step. A request runs its branches at all when one of its scale knobs is
-above 1 (``active``, which intake and the text encoder ask too); a step runs them when, in addition, one of the
-scales its fill holds for that step is (``Guidance.at``, by default the knobs at every step). Its other steps run
-branch 0 alone, so guidance on an interval of steps is a fill, not a mechanism.
+Whether guidance is on is decided per request, at intake: a request runs its branches at every step when one of its
+scale knobs is above 1 (``active``, which intake and the text encoder ask too), and branch 0 alone otherwise.
 
 Branch order is part of the contract. Branch ``b`` is ``branches[b]``, and ``combine`` receives the
 predictions in that order (``cfg``: conditional first). Within a step the rows are request-major
 (request 0's branches, then request 1's), and ``attention_segments`` lists a request's segments in the
-order of ``key.branches``. A model whose branches read KV labels instead of inputs (empty mappings) lists
-the sources of a ``combined_labels`` plan in branch order as well, since a combined plan concatenates its
-source labels in the order of that tuple.
+order of ``key.branches``.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from typing import NamedTuple, Protocol
 
 import torch
@@ -72,30 +68,17 @@ cfg = Cfg()
 cfg_renorm = CfgRenorm()
 
 
-def every_step(knobs: Mapping, step: int) -> Mapping:
-    """The default fill (``Guidance.at``): the request's knobs at every step."""
-    del step
-    return knobs
-
-
 class Guidance(NamedTuple):
     """A DiT's guidance branches and their combine (see the module docstring)."""
 
     # Per branch: {model_output argument: the request input it takes}. Inputs no branch names are shared
-    # by every branch. An empty mapping is a branch that differs by what its row reads, not by an input.
+    # by every branch.
     # ``request_inputs`` returns, under its input name, every input a branch of ``key.branches`` takes (it
     # may skip the others), each the same shape across the branches: the base stacks them as rows. A model
     # that shapes a branch's input per step (Qwen-Image left-pads each prompt to the step's longest) finds
     # the input's name here, ``branches[b][argument]``.
     branches: tuple[Mapping[str, str], ...]
     combine: GuidanceCombine
-    # The request's fill: ``(knobs, step) -> mapping``, holding by name the scales a denoise step runs at. ``knobs``
-    # is the request's value for each of ``scales``, by name, and nothing else of it, since the base memoizes the fill
-    # across requests by those values. Its step scalars are staged from it, and the step is guided when ``active`` of
-    # it is (in a request that is active at all). A schedule of scales (guidance on an interval of steps, a
-    # truncation) is a fill. It is a host function of the knobs and the step, as a step schedule's dtype is, since
-    # the scheduler asks it for a step before that step's inputs are prepared.
-    at: Callable[[Mapping, int], Mapping] = every_step
 
     @property
     def scales(self) -> tuple[str, ...]:
@@ -103,7 +86,6 @@ class Guidance(NamedTuple):
         return self.combine.scales
 
     def active(self, values: Mapping) -> bool:
-        """Whether guidance is on at these values (a request's ``step_metadata``, or one step's fill): one of its
-        scales above 1. Every place that acts on it (the text encoder skipping the negative prompt, intake, the step
-        key) asks here."""
+        """Whether guidance is on at these values (a request's ``step_metadata``): one of its scales above 1. Every
+        place that acts on it (the text encoder skipping the negative prompt, intake, the step key) asks here."""
         return any(float(values[name]) > 1.0 for name in self.scales)

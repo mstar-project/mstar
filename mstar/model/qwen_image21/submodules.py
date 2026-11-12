@@ -162,8 +162,9 @@ def _pad_inside_convs(vae: nn.Module) -> None:
 
 
 class QwenImage21VaeEncoderSubmodule(NodeSubmodule):
-    """RGBA uint8 ``[4, H, W]`` references -> their normalized latents (the posterior's mode) as
-    rows ``[h * w, C]``, every reference end to end. Images differ in size: one encode each."""
+    """RGBA references, float ``[4, H, W]`` in ``[0, 1]`` (:func:`unit_pixels`, in ``process_prompt``) -> their
+    normalized latents (the posterior's mode) as rows ``[h * w, C]``, every reference end to end. Images differ
+    in size: one encode each."""
 
     disable_torch_compile = True
     disable_autocast = True

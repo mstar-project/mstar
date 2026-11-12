@@ -30,7 +30,7 @@ from mstar.model.components.diffusion.flow_match import (  # noqa: E402
     euler_step,
 )
 from mstar.model.components.diffusion.guidance import Cfg, Guidance, cfg, cfg_renorm  # noqa: E402
-from mstar.model.submodule_base import InputMetadata, ModelInputsFromEngine  # noqa: E402
+from mstar.model.submodule_base import ModelInputsFromEngine  # noqa: E402
 
 LOOP = "denoise_loop"
 WALK = "image_gen"
@@ -710,42 +710,22 @@ def test_a_cfg_rank_runs_its_branch_and_matches_one_gpu(rank, scale):
     assert group.gathers == (1 if scale > 1.0 else 0)
 
 
-class IntervalGuidedToy(GuidedToy):
-    """Guidance on steps 1 and 2 only: the fill holds 1 (off) at the other steps."""
-
-    GUIDANCE = GuidedToy.GUIDANCE._replace(
-        at=lambda step_metadata, step: {"guidance_scale": step_metadata["guidance_scale"] if step in (1, 2) else 1.0},
-    )
-
-
-def test_guidance_turns_on_and_off_per_step_from_the_requests_fill():
-    """Off at a step, a guided request runs branch 0 alone, as an unguided one would; the scheduler's key for a
-    speculated step is that step's, not the one in flight's."""
-    sub = IntervalGuidedToy()
-    keys, preds = [], []
-    for k in range(4):
-        info = _guided_info("a", 3.0, k=k)
-        row = sub.prepare_inputs(WALK, info, _guided_inputs(2.0, 1.0))
-        engine_inputs = ModelInputsFromEngine(request_ids=["a"], per_request_info={})
-        kwargs = sub.preprocess(WALK, engine_inputs, [row])
-        keys.append(kwargs.pop("step_key"))
-        for name in ("sigma", "sigma_next", LATENTS):
-            kwargs.pop(name)
-        preds.append(sub.guided_output(engine_inputs, keys[-1], torch.zeros(1, 8, 4), kwargs.pop("timestep"), **kwargs))
-    assert [key.guided for key in keys] == [False, True, True, False]
-    fill = sub._stage_fill(4, (("guidance_scale", 3.0),))["guidance:guidance_scale"]
-    assert torch.equal(fill, torch.tensor([1.0, 3.0, 3.0, 1.0]))
-    for k in (0, 3):
-        assert torch.equal(preds[k], torch.full((1, 8, 4), 2.0))  # the conditional prediction alone
-    assert torch.equal(preds[1], torch.full((1, 8, 4), 1.0 + 3.0 * (2.0 - 1.0)))
-    in_flight = _guided_info("a", 3.0, k=2)
-    speculated = InputMetadata(stream_chunks={}, dynamic_loop_iter_counts={LOOP: 3})
-    assert sub.cg_key_info(WALK, {"a": in_flight}, per_request_input_metadata={"a": speculated}) == keys[3]
-
-
 def test_branches_that_do_not_split_over_the_cfg_group_are_refused_at_construction():
     with pytest.raises(ValueError, match="evenly"):
         GuidedToy(cfg_group=_Group(3))
+
+
+@pytest.mark.parametrize("branches", [
+    ({"cond": "cond_pos"},),                          # one branch: nothing to combine
+    ({"cond": "cond_pos"}, {"other": "cond_neg"}),    # branches mapping different arguments
+    ({}, {}),                                         # branches that differ by no input
+])
+def test_a_malformed_guidance_is_refused_at_construction(branches):
+    class Malformed(GuidedToy):
+        GUIDANCE = GuidedToy.GUIDANCE._replace(branches=branches)
+
+    with pytest.raises(ValueError, match="at least two branches"):
+        Malformed()
 
 
 def _renamed_scale(name):

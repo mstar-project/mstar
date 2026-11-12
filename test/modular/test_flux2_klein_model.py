@@ -30,6 +30,7 @@ from mstar.model.flux2_klein.flux2_klein_model import (  # noqa: E402
     Flux2KleinModel,
 )
 from mstar.model.flux2_klein.submodules import KleinShape, shape_from_metadata  # noqa: E402
+from mstar.model.media_limits import check_file_counts  # noqa: E402
 
 CONFIG_PATH = str(Path(__file__).resolve().parents[2] / "configs" / "flux2_klein.yaml")
 
@@ -156,9 +157,10 @@ def test_process_prompt_rejects_missing_prompt_or_wrong_modality():
         model.process_prompt("x", ["text"], ["text"])
     with pytest.raises(ValueError, match="reference image"):
         model.process_prompt("x", ["image", "text"], ["image"], tensors={"image_inputs": []})
-    too_many = {"image_inputs": [torch.zeros(3, 64, 64)] * (model.config.max_ref_images + 1)}
+    # more reference images than klein takes are refused before any is decoded
+    check_file_counts({"image": model.config.max_ref_images}, model.max_input_files())
     with pytest.raises(ValueError, match="at most"):
-        model.process_prompt("x", ["image", "text"], ["image"], tensors=too_many)
+        check_file_counts({"image": model.config.max_ref_images + 1}, model.max_input_files())
 
 
 def test_steps_past_the_loop_ceiling_are_refused_not_clamped():
@@ -332,8 +334,8 @@ def test_load_image_resamples_before_rgb_conversion(tmp_path):
     box = ((w - cw) // 2, (h - ch) // 2, (w - cw) // 2 + cw, (h - ch) // 2 + ch)
     expected = rgba.resize((w, h), Image.Resampling.LANCZOS).crop(box).convert("RGB")
     got = model.load_image(str(path), "cpu").data
-    assert got.shape == (3, ch, cw) and got.dtype == torch.uint8
-    assert torch.equal(got, torch.from_numpy(np.array(expected)).permute(2, 0, 1))
+    assert got.shape == (3, ch, cw) and got.dtype == torch.float32
+    assert torch.equal(got, torch.from_numpy(np.array(expected)).permute(2, 0, 1).float() / 255)
     # converting first would resample without the alpha weighting Pillow applies to RGBA
     other = rgba.convert("RGB").resize((w, h), Image.Resampling.LANCZOS).crop(box)
     assert not np.array_equal(np.array(other), np.array(expected))

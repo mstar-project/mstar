@@ -395,6 +395,16 @@ fn body_limit_mb() -> usize {
         .unwrap_or(128)
 }
 
+/// `MSTAR_MAX_MEDIA_FILES`, default 16: the media files one request may attach. The Python frontend reads it in
+/// `mstar/model/media_limits.py`, whose data worker refuses a value that isn't a positive integer at startup.
+fn max_media_files() -> usize {
+    std::env::var("MSTAR_MAX_MEDIA_FILES")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .filter(|&n: &usize| n > 0)
+        .unwrap_or(16)
+}
+
 /// Status and message for a failed multipart read: 413 naming the limit when
 /// the body passed `MSTAR_MAX_BODY_MB`, as the Python frontend answers, else
 /// 400 with `fallback`.
@@ -1461,9 +1471,12 @@ async fn images_edits(State(st): State<AppState>, mut mp: Multipart) -> Response
     // Multipart (image file + prompt + passthrough fields), parsed manually so
     // arbitrary model knobs (e.g. cfg_*_scale) flow through as model_kwargs.
     // `size` is kept: the adapter maps "WxH" onto the model's width / height
-    let known = ["model"];
-    // every image, in upload order, with its filename
+    // a text field named like the image list is dropped, as the Python frontend drops it
+    let known = ["model", "image", "image[]"];
+    // every image, in upload order, with its filename. The Python frontend refuses the same requests, in the same
+    // order and with the same text (`images_edits` in mstar/api_server/openai/router.py).
     let mut images: Vec<(Vec<u8>, Option<String>)> = Vec::new();
+    let most = max_media_files();
     let mut requested_model: Option<String> = None;
     let mut prompt = String::new();
     let mut n: Option<String> = None;
@@ -1491,7 +1504,12 @@ async fn images_edits(State(st): State<AppState>, mut mp: Multipart) -> Response
             let msg = format!("images/edits does not take a '{name}' upload; the whole image is edited");
             return error(400, &msg, "invalid_request_error");
         }
-        if name == "image" || name == "image[]" {
+        if has_file && (name == "image" || name == "image[]") {
+            // refused before it is read, so no request writes more than this many files
+            if images.len() == most {
+                let msg = format!("images/edits takes at most {most} images (MSTAR_MAX_MEDIA_FILES)");
+                return error(400, &msg, "invalid_request_error");
+            }
             let filename = field.file_name().map(str::to_string);
             match field.bytes().await {
                 Ok(b) => images.push((b.to_vec(), filename)),
@@ -1539,8 +1557,11 @@ async fn images_edits(State(st): State<AppState>, mut mp: Multipart) -> Response
         }
     }
 
-    if images.is_empty() || images.iter().any(|(b, _)| b.is_empty()) {
+    if images.is_empty() {
         return error(400, "images/edits requires an 'image' file upload", "invalid_request_error");
+    }
+    if let Some(i) = images.iter().position(|(b, _)| b.is_empty()) {
+        return error(400, &format!("images/edits: image {} is empty", i + 1), "invalid_request_error");
     }
     let n = match n.filter(|v| !v.is_empty()).map(|v| v.trim().parse::<i64>()) {
         None => None,
@@ -2456,13 +2477,19 @@ mod tests {
             (vec![("image", Some("a.png")), ("image", Some("b.png"))], "images/edits takes one image, got 2"),
             (vec![("image[]", Some("a.png")), ("n", None)], "n=2: this route returns one result per request"),
             (vec![("image", Some("a.png")), ("response_format", None)], "response_format 'url' is not served; results are returned as b64_json"),
+            // the Python frontend's answers to the same two (test_openai_router.py)
+            (vec![("image", Some("a.png")), ("image[]", Some("empty.png"))], "images/edits: image 2 is empty"),
+            // a text field named `image` is no image
+            (vec![("image", None), ("image[]", Some("empty.png"))], "images/edits: image 1 is empty"),
+            (vec![("image", Some("a.png")); 17], "images/edits takes at most 16 images (MSTAR_MAX_MEDIA_FILES)"),
         ] {
             let parts: Vec<(&str, Option<&str>, &[u8])> = fields
                 .iter()
                 .map(|&(name, file)| {
-                    let value: &[u8] = match name {
-                        "n" => b"2",
-                        "response_format" => b"url",
+                    let value: &[u8] = match (name, file) {
+                        ("n", _) => b"2",
+                        ("response_format", _) => b"url",
+                        (_, Some("empty.png")) => b"",
                         _ => b"\x89PNG",
                     };
                     (name, file, value)
