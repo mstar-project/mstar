@@ -374,7 +374,7 @@ class TestStart(unittest.TestCase):
                                        EXIT_FULL=gpu_review.gpu_py.EXIT_FULL,
                                        EXIT_RUN_NOT_STARTED=gpu_review.gpu_py.EXIT_RUN_NOT_STARTED,
                                        EXIT_UNCOUNTED=gpu_review.gpu_py.EXIT_UNCOUNTED,
-                                       USER_DATA_MAX=gpu_review.gpu_py.USER_DATA_MAX)
+                                       PROVIDERS=gpu_review.gpu_py.PROVIDERS)
         with workspace() as ws, unittest.mock.patch.object(gpu_review, "gpu_py", config), \
                 unittest.mock.patch.object(gpu_review, "time", self.clock), contextlib.redirect_stdout(io.StringIO()):
             (ws / "review.json").write_text(json.dumps({"live_test": {
@@ -519,14 +519,19 @@ class TestStart(unittest.TestCase):
                         "the session wouldn't know what it reads was cut")
         self.assertIn(self.body, (out / "pr-body.md").read_text())
         user_data = gpu_review.gpu_py.cloud_config(str(gpu_review.BOX), amd, None)
-        self.assertLessEqual(len(user_data.encode()), gpu_review.gpu_py.USER_DATA_MAX,
+        self.assertLessEqual(len(user_data.encode()), gpu_review.gpu_py.DigitalOcean.user_data_max,
                              "DigitalOcean would refuse every AMD box of a PR with a long description")
         sizes = []  # the key's stand-in must compress like a real key, or the cut lands within ~150 bytes too late
         real = gpu_review.gpu_py.cloud_config
         with unittest.mock.patch.object(gpu_review.gpu_py, "cloud_config",
                                         lambda run, files, secret: sizes.append(secret) or real(run, files, secret)):
-            gpu_review.fit_user_data(out, out / "amd", 100)
+            gpu_review.fit_user_data(out, out / "amd", 100, gpu_review.gpu_py.DigitalOcean.user_data_max)
         self.assertGreater(len(gzip.compress(sizes[0].encode())), 100, "a repeated letter would size the key at ~20")
+        lam = {"id": "lambda:gpu_1x_h100:us-west-1", "provider": "lambda", "gpu": "H100", "count": 1,
+               "usd_per_hour": 3.0, "availability": "available", "vendor": "nvidia"}
+        out, _ = self.start({"eras": {}}, offers={"nvidia": [lam]}, run="targeted", since="f" * 40, earlier=earlier)
+        self.assertIn(self.body, (out / "nvidia/pr-body.md").read_text(),
+                      "a Lambda box, whose user_data takes 1 MB, would get DigitalOcean's 64 KiB cut")
 
     def test_no_box_starts_unless_every_vendors_box_can(self):
         mi300x = {"id": "digitalocean:gpu-mi300x1-192gb", "provider": "digitalocean", "gpu": "AMD MI300X",

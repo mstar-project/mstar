@@ -355,6 +355,7 @@ class Provider:
     fixed_deadline = False  # its deadline was fixed at launch, so a later one wouldn't move it
     vendors = ("nvidia",)  # the GPU vendors its images run
     run_by_ssh = False  # `--run`'s files can't go in the create request: launch copies them over ssh and starts it
+    user_data_max = 0  # bytes of user_data its create request takes for `--run`'s files; 0: none (see run_by_ssh)
 
     def __init__(self, cfg: dict, region: str | None = None):
         self.cfg, self.region = cfg, region
@@ -516,6 +517,7 @@ class RunPod(Provider):
 
 class Lambda(Provider):
     name, key_env, user = "lambda", "LAMBDA_API_KEY", "ubuntu"
+    user_data_max = 1024 * 1024
     CREATED_TAG = "live-pr-created"  # Lambda lists no creation time: a launch tags its instance with its own
 
     @classmethod
@@ -564,7 +566,7 @@ class Lambda(Provider):
             "tags": [{"key": self.CREATED_TAG, "value": str(int(time.time()))}],
         }
         if args.run:
-            body["user_data"] = run_user_data(self.cfg, args)
+            body["user_data"] = run_user_data(self.cfg, args, self.user_data_max)
         return body, lambda: lambda_("POST", "/instance-operations/launch", body, retry=False)["instance_ids"][0]
 
     def hf_home(self):
@@ -682,6 +684,7 @@ class DigitalOcean(Provider):
     ("Size is not available in this region"); a size with none can't start, and only --all-regions lists it."""
     name, key_env = "digitalocean", "DIGITALOCEAN_TOKEN"
     vendors = ("nvidia", "amd")
+    user_data_max = 64 * 1024
 
     @classmethod
     def pool(cls, cfg, offer_id):  # read again at launch: a size whose regions emptied since is "no longer available"
@@ -715,7 +718,7 @@ class DigitalOcean(Provider):
         body = {"name": name, "size": o["id"].split(":", 1)[1], "region": o["region"], "image": image,
                 "ssh_keys": [key]}
         if args.run:
-            body["user_data"] = run_user_data(self.cfg, args)
+            body["user_data"] = run_user_data(self.cfg, args, self.user_data_max)
         return body, lambda: str(digitalocean("POST", "/droplets", body, retry=False)["droplet"]["id"])
 
     def hf_home(self):
@@ -739,9 +742,6 @@ class DigitalOcean(Provider):
 
     def release(self, iid, e):
         digitalocean("DELETE", f"/droplets/{iid}")
-
-
-USER_DATA_MAX = 64 * 1024  # the most user_data a launch sends (DigitalOcean's limit; Lambda's is far above)
 
 
 def run_secret(cfg: dict, dry_run: bool) -> str | None:
@@ -772,11 +772,11 @@ def cloud_config(run: str, inputs: list[str], secret: str | None) -> str:
         ["systemd-run", "--unit", "live-pr", "bash", f"/run/live-pr/{Path(run).name}"]]})
 
 
-def run_user_data(cfg: dict, args) -> str:
-    """cloud_config for `args.run`, its inputs and the run secret, checked against USER_DATA_MAX."""
+def run_user_data(cfg: dict, args, limit: int) -> str:
+    """cloud_config for `args.run`, its inputs and the run secret, checked against the provider's `limit`."""
     data = cloud_config(args.run, args.input, run_secret(cfg, args.dry_run))
-    if len(data.encode()) > USER_DATA_MAX:
-        die(f"the --run script and inputs take {len(data.encode())} bytes of user_data, over the {USER_DATA_MAX} "
+    if len(data.encode()) > limit:
+        die(f"the --run script and inputs take {len(data.encode())} bytes of user_data, over the {limit} "
             "a launch sends; send smaller inputs")
     return data
 

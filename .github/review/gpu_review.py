@@ -60,7 +60,6 @@ GITLINK = re.compile(r"^[-+]Subproject commit [0-9a-f]{40}$", re.MULTILINE)
 RANK = {"runpod": 0, "lambda": 0, "eras": 1, "digitalocean": 2}
 # What RunPod's pods run: gpu.py's own example config names it. Local disk only: the bot has no volumes there.
 RUNPOD_IMAGE = "runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404"
-USER_DATA = ("digitalocean", "lambda")  # the providers that carry a run's files in the create request
 GPU_WAIT = 300  # seconds `start` keeps trying for GPUs before it says there are none
 GPU_RETRY = 30  # seconds between its tries
 BOX_OUT = "/workspace/live-pr/out"
@@ -479,7 +478,8 @@ def start(out, pr, head_sha, runner_temp, tag, base, gpus, hours, run, checks, v
 
             # The first launch checks budget.max_running has room for every box this pass still needs.
             def launch(o, vendor=vendor, box=box, tried=tried, boxes=len(todo) if i == 0 else 1):
-                data = fit_user_data(lt, box, len(secret)) if o["provider"] in USER_DATA \
+                limit = gpu_py.PROVIDERS[o["provider"]].user_data_max  # 0: its files go over scp, whole
+                data = fit_user_data(lt, box, len(secret), limit) if limit \
                     else [lt / "findings.json", lt / "pr-body.md"]
                 inputs = [x for f in (box / "brief.md", *data, lt / "run.json", BOX_COMMON)
                           for x in ("--input", str(f))]
@@ -523,9 +523,9 @@ def start(out, pr, head_sha, runner_temp, tag, base, gpus, hours, run, checks, v
 CUT = "\n\n(cut to fit)\n"
 
 
-def fit_user_data(lt, box, secret_length):
+def fit_user_data(lt, box, secret_length, limit):
     """Copies in `box` of lt/findings.json and lt/pr-body.md, cut to fit with the box's other files in a
-    DigitalOcean droplet's user_data (64 KiB, which gpu.py checks again): the PR's description first, then the
+    provider's user_data of at most `limit` bytes (which gpu.py checks again): the PR's description first, then the
     earlier live test's report, each with a note where it was cut. Their paths."""
     body = (lt / "pr-body.md").read_text()
     findings = json.loads((lt / "findings.json").read_text())
@@ -541,7 +541,7 @@ def fit_user_data(lt, box, secret_length):
         paths[1].write_text(b)
         files = [str(f) for f in (box / "brief.md", *paths, lt / "run.json", BOX_COMMON)]
         text = gpu_py.cloud_config(str(BOX), files, key or None)
-        return len(text.encode()) <= gpu_py.USER_DATA_MAX - 64  # margin: the stand-in key compresses a bit differently
+        return len(text.encode()) <= limit - 64  # margin: the stand-in key compresses a bit differently
 
     nb, nr = len(body), len(report)
     while not fits(cut(body, nb), cut(report, nr)):
