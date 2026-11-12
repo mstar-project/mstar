@@ -31,6 +31,7 @@ from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Parallel,
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import Model, TensorAndMetadata, WalkStep
 from mstar.model.components.diffusion.attention import dit_entry, refuse_attention_backend_kwarg
+from mstar.model.components.diffusion.step_cache import step_cache_policy
 from mstar.model.components.video_encode import encode_mp4
 from mstar.model.media_limits import PILLOW_IMAGE_FORMATS, check_image_size
 from mstar.model.minimax_h3.components.layout import H3Layout
@@ -45,6 +46,7 @@ from mstar.model.minimax_h3.config import (
     DIT_ROWS,
     FPS,
     H3_REPO,
+    MAG_RATIOS,
     MAX_DURATION,
     MIN_DURATION,
     PARTITION,
@@ -172,6 +174,7 @@ class H3Model(Model):
         row_bucket: int | None = None,
         vae_tile_batch: int = 1,
         vae_compile: bool = False,
+        step_cache: dict | None = None,
         **kwargs,
     ):
         refuse_attention_backend_kwarg(kwargs)
@@ -200,6 +203,8 @@ class H3Model(Model):
             raise ValueError(f"row_bucket must be a positive int, got {row_bucket!r}")
         self.vae_tile_batch = int(vae_tile_batch)  # 1 decodes one tile a call, as the reference
         self.vae_compile = bool(vae_compile)
+        # opt-in, lossy: the DiT's step cache (components/diffusion/step_cache.py); None runs every step
+        self.step_cache = step_cache_policy(step_cache, MAG_RATIOS)
         self._snapshot = None
         self._config: H3Config | None = None
         self.tokenizer = None
@@ -627,6 +632,7 @@ class H3Model(Model):
                 weight_loader.build_transformer(config, snapshot, device, comm_group=tp_group, sp_group=sp_group),
                 config, loop_name=DENOISE_LOOP,
                 max_batch_size=1, compile_blocks=self.compile, row_bucket=self.row_bucket,
+                step_cache=self.step_cache,
             )
         if node_name == VAE_DECODER_NODE:
             return H3VideoDecoderSubmodule(weight_loader.build_video_decoder(config, snapshot, device), config,

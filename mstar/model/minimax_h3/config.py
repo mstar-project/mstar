@@ -329,3 +329,15 @@ def video_latent_num_frames(num_frames: int, frames_per_chunk: int = 17, latents
 def audio_latent_num_frames(num_frames: int) -> int:
     """Audio latents per channel covering ``num_frames`` video frames."""
     return int(round(num_frames / FPS * AUDIO_LATENTS_PER_SECOND))
+
+
+# MagCache tables for the DiT's opt-in step cache (``step_cache`` in model_kwargs), by name: the residual magnitude
+# ratio per step of a dense run, logged by ``{method: magcache_calibrate}``. "default" is 50 sigma points (49 steps) at
+# 832x480x124: the mean over 9 VBench prompts on an H200 (the prompts' tables differ by under 0.012 per step up to
+# step 44, 0.03 at the last).
+MAG_RATIOS: dict[str, tuple[float, ...]] = {"default": (
+    1.0, 1.01652, 1.01393, 1.01425, 1.01119, 1.01121, 1.01226, 1.01007, 1.00951, 1.01045, 1.01024, 1.01365, 1.00825,
+    1.00995, 1.00849, 1.0063, 1.00979, 1.00785, 1.01023, 1.00972, 1.0084, 1.00895, 1.0065, 1.00733, 1.0099, 1.00828,
+    1.00829, 1.01073, 1.00948, 1.00752, 1.00888, 1.01014, 1.00698, 1.00898, 1.01058, 1.00625, 1.00862, 1.00868,
+    1.00844, 1.0081, 1.00986, 1.00641, 1.00711, 1.00558, 0.9983, 1.00084, 0.99087, 0.97868, 0.9366,
+)}

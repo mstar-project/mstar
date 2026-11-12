@@ -365,12 +365,17 @@ class H3DiT(nn.Module):
 
     def forward(
         self, inputs: H3Inputs, layout: H3StepLayout, row_class: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        cached_residual: torch.Tensor | None = None, return_residual: bool = False,
+    ) -> tuple[torch.Tensor, ...]:
         """``inputs.timesteps`` is ``[B, 3]`` (video, audio, keyframe), or ``[B, 1]`` when all
         are one value: the reference then runs its AdaLN GEMMs on one row, which rounds
         differently from three. ``row_class`` (tests) indexes timesteps laid out as the
         reference's distinct values. `attend` attends within the step's segments
-        (`attention_segments`), so no request row sees a padding row."""
+        (`attention_segments`), so no request row sees a padding row.
+
+        Step caching (``step_cache.py``): with ``cached_residual`` (fp32, ``[B, S, hidden]`` over this rank's rows) the
+        blocks are skipped and their output is the stream plus it; ``return_residual`` also returns what the blocks
+        added, in that layout, as a third value."""
         cond, pad = layout.num_condition_rows, layout.num_pad_rows
         sp, start, count = None, 0, layout.num_rows
         if self.sp_group.world_size > 1:
@@ -390,8 +395,13 @@ class H3DiT(nn.Module):
             row_index = row_index.narrow(0, start, count)
             row_class = row_class.narrow(0, start, count)
         temb = self.time_embedding(inputs.timesteps)
-        for block in self.blocks:
-            x = block(x, temb, row_index, rope)
+        before = x
+        if cached_residual is not None:
+            x = (x.float() + cached_residual).to(x.dtype)
+        else:
+            for block in self.blocks:
+                x = block(x, temb, row_index, rope)
+        residual = x.float() - before.float() if return_residual else None
         h = self.final_layer(x, temb, row_class)
         # both heads over this rank's rows, then the rows gathered: [B, S, patch_dim + audio_dim]
         out = torch.cat([self.final_layer.video_out(h), self.final_layer.audio_out(h)], dim=-1)
@@ -403,4 +413,4 @@ class H3DiT(nn.Module):
             [out[:, text:text + cond, :patch_dim], out[:, text + cond + audio_rows:end, :patch_dim]], dim=1,
         )
         audio_v = out[:, text + cond:text + cond + audio_rows, patch_dim:]
-        return video_v, audio_v
+        return (video_v, audio_v, residual) if return_residual else (video_v, audio_v)
