@@ -356,7 +356,8 @@ class Provider:
     fixed_deadline = False  # its deadline was fixed at launch, so a later one wouldn't move it
     vendors = ("nvidia",)  # the GPU vendors its images run
     run_by_ssh = False  # `--run`'s files can't go in the create request: launch copies them over ssh and starts it
-    user_data_max = 0  # bytes of user_data its create request takes for `--run`'s files; 0: none (see run_by_ssh)
+    user_data_max = 0  # bytes of user_data its create request takes for `--run`'s files; 0: none (RunPod's go by
+    # ssh, see run_by_ssh; Eras's are in its own launch body)
 
     def __init__(self, cfg: dict, region: str | None = None):
         self.cfg, self.region = cfg, region
@@ -518,7 +519,7 @@ class RunPod(Provider):
 
 class Lambda(Provider):
     name, key_env, user = "lambda", "LAMBDA_API_KEY", "ubuntu"
-    user_data_max = 1024 * 1024
+    user_data_max = 1_000_000  # Lambda's limit is 1 MB
     CREATED_TAG = "live-pr-created"  # Lambda lists no creation time: a launch tags its instance with its own
 
     @classmethod
@@ -572,9 +573,8 @@ class Lambda(Provider):
 
     def hf_home(self):
         fs = self.filesystems().get(self.region)
-        if not fs:  # the local disk: where the config says when the box keeps nothing, else under the login's home
-            return (None if storage_on(self.cfg, self.name) else self.cfg["lambda"].get("hf_home")) \
-                or f"/home/{self.user}/hf"
+        if not fs:
+            return f"/home/{self.user}/hf"
         mount = fs.get("mount_point") or f"/lambda/nfs/{fs['name']}"
         return self.cfg["lambda"]["hf_home"].format(fs=fs["name"], mount=mount)
 
@@ -1050,7 +1050,8 @@ def start_run_over_ssh(key: str, cfg: dict, args) -> None:
         try:
             terminate(key, entry(key))
         except Exception as release_err:  # the pod is left to the watchdog and the job's cleanup
-            print(f"gpu.py: couldn't end {key}: {release_err}; its watchdog and the job's cleanup will", file=sys.stderr)
+            print(f"gpu.py: couldn't end {key}: {release_err}; its watchdog and the job's cleanup will",
+                  file=sys.stderr)
         if not isinstance(err, (Exception, SystemExit)):
             raise
         if not isinstance(err, SystemExit):  # a die has said why
