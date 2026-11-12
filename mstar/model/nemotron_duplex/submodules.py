@@ -1,14 +1,14 @@
 """NodeSubmodules for NVIDIA NemotronLabs VoiceChat-11B (full duplex).
 
-Nodes, and the resources each declares (``NemotronDuplexModel.get_node_resources``):
+Nodes, and the state or resources each declares:
 
     conformer_encoder  encoder_kv,                16 kHz speech -> per-frame LLM embeds; per session,
                        encoder_state,             its attention window, its layers' conv state and its
                        encoder_front              audio / mel tails (the shared
                                                   ``FastConformerStreamSubmodule``)
-    nano_llm           nano_kv, nano_attn,        Nemotron-H hybrid Mamba-2 / attention / MLP (9B):
-                       mamba_state, mamba,        paged KV for the 4 attention layers, recurrent-pool
-                       nano_sampler               slots for the 27 Mamba-2 layers, the text sampler
+    nano_llm           nano_kv, mamba_state,      Nemotron-H hybrid Mamba-2 / attention / MLP (9B):
+                       nano_sampler               the KV of the 4 attention layers, the conv and SSM
+                                                  state of the 27 Mamba-2 layers, the text sampler
     eartts_talker      talker_kv, talker_attn,    Gemma3 talker -> 31 RVQ codes per frame (two KV
                        talker_pos, codec_state    labels per session, cond / uncond, in one plan),
                                                   decoded in the same step to 80 ms of 22.05 kHz
@@ -39,19 +39,16 @@ from mstar.engine.resources import (
     AttentionStep,
     KVStep,
     PositionStep,
-    SamplerStep,
     Segment,
     SlotLease,
     SubmoduleStep,
 )
-from mstar.engine.resources.linear_attn.config import LinearAttnStep
 from mstar.engine.resources.recurrent import RecurrentStep
+from mstar.engine.state import ArrayStep, SampleStep, sample
 from mstar.model.nemotron_duplex.components.audio_codec import AudioCodec, CodecStreamAudio, CodecStreamState
 from mstar.model.nemotron_duplex.config import (
     CODEC_STATE,
-    MAMBA,
     MAMBA_STATE,
-    NANO_ATTN,
     NANO_KV,
     NANO_SAMPLER,
     SESSION_BATCH_SIZES,
@@ -96,8 +93,8 @@ class NemotronHLLMSubmodule(ARNodeSubmodule):
     samples the agent text (sampler resource) and the tool-call token (greedy).
     """
 
-    # No torch.compile: the per-layer resource cursors are compile-disabled
-    # and the decode step is a CUDA graph replay, which is where the time goes.
+    # No torch.compile: every state call is a graph break, and the decode step
+    # is a CUDA graph replay, which is where the time goes.
     disable_torch_compile = True
 
     # Decode batch sizes captured as CUDA graphs: one row per live session per
@@ -105,7 +102,6 @@ class NemotronHLLMSubmodule(ARNodeSubmodule):
     # take none (they address the sink).
     DECODE_CAPTURE_BATCH_SIZES = SESSION_BATCH_SIZES
     DECODE_KEY = "decode"            # the steady-state capture's bucket key (cg_key_info)
-    PROMPT_DONE_KEY = "prompt_consumed"   # set once the request's first step (prompt + frame) has run
 
     def __init__(self, language_model: nn.Module, config: NemotronDuplexConfig):
         super().__init__()
@@ -145,7 +141,10 @@ class NemotronHLLMSubmodule(ARNodeSubmodule):
             ),
         ]
 
-    # -- resources -------------------------------------------------------
+    # -- state -----------------------------------------------------------
+
+    def bind_state(self, handles: Mapping[str, Any]) -> None:
+        self.sampler = handles[NANO_SAMPLER]
 
     def declare_step(
         self,
@@ -156,19 +155,13 @@ class NemotronHLLMSubmodule(ARNodeSubmodule):
         piecewise_leases: Mapping[str, SlotLease] | None = None,
         **kwargs,
     ) -> SubmoduleStep:
-        steps = {
-            NANO_KV: KVStep(),
-            NANO_ATTN: AttentionStep(causal=True),
-            # one slot per request in the recurrent pool; the Mamba-2 resource
-            # picks the single-step kernels when every row spans one token
-            MAMBA_STATE: RecurrentStep(),
-            MAMBA: LinearAttnStep(),
-        }
+        # the Mamba-2 kernels take the single-step path when every row spans one token
+        state = {NANO_KV: ArrayStep(), MAMBA_STATE: ArrayStep()}
         if graph_walk == "decode":
             # The prompt region is not sampled (held at PAD), so only decode
             # steps the sampler; the reference's repetition penalty likewise
             # only ever sees generated tokens.
-            steps[NANO_SAMPLER] = SamplerStep(apply_penalty=True)
+            state[NANO_SAMPLER] = SampleStep(apply_penalty=True)
         # a session's prompt + first-frame step has more than one token per
         # request, which no fixed-shape decode capture fits (same answer as
         # cg_key_info, which the engine asks before the inputs exist)
@@ -179,7 +172,7 @@ class NemotronHLLMSubmodule(ARNodeSubmodule):
                 for rid, inp in zip(request_ids, inputs, strict=True)
             ],
             cg_key_info=None if (first or graph_walk != "decode") else self.DECODE_KEY,
-            steps=steps,
+            state=state,
         )
 
     def cg_key_info(
@@ -187,13 +180,13 @@ class NemotronHLLMSubmodule(ARNodeSubmodule):
     ) -> str | None:
         """Decode capture unless a request still has its prompt pending (its first
         step is prompt + frame and runs eager). The routing sets that flag once
-        for the whole loop, so the node also checks whether the request's first
-        step has already run."""
+        for the whole loop, so the node also checks that the step is the loop's
+        first, iteration 0."""
         if graph_walk != "decode":
             return None
-        for rid, info in per_request_info.items():
+        for info in per_request_info.values():
             if (getattr(info, "step_metadata", None) or {}).get("prompt_pending") and not (
-                self.request_state(rid).get(self.PROMPT_DONE_KEY)
+                info.dynamic_loop_iter_counts.get("decode_loop", 0)
             ):
                 return None
         return self.DECODE_KEY
@@ -349,7 +342,7 @@ class NemotronHLLMSubmodule(ARNodeSubmodule):
         cfg = self.config
         rids = list(engine_inputs.request_ids)
         n = len(rids)
-        hidden = self.language_model(input_embeds, label="main")
+        hidden = self.language_model(input_embeds)
         if graph_walk != "decode":
             # Prompt priming: no sampling, the region is held at PAD (reference
             # ``_prime_prompt``), so the first audio frame follows the last PAD.
@@ -361,7 +354,7 @@ class NemotronHLLMSubmodule(ARNodeSubmodule):
         else:
             ends = list(itertools.accumulate(seq_lens))
             last = hidden.index_select(0, torch.tensor([e - 1 for e in ends], device=hidden.device))
-        new_token = engine_inputs.resources[NANO_SAMPLER].sample(rids, logits=self.lm_head(last))
+        new_token = sample(self.sampler, self.lm_head(last))
         rows = {
             "new_token": new_token.reshape(n),
             # the prompt (if any) has been consumed by this step: the loop-back
@@ -394,8 +387,6 @@ class NemotronHLLMSubmodule(ARNodeSubmodule):
     ):
         # Feed the sampled agent-text + function tokens back into the next
         # frame's AddFusion (the decode loop's prev_text / prev_func edges).
-        # The prompt, if any, went with this step. Later steps use the capture.
-        self.request_state(request_id).add(self.PROMPT_DONE_KEY, True)
         if "new_token" in outputs:
             outputs["prev_text"] = outputs["new_token"]
         if "new_func" in outputs:

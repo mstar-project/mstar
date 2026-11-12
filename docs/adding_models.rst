@@ -1086,9 +1086,9 @@ The spec types are:
      - Linear attention planned against a ``RecurrentStateSpec`` pool that holds its
        state: gated DeltaNet (``LinearAttnVariant.GDN``), Kimi delta attention (``KDA``:
        fused Triton kernels on CUDA, a torch reference elsewhere) or Mamba-2. A layer
-       calls gated DeltaNet through ``causal_conv`` and ``gated_delta_net``, and the
-       others through ``KDACallable`` or ``Mamba2Callable``
-       (``mstar/engine/resources/convenience.py``), which hand the kernels the layer's
+       calls gated DeltaNet through ``causal_conv`` and ``gated_delta_net``, Mamba-2
+       through ``causal_conv`` and ``mamba2``, and KDA through ``KDACallable``
+       (``mstar/engine/resources/convenience.py``), which hands the kernels the layer's
        blocks of the pool, so the layer never names one. A KDA pool built with
        ``DeltaNetGeometry.to_blocks(speculative_tokens=k)`` also runs verify steps
        (``LinearAttnStep(speculative=True)``), and ``KDACallable.set_prefix_len``

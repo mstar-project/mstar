@@ -53,28 +53,30 @@ import torch.nn.functional as F
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import PartitionDefinition
-from mstar.engine.resources import (
-    AttentionConfig,
-    AttentionSpec,
-    KVReqConfig,
-    KVSpec,
-    NodeResourceSpec,
-    PagedKVConfig,
-    PositionConfig,
-    PositionSpec,
-    ResourceReqConfig,
-    SamplerSpec,
-    SamplingReqConfig,
-)
+from mstar.engine.resources import NodeResourceSpec, ResourceReqConfig
 from mstar.engine.resources.kv.bounded import BoundedKVSpec
 from mstar.engine.resources.kv.config import DEFAULT_PAGE_SIZE
-from mstar.engine.resources.linear_attn.config import LinearAttnConfig, LinearAttnSpec, LinearAttnVariant
-from mstar.engine.resources.recurrent import Mamba2Geometry, RecurrentStateConfig, RecurrentStateSpec
+from mstar.engine.resources.recurrent import RecurrentStateConfig, RecurrentStateSpec
+from mstar.engine.state import (
+    Array,
+    Attend,
+    Causal,
+    CausalConv,
+    Entry,
+    KVEntry,
+    Layout,
+    Mamba2,
+    Positions,
+    Read,
+    Sampler,
+    SampleSettings,
+    TensorType,
+    Value,
+)
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import (
     KVLabel,
-    LabelLayout,
     Model,
     ProcessPromptOutput,
     Span,
@@ -92,6 +94,7 @@ from mstar.model.nemotron_duplex.config import (
     ENCODER_KV,
     ENCODER_STATE,
     MAMBA,
+    MAMBA_CONV,
     MAMBA_STATE,
     NANO_ATTN,
     NANO_KV,
@@ -99,7 +102,6 @@ from mstar.model.nemotron_duplex.config import (
     SESSION_BATCH_SIZES,
     TALKER_ATTN,
     TALKER_KV,
-    TALKER_POS,
     NemotronDuplexConfig,
     session_too_long,
 )
@@ -224,10 +226,9 @@ class NemotronDuplexModel(Model):
         return types.SimpleNamespace(tokenizer=types.SimpleNamespace(vocab=v), vocab=v)
 
     # -------------------------------------------------------------------
-    # Resources. nano_llm: the paged KV (attention layers only) and attention
-    # plan, the recurrent-state pool holding every Mamba-2 layer's conv window
-    # and SSM state (one slot per session) with the Mamba-2 resource planned
-    # against it, and the agent-text sampler (NoPE: no position resource).
+    # State and resources. nano_llm declares the KV of its attention layers,
+    # every Mamba-2 layer's conv window and SSM state as one Value (a slot per
+    # session), and the agent-text sampler (NoPE: no positions).
     # eartts_talker: a paged KV over its 28 Gemma3 layers with attention and
     # positions; each session holds two streams (labels ``main`` / ``uncond``)
     # and RoPE runs over the full head dim with a per-layer theta the layer
@@ -344,58 +345,53 @@ class NemotronDuplexModel(Model):
         del model_kwargs
         return self.max_session_frames + self.LOOP_ITERS_MARGIN
 
-    def get_node_resources(self) -> list[NodeResourceSpec]:
-        nano = self.config.nano
-        eartts = self.config.eartts
-        kv_config = PagedKVConfig(
-            # Only the ``*`` (attention) layers hold a KV cache; the Mamba and
-            # MLP layers do not. The backbone maps global layer -> dense
-            # attention index (``NemotronHLLM._attn_cache_idx``).
-            num_layers=nano.num_attention_layers,
-            num_kv_heads=nano.num_key_value_heads,
-            head_dim=nano.head_dim,
-            max_seq_len=nano.max_position_embeddings,
-            num_qo_heads=nano.num_attention_heads,
+    def declare_state(self) -> list[Array | Sampler]:
+        nano, eartts = self.config.nano, self.config.eartts
+        kinds = nano.layer_types
+        return [
+            # only the ``*`` (attention) layers hold a KV cache
+            Array(
+                NANO_KV, nodes={"nano_llm"}, layers=frozenset(i for i, k in enumerate(kinds) if k == "attention"),
+                entry=KVEntry(heads=nano.num_key_value_heads, head_dim=nano.head_dim),
+                max_len=nano.max_position_embeddings,
+                reads={NANO_ATTN: Read(mask=Causal(), op=Attend(q_heads=nano.num_attention_heads))},
+            ),
+            Value(
+                MAMBA_STATE, nodes={"nano_llm"}, layers=frozenset(i for i, k in enumerate(kinds) if k == "mamba"),
+                entry=Entry({
+                    # fp32, as the reference keeps it: an exponentially decayed sum over the whole session
+                    "ssm": TensorType((nano.mamba_num_heads, nano.mamba_head_dim, nano.ssm_state_size),
+                                      dtype=torch.float32, shard=0),
+                    "conv": TensorType((nano.conv_dim, nano.conv_kernel - 1), dtype=None, shard=0),
+                }),
+                updates={MAMBA_CONV: CausalConv(), MAMBA: Mamba2(time_step_limit=nano.time_step_limit)},
+            ),
+            Sampler(NANO_SAMPLER, nodes={"nano_llm"}, vocab_size=self.config.vocab_size, penalty=True),
+            # Its positions are a counter: the talker rotates in torch, with a theta per layer kind.
+            Array(
+                TALKER_KV, nodes={"eartts_talker"}, layers=frozenset(range(eartts.num_hidden_layers)),
+                # 72 zero-padded to a FlashInfer head dim
+                entry=KVEntry(heads=eartts.num_key_value_heads, head_dim=eartts.kv_head_dim),
+                # the sliding window plus the speaker warm-up, rounded up
+                max_len=eartts.sliding_window + 512, labels=frozenset({"main", "uncond"}), positions=Positions(),
+                reads={TALKER_ATTN: Read(mask=Causal(), op=Attend(q_heads=eartts.num_attention_heads))},
+            ),
+        ]
+
+    def kernel_settings(self) -> dict[str, dict[str, int]]:
+        return {
             # a session holds its prompt and every frame for life (no eviction)
-            max_num_pages=self.nano_kv_pages(DEFAULT_PAGE_SIZE),
-        )
+            NANO_KV: {"max_num_pages": self.nano_kv_pages(DEFAULT_PAGE_SIZE)},
+            # + 1 for the pool's sink slot, so DEFAULT_SESSIONS sessions fit
+            MAMBA_STATE: {"max_slots": self.DEFAULT_SESSIONS + 1},
+            TALKER_KV: {"max_num_pages": self.talker_kv_pages(DEFAULT_PAGE_SIZE)},
+        }
+
+    def get_node_resources(self) -> list[NodeResourceSpec]:
         return [
             *stream_node_resources(
                 self.config.stt.encoder, self.config.stt.hop_length, "conformer_encoder", self.DEFAULT_SESSIONS,
                 kv_key=ENCODER_KV, conv_key=ENCODER_STATE, front_key=ENCODER_FRONT,
-            ),
-            KVSpec(resource_key=NANO_KV, nodes={"nano_llm"}, config=kv_config),
-            AttentionSpec(
-                resource_key=NANO_ATTN, nodes={"nano_llm"},
-                config=AttentionConfig(kv_cache=NANO_KV),
-            ),
-            RecurrentStateSpec(
-                resource_key=MAMBA_STATE, nodes={"nano_llm"},
-                config=RecurrentStateConfig(
-                    num_layers=nano.num_mamba_layers,
-                    blocks=Mamba2Geometry(
-                        num_heads=nano.mamba_num_heads,
-                        head_dim=nano.mamba_head_dim,
-                        state_size=nano.ssm_state_size,
-                        n_groups=nano.n_groups,
-                        conv_kernel_size=nano.conv_kernel,
-                    ).to_blocks(),
-                    # + 1 for the pool's sink slot, so DEFAULT_SESSIONS sessions fit
-                    max_slots=self.DEFAULT_SESSIONS + 1,
-                ),
-            ),
-            LinearAttnSpec(
-                resource_key=MAMBA, nodes={"nano_llm"},
-                config=LinearAttnConfig(
-                    recurrent_state=MAMBA_STATE,
-                    variant=LinearAttnVariant.MAMBA2,
-                    time_step_limit=nano.time_step_limit,
-                ),
-            ),
-            SamplerSpec(
-                resource_key=NANO_SAMPLER, nodes={"nano_llm"},
-                vocab_size=self.config.vocab_size,
-                enable_repetition_penalty=True,
             ),
             RecurrentStateSpec(
                 resource_key=CODEC_STATE, nodes={"eartts_talker"},
@@ -404,46 +400,19 @@ class NemotronDuplexModel(Model):
                     max_slots=self.DEFAULT_SESSIONS + 1,
                 ),
             ),
-            KVSpec(
-                resource_key=TALKER_KV, nodes={"eartts_talker"},
-                config=PagedKVConfig(
-                    num_layers=eartts.num_hidden_layers,
-                    num_kv_heads=eartts.num_key_value_heads,
-                    head_dim=eartts.kv_head_dim,    # 72 zero-padded to a FlashInfer head dim
-                    # the sliding window plus the speaker warm-up, rounded up
-                    max_seq_len=eartts.sliding_window + 512,
-                    num_qo_heads=eartts.num_attention_heads,
-                    max_num_pages=self.talker_kv_pages(DEFAULT_PAGE_SIZE),
-                ),
-            ),
-            AttentionSpec(
-                resource_key=TALKER_ATTN, nodes={"eartts_talker"},
-                config=AttentionConfig(kv_cache=TALKER_KV),
-            ),
-            PositionSpec(
-                resource_key=TALKER_POS, nodes={"eartts_talker"},
-                config=PositionConfig(
-                    kv_cache=TALKER_KV,
-                    rotary_dim=eartts.head_dim,     # Gemma3: RoPE over the full head
-                    interleave=False,
-                    rope_theta=eartts.rope_theta_local,   # default; full-attention layers pass 1e6
-                ),
-            ),
         ]
 
     def get_request_resource_configs(
         self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
-    ) -> dict[str, ResourceReqConfig]:
+    ) -> dict[str, ResourceReqConfig | SampleSettings]:
         del input_modalities, output_modalities
         model_kwargs = model_kwargs or {}
         keys = SAMPLING_KEYS
         return {
-            NANO_SAMPLER: SamplingReqConfig(
+            NANO_SAMPLER: SampleSettings(
                 **{k: model_kwargs.get(k, getattr(self.config, k)) for k in keys},
                 min_p=model_kwargs.get("min_p", 0.0),
             ),
-            # every talker session reads both of its streams
-            TALKER_KV: KVReqConfig(needed_labels=["main", "uncond"]),
         }
 
     # -------------------------------------------------------------------
@@ -639,16 +608,16 @@ class NemotronDuplexModel(Model):
         # A loop writes a row per frame and one for the final PAD. Its cap adds LOOP_ITERS_MARGIN, and no session
         # writes that margin.
         frames = self.max_session_frames + 1
-        nano = LabelLayout(
+        nano = Layout(
             spans=(Span("ids", "decode", prompt_len, prompt_len, "text_inputs"),) if prompt else (),
             growth=(("decode_loop", 1),), max_growth=frames,
         )
         warmup = self.TALKER_WARMUP_POSITIONS
-        talker = LabelLayout(
+        talker = Layout(
             spans=(Span("rows", "talker_decode", warmup, warmup, "audio_prompt_latents"),),
             growth=(("talker_decode_loop", 1),), max_growth=frames,
         )
-        return ProcessPromptOutput(out, {"kv_layout": {
+        return ProcessPromptOutput(out, {"state_layout": {
             NANO_KV: {"main": nano}, TALKER_KV: {"main": talker, "uncond": talker},
         }})
 
@@ -973,11 +942,17 @@ class NemotronDuplexModel(Model):
         rather than run its modules against pools of another shape."""
         loaded = copy.copy(self)
         loaded.config = cfg
-        for declared, needed in zip(self.get_node_resources(), loaded.get_node_resources(), strict=True):
+        settings, needed_settings = self.kernel_settings(), loaded.kernel_settings()
+        pairs = [
+            *((d.name, d, n) for d, n in zip(self.declare_state(), loaded.declare_state(), strict=True)),
+            *((key, settings[key], needed_settings[key]) for key in settings),
+            *((d.resource_key, d, n) for d, n in zip(self.get_node_resources(), loaded.get_node_resources(),
+                                                       strict=True)),
+        ]
+        for key, declared, needed in pairs:
             if declared != needed:
                 raise ValueError(
-                    f"the checkpoint's config.json sizes resources.{declared.resource_key} as {needed}, "
-                    f"not as declared ({declared})"
+                    f"the checkpoint's config.json sizes resources.{key} as {needed}, not as declared ({declared})"
                 )
 
     def _build_and_load(self, module: torch.nn.Module, device: str, autocast_dtype, local_dir: str):

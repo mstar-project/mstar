@@ -3,7 +3,7 @@
 Same shape as ``gdn.py``: the pool's addressing arrives through
 ``ctx.plan_results`` and its per-layer blocks as plain tensor arguments, one
 wrapper per (label, walk) plans the batch, and the layer reaches both through
-``Mamba2Callable``. The conv half reuses ``mstar.utils.causal_conv1d``; the
+the contract's ``causal_conv`` and ``mamba2``. The conv half reuses ``mstar.utils.causal_conv1d``; the
 recurrence is ``mamba2_kernels``: an in-place slot-indexed Triton step for
 decode and the sequential scan for prefill.
 

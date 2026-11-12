@@ -16,16 +16,16 @@ import torch
 
 from mstar.engine.resources import (
     AttentionSpec,
-    KVReqConfig,
     KVSpec,
     PositionSpec,
     SamplerSpec,
-    SamplingReqConfig,
     resolve_spec_dependencies,
 )
 from mstar.engine.resources.kv.bounded import BoundedKVSpec
 from mstar.engine.resources.linear_attn.config import LinearAttnSpec, LinearAttnVariant
 from mstar.engine.resources.recurrent import Mamba2Geometry, RecurrentStateSpec
+from mstar.engine.state import SampleSettings
+from mstar.engine.state.adapters import node_resources
 from mstar.model.nemotron_duplex.config import (
     CODEC_STATE,
     ENCODER_FRONT,
@@ -81,7 +81,7 @@ def test_duplex_node_resources():
     recurrent pools, its conv tails and its front end's audio / mel tails. A
     slot per session each."""
     model = _make_model()
-    specs = model.get_node_resources()
+    specs = node_resources(model)
     by_key = resolve_spec_dependencies(specs)          # unique keys, dependencies satisfied
     assert set(by_key) == {CODEC_STATE, ENCODER_FRONT, ENCODER_STATE, ENCODER_KV, NANO_KV, NANO_ATTN,
                            MAMBA_STATE, MAMBA,
@@ -119,7 +119,8 @@ def test_duplex_node_resources():
     assert isinstance(by_key[TALKER_ATTN], AttentionSpec) and by_key[TALKER_ATTN].config.kv_cache == TALKER_KV
     tpos = by_key[TALKER_POS]
     assert isinstance(tpos, PositionSpec) and tpos.config.kv_cache == TALKER_KV
-    assert tpos.config.rotary_dim == eartts.head_dim and tpos.config.interleave is False
+    # a counter: the talker rotates in torch, with a theta per layer kind, so its positions declare no Rope
+    assert tpos.config.rotary_dim is None and tpos.config.interleave is False
 
     nano = model.config.nano
     pool = by_key[MAMBA_STATE]
@@ -353,11 +354,10 @@ def test_duplex_talker_builds_its_codec_from_the_checkpoint(monkeypatch):
 def test_duplex_request_resource_configs():
     model = _make_model()
     cfg = model.get_request_resource_configs([], [], {})
-    assert set(cfg) == {NANO_SAMPLER, TALKER_KV}
-    assert isinstance(cfg[TALKER_KV], KVReqConfig)
-    assert cfg[TALKER_KV].get_labels("eartts_talker", "talker_decode") == ["main", "uncond"]
+    # the talker's two streams open from its layout's labels
+    assert set(cfg) == {NANO_SAMPLER}
     text = cfg[NANO_SAMPLER]
-    assert isinstance(text, SamplingReqConfig)
+    assert isinstance(text, SampleSettings)
     assert text.temperature == model.config.temperature and text.top_p == model.config.top_p
     # request knobs override the config defaults
     greedy = model.get_request_resource_configs([], [], {"temperature": 0.0, "ignore_eos": True})[NANO_SAMPLER]

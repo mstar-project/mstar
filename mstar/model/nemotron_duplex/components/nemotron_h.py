@@ -19,13 +19,12 @@ remapper) so weights load by name with no per-tensor renames:
 
 Design notes:
   * NoPE — attention layers apply no RoPE; we subclass ``Attention`` and make
-    ``_apply_rope`` a no-op. The layers bind the ``NANO_KV`` / ``NANO_ATTN``
-    resources the model declares (no position resource).
+    ``_apply_rope`` a no-op. The layers read the ``NANO_KV`` array the model
+    declares, which has no positions.
   * Mamba state — the conv window and the SSM state of every Mamba-2 layer
-    are slots in the engine's recurrent-state pool (``MAMBA_STATE``), stepped
-    by the ``MAMBA`` resource: the mixer binds a ``Mamba2Callable`` and calls
-    ``mix.conv`` then ``mix(...)`` per layer, like the attention layers call
-    ``attend``. Fixed-address, so the decode step captures as a CUDA graph.
+    are the ``MAMBA_STATE`` Value the model declares: the mixer calls
+    ``causal_conv`` then ``mamba2`` on its layer. Fixed-address, so the decode
+    step captures as a CUDA graph.
 
 The Mamba-2 forward is a pure-PyTorch reference scan (no ``mamba_ssm`` kernel
 dependency) — correct but not fast; the kernel fast path is a later swap.
@@ -39,10 +38,10 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from mstar.engine.resources.convenience import Mamba2Callable
+from mstar.engine.state import causal_conv, mamba2
 from mstar.model.components.attention import Attention
 from mstar.model.components.norm import RMSNorm
-from mstar.model.nemotron_duplex.config import MAMBA, MAMBA_STATE, NANO_ATTN, NANO_KV, NanoConfig
+from mstar.model.nemotron_duplex.config import MAMBA_STATE, NANO_ATTN, NANO_KV, NanoConfig
 
 # ---------------------------------------------------------------------------
 # Cached decode state (engine-free O(T) path; additive to offline_forward)
@@ -226,16 +225,11 @@ class Mamba2Mixer(nn.Module):
             self.d_inner, eps=config.rms_norm_eps, group_size=self.d_inner // self.n_groups
         )
         self.out_proj = nn.Linear(self.d_inner, config.hidden_size, bias=config.mamba_proj_bias)
-        # Resolved at load by ``NodeSubmodule.bind_node_resources``; None on
-        # the standalone (engine-free) paths.
-        self.mix: Mamba2Callable | None = None
+        # the handle on MAMBA_STATE, None on the standalone (engine-free) paths
+        self.state = None
 
-    def bind_resources(self, resources: dict) -> None:
-        """Resolve the recurrent pool and the Mamba-2 resource this layer steps
-        through. See ``NodeSubmodule.bind_node_resources``."""
-        pool = resources.get(MAMBA_STATE)
-        attn = resources.get(MAMBA)
-        self.mix = Mamba2Callable(pool=pool, attn=attn) if pool is not None and attn is not None else None
+    def bind_state(self, handles: dict) -> None:
+        self.state = handles.get(MAMBA_STATE)
 
     # -- helpers ---------------------------------------------------------
 
@@ -282,26 +276,24 @@ class Mamba2Mixer(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Engine forward over the step's packed rows ``[total_tokens, H]``.
 
-        The label and the layer index are cursors on ``self.mix`` (bound once
-        per stack, advanced per Mamba layer by ``NemotronHLLM.forward``). The
-        conv window and the SSM state are read from and written to this
-        layer's pool blocks by the resource; decode rows take the fused
+        The conv window and the SSM state are this layer's entry of the Value,
+        read and written in place by its updates; decode rows take the fused
         single-step kernels, prefill rows the varlen conv + sequential scan.
-        With no resources bound (standalone use) this is the single-sequence
-        math of ``_forward_seq`` from a fresh state.
+        With no handle bound (standalone use) this is the single-sequence math
+        of ``_forward_seq`` from a fresh state.
         """
-        if self.mix is None:
+        if self.state is None:
             out, _, _ = self._forward_seq(hidden_states, None, None)
             return out
         n = hidden_states.shape[0]
         z, xBC, dt = self._split_in_proj(self.in_proj(hidden_states))
         # [conv_dim, 1, k] -> [conv_dim, k] for the kernel; silu applied inside
-        xBC = self.mix.conv(xBC, weight=self.conv1d.weight.squeeze(1), bias=self.conv1d.bias)
+        xBC = causal_conv(self.state, self.layer_idx, xBC, weight=self.conv1d.weight.squeeze(1), bias=self.conv1d.bias)
         x, B, C = torch.split(
             xBC, [self.d_inner, self.n_groups * self.d_state, self.n_groups * self.d_state], dim=-1
         )
-        y = self.mix(
-            x.view(n, self.nheads, self.head_dim), dt,
+        y = mamba2(
+            self.state, self.layer_idx, x.view(n, self.nheads, self.head_dim), dt,
             B.view(n, self.n_groups, self.d_state), C.view(n, self.n_groups, self.d_state),
             self.A_log, self.D, self.dt_bias,
         )
@@ -455,6 +447,7 @@ def _build_mixer(config: NanoConfig, kind: str, layer_idx: int) -> nn.Module:
             attn_key=NANO_ATTN,
             kv_key=NANO_KV,
             pos_key=None,  # NoPE
+            layer=layer_idx,
         )
     if kind == "mlp":
         return NemotronHMLP(config)
@@ -472,8 +465,6 @@ class NemotronHBlock(nn.Module):
         self.mixer = _build_mixer(config, kind, layer_idx)
 
     def forward(self, hidden_states):
-        # Every mixer reads its resources through bound cursors (attention:
-        # ``attend``; Mamba-2: ``mix``); the MLP is stateless.
         return hidden_states + self.mixer(self.norm(hidden_states))
 
     def offline_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -532,38 +523,12 @@ class NemotronHLLM(nn.Module):
         )
         self.norm_f = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-        # attention layer -> dense KV-cache index (only ``*`` layers have a
-        # KV slot); mamba layer -> dense recurrent-pool index (only ``M``
-        # layers have state). Each pool is sized by its own layer count.
-        self._attn_cache_idx: dict[int, int] = {}
-        self._mamba_idx: dict[int, int] = {}
-        for i, kind in enumerate(kinds):
-            if kind == "attention":
-                self._attn_cache_idx[i] = len(self._attn_cache_idx)
-            elif kind == "mamba":
-                self._mamba_idx[i] = len(self._mamba_idx)
-
-    def forward(self, input_embeds, *, label: str = "main"):
-        """Engine forward over packed rows ``[sum(seq_lens), H]``.
-
-        The label and the per-kind dense layer indices are cursors on the
-        shared resources: bound once per step, advanced per layer (see
-        ``Attention.forward`` / ``Mamba2Mixer.forward``). The runner commits
-        the cache and state advance from the step declaration, so nothing is
-        advanced here.
-        """
+    def forward(self, input_embeds):
+        """Engine forward over packed rows ``[sum(seq_lens), H]``. Each stateful
+        layer calls its handle with its own layer id; the step's commit keeps
+        what the calls wrote, so nothing is advanced here."""
         hidden = input_embeds
-        first_attn = next((b for b in self.layers if b.kind == "attention"), None)
-        if first_attn is not None:
-            first_attn.mixer.attend.bind_step(label)
-        first_mamba = next((b for b in self.layers if b.kind == "mamba" and b.mixer.mix is not None), None)
-        if first_mamba is not None:
-            first_mamba.mixer.mix.bind_step(label)
         for block in self.layers:
-            if block.kind == "attention":
-                block.mixer.attend.set_layer_idx(self._attn_cache_idx[block.layer_idx])
-            elif block.kind == "mamba" and block.mixer.mix is not None:
-                block.mixer.mix.set_layer_idx(self._mamba_idx[block.layer_idx])
             hidden = block(hidden)
         return self.norm_f(hidden)
 
@@ -612,8 +577,8 @@ class NemotronHForCausalLM(nn.Module):
     def embeddings(self) -> nn.Embedding:
         return self.embed_tokens
 
-    def forward(self, input_embeds, *, label: str = "main") -> torch.Tensor:
-        return self.llm(input_embeds, label=label)
+    def forward(self, input_embeds) -> torch.Tensor:
+        return self.llm(input_embeds)
 
     def offline_forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         """Full-sequence offline forward: ``input_ids`` (L,) -> logits (L, vocab)."""

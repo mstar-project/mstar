@@ -12,13 +12,10 @@ import pytest
 import torch
 from torch import nn
 
-from mstar.engine.resources import AttentionStep, KVStep, SamplerStep
-from mstar.engine.resources.linear_attn.config import LinearAttnStep
-from mstar.engine.resources.recurrent import RecurrentStep
+from mstar.engine.state import ArrayStep, SampleStep
+from mstar.model.nemotron_duplex import submodules
 from mstar.model.nemotron_duplex.config import (
-    MAMBA,
     MAMBA_STATE,
-    NANO_ATTN,
     NANO_KV,
     NANO_SAMPLER,
     NemotronDuplexConfig,
@@ -64,15 +61,16 @@ def test_nano_never_stops_on_a_token():
 
 
 def _decode_engine(rids):
-    sampler = SimpleNamespace(sample=lambda rids, logits: logits.argmax(dim=-1))
-    return SimpleNamespace(request_ids=rids, resources={NANO_SAMPLER: sampler}, per_request_states=None)
+    return SimpleNamespace(request_ids=rids, resources={}, per_request_states=None)
 
 
-def test_nano_forward_hands_over_row_outputs_and_nothing_for_the_stop_check():
+def test_nano_forward_hands_over_row_outputs_and_nothing_for_the_stop_check(monkeypatch):
     """One batch tensor per output name, row i = request i (the engine clones
     it once and hands out views), the consumed-prompt sentinel on every row,
     and an empty stop-check set: no per-request device-to-host copy per step."""
+    monkeypatch.setattr(submodules, "sample", lambda sampler, logits: logits.argmax(dim=-1))
     nano = _make_nano()
+    nano.sampler = None
     nano.language_model.forward = lambda x, label=None: x
     torch.manual_seed(0)
     x = torch.randn(3, H)
@@ -142,38 +140,39 @@ def test_nano_prompt_rides_the_first_frame_step():
     assert torch.allclose(pre2["input_embeds"], frame_row)
 
 
-STATE_KEYS = {NANO_KV, NANO_ATTN, MAMBA_STATE, MAMBA}
+STATE_KEYS = {NANO_KV, MAMBA_STATE}
+
+
+def _info(prompt_pending: bool, iteration: int) -> SimpleNamespace:
+    return SimpleNamespace(step_metadata={"prompt_pending": prompt_pending},
+                           dynamic_loop_iter_counts={"decode_loop": iteration})
 
 
 def test_nano_declare_step_per_walk():
-    """Every walk steps the KV + attention and the Mamba pool + resource; only
-    decode steps the text sampler (the prompt region is never sampled). One
-    'main' segment per request, spanning its token count — padding rows
-    included (strict zip)."""
+    """Every walk steps the KV and the Mamba Value; only decode steps the text
+    sampler (the prompt region is never sampled). One 'main' segment per
+    request, spanning its token count — padding rows included (strict zip)."""
     nano = _make_nano()
     p_inp = nano.prepare_inputs("decode", None, {"text_inputs": [torch.arange(4)], "audio_frame": [torch.ones(H)]})
     step = nano.declare_step("decode", ["a"], [p_inp])
-    assert set(step.keys()) == STATE_KEYS | {NANO_SAMPLER}
-    assert isinstance(step.get(NANO_KV), KVStep) and isinstance(step.get(NANO_ATTN), AttentionStep)
-    assert isinstance(step.get(MAMBA_STATE), RecurrentStep) and isinstance(step.get(MAMBA), LinearAttnStep)
-    assert step.get(NANO_ATTN).causal is True
+    assert set(step.state) == STATE_KEYS | {NANO_SAMPLER}
+    assert step.state[NANO_KV] == ArrayStep() and step.state[MAMBA_STATE] == ArrayStep()
     assert [(s.request_id, s.label, s.span) for s in step.segments] == [("a", "main", 5)]
     assert step.cg_key_info is None                       # prompt + frame: no fixed-shape capture fits
 
     d_inp = nano.prepare_inputs("decode", None, {"audio_frame": [torch.ones(H)]})
     step = nano.declare_step("decode", ["a", "b"], [d_inp, d_inp])
-    assert set(step.keys()) == STATE_KEYS | {NANO_SAMPLER}
-    assert isinstance(step.get(NANO_SAMPLER), SamplerStep)
+    assert set(step.state) == STATE_KEYS | {NANO_SAMPLER}
+    assert step.state[NANO_SAMPLER] == SampleStep(apply_penalty=True)
     assert [(s.request_id, s.span) for s in step.segments] == [("a", 1), ("b", 1)]
     assert step.cg_key_info == nano.DECODE_KEY
-    # the engine asks before the inputs exist: the routing's step_metadata answers
-    pending = {"a": SimpleNamespace(step_metadata={"prompt_pending": True}), "b": SimpleNamespace(step_metadata={})}
+    # the engine asks before the inputs exist: the routing's step_metadata and the loop's count answer
+    pending = {"a": _info(True, 0), "b": _info(False, 0)}
     assert nano.cg_key_info("decode", pending, per_request_input_metadata={}) is None
     assert nano.cg_key_info("decode", {"b": pending["b"]}) == nano.DECODE_KEY
-    # the mark stays on the routing for the whole loop: once the request's first
-    # step (prompt + frame) has run, its later steps take the capture
-    nano.postprocess("a", None, {"new_token": [torch.tensor([7])]})
-    assert nano.cg_key_info("decode", pending) == nano.DECODE_KEY
+    # the mark stays on the routing for the whole loop: past the loop's first
+    # step (prompt + frame), its later steps take the capture
+    assert nano.cg_key_info("decode", {"a": _info(True, 1)}) == nano.DECODE_KEY
 
 
 def test_nano_captures_the_decode_step():
