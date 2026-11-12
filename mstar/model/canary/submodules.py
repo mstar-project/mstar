@@ -29,3 +29,8 @@ class CanaryDecoderSubmodule(EncoderDecoderNode):
 
     def layer_steps(self) -> dict[str, ResourceStep]:
         return {KV_CACHE: KVStep(), ATTN: AttentionStep(causal=True)}
+
+    def resident_walks(self) -> frozenset[str]:
+        # one token a row in the main stream; the context is read, not written,
+        # and positions are read in the forward, not in `preprocess`
+        return frozenset({self.DECODE_WALK})
