@@ -616,7 +616,9 @@ def _kept_array(**fields) -> Array:
                              "attn": _read(Causal(), layers={1})}, max_len=4096)],
     [_array("dit_kv", reads={"self_attn": _read(Bidirectional(kept_window=True), layers={0}),
                              "other": _read(Bidirectional(kept_window=True), layers={1})}, max_len=4096)],
-], ids=["beside_causal", "beside_kept_window"])
+    [_array("dit_kv", reads={"self_attn": _read(Bidirectional(kept_window=True), layers={0}),
+                             "reach": Read(mask=Bidirectional(kept_window=True), layers={1})}, max_len=4096)],
+], ids=["beside_causal", "beside_kept_window", "beside_a_read_with_no_op"])
 def test_a_kept_window_read_is_its_array_s_only_read(arrays):
     """The pool releases what one read's window no longer reaches, which any other read of the array may reach."""
     with pytest.raises(ValueError, match=r"Array 'dit_kv': no layout yet: reads\['\w+'\] keeps a window beside"):
@@ -759,3 +761,125 @@ def test_the_reach_equals_the_store_s_view_on_cuda():
     gathered, expected = _kept_and_rolling(torch.device("cuda"))
     for i, (got, want) in enumerate(zip(gathered, expected, strict=True)):
         assert torch.equal(got, want), f"pass {i % 5} of chunk {i // 5} gathered other keys than the rolling view"
+
+
+# A read with no op
+
+
+def _reach_handle(sink=18, window=24, chunk=12):
+    """A no-op kept-window read through `node_handles` over a CPU pool of pages of 8, with request ``a`` laid out."""
+    array = Array("dit_kv", nodes={"dit"}, layers={0}, entry=KVEntry(heads=1, head_dim=1), max_len=4096,
+                  reads={"self_attn": Read(mask=Bidirectional(kept_window=True))})
+    (kv_spec,) = build_specs([array], kernel_settings={"dit_kv": {"max_num_pages": 64}})
+    pool = KVManager(
+        cfg=replace(kv_spec.config, page_size=8), name="dit_kv", joint_comm_group=None,
+        transfer_engine_info=TransferEngineInfo("h", "h", LocalTransferEngine("h")), device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    handle = node_handles(SimpleNamespace(declare_state=lambda: [array]), "dit", {"dit_kv": pool})["dit_kv"]
+    (row,) = kv_layouts([array], {"dit_kv": {"main": Layout(
+        growth=(("rollout", chunk),), kept_windows={"self_attn": KeptWindow(sink, window=window)},
+    )}}, {})["dit_kv"].values()
+    request = KVReqConfig(needed_labels=["main"])
+    request.apply_conductor_config(kv_layout={"main": row.row()}, loop_caps={"rollout": 100})
+    pool.ingest_request("a", overrides=request)
+    return handle, pool
+
+
+def _reach_step(handle, pool, span, capture=False) -> SubmoduleStep:
+    step = state_steps(SubmoduleStep(segments=[Segment("a", "main", span)], state={"dit_kv": ArrayStep()}),
+                       {"dit_kv": handle}, graph_walk="rollout")
+    step.set_ctx(StepContext(request_ids=["a"], graph_walk="rollout", slot=0, capture=capture))
+    assert pool.admit(step.steps["dit_kv"], step.ctx).ok
+    pool.plan(step.steps["dit_kv"], step.ctx)
+    return step
+
+
+def test_a_read_with_no_op_returns_the_reach():
+    """Against the dense reference: the reach of each step, the step's own adds included, packed by row."""
+    sink, window, chunk = 18, 24, 12
+    handle, pool = _reach_handle(sink, window, chunk)
+    for index in range(6):
+        start = index * chunk
+        step = _reach_step(handle, pool, chunk)
+        step.begin_calls()
+        k = (start + torch.arange(chunk, dtype=torch.float32))[:, None, None]
+        handle.add(0, k=k, v=-k)
+        reached = handle.read(0)
+        expected = [*range(min(sink, start)), *range(max(sink, start - window), start), *range(start, start + chunk)]
+        assert reached.fields["k"].flatten().long().tolist() == sorted(set(expected)), f"chunk {index}"
+        assert torch.equal(reached.fields["v"], -reached.fields["k"])
+        assert reached.row_offsets.tolist() == [0, len(set(expected))]
+        step.check_calls()
+        pool.commit(step.steps["dit_kv"], step.ctx)
+        step.end_calls()
+
+
+def test_reference_mode_builds_its_pool():
+    """With no read that runs a kernel, the pool takes its KV heads as its query heads, and no attention is built."""
+    array = Array("dit_kv", nodes={"dit"}, layers={0, 1}, entry=KVEntry(heads=HEADS, head_dim=DIM), max_len=64,
+                  reads={"self_attn": Read(mask=Bidirectional(kept_window=True))})
+    (kv_spec,) = build_specs([array])
+    assert kv_spec.config.num_qo_heads == HEADS
+
+
+def test_a_reach_read_holds_no_add():
+    """Every add writes its pages, which the reach reads back, so nothing waits on the handle for the read."""
+    handle, pool = _reach_handle()
+    _reach_step(handle, pool, 12).begin_calls()
+    k = torch.arange(12, dtype=torch.float32)[:, None, None]
+    handle.add(0, k=k, v=-k)
+    assert handle._held is None
+    page = pool._streams["a"]["main"].page_indices[0]
+    assert pool.layer_view(0)[page, 0, :8].flatten().tolist() == list(range(8)), "the add should be on the pages"
+
+
+@pytest.mark.parametrize("mask", [Bidirectional(), Causal()], ids=["bidirectional", "causal"])
+def test_a_read_with_no_op_on_kept_entries_needs_a_kept_window(mask):
+    with pytest.raises(ValueError, match=r"reads\['attn'\].op must be Attend, the reads today's resources run"):
+        build_specs([_array(reads={"attn": Read(mask=mask)})])
+
+
+def test_a_reach_is_refused_under_capture():
+    """A reach changes length every step, so a captured graph has nothing fixed to replay. Validation sees no
+    capture, so the step that would capture refuses."""
+    handle, pool = _reach_handle()
+    step = _reach_step(handle, pool, 12, capture=True)
+    with pytest.raises(ValueError, match="Array 'dit_kv': no layout yet: a read with no op in a captured step"):
+        step.begin_calls()
+
+
+def test_a_reach_only_array_has_no_last_token_yet():
+    handle, pool = _reach_handle()
+    _reach_step(handle, pool, 12).begin_calls()
+    with pytest.raises(ValueError, match="Array 'dit_kv': no layout yet: at_last_token on an array whose read has"):
+        at_last_token(handle, torch.zeros(12, 1))
+
+
+def test_the_views_are_the_live_step_s_through_a_pre_plan():
+    """The forward reads the views of the step it runs: its own plan's, its promoted pre-plan's, or the read-only plan
+    it reuses. A pre-plan of the next step, which waits for this step's commit, stages its views without making them
+    live, and a commit drops the live ones, so a plan goes with its last reference."""
+    pool = _pool()
+    pool.ingest_request("a", overrides=KVReqConfig(needed_labels=["main"]))
+    first, second = (KVStep(segments=(Segment("a", "main", span),)) for span in (4, 2))
+    ctx = StepContext(request_ids=("a",), graph_walk="rollout", slot=0, capture=False)
+    assert pool.admit(first, ctx).ok
+    planned = pool.plan(first, ctx)
+    assert pool.views("main") is planned["main"].views
+    pool.commit(first, ctx)
+    ahead = StepContext(request_ids=("a",), graph_walk="rollout", slot=1, capture=False, is_preplan=True)
+    assert pool.admit(second, ahead).ok
+    staged = pool.plan(second, ahead)
+    with pytest.raises(RuntimeError, match="views of 'main' outside a step's forward, where no plan is live"):
+        pool.views("main")
+    assert pool.admit(second, ctx).ok
+    assert pool.plan(second, ctx) is staged, "the step should promote its pre-plan"
+    assert pool.views("main") is staged["main"].views, "the promoted step's views should be live"
+    pool.commit(second, ctx)
+    readonly = KVStep(segments=(Segment("a", "main", 0),), commit=False)
+    for _ in range(2):
+        assert pool.admit(readonly, ctx).ok
+        planned = pool.plan(readonly, ctx)
+        assert pool.views("main") is planned["main"].views, "a reused read-only plan's views should be live"
+        pool.commit(readonly, ctx)
