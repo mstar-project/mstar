@@ -557,7 +557,8 @@ impl Drop for DeferredCleanup {
 static PENDING_UPLOADS: Mutex<Option<HashSet<PathBuf>>> = Mutex::new(None);
 
 fn remove_pending_uploads() {
-    for f in PENDING_UPLOADS.lock().unwrap().take().into_iter().flatten() {
+    let files = PENDING_UPLOADS.lock().unwrap().take();
+    for f in files.into_iter().flatten() {
         let _ = std::fs::remove_file(f);
     }
 }
@@ -2062,8 +2063,12 @@ fn ndjson_line(c: &ResultChunk) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    // PENDING_UPLOADS is process-wide: tests that schedule uploads take turns.
+    static UPLOADS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[tokio::test(start_paused = true)]
     async fn a_speech_clip_is_removed_once_the_last_piece_is_done_with_it() {
+        let _turn = UPLOADS.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("mstar_cleanup_{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&dir).unwrap();
         let clip = dir.join("ref.wav");
@@ -2082,6 +2087,22 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         tokio::task::yield_now().await;
         assert!(!clip.exists(), "never removed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_removes_the_uploads_still_waiting_for_their_grace() {
+        let _turn = UPLOADS.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("mstar_cleanup_{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let clip = dir.join("shutdown.wav");
+        std::fs::write(&clip, b"RIFF").unwrap();
+        let mut args = super::SubmitArgs::default();
+        args.file_paths.insert("audio".into(), vec![clip.to_string_lossy().into_owned()]);
+        super::schedule_upload_cleanup(&dir, &args);
+        assert!(clip.exists());
+        super::remove_pending_uploads();
+        assert!(!clip.exists(), "left behind at shutdown");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
