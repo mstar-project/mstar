@@ -579,9 +579,13 @@ def test_max_concurrent_requests_must_be_a_positive_int(model, cap):
 
 
 def test_no_request_cap_is_a_warning(model, caplog):
+    """Neither LM cache has host pages, so nothing is offloaded to admit a request past them."""
     with caplog.at_level("WARNING"):
         model.validate_config_yaml({}, "voxcpm2.yaml")
     assert "sets no max_concurrent_requests" in caplog.text
+    assert "one without stalls until requests time out" in caplog.text, "the warning would promise an offload"
+    caches = [spec.config for spec in node_resources(model) if hasattr(spec.config, "cpu_offload_pages")]
+    assert [cache.cpu_offload_pages for cache in caches] == [0, 0]
 
 
 def test_build_prompt_matches_the_reference_layout():
