@@ -17,6 +17,7 @@ import torch
 
 sys.path.insert(0, ".")
 
+from mstar.distributed.communication import CommGroup  # noqa: E402
 from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner  # noqa: E402
 from mstar.engine.resources import resident as resident_mod  # noqa: E402
 from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec  # noqa: E402
@@ -41,10 +42,12 @@ from mstar.engine.resources.recurrent.config import (  # noqa: E402
 )
 from mstar.engine.resources.recurrent.pool import SINK_SLOT, RecurrentStatePool  # noqa: E402
 from mstar.engine.resources.resident import TRASH_SLOT, ResidentPlanner, build_planner  # noqa: E402
+from mstar.engine.resources.sequence_shard import SequenceShard  # noqa: E402
 from mstar.engine.resources.spec import resolve_spec_dependencies  # noqa: E402
 from mstar.engine.resources.step import (  # noqa: E402
     AllocationFailed,
     BucketKey,
+    ResourceStep,
     Segment,
     SlotLease,
     StepContext,
@@ -1995,16 +1998,33 @@ def test_a_resource_without_a_table_refuses():
     assert planner is None and "_Spare keeps no resident table" in why
 
 
-def test_a_sequence_shard_holds_no_node_back():
-    """Cosmos3-Edge's reasoner shares the dit's shard and decodes on resident tables (#1295)."""
-    from mstar.engine.resources.base import EngineResourceInfo
-    from mstar.engine.resources.sequence_shard import SeqShardSpec
-
+def test_a_sequence_shard_leaves_the_node_resident():
+    """Qwen3.5 declares its shard at every SP size, and Cosmos3-Edge's reasoner shares the dit's
+    (#1295): the shard holds no per-request state and never splits a one-token-a-row step, so it
+    costs no node its resident decode, at one SP rank or more. Its steps replay on the tables and
+    plan copied."""
     res = _resources()
-    spec = SeqShardSpec("shard", {"n"}, ("main",), 0)
-    shard = spec.resource_class.build(spec, EngineResourceInfo(device=CPU))
-    planner, why = _build({"kv": res["kv"], "shard": shard})
+    res["shard"] = SequenceShard(("main",), 0, None, 0, CommGroup.trivial())
+    planner, why = _build({k: res[k] for k in ("kv", "pool", "rope", "shard")})
     assert planner is not None and why == ""
+    _ingest(res, 1)
+    _host_step(res, [1], [3])
+    s = _captured_step(res, planner, [1], 0, 2)
+    assert s.positions[0] == 3
+    assert not res["shard"].plan(ResourceStep(segments=s.kv.segments), s.ctx).split
+    planner, why = _build({"shard": SequenceShard(("main",), 0, None, 0, SimpleNamespace(world_size=2))})
+    assert planner is not None and why == ""
+
+
+def test_gdn_on_a_node_whose_steps_split_refuses():
+    """Resident decode beside split prefills is untested, so a GDN node whose steps split plans on the host."""
+    from mstar.engine.resources.linear_attn.gdn import GDNManager
+
+    manager = GDNManager.__new__(GDNManager)
+    manager._shard = None
+    assert manager.resident_refusal() is None
+    manager._shard = SimpleNamespace(group=SimpleNamespace(world_size=2))
+    assert "split over 2 SP ranks" in manager.resident_refusal()
 
 
 def test_a_pool_shared_with_a_host_planned_node_builds():

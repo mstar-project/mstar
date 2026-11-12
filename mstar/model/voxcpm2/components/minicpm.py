@@ -227,9 +227,6 @@ class MiniCPMLocalAttention(ParallelAttention):
         super().__init__(pos_key=None, **kwargs)
         self.__dict__["_rope"] = rope
 
-    def bind_resources(self, resources: dict) -> None:
-        del resources
-
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         rows, seq, _ = hidden_states.shape
         qkv = self.qkv_proj(hidden_states.reshape(rows * seq, -1))

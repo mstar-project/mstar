@@ -534,6 +534,8 @@ them by that name:
                                     # flashinfer_backend
      seq_shard:                 # a node's sequence shard (SP ranks)
        min_tokens: 2048         # steps below this run copied on every SP rank; also: exchange
+     linear_attn:               # a recurrent layer's resource (GDN, Mamba-2)
+       backend: flashinfer
      sampler:
        greedy_capture: false    # also: enable_logprobs, enable_processed_logprobs
 
@@ -566,23 +568,36 @@ a sliding window (``AttentionConfig.sliding_window``) has no prefix cache yet: i
 ``prefix_cache: true`` on it is refused.
 
 A node on ``sp_size`` above 1 shares each step over its SP ranks along two axes. A model that
-declares a sequence shard (``SeqShardSpec``: the DiTs of LTX-2.5, Cosmos3, Wan2.2 and MiniMax-H3, and
-Qwen3-Omni's Thinker) splits a step's tokens
-over them; its ``min_tokens`` runs smaller steps copied on every rank instead (default 0: every
-step that can split does). A captured step decides from its bucket's size, not its prompt's.
+declares a sequence shard (a ``SeqShard``: Qwen3.5's LLM, Qwen3-Omni's Thinker and the DiTs of
+LTX-2.5, Wan2.2 and MiniMax-H3; a ``SeqShardSpec``: Cosmos3's DiT and MiniMax-H3's video
+decoder) splits a step's tokens over them; its ``min_tokens`` runs smaller steps copied on every
+rank instead (default 0: every step that can split does). A captured step decides from its
+bucket's size, not its prompt's. A node with a resource whose split steps run eagerly only (a
+ring, ``kv_gather``, a recurrent layer such as Qwen3.5's) never splits a captured step: the
+shard sets its own floor at load, for each walk it splits, one past that walk's largest captured
+bucket (from the node's capture configs, so the same on every rank). A step that fits a bucket
+runs copied in its graph, and a bigger one runs eagerly and splits; ``min_tokens`` only raises that
+floor, as a measured crossover does (Qwen3-Omni's Thinker, whose all_gather split replays in a graph).
 Separately, ``context_parallel: true`` stores a paged pool's K/V by position rather than by
 head: each request's positions split over the ranks that would otherwise hold the same KV
-heads, the TP ranks that share a KV head or the node's SP ranks, which is how a model with no
-sequence shard (such as Qwen3.5) runs on ``sp_size`` above 1. Raise ``max_num_pages`` by that
+heads, the TP ranks that share a KV head or the node's SP ranks, which is how a model whose
+attention takes no split steps runs on ``sp_size`` above 1. Raise ``max_num_pages`` by that
 factor to turn the freed memory into context. A node on SP ranks needs at least one of the two.
 
 The sequence shard's ``exchange`` picks how a split step reaches the node's paged attentions,
-from where their KV is stored. ``auto`` (the default) splits by Ulysses over KV stored by head,
+from where their KV is stored. ``auto`` (the default; Qwen3-Omni's Thinker and Qwen3.5 default to ``none``) splits by Ulysses over KV stored by head,
 and over KV stored by position runs the node's steps copied (KV capacity alone). Over KV stored by
 position, ``all_gather`` splits them, and ``ring`` also bounds the attention phase's memory to
 this rank's tokens and runs eager only. ``ulysses`` (by head) states the default, and ``none``
-never splits. A value the node's storage can't take fails at load, at any SP size, and so does
-``ring`` over an attention backend other than ``flashinfer`` (when the engine builds it):
+never splits. What every SP rank stores whole takes its own exchange wherever the node splits:
+a sliding-window attention over KV stored by position (whose window layers stay whole on each
+rank, so its decode needs no collective; CPU-tested only) gathers the
+step's keys (``kv_gather``); a recurrent layer's resource (``linear_attn``) takes ``ulysses`` where each TP rank's
+heads split ``sp_size`` ways, and ``state_passing`` where they don't (CPU-tested only, as
+Mamba-2's split is), picked from the model's head counts. A value the node's
+storage can't take fails at load, at any SP size, and so does ``ring`` over an attention backend
+other than ``flashinfer`` (when the engine builds it); ``ring`` beside a ``kv_gather`` attention or
+a recurrent layer fails at load on SP ranks:
 
 .. code-block:: yaml
 

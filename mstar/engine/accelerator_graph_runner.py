@@ -33,6 +33,7 @@ from mstar.engine.resources import BucketKey, CGSlotSpec, KVStep, Resource, Slot
 from mstar.engine.resources.resident import ResidentPlanner
 from mstar.engine.resources.step import PIECEWISE_WALK, lean_subsets
 from mstar.engine.state.adapters import state_steps
+from mstar.engine.state.calls import ShardHandle
 from mstar.engine.state.contract import EMPTY
 from mstar.model.submodule_base import (
     BatchedModelOutput,
@@ -2440,12 +2441,14 @@ class PiecewiseAcceleratorGraphRunner:
     ):
         """The config's step for the region, with a step of its own segments under each of
         the node's resources that takes them (``with_segment_steps``), and what it declares
-        about its state expanded (``state_steps``)."""
+        about its state expanded (``state_steps``). The node's shard handle stays out: the region runs inside the node's
+        step, which holds it open, and a region's step would close it at its end."""
         step = with_segment_steps(
             self._config.region_step(list(request_ids), list(seq_lens), label_seq_lens),
             self._segment_keys,
         )
-        return state_steps(step, self._state_handles)
+        handles = {name: h for name, h in self._state_handles.items() if not isinstance(h, ShardHandle)}
+        return state_steps(step, handles)
 
     def _plan(self, step, shape: PiecewiseCaptureShape) -> None:
         if step is None:

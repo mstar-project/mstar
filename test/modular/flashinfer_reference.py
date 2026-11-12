@@ -12,22 +12,29 @@ import types
 import torch
 
 
-def reference_attention(q, k, v, causal=True):
+def reference_attention(q, k, v, causal=True, window_left=-1):
     """Attention of ``q`` ``[T, Hq, D]`` over ``k``/``v`` ``[L, Hkv, D]``, the queries the last ``T``
-    positions when causal (FlashAttention's bottom-right alignment); fp32 ``(out, lse)``, lse
-    natural-log ``[T, Hq]``."""
+    positions when causal or windowed (FlashAttention's bottom-right alignment), each seeing the
+    ``window_left`` keys before it (FlashInfer's; -1 for all); fp32 ``(out, lse)``, lse natural-log
+    ``[T, Hq]``."""
     group = q.shape[1] // k.shape[1]
     k, v = (t.float().repeat_interleave(group, dim=1) for t in (k, v))
     scores = torch.einsum("thd,lhd->htl", q.float(), k) * q.shape[-1] ** -0.5
+    t, length = q.shape[0], k.shape[0]
+    pos, keys = torch.arange(t)[:, None] + (length - t), torch.arange(length)[None, :]
+    seen = torch.ones(t, length, dtype=torch.bool)
     if causal:
-        t, length = q.shape[0], k.shape[0]
-        seen = torch.arange(length)[None, :] <= torch.arange(t)[:, None] + (length - t)
+        seen &= keys <= pos
+    if window_left >= 0:
+        seen &= keys >= pos - window_left
+    if causal or window_left >= 0:
         scores = scores.masked_fill(~seen.to(scores.device), -math.inf)
     return torch.einsum("htl,lhd->thd", torch.softmax(scores, dim=-1), v), torch.logsumexp(scores, -1).T
 
 
 def reference_flashinfer() -> types.ModuleType:
-    """FlashInfer's paged prefill/decode and ragged wrappers, with their lse bases. A paged plan
+    """FlashInfer's paged prefill/decode and ragged wrappers, with their lse bases and the paged
+    ones' ``window_left``. A paged plan
     refuses a row FlashInfer's split-KV planner would miscount: no pages, or a last page holding no
     slot (see ``local_indptrs``); and a causal row with more queries than keys, whose first queries
     FlashInfer's bottom-right mask leaves none. The ragged one attends each row's queries over its
@@ -45,7 +52,7 @@ def reference_flashinfer() -> types.ModuleType:
 
         def plan(self, qo_indptr=None, paged_kv_indptr=None, paged_kv_indices=None,
                  paged_kv_last_page_len=None, *, page_size, seq_lens, causal=False, indptr=None,
-                 indices=None, last_page_len=None, **kwargs):
+                 indices=None, last_page_len=None, window_left=-1, **kwargs):
             kvp = (paged_kv_indptr if indptr is None else indptr).tolist()
             self.indices = (paged_kv_indices if indices is None else indices).tolist()
             last = (paged_kv_last_page_len if last_page_len is None else last_page_len).tolist()
@@ -53,7 +60,7 @@ def reference_flashinfer() -> types.ModuleType:
             for (start, end, length), tail in zip(self.rows, last, strict=True):
                 assert end > start and 1 <= tail <= page_size and length == (end - start - 1) * page_size + tail
             self.qo = qo_indptr.tolist() if qo_indptr is not None else list(range(len(last) + 1))
-            self.causal = causal
+            self.causal, self.window_left = causal, window_left
             assert not causal or all(
                 b - a <= length for (a, b), (_, _, length) in zip(itertools.pairwise(self.qo), self.rows, strict=True)
             ), "a causal row with more queries than keys"
@@ -64,7 +71,7 @@ def reference_flashinfer() -> types.ModuleType:
             caches = kv if isinstance(kv, tuple) else kv.unbind(1)
             for b, (start, end, length) in enumerate(self.rows):
                 k, v = (cache[self.indices[start:end]].flatten(0, 1)[:length] for cache in caches)
-                out, lse = reference_attention(q[self.qo[b]:self.qo[b + 1]], k, v, self.causal)
+                out, lse = reference_attention(q[self.qo[b]:self.qo[b + 1]], k, v, self.causal, self.window_left)
                 outs.append(out)
                 lses.append(lse)
             out, lse = torch.cat(outs).to(q.dtype), torch.cat(lses)

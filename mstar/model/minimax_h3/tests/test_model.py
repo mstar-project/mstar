@@ -56,6 +56,10 @@ def _model(**kwargs) -> H3Model:
     return model
 
 
+def _one_rank_shard() -> SequenceShard:
+    return SequenceShard(("main",), 0, None, 0, SimpleNamespace(world_size=1))
+
+
 def _on_sdpa(config: H3Config) -> dict:
     """The DiT's handles on SDPA, as a config that sets ``backend: sdpa`` on its resources binds them."""
     model = _model()
@@ -63,7 +67,7 @@ def _on_sdpa(config: H3Config) -> dict:
     on_sdpa = {key: {"backend": "sdpa"} for key in (DIT_ATTN, REFINER_ATTN)}
     setup, problems = state_setup({"resources": on_sdpa}, model.declare_state())
     assert not problems, problems
-    return node_handles(model, "dit", {}, setup=setup)
+    return node_handles(model, "dit", {DIT_SHARD: _one_rank_shard()}, setup=setup)
 
 
 def _opened(node: H3DenoiseSubmodule, layout: H3Layout, handles: dict):
@@ -641,7 +645,7 @@ def _sp_dit(rank: int, world: int, store: str, snapshot: str, out: str) -> None:
                 res = _sp_resources(model, [DIT_SHARD, DIT_ATTN], sp)
                 node.bind_node_state(node_handles(model, "dit", res))
                 _plan(node, res, [0], layout).begin_calls()
-                shard = res[DIT_SHARD]
+                shard = node.state_handles[DIT_SHARD]
             step_layout = node.build_layout(layout, "cpu")
             projected = []
             dit.video_patch_proj.register_forward_hook(lambda m, args, y, seen=projected: seen.append(args[0].shape[1]))
@@ -689,8 +693,8 @@ def test_the_padded_rows_split_evenly_over_the_sp_ranks_at_every_prompt_length(w
     from mstar.distributed.communication import sp_seq_split
 
     node = H3DenoiseSubmodule(_SPStub(), H3Config(), loop_name=DENOISE_LOOP, row_bucket=row_bucket)
-    # the bound shard's group is all the layout reads
-    node.bind_node_resources({DIT_SHARD: SequenceShard(("main",), 0, None, 0, SimpleNamespace(world_size=world))})
+    # the bound shard's rank count is all the layout reads
+    node.bind_node_state({DIT_SHARD: SimpleNamespace(ranks=world)})
     multiple = math.lcm(row_bucket, world)
     for text_len in range(1, 600):
         layout = H3Layout(text_len=text_len, latent_frames=2, latent_height=4, latent_width=6, audio_latents=3,
