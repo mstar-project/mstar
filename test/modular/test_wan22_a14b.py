@@ -70,19 +70,6 @@ def test_unknown_variant_is_refused():
         Wan22Model(model_path_hf="test/wan22", variant="i2v_a14b")
 
 
-def test_a14b_without_a_table_of_its_own_refuses_a_magcache():
-    """MAG_RATIOS has no A14B table: a step cache that names none is refused rather than read TI2V-5B's."""
-    def build(spec):
-        return Wan22Model(
-            model_path_hf="test/wan22", variant=WAN22_VARIANT_T2V_A14B, skip_weight_loading=True, step_cache=spec,
-        )
-
-    with pytest.raises(ValueError, match="no calibrated mag_ratios table 'default'"):
-        build({"method": "magcache", "threshold": 0.06})
-    for spec in ({"method": "magcache", "mag_ratios": [1.0, 0.99]}, {"method": "magcache_calibrate"}):
-        assert build(spec).config.step_cache == spec
-
-
 def test_a14b_accepts_its_benchmark_shapes():
     cfg = Wan22Config.for_variant(WAN22_VARIANT_T2V_A14B, compile_dit_sizes=["832x480x81", "1280x720x81"])
     assert cfg.compile_dit_grids() == {(21, 60, 104), (21, 90, 160)}

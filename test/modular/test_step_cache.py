@@ -368,6 +368,18 @@ def test_a_batch_straddling_the_boundary_keeps_each_rows_residual_from_its_own_e
     assert not torch.equal(together["a"][1], together["b"][1])
 
 
+def test_a_magcache_without_a_table_takes_its_variants_own():
+    """A14B's experts are calibrated on their own table, not TI2V-5B's (different step count, an expert switch)."""
+    spec = {"method": "magcache", "threshold": 0.12, "max_skip_steps": 4, "retention_ratio": 0.4}
+    five, (a14b, _, _) = _submodule(spec), _a14b(spec)
+    assert five.step_cache.mag_ratios == MAG_RATIOS[WAN22_VARIANT_TI2V_5B]["default"]
+    assert a14b.step_cache.mag_ratios == MAG_RATIOS[WAN22_VARIANT_T2V_A14B]["default"]
+    assert len(five.step_cache.mag_ratios) == 50 and len(a14b.step_cache.mag_ratios) == 40
+    # the setting measured on B300: the first 16 of 40 steps computed, 24 in all
+    plan = a14b.step_cache.reuse_plan(40, (26,))
+    assert not any(plan[:16]) and plan.count(False) == 24
+
+
 def test_a_step_cache_with_a_distilled_sampler_is_refused():
     """The calibrated table is a UniPC run's: resampled to FastWan's 3 steps it would skip the middle one."""
     table = MAG_RATIOS[WAN22_VARIANT_TI2V_5B]
