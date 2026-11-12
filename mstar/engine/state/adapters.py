@@ -847,8 +847,7 @@ class PagedCrossHandle(PagedArrayHandle):
         super().begin_step(step)
         if step.ctx.replays:
             return
-        self.queries.check(self, segments_of(step.state[self.name], step) or (), step)
-        queries = self.queries.segments(self, step)
+        queries = self.queries.check(self, segments_of(step.state[self.name], step) or (), step)
         if queries:
             self._query_label = queries[0].label
 
@@ -1054,9 +1053,10 @@ class QuerySide:
         # the array whose segments lay out the queries
         self.array = array
 
-    def check(self, handle: ArrayHandle, segments, step: SubmoduleStep) -> None:
-        """Refuse a step whose queries don't line up with ``segments``, the read's own array's."""
-        return
+    def check(self, handle: ArrayHandle, segments, step: SubmoduleStep) -> Sequence[Segment]:
+        """Refuse a step whose queries don't line up with ``segments``, the read's own array's, and give the queries'
+        segments."""
+        return segments
 
 
 class OtherArrayQueries(QuerySide):
@@ -1074,11 +1074,12 @@ class OtherArrayQueries(QuerySide):
             raise ValueError(f"Array {name!r}: a step lists it with no segments, its own or the step's")
         return query_segments
 
-    def check(self, handle: ArrayHandle, segments, step: SubmoduleStep) -> None:
+    def check(self, handle: ArrayHandle, segments, step: SubmoduleStep) -> Sequence[Segment]:
         queries = self.segments(handle, step)
         if [s.request_id for s in queries] != [s.request_id for s in segments]:
             raise handle._refusal(f"its segments and those of {self.array.name!r}, which lay out its queries, must "
                                   "name the same requests in the same order, with one segment to one")
+        return queries
 
 
 class Queries(QuerySide, ABC):
