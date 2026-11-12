@@ -385,3 +385,13 @@ def test_the_declared_stream_state_is_the_served_decoders():
     assert mimi_state_blocks() == decoder.state_blocks()
     padded = {name: int(module.padding_total) for name, module in decoder.convs if hasattr(module, "padding_total")}
     assert padded and all(decoder.keep[name] == value for name, value in padded.items())
+
+
+def test_the_incremental_decoder_lives_on_its_codecs_device():
+    """Built beside a codec already on its device (parity.py's path), it must not need a ``.to``."""
+    from mstar.model.personaplex.components.mimi_stream import IncrementalMimiDecoder
+
+    with _without_triton_stub():
+        model = mimi_mod.build_hf_mimi().float().to("meta")
+    decoder = IncrementalMimiDecoder(MimiCodec(model))
+    assert {buffer.device.type for buffer in decoder.buffers()} == {"meta"}

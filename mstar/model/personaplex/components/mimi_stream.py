@@ -68,11 +68,10 @@ class IncrementalMimiDecoder(nn.Module):
             raise ValueError("Mimi's transformer is expected to have as many KV heads as query heads")
         self.context = context
         self.cache = context - 1
-        self.register_buffer(
-            "inv_freq",
-            1.0 / _rope_theta(config) ** (torch.arange(0, self.head_dim, 2, dtype=torch.float32) / self.head_dim),
-            persistent=False,
-        )
+        # on the codec's device: a decoder built beside a loaded codec is used without a later ``.to``
+        device = next(codec.parameters()).device
+        steps = torch.arange(0, self.head_dim, 2, dtype=torch.float32, device=device)
+        self.register_buffer("inv_freq", 1.0 / _rope_theta(config) ** (steps / self.head_dim), persistent=False)
         self.convs: list[tuple[str, nn.Module]] = []
         # each stride-1 conv's left padding, read once here: Mimi keeps it in a buffer, and reading
         # that per step would be a host sync on the GPU
