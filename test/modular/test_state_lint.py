@@ -22,7 +22,7 @@ PORTED = (
     "mstar/model/z_image", "mstar/model/ltx2_5", "mstar/model/qwen3_omni", "mstar/model/minimax_h3",
     "mstar/model/canary_qwen", "mstar/model/qwen3_asr", "mstar/model/parakeet", "mstar/model/fish_s2_pro",
     "mstar/model/qwen3_tts", "mstar/model/kokoro", "mstar/model/omnilingual_asr", "mstar/model/omnivoice",
-    "mstar/model/orpheus", "mstar/model/voxcpm2",
+    "mstar/model/orpheus", "mstar/model/higgs_audio", "mstar/model/voxcpm2",
 )
 FORBIDDEN_ATTRIBUTES = {
     "node_resources", "resources", "request_state", "request_states", "per_request_states",
@@ -217,8 +217,10 @@ def test_an_exception_covers_only_its_own_functions_attribute(path, source, foun
     assert _violations(source, path) == (found, used)
 
 
-def test_the_lint_reads_the_five_speech_packages():
-    assert {path.parts[2] for path in _sources()} >= {"kokoro", "omnilingual_asr", "omnivoice", "orpheus", "voxcpm2"}
+def test_the_lint_reads_the_six_speech_packages():
+    assert {path.parts[2] for path in _sources()} >= {
+        "kokoro", "omnilingual_asr", "omnivoice", "orpheus", "higgs_audio", "voxcpm2",
+    }
 
 
 def test_the_lint_reads_all_five_reference_packages():

@@ -327,6 +327,16 @@ class _Unread:
         return True
 
 
+class _AtZero:
+    """The step's tokens at position 0, which the layers' fused RoPE leaves unrotated."""
+
+    def __init__(self, rows: _Rows):
+        self.rows = rows
+
+    def pos_ids(self, label):
+        return torch.zeros(sum(self.rows.lengths), dtype=torch.long)
+
+
 # -- Llama-shaped checkpoints -------------------------------------------------------------------
 
 def llama_layers(c, prefix: str) -> dict[str, tuple[int, int]]:
@@ -631,16 +641,6 @@ def _declare(walk):
     )
 
 
-def _ids_run(stub_root, embed, stack, head):
-    """A node run as embed -> stack -> head on each row's last token."""
-    def run(sub, rows):
-        lengths = [len(r) for r in rows]
-        stub_attention(stub_root(sub), lengths)
-        hidden = stack(sub, embed(sub, torch.cat(rows)))
-        return _per_row(hidden, head(sub, _last(hidden, lengths)), lengths)
-    return run
-
-
 def _subset(modules, *ends):
     return {k: v for k, v in modules.items() if k.endswith(ends)}
 
@@ -708,17 +708,27 @@ def _higgs():
     prompt), its LoRA rows planned by the walk it serves (``prefill_audio``). The forward
     is this test's own embed, splice, stack and head, over prompts that open with one
     audio pad (served prompts carry one per audio token) whose row replaces its embedding."""
-    from mstar.model.higgs_audio.config import HiggsAudioModelConfig
+    from mstar.engine.state.adapters import node_handles
+    from mstar.model.higgs_audio.config import ATTN, HiggsAudioModelConfig
     from mstar.model.higgs_audio.higgs_audio_model import HiggsAudioModel, audio_encoder
     from mstar.model.higgs_audio.submodules import HiggsAudioLLMSubmodule
+    from mstar.model.keys import KV_CACHE, ROPE, SAMPLER
     from mstar.model.multimodal import splice_media
+
+    def stub_cores(sub, rows: _Rows):
+        """``sub`` with its handles on Higgs's declared state bound over stubs of the kernels, which read ``rows``."""
+        resources = {KV_CACHE: _Unread(), ATTN: _AttendCore(rows), ROPE: _AtZero(rows), SAMPLER: None}
+        sub.bind_node_state(node_handles(model_object(HiggsAudioModel, sub.config), "LLM", resources))
+        return sub
 
     def build(c, group, weights):
         model = model_object(HiggsAudioModel, c)
         llm = model.build_llm(group).to(DTYPE)
         llm.load_weights((name, w) for k, w in weights.items() if (name := model._llm_remap(k)) is not None)
         encoders = (audio_encoder(),)
-        return HiggsAudioLLMSubmodule(llm.requires_grad_(False).eval(), c, encoders, text_prompts=False)
+        return stub_cores(
+            HiggsAudioLLMSubmodule(llm.requires_grad_(False).eval(), c, encoders, text_prompts=False), _Rows(),
+        )
 
     def inputs(c, n, seed):
         ids = torch.randint(0, c.vocab_size - 1, (n,), generator=torch.Generator().manual_seed(seed))
@@ -740,6 +750,14 @@ def _higgs():
             for i in rows
         ])
 
+    def run_(sub, rows):
+        lengths = _Rows([len(r) for r in rows])
+        stub_cores(sub, lengths)
+        x = embed(sub, torch.cat(rows))
+        with step_over(sub, lengths, (KV_CACHE,)):
+            hidden = sub.model(x)
+        return _per_row(hidden, sub.model.logits(_last(hidden, lengths.lengths)), lengths.lengths)
+
     head = "audio_decoder_proj.text_lm_head"
     return Stack(
         config=lambda: HiggsAudioModelConfig(
@@ -751,9 +769,7 @@ def _higgs():
         weights=lambda c: llama_weights(c, "", head, qk_norm=True),
         a1=lambda c: {**llama_layers(c, ""), head: (c.vocab_size, c.hidden_size)},
         a2=lambda c: _subset(llama_layers(c, ""), "0.self_attn.k_proj", "1.mlp.up_proj", "1.self_attn.o_proj"),
-        run=_ids_run(lambda s: s.model, embed,
-                     lambda s, x: s.model(input_embeds=x, label="main"), lambda s, x: s.model.logits(x)),
-        declare=declare, inputs=inputs,
+        run=run_, declare=declare, inputs=inputs,
         released=lambda: (model_object(HiggsAudioModel, HiggsAudioModelConfig()),
                           lambda c, g: model_object(HiggsAudioModel, c).build_llm(g)),
         a2_rename=lambda m: f"model.{m}",  # a Qwen3ForCausalLM-shaped adapter
@@ -880,21 +896,12 @@ def _qwen3_tts():
     dims = dict(num_attention_heads=4, num_key_value_heads=2, hidden_size=16, intermediate_size=32,
                 head_dim=4, vocab_size=64)
 
-    class AtZero:
-        """The step's tokens at position 0, which the layers' fused RoPE leaves unrotated."""
-
-        def __init__(self, rows: _Rows):
-            self.rows = rows
-
-        def pos_ids(self, label):
-            return torch.zeros(sum(self.rows.lengths), dtype=torch.long)
-
     def stub_cores(sub, rows: _Rows):
         """``sub`` with its handles on the Talker's declared state bound over stubs of the kernels, which read
         ``rows``."""
         declaring = model_object(Qwen3TTSModel, sub.config, codec_dtype=torch.float32)
         resources = {
-            TALKER_KV: _Unread(), TALKER_ATTN: _AttendCore(rows), "talker_pos": AtZero(rows), TALKER_SAMPLER: None,
+            TALKER_KV: _Unread(), TALKER_ATTN: _AttendCore(rows), "talker_pos": _AtZero(rows), TALKER_SAMPLER: None,
             CODE_PRED_SAMPLER: None,
         }
         sub.bind_node_state(node_handles(declaring, "Talker", resources))

@@ -441,6 +441,7 @@ def test_higgs_lays_out_its_prompt_as_one_audio_row(thinking):
     encoder keeps of each 4 s chunk), and the turn close. The layout's spans
     are that row, on a walk of the graph: the text around the clip as ids and
     the clip as rows, written in one step."""
+    from mstar.engine.state.adapters import kv_layouts
     from mstar.model.keys import KV_CACHE
     from mstar.model.multimodal import MEDIA_LAYOUT
 
@@ -465,7 +466,9 @@ def test_higgs_lays_out_its_prompt_as_one_audio_row(thinking):
     assert (layout["offset"], layout["tokens"], layout["output"]) == ([len(before)], [119], ["audio_embeds"])
     # each chunk's mel frames, which the encoder reads on the host
     assert layout["grid"] == [[400, 400, 150]]
-    kv_layout = out.metadata["kv_layout"][KV_CACHE]["main"]
+    kv_layout = kv_layouts(
+        model.declare_state(), out.metadata["state_layout"], out.metadata.get("keyed_spans", {}),
+    )[KV_CACHE]["main"]
     assert [(span.kind, span.walk, span.length, span.opens_step) for span in kv_layout.spans] == [
         ("ids", "prefill_audio", len(before), True), ("rows", "prefill_audio", 119, False),
         ("ids", "prefill_audio", len(after), False),

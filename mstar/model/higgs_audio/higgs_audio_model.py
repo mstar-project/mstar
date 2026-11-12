@@ -25,25 +25,18 @@ boundaries (fixed 4 s chunks only) and the client-side n-gram loop fix
 
 import logging
 from collections.abc import Mapping
-from dataclasses import asdict, replace
+from dataclasses import asdict
+from typing import Any
 
 import torch
 
-from mstar.engine.resources import (
-    AttentionConfig,
-    AttentionSpec,
-    KVSpec,
-    NodeResourceSpec,
-    PagedKVConfig,
-    PositionConfig,
-    PositionSpec,
-)
 from mstar.engine.resources.lora import LoraSpec
-from mstar.model.components.request_kwargs import GREEDY_SAMPLING, sampler_capabilities, sampling_defaults
+from mstar.engine.state import Array, Attend, Causal, KVEntry, Positions, Read, Rope, Sampler
+from mstar.model.components.request_kwargs import GREEDY_SAMPLING, sampler_flags, sampling_defaults
 from mstar.model.higgs_audio.config import ATTN, HiggsAudioModelConfig
-from mstar.model.keys import KV_CACHE, ROPE
+from mstar.model.keys import KV_CACHE, SAMPLER
 from mstar.model.multimodal import TEXT, MediaEncoder, PromptPart
-from mstar.model.multimodal_decoder import MediaIntake, MultimodalDecoderModel, PreparedMedia
+from mstar.model.multimodal_decoder import DeclaredDecoderModel, MediaIntake, PreparedMedia
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.utils import ByteLevelDetokenizer, TextOutput
 
@@ -62,7 +55,7 @@ def audio_encoder() -> MediaEncoder:
     return MediaEncoder("audio", "audio_encoder", ("audio_features",), "audio_embeds")
 
 
-class HiggsAudioModel(MultimodalDecoderModel):
+class HiggsAudioModel(DeclaredDecoderModel):
     """Higgs-Audio STT: audio_tower + projector + dense Qwen3 LLM."""
 
     NAME = "Higgs-Audio"
@@ -119,40 +112,30 @@ class HiggsAudioModel(MultimodalDecoderModel):
             rows={"lm_head": PER_SEGMENT},
         )
 
-    def get_node_resources(self) -> list[NodeResourceSpec]:
-        """LLM paged KV + attention/positions/sampler. audio_encoder is
-        stateless: it runs once per request and holds nothing."""
-        kv_config = PagedKVConfig(
-            num_layers=self.config.num_hidden_layers,
-            num_kv_heads=self.config.num_key_value_heads,
-            head_dim=self.config.head_dim,
-            max_seq_len=self.config.max_position_embeddings,
-            num_qo_heads=self.config.num_attention_heads,
-            # ~2k tokens per ASR request (prompt + 12.5 audio embeds/s +
-            # transcript); 256 pages = 32k tokens ≈ 16 concurrent
-            # requests at ~3.7 GB.
-            max_num_pages=256,
-        )
+    def declare_state(self) -> list[Array | Sampler]:
+        c = self.config
         return [
-            KVSpec(resource_key=KV_CACHE, nodes={"LLM"}, config=kv_config),
-            AttentionSpec(
-                resource_key=ATTN, nodes={"LLM"},
-                config=AttentionConfig(kv_cache=KV_CACHE),
-            ),
-            PositionSpec(
-                resource_key=ROPE, nodes={"LLM"},
-                config=PositionConfig(
-                    kv_cache=KV_CACHE,
-                    rope_theta=self.config.rope_theta,
-                ),
+            Array(
+                KV_CACHE, nodes={"LLM"}, layers=frozenset(range(c.num_hidden_layers)),
+                entry=KVEntry(heads=c.num_key_value_heads, head_dim=c.head_dim),
+                max_len=c.max_position_embeddings, positions=Positions(rope=Rope(theta=c.rope_theta)),
+                reads={ATTN: Read(mask=Causal(), op=Attend(q_heads=c.num_attention_heads))},
             ),
             # ASR transcription: the reference decodes greedily and exposes no
             # penalty knob, so no seen-token buffers unless the checkpoint
             # defaults one; without the capability a request penalty or min_p
             # is refused.
-            replace(self._sampler_spec(self.config.vocab_size), **sampler_capabilities(self.sampling_defaults)),
-            self._lora_spec(),
+            Sampler(SAMPLER, nodes={"LLM"}, vocab_size=c.vocab_size, **sampler_flags(self.sampling_defaults)),
         ]
+
+    def kernel_settings(self) -> dict[str, dict[str, Any]]:
+        # ~2k tokens per ASR request (prompt + 12.5 audio embeds/s +
+        # transcript); 256 pages = 32k tokens ≈ 16 concurrent
+        # requests at ~3.7 GB.
+        return {KV_CACHE: {"max_num_pages": 256}}
+
+    def get_node_resources(self):
+        return [self._lora_spec()]
 
     def get_max_output_tokens(self, **model_kwargs):
         return model_kwargs.get("max_output_tokens", MAX_OUTPUT_TOKENS)
@@ -296,10 +279,7 @@ class HiggsAudioModel(MultimodalDecoderModel):
         (`_llm_remap`)."""
         from mstar.model.components.qwen3_lm import Qwen3DenseLM, Qwen3LMConfig
 
-        return Qwen3DenseLM(
-            Qwen3LMConfig.from_hf(asdict(self.config)),
-            attn_key=ATTN, kv_key=KV_CACHE, pos_key=ROPE, comm_group=comm_group,
-        )
+        return Qwen3DenseLM(Qwen3LMConfig.from_hf(asdict(self.config)), array=KV_CACHE, comm_group=comm_group)
 
     def _create_llm_submodule(
         self, device: str, tp_group, dtype: torch.dtype,

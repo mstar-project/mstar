@@ -188,13 +188,15 @@ def test_higgs_is_rebuilt_from_its_audio_step_with_the_encoders_output_copied():
 def test_a_higgs_transcription_can_be_dropped_where_its_llm_runs():
     from test_model_kv_layouts import _higgs
 
+    from mstar.engine.state.adapters import kv_layouts
     from mstar.model.keys import KV_CACHE
 
     model = _higgs()
     out = model.process_prompt("transcribe", ["audio"], ["text"], tensors={"audio_inputs": [torch.zeros(16000 * 35)]})
+    layout = kv_layouts(model.declare_state(), out.metadata["state_layout"], out.metadata.get("keyed_spans", {}))
     config = KVReqConfig()
     config.apply_conductor_config(
-        kv_layout={"main": out.metadata["kv_layout"][KV_CACHE]["main"].row()}, loop_caps={"decode_loop": 8},
+        kv_layout={"main": layout[KV_CACHE]["main"].row()}, loop_caps={"decode_loop": 8},
     )
     rebuilds = Rebuilds(
         model.rebuild_policies(), model.get_graph_walk_graphs(), HostPool(1 << 22, torch.device("cpu")),
