@@ -840,7 +840,8 @@ def fixed_only_above(review, stacked):
 def to_fix_first(review, pr, above):
     """What the review left open that stops the live test from starting, and approval too: open P0–P2
     findings (counted as the summary counts them, fixed above judged) and skipped files, which under a full
-    review's team turn cap mean the review didn't finish. Open questions and the design risk stop only approval."""
+    review's team turn cap mean the review didn't finish. A `high` design risk stops only approval; open questions
+    and a medium risk stop nothing."""
     why = []
     if review.get("skipped"):
         why.append(render_summary.UNFINISHED)
@@ -876,7 +877,6 @@ class ApprovalFacts:
     findings_changed: tuple  # the bot's inline findings someone has deleted or retagged since it posted them
     blocked: tuple  # files that rule out any approval (the bot's rules, CI, dependencies, toolchains)
     risk_level: str
-    questions: int
     to_fix_first: tuple  # what the review left open (to_fix_first)
     fixed_only_above: tuple  # its P0/P1 findings a PR above fixes (fixed_only_above)
 
@@ -900,7 +900,6 @@ def approval_facts(pr, sha, verdict, review, vendors):
         findings_changed=tuple(findings_changed(review, pr)),
         blocked=(*blocked, *gitlinks),
         risk_level=(review.get("risk") or {}).get("level", "unrated"),
-        questions=len(review.get("questions") or ()),
         to_fix_first=tuple(to_fix_first(for_approval(review, pages), pr, "stacked-above.json")),
         fixed_only_above=tuple(fixed_only_above(review, render_summary.stacked_above("stacked-above.json"))),
     )
@@ -945,11 +944,9 @@ def decide(f):
         rule.append(f"touches the review's rules or dependencies ({COUNTED}): " + ", ".join(f.blocked[:8])
                     + (" and more" if len(f.blocked) > 8 else ""))
     review = []
-    if f.risk_level != "low":
+    if f.risk_level not in ("low", "medium"):  # a medium one is worth a maintainer's read, and holds nothing
         review.append(f"the review rated the design risk {f.risk_level}: a maintainer owns the decisions its "
                       "summary's \"What's left for you\" lists")
-    if f.questions:
-        review.append(f"{f.questions} open question(s)")
     return Decision(rule=tuple(rule), review=(*review, *f.to_fix_first, *f.fixed_only_above))
 
 
@@ -1003,8 +1000,8 @@ def approve(out, pr, head_sha, runner_temp, verdict, vendors="nvidia"):
         print("not approved: " + bot.log_value("; ".join(outcome.why)))  # the model's text and file names
         decision.write_text(left_for_you(pr, review, outcome) + "\n")
         return
-    body = (f"Approved by the review bot on `{head_sha[:7]}`: low design risk, no open P0–P2 finding, and the live "
-            "test passed on it. It covers this commit only: a push leaves it visible, but a merge then needs a new "
+    body = (f"Approved by the review bot on `{head_sha[:7]}`: no open P0–P2 finding, and the live test passed on "
+            "it. It covers this commit only: a push leaves it visible, but a merge then needs a new "
             "`/review` or a person's approval.")
     bot.gh("api", "-X", "POST", f"repos/{REPO}/pulls/{pr}/reviews", "--input", "-",
            input=json.dumps({"commit_id": head_sha, "event": "APPROVE", "body": body}))

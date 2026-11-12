@@ -97,8 +97,8 @@ class TestApproval(unittest.TestCase):
                          ["the file list is too long to check"], "a long file list would crash the approval")
         self.assertEqual(why("pass", "full", skipped=["mstar/worker/worker.py"]), [render_summary.UNFINISHED],
                          "a review that left files unread could approve them")
-        self.assertEqual(why("pass", "full", questions=["q"]), ["1 open question(s)"],
-                         "a review that left a question open could approve")
+        self.assertEqual(why("pass", "full", questions=["q"]), [],
+                         "an open question, which a person can answer after the merge, would hold the approval")
         for status in ("fixed", "moot"):
             judged = [{"ref": "4", "priority": "P1", "status": status, "why": "fixed in the caller"}]
             self.assertEqual(why("pass", "full", prior=judged, threads=[thread(4, "**[P1]** x", outdated=True)]), [],
@@ -932,7 +932,7 @@ class TestApprove(unittest.TestCase):
         blocked = {"filename": "docs/x.rst", "previous_filename": ".github/review/bot.py"}
         for name, kwargs, says in (("the head moved", {"head": "fedcba9876"}, "new commits"),
                                    ("the author can't write", {"perm": "read"}, "read"),
-                                   ("design risk", {"risk": "medium"}, ""),
+                                   ("a high design risk", {"risk": "high"}, ""),
                                    ("a blocked file", {"files": [{"filename": ".github/workflows/ci.yml"}]}, "rules"),
                                    ("a blocked file renamed away", {"files": [blocked]}, "rules"),
                                    ("a head on a stranger's fork", {
@@ -1097,12 +1097,14 @@ class TestApprove(unittest.TestCase):
     def test_approvals_happen_only_when_the_variable_reads_on(self):
         posted = []
         capture = {f"POST repos/{R}/pulls/7/reviews": lambda a, i: posted.append(json.loads(i)) or {}}
-        for files in (None, [{"filename": "mstar/engine/worker.py"}]):  # engine files follow the bot's risk call too
-            text, out, writes = self.approve({"value": "on"}, files=files, extra=capture)
+        for files, risk in ((None, "low"), ([{"filename": "mstar/engine/worker.py"}], "medium")):
+            # engine files follow the bot's risk call too, and a medium risk approves
+            text, out, writes = self.approve({"value": "on"}, files=files, risk=risk, extra=capture)
             self.assertEqual(writes, [f"POST repos/{R}/pulls/7/reviews"])
             self.assertEqual((posted[-1]["commit_id"], posted[-1]["event"]), ("0123456789", "APPROVE"),
                              "the approval would land on another commit, or not count as an approval")
             self.assertIn("**Approved** on `0123456`", text)
+            self.assertNotIn("low design risk", posted[-1]["body"], "a medium-risk approval would say it was low")
         for variable, what in (({"value": "off"}, "off"), (Fail("HTTP 404"), "unset"),
                                (Fail("HTTP 403"), "unreadable")):
             text, out, writes = self.approve(variable)

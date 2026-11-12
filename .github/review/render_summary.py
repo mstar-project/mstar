@@ -281,9 +281,10 @@ def carried(review, earlier, answered, pages):
     still open loses any `fixed_in` from before); its risk level as a floor, with the `look_at` that names
     the decision, unless a maintainer other than the author has commented since (`answered`), when this review's
     judgement stands; its questions, each until a maintainer's comment has answered it and this review says so
-    (`answered_questions`), so one comment can't drop the rest; and what the live test can't exercise
-    (`live_test.untestable`) when this review names nothing, whatever anyone has said, since no comment makes
-    the bot's GPUs able to run it. Everything here is carried into the next state too.
+    (`answered_questions`), so one comment can't drop the rest and an answered one is shown no more (a question
+    no longer holds the bot's approval, but it stays on the checklist until answered); and what the live test
+    can't exercise (`live_test.untestable`) when this review names nothing, whatever anyone has said, since no
+    comment makes the bot's GPUs able to run it. Everything here is carried into the next state too.
     An earlier finding's priority is the most severe of the bot's record of it (the tag on its thread in `pages`,
     the earlier state's items at its location) and this review's word on it (its verdict, an item restating it):
     a re-review can raise a priority, never lower it. An item at a location this review cleared (`fixed`, `moot`)
