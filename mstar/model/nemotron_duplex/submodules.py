@@ -552,7 +552,6 @@ class EarTTSTalkerSubmodule(ARNodeSubmodule):
         frames = tuple(Segment(request_id=rid, label="main", span=1) for rid in request_ids)
         return SubmoduleStep(
             segments=segments,
-            combined_labels={("main", "uncond"): TALKER_CFG_LABEL},
             # the same answer as cg_key_info(): a warm-up prefill in the batch
             # keeps the step off the fixed-shape decode capture
             cg_key_info=None if any(inp.kwargs.get("first") for inp in inputs) else self.DECODE_KEY,
