@@ -1741,8 +1741,8 @@ def test_a_bounded_array_refuses_position_ids_and_rope():
     h, kv = _bounded(_unbounded(positions=Positions()))
     _bounded_step(h, kv)
     q, k, _, _ = _frames()
-    _refused(r"no layout yet: positions\(\) on an unbounded array", lambda: positions(h))
-    _refused(r"no layout yet: rope\(\) on an unbounded array", lambda: rope(h, q, k))
+    _refused(r"no layout yet: positions\(\), and its positions are a count with no ids", lambda: positions(h))
+    _refused(r"no layout yet: rope\(\), and its positions declare no Rope", lambda: rope(h, q, k))
 
 
 def test_a_bounded_step_sets_no_advance_or_position_ids():

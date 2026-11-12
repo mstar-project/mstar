@@ -96,6 +96,11 @@ class BoundedKVManager(Resource):
         req = self._requests.get(rid)
         return 0 if req is None else req.written
 
+    def position(self, rid: str, label: str) -> int:
+        """Where ``rid``'s next entry goes, its count of committed entries, as a position resource answers."""
+        del label
+        return self.written(rid)
+
     @property
     def current(self) -> BoundedPlan:
         if self._current is None:

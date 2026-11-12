@@ -22,6 +22,7 @@ from test_state_ports import QWEN3_5, _qwen3_5
 
 from mstar.engine.resources.attn.config import AttentionSpec
 from mstar.engine.resources.kv.bounded.config import BoundedKVSpec, SinkWindow
+from mstar.engine.resources.kv.bounded.manager import BoundedKVManager
 from mstar.engine.resources.kv.config import KVSpec
 from mstar.engine.resources.linear_attn.config import LinearAttnSpec, LinearAttnVariant
 from mstar.engine.resources.recurrent.config import RecurrentBlockConfig, RecurrentStateSpec
@@ -977,7 +978,7 @@ def test_a_bounded_array_has_one_label_and_no_seq_sharding(field, refusal):
 
 def test_a_bounded_array_takes_no_rope():
     assert len(build_specs([_unbounded(positions=Positions())])) == 1, "a count of entries builds no position spec"
-    _no_layout("positions.rope, since the bounded KV keeps a count and no ids to rotate at",
+    _no_layout("positions.rope, and its storage keeps no position ids to rotate at",
                _unbounded(positions=Positions(rope=Rope())))
 
 
@@ -1016,6 +1017,8 @@ def test_a_cross_read_of_an_unbounded_array_s_queries_is_refused():
 
 class _StubBounded:
     """Counts as the bounded KV does, without a cache."""
+
+    position = BoundedKVManager.position
 
     def written(self, rid):
         return {1: 9}.get(rid, 0)

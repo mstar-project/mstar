@@ -707,6 +707,40 @@ class PositionsBinding(OpBinding):
         handle.positions, handle.rope_dtype = run, None if rope is None else rope.dtype
 
 
+class CounterPositions(OpBinding):
+    """`Positions` with no `Rope`, on an array whose own resource counts each row's entries and answers `position`."""
+
+    def check(self, array: Array, key: str, positions: Positions) -> None:
+        if positions.rope is not None:
+            raise _no_layout(array, "positions.rope, and its storage keeps no position ids to rotate at")
+
+    def resource(self, array: Array, key: str) -> str:
+        return array.name
+
+    def steps(
+        self, array: Array, key: str, positions: Positions, declared: ArrayStep, segments, steps: dict[str, Any],
+    ) -> None:
+        if declared.advance is not None or declared.position_ids is not None:
+            raise _no_layout(array, "a step sets advance or position_ids, and its storage counts each row's entries")
+
+    def attach(self, handle: ArrayHandle, key: str, run: Any) -> None:
+        handle.positions = _Counter(handle.array, run)
+
+
+class _Counter:
+    """The positions of a resource that counts each row's entries: `position` and nothing else."""
+
+    def __init__(self, array: Array, run: Any):
+        self._array = array
+        self.position = run.position
+
+    def pos_ids(self, label: str) -> torch.Tensor:
+        raise _no_layout(self._array, "positions(), and its positions are a count with no ids")
+
+    def apply_qk(self, q: torch.Tensor, k: torch.Tensor, *, label: str, rope_dtype: torch.dtype) -> tuple:
+        raise _no_layout(self._array, "rope(), and its positions declare no Rope")
+
+
 class BoundedAttend(OpBinding):
     """`Attend` on an unbounded array: the bounded KV's attention, which stores the step's keys as it attends. No spec,
     no step and no kernel setting."""
@@ -747,45 +781,6 @@ def _bounded_attend(
         layer_idx, q.to(k.dtype).transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), rel_bias=distance_bias,
         ieee=k.dtype == torch.float32,
     )
-
-
-class BoundedPositions(OpBinding):
-    """An unbounded array's `Positions`: each request's count of committed entries, which the bounded KV keeps, so
-    there is no spec and no step."""
-
-    def check(self, array: Array, key: str, positions: Positions) -> None:
-        if positions.rope is not None:
-            raise _no_layout(array, "positions.rope, since the bounded KV keeps a count and no ids to rotate at")
-
-    def steps(
-        self, array: Array, key: str, positions: Positions, declared: ArrayStep, segments, steps: dict[str, Any],
-    ) -> None:
-        if declared.advance is not None or declared.position_ids is not None:
-            raise _no_layout(array, "a step sets advance or position_ids, and the bounded KV counts each row's "
-                                    "entries itself")
-
-    def resource(self, array: Array, key: str) -> str:
-        return array.name
-
-    def attach(self, handle: ArrayHandle, key: str, run: Any) -> None:
-        handle.positions = _CommittedCount(handle.array, run)
-
-
-class _CommittedCount:
-    """An unbounded array's positions, as `position`, `positions` and `rope` ask for them: each request's count of
-    committed entries, which ``kv`` keeps, and no ids."""
-
-    def __init__(self, array: Array, kv: Any):
-        self._array, self._kv = array, kv
-
-    def position(self, rid_handle: int, label: str) -> int:
-        return self._kv.written(rid_handle)
-
-    def pos_ids(self, label: str) -> torch.Tensor:
-        raise _no_layout(self._array, "positions() on an unbounded array, whose positions are a count with no ids")
-
-    def apply_qk(self, q: torch.Tensor, k: torch.Tensor, label: str, rope_dtype: torch.dtype) -> tuple:
-        raise _no_layout(self._array, "rope() on an unbounded array, whose positions declare no Rope")
 
 
 class WithinStepAttend(OpBinding, ABC):
@@ -2136,7 +2131,7 @@ BINDINGS: dict[tuple[Storage, type[Op | Positions]], OpBinding] = {
     (PAGED_CROSS, Positions): PositionsBinding(),
     (WITHIN_STEP, Attend): RaggedAttend(),
     (BOUNDED, Attend): BoundedAttend(),
-    (BOUNDED, Positions): BoundedPositions(),
+    (BOUNDED, Positions): CounterPositions(),
     (VALUE, GatedDeltaNet): GDN(),
     (VALUE, Mamba2): SSD(),
     (VALUE, CausalConv): ConvOnLinearAttn(),
