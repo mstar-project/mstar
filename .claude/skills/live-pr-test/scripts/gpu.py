@@ -803,8 +803,9 @@ def has_provider(e: dict) -> bool:
     return e["provider"] in PROVIDERS
 
 
-# Statuses (lower case) of an instance that is gone or going: waiting on it is over.
-TERMINAL = ("exited", "error", "terminated", "terminating", "unhealthy", "preempted", "ended", "releasing")
+# Statuses (lower case) of an instance that is gone or going: waiting on it is over. Not a status it can recover
+# from (Lambda's `unhealthy`): a session may still be running on it.
+TERMINAL = ("exited", "terminated", "terminating", "preempted", "ended", "releasing")
 
 
 def job_name(pr: int, tag: str) -> str:

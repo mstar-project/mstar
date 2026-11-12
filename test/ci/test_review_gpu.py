@@ -1429,6 +1429,14 @@ class TestEras(unittest.TestCase):
             with unittest.mock.patch.object(gpu_review, "gpu_py", g):
                 self.assertEqual(gpu_review.finished(box, {}), st, "a KeyError would end the wait step, or a gone "
                                                                     "box would be waited on until the timeout")
+        for st in ("unhealthy", "error"):  # a Lambda box can recover from these: its session may be running
+            g = types.SimpleNamespace(ledger=lambda: {"digitalocean:9": {"provider": "digitalocean",
+                                                                         "instance_id": "9"}},
+                                      TERMINAL=gpu_review.gpu_py.TERMINAL, ledger_txn=ledger_txn,
+                                      status=lambda e, cfg, st=st: (st, "203.0.113.9", 22))
+            with unittest.mock.patch.object(gpu_review, "gpu_py", g), \
+                    unittest.mock.patch.object(gpu_review, "gpu", lambda *a, **k: types.SimpleNamespace(returncode=1)):
+                self.assertIsNone(gpu_review.finished(box, {}), "a live session would be ended on a passing status")
 
     def test_cleanup_releases_every_vendors_box_by_name(self):
         released = []
