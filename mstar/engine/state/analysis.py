@@ -201,7 +201,8 @@ def _read_problems(array: Array, walks: Mapping[str, set[str]], combined: set[st
 
 
 def deployment_problems(model: "Model", resources: Mapping[str, Mapping[str, object]]) -> list[str]:
-    """What a deployment's ``resources:`` block asks of the declarations that they can't do: of a sampler."""
+    """What a deployment's ``resources:`` block asks of the declarations that they can't do: of a sampler, and of an
+    array whose step writes its state itself."""
     declarations = model.declare_state()
     problems = [
         f"Sampler {declared.name!r}.draws: enable_logprobs, and draws is {declared.draws}; log-probs take one token "
