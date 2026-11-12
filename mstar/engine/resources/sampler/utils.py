@@ -745,9 +745,10 @@ def _fused_sample_kernel(
 # Vocabularies up to this size draw in one ``_fused_sample_kernel`` launch, one
 # program per row holding the whole row; larger ones through FlashInfer.
 FUSED_SAMPLE_MAX_VOCAB = 4096
-# The widest row `draw_row` draws as `sample` does: `fused_sample` launches 4
-# warps up to here, and 8 past it.
+# The widest row `draw_row` draws as `sample` does, and the warps `fused_sample`
+# launches up to it, which `draw_row`'s layout takes too.
 FUSED_DRAW_MAX_VOCAB = 2048
+FUSED_DRAW_WARPS = 4
 
 
 class FusedDrawArgs(NamedTuple):
@@ -780,7 +781,8 @@ def fused_sample(
         rep_penalty if penalty else temperature, seen_tokens if penalty else logits, out,
         V, logits.stride(0), logits.stride(1),
         seen_tokens.stride(0) if penalty else 0, seen_tokens.stride(1) if penalty else 0,
-        APPLY_PENALTY=penalty, BLOCK=triton.next_power_of_2(V), num_warps=4 if V <= FUSED_DRAW_MAX_VOCAB else 8,
+        APPLY_PENALTY=penalty, BLOCK=triton.next_power_of_2(V),
+        num_warps=FUSED_DRAW_WARPS if V <= FUSED_DRAW_MAX_VOCAB else 8,
     )
     return out
 

@@ -1339,7 +1339,8 @@ def test_fused_draws_stop_where_fused_sample_leaves_the_layout_draw_row_assumes(
     s = _drawing(vocab_size=vocab_size)
     _begin(s)
     assert (fused_draw_args(s) is not None) == fused
-    assert (launched["num_warps"] == 4) == fused, "draw_row_layout is the 4-warp layout, so the cap has to follow it"
+    assert (launched["num_warps"] == sampler_utils.FUSED_DRAW_WARPS) == fused, \
+        "draw_row's layout takes FUSED_DRAW_WARPS warps, so the cap has to follow the launch"
 
 
 def test_a_vocabulary_above_the_cap_draws_through_sample():
