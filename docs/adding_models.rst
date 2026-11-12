@@ -777,9 +777,10 @@ Under sequence parallelism an array declares nothing: the node's sequence shard
 (``SeqShardSpec``, in ``get_node_resources``) lists the labels whose tokens split, and an array
 is split on a step when the shard lists its label and splits that step. Segments always cover
 the whole sequence, so ``declare_step`` is the same on every rank, and the read's resource picks
-the exchange per step: Ulysses with both sides split, none with only the queries split, and a
-merge of the ranks' partial attentions with only the keys. A read on SDPA (``backend: sdpa``)
-over split keys is refused.
+the exchange per step: Ulysses for a self read over split tokens; for a cross read, none with
+only the queries split and a merge of the ranks' partial attentions with only the keys. A cross
+read with both sides split, and a read on SDPA (``backend: sdpa``) over split keys, are
+refused at load.
 
 A read takes its queries packed, ``(tokens, heads, head_dim)`` over every row. A read whose layers
 pass rows of one length, ``(rows, len, heads, head_dim)``, as a DiT's do, declares

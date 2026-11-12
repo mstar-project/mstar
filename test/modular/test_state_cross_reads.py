@@ -26,7 +26,7 @@ from mstar.engine.resources.attn.ragged.config import (
     RaggedCrossAttentionStep,
 )
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
-from mstar.engine.resources.sequence_shard import SeqShardSpec, SequenceShard
+from mstar.engine.resources.sequence_shard import SeqShardSpec
 from mstar.engine.resources.spec import resolve_spec_dependencies
 from mstar.engine.resources.step import ResourceStep, Segment, StepContext, SubmoduleStep
 from mstar.engine.state import Array, ArrayStep, Attend, Block, Causal, KVEntry, Read, TensorType, adapters
@@ -43,7 +43,7 @@ from mstar.engine.state.adapters import (
     state_setup,
     state_steps,
 )
-from mstar.engine.state.analysis import deployment_problems
+from mstar.engine.state.analysis import split_read_problems
 from mstar.engine.state.calls import kernel_setting
 from mstar.engine.state.contract import Entry
 from mstar.model.components.diffusion.attention import FrameSDPA, joint_attention, sdpa_attention
@@ -500,27 +500,24 @@ def test_sdpa_on_a_read_that_keeps_entries_is_refused_at_load():
     ] and setup.by_read == {}, "a paged read takes no SDPA"
 
 
-@pytest.mark.parametrize("world_size, read, refused", [
-    (2, "video_to_audio", True), (2, "video_self", True), (2, "video_text", False), (1, "video_to_audio", False),
-])
-def test_sdpa_over_keys_the_nodes_shard_splits_is_refused(world_size, read, refused):
+_SDPA_SPLIT = "backend sdpa over labels ['video'], which the sequence shard of ['dit'] splits over SP ranks"
+_BOTH_SPLIT = "and keys both split over the SP ranks of ['dit'], which no exchange serves"
+
+
+@pytest.mark.parametrize("split, sdpa, problems", [
+    (("video",), "video_to_audio", [f"Array 'video_a'.reads['video_to_audio']: {_SDPA_SPLIT}"]),
+    (("video",), "video_self", [f"Array 'video'.reads['video_self']: {_SDPA_SPLIT}"]),
+    (("video",), "video_text", []),
+    ((), "video_to_audio", []),
+    (("video", "audio"), None, [f"Array 'audio_v'.reads['audio_to_video']: its queries (Array 'video') {_BOTH_SPLIT}",
+                                f"Array 'video_a'.reads['video_to_audio']: its queries (Array 'audio') {_BOTH_SPLIT}"]),
+], ids=["sdpa-split-keys", "sdpa-self", "sdpa-copied-keys", "one-rank", "cross-both-split"])
+def test_reads_no_exchange_serves_on_split_labels_are_refused_from_the_declarations(split, sdpa, problems):
     """SDPA runs outside the resources, so no exchange reaches it: over split keys it would attend one rank's share.
-    Over split queries and copied keys (video to text) each rank's queries see every key, as they should."""
-    arrays = _av()
-    shard = SequenceShard(("video",), 1, None, 0, SimpleNamespace(world_size=world_size, rank=0))
-    resources = {"shard": shard, **{spec.resource_key: _StubRagged() for spec in build_specs(arrays)}}
-    split = {"dit": ("video",)} if world_size > 1 else {}
-    problems = deployment_problems(_Model(*arrays), {}, sdpa_reads=[read], split=split)
-    if not refused:
-        node_handles(_Model(*arrays), "dit", resources, setup=_on_sdpa(read))
-        assert problems == []
-        return
-    with pytest.raises(ValueError, match=rf"reads\['{read}'\] runs SDPA over label 'video', which its node's sequence "
-                                         "shard splits over SP ranks"):
-        node_handles(_Model(*arrays), "dit", resources, setup=_on_sdpa(read))
-    (problem,) = problems
-    assert problem.endswith("backend sdpa over labels ['video'], which the sequence shard of ['dit'] splits over SP "
-                            "ranks; SDPA would attend one rank's share"), problem
+    Over split queries and copied keys (video to text) each rank's queries see every key, as they should. A cross read
+    with both sides split has no exchange. The engine (at load) and validate_deployment both ask this."""
+    got = split_read_problems(_av(), [sdpa] if sdpa else [], {"dit": split} if split else {})
+    assert len(got) == len(problems) and all(g.startswith(p) for g, p in zip(got, problems, strict=True)), got
 
 
 # A segmented read

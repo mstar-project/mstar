@@ -36,7 +36,6 @@ from mstar.engine.resources.recurrent.config import (
     RecurrentStep,
 )
 from mstar.engine.resources.sampler.config import SamplerSpec, SamplerStep, SamplingReqConfig
-from mstar.engine.resources.sequence_shard import SequenceShard
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
 from mstar.engine.resources.step import Segment, SubmoduleStep
 from mstar.engine.state.analysis import position_key, query_array
@@ -1102,8 +1101,6 @@ class WithinStepHandle(ArrayHandle):
         self._packed = read.packed
         # a plain attribute, which a compiled caller's trace reads as a constant
         self._plans = self._binding.plans
-        if not self._plans:
-            _refuse_sdpa_on_split_keys(array, key, resources)
         self._rows = (SegmentedRows if read.segmented else RowLayout)(self)
         self.needs_step = self._plans or self._rows.must_open
         self._plan_label = queries.plan_label(array)
@@ -1156,18 +1153,6 @@ class WithinStepHandle(ArrayHandle):
                 raise self._refusal("packed queries on a read declared packed=False")
             return self.first_read.run(q, k, v, label=self._plan_label)
         return self._attend(q, k, v)
-
-
-def _refuse_sdpa_on_split_keys(array: Array, key: str, resources: Mapping[str, Any]) -> None:
-    """A read bound to SDPA runs outside the engine's resources, so no exchange reaches it: over keys the node's
-    sequence shard splits it would attend one rank's share. Refused on a shard that can split, which every rank of the
-    instance agrees on."""
-    label = _plan_label(array)
-    for resource in resources.values():
-        if isinstance(resource, SequenceShard) and resource.can_split and label in resource.labels:
-            raise ValueError(f"Array {array.name!r}: reads[{key!r}] runs SDPA over label {label!r}, which its node's "
-                             "sequence shard splits over SP ranks, so it would attend one rank's share: run it on "
-                             "the ragged resource (drop `backend: sdpa`)")
 
 
 # Storages

@@ -683,12 +683,8 @@ class _RaggedCrossManagerBase(_RaggedManagerBase, RaggedCrossAttnManager):
             label = cross_label(q_label, kv_label)
             self._kv_labels[label] = kv_label
             if split:
-                owner = f"ragged cross-attention {self._key!r}"
+                # a pair with both sides split is refused at load (`split_read_problems`)
                 q_range, kv_range = shard_plan.ranges.get(q_label), shard_plan.ranges.get(kv_label)
-                if q_range is not None and kv_range is not None:
-                    raise ValueError(
-                        f"{owner}: {label!r} attends split queries over split keys, which no exchange serves"
-                    )
                 if q_range is not None:
                     # each rank's queries over every key, each replicated; load refuses a packed
                     # (axis 0) split, so each row keeps ``count`` of its queries
@@ -701,7 +697,7 @@ class _RaggedCrossManagerBase(_RaggedManagerBase, RaggedCrossAttnManager):
 
     def _exchange(self, label: str) -> Callable | None:
         # split queries attend their rank's share locally; split keys merge every rank's partial
-        # (plan refuses both split)
+        # (load refuses both split)
         kv_label = self._kv_labels[label]
         r = self._shard.split_range(kv_label)
         if r is None:

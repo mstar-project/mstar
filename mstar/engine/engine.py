@@ -73,6 +73,7 @@ from mstar.engine.resources.step import (
     lean_subsets,
 )
 from mstar.engine.state.adapters import StateSetup, node_handles
+from mstar.engine.state.analysis import split_read_problems
 from mstar.engine.state.state_op import bind_state_ops
 from mstar.graph.runtime.base import GraphRuntime
 from mstar.model.base import keyed_labels
@@ -786,6 +787,12 @@ class Engine:
             shards[node] = head_shards(group, over_sp[node])
             if sp > 1 and any(spec.splits_steps and node in spec.nodes for spec in specs):
                 splitting.add(node)
+        if model is not None and splitting:
+            split = {node: spec.labels for spec in specs if spec.splits_steps for node in spec.nodes & splitting}
+            sdpa_reads = [read for read, binding in self._state_setup.by_read.items() if not binding.plans]
+            refusals = split_read_problems(model.declare_state(), sdpa_reads, split)
+            if refusals:
+                raise ValueError("; ".join(refusals))
 
         for spec in specs:
             relevant_nodes = spec.nodes & node_names

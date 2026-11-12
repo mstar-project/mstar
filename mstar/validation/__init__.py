@@ -13,7 +13,7 @@ from typing import Any, NamedTuple
 from mstar.distributed.base import ShardingConfig
 from mstar.engine.resources.lora.serving import refuse_unresolved_lora_adapters
 from mstar.engine.state.adapters import StateSetup, spec_overrides, state_setup
-from mstar.engine.state.analysis import deployment_problems, state_declaration_problems
+from mstar.engine.state.analysis import deployment_problems, split_read_problems, state_declaration_problems
 from mstar.model.base import (
     Model,
     WorkerGraph,
@@ -169,9 +169,8 @@ def validate_deployment(
                     node: spec.labels for spec in specs if spec.splits_steps for node in spec.nodes & sp_nodes
                 }
                 sdpa_reads = [read for read, binding in setup.by_read.items() if not binding.plans]
-                problems += deployment_problems(
-                    model, config.get("resources") or {}, sdpa_reads=sdpa_reads, split=split,
-                )
+                problems += deployment_problems(model, config.get("resources") or {})
+                problems += split_read_problems(model.declare_state(), sdpa_reads, split)
     except (ValueError, OSError) as e:
         problems.append(
             f"declaring the node resources failed: {type(e).__name__}: {e}; "
