@@ -617,7 +617,13 @@ def test_cosmos3s_eager_denoise_attends_each_branch_prefix_from_the_pages(kv_man
     """Cosmos3's eager denoise on the dense backend (``attention_backend="dense_gen"``): its own step declaration
     (cond and uncond in one combined plan, or a plan each), planned by the KV manager over committed text
     prefixes, attends every branch's [prefix | fresh] as the prefix commit wrote it, at every step."""
-    from mstar.model.cosmos3.submodules import COND_LABEL, KV_CACHE, UNCOND_LABEL, Cosmos3DiTSubmodule
+    from mstar.model.cosmos3.submodules import (
+        CFG_BATCHED_LABEL,
+        COND_LABEL,
+        KV_CACHE,
+        UNCOND_LABEL,
+        Cosmos3DiTSubmodule,
+    )
 
     kv, rids, fresh = kv_manager, ("r0", "r1"), 2
     prefix = {COND_LABEL: 5, UNCOND_LABEL: 2}
@@ -655,7 +661,11 @@ def test_cosmos3s_eager_denoise_attends_each_branch_prefix_from_the_pages(kv_man
         ctx.plan_results["kv"] = kv.plan(kv_step, ctx)
         kv.commit(kv_step, ctx)
         manager.plan(step.steps["attn"], ctx)
-        assert len(manager._current_plans) == (1 if batched else 2)
+        # label-major, as a combined plan concatenates its sources and Cosmos3 packs its rows
+        branches = {label: [(rid, label) for rid in rids] for label in prefix}
+        assert {label: [(s.request_id, s.label) for s in plan.segments]
+                for label, plan in manager._current_plans.items()} == (
+            {CFG_BATCHED_LABEL: [*branches[COND_LABEL], *branches[UNCOND_LABEL]]} if batched else branches)
         for label, plan in manager._current_plans.items():
             n = sum(s.q_len for s in plan.segments)
             k = torch.full((n, NUM_KV_HEADS, HEAD_DIM), 0.5)

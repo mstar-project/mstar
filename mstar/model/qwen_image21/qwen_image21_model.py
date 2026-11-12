@@ -430,7 +430,8 @@ class QwenImage21Model(Model):
                 # the references' features are spliced in at image pads, so a typed one (or a typed placeholder,
                 # which ids_for turns into one) would shift them
                 raise ValueError(
-                    f"Qwen-Image-2.1 prompts can't contain Qwen's vision tokens {[*VISION_TOKENS, PLACEHOLDER]}")
+                    f"Qwen-Image-2.1 prompts can't contain Qwen's vision tokens {list(VISION_TOKENS)} or the "
+                    f"processor's {PLACEHOLDER}")
         if not guided and kwargs.get("guidance_scale") is not None and float(kwargs["guidance_scale"]) > 1.0:
             logger.info("guidance_scale is ignored without a negative_prompt (classifier-free guidance stays off)")
 

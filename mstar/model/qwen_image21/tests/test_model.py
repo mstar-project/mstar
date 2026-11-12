@@ -134,7 +134,7 @@ def test_text_to_image_is_one_span_and_keys_nothing():
     ({"output_resolution": 128}, 1, "min_pixels|outside"),
     ({"negative_prompt": "<|image_pad|>", "guidance_scale": 2.0}, 0, "vision tokens"),
     # ids_for turns a typed placeholder into an image pad; the negative prompt's tail is never laid out
-    ({"negative_prompt": "x<|placeholder|>", "guidance_scale": 2.0}, 1, "vision tokens"),
+    ({"negative_prompt": "x<|placeholder|>", "guidance_scale": 2.0}, 1, "placeholder"),
     # a side past 2048 latents would wrap onto the rope tables' positive rows (or index past them)
     ({"height": 32, "width": 33024}, 0, "px per side"),
 ])
