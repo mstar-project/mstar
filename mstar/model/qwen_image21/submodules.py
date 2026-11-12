@@ -22,7 +22,7 @@ from mstar.engine.resources import AttentionStep, KVStep, Segment, SubmoduleStep
 from mstar.engine.resources.convenience import AttentionCallable
 from mstar.model.components.diffusion.attention import FrameSDPA
 from mstar.model.components.diffusion.decode_utils import latent_affine, latent_std
-from mstar.model.components.diffusion.denoise_loop import LATENTS, DenoiseLoopSubmodule, StepKey
+from mstar.model.components.diffusion.denoise_loop import LATENTS, NUM_STEPS, DenoiseLoopSubmodule, StepKey
 from mstar.model.components.diffusion.flow_match import FlowMatchSchedule
 from mstar.model.components.diffusion.guidance import Guidance, cfg
 from mstar.model.components.diffusion.image_io import pixels_to_uint8, vae_pixels
@@ -51,7 +51,8 @@ TEXT_INPUTS, VISION_PIXELS, REF_PIXELS = "text_inputs", "vision_pixels", "ref_pi
 TEXT_EMBEDS, REF_LATENTS, IMAGE_OUTPUT = "text_embeds", "ref_latents", "image_output"
 # step_metadata keys
 LAYOUT, SPAN, PROMPT_LENGTHS, DROP, GRIDS = "layout", "span", "prompt_lengths", "drop", "vision_grids"
-STEPS = "num_inference_steps"
+# the step count, under the name the scaffold reads it from (`DenoiseLoopSubmodule.schedule_settings`)
+STEPS = NUM_STEPS
 # the guidance branches' KV labels, in branch order, and the plan label a guided step attends both under
 BRANCH_LABELS = (MAIN, UNCOND)
 CFG_LABEL = "_cfg"
@@ -436,11 +437,12 @@ class QwenImage21DenoiseSubmodule(DenoiseLoopSubmodule):
     def bucket_key_for(self, fwd_info: CurrentForwardPassInfo) -> DitKey:
         return DitKey(*RequestLayout.from_metadata(fwd_info.step_metadata[LAYOUT]).target)
 
-    def schedule_for(self, walk: str, num_steps: int, bucket_key: DitKey) -> FlowMatchSchedule:
+    def schedule_for(self, walk: str, settings: int, bucket_key: DitKey) -> FlowMatchSchedule:
+        """``settings`` is the request's step count (``schedule_settings``); Turbo's fixed sigmas ignore it."""
         cfg = self.qi_config
         if cfg.sample_sigmas is not None:
             return FlowMatchSchedule.from_sigmas(cfg.sample_sigmas)
-        return FlowMatchSchedule.build(cfg.scheduler, int(num_steps), bucket_key.height * bucket_key.width)
+        return FlowMatchSchedule.build(cfg.scheduler, int(settings), bucket_key.height * bucket_key.width)
 
     def seed_latents(self, bucket_key: DitKey, generator: torch.Generator) -> torch.Tensor:
         """``randn_tensor`` of the packed target, in the transformer's dtype as the pipeline draws it."""
