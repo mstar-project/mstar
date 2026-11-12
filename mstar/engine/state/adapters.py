@@ -763,12 +763,6 @@ class PagedArrayHandle(ArrayHandle):
         # whether `check_step` needs an add, for a step that lists a row on the pages at span above 0
         self._grows = False
 
-    def check_step(self, step) -> None:
-        super().check_step(step)
-        if self._grows and not self._kept and self._keep and not step.ctx.replays:
-            raise self._refusal("a step that keeps lists rows at span above 0 and adds nothing, so the pages "
-                                "would keep entries no add wrote; list those rows at span 0")
-
     def _check_storage(self, declared: ArrayStep, segments, ctx) -> None:
         # a capture opens the handles once around `preprocess`, where `eager_add` adds run, and again around the forward
         self._grows = not (declared.eager_add and ctx.capture) and any(
@@ -794,6 +788,9 @@ class PagedArrayHandle(ArrayHandle):
         # in the step's forward, before its commit: the last add, if its layer went unread
         self._write_unread()
         super().check_step(step)
+        if self._grows and not self._kept and self._keep and not step.ctx.replays:
+            raise self._refusal("a step that keeps lists rows at span above 0 and adds nothing, so the pages "
+                                "would keep entries no add wrote; list those rows at span 0")
 
     @torch.compiler.disable
     def add(self, layer: int | torch.Tensor, *, keep: bool | None = None, **fields: torch.Tensor) -> None:
