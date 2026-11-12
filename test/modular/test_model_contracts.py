@@ -390,6 +390,17 @@ def test_qwen3_5_request_kwargs_are_the_keys_it_reads():
         assert read in keys
 
 
+def test_qwen3_request_kwargs_are_the_keys_it_reads():
+    from mstar.model.qwen3.qwen3_model import Qwen3Model
+
+    keys = object.__new__(Qwen3Model).request_kwargs()
+    for read in ("enable_thinking", "chat_template_kwargs", "temperature", "top_p", "top_k", "min_p",
+                 "repetition_penalty", "penalize_prompt", "ignore_eos", "max_output_tokens"):
+        assert read in keys
+    # nothing on the scaffold forwards these
+    assert not keys & {"min_tokens", "repetition_window", "top_p_first", "top_p_min_keep"}
+
+
 def test_qwen3_5_default_output_cap():
     c = Conductor.__new__(Conductor)
     c.model = _qwen3_5_model()

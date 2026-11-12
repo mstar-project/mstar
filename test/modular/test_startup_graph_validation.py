@@ -13,6 +13,7 @@ through ``Conductor.__init__`` (workers and sockets stubbed, no weights) so
 none of them trips the new checks.
 """
 import importlib.util
+import json
 import sys
 import types
 import urllib.error
@@ -926,6 +927,32 @@ def _parakeet(name, model_kwargs, tmp_path, monkeypatch):
     return _bare(ParakeetModel, config=ParakeetModelConfig(name, FastConformerConfig(), transducer))
 
 
+# config.json of each repo a shipped Qwen3-8B config names, the keys that matter
+_QWEN3_REPOS = {
+    "Qwen/Qwen3-8B": {
+        "model_type": "qwen3", "hidden_size": 4096, "num_hidden_layers": 36, "num_attention_heads": 32,
+        "num_key_value_heads": 8, "head_dim": 128, "intermediate_size": 12288, "vocab_size": 151936,
+        "rms_norm_eps": 1e-6, "rope_theta": 1000000, "max_position_embeddings": 40960,
+        "tie_word_embeddings": False, "eos_token_id": 151645, "torch_dtype": "bfloat16",
+    },
+}
+
+
+def _qwen3(name, model_kwargs, tmp_path, monkeypatch):
+    # through the model's own __init__ with the config's model_kwargs, as serving builds it
+    # (entrypoint), from a config-only snapshot of each repo it names: no Hub on CI
+    import huggingface_hub
+
+    def snapshot(repo_id, cache_dir=None, allow_patterns=None, **kwargs):
+        path = tmp_path / repo_id.replace("/", "--")
+        path.mkdir(exist_ok=True)
+        (path / "config.json").write_text(json.dumps(_QWEN3_REPOS[repo_id]))
+        return str(path)
+
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", snapshot)
+    return _constructed(name, model_kwargs)
+
+
 def _default(name, model_kwargs, tmp_path, monkeypatch):
     return _constructed(name, model_kwargs)
 
@@ -951,6 +978,7 @@ _FACTORIES = {
     "OrpheusModel": _orpheus,
     "ParakeetModel": _parakeet,
     "Phi4MMModel": _phi4mm,
+    "Qwen3Model": _qwen3,
     "Qwen3_5DenseModel": _qwen3_5,
     "Qwen3OmniModel": _qwen3_omni,
     "Qwen3TTSModel": _qwen3_tts,
