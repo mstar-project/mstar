@@ -36,7 +36,7 @@ from mstar.engine.resources.kv.config import DEFAULT_PAGE_SIZE
 from mstar.engine.state import Array, Attend, Bidirectional, Block, Entry, KVEntry, Layout, Read, Value
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.base import KVLabel, Model, ProcessPromptOutput, TensorAndMetadata, WalkStep
+from mstar.model.base import KVLabel, Model, ProcessPromptOutput, TensorAndMetadata, WalkStep, parse_autocast_dtype
 from mstar.model.lingbot_world.components.camera import latent_camera_poses, scale_intrinsics
 from mstar.model.lingbot_world.config import (
     LINGBOT_CONFIGS,
@@ -158,6 +158,11 @@ class LingBotWorldModel(Model):
                 f"LingBot-World requires `max_concurrent_requests: 1` in {config_path}; got {limit!r}. "
                 "The K/V pool admits each rollout's K/V, not its VAE caches, which go from chunk to chunk on the "
                 "rollout loop's edges, so the admit queue that this key enables is the only bound on them."
+            )
+        if "autocast_dtype" in config and parse_autocast_dtype(config["autocast_dtype"]) is not torch.bfloat16:
+            raise ValueError(
+                f"LingBot-World takes no `autocast_dtype` but bfloat16 in {config_path}; got "
+                f"{config['autocast_dtype']!r}. It is the K/V pool's dtype, and the DiT writes bf16 K/V."
             )
         cfg = self.config
         size = (cfg.default_height, cfg.default_width)

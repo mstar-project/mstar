@@ -222,6 +222,15 @@ def test_neither_node_runs_under_the_model_s_bf16(monkeypatch):
         assert resolve_node_dtype(node, model.get_autocast_dtype()) is None, type(node).__name__
 
 
+@pytest.mark.parametrize("dtype", ["float16", "float32", None])
+def test_a_config_can_t_change_the_pool_s_dtype(dtype):
+    """A YAML ``autocast_dtype`` sets the pool's dtype, and the DiT writes bf16 K/V into it."""
+    config = {"max_concurrent_requests": 1, "autocast_dtype": "bfloat16"}
+    _model().validate_config_yaml(config, "lingbot.yaml")
+    with pytest.raises(ValueError, match="takes no `autocast_dtype` but bfloat16"):
+        _model().validate_config_yaml({**config, "autocast_dtype": dtype}, "lingbot.yaml")
+
+
 def test_the_reference_numerics_read_with_no_op_and_declare_no_text():
     """FA2 attends what the read reaches and the step's own text K/V, so the pool is the only resource."""
     model = _model(**REFERENCE_MODEL_KWARGS)

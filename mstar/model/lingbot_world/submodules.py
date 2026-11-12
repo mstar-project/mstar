@@ -26,7 +26,8 @@ that runs more than one rollout at a time
 (``LingBotWorldModel.validate_config_yaml``).
 
 Numerics are the model's, not the engine's: ``LingBotWorldModel.get_autocast_dtype``
-returns None, the DiT enters the reference's bf16 autocast itself, and the VAE
+is bf16, which sizes the K/V pool and the attention kernels, and no node runs
+under autocast. The DiT enters the reference's bf16 autocast itself, and the VAE
 encode runs fp32 as the reference does; the decode runs bf16 (cuDNN >= 9.16)
 unless ``reference_numerics``.
 """
