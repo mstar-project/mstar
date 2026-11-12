@@ -19,7 +19,6 @@ if not hasattr(diffusers, "MiniMaxH3Transformer3DModel"):
 
 from safetensors.torch import save_file  # noqa: E402
 
-from mstar.model.components.diffusion.attention import sdpa_attention  # noqa: E402
 from mstar.model.minimax_h3 import weight_loader  # noqa: E402
 from mstar.model.minimax_h3.components.layout import (  # noqa: E402
     T_AUDIO,
@@ -109,7 +108,7 @@ def test_velocity_matches_diffusers(models, anchors):
         want_video, want_audio = reference(
             hidden_states=video, audio_hidden_states=audio, encoder_hidden_states=hidden, return_dict=False, **ref,
         )
-        text = conditioner(hidden, sdpa_attention)
+        text = conditioner(hidden)
         classes, tags = timestep_classes(layout), modality_tags(layout)
         step_layout = H3StepLayout(
             rope=rope_table(position_ids(layout), rope_inv_freq(CFG), torch.float32, CFG.attention_head_dim),
@@ -120,15 +119,14 @@ def test_velocity_matches_diffusers(models, anchors):
         )
         timesteps = torch.empty(1, 3)
         timesteps[0, T_VIDEO], timesteps[0, T_AUDIO], timesteps[0, T_COND] = t_video, t_audio, max(t_video, 0.999)
-        got_video, got_audio = dit(H3Inputs(video=video, audio=audio, text=text, timesteps=timesteps),
-                                   step_layout, sdpa_attention)
+        got_video, got_audio = dit(H3Inputs(video=video, audio=audio, text=text, timesteps=timesteps), step_layout)
     torch.testing.assert_close(got_video, want_video, rtol=1e-4, atol=1e-5)
     torch.testing.assert_close(got_audio, want_audio, rtol=1e-4, atol=1e-5)
     # the reference's own timestep layout (its distinct values, each row's index into them)
     with torch.no_grad():
         exact_video, exact_audio = dit(
             H3Inputs(video=video, audio=audio, text=text, timesteps=ref["timestep"][None]), step_layout,
-            sdpa_attention, row_class=ref["timestep_indices"],
+            row_class=ref["timestep_indices"],
         )
     torch.testing.assert_close(exact_video, want_video, rtol=1e-4, atol=1e-5)
     torch.testing.assert_close(exact_audio, want_audio, rtol=1e-4, atol=1e-5)

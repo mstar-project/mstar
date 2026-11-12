@@ -8,7 +8,6 @@ max_seq_len: 8192
 # group, each rank decoding half of the tiles between denoise steps; the conditioner and the VAE
 # encoder on rank 1 (~120 GiB in use there once loaded, so 141 GB GPUs).
 model_kwargs:
-  attention_backend: flashinfer
   compile: true
   vae_tile_batch: 64
 

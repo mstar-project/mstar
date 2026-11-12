@@ -37,7 +37,13 @@ from mstar.conductor.workers import accelerator_type, deployment_workers
 from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import GlobalParallelConfig, WorkerParallelGroups
 from mstar.engine.resources import KVReqConfig, ResourceReqConfig
-from mstar.engine.resources.kv.config import mark_unpausable, refuse_undeclared_labels, without_layouts
+from mstar.engine.resources.kv.config import (
+    KVSpec,
+    PagedKVConfig,
+    mark_unpausable,
+    refuse_undeclared_labels,
+    without_layouts,
+)
 from mstar.engine.resources.lora.config import LoraSpec
 from mstar.engine.state import SampleSettings
 from mstar.engine.state.adapters import sampling_configs
@@ -699,15 +705,34 @@ class Conductor:
 
     def _resource_specs(self) -> list[dict]:
         """Each worker's resource specs by key, after this deployment's YAML, for admission-time checks.
-        A spec's ``nodes`` is cut to the worker's own, as the worker's engine does when it builds the resource."""
+        A spec's ``nodes`` is cut to the worker's own, and a KV pool placed by position is paged for
+        the worker's ranks (`PagedKVConfig.paged_for`), as the worker's engine does when it builds the resource."""
         specs = getattr(self, "_resource_specs_cache", None)
         if specs is None:
             built = self._node_resources()
+            # one entry per set of node groups a worker can run (replicas run alike)
+            workers = {
+                tuple(frozenset(wg.section.get_nodes()) for wg in wgs): wgs for wgs in self._per_worker_graphs.values()
+            }.values()
             specs = self._resource_specs_cache = [
-                {s.resource_key: replace(s, nodes=s.nodes & nodes) for s in built if s.nodes & nodes}
-                for nodes in {frozenset(self._worker_nodes(worker_id)) for worker_id in self._per_worker_graphs}
+                {s.resource_key: self._for_worker(s, wgs) for s in built if s.nodes & self._nodes_of(wgs)}
+                for wgs in workers
             ]
         return specs
+
+    @staticmethod
+    def _nodes_of(wgs) -> frozenset[str]:
+        return frozenset().union(*(wg.section.get_nodes() for wg in wgs))
+
+    @classmethod
+    def _for_worker(cls, spec, wgs):
+        """``spec`` as a worker running ``wgs`` builds it."""
+        spec = replace(spec, nodes=spec.nodes & cls._nodes_of(wgs))
+        if isinstance(spec, KVSpec) and isinstance(spec.config, PagedKVConfig) and spec.config.context_parallel:
+            # every node group the pool spans splits alike (validation refuses a pool across different splits)
+            wg = next(wg for wg in wgs if spec.nodes & set(wg.section.get_nodes()))
+            spec = replace(spec, config=spec.config.paged_for(spec.resource_key, wg.tp_size, wg.sp_size))
+        return spec
 
     def _node_resources(self) -> list:
         """The deployment's resource specs (``serving_resources``), each with all of its nodes."""

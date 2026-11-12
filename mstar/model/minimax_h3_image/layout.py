@@ -35,6 +35,9 @@ class H3ImageLayout:
     # (start, length) of each reference's vision block among the prompt's rows (tagged image)
     text_image_spans: tuple[tuple[int, int], ...] = ()
     patch: tuple[int, int] = (2, 2)
+    # each reference's whole latent grid before that crop, the shape of its first noise draw
+    # (``seed_loop_back``); () where it is ``references``
+    reference_grids: tuple[tuple[int, int], ...] = ()
 
     def rows_of(self, height: int, width: int) -> int:
         return (height // self.patch[0]) * (width // self.patch[1])

@@ -12,7 +12,6 @@ from safetensors.torch import save_file
 
 from mstar.graph.base import GraphNode, Loop, Parallel, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.components.diffusion.attention import sdpa_attention
 from mstar.model.minimax_h3.components.layout import patchify_video
 from mstar.model.minimax_h3.components.transformer import H3DiT, H3Inputs
 from mstar.model.minimax_h3.config import DENOISE_LOOP, TEXT_TAG, VIDEO_TAG
@@ -133,10 +132,10 @@ def test_seed_draws_follow_the_reference_order():
     meta = {"text_len": 2, "latent_height": 4, "latent_width": 6, "reference_latent_grids": [[5, 7]]}
     layout = layout_from_metadata(meta)
     assert layout.references == ((4, 6),)  # cropped to whole patches
+    assert layout.reference_grids == ((5, 7),)  # the draws' shapes, in the bucket key
     sub = H3ImageDenoiseSubmodule.__new__(H3ImageDenoiseSubmodule)
     sub.config = H3ImageConfig()
-    info = type("Info", (), {"step_metadata": meta})()
-    rows = sub.seed_loop_back(info, layout, torch.Generator().manual_seed(7))[LATENTS]
+    rows = sub.seed_loop_back(layout, torch.Generator().manual_seed(7))[LATENTS]
     gen = torch.Generator().manual_seed(7)
     torch.randn((1, 24, 5, 7), generator=gen)
     target = torch.randn((1, 24, 1, 4, 6), generator=gen)
@@ -153,20 +152,20 @@ def test_dit_without_audio_runs_the_step_head():
         torch.nn.init.normal_(p, std=0.1)
     assert dit.audio_patch_proj is None and dit.final_layer.audio_out is None
     layout = H3ImageLayout(text_len=3, latent_height=4, latent_width=4, references=((2, 4),))
-    sub = H3ImageDenoiseSubmodule(dit, TINY, loop_name="denoise_loop", attn_resource_key=None)
+    sub = H3ImageDenoiseSubmodule(dit, TINY, loop_name="denoise_loop")
     step = sub.build_layout(layout, "cpu")
     video = torch.randn(1, layout.num_condition_rows + layout.num_video_rows, cfg.patch_dim)
     inputs = H3Inputs(video=video, audio=None, text=torch.randn(1, 3, cfg.hidden_size),
                       timesteps=torch.tensor([[0.25, 0.999]]))
     with torch.no_grad():
-        outs = [dit(inputs, step, sdpa_attention, head=torch.tensor([k]))[0] for k in range(3)]
+        outs = [dit(inputs, step, head=torch.tensor([k]))[0] for k in range(3)]
     assert outs[0].shape == video.shape
     # head k is the plain linear of its own weights
     heads = dit.final_layer.video_out
     with torch.no_grad():
         swapped = heads.weight.data[[1, 0, 2]].clone(), heads.bias.data[[1, 0, 2]].clone()
         heads.weight.data, heads.bias.data = swapped
-        again = dit(inputs, step, sdpa_attention, head=torch.tensor([0]))[0]
+        again = dit(inputs, step, head=torch.tensor([0]))[0]
     assert torch.equal(again, outs[1]) and not torch.equal(outs[0], outs[1])
 
 
@@ -263,6 +262,8 @@ def _sp_decode(rank: int, world: int, store: str, out: str) -> None:
     import torch.distributed as dist
 
     from mstar.distributed.communication import CommGroup
+    from mstar.model.minimax_h3.config import VAE_SHARD
+    from mstar.model.minimax_h3.tests.test_model import _plan, _sp_resources
     from mstar.model.minimax_h3_image.submodules import IMAGE_OUTPUT, H3ImageDecoderSubmodule
 
     dist.init_process_group("gloo", init_method=f"file://{store}", rank=rank, world_size=world)
@@ -275,7 +276,11 @@ def _sp_decode(rank: int, world: int, store: str, out: str) -> None:
         decode = vae.decoder.forward
         vae.decoder.forward = lambda *args, **kwargs: calls.append(1) or decode(*args, **kwargs)
         with torch.no_grad():
-            image = H3ImageDecoderSubmodule(vae, config, sp_group=group).run_batch(rows, layout)[IMAGE_OUTPUT]
+            split = H3ImageDecoderSubmodule(vae, config)
+            model = _model()
+            model.set_config(config)
+            _plan(split, _sp_resources(model, [VAE_SHARD], group), ["r0", "r1"], layout)
+            image = split.run_batch(rows, layout)[IMAGE_OUTPUT]
             torch.save(len(calls), f"{out}.{rank}.calls")
             if rank == 0:  # at the same thread count: CPU reductions round by it
                 torch.save(H3ImageDecoderSubmodule(vae, config).run_batch(rows, layout)[IMAGE_OUTPUT], f"{out}.one")
@@ -286,8 +291,8 @@ def _sp_decode(rank: int, world: int, store: str, out: str) -> None:
 
 @pytest.mark.parametrize("world", [2, 4])
 def test_sequence_parallel_decode_gives_every_rank_the_one_nodes_image(tmp_path, world):
-    """``vae_decoder`` as an SP node: each rank's share of the tiles, gathered, against one
-    decode; 4 ranks over 6 tiles leaves the last rank without a share, which decodes nothing."""
+    """``vae_decoder`` on SP ranks, its sequence shard splitting each request's tiles: each
+    rank's share, gathered, against one decode; 4 ranks over 6 tiles take 2, 2, 1 and 1."""
     import torch.multiprocessing as mp
 
     out = str(tmp_path / "image")
@@ -297,4 +302,4 @@ def test_sequence_parallel_decode_gives_every_rank_the_one_nodes_image(tmp_path,
     for rank in range(world):
         assert torch.equal(torch.load(f"{out}.{rank}"), want)
     calls = [torch.load(f"{out}.{rank}.calls") for rank in range(world)]
-    assert calls == ([3, 3] if world == 2 else [2, 2, 2, 0]), calls  # one decoder call per tile
+    assert calls == ([3, 3] if world == 2 else [2, 2, 1, 1]), calls  # one decoder call per tile

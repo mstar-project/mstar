@@ -14,7 +14,6 @@ against diffusers' pipeline.
 
 from __future__ import annotations
 
-import functools
 import logging
 import math
 from typing import NamedTuple
@@ -24,16 +23,15 @@ from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.distributed.communication import CommGroup
-from mstar.engine.resources import AttentionStep, Segment, SubmoduleStep
+from mstar.engine.state import ArrayStep, Segment, SubmoduleStep
 from mstar.model.components.batched_rows import BatchedRows
-from mstar.model.components.diffusion.attention import joint_attention, sdpa_attention
+from mstar.model.components.diffusion.attention import FrameSDPA, sdpa_attention
 from mstar.model.components.diffusion.compile_utils import compile_blocks as compile_blocks_
 from mstar.model.components.diffusion.denoise_loop import DenoiseLoopSubmodule, StepScalar
 from mstar.model.components.diffusion.qwen3.encoder import qwen3_inv_freq
 from mstar.model.components.diffusion.qwen3.vl_prompt import qwen3_vl_prompt
 from mstar.model.components.qwen3_vit import vision_interpolation, vision_position_ids, vision_seq_lengths
-from mstar.model.components.qwen_vision import VISION_ATTN, FrameSDPA, QwenVisionModel
+from mstar.model.components.qwen_vision import VISION_ATTN, QwenVisionModel
 from mstar.model.minimax_h3.components.layout import (
     H3Layout,
     modality_tags,
@@ -50,14 +48,17 @@ from mstar.model.minimax_h3.components.transformer import (
 )
 from mstar.model.minimax_h3.config import (
     AUDIO_CHANNELS,
+    DIT_ROWS,
+    DIT_SHARD,
     KEYFRAME_ENCODE_SEED,
     KEYFRAME_NOISE_AUG,
     NUM_MODALITIES,
     PIXEL_MEAN,
     PIXEL_STD,
+    PROMPT_ROWS,
     H3Config,
 )
-from mstar.model.minimax_h3.schedule import H3Schedule, h3_schedule, h3_step
+from mstar.model.minimax_h3.schedule import H3Schedule, ScheduleArgs, h3_schedule, h3_step
 from mstar.model.submodule_base import NodeInputs, NodeSubmodule
 from mstar.utils.h2d import to_device_nonblocking
 
@@ -88,12 +89,6 @@ def layout_from_metadata(step_metadata: dict) -> H3Layout:
     )
 
 
-def _ragged_or_sdpa(resource, label: str):
-    if resource is None:
-        return sdpa_attention
-    return functools.partial(joint_attention, ragged=functools.partial(resource.run, label=label))
-
-
 # ---------------------------------------------------------------------------
 # text_encoder
 # ---------------------------------------------------------------------------
@@ -114,13 +109,11 @@ class H3TextEncoderSubmodule(NodeSubmodule):
     # the Qwen3 rotary angles are an fp32 matmul (``inv_freq @ positions``); TF32 rounds them
     float32_matmul_precision = "highest"
 
-    def __init__(self, encoder: nn.Module, conditioner: nn.Module, *, attn_resource_key: str | None = None,
-                 vision: QwenVisionModel | None = None, config: H3Config | None = None):
+    def __init__(self, encoder: nn.Module, conditioner: nn.Module, *, vision: QwenVisionModel | None = None,
+                 config: H3Config | None = None):
         super().__init__()
         self.encoder = encoder
         self.conditioner = conditioner
-        self.attn_resource_key = attn_resource_key
-        self._attend = None
         self.vision = vision
         self.h3_config = config
         if vision is not None:
@@ -131,16 +124,6 @@ class H3TextEncoderSubmodule(NodeSubmodule):
                 block.attn.bind_resources({VISION_ATTN: self._frames})
             text = config.text
             self.register_buffer("mrope_inv_freq", qwen3_inv_freq(text.head_dim, text.rope_theta), persistent=False)
-
-    def bind_node_resources(self, resources) -> None:
-        super().bind_node_resources(resources)
-        self._attend = None
-
-    def attend(self):
-        if self._attend is None:
-            resource = self.node_resources.get(self.attn_resource_key) if self.attn_resource_key else None
-            self._attend = _ragged_or_sdpa(resource, TEXT_SPAN)
-        return self._attend
 
     def prepare_inputs(self, graph_walk, fwd_info, inputs: NameToTensorList, **kwargs) -> NodeInputs:
         ids = inputs[TEXT_INPUTS][0]
@@ -171,7 +154,7 @@ class H3TextEncoderSubmodule(NodeSubmodule):
             hidden = self.encoder(ids[None], torch.ones_like(ids[None]), padded=False)
         else:
             hidden = self._encode_with_images(ids, vision_pixels.flatten(0, -2).to(device), list(step.grids))
-        return {TEXT_EMBEDS: [self.conditioner(hidden, self.attend())[0]]}
+        return {TEXT_EMBEDS: [self.conditioner(hidden)[0]]}
 
     def _encode_with_images(self, ids: torch.Tensor, pixels: torch.Tensor, grids: list) -> torch.Tensor:
         vision, device = self.vision, ids.device
@@ -192,12 +175,10 @@ class H3TextEncoderSubmodule(NodeSubmodule):
                             rotary=prompt.rotary, deepstack=prompt.deepstack)
 
     def declare_step(self, graph_walk, request_ids, inputs: list[NodeInputs], slot_lease=None, piecewise_leases=None,
-                     **kwargs) -> SubmoduleStep | None:
-        if self.attn_resource_key is None:
-            return None
+                     **kwargs) -> SubmoduleStep:
         segments = [Segment(request_id=rid, label=TEXT_SPAN, span=int(inp.input_seq_len))
                     for rid, inp in zip(request_ids, inputs, strict=True)]
-        return SubmoduleStep(segments=segments, steps={self.attn_resource_key: AttentionStep(causal=False)})
+        return SubmoduleStep(segments=segments, state={PROMPT_ROWS: ArrayStep(segments=tuple(segments))})
 
 
 # ---------------------------------------------------------------------------
@@ -247,36 +228,44 @@ class H3PackedDenoise(DenoiseLoopSubmodule):
     packed-sequence DiT, its rows padded to a bucket as a tail segment of their own, and the
     step's attention within the segments. A bucket key carries ``total_rows``, ``text_len``,
     ``num_condition_rows`` and ``num_audio_rows``; a subclass gives its rows' positions,
-    timestep classes and tags (:meth:`step_layout`)."""
+    timestep classes and tags (:meth:`step_layout`). The attention reads the node's packed rows
+    (``DIT_ROWS``), and its sequence shard (``DIT_SHARD``) splits them over SP ranks."""
 
     PREFETCH_SEEDS = True  # the noise depends on the layout and the seed alone
     float32_matmul_precision = "highest"
 
-    def __init__(self, transformer: nn.Module, config, *, loop_name: str, attn_resource_key: str | None,
-                 max_batch_size: int = 1, compile_blocks: bool = False, row_bucket: int = 1):
+    def __init__(self, transformer: nn.Module, config, *, loop_name: str, max_batch_size: int = 1,
+                 compile_blocks: bool = False, row_bucket: int = 1):
         if max_batch_size != 1:
             # a batch's rows would have to agree on the step's first-step decisions (denoise)
             raise ValueError(f"the MiniMax-H3 dit runs one request per step; got max_batch_size={max_batch_size}")
         if int(row_bucket) < 1:
             raise ValueError(f"row_bucket must be a positive int; got {row_bucket!r}")
-        super().__init__(loop_name=loop_name, max_batch_size=1, attn_resource_key=attn_resource_key)
+        super().__init__(loop_name=loop_name, max_batch_size=1)
         self.transformer = transformer
         self.config = config
         self.compiled = bool(compile_blocks)
-        sp_group = getattr(transformer, "sp_group", None)
-        # The packed rows pad up to a multiple of this, as a tail segment of their own: the
-        # compiled blocks see one shape per bucket rather than per prompt length, and the rows
-        # split evenly over the SP ranks, which keeps the exchanges on their copy-free path.
-        self.row_multiple = math.lcm(int(row_bucket), sp_group.world_size if sp_group is not None else 1)
-        # SDPA within each segment where no ragged resource is bound; out of the compiled graph,
-        # so the segment lengths are no guard
-        self._sdpa = FrameSDPA()
-        self._sdpa_run = torch.compiler.disable(self._sdpa.run)
+        self.row_bucket = int(row_bucket)
         if compile_blocks and transformer is not None:
             # around the attention and the exchanges, static per row bucket: each new bucket
             # compiles once (5-8 s), and a step then runs the same kernels, at static speed, whatever
             # was served before it (dynamic-shape kernels ran 14-19% slower per step)
             compile_blocks_(transformer.blocks, dynamic=False)
+        # the node's sequence shard, which brackets the DiT (`bind_state`)
+        self.shard = None
+
+    def bind_state(self, handles) -> None:
+        """The node's sequence shard. See ``NodeSubmodule.bind_node_state``."""
+        self.shard = handles.get(DIT_SHARD)
+
+    @property
+    def row_multiple(self) -> int:
+        """The packed rows pad up to a multiple of this, as a tail segment of their own: the
+        compiled blocks see one shape per bucket rather than per prompt length, and the rows
+        split evenly over the sequence shard's SP ranks, which keeps the exchanges on their
+        copy-free path."""
+        shard = self.shard
+        return math.lcm(self.row_bucket, 1 if shard is None else shard.ranks)
 
     def padded_rows(self, bucket_key) -> int:
         return -(-bucket_key.total_rows // self.row_multiple) * self.row_multiple
@@ -284,9 +273,9 @@ class H3PackedDenoise(DenoiseLoopSubmodule):
     def num_tokens(self, bucket_key) -> int:
         return self.padded_rows(bucket_key)
 
-    def attention_segments(self, bucket_key) -> tuple[tuple[str, int], ...]:
+    def attention_segments(self, bucket_key) -> dict[str, tuple[tuple[str, int], ...]]:
         rows, pad = bucket_key.total_rows, self.padded_rows(bucket_key) - bucket_key.total_rows
-        return ((self.MAIN_SPAN, rows),) + (((self.MAIN_SPAN, pad),) if pad else ())
+        return {DIT_ROWS: ((self.MAIN_SPAN, rows),) + (((self.MAIN_SPAN, pad),) if pad else ())}
 
     def step_layout(self, bucket_key, positions: torch.Tensor, classes: torch.Tensor, tags: torch.Tensor,
                     device) -> H3StepLayout:
@@ -310,15 +299,6 @@ class H3PackedDenoise(DenoiseLoopSubmodule):
             num_pad_rows=pad,
         )
 
-    def attend(self, layout: H3StepLayout):
-        """The step's attention within ``layout.segments``: the ragged resource's plan of
-        ``attention_segments``, or SDPA over each segment."""
-        ragged = self.ragged_for(self.MAIN_SPAN)
-        if ragged is None:
-            self._sdpa.lengths = list(layout.segments)
-            ragged = self._sdpa_run
-        return functools.partial(joint_attention, ragged=ragged)
-
 
 class H3DenoiseSubmodule(H3PackedDenoise):
     """One denoise step of the packed audio-video DiT (``DenoiseLoopSubmodule``). The
@@ -341,11 +321,14 @@ class H3DenoiseSubmodule(H3PackedDenoise):
     def bucket_key_for(self, fwd_info: CurrentForwardPassInfo) -> H3Layout:
         return layout_from_metadata(fwd_info.step_metadata)
 
-    def schedule_for(self, fwd_info: CurrentForwardPassInfo, bucket_key: H3Layout) -> H3Schedule:
+    def schedule_settings(self, fwd_info: CurrentForwardPassInfo) -> ScheduleArgs:
         meta = fwd_info.step_metadata
-        return h3_schedule(int(meta["num_inference_steps"]), float(meta["video_shift"]), float(meta["audio_shift"]))
+        return ScheduleArgs(int(meta["num_inference_steps"]), float(meta["video_shift"]), float(meta["audio_shift"]))
 
-    def seed_loop_back(self, fwd_info, bucket_key: H3Layout, generator: torch.Generator) -> dict[str, torch.Tensor]:
+    def schedule_for(self, walk: str, settings: ScheduleArgs, bucket_key: H3Layout) -> H3Schedule:
+        return h3_schedule(*settings)
+
+    def seed_loop_back(self, bucket_key: H3Layout, generator: torch.Generator) -> dict[str, torch.Tensor]:
         # the reference's draw order from the one generator: each keyframe, the video
         # latents, then the audio rows
         cfg = self.config.transformer
@@ -410,7 +393,7 @@ class H3DenoiseSubmodule(H3PackedDenoise):
         else:
             timesteps = torch.stack([timestep, audio_timestep, cond_timestep], dim=-1).float()
         inputs = H3Inputs(video=latents, audio=audio_latents, text=text_embeds, timesteps=timesteps)
-        video_v, audio_v = self.transformer(inputs, layout, self.attend(layout))
+        video_v, audio_v = self.transformer(inputs, layout, shard=self.shard)
         generated = h3_step(latents[:, n:], video_v[:, n:], timestep.view(-1, 1, 1), sigma, sigma_next)
         return {
             LATENTS: torch.cat([latents[:, :n], generated], dim=1) if n else generated,
@@ -433,12 +416,6 @@ class _LayoutBatched:
 
     def max_batch_size(self, graph_walk: str):
         return self._max_batch_size
-
-
-def clip_share(num_clips: int, index: int, count: int) -> range:
-    """Part ``index`` of ``count``'s contiguous run of a clip walk's clips."""
-    per = -(-num_clips // count)
-    return range(min(index * per, num_clips), min((index + 1) * per, num_clips))
 
 
 class _VideoFrames(nn.Module):
@@ -470,18 +447,21 @@ class H3VideoDecoderSubmodule(_LayoutBatched, BatchedRows, NodeSubmodule):
     dropped, unpatchified, denormalized with the VAE's latent statistics, decoded in
     clips and tiles, the ImageNet normalization undone, clamped and rounded.
 
-    As a sequence-parallel node (``sp_group``), each rank decodes its contiguous share of
-    the clips (``clip_share``) and the shares are gathered on every rank: the DiT's ranks
-    then decode in lockstep, scheduled by its rank 0 between denoise steps."""
+    On SP ranks its sequence shard (``vae_shard``, ``exchanges=False``: nothing mixes
+    clips but the cross-fade after the gather) splits each request's clips: each rank decodes
+    its contiguous share and the shares are gathered on every rank, the DiT's ranks decoding
+    in lockstep, scheduled by its rank 0 between denoise steps."""
+
+    # the label a step declares a request's clips under
+    CLIPS = "clips"
 
     disable_torch_compile = True
     output_keys = (VIDEO_OUTPUT,)
 
     def __init__(self, vae: nn.Module, config: H3Config, *, max_batch_size: int = 1, tile_batch: int = 1,
-                 compile_blocks: bool = False, sp_group: CommGroup | None = None):
+                 compile_blocks: bool = False):
         super().__init__()
         self.vae = vae
-        self.sp_group = sp_group if sp_group is not None and sp_group.world_size > 1 else None
         if compile_blocks and vae is not None:
             # static per tile count: a rank's tiles (its clips' times the canvas's) go
             # tile_batch at a time, so a count tile_batch doesn't divide, e.g. 2 x 16 at
@@ -500,27 +480,38 @@ class H3VideoDecoderSubmodule(_LayoutBatched, BatchedRows, NodeSubmodule):
         return {LATENTS: torch.stack([inp.tensor_inputs[LATENTS] for inp in inputs]),
                 "layout": inputs[0].resource_step_info}
 
+    def declare_step(self, graph_walk, request_ids, inputs: list[NodeInputs], **kwargs) -> SubmoduleStep | None:
+        if self.sequence_shard is None:
+            return None
+        # a batch shares one layout (`can_batch`), so every request's clips are one count
+        segments = [
+            Segment(rid, self.CLIPS, self.vae.walk.num_clips(inp.resource_step_info.latent_frames))
+            for rid, inp in zip(request_ids, inputs, strict=True)
+        ]
+        return SubmoduleStep(steps={}, segments=segments)
+
     def run_batch(self, latents: torch.Tensor, layout: H3Layout, **kwargs):
         # SDPA within each fixed-size tile, as the reference: dense, one segment, no capture,
         # so a ragged resource would add planning for nothing
         z = self.ends.latents(latents.to(self.get_device()), layout)
-        if self.sp_group is not None:
-            return {VIDEO_OUTPUT: self.ends.frames(self._decode_shared(z))}
-        return {VIDEO_OUTPUT: self.ends.frames(self.vae.decode(z, sdpa_attention, tile_batch=self.tile_batch))}
+        shard = self.sequence_shard
+        split = None if shard is None else shard.split_range(self.CLIPS)
+        if split is None:
+            return {VIDEO_OUTPUT: self.ends.frames(self.vae.decode(z, sdpa_attention, tile_batch=self.tile_batch))}
+        return {VIDEO_OUTPUT: self.ends.frames(self._decode_shared(z, shard, split))}
 
-    def _decode_shared(self, z: torch.Tensor) -> torch.Tensor:
-        """This rank's ``clip_share`` of the decode, all-gathered in clip order and cross-faded
-        on every rank. A rank short of a full share pads it with zeros, which only the last
-        ranks are and the trim to ``num_clips`` drops, so a rank with no share decodes nothing."""
-        group, num_latents = self.sp_group, z.shape[2]
+    def _decode_shared(self, z: torch.Tensor, shard, split) -> torch.Tensor:
+        """This rank's range of the clips (``split``), gathered in clip order on every rank and
+        cross-faded there. A rank with no clips (fewer clips than ranks) decodes nothing."""
+        num_latents = z.shape[2]
         z, num_clips = self.vae.clip_plan(z)
-        clips = self.vae.decode_clips(z, clip_share(num_clips, group.rank, group.world_size), sdpa_attention,
+        if sum(split.counts) != num_clips:
+            # the declared count is the same on every rank, so every rank refuses alike
+            raise ValueError(f"the step declared {sum(split.counts)} clips, the decode plans {num_clips}")
+        clips = self.vae.decode_clips(z, range(split.start, split.start + split.count), sdpa_attention,
                                       self.tile_batch)
-        # rank r holds clips r * per ..., padded to per, so the gather lists them in order
-        per = -(-num_clips // group.world_size)
-        if len(clips) < per:
-            clips += [self.vae.empty_clip(z)] * (per - len(clips))
-        gathered = group.all_gather(torch.stack(clips), dim=0)[:num_clips]
+        mine = torch.stack(clips) if clips else self.vae.empty_clip(z)[None][:0]
+        gathered = shard.gather(self.CLIPS, mine, dim=0)
         return self.vae.walk.assemble(list(gathered.unbind(0)), num_latents)
 
 
@@ -558,5 +549,5 @@ class H3AudioDecoderSubmodule(_LayoutBatched, BatchedRows, NodeSubmodule):
 
 __all__ = [
     "H3TextEncoderSubmodule", "H3VaeEncoderSubmodule", "H3DenoiseSubmodule", "H3VideoDecoderSubmodule",
-    "H3AudioDecoderSubmodule", "clip_share", "layout_from_metadata",
+    "H3AudioDecoderSubmodule", "layout_from_metadata",
 ]

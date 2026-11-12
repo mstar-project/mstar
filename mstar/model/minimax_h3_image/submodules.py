@@ -20,7 +20,7 @@ from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.distributed.communication import CommGroup
+from mstar.engine.state import Segment, SubmoduleStep
 from mstar.model.components.batched_rows import BatchedRows
 from mstar.model.components.diffusion.attention import sdpa_attention
 from mstar.model.components.diffusion.compile_utils import compile_blocks as compile_blocks_
@@ -36,7 +36,6 @@ from mstar.model.minimax_h3.submodules import (
     LATENTS,
     TEXT_EMBEDS,
     H3PackedDenoise,
-    clip_share,
 )
 from mstar.model.minimax_h3_image.config import REFERENCE_NOISE_AUG, H3ImageConfig
 from mstar.model.minimax_h3_image.layout import H3ImageLayout, modality_tags, position_ids, timestep_classes
@@ -49,12 +48,15 @@ REFERENCE_PIXELS, IMAGE_OUTPUT = "reference_pixels", "image_output"
 
 def layout_from_metadata(step_metadata: dict) -> H3ImageLayout:
     """The request's packed layout, from the host values its step metadata carries."""
+    grids = tuple(reference_grids(step_metadata))
+    references = tuple((h // 2 * 2, w // 2 * 2) for h, w in grids)
     return H3ImageLayout(
         text_len=int(step_metadata["text_len"]),
         latent_height=int(step_metadata["latent_height"]),
         latent_width=int(step_metadata["latent_width"]),
-        references=tuple((h // 2 * 2, w // 2 * 2) for h, w in reference_grids(step_metadata)),
+        references=references,
         text_image_spans=tuple(tuple(span) for span in step_metadata.get("text_image_spans", ())),
+        reference_grids=() if grids == references else grids,
     )
 
 
@@ -157,16 +159,19 @@ class H3ImageDenoiseSubmodule(H3PackedDenoise):
     def bucket_key_for(self, fwd_info: CurrentForwardPassInfo) -> H3ImageLayout:
         return layout_from_metadata(fwd_info.step_metadata)
 
-    def schedule_for(self, fwd_info: CurrentForwardPassInfo, bucket_key: H3ImageLayout) -> H3ImageSchedule:
+    def schedule_settings(self, fwd_info: CurrentForwardPassInfo) -> None:
+        return None  # the checkpoint's fixed grid
+
+    def schedule_for(self, walk: str, settings: None, bucket_key: H3ImageLayout) -> H3ImageSchedule:
         return h3_image_schedule(self.config.sigmas)
 
-    def seed_loop_back(self, fwd_info, bucket_key: H3ImageLayout, generator: torch.Generator
-                       ) -> dict[str, torch.Tensor]:
+    def seed_loop_back(self, bucket_key: H3ImageLayout, generator: torch.Generator) -> dict[str, torch.Tensor]:
         # The reference's draw order from the one generator: the references' posterior
         # samples (drawn by the vae_encoder node from its own generator on the same seed, so
-        # skipped here), the generated image's noise, then each reference's noise.
+        # skipped here: their shapes are the uncropped grids), the generated image's noise,
+        # then each reference's noise.
         channels = self.config.transformer.latents_dim
-        for height, width in reference_grids(fwd_info.step_metadata):
+        for height, width in bucket_key.reference_grids or bucket_key.references:
             torch.randn((1, channels, height, width), generator=generator, dtype=torch.float32)
         target = torch.randn((1, channels, 1, bucket_key.latent_height, bucket_key.latent_width),
                              generator=generator, dtype=torch.float32)
@@ -211,7 +216,7 @@ class H3ImageDenoiseSubmodule(H3PackedDenoise):
         # text-to-image request, then the references' 0.999 for an edit
         timesteps = torch.stack([timestep, reference_timestep], dim=-1) if n else timestep.view(-1, 1)
         inputs = H3Inputs(video=latents, audio=None, text=text_embeds, timesteps=timesteps.float())
-        velocity, _ = self.transformer(inputs, layout, self.attend(layout), head=head.long())
+        velocity, _ = self.transformer(inputs, layout, shard=self.shard, head=head.long())
         generated = h3_image_step(latents[:, n:], velocity[:, n:], sigma, sigma_next)
         return torch.cat([latents[:, :n], generated], dim=1) if n else generated
 
@@ -226,18 +231,21 @@ class H3ImageDecoderSubmodule(BatchedRows, NodeSubmodule):
     ImageNet normalization undone, clamped, and quantized to 8 bits by truncation, as the
     released pipeline does (the resize to the requested size is the model's postprocess).
 
-    As a sequence-parallel node (``sp_group``), each rank decodes its contiguous share of the
-    tiles (``clip_share``) and the shares are gathered on every rank, which then stitch the
-    same image: the DiT's ranks decode in lockstep, as MiniMax-H3's video decoder does."""
+    On SP ranks its sequence shard (``vae_shard``, ``exchanges=False``: nothing mixes tiles
+    but the stitch after the gather) splits each request's tiles: each rank decodes its
+    contiguous share and the shares are gathered on every rank, which then stitch the same
+    image: the DiT's ranks decode in lockstep, as MiniMax-H3's video decoder does."""
+
+    # the label a step declares a request's tiles under
+    TILES = "tiles"
 
     disable_torch_compile = True
     output_keys = (IMAGE_OUTPUT,)
 
     def __init__(self, vae: nn.Module, config: H3ImageConfig, *, max_batch_size: int = 1, tile_batch: int = 1,
-                 compile_blocks: bool = False, sp_group: CommGroup | None = None):
+                 compile_blocks: bool = False):
         super().__init__()
         self.vae = vae
-        self.sp_group = sp_group if sp_group is not None and sp_group.world_size > 1 else None
         self._max_batch_size = max_batch_size
         # spatial tiles decoded per decoder call: 1 is the reference's order of work
         self.tile_batch = int(tile_batch)
@@ -264,6 +272,20 @@ class H3ImageDecoderSubmodule(BatchedRows, NodeSubmodule):
         return {LATENTS: torch.stack([inp.tensor_inputs[LATENTS] for inp in inputs]),
                 "layout": inputs[0].resource_step_info}
 
+    def declare_step(self, graph_walk, request_ids, inputs: list[NodeInputs], **kwargs) -> SubmoduleStep | None:
+        if self.sequence_shard is None:
+            return None
+        # a batch shares one layout (`can_batch`), so every request's tiles are one count
+        segments = [
+            Segment(rid, self.TILES, self.num_tiles(inp.resource_step_info))
+            for rid, inp in zip(request_ids, inputs, strict=True)
+        ]
+        return SubmoduleStep(steps={}, segments=segments)
+
+    def num_tiles(self, layout: H3ImageLayout) -> int:
+        grid, _, _ = self.vae.tile_slices(layout.latent_height, layout.latent_width)
+        return sum(len(row) for row in grid)
+
     def run_batch(self, latents: torch.Tensor, layout: H3ImageLayout, **kwargs):
         rows = latents.to(device=self.get_device(), dtype=torch.float32)[:, layout.num_condition_rows:]
         ph, pw = layout.patch
@@ -271,30 +293,34 @@ class H3ImageDecoderSubmodule(BatchedRows, NodeSubmodule):
         z = rows.reshape(b, h // ph, w // pw, self.channels, ph, pw).permute(0, 3, 1, 4, 2, 5)
         z = z.reshape(b, self.channels, h, w) * self.latents_std + self.latents_mean
         # SDPA within each fixed-size tile, as the reference: dense, one segment
-        if self.sp_group is None:
+        shard = self.sequence_shard
+        split = None if shard is None else shard.split_range(self.TILES)
+        if split is None:
             image = self.vae.decode(z, sdpa_attention, tile_batch=self.tile_batch)
         else:
-            image = self._decode_shared(z)
+            image = self._decode_shared(z, shard, split)
         image = (image.float() * self.pixel_std + self.pixel_mean).clamp(0, 1)
         return {IMAGE_OUTPUT: (image * 255).clamp(0, 255).to(torch.uint8)}
 
-    def _decode_shared(self, z: torch.Tensor) -> torch.Tensor:
-        """This rank's ``clip_share`` of the tiles, all-gathered in tile order and stitched on
-        every rank. A rank short of a full share pads it with zeros, which only the last ranks
-        are and the trim to the tile count drops, so a rank without a share decodes nothing."""
-        group, vae = self.sp_group, self.vae
+    def _decode_shared(self, z: torch.Tensor, shard, split) -> torch.Tensor:
+        """This rank's range of the tiles (``split``), gathered in tile order on every rank and
+        stitched there. A rank with no tiles (fewer tiles than ranks) decodes nothing."""
+        vae = self.vae
         z = z.to(vae.post_quant_conv.weight.dtype)
         grid, y_overlaps, x_overlaps = vae.tile_slices(z.shape[-2], z.shape[-1])
         tiles = [z[..., ys, xs] for row in grid for ys, xs in row]
-        share = clip_share(len(tiles), group.rank, group.world_size)
-        decoded = vae.decode_tiles([tiles[i] for i in share], sdpa_attention, max(1, self.tile_batch))
-        per = -(-len(tiles) // group.world_size)
-        if len(decoded) < per:
+        if sum(split.counts) != len(tiles):
+            # the declared count is the same on every rank, so every rank refuses alike
+            raise ValueError(f"the step declared {sum(split.counts)} tiles, the decode plans {len(tiles)}")
+        decoded = vae.decode_tiles(tiles[split.start:split.start + split.count], sdpa_attention,
+                                   max(1, self.tile_batch))
+        if decoded:
+            mine = torch.stack(decoded)
+        else:
             first = tiles[0]
-            empty = first.new_zeros(first.shape[0], vae.decoder.out_channels, first.shape[-2] * vae.ratio,
-                                    first.shape[-1] * vae.ratio, dtype=vae.decoder.proj_out.weight.dtype)
-            decoded += [empty] * (per - len(decoded))
-        gathered = iter(group.all_gather(torch.stack(decoded), dim=0)[:len(tiles)].unbind(0))
+            mine = first.new_zeros(0, first.shape[0], vae.decoder.out_channels, first.shape[-2] * vae.ratio,
+                                   first.shape[-1] * vae.ratio, dtype=vae.decoder.proj_out.weight.dtype)
+        gathered = iter(shard.gather(self.TILES, mine, dim=0).unbind(0))
         return stitch_tiles([[next(gathered) for _ in row] for row in grid], y_overlaps, x_overlaps)
 
 

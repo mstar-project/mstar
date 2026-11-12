@@ -22,23 +22,30 @@ import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.distributed.base import ShardingConfig
-from mstar.engine.resources import NodeResourceSpec, RaggedAttentionConfig, RaggedAttentionSpec
+from mstar.engine.resources import SeqShardSpec
+from mstar.engine.state import Array, SeqShard
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Parallel, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import Model, TensorAndMetadata, WalkStep
+from mstar.model.components.diffusion.attention import refuse_attention_backend_kwarg
 from mstar.model.components.diffusion.image_io import OUTPUT_FORMAT_KWARGS, encode_image, image_output_format
 from mstar.model.media_limits import PILLOW_IMAGE_FORMATS, check_image_size, decoding_upload, open_upright_image
 from mstar.model.minimax_h3.config import (
     DENOISE_LOOP,
-    DIT_ATTN,
     DIT_NODE,
-    REFINER_ATTN,
     TEXT_ENCODER_NODE,
     VAE_DECODER_NODE,
     VAE_ENCODER_NODE,
+    VAE_SHARD,
 )
 from mstar.model.minimax_h3.keyframes import presentation, vision_spans
-from mstar.model.minimax_h3.minimax_h3_model import VISION_TOKENS, _positive_int, import_image_processor
+from mstar.model.minimax_h3.minimax_h3_model import (
+    DIT_KERNEL_SETTINGS,
+    VISION_TOKENS,
+    _positive_int,
+    dit_state,
+    import_image_processor,
+)
 from mstar.model.minimax_h3.submodules import (
     COND_LATENTS,
     LATENTS,
@@ -81,7 +88,6 @@ ENCODE_TEXT_WALK = "encode_text"
 ENCODE_REFERENCES_WALK = "encode_references"
 GENERATE_WALK = "generate_image"
 GENERATE_EDIT_WALK = "generate_image_edit"  # the dit also reads cond_latents
-ATTENTION_BACKENDS = ("flashinfer", "sdpa")
 IMAGE_INPUTS = "image_inputs"
 VAE_RATIO = 16
 # A ceiling for the loop graph; a request runs the checkpoint's grid (get_loop_caps).
@@ -96,21 +102,22 @@ class H3ImageModel(Model):
         model_path_hf: str = H3_IMAGE_REPO,
         cache_dir: str | None = None,
         skip_weight_loading: bool = False,
-        attention_backend: str = "flashinfer",
         max_packed_rows: int = 131_072,
         async_scheduling: bool = True,
         compile: bool = False,
         row_bucket: int | None = None,
         vae_tile_batch: int = 1,
         vae_compile: bool = False,
+        **kwargs,
     ):
-        if attention_backend not in ATTENTION_BACKENDS:
-            raise ValueError(f"attention_backend must be one of {ATTENTION_BACKENDS}, got {attention_backend!r}")
+        refuse_attention_backend_kwarg(kwargs)
+        if kwargs:
+            # **kwargs is here for the refusal above, so any other key is a misspelling that has to fail the load
+            raise TypeError(f"H3ImageModel got unexpected model_kwargs {sorted(kwargs)}")
         self.model_path_hf = model_path_hf
         self.cache_dir = cache_dir
         # dummy mode: get_submodule returns None for every node (CPU tests)
         self.skip_weight_loading = skip_weight_loading
-        self.attention_backend = attention_backend
         # Prompt, reference and generated rows; a step's attention grows with their square. The
         # default covers the reference's largest request: a 16 MP image (16,384 rows) with 16
         # references at a 2048-px short edge (4,096 rows each, ~1k vision tokens each) and a
@@ -152,25 +159,24 @@ class H3ImageModel(Model):
         return str(self.snapshot)
 
     # ------------------------------------------------------------ structure
-    def get_node_resources(self) -> list[NodeResourceSpec]:
-        """The DiT's attention over the packed sequence (sharded by head under SP) and the
-        token refiner's over the prompt; ``"sdpa"`` declares nothing."""
-        if self.attention_backend != "flashinfer":
-            return []
-        cfg = self.config.transformer
+    def declare_state(self) -> list[Array | SeqShard]:
+        """MiniMax-H3's: the DiT's attention over the packed rows and its sequence shard, and
+        the token refiner's attention over the prompt (``dit_state``)."""
+        return dit_state(self.config.transformer)
 
-        def spec(key, node, shard_over_sp, segments):
-            return RaggedAttentionSpec(
-                resource_key=key, nodes={node},
-                config=RaggedAttentionConfig(
-                    num_qo_heads=cfg.num_attention_heads, num_kv_heads=cfg.num_attention_heads,
-                    head_dim=cfg.attention_head_dim, max_segments_per_request=segments, dtype=torch.bfloat16,
-                    shard_over_sp=shard_over_sp, workspace_mb=128,
-                ),
-            )
+    def kernel_settings(self) -> dict[str, dict[str, object]]:
+        return {key: dict(settings) for key, settings in DIT_KERNEL_SETTINGS.items()}
 
-        # the DiT's padding rows are a second segment of each request
-        return [spec(DIT_ATTN, DIT_NODE, True, 2), spec(REFINER_ATTN, TEXT_ENCODER_NODE, False, 1)]
+    def get_node_resources(self) -> list[SeqShardSpec]:
+        """The decoder's sequence shard, which splits each request's tiles, which nothing
+        exchanges (``exchanges=False``); a decoder batch is one layout, so one tile count
+        (``axis`` 1)."""
+        return [
+            SeqShardSpec(
+                resource_key=VAE_SHARD, nodes={VAE_DECODER_NODE}, labels=(H3ImageDecoderSubmodule.TILES,), axis=1,
+                exchanges=False,
+            ),
+        ]
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         def text_node(*inputs: str) -> GraphNode:
@@ -412,45 +418,42 @@ class H3ImageModel(Model):
         return None
 
     def get_default_sharding_config(self) -> ShardingConfig:
-        # The dit shards its rows by rank (Ulysses), the decoder its tiles. No tensor parallelism.
-        return ShardingConfig(groups=[], tp_enabled_nodes=set(), shard_dim={},
-                              sp_enabled_nodes={DIT_NODE, VAE_DECODER_NODE})
+        # The dit shards its rows by rank (its sequence shard), the decoder its tiles. No
+        # tensor parallelism.
+        return ShardingConfig(groups=[], tp_enabled_nodes=set(), shard_dim={})
 
-    def get_submodule(self, node_name: str, device="cpu", tp_group=None, autocast_dtype=None, sp_group=None):
+    def get_submodule(self, node_name: str, device="cpu", tp_group=None, autocast_dtype=None):
         if node_name in self._submodule_cache:
             return self._submodule_cache[node_name]
-        submodule = self._create_submodule(node_name, device, tp_group, sp_group)
+        submodule = self._create_submodule(node_name, device, tp_group)
         self._submodule_cache[node_name] = submodule
         if submodule is not None:
             logger.info("loaded MiniMax-H3-Image submodule for node %s", node_name)
         return submodule
 
-    def _create_submodule(self, node_name: str, device, tp_group=None, sp_group=None) -> NodeSubmodule | None:
+    def _create_submodule(self, node_name: str, device, tp_group=None) -> NodeSubmodule | None:
         if self.skip_weight_loading:
             return None
         from mstar.model.minimax_h3_image import weight_loader
 
-        ragged = self.attention_backend == "flashinfer"
         snapshot, config = self.snapshot, self.config
         if node_name == TEXT_ENCODER_NODE:
             return H3TextEncoderSubmodule(
                 weight_loader.build_text_encoder(config, snapshot, device),
                 weight_loader.build_text_conditioner(config, snapshot, device),
-                attn_resource_key=REFINER_ATTN if ragged else None,
                 vision=weight_loader.build_vision_tower(snapshot, device), config=config,
             )
         if node_name == VAE_ENCODER_NODE:
             return H3ImageEncoderSubmodule(weight_loader.build_image_encoder(config, snapshot, device))
         if node_name == DIT_NODE:
             return H3ImageDenoiseSubmodule(
-                weight_loader.build_transformer(config, snapshot, device, comm_group=tp_group, sp_group=sp_group),
-                config, loop_name=DENOISE_LOOP, attn_resource_key=DIT_ATTN if ragged else None,
-                max_batch_size=1, compile_blocks=self.compile, row_bucket=self.row_bucket,
+                weight_loader.build_transformer(config, snapshot, device, comm_group=tp_group),
+                config, loop_name=DENOISE_LOOP, max_batch_size=1, compile_blocks=self.compile,
+                row_bucket=self.row_bucket,
             )
         if node_name == VAE_DECODER_NODE:
             return H3ImageDecoderSubmodule(weight_loader.build_image_decoder(config, snapshot, device), config,
-                                           tile_batch=self.vae_tile_batch, compile_blocks=self.vae_compile,
-                                           sp_group=sp_group)
+                                           tile_batch=self.vae_tile_batch, compile_blocks=self.vae_compile)
         logger.warning("MiniMax-H3-Image has no submodule for node %r; running it dummy", node_name)
         return None
 

@@ -20,10 +20,10 @@ from mstar.model.minimax_h3_image.config import OUTPUT_HEADS, H3ImageConfig
 ROOT = ""  # every component sits at the snapshot's root
 
 
-def build_transformer(config: H3ImageConfig, snapshot: Path, device, comm_group=None, sp_group=None,
+def build_transformer(config: H3ImageConfig, snapshot: Path, device, comm_group=None,
                       dtype: torch.dtype = torch.bfloat16):
-    return h3.build_transformer(config, snapshot, device, comm_group=comm_group, sp_group=sp_group, dtype=dtype,
-                                partition=ROOT, output_heads=OUTPUT_HEADS)
+    return h3.build_transformer(config, snapshot, device, comm_group=comm_group, dtype=dtype, partition=ROOT,
+                                output_heads=OUTPUT_HEADS)
 
 
 def build_text_conditioner(config: H3ImageConfig, snapshot: Path, device, dtype: torch.dtype = torch.bfloat16):

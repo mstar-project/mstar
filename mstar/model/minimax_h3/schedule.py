@@ -8,6 +8,7 @@ timestep to the scaffold's ``FlowMatchSchedule``.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import NamedTuple
 
 import torch
 
@@ -37,6 +38,12 @@ class H3Schedule(FlowMatchSchedule):
     audio_sigmas: torch.Tensor | None = None
     audio_timesteps: torch.Tensor | None = None
     cond_timesteps: torch.Tensor | None = None
+
+
+class ScheduleArgs(NamedTuple):
+    steps: int
+    video_shift: float
+    audio_shift: float
 
 
 def h3_schedule(num_inference_steps: int, video_shift: float, audio_shift: float) -> H3Schedule:

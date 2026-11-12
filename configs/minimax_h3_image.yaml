@@ -9,7 +9,6 @@ max_seq_len: 8192
 # (~62 GB for the 50 layers it runs) and the VAE on rank 1, so the next request's encode and
 # the last one's decode overlap the denoise. Measured settings and times: docs/models.rst.
 model_kwargs:
-  attention_backend: flashinfer
   compile: true
   # tiles per decoder call: one at a time leaves the decode launch-bound (9.2 s for a 16 MP
   # image on a B300, 0.45 s at 64), and the batched decode is bit-identical

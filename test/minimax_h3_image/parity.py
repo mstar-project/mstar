@@ -89,7 +89,6 @@ def run(args, report: dict, failures: list[str]) -> None:
     from PIL import Image
 
     import mstar
-    from mstar.model.components.diffusion.attention import sdpa_attention
     from mstar.model.minimax_h3.components.layout import patchify_video
     from mstar.model.minimax_h3.components.transformer import H3Inputs
     from mstar.model.minimax_h3.submodules import TEXT_INPUTS, VISION_PIXELS, H3TextEncoderSubmodule
@@ -113,7 +112,7 @@ def run(args, report: dict, failures: list[str]) -> None:
     torch.set_float32_matmul_precision("highest")
     stages = set(args.stages.split(","))
     dev = torch.device(args.device)
-    model = H3ImageModel(model_path_hf=str(args.snapshot), attention_backend="sdpa")
+    model = H3ImageModel(model_path_hf=str(args.snapshot))
     config = model.config
     t0 = time.time()
     modules = types.SimpleNamespace()
@@ -126,8 +125,8 @@ def run(args, report: dict, failures: list[str]) -> None:
         ).to(dev)
     if "dit" in stages or "loop" in stages:
         modules.dit = weight_loader.build_transformer(config, args.snapshot, dev)
-        modules.denoise = H3ImageDenoiseSubmodule(modules.dit, config, loop_name="denoise_loop",
-                                                  attn_resource_key=None)
+        # no engine binds its state: the attention runs SDPA, the reference's kernel
+        modules.denoise = H3ImageDenoiseSubmodule(modules.dit, config, loop_name="denoise_loop")
     if "vae_encode" in stages:
         modules.vae_encoder = H3ImageEncoderSubmodule(weight_loader.build_image_encoder(config, args.snapshot, dev))
     if "vae" in stages or "loop" in stages:
@@ -171,8 +170,7 @@ def run(args, report: dict, failures: list[str]) -> None:
                                         for r in oracle["reference_latents"]])
         if "noise" in stages:
             gen = torch.Generator("cpu").manual_seed(seed)
-            info = types.SimpleNamespace(step_metadata=request)
-            rows = H3ImageDenoiseSubmodule.seed_loop_back(modules_or_stub(), info, layout, gen)["latents"]
+            rows = H3ImageDenoiseSubmodule.seed_loop_back(modules_or_stub(), layout, gen)["latents"]
             if n:
                 t = torch.tensor(REFERENCE_NOISE_AUG, dtype=torch.float32)
                 rows = torch.cat([t * reference_rows + (1.0 - t) * rows[:n], rows[n:]])
@@ -196,9 +194,8 @@ def run(args, report: dict, failures: list[str]) -> None:
                     hidden = modules.encoder(ids[None].to(dev), torch.ones_like(ids[None]).to(dev), padded=False)
                 entry["qwen_layer50"] = stats(hidden, oracle["prompt_embeds"])
                 # the DiT's text rows from the reference's own layer 50, so the steps compare alone
-                text_rows = modules.conditioner(oracle["prompt_embeds"].to(dev, hidden.dtype), sdpa_attention)
-                entry["conditioner_own_vs_reference_input"] = stats(modules.conditioner(hidden, sdpa_attention),
-                                                                    text_rows)
+                text_rows = modules.conditioner(oracle["prompt_embeds"].to(dev, hidden.dtype))
+                entry["conditioner_own_vs_reference_input"] = stats(modules.conditioner(hidden), text_rows)
 
         sched = h3_image_schedule(config.sigmas)
 
@@ -209,8 +206,7 @@ def run(args, report: dict, failures: list[str]) -> None:
             with torch.no_grad():
                 v, _ = modules.dit(H3Inputs(video=rows[None].to(dev), audio=None, text=text_rows,
                                             timesteps=timesteps.to(dev)),
-                                   step_layout, modules.denoise.attend(step_layout),
-                                   head=torch.tensor([k], device=dev))
+                                   step_layout, head=torch.tensor([k], device=dev))
             return v[0]
 
         if "dit" in stages:
@@ -246,8 +242,7 @@ def run(args, report: dict, failures: list[str]) -> None:
 
         if "loop" in stages:
             gen = torch.Generator("cpu").manual_seed(seed)
-            info = types.SimpleNamespace(step_metadata=request)
-            rows = H3ImageDenoiseSubmodule.seed_loop_back(modules.denoise, info, layout, gen)["latents"].to(dev)
+            rows = H3ImageDenoiseSubmodule.seed_loop_back(modules.denoise, layout, gen)["latents"].to(dev)
             if n:
                 with torch.no_grad():
                     cond = modules.vae_encoder.forward(None, None, prompted[REFERENCE_PIXELS], seed)
@@ -255,7 +250,7 @@ def run(args, report: dict, failures: list[str]) -> None:
                 rows = torch.cat([t * cond["cond_latents"][0].to(dev) + (1.0 - t) * rows[:n], rows[n:]])
             # the port's own text rows from here on
             with torch.no_grad():
-                text_rows = modules.conditioner(hidden, sdpa_attention)
+                text_rows = modules.conditioner(hidden)
             for k in range(sched.num_steps):
                 v = velocity(k, rows)
                 sigma, sigma_next = sched.sigmas[k].to(dev), sched.sigmas[k + 1].to(dev)
