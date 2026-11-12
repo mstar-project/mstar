@@ -16,6 +16,8 @@ from mstar.engine import recompile_limit, with_recompile_limit
 from mstar.engine.accelerator_graph_backend import (
     AcceleratorGraphPool,
     CapturedGraph,
+    SplitGraph,
+    replay_graph,
 )
 from mstar.engine.accelerator_graph_config import (
     DEFAULT_CAPTURE_BATCH_SIZES,
@@ -190,14 +192,14 @@ def capture_into_graph(
 ):
     """Capture ``run`` into a new CUDA graph allocated from ``pool``.
 
-    Returns the graph and what ``run`` returned. A capture that fails part
+    Returns the graph and what ``run`` returned. The graph is a `SplitGraph`
+    if ``run`` called `split_capture`. A capture that fails part
     way leaves two things behind that would sink every later capture on the
     same pool: the caching allocator keeps routing this thread's allocations
     into the pool (the next capture_begin fails with "already recording to
-    mempool_id"), and torch.cuda.graph never switches the thread back off its
-    capture stream. Undo both before re-raising, so the buckets after a
-    failed one still capture and the thread keeps running on the stream it
-    came in on.
+    mempool_id"), and the thread may be left on its capture stream. Undo both
+    before re-raising, so the buckets after a failed one still capture and
+    the thread keeps running on the stream it came in on.
 
     A torch.compile'd forward that would recompile inside the capture is
     failed up front with the guard that broke: dynamo saves the CUDA RNG state
@@ -214,20 +216,22 @@ def capture_into_graph(
     # candidates and emptying the allocator's cache, which fails the capture
     benchmark = torch.backends.cudnn.benchmark
     torch.backends.cudnn.benchmark = False
+    capture = None
     try:
         with torch.compiler.set_stance("fail_on_recompile"), \
                 autocast_scope(autocast_dtype, backend.device_type, node_name):
-            with backend.capture(graph, pool=pool, stream=stream):
+            with backend.capture(graph, pool=pool, stream=stream, keep_graph=keep_graph) as capture:
                 output = run()
     except BaseException:
-        pool.on_failure(graph)
+        # every piece of a split capture
+        pool.on_failure(graph if capture is None else capture.graph())
         backend.recover_failed_capture(pool, prev_stream)
         raise
     finally:
         torch.backends.cudnn.benchmark = benchmark
     backend.synchronize()
     pool.on_success()
-    return graph, output
+    return capture.graph(), output
 
 
 def capture_with_static_outputs(
@@ -462,7 +466,9 @@ def _capture_thrown_away(
         if counted:
             nodes = _graph_nodes(graph)
             if nodes and executable.per_node is None:
-                executable.measure(graph, nodes)
+                # a split graph's rate is its first part's, which holds the forward
+                first = graph.graphs[0] if isinstance(graph, SplitGraph) else graph
+                executable.measure(first, _graph_nodes(first))
                 if executable.per_node is None:
                     # Leave the graph unsized. Counted as zero, its executable memory would go unplanned.
                     logger.warning("Could not measure the executable memory of %s", what)
@@ -498,6 +504,8 @@ def _pool_bytes(pool_id) -> int:
 
 def _graph_nodes(graph) -> int:
     """``graph`` must be captured with ``keep_graph=True``, so the driver still holds it to count."""
+    if isinstance(graph, SplitGraph):
+        return sum(_graph_nodes(part) for part in graph.graphs)
     count = ctypes.c_size_t(0)
     status = ctypes.CDLL("libcuda.so.1").cuGraphGetNodes(
         ctypes.c_void_p(graph.raw_cuda_graph()), None, ctypes.byref(count),
@@ -1749,13 +1757,14 @@ class AcceleratorGraphRunner:
                 )
             target.copy_(value)
 
-    def _replay(self, lease: SlotLease) -> dict:
+    def _replay(self, lease: SlotLease, launching: Callable[[], None] | None = None) -> dict:
+        """Replay ``lease``'s slot; ``launching`` runs just before its last launch."""
         slot = self.slot_for(lease)
         # The launch, not the GPU work: replay is async, so this range measures
         # enqueue cost only. GPU-side duration comes from --cuda-graph-trace.
         if self._enable_nvtx:
             profiler.range_push(f"cg.replay.slot[{lease.slot}]")
-        slot.graph.replay()
+        replay_graph(slot.graph, launching)
         if self._enable_nvtx:
             profiler.range_pop()
         return slot.static_outputs
@@ -1824,20 +1833,19 @@ class AcceleratorGraphRunner:
         buffers on another stream, so the replay has to wait for those writes
         before it reads them.
 
-        ``launch_started_event`` releases the submitting thread. It is set HERE
-        rather than before the forward: staging copies each preprocessed tensor
-        into its static buffer and holds the GIL while doing so, so releasing
-        earlier hands the main thread a GIL the GPU thread still needs. Only
-        `graph.replay()` below drops it in C++.
+        ``launch_started_event`` releases the submitting thread. It is set just
+        before the replay's last launch rather than before the forward: staging
+        copies each preprocessed tensor into its static buffer, and a
+        `SplitGraph`'s host call runs between its launches, both holding the GIL
+        for stretches, so releasing earlier hands the main thread a GIL the GPU
+        thread still needs before the step is fully launched.
         """
         laps = profiler.PhaseLaps("engine.forward.")
         self._stage(lease, preprocessed)
         if plan_done_event is not None:
             self._graph_backend.current_stream().wait_event(plan_done_event)
-        if launch_started_event is not None:
-            launch_started_event.set()
         laps.lap("stage")
-        out = self._replay(lease)
+        out = self._replay(lease, None if launch_started_event is None else launch_started_event.set)
         laps.lap("replay")
         return out
 

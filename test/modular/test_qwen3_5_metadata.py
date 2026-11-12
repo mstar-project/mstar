@@ -66,3 +66,29 @@ def test_a_fresh_cache_renders_chats_with_the_checkpoints_template(tmp_path, mon
         return text.tolist()
 
     assert ids(fresh) == ids(full)
+
+
+def _prepared_kwargs(model, structured_outputs) -> dict:
+    """The request kwargs the data worker hands the conductor, without its threads or sockets."""
+    from mstar.api_server.data_worker import PreprocessWorkerThread
+    from mstar.api_server.request_types import PreprocessInput
+
+    worker = PreprocessWorkerThread.__new__(PreprocessWorkerThread)
+    worker.model, worker.device, worker._keyed_labels = model, "cpu", None
+    return worker._prepare_input(PreprocessInput(
+        request_id="r", text="Reply in JSON.", file_paths=None, input_modalities=["text"],
+        output_modalities=["text"], model_kwargs={"prefix_cache": False, "structured_outputs": structured_outputs},
+    )).model_kwargs
+
+
+@pytest.mark.parametrize("template, after", [(CHAT_TEMPLATE, "</think>"), (OTHER_TEMPLATE, None)],
+                         ids=["thinking", "reasoning closed"])
+def test_a_reply_grammar_starts_where_the_prompt_leaves_the_reasoning(tmp_path, template, after):
+    """A thinking turn reasons freely and then answers in its grammar; a turn
+    whose prompt already closed the reasoning is held to it from the start."""
+    from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
+
+    repo = _repo(tmp_path / "repo", None)
+    (repo / "chat_template.jinja").write_text(template)
+    kwargs = _prepared_kwargs(Qwen3_5DenseModel(str(repo)), {"json_object": True})
+    assert kwargs["structured_outputs"].get("after") == after

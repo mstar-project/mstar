@@ -247,6 +247,7 @@ class _StubTokenizer:
         "<|image_pad|>": 104, "<|vision_end|>": 105,
     }
     unk_token_id = 0
+    all_special_ids = ()
 
     def convert_tokens_to_ids(self, token):
         return self.SPECIALS.get(token, self.unk_token_id)

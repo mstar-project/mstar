@@ -354,7 +354,10 @@ class ByteLevelDetokenizer:
 
     def __init__(self, tokenizer, keep_special: bool = False):
         self.tokenizer = tokenizer
-        self.special_ids = frozenset() if keep_special else set(tokenizer.all_special_ids)
+        special = frozenset(tokenizer.all_special_ids)
+        # the ids ``to_bytes`` drops, and the ones it writes out as text (``keep_special``)
+        self.dropped_ids = frozenset() if keep_special else special
+        self.kept_special_ids = special if keep_special else frozenset()
         # GPT-2's bytes_to_unicode: printable unicode char <-> raw byte.
         printable = (
             list(range(ord("!"), ord("~") + 1))
@@ -375,7 +378,7 @@ class ByteLevelDetokenizer:
         self.verbatim = {}
         for i, added in getattr(tokenizer, "added_tokens_decoder", {}).items():
             text = str(added)
-            if i in self.special_ids or self._byte_map(text) == text.encode("utf-8"):
+            if i in self.dropped_ids or self._byte_map(text) == text.encode("utf-8"):
                 continue
             try:
                 decoded = tokenizer.decode([i])
@@ -402,7 +405,7 @@ class ByteLevelDetokenizer:
 
     def to_bytes(self, token_ids: list[int]) -> bytes:
         raw = bytearray()
-        ids = [i for i in token_ids if i not in self.special_ids]
+        ids = [i for i in token_ids if i not in self.dropped_ids]
         for i, token in zip(ids, self.tokenizer.convert_ids_to_tokens(ids), strict=True):
             if token is None:  # an id past the vocabulary, which decode skips too
                 continue
@@ -436,10 +439,12 @@ class TextChunkDetokenizer:
     per-step ``decode``.
     """
 
-    __slots__ = ("tokenizer", "_bytes", "_decoded")
+    __slots__ = ("tokenizer", "kept_special_ids", "_bytes", "_decoded")
 
     def __init__(self, tokenizer):
         self.tokenizer = tokenizer
+        # the ids a chunk writes out as text (a step's ``decode`` keeps special tokens too)
+        self.kept_special_ids = frozenset(tokenizer.all_special_ids)
         self._bytes = (
             ByteLevelDetokenizer(tokenizer, keep_special=True)
             if ByteLevelDetokenizer.is_byte_level(tokenizer) else None
@@ -465,6 +470,8 @@ class ByteIdDetokenizer:
     """Token ids that are bytes, as a reduced model's byte tokenizer
     (``tokenizer_mode: byte``) makes them: an id is its low byte."""
 
+    kept_special_ids: frozenset[int] = frozenset()
+
     @staticmethod
     def to_bytes(token_ids: list[int]) -> bytes:
         return bytes(t & 0xFF for t in token_ids)
@@ -480,6 +487,8 @@ class SentencePieceDetokenizer:
     ``tokenizer.json``. Same contract as :class:`ByteLevelDetokenizer`: bytes
     per token, so a character split across byte pieces reassembles client-side.
     """
+
+    kept_special_ids: frozenset[int] = frozenset()
 
     def __init__(self, tokenizer_json: dict, extra_skip_ids: set[int] = frozenset()):
         vocab = tokenizer_json["model"]["vocab"]
@@ -508,9 +517,14 @@ class TextOutput(NamedTuple):
     declares it, and ``Model.postprocess`` and ``Model.postprocess_inline``
     derive their text paths from it."""
 
+    # every kind has ``kept_special_ids``: the special-token ids its bytes write out as text
     detokenizer: ByteLevelDetokenizer | TextChunkDetokenizer | SentencePieceDetokenizer | ByteIdDetokenizer
     # ids that end a reply, dropped unless the request sets ``ignore_eos``
     stop_token_ids: Container[int] = frozenset()
+    # the text that ends the model's reasoning, None for a model that does not
+    # reason: a reply's ``structured_outputs`` grammar starts after it on a turn
+    # whose prompt leaves the reasoning open (`grammar.after_reasoning`)
+    reasoning_end: str | None = None
 
 
 class ByteLevelTextOutput:

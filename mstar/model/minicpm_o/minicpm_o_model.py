@@ -691,7 +691,7 @@ class MiniCPMOModel(Model):
         return cached
 
     def text_output(self) -> TextOutput:
-        return TextOutput(self._chunk_detokenizer(), self.config.stop_token_ids)
+        return TextOutput(self._chunk_detokenizer(), self.config.stop_token_ids, "</think>")
 
     # ------------------------------------------------------------------
     # Walks

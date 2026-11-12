@@ -97,6 +97,10 @@ class WhisperModelConfig:
     chunk_length: int = 30
 
     @property
+    def stop_token_ids(self) -> frozenset[int]:
+        return frozenset({self.eos_token_id})
+
+    @property
     def head_dim(self) -> int:
         return self.d_model // self.decoder_attention_heads
 

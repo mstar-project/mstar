@@ -133,6 +133,7 @@ class WhisperDetokenizer(ByteLevelDetokenizer):
         super().__init__(tokenizer)
         self.config = config
         self._render_ids = set(config.language_token_ids)
+        self.kept_special_ids = frozenset(i for i in tokenizer.all_special_ids if self._rendered(i))
 
     def _rendered(self, token_id: int) -> bool:
         return token_id in self._render_ids or self.config.is_timestamp(token_id)
@@ -142,7 +143,7 @@ class WhisperDetokenizer(ByteLevelDetokenizer):
         for token_id in token_ids:
             if self._rendered(token_id):
                 raw.extend(self.tokenizer.convert_ids_to_tokens(token_id).encode("utf-8"))
-            elif token_id not in self.special_ids:
+            elif token_id not in self.dropped_ids:
                 token = self.tokenizer.convert_ids_to_tokens(token_id)
                 raw.extend(self.byte_decoder[c] for c in token)
         return bytes(raw)
@@ -553,7 +554,7 @@ class WhisperModel(Model):
         return super().postprocess(output, modality, **kwargs)
 
     def text_output(self) -> TextOutput:
-        return TextOutput(self._detokenizer)
+        return TextOutput(self._detokenizer, self.config.stop_token_ids)
 
     def warmup_preprocess(self) -> None:
         # postprocess runs the word timestamps' DTW in this process

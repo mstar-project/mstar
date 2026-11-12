@@ -547,7 +547,8 @@ them by that name:
      linear_attn:               # a recurrent layer's resource (GDN, Mamba-2)
        backend: flashinfer
      sampler:
-       greedy_capture: false    # also: enable_logprobs, enable_processed_logprobs
+       greedy_capture: false    # also: enable_logprobs, enable_processed_logprobs, enable_grammar,
+                                # grammar_cache_mb (512)
 
 Use one block per resource. A model with two caches, such as Whisper's decoder cache and
 its encoder context, can therefore size each one separately. If a block names a resource

@@ -67,6 +67,7 @@ class _StubTokenizer:
     """
 
     unk_token_id = 0
+    all_special_ids = ()
 
     def convert_tokens_to_ids(self, token: str) -> int:
         return SPECIAL_IDS.get(token, self.unk_token_id)

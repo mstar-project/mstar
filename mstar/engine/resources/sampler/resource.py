@@ -1,10 +1,12 @@
 import logging
+from collections import Counter
 from collections.abc import Mapping
-from dataclasses import asdict
+from dataclasses import asdict, replace
 
 import torch
 
 from mstar.distributed.communication import JointGroups
+from mstar.engine.accelerator_graph_backend import split_capture
 from mstar.engine.resources.base import CachedPrefix, EngineResourceInfo, Resource
 from mstar.engine.resources.resident import CapturedResidentStep, ResidentPlan, ResidentPlanner, ResidentWrites
 from mstar.engine.resources.resident_hooks import ANY_REPEATS
@@ -15,6 +17,7 @@ from mstar.engine.resources.sampler.config import (
     SamplerStep,
     SamplingReqConfig,
 )
+from mstar.engine.resources.sampler.grammar import GrammarRows
 from mstar.engine.resources.sampler.resident import SamplerCells
 from mstar.engine.resources.sampler.utils import (
     FUSED_SAMPLE_MAX_VOCAB,
@@ -27,7 +30,7 @@ from mstar.engine.resources.sampler.utils import (
     _rng_offset_stride,
     samples_greedy,
 )
-from mstar.engine.resources.step import ASKS, AdmitOutcome, SlotLease, StepContext
+from mstar.engine.resources.step import ADMIT_OK, ASKS, AdmitOutcome, AdmitRuntimeError, SlotLease, StepContext
 from mstar.utils.device import DeviceCapability
 from mstar.utils.h2d import PinnedStager
 from mstar.utils.knobs import device_loopback_enabled, sampler_ingraph_scatter
@@ -193,7 +196,12 @@ class SamplerResource(Resource):
 
     @classmethod
     def build(cls, spec: SamplerSpec, info: EngineResourceInfo):
-        return cls(
+        resource_class, grammar = cls, {}
+        if spec.enable_grammar:
+            resource_class = GrammarSamplerResource
+            text_output = info.text_output() if info.text_output is not None else None
+            grammar = dict(text_output=text_output, grammar_cache_mb=spec.grammar_cache_mb)
+        return resource_class(
             vocab_size=spec.vocab_size,
             enable_repetition_penalty=spec.enable_repetition_penalty,
             device=info.device,
@@ -206,6 +214,7 @@ class SamplerResource(Resource):
             enable_logprobs=spec.enable_logprobs,
             enable_processed_logprobs=spec.enable_processed_logprobs,
             greedy_capture=spec.greedy_capture,
+            **grammar,
         )
 
     def build_accelerator_graph_buffers(
@@ -278,6 +287,10 @@ class SamplerResource(Resource):
         if problem is not None:
             self._sampler.remove_request(rid)
             raise ValueError(f"request {rid!r} {problem}")
+        if overrides is not None and overrides.grammar is not None:
+            self._sampler.remove_request(rid)
+            raise ValueError(f"request {rid!r} asks for structured_outputs but the node's "
+                             "SamplerSpec has enable_grammar=False")
         # after the refusals, so a refused request leaves no stale entry
         if resolved.presence_penalty != 1.0:
             self._penalty_rids.add(rid)
@@ -894,3 +907,173 @@ class SamplerResource(Resource):
         self._row_stager.copy_(index, rows)
         for dst, src in updates:
             dst.index_copy_(0, index, src.to(dst.dtype))
+
+
+class GrammarSamplerResource(SamplerResource):
+    """The sampler of a spec with ``enable_grammar``: it serves ``structured_outputs``
+    (`sampler/grammar.py`), masking each constrained row's logits before the draw."""
+
+    def __init__(self, vocab_size: int | None, enable_repetition_penalty: bool, device: torch.device, *,
+                 text_output, grammar_cache_mb: int, **kwargs):
+        if text_output is None:
+            raise ValueError("enable_grammar needs a model that declares text_output()")
+        super().__init__(vocab_size, enable_repetition_penalty, device, **kwargs)
+        self._grammar = GrammarRows(text_output, vocab_size, device, grammar_cache_mb << 20, self._decides)
+        self._grammar_stager = PinnedStager(torch.int32)
+        # The mask this step applies (None: none), with its rows and slot (None: eager), the static
+        # mask buffer of each cg slot the captures apply (shared by the slot's buckets), the slots
+        # holding a constrained row's mask in any row, and an eager step's drawn tokens (a captured
+        # step's are its slot's last-token row).
+        self._grammar_mask: torch.Tensor | None = None
+        self._grammar_rids: tuple = ()
+        self._grammar_slot: int | None = None
+        self._grammar_masks: dict[int, torch.Tensor] = {}
+        self._grammar_dirty: set[int] = set()
+        self._eager_draw: torch.Tensor | None = None
+        # rank 0's draw is every rank's (`_broadcast_tokens`), so only its masks are filled
+        self._fills_masks = self._decides or self._comm_group.rank == 0
+
+    def build_accelerator_graph_buffers(self, slots, max_bs: int, max_seq_len: int):
+        super().build_accelerator_graph_buffers(slots, max_bs, max_seq_len)
+        for slot in range(self._cg_slots):
+            buf = self._grammar_masks.get(slot)
+            if buf is None or buf.shape[0] < self._cg_max_bs:
+                self._grammar_masks[slot] = torch.full(
+                    (self._cg_max_bs, self._grammar.words), -1, dtype=torch.int32, device=self._device,
+                )
+
+    def ingest_request(self, rid: str, overrides: SamplingReqConfig | None = None):
+        grammar = overrides.grammar if overrides is not None else None
+        super().ingest_request(rid, overrides if grammar is None else replace(overrides, grammar=None))
+        if grammar is not None:
+            self._grammar.add(rid, grammar)
+
+    def remove_request(self, rid: str):
+        super().remove_request(rid)
+        self._grammar.remove(rid)
+
+    def admit_retrieve(self, rid: str, node_name: str, graph_walk: str, published: None) -> AdmitOutcome:
+        """Not ready while ``rid``'s grammar compiles: its first draw needs the
+        mask, and a step that waited for the compile would stall every row on
+        the worker. Readiness, not capacity, so the requests behind it start
+        meanwhile. Each rank compiles from the same request: the leader holds
+        the request back, and a follower handed its step waits only for what is
+        left of its own compile."""
+        return AdmitOutcome(ok=True, ready=False) if self._grammar.compiling(rid) else ADMIT_OK
+
+    def admit(self, step: SamplerStep, ctx: StepContext) -> AdmitOutcome:
+        """Fail the rows whose grammar can no longer be served (it failed to
+        compile, start or accept, or refused a drawn token; or, on one rank, failed
+        to fill), and a constrained request with two
+        rows in the step: an error to the client rather than a reply its
+        constraint stopped holding. The same on every rank, which compile and
+        accept the same tokens, each as its next draw begins (`_fill_grammar`).
+
+        A refused draw is found where the next step accepts it, so it fails its
+        request at the admit after that; meanwhile its row may draw only a stop
+        token. Admit accepts no draws itself: a pre-admitted step skips its full
+        admit on one rank and not another, and the ranks would disagree."""
+        if not self._grammar.any_of(ctx.request_ids):
+            return ADMIT_OK
+        failed = self._grammar.failures(ctx.request_ids)
+        for rid, rows in Counter(ctx.request_ids).items():
+            if rows > 1 and rid in self._grammar:
+                failed[rid] = "a constrained request has two rows in one step (speculative decoding is not served)"
+        if not failed:
+            return ADMIT_OK
+        return AdmitOutcome(ok=False, reason=AdmitRuntimeError(
+            message="; ".join(sorted(set(failed.values()))), request_ids=frozenset(failed),
+        ))
+
+    def lean_for(self, rids) -> bool:
+        """A step with a constrained row applies its mask: never lean."""
+        return not self._grammar.any_of(rids) and super().lean_for(rids)
+
+    def resident_refusal(self) -> str | None:
+        return "its grammar masks are staged by the host's rows (enable_grammar)"
+
+    def plan(self, step: SamplerStep, ctx: StepContext):
+        super().plan(step, ctx)
+        if not ctx.is_preplan:
+            self._eager_draw = None
+            self._stage_grammar(ctx)
+
+    def _stage_grammar(self, ctx: StepContext) -> None:
+        """Where `_fill_grammar` puts this step's grammar masks: the leased slot's
+        static buffer, which a full capture applies whatever it holds (all ones
+        when no row is constrained), or a fresh tensor for an eager step with a
+        constrained row. A lean step (greedy, unconstrained) applies none."""
+        lease = ctx.slot_lease
+        self._grammar_rids = ctx.request_ids
+        self._grammar_slot = None
+        if self._greedy_this_step:
+            # a lean step holds no grammar row, and its capture applies no mask
+            self._grammar_mask = None
+            return
+        buf = self._grammar_masks.get(lease.slot) if lease is not None else None
+        if buf is None:
+            self._grammar_mask = (
+                torch.full((len(ctx.request_ids), self._grammar.words), -1, dtype=torch.int32, device=self._device)
+                if self._grammar.any_of(ctx.request_ids) else None
+            )
+            return
+        self._grammar_mask = buf[:lease.bucket.bs]
+        self._grammar_slot = lease.slot
+
+    def _fill_grammar(self) -> None:
+        """Accept every token the step's rows drew so far and write their masks
+        where `_stage_grammar` said, on the current stream: inside `sample`, or
+        between the two graphs of a split capture's replay, so the forward is
+        already running.
+
+        A row whose accept fails, as a draw its grammar refuses does, fails its
+        request at admit, on every rank alike. A row whose fill raises (on rank 0
+        alone, which fills) is handled by `fill` (`GrammarRows`): it isolates each row,
+        so nothing else here raises."""
+        grammar, rids, slot = self._grammar, self._grammar_rids, self._grammar_slot
+        # MSTAR_PHASE_TIMING: accept includes draw_wait (`accept_pending`)
+        laps = PhaseLaps("res.grammar.")
+        grammar.accept_pending()
+        laps.lap("accept")
+        if not self._fills_masks:
+            return
+        masks = grammar.fill(rids) if grammar.any_of(rids) else None
+        laps.lap("fill")
+        if masks is not None:
+            self._grammar_stager.copy_(self._grammar_mask, masks.numpy().reshape(-1), pad_value=-1)
+            if slot is not None:
+                self._grammar_dirty.add(slot)
+        elif slot in self._grammar_dirty:
+            # the whole buffer: every bucket on the slot shares it, and a larger one
+            # than this step's may have left a mask past this step's rows
+            self._grammar_masks[slot].fill_(-1)
+            self._grammar_dirty.discard(slot)
+        laps.lap("h2d")
+
+    def commit(self, step: SamplerStep, ctx: StepContext):
+        if self._grammar.any_of(ctx.request_ids):
+            # the drawn tokens go to the host for the next step's masks. A replay never
+            # calls `sample`, but every graph on its slot writes the slot's last-token row
+            tokens = self._eager_draw if self._cg_sampler is None else self._cg_sampler.last_token_buf
+            if tokens is not None:
+                self._grammar.note_draws(ctx.request_ids, tokens, self._kept_rids_of(step, ctx))
+        super().commit(step, ctx)
+
+    @torch.compiler.disable
+    def sample(self, request_ids: list[str], logits: torch.Tensor, **kwargs):
+        if self._grammar_mask is not None:
+            # The masks need the draws of the step before, so a capture splits here and
+            # its replay fills them while the forward runs. The apply is before either
+            # draw, so a capture bakes it over the slot's buffer.
+            if DeviceCapability.of(self._device).is_capturing():
+                split_capture(self._fill_grammar)
+            else:
+                self._fill_grammar()
+            self._grammar.apply(logits, self._grammar_mask)
+        self._eager_draw = tokens = super().sample(request_ids, logits, **kwargs)
+        return tokens
+
+    @torch.compiler.disable
+    def fused_draw_args(self) -> FusedDrawArgs | None:
+        """None: a fused draw applies no mask."""
+        return None

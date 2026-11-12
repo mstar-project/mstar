@@ -286,7 +286,7 @@ class WhisperDecoderSubmodule(TokenStepNode, ARNodeSubmodule):
         # a stop on the first transcript token ends the partition (`_token_stops`)
         self.token_stop = TokenStop(
             loop=self.DECODE_LOOP, buffer="new_token",
-            stop_ids=frozenset({config.eos_token_id}), sampler=self.SAMPLER,
+            stop_ids=config.stop_token_ids, sampler=self.SAMPLER,
             prefill_walks=frozenset(FIRST_TOKEN_WALKS),
         )
         # The decode walk reads its last token off the sampler's slot masters.

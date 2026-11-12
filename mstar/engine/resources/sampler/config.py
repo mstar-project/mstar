@@ -7,12 +7,13 @@ step without pulling them in behind it.
 
 import hashlib
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING
 
 import torch
 
-from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
+from mstar.engine.resources.sampler.grammar import STRUCTURED_OUTPUTS_KWARG, GrammarRequest, grammar_request
+from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig, check_sizes
 from mstar.engine.resources.step import ResourceStep
 
 if TYPE_CHECKING:
@@ -79,7 +80,7 @@ class SamplerSpec(NodeResourceSpec):
     # apply a repetition penalty, which decides both the seen-token buffers and
     # the kernel variant baked into the captured graph. Whether the penalty
     # actually runs on a given step is settled per step from the resident
-    # requests' `repetition_penalty` — see `SamplerResource.admit`.
+    # requests' `repetition_penalty` — see `SamplerResource._set_penalty_flags`.
     enable_repetition_penalty: bool = True
     # Same kind of capability for min-p: whether the node's sampler (eager and
     # graph-captured) carries the filter. It costs two passes over ``[B, V]``
@@ -110,11 +111,26 @@ class SamplerSpec(NodeResourceSpec):
     # always. The twins cost capture memory and time, so a deployment that never
     # samples greedily turns them off in its ``resources:`` block.
     greedy_capture: bool | None = None
+    # Allows ``structured_outputs`` (grammar-constrained sampling, ``sampler/grammar.py``)
+    # on this node. The captured sampler then applies a bitmask on every step but a lean
+    # one (greedy, no constrained row), asked or not, so a deployment turns it on in its
+    # ``resources:`` block, on its text sampler.
+    enable_grammar: bool = False
+    # The most host memory, in MiB, the worker's compiled grammars are kept in
+    # (xgrammar's compile cache, keyed by each request's grammar text).
+    grammar_cache_mb: int = 512
 
     def apply_yaml_overrides(
         self, enable_logprobs: bool | None = None, enable_processed_logprobs: bool | None = None,
-        greedy_capture: bool | None = None,
+        greedy_capture: bool | None = None, enable_grammar: bool | None = None,
+        grammar_cache_mb: int | None = None,
     ) -> None:
+        if enable_grammar is not None:
+            check_bool_knob("enable_grammar", enable_grammar)
+            self.enable_grammar = enable_grammar
+        if grammar_cache_mb is not None:
+            check_sizes({"grammar_cache_mb": grammar_cache_mb})
+            self.grammar_cache_mb = grammar_cache_mb
         if greedy_capture is not None:
             check_bool_knob("greedy_capture", greedy_capture)
             self.greedy_capture = greedy_capture
@@ -126,6 +142,19 @@ class SamplerSpec(NodeResourceSpec):
             self.enable_processed_logprobs = enable_processed_logprobs
         if self.enable_processed_logprobs and not self.enable_logprobs:
             raise ValueError("enable_processed_logprobs needs enable_logprobs")
+
+    def request_config(
+        self, model_kwargs: dict | None, current: ResourceReqConfig | None = None,
+    ) -> "SamplingReqConfig | None":
+        """The model's sampler config with the request's grammar, when this node
+        serves ``structured_outputs`` and the request asks for one."""
+        if not self.enable_grammar:
+            return None
+        grammar = grammar_request((model_kwargs or {}).get(STRUCTURED_OUTPUTS_KWARG))
+        if grammar is None:
+            return None
+        base = current if isinstance(current, SamplingReqConfig) else SamplingReqConfig()
+        return replace(base, grammar=grammar)
 
     @property
     def resource_class(self) -> "type[Resource]":
@@ -166,6 +195,8 @@ class SamplingReqConfig(ResourceReqConfig):
     # "processed", the distribution it was drawn from (0 for greedy).
     return_logprobs: bool = False
     logprobs_mode: str = "raw"
+    # The request's grammar (``structured_outputs``); needs the spec's enable_grammar.
+    grammar: GrammarRequest | None = None
     _seed: int = 0 # set by the conductor
 
     def apply_conductor_config(
@@ -193,6 +224,10 @@ class SamplingReqConfig(ResourceReqConfig):
                 check_bool_knob(name, value)
         if self.logprobs_mode not in (None, "raw", "processed"):
             raise ValueError(f"logprobs_mode must be 'raw' or 'processed'; got {self.logprobs_mode!r}")
+        # a finished grammar allows only a stop token
+        if self.grammar is not None and (self.min_tokens or self.ignore_eos):
+            raise ValueError("structured_outputs ends the reply where its grammar ends; "
+                             "send it without min_tokens and ignore_eos")
         if spec is None:
             return
         # refused here, not ignored: the node's sampler has no such filter

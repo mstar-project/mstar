@@ -46,6 +46,7 @@ from mstar.engine.resources.kv.config import (
     without_layouts,
 )
 from mstar.engine.resources.lora.config import LoraSpec
+from mstar.engine.resources.sampler.grammar import STRUCTURED_OUTPUTS_KWARG
 from mstar.engine.state import SampleSettings
 from mstar.engine.state.adapters import sampling_configs
 from mstar.engine.state.analysis import declaration_digests
@@ -827,9 +828,14 @@ class Conductor:
         # each declared resource builds its own config from the request's kwargs (a LoRA
         # pool's from the adapter it names), so a model needs no request code for one
         for spec in self._node_resources():
-            config = spec.request_config(model_kwargs)
+            config = spec.request_config(model_kwargs, configs.get(spec.resource_key))
             if config is not None:
-                configs.setdefault(spec.resource_key, config)
+                configs[spec.resource_key] = config
+        # as return_logprobs above: a sampler with enable_grammar took it, or none serves it
+        if model_kwargs.get(STRUCTURED_OUTPUTS_KWARG) is not None and not any(
+            getattr(cfg, "grammar", None) is not None for cfg in configs.values()
+        ):
+            raise ValueError("this deployment does not serve structured_outputs")
         lora_ops = getattr(self, "_lora_ops_cache", None)
         if lora_ops is not None:
             lora_ops.refuse_request(configs.values())
