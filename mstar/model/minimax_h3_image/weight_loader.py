@@ -21,9 +21,10 @@ ROOT = ""  # every component sits at the snapshot's root
 
 
 def build_transformer(config: H3ImageConfig, snapshot: Path, device, comm_group=None, sp_group=None,
-                      dtype: torch.dtype = torch.bfloat16):
+                      dtype: torch.dtype = torch.bfloat16, head_groups: int = 1, group_streams: bool = False):
     return h3.build_transformer(config, snapshot, device, comm_group=comm_group, sp_group=sp_group, dtype=dtype,
-                                partition=ROOT, output_heads=OUTPUT_HEADS)
+                                partition=ROOT, output_heads=OUTPUT_HEADS, head_groups=head_groups,
+                                group_streams=group_streams)
 
 
 def build_text_conditioner(config: H3ImageConfig, snapshot: Path, device, dtype: torch.dtype = torch.bfloat16):

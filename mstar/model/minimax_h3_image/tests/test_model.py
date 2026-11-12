@@ -214,6 +214,15 @@ def test_requests_refused_at_the_seam():
                              tensors={"image_inputs": [torch.zeros(3, 16, 64, dtype=torch.uint8)]})
 
 
+def test_ulysses_head_groups_reach_the_dits_attention_only():
+    """MiniMax-H3's pipelined exchange: the DiT's resource is sharded by group, the refiner's isn't."""
+    specs = {spec.resource_key: spec.config for spec in _model(ulysses_head_groups=4).get_node_resources()}
+    assert [c.head_groups for c in specs.values()] == [4, 1]
+    with pytest.raises(ValueError, match="ulysses_group_streams"):
+        _model(ulysses_group_streams="false")
+    with pytest.raises(ValueError, match="ulysses_head_groups"):
+        _model(ulysses_head_groups=0)
+
 def test_postprocess_resizes_the_canvas_to_the_request():
     from PIL import Image
 

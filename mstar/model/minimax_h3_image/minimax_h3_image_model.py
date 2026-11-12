@@ -38,7 +38,12 @@ from mstar.model.minimax_h3.config import (
     VAE_ENCODER_NODE,
 )
 from mstar.model.minimax_h3.keyframes import presentation, vision_spans
-from mstar.model.minimax_h3.minimax_h3_model import VISION_TOKENS, _positive_int, import_image_processor
+from mstar.model.minimax_h3.minimax_h3_model import (
+    VISION_TOKENS,
+    _positive_int,
+    import_image_processor,
+    ulysses_options,
+)
 from mstar.model.minimax_h3.submodules import (
     COND_LATENTS,
     LATENTS,
@@ -103,6 +108,8 @@ class H3ImageModel(Model):
         row_bucket: int | None = None,
         vae_tile_batch: int = 1,
         vae_compile: bool = False,
+        ulysses_head_groups: int = 1,
+        ulysses_group_streams: bool = False,
     ):
         if attention_backend not in ATTENTION_BACKENDS:
             raise ValueError(f"attention_backend must be one of {ATTENTION_BACKENDS}, got {attention_backend!r}")
@@ -125,6 +132,9 @@ class H3ImageModel(Model):
             raise ValueError(f"row_bucket must be a positive int, got {row_bucket!r}")
         self.vae_tile_batch = int(vae_tile_batch)  # 1 decodes one tile a call, as the reference
         self.vae_compile = bool(vae_compile)
+        # under SP: the DiT's exchange pipelined over head groups on the copy engines (MiniMax-H3's knobs)
+        self.ulysses_head_groups, self.ulysses_group_streams = ulysses_options(ulysses_head_groups,
+                                                                               ulysses_group_streams)
         self._snapshot = None
         self._config: H3ImageConfig | None = None
         self.tokenizer = None
@@ -159,18 +169,19 @@ class H3ImageModel(Model):
             return []
         cfg = self.config.transformer
 
-        def spec(key, node, shard_over_sp, segments):
+        def spec(key, node, shard_over_sp, segments, head_groups=1):
             return RaggedAttentionSpec(
                 resource_key=key, nodes={node},
                 config=RaggedAttentionConfig(
                     num_qo_heads=cfg.num_attention_heads, num_kv_heads=cfg.num_attention_heads,
                     head_dim=cfg.attention_head_dim, max_segments_per_request=segments, dtype=torch.bfloat16,
-                    shard_over_sp=shard_over_sp, workspace_mb=128,
+                    shard_over_sp=shard_over_sp, workspace_mb=128, head_groups=head_groups,
                 ),
             )
 
         # the DiT's padding rows are a second segment of each request
-        return [spec(DIT_ATTN, DIT_NODE, True, 2), spec(REFINER_ATTN, TEXT_ENCODER_NODE, False, 1)]
+        return [spec(DIT_ATTN, DIT_NODE, True, 2, self.ulysses_head_groups),
+                spec(REFINER_ATTN, TEXT_ENCODER_NODE, False, 1)]
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         def text_node(*inputs: str) -> GraphNode:
@@ -443,7 +454,9 @@ class H3ImageModel(Model):
             return H3ImageEncoderSubmodule(weight_loader.build_image_encoder(config, snapshot, device))
         if node_name == DIT_NODE:
             return H3ImageDenoiseSubmodule(
-                weight_loader.build_transformer(config, snapshot, device, comm_group=tp_group, sp_group=sp_group),
+                weight_loader.build_transformer(config, snapshot, device, comm_group=tp_group, sp_group=sp_group,
+                                                head_groups=self.ulysses_head_groups,
+                                                group_streams=self.ulysses_group_streams),
                 config, loop_name=DENOISE_LOOP, attn_resource_key=DIT_ATTN if ragged else None,
                 max_batch_size=1, compile_blocks=self.compile, row_bucket=self.row_bucket,
             )

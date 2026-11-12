@@ -159,6 +159,15 @@ class ScheduleArgs(NamedTuple):
     audio_shift: float
 
 
+
+def ulysses_options(head_groups, group_streams) -> tuple[int, bool]:
+    """``ulysses_head_groups`` / ``ulysses_group_streams`` from ``model_kwargs``, checked."""
+    if not isinstance(head_groups, int) or isinstance(head_groups, bool) or head_groups < 1:
+        raise ValueError(f"ulysses_head_groups must be a positive int, got {head_groups!r}")
+    if not isinstance(group_streams, bool):  # a YAML string 'false' would read as true
+        raise ValueError(f"ulysses_group_streams must be true or false, got {group_streams!r}")
+    return head_groups, group_streams
+
 class H3Model(Model):
     """MiniMax-H3 (33B DiT, guidance-distilled) joint audio-video generation."""
 
@@ -206,12 +215,10 @@ class H3Model(Model):
         self.vae_compile = bool(vae_compile)
         # under SP, the DiT's attention runs this many head groups a layer, each group's exchange on the copy
         # engines while the previous group attends (ulysses_pipeline); 1 is one NCCL exchange each way
-        self.ulysses_head_groups = int(ulysses_head_groups)
-        if self.ulysses_head_groups < 1:
-            raise ValueError(f"ulysses_head_groups must be a positive int, got {ulysses_head_groups!r}")
-        # each head group attends on its own stream, so a group's last wave of attention tiles runs beside the
-        # next group's first (FA4 varlen is one tile a CTA: 7 heads x 150 tiles is 7.1 waves on 148 SMs)
-        self.ulysses_group_streams = bool(ulysses_group_streams)
+        # each head group may also attend on its own stream, so a group's last wave of attention tiles runs
+        # beside the next group's first (FA4 varlen is one tile a CTA: 7 heads x 150 tiles is 7.1 waves on 148 SMs)
+        self.ulysses_head_groups, self.ulysses_group_streams = ulysses_options(ulysses_head_groups,
+                                                                               ulysses_group_streams)
         self._snapshot = None
         self._config: H3Config | None = None
         self.tokenizer = None
