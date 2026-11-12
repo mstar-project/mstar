@@ -80,6 +80,12 @@ def sampler_capabilities(defaults: Mapping[str, object]) -> dict:
     }
 
 
+def sampler_flags(defaults: Mapping[str, object]) -> dict:
+    """`sampler_capabilities` as the ``penalty`` and ``min_p`` a declared `Sampler` takes."""
+    capabilities = sampler_capabilities(defaults)
+    return {"penalty": capabilities["enable_repetition_penalty"], "min_p": capabilities["enable_min_p"]}
+
+
 def sampling_config(defaults: Mapping[str, object], kwargs: dict | None) -> SamplingReqConfig:
     """The request's sampler config: ``defaults`` under the knobs it sets."""
     kw = checked_request_kwargs(kwargs)

@@ -36,7 +36,7 @@ from mstar.model.command_a_plus.config import (
 from mstar.model.components.request_kwargs import (
     SAMPLING_KEYS,
     sample_settings,
-    sampler_capabilities,
+    sampler_flags,
     sampling_config,
     sampling_defaults,
 )
@@ -132,7 +132,6 @@ class CommandAPlusModel(Model):
         every = frozenset(range(config.num_hidden_layers))
         local = frozenset(i for i, kind in enumerate(config.layer_types) if kind == "sliding_attention")
         attend = Attend(q_heads=config.num_attention_heads)
-        capabilities = sampler_capabilities(self.sampling_defaults)
         return [
             Array(
                 KV_CACHE, nodes={"LLM"}, layers=every,
@@ -146,7 +145,7 @@ class CommandAPlusModel(Model):
             ),
             Sampler(
                 SAMPLER, nodes={"LLM"}, vocab_size=config.vocab_size,
-                penalty=capabilities["enable_repetition_penalty"], min_p=capabilities["enable_min_p"],
+                **sampler_flags(self.sampling_defaults),
             ),
         ]
 

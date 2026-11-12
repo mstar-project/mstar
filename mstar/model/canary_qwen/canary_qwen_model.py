@@ -59,7 +59,7 @@ from mstar.model.components.request_kwargs import (
     SAMPLING_KEYS,
     checked_request_kwargs,
     sample_settings,
-    sampler_capabilities,
+    sampler_flags,
     sampling_config,
     sampling_defaults,
 )
@@ -174,7 +174,6 @@ class CanaryQwenModel(Model):
 
     def declare_state(self) -> list[Array | Sampler]:
         llm = self.config.llm
-        capabilities = sampler_capabilities(self.sampling_defaults)
         return [
             Array(
                 KV_CACHE, nodes={"llm"}, layers=frozenset(range(llm.num_hidden_layers)),
@@ -184,7 +183,7 @@ class CanaryQwenModel(Model):
             ),
             Sampler(
                 SAMPLER, nodes={"llm"}, vocab_size=llm.vocab_size,
-                penalty=capabilities["enable_repetition_penalty"], min_p=capabilities["enable_min_p"],
+                **sampler_flags(self.sampling_defaults),
             ),
         ]
 
