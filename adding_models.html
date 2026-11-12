@@ -3748,16 +3748,17 @@ page. Attention runs on each rank’s slots and merges the partials across the p
 (<code class="docutils literal notranslate"><span class="pre">mstar/engine/resources/context_parallel.py</span></code>). The model declares nothing.</p>
 <ul class="simple">
 <li><p><strong>TP mode (no SP ranks).</strong> The partners are the TP ranks sharing a KV head,
-<code class="docutils literal notranslate"><span class="pre">P</span> <span class="pre">=</span> <span class="pre">tp</span> <span class="pre">/</span> <span class="pre">num_kv_heads</span></code>, so TP must be a larger multiple of the KV heads. They are the contiguous blocks <code class="docutils literal notranslate"><span class="pre">kv_head_replicas</span></code>
-(<code class="docutils literal notranslate"><span class="pre">mstar/distributed/utils.py</span></code>) gives, as <code class="docutils literal notranslate"><span class="pre">QKVParallelLinear</span></code> loads them; a model that
+<code class="docutils literal notranslate"><span class="pre">P</span> <span class="pre">=</span> <span class="pre">tp</span> <span class="pre">/</span> <span class="pre">num_kv_heads</span></code>, so TP must be a larger multiple of the KV heads. They are the
+contiguous blocks <code class="docutils literal notranslate"><span class="pre">kv_head_replicas</span></code> (<code class="docutils literal notranslate"><span class="pre">mstar/distributed/utils.py</span></code>) gives, as
+<code class="docutils literal notranslate"><span class="pre">QKVParallelLinear</span></code> loads them; a model that
 shards K and V itself must match. Each layer exchanges queries and partials over the TP group,
 except for a plan label of an eager step that isn’t one token a row and has no stored context
 on any row, which attends its own tokens alone.</p></li>
 <li><p><strong>SP mode.</strong> The partners are the node’s SP ranks, <code class="docutils literal notranslate"><span class="pre">P</span> <span class="pre">=</span> <span class="pre">sp_size</span></code>. Heads shard over TP alone
 and the node loads without its SP group, so every layer but attention runs replicated across
 SP; prefer TP mode where it applies. Every paged pool of the node must set the key, and the
-node must not be in the model’s <code class="docutils literal notranslate"><span class="pre">sp_enabled_nodes</span></code>. Each layer all-gathers the partials,
-with the same exception.
+node must not be in the model’s <code class="docutils literal notranslate"><span class="pre">sp_enabled_nodes</span></code>. Each layer all-gathers the partials; under
+the same exception it attends no slots and gathers its own tokens’ shares alone.
 Chunked prefill stays off on SP ranks (<code class="docutils literal notranslate"><span class="pre">_unchunkable_nodes</span></code>), as for the model’s own SP, so
 SP mode prefills a prompt in one step; chunking an SP-placed pool’s prompts is not supported yet.
 TP mode chunks prompts as without placement.</p></li>
@@ -3784,7 +3785,11 @@ and its own tokens from the <code class="docutils literal notranslate"><span cla
 <code class="docutils literal notranslate"><span class="pre">attn.run</span></code> itself passes them (<code class="docutils literal notranslate"><span class="pre">AttentionCallable</span></code> and <code class="docutils literal notranslate"><span class="pre">MLAAttention</span></code> without
 <code class="docutils literal notranslate"><span class="pre">mla_absorb</span></code> do). A fused K/V write that leaves <code class="docutils literal notranslate"><span class="pre">k</span></code> unrotated asks <code class="docutils literal notranslate"><span class="pre">reads_step_kv()</span></code> first
 and rotates it when the step attends it (<code class="docutils literal notranslate"><span class="pre">AttentionCallable.norm_rope_attend</span></code>); a state op’s fused
-kernel doesn’t run on such a step, so its reference’s <code class="docutils literal notranslate"><span class="pre">add</span></code> hands the handle <code class="docutils literal notranslate"><span class="pre">k</span></code> and <code class="docutils literal notranslate"><span class="pre">v</span></code>.</p>
+kernel doesn’t run on such a step, so its reference’s <code class="docutils literal notranslate"><span class="pre">add</span></code> hands the handle <code class="docutils literal notranslate"><span class="pre">k</span></code> and <code class="docutils literal notranslate"><span class="pre">v</span></code>.
+In SP mode, rank <code class="docutils literal notranslate"><span class="pre">r</span></code> attends only the step’s
+own tokens in <em>zigzag</em> chunks <code class="docutils literal notranslate"><span class="pre">r</span></code> and <code class="docutils literal notranslate"><span class="pre">2P</span> <span class="pre">-</span> <span class="pre">1</span> <span class="pre">-</span> <span class="pre">r</span></code> of each row’s <code class="docutils literal notranslate"><span class="pre">2P</span></code> (<code class="docutils literal notranslate"><span class="pre">zigzag_rows</span></code>),
+which shares the causal work about evenly on rows of <code class="docutils literal notranslate"><span class="pre">2P</span></code> tokens or more; it merges them into
+its context partial before the gather.</p>
 <div class="admonition note">
 <p class="admonition-title">Note</p>
 <p>A top-level <code class="docutils literal notranslate"><span class="pre">kv_cache:</span></code> block is no longer read. It raises an error at load time,

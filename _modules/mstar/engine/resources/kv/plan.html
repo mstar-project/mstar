@@ -1182,6 +1182,18 @@ window.runMermaid = runMermaid;</script>
 
 
 
+<div class="viewcode-block" id="token_runs">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.plan.html#mstar.engine.resources.kv.plan.token_runs">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">token_runs</span><span class="p">(</span><span class="n">starts</span><span class="p">:</span> <span class="n">np</span><span class="o">.</span><span class="n">ndarray</span><span class="p">,</span> <span class="n">lens</span><span class="p">:</span> <span class="n">np</span><span class="o">.</span><span class="n">ndarray</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="n">np</span><span class="o">.</span><span class="n">ndarray</span><span class="p">,</span> <span class="n">np</span><span class="o">.</span><span class="n">ndarray</span><span class="p">]:</span>
+<span class="w">    </span><span class="sd">"""``(indptr, ids)`` for runs of consecutive token ids, ``arange(start, start + len)`` each,</span>
+<span class="sd">    end to end: a query block's keys as pages of one token each, the page lists the paged kernel</span>
+<span class="sd">    takes."""</span>
+    <span class="n">indptr</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">lens</span><span class="p">)</span> <span class="o">+</span> <span class="mi">1</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">int64</span><span class="p">)</span>
+    <span class="n">np</span><span class="o">.</span><span class="n">cumsum</span><span class="p">(</span><span class="n">lens</span><span class="p">,</span> <span class="n">out</span><span class="o">=</span><span class="n">indptr</span><span class="p">[</span><span class="mi">1</span><span class="p">:])</span>
+    <span class="k">return</span> <span class="n">indptr</span><span class="p">,</span> <span class="n">np</span><span class="o">.</span><span class="n">repeat</span><span class="p">(</span><span class="n">starts</span> <span class="o">-</span> <span class="n">indptr</span><span class="p">[:</span><span class="o">-</span><span class="mi">1</span><span class="p">],</span> <span class="n">lens</span><span class="p">)</span> <span class="o">+</span> <span class="n">np</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="n">indptr</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">])</span></div>
+
+
+
 <div class="viewcode-block" id="build_paged_indptrs">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.plan.html#mstar.engine.resources.kv.plan.build_paged_indptrs">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">build_paged_indptrs</span><span class="p">(</span>

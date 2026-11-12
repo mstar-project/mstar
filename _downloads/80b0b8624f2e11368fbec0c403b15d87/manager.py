@@ -612,7 +612,7 @@ class KVManager(AttentionResource):
         logger.info(
             "KV %s: %.2f GiB on this rank, %d pages of %d slots%s", name, self.kv_cache.nbytes / 2**30,
             cfg.max_num_pages, self.kv_cache.page_slots,
-            "" if cp is None else f" (context parallel, {cp.size} ranks over {'SP' if cp.over_sp else 'TP'})",
+            "" if cp is None else f" (context parallel, {cp.size} ranks, {type(cp).__name__})",
         )
         self._needs_remote_transfer = needs_remote_transfer
 
@@ -1814,7 +1814,7 @@ class KVManager(AttentionResource):
             self.config.layout.value, self.config.tokens_per_page,
             self.kv_cache.tensor.dtype, self._world_size,
             self.config.prefix_cache_salt,
-            *(() if cp is None else ("context_parallel", cp.size, cp.over_sp)),
+            *(() if cp is None else ("context_parallel", cp.size, type(cp).__name__)),
         )
 
     def ingest_request(self, rid, overrides: KVReqConfig | None=None):

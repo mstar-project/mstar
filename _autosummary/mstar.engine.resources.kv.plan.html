@@ -790,6 +790,7 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.plan.build_paged_indptrs"><code class="docutils literal notranslate"><span class="pre">build_paged_indptrs()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.plan.first_pages"><code class="docutils literal notranslate"><span class="pre">first_pages()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.plan.group_by_plan_label"><code class="docutils literal notranslate"><span class="pre">group_by_plan_label()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.plan.token_runs"><code class="docutils literal notranslate"><span class="pre">token_runs()</span></code></a></li>
 </ul>
             </nav>
         </div>
@@ -819,6 +820,9 @@ consumer depends on the contract rather than on the cache.</p>
 </tr>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.plan.group_by_plan_label" title="mstar.engine.resources.kv.plan.group_by_plan_label"><code class="xref py py-obj docutils literal notranslate"><span class="pre">group_by_plan_label</span></code></a>(segments, combined_labels)</p></td>
 <td><p>Segments per plan label in order of packed forward view</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.plan.token_runs" title="mstar.engine.resources.kv.plan.token_runs"><code class="xref py py-obj docutils literal notranslate"><span class="pre">token_runs</span></code></a>(starts, lens)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">(indptr,</span> <span class="pre">ids)</span></code> for runs of consecutive token ids, <code class="docutils literal notranslate"><span class="pre">arange(start,</span> <span class="pre">start</span> <span class="pre">+</span> <span class="pre">len)</span></code> each, end to end: a query block's keys as pages of one token each, the page lists the paged kernel takes.</p></td>
 </tr>
 </tbody>
 </table>
@@ -1231,6 +1235,25 @@ will read <cite>plan</cite> output of KV</p>
 </dl>
 </dd></dl>
 
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.plan.token_runs">
+<span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.kv.plan.</span></span><span class="sig-name descname"><span class="pre">token_runs</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">starts</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">lens</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/plan.html#token_runs"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.plan.token_runs" title="Link to this definition">#</a></dt>
+<dd><p><code class="docutils literal notranslate"><span class="pre">(indptr,</span> <span class="pre">ids)</span></code> for runs of consecutive token ids, <code class="docutils literal notranslate"><span class="pre">arange(start,</span> <span class="pre">start</span> <span class="pre">+</span> <span class="pre">len)</span></code> each,
+end to end: a query block’s keys as pages of one token each, the page lists the paged kernel
+takes.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>starts</strong> (<em>ndarray</em>)</p></li>
+<li><p><strong>lens</strong> (<em>ndarray</em>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)">tuple</a>[<em>ndarray</em>, <em>ndarray</em>]</p>
+</dd>
+</dl>
+</dd></dl>
+
 </section>
 
 
@@ -1329,6 +1352,7 @@ will read <cite>plan</cite> output of KV</p>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.plan.build_paged_indptrs"><code class="docutils literal notranslate"><span class="pre">build_paged_indptrs()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.plan.first_pages"><code class="docutils literal notranslate"><span class="pre">first_pages()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.plan.group_by_plan_label"><code class="docutils literal notranslate"><span class="pre">group_by_plan_label()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.plan.token_runs"><code class="docutils literal notranslate"><span class="pre">token_runs()</span></code></a></li>
 </ul>
   </nav></div>
 
