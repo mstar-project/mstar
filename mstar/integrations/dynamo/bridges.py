@@ -452,17 +452,25 @@ class RequestBridge:
 
 
 def _submit(server: APIServer, args: SubmitArgs, prefix: str) -> str:
+    from mstar.api_server import media_io
+
     rid = f"{prefix}-{uuid.uuid4()}"
-    server.submit_request(
-        text=args.text,
-        file_paths=args.file_paths,
-        input_modalities=args.input_modalities,
-        output_modalities=args.output_modalities,
-        model_kwargs=args.model_kwargs,
-        prompt_parts=args.prompt_parts,
-        streaming=True,
-        request_id=rid,
-    )
+    try:
+        server.submit_request(
+            text=args.text,
+            file_paths=args.file_paths,
+            input_modalities=args.input_modalities,
+            output_modalities=args.output_modalities,
+            model_kwargs=args.model_kwargs,
+            prompt_parts=args.prompt_parts,
+            streaming=True,
+            request_id=rid,
+        )
+    finally:
+        # the bridges save each request's media under upload_dir, and nothing
+        # downstream deletes it once the request is read; the native routes
+        # schedule the same cleanup
+        media_io.schedule_upload_cleanup(args.file_paths, server.upload_dir)
     logger.info("request %s submitted (out=%s)", rid, args.output_modalities)
     return rid
 
