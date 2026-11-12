@@ -19,13 +19,11 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from mstar.model.components.diffusion.attention import sdpa_attention  # noqa: E402
-from mstar.model.ltx2_5.components.transformer import LTX2Attends, build_rope  # noqa: E402
+from mstar.model.ltx2_5.components.transformer import build_rope  # noqa: E402
 from mstar.model.ltx2_5.config import LTX25_REPO, SNAPSHOT_PATTERNS, LTX25Config  # noqa: E402
 from mstar.utils.hf_snapshot import resolve_snapshot_dir  # noqa: E402
 
 ORACLE = Path(os.environ.get("LTX25_ORACLE_DIR", "integration_testing/ltx25/oracle/t2av"))
-SDPA = LTX2Attends(*([sdpa_attention] * 6))
 
 
 def load(name: str):
@@ -64,7 +62,7 @@ def check_dit(device="cuda:0"):
     video, audio = dit(
         inp["hidden_states"].to(device), inp["audio_hidden_states"].to(device),
         inp["encoder_hidden_states"].to(device), inp["audio_encoder_hidden_states"].to(device),
-        inp["timestep"].to(device), rope, SDPA,
+        inp["timestep"].to(device), rope,
     )
     for h in hooks:
         h.remove()
@@ -132,7 +130,7 @@ def check_loop(device="cuda:0"):
             report(f"step {k} video in", x.to(torch.bfloat16), ref_in["hidden_states"])
             report(f"step {k} audio in", a.to(torch.bfloat16), ref_in["audio_hidden_states"])
         v, va = dit(x.to(torch.bfloat16), a.to(torch.bfloat16), text, audio_text,
-                    sched.timesteps[k:k + 1].to(device), rope, SDPA)
+                    sched.timesteps[k:k + 1].to(device), rope)
         x, a = ltx_step(x, v, sigma, sigma_next), ltx_step(a, va, sigma, sigma_next)
     report("final video latents", x, load("latents_007"))
     torch.save((x.cpu(), a.cpu()), ORACLE / "native_final_latents.pt")
@@ -182,7 +180,7 @@ def check_forced(device="cuda:0", attention="flashinfer", compile_transformer=Tr
     from mstar.model.ltx2_5.weight_loader import build_transformer
 
     sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "benchmark" / "ltx2_5"))
-    from profile_step import ragged_attends
+    from profile_step import open_attention, run_step
 
     from mstar.model.ltx2_5.submodules import shape_from_metadata
 
@@ -193,12 +191,12 @@ def check_forced(device="cuda:0", attention="flashinfer", compile_transformer=Tr
     shape = shape_from_metadata(config, {"height": 544, "width": 960, "num_frames": 121, "fps": 24.0})
     rope = build_rope(config.transformer, shape.frames, shape.height, shape.width, shape.fps, shape.audio_frames,
                       device)
-    attends = SDPA if attention == "sdpa" else ragged_attends(config, shape, 1, device)
+    step = open_attention(dit, config, shape, 1, device, attention)
     for k in range(8):
         inp = load(f"dit_in_{k:03d}")
-        v, va = dit(inp["hidden_states"].to(device), inp["audio_hidden_states"].to(device),
-                    inp["encoder_hidden_states"].to(device), inp["audio_encoder_hidden_states"].to(device),
-                    inp["timestep"].to(device), rope, attends)
+        v, va = run_step(step, dit, inp["hidden_states"].to(device), inp["audio_hidden_states"].to(device),
+                         inp["encoder_hidden_states"].to(device), inp["audio_encoder_hidden_states"].to(device),
+                         inp["timestep"].to(device), rope)
         rv, ra = load(f"dit_out_{k:03d}")
         report(f"forced step {k} video", v, rv)
         report(f"forced step {k} audio", va, ra)
@@ -230,7 +228,7 @@ def check_two_stage_seed(device="cuda:0"):
     report("latent upsampler audio", up[REFINE_AUDIO], torch.load(two / "s2_seed_audio.pt"))
 
     sub = LTXDenoiseSubmodule(torch.nn.Linear(1, 1).to(device), config, loop_name="denoise_loop",
-                              use_ragged_attention=False, refine_walks=frozenset({"refine_av"}))
+                              refine_walks=frozenset({"refine_av"}))
     info = CurrentForwardPassInfo(request_id="r", graph_walk="refine_av", fwd_index=0, random_seed=0, max_tokens=0,
                                   step_metadata=meta)
     seeds = sub.initial_loop_back(info, {REFINE_LATENTS: [up[REFINE_LATENTS][0]], REFINE_AUDIO: [up[REFINE_AUDIO][0]]},

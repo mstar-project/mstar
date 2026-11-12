@@ -48,7 +48,7 @@ from mstar.model.components.diffusion.image_io import (
 from mstar.model.components.diffusion.qwen.submodule import TEXT_EMBEDS
 from mstar.model.components.diffusion.rope import MultiAxisRoPE
 from mstar.model.components.quant_linear import BF16, StepDtypes
-from mstar.model.flux2_klein.config import Flux2KleinConfig
+from mstar.model.flux2_klein.config import JOINT_TOKENS, Flux2KleinConfig
 from mstar.model.submodule_base import NodeInputs, NodeSubmodule
 
 logger = logging.getLogger(__name__)
@@ -144,7 +144,6 @@ class KleinDenoiseSubmodule(DenoiseLoopSubmodule):
         config: Flux2KleinConfig,
         *,
         loop_name: str,
-        attn_resource_key: str | None,
         compile_transformer: bool = True, compile_eager_rounding: bool = True, compile_exact_ops: ExactOps = False,
         max_batch_size: int = 8,
         capture_buckets=(),
@@ -153,7 +152,7 @@ class KleinDenoiseSubmodule(DenoiseLoopSubmodule):
         bf16_transformer: nn.Module | None = None,
     ):
         super().__init__(
-            loop_name=loop_name, max_batch_size=max_batch_size, attn_resource_key=attn_resource_key,
+            loop_name=loop_name, max_batch_size=max_batch_size,
             capture_buckets=capture_buckets, capture_batch_sizes=capture_batch_sizes, step_dtypes=step_dtypes,
         )
         self.transformer = transformer
@@ -177,12 +176,10 @@ class KleinDenoiseSubmodule(DenoiseLoopSubmodule):
     def bucket_key_for(self, fwd_info: CurrentForwardPassInfo) -> KleinShape:
         return shape_from_metadata(self.config, fwd_info.step_metadata)
 
-    def schedule_for(self, fwd_info, bucket_key: KleinShape) -> FlowMatchSchedule:
-        return FlowMatchSchedule.build(
-            self.config.scheduler, int(fwd_info.step_metadata["num_inference_steps"]), bucket_key.image_tokens,
-        )
+    def schedule_for(self, walk: str, num_steps: int, bucket_key: KleinShape) -> FlowMatchSchedule:
+        return FlowMatchSchedule.build(self.config.scheduler, int(num_steps), bucket_key.image_tokens)
 
-    def seed_latents(self, fwd_info, bucket_key: KleinShape, generator: torch.Generator) -> torch.Tensor:
+    def seed_latents(self, bucket_key: KleinShape, generator: torch.Generator) -> torch.Tensor:
         # randn_tensor parity: drawn in the packed [C, h, w] layout in bf16 on the CPU
         # generator, then packed row-major to tokens.
         h, w = bucket_key.grid
@@ -198,6 +195,9 @@ class KleinDenoiseSubmodule(DenoiseLoopSubmodule):
 
     def num_tokens(self, key: StepKey) -> int:
         return key.bucket.total_tokens
+
+    def attention_segments(self, key: StepKey):
+        return {JOINT_TOKENS: ((self.MAIN_SPAN, key.bucket.total_tokens),)}
 
     def capture_request_inputs(self, key: StepKey, device) -> dict[str, torch.Tensor]:
         bucket_key: KleinShape = key.bucket
@@ -235,7 +235,7 @@ class KleinDenoiseSubmodule(DenoiseLoopSubmodule):
                 self._compiled_shapes.add(shape)
                 logger.info("FLUX.2 klein: compiling the transformer for shape %s (one-time pause)", shape)
         transformer = self.bf16_transformer if key.dtype == BF16 else self.transformer
-        velocity = transformer(model_input, text_embeds, timestep_in, rope, ragged=self._ragged())
+        velocity = transformer(model_input, text_embeds, timestep_in, rope)
         return velocity[:, : latents.shape[1]]
 
 

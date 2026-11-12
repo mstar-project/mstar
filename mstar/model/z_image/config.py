@@ -20,7 +20,10 @@ from mstar.model.components.diffusion.flow_match import FlowMatchConfig
 from mstar.model.components.diffusion.qwen.encoder import QwenEncoderConfig
 from mstar.utils.hf_snapshot import resolve_snapshot_dir
 
-DIT_ATTN = "dit_attn"
+# The dit's attentions: its refiners read the image tokens alone and the caption alone, and its main layers both.
+# One resource holds their three plans, under the key of the first declared.
+DIT_ATTN, IMAGE_ATTN, CAPTION_ATTN = "dit_attn", "image_attn", "caption_attn"
+JOINT_TOKENS, IMAGE_TOKENS, CAPTION_TOKENS = "joint_tokens", "image_tokens", "caption_tokens"
 DENOISE_LOOP = "denoise_loop"
 Z_IMAGE_TURBO = "Tongyi-MAI/Z-Image-Turbo"
 
@@ -55,6 +58,11 @@ class ZImageTransformerConfig:
     @property
     def head_dim(self) -> int:
         return self.dim // self.n_heads
+
+    def layer_ids(self) -> tuple[range, range, range]:
+        """The noise refiner's, the context refiner's and the main stack's ids, in the one stack the three share."""
+        refiners, joint = self.n_refiner_layers, self.n_layers
+        return range(refiners), range(refiners, 2 * refiners), range(2 * refiners, 2 * refiners + joint)
 
     @property
     def ffn_hidden(self) -> int:

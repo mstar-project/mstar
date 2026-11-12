@@ -29,20 +29,30 @@ from mstar.engine.resources.spec import CombinedSplit, apply_yaml_overrides, spe
 from mstar.engine.state import (
     Array,
     Attend,
+    Block,
     Causal,
     CausalConv,
     Entry,
     GatedDeltaNet,
     KVEntry,
+    Positions,
     Read,
     Sampler,
     TensorType,
     Value,
     Window,
 )
-from mstar.engine.state.adapters import BINDINGS, VALUE, LinearAttnBinding, build_specs, node_resources
+from mstar.engine.state.adapters import (
+    BINDINGS,
+    VALUE,
+    LinearAttnBinding,
+    StateSetup,
+    _resolve,
+    build_specs,
+    node_resources,
+)
 from mstar.engine.state.contract import Mask, Op
-from mstar.model.base import Model, enabled_resources
+from mstar.model.base import Model, enabled_resources, serving_resources
 from mstar.validation import DeploymentError
 
 _SPLIT = CombinedSplit("mixed", prefill_walks=("prefill",))
@@ -289,16 +299,11 @@ NO_LAYOUT = {
         lambda: [_kv(entry=Entry({"k": TensorType((4, 16), dtype=None), "v": TensorType((4, 16), dtype=None)}))],
         "sharded on",
     ),
-    "a host field": (
-        "kv",
-        lambda: [_kv(entry=Entry(KVEntry(heads=4, head_dim=16).tensors, host={"done": bool}))],
-        "no host field",
-    ),
     "a rewritable log": ("kv", lambda: [_kv(rewritable=True)], "rewritable"),
     "a read on a value": ("gdn", lambda: [_kv(), Array(
         "gdn", nodes={"llm"}, layers={0}, entry=_gdn_entry(), max_len=1, rewritable=True,
         reads={"r": Read(mask=Causal())},
-    )], "reads must be empty"),
+    )], "today's resources run no read on this array"),
     "a value of one tensor": (
         "gdn",
         lambda: [_kv(), _gdn(entry=Entry({"state": TensorType((8, 128, 64), dtype=None)}),
@@ -362,6 +367,23 @@ def test_an_op_with_no_binding_on_its_storage_is_refused_as_no_layout_yet():
     refusal = "Array 'gdn': no layout yet: updates ['other'] must be CausalConv or GatedDeltaNet"
     with pytest.raises(ValueError, match=re.escape(refusal)):
         build_specs([_kv(), _gdn(updates={"delta": GatedDeltaNet(), "other": _OtherRecurrence()})])
+
+
+def test_resolve_records_the_resource_every_op_runs_on():
+    resolved = _resolve([_kv(positions=Positions()), _gdn()], StateSetup())
+    assert resolved.resource_of == {"attn": "attn", "rope": "rope", "delta": "delta", "conv": "delta"}, (
+        "an op with no resource here falls back to its own key, and the conv has no resource of its own"
+    )
+
+
+@pytest.mark.parametrize("field, refusal", [
+    ({"seq_sharded": True}, "seq_sharded takes max_len 0"),
+    ({"positions": Positions()}, "positions, which only an append-only array that keeps entries holds"),
+])
+def test_a_host_value_is_refused_what_only_another_storage_holds(field, refusal):
+    flags = replace(Value("flags", nodes={"talker"}, layers={0}, entry=Entry({}, host={"sent": bool})), **field)
+    with pytest.raises(ValueError, match=f"Array 'flags': no layout yet: {refusal}"):
+        build_specs([flags])
 
 
 def test_a_within_step_read_of_another_mask_is_refused_as_no_layout_yet():
@@ -462,7 +484,7 @@ def test_a_declared_name_clashing_with_a_hand_written_key_is_caught_on_the_joine
 
 
 def test_enabled_resources_builds_from_the_declarations():
-    specs = enabled_resources(_Declaring(_kv(), specs=[_SAMPLER]), {})
+    specs = enabled_resources(_Declaring(_kv(), specs=[_SAMPLER]), {}, StateSetup())
     assert {spec.resource_key for spec in specs} == {"kv", "attn", "sampler"}
 
 
@@ -474,7 +496,7 @@ def test_kernel_settings_with_no_declarations_are_refused():
 def test_enabled_resources_raises_the_first_problem():
     model = _Declaring(_kv(nodes={"dit"}), _kv(nodes={"sit"}))
     with pytest.raises(ValueError, match="the name 'kv' is declared twice"):
-        enabled_resources(model, {})
+        enabled_resources(model, {}, StateSetup())
 
 
 def _validation_problems(model, tmp_path, **config) -> list[str]:
@@ -538,6 +560,55 @@ def test_validate_deployment_reports_a_refusal_at_construction_with_the_rest(tmp
 def test_validate_deployment_reports_no_layout_yet_with_the_rest(tmp_path):
     problems = _validation_problems(_Declaring(_kv(reads={"attn": _read(op=None)})), tmp_path)
     assert len(problems) == 1 and "Array 'kv': no layout yet" in problems[0], problems
+
+
+def _tokens(packed: bool) -> Array:
+    return Array("tokens", nodes={"llm"}, layers={0}, entry=KVEntry(heads=2, head_dim=4), max_len=0,
+                 reads={"tokens_attn": Read(mask=Block(), op=Attend(q_heads=2), packed=packed)})
+
+
+_ON_SDPA = {"tokens_attn": {"backend": "sdpa"}}
+
+
+def test_validate_deployment_refuses_sdpa_on_a_read_of_packed_queries(tmp_path):
+    problems = _validation_problems(_Declaring(_tokens(True)), tmp_path, resources=_ON_SDPA)
+    (problem,) = problems
+    assert "reads['tokens_attn'] runs SDPA, which can't tell one segment" in problem, "a worker would bind it and fail"
+
+
+def test_validate_deployment_takes_sdpa_on_a_read_of_rows(tmp_path):
+    problems = _validation_problems(_Declaring(_tokens(False)), tmp_path, resources=_ON_SDPA)
+    assert problems == [], "the block chose a binding, which builds no spec for it to name"
+
+
+def test_validate_deployment_reports_a_refused_sdpa_block_with_the_rest_of_the_block_checks(tmp_path):
+    problems = _validation_problems(_Declaring(_tokens(True)), tmp_path, resources={**_ON_SDPA, "nope": {}})
+    assert len(problems) == 2 and "runs SDPA, which can't tell" in problems[0] and "['nope']" in problems[1], (
+        "a refused binding would hide the deployment's other problems"
+    )
+
+
+def test_a_worker_builds_no_spec_for_a_resource_on_sdpa():
+    assert serving_resources(_Declaring(_tokens(False)), {"resources": _ON_SDPA}) == [], (
+        "the overrides would name a resource SDPA doesn't build"
+    )
+
+
+def test_validate_deployment_refuses_attention_backend_on_a_node_group_naming_the_new_key(tmp_path):
+    groups = [{"node_names": ["llm"], "ranks": [0], "attention_backend": "sdpa"}]
+    problems = _validation_problems(_Declaring(_tokens(False)), tmp_path, node_groups=groups)
+    assert problems == [
+        "node_groups[0].attention_backend: the backend is a resource's setting, as "
+        "`resources: {<the read's resource key>: {backend: sdpa}}`",
+    ], "a config that asks for SDPA there would run the ragged kernel"
+
+
+def test_a_config_half_moved_to_the_new_key_gets_one_problem(tmp_path):
+    groups = [{"node_names": ["llm"], "ranks": [0], "attention_backend": "sdpa"}]
+    problems = _validation_problems(_Declaring(_tokens(False)), tmp_path, node_groups=groups, resources=_ON_SDPA)
+    assert len(problems) == 1 and problems[0].startswith("node_groups[0].attention_backend"), (
+        "the backend block it already moved would be refused too"
+    )
 
 
 def test_validate_deployment_labels_a_declaration_it_cannot_read(tmp_path):

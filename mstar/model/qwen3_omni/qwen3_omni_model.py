@@ -32,7 +32,7 @@ Text-only mode:
 
 import logging
 from pathlib import Path
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 import torch
 from jinja2 import TemplateError
@@ -40,21 +40,22 @@ from transformers import AutoTokenizer
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import FINAL_PREFILL, PartitionDefinition
-from mstar.engine.resources import (
-    AttentionConfig,
-    AttentionSpec,
-    KVSpec,
-    NodeResourceSpec,
-    PagedKVConfig,
-    PositionConfig,
-    PositionSpec,
-    RaggedAttentionConfig,
-    RaggedAttentionSpec,
-    ResourceReqConfig,
-    SamplerSpec,
-    SamplingReqConfig,
-)
 from mstar.engine.resources.lora import LoraSpec
+from mstar.engine.state import (
+    Array,
+    Attend,
+    Block,
+    Causal,
+    Entry,
+    KVEntry,
+    Layout,
+    Positions,
+    Read,
+    Rope,
+    Sampler,
+    SampleSettings,
+    Value,
+)
 from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import (
@@ -88,18 +89,19 @@ from mstar.model.multimodal import (
 from mstar.model.qwen3_omni.components.rope import get_rope_index_vision
 from mstar.model.qwen3_omni.config import (
     AUDIO_ATTN,
+    AUDIO_TOKENS,
     CODE_PRED_SAMPLER,
     TALKER_ATTN,
     TALKER_KV,
-    TALKER_POS,
     TALKER_SAMPLER,
+    TALKER_TEXT,
     THINKER_ATTN,
     THINKER_KV,
     THINKER_MIXED,
-    THINKER_POS,
     THINKER_SAMPLER,
     THINKER_TEXT_DECODE,
     VISION_ATTN,
+    VISION_TOKENS,
 )
 from mstar.model.qwen3_omni.video_reader import header_charged, install_budgeted_readers
 from mstar.model.rebuild import RebuildPolicy
@@ -305,6 +307,39 @@ class Qwen3OmniModel(Model):
     # -------------------------------------------------------------------
     # Model ABC: resources
     # -------------------------------------------------------------------
+    def declare_state(self) -> list[Array | Sampler]:
+        c = self.config
+        # min_p is on where the checkpoint defaults it on, so that default is not refused
+        defaults = self._generation_defaults()
+        tt, kt, a, v = c.thinker_text, c.talker_text, c.audio_encoder, c.vision
+        return [
+            Array(THINKER_KV, nodes={"Thinker"}, layers=frozenset(range(tt.num_hidden_layers)),
+                  entry=KVEntry(heads=tt.num_key_value_heads, head_dim=c.thinker_head_dim),
+                  max_len=tt.max_position_embeddings, positions=Positions(),
+                  reads={THINKER_ATTN: Read(mask=Causal(), op=Attend(q_heads=tt.num_attention_heads))}),
+            # the Talker's RoPE, which its layers don't name per call on the contract
+            Array(TALKER_KV, nodes={"Talker"}, layers=frozenset(range(kt.num_hidden_layers)),
+                  entry=KVEntry(heads=kt.num_key_value_heads, head_dim=c.talker_head_dim),
+                  max_len=tt.max_position_embeddings,
+                  positions=Positions(rope=Rope(
+                      theta=1_000_000.0, low_freq_factor=1.0, high_freq_factor=1.0, old_context_len=8192,
+                  )),
+                  reads={TALKER_ATTN: Read(mask=Causal(), op=Attend(q_heads=kt.num_attention_heads))}),
+            Value(TALKER_TEXT, nodes={"Talker"}, layers=frozenset({0}), entry=Entry({}, host={"eos_sent": bool})),
+            Sampler(THINKER_SAMPLER, nodes={"Thinker"}, vocab_size=tt.vocab_size, penalty=True,
+                    min_p=bool(defaults.get("thinker_min_p"))),
+            Sampler(TALKER_SAMPLER, nodes={"Talker"}, vocab_size=kt.vocab_size, penalty=True,
+                    min_p=bool(defaults.get("talker_min_p"))),
+            Sampler(CODE_PRED_SAMPLER, nodes={"Talker"}, vocab_size=c.code_predictor.vocab_size, penalty=False,
+                    min_p=bool(defaults.get("code_predictor_min_p")), draws=c.num_code_groups - 1),
+            Array(AUDIO_TOKENS, nodes={"audio_encoder"}, layers=frozenset(range(a.encoder_layers)), max_len=0,
+                  entry=KVEntry(heads=a.encoder_attention_heads, head_dim=a.head_dim),
+                  reads={AUDIO_ATTN: Read(mask=Block(), op=Attend(q_heads=a.encoder_attention_heads))}),
+            Array(VISION_TOKENS, nodes={"vision_encoder"}, layers=frozenset(range(v.depth)), max_len=0,
+                  entry=KVEntry(heads=v.num_heads, head_dim=v.head_dim),
+                  reads={VISION_ATTN: Read(mask=Block(), op=Attend(q_heads=v.num_heads))}),
+        ]
+
     def _lora_spec(self) -> LoraSpec:
         """Per-request adapters on the Thinker: its attention, any dense MLP layers, the
         LM head (one row per request: the last token's), and the routed experts when the
@@ -321,141 +356,46 @@ class Qwen3OmniModel(Model):
             rows={"lm_head": PER_SEGMENT},
         )
 
-    def get_node_resources(self) -> list[NodeResourceSpec]:
-        # min_p is on where the checkpoint defaults it on, so that default is not refused
-        defaults = self._generation_defaults()
-        thinker_kv = PagedKVConfig(
-            num_layers=self.config.thinker_text.num_hidden_layers,
-            num_kv_heads=self.config.thinker_text.num_key_value_heads,
-            head_dim=self.config.thinker_head_dim,
-            max_seq_len=self.config.thinker_text.max_position_embeddings,
-            num_qo_heads=self.config.thinker_text.num_attention_heads,
-        )
-        talker_kv = PagedKVConfig(
-            num_layers=self.config.talker_text.num_hidden_layers,
-            num_kv_heads=self.config.talker_text.num_key_value_heads,
-            head_dim=self.config.talker_head_dim,
-            max_seq_len=self.config.thinker_text.max_position_embeddings,
-            num_qo_heads=self.config.talker_text.num_attention_heads,
-        )
+    def get_node_resources(self):
+        return [self._lora_spec()]
 
-        return [
-            KVSpec(
-                resource_key=THINKER_KV,
-                nodes={"Thinker"},
-                config=thinker_kv
-            ),
-            KVSpec(
-                resource_key=TALKER_KV,
-                nodes={"Talker"},
-                config=talker_kv
-            ),
-            AttentionSpec(
-                resource_key=THINKER_ATTN,
-                nodes={"Thinker"},
-                config=AttentionConfig(
-                    kv_cache=THINKER_KV
-                ),
-            ),
-            AttentionSpec(
-                resource_key=TALKER_ATTN,
-                nodes={"Talker"},
-                config=AttentionConfig(
-                    kv_cache=TALKER_KV
-                ),
-            ),
-            PositionSpec(
-                resource_key=THINKER_POS,
-                nodes={"Thinker"},
-                config=PositionConfig(
-                    kv_cache=THINKER_KV
-                )
-            ),
-            PositionSpec(
-                resource_key=TALKER_POS,
-                nodes={"Talker"},
-                config=PositionConfig(
-                    kv_cache=TALKER_KV
-                )
-            ),
-            SamplerSpec(
-                resource_key=THINKER_SAMPLER,
-                nodes={"Thinker"},
-                vocab_size=self.config.thinker_text.vocab_size,
-                enable_repetition_penalty=True,
-                enable_min_p=bool(defaults.get("thinker_min_p")),
-            ),
-            SamplerSpec(
-                resource_key=TALKER_SAMPLER,
-                nodes={"Talker"},
-                vocab_size=self.config.talker_text.vocab_size,
-                enable_repetition_penalty=True,
-                enable_min_p=bool(defaults.get("talker_min_p")),
-            ),
-            SamplerSpec(
-                resource_key=CODE_PRED_SAMPLER,
-                nodes={"Talker"},
-                vocab_size=self.config.code_predictor.vocab_size,
-                enable_repetition_penalty=False,
-                enable_min_p=bool(defaults.get("code_predictor_min_p")),
-            ),
-            *self._encoder_resources(),
-            self._lora_spec(),
-        ]
-
-    def _encoder_resources(self) -> list[NodeResourceSpec]:
-        """The encoders' attention: within each 8 s audio window, and within
-        each image or video frame group. No cache, so nothing else."""
+    def kernel_settings(self) -> dict[str, dict[str, Any]]:
         from mstar.model.components.aut_submodule import AuTEncoderSubmodule
         from mstar.model.qwen3_omni.submodules import VisionEncoderSubmodule
 
-        audio, vision = self.config.audio_encoder, self.config.vision
-        return [
-            RaggedAttentionSpec(
-                resource_key=AUDIO_ATTN, nodes={"audio_encoder"},
-                config=RaggedAttentionConfig(
-                    num_qo_heads=audio.encoder_attention_heads,
-                    num_kv_heads=audio.encoder_attention_heads,
-                    head_dim=audio.head_dim,
-                    max_segments_per_request=AuTEncoderSubmodule.max_windows_per_replay(audio),
-                    # The 512 MB default costs 2 GB across both encoders and slots.
-                    # FA3 plans take none of it; FA2's captured plans split KV at
-                    # the bucket's segment ceiling, ~230 MB here at bs=8.
-                    workspace_mb=256,
-                ),
-            ),
-            RaggedAttentionSpec(
-                resource_key=VISION_ATTN, nodes={"vision_encoder"},
-                config=RaggedAttentionConfig(
-                    num_qo_heads=vision.num_heads,
-                    num_kv_heads=vision.num_heads,
-                    head_dim=vision.head_dim,
-                    # Frames of 256 patches or more fill the largest captured
-                    # bucket at this many; a step with more frames runs the
-                    # block loop eagerly (`PackedBlockLoopEncoder._fits_capture`).
-                    max_segments_per_step=VisionEncoderSubmodule.BLOCK_LOOP_PATCH_BUCKETS[-1] // 256,
-                    # FA2's split-KV partials at the 8192-patch bucket: ~95 MB.
-                    workspace_mb=128,
-                ),
-            ),
-        ]
+        audio = self.config.audio_encoder
+        return {
+            AUDIO_ATTN: {
+                "max_segments_per_request": AuTEncoderSubmodule.max_windows_per_replay(audio),
+                # The 512 MB default costs 2 GB across both encoders and slots. FA3 plans take none of it; FA2's
+                # captured plans split KV at the bucket's segment ceiling, ~230 MB here at bs=8.
+                "workspace_mb": 256,
+            },
+            VISION_ATTN: {
+                # Frames of 256 patches or more fill the largest captured bucket at this many; a step with more
+                # frames runs the block loop eagerly (`PackedBlockLoopEncoder._fits_capture`).
+                "max_segments_per_step": VisionEncoderSubmodule.BLOCK_LOOP_PATCH_BUCKETS[-1] // 256,
+                # FA2's split-KV partials at the 8192-patch bucket: ~95 MB.
+                "workspace_mb": 128,
+            },
+        }
 
     def get_request_resource_configs(
         self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
-    ) -> dict[str, ResourceReqConfig]:
+    ) -> dict[str, SampleSettings]:
         """One sampler per stage. Plain keys target the Thinker; a
         ``<stage>_<knob>`` key wins over a plain one for its stage."""
         del input_modalities, output_modalities
         model_kwargs = model_kwargs or {}
         return {
-            THINKER_SAMPLER: SamplingReqConfig(
+            THINKER_SAMPLER: SampleSettings(
                 **self._stage_sampling("thinker_", model_kwargs, primary=True),
                 ignore_eos=model_kwargs.get("ignore_eos", False),
             ),
-            TALKER_SAMPLER: SamplingReqConfig(
+            TALKER_SAMPLER: SampleSettings(
                 **self._stage_sampling("talker_", model_kwargs),
             ),
-            CODE_PRED_SAMPLER: SamplingReqConfig(
+            CODE_PRED_SAMPLER: SampleSettings(
                 **self._stage_sampling("code_predictor_", model_kwargs),
             ),
         }
@@ -1182,29 +1122,26 @@ class Qwen3OmniModel(Model):
             result["pixel_values_videos"].append(vid_out["pixel_values_videos"])
 
         if not attached:
-            return ProcessPromptOutput(self._split_steps(result, plan)[0], {})
-        kv_layout = self._kv_layout(plan, result, "audio" in output_modalities)
-        result, kv_layout = self._split_steps(result, plan, kv_layout)
-        return ProcessPromptOutput(result, {"kv_layout": kv_layout})
+            return ProcessPromptOutput(self._split_steps(result, plan), {})
+        metadata = self._state_layout(plan, result, "audio" in output_modalities)
+        return ProcessPromptOutput(self._split_steps(result, plan), metadata)
 
-    def _split_steps(
-        self, tensors: NameToTensorList, plan: list[PromptPart], kv_layout: dict | None = None,
-    ) -> tuple[NameToTensorList, dict | None]:
+    def _split_steps(self, tensors: NameToTensorList, plan: list[PromptPart]) -> NameToTensorList:
         """``tensors`` as the walk plan binds them: step ``k`` of ``_thinker_steps``
-        takes its text spans as one signal, ``text_inputs.k`` (``_kv_layout``
+        takes its text spans as one signal, ``text_inputs.k`` (``_state_layout``
         keys its ids spans under it), and each attachment's tensors are signals
         of their own (`split_spans`)."""
         texts = tensors["text_inputs"]
         out = {**tensors, "text_inputs": []}
         for k, step in enumerate(_thinker_steps(plan)):
             out[span_name("text_inputs", k)] = [texts[part.index] for part in step.parts if part.modality == TEXT]
-        return split_spans(out, self.MEDIA_SPANS, kv_layout)
+        return split_spans(out, self.MEDIA_SPANS)[0]
 
     def prompt_tokens(self, tensors: NameToTensorList, kv_layout: dict[str, dict[str, LabelLayout]]) -> int:
         # text_inputs leaves out each attachment, whose span in the Thinker's layout counts its sentinels and rows
         return sum(span.length for span in kv_layout[THINKER_KV]["main"].spans)
 
-    def _kv_layout(self, plan: list[PromptPart], tensors: NameToTensorList, audio_output: bool) -> dict:
+    def _state_layout(self, plan: list[PromptPart], tensors: NameToTensorList, audio_output: bool) -> dict:
         """What each Thinker prefill step writes and, with audio out, what the Talker writes of it.
 
         The Talker prefills every step's rows except those of a system or earlier
@@ -1250,17 +1187,17 @@ class Qwen3OmniModel(Model):
                 position += span.advance
         talker = [Span("rows", "talker_prefill", kept, kept, "thinker_states") for kept in talker_rows]
         prefix = TalkerSubmodule.TALKER_LAST_PREFILL_TOKENS_PER_REQ
-        # A prompt with a video keys only its leading text, since keying past it has never been run or tested.
-        video = any(step.modality == "video" for step in plan)
-        return {
-            THINKER_KV: {"main": LabelLayout(
-                spans=tuple(thinker), growth=(("thinker_decode_loop", 1),), keyed_spans=1 if video else None,
-            )},
-            TALKER_KV: {"main": LabelLayout(
+        metadata = {"state_layout": {
+            THINKER_KV: {"main": Layout(spans=tuple(thinker), growth=(("thinker_decode_loop", 1),))},
+            TALKER_KV: {"main": Layout(
                 spans=(*talker, Span("rows", "talker_last_prefill", prefix, prefix, "thinker_states")),
                 growth=(("talker_decode_loop", 1),),
-            ) if audio_output else LabelLayout()},
-        }
+            ) if audio_output else Layout()},
+        }}
+        # A prompt with a video keys only its leading text, since keying past it has never been run or tested.
+        if any(step.modality == "video" for step in plan):
+            metadata["keyed_spans"] = {THINKER_KV: {"main": 1}}
+        return metadata
 
     def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
         # the Thinker's last prefill emits its first text token and
@@ -1488,6 +1425,8 @@ class Qwen3OmniModel(Model):
         )
         code_predictor.consolidate_stacked_weights()
         code_predictor.eval()
+        # at load, so the engine's memory accounting counts it
+        code_predictor.depth.make(next(code_predictor.parameters()).dtype, device)
 
         talker_sub = TalkerSubmodule(
             talker_model=talker_model,
@@ -1537,7 +1476,7 @@ class Qwen3OmniModel(Model):
         from mstar.model.qwen3_omni.submodules import AudioEncoderSubmodule
 
         with torch.device("meta"):
-            encoder = AuTEncoder(self.config.audio_encoder, attn_key=AUDIO_ATTN)
+            encoder = AuTEncoder(self.config.audio_encoder, array=AUDIO_TOKENS)
         if autocast_dtype is not None:
             encoder = encoder.to(autocast_dtype)
         encoder.to_empty(device=device)
@@ -1559,7 +1498,7 @@ class Qwen3OmniModel(Model):
         # the weights are built on the device; the rotary inv_freq is built on the host, as transformers builds
         # it, and reaches the device with the engine's move (submodule.to)
         with torch.device(device):
-            tower = Qwen3OmniVisionTower(self.config.vision, attn_key=VISION_ATTN)
+            tower = Qwen3OmniVisionTower(self.config.vision, attn_key=VISION_ATTN, array=VISION_TOKENS)
         if autocast_dtype is not None:
             tower = tower.to(autocast_dtype)
         prefix = "thinker.visual."

@@ -5,7 +5,6 @@ max_seq_len: 8192
 # See qwen_image_edit.yaml. The DiT tensor-parallel over two GPUs (its attention and MLP
 # linears split; the AdaLN modulation stays whole on each); the text encoder and the VAE on rank 0.
 model_kwargs:
-  attention_backend: flashinfer
   compile: false
 
 node_groups:

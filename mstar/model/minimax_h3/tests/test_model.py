@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
+from mstar.engine.resources.step import StepContext
+from mstar.engine.state.adapters import node_handles, state_setup
 from mstar.graph.base import GraphNode, Loop, Parallel, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.components.diffusion.attention import sdpa_attention
 from mstar.model.components.diffusion.denoise_loop import StepKey
 from mstar.model.minimax_h3.components.layout import (
     T_AUDIO,
@@ -23,6 +26,7 @@ from mstar.model.minimax_h3.config import (
     AUDIO_TAG,
     DENOISE_LOOP,
     DIT_ATTN,
+    DIT_ROWS,
     REFINER_ATTN,
     TEXT_TAG,
     VIDEO_TAG,
@@ -40,12 +44,32 @@ from mstar.model.minimax_h3.minimax_h3_model import (
 )
 from mstar.model.minimax_h3.schedule import h3_schedule
 from mstar.model.minimax_h3.submodules import LATENTS, TEXT_INPUTS, H3DenoiseSubmodule, layout_from_metadata
+from mstar.model.submodule_base import NodeInputs, engine_step
 
 
 def _model(**kwargs) -> H3Model:
     model = H3Model(model_path_hf="test/minimax_h3", skip_weight_loading=True, **kwargs)
     model.set_config(H3Config())
     return model
+
+
+def _on_sdpa(config: H3Config, sp_group=None) -> dict:
+    """The DiT's handles on SDPA, as a config that sets ``backend: sdpa`` on its resources binds them."""
+    model = _model()
+    model.set_config(config)
+    on_sdpa = {key: {"backend": "sdpa"} for key in (DIT_ATTN, REFINER_ATTN)}
+    setup, problems = state_setup({"resources": on_sdpa}, model.declare_state())
+    assert not problems, problems
+    return node_handles(model, "dit", {}, sp_group=sp_group, setup=setup)
+
+
+def _opened(node: H3DenoiseSubmodule, layout: H3Layout, handles: dict):
+    """``node`` with ``handles`` bound and open for one step at ``layout``, as the engine opens it."""
+    node.bind_node_state(handles)
+    step = engine_step(node, "gen", [0], [NodeInputs(resource_step_info=StepKey(layout))])
+    step.set_ctx(StepContext(request_ids=[0], graph_walk="gen", slot=0, capture=False))
+    step.begin_calls()
+    return step
 
 
 def _tensor_info(dims: list[int]) -> TensorPointerInfo:
@@ -107,14 +131,6 @@ def test_graph_walks_and_nodes():
     assert isinstance(decoders, Parallel)
     emitted = {e.output_modality for d in decoders.sections for e in d.outputs if e.next_node == EMIT_TO_CLIENT}
     assert emitted == {"video", "audio"}
-
-
-def test_resources_per_backend():
-    assert _model(attention_backend="sdpa").get_node_resources() == []
-    specs = {s.resource_key: s for s in _model().get_node_resources()}
-    assert set(specs) == {DIT_ATTN, REFINER_ATTN}
-    assert specs[DIT_ATTN].nodes == {"dit"} and specs[DIT_ATTN].config.shard_over_sp
-    assert specs[REFINER_ATTN].nodes == {"text_encoder"} and not specs[REFINER_ATTN].config.shard_over_sp
 
 
 def test_request_defaults_and_validation():
@@ -451,10 +467,10 @@ def test_keyframe_walk_plan():
 
 def test_keyframe_noise_is_drawn_first():
     """One draw per keyframe (its latent's shape), then the video noise, then the audio's."""
-    dit = H3DenoiseSubmodule(None, H3Config(), loop_name=DENOISE_LOOP, attn_resource_key=None)
+    dit = H3DenoiseSubmodule(None, H3Config(), loop_name=DENOISE_LOOP)
     layout = H3Layout(text_len=3, latent_frames=2, latent_height=4, latent_width=6, audio_latents=3,
                       anchors=("first", "last"))
-    seeded = dit.seed_loop_back(None, layout, torch.Generator().manual_seed(7))
+    seeded = dit.seed_loop_back(layout, torch.Generator().manual_seed(7))
     g = torch.Generator().manual_seed(7)
     cond = [torch.randn(1, 24, 1, 4, 6, generator=g) for _ in range(2)]
     video = torch.randn(1, 24, 2, 4, 6, generator=g)
@@ -554,12 +570,13 @@ def _sp_dit(rank: int, world: int, store: str, snapshot: str, out: str) -> None:
             if sp is None and rank:
                 break
             dit = weight_loader.build_transformer(config, snapshot, "cpu", sp_group=sp, dtype=torch.float32)
-            node = H3DenoiseSubmodule(dit, config, loop_name=DENOISE_LOOP, attn_resource_key=None)
+            node = H3DenoiseSubmodule(dit, config, loop_name=DENOISE_LOOP)
             step_layout = node.build_layout(StepKey(layout), "cpu")
             projected = []
             dit.video_patch_proj.register_forward_hook(lambda m, args, y, seen=projected: seen.append(args[0].shape[1]))
+            _opened(node, layout, _on_sdpa(config, sp))
             with torch.no_grad():
-                torch.save(dit(inputs, step_layout, node.attend(step_layout)), f"{out}.{name}.{rank}")
+                torch.save(dit(inputs, step_layout), f"{out}.{name}.{rank}")
             torch.save(sum(projected), f"{out}.{name}.{rank}.projected")
     finally:
         dist.destroy_process_group()
@@ -605,8 +622,7 @@ def test_the_padded_rows_split_evenly_over_the_sp_ranks_at_every_prompt_length(w
 
     from mstar.model.components.distributed.sequence_parallel import sp_seq_split
 
-    node = H3DenoiseSubmodule(_SPStub(world), H3Config(), loop_name=DENOISE_LOOP, attn_resource_key=None,
-                              row_bucket=row_bucket)
+    node = H3DenoiseSubmodule(_SPStub(world), H3Config(), loop_name=DENOISE_LOOP, row_bucket=row_bucket)
     multiple = math.lcm(row_bucket, world)
     for text_len in range(1, 600):
         layout = H3Layout(text_len=text_len, latent_frames=2, latent_height=4, latent_width=6, audio_latents=3,
@@ -614,11 +630,11 @@ def test_the_padded_rows_split_evenly_over_the_sp_ranks_at_every_prompt_length(w
         rows, padded = layout.total_rows, node.num_tokens(StepKey(layout))
         assert padded % multiple == 0 and rows <= padded < rows + multiple
         assert len(set(sp_seq_split(padded, world))) == 1
-        segments = node.attention_segments(StepKey(layout))
+        segments = node.attention_segments(StepKey(layout))[DIT_ROWS]
         assert segments == (("main", rows), ("main", padded - rows))[:1 + (padded > rows)]
         if text_len % 97 == 0:
             step_layout = node.build_layout(StepKey(layout), "cpu")
-            assert step_layout.num_rows == padded and step_layout.segments == tuple(span for _, span in segments)
+            assert step_layout.num_rows == padded and step_layout.num_pad_rows == padded - rows
 
 
 def _padding_case():
@@ -649,11 +665,13 @@ def test_padding_rows_change_no_output():
     dit, config, layout, inputs = _padding_case()
     want = None
     for row_bucket in (1, 16, 64):  # 37 rows
-        node = H3DenoiseSubmodule(dit, config, loop_name=DENOISE_LOOP, attn_resource_key=None, row_bucket=row_bucket)
+        node = H3DenoiseSubmodule(dit, config, loop_name=DENOISE_LOOP, row_bucket=row_bucket)
         step_layout = node.build_layout(StepKey(layout), "cpu")
         assert (step_layout.num_pad_rows > 0) == (row_bucket > 1)
+        step = _opened(node, layout, _on_sdpa(config))
         with torch.no_grad():
-            got = dit(inputs, step_layout, node.attend(step_layout))
+            got = dit(inputs, step_layout)
+        step.end_calls()
         if want is None:
             want = got
         for a, b in zip(got, want, strict=True):
@@ -665,14 +683,16 @@ def test_padding_rows_stay_finite_and_never_reach_the_request():
     block, they still leave every output as it was: attention keeps them in their own segment
     and no output reads them."""
     dit, config, layout, inputs = _padding_case()
-    node = H3DenoiseSubmodule(dit, config, loop_name=DENOISE_LOOP, attn_resource_key=None, row_bucket=64)
+    node = H3DenoiseSubmodule(dit, config, loop_name=DENOISE_LOOP, row_bucket=64)
     step_layout = node.build_layout(StepKey(layout), "cpu")
     real = step_layout.num_rows - step_layout.num_pad_rows
     seen = []
     hooks = [block.register_forward_hook(lambda m, args, out: seen.append(out[:, real:])) for block in dit.blocks]
     hooks.append(dit.final_layer.register_forward_hook(lambda m, args, out: seen.append(out[:, real:])))
+    step = _opened(node, layout, _on_sdpa(config))
     with torch.no_grad():
-        want = dit(inputs, step_layout, node.attend(step_layout))
+        want = dit(inputs, step_layout)
+    step.end_calls()
     for hook in hooks:
         hook.remove()
     assert len(seen) == len(dit.blocks) + 1 and all(torch.isfinite(rows).all() for rows in seen)
@@ -683,23 +703,68 @@ def test_padding_rows_stay_finite_and_never_reach_the_request():
         return (x, *args[1:])
 
     hook = dit.blocks[0].register_forward_pre_hook(poison)
+    step = _opened(node, layout, _on_sdpa(config))
     try:
         with torch.no_grad():
-            got = dit(inputs, step_layout, node.attend(step_layout))
+            got = dit(inputs, step_layout)
     finally:
         hook.remove()
+        step.end_calls()
     for a, b in zip(got, want, strict=True):
         assert torch.equal(a, b)
 
 
-def test_an_sp_size_the_heads_do_not_divide_is_refused_at_load():
-    from mstar.distributed.communication import CommGroup
-    from mstar.model.minimax_h3.components.transformer import H3DiT
+def test_one_handle_runs_a_padded_step_and_then_an_unpadded_one():
+    """The split takes each step's spans, so one step's padding never reaches the next step's rows."""
+    dit, config, layout, inputs = _padding_case()
 
-    with torch.device("meta"):
-        H3DiT(_sp_cfg(), sp_group=CommGroup(0, 0, [0, 1, 2, 3]))
-        with pytest.raises(ValueError, match="8 heads don't split over sp_size 3"):
-            H3DiT(_sp_cfg(), sp_group=CommGroup(0, 0, [0, 1, 2]))
+    def run(row_bucket, handles):
+        node = H3DenoiseSubmodule(dit, config, loop_name=DENOISE_LOOP, row_bucket=row_bucket)
+        step = _opened(node, layout, handles)
+        with torch.no_grad():
+            out = dit(inputs, node.build_layout(StepKey(layout), "cpu"))
+        step.end_calls()
+        return out
+
+    want = run(1, _on_sdpa(config))
+    handles = _on_sdpa(config)
+    padded, unpadded = run(64, handles), run(1, handles)
+    for a, b in zip(padded, want, strict=True):
+        torch.testing.assert_close(a, b, rtol=1e-5, atol=1e-6)
+    assert all(torch.equal(a, b) for a, b in zip(unpadded, want, strict=True)), "the padded step's spans outlived it"
+
+
+def test_two_shift_pairs_at_one_layout_get_a_schedule_each_and_share_its_layout():
+    """The shifts key the schedule beside the bucket: a request at other shifts would otherwise run the schedule of
+    the one before it, and shifts in the bucket key would build its rope table twice."""
+    model = _model()
+    node = H3DenoiseSubmodule(_StubDiT(), H3Config(), loop_name=DENOISE_LOOP)
+    schedules = []
+    for kwargs, shifts in (({}, (12.0, 3.0)), ({"flow_shift": 7.0, "audio_flow_shift": 2.0}, (7.0, 2.0))):
+        plan = model.walk_plan("default", ["text"], ["video", "audio"], {"text_inputs": [_tensor_info([37])]},
+                               {"height": 256, "width": 448, "num_inference_steps": 30, **kwargs})
+        info = SimpleNamespace(graph_walk=GENERATE_AV_WALK, step_metadata=plan[-1].step_metadata)
+        key = node.bucket_key_for(info)
+        got, want = node.schedule_of(info, key), h3_schedule(30, *shifts)
+        for field in ("sigmas", "timesteps", "audio_sigmas", "audio_timesteps", "cond_timesteps"):
+            assert torch.equal(getattr(got, field), getattr(want, field)), f"{shifts}: {field}"
+        node.layout(StepKey(key), "cpu")
+        schedules.append(got)
+    assert not torch.equal(schedules[0].sigmas, schedules[1].sigmas)
+    assert node._schedules.cache_info().currsize == 2, "one schedule served both shift pairs"
+    assert len(node._uncaptured_layouts) == 1, "the shifts split the layout's rope table in two"
+
+
+def test_an_sp_size_the_heads_do_not_divide_is_refused_at_validation():
+    from mstar.engine.state.analysis import deployment_problems
+
+    model = _model()
+    model.set_config(H3Config(transformer=_sp_cfg()))
+    assert deployment_problems(model, {}, head_shards={"dit": 4}) == []
+    assert deployment_problems(model, {}, head_shards={"dit": 3}) == [
+        f"Array {DIT_ROWS!r}.reads[{DIT_ATTN!r}]: q_heads 8 doesn't divide by 3, TP times SP, which the read narrows "
+        "its heads by"
+    ]
 
 
 def test_a_torchaudio_that_does_not_load_fails_startup_by_name(monkeypatch):
@@ -734,7 +799,7 @@ def test_the_vision_tower_keeps_its_frame_attention_through_resource_binding():
         depth=2, hidden_size=32, intermediate_size=64, num_heads=2, in_channels=3, patch_size=4,
         temporal_patch_size=2, spatial_merge_size=2, num_position_embeddings=16, out_hidden_size=24,
     ))
-    node = H3TextEncoderSubmodule(nn.Identity(), nn.Identity(), attn_resource_key=REFINER_ATTN, vision=tower)
+    node = H3TextEncoderSubmodule(nn.Identity(), nn.Identity(), vision=tower)
     for resources in ({}, {REFINER_ATTN: object()}):
         node.bind_node_resources(resources)
         assert all(block.attn.ragged_attn is node._frames for block in tower.blocks)
@@ -751,7 +816,7 @@ class _StubDiT:
     def __init__(self):
         self.calls = []
 
-    def __call__(self, inputs, layout, attend):
+    def __call__(self, inputs, layout):
         self.calls.append(inputs)
         return torch.zeros_like(inputs.video), torch.zeros_like(inputs.audio)
 
@@ -780,8 +845,7 @@ def test_a_compiled_dit_sees_one_timestep_table_shape():
     layout = H3Layout(text_len=3, latent_frames=2, latent_height=4, latent_width=4, audio_latents=2)
     for compiled, step0 in ((False, (1, 1)), (True, (1, 3))):
         stub = _StubDiT()
-        node = H3DenoiseSubmodule(stub, H3Config(), loop_name=DENOISE_LOOP, attn_resource_key=None,
-                                  compile_blocks=compiled)
+        node = H3DenoiseSubmodule(stub, H3Config(), loop_name=DENOISE_LOOP, compile_blocks=compiled)
         for first in (True, False):
             _step(node, layout, first)
         assert [tuple(call.timesteps.shape) for call in stub.calls] == [step0, (1, 3)]
@@ -798,8 +862,7 @@ def test_step_0_gives_the_same_velocity_on_one_timestep_or_three():
     with torch.no_grad():
         for param in dit.parameters():
             param.normal_(0, 0.2)
-    node = H3DenoiseSubmodule(dit, replace(H3Config(), transformer=CFG), loop_name=DENOISE_LOOP,
-                              attn_resource_key=None)
+    node = H3DenoiseSubmodule(dit, replace(H3Config(), transformer=CFG), loop_name=DENOISE_LOOP)
     layout = H3Layout(text_len=5, latent_frames=3, latent_height=4, latent_width=6, audio_latents=4)
     step_layout = node.build_layout(StepKey(layout), "cpu")
     g = torch.Generator().manual_seed(1)
@@ -807,7 +870,7 @@ def test_step_0_gives_the_same_velocity_on_one_timestep_or_three():
     audio = torch.randn(1, layout.num_audio_rows, CFG.audio_latents_dim, generator=g)
     text = torch.randn(1, layout.text_len, CFG.hidden_size, generator=g)
     with torch.no_grad():
-        one, three = (dit(H3Inputs(video=video, audio=audio, text=text, timesteps=t), step_layout, sdpa_attention)
+        one, three = (dit(H3Inputs(video=video, audio=audio, text=text, timesteps=t), step_layout)
                       for t in (torch.zeros(1, 1), torch.tensor([[0.0, 0.0, 0.999]])))
     for got, want in zip(three, one, strict=True):
         torch.testing.assert_close(got, want, rtol=1e-4, atol=1e-5)
@@ -819,7 +882,7 @@ def test_denoise_noises_keyframe_rows_at_step_0_and_carries_them():
     layout = H3Layout(text_len=3, latent_frames=2, latent_height=4, latent_width=4, audio_latents=2,
                       anchors=("first",))
     stub = _StubDiT()
-    node = H3DenoiseSubmodule(stub, H3Config(), loop_name=DENOISE_LOOP, attn_resource_key=None)
+    node = H3DenoiseSubmodule(stub, H3Config(), loop_name=DENOISE_LOOP)
     n, rows, channels = layout.num_condition_rows, layout.num_video_rows, H3Config().transformer.patch_dim
     g = torch.Generator().manual_seed(0)
     noise = torch.randn(1, n + rows, channels, generator=g)

@@ -1,6 +1,6 @@
 """QwenImageModel: Qwen-Image-Edit-2511 (and 2509), editing 1-3 reference images from a prompt.
 
-Architecture (4 nodes; the dit optionally owns one ragged attention resource):
+Architecture (4 nodes; the dit declares the array its joint attention reads):
 
     text_encoder  Qwen2.5-VL-7B: the vision tower over the condition images, then the language model over the
                   positive prompt (and the negative, when guided) with the images spliced in
@@ -22,21 +22,23 @@ from __future__ import annotations
 
 import logging
 import math
+from typing import Any
 
 import numpy as np
 import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.distributed.base import ShardingConfig
-from mstar.engine.resources import NodeResourceSpec, RaggedAttentionConfig, RaggedAttentionSpec
+from mstar.engine.state import Array, Attend, Block, Read
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import Model, ProcessPromptOutput, TensorAndMetadata, WalkStep
+from mstar.model.components.diffusion.attention import dit_entry, refuse_attention_backend_kwarg
 from mstar.model.components.diffusion.denoise_loop import LATENTS
 from mstar.model.components.diffusion.guidance import GUIDANCE_SCALE
 from mstar.model.components.diffusion.image_io import OUTPUT_FORMAT_KWARGS, encode_image, image_output_format
 from mstar.model.media_limits import PILLOW_IMAGE_FORMATS, check_image_size, decoding_upload, open_upright_image
-from mstar.model.qwen_image.components.transformer import ROPE_POSITIONS
+from mstar.model.qwen_image.components.transformer import JOINT_TOKENS, ROPE_POSITIONS
 from mstar.model.qwen_image.config import (
     DENOISE_LOOP,
     DIT_ATTN,
@@ -70,7 +72,6 @@ ENCODE_EDIT_WALK = "encode_edit"
 ENCODE_REFS_WALK = "encode_refs"
 IMAGE_EDIT_WALK = "image_edit"
 
-ATTENTION_BACKENDS = ("flashinfer", "sdpa")
 
 
 class QwenImageModel(Model):
@@ -83,18 +84,15 @@ class QwenImageModel(Model):
         model_path_hf: str = QWEN_IMAGE_EDIT_2511,
         cache_dir: str | None = None,
         skip_weight_loading: bool = False,
-        attention_backend: str = "flashinfer",
         compile: bool = False,
         max_image_area: int = 2048 * 2048,
         **kwargs,
     ):
-        if attention_backend not in ATTENTION_BACKENDS:
-            raise ValueError(f"attention_backend must be one of {ATTENTION_BACKENDS}, got {attention_backend!r}")
+        refuse_attention_backend_kwarg(kwargs)
         self.model_path_hf = model_path_hf
         self.cache_dir = cache_dir
         # Dummy mode: get_submodule returns None for every node (CPU tests, no weights).
         self.skip_weight_loading = skip_weight_loading
-        self.attention_backend = attention_backend
         # EXPERIMENTAL torch.compile per transformer block (static but for the text axis) and the VAE's encoder and
         # decoder (dynamic): not bit-exact; on the perf runs it failed the fp32 yardstick on one prompt, served
         # slower than the fused-kernel eager path, and recompiled the DiT on the first batched step. Off by default.
@@ -124,18 +122,20 @@ class QwenImageModel(Model):
         self._config = config
 
     # ------------------------------------------------------------ structure
-    def get_node_resources(self) -> list[NodeResourceSpec]:
-        if self.attention_backend != "flashinfer":
-            return []
+    def declare_state(self) -> list[Array]:
         t = self.config.transformer
-        return [RaggedAttentionSpec(
-            resource_key=DIT_ATTN, nodes={"dit"},
-            config=RaggedAttentionConfig(
-                num_qo_heads=t.num_attention_heads, num_kv_heads=t.num_attention_heads, head_dim=t.attention_head_dim,
-                # two guidance branches a request, each a real span and possibly a pad
-                max_segments_per_request=4, dtype=torch.bfloat16, compile_op=self.compile,
-            ),
+        return [Array(
+            JOINT_TOKENS, nodes={"dit"}, layers=frozenset(range(t.num_layers)), max_len=0,
+            entry=dit_entry(t.num_attention_heads, t.attention_head_dim),
+            # a row holds a branch's pad and its prompt-plus-image segments end to end
+            reads={DIT_ATTN: Read(
+                mask=Block(), op=Attend(q_heads=t.num_attention_heads), packed=False, segmented=True,
+            )},
         )]
+
+    def kernel_settings(self) -> dict[str, dict[str, Any]]:
+        # two guidance branches a request, each a real span and possibly a pad
+        return {DIT_ATTN: {"max_segments_per_request": 4, "compile_op": self.compile}}
 
     def get_default_sharding_config(self) -> ShardingConfig:
         # the dit's linears split over tp_size; its guidance branches over cfg_size
@@ -355,7 +355,7 @@ class QwenImageModel(Model):
         if node_name == "dit":
             return QwenImageDenoiseSubmodule(
                 weight_loader.build_transformer(config, snapshot, device, comm_group=tp_group), config,
-                loop_name=DENOISE_LOOP, attn_resource_key=DIT_ATTN if self.attention_backend == "flashinfer" else None,
+                loop_name=DENOISE_LOOP,
                 compile_transformer=self.compile, cfg_group=cfg_group,
             )
         logger.warning("Qwen-Image has no submodule for node %r; running it dummy", node_name)

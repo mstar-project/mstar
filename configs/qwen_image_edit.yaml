@@ -1,17 +1,16 @@
 model: "qwen_image_edit"
 
-# Every node is stateless except the dit's cacheless ragged attention; max_seq_len only
-# satisfies the conductor's config check.
+# Every node is stateless except the dit's cacheless ragged attention (its `dit_attn` resource, FlashInfer by
+# default; `resources: {dit_attn: {backend: sdpa}}` runs the reference kernel); max_seq_len only satisfies the
+# conductor's config check.
 max_seq_len: 8192
 
 # Qwen-Image-Edit-2511 on one GPU (141 GB: the 41 GB DiT, the 16 GB text encoder and the VAE,
-# all colocated). Serving knobs (forwarded to QwenImageModel.__init__): attention_backend
-# sdpa|flashinfer, compile (EXPERIMENTAL, off: each transformer block, static but for the text length, and the
+# all colocated). Serving knob (forwarded to QwenImageModel.__init__): compile (EXPERIMENTAL, off: each transformer block, static but for the text length, and the
 # VAE's encoder and decoder, dynamic; it failed the fp32 yardstick on one prompt, served slower than eager and
 # recompiled the DiT on its first batched step).
 # Edit-2509: model_kwargs.model_path_hf: Qwen/Qwen-Image-Edit-2509.
 model_kwargs:
-  attention_backend: flashinfer
   compile: false
 
 node_groups:

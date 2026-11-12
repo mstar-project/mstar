@@ -28,10 +28,13 @@ from mstar.engine.resources.attn.ragged import kernels as kernels_module
 from mstar.engine.resources.attn.ragged.cudnn_wrappers import CudnnRaggedPrefillWrapper, uniform_segments
 from mstar.engine.resources.attn.ragged.flashinfer import FlashInferRaggedCrossManager, FlashInferRaggedManager
 from mstar.engine.resources.base import EngineResourceInfo, build_resource
+from mstar.engine.state import Array, Attend, Block, Read
+from mstar.engine.state.adapters import node_handles, node_resources, state_steps
 from mstar.kernels import Choice, DeviceKey
 from mstar.kernels import registry as registry_module
 from mstar.kernels.registry import reset_lookups
 from mstar.kernels.table import find_entries
+from mstar.model.components.diffusion.attention import dit_entry
 from mstar.model.components.diffusion.denoise_loop import DenoiseLoopSubmodule, StepKey
 from mstar.model.submodule_base import NodeInputs
 
@@ -330,18 +333,30 @@ def test_a_step_without_a_fixed_layout_keeps_a_captured_bucket_on_flashinfer(stu
 
 
 class _Dit(DenoiseLoopSubmodule):
-    """The scaffold's step declaration; a bucket key is its token count."""
+    """The scaffold's step declaration over one array; a bucket key is its token count."""
 
     def num_tokens(self, key):
         return key.bucket
 
+    def attention_segments(self, key):
+        return {"tokens": ((self.MAIN_SPAN, key.bucket),)}
+
+
+class _DitModel:
+    """Declares the DiT's tokens, read within a step on the resource under test."""
+
+    def declare_state(self):
+        return [Array("tokens", nodes={"dit"}, layers=frozenset({0}), max_len=0, entry=dit_entry(24, 128),
+                      reads={"dit_attn": Read(mask=Block(), op=Attend(q_heads=24), packed=False)})]
+
 
 def test_the_scaffolds_step_captures_its_buckets_on_cudnn(stub_flashinfer):
-    dit = _Dit(loop_name="denoise_loop", attn_resource_key="dit_attn")
-    declared = dit.declare_step("image_gen", ["r0", "r1"], [NodeInputs(resource_step_info=StepKey(4608))] * 2)
-    step = declared.steps["dit_attn"]
-    assert step.fixed_layout and [seg.span for seg in step.segments] == [4608, 4608]
     m = manager_with(CUDNN_ROWS)
+    declared = _Dit(loop_name="denoise_loop").declare_step(
+        "image_gen", ["r0", "r1"], [NodeInputs(resource_step_info=StepKey(4608))] * 2,
+    )
+    step = state_steps(declared, node_handles(_DitModel(), "dit", {"dit_attn": m})).steps["dit_attn"]
+    assert step.fixed_layout and [seg.span for seg in step.segments] == [4608, 4608]
     plan(m, step, lease(2, 2 * 4608))
     assert type(m._current_plan_states["main"]) is CudnnRaggedPrefillWrapper
 
@@ -351,20 +366,20 @@ def _image_dit(model: str):
         from mstar.model.flux2_klein.config import Flux2KleinConfig
         from mstar.model.flux2_klein.flux2_klein_model import Flux2KleinModel
 
-        m = Flux2KleinModel(model_path_hf="test/flux2_klein", skip_weight_loading=True, attention_backend="flashinfer")
+        m = Flux2KleinModel(model_path_hf="test/flux2_klein", skip_weight_loading=True)
         m.set_config(Flux2KleinConfig())
         return m
     from mstar.model.z_image.config import ZImageConfig
     from mstar.model.z_image.z_image_model import ZImageModel
 
-    m = ZImageModel(model_path_hf="test/z_image", skip_weight_loading=True, attention_backend="flashinfer")
+    m = ZImageModel(model_path_hf="test/z_image", skip_weight_loading=True)
     m.set_config(ZImageConfig())
     return m
 
 
 @pytest.mark.parametrize("model", ["flux2_klein", "z_image"])
 def test_the_image_dits_leave_their_kernel_to_the_table(model):
-    (resource,) = _image_dit(model).get_node_resources()
+    (resource,) = node_resources(_image_dit(model))
     assert resource.config.backend is RaggedAttnBackend.AUTO and resource.config.flashinfer_backend is None
 
 

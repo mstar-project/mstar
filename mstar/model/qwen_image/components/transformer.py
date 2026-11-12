@@ -33,9 +33,9 @@ from __future__ import annotations
 
 import functools
 import math
-from collections.abc import Callable, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 import torch
 import torch.nn.functional as F
@@ -43,6 +43,7 @@ from torch import nn
 
 from mstar.distributed.communication import CommGroup
 from mstar.distributed.utils import divide
+from mstar.model.components.diffusion.attention import attend
 from mstar.model.components.diffusion.ffn import addmm_gelu_tanh
 from mstar.model.components.diffusion.qwen import dit_kernels as kernels
 from mstar.model.components.distributed.linear import ColumnParallelLinear, RowParallelLinear
@@ -50,6 +51,8 @@ from mstar.model.components.norm import QwenRMSNorm
 
 # The rotary tables' extent in the reference (``QwenEmbedRope``'s 4096 positions per sign).
 ROPE_POSITIONS = 4096
+# The array the joint attention reads, over each guidance branch's [txt | img | ref] segments.
+JOINT_TOKENS = "joint_tokens"
 
 
 @dataclass(frozen=True)
@@ -218,9 +221,11 @@ class QwenImageJointAttention(nn.Module):
     """``QwenDoubleStreamAttnProcessor2_0``: per-stream q/k/v (column-parallel) and per-head RMSNorm
     of q and k, RoPE, one attention over each row's ``[txt | img]`` segments, per-stream outputs."""
 
-    def __init__(self, comm_group: CommGroup, dim: int, num_heads: int, head_dim: int, eps: float = 1e-6):
+    def __init__(self, comm_group: CommGroup, dim: int, num_heads: int, head_dim: int, layer: int, eps: float = 1e-6):
         super().__init__()
         self.head_dim = head_dim
+        self.layer = torch.tensor(layer, device="cpu")
+        self.state = None
         self.local_heads = divide(num_heads, comm_group.world_size)
         inner = num_heads * head_dim
         self.to_q, self.to_k, self.to_v = (ColumnParallelLinear(comm_group, dim, inner, bias=True) for _ in range(3))
@@ -232,9 +237,11 @@ class QwenImageJointAttention(nn.Module):
         self.to_out = nn.ModuleList([RowParallelLinear(comm_group, inner, dim, bias=True)])
         self.to_add_out = RowParallelLinear(comm_group, inner, dim, bias=True)
 
+    def bind_state(self, handles: Mapping[str, Any]) -> None:
+        self.state = handles.get(JOINT_TOKENS)
+
     def forward(
         self, img: torch.Tensor, txt: torch.Tensor, layout: QwenStepLayout, txt_freqs: torch.Tensor,
-        attend: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor]:
         def heads(x: torch.Tensor) -> torch.Tensor:
             return x.unflatten(-1, (-1, self.head_dim))
@@ -245,7 +252,7 @@ class QwenImageJointAttention(nn.Module):
             txt_freqs, layout.img_freqs,
         )
         v = heads(_joint_linear(self.add_v_proj, txt, self.to_v, img))
-        out = attend(q, k, v).flatten(2, 3).to(q.dtype)
+        out = attend(self.state, self.layer, q, k, v).flatten(2, 3).to(q.dtype)
         num_txt = txt.shape[1]
         return _rows_linear(self.to_out[0], out[:, num_txt:]), _rows_linear(self.to_add_out, out[:, :num_txt])
 
@@ -367,7 +374,7 @@ def _gated_norm_modulate(
 class QwenImageBlock(nn.Module):
     """``QwenImageTransformerBlock``."""
 
-    def __init__(self, comm_group: CommGroup, config: QwenImageTransformerConfig, eps: float = 1e-6):
+    def __init__(self, comm_group: CommGroup, config: QwenImageTransformerConfig, layer: int, eps: float = 1e-6):
         super().__init__()
         dim = config.inner_dim
         self.zero_cond_t = config.zero_cond_t
@@ -377,13 +384,15 @@ class QwenImageBlock(nn.Module):
         self.img_norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
         self.txt_norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
         self.txt_norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
-        self.attn = QwenImageJointAttention(comm_group, dim, config.num_attention_heads, config.attention_head_dim, eps)
+        self.attn = QwenImageJointAttention(
+            comm_group, dim, config.num_attention_heads, config.attention_head_dim, layer, eps,
+        )
         self.img_mlp = _FeedForward(comm_group, dim)
         self.txt_mlp = _FeedForward(comm_group, dim)
 
     def forward(
         self, img: torch.Tensor, txt: torch.Tensor, temb_act: torch.Tensor, layout: QwenStepLayout,
-        txt_freqs: torch.Tensor, attend,
+        txt_freqs: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """``temb_act``: ``silu(temb)``, the modulations' input, the same for every block (``img_mod`` /
         ``txt_mod`` are ``SiLU`` then the linear)."""
@@ -396,7 +405,7 @@ class QwenImageBlock(nn.Module):
 
         img_in, img_gate1 = _norm_modulate(self.img_norm1, img, img_mod1, split)
         txt_in, txt_gate1 = _norm_modulate(self.txt_norm1, txt, txt_mod1, txt_split)
-        img_attn, txt_attn = self.attn(img_in, txt_in, layout, txt_freqs, attend)
+        img_attn, txt_attn = self.attn(img_in, txt_in, layout, txt_freqs)
 
         img, img_in, img_gate2 = _gated_norm_modulate(img, img_gate1, img_attn, self.img_norm2, img_mod2, split)
         img = _gated_add(img, img_gate2, self.img_mlp(img_in), split)
@@ -433,7 +442,7 @@ class QwenImageTransformer(nn.Module):
         self.txt_norm = QwenRMSNorm(config.joint_attention_dim, 1e-6)
         self.img_in = nn.Linear(config.in_channels, dim)
         self.txt_in = nn.Linear(config.joint_attention_dim, dim)
-        self.transformer_blocks = nn.ModuleList(QwenImageBlock(comm_group, config) for _ in range(config.num_layers))
+        self.transformer_blocks = nn.ModuleList(QwenImageBlock(comm_group, config, i) for i in range(config.num_layers))
         self.norm_out = _AdaNormOut(dim)
         self.proj_out = nn.Linear(dim, config.patch_size**2 * config.out_channels)
         # set by a caller that compiles the blocks: their text axis is then dynamic
@@ -444,7 +453,7 @@ class QwenImageTransformer(nn.Module):
         return self.img_in.weight.dtype
 
     def forward(
-        self, img: torch.Tensor, txt: torch.Tensor, timestep: torch.Tensor, layout: QwenStepLayout, attend,
+        self, img: torch.Tensor, txt: torch.Tensor, timestep: torch.Tensor, layout: QwenStepLayout,
     ) -> torch.Tensor:
         """``img [R, L_img, C_in]`` (each row's target then its references), ``txt [R, Lt, C_txt]`` (left-padded),
         ``timestep [R]`` in the transformer's dtype (the reference's ``t / 1000``) -> ``[R, L_img, C_out * 4]``.
@@ -463,7 +472,7 @@ class QwenImageTransformer(nn.Module):
         temb_act = F.silu(temb)
         kernels.fits(img)  # the kernels' one-time self-check runs here, in eager, before any compiled block
         for block in self.transformer_blocks:
-            img, txt = block(img, txt, temb_act, layout, txt_freqs, attend)
+            img, txt = block(img, txt, temb_act, layout, txt_freqs)
         if self.config.zero_cond_t:
             temb = temb.chunk(2, dim=0)[0]
         return self.proj_out(self.norm_out(img, temb))
