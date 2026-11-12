@@ -262,6 +262,9 @@ def test_a_gated_delta_net_defaults_to_the_config_defaults():
 class _OtherMask(Mask):
     """A mask `build_specs` has no layout for."""
 
+    uses_query_position = True
+    sees_step_whole = False
+
 
 @dataclass(frozen=True)
 class _OtherUpdate(Op):

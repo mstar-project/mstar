@@ -466,6 +466,9 @@ def test_the_digest_matches_across_processes_with_different_hash_seeds():
 class _OtherMask(Mask):
     """Has no fields, as `Causal` has none, so only its class tells them apart."""
 
+    uses_query_position = True
+    sees_step_whole = False
+
 
 _T = TensorType((4, 8), dtype=None, shard=0)
 _READ = Read(mask=Causal(), op=_ATTEND)

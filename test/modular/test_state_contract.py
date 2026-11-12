@@ -36,7 +36,7 @@ from mstar.engine.state import (
     Value,
     Window,
 )
-from mstar.engine.state.contract import Op
+from mstar.engine.state.contract import Mask, Op
 
 _ENTRY = KVEntry(heads=4, head_dim=8)
 _GDN = Entry({
@@ -190,8 +190,14 @@ def test_a_bad_declaration_is_refused_naming_the_array_and_field(name):
     assert str(refused.value).startswith(where), f"the refusal should open with {where}: {refused.value}"
 
 
+@dataclass(frozen=True)
+class _UndeclaredMask(Mask):
+    """Sets neither property a mask declares."""
+
+
 @pytest.mark.parametrize("build, where", [
     (lambda: Read(mask="nope"), "Read.mask"),
+    (lambda: Read(mask=_UndeclaredMask()), "Read.mask: _UndeclaredMask leaves ['uses_query_position'"),
     (lambda: Read(mask=Causal(), op="garbage"), "Read.op"),
     (lambda: Read(mask=Causal(), op=CausalConv()), "Read.op: a read changes no field"),
 ])

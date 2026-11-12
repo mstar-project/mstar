@@ -195,6 +195,9 @@ class Read:
     def __post_init__(self):
         if not isinstance(self.mask, Mask):
             raise ValueError(f"Read.mask must be a Mask, got {self.mask!r}")
+        unset = [name for name in Mask.__annotations__ if not hasattr(type(self.mask), name)]
+        if unset:
+            raise ValueError(f"Read.mask: {type(self.mask).__name__} leaves {unset} unset, which every mask declares")
         if not (self.op is None or isinstance(self.op, Op)):
             raise ValueError(f"Read.op must be None or an Op, got {self.op!r}")
         if self.op is not None and (self.op.writes or self.op.adds):
