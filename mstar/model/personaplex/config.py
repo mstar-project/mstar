@@ -174,7 +174,8 @@ CONDITIONING_LOOP, DECODE_LOOP = "cond_loop", "decode_loop"
 LM_PARTITION, CODEC_PARTITION, CODEC_WALK = "LM", "Codec", "codec_chunk"
 # New agent frames per audio chunk the stream releases: 4 frames (320 ms of audio) first, then growing
 # to 25 frames (2 s), a ramp like Qwen3-TTS's for its 12 Hz codec, so a running stream costs few
-# decodes. The decode itself is exact whatever the grouping (``IncrementalMimiDecoder``).
+# decodes. Whatever the grouping, the decode equals a whole-track one up to floating-point rounding
+# (``IncrementalMimiDecoder``).
 STREAM_CHUNK_SCHEDULE = (4, 8, 16)
 STREAM_CHUNK_FRAMES = 25
 KV_LABEL = "main"  # the LM's one paged KV label

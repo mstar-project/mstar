@@ -220,8 +220,8 @@ class PersonaPlexModel(Model):
             max_iters=cfg.MAX_TEMPORAL_FORWARDS,
             outputs=[],
         )
-        # The decoder's stream state is in the mimi_state pool, read and written
-        # in step order; async scheduling stays off here until it is measured.
+        # Serial: with async scheduling on, a GH200 sweep showed no throughput
+        # gain at 1-32 sessions and p95 decoder steps of 149-459 ms.
         decoder = GraphNode(
             name=cfg.MIMI_DECODER_NODE, input_names=["agent_frame"], consumes_stream=True,
             enable_async_scheduling=False,

@@ -416,12 +416,15 @@ class MimiEncoderSubmodule(_MimiSubmodule):
 
 
 class MimiDecoderSubmodule(_MimiSubmodule):
-    """Streamed agent frames -> 24 kHz PCM, equal to one whole-track decode ([PP] offline.py:300-307).
+    """Streamed agent frames -> 24 kHz PCM, equal to one whole-track decode ([PP] offline.py:300-307)
+    up to floating-point rounding.
 
     Each chunk decodes only its new frames, from the stream's decoder state
     (``IncrementalMimiDecoder``), which lives in the ``mimi_state`` recurrent
-    pool: a step gathers its rows' state and scatters the new state back, so a
-    request's audio does not depend on how the stream grouped its frames.
+    pool: a step gathers its rows' state and scatters the new state back. A
+    batch pads its chunks to the widest, so on a GPU a row's rounding can
+    depend on the chunks it is decoded with (``max_batch_size: 1`` decodes
+    every request alone).
     Emission stops at the input's sample count; the stream can end on an empty
     chunk, which still runs.
     """
@@ -431,6 +434,7 @@ class MimiDecoderSubmodule(_MimiSubmodule):
     def __init__(self, codec: MimiCodec, max_batch_size: int = cfg.DEFAULT_MAX_BATCH_SIZE):
         super().__init__(codec)
         self.incremental = IncrementalMimiDecoder(codec)
+        self._state_names = tuple(self.incremental.state_blocks())
         self._max_batch_size = max_batch_size
         self._lengths_stager = PinnedStager(torch.long, numel=max_batch_size)
 
@@ -496,7 +500,7 @@ class MimiDecoderSubmodule(_MimiSubmodule):
             return torch.zeros(len(engine_inputs.request_ids), 1, 0, device=self.get_device())
         pool: RecurrentStatePool = engine_inputs.resources[cfg.MIMI_STATE]
         # a fresh stream, and a padding row on the sink, read zeros: the decoder's own left padding
-        state = {name: pool.gather(name) for name in self.incremental.state_blocks()}
+        state = {name: pool.gather(name) for name in self._state_names}
         pcm, new = self.incremental(codes, state, lengths)
         for name, value in new.items():
             pool.scatter_(name, value)
