@@ -332,6 +332,9 @@ class ParallelCrossAttention(nn.Module):
 
     def add_context(self, encoder_states: torch.Tensor) -> None:
         """Add this layer's K/V of the encoder output to the context array, on the walk that carries it."""
+        if self.layer is None:
+            raise ValueError("ParallelCrossAttention: a layer id picks the handle path, which add_context runs on, and "
+                             "this layer has none")
         if self.context is None:
             raise self._no_context()
         k, v = self.compute_kv(encoder_states)

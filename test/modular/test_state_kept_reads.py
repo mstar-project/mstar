@@ -498,6 +498,13 @@ def test_a_layer_on_a_node_without_its_context_array_is_refused_at_bind():
         _cross_attention(context_kv_key="context", layer=0).bind_state({"kv": _StubContext()})
 
 
+def test_add_context_on_a_layer_with_no_layer_id_is_refused():
+    layer = _cross_attention(cross_key="cross", context_kv_key="context")
+    with pytest.raises(ValueError, match="a layer id picks the handle path, which add_context runs on, and this layer "
+                                         "has none"):
+        layer.add_context(torch.randn(5, 8))
+
+
 @torch.no_grad()
 def test_a_layer_on_a_node_with_no_handles_is_refused_at_its_first_call():
     """The engine calls `bind_state` only on a node with handles."""
