@@ -9,17 +9,7 @@ from typing import TYPE_CHECKING, get_origin
 
 import torch
 
-from mstar.engine.state.contract import (
-    EMPTY,
-    Array,
-    Bidirectional,
-    Block,
-    Read,
-    Sampler,
-    SeqShard,
-    is_value,
-    read_layers,
-)
+from mstar.engine.state.contract import EMPTY, Array, Block, Read, Sampler, SeqShard, is_value, read_layers
 
 if TYPE_CHECKING:
     from mstar.model.base import Model
@@ -180,7 +170,7 @@ def _regrouping_problems(model: "Model", arrays: Sequence[Array], graphs: Mappin
     # worker keys its spans (`PreprocessWorkerThread._check_whole_steps`).
     whole = [
         (array, key, read) for array in arrays for key, read in array.reads.items()
-        if isinstance(read.mask, Block | Bidirectional)
+        if read.mask.sees_step_whole
     ]
     regrouped = [
         *((node, walk, "a chunking policy splits across steps", "leave it out of the policy")

@@ -53,7 +53,7 @@ from mstar.engine.resources.lora.config import LORA_ADAPTER_KWARG, LORA_DIGEST_K
 from mstar.engine.resources.position.config import MAX_POSITION_KWARG
 from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.engine.state.adapters import kv_layouts
-from mstar.engine.state.contract import Array, Bidirectional, Block
+from mstar.engine.state.contract import Array
 from mstar.model.base import (
     KEEP_ADAPTER,
     ClientChunk,
@@ -1557,7 +1557,7 @@ class PreprocessWorkerThread:
         return {
             array.name: whole for array in self._declarations
             if isinstance(array, Array) and array.name in self._keyed_labels and (whole := {
-                walk: key for key, read in array.reads.items() if isinstance(read.mask, Block | Bidirectional)
+                walk: key for key, read in array.reads.items() if read.mask.sees_step_whole
                 for walk in read.walks or (None,)
             })
         }
