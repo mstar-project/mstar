@@ -2,6 +2,12 @@ import torch
 from torch import Tensor
 from torch.nn.attention.flex_attention import _DEFAULT_SPARSE_BLOCK_SIZE
 
+
+def fits_block_mask(tokens: int) -> bool:
+    """Whether a frame of ``tokens`` fills whole blocks of the flex block mask a ring is read through, which has no
+    partial blocks."""
+    return tokens % _DEFAULT_SPARSE_BLOCK_SIZE == 0
+
 __all__ = ["LayerRingCache", "ring_scatter"]
 
 
@@ -73,7 +79,7 @@ class LayerRingCache:
                 f"ring_buckets ({ring_buckets}) must be in [1, ring_frames ({ring_frames})]; "
                 "the addressable slots have to fit inside the allocated ring."
             )
-        if tokens_per_frame % _DEFAULT_SPARSE_BLOCK_SIZE:
+        if not fits_block_mask(tokens_per_frame):
             raise ValueError(
                 f"tokens_per_frame ({tokens_per_frame}) must be a multiple of the sparse "
                 f"block size ({_DEFAULT_SPARSE_BLOCK_SIZE}); the BlockMask has no partial blocks."

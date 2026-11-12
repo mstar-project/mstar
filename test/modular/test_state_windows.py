@@ -341,7 +341,7 @@ def test_a_ring_takes_no_kernel_settings():
 
 
 @pytest.mark.parametrize(("read", "message"), [
-    (_read(FrameWindow(64, frames=2), packed=False), "mask.tokens is 64, and a flex block mask holds whole blocks"),
+    (_read(FrameWindow(64, frames=2), packed=False), "mask.tokens is 64, which doesn.t fill whole blocks"),
     (_read(FrameWindow(TPF, frames=2)), "takes packed queries, and flex attends rows of one frame"),
     (_read(FrameWindow(TPF, frames=2), packed=False, walks={"rollout"}), "walks must be None"),
 ], ids=["partial_block", "packed", "walks"])
@@ -923,4 +923,20 @@ def test_a_kept_window_picks_its_binding_only_through_for_mask():
     assert type(BINDINGS[PAGED, Attend].for_mask(plain)) is type(BINDINGS[PAGED, Attend])
     assert isinstance(BINDINGS[PAGED, type(None)].for_mask(kept), PagedReach)
     assert isinstance(BINDINGS[PAGED, type(None)].for_mask(plain), PagedNoOp)
+
+
+@pytest.mark.parametrize(("tokens", "fits"), [(128, True), (512, True), (64, False), (200, False)])
+def test_a_frame_fits_the_block_mask_by_one_rule(tokens, fits):
+    """The read's check at validation and the ring at build ask the same predicate."""
+    from mstar.engine.resources.kv.ring.cache import LayerRingCache, fits_block_mask
+
+    assert fits_block_mask(tokens) is fits
+    build = lambda: LayerRingCache(num_sessions=1, n_kv_heads=1, ring_frames=2, ring_buckets=2,  # noqa: E731
+                                   d_head=8, tokens_per_frame=tokens, pinned_dilation=1, dtype=torch.float32,
+                                   device="cpu")
+    if fits:
+        build()
+    else:
+        with pytest.raises(ValueError, match="must be a multiple of the sparse block size"):
+            build()
 

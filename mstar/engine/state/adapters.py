@@ -12,7 +12,6 @@ from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
 
 import numpy as np
 import torch
-from torch.nn.attention.flex_attention import _DEFAULT_SPARSE_BLOCK_SIZE
 
 from mstar.distributed.communication import CommGroup
 from mstar.engine.resources.attn.config import (
@@ -42,6 +41,7 @@ from mstar.engine.resources.kv.config import (
     RingKVStep,
 )
 from mstar.engine.resources.kv.plan import stage_reach
+from mstar.engine.resources.kv.ring.cache import fits_block_mask
 from mstar.engine.resources.linear_attn.config import (
     LinearAttnConfig,
     LinearAttnSpec,
@@ -710,9 +710,9 @@ class FlexAttend(OpBinding):
     steps."""
 
     def check(self, array: Array, key: str, read: Read) -> None:
-        if read.mask.tokens % _DEFAULT_SPARSE_BLOCK_SIZE:
-            raise _no_layout(array, f"reads[{key!r}].mask.tokens is {read.mask.tokens}, and a flex block mask holds "
-                                    f"whole blocks of {_DEFAULT_SPARSE_BLOCK_SIZE}")
+        if not fits_block_mask(read.mask.tokens):
+            raise _no_layout(array, f"reads[{key!r}].mask.tokens is {read.mask.tokens}, which doesn't fill whole "
+                                    "blocks of a flex block mask")
         if read.walks is not None:
             raise _no_layout(array, f"reads[{key!r}].walks must be None, since a ring's reads share one plan a step")
         if read.packed:
