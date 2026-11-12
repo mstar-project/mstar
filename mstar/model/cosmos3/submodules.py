@@ -184,8 +184,8 @@ ATTN = "attn"
 ATTN_GEN = "attn_gen"
 SAMPLER = "sampler"
 # The sequence shard over the KV pool's nodes: on SP ranks it splits a
-# generation step's tokens over them (the transformer binds it by this name).
-# Every step of those nodes declares it, a prefill and the reasoner's included.
+# generation step's tokens over them (the DiT submodule hands it to the transformer at bind).
+# No step declares it: its step is the node's segments (`Resource.steps_from_segments`).
 SEQ_SHARD = "seq_shard"
 
 # Denoise state (initial noise, latents between steps, the guidance combine and

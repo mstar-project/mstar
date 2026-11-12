@@ -546,8 +546,8 @@ def test_a_lora_refusal_does_not_look_for_an_eviction_victim(caplog):
 def test_a_node_running_sequence_or_cfg_parallelism_refuses_lora(adapters, axis):
     """LoRA rows are per request over the whole batch, not per SP shard or CFG branch: the
     build refuses CFG above 1, a node splitting its steps over SP ranks is refused before the
-    build, and it takes TP with both at 1, and a node that places its KV positions over its SP
-    ranks (heads split over TP alone), which runs every row on every SP rank."""
+    build, and it takes TP with both at 1, and a node whose steps run copied over KV placed over
+    its SP ranks (heads split over TP alone), which runs every row on every SP rank."""
     from mstar.distributed.communication import CommGroup, JointGroups
     from mstar.engine.resources.sequence_shard import SeqShardSpec, sequence_parallel_refusals
 

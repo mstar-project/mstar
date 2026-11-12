@@ -601,7 +601,7 @@ def _sequence_parallel(
                 except ValueError as e:
                     yield f"node_groups[{i}]: {e}"
         # node -> whether it places its KV positions over its SP ranks (heads over TP alone)
-        # rather than splitting its steps (heads over TP x SP)
+        # rather than keeping KV by head while its steps split (heads over TP x SP)
         placed = {}
         for node in sorted(nodes):
             refusals = sequence_parallel_refusals(specs, node, tp, sp, moe_parallel.get(node))
@@ -615,6 +615,6 @@ def _sequence_parallel(
         if mixed:
             yield (
                 f"node_groups[{i}]: {sorted(n for n, p in placed.items() if p)} place their KV positions over "
-                f"the SP ranks and {sorted(n for n, p in placed.items() if not p)} split their steps over them, "
+                f"the SP ranks and {sorted(n for n, p in placed.items() if not p)} keep KV by head over them, "
                 f"so they split heads different ways, yet share resources {mixed}"
             )

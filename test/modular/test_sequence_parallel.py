@@ -11,8 +11,10 @@ and into which ranges; and the Wan2.2 DiT over its own resources on two ranks ag
 
 from __future__ import annotations
 
+import dataclasses
 import types
 
+import numpy as np
 import pytest
 import torch
 import torch.distributed as dist
@@ -21,21 +23,25 @@ from flashinfer_reference import reference_attention, reference_flashinfer
 
 from mstar.distributed import communication
 from mstar.distributed.communication import CommGroup, JointGroups, gather_sequence, sp_seq_split
+from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec
+from mstar.engine.resources.attn.ragged.base import RaggedAttnManager
+from mstar.engine.resources.attn.ragged.config import RaggedAttentionConfig, RaggedAttentionSpec
 from mstar.engine.resources.base import EngineResourceInfo
-from mstar.engine.resources.context_parallel import gather_merge, merge
+from mstar.engine.resources.context_parallel import gather_merge, merge, stripe_owners
 from mstar.engine.resources.kv.config import KVSpec, KVStep, PagedKVConfig
-from mstar.engine.resources.kv.plan import KVPlanOutputs
+from mstar.engine.resources.kv.plan import KVPlanOutput, KVPlanOutputs, SequenceView, build_paged_indptrs
 from mstar.engine.resources.position.config import PositionConfig, PositionSpec, PositionStep
 from mstar.engine.resources.position.manager import PositionManager
 from mstar.engine.resources.sequence_shard import (
     SeqRange,
     SeqShardSpec,
+    all_gather,
     head_slice,
     sharded_key_merge,
     ulysses,
 )
-from mstar.engine.resources.spec import resolve_spec_dependencies
-from mstar.engine.resources.step import BucketKey, Segment, SlotLease, StepContext, SubmoduleStep
+from mstar.engine.resources.spec import apply_yaml_overrides, resolve_spec_dependencies
+from mstar.engine.resources.step import BucketKey, ResourceStep, Segment, SlotLease, StepContext, SubmoduleStep
 from mstar.model.components.diffusion.attention import sdpa_attention
 from mstar.model.submodule_base import with_segment_steps
 
@@ -168,7 +174,7 @@ def _split_exchanges(rank, world, total, rows):
     q, k, v = (torch.randn(b * total, heads, 4, generator=gen) for heads in (HEADS, world, world))
 
     def local(x):
-        return x.unflatten(0, (b, total)).narrow(1, r.start, r.count).flatten(0, 1)
+        return r.local(x.unflatten(0, (b, total)), 1).flatten(0, 1)
 
     def heads(x):
         per = x.shape[1] // world
@@ -186,6 +192,8 @@ def _split_exchanges(rank, world, total, rows):
     run = _rows_attention(b, causal=True)
     want = run(q, k, v)
     torch.testing.assert_close(ulysses(run, local(q), local(k), local(v), r), local(want))
+    if rows is None:
+        torch.testing.assert_close(all_gather(run, local(q), local(k), local(v), r), local(want))
     torch.testing.assert_close(head_slice(run, q, k, v, group), want)
     # copied queries over this rank's keys
     q_short = torch.randn(b * 5, HEADS, 4, generator=gen)
@@ -215,6 +223,57 @@ def _split_exchanges(rank, world, total, rows):
 )
 def test_sequence_shard_exchanges_match_one_rank(tmp_path, world, total, rows):
     _run(_split_exchanges, world, tmp_path / "store", total, rows)
+
+
+def _striped(rank, world):
+    """A step striped by stored KV position (rows with stored context below ``world``, of none, and
+    longer, an odd total): each rank holds exactly the tokens it stores, ``whole`` undoes
+    ``local``, and ``all_gather`` gives each rank its tokens' attention."""
+    group = _group(rank, world)
+    rows, stored = np.array([5, 3, 1, 2]), np.array([1, 0, 6, 3])
+    qo = np.concatenate([[0], np.cumsum(rows)])
+    owners = stripe_owners(qo, stored, world)
+    order = torch.from_numpy(np.argsort(owners, kind="stable"))
+    r = SeqRange(group, tuple(np.bincount(owners, minlength=world).tolist()), None, order)
+    n = int(qo[-1])
+    position = torch.from_numpy(np.repeat(stored - qo[:-1], rows) + np.arange(n))
+    mine = r.local(position)
+    assert (mine % world == rank).all() and mine.shape[0] == r.count and r.index.tolist() == sorted(r.index.tolist())
+    assert torch.equal(r.whole(mine), position)
+
+    gen = torch.Generator().manual_seed(0)
+    q, k, v = (torch.randn(n, heads, 4, generator=gen) for heads in (HEADS, world, world))
+
+    def run(q, k, v):
+        return torch.cat([reference_attention(q[a:b], k[a:b], v[a:b])[0] for a, b in zip(qo[:-1], qo[1:], strict=True)])
+
+    torch.testing.assert_close(all_gather(run, r.local(q), r.local(k), r.local(v), r), r.local(run(q, k, v)))
+
+
+@pytest.mark.parametrize("world", [2, 3])
+def test_a_striped_step_gives_each_rank_the_tokens_it_stores(tmp_path, world):
+    _run(_striped, world, tmp_path / "store")
+
+
+def _rows_to_peers(rank, world):
+    """``all_to_all_rows`` on SP groups whose ranks aren't the world's ({0, 2} and {1, 3} of 4),
+    a ring's hops: at offset i each rank sends its rows to group rank ``r + i`` and receives from
+    ``r - i``, each rank's count its own."""
+    groups = [dist.new_group([0, 2]), dist.new_group([1, 3])]
+    members = [rank % 2, rank % 2 + 2]
+    group = CommGroup(rank, members.index(rank), members)
+    group.device_group, group.initialized = groups[rank % 2], True
+    p, r = group.world_size, group.rank
+    for i in range(1, p):
+        to, back = [0] * p, [0] * p
+        to[(r + i) % p], back[(r - i) % p] = r + 1, (r - i) % p + 1
+        x = torch.full((r + 1, 3), float(rank))
+        got = group.all_to_all_rows(x, to, back)
+        assert torch.equal(got, torch.full((back[(r - i) % p], 3), float(members[(r - i) % p])))
+
+
+def test_all_to_all_rows_counts_are_group_relative(tmp_path):
+    _run(_rows_to_peers, 4, tmp_path / "store")
 
 
 # --- when a step splits ---------------------------------------------------------------------------
@@ -297,6 +356,74 @@ def test_a_split_step_refuses_what_it_cant_range():
     # a copied step leaves every label whole
     _split(shard, [("r0", "main", 1)])
     assert shard.scatter("other", x) is x
+
+
+def _kv_plan(*rows) -> KVPlanOutputs:
+    """A pool's plan of label ``main``'s rows, each (stored, new)."""
+    views = [SequenceView(f"r{i}", "main", list(range(1 + 4 * i, 1 + 4 * i - (-(c + n) // 16))), c + n, n)
+             for i, (c, n) in enumerate(rows)]
+    return KVPlanOutputs({"main": KVPlanOutput(build_paged_indptrs(views, 16), views)})
+
+
+@pytest.mark.parametrize("world, rows, lease, counts", [
+    # positions 1..4 and 0..2: rank 0 holds 2, 4, 0 and 2, step tokens 1, 3, 4 and 6
+    (2, ((1, 4), (0, 3)), None, (4, 3)),
+    # positions 1, 2, 5 and 6 over 4 ranks: ranks 0 and 3 would get none
+    (4, ((1, 2), (5, 2)), None, None),
+    # the ring runs eager: a leased step plans copied
+    (2, ((1, 4), (0, 3)), SlotLease(0, BucketKey("w", bs=2, num_tokens=8)), None),
+], ids=["split", "a-rank-gets-none", "leased"])
+def test_a_striped_shard_gives_each_rank_its_stored_positions(world, rows, lease, counts):
+    shard = _shard(world=world)
+    shard.stripe_pool = "kv"
+    ctx = StepContext(request_ids=("r0", "r1"), graph_walk="w", slot=0, capture=False, slot_lease=lease,
+                      force_prefill=lease is not None)
+    ctx.plan_results["kv"] = _kv_plan(*rows)
+    plan = shard.plan(ResourceStep(segments=tuple(Segment(f"r{i}", "main", n) for i, (_, n) in enumerate(rows))), ctx)
+    if counts is None:
+        assert not plan.split
+        return
+    r = plan.ranges["main"]
+    assert r.counts == counts and r.index.tolist() == [1, 3, 4, 6]
+
+
+def test_a_striped_shard_refuses_a_step_it_cant_stripe():
+    shard = _shard(world=2)
+    shard.stripe_pool = "kv"
+    ctx = StepContext(request_ids=("r0",), graph_walk="w", slot=0, capture=False)
+    ctx.plan_results["kv"] = KVPlanOutputs({})
+    step = ResourceStep(segments=(Segment("r0", "main", 8),))
+    with pytest.raises(ValueError, match="plans no such label there"):
+        shard.plan(step, ctx)
+    with pytest.raises(ValueError, match="which a combined label's rows"):
+        _split(shard, [("r0", "main", 4), ("r0", "other", 4)], combined={("main", "other"): "cfg"})
+
+
+def test_a_shard_that_never_splits_plans_every_step_copied():
+    """Over KV stored by position the shard's exchange auto (a config from before such a pool could
+    split runs as it did) or none: the shard derives that it splits nothing, so the node runs
+    copied (min_tokens 0 and all), as one without a shard; all_gather splits. A ragged Ulysses
+    attention there plans the heads its exchange hands it: over TP alone on a copied node, over
+    TP x SP on a splitting one, though the node's pool keeps every head (``replicated_over_sp``)."""
+    for choice, splits in ((None, False), ("none", False), ("all_gather", True)):
+        specs = [
+            KVSpec("kv", {"n"}, PagedKVConfig(num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=64,
+                                              num_qo_heads=1, context_parallel=True)),
+            AttentionSpec("attn", {"n"}, AttentionConfig(kv_cache="kv")),
+            SeqShardSpec("shard", {"n"}, ("main",), 0),
+            RaggedAttentionSpec("ragged", {"n"}, RaggedAttentionConfig(2, 2, 8), labels={"main"}),
+        ]
+        apply_yaml_overrides(specs, {"resources": {} if choice is None else {"shard": {"exchange": choice}}})
+        by_key = resolve_spec_dependencies(specs)
+        spec = by_key["shard"]
+        pair = CommGroup(0, 0, [0, 1])
+        joint = JointGroups(tp_group=CommGroup.trivial(), sp_group=pair, instance=pair)
+        shard = spec.resource_class.build(spec, EngineResourceInfo(device=torch.device("cpu"), joint_comm_group=joint))
+        assert (spec.splits, shard.can_split, _split(shard, [("r0", "main", 10)]) is not None) == (splits,) * 3
+        ragged = RaggedAttnManager.build(by_key["ragged"], EngineResourceInfo(
+            device=torch.device("cpu"), joint_comm_group=joint, dependencies={"shard": spec}, replicated_over_sp=True,
+        ))
+        assert ragged._kwargs["num_qo_heads"] == (1 if splits else 2)
 
 
 def test_a_resident_step_on_a_node_with_a_shard_is_not_refused_a_repeat():
@@ -471,7 +598,10 @@ def _wan_step(rank, world, grid):
         device=torch.device("cpu"), kv_dtype=torch.float32,
         joint_comm_group=JointGroups(tp_group=CommGroup.trivial(), sp_group=group, instance=group),
     )
-    res = {key: build_resource(spec, info) for key, spec in specs.items()}
+    res = {
+        key: build_resource(spec, dataclasses.replace(info, dependencies={d: specs[d] for d in spec.depends_on()}))
+        for key, spec in specs.items()
+    }
     for key, spec in specs.items():
         res[key].bind_dependencies({dep: res[dep] for dep in spec.depends_on()})
 

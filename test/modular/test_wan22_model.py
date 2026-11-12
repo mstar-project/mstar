@@ -123,7 +123,7 @@ def test_wan22_declares_only_dit_attention_resources():
     on_sdpa = node_resources(model, setup=setup)
     assert [spec.resource_key for spec in on_sdpa] == [DIT_SHARD]
     (refusal,) = sequence_parallel_refusals(resolve_spec_dependencies(on_sdpa).values(), "dit", 1, 2)
-    assert "declares no attention that can take them" in refusal
+    assert "its steps never split" in refusal
     assert model.get_request_resource_configs([], [], {}) == {}
 
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from types import SimpleNamespace
 
 import pytest
@@ -528,7 +529,8 @@ def _sp_resources(model: H3Model, keys, group) -> dict:
     for key in keys:
         if isinstance(getattr(specs[key], "config", None), RaggedAttentionConfig):
             specs[key].config.dtype, specs[key].config.workspace_mb = torch.float32, 1
-        res[key] = build_resource(specs[key], info)
+        deps = {dep: specs[dep] for dep in specs[key].depends_on()}
+        res[key] = build_resource(specs[key], dataclasses.replace(info, dependencies=deps))
     for key in keys:
         res[key].bind_dependencies({dep: res[dep] for dep in specs[key].depends_on()})
     return res
