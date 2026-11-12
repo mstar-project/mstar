@@ -904,12 +904,12 @@ def _decode_with_accepted(eng, k):
 
 
 @pytest.mark.parametrize("ingraph", [True, False])
-def test_the_loopback_masters_a_captured_carry_reads_are_never_replaced(ingraph):
+def test_a_loopback_master_is_fixed_with_the_ingraph_scatter_and_grows_without(ingraph):
     """With the in-graph scatter, a loop-back state's master is allocated once
     at the in-graph rows, as offset and last_token are: registrations past the
-    capture's batch size leave the tensor a captured graph holds in place.
-    Without it the master grows (a new tensor), which is why a carrying drafter
-    is refused there."""
+    capture's batch size leave the tensor in place. Without it the master grows
+    into a new tensor, which a captured step never reads: it reads rows staged
+    off the master (`SamplerResource.bind_graph_reads`)."""
     from mstar.engine.resources.sampler.config import LoopbackState
     from mstar.engine.resources.sampler.utils import SamplerBuffers
 
@@ -1216,11 +1216,11 @@ def test_a_verifying_node_on_a_pool_with_no_host_pool_is_warned_about(caplog):
     assert not any("no host pool" in r.getMessage() for r in caplog.records)
 
 
-def test_a_carrying_drafter_is_refused_where_the_loopback_masters_grow(monkeypatch):
+def test_a_carrying_drafter_needs_device_loopback(monkeypatch):
     from spec_toy import carry_oracle
 
-    monkeypatch.setenv("MSTAR_SAMPLER_INGRAPH_SCATTER", "0")
-    with pytest.raises(RuntimeError, match="loop-back rows, which grow"):
+    monkeypatch.setenv("MSTAR_DEVICE_LOOPBACK", "0")
+    with pytest.raises(RuntimeError, match="which MSTAR_DEVICE_LOOPBACK turns off"):
         engine(3, carry_oracle)
 
 
@@ -1245,23 +1245,30 @@ def _two_rank_node(monkeypatch, rank):
 
 
 @pytest.mark.parametrize("rank", [0, 1])
-def test_a_carrying_drafter_is_refused_above_one_rank(monkeypatch, rank):
-    """On every rank of the instance: above one rank the masters grow, whatever a rank's environment says."""
+def test_a_carrying_drafter_loads_above_one_rank(monkeypatch, rank):
+    """Every rank's masters may grow: the verify walk reads the carry staged off them."""
     from spec_toy import carry_oracle
 
+    from mstar.engine.resources.draft.drafter import DRAFT_CARRY
+
     _two_rank_node(monkeypatch, rank)
-    with pytest.raises(RuntimeError, match="not yet under TP"):
-        engine(3, carry_oracle)
+    sampler = engine(3, carry_oracle)._resources["sampler"]
+    assert not sampler.fixed_loopback_masters
+    assert sampler._graph_reads == {"decode": frozenset({DRAFT_CARRY})}
 
 
-def test_a_carry_survives_many_requests_a_recycled_handle_and_an_offload(monkeypatch):
+@pytest.mark.parametrize("ingraph_scatter", ["1", "0"], ids=["fixed-masters", "growing-masters"])
+def test_a_carry_survives_many_requests_a_recycled_handle_and_an_offload(monkeypatch, ingraph_scatter):
     """The carry oracle drafts the target's tokens only from a right carry, so
     every draft is accepted exactly when each row's carry is its own: ten
     requests (past the sampler buffers' eight), then the same handles again
     for new prompts, one of them offloaded mid-decode (the KV offload stubbed:
-    its length is recorded, its pages stay)."""
+    its length is recorded, its pages stay). Eager steps whose rows all bring
+    their token routed, the first verify steps among them; with the masters
+    fixed and with them growing (as above one rank)."""
     from spec_toy import carry_oracle
 
+    monkeypatch.setenv("MSTAR_SAMPLER_INGRAPH_SCATTER", ingraph_scatter)
     snapshots: dict[int, int] = {}
     stub_offload(monkeypatch, snapshots)
     k = 3

@@ -488,15 +488,19 @@ class _CopyingPool(_FakePool):
 
     def __init__(self):
         super().__init__()
-        self.host: dict[int, torch.Tensor] = {}
+        self.host: dict[int, list[torch.Tensor]] = {}
 
     def copy_out(self, gpu_kv_cache, copies):
+        # the KVCache (every storage, as the real pool copies them), or a pool's one tensor
+        storages = getattr(gpu_kv_cache, "storages", None) or [gpu_kv_cache]
         for gpu, cpu in zip(copies.gpu, copies.cpu, strict=True):
-            self.host[cpu] = gpu_kv_cache[:, gpu].clone()
+            self.host[cpu] = [t[:, gpu].clone() for t in storages]
 
     def copy_in(self, gpu_kv_cache, copies):
+        storages = getattr(gpu_kv_cache, "storages", None) or [gpu_kv_cache]
         for gpu, cpu in zip(copies.gpu, copies.cpu, strict=True):
-            gpu_kv_cache[:, gpu] = self.host[cpu]
+            for t, saved in zip(storages, self.host[cpu], strict=True):
+                t[:, gpu] = saved
 
 
 def test_window_survives_offload_and_reload() -> None:

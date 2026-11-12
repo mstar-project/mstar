@@ -1846,7 +1846,7 @@ What the model writes, and nothing more:
 - A drafter that reads the target declares its shapes in ``DrafterNeeds.geometry`` and the
   model the target's in ``VerifyNode.target`` (both ``ModelGeometry``); startup refuses a
   drafter whose taps, layer set, residual width, vocabulary or dtype don't fit, whose
-  attention has other query heads than the pool's attention plans (``num_qo_heads``), or whose
+  attention has other query heads than its attention plans (the binding's ``num_qo_heads``, else the pool's), or whose
   RoPE base isn't the node's positions' (``rope_theta``).
 
 - A drafter whose state crosses steps declares ``DrafterNeeds.carry`` (``CarrySpec(width,
@@ -1859,9 +1859,10 @@ What the model writes, and nothing more:
   which the engine stores; a prompt step stores the first, which a scaffold drafter's
   ``prefill`` returns and the scaffold stores, and any other node with
   ``self.store_draft_carry(engine_inputs, carry)``; it is kept for the rows whose token the step
-  keeps (a prompt's last prefill). A captured verify step reads the carry off the sampler's
-  loop-back masters, which only the in-graph scatter keeps fixed, so a carrying drafter is
-  refused where it is off (``MSTAR_SAMPLER_INGRAPH_SCATTER=0``, or above one rank).
+  keeps (a prompt's last prefill). A captured verify step reads the carry (and a lagged drafter's
+  keep flag) from rows the sampler stages off its loop-back masters before the forward
+  (``SamplerResource.bind_graph_reads``, which the engine binds for the verify walk), so the
+  masters may grow, as they do above one rank: a carrying drafter runs under TP.
 - A drafter whose ``observe`` reads the target's hidden states declares
   ``DrafterNeeds(target_hidden=True)``; ``target`` returns a ``TargetOutput(logits, hidden)``,
   its hidden states set only then.
@@ -1907,8 +1908,8 @@ head_dim)`` in ``DrafterNeeds.kv``, the checkpoint's unsharded counts, derived f
 ``drafter_resources`` joins it to the pool (``PagedKVConfig.join``): the layers are appended
 after the pool's, so they share its pages, lengths, reservations, take-backs, eviction, offload
 and prefix pages, and the pool records each set's slot (``layer_sets``; the declaring stack's
-is ``"target"``). Only a set of the pool's storage geometry (KV heads and head size) joins; a
-set with its own storage geometry is not supported yet and is refused, as is a name joined twice. Query heads are
+is ``"target"``). A set of the pool's storage geometry (KV heads and head size) is more of its tensor; a
+set of another geometry gets a storage of its own (``KVStorage``): a tensor of the pool's pages in its geometry, addressed by the same page ids, so a page stays one unit for reservation, take-back, eviction, offload and the prefix index, and ``max_num_pages`` still counts the pool's own pages (a page grows by the drafter's bytes). Its layers follow every layer of the pool's own storage in the global index whatever the join order. Its attention plans with the set's geometry through a binding of its own: ``AttentionConfig(kv_cache=..., layer_set=name, num_qo_heads=...)`` (FlashInfer, and FA3's verify kernel on that backend) gets a view of the pool (``PagedKVConfig.geometry_of``) with the set's KV heads and head size and the drafter's query heads, over the pool's pages; startup refuses a drafter in a storage of its own that no binding plans for, and checks its query heads against its binding's. A name joined twice is refused; a pool that keeps a sliding window, an MLA pool, or one another instance reads (KV publication or transfer) can't hold one. Query heads are
 not storage: they belong to the attention over the pool, and startup compares them. Layer
 indices are global across a pool's sets, but a stack never sees that: each of its attention
 layers names the set (``Attention(kv_layer_set=name)``, likewise ``ParallelAttention``), and
@@ -1933,6 +1934,21 @@ drafts, target, verify, observe), the bonus token in the sampler's loop-back slo
 length the resident graph advances by ``accepted + 1``, the token cut at stop ids and the
 budget, and the take-back of rejected tokens at a later admit. A model keeps no state across
 steps and undoes nothing.
+
+A drafter whose layers run a token behind the target (a separate draft model) declares it once,
+as ``DrafterNeeds.lag = Lag(rows, passes)``: its verify block is the target's shifted back
+``rows``, run in ``passes`` (``(2, 1, ..., 1)``: ``[prev, bonus]``, then a draft a pass). The
+model never puts a lag on a step: the engine copies the declaration into the verify walk's KV
+writes of the drafter's layer set, the positions over the pool and the drafter's attention binding
+(``drafter_step``), and checks at capture and on every verify step that they agree (``check_lag``).
+Each pass gets its own write addressing, positions and attention extent; the drafter picks the
+one it runs with ``select_pass(p)`` on those three resources, and a layer of the set writing
+outside a pass raises. The engine also keeps a per-request ``DRAFT_KEEP_FIRST`` flag (``accepted
+== k`` last step), which it adds to the verify step's loop-back writes, and sends the drafter's row 0, the token before the block, to the sink page in
+the graph unless it is set. FA3 plans every pass's extent on the device; FlashInfer plans them on
+the host, so a lagged drafter on FlashInfer runs synchronously. A lagged drafter
+can't rotate through LongRoPE positions, whose table ids keep no lagged copy;
+startup refuses it.
 
 **Recurrent state (GDN).** A verify step runs a row's ``k + 1`` tokens through FlashInfer's
 recurrent multi-token kernel (``gated_delta_rule_mtp``) for their outputs, and through the

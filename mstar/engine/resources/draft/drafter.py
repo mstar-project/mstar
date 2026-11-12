@@ -24,7 +24,7 @@ if TYPE_CHECKING:
     from mstar.engine.resources.kv.config import KVLayerSet
     from mstar.engine.resources.resident import CapturedResidentStep
     from mstar.engine.resources.spec import NodeResourceSpec
-    from mstar.engine.resources.step import ResourceStep
+    from mstar.engine.resources.step import Lag, ResourceStep
 
 # check_stop_buffers entries a verify step publishes, which reach the host in
 # the stop check's copy: the block's tokens and the drafts each row accepted
@@ -36,6 +36,10 @@ VERIFY_STOPPED = "verify_stopped"
 # in: a row per request, held from admission to removal, which the engine reads before
 # ``propose`` and writes from ``observe`` (and a prompt's last prefill writes first)
 DRAFT_CARRY = "draft_carry"
+# A lagged drafter's per-request flag (`DrafterNeeds.lag`), kept by the node's sampler: 1 when the
+# target accepted every draft last step, so the drafter's row 0 (the token before the block, which
+# its last block never reached) writes its KV; 0 sends that write to the sink. The engine sets it.
+DRAFT_KEEP_FIRST = "draft_keep_first"
 
 
 class ChunkBoundary(Enum):
@@ -59,7 +63,8 @@ class ModelGeometry(NamedTuple):
     layers, and the residual width, vocabulary and weight dtype against the
     drafter's (`geometry_problems`). A drafter's: its own layers, KV heads and
     head size, which make the layer set it joins the target's KV pool with
-    (`layer_set`; the join refuses another KV storage geometry), the residual
+    (`layer_set`; one of another KV geometry gets a storage of its own over the
+    same pages, `PagedKVConfig.join`), the residual
     width it reads, the vocabulary it drafts in, its weight dtype, and the query
     heads and RoPE base of its attention, checked against the pool's attention
     and the node's positions."""
@@ -103,6 +108,11 @@ class DrafterNeeds(NamedTuple):
     # its shapes, which must match the target's (`VerifyNode.target`); None for
     # a drafter that reads nothing of the target's but the tokens
     geometry: ModelGeometry | None = None
+    # a separate draft model's (`Lag`): its verify block is the target's shifted back ``rows``,
+    # ``[prev, bonus, d1 .. d(k-1)]``, run in ``passes`` (one-row passes after the first's two). The
+    # engine copies it into the verify step's KV writes of ``kv``, positions and the drafter's attention
+    # binding (`drafter_step`), and sinks row 0 unless `DRAFT_KEEP_FIRST` keeps it. No other walk lags.
+    lag: "Lag | None" = None
 
 
 class VerifyResult(NamedTuple):
@@ -164,6 +174,8 @@ def drafter_resources(
     if needs.carry is not None:
         width, dtype = needs.carry
         kept[DRAFT_CARRY] = LoopbackState(width, dtype, (0.0,) * width)
+    if needs.lag is not None:
+        kept[DRAFT_KEEP_FIRST] = LoopbackState(1, torch.int64, (0,))
     if kept:
         samplers = [spec for spec in out if isinstance(spec, SamplerSpec) and spec.nodes & nodes]
         if len(samplers) != 1:
@@ -219,6 +231,13 @@ class PrefillInputs(NamedTuple):
     tensors: Mapping[str, torch.Tensor] = MappingProxyType({})
 
 
+def verify_writes(needs: DrafterNeeds | None) -> frozenset[str]:
+    """The loop-back state a node's verify steps store for its drafter: `carry_writes`', and a lagged
+    drafter's `DRAFT_KEEP_FIRST`, which only a verify step sets."""
+    keep = frozenset({DRAFT_KEEP_FIRST}) if needs is not None and needs.lag is not None else frozenset()
+    return carry_writes(needs) | keep
+
+
 @runtime_checkable
 class Drafter(Protocol):
     """A verifying node's drafter, built and loaded by the model. Subclass it
@@ -245,9 +264,14 @@ class Drafter(Protocol):
 
 
 @torch.compiler.disable
-def _read_carry(sampler, request_ids: Sequence[int], n: int) -> torch.Tensor:
+def _read_carry(sampler, request_ids: Sequence[int], n: int, name: str = DRAFT_CARRY) -> torch.Tensor:
     # the sampler's loop-back reads stay out of the compiled forward, as `sample` does
-    return sampler.loopback_state(DRAFT_CARRY, request_ids)[:n]
+    return sampler.loopback_state(name, request_ids)[:n]
+
+
+@torch.compiler.disable
+def _sink_first_rows(kv, keep: torch.Tensor) -> None:
+    kv.sink_lagged_rows(keep)
 
 
 def draft_verify_step(
@@ -270,6 +294,11 @@ def draft_verify_step(
     n = input_ids.shape[0]
     needs = drafter.needs
     carry = _read_carry(sampler, request_ids, n) if needs.carry is not None else None
+    if needs.lag is not None:
+        # the drafter's row 0 rewrites the token before the block, which its last block wrote unless
+        # the target accepted every draft: in the graph, before any of the drafter's writes
+        keep = _read_carry(sampler, request_ids, n, DRAFT_KEEP_FIRST).reshape(n) != 0
+        _sink_first_rows(resources[needs.kv.kv_cache], keep)
     drafts = drafter.propose(DraftInputs(request_ids, input_ids, resources, k, carry))
     if drafts.shape != (n, k):
         raise ValueError(f"drafter proposed {tuple(drafts.shape)} drafts for {n} rows of {k}")
@@ -293,6 +322,8 @@ def draft_verify_step(
         if carry is None:
             raise RuntimeError("a drafter that declares a carry returned none from observe")
         sampler.store_loopback_state(DRAFT_CARRY, request_ids, carry)
+    if needs.lag is not None:
+        sampler.store_loopback_state(DRAFT_KEEP_FIRST, request_ids, (result.accepted == k).long().view(n, 1))
     if resident is not None and resident.buffers.advance is not None:
         # the KV length cell advances by what the row keeps, in the graph
         resident.buffers.advance[:n].copy_(result.accepted + 1)

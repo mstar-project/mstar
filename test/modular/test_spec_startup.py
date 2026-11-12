@@ -277,7 +277,7 @@ def test_a_kv_pool_without_the_slack_is_refused():
     assert len(problems) == 1 and "set resources.kv_cache.max_seq_len to 64" in problems[0]
     assert "or lower the serving max_seq_len to 56" in problems[0]
     # the engine's load runs the same list (no serving limit there)
-    assert node_problems(decl, decl.token_stop, specs, False, max_seq_len=64) == problems
+    assert node_problems(decl, decl.token_stop, specs, False, max_seq_len=64)[0] == problems
 
 
 def _fit(needs=None, target=None, tap_size=16, more_taps=False, tap_nodes=None, **drafter):

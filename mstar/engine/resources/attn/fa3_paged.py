@@ -64,8 +64,11 @@ class FA3PagedWrapper:
     or captured, so eager and replayed steps split alike. Each row's ``span``
     queries attend to its stored length plus ``kv_extent`` keys (``span`` by
     default; fewer hides the block's last rows), bottom-right causal or, with
-    ``causal`` False, all of them. Takes the calls `FlashInferPrefillWrapper`
-    takes from the manager, and main's in-graph `gather_resident`."""
+    ``causal`` False, all of them. ``plan_span``: the KV plan's rows a request,
+    when it counts more than the wrapper's queries (a lagged drafter's pass,
+    whose extent may pass its own rows); ``span`` by default. Takes the calls
+    `FlashInferPrefillWrapper` takes from the manager, and main's in-graph
+    `gather_resident`."""
 
     plans_in_graph = True
     supports_gather_resident = False
@@ -73,18 +76,22 @@ class FA3PagedWrapper:
     def __init__(
         self, *, page_size: int, table_width: int, device: torch.device, span: int, kv_extent: int | None = None,
         causal: bool = True, batch_size: int | None = None, accelerator_graph: bool = False,
-        dtype: torch.dtype = torch.bfloat16,
+        dtype: torch.dtype = torch.bfloat16, plan_span: int | None = None,
     ):
         from mstar.utils.h2d import PinnedStager
 
+        plan_span = span if plan_span is None else plan_span
         kv_extent = span if kv_extent is None else kv_extent
-        if not 0 < kv_extent <= span:
-            raise ValueError(f"FA3PagedWrapper: kv_extent {kv_extent} outside a span of {span}")
+        # a lagged pass's queries attend past their own rows, never past the plan's
+        if not 0 < kv_extent <= plan_span:
+            raise ValueError(f"FA3PagedWrapper: kv_extent {kv_extent} outside a plan span of {plan_span}")
         self.device = device
         self.page_size = page_size
         self.width = table_width
         self.span = span
         self.kv_extent = kv_extent
+        # the KV plan's rows a request: more than the queries a lagged pass runs (`Lag`)
+        self.plan_span = plan_span
         self.causal = causal
         self.accelerator_graph = accelerator_graph
         self.batch_size = batch_size
@@ -113,18 +120,18 @@ class FA3PagedWrapper:
         del kwargs, causal  # the mask is fixed by the wrapper
         if window_left >= 0:
             raise ValueError("FA3PagedWrapper plans no sliding window")
-        qo = qo_indptr.numpy()
-        spans = np.diff(qo)
+        spans = np.diff(qo_indptr.numpy())
         rows = len(spans)
-        if rows and (spans != self.span).any():
-            raise ValueError(f"FA3PagedWrapper plans rows of {self.span} queries; got {spans.tolist()}")
+        if rows and (spans != self.plan_span).any():
+            raise ValueError(f"FA3PagedWrapper plans rows of {self.plan_span} queries; got {spans.tolist()}")
         kvp = paged_kv_indptr.numpy().astype(np.int64)
         npages = np.diff(kvp)
         if rows and int(npages.max()) > self.width:
             raise ValueError(f"a row of {int(npages.max())} pages, past the page table's {self.width}")
-        # the KV plan already counts the whole span: keys past kv_extent come off here
+        # the KV plan counts the whole plan span: keys past kv_extent come off here
         lens = (
-            np.maximum(npages - 1, 0) * self.page_size + paged_kv_last_page_len.numpy() - (self.span - self.kv_extent)
+            np.maximum(npages - 1, 0) * self.page_size + paged_kv_last_page_len.numpy()
+            - self.plan_span + self.kv_extent
         )
         host = np.zeros((rows, self.width), dtype=np.int32)
         row_of = np.repeat(np.arange(rows), npages)
@@ -142,7 +149,8 @@ class FA3PagedWrapper:
         self._rows = rows
         self._page_table = to_device_nonblocking(torch.from_numpy(host), self.device)
         self._seqused = to_device_nonblocking(torch.from_numpy(lens.astype(np.int32)), self.device)
-        self._qo_indptr_buf = to_device_nonblocking(torch.from_numpy(qo.astype(np.int32)), self.device)
+        qo = np.arange(rows + 1, dtype=np.int32) * self.span
+        self._qo_indptr_buf = to_device_nonblocking(torch.from_numpy(qo), self.device)
 
     def gather_resident(
         self, store: torch.Tensor, slots: torch.Tensor, kv_len: torch.Tensor, stride: int, col: int,

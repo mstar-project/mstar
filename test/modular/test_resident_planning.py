@@ -1788,6 +1788,8 @@ def _fmha_manager(pool: str, wrapper):
     manager = FlashInferManager.__new__(FlashInferManager)
     manager._kv_cache_name = pool
     manager._cg_plan_states = {CGSlotKey(bucket=BucketKey(WALK, 2, 2), slot=0, label="main"): wrapper}
+    # no lagged binding (`AttentionStep.lag`)
+    manager._lagged_cg = {}
     return manager
 
 

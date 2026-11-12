@@ -976,7 +976,7 @@ class Engine:
         and bind what its verify steps read: the sampler's ``k``, the ledger, and
         the node's share (`NodeSubmodule.bind_draft`). Every rank of an instance
         picks the same."""
-        from mstar.engine.resources.draft.drafter import carry_writes
+        from mstar.engine.resources.draft.drafter import carry_writes, verify_writes
         from mstar.engine.resources.draft.node import DrafterShare, NodeDraft
         from mstar.engine.resources.draft.startup import log_mode, node_problems, submodule_problems
 
@@ -992,7 +992,7 @@ class Engine:
         # the submodule's own, which is what runs
         decl = decl._replace(device_loopback=getattr(submodule, "device_loopback", None))
         # from config and the built submodule: the same on every rank, so a raise here is every rank's
-        problems = node_problems(decl, stop, specs_by_key, chunks, combined)
+        problems, lag = node_problems(decl, stop, specs_by_key, chunks, combined)
         if problems:
             raise RuntimeError("speculative decoding: " + "; ".join(problems))
         mode, reason = self._agreed_mode(decl, mgmt, specs_by_key, async_scheduling)
@@ -1002,10 +1002,13 @@ class Engine:
         if decl.needs.carry is not None:
             self._check_carry_rows(decl, sampler, mgmt)
         sampler.bind_verify(decl.config.num_draft_tokens)
+        sampler.bind_graph_reads(decl.walk, verify_writes(decl.needs))
         for resource in mgmt.resources.values():
             # never refuses: what a resource can't do, its capabilities said before the agreement
             resource.bind_verify_walk(decl.walk, decl.config.block, decl.config.kv_slack)
-        draft = NodeDraft(decl, mode, reason, stop.sampler, stop, self._runner.take_back_keys(mgmt.resources))
+        draft = NodeDraft(
+            decl, mode, reason, stop.sampler, stop, self._runner.take_back_keys(mgmt.resources), lag=lag,
+        )
         if mgmt.joint_comm_group is None or mgmt.joint_comm_group.rank == 0:
             # the instance's leader logs the agreed mode once
             log_mode(decl, mode, reason)
@@ -1020,8 +1023,8 @@ class Engine:
         )
         submodule.bind_draft(DrafterShare(
             decl.walk, stop.sampler, decl.config.num_draft_tokens, stop.prefill_walks,
-            carry_writes(decl.needs), decl.prefill_steps, decl.verify_steps,
-            correcting_keys,
+            carry_writes(decl.needs), verify_writes(decl.needs), decl.prefill_steps, decl.verify_steps,
+            correcting_keys, lag,
         ))
         return draft
 
@@ -1072,18 +1075,15 @@ class Engine:
                 )
 
     def _check_carry_rows(self, decl: "VerifyNode", sampler, mgmt: SubmoduleManagement) -> None:
-        """A captured verify step reads the drafter's carry off the sampler's
-        loop-back masters, which must then never be replaced: refused where they
-        grow (the in-graph scatter off, as above one rank). A recurrent pool
-        holding more requests than those rows only idles its extra slots."""
+        """The drafter's carry crosses steps on the sampler's loop-back rows. A
+        captured verify step reads them staged off the masters
+        (`SamplerResource.bind_graph_reads`), so the masters may grow, as they do
+        above one rank. Where they are fixed, a recurrent pool holding more
+        requests than their rows only idles its extra slots."""
         from mstar.utils.knobs import sampler_slots
 
         if not sampler.fixed_loopback_masters:
-            raise RuntimeError(
-                f"speculative decoding on {decl.node}: its drafter's carry is read in the captured verify step "
-                "off the sampler's loop-back rows, which grow (and move) unless the in-graph scatter keeps them "
-                "fixed: MSTAR_SAMPLER_INGRAPH_SCATTER=1, device loop-back on, and one rank (not yet under TP)"
-            )
+            return
         from mstar.engine.resources.recurrent.pool import RecurrentStatePool
 
         rows = sampler_slots()

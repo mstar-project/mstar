@@ -187,6 +187,20 @@ class KVCache:
             raise NotImplementedError(
                 f"KV layout {cfg.layout} is not recognized."
             )
+        # A layer set of another KV geometry (`PagedKVConfig.extra_storages`): a tensor of its own
+        # over the same pages, its layers after the primary's in the global layer index.
+        # One rank's heads of each, sharded as the pool is (`PagedKVConfig.storage_kv_heads`).
+        self.extra: list[torch.Tensor] = [
+            torch.zeros(
+                storage.num_layers, cfg.max_num_pages, 2, cfg.tokens_per_page, cfg.storage_kv_heads(i),
+                storage.head_dim, dtype=dtype, device=device,
+            )
+            for i, storage in enumerate(cfg.extra_storages, start=1)
+        ]
+        # global layer -> (extra storage, its layer), for the layers past the primary's
+        self._extra_layers: list[tuple[int, int]] = [
+            (s, j) for s, storage in enumerate(cfg.extra_storages) for j in range(storage.num_layers)
+        ]
 
     def _allocate_groups(self, cfg: PagedKVConfig, device: torch.device, dtype) -> None:
         """One buffer of ``num_units`` equal pages, each holding one page of a group's layers
@@ -207,6 +221,31 @@ class KVCache:
             view = buf.view(cfg.num_units, len(group.layers), 2, group.page_size, heads, dim).transpose(0, 1)
             for j, layer in enumerate(group.layers):
                 self._layers[layer] = view[j]
+
+    @property
+    def storages(self) -> list[torch.Tensor]:
+        """Every tensor of the pool's pages: the primary (``tensor``), then each extra storage's.
+        A whole-page operation (copy, offload, reload) runs over each."""
+        return [self.tensor, *self.extra]
+
+    def layer_set_bytes_per_token(self) -> dict[str, int]:
+        """Each layer set's KV bytes a token: its layers' K and V in its storage's geometry."""
+        tensors = self.storages
+        out = {}
+        for name, layers, storage in self.config.joined:
+            t = tensors[storage]
+            out[name] = layers * 2 * t.shape[-2] * t.shape[-1] * t.element_size()
+        return out
+
+    @property
+    def page_bytes(self) -> int:
+        """Bytes of one page in every storage."""
+        return sum(t[:, 0].nbytes for t in self.storages)
+
+    def _check_one_storage(self, what: str) -> None:
+        # these address the primary tensor alone, which a pool with an extra storage isn't
+        if self.extra:
+            raise NotImplementedError(f"{what} is not implemented for a pool with a layer set of its own KV geometry")
 
     def _check_ungrouped(self, what: str) -> None:
         # these index ``tensor`` by layer and token, which a page of two groups doesn't have
@@ -235,7 +274,8 @@ class KVCache:
 
     @property
     def nbytes(self) -> int:
-        return self.tensor.nbytes
+        """Bytes of every storage."""
+        return sum(t.nbytes for t in self.storages)
 
     def data_ptr(self) -> int:
         return self.tensor.data_ptr()
@@ -253,6 +293,7 @@ class KVCache:
         it defaults to this cache's own storage.
         """
         self._check_ungrouped("chunk_ptrs")
+        self._check_one_storage("chunk_ptrs")
         if self.layout == KVLayout.MLA:
             layer_stride, page_stride, token_stride = self.tensor.stride()[:3]
             element_size = self.tensor.element_size()
@@ -293,6 +334,9 @@ class KVCache:
         head_dim]. MLA: [max_num_pages, page_size, latent_dim]."""
         if self._layers is not None:
             return self._layers[layer_idx]
+        if layer_idx >= self.config.num_layers:
+            storage, layer = self._extra_layers[layer_idx - self.config.num_layers]
+            return self.extra[storage][layer]
         if self.layout not in (KVLayout.NHD, KVLayout.MLA):
             raise NotImplementedError(
                 f"layer_view is not implemented for layout {self.layout}."
@@ -352,6 +396,7 @@ class KVCache:
         range, one each for K and V otherwise. ``tensor`` is as for
         `chunk_view`."""
         self._check_ungrouped("layer_rows")
+        self._check_one_storage("layer_rows")
         if self.layout not in (KVLayout.NHD, KVLayout.MLA):
             raise NotImplementedError(
                 f"layer_rows is not implemented for layout {self.layout}."
@@ -384,14 +429,16 @@ class KVCache:
         dst = torch.as_tensor(dst_pages, dtype=torch.long, device=self.device)
         # The gather is materialized before the scatter, so pages may appear
         # in both src and dst.
-        self.tensor[:, dst] = self.tensor[:, src]
+        for tensor in self.storages:
+            tensor[:, dst] = tensor[:, src]
 
     def copy_slots(self, src_page: int, dst_page: int, end: int) -> None:
         """Copy tokens [0, end) of one page onto another, every layer, both K and V."""
         self._check_ungrouped("copy_slots")
         # Index with slices rather than tensors. Slices need no copy from the host,
         # so the copy doesn't wait on the stream.
-        self.tensor[:, dst_page, :, :end] = self.tensor[:, src_page, :, :end]
+        for tensor in self.storages:
+            tensor[:, dst_page, :, :end] = tensor[:, src_page, :, :end]
 
     def chunk_view(
         self, layer_idx: int, page_idx: int,
@@ -403,6 +450,7 @@ class KVCache:
         a tensor rebuilt from another process' cache with this same layout).
         """
         self._check_ungrouped("chunk_view")
+        self._check_one_storage("chunk_view")
         if tensor is None:
             tensor = self.tensor
         if self.layout == KVLayout.MLA:

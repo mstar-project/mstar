@@ -14,12 +14,23 @@ import torch
 from mstar.engine.resources.draft.config import DraftMode
 from mstar.engine.resources.draft.drafter import VERIFY_ACCEPTED, VERIFY_STOPPED, VERIFY_TOKENS, VerifyNode
 from mstar.engine.resources.draft.ledger import VerifyLedger
-from mstar.engine.resources.step import ResourceStep
+from mstar.engine.resources.step import Lag, ResourceStep
 
 logger = logging.getLogger(__name__)
 
 # seconds between acceptance log lines
 _LOG_EVERY_S = 60.0
+
+
+class DraftLag(NamedTuple):
+    """Where a lagged drafter's lag goes on its node's verify steps (`DrafterNeeds.lag`): the KV pool its
+    layer set ``layer_set`` is in, the positions over that pool, and the drafter's attention binding."""
+    walk: str
+    lag: Lag
+    kv_key: str
+    layer_set: str
+    pos_key: str
+    attn_key: str
 
 
 class DrafterShare(NamedTuple):
@@ -32,14 +43,16 @@ class DrafterShare(NamedTuple):
     sampler_key: str
     num_draft_tokens: int
     prompt_walks: frozenset[str]
-    # the sampler loop-back state the drafter's carry is stored through, on its prompt and verify steps
-    # (`carry_writes`)
-    loopback_writes: frozenset[str]
+    # the sampler loop-back state the drafter's state is stored through: its carry on both walks
+    # (`carry_writes`), and on a verify step a lagged drafter's keep flag too (`verify_writes`)
+    prompt_writes: frozenset[str]
+    verify_writes: frozenset[str]
     # the drafter's own resources' steps (`VerifyNode.prefill_steps`, `VerifyNode.verify_steps`)
     prompt_steps: Mapping[str, ResourceStep]
     verify_steps: Mapping[str, ResourceStep]
     # the node's resources that correct a verify step's state in its graph, in dependency order
     correcting_keys: tuple[str, ...] = ()
+    lag: DraftLag | None = None
 
     @property
     def block(self) -> int:
@@ -49,17 +62,21 @@ class DrafterShare(NamedTuple):
 
 def drafter_step(step, graph_walk: str, share: DrafterShare | None):
     """``step`` with its drafter's share, as a new step: on a prompt or verify step, the drafter's resource
-    steps and its loop-back writes on the node's sampler step. The engine derives all of it from the drafter's
-    declaration, so a captured graph and each step it replays agree by construction."""
+    steps and its loop-back writes on the node's sampler step, and on a verify step a lagged drafter's lag in
+    its KV, position and attention steps. The engine derives all of it from the drafter's declaration, so a
+    captured graph and each step it replays agree by construction."""
     if share is None or step is None:
         return step
+    for key, resource_step in step.steps.items():
+        if getattr(resource_step, "lag", None):
+            raise RuntimeError(f"a {graph_walk!r} step's {key!r} declares a lag, which only the engine sets "
+                               "(from the drafter's DrafterNeeds.lag)")
     if graph_walk == share.verify_walk:
-        own = share.verify_steps
+        writes, own = share.verify_writes, share.verify_steps
     elif graph_walk in share.prompt_walks:
-        own = share.prompt_steps
+        writes, own = share.prompt_writes, share.prompt_steps
     else:
         return step
-    writes = share.loopback_writes
     steps = dict(step.steps)
     if clash := sorted(steps.keys() & own.keys()):
         raise RuntimeError(f"a {graph_walk!r} step declares {clash}, its drafter's steps, which the engine adds")
@@ -71,7 +88,29 @@ def drafter_step(step, graph_walk: str, share: DrafterShare | None):
         steps[share.sampler_key] = replace(sampler_step, loopback_writes=sampler_step.loopback_writes | writes)
     # fresh each step, as a declaration's are: a resource may stamp its own step (KV's commit count)
     steps.update((key, replace(resource_step)) for key, resource_step in own.items())
+    lag = share.lag
+    if lag is not None and graph_walk == lag.walk:
+        for key, value in ((lag.kv_key, {lag.layer_set: lag.lag}), (lag.pos_key, lag.lag), (lag.attn_key, lag.lag)):
+            resource_step = steps.get(key)
+            if resource_step is None:
+                raise RuntimeError(f"a {graph_walk!r} step declares no {key!r} step, which the drafter's lag rides on")
+            steps[key] = replace(resource_step, lag=value)
     return replace(step, steps=steps)
+
+
+def check_lag(step, graph_walk: str, lag: DraftLag | None) -> None:
+    """The lag a step carries is the drafter's declared one, on exactly its KV, position and attention steps
+    (`drafter_step`), and none on any other step or walk: at capture, and at each verify step."""
+    on = lag is not None and graph_walk == lag.walk
+    for key, resource_step in step.steps.items():
+        got = getattr(resource_step, "lag", None) or None
+        want = None
+        if on and key == lag.kv_key:
+            want = {lag.layer_set: lag.lag}
+        elif on and key in (lag.pos_key, lag.attn_key):
+            want = lag.lag
+        if got != want:
+            raise RuntimeError(f"a {graph_walk!r} step's {key!r} lags {got}; the drafter declares {want} there")
 
 
 class TokenCut:
@@ -92,9 +131,11 @@ class NodeDraft:
 
     def __init__(
         self, decl: VerifyNode, mode: DraftMode, reason: str, sampler_key: str,
-        token_stop, take_back_keys: Sequence[str],
+        token_stop, take_back_keys: Sequence[str], lag: DraftLag | None = None,
     ):
         self.decl = decl
+        # where a lagged drafter's lag goes (`draft_lag`), checked on every verify step (`check_lag`)
+        self.lag = lag
         self.node = decl.node
         self.walk = decl.walk
         self.mode = mode
@@ -166,6 +207,7 @@ class NodeDraft:
             for name in ("pre_forks", "post_forks", "retention", "sink", "advance"):
                 if getattr(resource_step, name, None):
                     raise RuntimeError(f"a verify step's {key!r} declares {name}, which a take-back can't follow")
+        check_lag(step, self.walk, self.lag)
         block, seen = self.decl.config.block, []
         for key in self.take_back_keys:
             resource_step = step.get(key)

@@ -25,19 +25,28 @@ class DraftMode(Enum):
 
 
 class DraftMethod:
-    """A kind of drafter: whether it loads a checkpoint of its own."""
+    """A kind of drafter: whether it loads a checkpoint of its own, the ``k`` it drafts when the config
+    names none, and the most it may (None: any)."""
 
-    __slots__ = ("name", "needs_model")
+    __slots__ = ("name", "needs_model", "default_k", "max_k")
 
-    def __init__(self, name: str, needs_model: bool):
+    def __init__(self, name: str, needs_model: bool, default_k: int | None = None, max_k: int | None = None):
         self.name = name
         self.needs_model = needs_model
+        self.default_k = default_k
+        self.max_k = max_k
 
 
 # The drafters the engine knows. A model may serve others (a test's scripted
 # drafter, say) by passing its own table to `DraftConfig.parse`.
 DSPARK = DraftMethod("dspark", needs_model=True)
-DRAFT_METHODS: Mapping[str, DraftMethod] = {m.name: m for m in (DSPARK,)}
+# its checkpoints' trained depth
+EAGLE3 = DraftMethod("eagle3", needs_model=True, default_k=3, max_k=7)
+# a separate draft model's k one-row passes stay under its target's verify step at k <= 4 (0.60-0.85x at k = 4)
+# and go over it at k = 7, at every row count (1.04-1.41x): Qwen3-0.6B for Qwen3-8B on one H100, rows 1-64
+# (benchmark/draft_model_cost/step_cost.py)
+DRAFT_MODEL = DraftMethod("draft_model", needs_model=True, default_k=3, max_k=4)
+DRAFT_METHODS: Mapping[str, DraftMethod] = {m.name: m for m in (DSPARK, EAGLE3, DRAFT_MODEL)}
 
 _KEYS = ("method", "model", "num_draft_tokens", "mode")
 
@@ -83,9 +92,12 @@ class DraftConfig:
                 problems.append(f"method {method!r} drafts from its own checkpoint: set model")
             if not kind.needs_model and model is not None:
                 problems.append(f"method {method!r} drafts from the target's checkpoint: drop model")
-        k = block.get("num_draft_tokens")
+        k = block.get("num_draft_tokens", kind.default_k if kind is not None else None)
         if not (isinstance(k, int) and not isinstance(k, bool) and k >= 1):
             problems.append(f"num_draft_tokens must be a positive integer, got {k!r}")
+        elif kind is not None and kind.max_k is not None and k > kind.max_k:
+            problems.append(f"method {method!r} drafts at most {kind.max_k} tokens a step (num_draft_tokens), "
+                            f"got {k}")
         mode = block.get("mode", DraftMode.AUTO.value)
         try:
             mode = DraftMode(mode)
