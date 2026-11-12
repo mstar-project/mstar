@@ -19,6 +19,7 @@ from torch._dynamo.testing import CompileCounter
 
 from mstar.communication.tensors import LocalTransferEngine
 from mstar.engine.resources.attn.config import AttentionConfig, AttentionStep, AttnBackend
+from mstar.engine.resources.attn.kept_window import KeptWindowAttention
 from mstar.engine.resources.base import EngineResourceInfo
 from mstar.engine.resources.kv.config import (
     KVReqConfig,
@@ -32,6 +33,8 @@ from mstar.engine.resources.kv.config import (
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.kv.plan import kept_reach
 from mstar.engine.resources.kv.ring import RingKVManager
+from mstar.engine.resources.kv.rolling import RollingKVConfig, RollingKVReqConfig, RollingKVStep, RollingPosition
+from mstar.engine.resources.kv.rolling.manager import RollingKVManager
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.step import Segment, StepContext, SubmoduleStep
 from mstar.engine.state import (
@@ -45,6 +48,7 @@ from mstar.engine.state import (
     FrameWindow,
     KeptWindow,
     KVEntry,
+    Layout,
     Positions,
     Read,
     Rope,
@@ -57,7 +61,7 @@ from mstar.engine.state import (
     positions,
     rope,
 )
-from mstar.engine.state.adapters import RingHandle, build_specs, node_handles, state_steps
+from mstar.engine.state.adapters import RingHandle, build_specs, kv_layouts, node_handles, state_steps
 from mstar.engine.state.analysis import state_declaration_problems
 from mstar.engine.state.calls import kernel_setting
 from mstar.graph.base import GraphNode, Loop
@@ -596,3 +600,162 @@ def test_a_removed_request_leaves_the_exact_set():
     assert "a" in pool._exact, "a reset keeps the request's layout, and so its policy"
     pool.remove_request("a")
     assert "a" not in pool._exact
+
+
+# A kept-window read on the paged pool
+
+requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="gathers on a CUDA pool")
+
+
+def _kept_array(**fields) -> Array:
+    return _array("dit_kv", reads={"self_attn": _read(Bidirectional(kept_window=True))}, max_len=4096, **fields)
+
+
+@pytest.mark.parametrize("arrays", [
+    [_array("dit_kv", reads={"self_attn": _read(Bidirectional(kept_window=True), layers={0}),
+                             "attn": _read(Causal(), layers={1})}, max_len=4096)],
+    [_array("dit_kv", reads={"self_attn": _read(Bidirectional(kept_window=True), layers={0}),
+                             "other": _read(Bidirectional(kept_window=True), layers={1})}, max_len=4096)],
+], ids=["beside_causal", "beside_kept_window"])
+def test_a_kept_window_read_is_its_array_s_only_read(arrays):
+    """The pool releases what one read's window no longer reaches, which any other read of the array may reach."""
+    with pytest.raises(ValueError, match=r"Array 'dit_kv': no layout yet: reads\['\w+'\] keeps a window beside"):
+        build_specs(arrays)
+
+
+@pytest.mark.parametrize(("arrays", "message"), [
+    ([_array("dit_kv", reads={"self_attn": _read(Bidirectional(kept_window=True), walks={"rollout"}),
+                              "attn": _read(Causal(), walks={"prefill"})}, max_len=4096)],
+     "keeps a window beside reads"),
+    ([_array("dit_kv", reads={"self_attn": _read(Bidirectional(kept_window=True), walks={"rollout"})}, max_len=4096)],
+     r"reads\['self_attn'\].walks must be None"),
+    ([_array("q", reads={"own": _read(Causal())}),
+      _array("dit_kv", reads={"self_attn": _read(Bidirectional(kept_window=True), queries="q")}, max_len=4096)],
+     r"reads\['self_attn'\].queries must be None"),
+], ids=["walks_beside", "walks", "queries"])
+def test_a_kept_window_read_takes_no_queries_or_walks(arrays, message):
+    """A read with walks lands on the by-walk storage and one with queries on the cross storage, and the kept window
+    swaps the binding on each."""
+    with pytest.raises(ValueError, match=f"Array 'dit_kv': no layout yet: .*{message}"):
+        build_specs(arrays)
+
+
+def test_a_kept_window_read_takes_packed_queries():
+    with pytest.raises(ValueError, match="declares packed=False, and the kept-window kernel takes packed queries"):
+        build_specs([_array("dit_kv", reads={"self_attn": _read(Bidirectional(kept_window=True), packed=False)},
+                            max_len=4096)])
+
+
+def test_a_layout_sizes_exactly_its_kept_window_reads():
+    """A request's layout gives each kept-window read its sizes, which become the label's exact retention."""
+    array = _kept_array()
+    (layout,) = kv_layouts([array], {"dit_kv": {"main": Layout(kept_windows={
+        "self_attn": KeptWindow(18, window=24),
+    })}}, {})["dit_kv"].values()
+    assert layout.retention == RetentionPolicy(24, 18, exact=True)
+    with pytest.raises(RuntimeError, match=r"kept_windows gives no sizes for the kept-window read 'self_attn'"):
+        kv_layouts([array], {"dit_kv": {"main": Layout()}}, {})
+    with pytest.raises(RuntimeError, match=r"kept_windows: \['other'\] name no kept-window read"):
+        kv_layouts([array], {"dit_kv": {"main": Layout(kept_windows={
+            "self_attn": KeptWindow(18, window=24), "other": KeptWindow(1, window=1),
+        })}}, {})
+
+
+class _StubInner:
+    """The ragged cross manager under a kept-window read: records the reach each call attends, returns q."""
+
+    force_double_buffer = True
+
+    def __init__(self):
+        self.keys = []
+        self.plans = []
+
+    def plan(self, step, ctx):
+        self.plans.append(step)
+
+    def run(self, q, k, v, label=None):
+        self.keys.append(k.clone())
+        return q
+
+
+def test_a_kept_window_read_is_never_captured():
+    """Its reach changes length every step, so the capture leaves it out, and a plan under a lease is refused."""
+    attention = KeptWindowAttention(_StubInner(), "dit_kv")
+    assert not attention.can_capture()
+    leased = StepContext(request_ids=["a"], graph_walk="rollout", slot=0, capture=False,
+                         slot_lease=SimpleNamespace(captured=True))
+    with pytest.raises(RuntimeError, match="a kept-window read is eager-only"):
+        attention.plan(AttentionStep(segments=[Segment("a", "main", 4)]), leased)
+
+
+def _kept_and_rolling(device: torch.device, chunks=6, frame=3):
+    """LingBot's window at a frame of ``frame`` entries, a 6-frame sink and 18 frames attended, chunks of 4: the
+    keys a kept-window read on the paged pool gathers at every pass, and the ones `main`'s rolling store gives for
+    the same writes, through `RollingKVManager.window`."""
+    sink, window, chunk = 6 * frame, 8 * frame, 4 * frame
+    array = Array("dit_kv", nodes={"dit"}, layers={0}, entry=KVEntry(heads=1, head_dim=1), max_len=4096,
+                  reads={"self_attn": Read(mask=Bidirectional(kept_window=True), op=Attend(q_heads=1))})
+    kv_spec, attention_spec = build_specs([array], kernel_settings={"dit_kv": {"max_num_pages": 64}})
+    pool = KVManager(
+        cfg=replace(kv_spec.config, page_size=8), name="dit_kv", joint_comm_group=None,
+        transfer_engine_info=TransferEngineInfo("h", "h", LocalTransferEngine("h")), device=device,
+        dtype=torch.float32,
+    )
+    inner = _StubInner()
+    attention = KeptWindowAttention(inner, "dit_kv")
+    attention.bind_dependencies({"dit_kv": pool})
+    handle = node_handles(SimpleNamespace(declare_state=lambda: [array]), "dit",
+                          {"dit_kv": pool, attention_spec.resource_key: attention})["dit_kv"]
+    (row,) = kv_layouts([array], {"dit_kv": {"main": Layout(
+        growth=(("rollout", chunk),), kept_windows={"self_attn": KeptWindow(sink, window=window)},
+    )}}, {})["dit_kv"].values()
+    request = KVReqConfig(needed_labels=["main"])
+    request.apply_conductor_config(kv_layout={"main": row.row()}, loop_caps={"rollout": chunks})
+    pool.ingest_request("a", overrides=request)
+    rolling = RollingKVManager(RollingKVConfig(num_layers=1, num_heads=1, head_dim=1, pool_tokens=sink + window + chunk,
+                                               dtype=torch.float32), device)
+    rolling.ingest_request("a", RollingKVReqConfig(tokens=sink + window + chunk))
+    assert rolling.reserve("a", "dit", "rollout", None) is None
+    gathered, expected = [], []
+    for index in range(chunks):
+        ctx = StepContext(request_ids=["a"], graph_walk="rollout", slot=0, capture=False)
+        step = state_steps(SubmoduleStep(segments=[Segment("a", "main", chunk)], state={"dit_kv": ArrayStep()}),
+                           {"dit_kv": handle}, graph_walk="rollout")
+        step.set_ctx(ctx)
+        assert pool.admit(step.steps["dit_kv"], ctx).ok
+        ctx.plan_results = {"dit_kv": pool.plan(step.steps["dit_kv"], ctx)}
+        attention.plan(step.steps["self_attn"], ctx)
+        rolled = RollingKVStep(segments=(Segment("a", "chunk", chunk),),
+                               positions={"a": RollingPosition(index * chunk, sink, window + chunk)})
+        assert rolling.admit(rolled, ctx).ok
+        rolling.plan(rolled, ctx)
+        step.begin_calls()
+        for keep in (False, False, False, False, True):
+            k = (index * chunk + torch.arange(chunk, dtype=torch.float32, device=device)) + (0.5 if not keep else 0)
+            k = k[:, None, None]
+            handle.add(0, keep=keep, k=k, v=-k)
+            handle.read(0, torch.zeros(chunk, 1, 1, device=device))
+            gathered.append(inner.keys[-1].flatten())
+            rolling.write(0, k[None], -k[None])
+            expected.append(rolling.window(0)[0].flatten().clone())
+        step.check_calls()
+        pool.commit(step.steps["dit_kv"], ctx)
+        rolling.commit(rolled, ctx)
+        step.end_calls()
+    assert pool._streams["a"]["main"].released, "the pool should have released pages behind the sink"
+    return gathered, expected
+
+
+def test_a_kept_window_read_sees_main_s_rolling_window():
+    """The one test that ties the port to `main`'s store: at every pass of 6 chunks, past the window's fill at chunk
+    4, the kept window gathers exactly the keys, in the order, that the rolling store's view holds."""
+    gathered, expected = _kept_and_rolling(torch.device("cpu"))
+    for i, (got, want) in enumerate(zip(gathered, expected, strict=True)):
+        assert torch.equal(got, want), f"pass {i % 5} of chunk {i // 5} gathered other keys than the rolling view"
+
+
+@requires_cuda
+def test_the_reach_equals_the_store_s_view_on_cuda():
+    gathered, expected = _kept_and_rolling(torch.device("cuda"))
+    for i, (got, want) in enumerate(zip(gathered, expected, strict=True)):
+        assert torch.equal(got, want), f"pass {i % 5} of chunk {i // 5} gathered other keys than the rolling view"
