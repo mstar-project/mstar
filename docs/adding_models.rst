@@ -3797,7 +3797,9 @@ submodule cache and where the files come from. A model sets ``NAME`` and
 ``METADATA_FILES`` and writes ``__init__`` (setting
 ``config``, ``tokenizer`` and ``media``), its resources (the sampler from
 ``_sampler_spec``; ``MIXED_SPLIT`` is the attention resources' split of a mixed step),
-``_prompt_ids`` and ``_create_submodule``. The scaffold's
+``_prompt_ids`` and ``_create_submodule``. A model on the state contract subclasses
+``DeclaredDecoderModel``, which returns the layout as ``state_layout`` and the request's
+settings as ``SampleSettings``. The scaffold's
 ``rebuild_policies`` lets the KV cache drop a request and reprefill its ids on its prefill
 walk, a media prompt's with host copies of its encoders' outputs. A model whose LLM node
 holds a resource that can't drop returns ``{}``, or the engine refuses to start; Muse

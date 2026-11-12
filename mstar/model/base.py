@@ -3,7 +3,7 @@ import functools
 import itertools
 import math
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from fractions import Fraction
 from typing import TYPE_CHECKING, Any, NamedTuple, Type
@@ -143,7 +143,7 @@ if TYPE_CHECKING:
     from mstar.model.components.moe_parallel import MoeParallelConfig
 
 if TYPE_CHECKING:
-    from mstar.engine.state import Array, Sampler, SampleSettings
+    from mstar.engine.state import Array, Layout, Sampler, SampleSettings
     from mstar.engine.state.adapters import StateSetup
     from mstar.worker.scheduling_policy import WalkPriority
 
@@ -260,6 +260,35 @@ class LabelLayout(NamedTuple):
             self.keyed_count(),
             self.max_growth,
         ]
+
+
+class StateLayouts(NamedTuple):
+    """What a model on the state contract returns from `process_prompt` for its paged labels."""
+    state_layout: "dict[str, dict[str, Layout]]"
+    keyed_spans: dict[str, dict[str, int]]
+
+
+def state_layouts(kv_layout: Mapping[str, Mapping[str, LabelLayout]]) -> StateLayouts:
+    """``kv_layout`` as a ``state_layout``, with the ``keyed_spans`` of each label that sets them.
+    `PagedStorage.layouts` converts back, and both go when `LabelLayout` goes.
+
+    `Layout` has no field for ``retention`` or ``max_growth`` yet, so a label that sets one raises
+    ``RuntimeError``, a 500, rather than lose it.
+    """
+    from mstar.engine.state import Layout
+
+    state_layout, keyed_spans = {}, {}
+    for array, by_label in kv_layout.items():
+        for label, layout in by_label.items():
+            for name, value in (("retention", layout.retention), ("max_growth", layout.max_growth)):
+                if value is not None:
+                    raise RuntimeError(f"kv_layout[{array!r}][{label!r}].{name} is set, and a Layout can't hold it")
+            state_layout.setdefault(array, {})[label] = Layout(
+                spans=layout.spans, growth=layout.growth, scratch=layout.scratch,
+            )
+            if layout.keyed_spans is not None:
+                keyed_spans.setdefault(array, {})[label] = layout.keyed_spans
+    return StateLayouts(state_layout, keyed_spans)
 
 
 def prompt_spans(

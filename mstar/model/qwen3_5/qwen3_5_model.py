@@ -18,13 +18,11 @@ from mstar.engine.state import (
     Positions,
     Read,
     Sampler,
-    SampleSettings,
     TensorType,
     Value,
 )
 from mstar.model.base import ProcessPromptOutput, TensorAndMetadata
 from mstar.model.components.mrope import image_position_advance
-from mstar.model.components.request_kwargs import sample_settings
 from mstar.model.keys import MIXED
 from mstar.model.media_limits import read_image
 from mstar.model.multimodal import (
@@ -36,8 +34,8 @@ from mstar.model.multimodal import (
 )
 from mstar.model.multimodal_decoder import (
     MIXED_SPLIT,
+    DeclaredDecoderModel,
     MediaIntake,
-    MultimodalDecoderModel,
     PreparedMedia,
 )
 from mstar.model.qwen3_5.components.language_model import Qwen3_5ForCausalLM
@@ -65,7 +63,7 @@ from mstar.utils.fast_tokenize import encode_ids
 logger = logging.getLogger(__name__)
 
 # TODO: implement MoE variants
-class Qwen3_5DenseModel(MultimodalDecoderModel):
+class Qwen3_5DenseModel(DeclaredDecoderModel):
     NAME = "Qwen3.5"
     METADATA_FILES = (
         "config.json",
@@ -180,12 +178,6 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
         processor = self.image_processor
         min_patches = processor.size["shortest_edge"] // processor.patch_size ** 2
         return VisionEncoderSubmodule.BLOCK_LOOP_PATCH_BUCKETS[-1] // min_patches
-
-    def get_request_resource_configs(
-        self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
-    ) -> dict[str, SampleSettings]:
-        config = super().get_request_resource_configs(input_modalities, output_modalities, model_kwargs)[SAMPLER]
-        return {SAMPLER: sample_settings(config)}
 
     # -----------------------------------------------------------------------
     # Chunked prefill
@@ -397,12 +389,7 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
 
     def process_prompt(self, *args: Any, **kwargs: Any) -> ProcessPromptOutput:
         out = super().process_prompt(*args, **kwargs)
-        kv = out.metadata.pop("kv_layout")[KV_CACHE]["main"]
-        out.metadata["state_layout"] = {
-            KV_CACHE: {"main": Layout(spans=kv.spans, growth=kv.growth)}, GDN_STATE: {"main": Layout()},
-        }
-        if kv.keyed_spans is not None:
-            out.metadata["keyed_spans"] = {KV_CACHE: {"main": kv.keyed_spans}}
+        out.metadata["state_layout"][GDN_STATE] = {"main": Layout()}
         return out
 
     # ------------------------------------------------------------------

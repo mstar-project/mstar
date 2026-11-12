@@ -41,14 +41,12 @@ from mstar.engine.state import (
     Block,
     Causal,
     KVEntry,
-    Layout,
     Positions,
     Read,
     Rope,
     Sampler,
     SampleSettings,
 )
-from mstar.model.base import ProcessPromptOutput
 from mstar.model.components.audio_features import LogMelSpectrogram
 from mstar.model.components.request_kwargs import (
     GREEDY_SAMPLING,
@@ -60,7 +58,7 @@ from mstar.model.components.request_kwargs import (
     sampling_defaults,
 )
 from mstar.model.multimodal import TEXT, MediaEncoder, PromptPart
-from mstar.model.multimodal_decoder import MediaIntake, MultimodalDecoderModel, PreparedMedia
+from mstar.model.multimodal_decoder import DeclaredDecoderModel, MediaIntake, PreparedMedia
 from mstar.model.qwen3_asr.config import (
     ASR_TEXT_TAG,
     ATTN,
@@ -86,7 +84,7 @@ def audio_encoder() -> MediaEncoder:
     return MediaEncoder("audio", ENCODER_NODE, ("audio",), "audio_embeds", walk="prefill")
 
 
-class Qwen3ASRModel(MultimodalDecoderModel):
+class Qwen3ASRModel(DeclaredDecoderModel):
     """Qwen3-ASR: AuT encoder + dense Qwen3 decoder."""
 
     NAME = "Qwen3-ASR"
@@ -185,14 +183,6 @@ class Qwen3ASRModel(MultimodalDecoderModel):
     ) -> dict[str, SampleSettings]:
         del input_modalities, output_modalities
         return {SAMPLER: sample_settings(sampling_config(self.sampling_defaults, model_kwargs))}
-
-    def process_prompt(self, *args: Any, **kwargs: Any) -> ProcessPromptOutput:
-        out = super().process_prompt(*args, **kwargs)
-        kv = out.metadata.pop("kv_layout")[KV_CACHE]["main"]
-        out.metadata["state_layout"] = {KV_CACHE: {"main": Layout(spans=kv.spans, growth=kv.growth)}}
-        if kv.keyed_spans is not None:
-            out.metadata["keyed_spans"] = {KV_CACHE: {"main": kv.keyed_spans}}
-        return out
 
     # -------------------------------------------------------------------
     # Serving config and budget
