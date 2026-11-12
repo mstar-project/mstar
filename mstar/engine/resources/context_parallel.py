@@ -4,7 +4,9 @@ that would otherwise hold the same KV heads.
 Page ids stay logical and are the same on every rank, so allocation, prefix keys,
 offload and admission need nothing new. Within a page, logical slot ``s`` belongs to
 partner ``s % P`` and sits at its physical slot ``s // P``, so each rank stores
-``page_size // P`` slots a page. ``PagedKVConfig.place`` resolves the placement.
+``page_size // P`` slots a page. ``PagedKVConfig.place`` resolves the placement. A pool that keeps
+a sliding window places its first group of layers alone; the window's stay whole on every partner
+(``PagedKVConfig.placed_groups``).
 
 Attention over such a pool (``ContextParallelWrapper``) runs on each rank over its own slots and
 returns the partial with its log-sum-exp; the partners exchange partials and ``merge`` them,
@@ -581,12 +583,12 @@ class RingAttentionWrapper:
     masked the same way. A row this partner holds no query of is left out of its plan.
 
     ``paged`` is one eager kernel over this rank's slots per partner, all planned per step.
-    Eager only: a striped shard plans a leased step copied. The partner plans differ by rank and
-    no admission bounds them: FlashInfer's paged manager, the one backend that takes a placed pool
-    (``PlacedAttention``), so the one that plans a ring, bounds no plan at admission, as no refusal
-    of its planner on lengths is known. A backend whose planner may refuse on lengths (MLA's FA
-    planner) would have to bound every rank's partner plans at admission before it could plan a
-    ring, or one rank alone could refuse a lockstep step."""
+    Eager only: the node never splits a captured step (``SeqShardSpec.eager``). The partner
+    plans differ by rank and no admission bounds them: FlashInfer's paged manager, the one backend
+    that takes a placed pool (``PlacedAttention``), so the one that plans a ring, bounds no plan at
+    admission, as no refusal of its planner on lengths is known. A backend whose planner may refuse
+    on lengths (MLA's FA planner) would have to bound every rank's partner plans at admission before
+    it could plan a ring, or one rank alone could refuse a lockstep step."""
 
     # the step attends its own tokens from the pages, written first (`PlacedAttention.reads_step_kv`)
     reads_step_kv = False
@@ -798,10 +800,11 @@ def gather_merge(group: CommGroup, out: torch.Tensor, lse: torch.Tensor) -> torc
 
 def position_pools(specs: Iterable[NodeResourceSpec], node: str) -> dict[str, bool]:
     """``node``'s resources that hold token positions, each to whether it places them
-    (``NodeResourceSpec.places_positions``). Raises when one is placed and another isn't."""
+    (``NodeResourceSpec.storage`` by position or by head; a copied one goes with either). Raises
+    when one is placed and another isn't."""
     pools = {
-        spec.resource_key: placed for spec in specs
-        if node in spec.nodes and (placed := spec.places_positions) is not None
+        spec.resource_key: spec.storage == "by_position" for spec in specs
+        if node in spec.nodes and spec.storage in ("by_head", "by_position")
     }
     if any(pools.values()) and not all(pools.values()):
         raise ValueError(

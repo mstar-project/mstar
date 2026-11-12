@@ -14,8 +14,9 @@ The attention resources over the node depend on it (``shard_key``, taken in thei
 The exchanges are the functions at the bottom of this module, each wrapped around the resource's
 own ``run``:
 
-- ``ulysses``: one all-to-all from tokens to heads, ``run``, and one back (head-stored KV, or a
-  cacheless attention planning a label the shard lists, ``RaggedAttentionSpec.labels``);
+- ``ulysses``: one all-to-all from tokens to heads, ``run``, and one back (head-stored KV, a
+  cacheless attention planning a label the shard lists, ``RaggedAttentionSpec.labels``, or a
+  recurrent layer's prompt rows);
 - ``all_gather``: every rank's q, k and v gathered, ``run`` as on a copied step, this rank's share
   of the output (KV stored by position, ``context_parallel``);
 - ``ring``: a striped label's own tokens, whose K/V this rank stores, ``run`` on them with their
@@ -24,7 +25,14 @@ own ``run``:
 - ``head_slice``: a copied step at a ``tp * sp`` head geometry: this rank's heads, ``run``, gather
   the heads;
 - ``sharded_key_merge``: copied queries over split keys (cacheless cross-attention): each rank's
-  partial with its log-sum-exp, merged.
+  partial with its log-sum-exp, merged;
+- ``kv_gather``: every rank's k and v gathered, ``run`` writes them and attends this rank's
+  queries (KV every rank stores whole: a sliding-window attention's layers of a pool stored by
+  position).
+
+A recurrent layer's resource takes its conv's left context from the earlier ranks (``conv_halo``),
+and its prompt rows through ``ulysses`` where its heads split over the SP ranks or else
+``state_passing``, the state a row enters a rank with (the spec picks from its head counts).
 
 ``sequence_parallel_refusals`` is what a node on SP ranks may not declare; the engine and
 ``validate_deployment`` both run it.
@@ -33,7 +41,7 @@ own ``run``:
 from __future__ import annotations
 
 import math
-from collections.abc import Callable, Collection, Iterable, Mapping
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal, NamedTuple
 
@@ -65,10 +73,11 @@ class SeqShardSpec(NodeResourceSpec):
     of a label one length). ``walks`` lists the walks that may split (None: every walk); the
     others plan copied. A step splits only when it is not one token a row, its listed tokens are
     at least ``max(sp, min_tokens)``, and every listed label has at least ``sp`` tokens (a row,
-    for ``axis`` 1), so no rank gets an empty range. ``min_tokens`` is a ``resources:`` override.
+    for ``axis`` 1), so no rank gets an empty range. ``min_tokens`` is a ``resources:`` override,
+    a floor above the one the node sets itself (below).
 
     ``exchange``, also a ``resources:`` override, is how a split step's tokens reach the node's
-    paged attentions, from the storage of their KV:
+    paged attentions, from the storage of the node's pools (``NodeResourceSpec.storage``):
 
     - ``auto`` (the default): Ulysses over KV stored by head; over KV stored by position
       (``context_parallel``) the node runs copied, so splitting there is the deployment's to opt into;
@@ -76,9 +85,11 @@ class SeqShardSpec(NodeResourceSpec):
       stored position): split;
     - ``none``: never split.
 
-    A ragged attention takes a split label by Ulysses wherever it plans one this shard lists
-    (``RaggedAttentionSpec.labels``), which ``exchange`` doesn't change; a shard that never splits
-    stops it splitting too.
+    Where the node splits, a resource over state every rank stores whole takes its own exchange
+    whatever this one is: a window attention gathers the step's keys (``kv_gather``), a recurrent
+    layer the one its head counts allow. So does a ragged attention, by Ulysses wherever it plans a
+    label this shard lists (``RaggedAttentionSpec.labels``); a shard that never splits stops them
+    all splitting.
 
     ``exchanges=False`` declares that no op on the node mixes a listed label's units (a video
     decoder's independent clips): nothing exchanges them, so the node needs no attention, and a
@@ -89,10 +100,16 @@ class SeqShardSpec(NodeResourceSpec):
     ``combined_labels`` (``Resource.steps_from_segments``), so a combined plan label gets a range
     over its sources too; at one SP rank it plans copied at no cost.
 
-    Two fields are derived from ``exchange`` and the resources on its nodes (``derive``):
-    ``splits``, whether the node's steps may split (not where ``exchange`` resolves to ``none``,
-    or where no attention there takes split steps and ``exchanges`` is True), and ``stripe_pool``, the pool a ring
-    attention reads, by whose stored positions each step is striped."""
+    Two fields are derived from ``exchange`` and the resources on its nodes (``derive``), from
+    their hooks alone: ``splits``, whether the node's steps may split (not where ``exchange``
+    resolves to ``none``, or where no resource there takes split steps and ``exchanges`` is True);
+    ``stripe_pool``, the pool a ring attention reads, by whose stored positions each step is
+    striped; and ``eager``, whether a resource there splits its steps eagerly only
+    (``NodeResourceSpec.splits_eagerly``: a ring, ``kv_gather``, a recurrent layer). Such a node
+    never splits a captured step: at load the shard sets, for each walk it splits, a floor one
+    past that walk's largest captured bucket (``SequenceShard.check_captures``), the same on
+    every rank, so a step that fits a captured bucket runs copied in its graph and a bigger one
+    runs eagerly and splits (``min_tokens`` raises the floor, never lowers it)."""
 
     labels: tuple[str, ...]
     axis: int
@@ -101,6 +118,7 @@ class SeqShardSpec(NodeResourceSpec):
     exchange: SpExchange | Literal["auto"] = field(default="auto", kw_only=True)
     splits: bool = field(default=True, init=False, repr=False)
     stripe_pool: str | None = field(default=None, init=False, repr=False)
+    eager: bool = field(default=False, init=False, repr=False)
     exchanges: bool = field(default=True, kw_only=True)
 
     def __post_init__(self):
@@ -141,17 +159,24 @@ class SeqShardSpec(NodeResourceSpec):
             return self.exchange
         return "none" if by_position else "ulysses"
 
+    def node_exchange(self, specs: Mapping[str, NodeResourceSpec]) -> SpExchange:
+        """``exchange`` over the storage of the pools on its nodes, from raw fields."""
+        return self.exchange_over(
+            any(spec.storage == "by_position" for spec in specs.values() if spec.nodes & self.nodes)
+        )
+
     def derive(self, specs: Mapping[str, NodeResourceSpec]) -> list[str]:
         # from raw fields alone, so it doesn't matter which spec derives first
         ours = [spec for spec in specs.values() if spec.nodes & self.nodes]
-        by_position = any(spec.places_positions for spec in ours)
+        by_position = any(spec.storage == "by_position" for spec in ours)
         exchanges = [(spec, spec.resolve_exchange(specs)) for spec in ours]
         # a split nothing exchanges (`exchanges`) needs no attention to take it
-        self.splits = self.exchange_over(by_position) != "none" and (
+        self.splits = self.node_exchange(specs) != "none" and (
             not self.exchanges or any(e != "none" for _, e in exchanges)
         )
         pools = sorted({spec.config.kv_cache for spec, exchange in exchanges if exchange == "ring"})
         self.stripe_pool = pools[0] if len(pools) == 1 else None
+        self.eager = any(spec.splits_eagerly(specs) for spec in ours)
         nodes = sorted(self.nodes)
         if self.exchange in ("all_gather", "ring") and not by_position:
             return [
@@ -182,12 +207,11 @@ def shards_over(spec: NodeResourceSpec, specs: Mapping[str, NodeResourceSpec]) -
     return [other for other in specs.values() if isinstance(other, SeqShardSpec) and other.nodes & spec.nodes]
 
 
-def shard_exchange(spec: NodeResourceSpec, specs: Mapping[str, NodeResourceSpec], by_position: bool) -> SpExchange:
-    """How a split step reaches ``spec``, an attention over KV stored by position or by head: its
-    node's ``SeqShardSpec.exchange``, from raw fields; ``none`` without one shard (two are refused,
-    ``take_shard_edge``)."""
+def shard_exchange(spec: NodeResourceSpec, specs: Mapping[str, NodeResourceSpec]) -> SpExchange:
+    """How a split step reaches ``spec``'s node: its ``SeqShardSpec.node_exchange``, from raw
+    fields; ``none`` without one shard (two are refused, ``take_shard_edge``)."""
     shards = shards_over(spec, specs)
-    return shards[0].exchange_over(by_position) if len(shards) == 1 else "none"
+    return shards[0].node_exchange(specs) if len(shards) == 1 else "none"
 
 
 def take_shard_edge(spec: NodeResourceSpec, specs: Mapping[str, NodeResourceSpec]) -> list[str]:
@@ -259,6 +283,17 @@ class SeqRange(NamedTuple):
             return out
         return torch.empty_like(out).index_copy_(dim, self.order, out)
 
+    def row_pieces(self, spans: Sequence[int]) -> np.ndarray:
+        """Each rank's piece of each row of a packed label laid out by ``spans``: ``[P, R]`` token
+        counts, a row's pieces in rank order summing to its span. Contiguous ranges only."""
+        assert self.order is None and self.rows is None, "row pieces are a packed label's contiguous ranges"
+        assert sum(spans) == sum(self.counts), f"rows of {sum(spans)} tokens over ranges of {sum(self.counts)}"
+        ranks = np.concatenate([[0], np.cumsum(self.counts)])
+        rows = np.concatenate([[0], np.cumsum(spans, dtype=np.int64)])
+        lo = np.maximum(ranks[:-1, None], rows[None, :-1])
+        hi = np.minimum(ranks[1:, None], rows[None, 1:])
+        return np.maximum(hi - lo, 0)
+
 
 class SeqShardPlan(NamedTuple):
     """A step's split: whether its tokens split, and each split label's ranges."""
@@ -278,8 +313,9 @@ class SequenceShard(Resource):
     ``prefix_skip_safe`` (it plans from the step a prefix hit already trimmed), ``supports_preplan``
     (its dependents pre-plan), ``supports_context_parallel`` (a striped shard reads a placed pool's
     plan), ``resident_refusal`` (None: a one-token-a-row step, what resident planning replays, is
-    never split) and so ``max_repeats`` (any); it keeps ``can_capture`` True and ``force_double_buffer``
-    False (a leased step, the only kind a pre-plan stages, never stripes)."""
+    never split) and so ``max_repeats`` (any); it keeps ``can_capture`` True and
+    ``force_double_buffer`` False (a leased step, the only kind a pre-plan stages, never stripes: an
+    eager node's floors sit above its buckets, ``SeqShardSpec.eager``)."""
 
     prefix_skip_safe = True
     supports_split_steps = True
@@ -299,13 +335,17 @@ class SequenceShard(Resource):
     def __init__(
         self, labels: tuple[str, ...], axis: int, walks: frozenset[str] | None, min_tokens: int,
         group: CommGroup, splits: bool = True, stripe_pool: str | None = None,
-        device: torch.device = torch.device("cpu"), exchanges: bool = True,
+        device: torch.device = torch.device("cpu"), exchanges: bool = True, eager: bool = False,
     ):
         self.labels = labels
         self.axis = axis
         # the walks that may split; None for every walk
         self.walks = walks
         self.min_tokens = min_tokens
+        # `SeqShardSpec.eager`: where set, `check_captures` fills `floors`
+        self.eager = eager
+        # walk -> the least listed tokens a step of it splits at, one past its largest captured bucket
+        self.floors: dict[str, int] = {}
         self.group = group
         # `SeqShardSpec.stripe_pool`
         self.stripe_pool = stripe_pool
@@ -331,7 +371,7 @@ class SequenceShard(Resource):
         walks = None if spec.walks is None else frozenset(spec.walks)
         return cls(
             spec.labels, spec.axis, walks, spec.min_tokens, group, spec.splits, spec.stripe_pool, info.device,
-            exchanges=spec.exchanges,
+            exchanges=spec.exchanges, eager=spec.eager,
         )
 
     def depends_on(self) -> set[str]:
@@ -349,9 +389,13 @@ class SequenceShard(Resource):
         """Refuse captures this node can't replay when it splits: a piecewise region (its inner
         steps aren't bracketed, and its replay resets padding rows, so ``reset_request``, inside the
         forward), a graph replayed under a walk that decides otherwise than the walk
-        it was captured under, and a packed capture whose padding has no one label to join."""
+        it was captured under, and a packed capture whose padding has no one label to join.
+
+        On an eager node (``SeqShardSpec.eager``) it also sets the floors: no captured step
+        splits. Every rank sees the same configs, so the floors agree."""
         # the config module reaches back here through the submodule base
         from mstar.engine.accelerator_graph_config import AcceleratorGraphConfigType
+        from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner
 
         if not self.can_split:
             return
@@ -367,6 +411,14 @@ class SequenceShard(Resource):
                     f"node {node!r}: a graph captured for walks {sorted(walks)} replays both walks its sequence "
                     f"shard splits ({sorted(listed)}) and walks it doesn't; list all of them or none"
                 )
+            if self.eager:
+                largest = max(
+                    (n for bs in config.capture_batch_sizes or AcceleratorGraphRunner.CAPTURE_BATCH_SIZES
+                     for n in config.get_total_tokens(bs)),
+                    default=0,
+                )
+                for walk in listed:
+                    self.floors[walk] = max(self.floors.get(walk, 0), largest + 1)
             packed = config.get_config_type() == AcceleratorGraphConfigType.FLASH_INFER_PACKED
             if listed and packed and (len(self.labels) > 1 or self.axis != 0 or config.total_tokens_multiplier > 1):
                 raise ValueError(
@@ -411,10 +463,6 @@ class SequenceShard(Resource):
         if bucket is not None and not ctx.force_prefill and bucket.bs == bucket.num_tokens:
             # a batched decode replay, which declares its bucket: copied in O(1)
             return COPIED
-        if bucket is not None and self.stripe_pool is not None:
-            # the ring runs eager only; the lease is the instance's capture decision, so every
-            # rank plans the step copied alike
-            return COPIED
         sp = self.group.world_size
         segments = step.segments or ()
         tokens = sum(segment.span for segment in segments)
@@ -441,7 +489,7 @@ class SequenceShard(Resource):
             spans.setdefault(self.labels[0], []).append(pad)
         # an exchange needs every rank to hold tokens; a split nothing exchanges takes empty ranges
         least = sp if self.exchanges else 1
-        if sum(map(sum, spans.values())) < max(least, self.min_tokens):
+        if sum(map(sum, spans.values())) < max(least, self.min_tokens, self.floors.get(ctx.graph_walk, 0)):
             return COPIED
         for label, label_spans in spans.items():
             if self.axis == 1 and len(set(label_spans)) > 1:
@@ -522,23 +570,32 @@ class SequenceShard(Resource):
             return None
         return plan.ranges.get(label)
 
-    def scatter(self, label: str, *xs: torch.Tensor | None, dim: int | None = None):
+    def scatter(self, label: str, *xs: torch.Tensor | None, dim: int | None = None, walk: str | None = None):
         """This rank's share of each of ``xs`` (whole on every rank) along ``dim`` (the spec's
         axis by default), when this step splits ``label`` (``SeqRange.local``), contiguous; the inputs
         unchanged otherwise. One tensor in, one out; several in, a tuple out. None passes through.
 
         Contiguous because eager pointwise ops keep their first input's layout: a view of a
         channel-major stream (Wan2.2's patchified latents) would carry that layout through every
-        block's norms and residual adds."""
-        if not self.can_split:
+        block's norms and residual adds.
+
+        ``walk``, the step's walk where the caller's frame is compiled per walk: a walk the shard
+        never splits (outside ``walks``) traces straight through, as at one SP rank, rather than
+        breaking the frame."""
+        if not self.may_split(walk):
             return xs[0] if len(xs) == 1 else xs
         return self._bracket(label, xs, dim, scatter=True)
 
-    def gather(self, label: str, *xs: torch.Tensor | None, dim: int | None = None):
+    def gather(self, label: str, *xs: torch.Tensor | None, dim: int | None = None, walk: str | None = None):
         """``scatter``'s inverse: every rank's share of each of ``xs`` back whole."""
-        if not self.can_split:
+        if not self.may_split(walk):
             return xs[0] if len(xs) == 1 else xs
         return self._bracket(label, xs, dim, scatter=False)
+
+    def may_split(self, walk: str | None) -> bool:
+        """Whether a step of ``walk`` may split (None: any walk), though ``_decide`` may still plan
+        it copied. In O(1) from what is fixed at bind, so a compiled frame specializes on its walk."""
+        return self.can_split and (walk is None or self.walks is None or walk in self.walks)
 
     @torch.compiler.disable
     def _bracket(self, label: str, xs: tuple, dim: int | None, scatter: bool):
@@ -629,44 +686,62 @@ def _packed(x: torch.Tensor, r: SeqRange) -> torch.Tensor:
     return x if r.rows is None else x.flatten(0, 1)
 
 
-def ulysses(run: Callable, q, k, v, r: SeqRange):
-    """Split tokens to split heads: one all-to-all of q, k and v (each ``[n, H, D]``, this rank's
-    tokens) to ``[N, H / P, D]``, ``run``, and the output back.
+def ulysses(run: Callable, *xs: torch.Tensor | None, r: SeqRange):
+    """Split tokens to split heads: one all-to-all of each of ``xs`` (``[n, H, ...]``, this rank's
+    tokens, heads on dim 1; None passed through) to ``[N, H / P, ...]``, one exchange per dtype,
+    ``run`` on them, and its output back by token. None where ``run`` returns None (a K/V write
+    alone). Attention passes q, k and v; a recurrent layer its projections and gates.
 
-    Eager, as main's exchange is (`CommGroup.all_to_all`): a traced variant measured no faster.
-    """
-    _check_entry(r, q, k, v)
-    all_to_all = CommGroup.all_to_all
+    Eager, as main's exchange is (`CommGroup.all_to_all`): a traced variant measured no faster."""
+    _check_entry(r, *xs)
     seq, head = (0, 1) if r.rows is None else (1, 2)
-    parts = [x for x in (q, k, v) if x is not None]
-    exchanged = all_to_all(
-        r.group, [_seq_view(x, r) for x in parts], scatter_dim=head, gather_dim=seq, gather_sizes=list(r.counts),
-    )
-    exchanged = [_packed(x, r) for x in exchanged]
-    if q is None:
-        run(None, *exchanged)
+    parts = [_seq_view(x, r) for x in xs if x is not None]
+    exchanged: list[torch.Tensor | None] = [None] * len(parts)
+    for dtype in dict.fromkeys(x.dtype for x in parts):
+        # `all_to_all` packs one dtype; the dtypes come in the same order on every rank
+        chosen = [i for i, x in enumerate(parts) if x.dtype == dtype]
+        got = r.group.all_to_all(
+            [parts[i] for i in chosen], scatter_dim=head, gather_dim=seq, gather_sizes=list(r.counts),
+        )
+        for i, x in zip(chosen, got, strict=True):
+            exchanged[i] = _packed(x, r)
+    it = iter(exchanged)
+    out = run(*(None if x is None else next(it) for x in xs))
+    if out is None:
         return None
-    out = run(*exchanged)
-    out = all_to_all(r.group, _seq_view(out, r), scatter_dim=seq, gather_dim=head, scatter_sizes=list(r.counts))
+    out = r.group.all_to_all(_seq_view(out, r), scatter_dim=seq, gather_dim=head, scatter_sizes=list(r.counts))
     return _packed(out, r)
 
 
-def all_gather(run: Callable, q, k, v, r: SeqRange):
-    """Every rank's q, k and v gathered whole in one collective, in the step's order whatever the
-    label's layout, ``run`` on them as on a copied step, then this rank's share of the output.
-    ``q`` None: k and v alone, for the write."""
-    _check_entry(r, q, k, v)
-    parts = [x for x in (q, k, v) if x is not None]
-    assert r.rows is None and len({x.dtype for x in parts}) == 1, (
-        "all_gather takes a packed label's q, k and v of one dtype"
-    )
+def _whole(r: SeqRange, xs: Sequence[torch.Tensor | None]) -> list[torch.Tensor | None]:
+    """Every rank's share of each of ``xs`` (one dtype, None passed through) gathered whole in one
+    collective, in the step's order whatever the label's layout."""
+    parts = [x for x in xs if x is not None]
+    assert r.rows is None and len({x.dtype for x in parts}) == 1, "a packed label's tensors of one dtype"
     whole = r.whole(torch.cat([x.flatten(1) for x in parts], dim=-1))
-    pieces = whole.split([math.prod(x.shape[1:]) for x in parts], dim=-1)
-    gathered = [piece.unflatten(-1, x.shape[1:]).contiguous() for piece, x in zip(pieces, parts, strict=True)]
+    pieces = iter(whole.split([math.prod(x.shape[1:]) for x in parts], dim=-1))
+    return [None if x is None else next(pieces).unflatten(-1, x.shape[1:]).contiguous() for x in xs]
+
+
+def all_gather(run: Callable, q, k, v, r: SeqRange):
+    """Every rank's q, k and v gathered whole in one collective, ``run`` on them as on a copied
+    step, then this rank's share of the output. ``q`` None: k and v alone, for the write."""
+    _check_entry(r, q, k, v)
+    q, k, v = _whole(r, [q, k, v])
     if q is None:
-        run(None, *gathered)
+        run(None, k, v)
         return None
-    return r.local(run(*gathered))
+    return r.local(run(q, k, v))
+
+
+def kv_gather(run: Callable, q, k, v, r: SeqRange):
+    """KV every SP rank stores whole (a sliding-window attention's layers of a pool stored by
+    position): every rank's k and v gathered in one collective, and ``run`` writes the whole step
+    and attends this rank's own queries, which the resource planned over each row's keys up to its
+    own piece (``SeqRange.row_pieces``)."""
+    _check_entry(r, q, k, v)
+    k, v = _whole(r, [k, v])
+    return run(q, k, v)
 
 
 def ring(run: Callable, q, k, v, r: SeqRange):
@@ -701,6 +776,93 @@ def sharded_key_merge(run: Callable, q, k, v, r: SeqRange):
     return gather_merge(r.group, *run(q, k, v))
 
 
+class ConvHalo(NamedTuple):
+    """One rank's conv windows for a split step (``conv_halo``), as indices. ``tails`` (``[R, W - 1]``
+    into this rank's tokens, the zero row past them where a piece is shorter) is each row's last
+    inputs here, right-aligned; ``initial`` (``[L, W - 1]``) the window each row with a piece here
+    starts from, and ``final`` (``[R, W - 1]``) the window each row ends with, both into the rows'
+    stored windows followed by every rank's tails. ``rows`` (``[L]``) are the rows with a piece here
+    and ``spans`` their pieces, which the local conv runs over. The three indices are host arrays
+    as planned (``conv_halo_plan``), and on the device the conv runs on once uploaded (``to``)."""
+
+    tails: np.ndarray | torch.Tensor
+    initial: np.ndarray | torch.Tensor
+    final: np.ndarray | torch.Tensor
+    rows: np.ndarray
+    spans: np.ndarray
+
+    def to(self, device: torch.device) -> ConvHalo:
+        """The indices on ``device``, one non-blocking upload each, for ``conv_halo``."""
+        return self._replace(**{
+            name: to_device_nonblocking(getattr(self, name), device, torch.int64)
+            for name in ("tails", "initial", "final")
+        })
+
+
+def conv_halo_plan(pieces: np.ndarray, rank: int, taps: int) -> ConvHalo:
+    """Rank ``rank``'s ``ConvHalo`` for rows split ``pieces`` (``SeqRange.row_pieces``) under a conv
+    keeping ``taps`` inputs. The same tails, and the same ``final``, on every rank."""
+    world, num_rows = pieces.shape
+    mine = pieces[rank].astype(np.int64)
+    offsets = np.cumsum(mine) - mine
+    kept = np.minimum(mine, taps)
+    col = np.arange(taps)
+    lead = taps - kept
+    tails = np.where(col >= lead[:, None], (offsets - lead)[:, None] + mine[:, None] - kept[:, None] + col, mine.sum())
+    # every rank's tokens of each row before rank j end at cum[j]
+    cum = np.concatenate([np.zeros((1, num_rows), dtype=np.int64), np.cumsum(pieces, axis=0)])
+
+    def window(rows: np.ndarray, before: int) -> np.ndarray:
+        # the last `taps` inputs of each of `rows` before rank `before`: row token t (from -taps, the
+        # stored window) is stored tap taps + t, or tap taps - (end of its rank's piece - t) of that
+        # rank's tail
+        t = cum[before, rows][:, None] - taps + col
+        owner = (cum[1:, rows][:, :, None] <= t[None]).sum(0)
+        end = cum[1:][np.minimum(owner, world - 1), rows[:, None]]
+        stored = rows[:, None] * taps + taps + t
+        tail = num_rows * taps + (owner * num_rows + rows[:, None]) * taps + taps - end + t
+        return np.where(t < 0, stored, tail)
+
+    rows = np.flatnonzero(mine)
+    return ConvHalo(tails, window(rows, rank), window(np.arange(num_rows), world), rows, mine[rows])
+
+
+def conv_halo(conv: Callable, x: torch.Tensor, stored: torch.Tensor, halo: ConvHalo, group: CommGroup):
+    """A causal conv over a split step's rows, every channel, on this rank's tokens ``x``
+    (``[n, C]``): one all-gather of every rank's ``tails`` (``[P, R, W - 1, C]``) gives each row
+    with a piece here its window from the earlier ranks and the stored one (``stored``, ``[R, C,
+    W - 1]`` in the pool's dtype, zeros for a row without state), and every row's final window,
+    the same bytes on every rank. ``conv(x, initial)`` runs the conv over ``halo.rows`` from
+    ``initial`` (``[L, C, W - 1]``). Returns its output and the final windows ``[R, C, W - 1]``.
+    The conv kernels read both in the pool's dtype, and so do the windows here. ``halo``'s indices
+    are on ``x``'s device (``ConvHalo.to``)."""
+    channels = x.shape[1]
+    local = torch.cat([x.to(stored.dtype), x.new_zeros(1, channels, dtype=stored.dtype)])
+    tails = local[halo.tails]
+    gathered = group.all_gather(tails.unsqueeze(0).contiguous(), dim=0)
+    src = torch.cat([stored.transpose(1, 2).reshape(-1, channels), gathered.reshape(-1, channels)])
+    initial = src[halo.initial].transpose(1, 2).contiguous()
+    return conv(x, initial), src[halo.final].transpose(1, 2)
+
+
+def state_passing(
+    group: CommGroup, transition: torch.Tensor, offset: torch.Tensor,
+    compose: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+) -> torch.Tensor:
+    """The state a row enters this rank with, from every rank's hand-off of the last row it holds:
+    that piece's map from the state it starts with, ``X -> compose(X, transition) + offset``. One
+    fixed-size fp32 all-gather of every rank's record, then zeros composed through ranks ``0 ..
+    rank - 1`` in order. A rank where the row starts hands off a zero transition, so the ranks
+    before it drop out; one whose last row ends there, the identity and zeros."""
+    records = torch.cat([transition.float().flatten(), offset.float().flatten()])
+    gathered = group.all_gather(records.unsqueeze(0).contiguous(), dim=0)
+    transitions, offsets = gathered.split([transition.numel(), offset.numel()], dim=1)
+    state = offset.new_zeros(offset.shape, dtype=torch.float32)
+    for j in range(group.rank):
+        state = compose(state, transitions[j].view(transition.shape)) + offsets[j].view(offset.shape)
+    return state
+
+
 # --- refusals ----------------------------------------------------------------------------------
 
 
@@ -713,8 +875,8 @@ def sequence_parallel_refusals(
     checks on built objects (``supports_split_steps``, ``check_captures``) are the engine's."""
     if sp == 1:
         return []
-    all_specs = list(specs)
-    specs = [spec for spec in all_specs if node in spec.nodes]
+    by_key = {spec.resource_key: spec for spec in specs}
+    specs = [spec for spec in by_key.values() if node in spec.nodes]
     shard = next((spec for spec in specs if isinstance(spec, SeqShardSpec)), None)
     try:
         placed = any(position_pools(specs, node).values())
@@ -726,18 +888,17 @@ def sequence_parallel_refusals(
         if placed:
             return []
         if shard is not None:
-            # a model may default its shard to none (Qwen3-Omni's Thinker), leaving Ulysses over its
+            # a model may default its shard to none (Qwen3-Omni's Thinker, Qwen3.5's LLM), leaving Ulysses over its
             # pools stored by head the deployment's opt-in
             opt_in = (
                 f", split its steps by Ulysses (resources: {shard.resource_key}: exchange: ulysses)"
-                if shard.exchange == "none" and any(spec.places_positions is False for spec in specs) else ""
+                if shard.exchange == "none" and any(spec.storage == "by_head" for spec in specs) else ""
             )
             return [
                 f"node {node!r} runs on {sp} SP ranks, and its steps never split (its sequence shard's exchange "
-                "none, or no attention there takes split steps: a ragged one over no label it lists, or a read on "
-                "backend: sdpa), so "
-                f"its SP ranks would only share heads: store its KV by position (context_parallel){opt_in} or run "
-                "it on TP ranks"
+                "none, or no resource there takes split steps: a ragged attention over no label it lists, or a "
+                "read on backend: sdpa), so its SP ranks would only share heads: store its KV by position "
+                f"(context_parallel){opt_in} or run it on TP ranks"
             ]
         return [
             f"node {node!r} runs on {sp} SP ranks but neither splits tokens (a SeqShardSpec) nor stores "
@@ -746,14 +907,13 @@ def sequence_parallel_refusals(
         ]
     refusals = []
     if not shard.exchanges:
-        by_key = {spec.resource_key: spec for spec in all_specs}
         if any(spec.resolve_exchange(by_key) != "none" for spec in specs):
             refusals.append(
                 f"node {node!r} declares SeqShardSpec {shard.resource_key!r} with exchanges=False, which can hand "
                 "a rank no tokens, beside an attention that exchanges split tokens"
             )
     for spec in specs:
-        refusals += spec.split_step_refusals(node, shard, tp, sp)
+        refusals += spec.split_step_refusals(node, shard, tp, sp, by_key)
     if moe_parallel is not None and moe_parallel.parallel == "ep":
         refusals.append(f"node {node!r} splits tokens over SP ranks, which expert parallelism (ep_config) can't")
     return refusals

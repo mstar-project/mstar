@@ -224,7 +224,9 @@ class RaggedAttentionSpec(_RaggedSpecBase):
         shards = shards_over(self, specs)
         return "ulysses" if len(shards) == 1 and self.labels & set(shards[0].labels) else "none"
 
-    def split_step_refusals(self, node: str, shard: "SeqShardSpec", tp: int, sp: int) -> list[str]:
+    def split_step_refusals(
+        self, node: str, shard: "SeqShardSpec", tp: int, sp: int, specs: Mapping[str, "NodeResourceSpec"],
+    ) -> list[str]:
         cfg = self.config
         q, kv = cfg._unsharded_qo_heads, cfg._unsharded_kv_heads
         if self.sp_exchange != "ulysses":
@@ -272,7 +274,9 @@ class RaggedCrossAttentionSpec(_RaggedSpecBase):
 
         return take_shard_edge(self, specs)
 
-    def split_step_refusals(self, node: str, shard: "SeqShardSpec", tp: int, sp: int) -> list[str]:
+    def split_step_refusals(
+        self, node: str, shard: "SeqShardSpec", tp: int, sp: int, specs: Mapping[str, "NodeResourceSpec"],
+    ) -> list[str]:
         if shard.axis == 0 or not shard.exchanges:
             how = "splits packed tokens (axis 0)" if shard.axis == 0 else "declares exchanges=False"
             return [

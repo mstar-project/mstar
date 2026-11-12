@@ -312,11 +312,6 @@ class ThinkerSubmodule(ARNodeSubmodule):
         self.kv = handles[THINKER_KV]
         self.sampler = handles[THINKER_SAMPLER]
 
-    def bind_node_resources(self, resources: dict) -> None:
-        super().bind_node_resources(resources)
-        # the Thinker brackets its layer stack on the node's shard
-        self.model.sequence_shard = self.sequence_shard
-
     def _get_inv_freq(self, device: torch.device) -> torch.Tensor:
         """Lazy-initialize and cache inverse frequencies."""
         if self._inv_freq is None or self._inv_freq.device != device:

@@ -49,6 +49,7 @@ from mstar.engine.state import (
     Sampler,
     SampleSettings,
     SampleStep,
+    SeqShard,
     Span,
     TensorType,
     Value,
@@ -132,6 +133,7 @@ def _handles(*declarations, node="LLM") -> dict:
         "rope": SimpleNamespace(), "kv_pos": SimpleNamespace(), "other_pos": SimpleNamespace(),
         "other_kv": _StubKV(), "gdn": _StubPool(), "linear": SimpleNamespace(), "conv": None,
         "sampler": SimpleNamespace(), "vision_attn": SimpleNamespace(run=lambda *args, **kwargs: None),
+        "shard": SimpleNamespace(can_split=True),
     }
     return node_handles(_StubModel(*declarations), node, resources)
 
@@ -253,6 +255,34 @@ def test_each_step_gets_fresh_step_objects():
     second = state_steps(SubmoduleStep(segments=[Segment(2, "main", 2)], state={"kv": ArrayStep()}), handles)
     assert first.steps["kv"].segments == [Segment(1, "main", 1)], "a step's KVStep carries that step's segments"
     assert second.steps["kv"].segments == [Segment(2, "main", 2)]
+
+
+def test_a_regions_step_leaves_the_nodes_shard_handle_open():
+    handles = _handles(SeqShard("shard", nodes={"LLM"}))
+    ctx = SimpleNamespace(replays=False, graph_walk="prefill")
+    node_step = state_steps(SubmoduleStep(segments=SEGMENTS), handles)
+    node_step.set_ctx(ctx)
+    node_step.begin_calls()
+    runner = object.__new__(agr.PiecewiseAcceleratorGraphRunner)
+    runner._config = SimpleNamespace(region_step=lambda *args: SubmoduleStep(segments=SEGMENTS))
+    runner._segment_keys, runner._state_handles = (), handles
+    region_step = runner._region_step([1], [4])
+    region_step.set_ctx(ctx)
+    region_step.begin_calls()
+    region_step.end_calls()
+    assert handles["shard"].label == "main", "the node's step is still running"
+
+
+@pytest.mark.parametrize("can_split", [False, True])
+def test_a_shard_holds_a_step_nothing_else_needs_only_where_it_can_split(can_split):
+    # at one SP rank the shard's plan is a constant, so the step skips its resources as on a node with no shard
+    handles = node_handles(
+        _StubModel(SeqShard("shard", nodes={"LLM"})), "LLM", {"shard": SimpleNamespace(can_split=can_split)},
+    )
+    step = state_steps(SubmoduleStep(segments=SEGMENTS), handles)
+    assert (step is not None) == can_split
+    if can_split:
+        assert step.state_handles == (handles["shard"],)
 
 
 def test_a_step_with_no_state_comes_back_as_it_was():

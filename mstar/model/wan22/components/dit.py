@@ -41,8 +41,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from mstar.engine.state import gather, scatter, split_range
 from mstar.model.components.diffusion.attention import attend
-from mstar.model.components.diffusion.denoise_loop import MAIN_SPAN
 from mstar.model.components.diffusion.ffn import gelu_tanh_ffn
 from mstar.model.components.diffusion.modulation import ada_layer_norm
 from mstar.model.components.diffusion.qk_norm_rope import rms_norm_rope
@@ -283,7 +283,7 @@ def _token_runs(shard, timestep: torch.Tensor, per_frame: int) -> torch.Tensor:
     unless the shard splits the step's tokens. A rank's share need not be whole frames, so it
     then modulates per run of tokens, the longest run that tiles a frame and every rank's share:
     ``[B, count / run]``. Eager, so a compiled forward doesn't guard on the step's plan."""
-    r = shard.split_range(MAIN_SPAN)
+    r = split_range(shard)
     if r is None:
         return timestep
     run = math.gcd(per_frame, *r.counts)
@@ -359,8 +359,8 @@ class Wan22DiT(nn.Module):
         token takes its frame's value), text embeds ``[B, 512, text_dim]``
         bf16. Returns ``[B, C_out, F, H, W]`` bf16. The self-attention reads the
         array bound to it, and the cross-attention always runs SDPA.
-        ``shard``: the node's sequence shard (``SequenceShard``), which on a
-        step it splits cuts each row's tokens (label ``MAIN_SPAN``) to this
+        ``shard``: the node's sequence shard's handle, which on a
+        step it splits cuts each row's tokens to this
         rank's share; the self-attention's resource then exchanges them."""
         batch_size, _, num_frames, height, width = hidden_states.shape
         p_t, p_h, p_w = self.config.patch_size
@@ -376,10 +376,10 @@ class Wan22DiT(nn.Module):
 
         # every per-token tensor is cut to this rank's tokens on a step the shard splits
         # `can_split` is fixed at bind: at one SP rank a compiled forward traces straight through
-        if shard is not None and shard.can_split:
+        if shard is not None and shard.needs_step:
             timestep = _token_runs(shard, timestep, hidden_states.shape[1] // grid[0])
-            hidden_states = shard.scatter(MAIN_SPAN, hidden_states)
-            rotary_emb = shard.scatter(MAIN_SPAN, *rotary_emb, dim=0)  # [S, D] tables
+            hidden_states = scatter(shard, hidden_states)
+            rotary_emb = scatter(shard, *rotary_emb, dim=0)  # [S, D] tables
 
         temb, timestep_proj, encoder_hidden_states = self.condition_embedder(
             timestep, encoder_hidden_states
@@ -394,7 +394,7 @@ class Wan22DiT(nn.Module):
         _, hidden_states = ada_layer_norm(hidden_states, shift, scale, eps=self.norm_out.eps)
         hidden_states = self.proj_out(hidden_states)
         if shard is not None:
-            hidden_states = shard.gather(MAIN_SPAN, hidden_states)
+            hidden_states = gather(shard, hidden_states)
 
         hidden_states = hidden_states.reshape(batch_size, *grid, p_t, p_h, p_w, -1)
         hidden_states = hidden_states.permute(0, 7, 1, 4, 2, 5, 3, 6)
