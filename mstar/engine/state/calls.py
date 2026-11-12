@@ -299,6 +299,9 @@ class ShardHandle(StepHandle):
     def check_step(self, step) -> None:
         return
 
+    def commit_step(self, step) -> None:
+        """Nothing: a shard holds no state across steps."""
+
     def end_step(self, step) -> None:
         self.label = self.walk = None
 
