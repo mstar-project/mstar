@@ -47,10 +47,10 @@ mod ws;
 
 use client_errors::scrub_paths;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::convert::Infallible;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use axum::{
     body::{Body, Bytes},
@@ -267,6 +267,7 @@ async fn main() {
         .with_graceful_shutdown(shutdown_signal())
         .await
         .unwrap();
+    remove_pending_uploads();
 }
 
 /// SIGTERM/SIGINT: stop accepting, drain in-flight requests, exit — with a
@@ -289,6 +290,7 @@ async fn shutdown_signal() {
     tokio::spawn(async {
         tokio::time::sleep(std::time::Duration::from_secs(30)).await;
         eprintln!("mstar-server: drain deadline reached, exiting");
+        remove_pending_uploads();
         std::process::exit(0);
     });
 }
@@ -550,6 +552,16 @@ impl Drop for DeferredCleanup {
     }
 }
 
+/// Uploads waiting out their 60 s; shutdown deletes what is left, since the
+/// sleeping tasks die with the runtime.
+static PENDING_UPLOADS: Mutex<Option<HashSet<PathBuf>>> = Mutex::new(None);
+
+fn remove_pending_uploads() {
+    for f in PENDING_UPLOADS.lock().unwrap().take().into_iter().flatten() {
+        let _ = std::fs::remove_file(f);
+    }
+}
+
 /// Delete a request's persisted media 60 s after translation, matching
 /// mstar's deferred upload cleanup. Only files under `upload_dir` are deleted.
 fn schedule_upload_cleanup(upload_dir: &std::path::Path, args: &SubmitArgs) {
@@ -563,10 +575,14 @@ fn schedule_upload_cleanup(upload_dir: &std::path::Path, args: &SubmitArgs) {
     if files.is_empty() {
         return;
     }
+    PENDING_UPLOADS.lock().unwrap().get_or_insert_default().extend(files.iter().cloned());
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
         for f in files {
-            let _ = std::fs::remove_file(f);
+            let _ = std::fs::remove_file(&f);
+            if let Some(pending) = PENDING_UPLOADS.lock().unwrap().as_mut() {
+                pending.remove(&f);
+            }
         }
     });
 }

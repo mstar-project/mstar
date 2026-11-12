@@ -377,8 +377,9 @@ def test_follower_ignores_conductor_drain():
 def test_a_follower_takes_the_conductors_teardown_of_a_request_it_follows_no_leader_for(replica):
     """Data-parallel over a TP group: this worker follows rank 0 of one replica,
     and also runs a node of a request whose TP node runs on the other one. No
-    leader forwards that request's drain and remove here, so the conductor's
-    count; ignored, its abort stalls for the drain TTL and its state leaks."""
+    leader forwards that request's drain and remove here, so the conductor's are
+    the only ones that arrive; if they were ignored, the abort would stall for
+    the drain TTL and the request's state would leak."""
     w = _worker(is_follower=True, sharding=tp_sharding(*(("lead", "w0") if replica == "followed" else ("w2", "w3"))))
     _drain(w, request_id="X")  # source=CONDUCTOR
     _remove(w, request_id="X")
