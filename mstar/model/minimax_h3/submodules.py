@@ -14,8 +14,10 @@ against diffusers' pipeline.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import math
+from collections import OrderedDict
 from typing import NamedTuple
 
 import torch
@@ -74,6 +76,9 @@ FIRST_STEP = "first_step"
 # the keyframes' uint8 pixels for the VAE encoder, and their normalized latent rows
 VISION_PIXELS, KEYFRAME_PIXELS, COND_LATENTS = "vision_pixels", "keyframe_pixels", "cond_latents"
 TEXT_SPAN = "text"
+# step metadata: a digest of everything the text node's output depends on (``text_cache_key``),
+# under which ``H3TextEncoderSubmodule`` memoises its output when its cache is on
+TEXT_CACHE_KEY = "text_cache_key"
 
 
 def layout_from_metadata(step_metadata: dict) -> H3Layout:
@@ -96,6 +101,18 @@ def layout_from_metadata(step_metadata: dict) -> H3Layout:
 class TextStep(NamedTuple):
     length: int
     grids: tuple[tuple[int, int, int], ...] = ()   # each keyframe's (t, h, w) patch grid
+    cache_key: str | None = None  # the request's TEXT_CACHE_KEY, where the node keeps a cache
+
+
+def text_cache_key(ids: torch.Tensor, pixels: list[torch.Tensor] = ()) -> str:
+    """The text node's output is a function of the prompt's token ids and the vision tower's
+    pixel rows alone (each tensor's shape carries its grid): a digest of both, on the host."""
+    digest = hashlib.blake2b(digest_size=16)
+    for tensor in (ids, *pixels):
+        tensor = tensor.detach().to("cpu").contiguous()
+        digest.update(f"{tensor.dtype}{tuple(tensor.shape)};".encode())
+        digest.update(tensor.view(-1).view(torch.uint8).numpy().tobytes())
+    return digest.hexdigest()
 
 
 class H3TextEncoderSubmodule(NodeSubmodule):
@@ -103,6 +120,11 @@ class H3TextEncoderSubmodule(NodeSubmodule):
     through layer 50, then the DiT's ``condition_proj`` and token refiner. The refiner's
     output doesn't depend on the step, so it runs here, once per request. With keyframes
     the prompt is laid out by ``qwen3_vl_prompt`` around the vision tower's tokens.
+
+    With ``cache_entries`` it memoises its output under the request's ``TEXT_CACHE_KEY``, the
+    ``cache_entries`` most recently used: a repeated prompt (and references) skips the encoder
+    and the refiner and is served the same tensor, which recomputing would reproduce bit for
+    bit (one request a forward, the same kernels). A request without a key always computes.
     """
 
     disable_torch_compile = True
@@ -110,12 +132,17 @@ class H3TextEncoderSubmodule(NodeSubmodule):
     float32_matmul_precision = "highest"
 
     def __init__(self, encoder: nn.Module, conditioner: nn.Module, *, vision: QwenVisionModel | None = None,
-                 config: H3Config | None = None):
+                 config: H3Config | None = None, cache_entries: int = 0):
         super().__init__()
         self.encoder = encoder
         self.conditioner = conditioner
         self.vision = vision
         self.h3_config = config
+        if isinstance(cache_entries, bool) or not isinstance(cache_entries, int) or cache_entries < 0:
+            raise ValueError(f"cache_entries must be a non-negative int, got {cache_entries!r}")
+        self.cache_entries = cache_entries
+        # TEXT_CACHE_KEY -> the text rows, least recently used first
+        self._cache: OrderedDict[str, torch.Tensor] = OrderedDict()
         if vision is not None:
             # per-frame SDPA, not a node resource: the tower runs once per request on a few
             # thousand patches
@@ -134,8 +161,9 @@ class H3TextEncoderSubmodule(NodeSubmodule):
             pixels = inputs[VISION_PIXELS]
             tensors[VISION_PIXELS] = pixels[0] if len(pixels) == 1 else torch.cat([p.flatten(0, -2) for p in pixels])
             grids = tuple(tuple(int(v) for v in g) for g in fwd_info.step_metadata["keyframe_grids"])
+        key = fwd_info.step_metadata.get(TEXT_CACHE_KEY) if self.cache_entries else None
         return NodeInputs(tensor_inputs=tensors, input_seq_len=int(ids.shape[0]),
-                          resource_step_info=TextStep(int(ids.shape[0]), grids))
+                          resource_step_info=TextStep(int(ids.shape[0]), grids, key))
 
     def can_batch(self, batch, model_inputs) -> bool:
         return False
@@ -148,13 +176,22 @@ class H3TextEncoderSubmodule(NodeSubmodule):
 
     def forward(self, graph_walk, engine_inputs, text_inputs: torch.Tensor, step: TextStep,
                 vision_pixels: torch.Tensor | None = None, **kwargs) -> NameToTensorList:
+        cached = self._cache.get(step.cache_key) if step.cache_key is not None else None
+        if cached is not None:
+            self._cache.move_to_end(step.cache_key)
+            return {TEXT_EMBEDS: [cached]}
         device = self.get_device()
         ids = text_inputs.to(device=device, dtype=torch.long)
         if vision_pixels is None:
             hidden = self.encoder(ids[None], torch.ones_like(ids[None]), padded=False)
         else:
             hidden = self._encode_with_images(ids, vision_pixels.flatten(0, -2).to(device), list(step.grids))
-        return {TEXT_EMBEDS: [self.conditioner(hidden)[0]]}
+        rows = self.conditioner(hidden)[0]
+        if step.cache_key is not None:
+            self._cache[step.cache_key] = rows
+            while len(self._cache) > self.cache_entries:
+                self._cache.popitem(last=False)
+        return {TEXT_EMBEDS: [rows]}
 
     def _encode_with_images(self, ids: torch.Tensor, pixels: torch.Tensor, grids: list) -> torch.Tensor:
         vision, device = self.vision, ids.device

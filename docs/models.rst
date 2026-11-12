@@ -2543,7 +2543,10 @@ Deployment knobs (``model_kwargs``; the configs set ``compile`` and ``vae_tile_b
 ``compile`` and ``row_bucket`` (the DiT's blocks, as ``minimax_h3``), ``vae_tile_batch``
 (256-px tiles per decoder call: one at a time, the reference's order, leaves the decode
 launch-bound at 9.2 s for 16 MP on a B300 against 0.45 s at 64, and the batched decode is
-bit-identical) and ``vae_compile``; the attention backend is a resource setting
+bit-identical), ``vae_compile`` and ``text_cache_entries`` (the text node keeps the text rows
+of that many recent prompts and their references, keyed by a digest of the token ids and the
+vision tower's pixels, as SGLang's conditioning cache does: a repeat skips the 33B encoder and
+gets the same image; the configs keep 16, 0 turns it off); the attention backend is a resource setting
 (``resources: {dit_attn: {backend: sdpa}, refiner_attn: {backend: sdpa}}``). The
 configs: ``minimax_h3_image.yaml`` (2 GPUs, the DiT alone on one), ``minimax_h3_image_sp2.yaml``
 (the DiT Ulysses over 2 GPUs, the decoder in its SP group decoding half of the tiles per rank,

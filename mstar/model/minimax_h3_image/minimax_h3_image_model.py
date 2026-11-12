@@ -26,7 +26,7 @@ from mstar.engine.resources import SeqShardSpec
 from mstar.engine.state import Array, SeqShard
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Parallel, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.base import Model, TensorAndMetadata, WalkStep
+from mstar.model.base import Model, ProcessPromptOutput, TensorAndMetadata, WalkStep
 from mstar.model.components.diffusion.attention import refuse_attention_backend_kwarg
 from mstar.model.components.diffusion.image_io import OUTPUT_FORMAT_KWARGS, encode_image, image_output_format
 from mstar.model.media_limits import PILLOW_IMAGE_FORMATS, check_image_size, decoding_upload, open_upright_image
@@ -50,10 +50,12 @@ from mstar.model.minimax_h3.minimax_h3_model import (
 from mstar.model.minimax_h3.submodules import (
     COND_LATENTS,
     LATENTS,
+    TEXT_CACHE_KEY,
     TEXT_EMBEDS,
     TEXT_INPUTS,
     VISION_PIXELS,
     H3TextEncoderSubmodule,
+    text_cache_key,
 )
 from mstar.model.minimax_h3_image.config import (
     CANVAS_MULTIPLE,
@@ -98,6 +100,9 @@ MAX_STEPS = 16
 class H3ImageModel(Model):
     """MiniMax-H3-Image (33B DiT, guidance- and step-distilled) text-to-image and editing."""
 
+    # the digest process_prompt keys the text node's cache by; a client's value is dropped
+    INTERNAL_KWARGS = (TEXT_CACHE_KEY,)
+
     def __init__(
         self,
         model_path_hf: str = H3_IMAGE_REPO,
@@ -109,6 +114,7 @@ class H3ImageModel(Model):
         row_bucket: int | None = None,
         vae_tile_batch: int = 1,
         vae_compile: bool = False,
+        text_cache_entries: int = 0,
         **kwargs,
     ):
         refuse_attention_backend_kwarg(kwargs)
@@ -133,6 +139,11 @@ class H3ImageModel(Model):
             raise ValueError(f"row_bucket must be a positive int, got {row_bucket!r}")
         self.vae_tile_batch = int(vae_tile_batch)  # 1 decodes one tile a call, as the reference
         self.vae_compile = bool(vae_compile)
+        # the text node keeps this many prompts' text rows (0: none), as SGLang's conditioning
+        # cache does: a repeated prompt and references skip the 33B encoder, bit-identically
+        if isinstance(text_cache_entries, bool) or not isinstance(text_cache_entries, int) or text_cache_entries < 0:
+            raise ValueError(f"text_cache_entries must be a non-negative int, got {text_cache_entries!r}")
+        self.text_cache_entries = text_cache_entries
         self._snapshot = None
         self._config: H3ImageConfig | None = None
         self.tokenizer = None
@@ -308,10 +319,11 @@ class H3ImageModel(Model):
     def process_prompt(
         self, prompt: str | None, input_modalities: list[str], output_modalities: list[str],
         tensors: NameToTensorList | None = None, **kwargs,
-    ) -> NameToTensorList:
+    ) -> NameToTensorList | ProcessPromptOutput:
         """Validate the request at the 400-producing seam; tokenize the prompt, and with
         references resize them for the VAE and the text encoder and lay out the prompt
-        around their vision blocks (``MiniMaxH3ImageEditResizeStep``, ``...EditTextEncoderStep``)."""
+        around their vision blocks (``MiniMaxH3ImageEditResizeStep``, ``...EditTextEncoderStep``).
+        With the text cache on, also the text node's key (``_keyed``)."""
         if any(m not in ("text", "image") for m in input_modalities or []):
             raise ValueError(f"MiniMax-H3-Image takes a text prompt and reference images; got {input_modalities}")
         if (output_modalities or ["image"]) != ["image"]:
@@ -328,7 +340,7 @@ class H3ImageModel(Model):
         prompt_ids = self._prompt_ids(prompt)
         if not images:
             self._check_rows(request, len(prompt_ids), [])
-            return {TEXT_INPUTS: [torch.tensor(prompt_ids, dtype=torch.long)]}
+            return self._keyed({TEXT_INPUTS: [torch.tensor(prompt_ids, dtype=torch.long)]})
         from PIL import Image
 
         pil = [Image.fromarray(img.permute(1, 2, 0).contiguous().cpu().numpy()) for img in images]
@@ -355,14 +367,22 @@ class H3ImageModel(Model):
         rows = vision["pixel_values"].to(torch.float32).split([t * h * w for t, h, w in grids])
         if any(t != 1 for t, _, _ in grids):
             raise ValueError(f"unexpected vision grids {grids} for still images")
-        return {
+        return self._keyed({
             TEXT_INPUTS: [torch.tensor(ids, dtype=torch.long)],
             VISION_PIXELS: [r.view(h, w, -1) for r, (_, h, w) in zip(rows, grids, strict=True)],
             REFERENCE_PIXELS: pixels,
             # the decoded uploads are spent (no node reads them); the store would hold
             # them for the whole request
             IMAGE_INPUTS: [],
-        }
+        })
+
+    def _keyed(self, tensors: NameToTensorList) -> NameToTensorList | ProcessPromptOutput:
+        """With the text node's cache on, the prompt's tensors and the digest it caches the text
+        rows under: of the token ids and the vision tower's pixel rows, its only inputs."""
+        if not self.text_cache_entries:
+            return tensors
+        key = text_cache_key(tensors[TEXT_INPUTS][0], tensors.get(VISION_PIXELS, []))
+        return ProcessPromptOutput(tensors, {TEXT_CACHE_KEY: key})
 
     def vision_tokens(self, grids: list[tuple[int, int, int]]) -> list[int]:
         """Each reference's merged vision tokens: its 16-px patches merged 2x2."""
@@ -395,6 +415,8 @@ class H3ImageModel(Model):
             spans = vision_spans(self._ensure_tokenizer(), self.vision_tokens(grids), label=PICTURE_LABEL)
             request.update(keyframe_grids=[list(grid) for grid in grids],
                            text_image_spans=[list(span) for span in spans])
+        if TEXT_CACHE_KEY in (model_kwargs or {}):
+            request[TEXT_CACHE_KEY] = model_kwargs[TEXT_CACHE_KEY]
         layout = layout_from_metadata(request)
         logger.info(
             "MiniMax-H3-Image request: %dx%d (canvas %dx%d) prompt=%d tokens refs=%d rows=%d seed=%s",
@@ -450,6 +472,7 @@ class H3ImageModel(Model):
                 weight_loader.build_text_encoder(config, snapshot, device),
                 weight_loader.build_text_conditioner(config, snapshot, device),
                 vision=weight_loader.build_vision_tower(snapshot, device), config=config,
+                cache_entries=self.text_cache_entries,
             )
         if node_name == VAE_ENCODER_NODE:
             return H3ImageEncoderSubmodule(weight_loader.build_image_encoder(config, snapshot, device))

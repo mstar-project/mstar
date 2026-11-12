@@ -6,6 +6,8 @@ client times submit to the last byte of the PNG. Every engine gets the OpenAI
 ``/v1/images/generations`` body the model card's ``examples/request.t2i.json`` sends
 (``size``, ``seed``, a CPU generator, ``b64_json``, PNG), plus ``min_generation_area``
 when asked. Each output is saved, so the arms' images can be compared side by side.
+``--vary-prompt`` appends a request counter to each prompt, so no engine's prompt cache
+(SGLang's conditioning cache, M*'s ``text_cache_entries``) serves a timed request.
 
     python -m benchmark.minimax_h3_image.bench_image --engine mstar --url http://127.0.0.1:8100 --out runs/m
     python -m benchmark.minimax_h3_image.bench_image --engine sglang --url http://127.0.0.1:30000 --out runs/s
@@ -61,16 +63,23 @@ def main():
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--warmup", type=int, default=1)
     p.add_argument("--repeat", type=int, default=3)
+    p.add_argument("--vary-prompt", action="store_true",
+                   help="a distinct prompt per request (the prompt, then its request number), so none repeats")
     args = p.parse_args()
+    count = iter(range(1 << 30))
+
+    def prompt() -> str:
+        return f"{args.prompt} {next(count)}" if args.vary_prompt else args.prompt
+
     args.out.mkdir(parents=True, exist_ok=True)
     results = {}
     for size in args.sizes.split(","):
         for _ in range(args.warmup):
-            generate(args.url, args.engine, args.prompt, size, args.seed, args.min_generation_area)
+            generate(args.url, args.engine, prompt(), size, args.seed, args.min_generation_area)
         seconds = []
         for i in range(args.repeat):
             start = time.perf_counter()
-            png = generate(args.url, args.engine, args.prompt, size, args.seed, args.min_generation_area)
+            png = generate(args.url, args.engine, prompt(), size, args.seed, args.min_generation_area)
             seconds.append(time.perf_counter() - start)
             (args.out / f"{size}_seed{args.seed}_{i}.png").write_bytes(png)
         results[size] = {"seconds": seconds, "median_s": statistics.median(seconds)}
