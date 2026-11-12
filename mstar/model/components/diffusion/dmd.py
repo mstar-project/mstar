@@ -79,3 +79,34 @@ def dmd_step(
     if noise is None:
         return x0
     return ((1 - sigma_next) * x0.float() + sigma_next * noise.float()).to(noise.dtype)
+
+
+# --- LightX2V's step distill (WanStepDistillScheduler, lightx2v/models/schedulers/wan/step_distill/scheduler.py) ---
+
+
+def step_distill_schedule(
+    timesteps: Sequence[int], shift: float, num_train_timesteps: int = 1000,
+) -> FlowMatchSchedule:
+    """The schedule of LightX2V's step-distill recipe: sigma ``shift``-ed from ``t / 1000`` on its
+    ``linspace(1, 0, 1001)`` table, and the model conditioned on ``sigma * 1000`` (750 -> 937.5 at
+    shift 5), not on ``t``; terminal 0 appended."""
+    if not timesteps:
+        raise ValueError("a step-distill schedule needs at least one timestep")
+    sigmas = torch.linspace(1.0, 0.0, num_train_timesteps + 1)[:-1]
+    sigmas = shift * sigmas / (1 + (shift - 1) * sigmas)
+    picked = sigmas[[num_train_timesteps - int(t) for t in timesteps]]
+    return FlowMatchSchedule(
+        sigmas=torch.cat([picked, torch.zeros(1, dtype=torch.float32)]),
+        timesteps=picked * num_train_timesteps, mu=None,
+    )
+
+
+def step_distill_step(sample: torch.Tensor, flow: torch.Tensor, sigma: float, sigma_next: float | None) -> torch.Tensor:
+    """LightX2V's ``step_post``: the clean prediction, moved back out to ``sigma_next`` along the
+    predicted flow (no fresh noise; the Euler step on these sigmas), in float32. Python-float sigmas,
+    as the reference reads them with ``.item()``; ``sigma_next`` None on the last step."""
+    flow = flow.float()
+    out = sample.float() - sigma * flow
+    if sigma_next is not None:
+        out = out + flow * sigma_next
+    return out

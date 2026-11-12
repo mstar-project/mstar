@@ -27,10 +27,13 @@ T2V-A14B's two experts load the same way, from ``transformer`` and ``transformer
 """
 
 import json
+import re
 from pathlib import Path
 
 import torch
 
+from mstar.engine.resources.lora.checkpoint import LoraFile
+from mstar.model.components.diffusion.lora import apply_loras
 from mstar.model.loader.base import load_weights_into
 from mstar.model.loader.iterators import iter_safetensors_file
 from mstar.model.wan22.components.dit import Wan22DiT
@@ -180,3 +183,32 @@ def build_wan22_dit(
             "serve a partially loaded transformer."
         )
     return dit.eval()
+
+
+# The original Wan layout's module names (Wan-AI's own repos, LightX2V's distill LoRAs) -> diffusers'.
+_WAN_LORA_MODULES = {
+    "self_attn.q": "attn1.to_q", "self_attn.k": "attn1.to_k", "self_attn.v": "attn1.to_v",
+    "self_attn.o": "attn1.to_out.0",
+    "cross_attn.q": "attn2.to_q", "cross_attn.k": "attn2.to_k", "cross_attn.v": "attn2.to_v",
+    "cross_attn.o": "attn2.to_out.0",
+    "ffn.0": "ffn.net.0.proj", "ffn.2": "ffn.net.2",
+}
+_WAN_LORA_KEY = re.compile(r"^blocks\.(\d+)\.(\w+\.\w+)\.(lora_A\.weight|lora_B\.weight|alpha)$")
+
+
+def convert_wan_lora_keys(sd: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Rewrite original-Wan-layout LoRA keys (``blocks.N.self_attn.q``, ``ffn.0``; the
+    ``diffusion_model.`` prefix already stripped) to diffusers module paths. Keys already in
+    diffusers naming pass through; anything else is left for the reader to refuse."""
+    out = {}
+    for key, value in sd.items():
+        m = _WAN_LORA_KEY.match(key)
+        if m is not None and m.group(2) in _WAN_LORA_MODULES:
+            key = f"blocks.{m.group(1)}.{_WAN_LORA_MODULES[m.group(2)]}.{m.group(3)}"
+        out[key] = value
+    return out
+
+
+def apply_dit_loras(dit: Wan22DiT, files: list[LoraFile]) -> None:
+    """Fold the configured adapters into one DiT's weights (static merge)."""
+    apply_loras(dit, files, remap_checkpoint_key, convert_keys=convert_wan_lora_keys)

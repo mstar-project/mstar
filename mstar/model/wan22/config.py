@@ -63,11 +63,16 @@ MAG_RATIOS: dict[str, dict[str, tuple[float, ...]]] = {
     )},
 }
 
-# The dit's samplers: the checkpoint's UniPC, or a DMD-distilled checkpoint's few fixed steps.
-SAMPLER_UNIPC, SAMPLER_DMD = "unipc", "dmd"
+# The dit's samplers: the checkpoint's UniPC, or a distilled checkpoint's few fixed steps,
+# FastVideo's DMD recipe (fresh noise between steps) or LightX2V's step distill (none).
+SAMPLER_UNIPC, SAMPLER_DMD, SAMPLER_STEP_DISTILL = "unipc", "dmd", "step_distill"
 # Each distilled recipe's timesteps and shift: FastWan2.2-TI2V-5B's (its README's
-# --dmd-denoising-steps; FastVideo's DMD_TRAINING_NOISE_SHIFT).
-_DISTILL_DEFAULTS = {SAMPLER_DMD: ((1000, 757, 522), 8.0)}
+# --dmd-denoising-steps; FastVideo's DMD_TRAINING_NOISE_SHIFT), and LightX2V's 4-step
+# Wan2.2 distill (configs/wan22/wan_moe_t2v_distill.json: denoising_step_list, sample_shift).
+_DISTILL_DEFAULTS = {
+    SAMPLER_DMD: ((1000, 757, 522), 8.0),
+    SAMPLER_STEP_DISTILL: ((1000, 750, 500, 250), 5.0),
+}
 
 # The DiT's self-attention: the array over its tokens, and the read that names its resource.
 DIT_TOKENS, SELF_ATTN = "dit_tokens", "dit_self_attn"
@@ -124,14 +129,19 @@ class Wan22Config:
     # port hardcodes their math, and a checkpoint that drifts from them hard-fails.
     flow_shift: float = 5.0
 
-    # "dmd" samples a DMD-distilled checkpoint (FastWan2.2-TI2V-5B) on ``dmd_timesteps``
-    # with no CFG (components/diffusion/dmd.py): one forward per timestep. A checkpoint
-    # choice, so a server setting, not a request one.
+    # "dmd" (FastWan2.2-TI2V-5B) and "step_distill" (A14B with LightX2V's distill LoRAs)
+    # sample a distilled checkpoint on ``dmd_timesteps`` with no CFG, one forward per
+    # timestep (components/diffusion/dmd.py). A checkpoint choice, so a server setting,
+    # not a request one.
     sampler: str = SAMPLER_UNIPC
     # None is the sampler's recipe (_DISTILL_DEFAULTS)
     dmd_timesteps: tuple[int, ...] | None = None
     # the shift of the sigma table the timesteps map through; None is the recipe's
     dmd_shift: float | None = None
+    # LoRA adapters folded into the DiT at load (A14B: the high-noise expert), and into
+    # A14B's low-noise expert: paths or {path, scale}
+    lora: tuple = ()
+    lora_2: tuple = ()
 
     # Generation defaults, each overridable per request via model_kwargs. The
     # sampling knobs match the diffusers WanPipeline defaults; the size defaults to
@@ -220,12 +230,14 @@ class Wan22Config:
         samplers = (SAMPLER_UNIPC, *_DISTILL_DEFAULTS)
         if self.sampler not in samplers:
             raise ValueError(f"Wan2.2 sampler must be one of {samplers}, got {self.sampler!r}.")
-        if self.sampler in _DISTILL_DEFAULTS and self.variant != WAN22_VARIANT_TI2V_5B:
-            # the recipe is FastWan2.2-TI2V-5B's; A14B has no distilled checkpoint here
+        if self.sampler == SAMPLER_DMD and self.variant != WAN22_VARIANT_TI2V_5B:
+            # the recipe is FastWan2.2-TI2V-5B's; A14B's distilled recipe is step_distill
             raise ValueError(f"Wan2.2 sampler {self.sampler!r} serves TI2V-5B only, got variant {self.variant!r}.")
         if self.sampler in _DISTILL_DEFAULTS and self.step_cache is not None:
             # MAG_RATIOS is calibrated on the UniPC schedule; a distilled sampler's few steps have no table
             raise ValueError(f"Wan2.2 step_cache runs with the unipc sampler only, not {self.sampler!r}.")
+        if self.lora_2 and not self.is_moe:
+            raise ValueError("Wan2.2 lora_2 is for A14B's low-noise expert; this variant has one DiT.")
         if self.sampler in _DISTILL_DEFAULTS:
             default_steps, default_shift = _DISTILL_DEFAULTS[self.sampler]
             steps = default_steps if self.dmd_timesteps is None else self.dmd_timesteps
@@ -244,6 +256,8 @@ class Wan22Config:
             # the recipe fixes both: one forward per timestep, and no CFG
             self.default_num_inference_steps = len(steps)
             self.guidance_scale = 1.0
+            if self.is_moe:
+                self.guidance_scale_2 = 1.0
 
     def fast_decode_sizes(self) -> frozenset[tuple[int, int]]:
         """``vae_decode_fast_sizes`` as (width, height) pixel pairs."""

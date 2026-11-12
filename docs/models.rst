@@ -2443,6 +2443,20 @@ attention, scores 25.9 dB / 0.860 / 0.094 here):
      - 0.743
      - 0.175
 
+**Four steps (LightX2V's distill LoRAs).** ``configs/wan22_a14b_distill.yaml`` folds
+LightX2V's 4-step distill LoRAs (``lightx2v/Wan2.2-Distill-Loras``, t2v high/low-noise,
+rank 64) into the two experts at load (``lora`` and ``lora_2``: local paths, or
+``{path, scale}``; the original Wan layout's ``blocks.N.self_attn.q`` keys are mapped)
+and samples them as LightX2V does (``sampler: step_distill``): timesteps 1000, 750,
+500, 250 at shift 5, the DiT conditioned on the shifted sigma (937.5 for 750), a flow
+Euler step between them, no CFG, the first two steps on the high-noise expert. 4 DiT
+forwards instead of 40 x 2: 11.7 s per 832x480x81 video and 43.4 s at 1280x720x81 on
+one H200, against 254.9 s for the dense 40-step model at 832x480. With the same noise
+and kernels, M*'s steps match LightX2V's loop over the diffusers experts bit for bit
+(``test/modular/test_wan22_step_distill_equivalence.py``). Another step count or
+guidance above 1 is a 400; a ``flow_shift`` goes unread, and a ``step_cache`` is refused
+with this sampler.
+
 LTX-2.5 (``ltx2_5``)
 --------------------
 

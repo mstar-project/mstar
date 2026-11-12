@@ -6,7 +6,7 @@ Architecture (4 nodes; nothing here is cached, the dit's self-attention reads an
     dit          - dense 5B video DiT, or A14B's high- and low-noise experts (both
                    resident); CFG as one batch-2 forward,
                    UniPC (bh2, order 2, flow prediction) run inline, or a
-                   DMD-distilled checkpoint's few unguided steps (sampler: dmd)
+                   distilled checkpoint's few unguided steps (sampler: dmd / step_distill)
     vae_decoder  - Wan2.2-VAE latent -> pixel decode (the Wan2.1 VAE on A14B)
 
 The variant is ``model_kwargs.variant`` (``ti2v_5b``, the default, or ``t2v_a14b``),
@@ -40,6 +40,7 @@ import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.distributed.base import ShardingConfig
+from mstar.engine.resources.lora.checkpoint import LoraFile
 from mstar.engine.state import Array, Attend, Block, Read, SeqShard
 from mstar.graph.base import (
     GraphEdge,
@@ -60,6 +61,7 @@ from mstar.model.wan22.config import (
     DIT_TOKENS,
     MAG_RATIOS,
     SAMPLER_DMD,
+    SAMPLER_STEP_DISTILL,
     SAMPLER_UNIPC,
     SELF_ATTN,
     WAN22_VARIANT_TI2V_5B,
@@ -69,6 +71,7 @@ from mstar.model.wan22.submodules import (
     DENOISE_LOOP_NAME,
     Wan22DitSubmodule,
     Wan22DmdDitSubmodule,
+    Wan22StepDistillDitSubmodule,
     Wan22TextEncoderSubmodule,
     Wan22VaeDecoderSubmodule,
     Wan22VaeEncoderSubmodule,
@@ -119,6 +122,8 @@ class Wan22Model(Model):
         sampler: str = SAMPLER_UNIPC,
         dmd_timesteps: tuple[int, ...] | None = None,
         dmd_shift: float | None = None,
+        lora: list | None = None,
+        lora_2: list | None = None,
         **kwargs,
     ):
         refuse_attention_backend_kwarg(kwargs)
@@ -131,9 +136,13 @@ class Wan22Model(Model):
             max_video_pixels=self._require_positive_int("max_video_pixels", max_video_pixels),
             vae_decode_fast=vae_decode_fast, vae_decode_fast_sizes=vae_decode_fast_sizes, step_cache=step_cache,
             sampler=sampler, dmd_timesteps=dmd_timesteps, dmd_shift=dmd_shift,
+            lora=tuple(lora or ()), lora_2=tuple(lora_2 or ()),
         )
         self.config.compile_dit_grids()  # a malformed list fails at startup
         step_cache_policy(step_cache, MAG_RATIOS[self.config.variant])  # and so does a malformed step cache
+        # LoRA adapters folded into the DiT (A14B: each expert its own) at load, a static merge
+        self.loras = [LoraFile.parse(item) for item in self.config.lora]
+        self.loras_2 = [LoraFile.parse(item) for item in self.config.lora_2]
         # Dummy mode: get_submodule returns None for every node, so engines run
         # without weights, GPU or network.
         self.skip_weight_loading = skip_weight_loading
@@ -429,18 +438,20 @@ class Wan22Model(Model):
         guidance = self._get(model_kwargs, "guidance_scale", cfg.guidance_scale)
         if not _is_number(guidance):
             raise ValueError(f"Wan2.2 guidance_scale must be a finite number; got {guidance!r}.")
-        if cfg.sampler == SAMPLER_DMD:
+        if cfg.sampler != SAMPLER_UNIPC:
             # the distilled checkpoint was trained for exactly these steps, unguided
             if steps != cfg.default_num_inference_steps:
                 raise ValueError(
-                    f"This Wan2.2 server samples a DMD-distilled checkpoint in {cfg.default_num_inference_steps} "
+                    f"This Wan2.2 server samples a distilled checkpoint in {cfg.default_num_inference_steps} "
                     f"steps (timesteps {list(cfg.dmd_timesteps)}); got num_inference_steps={steps}."
                 )
-            if guidance > 1.0:
-                raise ValueError(
-                    f"This Wan2.2 server samples a DMD-distilled checkpoint, which runs without CFG; "
-                    f"got guidance_scale={guidance}."
-                )
+            unguided = ("guidance_scale", "guidance_scale_2")
+            for name, value in ((name, model_kwargs.get(name)) for name in unguided):
+                if value is not None and _is_number(value) and value > 1.0:
+                    raise ValueError(
+                        f"This Wan2.2 server samples a distilled checkpoint, which runs without CFG; "
+                        f"got {name}={value}."
+                    )
         negative = self._get(model_kwargs, "negative_prompt", cfg.default_negative_prompt)
         if not isinstance(negative, str):
             raise ValueError(f"Wan2.2 negative_prompt must be a string; got {negative!r}.")
@@ -451,8 +462,8 @@ class Wan22Model(Model):
         if shift is not None:
             if not _is_number(shift) or shift <= 0:
                 raise ValueError(f"Wan2.2 flow_shift must be a positive finite number; got {shift!r}.")
-            if cfg.sampler != SAMPLER_DMD:
-                # the DMD recipe fixes its sigma table (dmd_shift) and reads no request shift
+            if cfg.sampler == SAMPLER_UNIPC:
+                # a distilled recipe fixes its sigma table (dmd_shift) and reads no request shift
                 knobs["flow_shift"] = float(shift)
         if cfg.is_moe:
             # a request that sets guidance_scale alone gets it for both experts, as
@@ -519,8 +530,8 @@ class Wan22Model(Model):
             raise ValueError(
                 f"Wan2.2 {self.config.variant} is text-to-video only; send no image."
             )
-        if "image" in input_modalities and self.config.sampler == SAMPLER_DMD:
-            raise ValueError("This Wan2.2 server's DMD sampler is text-to-video only; got an image input.")
+        if "image" in input_modalities and self.config.sampler != SAMPLER_UNIPC:
+            raise ValueError("This Wan2.2 server's distilled sampler is text-to-video only; got an image input.")
         if "image" in input_modalities and not (tensors or {}).get("image_inputs"):
             # A declared-but-missing input is a malformed request, not a mode
             # preference — do not silently downgrade an I2V request to T2V.
@@ -656,8 +667,8 @@ class Wan22Model(Model):
                 "Request declared an image input but no image_inputs tensor "
                 "arrived; image-to-video requires the conditioning image."
             )
-        if is_i2v and self.config.sampler == SAMPLER_DMD:
-            raise ValueError("This Wan2.2 server's DMD sampler is text-to-video only; got an image input.")
+        if is_i2v and self.config.sampler != SAMPLER_UNIPC:
+            raise ValueError("This Wan2.2 server's distilled sampler is text-to-video only; got an image input.")
         walks = [self.ENCODE_TEXT_WALK]
         if is_i2v:
             walks.append(self.ENCODE_IMAGE_WALK)
@@ -746,6 +757,11 @@ class Wan22Model(Model):
                 )
                 for subfolder in (("transformer", "transformer_2") if self.config.is_moe else ("transformer",))
             ]
+            for expert, files in zip(experts, (self.loras, self.loras_2), strict=False):
+                if files:
+                    from mstar.model.wan22.weight_loader import apply_dit_loras
+
+                    apply_dit_loras(expert, files)
             return self._dit_class()(
                 experts[0], self.config, cfg_group=cfg_group,
                 transformer_2=experts[1] if len(experts) > 1 else None,
@@ -754,7 +770,9 @@ class Wan22Model(Model):
         return None
 
     def _dit_class(self) -> type[Wan22DitSubmodule]:
-        return Wan22DmdDitSubmodule if self.config.sampler == SAMPLER_DMD else Wan22DitSubmodule
+        return {SAMPLER_DMD: Wan22DmdDitSubmodule, SAMPLER_STEP_DISTILL: Wan22StepDistillDitSubmodule}.get(
+            self.config.sampler, Wan22DitSubmodule,
+        )
 
     def _get_encode_vae(self) -> torch.nn.Module:
         """The vae_encoder's bf16 Wan2.2-VAE instance — the exact loading the
