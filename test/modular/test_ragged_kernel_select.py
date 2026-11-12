@@ -207,6 +207,30 @@ def test_backend_cudnn_is_refused_at_build_off_self_attention(gpu, cls):
         build(spec(cls=cls, backend=RaggedAttnBackend.CUDNN, **extra))
 
 
+def test_backend_fa4_fp8_runs_fp8_fa4_at_every_size(gpu):
+    gpu(B300)
+    s = spec(40)
+    apply_yaml_overrides([s], {"resources": {"dit_attn": {"backend": "fa4_fp8"}}})
+    assert s.config.backend is RaggedAttnBackend.FA4_FP8
+    assert build(s)._kernel_rows == ((None, Choice("fa4", {"precision": "fp8"})),)
+
+
+def test_backend_fa4_fp8_is_refused_at_build_off_datacenter_blackwell(gpu, monkeypatch):
+    gpu(H100)
+    monkeypatch.setattr(kernels_module, "current_platform", _Capability((9, 0)))
+    with pytest.raises(ValueError, match="names backend 'fa4_fp8'.*Blackwell"):
+        build(spec(backend=RaggedAttnBackend.FA4_FP8))
+
+
+@pytest.mark.parametrize("cls", [RaggedCrossAttentionSpec, RaggedBlockCausalAttentionSpec],
+                         ids=["cross", "block_causal"])
+def test_backend_fa4_fp8_is_refused_at_build_off_self_attention(gpu, cls):
+    gpu(B300)
+    extra = {"block_size": 64} if cls is RaggedBlockCausalAttentionSpec else {}
+    with pytest.raises(ValueError, match="'fa4_fp8' runs self-attention only"):
+        build(spec(cls=cls, backend=RaggedAttnBackend.FA4_FP8, **extra))
+
+
 def test_cudnn_cant_run_a_padded_head_dim(gpu):
     """So a table row naming cudnn there is refused like the explicit backend (``kernel_rows``)."""
     gpu(B300)

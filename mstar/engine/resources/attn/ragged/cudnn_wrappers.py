@@ -107,12 +107,32 @@ class CudnnRaggedPrefillWrapper(_UniformSegmentsPrefillWrapper):
 
 class Fa4UniformPrefillWrapper(_UniformSegmentsPrefillWrapper):
     """Equal-length segments through FlashAttention 4's dense forward (``flash_attn.cute``),
-    one call over the ``[n, S, H, D]`` batch, which it takes as laid out."""
+    one call over the ``[n, S, H, D]`` batch, which it takes as laid out.
+
+    ``precision="fp8"`` is lossy and opt-in (``RaggedAttnBackend.FA4_FP8``): q, k and v go
+    to e4m3 with one scale per (segment, head) and FA4's FP8 kernel runs them, the output
+    staying in the activation dtype.
+    """
+
+    def __init__(self, *args, precision: str = "bf16", **kwargs):
+        if precision not in ("bf16", "fp8"):
+            raise ValueError(f"{type(self).__name__}: precision is 'bf16' or 'fp8', not {precision!r}")
+        super().__init__(*args, **kwargs)
+        self.precision = precision
 
     def _attend(self, q, k, v, causal, return_lse):
         from flash_attn.cute import flash_attn_func
 
-        result = flash_attn_func(q, k, v, softmax_scale=self.sm_scale, causal=causal, return_lse=return_lse)
+        kwargs = {}
+        if self.precision == "fp8":
+            from flash_attn.cute.interface import TensorwiseScales
+            from mstar.engine.resources.attn.ragged.fp8_quant import quantize_per_segment_head
+
+            n, seq, heads, dim = q.shape
+            quantized = [quantize_per_segment_head(t.reshape(n * seq, heads, dim), n) for t in (q, k, v)]
+            q, k, v = (y.view(n, seq, heads, dim) for y, _ in quantized)
+            kwargs["scales"] = TensorwiseScales(*(scale for _, scale in quantized))
+        result = flash_attn_func(q, k, v, softmax_scale=self.sm_scale, causal=causal, return_lse=return_lse, **kwargs)
         if not return_lse:
             return (result[0] if isinstance(result, tuple) else result), None
         return result[0], result[1]

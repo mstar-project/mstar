@@ -120,15 +120,17 @@ def kernel_rows(
     return entry.rows
 
 
-def cudnn_rows(
-    key: str, num_qo_heads: int, num_kv_heads: int, head_dim: int, dtype: torch.dtype, device: torch.device,
+def named_rows(
+    key: str, choice: Choice, num_qo_heads: int, num_kv_heads: int, head_dim: int, dtype: torch.dtype,
+    device: torch.device,
 ) -> Rows:
-    """``backend: cudnn``'s rows, cuDNN at every size; raises where it can't run, so a
-    config that names it fails at build rather than at its first request."""
+    """The one row of a backend a config names (``cudnn``, ``fa4_fp8``), at every size; raises
+    where its implementation can't run, so the config fails at build rather than at its
+    first request."""
     shape = {"num_qo_heads": num_qo_heads, "num_kv_heads": num_kv_heads, "head_dim": head_dim}
-    why = RAGGED_ATTENTION.unavailable(RAGGED_ATTENTION.target(dtype, shape, device)).get("cudnn")
+    why = RAGGED_ATTENTION.unavailable(RAGGED_ATTENTION.target(dtype, shape, device)).get(choice.impl)
     if why is not None:
-        raise ValueError(f"ragged attention {key!r} names backend 'cudnn', which can't run "
+        name = choice.impl if not choice.config else f"{choice.impl}_{choice.config.get('precision', '')}"
+        raise ValueError(f"ragged attention {key!r} names backend {name!r}, which can't run "
                          f"{RAGGED_ATTENTION.format_shape(shape)} {str(dtype).removeprefix('torch.')} here: {why}")
-    return ((None, Choice("cudnn")),)
-
+    return ((None, choice),)
