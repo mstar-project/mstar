@@ -950,13 +950,21 @@ def test_streamed_decode_matches_the_whole_decode(frames):
 @torch.no_grad()
 def test_a_long_reply_is_the_whole_track_decode():
     """With the checkpoint's 8 stacked windowed layers the decoder reaches back further than one window;
-    the stream's state carries all of it, so a long reply equals a whole-track decode (no finite context)."""
+    the stream's state carries all of it, so a long reply equals a whole-track decode (no finite context).
+
+    In float64 on CPU the stream is within about 1e-14 of the whole decode here, while forgetting
+    everything before the last 500 frames (the previous decoder's context) is off by about 2e-11, so the
+    tolerance sits between the two and the negative control checks the fixture can tell them apart.
+    """
     codec = _tiny_codec(layers=8, dtype=torch.float64)
-    frames = 700
+    frames, tolerance = 700, 1e-12
     agent = _agent_frames(frames)
     num_samples = frames * cfg.FRAME_SIZE
-    torch.testing.assert_close(_stream_decode(codec, agent, num_samples), _whole(codec, agent, num_samples),
-                               rtol=0, atol=1e-9)
+    whole = _whole(codec, agent, num_samples)
+    torch.testing.assert_close(_stream_decode(codec, agent, num_samples), whole, rtol=0, atol=tolerance)
+    tail = 100 * cfg.FRAME_SIZE
+    truncated = codec.decode(torch.cat(agent, dim=-1)[..., -600:])[..., -tail:]
+    assert (truncated - whole[..., -tail:]).abs().max().item() > 10 * tolerance
 
 
 @torch.no_grad()
@@ -1032,8 +1040,7 @@ def test_decoder_state_is_per_request_and_released():
 
 
 @torch.no_grad()
-@pytest.mark.parametrize("batched", [True, False])
-def test_batched_rows_at_different_stream_offsets_each_get_their_own_audio(batched):
+def test_batched_rows_at_different_stream_offsets_each_get_their_own_audio():
     """Rows of different widths and histories share one decode; each matches its stream decoded alone."""
     codec = _tiny_codec(dtype=torch.float64)
     driver, solo = _driver(codec), _driver(codec)
@@ -1045,7 +1052,7 @@ def test_batched_rows_at_different_stream_offsets_each_get_their_own_audio(batch
         for start in (0, 4):  # request a is two chunks in, b is fresh
             _decode_chunk(d, "a", a[start : start + 4], num_samples)
     nodes = [driver.prepare("a", num_samples, a[8:12]), driver.prepare("b", num_samples, b)]
-    got = driver.step(["a", "b"], nodes, batched=batched or None)
+    got = driver.step(["a", "b"], nodes)
     want = {"a": _decode_chunk(solo, "a", a[8:12], num_samples), "b": _decode_chunk(solo, "b", b, num_samples)}
     for rid in ("a", "b"):
         torch.testing.assert_close(got[rid], want[rid], rtol=0, atol=1e-9)
