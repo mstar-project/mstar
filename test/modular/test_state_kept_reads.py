@@ -178,7 +178,7 @@ def test_a_kept_cross_read_builds_todays_spec_over_its_arrays_one_label():
 
 
 @pytest.mark.parametrize("arrays, cause", [
-    ([_self_array(), _context_array(labels={CONTEXT, "other"})], "a cross read's array declares one label"),
+    ([_self_array(), _context_array(labels={CONTEXT, "other"})], "a plan runs under one label, and Array 'context'"),
     (
         [_self_array(), _context_array(
             reads={
@@ -288,8 +288,8 @@ def test_a_max_len_0_read_over_a_kept_array_reads_through_node_handles():
 
 def test_a_max_len_0_read_over_queries_on_two_labels_has_no_layout_yet():
     """A step on the second label would plan a label the handle never reads."""
-    with pytest.raises(ValueError, match=r"Array 'text': no layout yet: reads\['text_attn'\] reads the queries of "
-                                         r"'kv', which has labels \['cond', 'uncond'\]"):
+    with pytest.raises(ValueError, match=r"Array 'text': no layout yet: a plan runs under one label, and Array 'kv' "
+                                         r"declares \['cond', 'uncond'\]"):
         build_specs(_form_b(labels=frozenset({"cond", "uncond"})))
 
 
