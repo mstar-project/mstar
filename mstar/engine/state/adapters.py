@@ -565,6 +565,13 @@ class PagedAttend(OpBinding):
     def steps(self, key: str, read: Read, declared: ArrayStep, segments, steps: dict[str, Any]) -> None:
         steps[key] = AttentionStep(segments=segments, causal=read.mask.uses_query_position)
 
+    def apply(self, spec: NodeResourceSpec | None, settings: Mapping[str, Any]) -> None:
+        """The decode keys go through the spec's own YAML path and its checks, as they do under `resources:`."""
+        decode = {field: settings[field] for field in settings.keys() & {"decode_tensor_cores", "decode_fmha"}}
+        super().apply(spec, {field: settings[field] for field in settings.keys() - decode.keys()})
+        if decode:
+            spec.apply_yaml_overrides(**decode)
+
     def attach(self, handle: "PagedArrayHandle", key: str, run: Any) -> None:
         handle.reads[key] = run
 
@@ -589,13 +596,6 @@ class PagedCrossAttend(OpBinding):
 
     def steps(self, key: str, read: Read, declared: ArrayStep, segments, steps: dict[str, Any]) -> None:
         steps[key] = AttentionStep(segments=segments, causal=False)
-
-    def apply(self, spec: NodeResourceSpec | None, settings: Mapping[str, Any]) -> None:
-        """The decode keys go through the spec's own YAML path and its checks, as they do under `resources:`."""
-        decode = {field: settings[field] for field in settings.keys() & {"decode_tensor_cores", "decode_fmha"}}
-        super().apply(spec, {field: settings[field] for field in settings.keys() - decode.keys()})
-        if decode:
-            spec.apply_yaml_overrides(**decode)
 
     def attach(self, handle: "PagedArrayHandle", key: str, run: Any) -> None:
         handle.reads[key] = run
