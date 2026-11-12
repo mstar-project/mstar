@@ -169,18 +169,19 @@ class H3ImageModel(Model):
             return []
         cfg = self.config.transformer
 
-        def spec(key, node, shard_over_sp, segments, head_groups=1):
+        def spec(key, node, shard_over_sp, segments, head_groups=1, compile_op=False):
             return RaggedAttentionSpec(
                 resource_key=key, nodes={node},
                 config=RaggedAttentionConfig(
                     num_qo_heads=cfg.num_attention_heads, num_kv_heads=cfg.num_attention_heads,
                     head_dim=cfg.attention_head_dim, max_segments_per_request=segments, dtype=torch.bfloat16,
-                    shard_over_sp=shard_over_sp, workspace_mb=128, head_groups=head_groups,
+                    shard_over_sp=shard_over_sp, workspace_mb=128, head_groups=head_groups, compile_op=compile_op,
                 ),
             )
 
-        # the DiT's padding rows are a second segment of each request
-        return [spec(DIT_ATTN, DIT_NODE, True, 2, self.ulysses_head_groups),
+        # the DiT's padding rows are a second segment of each request. Under compile its attention is an op of
+        # the block's graph rather than a break in it: a 1024x1024 step on one B300 issued in 36 ms, not 52.
+        return [spec(DIT_ATTN, DIT_NODE, True, 2, self.ulysses_head_groups, compile_op=self.compile),
                 spec(REFINER_ATTN, TEXT_ENCODER_NODE, False, 1)]
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:

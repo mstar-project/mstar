@@ -218,6 +218,9 @@ def test_ulysses_head_groups_reach_the_dits_attention_only():
     """MiniMax-H3's pipelined exchange: the DiT's resource is sharded by group, the refiner's isn't."""
     specs = {spec.resource_key: spec.config for spec in _model(ulysses_head_groups=4).get_node_resources()}
     assert [c.head_groups for c in specs.values()] == [4, 1]
+    # a compiled DiT traces its attention as the resource's op; the eager refiner calls it directly
+    assert [c.compile_op for c in specs.values()] == [False, False]
+    assert [s.config.compile_op for s in _model(compile=True).get_node_resources()] == [True, False]
     with pytest.raises(ValueError, match="ulysses_group_streams"):
         _model(ulysses_group_streams="false")
     with pytest.raises(ValueError, match="ulysses_head_groups"):
