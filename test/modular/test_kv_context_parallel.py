@@ -920,6 +920,11 @@ class _OneRank:
     def __init__(self, case: _Case):
         self.case = case
 
+    def _add_read(self, layer, q, *, keep, k, v):
+        assert keep is None, "this fake keeps every add"
+        self.add(layer, k=k, v=v)
+        return self.read(layer, q)
+
     def add(self, layer, *, k, v):
         new, at = torch.stack([k, v], 1), 0
         for kv, (context, n) in zip(self.case.keys, self.case.rows, strict=True):
