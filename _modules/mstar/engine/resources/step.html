@@ -410,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Nov 11, 2026"/>
+    <meta name="docbuild:last-update" content="Nov 12, 2026"/>
   
     
     <script src="../../../../_static/searchtools.js"></script>
@@ -626,10 +626,11 @@ window.runMermaid = runMermaid;</script>
 </ul>
 </details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../../_autosummary/mstar.engine.state.html">mstar.engine.state</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
-<li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.state.adapters.html">mstar.engine.state.adapters</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.state.analysis.html">mstar.engine.state.analysis</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.state.calls.html">mstar.engine.state.calls</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.state.contract.html">mstar.engine.state.contract</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.state.host_fields.html">mstar.engine.state.host_fields</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.state.state_op.html">mstar.engine.state.state_op</a></li>
 </ul>
 </details></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.engine.windowing.html">mstar.engine.windowing</a></li>
@@ -1311,6 +1312,13 @@ window.runMermaid = runMermaid;</script>
     <span class="nd">@abstractmethod</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">end_step</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">step</span><span class="p">:</span> <span class="s2">"SubmoduleStep"</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""Close the handle, on any path out of the step."""</span></div>
+
+
+<div class="viewcode-block" id="StepHandle.commit_step">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.step.html#mstar.engine.resources.StepHandle.commit_step">[docs]</a>
+    <span class="nd">@abstractmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">commit_step</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">step</span><span class="p">:</span> <span class="s2">"SubmoduleStep"</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Apply what the handle itself holds of a step the resources just committed."""</span></div>
 </div>
 
 
@@ -1374,6 +1382,13 @@ window.runMermaid = runMermaid;</script>
     <span class="k">def</span><span class="w"> </span><span class="nf">check_calls</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
         <span class="k">for</span> <span class="n">handle</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">state_handles</span><span class="p">:</span>
             <span class="n">handle</span><span class="o">.</span><span class="n">check_step</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="SubmoduleStep.commit_calls">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.step.html#mstar.engine.resources.SubmoduleStep.commit_calls">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">commit_calls</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">for</span> <span class="n">handle</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">state_handles</span><span class="p">:</span>
+            <span class="n">handle</span><span class="o">.</span><span class="n">commit_step</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span></div>
 
 
 <div class="viewcode-block" id="SubmoduleStep.end_calls">
@@ -1556,7 +1571,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Nov 11, 2026.
+  Last updated on Nov 12, 2026.
   <br/>
 </p>
   </div>

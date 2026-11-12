@@ -410,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Nov 11, 2026"/>
+    <meta name="docbuild:last-update" content="Nov 12, 2026"/>
   
     
     <script src="../../../_static/searchtools.js"></script>
@@ -626,10 +626,11 @@ window.runMermaid = runMermaid;</script>
 </ul>
 </details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../_autosummary/mstar.engine.state.html">mstar.engine.state</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
-<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.engine.state.adapters.html">mstar.engine.state.adapters</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.engine.state.analysis.html">mstar.engine.state.analysis</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.engine.state.calls.html">mstar.engine.state.calls</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.engine.state.contract.html">mstar.engine.state.contract</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.engine.state.host_fields.html">mstar.engine.state.host_fields</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.engine.state.state_op.html">mstar.engine.state.state_op</a></li>
 </ul>
 </details></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.engine.windowing.html">mstar.engine.windowing</a></li>
@@ -1056,7 +1057,8 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">_admit_taken, _wants, _reserved}</span>
 <span class="sd">(purged by remove_request), ResidentPlanner.{_slot_of, _stale, _moved} (purged by</span>
 <span class="sd">release), SamplerCells._cells and SamplerResource._sampled_rids (purged by the</span>
-<span class="sd">sampler's remove_request), RopeManager._counters and LongRopeManager._long_rids (purged by their</span>
+<span class="sd">sampler's remove_request), HostFields._fields (purged by the engine's</span>
+<span class="sd">remove_request), RopeManager._counters and LongRopeManager._long_rids (purged by their</span>
 <span class="sd">remove_request), and WorkerProfileInfo.</span>
 
 <span class="sd">Lockstep's follow count is the one deliberate exception: a</span>
@@ -1178,7 +1180,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Nov 11, 2026.
+  Last updated on Nov 12, 2026.
   <br/>
 </p>
   </div>

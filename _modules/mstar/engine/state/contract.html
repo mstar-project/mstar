@@ -410,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Nov 11, 2026"/>
+    <meta name="docbuild:last-update" content="Nov 12, 2026"/>
   
     
     <script src="../../../../_static/searchtools.js"></script>
@@ -626,10 +626,11 @@ window.runMermaid = runMermaid;</script>
 </ul>
 </details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../../_autosummary/mstar.engine.state.html">mstar.engine.state</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
-<li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.state.adapters.html">mstar.engine.state.adapters</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.state.analysis.html">mstar.engine.state.analysis</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.state.calls.html">mstar.engine.state.calls</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.state.contract.html">mstar.engine.state.contract</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.state.host_fields.html">mstar.engine.state.host_fields</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.state.state_op.html">mstar.engine.state.state_op</a></li>
 </ul>
 </details></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.engine.windowing.html">mstar.engine.windowing</a></li>
@@ -1245,6 +1246,9 @@ window.runMermaid = runMermaid;</script>
     <span class="n">op</span><span class="p">:</span> <span class="n">Op</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="n">layers</span><span class="p">:</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>    <span class="c1"># None: all of the array's layers</span>
     <span class="n">walks</span><span class="p">:</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>     <span class="c1"># None: all walks</span>
+    <span class="n">queries</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>              <span class="c1"># the array whose segments lay out the queries; None: this array</span>
+    <span class="n">packed</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>                     <span class="c1"># queries may come as (tokens, heads, head_dim); False: only as rows</span>
+    <span class="n">segmented</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>                 <span class="c1"># a request's segments lie end to end in one row</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">__post_init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">if</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">mask</span><span class="p">,</span> <span class="n">Mask</span><span class="p">):</span>
@@ -1254,6 +1258,10 @@ window.runMermaid = runMermaid;</script>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">op</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">op</span><span class="o">.</span><span class="n">writes</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">op</span><span class="o">.</span><span class="n">adds</span><span class="p">):</span>
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Read.op: a read changes no field, and </span><span class="si">{</span><span class="nb">type</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">op</span><span class="p">)</span><span class="o">.</span><span class="vm">__name__</span><span class="si">}</span><span class="s2"> writes "</span>
                              <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="nb">list</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">op</span><span class="o">.</span><span class="n">writes</span><span class="p">)</span><span class="si">}</span><span class="s2"> and adds </span><span class="si">{</span><span class="nb">list</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">op</span><span class="o">.</span><span class="n">adds</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">segmented</span> <span class="ow">and</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">packed</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">queries</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">or</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">mask</span><span class="p">,</span> <span class="n">Block</span><span class="p">)):</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Read.segmented lays a request's segments end to end in one row, which takes Block(), "</span>
+                             <span class="sa">f</span><span class="s2">"packed=False and no queries, and got mask=</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">mask</span><span class="si">!r}</span><span class="s2">, packed=</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">packed</span><span class="si">}</span><span class="s2">, "</span>
+                             <span class="sa">f</span><span class="s2">"queries=</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">queries</span><span class="si">!r}</span><span class="s2">"</span><span class="p">)</span>
         <span class="k">for</span> <span class="n">name</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">"layers"</span><span class="p">,</span> <span class="s2">"walks"</span><span class="p">):</span>
             <span class="k">if</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">name</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
                 <span class="nb">object</span><span class="o">.</span><span class="fm">__setattr__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">name</span><span class="p">,</span> <span class="nb">frozenset</span><span class="p">(</span><span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">name</span><span class="p">)))</span></div>
@@ -1313,6 +1321,9 @@ window.runMermaid = runMermaid;</script>
     <span class="n">rewritable</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
     <span class="n">labels</span><span class="p">:</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="nb">frozenset</span><span class="p">({</span><span class="s2">"main"</span><span class="p">})</span>
     <span class="n">positions</span><span class="p">:</span> <span class="n">Positions</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="c1"># under sequence parallelism, each rank's calls carry its share of every segment, or of each request's row for a</span>
+    <span class="c1"># segmented read</span>
+    <span class="n">seq_sharded</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">__post_init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="nb">object</span><span class="o">.</span><span class="fm">__setattr__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="s2">"nodes"</span><span class="p">,</span> <span class="nb">frozenset</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">nodes</span><span class="p">))</span>
@@ -1348,6 +1359,8 @@ window.runMermaid = runMermaid;</script>
                 <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">where</span><span class="si">}</span><span class="s2">.shape must be a non-empty tuple of ints &gt;= </span><span class="si">{</span><span class="n">least</span><span class="si">}</span><span class="s2">, got </span><span class="si">{</span><span class="n">tensor</span><span class="o">.</span><span class="n">shape</span><span class="si">!r}</span><span class="s2">"</span><span class="p">)</span>
             <span class="k">if</span> <span class="n">tensor</span><span class="o">.</span><span class="n">shard</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="ow">not</span> <span class="p">(</span><span class="nb">type</span><span class="p">(</span><span class="n">tensor</span><span class="o">.</span><span class="n">shard</span><span class="p">)</span> <span class="ow">is</span> <span class="nb">int</span> <span class="ow">and</span> <span class="mi">0</span> <span class="o">&lt;=</span> <span class="n">tensor</span><span class="o">.</span><span class="n">shard</span> <span class="o">&lt;</span> <span class="nb">len</span><span class="p">(</span><span class="n">tensor</span><span class="o">.</span><span class="n">shape</span><span class="p">)):</span>
                 <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">where</span><span class="si">}</span><span class="s2">.shard must be None or an axis of shape </span><span class="si">{</span><span class="n">tensor</span><span class="o">.</span><span class="n">shape</span><span class="si">}</span><span class="s2">, got </span><span class="si">{</span><span class="n">tensor</span><span class="o">.</span><span class="n">shard</span><span class="si">!r}</span><span class="s2">"</span><span class="p">)</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">entry</span><span class="o">.</span><span class="n">host</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">is_value</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Array </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">name</span><span class="si">!r}</span><span class="s2">.entry.host: only a Value (rewritable, max_len 1) holds host fields"</span><span class="p">)</span>
         <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">kind</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">entry</span><span class="o">.</span><span class="n">host</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
             <span class="k">if</span> <span class="ow">not</span> <span class="n">_is_host_type</span><span class="p">(</span><span class="n">kind</span><span class="p">):</span>
                 <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Array </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">name</span><span class="si">!r}</span><span class="s2">.entry.host[</span><span class="si">{</span><span class="n">name</span><span class="si">!r}</span><span class="s2">] must be int, float, bool, str, bytes or a "</span>
@@ -1364,6 +1377,9 @@ window.runMermaid = runMermaid;</script>
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">where</span><span class="si">}</span><span class="s2">.layers has </span><span class="si">{</span><span class="nb">sorted</span><span class="p">(</span><span class="n">read</span><span class="o">.</span><span class="n">layers</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="bp">self</span><span class="o">.</span><span class="n">layers</span><span class="p">)</span><span class="si">}</span><span class="s2">, outside the array's layers"</span><span class="p">)</span>
         <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">read</span><span class="o">.</span><span class="n">mask</span><span class="p">,</span> <span class="n">Window</span><span class="p">)</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">_is_positive</span><span class="p">(</span><span class="n">read</span><span class="o">.</span><span class="n">mask</span><span class="o">.</span><span class="n">size</span><span class="p">):</span>
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">where</span><span class="si">}</span><span class="s2">.mask.size must be a positive int, got </span><span class="si">{</span><span class="n">read</span><span class="o">.</span><span class="n">mask</span><span class="o">.</span><span class="n">size</span><span class="si">!r}</span><span class="s2">"</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">read</span><span class="o">.</span><span class="n">queries</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">read</span><span class="o">.</span><span class="n">mask</span><span class="p">,</span> <span class="n">Block</span><span class="p">):</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">where</span><span class="si">}</span><span class="s2">.queries: a read of another array's queries takes a mask that uses no query "</span>
+                             <span class="sa">f</span><span class="s2">"position, and </span><span class="si">{</span><span class="nb">type</span><span class="p">(</span><span class="n">read</span><span class="o">.</span><span class="n">mask</span><span class="p">)</span><span class="o">.</span><span class="vm">__name__</span><span class="si">}</span><span class="s2"> does"</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">read</span><span class="o">.</span><span class="n">op</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_check_op</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">where</span><span class="si">}</span><span class="s2">.op"</span><span class="p">,</span> <span class="n">read</span><span class="o">.</span><span class="n">op</span><span class="p">)</span>
 
@@ -1390,6 +1406,14 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../../_autosummary/mstar.engine.state.contract.html#mstar.engine.state.is_value">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">is_value</span><span class="p">(</span><span class="n">array</span><span class="p">:</span> <span class="n">Array</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
     <span class="k">return</span> <span class="n">array</span><span class="o">.</span><span class="n">rewritable</span> <span class="ow">and</span> <span class="n">array</span><span class="o">.</span><span class="n">max_len</span> <span class="o">==</span> <span class="mi">1</span></div>
+
+
+
+<div class="viewcode-block" id="read_layers">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.state.contract.html#mstar.engine.state.read_layers">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">read_layers</span><span class="p">(</span><span class="n">array</span><span class="p">:</span> <span class="n">Array</span><span class="p">,</span> <span class="n">read</span><span class="p">:</span> <span class="n">Read</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">int</span><span class="p">]:</span>
+<span class="w">    </span><span class="sd">"""The layers ``read`` reads of ``array``: its own, or all of the array's."""</span>
+    <span class="k">return</span> <span class="n">read</span><span class="o">.</span><span class="n">layers</span> <span class="ow">or</span> <span class="n">array</span><span class="o">.</span><span class="n">layers</span></div>
 
 
 
@@ -1470,8 +1494,10 @@ window.runMermaid = runMermaid;</script>
     <span class="n">forks</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="n">Fork</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span> <span class="o">=</span> <span class="p">()</span>
     <span class="n">placeholders</span><span class="p">:</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">str</span><span class="p">]]</span> <span class="o">=</span> <span class="nb">frozenset</span><span class="p">()</span>    <span class="c1"># (row, label): holds a place, reads and keeps nothing</span>
     <span class="n">eager_add</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>                        <span class="c1"># this step's adds run outside the captured graph</span>
+    <span class="n">fixed_layout</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>                     <span class="c1"># replays of its capture bucket plan the capture's layout</span>
     <span class="n">advance</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>         <span class="c1"># positions per row; None: the span</span>
-    <span class="n">position_ids</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>       <span class="c1"># explicit ids, (tokens,) in segment order</span></div>
+    <span class="n">position_ids</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>       <span class="c1"># explicit ids, (tokens,) in segment order</span>
+    <span class="n">host</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">],</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">object</span><span class="p">]]</span> <span class="o">=</span> <span class="n">EMPTY</span>    <span class="c1"># (row, label, layer) -&gt; fields, at commit</span></div>
 
 
 
@@ -1497,6 +1523,34 @@ window.runMermaid = runMermaid;</script>
     <span class="n">spans</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="n">Span</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span> <span class="o">=</span> <span class="p">()</span>
     <span class="n">growth</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">],</span> <span class="o">...</span><span class="p">]</span> <span class="o">=</span> <span class="p">()</span>    <span class="c1"># (loop, entries per iteration)</span>
     <span class="n">scratch</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>                            <span class="c1"># most one scratch step writes past the kept length</span></div>
+
+
+
+<div class="viewcode-block" id="PagedNHD">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.state.contract.html#mstar.engine.state.PagedNHD">[docs]</a>
+<span class="nd">@dataclass</span><span class="p">(</span><span class="n">frozen</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">kw_only</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">PagedNHD</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""A storage format a state op can address: pages of (tokens, heads, head_dim)."""</span>
+
+    <span class="n">dtypes</span><span class="p">:</span> <span class="nb">frozenset</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">dtype</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>    <span class="c1"># None: any</span>
+    <span class="n">devices</span><span class="p">:</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>           <span class="c1"># None: any</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">__post_init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="k">for</span> <span class="n">name</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">"dtypes"</span><span class="p">,</span> <span class="s2">"devices"</span><span class="p">):</span>
+            <span class="k">if</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">name</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="nb">object</span><span class="o">.</span><span class="fm">__setattr__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">name</span><span class="p">,</span> <span class="nb">frozenset</span><span class="p">(</span><span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">name</span><span class="p">)))</span></div>
+
+
+
+<div class="viewcode-block" id="PagedNHDTarget">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.state.contract.html#mstar.engine.state.PagedNHDTarget">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">PagedNHDTarget</span><span class="p">(</span><span class="n">NamedTuple</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""Where a state op writes this step's entries on one layer of a `PagedNHD` array."""</span>
+
+    <span class="n">cache</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span>
+    <span class="n">page_of_token</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span>
+    <span class="n">slot_of_token</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span>
+    <span class="n">count</span><span class="p">:</span> <span class="nb">int</span>    <span class="c1"># tokens to write</span></div>
 
 
 
@@ -1555,7 +1609,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Nov 11, 2026.
+  Last updated on Nov 12, 2026.
   <br/>
 </p>
   </div>

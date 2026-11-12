@@ -13,9 +13,12 @@ mstar.engine.state.analysis
 
    .. autosummary::
    
+      both_sharded
       declaration_digest
       deployment_problems
+      narrows_heads
       position_key
+      query_array
       state_declaration_problems
    
    

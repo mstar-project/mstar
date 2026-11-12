@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Nov 11, 2026"/>
+    <meta name="docbuild:last-update" content="Nov 12, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -273,10 +273,11 @@
 </ul>
 </details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.engine.state.html">mstar.engine.state</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
-<li class="toctree-l4"><a class="reference internal" href="mstar.engine.state.adapters.html">mstar.engine.state.adapters</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.state.analysis.html">mstar.engine.state.analysis</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.state.calls.html">mstar.engine.state.calls</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.state.contract.html">mstar.engine.state.contract</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.engine.state.host_fields.html">mstar.engine.state.host_fields</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.engine.state.state_op.html">mstar.engine.state.state_op</a></li>
 </ul>
 </details></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.engine.windowing.html">mstar.engine.windowing</a></li>
@@ -846,6 +847,7 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.StepHandle"><code class="docutils literal notranslate"><span class="pre">StepHandle</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.StepHandle.begin_step"><code class="docutils literal notranslate"><span class="pre">StepHandle.begin_step()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.StepHandle.check_step"><code class="docutils literal notranslate"><span class="pre">StepHandle.check_step()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.StepHandle.commit_step"><code class="docutils literal notranslate"><span class="pre">StepHandle.commit_step()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.StepHandle.end_step"><code class="docutils literal notranslate"><span class="pre">StepHandle.end_step()</span></code></a></li>
 </ul>
 </li>
@@ -853,6 +855,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.SubmoduleStep.begin_calls"><code class="docutils literal notranslate"><span class="pre">SubmoduleStep.begin_calls()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.SubmoduleStep.cg_key_info"><code class="docutils literal notranslate"><span class="pre">SubmoduleStep.cg_key_info</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.SubmoduleStep.check_calls"><code class="docutils literal notranslate"><span class="pre">SubmoduleStep.check_calls()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.SubmoduleStep.commit_calls"><code class="docutils literal notranslate"><span class="pre">SubmoduleStep.commit_calls()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.SubmoduleStep.ctx"><code class="docutils literal notranslate"><span class="pre">SubmoduleStep.ctx</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.SubmoduleStep.end_calls"><code class="docutils literal notranslate"><span class="pre">SubmoduleStep.end_calls()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.SubmoduleStep.get"><code class="docutils literal notranslate"><span class="pre">SubmoduleStep.get()</span></code></a></li>
@@ -1597,6 +1600,20 @@ should reserve, address and commit nothing on its behalf.</p>
 </dd></dl>
 
 <dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.step.StepHandle.commit_step">
+<span class="property"><span class="k"><span class="pre">abstractmethod</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">commit_step</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">step</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/step.html#StepHandle.commit_step"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.step.StepHandle.commit_step" title="Link to this definition">#</a></dt>
+<dd><p>Apply what the handle itself holds of a step the resources just committed.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>step</strong> (<a class="reference internal" href="#mstar.engine.resources.step.SubmoduleStep" title="mstar.engine.resources.step.SubmoduleStep"><em>SubmoduleStep</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.step.StepHandle.end_step">
 <span class="property"><span class="k"><span class="pre">abstractmethod</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">end_step</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">step</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/step.html#StepHandle.end_step"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.step.StepHandle.end_step" title="Link to this definition">#</a></dt>
 <dd><p>Close the handle, on any path out of the step.</p>
@@ -1645,6 +1662,16 @@ should reserve, address and commit nothing on its behalf.</p>
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.step.SubmoduleStep.check_calls">
 <span class="sig-name descname"><span class="pre">check_calls</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/step.html#SubmoduleStep.check_calls"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.step.SubmoduleStep.check_calls" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.step.SubmoduleStep.commit_calls">
+<span class="sig-name descname"><span class="pre">commit_calls</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/step.html#SubmoduleStep.commit_calls"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.step.SubmoduleStep.commit_calls" title="Link to this definition">#</a></dt>
 <dd><dl class="field-list simple">
 <dt class="field-odd">Return type<span class="colon">:</span></dt>
 <dd class="field-odd"><p>None</p>
@@ -1902,6 +1929,7 @@ replay, in the order it tries them.</p>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.StepHandle"><code class="docutils literal notranslate"><span class="pre">StepHandle</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.StepHandle.begin_step"><code class="docutils literal notranslate"><span class="pre">StepHandle.begin_step()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.StepHandle.check_step"><code class="docutils literal notranslate"><span class="pre">StepHandle.check_step()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.StepHandle.commit_step"><code class="docutils literal notranslate"><span class="pre">StepHandle.commit_step()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.StepHandle.end_step"><code class="docutils literal notranslate"><span class="pre">StepHandle.end_step()</span></code></a></li>
 </ul>
 </li>
@@ -1909,6 +1937,7 @@ replay, in the order it tries them.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.SubmoduleStep.begin_calls"><code class="docutils literal notranslate"><span class="pre">SubmoduleStep.begin_calls()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.SubmoduleStep.cg_key_info"><code class="docutils literal notranslate"><span class="pre">SubmoduleStep.cg_key_info</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.SubmoduleStep.check_calls"><code class="docutils literal notranslate"><span class="pre">SubmoduleStep.check_calls()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.SubmoduleStep.commit_calls"><code class="docutils literal notranslate"><span class="pre">SubmoduleStep.commit_calls()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.SubmoduleStep.ctx"><code class="docutils literal notranslate"><span class="pre">SubmoduleStep.ctx</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.SubmoduleStep.end_calls"><code class="docutils literal notranslate"><span class="pre">SubmoduleStep.end_calls()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.SubmoduleStep.get"><code class="docutils literal notranslate"><span class="pre">SubmoduleStep.get()</span></code></a></li>
@@ -1955,7 +1984,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Nov 11, 2026.
+  Last updated on Nov 12, 2026.
   <br/>
 </p>
   </div>

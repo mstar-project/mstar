@@ -54,7 +54,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Nov 11, 2026"/>
+    <meta name="docbuild:last-update" content="Nov 12, 2026"/>
   
     
     <script src="_static/searchtools.js"></script>
@@ -272,10 +272,11 @@
 </ul>
 </details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.engine.state.html">mstar.engine.state</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
-<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.state.adapters.html">mstar.engine.state.adapters</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.state.analysis.html">mstar.engine.state.analysis</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.state.calls.html">mstar.engine.state.calls</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.state.contract.html">mstar.engine.state.contract</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.state.host_fields.html">mstar.engine.state.host_fields</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.state.state_op.html">mstar.engine.state.state_op</a></li>
 </ul>
 </details></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.engine.windowing.html">mstar.engine.windowing</a></li>
@@ -1520,9 +1521,31 @@ above one draw.</p></li>
 </div>
 <p>A declaration today’s engine can’t hold fails at load, with <code class="docutils literal notranslate"><span class="pre">no</span> <span class="pre">layout</span> <span class="pre">yet</span></code> and what is
 missing. Every refusal names the declaration and the field.</p>
+<p>A read with <code class="docutils literal notranslate"><span class="pre">queries=ARRAY</span></code> is cross-attention: its queries are laid out by that array’s
+segments in this step, and each request’s k-th segment on one pairs with its k-th on the other.
+It takes <code class="docutils literal notranslate"><span class="pre">Block()</span></code>, since no query position decides what it sees. Separate token sets are
+separate arrays, and arrays of one kind and geometry on one node share one resource, each under
+its own label.</p>
+<p>An array whose calls carry each rank’s share of its tokens under sequence parallelism declares
+<code class="docutils literal notranslate"><span class="pre">seq_sharded=True</span></code>. Segments always cover the whole sequence, so <code class="docutils literal notranslate"><span class="pre">declare_step</span></code> is the same
+on every rank, and the two flags pick the exchange: Ulysses with both sides sharded, none with
+only the queries sharded, and a merge of the ranks’ partial attentions with only the keys.</p>
+<p>A read takes its queries packed, <code class="docutils literal notranslate"><span class="pre">(tokens,</span> <span class="pre">heads,</span> <span class="pre">head_dim)</span></code> over every row. A read whose layers
+pass rows of one length, <code class="docutils literal notranslate"><span class="pre">(rows,</span> <span class="pre">len,</span> <span class="pre">heads,</span> <span class="pre">head_dim)</span></code>, as a DiT’s do, declares
+<code class="docutils literal notranslate"><span class="pre">packed=False</span></code>, and a packed call to it is refused.
+A read whose request’s segments lie end to end in one row, as a DiT’s packed rows and their pad
+do, declares <code class="docutils literal notranslate"><span class="pre">segmented=True</span></code>. It takes <code class="docutils literal notranslate"><span class="pre">Block()</span></code>, <code class="docutils literal notranslate"><span class="pre">packed=False</span></code> and no <code class="docutils literal notranslate"><span class="pre">queries</span></code>, and it
+runs one request a step. Under sequence parallelism the ranks split each request’s whole row by
+<code class="docutils literal notranslate"><span class="pre">sp_seq_split</span></code>, not each segment.</p>
+<p>A <code class="docutils literal notranslate"><span class="pre">Value</span></code> may hold only host fields, small values a step changes, as
+<code class="docutils literal notranslate"><span class="pre">Entry({},</span> <span class="pre">host={&quot;eos_sent&quot;:</span> <span class="pre">bool})</span></code>. Each starts at its type’s zero value. <code class="docutils literal notranslate"><span class="pre">host(h,</span> <span class="pre">request,</span>
+<span class="pre">label,</span> <span class="pre">layer)</span></code> reads them, and <code class="docutils literal notranslate"><span class="pre">ArrayStep(host={(row,</span> <span class="pre">label,</span> <span class="pre">layer):</span> <span class="pre">{field:</span> <span class="pre">value}})</span></code> writes
+them when the step commits, so the next step’s <code class="docutils literal notranslate"><span class="pre">prepare_inputs</span></code> sees the write and a step that
+never ran changes nothing.</p>
 <p><code class="docutils literal notranslate"><span class="pre">kernel_settings(self)</span></code> is a temporary hook for what the engine doesn’t pick itself yet:
 <code class="docutils literal notranslate"><span class="pre">splits</span></code> and <code class="docutils literal notranslate"><span class="pre">decode_fmha</span></code> on a read, <code class="docutils literal notranslate"><span class="pre">splits</span></code> on a <code class="docutils literal notranslate"><span class="pre">GatedDeltaNet</span></code>, and
-<code class="docutils literal notranslate"><span class="pre">max_segments_per_step</span></code> and <code class="docutils literal notranslate"><span class="pre">compile_op</span></code> on a <code class="docutils literal notranslate"><span class="pre">Block</span></code> read. It refuses anything else.</p>
+<code class="docutils literal notranslate"><span class="pre">max_segments_per_request</span></code>, <code class="docutils literal notranslate"><span class="pre">max_segments_per_step</span></code>, <code class="docutils literal notranslate"><span class="pre">compile_op</span></code> and <code class="docutils literal notranslate"><span class="pre">workspace_mb</span></code> on a
+<code class="docutils literal notranslate"><span class="pre">Block</span></code> read. It refuses anything else.</p>
 <section id="resource-specs">
 <h3>Resource specs<a class="headerlink" href="#resource-specs" title="Link to this heading">#</a></h3>
 <p>The engine builds these specs from <code class="docutils literal notranslate"><span class="pre">declare_state</span></code>, and a deployment tunes them under the
@@ -2027,9 +2050,10 @@ default. A GPU of the architecture reads the file
 whichever model it is, and the build-time log names the GPU the row was swept on. The cuDNN wrapper runs a layout of equal-length
 segments, a DiT batch’s, as one dense <code class="docutils literal notranslate"><span class="pre">[segments,</span> <span class="pre">S,</span> <span class="pre">H,</span> <span class="pre">D]</span></code> call. A captured one replays only
 the layout it was planned with, so a captured bucket takes it only when the step that plans it
-declares <code class="docutils literal notranslate"><span class="pre">AttentionStep(fixed_layout=True)</span></code>, and stays on FlashInfer otherwise. The DiT
-scaffold’s denoise step declares it (<code class="docutils literal notranslate"><span class="pre">DenoiseLoopSubmodule.attention_step</span></code>): every row of a
-denoise bucket, padding rows included, spans the bucket’s tokens. An eager layout of unequal
+declares <code class="docutils literal notranslate"><span class="pre">AttentionStep(fixed_layout=True)</span></code> (<code class="docutils literal notranslate"><span class="pre">ArrayStep(fixed_layout=True)</span></code> on a declared
+array), and stays on FlashInfer otherwise. The DiT scaffold’s denoise step declares it on each
+of its arrays: every row of a denoise bucket, padding rows included, spans the bucket’s tokens.
+An eager layout of unequal
 segments runs FlashInfer. It is self-attention only. A config that names <code class="docutils literal notranslate"><span class="pre">backend:</span> <span class="pre">cudnn</span></code>
 fails at build where cuDNN can’t run it: on a cross-attention or block-causal resource, under
 GQA, in a dtype other than bf16 / fp16, or at a head dim FlashInfer pads. Where no table has the
@@ -2842,7 +2866,7 @@ step does to each array and sampler it touches. The engine expands <code class="
 step. <code class="docutils literal notranslate"><span class="pre">span</span></code> is how far the row advances on that label: an append-only array adds that
 many entries, and a Value folds that many positions into its one entry. A <code class="docutils literal notranslate"><span class="pre">span</span></code> of 0
 reads the array without extending it. Under <code class="docutils literal notranslate"><span class="pre">max_len=0</span></code> each segment is one block.</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">ArrayStep(segments=,</span> <span class="pre">keep=,</span> <span class="pre">forks=,</span> <span class="pre">placeholders=,</span> <span class="pre">eager_add=,</span> <span class="pre">advance=,</span> <span class="pre">position_ids=)</span></code>.
+<li><p><code class="docutils literal notranslate"><span class="pre">ArrayStep(segments=,</span> <span class="pre">keep=,</span> <span class="pre">forks=,</span> <span class="pre">placeholders=,</span> <span class="pre">eager_add=,</span> <span class="pre">fixed_layout=,</span> <span class="pre">advance=,</span> <span class="pre">position_ids=)</span></code>.
 A step lists every array it touches, and a call on one it doesn’t list raises. <code class="docutils literal notranslate"><span class="pre">segments</span></code>
 gives one array its own spans, <code class="docutils literal notranslate"><span class="pre">None</span></code> being the step’s. <code class="docutils literal notranslate"><span class="pre">keep=False</span></code> makes every add
 this step scratch. <code class="docutils literal notranslate"><span class="pre">advance</span></code> moves each row’s position counter by something other than
@@ -2915,6 +2939,9 @@ example in <code class="docutils literal notranslate"><span class="pre">preproce
 than the slot’s static buffers, which are sized for the bucket’s in-graph tokens. Whisper’s
 prefill uses it to write its 1500-token encoder context while replaying a graph sized by
 its few prompt tokens.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">fixed_layout=True</span></code> (<code class="docutils literal notranslate"><span class="pre">fixed_layout</span></code>): every replay of the step’s capture bucket lays its
+rows out as the capture did, so a ragged self-attention may capture a kernel that bakes the
+layout in (cuDNN). A resource’s step takes it only if every read on the resource declares it.</p></li>
 </ul>
 <p>Only a model that hasn’t moved writes <code class="docutils literal notranslate"><span class="pre">KVStep(combined_labels=...)</span></code>. On the contract, a
 step’s calls cover all of its rows in segment order.</p>
@@ -2923,8 +2950,8 @@ of its own, rather than through <code class="docutils literal notranslate"><span
 <code class="docutils literal notranslate"><span class="pre">kv.write_target(layer_idx,</span> <span class="pre">label)</span></code> returns <code class="docutils literal notranslate"><span class="pre">(layer</span> <span class="pre">cache,</span> <span class="pre">page</span> <span class="pre">of</span> <span class="pre">each</span> <span class="pre">token,</span> <span class="pre">slot</span> <span class="pre">in</span>
 <span class="pre">page</span> <span class="pre">of</span> <span class="pre">each</span> <span class="pre">token,</span> <span class="pre">number</span> <span class="pre">of</span> <span class="pre">tokens</span> <span class="pre">to</span> <span class="pre">write)</span></code> for the current plan (NHD layout only).
 Tokens past that number are the plan’s padding and must not be written. The fused q/k
-norm, RoPE and KV-write kernels that Qwen3-ASR and Qwen3-Omni’s Thinker call through
-<code class="docutils literal notranslate"><span class="pre">AttentionCallable.norm_rope_attend</span></code> and <code class="docutils literal notranslate"><span class="pre">norm_rope_table_attend</span></code> are the example.</p>
+norm, RoPE and KV-write kernel that Qwen3-ASR calls through
+<code class="docutils literal notranslate"><span class="pre">AttentionCallable.norm_rope_attend</span></code> is the example.</p>
 <p><strong>Testing.</strong> <code class="docutils literal notranslate"><span class="pre">declare_step</span></code> performs only host-side bookkeeping, so you can unit-test it
 on CPU without model weights. <code class="docutils literal notranslate"><span class="pre">test/modular/test_state_ports.py</span></code> compares both ports’ steps
 against hand-written ones, and <code class="docutils literal notranslate"><span class="pre">test/modular/test_resource_runner.py</span></code> tests the runner’s
@@ -2982,6 +3009,25 @@ frame serves every layer, a compiled layer passes its layer id as a 0-d int64 CP
 plain attribute, not a buffer. An eager caller can pass the int.</p>
 <p><code class="docutils literal notranslate"><span class="pre">kernel_setting(h,</span> <span class="pre">read,</span> <span class="pre">field)</span></code> reads a <code class="docutils literal notranslate"><span class="pre">kernel_settings</span></code> field in effect, YAML
 included. It is temporary, with that hook.</p>
+<p>A kernel that writes state itself, in one launch with the math before it, is a state op. It
+names what it touches, the formats its kernel can address, and a reference over the contract’s
+calls, which any other format runs:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="nd">@state_op</span><span class="p">(</span><span class="n">adds</span><span class="o">=</span><span class="p">(</span><span class="s2">"kv"</span><span class="p">,),</span> <span class="n">mutates</span><span class="o">=</span><span class="p">(</span><span class="s2">"q"</span><span class="p">,),</span> <span class="n">formats</span><span class="o">=</span><span class="p">(</span><span class="n">PagedNHD</span><span class="p">(</span><span class="n">devices</span><span class="o">=</span><span class="p">{</span><span class="s2">"cuda"</span><span class="p">}),),</span> <span class="n">reference</span><span class="o">=</span><span class="n">_reference</span><span class="p">)</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">write</span><span class="p">(</span><span class="n">kv</span><span class="p">,</span> <span class="n">layer</span><span class="p">,</span> <span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">,</span> <span class="o">*</span><span class="p">,</span> <span class="n">target</span><span class="p">:</span> <span class="n">PagedNHDTarget</span><span class="p">):</span> <span class="o">...</span>
+
+<span class="n">write</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">kv</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">layer</span><span class="p">,</span> <span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">)</span>      <span class="c1"># counts as the layer's add, and breaks the graph as add does</span>
+<span class="n">out</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv</span><span class="o">.</span><span class="n">read</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">layer</span><span class="p">,</span> <span class="n">q</span><span class="p">)</span>
+</pre></div>
+</div>
+<p>The engine picks the kernel or the reference at bind. <code class="docutils literal notranslate"><span class="pre">target</span></code> says where this step’s entries go
+on the layer. A conformance test holds each kernel to its reference on each listed format, and
+<code class="docutils literal notranslate"><span class="pre">MSTAR_KV_DEBUG_ASSERTS=1</span></code> checks that an eager call writes nothing outside the step’s slots.</p>
+<p>Between steps, a model may keep a memo of a pure function of request inputs, whose loss costs time
+and changes no output, and scratch buffers that it makes at load and that no step reads before
+writing. Anything else it keeps between steps is declared state or an edge. This rests on the
+engine running a node’s forwards one at a time, in stream order. The diffusion loop’s schedule and
+prefetched seeds are memos, its latents and solver state are loop-back edges, and a code
+predictor’s frame-local KV is scratch.</p>
 <p>A model on the contract reads no <code class="docutils literal notranslate"><span class="pre">node_resources</span></code>, <code class="docutils literal notranslate"><span class="pre">engine_inputs.resources</span></code>,
 <code class="docutils literal notranslate"><span class="pre">request_state</span></code> or <code class="docutils literal notranslate"><span class="pre">per_request_states</span></code>, and imports the engine only through
 <code class="docutils literal notranslate"><span class="pre">mstar.engine.state</span></code>; <code class="docutils literal notranslate"><span class="pre">test/modular/test_state_lint.py</span></code> holds each ported package to that.</p>
@@ -4239,9 +4285,9 @@ image_edit   : image_gen with ref_latents as an extra Loop input
 iteration. The step index is the engine’s loop counter
 (<code class="docutils literal notranslate"><span class="pre">fwd_info.dynamic_loop_iter_counts</span></code>), so there is no host sync per step.</p>
 <p>The <code class="docutils literal notranslate"><span class="pre">dit</span></code> node subclasses <code class="docutils literal notranslate"><span class="pre">DenoiseLoopSubmodule</span></code> (<code class="docutils literal notranslate"><span class="pre">denoise_loop.py</span></code>), which owns
-the engine contract — seeded initial noise, per-request schedules, equal-key request
-batching (<code class="docutils literal notranslate"><span class="pre">can_batch</span></code>), stacked <code class="docutils literal notranslate"><span class="pre">forward_batched</span></code>, the ragged-attention
-<code class="docutils literal notranslate"><span class="pre">declare_step</span></code> and one CUDA-graph bucket per <code class="docutils literal notranslate"><span class="pre">bucket_key</span></code> with the Euler update inside
+the engine contract — seeded initial noise, memoized schedules, equal-key request
+batching (<code class="docutils literal notranslate"><span class="pre">can_batch</span></code>), stacked <code class="docutils literal notranslate"><span class="pre">forward_batched</span></code>, the <code class="docutils literal notranslate"><span class="pre">declare_step</span></code> over the arrays
+it attends through and one CUDA-graph bucket per <code class="docutils literal notranslate"><span class="pre">bucket_key</span></code> with the Euler update inside
 the graph — and asks the model for the hooks below. The loop ends on its iteration count:
 a model whose request picks its step count returns it from <code class="docutils literal notranslate"><span class="pre">get_loop_caps</span></code>
 (<code class="docutils literal notranslate"><span class="pre">{&quot;denoise_loop&quot;:</span> <span class="pre">steps}</span></code>), resolved exactly as <code class="docutils literal notranslate"><span class="pre">schedule_for</span></code> resolves it, and a
@@ -4249,14 +4295,16 @@ stage that always runs its graph <code class="docutils literal notranslate"><spa
 iteration past the schedule. The hooks:</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">class</span><span class="w"> </span><span class="nc">MyDenoise</span><span class="p">(</span><span class="n">DenoiseLoopSubmodule</span><span class="p">):</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">bucket_key_for</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">fwd_info</span><span class="p">):</span> <span class="o">...</span>       <span class="c1"># hashable: latent grid, text length, ...</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">schedule_for</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">fwd_info</span><span class="p">,</span> <span class="n">key</span><span class="p">):</span> <span class="o">...</span>    <span class="c1"># FlowMatchSchedule (flow_match.py)</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">seed_latents</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">fwd_info</span><span class="p">,</span> <span class="n">key</span><span class="p">,</span> <span class="n">gen</span><span class="p">):</span> <span class="o">...</span>  <span class="c1"># [L, C] initial noise, seeded</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">schedule_for</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">walk</span><span class="p">,</span> <span class="n">settings</span><span class="p">,</span> <span class="n">key</span><span class="p">):</span> <span class="o">...</span>  <span class="c1"># FlowMatchSchedule (flow_match.py), memoized</span>
+    <span class="c1"># optional: what the request sets of its schedule; its step count by default</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">schedule_settings</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">fwd_info</span><span class="p">):</span> <span class="o">...</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">seed_latents</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">key</span><span class="p">,</span> <span class="n">gen</span><span class="p">):</span> <span class="o">...</span>         <span class="c1"># [L, C] initial noise, seeded</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">request_inputs</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">fwd_info</span><span class="p">,</span> <span class="n">inputs</span><span class="p">,</span> <span class="n">key</span><span class="p">):</span> <span class="o">...</span>  <span class="c1"># per-row conditioning tensors</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">num_tokens</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">key</span><span class="p">):</span> <span class="o">...</span>                <span class="c1"># image tokens for the attention step</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">capture_request_inputs</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">key</span><span class="p">,</span> <span class="n">device</span><span class="p">):</span> <span class="o">...</span>   <span class="c1"># dummy rows for graph capture</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">denoise</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">engine_inputs</span><span class="p">,</span> <span class="n">key</span><span class="p">,</span> <span class="n">latents</span><span class="p">,</span> <span class="n">timestep</span><span class="p">,</span> <span class="n">sigma</span><span class="p">,</span> <span class="n">sigma_next</span><span class="p">,</span> <span class="o">**</span><span class="n">cond</span><span class="p">):</span> <span class="o">...</span>
     <span class="c1"># optional: extra attention spans (a refiner over the image tokens alone, ...)</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">attention_segments</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">key</span><span class="p">):</span> <span class="k">return</span> <span class="p">((</span><span class="s2">"main"</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_tokens</span><span class="p">(</span><span class="n">key</span><span class="p">)),)</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">attention_segments</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">key</span><span class="p">):</span> <span class="k">return</span> <span class="p">{</span><span class="n">TOKENS</span><span class="p">:</span> <span class="p">((</span><span class="s2">"main"</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_tokens</span><span class="p">(</span><span class="n">key</span><span class="p">)),)}</span>
 </pre></div>
 </div>
 <p><code class="docutils literal notranslate"><span class="pre">bucket_key</span></code> is whatever has to match for two rows to share a forward, and it is also
@@ -4277,12 +4325,13 @@ seed sets <code class="docutils literal notranslate"><span class="pre">PREFETCH_
 when the request reaches the worker, on a thread of its own, and iteration 0 only copies
 it to the device. Otherwise the CPU draw runs on the GPU thread at iteration 0, once per
 joining row.</p>
-<p>Every span a layer attends over must be declared with its own label (default: one
-<code class="docutils literal notranslate"><span class="pre">&quot;main&quot;</span></code> segment per request); <code class="docutils literal notranslate"><span class="pre">ragged_for(label)</span></code> hands that span’s kernel to the
-layers, which fall back to SDPA when no ragged resource is bound.</p>
+<p>Every span a layer attends over is a segment of a declared array with <code class="docutils literal notranslate"><span class="pre">max_len</span></code> 0, listed
+in <code class="docutils literal notranslate"><span class="pre">attention_segments</span></code> per request. A layer calls <code class="docutils literal notranslate"><span class="pre">attend(self.state,</span> <span class="pre">self.layer,</span> <span class="pre">q,</span> <span class="pre">k,</span> <span class="pre">v)</span></code>
+from <code class="docutils literal notranslate"><span class="pre">attention.py</span></code>, which adds and reads through its array, and runs SDPA on a layer no
+engine bound a handle to. Arrays of one geometry share one resource, each under its own label.</p>
 <p>Shared pieces to build the components from: <code class="docutils literal notranslate"><span class="pre">flow_match.py</span></code> (shift schedules and the
 exact Euler step), <code class="docutils literal notranslate"><span class="pre">rope.py</span></code> (multi-axis rotary embeddings), <code class="docutils literal notranslate"><span class="pre">attention.py</span></code> (joint
-attention over packed tokens: SDPA eagerly, the ragged FlashInfer resource under graphs),
+attention over packed tokens: SDPA, or the ragged FlashInfer resource through a read),
 <code class="docutils literal notranslate"><span class="pre">text_encoder.py</span></code> (native Qwen3 hidden-state taps), <code class="docutils literal notranslate"><span class="pre">autoencoder_kl.py</span></code> (the KL VAE
 family), <code class="docutils literal notranslate"><span class="pre">image_io.py</span></code> (latent packing, PNG) and <code class="docutils literal notranslate"><span class="pre">lora.py</span></code> (static LoRA merge at load,
 also into fused <code class="docutils literal notranslate"><span class="pre">q</span></code>/<code class="docutils literal notranslate"><span class="pre">k</span></code>/<code class="docutils literal notranslate"><span class="pre">v</span></code> shards via <code class="docutils literal notranslate"><span class="pre">FusedColumnLinear.shard_slice</span></code>; the checkpoint
@@ -4818,7 +4867,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Nov 11, 2026.
+  Last updated on Nov 12, 2026.
   <br/>
 </p>
   </div>

@@ -410,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Nov 11, 2026"/>
+    <meta name="docbuild:last-update" content="Nov 12, 2026"/>
   
     
     <script src="../../../../_static/searchtools.js"></script>
@@ -626,10 +626,11 @@ window.runMermaid = runMermaid;</script>
 </ul>
 </details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../../_autosummary/mstar.engine.state.html">mstar.engine.state</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
-<li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.state.adapters.html">mstar.engine.state.adapters</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.state.analysis.html">mstar.engine.state.analysis</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.state.calls.html">mstar.engine.state.calls</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.state.contract.html">mstar.engine.state.contract</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.state.host_fields.html">mstar.engine.state.host_fields</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.state.state_op.html">mstar.engine.state.state_op</a></li>
 </ul>
 </details></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.engine.windowing.html">mstar.engine.windowing</a></li>
@@ -1037,13 +1038,32 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">"""</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">abstractmethod</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Mapping</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">Any</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Mapping</span><span class="p">,</span> <span class="n">Sequence</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">TYPE_CHECKING</span><span class="p">,</span> <span class="n">Any</span>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
 
-<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.step</span><span class="w"> </span><span class="kn">import</span> <span class="n">StepHandle</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.state.contract</span><span class="w"> </span><span class="kn">import</span> <span class="n">Array</span><span class="p">,</span> <span class="n">ArrayStep</span><span class="p">,</span> <span class="n">CausalConv</span><span class="p">,</span> <span class="n">GatedDeltaNet</span><span class="p">,</span> <span class="n">Op</span><span class="p">,</span> <span class="n">Sampler</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.step</span><span class="w"> </span><span class="kn">import</span> <span class="n">Segment</span><span class="p">,</span> <span class="n">StepHandle</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.state.contract</span><span class="w"> </span><span class="kn">import</span> <span class="n">EMPTY</span><span class="p">,</span> <span class="n">Array</span><span class="p">,</span> <span class="n">ArrayStep</span><span class="p">,</span> <span class="n">CausalConv</span><span class="p">,</span> <span class="n">GatedDeltaNet</span><span class="p">,</span> <span class="n">Op</span><span class="p">,</span> <span class="n">Sampler</span>
+
+<span class="k">if</span> <span class="n">TYPE_CHECKING</span><span class="p">:</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.state.state_op</span><span class="w"> </span><span class="kn">import</span> <span class="n">StateOp</span>
+
+
+<div class="viewcode-block" id="segments_of">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.state.calls.html#mstar.engine.state.segments_of">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">segments_of</span><span class="p">(</span><span class="n">declared</span><span class="p">:</span> <span class="n">ArrayStep</span><span class="p">,</span> <span class="n">step</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Sequence</span><span class="p">[</span><span class="n">Segment</span><span class="p">]:</span>
+<span class="w">    </span><span class="sd">"""The segments ``declared`` lays out in ``step``: its own, or the step's where it lists None."""</span>
+    <span class="k">return</span> <span class="n">step</span><span class="o">.</span><span class="n">segments</span> <span class="k">if</span> <span class="n">declared</span><span class="o">.</span><span class="n">segments</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">declared</span><span class="o">.</span><span class="n">segments</span></div>
+
+
+
+<div class="viewcode-block" id="pool_layers">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.state.calls.html#mstar.engine.state.pool_layers">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">pool_layers</span><span class="p">(</span><span class="n">array</span><span class="p">:</span> <span class="n">Array</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">]:</span>
+<span class="w">    </span><span class="sd">"""Each of ``array``'s layers to its index in the array's pool, which holds only those layers, in order."""</span>
+    <span class="k">return</span> <span class="p">{</span><span class="n">layer</span><span class="p">:</span> <span class="n">i</span> <span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="n">layer</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="nb">sorted</span><span class="p">(</span><span class="n">array</span><span class="o">.</span><span class="n">layers</span><span class="p">))}</span></div>
+
 
 
 <div class="viewcode-block" id="ArrayHandle">
@@ -1058,16 +1078,23 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">    resources hold the step's plan.</span>
 <span class="sd">    """</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">array</span><span class="p">:</span> <span class="n">Array</span><span class="p">,</span> <span class="n">resources</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">],</span> <span class="n">positions_key</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span><span class="p">):</span>
+    <span class="c1"># whether a step that lists the array has anything to do for it</span>
+    <span class="n">needs_step</span> <span class="o">=</span> <span class="kc">True</span>
+    <span class="c1"># each read's runner, and the ops bound with their keys, where the storage binds them</span>
+    <span class="n">reads</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]</span> <span class="o">=</span> <span class="n">EMPTY</span>
+    <span class="n">_bindings</span><span class="p">:</span> <span class="nb">tuple</span> <span class="o">=</span> <span class="p">()</span>
+    <span class="c1"># the position resource and the dtype its `Rope` rotates in, where the array declares positions</span>
+    <span class="n">positions</span><span class="p">:</span> <span class="n">Any</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">rope_dtype</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">dtype</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">array</span><span class="p">:</span> <span class="n">Array</span><span class="p">,</span> <span class="n">resources</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">array</span> <span class="o">=</span> <span class="n">array</span>
+        <span class="c1"># the state ops whose fused kernel can write this array's pages (`bind_state_ops`)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">fused_ops</span><span class="p">:</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="nb">frozenset</span><span class="p">()</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">name</span> <span class="o">=</span> <span class="n">array</span><span class="o">.</span><span class="n">name</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">label</span> <span class="o">=</span> <span class="s2">"main"</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">positions_key</span> <span class="o">=</span> <span class="n">positions_key</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">positions</span> <span class="o">=</span> <span class="kc">None</span> <span class="k">if</span> <span class="n">positions_key</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">resources</span><span class="p">[</span><span class="n">positions_key</span><span class="p">]</span>
-        <span class="n">rope</span> <span class="o">=</span> <span class="kc">None</span> <span class="k">if</span> <span class="n">array</span><span class="o">.</span><span class="n">positions</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">array</span><span class="o">.</span><span class="n">positions</span><span class="o">.</span><span class="n">rope</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">rope_dtype</span> <span class="o">=</span> <span class="kc">None</span> <span class="k">if</span> <span class="n">rope</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">rope</span><span class="o">.</span><span class="n">dtype</span>
 
-        <span class="bp">self</span><span class="o">.</span><span class="n">_pool_layer</span> <span class="o">=</span> <span class="p">{</span><span class="n">layer</span><span class="p">:</span> <span class="n">i</span> <span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="n">layer</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="nb">sorted</span><span class="p">(</span><span class="n">array</span><span class="o">.</span><span class="n">layers</span><span class="p">))}</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_pool_layer</span> <span class="o">=</span> <span class="n">pool_layers</span><span class="p">(</span><span class="n">array</span><span class="p">)</span>
 
         <span class="c1"># This step's calls, checked in eager steps and at capture.</span>
         <span class="c1"># `_held` is the k and v an add left for `_held_layer`'s read, on a kernel that takes them there.</span>
@@ -1075,6 +1102,7 @@ window.runMermaid = runMermaid;</script>
         <span class="c1"># and `_updated` the update calls run.</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_open</span> <span class="o">=</span> <span class="kc">False</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_keep</span> <span class="o">=</span> <span class="kc">True</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_capturing</span> <span class="o">=</span> <span class="kc">False</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_held</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_held_layer</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_kept</span><span class="p">:</span> <span class="nb">set</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="nb">set</span><span class="p">()</span>
@@ -1107,13 +1135,17 @@ window.runMermaid = runMermaid;</script>
             <span class="k">raise</span> <span class="bp">self</span><span class="o">.</span><span class="n">_refusal</span><span class="p">(</span><span class="s2">"a step began while another is open"</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_open</span> <span class="o">=</span> <span class="kc">True</span>
         <span class="n">declared</span><span class="p">:</span> <span class="n">ArrayStep</span> <span class="o">=</span> <span class="n">step</span><span class="o">.</span><span class="n">state</span><span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">name</span><span class="p">]</span>
-        <span class="n">segments</span> <span class="o">=</span> <span class="n">declared</span><span class="o">.</span><span class="n">segments</span> <span class="ow">or</span> <span class="n">step</span><span class="o">.</span><span class="n">segments</span>
+        <span class="n">segments</span> <span class="o">=</span> <span class="n">segments_of</span><span class="p">(</span><span class="n">declared</span><span class="p">,</span> <span class="n">step</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">segments</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">label</span> <span class="o">=</span> <span class="n">segments</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">label</span>
         <span class="c1"># on a replay too, whose `eager_add` adds still run</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_keep</span> <span class="o">=</span> <span class="n">declared</span><span class="o">.</span><span class="n">keep</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_capturing</span> <span class="o">=</span> <span class="n">step</span><span class="o">.</span><span class="n">ctx</span><span class="o">.</span><span class="n">capture</span>
         <span class="k">for</span> <span class="n">calls</span> <span class="ow">in</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_kept</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_scratch</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_read</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_updated</span><span class="p">):</span>
             <span class="n">calls</span><span class="o">.</span><span class="n">clear</span><span class="p">()</span>
+        <span class="c1"># before the replay's return, since a captured step's writes reach this on a replay</span>
+        <span class="k">if</span> <span class="n">declared</span><span class="o">.</span><span class="n">host</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_check_host_writes</span><span class="p">(</span><span class="n">declared</span><span class="p">,</span> <span class="n">step</span><span class="o">.</span><span class="n">ctx</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">step</span><span class="o">.</span><span class="n">ctx</span><span class="o">.</span><span class="n">replays</span><span class="p">:</span>
             <span class="k">return</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_check_step</span><span class="p">(</span><span class="n">declared</span><span class="p">,</span> <span class="n">segments</span> <span class="ow">or</span> <span class="p">(),</span> <span class="n">step</span><span class="o">.</span><span class="n">ctx</span><span class="p">)</span></div>
@@ -1133,12 +1165,21 @@ window.runMermaid = runMermaid;</script>
                                 <span class="s2">"adds on others, and every layer stays the same length"</span><span class="p">)</span></div>
 
 
+<div class="viewcode-block" id="ArrayHandle.commit_step">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.state.calls.html#mstar.engine.state.ArrayHandle.commit_step">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">commit_step</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">step</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Nothing: the resources hold what a step keeps of the array."""</span></div>
+
+
 <div class="viewcode-block" id="ArrayHandle.end_step">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.engine.state.calls.html#mstar.engine.state.ArrayHandle.end_step">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">end_step</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">step</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_open</span> <span class="o">=</span> <span class="kc">False</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_held</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_held_layer</span> <span class="o">=</span> <span class="kc">None</span></div>
 
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_check_host_writes</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">declared</span><span class="p">:</span> <span class="n">ArrayStep</span><span class="p">,</span> <span class="n">ctx</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">raise</span> <span class="bp">self</span><span class="o">.</span><span class="n">_refusal</span><span class="p">(</span><span class="s2">"a host write, and the array declares no host fields"</span><span class="p">)</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_check_step</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">declared</span><span class="p">:</span> <span class="n">ArrayStep</span><span class="p">,</span> <span class="n">segments</span><span class="p">,</span> <span class="n">ctx</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
         <span class="n">declared_labels</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">array</span><span class="o">.</span><span class="n">labels</span>
@@ -1152,8 +1193,8 @@ window.runMermaid = runMermaid;</script>
         <span class="k">if</span> <span class="n">forked</span> <span class="o">-</span> <span class="n">declared_labels</span><span class="p">:</span>
             <span class="k">raise</span> <span class="bp">self</span><span class="o">.</span><span class="n">_refusal</span><span class="p">(</span><span class="sa">f</span><span class="s2">"a fork names labels </span><span class="si">{</span><span class="nb">sorted</span><span class="p">(</span><span class="n">forked</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">declared_labels</span><span class="p">)</span><span class="si">}</span><span class="s2">, and the array declares "</span>
                                 <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="nb">sorted</span><span class="p">(</span><span class="n">declared_labels</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">positions</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">and</span> <span class="p">(</span><span class="n">declared</span><span class="o">.</span><span class="n">advance</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">or</span> <span class="n">declared</span><span class="o">.</span><span class="n">position_ids</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">):</span>
-            <span class="k">raise</span> <span class="bp">self</span><span class="o">.</span><span class="n">_refusal</span><span class="p">(</span><span class="s2">"a step sets advance or position_ids, and the array declares no positions"</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">declared</span><span class="o">.</span><span class="n">advance</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">or</span> <span class="n">declared</span><span class="o">.</span><span class="n">position_ids</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">_positions</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="s2">"a step sets advance or position_ids, and the array declares no positions"</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_check_storage</span><span class="p">(</span><span class="n">declared</span><span class="p">,</span> <span class="n">segments</span><span class="p">,</span> <span class="n">ctx</span><span class="p">)</span>
 
     <span class="nd">@abstractmethod</span>
@@ -1242,13 +1283,32 @@ window.runMermaid = runMermaid;</script>
         <span class="k">raise</span> <span class="bp">self</span><span class="o">.</span><span class="n">_unsupported</span><span class="p">(</span><span class="s2">"at_last_token"</span><span class="p">)</span></div>
 
 
+<div class="viewcode-block" id="ArrayHandle.takes_fused">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.state.calls.html#mstar.engine.state.ArrayHandle.takes_fused">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">takes_fused</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">op</span><span class="p">:</span> <span class="s2">"StateOp"</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Whether ``op``'s fused kernel writes this array itself, in place of its reference running the calls."""</span>
+        <span class="k">return</span> <span class="kc">False</span></div>
+
+
     <span class="k">def</span><span class="w"> </span><span class="nf">_kernel_setting</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">read</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">field</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Any</span><span class="p">:</span>
-        <span class="k">raise</span> <span class="bp">self</span><span class="o">.</span><span class="n">_unsupported</span><span class="p">(</span><span class="sa">f</span><span class="s2">"kernel_setting of </span><span class="si">{</span><span class="n">read</span><span class="si">!r}</span><span class="s2">"</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">read</span> <span class="ow">not</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">reads</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="bp">self</span><span class="o">.</span><span class="n">_unsupported</span><span class="p">(</span><span class="sa">f</span><span class="s2">"kernel_setting of </span><span class="si">{</span><span class="n">read</span><span class="si">!r}</span><span class="s2">"</span><span class="p">)</span>
+        <span class="p">(</span><span class="n">binding</span><span class="p">,)</span> <span class="o">=</span> <span class="p">(</span><span class="n">bound</span><span class="o">.</span><span class="n">binding</span> <span class="k">for</span> <span class="n">bound</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_bindings</span> <span class="k">if</span> <span class="n">bound</span><span class="o">.</span><span class="n">key</span> <span class="o">==</span> <span class="n">read</span><span class="p">)</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">binding</span><span class="o">.</span><span class="n">kernel_settings</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="bp">self</span><span class="o">.</span><span class="n">_refusal</span><span class="p">(</span><span class="sa">f</span><span class="s2">"no </span><span class="si">{</span><span class="n">field</span><span class="si">}</span><span class="s2"> for read </span><span class="si">{</span><span class="n">read</span><span class="si">!r}</span><span class="s2">, whose binding </span><span class="si">{</span><span class="nb">type</span><span class="p">(</span><span class="n">binding</span><span class="p">)</span><span class="o">.</span><span class="vm">__name__</span><span class="si">}</span><span class="s2"> takes no "</span>
+                                <span class="s2">"kernel settings"</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">field</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">binding</span><span class="o">.</span><span class="n">read_back</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="bp">self</span><span class="o">.</span><span class="n">_refusal</span><span class="p">(</span><span class="sa">f</span><span class="s2">"no </span><span class="si">{</span><span class="n">field</span><span class="si">}</span><span class="s2"> for read </span><span class="si">{</span><span class="n">read</span><span class="si">!r}</span><span class="s2">, whose binding </span><span class="si">{</span><span class="nb">type</span><span class="p">(</span><span class="n">binding</span><span class="p">)</span><span class="o">.</span><span class="vm">__name__</span><span class="si">}</span><span class="s2"> reports back "</span>
+                                <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="nb">sorted</span><span class="p">(</span><span class="n">binding</span><span class="o">.</span><span class="n">read_back</span><span class="p">)</span><span class="w"> </span><span class="ow">or</span><span class="w"> </span><span class="s1">'none'</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+        <span class="k">return</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">reads</span><span class="p">[</span><span class="n">read</span><span class="p">],</span> <span class="n">field</span><span class="p">)</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_update</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">kind</span><span class="p">:</span> <span class="nb">type</span><span class="p">[</span><span class="n">Op</span><span class="p">],</span> <span class="n">field</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">layer</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="n">Any</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]:</span>
 <span class="w">        </span><span class="sd">"""Record the update of type ``kind`` on ``layer``'s ``field``, and return the resource that runs it and the</span>
 <span class="sd">        field's view."""</span>
-        <span class="k">raise</span> <span class="bp">self</span><span class="o">.</span><span class="n">_unsupported</span><span class="p">(</span><span class="sa">f</span><span class="s2">"an update of type </span><span class="si">{</span><span class="n">kind</span><span class="o">.</span><span class="vm">__name__</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span></div>
+        <span class="k">raise</span> <span class="bp">self</span><span class="o">.</span><span class="n">_unsupported</span><span class="p">(</span><span class="sa">f</span><span class="s2">"an update of type </span><span class="si">{</span><span class="n">kind</span><span class="o">.</span><span class="vm">__name__</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_host</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">request</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">label</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">layer</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">object</span><span class="p">]:</span>
+        <span class="k">raise</span> <span class="bp">self</span><span class="o">.</span><span class="n">_unsupported</span><span class="p">(</span><span class="s2">"host"</span><span class="p">)</span></div>
 
 
 
@@ -1281,8 +1341,17 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="SamplerHandle.check_step">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.engine.state.calls.html#mstar.engine.state.SamplerHandle.check_step">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">check_step</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">step</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
-        <span class="k">if</span> <span class="ow">not</span> <span class="n">step</span><span class="o">.</span><span class="n">ctx</span><span class="o">.</span><span class="n">replays</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">_drawn</span> <span class="o">!=</span> <span class="bp">self</span><span class="o">.</span><span class="n">sampler</span><span class="o">.</span><span class="n">draws</span><span class="p">:</span>
+        <span class="c1"># a step that keeps no row's sample may skip the kernel: an eager prefill short of its last chunk</span>
+        <span class="k">if</span> <span class="n">step</span><span class="o">.</span><span class="n">ctx</span><span class="o">.</span><span class="n">replays</span> <span class="ow">or</span> <span class="p">(</span><span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">_drawn</span> <span class="ow">and</span> <span class="n">step</span><span class="o">.</span><span class="n">state</span><span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">name</span><span class="p">]</span><span class="o">.</span><span class="n">kept_rows</span> <span class="o">==</span> <span class="nb">frozenset</span><span class="p">()):</span>
+            <span class="k">return</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_drawn</span> <span class="o">!=</span> <span class="bp">self</span><span class="o">.</span><span class="n">sampler</span><span class="o">.</span><span class="n">draws</span><span class="p">:</span>
             <span class="k">raise</span> <span class="bp">self</span><span class="o">.</span><span class="n">_refusal</span><span class="p">(</span><span class="sa">f</span><span class="s2">"a step listing it sampled </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">_drawn</span><span class="si">}</span><span class="s2"> times, and draws is </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">sampler</span><span class="o">.</span><span class="n">draws</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="SamplerHandle.commit_step">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.state.calls.html#mstar.engine.state.SamplerHandle.commit_step">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">commit_step</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">step</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Nothing: the resource holds a sampler's state."""</span></div>
 
 
 <div class="viewcode-block" id="SamplerHandle.end_step">
@@ -1319,11 +1388,25 @@ window.runMermaid = runMermaid;</script>
 
 
 
+<div class="viewcode-block" id="host">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.state.calls.html#mstar.engine.state.host">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">host</span><span class="p">(</span><span class="n">h</span><span class="p">:</span> <span class="n">ArrayHandle</span><span class="p">,</span> <span class="n">request</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">label</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">layer</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">object</span><span class="p">]:</span>
+<span class="w">    </span><span class="sd">"""One entry's host fields on the host, as the last committed step left them."""</span>
+    <span class="k">return</span> <span class="n">h</span><span class="o">.</span><span class="n">_host</span><span class="p">(</span><span class="n">request</span><span class="p">,</span> <span class="n">label</span><span class="p">,</span> <span class="n">h</span><span class="o">.</span><span class="n">_layer_id</span><span class="p">(</span><span class="n">layer</span><span class="p">))</span></div>
+
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_positions</span><span class="p">(</span><span class="n">h</span><span class="p">:</span> <span class="n">ArrayHandle</span><span class="p">,</span> <span class="n">cause</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"the array declares no positions"</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Any</span><span class="p">:</span>
+    <span class="k">if</span> <span class="n">h</span><span class="o">.</span><span class="n">positions</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">raise</span> <span class="n">h</span><span class="o">.</span><span class="n">_refusal</span><span class="p">(</span><span class="n">cause</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">h</span><span class="o">.</span><span class="n">positions</span>
+
+
 <div class="viewcode-block" id="position">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.engine.state.calls.html#mstar.engine.state.position">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">position</span><span class="p">(</span><span class="n">h</span><span class="p">:</span> <span class="n">ArrayHandle</span><span class="p">,</span> <span class="n">rid_handle</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">label</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">"""The next position on ``label`` of the request at worker handle ``rid_handle``, on the host."""</span>
-    <span class="k">return</span> <span class="n">h</span><span class="o">.</span><span class="n">positions</span><span class="o">.</span><span class="n">position</span><span class="p">(</span><span class="n">rid_handle</span><span class="p">,</span> <span class="n">label</span><span class="p">)</span></div>
+    <span class="k">return</span> <span class="n">_positions</span><span class="p">(</span><span class="n">h</span><span class="p">)</span><span class="o">.</span><span class="n">position</span><span class="p">(</span><span class="n">rid_handle</span><span class="p">,</span> <span class="n">label</span><span class="p">)</span></div>
 
 
 
@@ -1333,7 +1416,7 @@ window.runMermaid = runMermaid;</script>
 <span class="w">    </span><span class="sd">"""This step's position ids in segment order, on the device. Under a graph lease the buffer runs to the bucket's</span>
 <span class="sd">    length, past the step's tokens."""</span>
     <span class="n">h</span><span class="o">.</span><span class="n">_check_open</span><span class="p">(</span><span class="s2">"positions"</span><span class="p">)</span>
-    <span class="k">return</span> <span class="n">h</span><span class="o">.</span><span class="n">positions</span><span class="o">.</span><span class="n">pos_ids</span><span class="p">(</span><span class="n">h</span><span class="o">.</span><span class="n">label</span><span class="p">)</span></div>
+    <span class="k">return</span> <span class="n">_positions</span><span class="p">(</span><span class="n">h</span><span class="p">)</span><span class="o">.</span><span class="n">pos_ids</span><span class="p">(</span><span class="n">h</span><span class="o">.</span><span class="n">label</span><span class="p">)</span></div>
 
 
 
@@ -1342,7 +1425,7 @@ window.runMermaid = runMermaid;</script>
 <span class="k">def</span><span class="w"> </span><span class="nf">rope</span><span class="p">(</span><span class="n">h</span><span class="p">:</span> <span class="n">ArrayHandle</span><span class="p">,</span> <span class="n">q</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">k</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]:</span>
 <span class="w">    </span><span class="sd">"""``q`` and ``k`` rotated at this step's positions with the declared `Rope`."""</span>
     <span class="n">h</span><span class="o">.</span><span class="n">_check_open</span><span class="p">(</span><span class="s2">"rope"</span><span class="p">)</span>
-    <span class="k">return</span> <span class="n">h</span><span class="o">.</span><span class="n">positions</span><span class="o">.</span><span class="n">apply_qk</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">label</span><span class="o">=</span><span class="n">h</span><span class="o">.</span><span class="n">label</span><span class="p">,</span> <span class="n">rope_dtype</span><span class="o">=</span><span class="n">h</span><span class="o">.</span><span class="n">rope_dtype</span> <span class="ow">or</span> <span class="n">q</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span></div>
+    <span class="k">return</span> <span class="n">_positions</span><span class="p">(</span><span class="n">h</span><span class="p">)</span><span class="o">.</span><span class="n">apply_qk</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">label</span><span class="o">=</span><span class="n">h</span><span class="o">.</span><span class="n">label</span><span class="p">,</span> <span class="n">rope_dtype</span><span class="o">=</span><span class="n">h</span><span class="o">.</span><span class="n">rope_dtype</span> <span class="ow">or</span> <span class="n">q</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span></div>
 
 
 
@@ -1433,7 +1516,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Nov 11, 2026.
+  Last updated on Nov 12, 2026.
   <br/>
 </p>
   </div>

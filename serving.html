@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Nov 11, 2026"/>
+    <meta name="docbuild:last-update" content="Nov 12, 2026"/>
   
     
     <script src="_static/searchtools.js"></script>
@@ -273,10 +273,11 @@
 </ul>
 </details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.engine.state.html">mstar.engine.state</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
-<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.state.adapters.html">mstar.engine.state.adapters</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.state.analysis.html">mstar.engine.state.analysis</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.state.calls.html">mstar.engine.state.calls</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.state.contract.html">mstar.engine.state.contract</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.state.host_fields.html">mstar.engine.state.host_fields</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.state.state_op.html">mstar.engine.state.state_op</a></li>
 </ul>
 </details></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.engine.windowing.html">mstar.engine.windowing</a></li>
@@ -1380,6 +1381,9 @@ its encoder context, can therefore size each one separately. If a block names a 
 that the model does not declare, or sets a key that the resource does not accept, loading
 fails. A misspelled setting is never silently ignored. A top-level <code class="docutils literal notranslate"><span class="pre">kv_cache:</span></code> block is
 no longer read. It raises an error with a message describing the migration.</p>
+<p><code class="docutils literal notranslate"><span class="pre">backend:</span> <span class="pre">sdpa</span></code> on the resource of a declared read within a step runs each read on it
+through torch’s SDPA, as a DiT’s reference pipeline does, and builds no resource, so its block
+takes no other key. A read whose queries come packed can’t run on SDPA, and loading refuses it.</p>
 <p><code class="docutils literal notranslate"><span class="pre">greedy_capture:</span> <span class="pre">false</span></code> on a sampler stops all-greedy steps from taking each row’s
 argmax, and the engine from capturing a twin of each batched bucket for them. A sampler
 whose vocabulary is past 4096 has them by default (see <code class="docutils literal notranslate"><span class="pre">SamplerSpec</span></code> in
@@ -2247,7 +2251,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Nov 11, 2026.
+  Last updated on Nov 12, 2026.
   <br/>
 </p>
   </div>
