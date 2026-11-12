@@ -36,6 +36,9 @@ class RaggedAttnBackend(Enum):
     # layout; self-attention only, and refused at build where cuDNN can't run
     # the geometry (GQA, a dtype other than bf16 / fp16, a padded head dim)
     CUDNN = "cudnn"
+    # FlashAttention 4 (flash_attn.cute) varlen, Blackwell (sm_100 / sm_103) only;
+    # elsewhere the resource falls back to FLASHINFER
+    FA4 = "fa4"
     # video sparse attention (``attn.ragged.vsa``) over the segments that carry a
     # ``VideoSparseLayout``, the ``auto`` kernels over the rest; self-attention only, eager
     VSA = "vsa"
