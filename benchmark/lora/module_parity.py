@@ -163,6 +163,21 @@ class _Positions:
         return (q, k) if self.rope is None else self.rope(q, k)
 
 
+class _RowPositions(_Positions):
+    """``_Positions`` for layers that rotate inside their state op from the step's position ids: each row's from 0
+    with ``rope``, all 0 (no rotation) without."""
+
+    def __init__(self, rope, device):
+        super().__init__(rope)
+        self.device = device
+
+    def pos_ids(self, label):
+        import torch
+
+        positions = _POSITIONS["positions"].to(self.device)
+        return positions if self.rope is not None else torch.zeros_like(positions)
+
+
 class _Unread:
     """The KV pages, which the stubbed read never reads."""
 
@@ -321,12 +336,29 @@ def _orpheus() -> ModelSpec:
 
 
 def _higgs() -> ModelSpec:
+    from mstar.engine.state.adapters import node_handles
+    from mstar.model.higgs_audio.config import ATTN
+    from mstar.model.higgs_audio.higgs_audio_model import HiggsAudioModel
+    from mstar.model.keys import KV_CACHE, ROPE, SAMPLER
     from mstar.model.submodule_base import engine_step
 
+    def bind(sub, lengths, rope=None):
+        """``sub``'s handles on Higgs's declared state, over the SDPA stub and ``rope``."""
+        declaring = object.__new__(HiggsAudioModel)
+        declaring.config = sub.config
+        sub.bind_node_state(node_handles(declaring, "LLM", {
+            KV_CACHE: _Unread(), ATTN: _AttendCore(lengths), ROPE: _RowPositions(rope, sub.get_device()), SAMPLER: None,
+        }))
+
     def run(sub, ids, lengths, rope=None):
-        _stub_attention(sub.model, lengths, rope)
-        hidden = sub.model(input_embeds=sub.model.embed_tokens(ids), label="main")
+        bind(sub, lengths, rope)
+        with _step_over(sub, lengths, KV_CACHE):
+            hidden = sub.model(sub.model.embed_tokens(ids))
         return sub.model.lm_head(_last(hidden, lengths)).float()
+
+    def declare(sub, rids, ids):
+        bind(sub, [len(i) for i in ids])
+        return engine_step(sub, "prefill_audio", rids, _ar_inputs(ids))
 
     def hf(model):
         """transformers' Qwen3 over the checkpoint's text weights: the LLM Higgs runs."""
@@ -358,8 +390,7 @@ def _higgs() -> ModelSpec:
         )
 
     return ModelSpec(
-        "LLM", lambda model: [model.tokenizer(t, return_tensors="pt").input_ids[0] for t in TEXTS], run,
-        lambda sub, rids, ids: engine_step(sub, "prefill_text", rids, _ar_inputs(ids)),
+        "LLM", lambda model: [model.tokenizer(t, return_tensors="pt").input_ids[0] for t in TEXTS], run, declare,
         config="configs/higgs_audio.yaml",
         request={"output_modalities": "text", "model_kwargs": {"temperature": 0.0}, "audio": True},
         hf=hf,
@@ -429,25 +460,13 @@ def _qwen3_tts() -> ModelSpec:
     from mstar.model.qwen3_tts.qwen3_tts_model import Qwen3TTSModel
     from mstar.model.submodule_base import engine_step
 
-    class RowPositions(_Positions):
-        """``_Positions`` for layers that rotate inside their state op from the step's position ids: each row's from 0
-        with ``rope``, all 0 (no rotation) without."""
-
-        def __init__(self, rope, device):
-            super().__init__(rope)
-            self.device = device
-
-        def pos_ids(self, label):
-            positions = _POSITIONS["positions"].to(self.device)
-            return positions if self.rope is not None else torch.zeros_like(positions)
-
     def bind(sub, lengths, rope=None):
         """``sub``'s handles on the Talker's declared state, over the SDPA stub and ``rope``."""
         declaring = object.__new__(Qwen3TTSModel)
         declaring.config, declaring.codec_dtype = sub.config, torch.float32
         sub.bind_node_state(node_handles(declaring, "Talker", {
-            TALKER_KV: _Unread(), TALKER_ATTN: _AttendCore(lengths), "talker_pos": RowPositions(rope, sub.get_device()),
-            TALKER_SAMPLER: None, CODE_PRED_SAMPLER: None,
+            TALKER_KV: _Unread(), TALKER_ATTN: _AttendCore(lengths),
+            "talker_pos": _RowPositions(rope, sub.get_device()), TALKER_SAMPLER: None, CODE_PRED_SAMPLER: None,
         }))
 
     def run(sub, ids, lengths, rope=None):
