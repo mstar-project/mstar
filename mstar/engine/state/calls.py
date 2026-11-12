@@ -223,6 +223,12 @@ class ArrayHandle(StepHandle):
             raise self._refusal(f"a second update of {field} on layer {layer} in one step")
         self._updated.add((field, layer))
 
+    def _check_nothing_held(self, layer: int) -> None:
+        """Refuse an add on ``layer`` while another layer's add waits for its read, which would then never be stored."""
+        if self._held is not None and self._held_layer != layer:
+            raise self._refusal(f"an add on layer {layer} while layer {self._held_layer}'s add waits for its read, on "
+                                "a kernel that takes k and v at the read")
+
     def _take_hold(self, layer: int) -> tuple[torch.Tensor, torch.Tensor]:
         held = self._held
         if held is None:

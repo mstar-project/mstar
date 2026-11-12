@@ -1018,9 +1018,7 @@ class PagedArrayHandle(ArrayHandle):
     def add(self, layer: int | torch.Tensor, *, keep: bool | None = None, **fields: torch.Tensor) -> None:
         layer = self._layer_id(layer)
         self._record_add(layer, keep)
-        if self._held is not None and self._held_layer != layer:
-            raise self._refusal(f"an add on layer {layer} while layer {self._held_layer}'s add waits for its read, on "
-                                "a kernel that takes k and v at the read")
+        self._check_nothing_held(layer)
         if self._holds(layer):
             self._held, self._held_layer = (fields["k"], fields["v"]), layer
             return
@@ -1583,6 +1581,7 @@ class BoundedHandle(ArrayHandle):
             raise self._no_layout(f"keep=False on layer {layer} of an unbounded array, whose kernel stores the add it "
                                   "reads")
         self._record_add(layer, keep)
+        self._check_nothing_held(layer)
         self._held, self._held_layer = (fields["k"], fields["v"]), layer
 
     @torch.compiler.disable

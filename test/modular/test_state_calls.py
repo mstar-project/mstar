@@ -1771,6 +1771,15 @@ def test_a_bounded_add_is_kept_since_its_read_stores_it():
              lambda: h.add(3, keep=False, k=k, v=v))
 
 
+def test_a_bounded_add_while_another_layer_s_add_waits_is_refused():
+    """The kernel stores an add at its read, so a second layer's add would leave the first one's keys unstored."""
+    h, kv = _bounded()
+    _bounded_step(h, kv)
+    _, k, v, _ = _frames()
+    h.add(3, k=k, v=v)
+    _refused(r"Array 'enc_kv': an add on layer 6 while layer 3's add waits for its read", lambda: h.add(6, k=k, v=v))
+
+
 def test_a_bounded_add_left_unread_is_refused():
     """The kernel stores an add as it attends, so an add with no read would leave a committed entry unwritten."""
     h, kv = _bounded()
