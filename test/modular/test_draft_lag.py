@@ -29,7 +29,7 @@ from mstar.engine.resources.draft.drafter import (
 from mstar.engine.resources.draft.node import DrafterShare, DraftLag, drafter_step
 from mstar.engine.resources.draft.startup import draft_lag
 from mstar.engine.resources.kv.config import KVLayerSet, KVSpec, KVStep, PagedKVConfig
-from mstar.engine.resources.position.config import PositionConfig, PositionSpec, PositionStep
+from mstar.engine.resources.position.config import LongRoPE, PositionConfig, PositionSpec, PositionStep
 from mstar.engine.resources.sampler.config import SamplerStep
 from mstar.engine.resources.step import Lag, Segment, SubmoduleStep
 
@@ -37,6 +37,8 @@ NODE, WALK, K = "LLM", "decode", 3
 DRAFT = KVLayerSet("kv", "draft", 2, 2, 8)
 LAYOUT = Lag(1, (2, 1, 1))
 LAG = DraftLag(WALK, LAYOUT, "kv", "draft", "rope", "draft_attn")
+LONGROPE = LongRoPE(short_factor=(1.0,) * 4, long_factor=(2.0,) * 4,
+                    original_max_position_embeddings=16, max_position_embeddings=512)
 
 
 def lag_step(step, walk, lag):
@@ -95,7 +97,7 @@ def test_only_a_verify_step_stores_a_lagged_drafters_keep_flag():
     assert verify.steps["sampler"].loopback_writes == {DRAFT_CARRY, DRAFT_KEEP_FIRST}
 
 
-def _specs(binding: bool = True, positions: int = 1) -> dict:
+def _specs(binding: bool = True, positions: int = 1, longrope=None) -> dict:
     pool = PagedKVConfig(num_layers=2, num_kv_heads=2, head_dim=8, max_seq_len=64, max_num_pages=8, page_size=4)
     pool.join(DRAFT)
     specs = {"kv": KVSpec("kv", {NODE}, pool),
@@ -103,7 +105,8 @@ def _specs(binding: bool = True, positions: int = 1) -> dict:
     if binding:
         specs["draft_attn"] = AttentionSpec("draft_attn", {NODE}, AttentionConfig(kv_cache="kv", layer_set="draft"))
     for i in range(positions):
-        specs[f"rope{i or ''}"] = PositionSpec(f"rope{i or ''}", {NODE}, PositionConfig(kv_cache="kv"))
+        config = PositionConfig(kv_cache="kv", longrope=longrope)
+        specs[f"rope{i or ''}"] = PositionSpec(f"rope{i or ''}", {NODE}, config)
     return specs
 
 
@@ -120,6 +123,7 @@ def test_startup_finds_where_the_lag_goes_or_says_why_it_cant():
         (_decl(lag=LAYOUT), _specs(), "joins no layers"),
         (_decl(kv=DRAFT, lag=LAYOUT), _specs(binding=False), "AttentionConfig\\(layer_set='draft'\\)"),
         (_decl(kv=DRAFT, lag=LAYOUT), _specs(positions=2), "declares 2"),
+        (_decl(kv=DRAFT, lag=LAYOUT), _specs(longrope=LONGROPE), "LongRoPE's"),
     ]:
         lag, problems = draft_lag(decl, specs)
         assert lag is None and len(problems) == 1

@@ -1946,7 +1946,9 @@ one it runs with ``select_pass(p)`` on those three resources, and a layer of the
 outside a pass raises. The engine also keeps a per-request ``DRAFT_KEEP_FIRST`` flag (``accepted
 == k`` last step), which it adds to the verify step's loop-back writes, and sends the drafter's row 0, the token before the block, to the sink page in
 the graph unless it is set. FA3 plans every pass's extent on the device; FlashInfer plans them on
-the host, so a lagged drafter on FlashInfer runs synchronously.
+the host, so a lagged drafter on FlashInfer runs synchronously. A lagged drafter
+can't rotate through LongRoPE positions, whose table ids keep no lagged copy;
+startup refuses it.
 
 **Recurrent state (GDN).** A verify step runs a row's ``k + 1`` tokens through FlashInfer's
 recurrent multi-token kernel (``gated_delta_rule_mtp``) for their outputs, and through the

@@ -234,8 +234,8 @@ def draft_lag(decl: VerifyNode, specs: Mapping[str, NodeResourceSpec]):
     on_node = [spec for spec in specs.values() if decl.node in spec.nodes]
     bindings = [spec.resource_key for spec in on_node if isinstance(spec, AttentionSpec)
                 and spec.config.kv_cache == pool and spec.config.layer_set == name]
-    positions = [spec.resource_key for spec in on_node
-                 if isinstance(spec, PositionSpec) and spec.config.kv_cache == pool]
+    position_specs = [spec for spec in on_node if isinstance(spec, PositionSpec) and spec.config.kv_cache == pool]
+    positions = [spec.resource_key for spec in position_specs]
     problems = []
     if len(bindings) != 1:
         problems.append(f"{where}: the lagged drafter's attention plans its own extent: declare one attention over "
@@ -243,6 +243,10 @@ def draft_lag(decl: VerifyNode, specs: Mapping[str, NodeResourceSpec]):
     if len(positions) != 1:
         problems.append(f"{where}: the lagged drafter rotates through the positions over KV {pool!r}; the node "
                         f"declares {len(positions)}")
+    elif position_specs[0].config.longrope is not None:
+        # LongRoPE rotates by table id (`LongRopeManager.apply_qk`), and its table ids keep no lagged copy
+        problems.append(f"{where}: the lagged drafter rotates through positions {positions[0]!r}, which are "
+                        "LongRoPE's: a draft model can't share a LongRoPE position resource")
     if problems:
         return None, problems
     return DraftLag(decl.walk, lag, pool, name, positions[0], bindings[0]), []
