@@ -558,7 +558,7 @@ class QwenImage21Model(Model):
         # the dit's linears split over tp_size; its guidance branches over cfg_size (each cfg rank holds both labels'
         # prefixes, so its branch attends its own label's)
         return ShardingConfig(
-            groups=[], tp_enabled_nodes={DIT_NODE}, shard_dim={}, sp_enabled_nodes=set(),
+            groups=[], tp_enabled_nodes={DIT_NODE}, shard_dim={},
             cfg_enabled_nodes={DIT_NODE: len(QwenImage21DenoiseSubmodule.GUIDANCE.branches)},
         )
 
@@ -567,8 +567,8 @@ class QwenImage21Model(Model):
             return []
         return [(IMAGE_GEN_WALK, DitKey(h // VAE_SCALE, w // VAE_SCALE)) for h, w in self.capture_sizes]
 
-    def get_submodule(self, node_name: str, device="cpu", tp_group=None, autocast_dtype=None, sp_group=None,
-                      moe_parallel=None, cfg_group=None):
+    def get_submodule(self, node_name: str, device="cpu", tp_group=None, autocast_dtype=None, moe_parallel=None,
+                      cfg_group=None):
         if node_name in self._submodule_cache:
             return self._submodule_cache[node_name]
         submodule = self._create_submodule(node_name, device, tp_group, cfg_group)

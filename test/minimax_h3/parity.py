@@ -317,7 +317,7 @@ def run(args, report: dict, failures: list[str]) -> None:
             else:
                 t = torch.stack([sched.timesteps[k], sched.audio_timesteps[k], sched.cond_timesteps[k]])[None].to(dev)
                 row_class = None
-            step = engine_step(sub, "gen", [0], [NodeInputs(resource_step_info=layout)])
+            step = engine_step(sub, "gen", [0], [NodeInputs(resource_step_info=StepKey(layout))])
             step.set_ctx(StepContext(request_ids=[0], graph_walk="gen", slot=0, capture=False))
             step.begin_calls()
             with torch.no_grad():

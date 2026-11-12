@@ -212,6 +212,8 @@ class DenseAttentionManager(AttentionManager):
     (``PositionManager`` would only work for labels supplying explicit pos_ids).
     """
 
+    # attends the K/V it is handed, which an exchange hands it whole
+    supports_split_steps = True
     # it holds nothing per request
     supports_drop = True
 
@@ -316,6 +318,7 @@ class DenseAttentionManager(AttentionManager):
         assert plan_outputs is not None, (
             f"Dense Attention Manager expected plan result from {self._kv_cache_name}"
         )
+        self._check_sequence_shard(ctx)
 
         # Only the labels the step attends: a cfg rank's KV step holds every branch's label, and its attention
         # reads only its own branches' (a combined plan label carries its streams' labels on its views).
@@ -414,6 +417,8 @@ class DenseAttentionManager(AttentionManager):
         written to the pages."""
         if label is None:
             label = self._default_label
+        if self._shard is not None:
+            self._shard.check_bypass(label, "attention run")
         if layer_idx is None:
             layer_idx = self._default_layer_idx
         assert k is not None and v is not None and layer_idx is not None, (

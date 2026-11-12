@@ -29,6 +29,7 @@ from mstar.engine.resources.context_parallel import (
 )
 from mstar.engine.resources.kv.config import KVConfig, KVGroup, PagedKVConfig, RingKVConfig
 from mstar.engine.resources.kv.keys import fingerprint
+from mstar.engine.resources.sequence_shard import SequenceShard, check_shard_plan, head_slice, ulysses
 from mstar.platforms import current_platform
 
 if TYPE_CHECKING:
@@ -62,6 +63,15 @@ def resolve_attn_backend(backend: AttnBackend, device: torch.device) -> AttnBack
 
 class AttentionManager(AttentionResource):
     prefix_skip_safe = True
+    # the sequence shard over its node (`AttentionSpec.derive`), set by `build`; and the shard
+    # itself where it can split (`bind_dependencies`)
+    _shard_key: str | None = None
+    _shard: SequenceShard | None = None
+
+    @property
+    def splits(self) -> bool:
+        """Whether this node's steps may split over SP ranks, so a call goes through `exchange`."""
+        return self._shard is not None
 
     # Remains abstract except for build; will build based
     # on the attention backend
@@ -69,7 +79,45 @@ class AttentionManager(AttentionResource):
     # Label / layer cursors come from `AttentionResource`; `run` resolves them.
 
     def depends_on(self):
-        return {self._kv_cache_name}
+        keys = {self._kv_cache_name}
+        if self._shard_key is not None:
+            keys.add(self._shard_key)
+        return keys
+
+    def bind_dependencies(self, resources) -> None:
+        if self._shard_key is None or not resources[self._shard_key].can_split:
+            return
+        # heads over every TP and SP rank (a pool stored by position is refused on a splitting node
+        # at load): a split step's tokens trade for heads, a copied step's heads are sliced
+        shard = self._shard = resources[self._shard_key]
+        resources[self._kv_cache_name].bind_sequence_shard(shard)
+        logger.info(
+            "attention over KV %r takes split steps over %d SP ranks: split labels by Ulysses, copied ones by "
+            "head slice", self._kv_cache_name, shard.group.world_size,
+        )
+
+    @torch.compiler.disable
+    def exchange(self, run, q, k, v, label: str | None = None):
+        """``run(q, k, v)`` (a K/V write and the attention, ``q=None`` the write alone) for this
+        step's ``label`` through the exchange its pool takes: of a split label's tokens, or of a
+        copied label's heads at a ``tp * sp`` geometry (`sequence_shard`)."""
+        label = self._default_label if label is None else label
+        shard = self._shard
+        r = shard.split_range(label)
+        # the paged run and K/V writes refuse a split label reached without it (`check_bypass`)
+        shard.exchanging = True
+        try:
+            if r is not None:
+                shard.check_scattered(label)
+                return ulysses(run, q, k, v, r)
+            return head_slice(run, q, k, v, shard.group)
+        finally:
+            shard.exchanging = False
+
+    def _check_sequence_shard(self, ctx) -> None:
+        """At plan: the step declares the node's sequence shard."""
+        if self._shard_key is not None:
+            check_shard_plan(f"attention over KV {self._kv_cache_name!r}", self._shard_key, ctx)
 
     def fingerprint(self) -> bytes:
         # the class, not the declared backend: `build` moves dense to another
@@ -115,6 +163,12 @@ class AttentionManager(AttentionResource):
 
     @classmethod
     def build(cls, spec: AttentionSpec, info: EngineResourceInfo):
+        manager = cls._build_backend(spec, info)
+        manager._shard_key = spec.shard_key
+        return manager
+
+    @classmethod
+    def _build_backend(cls, spec: AttentionSpec, info: EngineResourceInfo):
         backend = resolve_attn_backend(spec.config.backend, info.device)
         cls._refuse_unread(spec, backend)
         # the KV resource's own config, not a copy; per-rank head counts, and
@@ -332,6 +386,7 @@ class PlacedAttention(AttentionManager):
         self._preplanned = False
 
     def bind_dependencies(self, resources) -> None:
+        super().bind_dependencies(resources)
         placement = resources[self._kv_cache_name].placement
         if placement is not None:
             self._placement = placement

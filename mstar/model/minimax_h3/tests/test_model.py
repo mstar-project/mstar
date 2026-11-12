@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from mstar.engine.resources.sequence_shard import SequenceShard
 from mstar.engine.resources.step import StepContext
 from mstar.engine.state.adapters import node_handles, state_setup
 from mstar.graph.base import GraphNode, Loop, Parallel, Sequential, TensorPointerInfo
@@ -27,8 +28,10 @@ from mstar.model.minimax_h3.config import (
     DENOISE_LOOP,
     DIT_ATTN,
     DIT_ROWS,
+    DIT_SHARD,
     REFINER_ATTN,
     TEXT_TAG,
+    VAE_SHARD,
     VIDEO_TAG,
     H3Config,
 )
@@ -53,14 +56,14 @@ def _model(**kwargs) -> H3Model:
     return model
 
 
-def _on_sdpa(config: H3Config, sp_group=None) -> dict:
+def _on_sdpa(config: H3Config) -> dict:
     """The DiT's handles on SDPA, as a config that sets ``backend: sdpa`` on its resources binds them."""
     model = _model()
     model.set_config(config)
     on_sdpa = {key: {"backend": "sdpa"} for key in (DIT_ATTN, REFINER_ATTN)}
     setup, problems = state_setup({"resources": on_sdpa}, model.declare_state())
     assert not problems, problems
-    return node_handles(model, "dit", {}, sp_group=sp_group, setup=setup)
+    return node_handles(model, "dit", {}, setup=setup)
 
 
 def _opened(node: H3DenoiseSubmodule, layout: H3Layout, handles: dict):
@@ -496,6 +499,53 @@ def _tiny_decode_case():
     return vae, H3Config(video_vae=vcfg), layout, torch.randn(2, layout.num_video_rows, 4 * 2 * 2)
 
 
+def _sp_resources(model: H3Model, keys, group) -> dict:
+    """``keys``' resources from the model's own declaration on SP ranks ``group``, built and bound
+    as the engine does, the ragged attention in fp32 over FlashInfer's CPU math."""
+    import importlib.util
+    import pathlib
+    import sys
+
+    from mstar.distributed.communication import CommGroup, JointGroups
+    from mstar.engine.resources import RaggedAttentionConfig
+    from mstar.engine.resources.base import EngineResourceInfo, build_resource
+    from mstar.engine.resources.spec import resolve_spec_dependencies
+
+    # test/modular's FlashInfer-as-CPU-math helper, by path: this module isn't on its sys.path
+    path = pathlib.Path(__file__).resolve().parents[4] / "test" / "modular" / "flashinfer_reference.py"
+    spec = importlib.util.spec_from_file_location("flashinfer_reference", path)
+    helper = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(helper)
+    sys.modules["flashinfer"] = helper.reference_flashinfer()
+    from mstar.engine.state.adapters import node_resources
+
+    specs = resolve_spec_dependencies(node_resources(model))
+    info = EngineResourceInfo(
+        device=torch.device("cpu"), kv_dtype=torch.float32,
+        joint_comm_group=JointGroups(tp_group=CommGroup.trivial(), sp_group=group, instance=group),
+    )
+    res = {}
+    for key in keys:
+        if isinstance(getattr(specs[key], "config", None), RaggedAttentionConfig):
+            specs[key].config.dtype, specs[key].config.workspace_mb = torch.float32, 1
+        res[key] = build_resource(specs[key], info)
+    for key in keys:
+        res[key].bind_dependencies({dep: res[dep] for dep in specs[key].depends_on()})
+    return res
+
+
+def _plan(node, res: dict, rids, layout):
+    """The node's step for ``rids`` at ``layout``, planned over ``res`` as the runner does."""
+    from mstar.engine.resources import StepContext, StepRunner
+    from mstar.model.submodule_base import NodeInputs, engine_step
+
+    node.bind_node_resources(res)
+    step = engine_step(node, "w", rids, [NodeInputs(resource_step_info=layout)] * len(rids))
+    step.set_ctx(StepContext(request_ids=rids, graph_walk="w", slot=0, capture=False))
+    StepRunner(res).plan(step)
+    return step
+
+
 def _sp_decode(rank: int, world: int, store: str, out: str) -> None:
     import torch.distributed as dist
 
@@ -512,7 +562,9 @@ def _sp_decode(rank: int, world: int, store: str, out: str) -> None:
         decode = vae.decoder.forward
         vae.decoder.forward = lambda *args, **kwargs: calls.append(1) or decode(*args, **kwargs)
         with torch.no_grad():
-            frames = H3VideoDecoderSubmodule(vae, config, sp_group=group).run_batch(rows, layout)["video_output"]
+            split = H3VideoDecoderSubmodule(vae, config)
+            _plan(split, _sp_resources(_model(), [VAE_SHARD], group), ["r0", "r1"], layout)
+            frames = split.run_batch(rows, layout)["video_output"]
             torch.save(len(calls), f"{out}.{rank}.calls")
             if rank == 0:  # at the same thread count: CPU reductions round by it
                 torch.save(H3VideoDecoderSubmodule(vae, config).run_batch(rows, layout)["video_output"], f"{out}.one")
@@ -523,8 +575,9 @@ def _sp_decode(rank: int, world: int, store: str, out: str) -> None:
 
 @pytest.mark.parametrize("world", [2, 4])
 def test_sequence_parallel_decode_gives_every_rank_the_one_nodes_frames(tmp_path, world):
-    """``vae_decoder`` as an SP node: each rank's share, gathered, against one decode; 4 ranks
-    over 3 clips leaves one rank without a share, which decodes nothing."""
+    """``vae_decoder`` on SP ranks, its sequence shard splitting each request's clips: each
+    rank's share, gathered, against one decode; 4 ranks over 3 clips leave one rank without a
+    share, which decodes nothing."""
     import torch.multiprocessing as mp
 
     out = str(tmp_path / "frames")
@@ -541,7 +594,9 @@ def _sp_cfg():
 
     from mstar.model.minimax_h3.tests.tiny_checkpoint import CFG
 
-    return replace(CFG, num_attention_heads=8)  # Ulysses splits the heads over the ranks
+    # Ulysses splits the heads over the ranks; a head dim FlashInfer has kernels for, so its CPU
+    # math (the ragged resource's kernel here) attends it unpadded
+    return replace(CFG, num_attention_heads=8, attention_head_dim=64)
 
 
 def _sp_dit(rank: int, world: int, store: str, snapshot: str, out: str) -> None:
@@ -569,14 +624,24 @@ def _sp_dit(rank: int, world: int, store: str, snapshot: str, out: str) -> None:
         for name, sp in (("sp", group), ("one", None)):
             if sp is None and rank:
                 break
-            dit = weight_loader.build_transformer(config, snapshot, "cpu", sp_group=sp, dtype=torch.float32)
+            dit = weight_loader.build_transformer(config, snapshot, "cpu", dtype=torch.float32)
             node = H3DenoiseSubmodule(dit, config, loop_name=DENOISE_LOOP)
+            shard = None
+            if sp is None:
+                # one rank attending through SDPA
+                _opened(node, layout, _on_sdpa(config))
+            else:
+                model = _model()
+                model.set_config(config)
+                res = _sp_resources(model, [DIT_SHARD, DIT_ATTN], sp)
+                node.bind_node_state(node_handles(model, "dit", res))
+                _plan(node, res, [0], StepKey(layout)).begin_calls()
+                shard = res[DIT_SHARD]
             step_layout = node.build_layout(StepKey(layout), "cpu")
             projected = []
             dit.video_patch_proj.register_forward_hook(lambda m, args, y, seen=projected: seen.append(args[0].shape[1]))
-            _opened(node, layout, _on_sdpa(config, sp))
             with torch.no_grad():
-                torch.save(dit(inputs, step_layout), f"{out}.{name}.{rank}")
+                torch.save(dit(inputs, step_layout, shard=shard), f"{out}.{name}.{rank}")
             torch.save(sum(projected), f"{out}.{name}.{rank}.projected")
     finally:
         dist.destroy_process_group()
@@ -584,8 +649,9 @@ def _sp_dit(rank: int, world: int, store: str, snapshot: str, out: str) -> None:
 
 @pytest.mark.parametrize("world", [2, 4, 8])
 def test_the_sequence_parallel_dit_gives_every_rank_the_one_ranks_velocity(tmp_path, world):
-    """``narrow``, ``rope.rows``, the Ulysses exchange and ``gather_sequence`` through ``H3DiT``,
-    over rows no rank count divides (padded to one it does), against the unpadded DiT on one rank."""
+    """The DiT over its own resources (its sequence shard and Ulysses attention): ``rope.rows``,
+    the shard's ranges, the exchange and the gather through ``H3DiT``, over rows no rank count
+    divides (padded to one it does), against the unpadded DiT on one rank attending through SDPA."""
     import torch.multiprocessing as mp
     from safetensors.torch import save_file
 
@@ -609,20 +675,17 @@ class _SPStub:
     dtype = torch.float32
     blocks = ()
 
-    def __init__(self, world: int):
-        from mstar.distributed.communication import CommGroup
-
-        self.sp_group = CommGroup(0, 0, list(range(world)))
-
 
 @pytest.mark.parametrize("world", [1, 2, 4, 8])
 @pytest.mark.parametrize("row_bucket", [1, 256])
 def test_the_padded_rows_split_evenly_over_the_sp_ranks_at_every_prompt_length(world, row_bucket):
     import math
 
-    from mstar.model.components.distributed.sequence_parallel import sp_seq_split
+    from mstar.distributed.communication import sp_seq_split
 
-    node = H3DenoiseSubmodule(_SPStub(world), H3Config(), loop_name=DENOISE_LOOP, row_bucket=row_bucket)
+    node = H3DenoiseSubmodule(_SPStub(), H3Config(), loop_name=DENOISE_LOOP, row_bucket=row_bucket)
+    # the bound shard's group is all the layout reads
+    node.bind_node_resources({DIT_SHARD: SequenceShard(("main",), 0, None, 0, SimpleNamespace(world_size=world))})
     multiple = math.lcm(row_bucket, world)
     for text_len in range(1, 600):
         layout = H3Layout(text_len=text_len, latent_frames=2, latent_height=4, latent_width=6, audio_latents=3,
@@ -756,14 +819,18 @@ def test_two_shift_pairs_at_one_layout_get_a_schedule_each_and_share_its_layout(
 
 
 def test_an_sp_size_the_heads_do_not_divide_is_refused_at_validation():
-    from mstar.engine.state.analysis import deployment_problems
+    """The DiT's attention runs Ulysses over the rows its shard splits, so its heads split over the SP ranks."""
+    from mstar.engine.resources.sequence_shard import sequence_parallel_refusals
+    from mstar.engine.resources.spec import resolve_spec_dependencies
+    from mstar.engine.state.adapters import node_resources
 
     model = _model()
     model.set_config(H3Config(transformer=_sp_cfg()))
-    assert deployment_problems(model, {}, head_shards={"dit": 4}) == []
-    assert deployment_problems(model, {}, head_shards={"dit": 3}) == [
-        f"Array {DIT_ROWS!r}.reads[{DIT_ATTN!r}]: q_heads 8 doesn't divide by 3, TP times SP, which the read narrows "
-        "its heads by"
+    specs = list(resolve_spec_dependencies(node_resources(model)).values())
+    assert sequence_parallel_refusals(specs, "dit", 1, 4) == []
+    assert sequence_parallel_refusals(specs, "dit", 1, 3) == [
+        f"ragged attention {DIT_ATTN!r} attends labels its sequence shard splits (Ulysses), and its 8 query and 8 KV "
+        "heads don't split over 1 TP x 3 SP ranks"
     ]
 
 
@@ -816,7 +883,7 @@ class _StubDiT:
     def __init__(self):
         self.calls = []
 
-    def __call__(self, inputs, layout):
+    def __call__(self, inputs, layout, shard=None):
         self.calls.append(inputs)
         return torch.zeros_like(inputs.video), torch.zeros_like(inputs.audio)
 
