@@ -504,9 +504,14 @@ class EarTTSTalkerSubmodule(ARNodeSubmodule):
         leases the slot before ``prepare_inputs`` runs, so this answers from
         the talker loop's count, as ``declare_step`` does."""
         del graph_walk
-        if any(not info.dynamic_loop_iter_counts.get("talker_decode_loop", 0) for info in per_request_info.values()):
+        if any(not self._talker_step(info) for info in per_request_info.values()):
             return None
         return self.DECODE_KEY
+
+    @staticmethod
+    def _talker_step(info) -> int:
+        """The request's step in the talker loop, 0 on its first."""
+        return info.dynamic_loop_iter_counts.get("talker_decode_loop", 0)
 
     def prepare_inputs(self, graph_walk, fwd_info, inputs, is_final_stream_chunk=False, **kwargs) -> ARNodeInputs:
         # The LLM streams the sampled agent text token under "new_token". A
@@ -521,7 +526,7 @@ class EarTTSTalkerSubmodule(ARNodeSubmodule):
             # the call's ``audio_end`` (see postprocess).
             dev = self.talker.embed_code.weight.device
             tok = torch.tensor([self.config.text_pad_id], dtype=torch.long, device=dev)
-        step = fwd_info.dynamic_loop_iter_counts.get("talker_decode_loop", 0)
+        step = self._talker_step(fwd_info)
         first = step == 0
         span = self.warmup_len + 1 if first else 1
         final = bool(is_final_stream_chunk)
