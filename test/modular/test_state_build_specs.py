@@ -872,3 +872,21 @@ def test_only_a_snapshot_writing_value_links_its_pool_to_the_kv():
     assert specs["ssm"].config.variant is LinearAttnVariant.MAMBA2
     alone = _by_key(_mamba())
     assert alone["mamba"].config.kv_cache is None, "a Mamba-2 Value needs no paged array on its nodes"
+
+
+def _context(read: Read) -> Array:
+    return Array("ctx", nodes={"llm"}, layers={2, 5}, entry=KVEntry(heads=4, head_dim=16), max_len=64,
+                 reads={"x": read})
+
+
+@pytest.mark.parametrize("arrays, key", [
+    (lambda: [_kv(reads={"r": _read(packed=False)})], "r"),
+    (lambda: [_kv(reads={"r": _read(packed=False, walks={"decode"}), "p": _read(walks={"prefill"})})], "r"),
+    (lambda: [_kv(), _context(_read(mask=Bidirectional(), queries="kv", packed=False))], "x"),
+], ids=["paged", "paged by walk", "paged cross"])
+def test_a_paged_read_takes_packed_queries(arrays, key):
+    """Padded rows reach no paged kernel, which would read the padding as tokens."""
+    with pytest.raises(ValueError, match=re.escape(
+        f"no layout yet: reads[{key!r}].packed is False, and the paged kernels take packed queries",
+    )):
+        build_specs(arrays())
