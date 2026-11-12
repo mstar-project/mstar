@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections import defaultdict
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field, fields, replace
 from enum import Enum
 from types import MappingProxyType
@@ -1165,6 +1165,27 @@ class NodeSubmodule(torch.nn.Module, ABC):
         del graph_walk, has_loopback
         return None
 
+    def repeat_carry(self, graph_walk: str, signals: Collection[str]) -> dict[str, str] | None:
+        """How each loop-back signal of this walk (``signals``, from the graph)
+        moves from one replay of its capture to the next, as {output buffer:
+        static input}; None when the walk's step can't repeat."""
+        del graph_walk, signals
+        return None
+
+    def enable_repeats(self, walks: Collection[str]) -> None:
+        """Before capture: the deployment asks these walks of this node to repeat
+        (``step_repeats:``)."""
+        del walks
+
+    def record_tokens(
+        self, graph_walk: str, host_rows: "HostRows", info_of: Callable[[int], CurrentForwardPassInfo],
+    ) -> None:
+        """A landed step's host tokens, every iteration, for a node that keeps
+        them on the host: when the runtime checks the stop, ``check_stop`` has
+        nothing to read them from. Called on every step of a worker with
+        ``step_repeats:``; a node reads only the walks it asked to repeat."""
+        del graph_walk, host_rows, info_of
+
     def resident_walks(self) -> frozenset[str]:
         """Walks whose captured steps may read their rows off the resident
         tables (`mstar.engine.resources.resident`). A walk here runs, for each
@@ -1589,6 +1610,14 @@ class ARNodeSubmodule(NodeSubmodule):
     # Set by a submodule whose decode walk reads its last sampled token back on
     # the device; the loop-back hooks below follow from it.
     device_loopback: DeviceLoopback | None = None
+    # The walks a deployment asks to repeat (``step_repeats:``): their stop is
+    # the runtime's. Empty otherwise, so a deployment that doesn't ask runs the
+    # node as declared. Whether they also run on resident tables and loop their
+    # token back is the node's to say (``resident_walks``, ``device_loopback``).
+    _repeat_walks: frozenset[str] = frozenset()
+
+    def enable_repeats(self, walks: Collection[str]) -> None:
+        self._repeat_walks = frozenset(walks)
 
     def bind_node_state(self, handles: Mapping[str, Any]) -> None:
         super().bind_node_state(handles)
@@ -1624,6 +1653,12 @@ class ARNodeSubmodule(NodeSubmodule):
             return frozenset({self.device_loopback.signal})
         return super().device_loopback_signals(graph_walk)
 
+    def repeat_carry(self, graph_walk: str, signals: Collection[str]) -> dict[str, str] | None:
+        if not self._loops_back(graph_walk) or self.device_loopback.signal not in signals:
+            return None
+        carried = {signal: signal for signal in signals if signal != self.device_loopback.signal}
+        return {self.device_loopback.buffer: "input_ids", **carried}
+
     def inline_signals(self, graph_walk: str) -> dict[str, str]:
         # the loop-back token, which the stop check already has on the host
         if self._loops_back(graph_walk):
@@ -1655,7 +1690,16 @@ class ARNodeSubmodule(NodeSubmodule):
 
     def get_stop_policies(self, graph_walk: str) -> dict[str, StopPolicy] | None:
         stop = self.token_stop
-        if stop is None or not stop.runtime_check or graph_walk in stop.prefill_walks:
+        # A walk asked to repeat that can (it runs resident and loops its token
+        # back) reads its stop in the runtime, unless the stop withholds a frame,
+        # which only check_stop does. Any other walk keeps the node's own stop.
+        runtime = stop is not None and (
+            stop.runtime_check or (
+                graph_walk in self._repeat_walks and graph_walk in self.resident_walks()
+                and self._loops_back(graph_walk) and not stop.withhold
+            )
+        )
+        if not runtime or graph_walk in stop.prefill_walks:
             return super().get_stop_policies(graph_walk)
         if not stop.stops_on(graph_walk):
             return {}  # as `_token_stops`: only a row of ``walk`` ends the loop

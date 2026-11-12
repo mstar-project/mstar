@@ -645,6 +645,26 @@ can be selected, so every request on one has its root; one that arrives without 
 cached.
 Nothing on the model side is needed for this.
 
+A model that picks a request's adapter itself (Phi-4-multimodal runs an image prompt on
+its ``vision`` adapter and an audio prompt on ``speech``) names the adapters it may pick
+in ``Model.prompt_lora_adapters`` and returns its pick as ``ProcessPromptOutput.lora_adapter``
+(``None`` for the base model; left at ``KEEP_ADAPTER``, the client's choice stands). The
+API server refuses at startup a deployment whose ``resources: lora: adapters:`` block does
+not serve them all. The data worker then gives the request what ``ServedModels.select``
+gives a client that names the adapter: its digest and its root, from the API server's
+``ServedModels``, so runtime loads and unloads apply. An adapter unloaded since startup,
+or one other than the adapter the client named (``None`` included), refuses the request
+with a 400; a pick outside ``prompt_lora_adapters`` is a 500.
+
+A resource whose KV differs per request for the same tokens (a LongRoPE table picked by
+prompt length) says so in ``NodeResourceSpec.prefix_variant(model_kwargs)``: opaque
+bytes, from the same kwargs its ``request_config`` reads, or None. The data worker folds
+every declared spec's variant into the root after any adapter's, in declaration order and
+under the spec's key (``variant_root`` in ``mstar/engine/resources/kv/keys.py``), keys the
+prompt and sends that root on, so generated pages are keyed under it too. Requests share
+pages only under the same variants, and a request whose resources name none keys under the
+root it had.
+
 .. _Step 2a — Declare your state:
 
 Step 2a — Declare your state
@@ -745,9 +765,35 @@ Qwen3.5's declaration shows both kinds of state, and its ViT:
 A declaration today's engine can't hold fails at load, with ``no layout yet`` and what is
 missing. Every refusal names the declaration and the field.
 
+A read with ``queries=ARRAY`` is cross-attention: its queries are laid out by that array's
+segments in this step, and each request's k-th segment on one pairs with its k-th on the other.
+It takes ``Block()``, since no query position decides what it sees. Separate token sets are
+separate arrays, and arrays of one kind and geometry on one node share one resource, each under
+its own label.
+
+An array whose calls carry each rank's share of its tokens under sequence parallelism declares
+``seq_sharded=True``. Segments always cover the whole sequence, so ``declare_step`` is the same
+on every rank, and the two flags pick the exchange: Ulysses with both sides sharded, none with
+only the queries sharded, and a merge of the ranks' partial attentions with only the keys.
+
+A read takes its queries packed, ``(tokens, heads, head_dim)`` over every row. A read whose layers
+pass rows of one length, ``(rows, len, heads, head_dim)``, as a DiT's do, declares
+``packed=False``, and a packed call to it is refused.
+A read whose request's segments lie end to end in one row, as a DiT's packed rows and their pad
+do, declares ``segmented=True``. It takes ``Block()``, ``packed=False`` and no ``queries``, and it
+runs one request a step. Under sequence parallelism the ranks split each request's whole row by
+``sp_seq_split``, not each segment.
+
+A ``Value`` may hold only host fields, small values a step changes, as
+``Entry({}, host={"eos_sent": bool})``. Each starts at its type's zero value. ``host(h, request,
+label, layer)`` reads them, and ``ArrayStep(host={(row, label, layer): {field: value}})`` writes
+them when the step commits, so the next step's ``prepare_inputs`` sees the write and a step that
+never ran changes nothing.
+
 ``kernel_settings(self)`` is a temporary hook for what the engine doesn't pick itself yet:
 ``splits`` and ``decode_fmha`` on a read, ``splits`` on a ``GatedDeltaNet``, and
-``max_segments_per_step`` and ``compile_op`` on a ``Block`` read. It refuses anything else.
+``max_segments_per_request``, ``max_segments_per_step``, ``compile_op`` and ``workspace_mb`` on a
+``Block`` read. It refuses anything else.
 
 Resource specs
 ~~~~~~~~~~~~~~
@@ -968,6 +1014,18 @@ The spec types are:
        kernel must turn. A model with learned position
        embeddings also declares this spec, because it needs the position counter. Such a
        model never applies RoPE.
+       ``longrope=LongRoPE.from_hf(config)`` (Phi-3, Phi-4-mini) builds a short and a long
+       table, each with its per-dimension factors and attention scale (``LongRopeManager``).
+       A request whose ``MAX_POSITION_KWARG`` (set by ``process_prompt``; the data worker
+       drops a client's value) passes
+       ``original_max_position_embeddings`` rotates with the long one for its whole life,
+       others with the short one. Set it to the length the model's reference picks its table
+       by: the prompt's for Phi-3 and Phi-4, not prompt plus ``max_tokens``. The spec builds the request's config from that kwarg and
+       names the long table in its prefix keys (``PositionSpec.prefix_variant``), so the two
+       cannot disagree. Explicit ``pos_ids`` are refused under it. On resident tables a
+       row keeps its table id's offset beside its position's, both fixed between host
+       steps. A cos/sin table on CUDA needs a ``rotary_dim`` that is a multiple of 32 with NeoX
+       pairing, of 16 with GPT-J pairing (``interleave``).
    * - ``SamplerSpec(vocab_size=..., enable_repetition_penalty=...)``
      - A sampler with its own per-request parameter buffers, philox stream, and optional
        seen-token mask. ``enable_repetition_penalty`` declares a capability, not an
@@ -1227,9 +1285,10 @@ default. A GPU of the architecture reads the file
 whichever model it is, and the build-time log names the GPU the row was swept on. The cuDNN wrapper runs a layout of equal-length
 segments, a DiT batch's, as one dense ``[segments, S, H, D]`` call. A captured one replays only
 the layout it was planned with, so a captured bucket takes it only when the step that plans it
-declares ``AttentionStep(fixed_layout=True)``, and stays on FlashInfer otherwise. The DiT
-scaffold's denoise step declares it (``DenoiseLoopSubmodule.attention_step``): every row of a
-denoise bucket, padding rows included, spans the bucket's tokens. An eager layout of unequal
+declares ``AttentionStep(fixed_layout=True)`` (``ArrayStep(fixed_layout=True)`` on a declared
+array), and stays on FlashInfer otherwise. The DiT scaffold's denoise step declares it on each
+of its arrays: every row of a denoise bucket, padding rows included, spans the bucket's tokens.
+An eager layout of unequal
 segments runs FlashInfer. It is self-attention only. A config that names ``backend: cudnn``
 fails at build where cuDNN can't run it: on a cross-attention or block-causal resource, under
 GQA, in a dtype other than bf16 / fp16, or at a head dim FlashInfer pads. Where no table has the
@@ -1322,9 +1381,8 @@ Called with ``return_lse=True``, a ragged or ragged cross-attention resource's `
 FlashInfer backend also returns each query row's log-sum-exp (``[total_tokens, H]``, fp32,
 natural log) from the same plan, which is what merging attentions over disjoint key sets
 needs; a compiled caller breaks there even with ``compile_op``. Under sequence parallelism
-LTX-2.5's audio queries attend each rank's share of the video tokens, and
-``attention_over_sharded_keys`` (``mstar/model/components/distributed/sequence_parallel.py``)
-merges them.
+LTX-2.5's audio queries attend each rank's share of the video tokens, and ``gather_merge``
+(``mstar/engine/resources/context_parallel.py``, the merge context parallelism uses) merges them.
 
 Block-causal attention within spans
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -1596,7 +1654,8 @@ placed exactly as weights are.
   the deployment.
 - **Requests.** Nothing per model. ``LoraSpec.request_config`` opens a request that
   names an adapter in the ``lora_adapter`` kwarg, which the OpenAI ``model`` field maps
-  onto, with a ``LoraReqConfig``, which each node's pool takes; a base-model request
+  onto (or which the model's ``process_prompt`` sets; see **Cross-request prefix
+  reuse**), with a ``LoraReqConfig``, which each node's pool takes; a base-model request
   carries none. The API server refuses, with a 400, an adapter it does not serve
   (``ServedModels``), and the conductor, with a 409, one a runtime load or unload is in
   flight for; an adapter is checked when it is registered (rank within
@@ -1686,10 +1745,12 @@ ingest can leave a follower without a copy rank 0 kept. Neither the wait nor the
 agreement holds the pool's lock, so the main thread's ingests and removes go on
 meanwhile.
 
-A node that runs sequence parallelism (SP > 1) or CFG parallelism (cfg_size > 1) cannot
-serve LoRA yet: the pool lays rows out per request over the whole batch, while each SP rank
-holds a shard of the tokens and each CFG rank one guidance branch's rows, so building the
-pool refuses the deployment.
+A node that runs its own sequence parallelism (in ``sp_enabled_nodes``, SP > 1) or CFG
+parallelism (cfg_size > 1) cannot serve LoRA yet: the pool lays rows out per request over the
+whole batch, while each SP rank holds a shard of the tokens and each CFG rank one guidance
+branch's rows, so building the pool refuses the deployment. A node whose KV pools place
+positions over its SP ranks instead (context parallelism) runs every row on every SP rank, so
+it serves LoRA.
 
 Adapters loaded and unloaded at runtime (``/v1/load_lora_adapter``) reach each worker as
 a control message from the conductor, which each rank applies whenever it arrives rather
@@ -2101,7 +2162,7 @@ step does to each array and sampler it touches. The engine expands ``state`` int
   step. ``span`` is how far the row advances on that label: an append-only array adds that
   many entries, and a Value folds that many positions into its one entry. A ``span`` of 0
   reads the array without extending it. Under ``max_len=0`` each segment is one block.
-- ``ArrayStep(segments=, keep=, forks=, placeholders=, eager_add=, advance=, position_ids=)``.
+- ``ArrayStep(segments=, keep=, forks=, placeholders=, eager_add=, fixed_layout=, advance=, position_ids=)``.
   A step lists every array it touches, and a call on one it doesn't list raises. ``segments``
   gives one array its own spans, ``None`` being the step's. ``keep=False`` makes every add
   this step scratch. ``advance`` moves each row's position counter by something other than
@@ -2179,7 +2240,12 @@ handled as special cases. BAGEL and Whisper use today's forms of them:
   example in ``preprocess`` before the replay. Their addressing stays an ordinary plan rather
   than the slot's static buffers, which are sized for the bucket's in-graph tokens. Whisper's
   prefill uses it to write its 1500-token encoder context while replaying a graph sized by
-  its few prompt tokens.
+  its few prompt tokens. The reads of such a step attend the pages alone, so one that needs the
+  step's own k and v (an attention through an exchange, a context-parallel pool on a multi-token
+  step, the dense backend) is refused at the first add.
+- ``fixed_layout=True`` (``fixed_layout``): every replay of the step's capture bucket lays its
+  rows out as the capture did, so a ragged self-attention may capture a kernel that bakes the
+  layout in (cuDNN). A resource's step takes it only if every read on the resource declares it.
 
 Only a model that hasn't moved writes ``KVStep(combined_labels=...)``. On the contract, a
 step's calls cover all of its rows in segment order.
@@ -2189,8 +2255,8 @@ of its own, rather than through ``write_kv``, asks the KV resource where the ste
 ``kv.write_target(layer_idx, label)`` returns ``(layer cache, page of each token, slot in
 page of each token, number of tokens to write)`` for the current plan (NHD layout only).
 Tokens past that number are the plan's padding and must not be written. The fused q/k
-norm, RoPE and KV-write kernels that Qwen3-ASR and Qwen3-Omni's Thinker call through
-``AttentionCallable.norm_rope_attend`` and ``norm_rope_table_attend`` are the example.
+norm, RoPE and KV-write kernel that Qwen3-ASR calls through
+``AttentionCallable.norm_rope_attend`` is the example.
 
 **Testing.** ``declare_step`` performs only host-side bookkeeping, so you can unit-test it
 on CPU without model weights. ``test/modular/test_state_ports.py`` compares both ports' steps
@@ -2259,6 +2325,30 @@ plain attribute, not a buffer. An eager caller can pass the int.
 
 ``kernel_setting(h, read, field)`` reads a ``kernel_settings`` field in effect, YAML
 included. It is temporary, with that hook.
+
+A kernel that writes state itself, in one launch with the math before it, is a state op. It
+names what it touches, the formats its kernel can address, and a reference over the contract's
+calls, which any other format runs:
+
+.. code-block:: python
+
+   @state_op(adds=("kv",), mutates=("q",), formats=(PagedNHD(devices={"cuda"}),), reference=_reference)
+   def write(kv, layer, q, k, v, *, target: PagedNHDTarget): ...
+
+   write(self.kv, self.layer, q, k, v)      # counts as the layer's add, and breaks the graph as add does
+   out = self.kv.read(self.layer, q)
+
+The engine picks the kernel or the reference at bind, and a step whose reads attend its own ``k`` and ``v``
+(a context-parallel pool's multi-token step) runs the reference. ``target`` says where this step's entries go
+on the layer. A conformance test holds each kernel to its reference on each listed format, and
+``MSTAR_KV_DEBUG_ASSERTS=1`` checks that an eager call writes nothing outside the step's slots.
+
+Between steps, a model may keep a memo of a pure function of request inputs, whose loss costs time
+and changes no output, and scratch buffers that it makes at load and that no step reads before
+writing. Anything else it keeps between steps is declared state or an edge. This rests on the
+engine running a node's forwards one at a time, in stream order. The diffusion loop's schedule and
+prefetched seeds are memos, its latents and solver state are loop-back edges, and a code
+predictor's frame-local KV is scratch.
 
 A model on the contract reads no ``node_resources``, ``engine_inputs.resources``,
 ``request_state`` or ``per_request_states``, and imports the engine only through
@@ -2939,7 +3029,7 @@ that a misspelled setting is never silently ignored:
      - Accepts
    * - ``KVSpec`` with ``PagedKVConfig``
      - ``max_num_pages``, ``page_size``, ``max_seq_len``, ``cpu_offload_pages``,
-       ``prefix_cache``, ``prefix_cache_salt``
+       ``prefix_cache``, ``prefix_cache_salt``, ``context_parallel`` (see below)
    * - ``KVSpec`` with ``RingKVConfig``
      - ``num_sessions``
    * - ``BoundedKVSpec``
@@ -2989,6 +3079,52 @@ Tune the cache shape on the KV resource, not on the attention resource that read
 example, ``configs/qwen3tts.yaml`` selects FA2 under ``talker_attn``,
 ``configs/cosmos3_nano.yaml`` sets the page count under its paged KV key, and
 ``configs/waypoint.yaml`` sets the resident world count under its ring KV key.
+
+**Context parallelism.** ``context_parallel: true`` on a paged KV pool stripes each page's slots
+over the ranks that would otherwise store the same KV heads: slot ``s`` lives on partner
+``s % P``, page ids stay the same on every rank, and each rank holds ``page_size / P`` slots a
+page. Attention runs on each rank's slots and merges the partials across the partners exactly
+(``mstar/engine/resources/context_parallel.py``). The model declares nothing.
+
+- **TP mode (no SP ranks).** The partners are the TP ranks sharing a KV head,
+  ``P = tp / num_kv_heads``, so TP must be a larger multiple of the KV heads. They are the contiguous blocks ``kv_head_replicas``
+  (``mstar/distributed/utils.py``) gives, as ``QKVParallelLinear`` loads them; a model that
+  shards K and V itself must match. Each layer exchanges queries and partials over the TP group,
+  except for a plan label of an eager step that isn't one token a row and has no stored context
+  on any row, which attends its own tokens alone.
+- **SP mode.** The partners are the node's SP ranks, ``P = sp_size``. Heads shard over TP alone
+  and the node loads without its SP group, so every layer but attention runs replicated across
+  SP; prefer TP mode where it applies. Every paged pool of the node must set the key, and the
+  node must not be in the model's ``sp_enabled_nodes``. Each layer all-gathers the partials,
+  with the same exception.
+  Chunked prefill stays off on SP ranks (``_unchunkable_nodes``), as for the model's own SP, so
+  SP mode prefills a prompt in one step; chunking an SP-placed pool's prompts is not supported yet.
+  TP mode chunks prompts as without placement.
+
+A page's tokens (``page_size``, 128 when it is unset) must be divisible by ``P``; the conductor
+checks these rules against ``node_groups`` before it starts a worker. ``max_num_pages`` counts
+logical pages, so raise it by ``P`` to use the memory placement frees (the pool logs its bytes per
+rank). Every resource over the pool must support it, or loading fails naming the one that doesn't.
+FlashInfer attention (``flashinfer``) with ``flashinfer_backend`` ``auto``, ``fa2`` or ``fa3``
+(``auto`` runs as ``fa2`` from SM100; after an unexplained one-off lockstep hang in an ``fa2``
+prefill over an SP-placed pool (#1363), an SP-placed pool that prefills on ``fa2`` warns at
+startup: an explicit ``fa2`` on any architecture, and ``auto`` where FlashInfer has no ``fa3``
+(below SM90 and from SM100), while ``auto`` on SM90 prefills on ``fa3``), RoPE positions and the recurrent state pool (GDN, KDA;
+the same state on every SP partner) do; dense, flex, XPU, block-causal and MLA (``flashinfer_mla``)
+attention,
+cross-attention, DSA and ``sliding_window`` don't, and a ring or bounded KV pool can't set the key.
+A decode/prefill ``splits`` and ``decode_fmha`` are ignored over a placed pool, and a node over
+one plans on the host rather than resident (``resident_planning``). A node that captures a step
+combining labels into one plan (``KVStep.combined_labels``, as classifier-free guidance does) at a
+batch size above 1 is refused at load: a replay's padding rows would sit between its real ones.
+
+A step of one token a row attends the pages after its KV write (in TP mode on tensor cores
+whatever ``decode_tensor_cores`` says). Any other step attends its stored context on the pages
+and its own tokens from the ``k`` and ``v`` the layer passes ``run``, so a layer that calls
+``attn.run`` itself passes them (``AttentionCallable`` and ``MLAAttention`` without
+``mla_absorb`` do). A fused K/V write that leaves ``k`` unrotated asks ``reads_step_kv()`` first
+and rotates it when the step attends it (``AttentionCallable.norm_rope_attend``); a state op's fused
+kernel doesn't run on such a step, so its reference's ``add`` hands the handle ``k`` and ``v``.
 
 .. note::
 
@@ -3592,9 +3728,9 @@ iteration. The step index is the engine's loop counter
 (``fwd_info.dynamic_loop_iter_counts``), so there is no host sync per step.
 
 The ``dit`` node subclasses ``DenoiseLoopSubmodule`` (``denoise_loop.py``), which owns
-the engine contract — seeded initial noise, per-request schedules, equal-key request
-batching (``can_batch``), stacked ``forward_batched``, the ragged-attention
-``declare_step`` and one CUDA-graph bucket per ``bucket_key`` with the Euler update inside
+the engine contract — seeded initial noise, memoized schedules, equal-key request
+batching (``can_batch``), stacked ``forward_batched``, the ``declare_step`` over the arrays
+it attends through and one CUDA-graph bucket per ``bucket_key`` with the Euler update inside
 the graph — and asks the model for the hooks below. The loop ends on its iteration count:
 a model whose request picks its step count returns it from ``get_loop_caps``
 (``{"denoise_loop": steps}``), resolved exactly as ``schedule_for`` resolves it, and a
@@ -3605,14 +3741,16 @@ iteration past the schedule. The hooks:
 
     class MyDenoise(DenoiseLoopSubmodule):
         def bucket_key_for(self, fwd_info): ...       # hashable: latent grid, text length, ...
-        def schedule_for(self, fwd_info, key): ...    # FlowMatchSchedule (flow_match.py)
-        def seed_latents(self, fwd_info, key, gen): ...  # [L, C] initial noise, seeded
+        def schedule_for(self, walk, settings, key): ...  # FlowMatchSchedule (flow_match.py), memoized
+        # optional: what the request sets of its schedule; its step count by default
+        def schedule_settings(self, fwd_info): ...
+        def seed_latents(self, key, gen): ...         # [L, C] initial noise, seeded
         def request_inputs(self, fwd_info, inputs, key): ...  # per-row conditioning tensors
         def num_tokens(self, key): ...                # image tokens for the attention step
         def capture_request_inputs(self, key, device): ...   # dummy rows for graph capture
         def denoise(self, engine_inputs, key, latents, timestep, sigma, sigma_next, **cond): ...
         # optional: extra attention spans (a refiner over the image tokens alone, ...)
-        def attention_segments(self, key): return (("main", self.num_tokens(key)),)
+        def attention_segments(self, key): return {TOKENS: (("main", self.num_tokens(key)),)}
 
 ``bucket_key`` is whatever has to match for two rows to share a forward, and it is also
 the CUDA-graph bucket key — shape, but equally a knob like whether CFG is on.
@@ -3635,13 +3773,14 @@ when the request reaches the worker, on a thread of its own, and iteration 0 onl
 it to the device. Otherwise the CPU draw runs on the GPU thread at iteration 0, once per
 joining row.
 
-Every span a layer attends over must be declared with its own label (default: one
-``"main"`` segment per request); ``ragged_for(label)`` hands that span's kernel to the
-layers, which fall back to SDPA when no ragged resource is bound.
+Every span a layer attends over is a segment of a declared array with ``max_len`` 0, listed
+in ``attention_segments`` per request. A layer calls ``attend(self.state, self.layer, q, k, v)``
+from ``attention.py``, which adds and reads through its array, and runs SDPA on a layer no
+engine bound a handle to. Arrays of one geometry share one resource, each under its own label.
 
 Shared pieces to build the components from: ``flow_match.py`` (shift schedules and the
 exact Euler step), ``rope.py`` (multi-axis rotary embeddings), ``attention.py`` (joint
-attention over packed tokens: SDPA eagerly, the ragged FlashInfer resource under graphs),
+attention over packed tokens: SDPA, or the ragged FlashInfer resource through a read),
 ``text_encoder.py`` (native Qwen3 hidden-state taps), ``autoencoder_kl.py`` (the KL VAE
 family), ``image_io.py`` (latent packing, PNG) and ``lora.py`` (static LoRA merge at load,
 also into fused ``q``/``k``/``v`` shards via ``FusedColumnLinear.shard_slice``; the checkpoint

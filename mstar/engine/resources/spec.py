@@ -146,6 +146,13 @@ class NodeResourceSpec(ABC):
         return False
 
     @property
+    def places_positions(self) -> bool | None:
+        """Whether this resource places its token positions over ranks that would otherwise hold
+        the same copy (``mstar.engine.resources.context_parallel``); None for one that holds no
+        positions to place. A node whose resources place them runs replicated across its SP ranks."""
+        return None
+
+    @property
     @abstractmethod
     def resource_class(self) -> "type[Resource]":
         """What builds this spec. Imported inside the property, so declaring a
@@ -175,6 +182,14 @@ class NodeResourceSpec(ABC):
         None. The conductor adds it to the model's own (``get_request_resource_configs``),
         so a resource the deployment declares needs no model code to take request
         settings."""
+        return None
+
+    def prefix_variant(self, model_kwargs: dict) -> bytes | None:
+        """What sets a request's KV on this resource apart from another's for the same
+        tokens (a LongRoPE table picked per request), from the kwargs ``request_config``
+        reads; None (the default) for nothing. The API server's data worker folds it into
+        the request's prefix-cache root, so the two never share pages. Called per request
+        on the data worker's threads, so it reads only ``model_kwargs`` and the spec."""
         return None
 
     def apply_yaml_overrides(self, **kwargs):

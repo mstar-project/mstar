@@ -22,9 +22,8 @@ from mstar.model.base import WorkerGraph  # noqa: E402
 from mstar.model.components.mrope import mrope_position_ids  # noqa: E402
 from mstar.model.qwen3_omni.components.rope import compute_3d_cos_sin, compute_rope_freqs  # noqa: E402
 from mstar.model.qwen3_omni.config import (  # noqa: E402
-    THINKER_ATTN,
+    THINKER_KV,
     THINKER_MIXED,
-    THINKER_POS,
     THINKER_SAMPLER,
     THINKER_TEXT_DECODE,
 )
@@ -83,6 +82,16 @@ class _Body:
         pass
 
 
+class _SamplerHandle:
+    """What `sample` and `last_sampled` read of a handle, over the sampler of the last `_engine_inputs`."""
+
+    _open, _drawn, sampler, rows = True, 0, SimpleNamespace(draws=1 << 30), ()
+
+    @property
+    def resource(self):
+        return _engine_inputs.sampler
+
+
 @pytest.fixture
 def thinker():
     sub = ThinkerSubmodule(_Body(), SimpleNamespace(
@@ -91,6 +100,11 @@ def thinker():
         vision=SimpleNamespace(deepstack_visual_indexes=[]),
     ))
     sub.bind_node_resources({THINKER_SAMPLER: SimpleNamespace(has_slot_masters=True)})
+    sub.kv = SimpleNamespace(
+        _check_open=lambda call: None, label="main", positions=None,
+        at_last_token=lambda h: h[-2:],
+    )
+    sub.sampler = _SamplerHandle()
     sub.get_device = lambda: torch.device("cpu")
     return sub
 
@@ -115,9 +129,9 @@ def _engine_inputs(request_ids, tokens, captured=False):
         sample=lambda request_ids, logits: logits[:, 0].long(),
         _row_stager=PinnedStager(torch.long, numel=64),
     )
+    _engine_inputs.sampler = sampler
     return ModelInputsFromEngine(
-        request_ids=request_ids, per_request_info={}, captured=captured,
-        resources={THINKER_SAMPLER: sampler, THINKER_ATTN: SimpleNamespace(select_last_hidden=lambda h: h[-2:])},
+        request_ids=request_ids, per_request_info={}, captured=captured, resources={THINKER_SAMPLER: sampler},
     )
 
 
@@ -203,9 +217,9 @@ def test_a_decode_step_is_declared_input_free(thinker, walk):
     assert [(s.request_id, s.span) for s in declared.segments] == [(s.request_id, s.span) for s in real.segments]
     assert declared.cg_key_info is real.cg_key_info is None
     for step in (declared, real):
-        sampler = step.steps[THINKER_SAMPLER]
-        assert sampler.kept_rids is None and not sampler.prefill_tracked_tokens
-        assert step.steps[THINKER_POS].advance is None
+        sampler = step.state[THINKER_SAMPLER]
+        assert sampler.kept_rows is None and not sampler.prompt_tokens
+        assert step.state[THINKER_KV].advance is None
 
 
 @pytest.mark.parametrize("walk", [*PREFILL_WALKS, THINKER_MIXED])
@@ -243,7 +257,7 @@ def test_both_decode_captures_take_ids():
 
 
 def test_a_decode_step_takes_each_rows_last_token_and_a_routed_row_keeps_its_own(thinker):
-    thinker.node_resources[THINKER_POS] = SimpleNamespace(pos_ids=lambda label: torch.tensor([4.0, 5.0, 6.0]))
+    thinker.kv.positions = SimpleNamespace(pos_ids=lambda label: torch.tensor([4.0, 5.0, 6.0]))
     row = ARNodeInputs(input_seq_len=1)
     routed = ARNodeInputs(input_seq_len=1, input_ids=torch.tensor([7]))
     out = thinker.preprocess(THINKER_TEXT_DECODE, _engine_inputs(["a", "b", "c"], [11, 12, 13]), [row, routed, row])
@@ -258,7 +272,7 @@ def test_a_padding_row_of_a_capture_keeps_what_its_slot_reads(thinker):
 
 
 def test_a_step_of_routed_rows_alone_takes_their_tokens(thinker):
-    thinker.node_resources[THINKER_POS] = SimpleNamespace(pos_ids=lambda label: torch.tensor([4.0, 5.0]))
+    thinker.kv.positions = SimpleNamespace(pos_ids=lambda label: torch.tensor([4.0, 5.0]))
     rows = [ARNodeInputs(input_seq_len=1, input_ids=torch.tensor([t])) for t in (3, 4)]
     out = thinker.preprocess(THINKER_TEXT_DECODE, _engine_inputs(["a", "b"], [11, 12]), rows)
     assert out["input_ids"].tolist() == [3, 4]
@@ -267,7 +281,7 @@ def test_a_step_of_routed_rows_alone_takes_their_tokens(thinker):
 @pytest.mark.parametrize("walk", DECODE_WALKS)
 def test_a_captured_decode_step_builds_its_rotary_tables_in_the_graph(thinker, walk):
     planned = torch.tensor([4.0, 5.0, 6.0, 99.0])
-    thinker.node_resources[THINKER_POS] = SimpleNamespace(pos_ids=lambda label: planned)
+    thinker.kv.positions = SimpleNamespace(pos_ids=lambda label: planned)
     engine_inputs = _engine_inputs(["a", "b", "c"], [1, 2, 3], captured=True)
     rows = [ARNodeInputs(input_seq_len=1, input_ids=torch.tensor([t])) for t in (1, 2, 3)]
     out = thinker.preprocess(walk, engine_inputs, rows)
@@ -285,7 +299,7 @@ def test_a_captured_decode_step_builds_its_rotary_tables_in_the_graph(thinker, w
 
 
 def test_a_captured_audio_decode_step_keeps_the_talkers_states_and_mask(thinker):
-    thinker.node_resources[THINKER_POS] = SimpleNamespace(pos_ids=lambda label: torch.tensor([4.0, 5.0]))
+    thinker.kv.positions = SimpleNamespace(pos_ids=lambda label: torch.tensor([4.0, 5.0]))
     engine_inputs = _engine_inputs(["a", "b"], [0, 0], captured=True)
     rows = [ARNodeInputs(input_seq_len=1, input_ids=torch.tensor([t])) for t in (3, 8)]
     out = thinker.preprocess("thinker_decode", engine_inputs, rows)
@@ -297,7 +311,7 @@ def test_a_captured_audio_decode_step_keeps_the_talkers_states_and_mask(thinker)
 
 
 def test_an_eager_audio_decode_step_stages_its_tables_and_keeps_the_talkers_states(thinker):
-    thinker.node_resources[THINKER_POS] = SimpleNamespace(pos_ids=lambda label: torch.tensor([4.0]))
+    thinker.kv.positions = SimpleNamespace(pos_ids=lambda label: torch.tensor([4.0]))
     rows = [ARNodeInputs(input_seq_len=1, input_ids=torch.tensor([3]))]
     single = _engine_inputs(["a"], [0])
     out = thinker.preprocess("thinker_decode", single, rows)
@@ -310,7 +324,7 @@ def test_an_eager_audio_decode_step_stages_its_tables_and_keeps_the_talkers_stat
 
 @pytest.mark.parametrize("walk", DECODE_WALKS)
 def test_a_decode_step_reads_nothing_on_the_host(thinker, walk):
-    thinker.node_resources[THINKER_POS] = SimpleNamespace(pos_ids=lambda label: torch.tensor([4.0, 5.0, 6.0]))
+    thinker.kv.positions = SimpleNamespace(pos_ids=lambda label: torch.tensor([4.0, 5.0, 6.0]))
     rows = [
         ARNodeInputs(input_seq_len=1),
         thinker.prepare_inputs(THINKER_TEXT_DECODE, None, {"text_inputs": [torch.tensor([7])]}, has_loopback=False),
@@ -342,7 +356,7 @@ def test_a_text_decode_output_is_addressed_by_row(thinker):
         "a per-row filter would keep the step out of the engine's rows-only path"
     )
     engine_inputs = _engine_inputs(["a", "b"], [1, 2], captured=True)
-    thinker.node_resources[THINKER_POS] = SimpleNamespace(pos_ids=lambda label: torch.tensor([1.0, 2.0]))
+    thinker.kv.positions = SimpleNamespace(pos_ids=lambda label: torch.tensor([1.0, 2.0]))
     out = thinker.forward_batched(THINKER_TEXT_DECODE, engine_inputs, input_ids=torch.tensor([1, 2]))
     assert set(out.row_outputs) == {"new_token"} and not out.per_rid_outputs and not out.packed_outputs
     assert set(out.check_stop_buffers) == {"new_token", "text_inputs"}
@@ -429,7 +443,7 @@ def test_a_mixed_step_embeds_its_loop_back_rows_beside_the_prompts(thinker):
     prompt = ARNodeInputs(input_seq_len=2, input_embeds=torch.full((2, HIDDEN), 20.0))
     row = ARNodeInputs(input_seq_len=1)
     routed = thinker.prepare_inputs(THINKER_TEXT_DECODE, None, {"text_inputs": [torch.tensor(9)]})
-    thinker.node_resources[THINKER_POS] = SimpleNamespace(
+    thinker.kv.positions = SimpleNamespace(
         pos_ids=lambda label: torch.tensor([0.0, 1.0, 2.0, 3.0]),
     )
     out = thinker.preprocess(THINKER_MIXED, _engine_inputs(["a", "b", "c"], [5, 6, 7]), [prompt, row, routed])
@@ -442,7 +456,7 @@ def test_a_mixed_step_embeds_an_audio_decode_row_at_its_planned_position(thinker
     prompt = ARNodeInputs(input_seq_len=2, input_embeds=torch.full((2, HIDDEN), 20.0))
     row = thinker.prepare_inputs("thinker_decode", None, {"text_inputs": [torch.tensor(9)]})
     planned = torch.tensor([30.0, 31.0, 12.0])
-    thinker.node_resources[THINKER_POS] = SimpleNamespace(pos_ids=lambda label: planned)
+    thinker.kv.positions = SimpleNamespace(pos_ids=lambda label: planned)
     # no loop-back row in this step, so nothing reads the sampler's slot masters
     engine_inputs = _engine_inputs(["a", "b"], [5, 6])
     engine_inputs.resources[THINKER_SAMPLER].loopback_tokens = None
@@ -462,8 +476,8 @@ def test_a_mixed_step_keeps_a_decode_rows_token_and_drops_a_mid_prompt_one(think
         ARNodeInputs(input_seq_len=4, graph_walk="prefill_text", input_ids=torch.arange(4)),
     ]
     step = thinker.declare_step(THINKER_MIXED, ["text", "audio", "prompt"], rows, per_request_info={})
-    assert step.steps[THINKER_SAMPLER].kept_rids == frozenset({"text", "audio"})
-    assert set(step.steps[THINKER_SAMPLER].prefill_tracked_tokens) == {"prompt"}
+    assert step.state[THINKER_SAMPLER].kept_rows == frozenset({"text", "audio"})
+    assert set(step.state[THINKER_SAMPLER].prompt_tokens) == {"prompt"}
 
 
 def test_a_mixed_steps_text_decode_rows_get_their_stop_and_inline_rows_and_no_talker_states(thinker):

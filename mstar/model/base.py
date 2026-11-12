@@ -1,3 +1,4 @@
+import enum
 import functools
 import itertools
 import math
@@ -143,6 +144,7 @@ if TYPE_CHECKING:
 
 if TYPE_CHECKING:
     from mstar.engine.state import Array, Sampler, SampleSettings
+    from mstar.engine.state.adapters import StateSetup
     from mstar.worker.scheduling_policy import WalkPriority
 
 DECODE = "decode"
@@ -164,15 +166,30 @@ class RobotIO(NamedTuple):
     action_dim: int
 
 
+class KeepAdapter(enum.Enum):
+    """``ProcessPromptOutput.lora_adapter`` left unset."""
+    KEEP = "keep"
+
+
+# the request runs on the adapter its client named, or on the base model
+KEEP_ADAPTER = KeepAdapter.KEEP
+
+
 class ProcessPromptOutput(NamedTuple):
     """Tensors from `process_prompt`, and metadata to carry beside them.
 
     The data worker folds ``metadata`` into the request's ``model_kwargs``, so
     what a model settles while tokenizing reaches
     `get_request_resource_configs` without a field of its own on the request.
+
+    ``lora_adapter`` is the LoRA adapter the model runs this prompt on, one of
+    ``Model.prompt_lora_adapters``, or None for the base model; the data worker
+    gives the request what the API server gives a client that names it
+    (``ServedModels.model_chose``). Unset keeps the client's choice.
     """
     new_input_tensors: NameToTensorList
     metadata: dict
+    lora_adapter: str | None | KeepAdapter = KEEP_ADAPTER
 
 
 class ClientChunk(NamedTuple):
@@ -532,7 +549,7 @@ def streamed_inputs(model: "Model", graph_walk: str, graph: GraphSection) -> set
     }
 
 
-def enabled_resources(model: "Model", model_config: dict) -> list[NodeResourceSpec]:
+def enabled_resources(model: "Model", model_config: dict, setup: "StateSetup") -> list[NodeResourceSpec]:
     """The resource specs a deployment's YAML turns on, before its ``resources:``
     overrides: the model's declaration, less the opt-in specs (``NodeResourceSpec.opt_in``)
     its ``resources:`` block does not name. Raises the first problem with the declaration,
@@ -545,19 +562,22 @@ def enabled_resources(model: "Model", model_config: dict) -> list[NodeResourceSp
         raise ValueError(problems[0])
     named = (model_config.get("resources") or {}).keys()
     return [
-        spec for spec in node_resources(model)
+        spec for spec in node_resources(model, setup=setup)
         if not spec.opt_in or spec.resource_key in named
     ]
 
 
-def declared_resources(model: "Model", model_config: dict) -> list[NodeResourceSpec]:
+def declared_resources(
+    model: "Model", model_config: dict, setup: "StateSetup | None" = None,
+) -> list[NodeResourceSpec]:
     """The resource specs a deployment declares: ``enabled_resources`` with the YAML's
     overrides applied. A ``per_node`` spec is whole here, as the API server checks
     requests and adapters against it; ``serving_resources`` splits it."""
     from mstar.engine.resources.spec import apply_yaml_overrides
+    from mstar.engine.state.adapters import spec_overrides
 
-    specs = enabled_resources(model, model_config)
-    apply_yaml_overrides(specs, model_config)
+    specs = enabled_resources(model, model_config, setup or deployment_setup(model, model_config))
+    apply_yaml_overrides(specs, spec_overrides(model_config))
     return specs
 
 
@@ -585,7 +605,20 @@ def parse_autocast_dtype(value) -> torch.dtype | None:
     return dtype
 
 
-def serving_resources(model: "Model", model_config: dict) -> list[NodeResourceSpec]:
+def deployment_setup(model: "Model", model_config: dict) -> "StateSetup":
+    """The `StateSetup` ``model_config`` asks for, raising its first problem, for callers that skip
+    ``validate_deployment``, which reports them all."""
+    from mstar.engine.state.adapters import state_setup
+
+    setup, problems = state_setup(model_config, model.declare_state())
+    if problems:
+        raise ValueError(problems[0])
+    return setup
+
+
+def serving_resources(
+    model: "Model", model_config: dict, setup: "StateSetup | None" = None,
+) -> list[NodeResourceSpec]:
     """The resource specs a deployment builds: ``declared_resources``, as
     ``built_resources``.
 
@@ -594,7 +627,7 @@ def serving_resources(model: "Model", model_config: dict) -> list[NodeResourceSp
     ``validate_deployment`` takes the same steps, reporting every problem rather than
     the first.
     """
-    return built_resources(declared_resources(model, model_config))
+    return built_resources(declared_resources(model, model_config, setup))
 
 
 class Model(ABC):
@@ -1046,6 +1079,12 @@ class Model(ABC):
         ``text_inputs``, which hold each attachment's pads in place; a model
         that splits ``text_inputs`` around its attachments adds theirs."""
         return sum(ids.numel() for ids in tensors.get("text_inputs", ()))
+
+    def prompt_lora_adapters(self) -> frozenset[str]:
+        """The LoRA adapters ``process_prompt`` may run a prompt on
+        (``ProcessPromptOutput.lora_adapter``). The API server refuses, at startup, a
+        deployment whose ``resources: lora: adapters:`` block does not serve them all."""
+        return frozenset()
 
     def max_input_files(self) -> dict[str, int]:
         """Most files of each input modality one request may attach, e.g.

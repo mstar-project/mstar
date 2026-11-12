@@ -170,6 +170,11 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
    * - ``higgs_audio`` *(Beta)*
      - ``bosonai/higgs-audio-v3-stt``
      - Audio-tower + Qwen3 LLM speech-to-text. Beta / un-optimized.
+   * - ``phi4mm`` *(Beta)*
+     - ``microsoft/Phi-4-multimodal-instruct``
+     - Phi-4-mini with a SigLIP vision tower and a conformer audio tower: text, images
+       and audio in, text out. Each request runs under the checkpoint's vision or speech
+       LoRA as its media call for, from the engine's LoRA pool.
    * - ``omnilingual_asr_ctc_{300m,1b,3b,7b}``
      - ``facebook/omniASR-CTC-300M`` (v1); v2 from Meta's CDN (default)
      - Meta Omnilingual ASR, CTC variants: wav2vec 2.0 encoder + CTC head, speech-to-text
@@ -853,9 +858,9 @@ on one GPU in every shipped config.
 
 Both frontends serve LoRA: a request's ``model`` names the adapter it runs under
 (``ServedModels``), and ``/v1/models`` lists the adapters beside the base model.
-Runtime updates (below) are the Python frontend's only for now: ``mstar-server``
-reads the served adapters once at launch and has neither route, so ``mstar serve``
-refuses ``--rust-frontend`` with ``runtime_updates: true``.
+Both serve runtime updates (below) too: ``mstar-server`` selects the adapter itself,
+and the API server pushes it the served set after every change, so a request pays no
+extra round trip for it.
 
 Adapters can also be loaded and unloaded while the server runs, with vLLM's
 endpoints and bodies. They make the server read paths a client names, so they are off
@@ -2177,12 +2182,12 @@ each row count compiling its own graph.
 **What is accelerated by default.** The DiT runs under ``torch.compile``
 (``compile_dit``); its self-attention runs on the engine's ragged attention
 resource (FlashInfer, FA3 on Hopper; on a B300 the ``ragged_attention`` kernel table
-picks torch's cuDNN SDPA, the kernel ``attention_backend: sdpa`` runs, and the two
+picks torch's cuDNN SDPA, the kernel ``backend: sdpa`` runs, and the two
 configs give the same videos at the same step time) as an opaque op inside the compiled graph,
 6% off a 1280x704x81 denoise step on an H200 against cuDNN SDPA, measured on
 an earlier version of the DiT block, before the adaLN was computed in one pass
 and the q/k norm and RoPE were fused
-(``model_kwargs: attention_backend: sdpa`` restores the reference kernel; the
+(``backend: sdpa`` on the ``dit_self_attn`` resource restores the reference kernel; the
 cross-attention over the 512 text tokens stays on SDPA, which is faster at that
 shape). The untiled VAE decode runs the shared Wan VAE decoder,
 channels-last and compiled (``vae_decode_fast``; set it to ``false`` under the
@@ -2333,7 +2338,9 @@ Deployment knobs (``model_kwargs``; the SP configs set ``compile``, ``vae_tile_b
 - ``vae_compile``: the decoder's blocks, static per tile batch; a canvas or clip share with
   another tile count compiles again. A 768p clip's share decodes in 2.1 s instead of 3.2 s
   on one H200, within 62.9 dB of eager.
-- ``attention_backend``: ``flashinfer``, or ``sdpa`` (the reference's kernel).
+
+The attention kernel is a resource's setting: ``backend: sdpa`` on the ``dit_attn`` and
+``refiner_attn`` resources runs the reference's kernel, and FlashInfer runs without it.
 
 Async scheduling is on for the DiT and the decoder, the default for parallel nodes
 (``tp_async_sched: false`` turns it off); on and off measured within noise. Runtime needs:
@@ -2342,9 +2349,9 @@ torchaudio built for another torch, refuses to start), FlashInfer, and ``ffmpeg`
 rank holds the whole DiT, and the SP configs put the conditioner beside it on rank 0 (117 GiB
 in use once loaded), so they need 141 GB GPUs (H200); no config has been run on 80 GB cards.
 
-At ``attention_backend: sdpa`` the nodes' modules, driven by ``test/minimax_h3/parity.py``
-(fp32 matmuls at "highest"), are bit-identical to diffusers' MiniMax-H3 pipeline end to end
-(latents, frames, waveform); with ``--exact`` the script exits nonzero when one isn't.
+On SDPA the nodes' modules, driven by ``test/minimax_h3/parity.py`` (fp32 matmuls at
+"highest"), were bit-identical to diffusers' MiniMax-H3 pipeline end to end (latents, frames,
+waveform), measured at ``f6260f2677``; with ``--exact`` the script exits nonzero when one isn't.
 FA3 and the compiled DiT are not bit-exact. Served at 768p (50 steps, SP2 on H200, three
 seeds), clips are 23.7-32.8 dB (video) and 17.8-22.3 dB (audio) from diffusers', where the
 reference on another SDPA kernel is 23.5-33.1 and 21.6-22.3 dB from itself; per seed, the
@@ -2405,16 +2412,14 @@ The OpenAI routes are ``POST /v1/images/generations`` (``size`` as ``WxH``, ``se
 (multipart ``image`` + ``prompt``; up to four reference images are concatenated as
 conditioning tokens, in order).
 
-Deployment knobs live under ``model_kwargs`` in ``configs/flux2_klein.yaml``:
+``backend: sdpa`` on the ``dit_attn`` resource, as the shipped configs set it, runs the
+reference kernel: torch's SDPA called by the model, cuDNN on an H100 and a B300. Without it the
+DiT's joint attention runs on the engine's ragged attention resource, whose kernel the GPU's
+``ragged_attention`` table picks: torch's cuDNN SDPA on ``sm_103`` (B300), FlashInfer's ragged
+prefill (FA3 on Hopper) where no table covers the GPU. ``backend: flashinfer`` keeps
+FlashInfer. Both are CUDA-graph replayable. Z-Image takes the same block.
 
-``attention_backend``
-   ``sdpa`` (the shipped configs) is the reference kernel: torch's SDPA called by the model,
-   cuDNN on an H100 and a B300. ``flashinfer`` (the model's default when a config names none)
-   runs the DiT's joint attention on the engine's ragged attention resource, whose kernel the
-   GPU's ``ragged_attention`` table picks: torch's cuDNN SDPA on ``sm_103`` (B300), FlashInfer's
-   ragged prefill (FA3 on Hopper) where no table covers the GPU. ``resources: dit_attn:
-   backend: flashinfer`` keeps FlashInfer. Both are CUDA-graph replayable. Z-Image takes the
-   same knob.
+Deployment knobs live under ``model_kwargs`` in ``configs/flux2_klein.yaml``:
 
 ``compile``
    ``torch.compile`` of the transformer, one trace per shape.
@@ -2511,7 +2516,7 @@ Deployment knobs live under ``model_kwargs`` in ``configs/flux2_klein.yaml``:
    the same GPU the 4B's denoise step goes from 31.4 ms to 24.4 ms (MXFP8) or 22.9 ms (NVFP4),
    and images per second at 8 concurrent requests rise 25% or 39%. Device memory after 8
    concurrent requests falls by 2.3 GiB on klein 4B with MXFP8 (5.1 GiB with NVFP4), 7.6 GiB on
-   9B and 6.9 GiB on Z-Image (MXFP8, each model's shipped config with ``attention_backend: sdpa``).
+   9B and 6.9 GiB on Z-Image (MXFP8, each model's shipped config with ``backend: sdpa``).
 
 ``linear_keep_bf16``
    A list of module-name patterns over the transformer's linears to keep in bf16 for one

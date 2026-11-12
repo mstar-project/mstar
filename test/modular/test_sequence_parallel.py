@@ -5,10 +5,10 @@ even and uneven splits and over negative dims, and of several tensors at once ag
 one at a time; and
 ``ulysses_attention`` over sharded tokens against one rank attending the whole
 sequence (with fewer key/value heads than query heads too), for the
-``[S, H, D]`` and ``[B, S, H, D]`` layouts; ``attention_over_sharded_keys``, a
-replicated query over sharded keys merged by log-sum-exp, against one rank attending
-all the keys; a compiled stack over packs of new lengths, without recompiling; and the
-Wan2.2 DiT under Ulysses against the same DiT on one rank.
+``[S, H, D]`` and ``[B, S, H, D]`` layouts; ``attention_over_sharded_keys``, a replicated query over sharded
+keys merged by log-sum-exp, against one rank attending all the keys; a compiled stack over packs
+of new lengths, without recompiling; and the Wan2.2 DiT under Ulysses against the same DiT on one
+rank.
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ import torch.multiprocessing as mp
 import torch.nn.functional as F
 
 from mstar.distributed.communication import CommGroup
+from mstar.engine.resources.context_parallel import gather_merge, merge
 from mstar.model.components.diffusion.attention import sdpa_attention
 from mstar.model.components.distributed.sequence_parallel import (
     attention_over_sharded_keys,
@@ -139,15 +140,27 @@ def _sharded_keys(rank, world, total):
     k, v = (_full(total, batched=True, seed=seed) for seed in (1, 2))
     want = _sdpa(batched=True)(q, k, v)
     start = sum(sizes[:rank])
-    out = attention_over_sharded_keys(
-        group, q, k.narrow(1, start, sizes[rank]), v.narrow(1, start, sizes[rank]), sdpa_attention,
-    )
+    k, v = (x.narrow(1, start, sizes[rank]) for x in (k, v))
+    out = attention_over_sharded_keys(group, q, k, v, sdpa_attention)
     torch.testing.assert_close(out, want)
 
 
 @pytest.mark.parametrize("world,total", [(1, 7), (2, 7), (3, 11)], ids=["1", "2-uneven", "3-uneven"])
 def test_attention_over_sharded_keys_matches_one_rank(tmp_path, world, total):
     _run(_sharded_keys, world, tmp_path / "store", total)
+
+
+def _bf16_partials(rank, world):
+    # every rank's partial, built alike on each: a bf16 out (as LTX-2.5's kernels return) and fp32 lse
+    parts = [(_full(5, True, seed=2 * r).to(torch.bfloat16), _full(5, True, seed=2 * r + 1)[..., 0])
+             for r in range(world)]
+    want = merge(torch.stack([out.float() for out, _ in parts]), torch.stack([lse for _, lse in parts]))
+    assert torch.equal(gather_merge(_group(rank, world), *parts[rank]), want.to(torch.bfloat16))
+
+
+def test_gather_merge_of_bf16_partials_is_the_fp32_merge_bit_for_bit(tmp_path):
+    """The out travels at its own width and the lse in fp32, one byte tensor viewed back per dtype."""
+    _run(_bf16_partials, 2, tmp_path / "store")
 
 
 def _compiled_packs(rank, world):
@@ -181,6 +194,27 @@ def test_compiled_sequence_parallel_stack_takes_new_pack_lengths_without_recompi
     _run(_compiled_packs, world, tmp_path / "store")
 
 
+def _opened_on_sdpa(dit, config, group, tokens: int) -> None:
+    """``dit`` with its handles bound and open for a step of one row on SDPA, as the engine would on a node set to it:
+    the array's read runs the exchange."""
+    from mstar.engine.resources.step import Segment, StepContext, SubmoduleStep
+    from mstar.engine.state import ArrayStep
+    from mstar.engine.state.adapters import node_handles, state_setup, state_steps
+    from mstar.model.wan22.config import DIT_TOKENS, SELF_ATTN
+    from mstar.model.wan22.wan22_model import Wan22Model
+
+    model = object.__new__(Wan22Model)
+    model.config = config
+    setup, _ = state_setup({"resources": {SELF_ATTN: {"backend": "sdpa"}}}, model.declare_state())
+    handles = node_handles(model, "dit", {}, sp_group=group, setup=setup)
+    for module in dit.modules():
+        if hasattr(module, "bind_state"):
+            module.bind_state(handles)
+    step = state_steps(SubmoduleStep(segments=[Segment(0, "main", tokens)], state={DIT_TOKENS: ArrayStep()}), handles)
+    step.set_ctx(StepContext(request_ids=[0], graph_walk="video_gen", slot=0, capture=False))
+    step.begin_calls()
+
+
 def _wan_dit_forward(grid, sp_group=None) -> torch.Tensor:
     from mstar.model.wan22.components.dit import Wan22DiT
     from mstar.model.wan22.config import Wan22Config
@@ -195,6 +229,9 @@ def _wan_dit_forward(grid, sp_group=None) -> torch.Tensor:
         torch.nn.init.normal_(param, std=0.2)
     gen = torch.Generator().manual_seed(1)
     frames, height, width = grid
+    if sp_group is not None:
+        p_t, p_h, p_w = config.patch_size
+        _opened_on_sdpa(dit, config, sp_group, frames // p_t * (height // p_h) * (width // p_w))
     latents = torch.randn(1, 4, frames, height, width, generator=gen)
     timestep = torch.rand(1, frames, generator=gen) * 1000
     text = torch.randn(1, 5, 8, generator=gen)
