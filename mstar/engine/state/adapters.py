@@ -1483,7 +1483,7 @@ class WithinStepStorage(Storage):
             resolved.resource_of[key] = spec.resource_key
             if bound.binding.plans and isinstance(spec, RaggedAttentionSpec):
                 # the labels the node's sequence shard may split (`RaggedAttentionSpec.derive`)
-                spec.labels = spec.labels | {_plan_label(array)}
+                spec.labels = spec.labels | {_plan_label(array, array)}
             resolved.specs[array.name] = [spec] if bound.binding.plans and spec.resource_key == key else []
         return resolved
 
