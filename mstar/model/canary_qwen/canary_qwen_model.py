@@ -333,7 +333,7 @@ class CanaryQwenModel(Model):
         return {"audio": 1}
 
     def text_output(self) -> TextOutput:
-        return TextOutput(self._detokenizer)
+        return TextOutput(self._detokenizer, self.config.stop_token_ids)
 
     # -------------------------------------------------------------------
     # submodules

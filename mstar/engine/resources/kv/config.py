@@ -10,7 +10,7 @@ from collections.abc import Collection, Iterable, Mapping, Sequence
 from copy import copy
 from dataclasses import dataclass, field, replace
 from enum import Enum, StrEnum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 from mstar.engine.resources.spec import (
     NodeResourceSpec,
@@ -344,6 +344,32 @@ class SpanKind(StrEnum):
     IDS = "ids"
     DIGEST = "digest"
     ROWS = "rows"
+
+
+class Span(NamedTuple):
+    """One write to a KV stream. A layout lists them in the order the walks write.
+
+    Each span is one step's row, unless a span sets ``opens_step`` False: the step of
+    the span before it then writes it too, in the same row, as text around an attachment is.
+    That span is of the same walk, since a step runs one.
+
+    ``length`` is how many KV slots the write fills, and ``advance`` is how far
+    it moves the position counter, which is the length for text. ``source`` is
+    the tensor whose next entry an ids span keys, or the file of a digest span
+    as ``(modality, index)``. ``params`` are the preprocessing arguments that
+    change the tensors made from the file. A ``rows`` span writes KV made from
+    anything else, such as another node's outputs, and is never keyed.
+    ``scratch`` is the most a non-committing step writes before the span
+    commits into those slots, as a denoised window does.
+    """
+    kind: SpanKind
+    walk: str
+    length: int
+    advance: int
+    source: str | tuple[str, int]
+    params: tuple = ()
+    scratch: int = 0
+    opens_step: bool = True
 
 
 @dataclass(frozen=True)

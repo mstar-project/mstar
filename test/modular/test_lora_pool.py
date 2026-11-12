@@ -900,3 +900,12 @@ def test_a_request_waiting_for_a_slot_holds_no_kv(adapters):
     runner.remove_request("r1")
     assert runner.admit_waiting(_nothing_published) == [("LLM", "r2"), ("LLM", "base")]
     assert kv.held == {"base", "r2"} and run_step(pool, ["r2", "base"]).ok
+
+
+def test_a_pool_does_not_hold_its_node_off_resident_planning(adapters):
+    """Its addressing comes from the step's segments and its own slots, so a
+    resident step plans it on the host like any other step."""
+    from mstar.engine.resources.resident import build_planner
+
+    planner, why = build_planner("LLM", ("decode",), {"lora": make_pool(adapters[1])}, {}, torch.device("cpu"), 4)
+    assert planner is not None and why == ""

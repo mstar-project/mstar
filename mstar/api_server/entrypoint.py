@@ -563,6 +563,7 @@ class APIServer:
         self.served_models = ServedModels.of(
             model_name, model_config, lora.adapter_digests if lora is not None else None,
         )
+        self.served_models.refuse_unserved(model)
         # Requests to a model with client streams keep their input open until
         # the client ends it (see ``stream_input``).
         connections = model.get_partition_topology().client_connections() if model is not None else []
@@ -594,6 +595,7 @@ class APIServer:
             enable_nvtx=self.enable_nvtx,
             is_pending=self.is_pending,
             upload_dir=self.upload_dir,
+            served_models=self.served_models,
         )
 
         # /v1/load_lora_adapter and /v1/unload_lora_adapter; sent from the data worker
@@ -3171,14 +3173,6 @@ def main(argv: list[str] | None = None):
     with open(args.config) as f:
         config = yaml.safe_load(f)
 
-    lora_block = (config.get("resources") or {}).get("lora") if lora_enabled(config) else None
-    if args.rust_frontend and isinstance(lora_block, dict) and lora_block.get("runtime_updates"):
-        # mstar-server reads the served adapters once at launch and has no
-        # /v1/load_lora_adapter or /v1/unload_lora_adapter
-        raise SystemExit(
-            "LoRA runtime updates (`runtime_updates: true` in the serving config's `lora:` block) "
-            "are served by the Python frontend only; drop --rust-frontend or the setting"
-        )
     try:
         _ws_max_size(config)  # here, not at the bind after the workers' compile
     except ValueError as e:
@@ -3188,9 +3182,6 @@ def main(argv: list[str] | None = None):
 
         # Before anything loads, so a missing or stale binary fails fast.
         rust_frontend_bin = find_server_binary(args.rust_frontend_bin)
-        if config.get("openpi") is not None:
-            logger.warning("The openpi WebSocket (`openpi:` in the config) is served by the Python frontend only; "
-                           "--rust-frontend serves without it")
 
     model_name = config.get("model", "dummy")
     # Forward yaml-level model_kwargs to the API-server-side lightweight
@@ -3286,6 +3277,8 @@ def main(argv: list[str] | None = None):
             from mstar.api_server.rust_frontend import (
                 RustFrontendBridge,
                 launch_rust_server,
+                openpi_facts,
+                realtime_facts,
                 transcription_facts,
             )
 
@@ -3300,7 +3293,11 @@ def main(argv: list[str] | None = None):
                 timeout_s=args.timeout,
                 sample_rate=model.get_output_sample_rate("audio") if model is not None else None,
                 served_models=api_server.served_models,
-                transcription=transcription_facts(api_server, get_adapter(model_name)))
+                transcription=transcription_facts(api_server, get_adapter(model_name)),
+                openpi=openpi_facts(api_server.openpi_policy),
+                ws_max_bytes=_ws_max_size(config),
+                client_streams=api_server.client_streams,
+                realtime=realtime_facts(api_server, get_adapter(model_name), bridge_dir))
             logger.info("Starting mstar API server (Rust frontend) on port %s",
                         args.port)
             bridge = RustFrontendBridge(api_server, bridge_dir)

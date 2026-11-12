@@ -25,7 +25,7 @@ A worker that dies (an exception during setup, an OOM kill, a segfault) sends no
 
 - **Models define execution plans.** Each model provides its own graph walks (e.g. `prefill`, `decode`, `image_gen`) via `get_graph_walk_graphs()`.
 - **Disaggregated.** Logical computation nodes map to physical workers via the YAML config's `node_groups` (node names → GPU ranks).
-- **Models declare, the engine executes.** A model declares its resources in `get_node_resources()`, and declares what each step does to them in `NodeSubmodule.declare_step()`. The engine performs admission, planning, capture and commit. A step that cannot be admitted therefore becomes backpressure that the scheduler can resolve by eviction, instead of an error inside a forward pass.
+- **Models declare, the engine executes.** A model declares its state in `declare_state()` and any other resources in `get_node_resources()`, and declares what each step does to them in `NodeSubmodule.declare_step()`. The engine performs admission, planning, capture and commit. A step that cannot be admitted therefore becomes backpressure that the scheduler can resolve by eviction, instead of an error inside a forward pass.
 - **Graph-driven scheduling.** The conductor schedules graph walks and their transitions to coordinate multi-engine pipelines, including async producer/consumer partitions.
 
 ## Execution flow (simplified) {#execution-flow-simplified}
