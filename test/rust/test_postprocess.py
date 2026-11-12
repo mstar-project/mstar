@@ -263,7 +263,7 @@ def test_missing_limits_leave_the_check_to_the_model(tmp_path, landing):
         wide = torch.full((MAX_ITERS, 1), EOS, dtype=torch.int64).t()
         running = SimpleNamespace(query=lambda: pytest.fail("the host kept looking at a step it can't send"))
         landed = _landing()[0]
-        assert stream_run(rt, PART, NODE, WALK, [rid], [rid], wide, InlineColumn(SIG, wide), landed, running) == 0
+        assert stream_run(rt, PART, NODE, WALK, [rid], [rid], wide, InlineColumn(SIG, wide), landed, running)[0] == 0
     column = torch.tensor([EOS], dtype=torch.int64)
     step = rt.begin_postprocess(PostprocessRequest(
         partition=PART, node_name=NODE, graph_walk=WALK, output_signals=[SIG],
@@ -446,7 +446,7 @@ def test_a_repeated_steps_client_tokens_match_one_iteration_a_step(tmp_path, lan
                 continue
             start = 0
             if landing is not None:
-                start = stream_run(
+                start, _ = stream_run(
                     rt, PART, NODE, WALK, list(rids), rids, wide, InlineColumn(SIG, wide),
                     *_landing(late=landing == "late"),
                 )

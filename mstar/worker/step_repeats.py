@@ -17,6 +17,7 @@ whole step does.
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, fields
 from typing import TYPE_CHECKING, NamedTuple
@@ -186,16 +187,19 @@ class StepRepeats:
 def stream_run(
     runtime: GraphRuntime, partition: str, node: str, walk: str, rids: list[int], row_rids: Sequence[int],
     tokens: torch.Tensor, inline: InlineColumn, landing: ReplayEvents, completion: torch.Event,
-) -> int:
+) -> tuple[int, float]:
     """While a repeated step runs, send the client each iteration's tokens as
     it lands (``landing``, then ``GraphRuntime.emit_prefix``), until every row
-    has stopped or the step has run; returns how many iterations went out.
-    Called before the step's wait, with the rows its route takes: what it
-    sends is a prefix of what the route would, which then sends the rest."""
+    has stopped or the step has run; returns how many iterations went out,
+    and the seconds spent waiting for them to land. Called before the step's
+    wait, with the rows its route takes: what it sends is a prefix of what the
+    route would, which then sends the rest."""
     width = inline.column.shape[1]
-    taken, looks, first = 0, 0, 0
+    taken, looks, first, waited = 0, 0, 0, 0.0
     while taken < width:
+        started = time.perf_counter()
         end = min(landing.landed(taken), width)
+        waited += time.perf_counter() - started
         looks += 1
         if end > taken:
             sent, stopped = runtime.emit_prefix(
@@ -212,4 +216,4 @@ def stream_run(
     # how many iterations had landed when the host first saw any: what went out at once
     phase_record(f"repeats.{walk}.first_look#", first)
     phase_record(f"repeats.{walk}.looks#", looks)
-    return taken
+    return taken, waited
