@@ -258,7 +258,7 @@ class MStarTalkerDriver:
 
     def _text_chunk(self, rid: str) -> list[torch.Tensor]:
         """The decode's next ``text_in`` chunk, as a one-shot stream pops it:
-        one item each, then empty chunks."""
+        one item each, then none: the input is absent once the stream has ended."""
         items, popped = self.text_in[rid]
         index = popped[0]
         popped[0] += 1
@@ -271,7 +271,7 @@ class MStarTalkerDriver:
             walk = "talker_prefill_clone"
         fwd.graph_walk = walk
         if walk == "talker_decode":
-            inputs = {**inputs, "text_in": self._text_chunk(rid)}
+            inputs = {**inputs, **({"text_in": chunk} if (chunk := self._text_chunk(rid)) else {})}
         else:
             self.text_in[rid] = (list(inputs.get("text_in", [])), [0])
         prepared = self.talker.prepare_inputs(walk, fwd, inputs)

@@ -844,13 +844,14 @@ def test_qwen3_tts_decode_feeds_its_text_stream_then_eos_then_pad(layout, first_
     loop_back = {"talker_input_embeds": [torch.zeros(1, 16)]}
 
     def prepare(fed=()):
-        return submodule.prepare_inputs("talker_decode", info, {**loop_back, "text_in": list(fed)})
+        # once the stream has ended its input is absent, not an empty chunk
+        return submodule.prepare_inputs("talker_decode", info, {**loop_back, **({"text_in": list(fed)} if fed else {})})
 
     def ran(prepared):
         submodule.postprocess("r", info, {}, inputs=prepared)
 
     tokens = {"eos": config.tts_eos_token_id, "pad": config.tts_pad_token_id}
-    # two tokens streamed, then the stream's empty chunks
+    # two tokens streamed, then the stream has ended: no text_in
     for token in (7, 8):
         step = prepare([torch.tensor([token])])
         assert int(step.kwargs["text_id"]) == token
