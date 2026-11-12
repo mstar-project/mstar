@@ -2070,7 +2070,8 @@ class WarmupRequest:
             output_modalities=self.output_modalities,
             model_kwargs=self.model_kwargs,
             prompt_parts=parts or None,
-            streaming=False,
+            # collect_results waits for the end either way
+            streaming=bool(STREAMING_ONLY_MODALITIES.intersection(self.output_modalities)),
             request_id=request_id,
         )
 
