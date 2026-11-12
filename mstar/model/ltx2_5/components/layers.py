@@ -6,21 +6,21 @@ reference kept, so the bf16 results match it. Linear layers are the tensor-paral
 ones from ``mstar.model.components.distributed``; with a trivial comm group they are
 plain linears.
 
-Attention itself goes through an ``Attend`` callable the caller supplies (the
-scaffold's ``joint_attention`` over a ragged attention resource, or
-``sdpa_attention``). Layers never pick a kernel.
+Attention itself goes through the read of the array a layer binds, which picks the
+kernel and the sequence-parallel exchange, or SDPA with no array (the text connectors).
 """
 
 from __future__ import annotations
 
-from typing import NamedTuple
+from collections.abc import Mapping
+from typing import Any, NamedTuple
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
-from mstar.model.components.diffusion.attention import Attend
+from mstar.model.components.diffusion.attention import attend
 from mstar.model.components.distributed.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -112,8 +112,13 @@ class GatedAttention(nn.Module):
         bias: bool = True,
         out_bias: bool = True,
         eps: float = 1e-6,
+        array: str | None = None,
+        layer: int | None = None,
     ):
         super().__init__()
+        self.array = array
+        self.layer = None if layer is None else torch.tensor(layer, device="cpu")
+        self.state = None
         self.is_self = kv_dim is None
         self.heads = heads
         self.head_dim = head_dim
@@ -130,10 +135,12 @@ class GatedAttention(nn.Module):
         self.to_gate_logits = ColumnParallelLinear(comm_group, query_dim, heads, bias=True) if gated else None
         self.to_out = RowParallelLinear(comm_group, inner, query_dim, bias=out_bias)
 
+    def bind_state(self, handles: Mapping[str, Any]) -> None:
+        self.state = handles.get(self.array)
+
     def forward(
         self,
         x: torch.Tensor,
-        attend: Attend,
         context: torch.Tensor | None = None,
         q_rope: RotaryTable | None = None,
         k_rope: RotaryTable | None = None,
@@ -151,7 +158,7 @@ class GatedAttention(nn.Module):
             q = apply_split_rope(q, q_rope.heads(self.head_offset, self.local_heads))
             k_rope = q_rope if k_rope is None else k_rope
             k = apply_split_rope(k, k_rope.heads(self.head_offset, self.local_heads))
-        out = attend(q, k, v).to(q.dtype)
+        out = attend(self.state, self.layer, q, k, v).to(q.dtype)
         if self.to_gate_logits is not None:
             out = out * (2.0 * torch.sigmoid(self.to_gate_logits(x))).unsqueeze(-1)
         return self.to_out(out.flatten(-2))

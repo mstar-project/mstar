@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import copy
 import dataclasses
-import functools
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -26,21 +25,25 @@ from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.resources import (
-    RaggedCrossAttentionStep,
-    Segment,
-    SlotLease,
-    SubmoduleStep,
-    cross_label,
-)
 from mstar.model.components.batched_rows import BatchedRows
-from mstar.model.components.diffusion.attention import joint_attention, sdpa_attention
 from mstar.model.components.diffusion.compile_utils import compile_transformer_forward, with_inductor_rounding
 from mstar.model.components.diffusion.denoise_loop import DenoiseLoopSubmodule
 from mstar.model.components.diffusion.flow_match import FlowMatchSchedule, euler_step
-from mstar.model.ltx2_5.components.layers import RotaryTable
-from mstar.model.ltx2_5.components.transformer import LTX2Attends, build_rope
-from mstar.model.ltx2_5.config import DISTILLED_SIGMA_VALUES, STAGE_2_DISTILLED_SIGMA_VALUES, LTX25Config
+from mstar.model.ltx2_5.components.transformer import build_rope
+from mstar.model.ltx2_5.config import (
+    AUDIO,
+    AUDIO_FOR_VIDEO,
+    AUDIO_SPAN,
+    DISTILLED_SIGMA_VALUES,
+    STAGE_2_DISTILLED_SIGMA_VALUES,
+    TEXT_FOR_AUDIO,
+    TEXT_FOR_VIDEO,
+    TEXT_SPAN,
+    VIDEO,
+    VIDEO_FOR_AUDIO,
+    VIDEO_SPAN,
+    LTX25Config,
+)
 from mstar.model.submodule_base import NodeInputs, NodeSubmodule
 
 logger = logging.getLogger(__name__)
@@ -52,19 +55,6 @@ LATENTS, AUDIO_LATENTS = "latents", "audio_latents"
 # the two-stage recipe's stage-2 starting point, made by the latent upsampler
 REFINE_LATENTS, REFINE_AUDIO = "refine_latents", "refine_audio"
 VIDEO_OUTPUT, AUDIO_OUTPUT = "video_output", "audio_output"
-
-# The dit's ragged attention resources, one per (kind, head geometry): the video
-# stream's 32 x 128 heads, and the 32 x 64 heads of the audio stream and of both
-# cross-modal attentions.
-VIDEO_ATTN, AUDIO_ATTN = "dit_attn_video", "dit_attn_audio"            # self-attention
-VIDEO_XATTN, AUDIO_XATTN = "dit_xattn_video", "dit_xattn_audio"        # cross-attention
-# On SP ranks, splits each row's video tokens over them (audio and text stay whole).
-VIDEO_SHARD = "dit_video_shard"
-# (q_label, kv_label) pairs each cross resource plans
-VIDEO_XATTN_PAIRS = (("video", "text"),)
-AUDIO_XATTN_PAIRS = (("audio", "text"), ("video", "audio"), ("audio", "video"))
-# Spans each request contributes to a dit step.
-VIDEO_SPAN, AUDIO_SPAN, TEXT_SPAN = "video", "audio", "text"
 
 
 @dataclass(frozen=True)
@@ -190,7 +180,7 @@ class LTXTextEncoderSubmodule(BatchedRows, NodeSubmodule):
         stacked = torch.stack([
             torch.nn.functional.pad(h, (0, 0, 0, 0, 0, longest - h.shape[0])) for h in hidden
         ])
-        video, audio = self.connectors(stacked, valid, seq_len, sdpa_attention)
+        video, audio = self.connectors(stacked, valid, seq_len)
         return {TEXT_VIDEO: video, TEXT_AUDIO: audio}
 
 
@@ -206,16 +196,11 @@ class LTXDenoiseSubmodule(DenoiseLoopSubmodule):
     each step casts them to bf16 for the DiT and updates them in fp32. Per-shape
     derived state is the four rotary tables (``build_rope``).
 
-    Every attention in the DiT goes through a ragged resource (see ``VIDEO_ATTN``):
+    Every attention in the DiT reads a declared array (``LTX25Model.declare_state``):
     three spans per request, ``video``, ``audio`` and ``text``; two self-attentions
     and four cross-attentions between them, on four resources (self / cross x the
-    two head geometries). With no resource bound
-    (``attention_backend="sdpa"``), every attention runs SDPA, which is what the
-    reference pipeline runs; so does any attention whose resource is not bound.
-
-    On SP ranks the sequence shard (``VIDEO_SHARD``) splits each row's video tokens:
-    ``denoise`` runs the DiT on this rank's share, and the video self-attention
-    exchanges tokens for heads inside its resource (``sp_exchange="ulysses"``).
+    two head geometries). With ``backend: sdpa`` on all four every attention runs SDPA,
+    which is what the reference pipeline runs.
     """
 
     SOLVER_STATE = (AUDIO_LATENTS,)
@@ -226,7 +211,6 @@ class LTXDenoiseSubmodule(DenoiseLoopSubmodule):
         config: LTX25Config,
         *,
         loop_name: str,
-        use_ragged_attention: bool,
         refine_walks: frozenset[str] = frozenset(),
         compile_transformer: bool = False,
         compile_eager_rounding: bool = True,
@@ -236,15 +220,13 @@ class LTXDenoiseSubmodule(DenoiseLoopSubmodule):
         replay_walks=None,
     ):
         super().__init__(
-            loop_name=loop_name, max_batch_size=max_batch_size, attn_resource_key=None,
+            loop_name=loop_name, max_batch_size=max_batch_size,
             capture_buckets=capture_buckets, capture_batch_sizes=capture_batch_sizes, replay_walks=replay_walks,
         )
         self.transformer = transformer
         self.config = config
-        self.use_ragged_attention = use_ragged_attention
         # walks that run the two-stage recipe's stage 2 (the refine loop)
         self.refine_walks = frozenset(refine_walks)
-        self._attends: LTX2Attends | None = None
         if compile_transformer and transformer is not None:
             # Fuses the AdaLN modulation, norms, RoPE and gating chains (44% of an eager
             # step's kernel time at 544x960x121) around the GEMMs and attention; one static
@@ -255,10 +237,8 @@ class LTXDenoiseSubmodule(DenoiseLoopSubmodule):
     def bucket_key_for(self, fwd_info: CurrentForwardPassInfo) -> LTXShape:
         return shape_from_metadata(self.config, fwd_info.step_metadata)
 
-    def schedule_for(self, fwd_info, bucket_key: LTXShape) -> FlowMatchSchedule:
-        if fwd_info.graph_walk in self.refine_walks:
-            return distilled_schedule(STAGE_2_DISTILLED_SIGMA_VALUES)
-        return distilled_schedule()
+    def schedule_for(self, walk: str, num_steps: None, bucket_key: LTXShape) -> FlowMatchSchedule:
+        return distilled_schedule(STAGE_2_DISTILLED_SIGMA_VALUES) if walk in self.refine_walks else distilled_schedule()
 
     def initial_loop_back(self, fwd_info, inputs, bucket_key: LTXShape, generator: torch.Generator):
         """Stage 2 of the two-stage recipe starts from the upsampled stage-1 latents,
@@ -269,9 +249,9 @@ class LTXDenoiseSubmodule(DenoiseLoopSubmodule):
         dropped) first. Stage 2 draws its video noise in bf16 in the packed layout (it
         takes the dtype of the upsampled latents) and its audio noise in fp32."""
         if fwd_info.graph_walk not in self.refine_walks:
-            return self.seed_loop_back(fwd_info, bucket_key, generator)
+            return self.seed_loop_back(bucket_key, generator)
         stage1 = dataclasses.replace(bucket_key, height=bucket_key.height // 2, width=bucket_key.width // 2)
-        self.seed_loop_back(fwd_info, stage1, generator)
+        self.seed_loop_back(stage1, generator)
         device = self.get_device()
         refine_video = inputs[REFINE_LATENTS][0].to(device)
         refine_audio = inputs[REFINE_AUDIO][0].to(device)
@@ -282,7 +262,7 @@ class LTXDenoiseSubmodule(DenoiseLoopSubmodule):
         audio = scale * self.stage_seed(audio_noise, device) + (1 - scale) * refine_audio
         return {LATENTS: video.to(torch.float32), AUDIO_LATENTS: audio.to(torch.float32)}
 
-    def seed_loop_back(self, fwd_info, bucket_key: LTXShape, generator: torch.Generator) -> dict[str, torch.Tensor]:
+    def seed_loop_back(self, bucket_key: LTXShape, generator: torch.Generator) -> dict[str, torch.Tensor]:
         # LTX2Pipeline draws the video noise, then the audio noise, from one generator,
         # both fp32 in the unpacked layout, then packs them.
         geo = self.config.geometry
@@ -334,7 +314,8 @@ class LTXDenoiseSubmodule(DenoiseLoopSubmodule):
             video, *tables = shard.scatter(VIDEO_SPAN, latents, *rope.video, *rope.cross_video)
             rope = rope._replace(video=RotaryTable(*tables[:2]), cross_video=RotaryTable(*tables[2:]))
         velocity, audio_velocity = self.transformer(
-            video.to(dtype), audio_latents.to(dtype), text_video, text_audio, timestep, rope, self.attends(),
+            latents.to(dtype), audio_latents.to(dtype), text_video, text_audio, timestep,
+            self.layout(bucket_key, latents.device),
         )
         if shard is not None:
             velocity = shard.gather(VIDEO_SPAN, velocity)
@@ -343,60 +324,14 @@ class LTXDenoiseSubmodule(DenoiseLoopSubmodule):
             AUDIO_LATENTS: ltx_step(audio_latents, audio_velocity, sigma, sigma_next),
         }
 
-    # attention ------------------------------------------------------------
-    def bind_node_resources(self, resources) -> None:
-        super().bind_node_resources(resources)
-        self._attends = None  # the memoized callables hold the old resources
-
-    def attends(self) -> LTX2Attends:
-        """The six attentions' callables, built once per resource binding rather than
-        per step."""
-        if self._attends is None:
-            def on(key, label):
-                resource = self.node_resources.get(key) if self.use_ragged_attention else None
-                if resource is None:
-                    return sdpa_attention
-                # every row has the bucket's spans, so [B, L, H, D] packs per request
-                return functools.partial(joint_attention, ragged=functools.partial(resource.run, label=label))
-            self._attends = LTX2Attends(
-                video_self=on(VIDEO_ATTN, VIDEO_SPAN),
-                audio_self=on(AUDIO_ATTN, AUDIO_SPAN),
-                video_text=on(VIDEO_XATTN, cross_label(VIDEO_SPAN, TEXT_SPAN)),
-                audio_text=on(AUDIO_XATTN, cross_label(AUDIO_SPAN, TEXT_SPAN)),
-                audio_to_video=on(AUDIO_XATTN, cross_label(VIDEO_SPAN, AUDIO_SPAN)),
-                video_to_audio=on(AUDIO_XATTN, cross_label(AUDIO_SPAN, VIDEO_SPAN)),
-            )
-        return self._attends
-
-    def declare_step(
-        self, graph_walk: str, request_ids: list[str], inputs: list[NodeInputs],
-        slot_lease: SlotLease | None = None, piecewise_leases=None, **kwargs,
-    ) -> SubmoduleStep | None:
-        if not self.use_ragged_attention:
-            return None
-        video, audio, text = [], [], []
-        for rid, inp in zip(request_ids, inputs, strict=True):
-            shape: LTXShape = inp.resource_step_info
-            video.append(Segment(request_id=rid, label=VIDEO_SPAN, span=shape.video_tokens))
-            audio.append(Segment(request_id=rid, label=AUDIO_SPAN, span=shape.audio_frames))
-            text.append(Segment(request_id=rid, label=TEXT_SPAN, span=shape.text_len))
-        # Every span whole: on a split step the attention resources cut the video spans to
-        # this rank's share themselves. The step's segments are the video's alone: those are
-        # the sequence shard's, and every other step here declares its own.
-        return SubmoduleStep(
-            segments=video,
-            steps={
-                VIDEO_ATTN: self.attention_step(video),
-                AUDIO_ATTN: self.attention_step(audio),
-                VIDEO_XATTN: RaggedCrossAttentionStep(
-                    segments=tuple(video + text), pairs=VIDEO_XATTN_PAIRS,
-                ),
-                AUDIO_XATTN: RaggedCrossAttentionStep(
-                    segments=tuple(video + audio + text), pairs=AUDIO_XATTN_PAIRS,
-                ),
-            },
-            cg_key_info=self._uniform_key(inp.resource_step_info for inp in inputs),
-        )
+    def attention_segments(self, bucket_key: LTXShape):
+        video = (VIDEO_SPAN, bucket_key.video_tokens)
+        audio = (AUDIO_SPAN, bucket_key.audio_frames)
+        text = (TEXT_SPAN, bucket_key.text_len)
+        return {
+            VIDEO: (video,), AUDIO: (audio,), TEXT_FOR_VIDEO: (text,), TEXT_FOR_AUDIO: (text,),
+            AUDIO_FOR_VIDEO: (audio,), VIDEO_FOR_AUDIO: (video,),
+        }
 
 
 class _ShapeBatchedBase:

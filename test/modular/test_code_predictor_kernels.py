@@ -241,3 +241,36 @@ def test_code_predictor_depth_loop_matches_its_layers_unfused(embed_sum_dtype, w
     want = torch.stack(want_logits)
     torch.testing.assert_close(torch.stack(got_logits), want, rtol=5e-2, atol=5e-2 * want.abs().max().item())
     assert torch.equal(embed_sum, want_sum.bfloat16())
+
+
+def test_the_depth_scratch_holds_nothing_between_steps():
+    """A step writes every depth position before it reads it, so filling the
+    buffers with NaN between steps changes no output. Anything read from an
+    earlier step would come back NaN, and this is what lets the scratch stay out
+    of the declared state."""
+    from mstar.model.components.code_predictor_kernels import ResidualCodePredictor
+    from mstar.model.qwen3_tts.config import Qwen3TTSCodePredictorConfig
+
+    torch.manual_seed(7)
+    cp = Qwen3TTSCodePredictorConfig(num_hidden_layers=2)
+    width, bs = cp.hidden_size, 3
+    predictor = ResidualCodePredictor(
+        cp, width, max_batch_size=64, embed_sum_dtype=torch.float32,
+    ).to("cuda", torch.bfloat16).eval()
+    for param in predictor.parameters():
+        param.data.normal_(std=0.02)
+    predictor.consolidate_stacked_weights()
+    last_hidden = torch.randn(bs, width, device="cuda", dtype=torch.bfloat16)
+    layer0_embed = torch.randn(bs, width, device="cuda", dtype=torch.bfloat16)
+    layer0_codes = torch.randint(0, cp.vocab_size, (bs,), device="cuda")
+
+    def frame():
+        with torch.no_grad():
+            return predictor.depth_loop(last_hidden, layer0_codes, layer0_embed, lambda logits: logits.argmax(-1))
+
+    clean_codes, clean_sum = frame()
+    predictor.depth.kv_cache.fill_(float("nan"))
+    predictor.depth.partials.fill_(float("nan"))
+    poisoned_codes, poisoned_sum = frame()
+    assert torch.equal(clean_codes, poisoned_codes), "a code came from what an earlier frame left in the scratch"
+    assert torch.equal(clean_sum, poisoned_sum)

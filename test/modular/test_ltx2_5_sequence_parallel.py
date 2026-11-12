@@ -19,15 +19,14 @@ from flashinfer_reference import reference_flashinfer
 
 sys.path.insert(0, ".")
 
-from mstar.distributed.communication import CommGroup, JointGroups, sp_seq_split  # noqa: E402
-from mstar.engine.resources import RaggedAttentionConfig, StepContext, StepRunner  # noqa: E402
-from mstar.engine.resources.base import EngineResourceInfo, build_resource  # noqa: E402
-from mstar.engine.resources.spec import resolve_spec_dependencies  # noqa: E402
-from mstar.model.ltx2_5.components.transformer import LTX2DiT  # noqa: E402
-from mstar.model.ltx2_5.config import DENOISE_LOOP, LTX25Config  # noqa: E402
+from mstar.distributed.communication import CommGroup  # noqa: E402
+from mstar.engine.resources.step import StepContext  # noqa: E402
+from mstar.engine.state.adapters import node_handles, node_resources, state_setup, state_steps  # noqa: E402
+from mstar.model.ltx2_5.components.transformer import LTX2DiT, build_rope  # noqa: E402
+from mstar.model.ltx2_5.config import LTX25Config  # noqa: E402
 from mstar.model.ltx2_5.ltx2_5_model import LTX25Model  # noqa: E402
-from mstar.model.ltx2_5.submodules import VIDEO_SHARD, LTXDenoiseSubmodule, LTXShape  # noqa: E402
-from mstar.model.submodule_base import NodeInputs, engine_step  # noqa: E402
+from mstar.model.ltx2_5.submodules import LTXDenoiseSubmodule, LTXShape  # noqa: E402
+from mstar.model.submodule_base import NodeInputs  # noqa: E402
 
 WORLD = 2
 CPU = torch.device("cpu")
@@ -79,6 +78,23 @@ def _resources(cfg: LTX25Config, joint: JointGroups) -> dict:
     return res
 
 
+def _opened_on_sdpa(dit, cfg, group, shape, rows):
+    """``dit`` with its handles bound and open for one step on SDPA, as the engine would on a node set to it."""
+    config = dataclasses.replace(LTX25Config(), transformer=cfg)
+    model = LTX25Model(skip_weight_loading=True)
+    model.set_config(config)
+    on_sdpa = {spec.resource_key: {"backend": "sdpa"} for spec in node_resources(model)}
+    setup, _ = state_setup({"resources": on_sdpa}, model.declare_state())
+    handles = node_handles(model, "dit", {}, sp_group=group, setup=setup)
+    for module in dit.modules():
+        if hasattr(module, "bind_state"):
+            module.bind_state(handles)
+    sub = LTXDenoiseSubmodule(None, config, loop_name="denoise_loop")
+    step = state_steps(sub.declare_step("gen", rows, [NodeInputs(resource_step_info=shape)] * len(rows)), handles)
+    step.set_ctx(StepContext(request_ids=rows, graph_walk="gen", slot=0, capture=False))
+    step.begin_calls()
+
+
 @torch.inference_mode()
 def _denoise(rank, frames, height, width):
     sys.modules["flashinfer"] = reference_flashinfer()
@@ -98,16 +114,13 @@ def _denoise(rank, frames, height, width):
     step.set_ctx(StepContext(request_ids=rids, graph_walk="generate_av", slot=0, capture=False))
     StepRunner(split.node_resources).plan(step)
     tokens = frames * height * width
-    assert split.node_resources[VIDEO_SHARD].split_range("video").counts == tuple(sp_seq_split(tokens, WORLD))
-
-    t = cfg.transformer
+    rope = build_rope(cfg, frames, height, width, 24.0, 5, "cpu")
+    _opened_on_sdpa(sharded, cfg, _group(rank), LTXShape(frames, height, width, 5, 24.0, 7), [0, 1])
     g = torch.Generator().manual_seed(1)
-    sigma = torch.tensor([0.9, 0.5]).view(-1, 1, 1)
-    inputs = dict(
-        latents=torch.randn(2, tokens, t.in_channels, generator=g), timestep=sigma.flatten() * 1000,
-        sigma=sigma, sigma_next=sigma * 0.5, audio_latents=torch.randn(2, 5, t.audio_in_channels, generator=g),
-        text_video=torch.randn(2, 7, t.cross_attention_dim, generator=g),
-        text_audio=torch.randn(2, 7, t.audio_cross_attention_dim, generator=g),
+    inputs = (
+        torch.randn(2, tokens, 8, generator=g), torch.randn(2, 5, 8, generator=g),
+        torch.randn(2, 7, 64, generator=g), torch.randn(2, 7, 32, generator=g),
+        torch.tensor([1000.0, 500.0]), rope,
     )
     want = whole.denoise(None, shape, **inputs)
     got = split.denoise(None, shape, **inputs)

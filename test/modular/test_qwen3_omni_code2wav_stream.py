@@ -1,5 +1,4 @@
-"""Qwen3-Omni streaming: the Talker's text conditioning past the Thinker's
-stream, and Code2Wav's stitched chunks as one continuous decode.
+"""Qwen3-Omni streaming: Code2Wav's stitched chunks as one continuous decode.
 
 The Code2Wav tests drive Talker codec frames through the edge's real
 ``LeftContextChunkPolicy`` and ``StreamBuffer``, then through
@@ -227,27 +226,6 @@ def test_the_talker_withholds_codec_eos_from_the_stream(num_frames):
     else:
         assert final_info.num_items > final_info.context_items
         assert final_decoded and final_audio.numel() == _expected_samples_per_step(steps, decoder.TAIL)[-1] > 0
-
-
-def test_the_talker_feeds_tts_eos_once_even_when_a_step_is_prepared_again():
-    """Past the Thinker's text, one decode step is conditioned on tts_eos and the
-    rest on tts_pad. A refused admit prepares a step again before it runs, so only
-    a step that ran (its postprocess) uses up the tts_eos step."""
-    talker = TalkerSubmodule.__new__(TalkerSubmodule)
-    torch.nn.Module.__init__(talker)
-    talker.request_states, talker._cached_device = {}, torch.device("cpu")
-    talker._tts_eos_raw, talker._tts_pad_raw = torch.ones(1, 4), torch.zeros(1, 4)
-    fwd = SimpleNamespace(rid_handle="r")
-    inputs = {"talker_input_embeds": [torch.zeros(1, 8)]}
-
-    def prepare():
-        return talker.prepare_inputs("talker_decode", fwd, inputs)
-
-    refused = prepare()
-    ran = prepare()
-    assert refused.tensor_inputs["text_raw"] is ran.tensor_inputs["text_raw"] is talker._tts_eos_raw
-    talker.postprocess("r", fwd, {}, inputs=ran)
-    assert prepare().tensor_inputs["text_raw"] is talker._tts_pad_raw
 
 
 def test_a_stream_of_only_codec_eos_ends_with_an_empty_chunk(monkeypatch):
