@@ -170,7 +170,7 @@ def build_executing_batch(services: WorkerServices, batch: ScheduledBatch) -> Ex
         logger.error(
             "Worker %s: request %s has an input tensor the store no longer "
             "holds; failing it and running %s without it",
-            services.worker_id, rid, batch.node_name,
+            services.worker_id, services.graph_runtime.get_rid_string(rid), batch.node_name,
         )
         node_batch.register_failure(
             rid, KeyError(f"input tensor missing for {batch.node_name}"),

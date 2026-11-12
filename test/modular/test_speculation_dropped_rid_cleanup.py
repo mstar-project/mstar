@@ -67,6 +67,7 @@ def test_dropped_rid_gets_its_own_edges_back():
             commit_speculation=lambda sid, ok, dropped, **kw: committed.append(
                 (sid, ok, sorted(dropped), kw.get('scheduled_rids'))
             ),
+            get_rid_string=str,
         ),
     ).speculator
     # The dropped rid goes first: the threading loop leaves its variable bound
@@ -113,7 +114,7 @@ def test_failed_settle_after_success_returns_nothing():
     returned: list[tuple[str, str]] = []
     speculator = make_worker(
         streams=SimpleNamespace(return_edge=lambda rid, se: returned.append((rid, se.name)), consumer_node={}),
-        graph_runtime=SimpleNamespace(commit_speculation=lambda *a, **kw: None),
+        graph_runtime=SimpleNamespace(commit_speculation=lambda *a, **kw: None, get_rid_string=str),
         engine_manager=SimpleNamespace(
             get_engine=lambda node: SimpleNamespace(release_cached_prefix=lambda batch: None),
         ),

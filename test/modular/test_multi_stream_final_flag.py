@@ -56,7 +56,7 @@ def _worker(rids=("r",)):
     streams.consumer_node = {name: node for name, (node, _) in TOPOLOGY.items()}
     streams._partition = dict.fromkeys(TOPOLOGY, PARTITION)
     return make_worker(
-        graph_runtime=SimpleNamespace(commit_speculation=lambda *a, **kw: None),
+        graph_runtime=SimpleNamespace(commit_speculation=lambda *a, **kw: None, get_rid_string=str),
         request_state=request_state, streams=streams,
     )
 

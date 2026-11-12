@@ -507,10 +507,11 @@ class InputIngest:
             )
             # reported once per request; the tensor manager logged the read's
             # error where it failed
+            rid_str = self._runtime.get_rid_string
             self._lifecycle.fail({
                 f.request_id: "Error in worker: input tensor read failed: " + client_error_text(
                     f.error,
-                    f"Worker {self._worker_id}: input tensor read of request {f.request_id} failed",
+                    f"Worker {self._worker_id}: input tensor read of request {rid_str(f.request_id)} failed",
                     log=logger, traceback=False,
                 )[0]
                 for f in failed_reads
