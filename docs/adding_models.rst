@@ -3165,7 +3165,7 @@ the model writes no exchange (a ragged attention's Ulysses follows from the labe
      - by the shard's ``exchange`` (below): ``all_gather``, one gather of every rank's q, k and
        v, attend as a copied step, keep this rank's rows; or ``ring``. With ``auto``, the node's
        steps run copied
-     - Ulysses over a label the spec's ``labels`` list; any other split label refused at load
+     - Ulysses over a label the spec's ``labels`` list; any other split label refused at its first split step (hand-written spec)
    * - Cross, split queries
      - n/a
      - n/a
@@ -3177,7 +3177,7 @@ the model writes no exchange (a ragged attention's Ulysses follows from the labe
    * - Cross, both split
      - n/a
      - n/a
-     - refused at load
+     - refused at load for array reads; a hand-written spec, at its first split step
 
 Splitting is declared in four places:
 
