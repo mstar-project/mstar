@@ -804,8 +804,10 @@ def test_qwen3_5_takes_each_rows_last_token_on_a_prefill_only(monkeypatch, walk,
     llm.kv, llm.sampler = object(), object()
     monkeypatch.setattr(LLMSubmodule, "_rope_in_graph", lambda *args: False)
     taken = []
-    monkeypatch.setattr("mstar.model.qwen3_5.submodules.at_last_token", lambda h, x: taken.append(h) or x[-1:])
-    monkeypatch.setattr("mstar.model.qwen3_5.submodules.sample", lambda s, logits: logits)
+    monkeypatch.setattr(
+        "mstar.model.components.sampled_token_decoder.at_last_token", lambda h, x: taken.append(h) or x[-1:],
+    )
+    monkeypatch.setattr("mstar.model.components.sampled_token_decoder.sample", lambda s, logits: logits)
     logits = llm._forward(walk, None, torch.tensor([1, 2, 3]), cos_3d=torch.ones(1), sin_3d=torch.ones(1))
     assert (taken == [llm.kv]) is last_token
     assert logits.shape[0] == (1 if last_token else 3)

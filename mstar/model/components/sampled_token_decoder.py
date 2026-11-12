@@ -9,7 +9,8 @@ the sampler and the position resource, the forward through the sampler, and
 the stop: a `TokenStop` over its prefill and decode walks (a stop id; a
 stop, or a one-token budget, on the step the walk plan marks `FINAL_PREFILL`
 ends the partition, and the model's loop cap is the decode budget). A model subclasses it with its resource steps
-and its attention key, and an MRoPE model adds its own positions.
+and its attention key, or subclasses `DeclaredTokenDecoder` on the state contract, and an MRoPE model adds its own
+positions.
 
 A media walk's row is the whole prompt's ids, each attachment expanded to
 one pad per token at intake (`expand_media_pads`). Its encoders' outputs
@@ -44,8 +45,8 @@ The decoder module (``self.model``, e.g. ``Qwen3DenseLM``) provides:
 
 and ``config`` has ``hidden_size`` and ``stop_token_ids`` (and the model's
 ``max_position_embeddings`` bounds the decode loop, see `media_walks`).
-The node's sampler is declared under ``mstar.model.keys``' ``SAMPLER`` key and
-its positions under ``POS_KEY`` (``ROPE`` by default).
+The node's sampler is declared under ``mstar.model.keys``' ``SAMPLER`` key and,
+on resources, its positions under ``POS_KEY`` (``ROPE`` by default).
 """
 
 import functools
@@ -68,8 +69,9 @@ from mstar.engine.accelerator_graph_config import (
 from mstar.engine.resources.position.config import PositionStep
 from mstar.engine.resources.sampler.config import SamplerStep
 from mstar.engine.resources.step import ResourceStep, Segment, SubmoduleStep
+from mstar.engine.state import ArrayStep, SampleStep, at_last_token, last_sampled, position, sample
 from mstar.model.components.token_step import TokenStepNode
-from mstar.model.keys import MIXED, PREFILL_TEXT, ROPE, SAMPLER
+from mstar.model.keys import KV_CACHE, MIXED, PREFILL_TEXT, ROPE, SAMPLER
 from mstar.model.multimodal import MEDIA_LAYOUT, MediaEncoder, media_rows, media_walk_names, splice_media
 from mstar.model.submodule_base import (
     ARNodeInputs,
@@ -669,3 +671,33 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
         # `prefill_tokens` from the inputs
         return graph_walk == self.DECODE_WALK
 
+
+class DeclaredTokenDecoder(SampledTokenDecoder):
+    """A `SampledTokenDecoder` on the state contract, which steps the array under ``KV_CACHE`` and the sampler under
+    ``SAMPLER`` through their handles. It folds into `SampledTokenDecoder` once no subclass is left on resources."""
+
+    KV_CACHE = KV_CACHE
+
+    def bind_state(self, handles: Mapping[str, Any]) -> None:
+        self.kv = handles[self.KV_CACHE]
+        self.sampler = handles[self.SAMPLER]
+
+    def node_step(
+        self, segments: list[Segment], prefill_tokens: Mapping[int, torch.Tensor], advance: tuple[int, ...] | None,
+    ) -> SubmoduleStep:
+        return SubmoduleStep(
+            segments=segments,
+            state={self.KV_CACHE: ArrayStep(advance=advance), self.SAMPLER: SampleStep(prompt_tokens=prefill_tokens)},
+        )
+
+    def next_position(self, rid_handle: int) -> int:
+        return position(self.kv, rid_handle, "main")
+
+    def loopback_tokens(self, engine_inputs: ModelInputsFromEngine) -> torch.Tensor:
+        return last_sampled(self.sampler)
+
+    def last_token_hidden(self, engine_inputs: ModelInputsFromEngine, hidden: torch.Tensor) -> torch.Tensor:
+        return at_last_token(self.kv, hidden)
+
+    def sample_tokens(self, engine_inputs: ModelInputsFromEngine, logits: torch.Tensor) -> torch.Tensor:
+        return sample(self.sampler, logits)
