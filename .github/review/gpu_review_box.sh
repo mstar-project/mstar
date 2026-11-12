@@ -15,6 +15,8 @@ set -uo pipefail
 W=/workspace/live-pr IN=/run/live-pr
 OUT=$W/out
 mkdir -p "$OUT" "$W/home"
+# Lambda's runner logs in as ubuntu, not root: it pulls the results and touches `collected` in this directory.
+chmod a+rwx "$OUT"
 # shellcheck disable=SC1091
 source "$IN/box_common.sh"
 MAIN_SHA=$(field main_sha)
@@ -41,6 +43,7 @@ VERDICT=unavailable
 finish() {
   trap - EXIT
   [ -s "$OUT/result.json" ] || printf '{"verdict": "%s", "summary": "%s"}\n' "$VERDICT" "$1" > "$OUT/result.json"
+  chmod -R a+rX "$OUT"
   touch "$OUT/done"
   await_collection
   exit 0

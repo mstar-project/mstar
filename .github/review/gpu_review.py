@@ -118,7 +118,7 @@ def configure(out, runner_temp, ssh_key="", hours="4", max_usd="30", max_runs="2
            "eras": eras, "digitalocean": reachable,
            "runpod": {"image": RUNPOD_IMAGE, "disk_gb": 300, "hf_home": "/workspace/live-pr/hf", "storage": False,
                       **reachable},
-           "lambda": {"storage": False, **reachable}}
+           "lambda": {"hf_home": "/workspace/live-pr/hf", "storage": False, **reachable}}
     (GPU.parent.parent / "config.local.json").write_text(json.dumps(cfg, indent=1))
 
 

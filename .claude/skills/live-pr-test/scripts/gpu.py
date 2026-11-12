@@ -571,8 +571,9 @@ class Lambda(Provider):
 
     def hf_home(self):
         fs = self.filesystems().get(self.region)
-        if not fs:
-            return f"/home/{self.user}/hf"
+        if not fs:  # the local disk: where the config says when the box keeps nothing, else under the login's home
+            return (None if storage_on(self.cfg, self.name) else self.cfg["lambda"].get("hf_home")) \
+                or f"/home/{self.user}/hf"
         mount = fs.get("mount_point") or f"/lambda/nfs/{fs['name']}"
         return self.cfg["lambda"]["hf_home"].format(fs=fs["name"], mount=mount)
 
