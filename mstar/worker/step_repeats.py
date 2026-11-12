@@ -18,7 +18,6 @@ from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass, fields
 from typing import TYPE_CHECKING, NamedTuple
 
-from mstar.engine.device_run import WalkAsk
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 
 if TYPE_CHECKING:
@@ -113,13 +112,12 @@ class StepRepeats:
         self.loops = loops
         self._walks: set[tuple[str, str]] = set()
 
-    def asked_walks(self) -> dict[str, dict[str, WalkAsk]]:
+    def asked_walks(self) -> dict[str, set[str]]:
         """Node -> the walks a step of which may repeat if capture allows it."""
-        asked: dict[str, dict[str, WalkAsk]] = {}
+        asked: dict[str, set[str]] = {}
         for (node, walk), signals in self.loops.items():
             if signals.refusal is None:
-                config = self._configs[node]
-                asked.setdefault(node, {})[walk] = WalkAsk(signals.loop_back)
+                asked.setdefault(node, set()).add(walk)
         return asked
 
     def settle(self, refusal: Callable[[str, str], str | None]) -> None:

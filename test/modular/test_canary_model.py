@@ -431,7 +431,6 @@ def test_canary_keeps_mains_token_path_unless_a_deployment_asks_it_to_repeat():
     ``step_repeats:`` turns it on, with resident decode and the runtime's stop."""
     from types import SimpleNamespace
 
-    from mstar.engine.device_run import WalkAsk
     from mstar.model.canary.config import SAMPLER
     from mstar.model.submodule_base import DeviceLoopback
     from mstar.testing_utils.engine import make_engine, make_mgmt
@@ -444,7 +443,7 @@ def test_canary_keeps_mains_token_path_unless_a_deployment_asks_it_to_repeat():
     )
     engine = make_engine(_submodules={"decoder": make_mgmt(node, resources={SAMPLER: sampler})})
 
-    engine.enable_repeats("decoder", {node.DECODE_WALK: WalkAsk(frozenset({"text_inputs"}))})
+    engine.enable_repeats("decoder", {node.DECODE_WALK})
 
     assert node.device_loopback == DeviceLoopback(node.DECODE_WALK, "text_inputs", SAMPLER, "new_token")
     assert node.resident_walks() == {node.DECODE_WALK} and node.get_stop_policies(node.DECODE_WALK)
