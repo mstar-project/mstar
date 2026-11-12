@@ -592,6 +592,24 @@ def test_other_streams_carry_no_retention_on_their_views():
     assert [view.retention for view in views] == [RetentionPolicy(8, 3, exact=True), None, None]
 
 
+def test_the_staged_reach_is_each_row_s_reach_end_to_end():
+    """What the kept-window resource and a read with no op both gather from: each row's `kept_reach`, rows in order."""
+    from mstar.engine.resources.kv.plan import kept_reach, stage_reach
+
+    pool = _pool()
+    _open_exact(pool, "a", sink=3, window=8)
+    _open_exact(pool, "b", sink=3, window=8, exact=False)
+    step = KVStep(segments=(Segment("a", "main", 4), Segment("b", "main", 6)))
+    ctx = StepContext(request_ids=("a", "b"), graph_walk="rollout", slot=0, capture=False)
+    assert pool.admit(step, ctx).ok
+    views = pool.plan(step, ctx)["main"].views
+    staged = stage_reach(views, 8, torch.device("cpu"))
+    rows = [kept_reach(view, 8) for view in views]
+    assert staged.lengths == (4, 6)
+    assert staged.pages.tolist() == [p for row in rows for p in row.pages.tolist()]
+    assert staged.offsets.tolist() == [o for row in rows for o in row.offsets.tolist()]
+
+
 def test_a_removed_request_leaves_the_exact_set():
     """A handle comes back for another request, which would inherit the policy."""
     pool = _pool()

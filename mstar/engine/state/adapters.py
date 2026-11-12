@@ -41,7 +41,7 @@ from mstar.engine.resources.kv.config import (
     RingKVLayerConfig,
     RingKVStep,
 )
-from mstar.engine.resources.kv.plan import kept_reach
+from mstar.engine.resources.kv.plan import stage_reach
 from mstar.engine.resources.linear_attn.config import (
     LinearAttnConfig,
     LinearAttnSpec,
@@ -817,14 +817,12 @@ class ReachRead:
     def run(self, q: None, label: str, kv_cache_layer: torch.Tensor, k=None, v=None, layer_idx: int = 0) -> Reached:
         views = self._kv.views(label)
         if views is not self._views:
-            page_size, device = self._kv.config.tokens_per_page, kv_cache_layer.device
-            slots = [kept_reach(view, page_size) for view in views]
-            self._pages = torch.from_numpy(np.concatenate([each.pages for each in slots])).to(device)
-            self._offsets = torch.from_numpy(np.concatenate([each.offsets for each in slots])).to(device)
-            ends = np.cumsum([0, *(len(each.pages) for each in slots)])
-            self._row_offsets = torch.from_numpy(ends.astype(np.int32)).to(device)
+            device = kv_cache_layer.device
+            self._reach = stage_reach(views, self._kv.config.tokens_per_page, device)
+            ends = np.cumsum([0, *self._reach.lengths]).astype(np.int32)
+            self._row_offsets = torch.from_numpy(ends).to(device)
             self._views = views
-        reach = self._kv.kv_cache.read_tokens(layer_idx, self._pages, self._offsets)
+        reach = self._kv.kv_cache.read_tokens(layer_idx, self._reach.pages, self._reach.offsets)
         return Reached({"k": reach[:, 0], "v": reach[:, 1]}, row_offsets=self._row_offsets)
 
     def select_last_hidden(self, x: torch.Tensor, label: str = "main") -> torch.Tensor:

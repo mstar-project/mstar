@@ -1,6 +1,5 @@
 """Attention over a kept window: each row's sink and latest window on a paged array, and the step's own adds."""
 
-import numpy as np
 import torch
 
 from mstar.engine.resources.attn.base import AttentionManager
@@ -13,7 +12,7 @@ from mstar.engine.resources.attn.ragged.config import (
     cross_label,
 )
 from mstar.engine.resources.base import EngineResourceInfo
-from mstar.engine.resources.kv.plan import kept_reach
+from mstar.engine.resources.kv.plan import StagedReach, stage_reach
 from mstar.engine.resources.step import Segment, StepContext
 
 # the inner plan's labels: the step's queries, and the reach they attend
@@ -32,8 +31,7 @@ class KeptWindowAttention(AttentionManager):
         self._kv_cache_name = kv_cache
         self._kv = None
         # each row's reach, staged by `plan`: every entry's page and its offset in the page
-        self._pages: torch.Tensor | None = None
-        self._offsets: torch.Tensor | None = None
+        self._reach: StagedReach | None = None
 
     @classmethod
     def build(cls, spec: KeptWindowAttentionSpec, info: EngineResourceInfo) -> "KeptWindowAttention":
@@ -71,18 +69,11 @@ class KeptWindowAttention(AttentionManager):
         if len(labels) != 1:
             raise RuntimeError(f"no layout yet: a kept-window read over labels {sorted(labels)}, and it plans one")
         (label,) = labels
-        page_size = self._kv.config.tokens_per_page
-        queries, reaches, pages, offsets = [], [], [], []
-        for view in ctx.plan_results[self._kv_cache_name][label].views:
-            slots = kept_reach(view, page_size)
-            queries.append(Segment(view.request_id, _QUERIES, view.to_compute))
-            reaches.append(Segment(view.request_id, _REACH, len(slots.pages)))
-            pages.append(slots.pages)
-            offsets.append(slots.offsets)
+        views = ctx.plan_results[self._kv_cache_name][label].views
+        self._reach = stage_reach(views, self._kv.config.tokens_per_page, self._kv.kv_cache.tensor.device)
+        queries = [Segment(view.request_id, _QUERIES, view.to_compute) for view in views]
+        reaches = [Segment(view.request_id, _REACH, n) for view, n in zip(views, self._reach.lengths, strict=True)]
         self._inner.plan(RaggedCrossAttentionStep(segments=(*queries, *reaches), pairs=((_QUERIES, _REACH),)), ctx)
-        device = self._kv.kv_cache.tensor.device
-        self._pages = torch.from_numpy(np.concatenate(pages)).to(device)
-        self._offsets = torch.from_numpy(np.concatenate(offsets)).to(device)
 
     def select_last_hidden(self, hidden: torch.Tensor, label: str = "main") -> torch.Tensor:
         raise ValueError("no layout yet: at_last_token on a kept-window read, whose plan selects no last token")
@@ -94,5 +85,5 @@ class KeptWindowAttention(AttentionManager):
         """Attend ``q`` over the reach `plan` staged, read from the pages of pool layer ``layer_idx``."""
         if layer_idx is None:
             layer_idx = self._default_layer_idx
-        reach = self._kv.kv_cache.read_tokens(layer_idx, self._pages, self._offsets)
+        reach = self._kv.kv_cache.read_tokens(layer_idx, self._reach.pages, self._reach.offsets)
         return self._inner.run(q, reach[:, 0], reach[:, 1], label=cross_label(_QUERIES, _REACH))

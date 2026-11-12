@@ -7,6 +7,7 @@ consumer depends on the contract rather than on the cache.
 """
 
 import itertools
+from collections.abc import Sequence
 from typing import NamedTuple
 
 import numpy as np
@@ -92,6 +93,25 @@ def kept_reach(view: SequenceView, page_size: int) -> ReachSlots:
     offsets = np.tile(np.arange(page_size, dtype=np.int64), len(view.page_idxs))
     cuts = [slice(view.start + a, view.start + b) for a, b in ranges]
     return ReachSlots(np.concatenate([pages[cut] for cut in cuts]), np.concatenate([offsets[cut] for cut in cuts]))
+
+
+class StagedReach(NamedTuple):
+    """The reach of a step's rows on the device, rows end to end, for `KVCache.read_tokens`: each entry's page and
+    its offset in the page, and each row's count of entries."""
+
+    pages: torch.Tensor
+    offsets: torch.Tensor
+    lengths: tuple[int, ...]
+
+
+def stage_reach(views: Sequence[SequenceView], page_size: int, device: torch.device) -> StagedReach:
+    """`kept_reach` of each of ``views``, staged on ``device``."""
+    slots = [kept_reach(view, page_size) for view in views]
+    return StagedReach(
+        torch.from_numpy(np.concatenate([each.pages for each in slots])).to(device),
+        torch.from_numpy(np.concatenate([each.offsets for each in slots])).to(device),
+        tuple(len(each.pages) for each in slots),
+    )
 
 
 class PagedIndptrs(NamedTuple):
