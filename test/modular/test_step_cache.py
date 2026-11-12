@@ -16,7 +16,7 @@ from mstar.model.components.diffusion.step_cache import (
 )
 from mstar.model.submodule_base import InputMetadata, ModelInputsFromEngine
 from mstar.model.wan22.components.dit import Wan22DiT
-from mstar.model.wan22.config import MAG_RATIOS, Wan22Config
+from mstar.model.wan22.config import MAG_RATIOS, WAN22_VARIANT_T2V_A14B, WAN22_VARIANT_TI2V_5B, Wan22Config
 from mstar.model.wan22.submodules import DENOISE_LOOP_NAME, Wan22DitSubmodule
 from mstar.model.wan22.wan22_model import Wan22Model
 
@@ -269,8 +269,108 @@ def test_cfg_ranks_take_the_same_decisions_and_keep_their_own_branch():
     assert not torch.equal(*(sub.request_state("r0").tensors[RESIDUAL] for sub in ranks))
 
 
+# --------------------------------------------------------------------- A14B: two experts over the schedule
+
+
+def test_an_expert_switch_computes_and_starts_the_skip_rule_over():
+    """At a segment start (another expert's first step) the step computes, and the skip cap and the accumulated
+    error restart there; the table entry at that step, which compares two experts' residuals, is never read."""
+    policy = MagCache(mag_ratios=(1.0,) * 8, threshold=1.0, max_skip_steps=9, retention_ratio=0.0)
+    assert policy.reuse_plan(8) == (False, True, True, True, True, True, True, False)
+    assert policy.reuse_plan(8, (4,)) == (False, True, True, True, False, True, True, False)
+    # an error spike in the switch step's entry changes nothing
+    spiked = MagCache(mag_ratios=(1.0,) * 4 + (0.1,) + (1.0,) * 3, threshold=1.0, max_skip_steps=9,
+                      retention_ratio=0.0)
+    assert spiked.reuse_plan(8, (4,)) == policy.reuse_plan(8, (4,))
+
+
+_A14B_STEPS = 8
+
+
+def _a14b(step_cache=None):
+    config = Wan22Config.for_variant(WAN22_VARIANT_T2V_A14B, **_TINY, step_cache=step_cache)
+    high, low = _tiny_dit(), _tiny_dit()
+    for param in low.parameters():
+        torch.nn.init.normal_(param, std=0.2)
+    sub = Wan22DitSubmodule(transformer=high, config=config, transformer_2=low)
+    sub.get_device = lambda: torch.device("cpu")
+    return sub, _BlockCounter(high), _BlockCounter(low)
+
+
+def _a14b_info(k: int, rid: str = "r0") -> CurrentForwardPassInfo:
+    return _info(k, rid, steps=_A14B_STEPS, guidance_scale_2=3.0)
+
+
+def _a14b_step(sub: Wan22DitSubmodule, steps: dict[str, int], carried: dict[str, dict]) -> dict[str, dict]:
+    """One dit step over the requests of ``steps``, each at its own step index; every request's outputs."""
+    rids = list(steps)
+    infos = {rid: _a14b_info(steps[rid], rid) for rid in rids}
+    inputs = [sub.prepare_inputs(Wan22Model.VIDEO_GEN_WALK, infos[rid], {**_text(rid), **carried.get(rid, {})})
+              for rid in rids]
+    assert len(rids) == 1 or sub.can_batch(None, inputs)
+    engine_inputs = ModelInputsFromEngine(request_ids=rids, per_request_info=infos)
+    kwargs = sub.preprocess(Wan22Model.VIDEO_GEN_WALK, engine_inputs, inputs)
+    if len(rids) == 1:
+        return {rids[0]: sub.forward(Wan22Model.VIDEO_GEN_WALK, engine_inputs, **kwargs)}
+    return sub.forward_batched(Wan22Model.VIDEO_GEN_WALK, engine_inputs, **kwargs)
+
+
+def test_a14b_segments_at_the_low_noise_experts_first_step():
+    sub, _, _ = _a14b(_FLAT)
+    key = sub.bucket_key_for(_a14b_info(0))
+    timesteps = sub.schedule_of(_a14b_info(0), key).timesteps.tolist()
+    first_low = next(k for k, t in enumerate(timesteps) if t < 875)
+    assert 1 < first_low < _A14B_STEPS - 1
+    assert sub.step_cache_segments(_a14b_info(0), key) == (first_low,)
+    assert sub.step_key(_a14b_info(first_low), key) == StepBucket(key, None, False)
+    # TI2V-5B has one DiT, so no segments
+    assert _submodule(_FLAT).step_cache_segments(_info(0), key) == ()
+
+
+def test_a14b_never_reuses_one_experts_residual_in_the_other():
+    """Each expert's blocks run on its first step; the low-noise expert never adds the high-noise one's residual."""
+    sub, high, low = _a14b(_FLAT)
+    key = sub.bucket_key_for(_a14b_info(0))
+    first_low = sub.step_cache_segments(_a14b_info(0), key)[0]
+    plan = sub.step_cache.reuse_plan(_A14B_STEPS, (first_low,))
+    carried = {}
+    for k in range(_A14B_STEPS):
+        out = _a14b_step(sub, {"r0": k}, {"r0": carried})["r0"]
+        carried = {name: out[name] for name in sub.loop_back_names}
+    assert not plan[first_low] and any(plan[:first_low]) and any(plan[first_low:])
+    assert high.calls == plan[:first_low].count(False)
+    assert low.calls == plan[first_low:].count(False)
+
+
+def test_a_batch_straddling_the_boundary_keeps_each_rows_residual_from_its_own_expert():
+    """Rows on both sides of the boundary at one decision share a step: each expert's forward keeps the residuals
+    of its own rows (``BlockCache.rows``), as each row keeps alone."""
+    def at_the_boundary(batched: bool) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
+        sub, high, low = _a14b(_FLAT)
+        first_low = sub.step_cache_segments(_a14b_info(0), sub.bucket_key_for(_a14b_info(0)))[0]
+        carried = {}
+        for k in range(first_low):  # request b, up to the low-noise expert's first step
+            out = _a14b_step(sub, {"b": k}, {"b": carried})["b"]
+            carried = {name: out[name] for name in sub.loop_back_names}
+        before = (high.calls, low.calls)
+        # a's step 0 runs the high-noise expert and b's step the low-noise one; both compute
+        rows = ({"a": 0, "b": first_low},) if batched else ({"a": 0}, {"b": first_low})
+        outs = {}
+        for steps in rows:
+            outs.update(_a14b_step(sub, steps, {"b": carried}))
+        assert (high.calls - before[0], low.calls - before[1]) == (1, 1)
+        return {rid: (outs[rid][sub.LATENTS][0], sub.request_state(rid).tensors[RESIDUAL]) for rid in ("a", "b")}
+
+    together, alone = at_the_boundary(True), at_the_boundary(False)
+    for rid in ("a", "b"):
+        for x, y in zip(together[rid], alone[rid], strict=True):
+            torch.testing.assert_close(x, y, rtol=1e-5, atol=1e-5)
+    assert not torch.equal(together["a"][1], together["b"][1])
+
+
 def test_a_step_cache_with_a_distilled_sampler_is_refused():
     """The calibrated table is a UniPC run's: resampled to FastWan's 3 steps it would skip the middle one."""
-    assert step_cache_policy({"method": "magcache"}, MAG_RATIOS).reuse_plan(3) == (False, True, False)
+    table = MAG_RATIOS[WAN22_VARIANT_TI2V_5B]
+    assert step_cache_policy({"method": "magcache"}, table).reuse_plan(3) == (False, True, False)
     with pytest.raises(ValueError, match="unipc sampler only"):
         Wan22Config(sampler="dmd", step_cache=_FLAT)

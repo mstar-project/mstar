@@ -2272,8 +2272,8 @@ step) and no component offload.
 skips the DiT's 30 blocks on the steps MagCache picks and adds back the residual
 they produced at the last step that ran them
 (``components/diffusion/step_cache.py``); off by default. The pick comes from a
-per-step table calibrated on this model (``MAG_RATIOS["default"]``: TI2V-5B at
-1280x704x81, 50 steps) and the step index alone, so it costs no host sync and
+per-step table calibrated on this model (``MAG_RATIOS["ti2v_5b"]["default"]``: TI2V-5B
+at 1280x704x81, 50 steps) and the step index alone, so it costs no host sync and
 every CFG and SP rank makes the same one. On one H200 at 1280x704x81, 50 steps,
 against the dense output on 8 VBench prompts:
 
@@ -2404,8 +2404,13 @@ shared Wan VAE decoder takes it as it takes Wan2.2's.
 GPUs (``cfg_size: 2``), each rank holding both experts, and
 ``configs/wan22_a14b_sp2.yaml`` splits the tokens instead (``sp_size: 2``, 20 of the
 40 heads per rank). Both compile the DiT for ``1280x720x81`` and ``832x480x81``, each
-expert once per CFG setting. ``step_cache`` is TI2V-5B's only: its calibrated table is
-that model's, so A14B refuses one at startup.
+expert once per CFG setting.
+
+**Step caching on A14B.** ``step_cache`` works on A14B as on TI2V-5B. The low-noise
+expert's first step always computes and starts the skip rule over, so neither expert
+reuses the other's residual. A14B has no calibrated table yet: its ``step_cache`` names
+a ``mag_ratios`` list (``{method: magcache_calibrate}`` logs one), and one that names
+none is refused at startup.
 
 LTX-2.5 (``ltx2_5``)
 --------------------

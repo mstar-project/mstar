@@ -367,7 +367,7 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         k = self.step_index(fwd_info) if step is None else step
         dtype = None if self.step_dtypes is None else self.step_dtypes.at(k)
         reuse = self.step_cache is not None and self.step_cache.reuses(
-            k, self.schedule_of(fwd_info, bucket_key).num_steps,
+            k, self.schedule_of(fwd_info, bucket_key).num_steps, self.step_cache_segments(fwd_info, bucket_key),
         )
         return StepBucket(bucket_key, dtype, reuse)
 
@@ -540,6 +540,13 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         # a step mixing dtypes matches no capture and would run a row at a time; one mixing reuse decisions cannot run
         del graph_walk
         return self.step_dtypes is not None or self.step_cache is not None
+
+    def step_cache_segments(self, fwd_info: CurrentForwardPassInfo, bucket_key: Hashable) -> tuple[int, ...]:
+        """The steps where the model switches to another set of weights (a mixture of experts over the schedule, as
+        Wan2.2-A14B's two DiTs): a step cache computes there and starts its skip rule over, since a residual of one
+        expert says nothing about another's. A pure function of host values; none by default."""
+        del fwd_info, bucket_key
+        return ()
 
     def block_cache(self, engine_inputs: ModelInputsFromEngine) -> BlockCache | None:
         """The step's view of its rows' cached block residuals, for ``denoise`` to route its block stack through; None

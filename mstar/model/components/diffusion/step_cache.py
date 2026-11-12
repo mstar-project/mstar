@@ -43,12 +43,13 @@ _RATIOS = "step_cache_ratios"
 class StepCachePolicy:
     """Which steps of a request reuse the cached residual. A pure function of the step count, memoized."""
 
-    def reuse_plan(self, num_steps: int) -> tuple[bool, ...]:
-        """One flag per step, True where the step reuses. Step 0 never does, as nothing is cached yet."""
+    def reuse_plan(self, num_steps: int, segment_starts: tuple[int, ...] = ()) -> tuple[bool, ...]:
+        """One flag per step, True where the step reuses. Step 0 never does, as nothing is cached yet, and neither
+        does a step in ``segment_starts``, where the model changes weights (``step_cache_segments``)."""
         raise NotImplementedError
 
-    def reuses(self, step: int, num_steps: int) -> bool:
-        return self.reuse_plan(num_steps)[step]
+    def reuses(self, step: int, num_steps: int, segment_starts: tuple[int, ...] = ()) -> bool:
+        return self.reuse_plan(num_steps, segment_starts)[step]
 
     # Calibration policies record each computed step's residual magnitude ratio.
     records = False
@@ -72,7 +73,9 @@ class MagCache(StepCachePolicy):
     ``k`` of a dense run (:class:`MagCacheCalibration` logs it); a table calibrated at another step count is resampled
     by nearest index. Past the first ``retention_ratio`` of the steps, a step reuses while the error accumulated since
     the last computed step, ``sum |1 - prod(ratios)|``, stays at or under ``threshold`` and no more than
-    ``max_skip_steps`` steps in a row have reused. The last step always computes."""
+    ``max_skip_steps`` steps in a row have reused. The last step always computes, and so does each step in
+    ``segment_starts`` (another expert's first step), where the accumulated error starts over: the table's entry
+    there compares two experts' residuals and is never read."""
 
     mag_ratios: tuple[float, ...]
     threshold: float = 0.06
@@ -90,13 +93,13 @@ class MagCache(StepCachePolicy):
         object.__setattr__(self, "mag_ratios", tuple(float(r) for r in self.mag_ratios))
 
     @functools.lru_cache(maxsize=16)  # noqa: B019 - frozen and hashable; a handful of step counts per deployment
-    def reuse_plan(self, num_steps: int) -> tuple[bool, ...]:
+    def reuse_plan(self, num_steps: int, segment_starts: tuple[int, ...] = ()) -> tuple[bool, ...]:
         ratios = _nearest(self.mag_ratios, num_steps)
         retained = max(1, int(self.retention_ratio * num_steps + 0.5))
         plan, ratio, err, skipped = [], 1.0, 0.0, 0
         for k in range(num_steps):
             reuse = False
-            if retained <= k < num_steps - 1:
+            if retained <= k < num_steps - 1 and k not in segment_starts:
                 ratio *= ratios[k]
                 err += abs(1.0 - ratio)
                 reuse = err <= self.threshold and skipped < self.max_skip_steps
@@ -115,7 +118,7 @@ class MagCacheCalibration(StepCachePolicy):
 
     records = True
 
-    def reuse_plan(self, num_steps: int) -> tuple[bool, ...]:
+    def reuse_plan(self, num_steps: int, segment_starts: tuple[int, ...] = ()) -> tuple[bool, ...]:
         return (False,) * num_steps
 
 
@@ -169,6 +172,13 @@ class BlockCache:
         if any(r is None for r in cached):
             raise RuntimeError("step cache: a reusing step found no residual; step 0 must compute")
         return cached[0].unsqueeze(0) if len(cached) == 1 else torch.stack(cached)
+
+    def rows(self, index: list[int]) -> BlockCache:
+        """The view over a subset of the step's rows (a model running some rows through another expert)."""
+        return BlockCache(
+            reuse=self.reuse, _states=[self._states[i] for i in index], _final=[self._final[i] for i in index],
+            _records=self._records,
+        )
 
     def keep(self, residual: torch.Tensor) -> None:
         """Cache each row of ``residual`` (``[rows, ...]``, what the block stack added; fp32 recommended) for the

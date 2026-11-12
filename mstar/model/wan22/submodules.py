@@ -338,7 +338,7 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
     ):
         super().__init__(
             loop_name=DENOISE_LOOP_NAME, max_batch_size=config.dit_max_batch_size,
-            step_cache=step_cache_policy(config.step_cache, MAG_RATIOS),
+            step_cache=step_cache_policy(config.step_cache, MAG_RATIOS[config.variant]),
         )
         if config.is_moe and transformer is not None and transformer_2 is None:
             raise ValueError("Wan2.2 A14B needs both experts: transformer_2 is missing.")
@@ -449,6 +449,15 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
         timesteps = self.schedule_of(fwd_info, bucket_key).timesteps
         return bool(timesteps[self.step_index(fwd_info)] >= self._boundary_timestep)
 
+    def step_cache_segments(self, fwd_info: CurrentForwardPassInfo, bucket_key: WanStepKey) -> tuple[int, ...]:
+        # A14B: the low-noise expert's first step, from the host timestep table. Its residual has nothing to do with
+        # the high-noise expert's, so that step computes and the skip rule starts over.
+        if not self.config.is_moe:
+            return ()
+        timesteps = self.schedule_of(fwd_info, bucket_key).timesteps
+        low = [k for k, t in enumerate(timesteps.tolist()) if t < self._boundary_timestep]
+        return (low[0],) if low and low[0] > 0 else ()
+
     def _expert_groups(
         self, engine_inputs: ModelInputsFromEngine, bucket_key: WanStepKey,
     ) -> list[tuple[nn.Module, float, list[int]]]:
@@ -516,20 +525,22 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
             temp_ts = timestep[:, None]
         pos, neg = text_embeds_pos.flatten(0, 1), text_embeds_neg.flatten(0, 1)
         groups = self._expert_groups(engine_inputs, bucket_key)
+        block_cache = self.block_cache(engine_inputs)
         if len(groups) == 1:
             transformer, guidance, _ = groups[0]
             output = self._noise_prediction(
                 model_input.to(transformer.dtype), temp_ts.squeeze(0), pos, neg, bucket_key.guidance,
-                transformer=transformer, combine_scale=guidance, block_cache=self.block_cache(engine_inputs),
+                transformer=transformer, combine_scale=guidance, block_cache=block_cache,
             )
             return output[:, None]
-        # rows on both sides of A14B's boundary: one forward per expert (no step cache: the config refuses one on A14B)
+        # rows on both sides of A14B's boundary: one forward per expert
         output = None
         for transformer, guidance, rows in groups:
             index = torch.tensor(rows, device=batch.device)
             part = self._noise_prediction(
                 model_input[index].to(transformer.dtype), temp_ts[index], pos[index], neg[index],
                 bucket_key.guidance, transformer=transformer, combine_scale=guidance,
+                block_cache=None if block_cache is None else block_cache.rows(rows),
             )
             if output is None:
                 output = part.new_empty((batch.shape[0], *part.shape[1:]))

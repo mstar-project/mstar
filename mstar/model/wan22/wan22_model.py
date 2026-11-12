@@ -133,7 +133,7 @@ class Wan22Model(Model):
             sampler=sampler, dmd_timesteps=dmd_timesteps, dmd_shift=dmd_shift,
         )
         self.config.compile_dit_grids()  # a malformed list fails at startup
-        step_cache_policy(step_cache, MAG_RATIOS)  # and so does a malformed step cache
+        step_cache_policy(step_cache, MAG_RATIOS[self.config.variant])  # and so does a malformed step cache
         # Dummy mode: get_submodule returns None for every node, so engines run
         # without weights, GPU or network.
         self.skip_weight_loading = skip_weight_loading
