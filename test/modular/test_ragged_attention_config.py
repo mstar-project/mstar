@@ -60,3 +60,16 @@ def test_a_per_request_ceiling_on_a_per_step_resource_is_refused(declared, overr
     spec.config.max_segments_per_step = declared
     with pytest.raises(ValueError, match="max_segments_per_step"):
         spec.apply_yaml_overrides(**override)
+
+
+def test_head_groups_plan_the_kernel_for_one_group_of_the_ranks_heads():
+    """A Ulysses exchange pipelined over head groups attends one group a call: the plan is for this rank's
+    heads / head_groups, after the TP x SP sharding."""
+    config = RaggedAttentionConfig(num_qo_heads=56, num_kv_heads=56, head_dim=128, head_groups=7)
+    config.shard(4)
+    assert (config.num_qo_heads, config.num_kv_heads) == (2, 2)
+    config.shard(4)  # idempotent
+    assert config.num_qo_heads == 2
+    whole = RaggedAttentionConfig(num_qo_heads=56, num_kv_heads=56, head_dim=128)
+    whole.shard(4)
+    assert whole.num_qo_heads == 14

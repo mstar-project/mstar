@@ -2336,6 +2336,13 @@ Deployment knobs (``model_kwargs``; the SP configs set ``compile``, ``vae_tile_b
   another tile count compiles again. A 768p clip's share decodes in 2.1 s instead of 3.2 s
   on one H200, within 62.9 dB of eager.
 - ``attention_backend``: ``flashinfer``, or ``sdpa`` (the reference's kernel).
+- ``ulysses_head_groups``: under SP the DiT attends this many head groups a layer, and each group's q/k/v and
+  output rows move on the copy engines (CUDA IPC peer copies, stream memory operations) while the previous group
+  attends, instead of one NCCL all-to-all each way, which runs on the SMs and doesn't overlap. Bit-identical: the
+  first call of each shape checks against the NCCL exchange on every rank, which a shape keeps if not (or if the
+  buffers, ~0.5 GB a rank at 768p 5 s, don't fit). The SP4 config sets 2: 1344x768x124 at 49 forwards on 4 H200s
+  takes 74.7 s instead of 76.7 s (step 1470 vs 1510 ms; 7 groups saves 6 ms, too few heads a group). At SP8 (7
+  heads a rank) neither 7 groups (+6% a clip) nor the copy engines alone (same step) helps, so that config keeps 1.
 
 Async scheduling is on for the DiT and the decoder, the default for parallel nodes
 (``tp_async_sched: false`` turns it off); on and off measured within noise. Runtime needs:

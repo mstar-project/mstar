@@ -121,6 +121,23 @@ def ulysses_attention(
     return sp_group.all_to_all(out, scatter_dim=seq_dim, gather_dim=head_dim, scatter_sizes=seq_sizes)
 
 
+def head_grouped(
+    run_attention: Callable[..., torch.Tensor], groups: int, head_dim: int = 1,
+) -> Callable[..., torch.Tensor]:
+    """``run_attention`` for an attention planned per head group (``RaggedAttentionConfig.head_groups``): the
+    heads split into ``groups`` runs along ``head_dim``, each attended on its own, then concatenated. Heads attend
+    independently, so the result is the one call's."""
+    if groups == 1:
+        return run_attention
+
+    def run(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        pieces = zip(*(t.chunk(groups, dim=head_dim) for t in (q, k, v)), strict=True)
+        return torch.cat([run_attention(q=a.contiguous(), k=b.contiguous(), v=c.contiguous()) for a, b, c in pieces],
+                         dim=head_dim)
+
+    return run
+
+
 @torch.compiler.disable
 def attention_over_sharded_keys(
     sp_group: CommGroup,

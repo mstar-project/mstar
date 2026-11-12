@@ -18,6 +18,8 @@ model_kwargs:
   compile: true
   vae_tile_batch: 28
   vae_compile: true
+  # Ulysses exchange on the copy engines, pipelined over 2 head groups (bit-identical; -2.6% at 768p 5 s)
+  ulysses_head_groups: 2
 
 node_groups:
   - node_names: [dit, vae_decoder]

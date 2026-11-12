@@ -30,9 +30,11 @@ from mstar.model.components.distributed.linear import (
 )
 from mstar.model.components.distributed.sequence_parallel import (
     gather_sequence,
+    head_grouped,
     sp_seq_split,
     ulysses_attention,
 )
+from mstar.model.components.distributed.ulysses_pipeline import UlyssesPipeline
 from mstar.model.minimax_h3.components.qk_norm_rope import qk_norm_rope
 from mstar.model.minimax_h3.config import NUM_MODALITIES, H3TransformerConfig
 
@@ -277,10 +279,14 @@ class H3FinalLayer(nn.Module):
 
 
 class SeqParallel(NamedTuple):
-    """Ulysses over the packed rows: ``sizes`` is each rank's share of them."""
+    """Ulysses over the packed rows: ``sizes`` is each rank's share of them. With ``head_groups`` > 1 the
+    attention runs a head group at a time, and ``pipeline`` (when set) overlaps each group's exchange with the
+    previous group's attention."""
 
     group: CommGroup
     sizes: list[int]
+    head_groups: int = 1
+    pipeline: UlyssesPipeline | None = None
 
     @property
     def start(self) -> int:
@@ -291,7 +297,18 @@ class SeqParallel(NamedTuple):
         return self.sizes[self.group.rank]
 
     def attend(self, q, k, v, run: Attend) -> torch.Tensor:
-        return ulysses_attention(self.group, q, k, v, run, self.sizes, seq_dim=1, head_dim=2)
+        """``run`` attends one head group's ``[B, S, H / head_groups, D]``."""
+
+        def sequential() -> torch.Tensor:
+            return ulysses_attention(self.group, q, k, v, head_grouped(run, self.head_groups, head_dim=2),
+                                     self.sizes, seq_dim=1, head_dim=2)
+
+        if self.pipeline is not None and q.shape[0] == 1 and len(set(self.sizes)) == 1:
+            out = self.pipeline(q[0], k[0], v[0], lambda a, b, c: run(a[None], b[None], c[None])[0],
+                                lambda: sequential()[0])
+            if out is not None:
+                return out[None]
+        return sequential()
 
 
 class H3Inputs(NamedTuple):
@@ -335,7 +352,7 @@ class H3DiT(nn.Module):
     (keyframe rows included, which the caller masks) and every audio row, fp32."""
 
     def __init__(self, cfg: H3TransformerConfig, comm_group: CommGroup | None = None,
-                 sp_group: CommGroup | None = None):
+                 sp_group: CommGroup | None = None, head_groups: int = 1):
         super().__init__()
         comm_group = comm_group or CommGroup.trivial()
         self.cfg = cfg
@@ -345,6 +362,13 @@ class H3DiT(nn.Module):
             # Ulysses gives each rank whole heads; under SDPA nothing else would refuse this
             # before the first request
             raise ValueError(f"MiniMax-H3's {heads} heads don't split over sp_size {self.sp_group.world_size}")
+        self.head_groups = int(head_groups)
+        if self.head_groups < 1 or heads // self.sp_group.world_size % self.head_groups:
+            raise ValueError(f"MiniMax-H3's {heads // self.sp_group.world_size} heads a rank don't split into "
+                             f"{head_groups} head groups")
+        # the exchange pipelined over the head groups; the serving exchange when either is 1
+        self.ulysses_pipeline = (UlyssesPipeline(self.sp_group, self.head_groups)
+                                 if self.sp_group.world_size > 1 and self.head_groups > 1 else None)
         self.video_patch_proj = nn.Linear(cfg.patch_dim, cfg.hidden_size)
         self.audio_patch_proj = nn.Linear(cfg.audio_latents_dim, cfg.hidden_size) if cfg.audio_enabled else None
         self.time_embedder = H3TimeEmbedder(cfg)
@@ -414,8 +438,11 @@ class H3DiT(nn.Module):
         cond, pad = layout.num_condition_rows, layout.num_pad_rows
         sp, start, count = None, 0, layout.num_rows
         if self.sp_group.world_size > 1:
-            sp = SeqParallel(self.sp_group, sp_seq_split(layout.num_rows, self.sp_group.world_size))
+            sp = SeqParallel(self.sp_group, sp_seq_split(layout.num_rows, self.sp_group.world_size),
+                             self.head_groups, self.ulysses_pipeline)
             start, count = sp.start, sp.count
+        else:
+            attend = head_grouped(attend, self.head_groups, head_dim=2)
         x = self.packed_rows(inputs, layout, start, count)
         rope, row_index = layout.rope, layout.row_index
         if row_class is not None:

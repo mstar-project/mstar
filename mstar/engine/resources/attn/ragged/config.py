@@ -104,6 +104,11 @@ class RaggedAttentionConfig:
     # replicated stream, or a cross-attention from the rank's query shard.
     shard_over_sp: bool = True
 
+    # Head groups a layer attends one at a time, the kernel planned for one group (this rank's heads /
+    # head_groups): for a Ulysses exchange pipelined over head groups (``ulysses_pipeline``), which attends each
+    # group as its rows arrive. 1 attends every head in one call.
+    head_groups: int = 1
+
     # Where each label's FlashInfer workspace starts, per slot; None takes
     # MSTAR_WORKSPACE_BUFFER_MB, which a declared size wins over. A floor: a plan that
     # asks for more grows it. FA3 plans don't use it; FA2 spends it on split-KV
@@ -124,6 +129,7 @@ class RaggedAttentionConfig:
         """
         from mstar.distributed.utils import divide
 
+        num_shards *= self.head_groups
         if num_shards >= self._unsharded_kv_heads:
             # fewer KV heads than ranks — every rank replicates one
             self.num_kv_heads = 1

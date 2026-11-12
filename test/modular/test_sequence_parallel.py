@@ -24,6 +24,7 @@ from mstar.model.components.diffusion.attention import sdpa_attention
 from mstar.model.components.distributed.sequence_parallel import (
     attention_over_sharded_keys,
     gather_sequence,
+    head_grouped,
     scatter_sequence,
     sp_seq_split,
     ulysses_attention,
@@ -217,3 +218,26 @@ def test_wan_dit_under_ulysses_matches_one_rank(tmp_path, grid):
     frame)."""
     _run(_wan_dit, 2, tmp_path / "two", grid, str(tmp_path / "two.pt"))
     torch.testing.assert_close(torch.load(tmp_path / "two.pt"), _wan_dit_forward(grid))
+
+
+@pytest.mark.parametrize("batched", [False, True], ids=["SHD", "BSHD"])
+def test_head_grouped_attention_is_the_one_call(batched):
+    """Heads attend independently, so attending them a group at a time gives the one call's output."""
+    _, head_dim = _layout(batched)
+    q, k, v = (_full(9, batched, seed) for seed in range(3))
+    run = lambda q, k, v: _sdpa(batched)(q=q, k=k, v=v)  # noqa: E731
+    want = run(q, k, v)
+    assert head_grouped(run, 1, head_dim) is run
+    for groups in (2, 3, 6):
+        torch.testing.assert_close(head_grouped(run, groups, head_dim)(q, k, v), want, rtol=0, atol=0)
+
+
+def test_the_pipeline_serves_no_cpu_tensors():
+    """The copy-engine pipeline is CUDA only; on CPU tensors it declines before touching a collective, and the
+    caller runs the serving exchange."""
+    from mstar.model.components.distributed.ulysses_pipeline import UlyssesPipeline
+
+    pipe = UlyssesPipeline(CommGroup(0, 0, [0, 1]), groups=3)
+    q = torch.zeros(4, HEADS, 4)
+    assert pipe(q, q, q, lambda *a: None, lambda: None) is None
+    assert pipe._usable is None  # never asked the other ranks

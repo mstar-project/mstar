@@ -531,7 +531,7 @@ def _sp_cfg():
     return replace(CFG, num_attention_heads=8)  # Ulysses splits the heads over the ranks
 
 
-def _sp_dit(rank: int, world: int, store: str, snapshot: str, out: str) -> None:
+def _sp_dit(rank: int, world: int, store: str, snapshot: str, out: str, head_groups: int = 1) -> None:
     import torch.distributed as dist
 
     from mstar.distributed.communication import CommGroup
@@ -556,7 +556,8 @@ def _sp_dit(rank: int, world: int, store: str, snapshot: str, out: str) -> None:
         for name, sp in (("sp", group), ("one", None)):
             if sp is None and rank:
                 break
-            dit = weight_loader.build_transformer(config, snapshot, "cpu", sp_group=sp, dtype=torch.float32)
+            dit = weight_loader.build_transformer(config, snapshot, "cpu", sp_group=sp, dtype=torch.float32,
+                                                  head_groups=head_groups if sp is not None else 1)
             node = H3DenoiseSubmodule(dit, config, loop_name=DENOISE_LOOP, attn_resource_key=None)
             step_layout = node.build_layout(layout, "cpu")
             projected = []
@@ -568,10 +569,11 @@ def _sp_dit(rank: int, world: int, store: str, snapshot: str, out: str) -> None:
         dist.destroy_process_group()
 
 
-@pytest.mark.parametrize("world", [2, 4, 8])
-def test_the_sequence_parallel_dit_gives_every_rank_the_one_ranks_velocity(tmp_path, world):
+@pytest.mark.parametrize("world,head_groups", [(2, 1), (4, 1), (8, 1), (2, 2), (4, 2)])
+def test_the_sequence_parallel_dit_gives_every_rank_the_one_ranks_velocity(tmp_path, world, head_groups):
     """``narrow``, ``rope.rows``, the Ulysses exchange and ``gather_sequence`` through ``H3DiT``,
-    over rows no rank count divides (padded to one it does), against the unpadded DiT on one rank."""
+    over rows no rank count divides (padded to one it does), against the unpadded DiT on one rank; with
+    ``head_groups`` the attention runs a head group at a time (on CPU the pipeline declines)."""
     import torch.multiprocessing as mp
     from safetensors.torch import save_file
 
@@ -580,7 +582,7 @@ def test_the_sequence_parallel_dit_gives_every_rank_the_one_ranks_velocity(tmp_p
     (tmp_path / "FL2VA" / "transformer").mkdir(parents=True)
     save_file(random_checkpoint(_sp_cfg()), str(tmp_path / "FL2VA" / "transformer" / "model.safetensors"))
     out = str(tmp_path / "v")
-    mp.spawn(_sp_dit, args=(world, str(tmp_path / "store"), str(tmp_path), out), nprocs=world)
+    mp.spawn(_sp_dit, args=(world, str(tmp_path / "store"), str(tmp_path), out, head_groups), nprocs=world)
     want = torch.load(f"{out}.one.0")
     for rank in range(world):
         for got, ref in zip(torch.load(f"{out}.sp.{rank}"), want, strict=True):
@@ -703,6 +705,8 @@ def test_an_sp_size_the_heads_do_not_divide_is_refused_at_load():
         H3DiT(_sp_cfg(), sp_group=CommGroup(0, 0, [0, 1, 2, 3]))
         with pytest.raises(ValueError, match="8 heads don't split over sp_size 3"):
             H3DiT(_sp_cfg(), sp_group=CommGroup(0, 0, [0, 1, 2]))
+        with pytest.raises(ValueError, match="2 heads a rank don't split into 3 head groups"):
+            H3DiT(_sp_cfg(), sp_group=CommGroup(0, 0, [0, 1, 2, 3]), head_groups=3)
 
 
 def test_a_torchaudio_that_does_not_load_fails_startup_by_name(monkeypatch):
