@@ -6,12 +6,14 @@ reference ``Phi4MMImageProcessor`` on synthetic images."""
 from __future__ import annotations
 
 import glob
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
 
 from mstar.model.phi4mm.components.vision import Phi4MMVisionConfig
+from mstar.model.phi4mm.phi4mm_model import Phi4MMModel
 from mstar.model.phi4mm.tests._paths import snapshot
 from mstar.model.phi4mm.vision import (
     GLB_GN,
@@ -60,6 +62,9 @@ def test_intake_takes_float_or_bytes_and_ships_crops_as_bytes():
     pixels = torch.from_numpy(rng.randint(0, 256, (3, 427, 464), dtype=np.uint8))
     from_bytes = image_intake(pixels, {}, CONFIG)
     from_float = image_intake(pixels.float() / 255, {}, CONFIG)  # as `Model.load_image` gives it
+    # the model's intake, called as the scaffold calls it (with the request's kwargs)
+    via_model = Phi4MMModel._image_intake(SimpleNamespace(vision_config=CONFIG), pixels, {}, {})
+    assert via_model.tokens == from_bytes.tokens
     crops = from_bytes.inputs[PIXEL_VALUES]
     assert crops.dtype == torch.uint8 and crops.shape == (2, 3, 448, 448)
     assert from_bytes.inputs[GLOBAL_PIXEL_VALUES].dtype == torch.float32

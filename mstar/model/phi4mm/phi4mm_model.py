@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Mapping
 from pathlib import Path
 
 import torch
@@ -111,12 +112,12 @@ class Phi4MMModel(MultimodalDecoderModel):
         waveform = load_speech_file(filepath, target, self.MAX_AUDIO_SECONDS)
         return TensorAndMetadata(data=waveform, metadata=dict(sample_rate=target, num_channels=1))
 
-    def _image_intake(self, image: torch.Tensor, metadata: dict):
+    def _image_intake(self, image: torch.Tensor, metadata: dict, request: Mapping = {}):
         from mstar.model.phi4mm.vision import image_intake
 
         return image_intake(image, metadata, self.vision_config)
 
-    def _audio_intake(self, clip: torch.Tensor, metadata: dict):
+    def _audio_intake(self, clip: torch.Tensor, metadata: dict, request: Mapping = {}):
         from mstar.model.phi4mm.audio import audio_intake
 
         return audio_intake(clip, metadata, self.audio_config)
