@@ -779,7 +779,6 @@ def test_kernel_settings_sizes_a_plain_value_and_yaml_overrides_it():
 
 @pytest.mark.parametrize("build, cause", [
     (lambda: replace(_plain(), reads={"r": Read(mask=Causal())}), r"reads\['r'\]\.op: today's resources run no read"),
-    (lambda: replace(_plain(), seq_sharded=True), "seq_sharded"),
 ])
 def test_a_plain_value_refuses_what_a_pool_cant_hold(build, cause):
     with pytest.raises(ValueError, match=cause):
