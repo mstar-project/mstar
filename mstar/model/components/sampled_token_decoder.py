@@ -439,8 +439,9 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
     @property
     def _decode_rows_mix(self) -> bool:
         """Whether a mixed step can hold decode rows of more than one walk and no
-        prompt row: one decode walk's rows alone are relabelled to it by the
-        scheduler, and so replay the decode capture already."""
+        prompt row, and replay the decode capture. One decode walk's rows alone
+        are relabelled to it by the scheduler; those left alone in a mixed step
+        once its prompt row drops replay the packed capture (`_step_walk`)."""
         return len(self._decode_walks) > 1 and self._text_prompts and self.CAPTURE_PREFILL
 
     def _step_walk(self, graph_walk: str, rows: Collection[ARNodeInputs | CurrentForwardPassInfo]) -> str:
