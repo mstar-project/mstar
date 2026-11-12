@@ -533,13 +533,14 @@ def _worker_parallelism(
                 "must use the same parallel shape across replicas"
             )
         # Every cfg rank of an instance holds a full copy of a resource rank 0 decides for, but a transfer to
-        # another instance (`PublishedKVInfo`) pairs ranks by instance rank, as head shards
+        # another instance (`PublishedKVInfo`) pairs ranks by instance rank, as head shards. The resource's class is
+        # asked last: importing it imports its manager and kernels, which a one-instance deployment never needs here.
         cfg = next((
             wg for wg in worker_graphs if wg.cfg_size > 1 and spec.nodes & wg.section.get_nodes().keys()
         ), None)
         if (
-            cfg is not None and spec.resource_class.journals_resident_moves()
-            and any_worker.resource_needs_remote_transfer(spec.nodes, set())
+            cfg is not None and any_worker.resource_needs_remote_transfer(spec.nodes, set())
+            and spec.resource_class.journals_resident_moves()
         ):
             yield (
                 f"Resource {spec.resource_key}: its nodes span more than one lockstep instance, and "
