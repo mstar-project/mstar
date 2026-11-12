@@ -14,7 +14,7 @@ import weakref
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 
@@ -37,12 +37,16 @@ from mstar.engine.resources.sequence_shard import (
     SequenceShard,
     check_shard_plan,
     head_slice,
+    pipelined_ulysses,
     sharded_key_merge,
     ulysses,
 )
 from mstar.engine.resources.step import BucketKey, Segment, SlotLease, StepContext
 from mstar.kernels.registry import describe_rows
 from mstar.kernels.table import Choice, Rows
+
+if TYPE_CHECKING:
+    from mstar.distributed.ulysses_pipeline import UlyssesPipeline
 
 logger = logging.getLogger(__name__)
 
@@ -261,6 +265,8 @@ class _RaggedManagerBase:
     _ulysses = False
     # the shard, when it can split (`bind_dependencies`)
     _shard: SequenceShard | None = None
+    # the Ulysses exchange pipelined over head groups (`RaggedAttentionConfig.ulysses_head_groups`)
+    _ulysses_pipeline: "UlyssesPipeline | None" = None
 
     def __init__(
         self,
@@ -302,6 +308,10 @@ class _RaggedManagerBase:
         if self._shard_key is None or not resources[self._shard_key].can_split:
             return
         self._shard = resources[self._shard_key]
+        if self._config.ulysses_head_groups > 1:
+            from mstar.distributed.ulysses_pipeline import UlyssesPipeline
+
+            self._ulysses_pipeline = UlyssesPipeline(self._shard.group, self._config.ulysses_head_groups)
         logger.info(
             "%s %r takes split steps over %d SP ranks%s", type(self).__name__, self._key,
             self._shard.group.world_size, " (Ulysses)" if self._ulysses else "",
@@ -636,6 +646,8 @@ class _RaggedSelfManagerBase(_RaggedManagerBase, RaggedAttnManager):
         r = self._shard.split_range(label)
         if r is not None:
             self._shard.check_scattered(label)
+            if self._ulysses_pipeline is not None and self._wrapper(label).any_heads:
+                return functools.partial(pipelined_ulysses, r=r, pipeline=self._ulysses_pipeline)
             return functools.partial(ulysses, r=r)
         return functools.partial(head_slice, group=self._shard.group) if self._ulysses else None
 

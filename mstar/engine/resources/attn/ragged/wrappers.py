@@ -226,6 +226,10 @@ class RaggedPrefillWrapper(_RaggedPrefillBase):
     """Varlen self-attention: each segment attends within itself.
     ``cu_seqlens`` is both ``qo_indptr`` and ``kv_indptr``."""
 
+    # whether an eager ``run`` takes q / k / v of any head count, not only the planned one (a
+    # pipelined Ulysses exchange attends a group of heads at a time)
+    any_heads = False
+
     @torch.compiler.disable
     def plan(self, cu_seqlens: torch.Tensor, causal: bool = False) -> None:
         """Plan one packed layout. ``cu_seqlens``: ``[num_segments + 1]``, [0] == 0.

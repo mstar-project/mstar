@@ -39,6 +39,9 @@ class UniformSegmentsWrapper(RaggedPrefillWrapper):
     of unequal ones to another wrapper.
     """
 
+    # the dense kernels take the head count off the tensors
+    any_heads = True
+
     def __init__(self, num_qo_heads: int, num_kv_heads: int, head_dim: int, **kwargs):
         if num_qo_heads != num_kv_heads:
             raise ValueError(f"{type(self).__name__} runs MHA only, got {num_qo_heads} q and {num_kv_heads} kv heads")
@@ -85,13 +88,13 @@ class UniformSegmentsWrapper(RaggedPrefillWrapper):
             self._check_rows(q.shape[0])
         q4, k4, v4 = (t[:rows].to(self.q_data_type).view(n, seq, t.shape[1], t.shape[2]) for t in (q, k, v))
         out, lse = self._attend(q4, k4, v4, causal, return_lse)
-        out = out.reshape(rows, self.num_qo_heads, self.head_dim)
+        out = out.reshape(rows, q.shape[1], self.head_dim)
         if rows < q.shape[0]:
             # rows past the layout read back zero, as on the other backends
             out = torch.cat([out, out.new_zeros(q.shape[0] - rows, *out.shape[1:])])
         if not return_lse:
             return out
-        lse = lse.transpose(1, 2).reshape(rows, self.num_qo_heads).float()
+        lse = lse.transpose(1, 2).reshape(rows, q.shape[1]).float()
         if rows < q.shape[0]:
             lse = torch.cat([lse, lse.new_zeros(q.shape[0] - rows, lse.shape[1])])
         return out, lse
