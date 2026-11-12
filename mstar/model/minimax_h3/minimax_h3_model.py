@@ -177,6 +177,7 @@ class H3Model(Model):
         vae_tile_batch: int = 1,
         vae_compile: bool = False,
         ulysses_head_groups: int = 1,
+        ulysses_group_streams: bool = False,
     ):
         if attention_backend not in ATTENTION_BACKENDS:
             raise ValueError(f"attention_backend must be one of {ATTENTION_BACKENDS}, got {attention_backend!r}")
@@ -208,6 +209,9 @@ class H3Model(Model):
         self.ulysses_head_groups = int(ulysses_head_groups)
         if self.ulysses_head_groups < 1:
             raise ValueError(f"ulysses_head_groups must be a positive int, got {ulysses_head_groups!r}")
+        # each head group attends on its own stream, so a group's last wave of attention tiles runs beside the
+        # next group's first (FA4 varlen is one tile a CTA: 7 heads x 150 tiles is 7.1 waves on 148 SMs)
+        self.ulysses_group_streams = bool(ulysses_group_streams)
         self._snapshot = None
         self._config: H3Config | None = None
         self.tokenizer = None
@@ -634,7 +638,8 @@ class H3Model(Model):
         if node_name == DIT_NODE:
             return H3DenoiseSubmodule(
                 weight_loader.build_transformer(config, snapshot, device, comm_group=tp_group, sp_group=sp_group,
-                                                head_groups=self.ulysses_head_groups),
+                                                head_groups=self.ulysses_head_groups,
+                                                group_streams=self.ulysses_group_streams),
                 config, loop_name=DENOISE_LOOP, attn_resource_key=DIT_ATTN if ragged else None,
                 max_batch_size=1, compile_blocks=self.compile, row_bucket=self.row_bucket,
             )

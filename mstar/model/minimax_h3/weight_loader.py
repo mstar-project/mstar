@@ -81,14 +81,14 @@ def _check_inv_freq(stored: torch.Tensor, config: H3Config) -> None:
 def build_transformer(
     config: H3Config, snapshot: Path, device, comm_group: CommGroup | None = None, sp_group: CommGroup | None = None,
     dtype: torch.dtype = torch.bfloat16, partition: str = PARTITION, output_heads: str | None = None,
-    head_groups: int = 1,
+    head_groups: int = 1, group_streams: bool = False,
 ) -> H3DiT:
     """``output_heads`` names a file under ``partition`` holding the per-step video heads
     (``video_out.weight [n, out, in]``, ``video_out.bias``), which replace the transformer's
     own ``final_layer.video_out``."""
     cfg = config.transformer
     with torch.device("meta"):
-        dit = H3DiT(cfg, comm_group, sp_group, head_groups)
+        dit = H3DiT(cfg, comm_group, sp_group, head_groups, group_streams)
     dit.to(dtype)
     dit.keep_fp32()  # on meta: the fp32 modules are allocated in fp32, never rounded
     dit.to_empty(device=device)

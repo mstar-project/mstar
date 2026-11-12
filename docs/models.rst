@@ -2343,6 +2343,11 @@ Deployment knobs (``model_kwargs``; the SP configs set ``compile``, ``vae_tile_b
   buffers, ~0.5 GB a rank at 768p 5 s, don't fit). The SP4 config sets 2: 1344x768x124 at 49 forwards on 4 H200s
   takes 74.7 s instead of 76.7 s (step 1470 vs 1510 ms; 7 groups saves 6 ms, too few heads a group). At SP8 (7
   heads a rank) neither 7 groups (+6% a clip) nor the copy engines alone (same step) helps, so that config keeps 1.
+- ``ulysses_group_streams``: with ``ulysses_head_groups`` > 1, each head group attends on a stream of its own,
+  so one group's last wave of attention tiles runs beside the next group's first. On 4 B300s with the FA4 ragged
+  backend (one tile a CTA: 7 heads by 150 tiles is 7.1 waves on 148 SMs), 7 groups on their own streams take
+  34.8 s a clip instead of 35.6 s for 2 groups on one stream (2 groups with streams 35.0 s, 14 groups 35.1 s);
+  clips are bit-identical. Off by default: on H200 it measured the same as one stream.
 
 Async scheduling is on for the DiT and the decoder, the default for parallel nodes
 (``tp_async_sched: false`` turns it off); on and off measured within noise. Runtime needs:

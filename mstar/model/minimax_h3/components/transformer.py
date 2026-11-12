@@ -352,7 +352,7 @@ class H3DiT(nn.Module):
     (keyframe rows included, which the caller masks) and every audio row, fp32."""
 
     def __init__(self, cfg: H3TransformerConfig, comm_group: CommGroup | None = None,
-                 sp_group: CommGroup | None = None, head_groups: int = 1):
+                 sp_group: CommGroup | None = None, head_groups: int = 1, group_streams: bool = False):
         super().__init__()
         comm_group = comm_group or CommGroup.trivial()
         self.cfg = cfg
@@ -367,7 +367,7 @@ class H3DiT(nn.Module):
             raise ValueError(f"MiniMax-H3's {heads // self.sp_group.world_size} heads a rank don't split into "
                              f"{head_groups} head groups")
         # the exchange pipelined over the head groups; the serving exchange when either is 1
-        self.ulysses_pipeline = (UlyssesPipeline(self.sp_group, self.head_groups)
+        self.ulysses_pipeline = (UlyssesPipeline(self.sp_group, self.head_groups, group_streams)
                                  if self.sp_group.world_size > 1 and self.head_groups > 1 else None)
         self.video_patch_proj = nn.Linear(cfg.patch_dim, cfg.hidden_size)
         self.audio_patch_proj = nn.Linear(cfg.audio_latents_dim, cfg.hidden_size) if cfg.audio_enabled else None
