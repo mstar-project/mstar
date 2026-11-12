@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 
-from mstar.engine.resources.spec import NodeResourceSpec
+from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
 from mstar.engine.resources.step import ResourceStep
 
 if TYPE_CHECKING:
@@ -116,6 +116,16 @@ class BoundedKVSpec(NodeResourceSpec):
         from mstar.engine.resources.kv.bounded.manager import BoundedKVManager
 
         return BoundedKVManager
+
+    def capacity_problem(self, requests: int, request: ResourceReqConfig | None) -> str | None:
+        """A request keeps a slot from its first step until it is torn down, and every slot is a request's."""
+        if requests <= self.config.max_slots:
+            return None
+        return (
+            f"{requests} concurrent requests (max_concurrent_requests) need {requests} slots of resources."
+            f"{self.resource_key}, which holds {self.config.max_slots}; raise max_slots or lower "
+            "max_concurrent_requests"
+        )
 
     def apply_yaml_overrides(self, max_slots: int | None = None):
         if max_slots is not None:
