@@ -3334,17 +3334,19 @@ and ``sp_size`` (see :doc:`serving`). Declare the node and the most branches it 
            cfg_enabled_nodes={"dit": 2},
        )
 
-The submodule receives ``cfg_group`` from ``get_submodule``, takes its rows of the branch
-batch with ``my_rows(cfg_group, branches)``
-(``mstar/model/components/distributed/sequence_parallel.py``), and after the forward
-reassembles them with ``cfg_group.all_gather(out, dim=0)``. Every rank then runs the same
-guidance combine and solver step on replicated latents. CFG ranks keep every attention
+A node on the DiT scaffold writes no cfg code: it declares
+``GUIDANCE = Guidance(branches=..., combine=...)``
+(``mstar/model/components/diffusion/guidance.py``) on its ``DenoiseLoopSubmodule``, which
+receives ``cfg_group`` from ``get_submodule``. The base's ``guided_output``
+(``denoise_loop.py``) runs this rank's share of the branches as rows, gathers the
+predictions over the group and combines them. Every rank then runs the same guidance
+combine and solver step on replicated latents. CFG ranks keep every attention
 head; only TP and SP ranks split them. The ranks run in lockstep on the same requests, so
 any per-request resource the node declares must stay the same shape on every rank, and a
 node with ``cfg_size > 1`` can't hold a paged KV cache (placement refuses one before
 any worker starts): branches that hold different KV are separate nodes in a graph ``Parallel``
 instead, on a node group with ``cfg_size: 1``, as BAGEL's ``LLM_cfg_text`` and ``LLM_cfg_img`` are.
-``Wan22DitSubmodule`` is the reference.
+Wan2.2 and Qwen-Image are the references.
 
 .. _Expert parallelism (MoE):
 

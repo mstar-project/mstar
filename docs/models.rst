@@ -2172,8 +2172,8 @@ stage: the solver state (the order-2 history buffer and the corrector's
 ``last_sample``) is carried on the denoise loop's own edges, so it travels with
 the request rather than living in a scheduler object on one rank. Requests are
 therefore independent and the loop is resumable across ranks. ``dit_max_batch_size``
-(default 1) lets requests at one latent grid and guidance scale share a forward,
-each row count compiling its own graph.
+(default 1) lets requests at one latent grid, guided or not alike, share a forward
+(their guidance scales may differ), each row count compiling its own graph.
 
 **What is accelerated by default.** The DiT runs under ``torch.compile``
 (``compile_dit``); its self-attention runs on the engine's ragged attention
