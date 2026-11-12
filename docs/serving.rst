@@ -914,15 +914,14 @@ of an openpi ``norm_stats.json``. Without it, ``robot_state`` must already be no
 ``max_state_dim``, 32 when it sets none); anything else is a 400.
 
 A model that supports speculative decoding (drafting several tokens and verifying them in
-one target pass) turns it on with a ``draft`` block; without one it decodes as usual. No shipped
-model declares a drafter yet; a block looks like this:
+one target pass) turns it on with a ``draft`` block; without one it decodes as usual:
 
 .. code-block:: yaml
 
    model_kwargs:
      draft:
-       method: <method>                            # the drafter
-       model: <checkpoint>                         # its checkpoint, for a method that loads one
+       method: dspark                              # the drafter
+       model: deepseek-ai/dspark_qwen3_8b_block7   # its checkpoint
        num_draft_tokens: 7
        mode: auto                                  # auto | synchronous | asynchronous
 

@@ -154,11 +154,26 @@ class ObserveInputs(NamedTuple):
     result: VerifyResult
 
 
+class PrefillInputs(NamedTuple):
+    """What a drafter's ``prefill`` reads on a prompt step, once the target ran and sampled."""
+    # the engine resources of the node
+    resources: Mapping[str, Any]
+    # [tokens]: the step's input ids, and [rows] the token it sampled for each
+    input_ids: torch.Tensor
+    sampled: torch.Tensor
+    # [tokens, hidden]: the target's last hidden states and its input embeddings, every row
+    hidden: torch.Tensor | None = None
+    embeds: torch.Tensor | None = None
+    # what the target's forward was given beside its input (Qwen3's taps), and preprocess's other tensors
+    decoder_kwargs: Mapping[str, Any] = MappingProxyType({})
+    tensors: Mapping[str, torch.Tensor] = MappingProxyType({})
+
+
 @runtime_checkable
 class Drafter(Protocol):
     """A verifying node's drafter, built and loaded by the model. Subclass it
     (beside ``nn.Module`` for one with weights): ``propose`` is abstract, and
-    ``observe`` has a default."""
+    ``observe`` and ``prefill`` have defaults."""
     needs: DrafterNeeds
 
     @abstractmethod
@@ -169,6 +184,11 @@ class Drafter(Protocol):
     def observe(self, inputs: ObserveInputs) -> None:
         """After the verify, in the same forward: what the drafter keeps of the
         step. Nothing by default."""
+        return None
+
+    def prefill(self, inputs: PrefillInputs) -> None:
+        """After a prompt step samples: the drafter's pass over the step's prompt
+        rows. Nothing by default."""
         return None
 
 

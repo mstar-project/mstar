@@ -90,7 +90,11 @@ class Qwen3DenseLM(nn.Module):
         kv_key: str,
         pos_key: str,
         comm_group: CommGroup | None = None,
+        kv_layer_set: str | None = None,
     ):
+        """``kv_layer_set``: the layer set this stack joined its KV pool as, for a
+        stack whose layers follow another's in one pool (a drafter's after its
+        target's); the pool places them, and the stack addresses its own 0..n-1."""
         super().__init__()
         self.config = config
         comm_group = comm_group or CommGroup.trivial()
@@ -114,6 +118,7 @@ class Qwen3DenseLM(nn.Module):
                     attn_key=attn_key,
                     kv_key=kv_key,
                     pos_key=pos_key,
+                    kv_layer_set=kv_layer_set,
                 ),
                 mlp=ParallelGatedMLP(
                     comm_group=comm_group,
@@ -163,15 +168,25 @@ class Qwen3DenseLM(nn.Module):
     def embed(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
-    def forward(self, input_embeds: torch.Tensor, *, label: str) -> torch.Tensor:
+    def forward(self, input_embeds: torch.Tensor, *, label: str, taps=None) -> torch.Tensor:
         """``(tokens, hidden)`` -> ``(tokens, hidden)`` after the final norm.
 
         The label and layer index are cursors on the shared resources: bind
         the label once, advance the index per layer. Passing them as
         arguments instead would make inductor specialize on the int.
+        ``taps``: a drafter's `TapResource`, which ``run_layers`` hands the
+        residual stream entering its layers.
         """
         self.layers[0].self_attn.attend.bind_step(label)
-        return run_layers(self.layers, input_embeds, self.norm)
+        return run_layers(self.layers, input_embeds, self.norm, taps=taps)
+
+    def write_kv(self, hidden_states: torch.Tensor, *, label: str) -> None:
+        """Every layer's K/V of the same ``hidden_states``, under ``label``, without
+        running the stack (`ParallelAttention.write_kv`, the unfused path)."""
+        self.layers[0].self_attn.attend.bind_step(label)
+        for i, layer in enumerate(self.layers):
+            layer.self_attn.attend.set_layer_idx(i)
+            layer.self_attn.write_kv(hidden_states)
 
     def logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.lm_head(hidden_states)

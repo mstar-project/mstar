@@ -13,6 +13,13 @@ setting ``config``, with ``max_position_embeddings`` and ``stop_token_ids``,
 resources (the LLM's sampler from `_sampler_spec`), ``_prompt_ids`` (render
 and tokenize) and ``_create_submodule``.
 
+A subclass that drafts (speculative decoding) sets ``draft`` and
+``drafter_decl`` in its ``__init__`` from its ``draft`` block, and supplies
+`verify_node_fields`; the base then declares the verify node and turns off
+what a verifying node doesn't run yet (mixed steps; the engine turns rebuild
+off, `Engine.rebuild_policies`). Without a draft
+block none of it applies.
+
 Not in ``multimodal.py``: ``mstar.model.base`` imports that module, so a
 `Model` subclass there would be a circular import.
 """
@@ -28,6 +35,8 @@ import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.distributed.base import ShardingConfig
+from mstar.engine.resources.draft.config import DraftConfig
+from mstar.engine.resources.draft.drafter import VerifyNode
 from mstar.engine.resources.sampler.config import SamplerSpec, SamplingReqConfig
 from mstar.engine.resources.spec import CombinedSplit, ResourceReqConfig
 from mstar.graph.base import GraphSection, TensorPointerInfo
@@ -142,6 +151,10 @@ class MultimodalDecoderModel(Model):
     # the checkpoint's sampling defaults, under whatever a request sets (set
     # by `__init__`; a model built without it reads none)
     sampling_defaults: Mapping[str, object] = MappingProxyType({})
+    # speculative decoding, off unless a subclass's `__init__` sets them from its
+    # ``draft`` block: the block, and its drafter's declaration (`DrafterDecl`)
+    draft: DraftConfig | None = None
+    drafter_decl: object | None = None
 
     def __init__(self, model_path_hf: str, cache_dir: str | None = None):
         self.model_path_hf = model_path_hf
@@ -187,6 +200,9 @@ class MultimodalDecoderModel(Model):
     # -----------------------------------------------------------------------
 
     def get_combined_graph_walks(self) -> dict[str, dict[str, set[str]]]:
+        if self.draft is not None:
+            # the engine refuses a verifying node in a combined walk for now
+            return {}
         return text_combined_walks() if self.TEXT_PROMPTS else {}
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
@@ -228,6 +244,8 @@ class MultimodalDecoderModel(Model):
         ``rows`` spans, which the encoders' outputs fill, and the text around
         them ``ids`` spans."""
         present = media_encoders(self.encoders, layout)
+        # a verifying node's rows reserve the verify slack past the verified length, as scratch
+        # the conductor adds from the pool (`KVSpec.request_layout`)
         if not present:
             span = Span("ids", PREFILL_TEXT, length, length, "text_inputs")
             return {KV_CACHE: {"main": LabelLayout(spans=(span,), growth=(("decode_loop", 1),))}}
@@ -249,6 +267,11 @@ class MultimodalDecoderModel(Model):
         """How far a run of ``tokens`` pads moves the position counter: one a
         pad, unless the model places media by their patch ``grid``."""
         return tokens
+
+    def mixed_splits(self) -> tuple[CombinedSplit, ...]:
+        """The LLM's attention resources' ``splits``: the mixed step's, unless
+        the node verifies, which runs no mixed steps."""
+        return () if self.draft is not None else (MIXED_SPLIT,)
 
     # -----------------------------------------------------------------------
     # Intake
@@ -401,6 +424,8 @@ class MultimodalDecoderModel(Model):
         admission (a 400), not dropped."""
         return SamplerSpec(
             resource_key=SAMPLER, nodes={"LLM"}, vocab_size=vocab_size,
+            # `drafter_resources` turns it off for a verifying node, whose verify step can't
+            # penalize per draft position
             enable_repetition_penalty=True,
             enable_min_p=bool(self.sampling_defaults.get("min_p")),
         )
@@ -418,6 +443,39 @@ class MultimodalDecoderModel(Model):
     def request_kwargs(self) -> frozenset[str]:
         # enable_thinking: what each subclass's chat template reads
         return frozenset({"max_output_tokens", "enable_thinking", *SAMPLING_KEYS})
+
+    # -----------------------------------------------------------------------
+    # Speculative decoding
+    # -----------------------------------------------------------------------
+
+    def verify_nodes(self) -> list[VerifyNode]:
+        if self.draft is None:
+            return []
+        penalty = self.sampling_defaults.get("repetition_penalty", 1)
+        if penalty not in (None, 1, 1.0):
+            # it would be every request's default, which verifying refuses
+            raise ValueError(
+                f"the checkpoint defaults repetition_penalty to {penalty}, which speculative decoding can't apply"
+            )
+        node = self.llm_node_class()
+        return [VerifyNode(
+            "LLM", node.DECODE_WALK, self.draft, self.drafter_decl.needs,
+            token_stop=node.node_token_stop(self.config.stop_token_ids, self.encoders, self.TEXT_PROMPTS),
+            device_loopback=node.node_device_loopback(),
+            **self.verify_node_fields(),
+        )]
+
+    def llm_node_class(self) -> type:
+        """The LLM node's `SampledTokenDecoder` subclass, whose stop and
+        loop-back the verify node declares before any submodule exists. A
+        drafting model sets it."""
+        raise NotImplementedError(f"{self.NAME} drafts but names no LLM node class")
+
+    def verify_node_fields(self) -> dict:
+        """The model's own `VerifyNode` fields (its ``input_kinds``, the
+        target's geometry, the drafter's checkpoint and steps). A drafting
+        model sets them."""
+        raise NotImplementedError(f"{self.NAME} drafts but declares no verify node fields")
 
     # -----------------------------------------------------------------------
     # Walk plan

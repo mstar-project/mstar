@@ -35,3 +35,4 @@ def qwen3_lm_config(hf: dict) -> Qwen3Config:
     if hf.get("hidden_act", "silu") != "silu":
         raise ValueError(f"hidden_act {hf['hidden_act']!r} is not supported for Qwen3")
     return Qwen3Config.from_hf({k: v for k, v in hf.items() if k != "stop_token_ids"})
+
