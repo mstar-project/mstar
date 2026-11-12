@@ -36,7 +36,9 @@ AUDIO_IN = "audio_in"               # the client stream carrying the user's audi
 ENCODER_STATE = "encoder_state"     # recurrent-state pool: each call's streaming-encoder conv tails
 ENCODER_FRONT = "encoder_front"     # recurrent-state pool: each call's streaming-encoder audio and mel tails
 CODEC_STATE = "codec_state"         # recurrent-state pool: each call's streaming codec decoder state
-ENCODER_KV = "encoder_kv"           # bounded KV: each call's streaming-encoder attention window, per layer
+ENCODER_KV = "encoder_kv"           # each call's streaming-encoder keys, which its attention window reads, per layer
+ENCODER_ATTN = "encoder_attn"       # the streaming encoder's window read of ENCODER_KV
+ENCODER_STREAM = "encoder_stream"   # each call's counts of samples and mel frames, on the host
 
 # Every node's CUDA-graph batch sizes: a row per live session, up to the sessions
 # a deployment serves by default (``NemotronDuplexModel.DEFAULT_SESSIONS``).

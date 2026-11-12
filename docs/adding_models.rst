@@ -1457,8 +1457,8 @@ within itself and matches the offline mask. ``rel_bias`` is then indexed by that
 ``head_dim ** -0.5``). A per-query window takes no sink, and its right context is 0.
 ``retention`` may be a single ``SinkWindow`` when it does not depend on the source length.
 ``BoundedKVConfig(dtype=None)`` stores the cache in the engine's KV dtype, for layers that
-compute in it. The streaming FastConformer (``encoder_kv_config`` in
-``mstar/model/components/fastconformer_stream.py``, Nemotron VoiceChat's ``ENCODER_KV``) is
+compute in it. The streaming FastConformer (Nemotron VoiceChat's ``ENCODER_KV``, an ``Array``
+with ``max_len=None`` and a ``Window`` read, which the state contract holds in such a cache) is
 the per-query example.
 
 Rolling (compacted) caches

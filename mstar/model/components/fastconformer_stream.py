@@ -15,13 +15,13 @@ kernel shapes.
   exact; the window starts on a multiple of 8 so the strides line up with the
   offline ones.
 - Blocks: each new frame attends the ``left_context`` frames before it and
-  itself in the bounded KV, and each depthwise conv continues from its cached
-  last inputs (``FastConformerEncoder.blocks_stream``).
+  itself through an unbounded array's window, and each depthwise conv
+  continues from its cached last inputs (``FastConformerEncoder.blocks_stream``).
 
-A stream's state is bounded however long it runs: its host counters
-(``StreamState``, in its per-request state), its newest audio and mel frames
-(``front_state_blocks``), the conv tails (``encoder_state_blocks``) and the
-bounded KV (``encoder_kv_config``).
+A stream's state is bounded however long it runs: its counts of samples and mel
+frames (host fields of a Value), its newest audio and mel frames
+(``front_entry``), the conv tails and the array's window, whose count of kept
+entries is the stream's count of encoder frames.
 """
 from __future__ import annotations
 
@@ -35,16 +35,7 @@ from mstar.engine.accelerator_graph_config import (
     PiecewiseCallInputs,
     PiecewiseCaptureShape,
 )
-from mstar.engine.resources import NodeResourceSpec, Segment, SubmoduleStep
-from mstar.engine.resources.kv.bounded import (
-    BoundedKVConfig,
-    BoundedKVSpec,
-    BoundedKVStep,
-    SinkWindow,
-    StreamPosition,
-)
-from mstar.engine.resources.recurrent import RecurrentStateConfig, RecurrentStateSpec, RecurrentStep
-from mstar.engine.resources.recurrent.config import RecurrentBlockConfig
+from mstar.engine.state import ArrayStep, Entry, Segment, SubmoduleStep, TensorType, host, position
 from mstar.model.components.audio_features import NemoLogMel
 from mstar.model.components.dft import stft_basis
 from mstar.model.components.fastconformer import FastConformerConfig, FastConformerEncoder
@@ -52,78 +43,17 @@ from mstar.model.submodule_base import BatchedModelOutput, NodeInputs, NodeSubmo
 from mstar.utils.h2d import to_device_nonblocking
 
 
-class StreamState:
-    """One stream's place in its audio: host counters, which drive every slice
-    so a step needs no sync. The audio and mel frames a later step still reads
-    live in the front pool (``front_state_blocks``)."""
-
-    __slots__ = ("samples", "mels", "position")
-
-    def __init__(self):
-        self.samples = 0        # samples of the stream so far
-        self.mels = 0           # mel frames computed
-        # its place in the bounded KV, which a step's declarations share
-        self.position = StreamPosition(source_len=0, written=0)
-
-    @property
-    def frames(self) -> int:
-        """Encoder frames emitted."""
-        return self.position.written
-
-    @frames.setter
-    def frames(self, value: int):
-        self.position = StreamPosition(source_len=0, written=value)
-
-
-def front_state_blocks(config: FastConformerConfig, hop_length: int) -> dict[str, RecurrentBlockConfig]:
+def front_entry(config: FastConformerConfig, hop_length: int) -> Entry:
     """A stream's front-end state, all a later step reads: its newest
     preemphasized samples (``sig``; every sample until its first mel frame,
     then the window of the next one), its newest mel frames (``mel``; the
     subsampling window of the next encoder frame) and its last raw sample, for
     the preemphasis. Right-aligned: the newest sample / frame is last."""
-    return {
-        "sig": RecurrentBlockConfig(shape=(hop_length * config.subsampling_factor,), dtype=torch.float32),
-        "mel": RecurrentBlockConfig(shape=(2 * config.subsampling_factor, config.num_mel_bins), dtype=torch.float32),
-        "last": RecurrentBlockConfig(shape=(1,), dtype=torch.float32),
-    }
-
-
-def encoder_state_blocks(
-    config: FastConformerConfig, dtype: torch.dtype | None = None,
-) -> dict[str, RecurrentBlockConfig]:
-    """A stream's conv state, per layer: the last ``kernel - 1`` inputs of its
-    depthwise conv. By default in the engine's compute dtype, which the layers
-    compute it in: stored in another, a stream's frames drift from the offline ones."""
-    return {"conv": RecurrentBlockConfig(shape=(config.hidden_size, config.conv_kernel_size - 1), dtype=dtype)}
-
-
-def encoder_kv_config(config: FastConformerConfig, max_slots: int) -> BoundedKVConfig:
-    """A stream's attention keys and values, per layer: each new frame attends
-    the ``left_context`` frames before it and itself, so the KV keeps that many.
-    In the engine's compute dtype, as ``encoder_state_blocks``."""
-    return BoundedKVConfig(
-        num_layers=config.num_layers, num_heads=config.num_heads, head_dim=config.head_dim, rows_per_request=1,
-        max_source_len=0, retention=SinkWindow(0, config.left_context),
-        query_window=config.left_context, max_slots=max_slots, dtype=None,
-    )
-
-
-def stream_node_resources(
-    config: FastConformerConfig, hop_length: int, node: str, max_streams: int, *,
-    kv_key: str, conv_key: str, front_key: str,
-) -> list[NodeResourceSpec]:
-    """The stream node's resources for ``max_streams`` streams: the conv and
-    front pools, each with a sink slot for a capture's padding rows, and the
-    bounded KV, which padding rows leave alone."""
-    def pool(key: str, num_layers: int, blocks: dict[str, RecurrentBlockConfig]) -> RecurrentStateSpec:
-        return RecurrentStateSpec(resource_key=key, nodes={node}, config=RecurrentStateConfig(
-            num_layers=num_layers, blocks=blocks, max_slots=max_streams + 1))
-
-    return [
-        pool(conv_key, config.num_layers, encoder_state_blocks(config)),
-        pool(front_key, 1, front_state_blocks(config, hop_length)),
-        BoundedKVSpec(resource_key=kv_key, nodes={node}, config=encoder_kv_config(config, max_slots=max_streams)),
-    ]
+    return Entry({
+        "sig": TensorType((hop_length * config.subsampling_factor,), dtype=torch.float32),
+        "mel": TensorType((2 * config.subsampling_factor, config.num_mel_bins), dtype=torch.float32),
+        "last": TensorType((1,), dtype=torch.float32),
+    })
 
 
 class FastConformerStreamSubmodule(NodeSubmodule):
@@ -136,8 +66,10 @@ class FastConformerStreamSubmodule(NodeSubmodule):
     Live streams' chunks run in one batched pass, except that a step holding a
     chunk of more than a second (an upload, an opening clip, the stream's last
     append) is not batched (``can_batch``): the engine then runs each stream of
-    it on its own. The encoder is bound to the bounded KV and the conv pool;
-    ``front_key`` names the pool of each stream's audio and mel tails.
+    it on its own. The encoder's layers hold the arrays its ``kv_key`` and
+    ``conv_key`` name; ``front_key`` names the Value of each stream's audio and
+    mel tails, and ``stream_key`` the host-only Value of its sample and mel
+    counts.
 
     A stream one frame of audio further on the frame grid (every live step of
     a stream that declares ``ClientAudio``) runs whole as a CUDA graph (``STEP_REGION``). The
@@ -163,7 +95,6 @@ class FastConformerStreamSubmodule(NodeSubmodule):
 
     STEP_REGION = "conformer_step"
     LAYERS_REGION = "conformer_layers"
-    STATE_KEY = "encoder_stream"         # a stream's StreamState
     # Longest chunk batched with other streams': a pass pads every stream to its
     # longest chunk. One second is a judgement, not a measured crossover.
     BATCHED_CHUNK_S = 1.0
@@ -177,6 +108,7 @@ class FastConformerStreamSubmodule(NodeSubmodule):
         input_edge: str,
         output_edge: str,
         front_key: str,
+        stream_key: str,
         batch_sizes: list[int],
     ):
         super().__init__()
@@ -200,13 +132,13 @@ class FastConformerStreamSubmodule(NodeSubmodule):
             # per-clip normalization can't be streamed; the front end keeps one
             # encoder frame of samples, which must hold the next mel window
             raise ValueError(f"the streaming FastConformer takes a causal [L, 0] encoder bound to its "
-                             f"KV and conv pool, NeMo's pre-2.5 unnormalized featurizer with a preemphasis "
+                             f"KV and conv state, NeMo's pre-2.5 unnormalized featurizer with a preemphasis "
                              f"and n_fft <= {frame_samples}, and capture batch sizes; got {unsupported}")
         self.encoder = encoder
         self.log_mel = log_mel
         self.projection = projection
-        self.input_edge, self.output_edge, self.front_key = input_edge, output_edge, front_key
-        self.front = None   # the front pool, bound as the encoder's layers bind theirs
+        self.input_edge, self.output_edge = input_edge, output_edge
+        self.front_key, self.stream_key = front_key, stream_key
         self.capture_batch_sizes = sorted(batch_sizes)
         self.frame_samples = frame_samples
         # the whole-step region's slices take a featurizer whose half window
@@ -226,26 +158,32 @@ class FastConformerStreamSubmodule(NodeSubmodule):
             return int(self.encoder.config.output_lengths(self.log_mel.num_frames(samples)))
         return (mels - 1) // self.encoder.config.subsampling_factor + 1
 
-    def new_frames(self, st: StreamState, samples: int, final: bool) -> int:
-        """The encoder frames a step makes final for a stream at ``st`` that
-        then has ``samples`` of audio, counted on the host before the step runs,
-        so its declaration can name them and the front end make them. Also
-        without a new mel frame: the end of input can make its last frame final."""
-        mels = max(st.mels, self.log_mel.complete_frames(samples, final))
+    def stream_mels(self, mels: int, samples: int, final: bool) -> int:
+        """The mel frames a stream at ``mels`` has once it holds ``samples`` of audio."""
+        return max(mels, self.log_mel.complete_frames(samples, final))
+
+    def new_frames(self, mels: int, frames: int, samples: int, final: bool) -> int:
+        """The encoder frames a step makes final for a stream at ``mels`` mel
+        frames and ``frames`` encoder frames that then has ``samples`` of audio,
+        counted on the host before the step runs, so its declaration can name
+        them and the front end make them. Also without a new mel frame: the end
+        of input can make its last frame final."""
+        mels = self.stream_mels(mels, samples, final)
         if not mels:
             return 0
-        return max(0, self._final_frames(mels, samples, final) - st.frames)
+        return max(0, self._final_frames(mels, samples, final) - frames)
 
-    def is_steady(self, st: StreamState, chunk: torch.Tensor | None, final: bool) -> bool:
-        """Whether the whole-step region serves this stream's step: one frame of
-        audio onto a stream already two frames in, on the frame grid."""
+    def is_steady(self, samples: int, chunk: torch.Tensor | None, final: bool) -> bool:
+        """Whether the whole-step region serves the step of a stream ``samples``
+        in: one frame of audio onto a stream already two frames in, on the frame
+        grid."""
         fs = self.frame_samples
         return (self.has_steady_step and not final and chunk is not None and chunk.numel() == fs
-                and st.samples >= 2 * fs and st.samples % fs == 0)
+                and samples >= 2 * fs and samples % fs == 0)
 
-    def bind_node_resources(self, resources: dict) -> None:
-        super().bind_node_resources(resources)
-        self.front = resources[self.front_key]
+    def bind_state(self, handles: dict) -> None:
+        self.encoder_kv, self.front_state = handles[self.encoder.kv_key], handles[self.front_key]
+        self.stream_state = handles[self.stream_key]
 
     def encode_clip(self, wav: torch.Tensor) -> torch.Tensor:
         """A whole clip through the featurizer, encoder and projection, as
@@ -264,9 +202,11 @@ class FastConformerStreamSubmodule(NodeSubmodule):
         # the client stream releases one item per step; only its final flush is empty
         assert wav is not None or is_final_stream_chunk, "an empty chunk before the end of the stream"
         # Read, not counted here: admit can refuse the step and run this again.
-        # The previous step's forward has returned, so the state is current.
-        st = self.request_state(fwd_info.rid_handle).get(self.STATE_KEY)
-        samples = (st.samples if st is not None else 0) + (wav.numel() if wav is not None else 0)
+        # The previous step has committed, so the counts are current.
+        rid = fwd_info.rid_handle
+        counts = host(self.stream_state, rid, "main", 0)
+        before = counts["samples"]
+        samples = before + (wav.numel() if wav is not None else 0)
         shortest, rate = self.log_mel.min_samples, self.log_mel.sampling_rate
         if is_final_stream_chunk and samples < shortest:
             # too short to featurize (offline can't either): fail rather than reply to nothing
@@ -275,17 +215,18 @@ class FastConformerStreamSubmodule(NodeSubmodule):
                 f"it needs at least {1000 * shortest / rate:g} ms"
             )
         final = bool(is_final_stream_chunk)
-        at = st or StreamState()
+        frames = position(self.encoder_kv, rid, "main")
         return NodeInputs(
             tensor_inputs={} if wav is None else {"chunk": wav},
             kwargs={
                 "final": final,
                 # whether the whole-step region can serve the stream: decided
                 # here, once, for the declaration and the forward to share
-                "steady": st is not None and self.is_steady(st, wav, final),
-                # the stream's position in the KV and the frames this step adds
-                "position": at.position,
-                "n": self.new_frames(at, samples, final),
+                "steady": self.is_steady(before, wav, final),
+                # the stream's counts before the step, and after it
+                "before": (before, counts["mels"], frames),
+                "after": {"samples": samples, "mels": self.stream_mels(counts["mels"], samples, final)},
+                "n": self.new_frames(counts["mels"], frames, samples, final),
             },
             input_seq_len=0 if wav is None else wav.numel(),   # samples, for can_batch
         )
@@ -296,6 +237,7 @@ class FastConformerStreamSubmodule(NodeSubmodule):
             "final": [inp.kwargs.get("final", False) for inp in inputs],
             "steady": [inp.kwargs.get("steady", False) for inp in inputs],
             "n": [inp.kwargs.get("n", 0) for inp in inputs],
+            "before": [inp.kwargs.get("before") for inp in inputs],
         }
 
     def can_batch(self, batch, model_inputs) -> bool:
@@ -312,52 +254,47 @@ class FastConformerStreamSubmodule(NodeSubmodule):
         # widest region capture every stream of the step would run eagerly.
         return self.capture_batch_sizes[-1]
 
-    def _declare(self, request_ids, keys, kv: BoundedKVStep) -> SubmoduleStep:
+    def _region_step(self, request_ids, keys) -> SubmoduleStep:
+        """A region's streams each add one frame. A region declares no count, since
+        its outer step declares every stream's."""
         return SubmoduleStep(
             segments=[Segment(request_id=rid, label="main", span=1) for rid in request_ids],
-            steps={**{key: RecurrentStep() for key in keys}, self.encoder.kv_key: kv},
+            state={key: ArrayStep() for key in (self.encoder.kv_key, *keys)},
         )
-
-    @staticmethod
-    def _kv_step(request_ids, spans: list[int], positions: dict) -> BoundedKVStep:
-        """Each stream's new frames (``spans``) at its position in the stream."""
-        return BoundedKVStep(
-            segments=tuple(Segment(request_id=rid, label="main", span=n)
-                           for rid, n in zip(request_ids, spans, strict=True)),
-            positions=positions,
-        )
-
-    def _region_kv_step(self, request_ids) -> BoundedKVStep:
-        """A region's streams each add one frame. A capture's or a replay's
-        padding row has no stream state, so it gets no position: the resource
-        plans it as padding."""
-        positions = {}
-        for rid in request_ids:
-            state = self.request_states.get(rid)
-            st = None if state is None else state.get(self.STATE_KEY)
-            if st is not None:
-                positions[rid] = st.position
-        return self._kv_step(request_ids, [1] * len(request_ids), positions)
 
     def declare_step(self, graph_walk, request_ids, inputs, slot_lease=None, piecewise_leases=None,
-                     **kwargs) -> SubmoduleStep | None:
+                     **kwargs) -> SubmoduleStep:
         del graph_walk, slot_lease, kwargs
+        counts = {(rid, "main", 0): inp.kwargs["after"] for rid, inp in zip(request_ids, inputs, strict=True)}
         # A live step where every stream is one frame on replays STEP_REGION
         # over the whole batch, at the bucket its lease names, and the region's
-        # own step owns every resource. Each such stream already holds its slots,
-        # from a first step declared below, so that step's admit reserves nothing.
+        # own step owns every array but the counts. Each such stream already
+        # holds its slots, from a first step declared below.
+        segments = [Segment(request_id=rid, label="main", span=1) for rid in request_ids]
         if self.STEP_REGION in (piecewise_leases or {}) and all(inp.kwargs["steady"] for inp in inputs):
-            return None
+            return SubmoduleStep(segments=segments, state={self.stream_key: ArrayStep(host=counts)})
         # Otherwise this step reserves and plans every stream's slots and new
         # frames, and the eager path reads that plan. A region the forward still
         # replays for some streams re-plans their rows into its own buffers, after
         # the eager path has read this plan. It can't own those rows instead: its
         # lease names the whole batch's bucket, not the sub-batch's, which may
         # have no graph, and its admit can't refuse a stream that has no slot yet.
-        spans = [inp.kwargs["n"] for inp in inputs]
-        positions = {rid: inp.kwargs["position"] for rid, inp in zip(request_ids, inputs, strict=True)}
-        return self._declare(request_ids, (self.front_key, self.encoder.conv_key),
-                             self._kv_step(request_ids, spans, positions))
+        frames = tuple(Segment(request_id=rid, label="main", span=inp.kwargs["n"])
+                       for rid, inp in zip(request_ids, inputs, strict=True))
+        # a stream with no chunk that doesn't end leaves its front end as it is
+        front = tuple(
+            Segment(request_id=rid, label="main", span=int("chunk" in inp.tensor_inputs or inp.kwargs["final"]))
+            for rid, inp in zip(request_ids, inputs, strict=True)
+        )
+        return SubmoduleStep(
+            segments=segments,
+            state={
+                self.encoder.kv_key: ArrayStep(segments=frames),
+                self.encoder.conv_key: ArrayStep(segments=frames),
+                self.front_key: ArrayStep(segments=front),
+                self.stream_key: ArrayStep(host=counts),
+            },
+        )
 
     def get_piecewise_accelerator_graph_configs(
         self, device: torch.device, autocast_dtype: torch.dtype, tp_world_size: int = 1,
@@ -380,8 +317,7 @@ class FastConformerStreamSubmodule(NodeSubmodule):
         def region(fn, inputs, keys, lease) -> PiecewiseBatchedConfig:
             return PiecewiseBatchedConfig(
                 capture_fn=fn, make_static_inputs=inputs,
-                declare_step=lambda request_ids, seq_lens: self._declare(
-                    request_ids, keys, self._region_kv_step(request_ids)),
+                declare_step=lambda request_ids, seq_lens: self._region_step(request_ids, keys),
                 seq_len=1, capture_batch_sizes=self.capture_batch_sizes, compile=False, lease_before_step=lease,
             )
 
@@ -423,8 +359,8 @@ class FastConformerStreamSubmodule(NodeSubmodule):
         window is the 15 mel frames before them plus them (the third output)."""
         fs, f = self.frame_samples, self.encoder.config.subsampling_factor
         hop, pad = self.log_mel.hop_length, self.log_mel.n_fft // 2
-        last, sig = self.front.gather("last"), self.front.gather("sig")
-        mel_tail = self.front.gather("mel")
+        front = self.front_state.read(0).fields
+        last, sig, mel_tail = front["last"], front["sig"], front["mel"]
         x = chunk.to(torch.float32)
         y = x - self.log_mel.preemphasis * torch.cat([last, x[:, :-1]], dim=1)
         win = torch.cat([sig, y], dim=1)                                    # samples S - fs .. S + fs
@@ -432,14 +368,13 @@ class FastConformerStreamSubmodule(NodeSubmodule):
         mel_new = self.log_mel.windows(win[:, fs - hop - pad: 2 * fs - 2 * hop + pad], self.stft_basis)
         window = torch.cat([mel_tail[:, 1:], mel_new], dim=1)               # (B, 23, n_mels)
         new = self.encoder.subsample(window)[:, 2:3]
-        self.front.scatter_("sig", y)
-        self.front.scatter_("last", x[:, -1:])
-        self.front.scatter_("mel", torch.cat([mel_tail, mel_new], dim=1)[:, -2 * f:])
+        self.front_state.write(0, sig=y, last=x[:, -1:], mel=torch.cat([mel_tail, mel_new], dim=1)[:, -2 * f:])
         return self._blocks_stream(new, chunk.new_ones(chunk.shape[0], dtype=torch.long))
 
-    def _front(self, sts: list[StreamState], chunks: list[torch.Tensor | None], final: list[bool],
-               n: list[int]) -> torch.Tensor | None:
-        """Append each stream's chunk; the ``n`` block inputs it made final
+    def _front(self, chunks: list[torch.Tensor | None], final: list[bool], n: list[int],
+               before: list[tuple[int, int, int]]) -> torch.Tensor | None:
+        """Append each stream's chunk to a stream ``before[i]`` = (samples, mel
+        frames, encoder frames) in; the ``n`` block inputs it made final
         (``new_frames``, counted before the step), ``(B, max(n), hidden)``
         zero-padded, or None when no stream has one. A stream with no chunk and
         not at its end is left as it is."""
@@ -449,23 +384,25 @@ class FastConformerStreamSubmodule(NodeSubmodule):
                 if fin or (ch is not None and ch.numel())]
         if not busy:
             return None
-        last, sig = self.front.gather("last"), self.front.gather("sig")
-        mel_tail = self.front.gather("mel")
+        front = self.front_state.read(0).fields
+        last, sig, mel_tail = front["last"], front["sig"], front["mel"]
         new_sig, new_last, new_mel = list(sig), list(last), list(mel_tail)
+        samples = {i: before[i][0] for i in busy}
+        mels = {i: before[i][1] for i in busy}
         rows, lo_hi, mel_rows = [], [], []
         for i in busy:
-            st, chunk = sts[i], chunks[i]
-            held = min(st.samples, keep_sig)
-            win, base = sig[i, keep_sig - held:], st.samples - held          # win[0] is sample ``base``
+            chunk = chunks[i]
+            held = min(samples[i], keep_sig)
+            win, base = sig[i, keep_sig - held:], samples[i] - held          # win[0] is sample ``base``
             if chunk is not None and chunk.numel():
                 xr = chunk.to(torch.float32).reshape(-1)
                 # ``last`` reads 0 in a fresh slot: the featurizer's preemphasis keeps the first sample
                 y = xr - self.log_mel.preemphasis * torch.cat([last[i], xr[:-1]])
                 win = torch.cat([win, y])
                 new_last[i] = xr[-1:]
-                st.samples += xr.numel()
+                samples[i] += xr.numel()
             new_sig[i] = F.pad(win[-keep_sig:], (max(0, keep_sig - win.numel()), 0))
-            lo, hi = st.mels, self.log_mel.complete_frames(st.samples, final[i])
+            lo, hi = mels[i], self.log_mel.complete_frames(samples[i], final[i])
             if hi <= lo:
                 continue
             rows.append(self.log_mel.stream_span(win, base, lo, hi, final[i]))
@@ -476,19 +413,17 @@ class FastConformerStreamSubmodule(NodeSubmodule):
             mel = self.log_mel.windows(torch.stack([F.pad(r, (0, width - r.numel())) for r in rows]))
             added = {i: mel[row, : hi - lo] for row, (i, lo, hi) in enumerate(lo_hi)}
         for i in busy:
-            st = sts[i]
-            held = min(st.mels, keep_mel)
-            mels, first = mel_tail[i, keep_mel - held:], st.mels - held      # mels[0] is mel frame ``first``
+            frames = before[i][2]
+            held = min(mels[i], keep_mel)
+            kept, first = mel_tail[i, keep_mel - held:], mels[i] - held      # kept[0] is mel frame ``first``
             if i in added:
-                mels = torch.cat([mels, added[i]])
-                st.mels += added[i].shape[0]
-                new_mel[i] = F.pad(mels[-keep_mel:], (0, 0, max(0, keep_mel - mels.shape[0]), 0))
+                kept = torch.cat([kept, added[i]])
+                mels[i] += added[i].shape[0]
+                new_mel[i] = F.pad(kept[-keep_mel:], (0, 0, max(0, keep_mel - kept.shape[0]), 0))
             if n[i]:
-                start = max(0, f * st.frames - 2 * f)     # the subsampling window's first mel frame
-                mel_rows.append((i, mels[start - first:], (st.frames - start // f, n[i])))
-        self.front.scatter_("sig", torch.stack(new_sig))
-        self.front.scatter_("last", torch.stack(new_last))
-        self.front.scatter_("mel", torch.stack(new_mel))
+                start = max(0, f * frames - 2 * f)     # the subsampling window's first mel frame
+                mel_rows.append((i, kept[start - first:], (frames - start // f, n[i])))
+        self.front_state.write(0, sig=torch.stack(new_sig), last=torch.stack(new_last), mel=torch.stack(new_mel))
         if not mel_rows:
             return None
         lens = [w.shape[0] for _, w, _ in mel_rows]
@@ -496,20 +431,12 @@ class FastConformerStreamSubmodule(NodeSubmodule):
         # a strided conv reads a frame past a row's end, which alone is the conv's
         # zero padding: the subsampling masks each row past its own length
         out = self.encoder.subsample(windows, to_device_nonblocking(lens, windows.device))
-        x = out.new_zeros(len(sts), max(n), out.shape[-1])
+        x = out.new_zeros(len(chunks), max(n), out.shape[-1])
         for row, (i, _, (at, k)) in enumerate(mel_rows):
             x[i, :k] = out[row, at: at + k]
         return x
 
     # -- the step ---------------------------------------------------------------
-
-    def _stream_state(self, rid) -> StreamState:
-        state = self.request_state(rid)
-        st = state.get(self.STATE_KEY)
-        if st is None:
-            st = StreamState()
-            state.add(self.STATE_KEY, st)
-        return st
 
     @staticmethod
     def _to_device(chunks: list, device: torch.device) -> list:
@@ -524,10 +451,10 @@ class FastConformerStreamSubmodule(NodeSubmodule):
                 moved[i] = part
         return moved
 
-    def forward_batched(self, graph_walk, engine_inputs, chunk=None, final=None, steady=None, n=None, **kwargs):
+    def forward_batched(self, graph_walk, engine_inputs, chunk=None, final=None, steady=None, n=None, before=None,
+                        **kwargs):
         rids = list(engine_inputs.request_ids)
         device = self.projection.weight.device
-        states = [self._stream_state(rid) for rid in rids]
         chunks = self._to_device(chunk, device)
         runners = engine_inputs.piecewise_runners or {}
         frames: list[torch.Tensor | None] = [None] * len(rids)
@@ -541,9 +468,8 @@ class FastConformerStreamSubmodule(NodeSubmodule):
             return (bool(new) and max(n[i] for i in new) == 1 and layers_runner is not None
                     and layers_runner.can_run(len(new)))
 
-        if engine_inputs.step is None:
-            # declare_step left every resource to the region, which its lease says can replay the batch
-            assert all(steady), "an encoder step declared nothing but is not all steady"
+        if self.STEP_REGION in engine_inputs.piecewise_leases and all(steady):
+            # declare_step left every array but the counts to the region, which its lease says can replay the batch
             steady = list(range(len(rids)))
         else:
             # This step's KV plan writes every stream's new frames, so the region (which
@@ -566,7 +492,7 @@ class FastConformerStreamSubmodule(NodeSubmodule):
         # a step of its own (see can_batch).
         x = None
         if len(steady) < len(rids):
-            x = self._front(states, chunks, final, eager_n)
+            x = self._front(chunks, final, eager_n, before)
         if x is not None:
             new = [i for i, k in enumerate(eager_n) if k]
             if layers_graph(new):
@@ -578,17 +504,12 @@ class FastConformerStreamSubmodule(NodeSubmodule):
             else:
                 y = self._blocks_stream(x, to_device_nonblocking(eager_n, device))
             for i in new:
-                states[i].frames += eager_n[i]
                 frames[i] = y[i][: eager_n[i]]
 
         if steady:
             y = step_runner.run(static_inputs={"chunk": torch.stack(steady_chunks)},
                                 request_ids=[rids[i] for i in steady])["y"]
             for row, i in enumerate(steady):
-                st = states[i]
-                st.samples += self.frame_samples
-                st.mels += self.encoder.config.subsampling_factor
-                st.frames += 1
                 frames[i] = y[row]
         # One stream item per frame: a single (T, H) tensor would be ONE item,
         # which the chunk policy could not slice. No check_stop, so nothing to

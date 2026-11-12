@@ -72,6 +72,7 @@ from mstar.engine.state import (
     SampleSettings,
     TensorType,
     Value,
+    Window,
 )
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
@@ -84,15 +85,17 @@ from mstar.model.base import (
     serving_resources,
 )
 from mstar.model.components.audio_features import NemoLogMel
-from mstar.model.components.fastconformer_stream import stream_node_resources
+from mstar.model.components.fastconformer_stream import front_entry
 from mstar.model.multimodal import PromptPart
 from mstar.model.nemotron_duplex.components.audio_codec import codec_entry
 from mstar.model.nemotron_duplex.config import (
     AUDIO_IN,
     CODEC_STATE,
+    ENCODER_ATTN,
     ENCODER_FRONT,
     ENCODER_KV,
     ENCODER_STATE,
+    ENCODER_STREAM,
     MAMBA,
     MAMBA_CONV,
     MAMBA_STATE,
@@ -346,9 +349,24 @@ class NemotronDuplexModel(Model):
         return self.max_session_frames + self.LOOP_ITERS_MARGIN
 
     def declare_state(self) -> list[Array | Sampler]:
-        nano, eartts = self.config.nano, self.config.eartts
+        nano, eartts, enc = self.config.nano, self.config.eartts, self.config.stt.encoder
         kinds = nano.layer_types
+        encoder_layers = frozenset(range(enc.num_layers))
         return [
+            Value(ENCODER_STATE, nodes={"conformer_encoder"}, layers=encoder_layers,
+                  entry=Entry({"conv": TensorType((enc.hidden_size, enc.conv_kernel_size - 1), dtype=None)})),
+            Value(ENCODER_FRONT, nodes={"conformer_encoder"}, layers={0},
+                  entry=front_entry(enc, self.config.stt.hop_length)),
+            # each frame attends the left_context frames before it and itself, and the count of kept entries is the
+            # stream's encoder frames
+            Array(
+                ENCODER_KV, nodes={"conformer_encoder"}, layers=encoder_layers, max_len=None,
+                entry=KVEntry(heads=enc.num_heads, head_dim=enc.head_dim), positions=Positions(),
+                reads={ENCODER_ATTN: Read(mask=Window(enc.left_context + 1), op=Attend(q_heads=enc.num_heads),
+                                          packed=False)},
+            ),
+            Value(ENCODER_STREAM, nodes={"conformer_encoder"}, layers={0},
+                  entry=Entry({}, host={"samples": int, "mels": int})),
             # only the ``*`` (attention) layers hold a KV cache
             Array(
                 NANO_KV, nodes={"nano_llm"}, layers=frozenset(i for i, k in enumerate(kinds) if k == "attention"),
@@ -383,6 +401,9 @@ class NemotronDuplexModel(Model):
 
     def kernel_settings(self) -> dict[str, dict[str, int]]:
         return {
+            ENCODER_KV: {"max_slots": self.DEFAULT_SESSIONS},
+            ENCODER_STATE: {"max_slots": self.DEFAULT_SESSIONS + 1},
+            ENCODER_FRONT: {"max_slots": self.DEFAULT_SESSIONS + 1},
             # a session holds its prompt and every frame for life (no eviction)
             NANO_KV: {"max_num_pages": self.nano_kv_pages(DEFAULT_PAGE_SIZE)},
             # + 1 for the pool's sink slot, so DEFAULT_SESSIONS sessions fit
@@ -393,12 +414,7 @@ class NemotronDuplexModel(Model):
         }
 
     def get_node_resources(self) -> list[NodeResourceSpec]:
-        return [
-            *stream_node_resources(
-                self.config.stt.encoder, self.config.stt.hop_length, "conformer_encoder", self.DEFAULT_SESSIONS,
-                kv_key=ENCODER_KV, conv_key=ENCODER_STATE, front_key=ENCODER_FRONT,
-            ),
-        ]
+        return []
 
     def get_request_resource_configs(
         self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
@@ -998,7 +1014,7 @@ class NemotronDuplexModel(Model):
         )
         return FastConformerStreamSubmodule(
             encoder, log_mel, proj, input_edge=AUDIO_IN, output_edge="audio_frame",
-            front_key=ENCODER_FRONT, batch_sizes=SESSION_BATCH_SIZES,
+            front_key=ENCODER_FRONT, stream_key=ENCODER_STREAM, batch_sizes=SESSION_BATCH_SIZES,
         )
 
     def _create_talker_submodule(

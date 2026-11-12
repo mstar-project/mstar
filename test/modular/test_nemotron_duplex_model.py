@@ -214,7 +214,7 @@ def test_duplex_encoder_state_is_stored_in_the_engines_compute_dtype(autocast_dt
 
     model = _make_model()
     model.validate_config_yaml({"autocast_dtype": autocast_dtype}, "c.yaml")
-    specs = {s.resource_key: s for s in model.get_node_resources()}
+    specs = {s.resource_key: s for s in node_resources(model)}
     info = EngineResourceInfo(device=torch.device("cpu"), kv_dtype=autocast_dtype)
     pool = RecurrentStatePool.build(specs[ENCODER_STATE], info)
     want = torch.float32 if autocast_dtype is None else autocast_dtype
@@ -449,7 +449,7 @@ def test_duplex_realtime_frames_audio_on_the_encoder_fronts_frame():
     off the whole-step graph."""
     model = _make_model()
     (client,) = model.get_partition_topology().client_connections()
-    front = {s.resource_key: s for s in model.get_node_resources()}[ENCODER_FRONT]
+    front = {s.resource_key: s for s in node_resources(model)}[ENCODER_FRONT]
     assert client.audio.frame_samples == front.config.blocks["sig"].shape[0]
 
 
