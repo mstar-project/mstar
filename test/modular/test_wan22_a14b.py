@@ -141,6 +141,21 @@ def test_a14b_configs_place_every_node(name):
     assert walks == {Wan22Model.ENCODE_TEXT_WALK, Wan22Model.VIDEO_GEN_WALK}
 
 
+def test_a14b_sp2_pipelines_its_ulysses_exchange_over_two_head_groups():
+    """A14B's 40 heads on its SP2 config's two ranks split into the DiT's two head groups, 10 heads each."""
+    import yaml
+
+    from mstar.distributed.ulysses_pipeline import UlyssesPipeline
+    from mstar.engine.state.adapters import node_resources
+    from mstar.model.wan22.config import SELF_ATTN
+
+    with open(CONFIGS / "wan22_a14b_sp2.yaml") as f:
+        (dit,) = [group for group in yaml.safe_load(f)["node_groups"] if "dit" in group["node_names"]]
+    (attn,) = [spec for spec in node_resources(_model()) if spec.resource_key == SELF_ATTN]
+    assert (attn.config.num_qo_heads, attn.config.ulysses_head_groups) == (40, 2)
+    assert UlyssesPipeline(SimpleNamespace(world_size=dit["sp_size"]), attn.config.ulysses_head_groups).supports(40)
+
+
 # ----------------------------------------------------------------------
 # the two experts
 # ----------------------------------------------------------------------
