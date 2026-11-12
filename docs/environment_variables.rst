@@ -258,10 +258,13 @@ model, so they are named for it.
        model code does not run on transformers 5). Unset under transformers 5,
        the SDK comparison skips.
 
-Serving (Python frontend)
--------------------------
+Serving (API server)
+--------------------
 
-Read by ``mstar-serve`` / ``mstar.api_server.entrypoint``.
+Read by ``mstar-serve`` / ``mstar.api_server.entrypoint``, whichever frontend
+serves HTTP. Where a row describes how a route answers, it is the Python
+frontend's (``--python-frontend``); ``mstar-server``'s rows are under
+`Serving (Rust frontend)`_.
 
 .. list-table::
    :header-rows: 1
@@ -330,8 +333,8 @@ Read by ``mstar-serve`` / ``mstar.api_server.entrypoint``.
 Serving (Rust frontend)
 -----------------------
 
-Read by the ``mstar-server`` binary and its bridge
-(``mstar-serve --rust-frontend``; see :doc:`installation`).
+Read by the ``mstar-server`` binary, ``mstar serve``'s default HTTP frontend,
+and its bridge (see :doc:`installation`).
 
 .. list-table::
    :header-rows: 1
@@ -352,19 +355,19 @@ Read by the ``mstar-server`` binary and its bridge
      - unset
      - Same rule as the Python server (``rust/server/src/auth.rs``, read
        once at startup): every route except ``/health`` and ``/metrics`` needs
-       ``Authorization: Bearer <key>``. ``mstar-serve --rust-frontend``
+       ``Authorization: Bearer <key>``. ``mstar-serve``
        sets it from ``--api-key`` / its own environment.
    * - ``MSTAR_REQUEST_TIMEOUT_S``
      - ``600``
      - Per-request budget in the Rust frontend, in seconds; on expiry the
        client gets an error and the request is aborted in the backend. ``0``
        times every request out; a negative, non-finite or unreadable value is
-       the default. ``mstar serve --rust-frontend`` sets it from ``--timeout``
+       the default. ``mstar serve`` sets it from ``--timeout``
        (``launch_rust_server``).
    * - ``MSTAR_SAMPLE_RATE``
      - ``24000``
      - Sample rate stamped on the Rust frontend's WAV output.
-       ``mstar serve --rust-frontend`` sets it to the model's
+       ``mstar serve`` sets it to the model's
        ``get_output_sample_rate("audio")``, as the Python frontend reads it.
    * - ``MSTAR_LIBSNDFILE``
      - unset
@@ -380,9 +383,10 @@ Read by the ``mstar-server`` binary and its bridge
    * - ``MSTAR_SERVED_MODELS``
      - unset
      - The names a Rust-frontend request's ``model`` may carry, as JSON: the
-       base model's names and the served LoRA adapters
-       (``api_server/served_models.py``, ``rust/server/src/served_models.rs``).
-       Unset serves the base model alone. Not for deployments to set:
+       base model's names and the LoRA adapters served at launch
+       (``api_server/served_models.py``, ``rust/server/src/served_models.rs``);
+       the API server pushes each later change over the bridge. Unset serves
+       the base model alone. Not for deployments to set:
        ``launch_rust_server`` sets it from the API server's ``ServedModels``.
    * - ``MSTAR_TRANSCRIPTION``
      - unset
@@ -416,6 +420,15 @@ Read by the ``mstar-server`` binary and its bridge
        library ``onnxruntime`` loads, Silero's weights, why Smart Turn did not
        load (if it didn't), and the model's tokenizer. Not for deployments to
        set: ``launch_rust_server`` sets it from ``realtime_facts``.
+   * - ``MSTAR_CHAT_TEMPLATE``
+     - unset
+     - What the Rust frontend's GLM chat needs of the model's chat template, as
+       JSON: whether the model always reasons, the ``chat_template_kwargs`` keys
+       the template reads, and its ``reasoning_effort`` levels, which
+       ``/v1/messages`` and ``/v1/responses`` map an effort onto. Not for
+       deployments to set:
+       ``launch_rust_server`` sets it from ``chat_template_facts`` for
+       ``glm52`` and ``glm5_next``.
    * - ``MSTAR_ALLOW_REMOTE``
      - ``0``
      - Allow ``http(s)`` media URLs in requests, fetched server-side by both
@@ -468,7 +481,7 @@ Read by the ``mstar-server`` binary and its bridge
      - The class name of the model's adapter in ``ADAPTER_REGISTRY``
        (``openai_adapter_class`` in ``mstar/api_server/rust_frontend.py``), which
        picks the OpenAI translation ``mstar-server`` uses
-       (``adapters::from_python``, which looks it up in ``ADAPTERS``). ``mstar-serve --rust-frontend`` always sets it;
+       (``adapters::from_python``, which looks it up in ``ADAPTERS``). ``mstar-serve`` always sets it;
        a ``mstar-server`` started by hand without it answers 404 on ``/v1/*``.
    * - ``MSTAR_TOKENIZER``
      - unset
@@ -476,14 +489,6 @@ Read by the ``mstar-server`` binary and its bridge
        tokenization. Leave unset with the Python backend — its preprocess
        worker owns tokenization, and the bridge rejects pre-tokenized
        ingest.
-
-Rust frontend limitations
-~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-The Rust frontend serves every route the Python frontend serves but LoRA's
-runtime updates (``/v1/load_lora_adapter`` and ``/v1/unload_lora_adapter``, see
-:doc:`models`): ``mstar serve`` refuses ``--rust-frontend`` with
-``runtime_updates: true``.
 
 Request media
 -------------

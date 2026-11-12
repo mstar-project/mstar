@@ -10,7 +10,7 @@ protocol are untouched):
     frontend -> bridge:  {t:"submit", rid, sub, text, file_paths,
                           input_modalities, output_modalities, model_kwargs,
                           prompt_parts, streaming, accepts_chunks, report_usage}
-                       | {t:"abort", rid, sub}
+                       | {t:"abort", rid, sub, outcome?}
                        | {t:"ping", rid, sub}
                        | {t:"metrics", rid, sub, refusals:{route, status, count}}
                        | {t:"check_ref_audio", rid, sub, path, decoder, bare}
@@ -18,8 +18,11 @@ protocol are untouched):
                        | {t:"windows", rid, sub, op, plan, ...}
                        | {t:"live", rid, sub, op, call, ..., stream?, audio?(bin)}
                        | {t:"end_of_turn", rid, sub, audio(bin)}
-    bridge -> frontend:  {t:"chunk", rid, sub, modality, data(bin), metadata}
-                       | {t:"chunks", subs, modalities, payloads(bin), metadatas}
+                       | {t:"lora", rid, sub, op, lora_name, lora_path?}
+                       | {t:"count_tokens", rid, sub, text, input_modalities, output_modalities,
+                          model_kwargs, prompt_parts}
+    bridge -> frontend:  {t:"chunk", rid, sub, modality, data(bin), metadata, num_tokens, prompt_tokens}
+                       | {t:"chunks", subs, modalities, payloads(bin), metadatas, token_counts, prompt_counts}
                        | {t:"err", rid, sub, msg} | {t:"done", rid, sub}
                        | {t:"pong", rid, sub}
                        | {t:"metrics", rid, sub, data(bin), metadata}
@@ -28,6 +31,9 @@ protocol are untouched):
                        | {t:"windows", rid, sub, metadata:{duration, single, windows} | {error}}
                        | {t:"live", rid, sub, metadata:{taking | accepted | rejected | error, status, error_id?}}
                        | {t:"end_of_turn", rid, sub, metadata:{p} | {error}}
+                       | {t:"lora", rid, sub, metadata:{text} | {error:{status, message}}}
+                       | {t:"count_tokens", rid, sub, metadata:{input_tokens} | {error:{status, message}}}
+                       | {t:"served", adapters}   (unsolicited, on every change)
 
 A ``live`` request is one operation on a ``/generate/ws`` live call, the
 submission ``call`` names: ``taking`` (``taking_input``), ``append``
@@ -59,7 +65,10 @@ end, always goes out as ``chunk``.
 
 A submit that sets ``report_usage`` (a chat) gets a last ``chunk`` of
 modality ``usage`` before ``done``: its token counts and finish reason in
-``metadata`` (``APIServer.submit_request``'s ``report_usage``).
+``metadata`` (``APIServer.submit_request``'s ``report_usage``). Every chunk also
+carries ``ResultChunk.num_tokens`` and ``prompt_tokens``, so a reply the
+frontend ends before that chunk (at a stop string) still has its usage; that
+abort carries ``outcome: "success"``, as the reply was whole.
 
 ``sub`` names one submission and is never reused. A client may resubmit its
 ``rid`` as soon as it drops a stream, and that stream's ``done`` or late
@@ -74,8 +83,8 @@ only, one map of ``PromptPart``'s fields per part. The bridge mesh lives in
 its own socket dir (private to the frontend/bridge pair), so entity names
 never collide with the conductor/worker mesh.
 
-Opt-in: ``mstar-serve --rust-frontend`` replaces ``uvicorn.run`` with the
-``mstar-server`` binary + this loop. Everything else in the process
+``mstar-serve`` runs the ``mstar-server`` binary + this loop in place of
+``uvicorn.run`` (unless ``--python-frontend``). Everything else in the process
 (preprocess worker, conductor spawn, tensor transport) is identical. The
 frontend enforces the API key (``--api-key`` / ``MSTAR_API_KEY``) itself; the
 bridge socket is private to the pair.
@@ -89,8 +98,10 @@ import logging
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sysconfig
+import threading
 from enum import StrEnum
 from pathlib import Path
 
@@ -102,7 +113,7 @@ from mstar.communication.rust_communicator import (
 )
 from mstar.graph.runtime.utils import CHECKOUT_RUST, is_mstar_rust_crate, require_rust_extension
 from mstar.model.multimodal import PromptPart
-from mstar.utils.client_errors import client_error_text, scrub_paths
+from mstar.utils.client_errors import client_error_text, exception_status_text, scrub_paths
 from mstar.utils.threads import ThreadPool
 
 logger = logging.getLogger(__name__)
@@ -210,6 +221,8 @@ WS_MAX_BYTES_ENV = "MSTAR_WS_MAX_BYTES"
 CLIENT_STREAMS_ENV = "MSTAR_CLIENT_STREAMS"
 #: What ``/v1/realtime`` runs with, as JSON (``realtime_facts``).
 REALTIME_ENV = "MSTAR_REALTIME"
+#: What a chat adapter's port needs of the model's chat template, as JSON (``chat_template_facts``).
+CHAT_TEMPLATE_ENV = "MSTAR_CHAT_TEMPLATE"
 
 
 class WindowOp(StrEnum):
@@ -340,6 +353,20 @@ def conversation_facts(server) -> dict | None:
     return facts
 
 
+def chat_template_facts(adapter) -> dict | None:
+    """``CHAT_TEMPLATE_ENV``'s value for an adapter whose port renders the chat
+    template's switches (``GlmChatAdapter``): whether the model always reasons,
+    the ``chat_template_kwargs`` keys its template reads, and its
+    ``reasoning_effort`` levels, least first. ``None`` for any other adapter."""
+    from mstar.api_server.openai.adapters import GlmChatAdapter
+    from mstar.model.multimodal import GLM_TEMPLATE_KWARGS
+
+    if not isinstance(adapter, GlmChatAdapter):
+        return None
+    return {"always_thinks": adapter.always_thinks, "template_kwargs": list(GLM_TEMPLATE_KWARGS),
+            "reasoning_efforts": list(adapter.reasoning_efforts)}
+
+
 def realtime_facts(server, adapter, directory: str) -> dict | None:
     """``REALTIME_ENV``'s value for a model with a ``/v1/realtime`` surface.
     ``conversation`` is ``conversation_facts``'. For a realtime transcription
@@ -381,7 +408,7 @@ def launch_rust_server(binary: str, model_name: str, port: int,
                        sample_rate: int | None = None, served_models=None,
                        transcription: dict | None = None, openpi: dict | None = None,
                        ws_max_bytes: int | None = None, client_streams=(),
-                       realtime: dict | None = None) -> subprocess.Popen:
+                       realtime: dict | None = None, chat_template: dict | None = None) -> subprocess.Popen:
     """``timeout_s`` is ``--timeout`` and ``sample_rate`` the model's audio output rate
     (``get_output_sample_rate``); ``None`` leaves the frontend's own default.
     ``served_models`` is the API server's ``ServedModels``, whose LoRA adapters a
@@ -389,7 +416,8 @@ def launch_rust_server(binary: str, model_name: str, port: int,
     ``transcription`` is ``transcription_facts``' for the served model, ``openpi``
     ``openpi_facts``' for its policy, ``ws_max_bytes`` the config's WebSocket
     message limit, ``client_streams`` the model's (``APIServer.client_streams``), and
-    ``realtime`` ``realtime_facts``' for its realtime surface."""
+    ``realtime`` ``realtime_facts``' for its realtime surface, and
+    ``chat_template`` ``chat_template_facts``' for its chat adapter."""
     # The key goes through the environment, not argv, which any local user
     # can read from the process list. ``api_key`` is the resolved setting, so
     # an inherited MSTAR_API_KEY must not override it.
@@ -419,6 +447,9 @@ def launch_rust_server(binary: str, model_name: str, port: int,
     env.pop(REALTIME_ENV, None)
     if realtime is not None:
         env[REALTIME_ENV] = json.dumps(realtime)
+    env.pop(CHAT_TEMPLATE_ENV, None)
+    if chat_template is not None:
+        env[CHAT_TEMPLATE_ENV] = json.dumps(chat_template)
     env.pop(LIBSNDFILE_ENV, None)
     if (libsndfile := soundfile_library()) is not None:
         env[LIBSNDFILE_ENV] = libsndfile
@@ -475,11 +506,30 @@ class RustFrontendBridge:
         self.loop: asyncio.AbstractEventLoop | None = None
         # a transcription upload's WindowPlanner, by the frontend's plan id, until it closes
         self._planners: dict = {}
+        # mstar-server selects LoRA adapters itself, with no round trip per request:
+        # every change to the served set (a runtime load or unload, a conductor's
+        # answer that came after its request timed out) is pushed to it
+        served = getattr(server, "served_models", None)
+        if served is not None:
+            served.subscribe(self._push_served)
 
     # -- outbound ----------------------------------------------------------
 
     def _send(self, msg: dict) -> None:
         self.comm.send("frontend", msg)
+
+    def _push_served(self, adapters: tuple[str, ...]) -> None:
+        """``ServedModels``' listener: the served adapters, from whichever thread
+        changed them (the conductor's answers arrive on the message thread)."""
+        msg = {"t": "served", "rid": "", "sub": None, "adapters": list(adapters)}
+        loop = self.loop
+        if loop is None:
+            self._send(msg)   # not serving yet: nothing else sends
+            return
+        try:
+            loop.call_soon_threadsafe(self._send, msg)
+        except RuntimeError:
+            pass  # the loop has closed, and the frontend with it
 
     def _err(self, rid: str, sub: int | None, detail: str) -> None:
         self._send({"t": "err", "rid": rid, "sub": sub, "msg": detail})
@@ -498,6 +548,8 @@ class RustFrontendBridge:
             "modalities": [c.modality for c in chunks],
             "payloads": [bytes(c.data) for c in chunks],
             "metadatas": [c.metadata for c in chunks],
+            "token_counts": [c.num_tokens for c in chunks],
+            "prompt_counts": [c.prompt_tokens for c in chunks],
         })
 
     # -- request lifecycle ---------------------------------------------------
@@ -564,6 +616,7 @@ class RustFrontendBridge:
                 self._send({
                     "t": "chunk", "rid": rid, "sub": sub, "modality": chunk.modality,
                     "data": bytes(chunk.data), "metadata": chunk.metadata,
+                    "num_tokens": chunk.num_tokens, "prompt_tokens": chunk.prompt_tokens,
                 })
             self._send({"t": "done", "rid": rid, "sub": sub})
         except Exception as e:  # noqa: BLE001 — includes the per-request timeout
@@ -581,10 +634,14 @@ class RustFrontendBridge:
 
     def _abort(self, msg: dict) -> None:
         """The frontend dropped submission ``sub``; a newer one under its rid
-        (the client's retry) may already be running and is left alone."""
+        (the client's retry) may already be running and is left alone. With
+        ``outcome: "success"`` the frontend ended a reply the client has whole
+        (at a stop string), which the metrics count as served."""
         sub = msg.get("sub")
         if sub is None:
             self.server.abort_request(msg["rid"])
+        elif msg.get("outcome") == "success":
+            self.server.abort_submission(self._keys.pop(sub, None), outcome="success")
         else:
             self.server.abort_submission(self._keys.pop(sub, None))
 
@@ -702,6 +759,58 @@ class RustFrontendBridge:
             meta = {"error": text, "status": 500}
         reply["metadata"] = meta
         self._send(reply)
+
+    def _lora(self, msg: dict) -> None:
+        """``/v1/load_lora_adapter`` or ``/v1/unload_lora_adapter``: the API server's
+        ``LoraAdmin`` call, answered with its text or with the error the Python
+        route answers (``exception_status_text``). The served set it changes
+        reaches mstar-server by ``_push_served``."""
+        reply = {"t": "lora", "rid": msg.get("rid"), "sub": msg.get("sub"), "data": b"", "metadata": {}}
+        route = "/v1/load_lora_adapter" if msg.get("op") == "load" else "/v1/unload_lora_adapter"
+
+        async def run() -> None:
+            try:
+                admin = getattr(self.server, "lora_admin", None)
+                if admin is None:
+                    raise RuntimeError("this API server has no LoRA admin")
+                if msg.get("op") == "load":
+                    text = await admin.load(msg.get("lora_name"), msg.get("lora_path"))
+                elif msg.get("op") == "unload":
+                    text = await admin.unload(msg.get("lora_name"))
+                else:
+                    raise RuntimeError(f"unknown lora operation {msg.get('op')!r}")
+                reply["metadata"] = {"text": text}
+            except Exception as exc:  # noqa: BLE001 — the call fails, the bridge goes on
+                status, text = exception_status_text(exc, route, log=logger)
+                reply["metadata"] = {"error": {"status": status, "message": text}}
+            self._send(reply)
+
+        self.loop.create_task(run())
+
+    def _count_tokens(self, msg: dict) -> None:
+        """``/v1/messages/count_tokens``: the tokens the model's own
+        ``process_prompt`` renders the submission's prompt to, called as the data
+        worker calls it and off the loop; or the error the Python route answered
+        (``exception_status_text``)."""
+        reply = {"t": "count_tokens", "rid": msg.get("rid"), "sub": msg.get("sub"), "data": b"", "metadata": {}}
+
+        async def run() -> None:
+            try:
+                parts = msg.get("prompt_parts")
+                tensors = await asyncio.to_thread(
+                    self.server.model.process_prompt, msg.get("text"), list(msg.get("input_modalities") or []),
+                    list(msg.get("output_modalities") or ["text"]),
+                    prompt_parts=[PromptPart(**p) for p in parts] if parts else None,
+                    **dict(msg.get("model_kwargs") or {}))
+                # a model that also lays out its KV returns a ProcessPromptOutput
+                tensors = getattr(tensors, "new_input_tensors", tensors)
+                reply["metadata"] = {"input_tokens": sum(t.numel() for t in tensors.get("text_inputs", []))}
+            except Exception as exc:  # noqa: BLE001 — the call fails, the bridge goes on
+                status, text = exception_status_text(exc, "/v1/messages/count_tokens", log=logger)
+                reply["metadata"] = {"error": {"status": status, "message": text}}
+            self._send(reply)
+
+        self.loop.create_task(run())
 
     def _end_of_turn(self, msg: dict) -> None:
         """``semantic_vad``'s end-of-turn probability of a turn's last audio
@@ -846,6 +955,10 @@ class RustFrontendBridge:
             self._windows(msg)
         elif t == "live":
             self._live(msg)
+        elif t == "lora":
+            self._lora(msg)
+        elif t == "count_tokens":
+            self._count_tokens(msg)
         elif t == "end_of_turn":
             self._end_of_turn(msg)
         else:
@@ -892,10 +1005,20 @@ class RustFrontendBridge:
         pin = getattr(self.server, "pin_result_thread", None)
         if pin is not None:
             pin()
+        # SIGINT and SIGTERM end the loop, as uvicorn's handlers end its server:
+        # asyncio.run installs a SIGINT handler only over Python's default one,
+        # and a server started as a background job inherits SIGINT ignored
+        stop = lambda signum, frame: setattr(self, "running", False)  # noqa: E731
+        handled = (signal.SIGINT, signal.SIGTERM)
+        on_main = threading.current_thread() is threading.main_thread()
+        previous = {sig: signal.signal(sig, stop) for sig in handled} if on_main else {}
         try:
             asyncio.run(self._serve())
         except KeyboardInterrupt:
             pass
+        finally:
+            for sig, handler in previous.items():
+                signal.signal(sig, handler)
 
     def stop(self) -> None:
         self.running = False

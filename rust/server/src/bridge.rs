@@ -16,15 +16,19 @@
 //!       input_modalities, output_modalities, model_kwargs, prompt_parts,
 //!       streaming, accepts_chunks, report_usage}, `prompt_parts` present for a
 //!       chat only, `report_usage` only when set
-//!                        | {t:"abort", rid, sub}
+//!                        | {t:"abort", rid, sub, outcome?}
 //!                        | {t:"ping", rid, sub}
 //!                        | {t:"metrics", rid, sub, refusals:{route, status, count}}
 //!                        | {t:"check_ref_audio", rid, sub, path, decoder, bare}
 //!                        | {t:"voices", rid, sub}
 //!                        | {t:"windows", rid, sub, op, plan, ...}
 //!                        | {t:"live", rid, sub, op, call, ...}
-//!   conductor -> frontend: {t:"chunk", rid, sub, modality, data(bin), metadata}
-//!                        | {t:"chunks", subs, modalities, payloads(bin), metadatas}
+//!                        | {t:"count_tokens", rid, sub, text, input_modalities,
+//!                           output_modalities, model_kwargs, prompt_parts}
+//!   conductor -> frontend: {t:"chunk", rid, sub, modality, data(bin), metadata,
+//!                           num_tokens, prompt_tokens}
+//!                        | {t:"chunks", subs, modalities, payloads(bin), metadatas,
+//!                           token_counts, prompt_counts}
 //!                        | {t:"done",  rid, sub}
 //!                        | {t:"pong",  rid, sub}
 //!                        | {t:"metrics", rid, sub, data(bin), metadata}
@@ -32,6 +36,7 @@
 //!                        | {t:"voices", rid, sub, metadata:{voices?}}
 //!                        | {t:"windows", rid, sub, metadata:{duration, single, windows} | {error}}
 //!                        | {t:"live", rid, sub, metadata:{taking | accepted | rejected | error, status}}
+//!                        | {t:"count_tokens", rid, sub, metadata:{input_tokens} | {error:{status, message}}}
 //!
 //! A `metrics` request carries this frontend's cumulative refusal counts
 //! (`refusals.rs`) as three parallel lists, for the API server to export. Its
@@ -45,7 +50,9 @@
 //!
 //! A submission with `report_usage` ends with a `chunk` of modality `usage`
 //! before its `done`: `metadata` holds `prompt_tokens`, `completion_tokens`
-//! and `finish_reason`.
+//! and `finish_reason`. Each chunk also carries its own token count and, on a
+//! text chunk, the prompt's, for a reply that ends before that `usage` chunk;
+//! its abort then says `outcome: "success"`.
 //!
 //! `sub` names one submission and is never reused; `rid` is the client's id,
 //! which a client may reuse as soon as it drops a stream (that stream's `done`
@@ -69,11 +76,16 @@ use crate::adapters::{Part, SubmitArgs};
 use crate::refusals::Snapshot;
 
 /// One chunk of generated output, matching mstar's `ResultChunk`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ResultChunk {
     pub modality: String,
     pub data: Vec<u8>,
     pub metadata: Value,
+    /// A text chunk's token count, and the prompt's (`ResultChunk.num_tokens`
+    /// and `prompt_tokens`): a reply ended before the closing `usage` chunk
+    /// counts its usage from them.
+    pub num_tokens: u64,
+    pub prompt_tokens: Option<u64>,
 }
 
 /// A result chunk, a backend error, or end-of-stream, delivered to a
@@ -187,6 +199,19 @@ struct Inbound {
     payloads: Vec<serde_bytes::ByteBuf>,
     #[serde(default)]
     metadatas: Vec<Value>,
+    // t == "served": the API server's served LoRA adapters, after a change
+    #[serde(default)]
+    adapters: Option<Vec<String>>,
+    // t == "chunk": a text chunk's token counts; t == "chunks": one entry per
+    // chunk, or none from a backend that sends no counts
+    #[serde(default)]
+    num_tokens: u64,
+    #[serde(default)]
+    prompt_tokens: Option<u64>,
+    #[serde(default)]
+    token_counts: Vec<u64>,
+    #[serde(default)]
+    prompt_counts: Vec<Option<u64>>,
 }
 
 struct Route {
@@ -270,6 +295,8 @@ pub struct Bridge {
     mbox: Arc<RawZmqCommunicator>,
     routes: Arc<Routes>,
     next_sub: AtomicU64,
+    /// Where the API server's `served` pushes land (`Bridge::serve_models`).
+    served: Arc<std::sync::OnceLock<Arc<crate::served_models::ServedModels>>>,
 }
 
 impl Bridge {
@@ -283,12 +310,25 @@ impl Bridge {
 
         let mbox_r = mbox.clone();
         let routes_r = routes.clone();
-        std::thread::spawn(move || Self::demux_loop(mbox_r, routes_r));
+        let served = Arc::new(std::sync::OnceLock::new());
+        let served_r = served.clone();
+        std::thread::spawn(move || Self::demux_loop(mbox_r, routes_r, served_r));
 
-        Ok(Self { mbox, routes, next_sub: AtomicU64::new(1) })
+        Ok(Self { mbox, routes, next_sub: AtomicU64::new(1), served })
     }
 
-    fn demux_loop(mbox: Arc<RawZmqCommunicator>, routes: Arc<Routes>) {
+    /// Keep `served` up to date with the API server's served LoRA adapters, which
+    /// it pushes after every change: a runtime load or unload, and a conductor's
+    /// answer that arrived after its request timed out.
+    pub fn serve_models(&self, served: Arc<crate::served_models::ServedModels>) {
+        let _ = self.served.set(served);
+    }
+
+    fn demux_loop(
+        mbox: Arc<RawZmqCommunicator>,
+        routes: Arc<Routes>,
+        served: Arc<std::sync::OnceLock<Arc<crate::served_models::ServedModels>>>,
+    ) {
         loop {
             let Some(payload) = mbox.recv_timeout(Duration::from_millis(500)) else {
                 continue;
@@ -306,6 +346,12 @@ impl Bridge {
                     continue;
                 }
             };
+            if msg.t == "served" {
+                if let (Some(adapters), Some(served)) = (msg.adapters, served.get()) {
+                    served.set_adapters(adapters);
+                }
+                continue;
+            }
             deliver(&routes, msg);
         }
     }
@@ -432,6 +478,30 @@ impl Bridge {
         }
     }
 
+    /// `/v1/load_lora_adapter` (`op` "load", with `lora_path`) or
+    /// `/v1/unload_lora_adapter` ("unload"): the API server's `LoraAdmin` call,
+    /// its text or the `(status, message)` the Python route answers with.
+    pub async fn lora(&self, op: &str, name: &Value, path: Option<&Value>, timeout: Duration) -> Result<String, (u16, String)> {
+        let mut args = serde_json::Map::new();
+        args.insert("op".into(), Value::from(op));
+        args.insert("lora_name".into(), name.clone());
+        if let Some(path) = path {
+            args.insert("lora_path".into(), path.clone());
+        }
+        match self.round_trip("lora", Extras { op: Some(&args), ..Extras::default() }, timeout).await {
+            Some(StreamItem::Chunk(chunk)) => match (chunk.metadata.get("text"), chunk.metadata.get("error")) {
+                (Some(Value::String(text)), _) => Ok(text.clone()),
+                (_, Some(error)) => Err((
+                    error.get("status").and_then(Value::as_u64).unwrap_or(500) as u16,
+                    error.get("message").and_then(Value::as_str).unwrap_or_default().to_string(),
+                )),
+                _ => Err((500, "the API server's LoRA admin gave no answer".to_string())),
+            },
+            Some(StreamItem::Error { status, message, .. }) => Err((status, message)),
+            _ => Err((503, "backend bridge unreachable".to_string())),
+        }
+    }
+
     /// One operation on a transcription upload's `WindowPlanner` (`op` and its
     /// arguments): the reply's `metadata` carries the planner's `duration`,
     /// `single` and the `windows` it cut, or the `error` it raised. None on
@@ -506,6 +576,38 @@ impl Bridge {
         }
     }
 
+    /// `/v1/messages/count_tokens`: how many tokens the model's own
+    /// `process_prompt` renders the submission's prompt to, or the error the
+    /// Python route answered (`exception_status_text`).
+    pub async fn count_tokens(
+        &self,
+        args: &SubmitArgs,
+        timeout: Duration,
+    ) -> Result<u64, (u16, String)> {
+        let mut op = serde_json::Map::new();
+        op.insert("text".into(), args.text.as_deref().map_or(Value::Null, Value::from));
+        op.insert("input_modalities".into(), Value::from(args.input_modalities.clone()));
+        op.insert("output_modalities".into(), Value::from(args.output_modalities.clone()));
+        op.insert("model_kwargs".into(), Value::Object(args.model_kwargs.clone()));
+        let parts = serde_json::to_value(&args.parts).unwrap_or_default();
+        op.insert("prompt_parts".into(), parts);
+        let extras = Extras { op: Some(&op), ..Extras::default() };
+        let chunk = match self.round_trip("count_tokens", extras, timeout).await {
+            Some(StreamItem::Chunk(chunk)) => chunk,
+            None => return Err((500, "Request timed out".to_string())),
+            _ => return Err((503, "backend bridge unreachable".to_string())),
+        };
+        if let Some(n) = chunk.metadata.get("input_tokens").and_then(Value::as_u64) {
+            return Ok(n);
+        }
+        let Some(error) = chunk.metadata.get("error") else {
+            return Err((500, "the server could not count the prompt's tokens".to_string()));
+        };
+        let status = error.get("status").and_then(Value::as_u64).unwrap_or(500) as u16;
+        let message = error.get("message").and_then(Value::as_str).unwrap_or_default();
+        Err((status, message.to_string()))
+    }
+
     /// Have the API server check a saved reference clip with the model's
     /// loader (`media_io.check_saved_ref_audio`): `Ok`, or the refusal's
     /// `(status, message)`, as the Python adapter refuses it. A refused clip is
@@ -523,9 +625,14 @@ impl Bridge {
 
     /// Abort submission `sub` of `request_id` (client disconnected or timed
     /// out): tell the backend to release its state (a finished submission is
-    /// a no-op there) and drop the local route.
-    pub fn abort(&self, request_id: &str, sub: u64) {
-        let msg = serde_json::json!({"t": "abort", "rid": request_id, "sub": sub});
+    /// a no-op there) and drop the local route. `served`: its handler ended a
+    /// reply the client has whole (at a stop string), which the backend stops
+    /// alike and counts as a success (`abort_submission`'s `outcome`).
+    pub fn abort(&self, request_id: &str, sub: u64, served: bool) {
+        let mut msg = serde_json::json!({"t": "abort", "rid": request_id, "sub": sub});
+        if served {
+            msg["outcome"] = serde_json::Value::from("success");
+        }
         // Sent before the rid is freed, so a retry's submit (which needs the
         // rid free) goes out after it and the backend never refuses the
         // retry. Not under the routes lock: a send can block, and the demux
@@ -566,6 +673,8 @@ fn deliver(routes: &Routes, msg: Inbound) {
                 modality: msg.modality,
                 data: msg.data.into_vec(),
                 metadata: msg.metadata,
+                num_tokens: msg.num_tokens,
+                prompt_tokens: msg.prompt_tokens,
             })),
             false,
         ),
@@ -582,11 +691,12 @@ fn deliver(routes: &Routes, msg: Inbound) {
             Some(message) => (Some(StreamItem::Error { status: msg.status.unwrap_or(400), message, refused: false }), true),
             None => (Some(StreamItem::Done), true),
         },
-        "metrics" | "voices" | "windows" | "live" | "end_of_turn" => (
+        "metrics" | "voices" | "windows" | "live" | "end_of_turn" | "lora" | "count_tokens" => (
             Some(StreamItem::Chunk(ResultChunk {
                 modality: msg.t,
                 data: msg.data.into_vec(),
                 metadata: msg.metadata,
+                ..Default::default()
             })),
             true,
         ),
@@ -612,11 +722,15 @@ fn deliver_batch(routes: &Routes, msg: Inbound) {
         eprintln!("mstar-server bridge: dropping a chunks message with ragged lists");
         return;
     }
+    let counted = msg.token_counts.len() == n && msg.prompt_counts.len() == n;
+    let (mut tokens, mut prompts) = (msg.token_counts.into_iter(), msg.prompt_counts.into_iter());
     let table = routes.lock().expect("routes lock");
     let items = msg.subs.into_iter().zip(msg.modalities).zip(msg.payloads).zip(msg.metadatas);
     for (((sub, modality), data), metadata) in items {
+        let (num_tokens, prompt_tokens) =
+            if counted { (tokens.next().unwrap_or(0), prompts.next().flatten()) } else { (0, None) };
         if let Some(route) = table.routes.get(&sub) {
-            let chunk = ResultChunk { modality, data: data.into_vec(), metadata };
+            let chunk = ResultChunk { modality, data: data.into_vec(), metadata, num_tokens, prompt_tokens };
             let _ = route.tx.send(StreamItem::Chunk(chunk));
         }
     }

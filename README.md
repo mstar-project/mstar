@@ -68,7 +68,7 @@ mstar serve bagel          # one command — launch a server (default: http://lo
 
 The PyPI package is `mstar-ai` (`mstar-project` and `mstar-serve` install the same thing); the import package
 and the CLI are `mstar`. Working from a checkout instead: `uv pip install --torch-backend=auto -e .[all]`,
-then build the [Rust extension](#rust-extension).
+then build the [Rust extension and HTTP frontend](#rust-extension).
 Qwen3-TTS also needs `uv pip install --no-deps "qwen-tts==0.1.1"` (see `docs/installation.rst`).
 
 To enable flash-attn support (recommended for BAGEL),
@@ -168,7 +168,9 @@ Serving needs the `mstar_rust` extension (vendored in [`rust/`](rust/)): the gra
 Rust, and every process sends its control messages on the extension's ZeroMQ transport. Each
 process logs it at startup (`control mesh transport: rust <version> from <path>`).
 From a checkout, build it with [maturin](https://www.maturin.rs): `uv pip install maturin && maturin develop --release -m rust/Cargo.toml`.
-The Linux wheels of `mstar-ai` on PyPI carry it, with libzmq 4.3.4 statically linked under
+`mstar serve` serves HTTP from the `mstar-server` binary ([`rust/server/`](rust/server/)); from a checkout, build it too:
+`cargo build --release --manifest-path rust/server/Cargo.toml`.
+The Linux wheels of `mstar-ai` on PyPI carry both, the extension with libzmq 4.3.4 statically linked under
 LGPL-3.0-or-later and its static-linking exception ([PACKAGING.md](PACKAGING.md) has where its source is).
 See the [installation docs](https://m-star.org/mstar/installation.html) and
 [environment variables](https://m-star.org/mstar/environment_variables.html).

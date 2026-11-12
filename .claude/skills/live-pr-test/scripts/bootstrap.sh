@@ -134,10 +134,13 @@ build_arm() {  # build_arm <dir>
     source .venv/bin/activate
     uv pip install -q --torch-backend=auto -e ".[all]" maturin
     maturin develop -q --release -m rust/Cargo.toml
-    # mstar-server, for rows served with --rust-frontend
+    # mstar-server, the HTTP frontend mstar serve launches
     [ ! -d rust/server ] || (cd rust/server && cargo build --release -q)
     find mstar -name __pycache__ -type d -prune -exec rm -rf {} +
     python -c "import mstar, mstar_rust, mstar.conductor.conductor, mstar.worker.worker; print('import ok:', mstar.__file__)"
+    # A wheel for the wrong platform (CUDA torch on a ROCm box, say) imports fine and runs on the CPU.
+    python -c "import torch; assert torch.cuda.is_available() and torch.cuda.device_count() > 0, \
+      f'torch {torch.__version__} sees no GPU (cuda {torch.version.cuda}, hip {torch.version.hip})'"
   )
 }
 
@@ -153,9 +156,11 @@ fi
   [ "$WITH_MAIN" = 1 ] && echo "base $BASE: $(git -C "$WORKDIR/main" rev-parse HEAD)"
   git -C "$WORKDIR/pr" fetch -q origin "$BASE"
   echo "merge-base with $BASE: $(git -C "$WORKDIR/pr" merge-base HEAD FETCH_HEAD 2>/dev/null || echo unknown)"
-  nvidia-smi --query-gpu=index,name,memory.total,driver_version --format=csv,noheader
+  nvidia-smi --query-gpu=index,name,memory.total,driver_version --format=csv,noheader 2>/dev/null \
+    || amd-smi list 2>/dev/null || true
   echo "cpus: $(nproc)  mem: $(free -g | awk '/Mem:/{print $2}')G"
-  "$WORKDIR/pr/.venv/bin/python" -c "import torch; print('torch', torch.__version__, 'cuda', torch.version.cuda)"
+  "$WORKDIR/pr/.venv/bin/python" -c "import torch; print('torch', torch.__version__, 'cuda', torch.version.cuda, \
+    'hip', torch.version.hip, torch.cuda.device_count(), 'x', torch.cuda.get_device_name(0))"
   [ "$RESTORE" = 0 ] || [ ! -f "$CACHE_TAR.info" ] || echo "compile cache: $(paste -sd' ' "$CACHE_TAR.info")"
   if [ "$WITH_MAIN" = 1 ]; then
     echo "--- dependency diff (base vs pr venv) ---"

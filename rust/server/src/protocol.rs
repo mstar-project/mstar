@@ -115,6 +115,10 @@ pub struct ChatMessage {
     pub role: String,
     #[serde(default)]
     pub content: Option<Content>,
+    /// The other fields, in the client's order (`extra="allow"`): an
+    /// assistant turn's `tool_calls`, a tool turn's `tool_call_id`.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, Value>,
 }
 
 /// `content` may be a bare string or a list of content-part objects.

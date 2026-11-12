@@ -201,7 +201,7 @@ set.
 .. code-block:: bash
 
    export MSTAR_API_KEY="$(openssl rand -hex 32)"
-   mstar serve qwen3_omni            # or: mstar-serve --config ... [--rust-frontend]
+   mstar serve qwen3_omni            # or: mstar-serve --config ... [--python-frontend]
 
 With a key set, every HTTP route except ``/health`` and ``/metrics`` (see
 :ref:`serving-metrics`) answers ``401`` unless the request carries
@@ -211,7 +211,7 @@ With a key set, every HTTP route except ``/health`` and ``/metrics`` (see
 Anthropic SDKs and Claude Code send for an API key (``ANTHROPIC_API_KEY``; an auth token,
 ``ANTHROPIC_AUTH_TOKEN``, goes as the bearer), and refuse in Anthropic's error shape
 (``authentication_error``). The check is one middleware over the
-whole app (FastAPI and the Rust frontend alike), and the comparison takes the same time
+whole app (``mstar-server`` and the Python frontend alike), and the comparison takes the same time
 however much of the key matches. CORS preflights still get their answer, since browsers
 send them without credentials. ``--api-key`` overrides the environment variable, but
 prefer the variable: a command-line flag is visible to every local user in the process
@@ -330,8 +330,9 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        55-90% as binary PCM, and digital silence to 1-2%, but compressing every frame
        costs the event loop: about 8% of it at 32 live Nemotron VoiceChat calls on
        ``/generate/ws``, whose configs turn it off. Turn it off where the server's
-       event loop, not the network, is the bottleneck. The Rust frontend
-       (``--rust-frontend``) offers no deflate, whatever this says.
+       event loop, not the network, is the bottleneck. ``mstar-server``, the default
+       frontend, offers no deflate whatever this says, so this applies only under
+       ``--python-frontend``.
    * - ``ws_max_message_mb``
      - *(optional)* The largest WebSocket message the server reads, in MiB, on every
        WebSocket route; by default the HTTP body limit, ``MSTAR_MAX_BODY_MB``. A larger one
@@ -1164,8 +1165,8 @@ Prometheus metrics at ``GET /metrics``. It needs the ``metrics`` extra
 hint. Off by default, and ``/metrics`` answers 404 then. Like ``/health``, it needs no
 API key even when one is set, the usual convention for scrape endpoints. It exposes
 request counts, latencies and the model name (never prompts or outputs); if that
-matters for a deployment, keep the port on an internal network. With
-``--rust-frontend``, ``mstar-server`` serves the same text: it asks the API server for
+matters for a deployment, keep the port on an internal network.
+``mstar-server`` serves the same text as the Python frontend: it asks the API server for
 it over the bridge, so both frontends show the same names, and it answers ``503`` if the
 bridge does not reply within two seconds, as ``/health`` does.
 
@@ -1201,8 +1202,8 @@ warmup requests. Every family has a ``model_name`` label (the config's ``model``
   ``MSTAR_MAX_CONCURRENT_REQUESTS`` cap turns a request away. ``route`` is the route's
   path as declared (``/v1/chat/completions``), ``unmatched`` when no route matches.
   A request that was submitted and then failed counts once, as an ``error`` in
-  ``mstar_requests_total``, never here. WebSocket handshakes are not counted. With
-  ``--rust-frontend``, ``mstar-server`` keeps these counts and sends them with each
+  ``mstar_requests_total``, never here. WebSocket handshakes are not counted.
+  ``mstar-server`` keeps these counts and sends them with each
   ``/metrics`` request, so the API server exports them under the same name.
 - ``mstar_request_queue_seconds{model_name, output_modalities}``: histogram over
   successful requests, from the conductor taking the request in to admitting it for
