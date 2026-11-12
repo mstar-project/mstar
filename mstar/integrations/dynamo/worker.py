@@ -33,7 +33,7 @@ from mstar.integrations.dynamo.bridges import (
     TensorBridge,
     get_tensor_spec,
 )
-from mstar.utils import cpus
+from mstar.utils import cpus, knobs
 from mstar.utils.socket_prefix import per_launch_socket_prefix
 
 if TYPE_CHECKING:
@@ -89,6 +89,8 @@ def build_server(args) -> tuple[APIServer, mp.process.BaseProcess, str]:
         cpus.install(deployment_cpu_plan(config))
     except cpus.CpuPlanError as e:
         raise SystemExit(f"mstar: {e}") from None
+    if knobs.idle_hold() == "qos":
+        logger.info(cpus.hold_idle())
     _set_preprocess_threads(model, config)
     # the deployment config, as the native server passes it: prefix-cache keys,
     # LoRA adapters and request limits all come from it

@@ -1108,6 +1108,32 @@ def test_the_worker_builds_its_server_on_the_deployment_config(monkeypatch, tmp_
     assert seen["conductor"].kwargs == {"model_config": config}
 
 
+@pytest.mark.parametrize("hold", ["qos", "off"])
+def test_the_worker_takes_the_idle_hold_the_config_asks_for(monkeypatch, tmp_path, hold):
+    """``knobs: idle_hold: qos`` holds the CPUs out of deep idle for the
+    worker's life, as it does for the native server."""
+    import yaml
+
+    from mstar.api_server import entrypoint
+    from mstar.integrations.dynamo import worker
+
+    path = tmp_path / "c.yaml"
+    path.write_text(yaml.safe_dump({"model": "whisper_large", "preprocess_torch_threads": None}))
+    held = []
+    monkeypatch.setattr("mstar.model.registry.get_model_class", lambda name: lambda **kw: SimpleNamespace())
+    monkeypatch.setattr(entrypoint, "deployment_cpu_plan", lambda c: None)
+    monkeypatch.setattr(worker.cpus, "install", lambda plan: None)
+    monkeypatch.setattr(worker.cpus, "hold_idle", lambda: held.append(True) or "held")
+    monkeypatch.setattr(worker.knobs, "idle_hold", lambda: hold)
+    monkeypatch.setattr(entrypoint, "APIServer", SimpleNamespace)
+    monkeypatch.setattr(worker.mp, "get_context", lambda method: SimpleNamespace(
+        Process=lambda **kw: SimpleNamespace(start=lambda: None, pid=1, **kw)))
+    worker.build_server(SimpleNamespace(
+        config=str(path), cache_dir=None, socket_path_prefix="p", upload_dir="u", timeout=1,
+        tensor_comm_protocol="TCP", log_level="INFO"))
+    assert held == ([True] if hold == "qos" else [])
+
+
 def test_the_worker_runs_the_deployment_s_warmups_before_it_serves(monkeypatch):
     """Without them the first Dynamo request of a shape paid its compile."""
     from mstar.api_server import entrypoint
