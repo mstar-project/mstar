@@ -172,23 +172,18 @@ GENERATE_AUDIO_WALK = "generate_audio"  # generate without emitting text
 CONDITIONING_LOOP, DECODE_LOOP = "cond_loop", "decode_loop"
 # The reply's audio streams from the LM partition to the codec partition one agent frame at a time.
 LM_PARTITION, CODEC_PARTITION, CODEC_WALK = "LM", "Codec", "codec_chunk"
-# New agent frames per decoded audio chunk: the first block holds 4 frames (320 ms of audio), then
-# blocks grow to 25 frames (2 s), a ramp like Qwen3-TTS's for its 12 Hz codec, so a running stream
-# costs few decodes. A chunk is decoded in these blocks whatever the stream delivers, so a request's
-# audio does not depend on delivery timing.
+# New agent frames per audio chunk the stream releases: 4 frames (320 ms of audio) first, then growing
+# to 25 frames (2 s), a ramp like Qwen3-TTS's for its 12 Hz codec, so a running stream costs few
+# decodes. The decode itself is exact whatever the grouping (``IncrementalMimiDecoder``).
 STREAM_CHUNK_SCHEDULE = (4, 8, 16)
 STREAM_CHUNK_FRAMES = 25
-# Agent frames of left context each block is decoded behind. Mimi's decoder transformer attends
-# 250 steps (125 frames) per layer, but its 8 stacked layers reach further back. On a long reply
-# measured on the checkpoint under TF32, 500 and 1,000 frames gave the same maximum absolute error
-# against a whole-clip decode, with RMSE 2.70e-5 and 2.62e-5 respectively; this is not a general error bound.
-STREAM_CONTEXT_FRAMES = 500
-# Frames before a block's new ones that Mimi's causal SEANet decoder reruns over: its receptive
-# field, so only the transformer pays for the long context.
-SEANET_MARGIN_FRAMES = 4
 KV_LABEL = "main"  # the LM's one paged KV label
 LM_KV, LM_ATTN, LM_POS = "lm_kv", "lm_attn", "lm_pos"
 LM_CACHE = "lm_cache"  # the recurrent state pool holding each request's delayed token cache
+MIMI_STATE = "mimi_state"  # the recurrent state pool holding each stream's Mimi decoder state
+# Streams the decoder's pool holds by default (about 8 MB each in fp32), + 1 for its sink slot; a
+# deployment sizes it with ``resources: {mimi_state: {max_slots: ...}}``.
+DEFAULT_DECODER_STREAMS = 64
 CONDITIONING_TICK = "conditioning_tick"  # the conditioning loop's loop-back; nothing reads its value
 TEXT_SAMPLER, DEPTH_SAMPLER = "text_sampler", "depth_sampler"
 

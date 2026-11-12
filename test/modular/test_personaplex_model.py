@@ -763,8 +763,13 @@ def test_dummy_mode_builds_without_submodules_or_network():
     assert model.tokenizer is None and model.model_path_hf == "nvidia/personaplex-7b-v1"
     assert all(model.get_submodule(node) is None for node in model.nodes)
     specs = {spec.resource_key: spec for spec in model.get_node_resources()}
-    assert set(specs) == {cfg.LM_KV, cfg.LM_ATTN, cfg.LM_POS, cfg.TEXT_SAMPLER, cfg.DEPTH_SAMPLER, cfg.LM_CACHE}
-    assert all(spec.nodes == {"LM"} for spec in specs.values())
+    assert set(specs) == {cfg.LM_KV, cfg.LM_ATTN, cfg.LM_POS, cfg.TEXT_SAMPLER, cfg.DEPTH_SAMPLER, cfg.LM_CACHE,
+                          cfg.MIMI_STATE}
+    assert all(spec.nodes == {"LM"} for key, spec in specs.items() if key != cfg.MIMI_STATE)
+    mimi = specs[cfg.MIMI_STATE]
+    assert mimi.nodes == {cfg.MIMI_DECODER_NODE} and mimi.config.max_slots == cfg.DEFAULT_DECODER_STREAMS + 1
+    # the served decoder's state, derived without weights: 8 layers of keys and values, the conv tails, a step count
+    assert mimi.config.blocks["k0"].shape == (8, 249, 64) and mimi.config.blocks["steps"].dtype == torch.long
     kv = specs[cfg.LM_KV].config
     assert (kv.num_layers, kv.num_kv_heads, kv.num_qo_heads, kv.head_dim, kv.max_seq_len) == (32, 32, 32, 128, 2999)
     assert kv.max_num_pages == 128
@@ -1012,9 +1017,10 @@ def test_shipped_yaml_fits_its_request_cap_in_the_kv_pool(caplog):
     with pytest.raises(ValueError, match=r"6 concurrent requests .* need 145 pages of resources\.lm_kv, which has 128"):
         model.validate_config_yaml({**deployment, "max_concurrent_requests": 6}, CONFIG_PATH)
     model.validate_config_yaml({k: v for k, v in deployment.items() if k != "max_concurrent_requests"}, CONFIG_PATH)
-    too_few = {**deployment, "resources": {**deployment["resources"], cfg.LM_CACHE: {"max_slots": 5}}}
-    with pytest.raises(ValueError, match="raise max_slots"):
-        model.validate_config_yaml(too_few, CONFIG_PATH)  # 5 requests + the sink need 6
+    for pool in (cfg.LM_CACHE, cfg.MIMI_STATE):
+        too_few = {**deployment, "resources": {**deployment["resources"], pool: {"max_slots": 5}}}
+        with pytest.raises(ValueError, match=f"resources.{pool}.*raise max_slots"):
+            model.validate_config_yaml(too_few, CONFIG_PATH)  # 5 requests + the sink need 6
     assert "sets no max_concurrent_requests" in caplog.text
 
 

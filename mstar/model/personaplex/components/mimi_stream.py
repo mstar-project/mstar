@@ -21,13 +21,14 @@ real samples.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from functools import cache
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
 from ..config import AUDIO_CODEBOOKS_PER_STREAM, FRAME_SIZE
-from .mimi import MIMI_CONTEXT, MIMI_STEPS_PER_FRAME, MimiCodec, _mimi_modules
+from .mimi import MIMI_CONTEXT, MIMI_STEPS_PER_FRAME, MimiCodec, _mimi_modules, build_hf_mimi
 
 STEPS = "steps"
 
@@ -73,6 +74,9 @@ class IncrementalMimiDecoder(nn.Module):
             persistent=False,
         )
         self.convs: list[tuple[str, nn.Module]] = []
+        # each stride-1 conv's left padding, read once here: Mimi keeps it in a buffer, and reading
+        # that per step would be a host sync on the GPU
+        self.keep: dict[str, int] = {}
         self._collect("upsample", self.upsample)
         self._collect("seanet", self.seanet.layers)
 
@@ -91,9 +95,12 @@ class IncrementalMimiDecoder(nn.Module):
                 raise TypeError("incremental decode assumes transposed convs of kernel 2 * stride")
             self.convs.append((prefix, module))
         elif isinstance(getattr(module, "conv", None), nn.Conv1d):
-            if module.conv.stride[0] != 1 or module.pad_mode != "constant":
+            conv = module.conv
+            if conv.stride[0] != 1 or module.pad_mode != "constant":
                 raise TypeError("incremental decode assumes stride-1 convs with zero padding")
-            if int(module.padding_total):
+            # transformers' MimiConv1d.padding_total for stride 1
+            self.keep[prefix] = (conv.kernel_size[0] - 1) * conv.dilation[0]
+            if self.keep[prefix]:
                 self.convs.append((prefix, module))
 
     def state_blocks(self) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
@@ -105,7 +112,7 @@ class IncrementalMimiDecoder(nn.Module):
                 blocks[f"{kv}{layer}"] = ((self.heads, self.cache, self.head_dim), dtype)
         for name, module in self.convs:
             transposed = isinstance(module.conv, nn.ConvTranspose1d)
-            width = 1 if transposed else int(module.padding_total)
+            width = 1 if transposed else self.keep[name]
             blocks[name] = ((module.conv.in_channels, width), dtype)
         return blocks
 
@@ -148,9 +155,9 @@ class IncrementalMimiDecoder(nn.Module):
         return h
 
     def _conv(self, name: str, module: nn.Module, x: torch.Tensor, state, new, valid: torch.Tensor) -> torch.Tensor:
-        if not int(module.padding_total):
+        keep = self.keep[name]
+        if not keep:
             return module.conv(x)
-        keep = int(module.padding_total)
         xs = torch.cat([state[name], x], -1)
         new[name] = _tail(xs, valid, keep, 2)
         return module.conv(xs)
@@ -195,3 +202,12 @@ class IncrementalMimiDecoder(nn.Module):
         if pcm.shape[-1] != codes.shape[-1] * FRAME_SIZE:
             raise RuntimeError(f"decoded {pcm.shape[-1]} samples for {codes.shape[-1]} frames")
         return pcm, new
+
+
+@cache
+def mimi_state_blocks() -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
+    """The served Mimi's (``MimiConfig`` defaults, fp32) per-stream state, without its weights: the decoder
+    built on the meta device, so the pool can be declared before the checkpoint loads."""
+    with torch.device("meta"):
+        model = build_hf_mimi().float()
+    return IncrementalMimiDecoder(MimiCodec(model)).state_blocks()

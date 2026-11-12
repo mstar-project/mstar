@@ -111,6 +111,8 @@ class PersonaPlexModel(Model):
         here only keeps a YAML without one off the generic 2048-page pool,
         which at this KV geometry would not fit a 96 GB GPU.
         """
+        from .components.mimi_stream import mimi_state_blocks
+
         c = self.lm_config
         kv = PagedKVConfig(
             num_layers=c.num_layers, num_kv_heads=c.num_heads, head_dim=c.head_dim,
@@ -136,6 +138,12 @@ class PersonaPlexModel(Model):
                     "provided": RecurrentBlockConfig((cfg.NUM_CODEBOOKS, cfg.CACHE_SIZE), torch.int64),
                     "offset": RecurrentBlockConfig((), torch.int64),
                 }, labels=(cfg.KV_LABEL,)),
+            ),
+            RecurrentStateSpec(
+                resource_key=cfg.MIMI_STATE, nodes={cfg.MIMI_DECODER_NODE},
+                config=RecurrentStateConfig(num_layers=1, blocks={
+                    name: RecurrentBlockConfig(shape, dtype) for name, (shape, dtype) in mimi_state_blocks().items()
+                }, max_slots=cfg.DEFAULT_DECODER_STREAMS + 1),
             ),
         ]
 
@@ -163,13 +171,14 @@ class PersonaPlexModel(Model):
         overrides = (config.get("resources") or {}).get(cfg.LM_KV) or {}
         page_size = int(overrides.get("page_size") or kv.tokens_per_page)
         max_num_pages = int(overrides.get("max_num_pages", kv.max_num_pages))
-        cache = next(s for s in self.get_node_resources() if s.resource_key == cfg.LM_CACHE).config
-        slots = int(((config.get("resources") or {}).get(cfg.LM_CACHE) or {}).get("max_slots", cache.max_slots))
-        if int(cap) > slots - 1:  # the pool's sink takes one slot
-            raise ValueError(
-                f"{config_path}: {cap} concurrent requests (max_concurrent_requests) need {int(cap) + 1} slots of "
-                f"resources.{cfg.LM_CACHE}, which has {slots}; raise max_slots or lower max_concurrent_requests"
-            )
+        for key in (cfg.LM_CACHE, cfg.MIMI_STATE):
+            pool = next(s for s in self.get_node_resources() if s.resource_key == key).config
+            slots = int(((config.get("resources") or {}).get(key) or {}).get("max_slots", pool.max_slots))
+            if int(cap) > slots - 1:  # the pool's sink takes one slot
+                raise ValueError(
+                    f"{config_path}: {cap} concurrent requests (max_concurrent_requests) need {int(cap) + 1} slots "
+                    f"of resources.{key}, which has {slots}; raise max_slots or lower max_concurrent_requests"
+                )
         need = 1 + int(cap) * self._request_kv_pages(page_size)
         if need > max_num_pages:
             raise ValueError(
@@ -211,9 +220,8 @@ class PersonaPlexModel(Model):
             max_iters=cfg.MAX_TEMPORAL_FORWARDS,
             outputs=[],
         )
-        # The decoder keeps each request's code context in its own state and
-        # updates it in the forward, so a step must not be prepared ahead of the
-        # previous one.
+        # The decoder's stream state is in the mimi_state pool, read and written
+        # in step order; async scheduling stays off here until it is measured.
         decoder = GraphNode(
             name=cfg.MIMI_DECODER_NODE, input_names=["agent_frame"], consumes_stream=True,
             enable_async_scheduling=False,
@@ -562,5 +570,10 @@ class PersonaPlexModel(Model):
             codec = load_mimi_codec(load_file(self._download(MIMI_CHECKPOINT_NAME)), device=device)
             if node_name == cfg.MIMI_ENCODER_NODE:
                 return MimiEncoderSubmodule(codec)
-            return MimiDecoderSubmodule(codec, max_batch_size=self.max_batch_size)
+            decoder = MimiDecoderSubmodule(codec, max_batch_size=self.max_batch_size)
+            declared = next(s for s in self.get_node_resources() if s.resource_key == cfg.MIMI_STATE).config.blocks
+            loaded = decoder.incremental.state_blocks()
+            if {name: (tuple(b.shape), b.dtype) for name, b in declared.items()} != loaded:
+                raise ValueError("the loaded Mimi decoder's stream state does not match the mimi_state blocks declared")
+            return decoder
         raise ValueError(f"PersonaPlex has no node {node_name!r}")

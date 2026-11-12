@@ -371,3 +371,17 @@ def test_incremental_rows_of_different_length_and_history_share_a_decode(referen
     for name, block in new.items():
         torch.testing.assert_close(block[0:1], want_first[name], rtol=1e-5, atol=1e-5)
         torch.testing.assert_close(block[1:2], want_second[name], rtol=1e-5, atol=1e-5)
+
+
+@torch.no_grad()
+def test_the_declared_stream_state_is_the_served_decoders():
+    """The pool is declared from a weightless (meta) build of the served Mimi; it must match a real build,
+    and each conv's left state must be the padding transformers itself applies."""
+    from mstar.model.personaplex.components.mimi_stream import IncrementalMimiDecoder, mimi_state_blocks
+
+    with _without_triton_stub():
+        model = mimi_mod.build_hf_mimi().float()
+    decoder = IncrementalMimiDecoder(MimiCodec(model))
+    assert mimi_state_blocks() == decoder.state_blocks()
+    padded = {name: int(module.padding_total) for name, module in decoder.convs if hasattr(module, "padding_total")}
+    assert padded and all(decoder.keep[name] == value for name, value in padded.items())

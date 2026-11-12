@@ -234,19 +234,6 @@ class MimiCodec(nn.Module):
         x = upsample(self.model.quantizer.decode(codes))
         return decoder(self._transformer(transformer, x))
 
-    def decode_last(self, codes: torch.Tensor, frames: int, margin: int) -> torch.Tensor:
-        """``[B, 8, N]`` codes -> PCM of the last ``frames`` frames, ``[B, 1, frames * 1920]``.
-
-        The transformer runs over all ``N`` frames; the causal SEANet decoder only over
-        ``margin + frames``, which equals ``decode`` when ``margin`` covers its receptive field.
-        """
-        if not 0 < frames <= codes.shape[-1]:
-            raise ValueError(f"expected 0 < frames <= {codes.shape[-1]}, got {frames}")
-        decoder, transformer, upsample = _mimi_modules(self.model, "decoder")
-        h = self._transformer(transformer, upsample(self.model.quantizer.decode(codes)))
-        steps = (frames + margin) * MIMI_STEPS_PER_FRAME
-        return decoder(h[..., max(h.shape[-1] - steps, 0) :])[..., -frames * FRAME_SIZE :]
-
 
 def load_mimi_codec(
     state_dict: dict[str, torch.Tensor], config_kwargs: dict | None = None, device: torch.device | str = "cpu"

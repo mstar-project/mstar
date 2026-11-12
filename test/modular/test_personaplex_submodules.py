@@ -858,23 +858,30 @@ def _chunk_inputs(group):
     return torch.stack(group) if len(group) > 1 else group[0]
 
 
-def _decode_chunk(decoder, rid, group, num_samples, final=False):
-    info = SimpleNamespace(step_metadata={"num_samples": num_samples})
-    inputs = {"agent_frame": [_chunk_inputs(group)]} if group else {}
-    node = decoder.prepare_inputs(cfg.CODEC_WALK, info, inputs, is_final_stream_chunk=final)
-    if node is None:
-        return None
-    engine = SimpleNamespace(request_ids=[rid])
-    staged = decoder.preprocess(cfg.CODEC_WALK, engine, [node])
-    return decoder.forward(cfg.CODEC_WALK, engine, **staged)["audio_output"][0]
+def _driver(codec, max_slots=16):
+    from benchmark.personaplex.decode import DecoderDriver
+
+    return DecoderDriver(MimiDecoderSubmodule(codec), max_slots=max_slots)
 
 
-def _stream_decode(decoder, frames, num_samples, rid="r", sizes=None):
+def _decode_chunk(driver, rid, group, num_samples, final=False):
+    """One chunk through the decoder node over the real pool; None when there is nothing to run."""
+    node = driver.prepare(rid, num_samples, group, final=final)
+    return None if node is None else driver.step([rid], [node])[rid]
+
+
+def _stream_decode(codec_or_driver, frames, num_samples, rid="r", sizes=None):
     """Feed agent frames through the decoder node as the stream delivers them (the harnesses' own helper)."""
-    from benchmark.personaplex.decode import stream_decode
+    from benchmark.personaplex.decode import DecoderDriver, stream_decode
 
+    if isinstance(codec_or_driver, DecoderDriver):
+        driver = codec_or_driver
+    elif isinstance(codec_or_driver, MimiDecoderSubmodule):
+        driver = DecoderDriver(codec_or_driver)
+    else:
+        driver = _driver(codec_or_driver)
     info = SimpleNamespace(step_metadata={"num_samples": num_samples})
-    return stream_decode(decoder, frames, info, rid=rid, sizes=sizes)
+    return stream_decode(driver.decoder, frames, info, rid=rid, sizes=sizes, driver=driver)
 
 
 def _whole(codec, frames, num_samples):
@@ -893,81 +900,12 @@ def test_stream_codes_keep_frame_and_codebook_order():
         MimiDecoderSubmodule.stream_codes(torch.zeros(2, 8, 1, dtype=torch.long))
 
 
-@torch.no_grad()
-@pytest.mark.parametrize("frames", [28, 37, 53, 300])
-def test_streamed_decode_within_one_window_matches_the_whole_decode(frames):
-    """While the track fits the context: full, partial and empty last chunks align with a whole decode."""
-    codec = _tiny_codec(dtype=torch.float64)
-    agent = _agent_frames(frames)
-    num_samples = frames * cfg.FRAME_SIZE - 700
-    streamed = _stream_decode(MimiDecoderSubmodule(codec), agent, num_samples)
-    assert streamed.shape == (1, 1, num_samples)
-    torch.testing.assert_close(streamed, _whole(codec, agent, num_samples), rtol=0, atol=1e-5)
-
-
 def test_tiny_codec_decodes_different_codes_differently():
     """Guards the fixture itself: the decoder tests below mean nothing if all codes sound alike."""
     codec = _tiny_codec()
     a, b = torch.cat(_agent_frames(8, seed=2), dim=-1), torch.cat(_agent_frames(8, seed=3), dim=-1)
     with torch.no_grad():
         assert (codec.decode(a) - codec.decode(b)).abs().max().item() > 1e-3
-
-
-@torch.no_grad()
-def test_streamed_decode_past_the_window_differs_only_slightly_and_needs_its_context():
-    """With the checkpoint's 8 stacked windowed layers the decoder reaches past any finite context, so a
-    long reply differs slightly from a whole-track decode (the Qwen3-TTS trade-off), less with more context."""
-    codec = _tiny_codec(layers=8, dtype=torch.float64)
-    frames = 700
-    agent = _agent_frames(frames)
-    num_samples = frames * cfg.FRAME_SIZE
-    whole = _whole(codec, agent, num_samples)
-
-    def error(context):
-        streamed = _stream_decode(MimiDecoderSubmodule(codec, context_frames=context), agent, num_samples)
-        return (streamed - whole).abs().max().item()
-
-    window = 125 * cfg.FRAME_SIZE  # one attention window: exact while the reply fits
-    streamed = _stream_decode(MimiDecoderSubmodule(codec, context_frames=125), agent, num_samples)
-    torch.testing.assert_close(streamed[..., :window], whole[..., :window], rtol=0, atol=1e-5)
-    short, default, none = error(125), error(cfg.STREAM_CONTEXT_FRAMES), error(0)
-    assert 0 < default < short < none, (default, short, none)  # the truncation is real, and context reduces it
-    assert none > 100 * default
-
-
-@torch.no_grad()
-@pytest.mark.parametrize("frames,short", [(12, 700), (13, 700), (12, 6 * 1920 + 5)])
-def test_every_emission_respects_the_sample_budget(frames, short):
-    """No chunk, final or not, emits past the input's length; frames short of a block wait for the final chunk."""
-    codec = _tiny_codec(dtype=torch.float64)
-    agent = _agent_frames(frames)
-    num_samples = frames * cfg.FRAME_SIZE - short
-    decoder = MimiDecoderSubmodule(codec)
-    pieces, sent = [], 0
-    for start in range(0, frames, 4):
-        # The final flag can come with the last data chunk or only with an empty chunk after it.
-        piece = _decode_chunk(decoder, "r", agent[start : start + 4], num_samples, final=False)
-        sent += piece.shape[-1]
-        assert sent <= num_samples
-        pieces.append(piece)
-    held = frames - 12 if frames > 12 else 0  # blocks of 4 and 8 cover 12 frames
-    assert sum(p.shape[-1] for p in pieces) == min(num_samples, (frames - held) * cfg.FRAME_SIZE)
-    tail = _decode_chunk(decoder, "r", [], num_samples, final=True)
-    assert tail.shape[-1] == max(num_samples - sent, 0)
-    joined = torch.cat([*pieces, tail], dim=-1)
-    assert joined.shape[-1] == num_samples
-    torch.testing.assert_close(joined, _whole(codec, agent, num_samples), rtol=0, atol=1e-5)
-    assert _decode_chunk(decoder, "r", [], num_samples, final=False) is None  # no data, not final: nothing to run
-
-
-def test_blocks_follow_the_stream_schedule():
-    sizes, done = [], 0
-    while done < 120:
-        sizes.append(MimiDecoderSubmodule.block_frames(done))
-        done += sizes[-1]
-    assert sizes[:6] == [*cfg.STREAM_CHUNK_SCHEDULE, *[cfg.STREAM_CHUNK_FRAMES] * 3]
-    assert MimiDecoderSubmodule.block_frames(1) == 3  # mid-block: the frames left to the next boundary
-    assert MimiDecoderSubmodule.block_frames(30) == cfg.STREAM_CHUNK_FRAMES - 2
 
 
 @pytest.mark.parametrize("total", [3, 4, 12, 28, 30, 53, 78, 79])
@@ -998,113 +936,143 @@ def test_decoder_blocks_match_the_chunks_the_stream_releases(total):
 
 
 @torch.no_grad()
-@pytest.mark.parametrize("sizes", [[1] * 40, [3] * 13 + [1], [7, 7, 7, 7, 7, 5], [40], [6, 0, 34]])
-def test_streamed_audio_does_not_depend_on_how_the_stream_groups_frames(sizes):
-    """Bit-identical whatever the delivery: the decoder decodes in its own blocks and holds the rest."""
-    codec = _tiny_codec()
-    agent = _agent_frames(40)
-    num_samples = 40 * cfg.FRAME_SIZE - 300
-    want = _stream_decode(MimiDecoderSubmodule(codec), agent, num_samples)
-    got = _stream_decode(MimiDecoderSubmodule(codec), agent, num_samples, sizes=sizes)
-    assert torch.equal(got, want)
+@pytest.mark.parametrize("frames", [28, 37, 53, 300])
+def test_streamed_decode_matches_the_whole_decode(frames):
+    """Full, partial and empty last chunks align with a whole decode, past the ring window too."""
+    codec = _tiny_codec(dtype=torch.float64)
+    agent = _agent_frames(frames)
+    num_samples = frames * cfg.FRAME_SIZE - 700
+    streamed = _stream_decode(codec, agent, num_samples)
+    assert streamed.shape == (1, 1, num_samples)
+    torch.testing.assert_close(streamed, _whole(codec, agent, num_samples), rtol=0, atol=1e-9)
 
 
 @torch.no_grad()
-def test_decode_last_reruns_seanet_only_over_its_receptive_field():
+def test_a_long_reply_is_the_whole_track_decode():
+    """With the checkpoint's 8 stacked windowed layers the decoder reaches back further than one window;
+    the stream's state carries all of it, so a long reply equals a whole-track decode (no finite context)."""
+    codec = _tiny_codec(layers=8, dtype=torch.float64)
+    frames = 700
+    agent = _agent_frames(frames)
+    num_samples = frames * cfg.FRAME_SIZE
+    torch.testing.assert_close(_stream_decode(codec, agent, num_samples), _whole(codec, agent, num_samples),
+                               rtol=0, atol=1e-9)
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("frames,short", [(12, 700), (13, 700), (12, 6 * 1920 + 5)])
+def test_every_emission_respects_the_sample_budget(frames, short):
+    """Each chunk emits its frames at once; none, final or not, emits past the input's length."""
     codec = _tiny_codec(dtype=torch.float64)
-    codes = torch.cat(_agent_frames(60), dim=-1)
-    whole = codec.decode(codes)
-    for frames in (1, 4, 25):
-        last = codec.decode_last(codes, frames, cfg.SEANET_MARGIN_FRAMES)
-        torch.testing.assert_close(last, whole[..., -frames * cfg.FRAME_SIZE :], rtol=0, atol=1e-6)
-    no_margin = codec.decode_last(codes, 4, 0) - whole[..., -4 * cfg.FRAME_SIZE :]
-    assert no_margin.abs().max().item() > 1e-4  # the margin is what makes it exact
-    with pytest.raises(ValueError):
-        codec.decode_last(codes, 0, cfg.SEANET_MARGIN_FRAMES)
+    agent = _agent_frames(frames)
+    num_samples = frames * cfg.FRAME_SIZE - short
+    driver = _driver(codec)
+    driver.add("r")
+    pieces, sent = [], 0
+    for start in range(0, frames, 4):
+        # The final flag can come with the last data chunk or only with an empty chunk after it.
+        piece = _decode_chunk(driver, "r", agent[start : start + 4], num_samples, final=False)
+        sent += piece.shape[-1]
+        assert sent == min(num_samples, min(start + 4, frames) * cfg.FRAME_SIZE)
+        pieces.append(piece)
+    tail = _decode_chunk(driver, "r", [], num_samples, final=True)
+    assert tail.shape[-1] == 0
+    joined = torch.cat([*pieces, tail], dim=-1)
+    assert joined.shape[-1] == num_samples
+    torch.testing.assert_close(joined, _whole(codec, agent, num_samples), rtol=0, atol=1e-9)
+    assert _decode_chunk(driver, "r", [], num_samples, final=False) is None  # no data, not final: nothing to run
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("sizes", [[1] * 40, [3] * 13 + [1], [7, 7, 7, 7, 7, 5], [40], [6, 0, 34]])
+def test_streamed_audio_does_not_depend_on_how_the_stream_groups_frames(sizes):
+    codec = _tiny_codec(dtype=torch.float64)
+    agent = _agent_frames(40)
+    num_samples = 40 * cfg.FRAME_SIZE - 300
+    want = _stream_decode(codec, agent, num_samples)
+    got = _stream_decode(codec, agent, num_samples, sizes=sizes)
+    torch.testing.assert_close(got, want, rtol=0, atol=1e-9)
+
+
+@torch.no_grad()
+def test_an_empty_final_chunk_emits_nothing_and_keeps_the_state():
+    codec = _tiny_codec(dtype=torch.float64)
+    driver = _driver(codec)
+    driver.add("r")
+    agent = _agent_frames(8)
+    _decode_chunk(driver, "r", agent[:4], 8 * cfg.FRAME_SIZE)
+    assert _decode_chunk(driver, "r", [], 8 * cfg.FRAME_SIZE, final=True).shape[-1] == 0
+    # the stream carries on exactly where it was
+    rest = _decode_chunk(driver, "r", agent[4:], 8 * cfg.FRAME_SIZE)
+    want = _whole(codec, agent, 8 * cfg.FRAME_SIZE)[..., 4 * cfg.FRAME_SIZE :]
+    torch.testing.assert_close(rest, want, rtol=0, atol=1e-9)
 
 
 @torch.no_grad()
 def test_decoder_state_is_per_request_and_released():
     codec = _tiny_codec(dtype=torch.float64)
-    decoder = MimiDecoderSubmodule(codec)
+    driver = _driver(codec)
     a, b = _agent_frames(10, seed=2), _agent_frames(10, seed=3)
     num_samples = 10 * cfg.FRAME_SIZE
     interleaved = {"a": [], "b": []}
+    driver.add("a")
+    driver.add("b")
     for start in range(0, 10, 4):  # two requests' chunks interleaved on one decoder
-        interleaved["a"].append(_decode_chunk(decoder, "a", a[start : start + 4], num_samples, final=start + 4 >= 10))
-        interleaved["b"].append(_decode_chunk(decoder, "b", b[start : start + 4], num_samples, final=start + 4 >= 10))
+        for rid, frames in (("a", a), ("b", b)):
+            interleaved[rid].append(
+                _decode_chunk(driver, rid, frames[start : start + 4], num_samples, final=start + 4 >= 10))
     for rid, frames in (("a", a), ("b", b)):
         torch.testing.assert_close(torch.cat(interleaved[rid], dim=-1), _whole(codec, frames, num_samples),
-                                   rtol=0, atol=1e-5)
-    # Without cleanup, request a's context would precede b's frames on a recycled handle.
-    leaked, want_b = _stream_decode(decoder, b, num_samples, rid="a"), _whole(codec, b, num_samples)
-    assert leaked.shape != want_b.shape or (leaked - want_b).abs().max().item() > 1e-3
-    decoder.cleanup_request("a")
-    assert "a" not in decoder.request_states and "b" in decoder.request_states
-    # A recycled handle starts clean: decoding request b's frames under handle "a" gives b's audio.
-    again = _stream_decode(decoder, b, num_samples, rid="a")
-    torch.testing.assert_close(again, _whole(codec, b, num_samples), rtol=0, atol=1e-5)
+                                   rtol=0, atol=1e-9)
+    driver.remove("a")
+    assert "a" not in driver.decoder.request_states and "b" in driver.decoder.request_states
+    # A request that reuses the id (and the freed slot) starts clean: b's frames under "a" give b's audio.
+    again = _stream_decode(driver, b, num_samples, rid="a")
+    torch.testing.assert_close(again, _whole(codec, b, num_samples), rtol=0, atol=1e-9)
 
 
 @torch.no_grad()
-def test_batched_rows_at_different_stream_offsets_each_get_their_own_audio():
-    codec = _tiny_codec()
-    decoder, solo_decoder = MimiDecoderSubmodule(codec), MimiDecoderSubmodule(codec)
-    a, b = _agent_frames(12, seed=4), _agent_frames(4, seed=5)
-    num_samples = 12 * cfg.FRAME_SIZE
-    for start in (0, 4):  # request a is two chunks in, so its window is longer than b's
-        _decode_chunk(decoder, "a", a[start : start + 4], num_samples)
-        _decode_chunk(solo_decoder, "a", a[start : start + 4], num_samples)
-    info = SimpleNamespace(step_metadata={"num_samples": num_samples})
-    nodes = [decoder.prepare_inputs(cfg.CODEC_WALK, info, {"agent_frame": [_chunk_inputs(a[8:12])]}),
-             decoder.prepare_inputs(cfg.CODEC_WALK, info, {"agent_frame": [_chunk_inputs(b)]})]
-    engine = SimpleNamespace(request_ids=["a", "b"])
-    got = decoder.forward_batched(cfg.CODEC_WALK, engine, **decoder.preprocess(cfg.CODEC_WALK, engine, nodes))
-    want_a = _decode_chunk(solo_decoder, "a", a[8:12], num_samples)
-    want_b = _decode_chunk(solo_decoder, "b", b, num_samples)
-    torch.testing.assert_close(got["a"]["audio_output"][0], want_a, rtol=0, atol=1e-5)
-    torch.testing.assert_close(got["b"]["audio_output"][0], want_b, rtol=0, atol=1e-5)
-    # The rows are distinguishable, so a swap or a shared context would fail the checks above.
-    head = min(want_a.shape[-1], want_b.shape[-1])
-    assert (want_a[..., :head] - want_b[..., :head]).abs().max().item() > 1e-3
-
-
-@torch.no_grad()
-def test_requests_sharing_one_batched_decode_each_get_their_own_audio():
-    """Two requests at the same stream offset are decoded as rows of one batch; each must get its own row."""
+@pytest.mark.parametrize("batched", [True, False])
+def test_batched_rows_at_different_stream_offsets_each_get_their_own_audio(batched):
+    """Rows of different widths and histories share one decode; each matches its stream decoded alone."""
     codec = _tiny_codec(dtype=torch.float64)
-    decoder, solo = MimiDecoderSubmodule(codec), MimiDecoderSubmodule(codec)
-    frames = {"a": _agent_frames(12, seed=6), "b": _agent_frames(12, seed=7)}
+    driver, solo = _driver(codec), _driver(codec)
+    a, b = _agent_frames(12, seed=4), _agent_frames(9, seed=5)
     num_samples = 12 * cfg.FRAME_SIZE
-    info = SimpleNamespace(step_metadata={"num_samples": num_samples})
-    engine = SimpleNamespace(request_ids=["a", "b"])
-    got = {"a": [], "b": []}
-    for start, stop in ((0, 4), (4, 12)):  # the first two blocks, both requests in every step
-        nodes = [decoder.prepare_inputs(cfg.CODEC_WALK, info, {"agent_frame": [_chunk_inputs(frames[r][start:stop])]})
-                 for r in ("a", "b")]
-        out = decoder.forward_batched(cfg.CODEC_WALK, engine, **decoder.preprocess(cfg.CODEC_WALK, engine, nodes))
-        for rid in ("a", "b"):
-            got[rid].append(out[rid]["audio_output"][0])
+    for d in (driver, solo):
+        d.add("a")
+        d.add("b")
+        for start in (0, 4):  # request a is two chunks in, b is fresh
+            _decode_chunk(d, "a", a[start : start + 4], num_samples)
+    nodes = [driver.prepare("a", num_samples, a[8:12]), driver.prepare("b", num_samples, b)]
+    got = driver.step(["a", "b"], nodes, batched=batched or None)
+    want = {"a": _decode_chunk(solo, "a", a[8:12], num_samples), "b": _decode_chunk(solo, "b", b, num_samples)}
     for rid in ("a", "b"):
-        want = _stream_decode(solo, frames[rid], num_samples, rid=rid)
-        torch.testing.assert_close(torch.cat(got[rid], dim=-1), want, rtol=0, atol=1e-5)
-    assert (torch.cat(got["a"], dim=-1) - torch.cat(got["b"], dim=-1)).abs().max().item() > 1e-3
+        torch.testing.assert_close(got[rid], want[rid], rtol=0, atol=1e-9)
+    assert got["a"].shape[-1] == 4 * cfg.FRAME_SIZE and got["b"].shape[-1] == 9 * cfg.FRAME_SIZE
+    head = min(want["a"].shape[-1], want["b"].shape[-1])
+    assert (want["a"][..., :head] - want["b"][..., :head]).abs().max().item() > 1e-3
 
 
 @torch.no_grad()
 def test_preparing_the_next_chunk_first_changes_nothing():
-    """prepare_inputs reads no request state, so N+1's preparation before N's forward is harmless."""
+    """Speculation prepares chunk N+1 before chunk N runs: prepare_inputs reads no stream state, and the
+    forward reads it from the pool in step order, so the audio is unchanged."""
     codec = _tiny_codec(dtype=torch.float64)
     agent = _agent_frames(12)
     num_samples = 12 * cfg.FRAME_SIZE
-    decoder = MimiDecoderSubmodule(codec)
-    info = SimpleNamespace(step_metadata={"num_samples": num_samples})
-    engine = SimpleNamespace(request_ids=["r"])
-    first = decoder.prepare_inputs(cfg.CODEC_WALK, info, {"agent_frame": [_chunk_inputs(agent[:4])]})
-    second = decoder.prepare_inputs(cfg.CODEC_WALK, info, {"agent_frame": [_chunk_inputs(agent[4:])]})
-    out = [decoder.forward(cfg.CODEC_WALK, engine, **decoder.preprocess(cfg.CODEC_WALK, engine, [node]))
-           ["audio_output"][0] for node in (first, second)]
-    torch.testing.assert_close(torch.cat(out, dim=-1), _whole(codec, agent, num_samples), rtol=0, atol=1e-5)
+    driver = _driver(codec)
+    driver.add("r")
+    first, second = driver.prepare("r", num_samples, agent[:4]), driver.prepare("r", num_samples, agent[4:])
+    out = [driver.step(["r"], [node])["r"] for node in (first, second)]
+    torch.testing.assert_close(torch.cat(out, dim=-1), _whole(codec, agent, num_samples), rtol=0, atol=1e-9)
+
+
+def test_decoder_declares_its_stream_state_on_every_row():
+    codec = _tiny_codec()
+    step = MimiDecoderSubmodule(codec).declare_step(cfg.CODEC_WALK, ["a", "b"], [None, None])
+    assert set(step.steps) == {cfg.MIMI_STATE}
+    assert [(s.request_id, s.label, s.span) for s in step.segments] == [("a", "main", 1), ("b", "main", 1)]
 
 
 def _code_margins(codec, pcm):

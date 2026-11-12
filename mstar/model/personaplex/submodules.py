@@ -43,10 +43,12 @@ from mstar.model.submodule_base import (
     NodeSubmodule,
     StopPolicy,
 )
+from mstar.utils.h2d import PinnedStager
 
 from . import config as cfg
 from .components.delayed_cache import CacheRows, DelayedTokenCache, commit_rows, prepare_rows
 from .components.mimi import MimiCodec, pad_to_frames
+from .components.mimi_stream import IncrementalMimiDecoder
 from .weights import PersonaPlexLM
 
 GENERATE_WALKS = frozenset({cfg.GENERATE_WALK, cfg.GENERATE_AUDIO_WALK})
@@ -384,7 +386,7 @@ class _MimiSubmodule(NodeSubmodule):
     """Mimi runs in fp32 like the reference ([PP] models/loaders.py:129-163).
 
     The encoder runs once per request over its whole clip and does not batch;
-    the decoder batches chunks whose windows have the same length.
+    the decoder batches any chunks, padded to the widest.
     """
 
     disable_autocast = True
@@ -414,30 +416,23 @@ class MimiEncoderSubmodule(_MimiSubmodule):
 
 
 class MimiDecoderSubmodule(_MimiSubmodule):
-    """Streamed agent frames -> 24 kHz PCM ([PP] offline.py:300-307 decodes the whole track).
+    """Streamed agent frames -> 24 kHz PCM, equal to one whole-track decode ([PP] offline.py:300-307).
 
-    Frames are decoded in fixed blocks (``block_frames``), each behind the
-    request's last ``context_frames`` decoded frames, and only the block's
-    samples are emitted. Frames that do not yet fill a block wait in the
-    request's state until the next chunk or the stream's end, so a request's
-    audio depends only on its frames, not on how the stream grouped them.
-    Past the context, the decoder's 8 stacked windowed attention layers reach
-    further back than the window, so a block can differ slightly from a
-    whole-track decode. Emission
-    stops at the input's sample count; the stream can end on an empty chunk,
-    which still runs.
+    Each chunk decodes only its new frames, from the stream's decoder state
+    (``IncrementalMimiDecoder``), which lives in the ``mimi_state`` recurrent
+    pool: a step gathers its rows' state and scatters the new state back, so a
+    request's audio does not depend on how the stream grouped its frames.
+    Emission stops at the input's sample count; the stream can end on an empty
+    chunk, which still runs.
     """
 
-    CONTEXT_KEY = "mimi_context"  # [8, n] agent codes, the last n <= context_frames decoded frames
-    PENDING_KEY = "mimi_pending"  # [8, p] agent codes received but not yet decoded
-    DECODED_KEY = "mimi_decoded"  # frames decoded so far
-    EMITTED_KEY = "mimi_emitted"  # samples sent so far
+    EMITTED_KEY = "mimi_emitted"  # samples sent so far, kept by postprocess
 
-    def __init__(self, codec: MimiCodec, context_frames: int = cfg.STREAM_CONTEXT_FRAMES,
-                 max_batch_size: int = cfg.DEFAULT_MAX_BATCH_SIZE):
+    def __init__(self, codec: MimiCodec, max_batch_size: int = cfg.DEFAULT_MAX_BATCH_SIZE):
         super().__init__(codec)
-        self.context_frames = context_frames
+        self.incremental = IncrementalMimiDecoder(codec)
         self._max_batch_size = max_batch_size
+        self._lengths_stager = PinnedStager(torch.long, numel=max_batch_size)
 
     @staticmethod
     def stream_codes(chunk: torch.Tensor) -> torch.Tensor:
@@ -450,32 +445,39 @@ class MimiDecoderSubmodule(_MimiSubmodule):
             raise ValueError(f"agent frames must be [k, 1, 8, 1] or [1, 8, 1], got {tuple(chunk.shape)}")
         return frames.transpose(0, 1).contiguous()
 
-    @staticmethod
-    def block_frames(decoded: int) -> int:
-        """Frames in the block that starts after ``decoded`` frames: ``STREAM_CHUNK_SCHEDULE``, then
-        ``STREAM_CHUNK_FRAMES`` each, the same sizes the stream's chunk policy releases."""
-        start = 0
-        for size in cfg.STREAM_CHUNK_SCHEDULE:
-            if decoded < start + size:
-                return start + size - decoded
-            start += size
-        return cfg.STREAM_CHUNK_FRAMES - (decoded - start) % cfg.STREAM_CHUNK_FRAMES
-
     def prepare_inputs(self, graph_walk, fwd_info, inputs, is_final_stream_chunk=False, **kwargs) -> NodeInputs | None:
         del graph_walk, kwargs
-        static = {"num_samples": int(fwd_info.step_metadata["num_samples"]), "final": bool(is_final_stream_chunk)}
+        static = {"num_samples": int(fwd_info.step_metadata["num_samples"])}
         chunk = inputs.get("agent_frame") or []
         if not chunk:
             # A stream can end on an empty final chunk; it must still run to flush and close the stream.
-            return NodeInputs(kwargs=static) if is_final_stream_chunk else None
+            return NodeInputs(kwargs={**static, "frames": 0}) if is_final_stream_chunk else None
         codes = self.stream_codes(chunk[0].to(self.get_device()).long())
-        return NodeInputs(tensor_inputs={"codes": codes}, kwargs=static, input_seq_len=codes.shape[1])
+        return NodeInputs(tensor_inputs={"codes": codes}, kwargs={**static, "frames": codes.shape[1]},
+                          input_seq_len=codes.shape[1])
+
+    def declare_step(self, graph_walk, request_ids, inputs, slot_lease=None, piecewise_leases=None,
+                     **kwargs) -> SubmoduleStep:
+        """Every row reads and writes its stream's decoder state."""
+        del graph_walk, inputs, slot_lease, piecewise_leases, kwargs
+        return SubmoduleStep(segments=[Segment(request_id=rid, label="main", span=1) for rid in request_ids],
+                             steps={cfg.MIMI_STATE: RecurrentStep()})
 
     def preprocess(self, graph_walk, engine_inputs, inputs):
+        """The batch's chunks as ``[B, 8, width]``, right-padded to its widest, and each row's real length."""
         del graph_walk, engine_inputs
-        return {"codes": [inp.tensor_inputs.get("codes") for inp in inputs],
-                "num_samples": [inp.kwargs["num_samples"] for inp in inputs],
-                "final": [inp.kwargs["final"] for inp in inputs]}
+        frames = [inp.kwargs["frames"] for inp in inputs]
+        width = max(frames)
+        if width == 0:
+            return {"codes": None, "lengths": None}
+        device = self.get_device()
+        rows = [inp.tensor_inputs["codes"] if n else torch.zeros(cfg.AUDIO_CODEBOOKS_PER_STREAM, 0, dtype=torch.long,
+                                                                  device=device)
+                for inp, n in zip(inputs, frames, strict=True)]
+        codes = torch.stack([torch.nn.functional.pad(row, (0, width - row.shape[1])) for row in rows])
+        lengths = torch.empty(len(inputs), dtype=torch.long, device=device)
+        self._lengths_stager.copy_(lengths, frames)
+        return {"codes": codes, "lengths": lengths}
 
     def can_batch(self, batch, model_inputs) -> bool:
         del batch, model_inputs
@@ -488,60 +490,40 @@ class MimiDecoderSubmodule(_MimiSubmodule):
         return self._max_batch_size
 
     @torch.no_grad()
-    def forward_batched(self, graph_walk, engine_inputs, codes, num_samples, final,
-                        **kwargs) -> dict[str, NameToTensorList]:
-        """Decode every full block (and, at the stream's end, the rest); rows whose blocks have equal
-        shapes share one decode.
+    def _decode(self, engine_inputs, codes, lengths) -> torch.Tensor:
+        """``[B, 1, width * 1920]`` PCM from each row's state; a row's samples past its length are padding."""
+        if codes is None:  # only empty final chunks: nothing to decode, no state to move
+            return torch.zeros(len(engine_inputs.request_ids), 1, 0, device=self.get_device())
+        pool: RecurrentStatePool = engine_inputs.resources[cfg.MIMI_STATE]
+        # a fresh stream, and a padding row on the sink, read zeros: the decoder's own left padding
+        state = {name: pool.gather(name) for name in self.incremental.state_blocks()}
+        pcm, new = self.incremental(codes, state, lengths)
+        for name, value in new.items():
+            pool.scatter_(name, value)
+        return pcm
 
-        The context and pending frames are read and written here, in the forward, so the next chunk
-        of a request always sees this one's frames.
-        """
+    def forward(self, graph_walk, engine_inputs, codes, lengths, **kwargs) -> NameToTensorList:
         del graph_walk, kwargs
-        rids = list(engine_inputs.request_ids)
-        states = [self.request_state(rid) for rid in rids]
-        pending = []
-        for state, new in zip(states, codes, strict=True):
-            held = state.get(self.PENDING_KEY)
-            pending.append(new if held is None else held if new is None else torch.cat([held, new], dim=1))
-        pieces: list[list[torch.Tensor]] = [[] for _ in rids]
-        while True:
-            groups: dict[tuple[int, int], list[tuple[int, torch.Tensor]]] = {}
-            for i, state in enumerate(states):
-                if pending[i] is None or pending[i].shape[1] == 0:
-                    continue
-                size = self.block_frames(state.get(self.DECODED_KEY, 0))
-                if pending[i].shape[1] < size and not final[i]:
-                    continue
-                size = min(size, pending[i].shape[1])
-                context = state.get(self.CONTEXT_KEY)
-                block = pending[i][:, :size]
-                window = block if context is None else torch.cat([context, block], dim=1)
-                groups.setdefault((window.shape[1], size), []).append((i, window))
-            if not groups:
-                break
-            for (_, size), rows in groups.items():
-                pcm = self.codec.decode_last(torch.stack([w for _, w in rows]), size, cfg.SEANET_MARGIN_FRAMES)
-                for row, (i, window) in enumerate(rows):
-                    state = states[i]
-                    pieces[i].append(pcm[row : row + 1])
-                    # an explicit start: a -0 slice would keep the whole history
-                    state.add(self.CONTEXT_KEY, window[:, max(window.shape[1] - self.context_frames, 0) :])
-                    state.add(self.DECODED_KEY, state.get(self.DECODED_KEY, 0) + size)
-                    pending[i] = pending[i][:, size:]
-        out: dict[str, NameToTensorList] = {}
-        device = self.get_device()
-        for i, (rid, state) in enumerate(zip(rids, states, strict=True)):
-            if pending[i] is not None and pending[i].shape[1]:
-                state.add(self.PENDING_KEY, pending[i])
-            else:
-                state.remove(self.PENDING_KEY)
-            emitted = state.get(self.EMITTED_KEY, 0)
-            fresh = torch.cat(pieces[i], dim=-1) if pieces[i] else torch.zeros(1, 1, 0, device=device)
-            fresh = fresh[..., : max(num_samples[i] - emitted, 0)]
-            state.add(self.EMITTED_KEY, emitted + fresh.shape[-1])
-            out[rid] = {"audio_output": [fresh.contiguous()]}
-        return out
+        return {"audio_output": [self._decode(engine_inputs, codes, lengths)]}
 
-    def forward(self, graph_walk, engine_inputs, codes, num_samples, final, **kwargs) -> NameToTensorList:
-        outputs = self.forward_batched(graph_walk, engine_inputs, codes, num_samples, final, **kwargs)
-        return outputs[engine_inputs.request_ids[0]]
+    def forward_batched(self, graph_walk, engine_inputs, codes, lengths, **kwargs) -> BatchedModelOutput:
+        del graph_walk, kwargs
+        return BatchedModelOutput(row_outputs={"audio_output": self._decode(engine_inputs, codes, lengths)})
+
+    def postprocess(self, request_id, request_info, outputs, inputs=None, **kwargs) -> None:
+        """Cut the row to its chunk's frames and stop at the input's sample count.
+
+        Runs once per executed step, in step order, so the count of samples sent
+        is exact whatever the worker speculated.
+        """
+        del request_info, kwargs
+        if "audio_output" not in outputs:
+            return
+        if inputs is None:
+            raise ValueError("decoder postprocess needs the pass's inputs for its chunk length")
+        state = self.request_state(request_id)
+        emitted = state.get(self.EMITTED_KEY, 0)
+        audio = outputs["audio_output"][0].reshape(-1)[: inputs.kwargs["frames"] * cfg.FRAME_SIZE]
+        audio = audio[: max(inputs.kwargs["num_samples"] - emitted, 0)]
+        state.add(self.EMITTED_KEY, emitted + audio.shape[-1])
+        outputs["audio_output"][0] = audio.reshape(1, 1, -1)
