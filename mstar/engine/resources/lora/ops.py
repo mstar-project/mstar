@@ -14,6 +14,11 @@ be checked on a CPU.
 
 Rows of ``h`` the expand does not read (tokens on the zero adapter, columns past a
 slot's rank) are unspecified; the reference writes zeros there.
+
+``b`` must be finite everywhere, including ``b[slot, :, rank:]`` past each slot's rank: the
+CUDA expand reads it up to the max rank against zeros in ``h``, so a NaN or inf there reaches
+the output (the reference's one GEMM over every slot reads all of ``b``). The pool keeps those
+columns zero.
 """
 
 from __future__ import annotations
@@ -54,7 +59,8 @@ def lora_expand_(
     slot_indptr: torch.Tensor, token_slot: torch.Tensor, ranks: torch.Tensor, scalings: torch.Tensor,
     out_slices: list[int],
 ) -> None:
-    """``y[:, slice] += scaling * h[:, slice ranks] @ b[slot, slice]^T`` in place."""
+    """``y[:, slice] += scaling * h[:, slice ranks] @ b[slot, slice]^T`` in place. ``b`` must be
+    finite past each slot's rank (see above)."""
     expand_reference_(y, h, b, token_slot, ranks, scalings, out_slices)
 
 
@@ -70,7 +76,8 @@ def lora_apply_(
     scalings: torch.Tensor, out_slices: list[int],
 ) -> None:
     """``lora_expand_(y, lora_shrink(x, ...), ...)`` as one op, so a kernel may keep the
-    shrink's output in whatever form suits its expand (split partials on CUDA)."""
+    shrink's output in whatever form suits its expand (split partials on CUDA). ``b`` must be
+    finite past each slot's rank, as for ``lora_expand_``."""
     h = shrink_reference(x, a, token_slot, ranks, len(out_slices))
     expand_reference_(y, h, b, token_slot, ranks, scalings, out_slices)
 
