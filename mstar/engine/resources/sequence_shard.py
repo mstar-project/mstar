@@ -35,6 +35,7 @@ import torch
 from mstar.distributed.communication import CommGroup, gather_sequence, sp_seq_split
 from mstar.engine.resources.base import EngineResourceInfo, Resource
 from mstar.engine.resources.context_parallel import gather_merge, position_pools
+from mstar.engine.resources.resident_hooks import ANY_REPEATS
 from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.engine.resources.step import ResourceStep, StepContext
 
@@ -167,8 +168,8 @@ class SequenceShard(Resource):
     host-only, from the declared step and the lease, the same on every rank. Off its defaults:
     ``prefix_skip_safe`` (it plans from the step a prefix hit already trimmed), ``supports_preplan``
     (its dependents pre-plan), ``resident_refusal`` (None: a one-token-a-row step, what resident
-    planning replays, is never split); it keeps ``supports_context_parallel`` False (it depends on no pool),
-    ``can_capture`` True and ``force_double_buffer`` False (nothing staged)."""
+    planning replays, is never split) and so ``max_repeats`` (any); it keeps ``supports_context_parallel``
+    False (it depends on no pool), ``can_capture`` True and ``force_double_buffer`` False (nothing staged)."""
 
     prefix_skip_safe = True
     supports_split_steps = True
@@ -179,6 +180,10 @@ class SequenceShard(Resource):
 
     def resident_refusal(self) -> str | None:
         return None
+
+    def max_repeats(self, step, ctx) -> int:
+        # a replay is a batched decode, which plans copied (`_decide`), so no plan goes stale between replays
+        return ANY_REPEATS
 
     def __init__(
         self, labels: tuple[str, ...], axis: int, walks: frozenset[str] | None, min_tokens: int,

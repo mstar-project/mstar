@@ -299,6 +299,12 @@ def test_a_split_step_refuses_what_it_cant_range():
     assert shard.scatter("other", x) is x
 
 
+def test_a_decode_step_on_a_node_with_a_shard_may_repeat():
+    """A resident replay is a batched decode, which the shard plans copied, so it holds no node to
+    one iteration a step (`step_repeats`)."""
+    assert _shard().max_repeats(None, None) > 1
+
+
 def test_a_rows_share_comes_back_row_major():
     """Wan2.2's patchified stream is channel-major. Eager pointwise ops keep their first input's
     layout, so a strided share would run every block's norms and residual adds strided."""
