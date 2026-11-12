@@ -388,8 +388,11 @@ def _speech_model(kind, path):
     if kind == "omnilingual":
         from mstar.model.omnilingual_asr.omnilingual_asr_model import OmnilingualASRModel
 
-        # the upload's decode and normalize read nothing the constructor sets
-        return OmnilingualASRModel.__new__(OmnilingualASRModel)
+        # The upload's decode and normalize read nothing the constructor sets. The data worker reads the model's
+        # declarations, and an fp32 model declares none.
+        model = OmnilingualASRModel.__new__(OmnilingualASRModel)
+        model.dtype = torch.float32
+        return model
     from mstar.model.parakeet.parakeet_model import ParakeetModel
 
     return ParakeetModel(str(_snapshot(path, nemotron=kind == "nemotron")))
