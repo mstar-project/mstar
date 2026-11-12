@@ -11,12 +11,14 @@ from itertools import groupby
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
 
 import torch
+from torch.nn.attention.flex_attention import _DEFAULT_SPARSE_BLOCK_SIZE
 
 from mstar.distributed.communication import CommGroup
 from mstar.engine.resources.attn.config import (
     AttentionConfig,
     AttentionSpec,
     AttentionStep,
+    AttnBackend,
     CrossAttentionConfig,
     CrossAttentionSpec,
 )
@@ -27,7 +29,15 @@ from mstar.engine.resources.attn.ragged.config import (
     RaggedCrossAttentionStep,
     cross_label,
 )
-from mstar.engine.resources.kv.config import KVLayout, KVSpec, KVStep, PagedKVConfig
+from mstar.engine.resources.kv.config import (
+    KVLayout,
+    KVSpec,
+    KVStep,
+    PagedKVConfig,
+    RingKVConfig,
+    RingKVLayerConfig,
+    RingKVStep,
+)
 from mstar.engine.resources.linear_attn.config import (
     LinearAttnConfig,
     LinearAttnSpec,
@@ -66,6 +76,7 @@ from mstar.engine.state.contract import (
     Causal,
     CausalConv,
     Entry,
+    FrameWindow,
     GatedDeltaNet,
     KVEntry,
     Layout,
@@ -432,7 +443,7 @@ class ArraySteps(StepBuilder):
         segments = segments_of(declared, step)
         self._storage.steps(handle, declared, step, self._steps)
         for key, bound in handle._step_ops(walk):
-            bound.binding.steps(key, bound.declared, declared, segments, self._steps)
+            bound.binding.steps(handle.array, key, bound.declared, declared, segments, self._steps)
 
     def steps(self) -> dict[str, Any]:
         return self._steps
@@ -565,7 +576,7 @@ class OpBinding:
         return []
 
     def steps(
-        self, key: str, op: Read | Op | Positions, declared: ArrayStep, segments, steps: dict[str, Any],
+        self, array: Array, key: str, op: Read | Op | Positions, declared: ArrayStep, segments, steps: dict[str, Any],
     ) -> None:
         """Add the step of ``op``'s resource under ``key``, for the array's ``declared`` step over ``segments``."""
         return
@@ -595,7 +606,7 @@ class OpBinding:
         """What a handle calls to run the op, on the resource under ``key``."""
         return resources[key]
 
-    def attach(self, handle: "PagedArrayHandle", key: str, run: Any) -> None:
+    def attach(self, handle: ArrayHandle, key: str, run: Any) -> None:
         """Give a paged ``handle`` ``run``, what it calls for the op under ``key``."""
         raise _no_layout(handle.array, f"{key!r} binds through {type(self).__name__}, which no paged array holds")
 
@@ -628,7 +639,9 @@ class PagedAttend(OpBinding):
             ),
         )]
 
-    def steps(self, key: str, read: Read, declared: ArrayStep, segments, steps: dict[str, Any]) -> None:
+    def steps(
+        self, array: Array, key: str, read: Read, declared: ArrayStep, segments, steps: dict[str, Any],
+    ) -> None:
         steps[key] = AttentionStep(segments=segments, causal=not isinstance(read.mask, Bidirectional))
 
     def apply(self, spec: NodeResourceSpec | None, settings: Mapping[str, Any]) -> None:
@@ -666,8 +679,28 @@ class PagedCrossAttend(PagedAttend):
             ),
         )]
 
-    def steps(self, key: str, read: Read, declared: ArrayStep, segments, steps: dict[str, Any]) -> None:
+    def steps(
+        self, array: Array, key: str, read: Read, declared: ArrayStep, segments, steps: dict[str, Any],
+    ) -> None:
         steps[key] = AttentionStep(segments=segments, causal=False)
+
+
+class FlexAttend(OpBinding):
+    """`Attend` on a ring: the flex attention resource every read of the array shares, which its storage builds and
+    steps."""
+
+    def check(self, array: Array, key: str, read: Read) -> None:
+        if read.mask.tokens % _DEFAULT_SPARSE_BLOCK_SIZE:
+            raise _no_layout(array, f"reads[{key!r}].mask.tokens is {read.mask.tokens}, and a flex block mask holds "
+                                    f"whole blocks of {_DEFAULT_SPARSE_BLOCK_SIZE}")
+        if read.walks is not None:
+            raise _no_layout(array, f"reads[{key!r}].walks must be None, since a ring's reads share one plan a step")
+        if read.packed:
+            raise _no_layout(array, f"reads[{key!r}] takes packed queries, and flex attends rows of one frame; declare "
+                                    "packed=False")
+
+    def attach(self, handle: ArrayHandle, key: str, run: Any) -> None:
+        handle.reads[key] = run
 
 
 class PositionsBinding(OpBinding):
@@ -677,7 +710,9 @@ class PositionsBinding(OpBinding):
     def specs(self, array: Array, key: str, declared: Positions) -> list[NodeResourceSpec]:
         return [_position_spec(array)]
 
-    def steps(self, key: str, positions: Positions, declared: ArrayStep, segments, steps: dict[str, Any]) -> None:
+    def steps(
+        self, array: Array, key: str, positions: Positions, declared: ArrayStep, segments, steps: dict[str, Any],
+    ) -> None:
         # a step that keeps nothing doesn't advance the counter
         advance = declared.advance if declared.keep else (0,) * len(segments)
         steps[key] = PositionStep(segments=segments, advance=advance, pos_ids=declared.position_ids)
@@ -686,6 +721,40 @@ class PositionsBinding(OpBinding):
         """Set the handle's position resource, and the dtype the declared `Rope` rotates in, None for the query's."""
         rope = handle.array.positions.rope
         handle.positions, handle.rope_dtype = run, None if rope is None else rope.dtype
+
+
+class CounterPositions(OpBinding):
+    """`Positions` with no `Rope`, on an array whose own resource counts each row's entries and answers `position`."""
+
+    def check(self, array: Array, key: str, positions: Positions) -> None:
+        if positions.rope is not None:
+            raise _no_layout(array, "positions.rope, and its storage keeps no position ids to rotate at")
+
+    def resource(self, array: Array, key: str) -> str:
+        return array.name
+
+    def steps(
+        self, array: Array, key: str, positions: Positions, declared: ArrayStep, segments, steps: dict[str, Any],
+    ) -> None:
+        if declared.advance is not None or declared.position_ids is not None:
+            raise _no_layout(array, "a step sets advance or position_ids, and its storage counts each row's entries")
+
+    def attach(self, handle: ArrayHandle, key: str, run: Any) -> None:
+        handle.positions = _Counter(handle.array, run)
+
+
+class _Counter:
+    """The positions of a resource that counts each row's entries: `position` and nothing else."""
+
+    def __init__(self, array: Array, run: Any):
+        self._array = array
+        self.position = run.position
+
+    def pos_ids(self, label: str) -> torch.Tensor:
+        raise _no_layout(self._array, "positions(), and its positions are a count with no ids")
+
+    def apply_qk(self, q: torch.Tensor, k: torch.Tensor, *, label: str, rope_dtype: torch.dtype) -> tuple:
+        raise _no_layout(self._array, "rope(), and its positions declare no Rope")
 
 
 class WithinStepAttend(OpBinding, ABC):
@@ -744,7 +813,9 @@ class LinearAttnBinding(OpBinding):
 
     kernel_settings = frozenset({"splits"})
 
-    def steps(self, key: str, op: Op, declared: ArrayStep, segments, steps: dict[str, Any]) -> None:
+    def steps(
+        self, array: Array, key: str, op: Op, declared: ArrayStep, segments, steps: dict[str, Any],
+    ) -> None:
         steps[key] = LinearAttnStep(segments=segments)
 
     @staticmethod
@@ -1055,6 +1126,61 @@ class PagedCrossHandle(PagedArrayHandle):
         self._check_open("at_last_token")
         raise self._refusal(f"at_last_token lays x out by this array's segments, and its read's queries are laid out "
                             f"by {self.queries.array.name!r}; call it on that array")
+
+
+class RingHandle(ArrayHandle):
+    """Adds and reads one frame per row through a ring of frame slots per layer. A compiled region traces its calls, so
+    they carry no graph break, and their checks run only while not compiling: a traced check would guard on the
+    handle's records, and the region would compile again for each kind of step. ``k``, ``v`` and ``q`` come as rows,
+    (rows, tokens, heads, head_dim)."""
+
+    def __init__(
+        self, array: Array, resources: Mapping[str, Any], bindings: tuple[BoundOp, ...], resolved: "Resolved",
+    ):
+        super().__init__(array, resources)
+        self._bindings = bindings
+        self.reads = {}
+        for bound in bindings:
+            run = bound.binding.bind(array, resolved.resource_of[bound.key], resources)
+            bound.binding.attach(self, bound.key, run)
+        self._ring = resources[array.name]
+        # the flex resource every read shares, and its key
+        self.flex_key = resolved.resource_of[next(iter(array.reads))]
+        self._flex = self.reads[next(iter(array.reads))]
+        # each layer's k and v over every session, which the ring's writes fill in place
+        self._views = {layer: self._ring.layers[i].kv.unbind(0) for layer, i in self._pool_layer.items()}
+
+    def _check_storage(self, declared: ArrayStep, segments, ctx) -> None:
+        tokens = self._ring.tokens_per_frame
+        other = next((segment for segment in segments if segment.span != tokens), None)
+        if other is not None:
+            raise self._no_layout(f"row {other.request_id} adds {other.span} entries, and a ring step adds one frame "
+                                  f"of {tokens} per row")
+        if declared.forks:
+            raise self._no_layout("a step forks a ring, whose sessions hold one request each")
+        if not declared.keep:
+            raise self._no_layout("keep=False on a ring, whose commit counts a frame for every row the step lists")
+        super()._check_storage(declared, segments, ctx)
+
+    def add(self, layer: int | torch.Tensor, *, keep: bool | None = None, **fields: torch.Tensor) -> None:
+        layer = self._layer_id(layer)
+        if not torch.compiler.is_compiling():
+            self._record_add(layer, keep)
+        k, v = fields["k"].transpose(1, 2), fields["v"].transpose(1, 2)
+        self._ring.write(k, v, self._pool_layer[layer], keep=keep is not False)
+
+    def read(self, layer: int | torch.Tensor, q: torch.Tensor | None = None, **mask_args: Any) -> torch.Tensor:
+        if q is None:
+            raise self._no_layout("a read with no op")
+        if mask_args:
+            raise self._no_layout(f"mask arguments {sorted(mask_args)}, which no mask defines")
+        layer = self._layer_id(layer)
+        if not torch.compiler.is_compiling():
+            self._record_read(layer)
+        k, v = self._views[layer]
+        q = q.transpose(1, 2)
+        out = self._flex.attend(q, k, v, None, enable_gqa=q.size(1) != k.size(1), layer_idx=self._pool_layer[layer])
+        return out.transpose(1, 2)
 
 
 class ValueHandle(ArrayHandle):
@@ -1772,6 +1898,66 @@ class PagedCrossStorage(PagedStorage):
         super().steps(handle, declared, step, steps)
 
 
+class RingStorage(Storage):
+    """An append-only array whose reads are all frame windows, in a ring of frame slots per layer that keeps only what
+    the layer's window reaches. Its reads share one flex attention resource, which stages every layer's mask from the
+    ring's plan."""
+
+    handle_class = RingHandle
+
+    def resolve(self, arrays: Sequence[Array], declared: Sequence[Array], setup: "StateSetup") -> Resolved:
+        resolved = Resolved({}, {}, {}, {})
+        for array in arrays:
+            bound = resolved.bound[array.name] = _bindings(self, array, setup.by_read)
+            heads, head_dim = _kv_shape(array)
+            masks = {layer: read.mask for read in array.reads.values() for layer in read_layers(array, read)}
+            uncovered = sorted(array.layers - masks.keys())
+            if uncovered:
+                raise _no_layout(array, f"layers {uncovered} have no read, and a ring sizes each layer by its read")
+            tokens = {mask.tokens for mask in masks.values()}
+            if len(tokens) > 1:
+                raise _no_layout(array, f"reads take frames of {sorted(tokens)} entries, and a ring holds one size")
+            q_heads = {read.op.q_heads for read in array.reads.values()}
+            if len(q_heads) > 1:
+                raise _no_layout(array, f"reads have q_heads {sorted(q_heads)}, and RingKVConfig has one num_qo_heads")
+            if len(array.labels) != 1:
+                raise _no_layout(array, f"labels {sorted(array.labels)}, and a ring holds one session per request")
+            (frame,) = tokens
+            if array.max_len < frame:
+                raise _no_layout(array, f"max_len {array.max_len} holds no frame of {frame} entries")
+            shared = next(iter(array.reads))
+            resolved.specs[array.name] = [
+                KVSpec(resource_key=array.name, nodes=array.nodes, config=RingKVConfig(
+                    num_layers=len(array.layers), num_kv_heads=heads, num_qo_heads=q_heads.pop(), head_dim=head_dim,
+                    tokens_per_frame=frame, max_frames=array.max_len // frame, layers=tuple(
+                        RingKVLayerConfig(
+                            ring_frames=masks[layer].frames // masks[layer].stride,
+                            ring_buckets=masks[layer].frames // masks[layer].stride,
+                            pinned_dilation=masks[layer].stride,
+                        )
+                        for layer in sorted(array.layers)
+                    ),
+                )),
+                AttentionSpec(
+                    resource_key=shared, nodes=array.nodes,
+                    config=AttentionConfig(kv_cache=array.name, backend=AttnBackend.FLEX),
+                ),
+            ]
+            others = [each for each in bound if each.key not in array.reads]
+            resolved.resource_of.update(dict.fromkeys(array.reads, shared) | _resources_of(array, others))
+        return resolved
+
+    def steps(self, handle: RingHandle, declared: ArrayStep, step: SubmoduleStep, steps: dict[str, Any]) -> None:
+        ring = handle._ring
+        # the ring's admit checks each row's frame against the one it last committed, while a model still declares one
+        frames = tuple(
+            (segment.request_id, ring.position(segment.request_id, segment.label) // ring.tokens_per_frame)
+            for segment in segments_of(declared, step)
+        )
+        steps[handle.name] = RingKVStep(segments=declared.segments, frames=frames)
+        steps[handle.flex_key] = AttentionStep(segments=declared.segments)
+
+
 class ValueStorage(Storage):
     """A rewritable array of one entry, in a recurrent state pool."""
 
@@ -1890,6 +2076,7 @@ class WithinStepStorage(Storage):
 PAGED = PagedStorage()
 PAGED_BY_WALK = PagedByWalkStorage()
 PAGED_CROSS = PagedCrossStorage()
+RING = RingStorage()
 VALUE = ValueStorage()
 VALUE_WITH_HOST = ValueWithHostStorage()
 HOST_VALUE = HostValueStorage()
@@ -1906,6 +2093,8 @@ def storage_of(array: Array) -> Storage:
         raise _no_layout(array, "a rewritable array has no spec unless it is a Value, of max_len 1")
     if not array.max_len:
         return WITHIN_STEP
+    if array.reads and all(isinstance(read.mask, FrameWindow) for read in array.reads.values()):
+        return RING
     if any(read.queries is not None for read in array.reads.values()):
         return PAGED_CROSS
     return PAGED_BY_WALK if reads_differ_by_walk(array) else PAGED
@@ -1920,6 +2109,8 @@ BINDINGS: dict[tuple[Storage, type[Op | Positions]], OpBinding] = {
     (PAGED_BY_WALK, Positions): PositionsBinding(),
     (PAGED_CROSS, Attend): PagedCrossAttend(),
     (PAGED_CROSS, Positions): PositionsBinding(),
+    (RING, Attend): FlexAttend(),
+    (RING, Positions): CounterPositions(),
     (WITHIN_STEP, Attend): RaggedAttend(),
     (VALUE, GatedDeltaNet): GDN(),
     (VALUE, CausalConv): ConvOnLinearAttn(),
