@@ -192,7 +192,7 @@ def _clear_fa3_caches():
     dense_module._fa3_unavailable_reason.cache_clear()
     from mstar.engine.resources.attn.ragged import dense as ragged_dense
 
-    ragged_dense._warn_ragged_dense_fallback.cache_clear()
+    ragged_dense._warn_ragged_fallback.cache_clear()
     ragged_dense._warn_dense_on_flashinfer.cache_clear()
 
 
