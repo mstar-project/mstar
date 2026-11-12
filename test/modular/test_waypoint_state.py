@@ -193,3 +193,10 @@ def test_a_second_request_in_a_reused_slot_reads_zeros():
         pool.commit(step, ctx)
         decoder.end_step(expanded)
         pool.remove_request(rid)
+
+
+def test_the_decoder_s_weights_load_in_the_dtype_its_histories_declare(monkeypatch):
+    monkeypatch.setattr("mstar.model.waypoint.components.taehv.load_taehv", lambda uri, cache_dir=None: _taehv())
+    weights = _model()._taehv_weights("cpu")
+    assert {p.dtype for p in weights.parameters()} == {AE_DTYPE}
+

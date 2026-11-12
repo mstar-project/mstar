@@ -594,7 +594,5 @@ class WaypointModel(Model):
         if self._taehv is None:
             from mstar.model.waypoint.components.taehv import load_taehv
 
-            self._taehv = load_taehv(self.ae_uri, cache_dir=self.cache_dir).to(
-                device=device, dtype=torch.bfloat16
-            )
+            self._taehv = load_taehv(self.ae_uri, cache_dir=self.cache_dir).to(device=device, dtype=AE_DTYPE)
         return self._taehv
