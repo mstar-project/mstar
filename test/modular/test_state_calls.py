@@ -94,6 +94,9 @@ class _StubAttn:
     def select_last_hidden(self, x, label="main"):
         return x[-1:]
 
+    def reads_step_kv(self, label=None):
+        return not self.requires_kv_write
+
 
 class _StubDense(_StubAttn):
     """Takes k and v at the read, as the dense backend does."""
@@ -236,7 +239,7 @@ def test_a_read_sees_this_layers_add_through_the_layers_own_pages():
     q, k, v = _tensors()
     h.add(2, k=k, v=v)
     out = h.read(2, q)
-    assert kv.writes == [(2, "main")] and attn.runs == [(2, "main", False)]
+    assert kv.writes == [(2, "main")] and attn.runs == [(2, "main", True)]
     assert torch.equal(out, q + k), "the read should see the k this layer just added"
     assert kv.pages[0].abs().sum() == 0 and kv.pages[3].abs().sum() == 0, "the add should touch only its own layer"
 
@@ -248,7 +251,7 @@ def test_a_layer_id_is_the_models_and_the_pool_counts_among_the_arrays_layers():
     q, k, v = _tensors()
     h.add(7, k=k, v=v)
     h.read(7, q)
-    assert kv.writes == [(1, "main")] and attn.runs == [(1, "main", False)]
+    assert kv.writes == [(1, "main")] and attn.runs == [(1, "main", True)]
 
 
 def test_a_label_comes_from_the_steps_segments():
@@ -258,7 +261,7 @@ def test_a_label_comes_from_the_steps_segments():
     q, k, v = _tensors()
     h.add(0, k=k, v=v)
     h.read(0, q)
-    assert kv.writes == [(0, "cfg")] and attn.runs == [(0, "cfg", False)]
+    assert kv.writes == [(0, "cfg")] and attn.runs == [(0, "cfg", True)]
 
 
 def test_an_array_steps_own_segments_win_over_the_steps():
@@ -644,6 +647,26 @@ def test_each_replay_starts_clean_for_an_add_that_runs_outside_the_graph():
         step = _begin(h, ctx=_ctx(leased=True), kv=ArrayStep(eager_add=True))
         _add(h, 1)
         h.end_step(step)
+
+
+def test_adds_outside_the_graph_write_every_layer_before_a_read_attends_the_pages():
+    kv, attn = _StubKV(), _StubAttn()
+    h = _kv_handle(kv=kv, attn=attn)
+    _begin(h, kv=ArrayStep(eager_add=True))
+    q, k, v = _tensors()
+    for layer in range(LAYERS):
+        h.add(layer, k=k + layer, v=v)
+    out = h.read(0, q)
+    assert kv.writes == [(layer, "main") for layer in range(LAYERS)]
+    assert attn.runs == [(0, "main", False)] and torch.equal(out, q + k)
+
+
+def test_an_add_outside_the_graph_is_refused_where_its_read_needs_the_steps_kv():
+    h = _kv_handle(attn=_StubDense())
+    _begin(h, kv=ArrayStep(eager_add=True))
+    _, k, v = _tensors()
+    _refused(r"Array 'kv': an eager_add step adds layer 0 outside the graph .* needs the step's own k and v",
+             lambda: h.add(0, k=k, v=v))
 
 
 @pytest.mark.parametrize("make, declared, cause", [

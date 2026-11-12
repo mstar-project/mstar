@@ -737,19 +737,31 @@ class PagedArrayHandle(ArrayHandle):
                 raise self._refusal(f"a step touches label {segment.label!r} of request {segment.request_id}, "
                                     "which it didn't open")
 
-    def _holds(self, layer: int) -> bool:
-        """Whether this layer's add waits for its read: the kernel takes k and v there rather than from the pages."""
-        attn = self._attn.get(layer)
-        return attn is not None and not attn.requires_kv_write
+    def begin_step(self, step) -> None:
+        super().begin_step(step)
+        # adds that run before the reads, outside the captured graph, which the reads find in the pages
+        self._eager = step.state[self.name].eager_add
 
     @torch.compiler.disable
     def add(self, layer: int | torch.Tensor, *, keep: bool | None = None, **fields: torch.Tensor) -> None:
         layer = self._layer_id(layer)
         self._record_add(layer, keep)
-        if self._holds(layer):
+        attn = self._attn.get(layer)
+        if self._eager and attn is not None and self._needs_step_kv(attn):
+            raise self._refusal(
+                f"an eager_add step adds layer {layer} outside the graph and keeps nothing for its read, and that read "
+                "needs the step's own k and v (an exchange, a context-parallel pool on a multi-token step, or the "
+                "dense backend)")
+        if attn is not None and not self._eager:
+            # held for the read, which passes them on as a layer calls attention (`requires_kv_write`): a kernel may
+            # attend the step's own k and v rather than the pages (`reads_step_kv`)
             self._held, self._held_layer = (fields["k"], fields["v"]), layer
-            return
-        self._kv.write_kv(fields["k"], fields["v"], layer_idx=self._pool_layer[layer], label=self.label)
+        if attn is None or attn.requires_kv_write:
+            self._kv.write_kv(fields["k"], fields["v"], layer_idx=self._pool_layer[layer], label=self.label)
+
+    def _needs_step_kv(self, attn: Any) -> bool:
+        """Whether a read through ``attn`` attends the step's own k and v rather than only the pages."""
+        return attn.reads_step_kv(self.label)
 
     @torch.compiler.disable
     def read(self, layer: int | torch.Tensor, q: torch.Tensor | None = None, **mask_args: Any) -> torch.Tensor:
@@ -759,8 +771,10 @@ class PagedArrayHandle(ArrayHandle):
             raise self._no_layout(f"mask arguments {sorted(mask_args)}, which no mask defines")
         layer = self._layer_id(layer)
         self._record_read(layer)
-        k, v = self._take_hold(layer) if self._holds(layer) else (None, None)
-        return self._attn[layer].run(
+        attn = self._attn[layer]
+        # a read with no add before it attends the pages alone, which a kernel that takes no writes can't
+        k, v = self._take_hold(layer) if self._held is not None or not attn.requires_kv_write else (None, None)
+        return attn.run(
             q, label=self.label, kv_cache_layer=self._views[layer], k=k, v=v, layer_idx=self._pool_layer[layer],
         )
 
@@ -770,13 +784,28 @@ class PagedArrayHandle(ArrayHandle):
 
     def takes_fused(self, op: "StateOp") -> bool:
         """An op that adds to the array, on a pool in one of its formats, while no layer's read takes k and v at its
-        kernel, which would never see the pages the op writes."""
+        kernel, which would never see the pages the op writes. A step whose reads attend its own k and v also runs
+        the reference (``fused_ops``)."""
         cache = self._kv.kv_cache
         dtype, device = cache.dtype, cache.device.type
-        return bool(op.adds) and cache.layout is KVLayout.NHD and not any(map(self._holds, self.array.layers)) and any(
+        dense = any(not attn.requires_kv_write for attn in self._attn.values())
+        return bool(op.adds) and cache.layout is KVLayout.NHD and not dense and any(
             (fmt.dtypes is None or dtype in fmt.dtypes) and (fmt.devices is None or device in fmt.devices)
             for fmt in op.formats
         )
+
+    @property
+    def fused_ops(self) -> frozenset[str]:
+        # A fused op writes the pages itself and never passes k and v through `add`, so on a step whose reads attend
+        # the step's own k and v (a context-parallel pool's multi-token step: `reads_step_kv`) every op runs its
+        # reference. Fixed once the step is planned, so a captured bucket replays the same choice.
+        if any(map(self._needs_step_kv, self.reads.values())):
+            return frozenset()
+        return self._fused_ops
+
+    @fused_ops.setter
+    def fused_ops(self, ops: frozenset[str]) -> None:
+        self._fused_ops = ops
 
     def fused_target(self, layer: int) -> PagedNHDTarget:
         """Record ``layer``'s add, which a fused op makes, and give where it writes the step's entries."""

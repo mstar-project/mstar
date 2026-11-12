@@ -361,9 +361,13 @@ class LoraAdapterPool(Resource):
         joint = info.joint_comm_group
         if joint is not None:
             # its rows are laid out per request over the whole batch; every axis but TP
-            # (cfg branches, sp token shards) hands each rank only part of it
+            # (cfg branches, sp token shards) hands each rank only part of it, except SP
+            # under a node whose pools place positions over its SP ranks, which runs
+            # replicated over them
             for axis in PARALLEL_AXES:
-                if axis != "tp" and (size := getattr(joint, f"{axis}_group").world_size) > 1:
+                if axis == "tp" or (axis == "sp" and info.replicated_over_sp):
+                    continue
+                if (size := getattr(joint, f"{axis}_group").world_size) > 1:
                     raise ValueError(
                         f"LoRA resource {spec.resource_key!r} serves a node at {axis}_size {size}, "
                         "which LoRA does not support: its rows are laid out per request over the "

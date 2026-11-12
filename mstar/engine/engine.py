@@ -49,7 +49,15 @@ from mstar.engine.resources import (
     StepRunner,
     SubmoduleStep,
 )
-from mstar.engine.resources.base import CachedLease, EngineResourceInfo, KeyedWalks, StepAllowance, build_resource
+from mstar.engine.resources.base import (
+    CachedLease,
+    EngineResourceInfo,
+    KeyedWalks,
+    StepAllowance,
+    build_resource,
+    head_shards,
+)
+from mstar.engine.resources.context_parallel import positions_over_sp
 from mstar.engine.resources.kv.config import instance_size, opening_prefix_caches, unrestorable
 from mstar.engine.resources.kv.keys import fingerprint
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
@@ -233,6 +241,8 @@ class SubmoduleManagement:
     capture_runner: AcceleratorGraphRunner | None = None
     # the submodule's declared float32 settings; None keeps the process default
     fp32_precision: Fp32Precision | None = None
+    # see `EngineResourceInfo.head_shards`
+    head_shards: int = field(kw_only=True)
     # the node's request slots and device tables, where it runs on them
     resident: ResidentPlanner | None = None
     # a deployment asks a walk of this node to repeat (`Engine.enable_repeats`):
@@ -754,6 +764,16 @@ class Engine:
         prefix_caches = opening_prefix_caches(specs, instance, checkpoint_named=checkpoint is not None)
 
         self._classify_tp_roles(node_names, parallel_groups)
+        # node -> whether it runs replicated over its SP ranks, its pools placing positions over them,
+        # and how many ways its heads split then: TP alone where it does
+        over_sp, shards = {}, {}
+        for node in node_names:
+            group = parallel_groups.get_joint_group_for_node(node)
+            sp = group.sp_group.world_size
+            over_sp[node] = sp > 1 and positions_over_sp(
+                specs, node, sp, () if model is None else model.get_default_sharding_config().sp_enabled_nodes,
+            )
+            shards[node] = head_shards(group, over_sp[node])
 
         for spec in specs:
             relevant_nodes = spec.nodes & node_names
@@ -764,7 +784,17 @@ class Engine:
             # different workers (for example BAGEL's three CFG branches).
             # This Engine constructs only the local instance, whose consumers
             # validate_deployment checked share one parallel group.
-            joint_comm_group = parallel_groups.get_joint_group_for_node(min(relevant_nodes))
+            first_node = min(relevant_nodes)
+            # one resource is sized by one head-shard count over one parallel group, so its nodes
+            # all run replicated over SP or none do (validate_deployment checks this first);
+            # conservative for a resource that never reads it
+            if len({over_sp[node] for node in relevant_nodes}) > 1:
+                raise ValueError(
+                    f"resource {spec.resource_key!r} serves nodes that split heads different ways "
+                    f"({ {node: shards[node] for node in sorted(relevant_nodes)} }): one places its KV "
+                    "positions over its SP ranks and another runs its own sequence parallelism"
+                )
+            joint_comm_group = parallel_groups.get_joint_group_for_node(first_node)
             self._resources[spec.resource_key] = build_resource(
                 spec,
                 EngineResourceInfo(
@@ -787,14 +817,21 @@ class Engine:
                     ),
                     host_allowance=self.host_allowance,
                     prefix_caches=prefix_caches,
+                    replicated_over_sp=over_sp[first_node],
                 ),
             )
-
             for node in relevant_nodes:
                 node_to_resources.setdefault(node, []).append(spec.resource_key)
             self._resource_nodes[spec.resource_key] = frozenset(relevant_nodes)
             self._add_split_row_order(spec, relevant_nodes)
             declared_by[spec.resource_key] = frozenset(spec.nodes)
+        for key, resource in self._resources.items():
+            for dep in sorted(specs_by_key[key].depends_on() & self._resources.keys()):
+                if self._resources[dep].placement is not None and not resource.supports_context_parallel:
+                    raise ValueError(
+                        f"resource {key!r} ({type(resource).__name__}) does not support context "
+                        f"parallelism, and the pool {dep!r} it depends on sets context_parallel"
+                    )
 
         # rid -> (node, walk) of its last step here when that step was rows-only,
         # i.e. the sampler's slot master holds the token its next step reads
@@ -832,6 +869,8 @@ class Engine:
                 # the dtype the engine manager cast this node to
                 node_dtype=resolve_node_dtype(submodule, self._autocast_dtype),
                 fp32_precision=node_fp32_precision(node_name, submodule),
+                # the count its resources shard heads by
+                head_shards=shards[node_name],
                 token_ladders=(token_ladders or {}).get(node_name) or {},
                 region_ladders=(region_ladders or {}).get(node_name) or {},
             )
@@ -1044,6 +1083,7 @@ class Engine:
                 num_slots=submodule_mgmt.num_slots,
                 enable_nvtx=self._enable_nvtx,
                 device_capability=self.device_capability,
+                head_shards=submodule_mgmt.head_shards,
                 capture_stream=capture_stream,
                 token_ladders=submodule_mgmt.token_ladders,
                 step_tokens=functools.partial(self._chunking.max_step_tokens, node_name),
@@ -1243,7 +1283,7 @@ class Engine:
             self._device,
             # the dtype the region runs in; an opted-out node keeps its params'
             node_dtype or torch.float32,
-            submodule_mgmt.joint_comm_group.world_size,
+            submodule_mgmt.head_shards,
         )
         apply_region_ladders(
             node_name, configs, submodule_mgmt.region_ladders, submodule_mgmt.token_ladders,

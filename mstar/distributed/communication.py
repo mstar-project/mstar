@@ -282,6 +282,22 @@ class CommGroup:
         dist.broadcast(tensor, self.group_members[src], self._device_pg())
         return tensor
 
+    def to_partners(self, blocks: torch.Tensor, partners: Sequence[int]) -> torch.Tensor:
+        """``blocks[j]`` to group rank ``partners[j]`` (ascending, this rank among them), and back
+        the block each partner sent this rank, in the same order: one all-to-all over the whole
+        group with nothing sent to or from the ranks outside ``partners``. Every member calls it,
+        with partner sets that pair up (a lists b exactly when b lists a). Replays from a CUDA
+        graph."""
+        if self.world_size == 1:
+            return blocks
+        blocks = blocks.contiguous()
+        splits = [0] * self.world_size
+        for partner in partners:
+            splits[partner] = blocks[0].numel()
+        recv = torch.empty_like(blocks)
+        _all_to_all_single(self._device_pg(), blocks.view(-1), recv.view(-1), splits, splits)
+        return recv
+
     # Eager as a whole, the boundary where the per-rank sizes become the collective's host split
     # lists: traced, its branches on them would compile per sequence length, and a traced variant
     # that kept them symbolic measured no faster on Cosmos3 SP.

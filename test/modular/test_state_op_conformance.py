@@ -74,7 +74,7 @@ def _opened_step(kv: KVManager, lengths: dict[int, int]) -> ArrayHandle:
     assert kv.admit(step, ctx).ok
     kv.plan(step, ctx)
     array = _array()
-    resources = {"kv": kv, "attn": SimpleNamespace(requires_kv_write=True)}
+    resources = {"kv": kv, "attn": SimpleNamespace(requires_kv_write=True, reads_step_kv=lambda label=None: False)}
     handle = build_handle(array, resources, _resolve([array], StateSetup()))
     bind_state_ops({"kv": handle})
     contract_step = SubmoduleStep(segments=segments, state={"kv": ArrayStep()})

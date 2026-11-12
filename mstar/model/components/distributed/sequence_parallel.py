@@ -30,6 +30,7 @@ from typing import Callable, NamedTuple
 import torch
 
 from mstar.distributed.communication import CommGroup
+from mstar.engine.resources.context_parallel import gather_merge
 
 
 def sp_seq_split(total: int, world_size: int) -> list[int]:
@@ -132,18 +133,15 @@ def attention_over_sharded_keys(
     """A query replicated on every rank attending keys sharded along the sequence:
     ``q`` ``[B, Lq, H, D]``, ``k``/``v`` ``[B, Lk/P, H, D]`` (this rank's tokens), returns
     ``[B, Lq, H, D]``. Each rank attends its own shard and the partial attentions merge
-    exactly by their log-sum-exps, which moves query-sized results rather than the keys.
+    exactly by their log-sum-exps (``gather_merge``, the merge a context-parallel pool's
+    partials take), which moves query-sized results rather than the keys.
 
     ``run_attention(q, k, v, return_lse=True)`` returns ``(out, lse)`` with ``lse``
     ``[B, Lq, H]`` in natural log (``joint_attention`` over a ragged resource, or
     ``sdpa_attention``)."""
     if sp_group.world_size == 1:
         return run_attention(q, k, v)
-    out, lse = run_attention(q, k, v, return_lse=True)
-    # one gather for both: [P, B, Lq, H, D + 1] fp32, the log-sum-exp in the last column
-    gathered = sp_group.all_gather(torch.cat([out.float(), lse.float().unsqueeze(-1)], dim=-1).unsqueeze(0), dim=0)
-    outs, lses = gathered[..., :-1], gathered[..., -1:]
-    return (outs * torch.softmax(lses, dim=0)).sum(dim=0).to(q.dtype)
+    return gather_merge(sp_group, *run_attention(q, k, v, return_lse=True))
 
 
 def sp_head_slice(sp_group: CommGroup, x: torch.Tensor) -> torch.Tensor:

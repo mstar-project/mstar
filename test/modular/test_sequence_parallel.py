@@ -5,10 +5,10 @@ even and uneven splits and over negative dims, and of several tensors at once ag
 one at a time; and
 ``ulysses_attention`` over sharded tokens against one rank attending the whole
 sequence (with fewer key/value heads than query heads too), for the
-``[S, H, D]`` and ``[B, S, H, D]`` layouts; ``attention_over_sharded_keys``, a
-replicated query over sharded keys merged by log-sum-exp, against one rank attending
-all the keys; a compiled stack over packs of new lengths, without recompiling; and the
-Wan2.2 DiT under Ulysses against the same DiT on one rank.
+``[S, H, D]`` and ``[B, S, H, D]`` layouts; ``attention_over_sharded_keys``, a replicated query over sharded
+keys merged by log-sum-exp, against one rank attending all the keys; a compiled stack over packs
+of new lengths, without recompiling; and the Wan2.2 DiT under Ulysses against the same DiT on one
+rank.
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ import torch.multiprocessing as mp
 import torch.nn.functional as F
 
 from mstar.distributed.communication import CommGroup
+from mstar.engine.resources.context_parallel import gather_merge, merge
 from mstar.model.components.diffusion.attention import sdpa_attention
 from mstar.model.components.distributed.sequence_parallel import (
     attention_over_sharded_keys,
@@ -139,15 +140,27 @@ def _sharded_keys(rank, world, total):
     k, v = (_full(total, batched=True, seed=seed) for seed in (1, 2))
     want = _sdpa(batched=True)(q, k, v)
     start = sum(sizes[:rank])
-    out = attention_over_sharded_keys(
-        group, q, k.narrow(1, start, sizes[rank]), v.narrow(1, start, sizes[rank]), sdpa_attention,
-    )
+    k, v = (x.narrow(1, start, sizes[rank]) for x in (k, v))
+    out = attention_over_sharded_keys(group, q, k, v, sdpa_attention)
     torch.testing.assert_close(out, want)
 
 
 @pytest.mark.parametrize("world,total", [(1, 7), (2, 7), (3, 11)], ids=["1", "2-uneven", "3-uneven"])
 def test_attention_over_sharded_keys_matches_one_rank(tmp_path, world, total):
     _run(_sharded_keys, world, tmp_path / "store", total)
+
+
+def _bf16_partials(rank, world):
+    # every rank's partial, built alike on each: a bf16 out (as LTX-2.5's kernels return) and fp32 lse
+    parts = [(_full(5, True, seed=2 * r).to(torch.bfloat16), _full(5, True, seed=2 * r + 1)[..., 0])
+             for r in range(world)]
+    want = merge(torch.stack([out.float() for out, _ in parts]), torch.stack([lse for _, lse in parts]))
+    assert torch.equal(gather_merge(_group(rank, world), *parts[rank]), want.to(torch.bfloat16))
+
+
+def test_gather_merge_of_bf16_partials_is_the_fp32_merge_bit_for_bit(tmp_path):
+    """The out travels at its own width and the lse in fp32, one byte tensor viewed back per dtype."""
+    _run(_bf16_partials, 2, tmp_path / "store")
 
 
 def _compiled_packs(rank, world):

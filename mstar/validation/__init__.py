@@ -174,7 +174,9 @@ def validate_deployment(
             specs = built_resources(specs)
         except (ValueError, OSError) as e:
             problems.append(f"building the node resources failed: {type(e).__name__}: {e}")
-            specs = None
+            # the placement checks still see the specs built whole; a per-node one (LoRA) may be what
+            # failed, and reading it again would raise again
+            specs = [spec for spec in specs if not spec.per_node]
     # after get_worker_graphs too: a model may shape its walks from the deployment (BAGEL)
     problems += _checked(
         "checking the client streams", check_client_streams,
