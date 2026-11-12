@@ -297,6 +297,9 @@ class _AttendCore:
     def __init__(self, rows: _Rows):
         self.attend = CausalAttend(rows)
 
+    def reads_step_kv(self, label=None):
+        return True
+
     def run(self, q, *, label, kv_cache_layer, k, v, layer_idx):
         return self.attend(q, k, v)
 

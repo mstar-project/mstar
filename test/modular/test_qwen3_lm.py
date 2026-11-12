@@ -315,6 +315,9 @@ class _FakePages(_FakeKVAttention):
     def opens_label(self, rid, label):
         return True
 
+    def reads_step_kv(self, label=None):
+        return False
+
     def write_kv(self, k, v, layer_idx=None, label=None):
         self._pending = (k, v)
 
