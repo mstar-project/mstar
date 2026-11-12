@@ -14,6 +14,7 @@ from torch.distributed.distributed_c10d import _set_pg_timeout
 
 from mstar.distributed.all_reduce import AllReduce
 from mstar.distributed.base import PARALLEL_AXES
+from mstar.distributed.row_copy import copy_blocks
 from mstar.distributed.utils import resolve_dist_timeout
 
 
@@ -413,6 +414,63 @@ class CommGroup:
             for piece, shape in zip(recv.split(numels), shapes, strict=True)
         ]
         return torch.cat(pieces, dim=gather_dim)
+
+
+    # The Ulysses exchange's two halves (``sequence_shard.ulysses``). ``all_to_all`` packs q, k and v
+    # into one buffer and unpacks each with a strided copy, and with rows (a CFG batch) ahead of the
+    # gathered tokens the unpack can't be a view: ~8 activation-sized copies around each attention,
+    # at the speed of torch's 5-dim strided copy. These exchange each row on its own, so a row's
+    # tokens land where the attention reads them and only the packing side copies, once a tensor,
+    # in whole rows (``row_copy.copy_blocks``). Eager for the reason ``all_to_all`` is.
+    @torch.compiler.disable
+    def tokens_to_heads(self, x: torch.Tensor, counts: Sequence[int], rows: int | None = None) -> torch.Tensor:
+        """``x`` ``[B * n, H, ...]``, this rank's ``n = counts[rank]`` tokens of each of ``B = rows`` rows (one
+        when None), every head -> ``[B * S, H / P, ...]``: every rank's tokens of each row (``S = sum(counts)``,
+        in rank order) at this rank's block of heads. One copy packs this rank's tokens by destination; one
+        exchange a row then writes the row in place."""
+        world = self.world_size
+        if world == 1:
+            return x
+        batch, n, total = rows or 1, counts[self.rank], sum(counts)
+        heads, rest = x.shape[1], x.shape[2:]
+        assert heads % world == 0, f"Ulysses splits {heads} heads over {world} ranks"
+        width = heads // world * math.prod(rest)
+        src = _token_rows(x).unflatten(0, (batch, n)).flatten(2).unflatten(2, (world, width)).transpose(1, 2)
+        send = x.new_empty(batch, world, n, width)
+        copy_blocks(send, src)
+        out = x.new_empty(batch, total, width)
+        for b in range(batch):
+            _all_to_all_single(
+                self._device_pg(), send[b].view(-1), out[b].view(-1), [c * width for c in counts], [n * width] * world,
+            )
+        return out.view(batch * total, heads // world, *rest)
+
+    @torch.compiler.disable
+    def heads_to_tokens(self, x: torch.Tensor, counts: Sequence[int], rows: int | None = None) -> torch.Tensor:
+        """``tokens_to_heads``'s inverse: ``x`` ``[B * S, H / P, ...]`` -> ``[B * n, H, ...]``. A row's tokens for
+        each rank already sit together, so the exchange reads ``x`` as it is, and one copy puts every rank's
+        heads back beside each other."""
+        world = self.world_size
+        if world == 1:
+            return x
+        batch, n, total = rows or 1, counts[self.rank], sum(counts)
+        heads, rest = x.shape[1], x.shape[2:]
+        width = heads * math.prod(rest)
+        x = x.contiguous().view(batch, total, width)
+        recv = x.new_empty(batch, world, n, width)
+        for b in range(batch):
+            _all_to_all_single(
+                self._device_pg(), x[b].view(-1), recv[b].view(-1), [n * width] * world, [c * width for c in counts],
+            )
+        out = x.new_empty(batch, n, world, width)
+        copy_blocks(out.transpose(1, 2), recv)
+        return out.view(batch * n, heads * world, *rest)
+
+
+def _token_rows(x: torch.Tensor) -> torch.Tensor:
+    """``x`` with each token's ``[H, ...]`` contiguous (a strided view of tokens is fine)."""
+    inner = x[0] if x.shape[0] else x
+    return x if inner.is_contiguous() else x.contiguous()
 
 
 def sp_seq_split(total: int, world_size: int) -> list[int]:
