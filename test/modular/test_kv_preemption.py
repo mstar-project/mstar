@@ -24,6 +24,9 @@ from test_kv_admission import _RUNNERS, _remove, _runner
 from test_kv_prefix_layout_lease import IMAGE, IMAGE_WALK, RID, TAIL, TEXT, TEXT_WALK
 from test_kv_prefix_layout_lease import _Node as _LayoutNode
 from test_kv_prefix_lease import NODE, PAGE_SIZE, WALK, _ctx, _keys, _manager, _StubTransfer
+from test_kv_prefix_lease import _grow as _grow_kv
+from test_kv_prefix_lease import _window_manager as _cached_window_manager
+from test_kv_prefix_lease import _write as _cache
 from test_kv_release import _window_manager
 from test_kv_row_passes import backend  # noqa: F401, the Rust and the Python page arena
 from test_runner_admission import _PassingPool, _StubPool
@@ -954,6 +957,53 @@ def test_a_request_dropped_on_a_pool_that_keeps_a_window_returns_with_its_window
     assert window and kv._dropped["r"].returns == window + 6, "r would return without room for its window's pages"
 
 
+@pytest.mark.parametrize("dropped", ["a", "b"])
+def test_a_drop_of_a_request_sharing_cached_window_pages_keeps_the_count_and_its_rebuild_hits_the_window(
+    monkeypatch, dropped,
+):
+    """a and b hit the same cached window pages, so the pool keeps room for the second holder (`_shared`). Preemption
+    drops either one, which gives that room back, the other decodes its window past those pages, and the dropped
+    one's rebuild probes the window pool again and hits it, with every page counted throughout."""
+    monkeypatch.setattr(manager_mod, "_DEBUG_ASSERTS", True)
+    kv = _cached_window_manager()
+    shared = list(range(100))
+    _cache(kv, "seed", shared)
+    _remove(kv, "seed")
+    prompts = {rid: shared[:96] + list(range(own, own + 8)) for rid, own in (("a", 1000), ("b", 2000))}
+    for rid, prompt in prompts.items():
+        layout = StreamLayout(spans=(PrefixSpan(104, 104, WALK),), keyed_spans=1, growth=(("decode", 1),))
+        kv.ingest_request(rid, KVReqConfig(
+            prefix_keys={"main": _keys(prompt)}, kv_layout={"main": layout}, loop_caps={"decode": 32},
+        ))
+        assert _admitted(kv, rid)
+        inputs = ARNodeInputs(input_seq_len=104)
+        kv.apply_cached_prefix(rid, NODE, WALK, inputs, kv.resolve_cached_prefix(rid, NODE, WALK, inputs))
+    for rid in prompts:
+        _grow_kv(kv, rid, 8)
+        for _ in range(4):
+            _grow_kv(kv, rid, 1)
+    window = [set(kv._streams[rid]["main"].later[0].page_indices) for rid in prompts]
+    assert window[0] & window[1] and kv._shared, "a and b share none of the cached window pages"
+    kept = "b" if dropped == "a" else "a"
+
+    room, frees = kv._room(), kv._frees([dropped])
+    assert kv._choose(frees, [dropped], lambda rid: True) == Victims([], [dropped], [])
+    _drop(kv, dropped)
+    assert kv._room() - room == frees, "preemption counts the drop's room wrong"
+    for _ in range(24):
+        _grow_kv(kv, kept, 1)
+
+    assert _admitted(kv, dropped)
+    kv.prepare_rebuild(dropped, Rebuild(array("i", range(3000, 3005))))
+    inputs = ARNodeInputs(input_seq_len=108)
+    prefix = kv.resolve_cached_prefix(dropped, NODE, WALK, inputs)
+    kv.apply_cached_prefix(dropped, NODE, WALK, inputs, prefix)
+    assert prefix.tokens == 96, "the rebuild missed the window pages the cache holds"
+    _grow_kv(kv, dropped, 108 - prefix.tokens)
+    kv.land_rebuild(dropped)
+    kv.assert_pages_conserved()
+
+
 @pytest.mark.usefixtures("backend")
 def test_a_dropped_request_is_charged_nothing_for_hits_another_request_holds():
     """v reads 3 of its 4 pages from a's prefix. Dropped, it asked to return with its whole history and a page, though
@@ -1140,7 +1190,8 @@ def test_a_guaranteed_lease_of_pages_another_request_holds_gives_their_charge_ba
     room, inputs = kv._room(), ARNodeInputs(input_seq_len=3 * PAGE_SIZE)
 
     kv.apply_cached_prefix("g", NODE, WALK, inputs, kv.resolve_cached_prefix("g", NODE, WALK, inputs))
-    leased = len(kv._streams["g"]["main"].lease or ())
+    lease = kv._streams["g"]["main"].lease
+    leased = len(lease.pages()) if lease else 0
     assert _step(kv, "g", PAGE_SIZE).ok
     assert leased and kv._room() == room + leased, "g's charge for the pages it leases stayed out of the room"
 
@@ -1693,7 +1744,7 @@ def test_a_request_the_full_host_turns_guaranteed_before_it_adopts_its_lease_gro
     assert _ready(kv, "g")
     inputs = ARNodeInputs(input_seq_len=3 * PAGE_SIZE)
     kv.apply_cached_prefix("g", NODE, WALK, inputs, kv.resolve_cached_prefix("g", NODE, WALK, inputs))
-    assert kv._streams["g"]["main"].lent == set(kv._streams["g"]["main"].lease)
+    assert kv._streams["g"]["main"].lent == set(kv._streams["g"]["main"].lease.pages())
     # the third page is one the host can't cover
     for _ in range(3):
         assert _step(kv, "g", PAGE_SIZE, label="other", walk="other").ok

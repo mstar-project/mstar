@@ -152,7 +152,9 @@ class StepRunner:
         The smallest answer wins, because a step is one span: a resource that
         holds less than another has to be caught up by the tokens that run.
         A resource with no opinion is not an answer of zero. A resource that
-        holds only some lengths then caps the agreed prefix.
+        holds only some lengths then caps the agreed prefix, and the caps are
+        asked again until none lowers it, since a later cap can leave less
+        than an earlier one kept.
         """
         agreed = None
         for key in self._sweep(self._node_order, self._order, node_name):
@@ -161,10 +163,15 @@ class StepRunner:
             )
             if answer is not None and (agreed is None or answer.tokens < agreed.tokens):
                 agreed = answer
-        if agreed is not None:
-            for key in self._sweep(self._node_cap_order, self._cap_order, node_name):
+        if agreed is None:
+            return None
+        caps = self._sweep(self._node_cap_order, self._cap_order, node_name)
+        while True:
+            tokens = agreed.tokens
+            for key in caps:
                 agreed = self._resources[key].cap_cached_prefix(rid, node_name, graph_walk, agreed)
-        return agreed
+            if agreed.tokens == tokens:
+                return agreed
 
     def apply_cached_prefix(
         self, rid: str, node_name: str, graph_walk: str,

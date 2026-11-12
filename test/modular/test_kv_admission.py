@@ -32,6 +32,8 @@ from test_kv_prefix_lease import (
     _manager,
     _seed,
     _StubTransfer,
+    _window_manager,
+    _write,
 )
 from test_sampler_admission import _resource as _sampler
 
@@ -766,7 +768,7 @@ def test_a_repeat_whose_allotment_is_spent_leaves_its_image_end_to_the_walk():
     _probe(kv, RID, len(TEXT))
 
     kv.assert_pages_conserved()
-    assert node.stream.lease_len == 3 * PAGE_SIZE, "the repeat copied its image end onto a page \"b\" counts on"
+    assert node.stream.lease.end == 3 * PAGE_SIZE, "the repeat copied its image end onto a page \"b\" counts on"
 
 
 def test_a_grant_past_its_allotment_takes_only_room():
@@ -836,6 +838,78 @@ def test_a_cut_lease_refunds_only_the_pages_that_go_back_to_the_evictable_set():
 
     assert kv._room() == room, "the cut moved room that allotments count on"
     assert kv._allotments["a"].remaining == remaining + 1, "the page \"b\" still holds was allotted again"
+
+
+@pytest.mark.parametrize("b_decodes", [False, True], ids=["b_in_its_prompt", "b_decoded_through_its_allotment"])
+def test_a_window_page_another_request_holds_is_no_room_once_the_first_rolls_it_out(b_decodes: bool):
+    """Two repeats lease the same cached window pages. When the first's window rolls them out before its prompt
+    ends, the second still holds them, so they don't come back as room. The room the pool kept for the second
+    holding them (`_shared`) covers them, so the first's allotment still has the pages its window takes in their
+    place, whether or not the second has decoded through its allotment."""
+    kv = _window_manager()
+    shared = list(range(100))
+    _write(kv, "seed", shared)
+    _remove(kv, "seed")
+    # one step writes the prompt's 40-token spans, so the allotment holds a window of 40-token steps
+    spans = tuple(PrefixSpan(40, 40, WALK, opens_step=not i) for i in range(5))
+    # past the prompt, one token a step
+    layout = {"main": StreamLayout(spans=spans, keyed_spans=len(spans), growth=(("decode", 1),))}
+    # with ``b_decodes``, "b"'s prompt is the cached 96 tokens and 8 more
+    short = {"main": StreamLayout(spans=(PrefixSpan(104, 104, WALK),), keyed_spans=1, growth=(("decode", 1),))}
+    b = (shared[:96] + list(range(2000, 2008)), short) if b_decodes else (shared + list(range(2000, 2100)), layout)
+    for rid, (tokens, kv_layout) in (("a", (shared + list(range(1000, 1100)), layout)), ("b", b)):
+        kv.ingest_request(rid, KVReqConfig(
+            prefix_keys={"main": _keys(tokens)}, kv_layout=kv_layout, loop_caps={"decode": 16},
+        ))
+        assert _ready(kv, rid) and _probe(kv, rid, len(tokens)).tokens == 96
+    if b_decodes:
+        _grow(kv, "b", 8)
+        while kv._allotments["b"].remaining:
+            _grow(kv, "b", 1)
+        held = set(kv._streams["b"]["main"].later[0].page_indices)
+        assert held & set(kv._streams["a"]["main"].lease.groups[1]), "b's window holds none of a's leased pages"
+    # a third request is allotted what room is left
+    for slots in range(kv._room(), 0, -1):
+        _laid_out(kv, "c", list(range(5000, 5000 + 8 * slots)))
+        if _ready(kv, "c"):
+            break
+        _remove(kv, "c")
+
+    pages = kv._allotments["a"].pages
+    _grow(kv, "a", 40)
+    kv.assert_pages_conserved()
+    assert kv._allotments["a"].pages == pages, "\"a\"'s allotment gave up room for pages \"b\" still holds"
+
+    # and "a"'s allotment still covers the pages its window takes in their place through the rest of its prompt
+    _grow(kv, "a", 24)
+    _grow(kv, "a", 40)
+    kv.assert_pages_conserved()
+
+
+def test_a_lease_takes_the_window_at_its_walk_starts_only_while_the_room_lasts():
+    """A lease also holds the window at each walk start under its end, which its allotment doesn't count. Taken
+    past the room, they would leave the pool short of what admitted requests were allotted."""
+    kv = _window_manager()
+    shared = list(range(160))
+    # five walks of 32 slots, each its own step, so the cache keeps the window at each one's start
+    layout = {"main": StreamLayout(spans=tuple(PrefixSpan(32, 32, WALK) for _ in range(5)), keyed_spans=5)}
+    kv.ingest_request("seed", KVReqConfig(prefix_keys={"main": _keys(shared)}, kv_layout=layout))
+    for _ in range(5):
+        _probe(kv, "seed", 32)
+        _grow(kv, "seed", 32)
+    _remove(kv, "seed")
+    kv.ingest_request("a", KVReqConfig(prefix_keys={"main": _keys(shared)}, kv_layout=layout))
+    assert _ready(kv, "a")
+    # a second request is allotted what room is left
+    for slots in range(kv._room(), 0, -1):
+        _laid_out(kv, "c", list(range(5000, 5000 + 8 * slots)))
+        if _ready(kv, "c"):
+            break
+        _remove(kv, "c")
+
+    assert _probe(kv, "a", 32).tokens == 32
+    assert kv._room() >= 0, f"a's lease took {len(kv._streams['a']['main'].lease.starts)} walk-start pages past it"
+    kv.assert_pages_conserved()
 
 
 def test_a_request_one_pool_holds_back_keeps_no_allotment_in_another_on_its_node():

@@ -14,13 +14,14 @@ import torch
 import yaml
 from test_kv_prefix_correctness import NODE, PAGE_SIZE, ROOT, WALK
 from test_kv_prefix_layout_lease import ASK, IMAGE, IMAGE_WALK, OTHER_ASK, TEXT, _config, _walks
-from test_kv_prefix_lease import _StubTransfer
+from test_kv_prefix_lease import _Holding, _StubTransfer
 from test_resident_delta import _Commit
 from test_tp_async_teardown_order import _rank, _Stop
 from test_tp_rebuild_land import _Rank
 from test_worker_rebuild import _kept
 
 import mstar.communication.wire_types  # noqa: F401  (registers the tags)
+from mstar.communication import wire
 from mstar.engine.engine import Engine
 from mstar.engine.resources import Rebuild, StepRunner, apply_yaml_overrides
 from mstar.engine.resources.base import KeyedWalks
@@ -44,15 +45,19 @@ def _stub_transfer(monkeypatch):
 
 def _manager(
     rank: int, max_num_pages: int = 32, opt_in: bool = True,
-    world_size: int = 2, shared: bool = False, **overrides,
+    world_size: int = 2, shared: bool = False, window: int | None = None, **overrides,
 ) -> KVManager:
     cfg = dict(
-        num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=4096, num_qo_heads=2,
+        num_layers=1 if window is None else 3, num_kv_heads=1, head_dim=8, max_seq_len=4096, num_qo_heads=2,
         max_num_pages=max_num_pages, page_size=PAGE_SIZE, prefix_cache_tp=opt_in,
     )
     cfg.update(overrides)
+    cfg = PagedKVConfig(**cfg)
+    if window is not None:
+        # layers 1 and 2 keep the last ``window`` tokens, in pages of half the first layer's
+        cfg.keep_window(window, (1, 2))
     kv = KVManager(
-        cfg=PagedKVConfig(**cfg),
+        cfg=cfg,
         name="kv", joint_comm_group=SimpleNamespace(rank=rank, world_size=world_size),
         transfer_engine_info=None, device=torch.device("cpu"), dtype=torch.float32,
         needs_remote_transfer=shared,
@@ -132,11 +137,12 @@ def _batch(rid: str, walk: str = WALK) -> SimpleNamespace:
 
 
 def _send(leader: KVManager, rid: str) -> ScheduleTPNode:
+    """Rank 0's head for ``rid``'s step, as a follower decodes it."""
     engine = _engine(leader)
-    return ScheduleTPNode(
+    return wire.decode(wire.encode(ScheduleTPNode(
         NODE, WALK, [f"wire-{rid}"],
         prefix_hits=engine.decide_cached_prefix(_batch(rid)), page_trails=engine.page_trails(NODE),
-    )
+    )))
 
 
 def _follow(follower: KVManager, head: ScheduleTPNode, caught_up: bool = True) -> bool:
@@ -170,8 +176,9 @@ def _follower_worker(follower: KVManager) -> Worker:
     )
 
 
-def test_a_follower_takes_rank_0s_hit_and_never_probes_itself():
-    ranks = leader, follower = _manager(0), _manager(1)
+@pytest.mark.parametrize("window", [None, 24])
+def test_a_follower_takes_rank_0s_hit_and_never_probes_itself(window):
+    ranks = leader, follower = _manager(0, window=window), _manager(1, window=window)
     shared = _tokens(5 * PAGE_SIZE + 3, seed=0)
     prompt = shared[:5 * PAGE_SIZE] + _tokens(20, seed=1)
     _cache(ranks, "a", shared)
@@ -183,8 +190,75 @@ def test_a_follower_takes_rank_0s_hit_and_never_probes_itself():
 
     for kv in ranks:
         _run(kv, "b", prompt)
-    assert _pages(leader, "b") == _pages(follower, "b")
+    assert leader._streams["b"]["main"].pages() == follower._streams["b"]["main"].pages()
     assert _pages(leader, "b")[:5] == _pages(leader, "a")[:5], "b missed the prefix a cached"
+    if window is not None:
+        # The window page of tokens 72-80: a, at 83 tokens, holds window pages 7-10, and b, at 100, 9-12.
+        a, b = (leader._streams[rid]["main"].later[0] for rid in "ab")
+        assert a.page_indices[2] == b.page_indices[0], "b's sliding layers missed the window a cached"
+
+
+def test_ranks_cut_a_window_lease_alike_when_one_index_has_dropped_a_page():
+    """A cut below a window lease's end needs window pages the lease doesn't hold, and a follower's index can be
+    ahead of rank 0's, so the ranks cut from the lease's own pages rather than looking them up."""
+    ranks = leader, follower = _manager(0, window=24), _manager(1, window=24)
+    shared = _tokens(6 * PAGE_SIZE + 4, seed=0)
+    _cache(ranks, "a", shared)
+    for kv in ranks:
+        _ingest(kv, "b", shared)
+    assert _follow(follower, _send(leader, "b"))
+    # the follower's index has dropped the window page of tokens 64-72, which a cut to 80 needs
+    rooted = follower._streams["b"]["main"].chain.rooted
+    follower._index._remove(follower._index.page_for(follower._window_key(rooted[follower._ends_on(1, 8)], 1, 8)))
+
+    answers = [
+        StepRunner({"kv": kv, "other": _Holding(80)}, node_resources={NODE: ["kv", "other"]})
+        .resolve_cached_prefix("b", NODE, WALK, ARNodeInputs(input_seq_len=len(shared)))
+        for kv in ranks
+    ]
+
+    assert answers[0] == answers[1], "the ranks cut the lease to different lengths"
+    assert leader._streams["b"]["main"].lease == follower._streams["b"]["main"].lease
+
+
+@pytest.mark.parametrize("holder", [False, True], ids=["alone", "beside_a_holder"])
+def test_ranks_keep_the_walks_a_window_lease_served_when_a_later_walk_drops_it(holder):
+    """A window lease holds the window's pages at its end. A later walk that writes unprobed cuts it back to the
+    walks it served, and above one rank only the lease's own pages count, so it holds the window there too. With
+    ``holder``, c holds the window pages at the first walk's end already, which b's lease holds as walk starts."""
+    ranks = leader, follower = _manager(0, window=24, max_num_pages=64), _manager(1, window=24, max_num_pages=64)
+    parts = [_tokens(3 * PAGE_SIZE, seed=1), 3 * PAGE_SIZE, _tokens(52, seed=2)]
+    for kv in ranks:
+        _ingest(kv, "a", *parts)
+        _run(kv, "a", *parts)
+        kv.remove_request("a")
+    if holder:
+        c = parts[0] + _tokens(4, seed=3)
+        for kv in ranks:
+            _ingest(kv, "c", c)
+        assert _follow(follower, _send(leader, "c"))
+        for kv in ranks:
+            _run(kv, "c", c)
+    for kv in ranks:
+        _ingest(kv, "b", *parts)
+    assert _follow(follower, _send(leader, "b"))
+    for kv in ranks:
+        assert kv._shared == (3 if holder else 0), "the pool keeps no room for the window pages b's lease shares"
+        for walk, length in _walks(parts)[:2]:
+            assert _step(kv, "b", length, walk) is None, "the cache didn't serve the first two walks whole"
+
+        kv.apply_cached_prefix("b", NODE, WALK, ARNodeInputs(input_seq_len=52), None)
+
+        stream = kv._streams["b"]["main"]
+        assert (stream.stored_len, stream.later[0].stored_len) == (6 * PAGE_SIZE, 24), "the served walks' KV went"
+        kv.assert_pages_conserved()
+    assert [part.page_indices for part in leader._streams["b"]["main"].groups] == [
+        part.page_indices for part in follower._streams["b"]["main"].groups
+    ]
+    for kv in ranks:
+        for rid in ("b", "c") if holder else ("b",):
+            kv.remove_request(rid)
+        assert kv._shared == 0
 
 
 def test_ranks_evict_alike_however_their_probes_and_commits_interleave():
@@ -426,6 +500,78 @@ def test_a_tp_leader_admits_a_yield_away_step_unplanned_as_its_followers_do(cach
     assert leader.plans_ahead(spec("other", True)), "a node with no followers keeps its pre-plan"
 
 
+# Each rank's own order of c's lease (L), a's commit that rolls the shared pages out of a's window (R), c's admit
+# that converts the lease (C) and c's next step once converted (G): rank 0's, then the follower's.
+@pytest.mark.parametrize("order", ["LR/RL", "RL/LR", "CR/RC", "RC/CR", "GR/RG", "RG/GR"])
+def test_ranks_count_a_shared_window_page_alike_whichever_of_its_holders_events_lands_first(order):
+    """c leases a hit whose window pages a holds, and a's commit that rolls those pages out of a's window lands
+    before or after c's lease, c's admit, or c's next step, in one order on rank 0 and in the other on a follower.
+    Every rank ends up counting the same pages lent, the same allotments and the same room."""
+    there, here = order.split("/")
+    ranks = leader, follower = _manager(0, window=24, max_num_pages=64), _manager(1, window=24, max_num_pages=64)
+    shared, rest = _tokens(6 * PAGE_SIZE, seed=3), _tokens(52, seed=4)
+    prompt = shared + _tokens(20, seed=5)
+    runner = StepRunner({"kv": leader}, node_resources={NODE: ["kv"]})
+    for kv in ranks:
+        _ingest(kv, "a", shared, rest)
+        kv.ingest_request("c", _config([prompt], decode=4 * PAGE_SIZE))
+    assert runner.admit_retrieve("a", NODE, WALK).ready
+    follower.replay(MoveKind.RESERVE, "a", leader._allotments["a"].pages, [])
+    rolls = {}
+    for kv in ranks:
+        kv.commit(_step(kv, "a", len(shared)), _ctx("a"))
+        window = set(kv._streams["a"]["main"].later[0].page_indices)
+        # a's next step rolls the window pages c leases out of a's window
+        rolls[kv] = _step(kv, "a", len(rest))
+    assert runner.admit_retrieve("c", NODE, WALK).ready
+    follower.replay(MoveKind.RESERVE, "c", leader._allotments["c"].pages, [])
+
+    def land(kv: KVManager, event: str) -> None:
+        if event == "L":
+            if kv is leader:
+                heads.append(_send(leader, "c"))
+                assert set(heads[0].prefix_hits["wire-c"]["kv"].groups[1]) & window, "c leases none of a's window pages"
+            else:
+                assert _follow(follower, heads[0])
+        elif event == "R":
+            kv.commit(rolls[kv], _ctx("a"))
+        elif event == "C":
+            _step(kv, "c", len(prompt))
+        else:
+            assert kv.admit(KVStep(segments=(Segment("c", "main", PAGE_SIZE),)), _ctx("c", "decode")).ok
+
+    heads = []
+    if "L" not in there:
+        for kv in ranks:
+            land(kv, "L")
+        # c's allotment has room for nothing past what it holds, or once converted for just as many pages as it
+        # holds of a's window
+        for kv in ranks:
+            if "G" in there:
+                kv.commit(_step(kv, "c", len(prompt)), _ctx("c"))
+            held = len(set(kv._streams["c"]["main"].pages()) & window) if "G" in there else 0
+            kv._allotments["c"].pages = kv._held("c") + held
+            kv._recount("c")
+        assert leader._allotments["c"] == follower._allotments["c"]
+    for event in there:
+        land(leader, event)
+    for event in here:
+        land(follower, event)
+    if "L" in there:
+        for kv in ranks:
+            land(kv, "C")
+
+    assert not window & set(leader._streams["a"]["main"].later[0].page_indices), "a still holds c's window"
+    for rid in "ac":
+        assert follower._streams[rid]["main"].lent == leader._streams[rid]["main"].lent, f"{rid} lends other pages"
+        assert follower._allotments[rid] == leader._allotments[rid], f"{rid}'s allotment differs between the ranks"
+    assert (follower._unused, follower._room()) == (leader._unused, leader._room()), (
+        "the follower's room differs from rank 0's"
+    )
+    for kv in ranks:
+        kv.assert_pages_conserved()
+
+
 @pytest.mark.parametrize("guaranteed", [False, True])
 def test_a_hit_counts_alike_on_rank_0_and_on_the_follower_that_adopts_it(guaranteed):
     """The follower lends the pages it adopts as rank 0 lent the pages it leased, a guaranteed request's
@@ -548,7 +694,9 @@ def test_a_follower_keys_a_dropped_request_as_rank_0_did_before_it_takes_rank_0s
     head = ScheduleTPNode(
         NODE, WALK, ["v"], prefix_hits=lead.decide_cached_prefix(_batch("v")), page_trails=lead.page_trails(NODE),
     )
-    assert len(leader._streams["v"]["main"].lease) > len(prompt) // PAGE_SIZE, "rank 0's hit is the prompt's alone"
+    assert len(leader._streams["v"]["main"].lease.groups[0]) > len(prompt) // PAGE_SIZE, (
+        "rank 0's hit is the prompt's alone"
+    )
     one = _Rank(follower, _engine(follower))
     one.rebuilds._kept[NODE]["v"] = _kept(*reply, prompt=prompt)
     one.lockstep.enqueue_follow(head)

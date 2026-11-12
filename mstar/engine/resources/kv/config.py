@@ -780,6 +780,14 @@ class RetentionPolicy:
         if self.protected_prefix < 0:
             raise ValueError(f"protected_prefix must be >= 0, got {self.protected_prefix}")
 
+    def released_pages(self, written: int, page_size: int) -> range:
+        """The pages of ``page_size`` a stream that has written ``written`` tokens no longer holds, once each
+        commit has applied this policy (`KVManager._apply_retention`): whole pages from the first past the
+        prefix, until what is left past the prefix is under a page over the budget."""
+        first = -(-self.protected_prefix // page_size)
+        over = (written - self.protected_prefix - self.context_budget) // page_size
+        return range(first, first + max(0, min(over, written // page_size - first)))
+
     def max_pages(self, page_size: int, step: int = 0) -> int:
         """The most pages of ``page_size`` a stream under this policy holds, with a step of
         ``step`` tokens past its prefix. `KVManager._apply_retention` leaves less than a page over

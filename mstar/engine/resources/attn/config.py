@@ -122,8 +122,8 @@ def derive_kv_groups(name: str, cfg: KVConfig, specs: Mapping[str, NodeResourceS
     """Pool ``name``'s groups (`PagedKVConfig.keep_window`), from the attentions over it whose
     ``sliding_window`` is shorter than its ``max_seq_len`` (a longer one keeps every token),
     and what about them no pool can serve, before anything builds or sizes from it; a pool
-    with a problem keeps every token. A pool that keeps a window doesn't prefix cache yet, so
-    its ``prefix_cache`` goes off. Run by `KVSpec.derive`."""
+    with a problem keeps every token. A pool that keeps a window beside a host tier doesn't
+    prefix cache, so its ``prefix_cache`` goes off. Run by `KVSpec.derive`."""
     readers = {key: spec for key, spec in specs.items()
                if isinstance(spec, (AttentionSpec, CrossAttentionSpec)) and spec.config.kv_cache == name}
     paged = isinstance(cfg, PagedKVConfig) and cfg.layout == KVLayout.NHD
@@ -172,11 +172,13 @@ def derive_kv_groups(name: str, cfg: KVConfig, specs: Mapping[str, NodeResourceS
         problems.append(str(e))
         cfg.keep_window(None, ())
         return problems
-    if window is not None and cfg.prefix_cache:
+    if window is not None and cfg.prefix_cache and cfg.cpu_offload_pages:
+        # a copy from the host walks the first group's keys only, so a window's pages never come back
+        why = "keeps a sliding window and a host tier (cpu_offload_pages), whose copies back skip the window's pages"
         if cfg.prefix_cache_given:
-            problems.append("keeps a sliding window, which doesn't prefix cache yet; drop its prefix_cache: true")
+            problems.append(f"{why}; drop its prefix_cache: true or its cpu_offload_pages")
             return problems
-        logger.info("KV %s keeps a sliding window, which doesn't prefix cache yet: its prefix cache is off", name)
+        logger.info("KV %s %s: its prefix cache is off", name, why)
         cfg.prefix_cache = False
     return problems
 

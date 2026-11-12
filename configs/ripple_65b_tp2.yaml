@@ -10,8 +10,6 @@ resources:
     # request holds every token of the 16 full layers but only the last ~1024 of the 64
     # sliding ones (all of a prompt's until its prefill commits).
     max_num_pages: 2048
-    # a pool that keeps a window doesn't prefix cache yet
-    prefix_cache: false
 
 node_groups:
   # ~130 GB of bf16 weights: two 141 GB GPUs

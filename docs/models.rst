@@ -493,8 +493,8 @@ Ripple-65B (``ripple_65b``)
   ``<think>``. Set ``max_tokens`` for hard problems.
 - Text in, text out, on ``/generate`` and ``/v1/chat/completions``. A reply's reasoning stays
   inline as ``<think>...</think>``, and a chat that asks for tool calls is refused.
-- Not supported yet: the NVFP4 checkpoint, prefix caching (a pool that keeps a sliding window
-  doesn't prefix cache) and DP replicas (a window pool can't span instances).
+- Not supported yet: the NVFP4 checkpoint and DP replicas (a window pool can't span instances).
+  The prefix cache needs ``prefix_cache_tp: true``, as on any TP config.
 - The GPU parity scripts live in ``test/ripple/``: ``run_parity.py`` drives a server and gates
   the result, and ``record_oracle.py`` teacher-forces its replies through the checkpoint's own
   ``modeling_ricursive.py``, in its own venv, with the attention gate and the value residual
@@ -617,8 +617,7 @@ attention resource. The cache keeps only the window of the sliding layers'
 K/V (``AttentionConfig.layers``) and returns the pages behind it to the
 pool, so a 32k-token request holds about 3.4x less KV than with every layer's
 history. A page holds 192 tokens of the full layers, or 64 of the sliding
-ones. Such a cache doesn't prefix cache yet, so the configs set
-``prefix_cache: false``. Sampling defaults to the checkpoint's (temperature 1,
+ones, and the prefix cache keeps both. Sampling defaults to the checkpoint's (temperature 1,
 top_p 0.95, top_k 64); a request's ``min_p`` above 0 is refused (a 400)
 unless the checkpoint's generation_config sets a ``min_p``, which turns the
 sampler's min-p filter on. ``reasoning_effort`` (``low``, ``medium``, ``high``,
@@ -962,7 +961,8 @@ checkpoint and set ``model_kwargs.checkpoint_dir`` in
 ``configs/command_a_plus_tp4.yaml``, the default (TP4, 65536-token
 ``max_seq_len``). Its 8192-page KV pool fits on GB200; on 141 GB GPUs such as
 H200, set ``resources.kv_cache.max_num_pages`` to 2048. It keeps only the
-sliding layers' window per request, and no prefix cache yet. Tokenizer and config
+sliding layers' window per request. Its prompts aren't keyed, so nothing is
+prefix cached. Tokenizer and config
 metadata are pinned to one checkpoint revision.
 ``configs/command_a_plus_tp8.yaml`` targets 8x 80 GB GPUs and keeps NCCL's
 all-reduce until FlashInfer's is measured there.

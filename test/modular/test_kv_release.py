@@ -558,11 +558,9 @@ def test_an_unset_page_size_is_whole_for_both_groups(layers, sliding, pages) -> 
 def test_window_pool_refusals_and_tp_offload(monkeypatch) -> None:
     with pytest.raises(ValueError, match="reads this pool"):
         _window_manager(needs_remote_transfer=True)
-    # a model that keys labels still starts, without a prefix cache (a limitation for now)
+    # a window keeps the prefix cache open, for the engines and the router's mirrors alike
     m = _window_manager()
-    assert not m.config.prefix_cache
-    # so the startup rule leaves it shut, for the engines and the router's mirrors alike
-    assert not opening_prefix_caches([KVSpec(resource_key="kv", nodes={"LLM"}, config=m.config)], {"LLM": 1}, True)
+    assert opening_prefix_caches([KVSpec(resource_key="kv", nodes={"LLM"}, config=m.config)], {"LLM": 1}, True)
     m.ingest_request("r")
     free = m._arena.num_free
     step = KVStep(segments=(Segment("r", "main", 4),), pre_forks=(("main", "other"),))
@@ -571,7 +569,7 @@ def test_window_pool_refusals_and_tp_offload(monkeypatch) -> None:
     assert m._arena.num_free == free
     with pytest.raises(ValueError):
         m.write_slots()
-    # no prefix cache, so prefix_cache_tp has no hit order for an offload to break
+    # a window beside a host tier has no prefix cache, so prefix_cache_tp has no hit order for an offload to break
     monkeypatch.setattr(manager_mod, "CPUPagePool", lambda **kw: _FakePool())
     _window_manager(
         joint_comm_group=SimpleNamespace(rank=0, world_size=2),

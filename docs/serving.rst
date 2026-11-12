@@ -558,9 +558,15 @@ travels with its other ``model_kwargs``. Above one rank the cache stays off unle
 ranks adopt it. ``prefix_cache_tp`` can't be combined with ``cpu_offload_pages``, and the
 cache's nodes must run on one TP group, with no replicas and no walks placed on other
 ranks. Loading fails otherwise. A cache that keeps
-a sliding window (``AttentionConfig.sliding_window``) has no prefix cache yet: its
-``prefix_cache`` goes off (logged at info), and a serving config that sets
-``prefix_cache: true`` on it is refused.
+a sliding window (``AttentionConfig.sliding_window``) caches the sliding layers' pages
+too: a hit ends on a page of every group, and needs the full layers' pages up to it
+and the sliding layers' pages of the window before it. A sliding page is filed in
+the cache when the full layers' page its last token is on fills, while the request
+still holds it, so it stays cached after the window moves past it. Eviction takes it
+before that full layers' page.
+With ``cpu_offload_pages`` as well its ``prefix_cache`` goes off (logged at info),
+since a copy back from the host skips the window's pages, and a serving config that
+sets ``prefix_cache: true`` on it is refused.
 
 A request waits at the head of its pool's queue until its reservation fits beside the
 reservations already admitted. A request behind it starts first when its own pages fit, output

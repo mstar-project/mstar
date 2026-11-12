@@ -72,18 +72,24 @@ def _stub_transfer(monkeypatch):
 class _Node:
     """One node's KV and position resources, with a stand-in for its forward."""
 
-    def __init__(self, cached: bool = True):
+    def __init__(self, cached: bool = True, window: int | None = None):
         device = torch.device("cpu")
+        cfg = PagedKVConfig(
+            num_layers=3, num_kv_heads=1, head_dim=4, max_seq_len=4096,
+            max_num_pages=128, page_size=PAGE_SIZE,
+        )
+        if window is not None:
+            # layers 1 and 2 keep the last ``window`` tokens, in pages of half the full layer's
+            cfg.keep_window(window, (1, 2))
         self.kv = KVManager(
-            cfg=PagedKVConfig(
-                num_layers=2, num_kv_heads=1, head_dim=4, max_seq_len=4096,
-                max_num_pages=128, page_size=PAGE_SIZE,
-            ),
+            cfg=cfg,
             name=KV, joint_comm_group=None, transfer_engine_info=None,
             device=device, dtype=torch.float32,
         )
         if cached:
             self.kv.enable_prefix_cache(ROOT)
+        # what each step's forward reads (`attended`)
+        self.reads: list[torch.Tensor] = []
         self.rope = RopeManager(
             config=PositionConfig(kv_cache=KV), device=device,
             dtype=torch.float32,
@@ -129,34 +135,38 @@ class _Node:
         assert self.runner.admit(step).outcome.ok
         results = self.runner.plan(step)
         positions = results[ROPE]["main"].tolist()
-        view = results[KV]["main"].views[0]
-        self._write(view, positions)
+        self._write(rid, positions)
+        self.reads.append(self.attended(rid, span))
         self.runner.commit(step)
         return positions
 
-    def _write(self, view, positions: list[int]) -> None:
+    def _slots(self, rid: str):
+        """Each layer's view and the stream's pages and slot count in that layer's group."""
+        stream = self.kv._streams[rid]["main"]
+        for part, group in zip(stream.groups, self.kv._groups, strict=True):
+            for layer in group.layers:
+                yield self.kv.kv_cache.layer_view(layer), part, group.page_size
+
+    def _write(self, rid: str, positions: list[int]) -> None:
         """Stand in for the forward: a slot's contents depend on its position.
 
         The point of the test is that a cached page and a freshly computed one
         are indistinguishable, so what is written has to be a function of the
         position alone — which is exactly what a correct prefix reuse claims.
+        Before commit, so the new slots follow each group's stored ones.
         """
-        resident = view.length - view.to_compute
-        for offset, position in enumerate(positions):
-            slot = resident + offset
-            page = view.page_idxs[slot // PAGE_SIZE]
-            self.kv.kv_cache.tensor[:, page, :, slot % PAGE_SIZE] = (
-                float(position) + 0.5
-            )
+        for view, part, page_size in self._slots(rid):
+            for offset, position in enumerate(positions):
+                slot = part.stored_len + offset
+                view[part.page_indices[slot // page_size], :, slot % page_size] = float(position) + 0.5
 
-    def attended(self, rid: str) -> torch.Tensor:
-        """Every slot this request would attend over, in order."""
-        stream = self.kv._streams[rid]["main"]
+    def attended(self, rid: str, written: int = 0) -> torch.Tensor:
+        """Every slot this request would attend over, in order, layer by layer, with ``written`` slots a step
+        wrote and hasn't committed."""
         return torch.stack([
-            self.kv.kv_cache.tensor[
-                :, stream.page_indices[at // PAGE_SIZE], :, at % PAGE_SIZE
-            ].clone()
-            for at in range(stream.stored_len)
+            view[part.page_indices[at // page_size], :, at % page_size].clone()
+            for view, part, page_size in self._slots(rid)
+            for at in range(part.stored_len + written)
         ])
 
 
@@ -167,7 +177,7 @@ def _schedule_a(node: _Node, rid: str, tokens: list[int]) -> None:
     node.step(rid, len(tokens))
 
 
-def _schedule_b(node: _Node, rid: str, tokens: list[int]) -> tuple[int, list[int]]:
+def _schedule_b(node: _Node, rid: str, tokens: list[int], chunks: tuple[int, ...] = (37, 61)) -> tuple[int, list[int]]:
     """The same request, arriving in uneven chunks after whatever was cached.
 
     Gives back how much it skipped and the positions it actually computed.
@@ -176,7 +186,7 @@ def _schedule_b(node: _Node, rid: str, tokens: list[int]) -> tuple[int, list[int
     matched = node.resolve(rid)
     positions: list[int] = []
     at = matched
-    for chunk in (37, 61, len(tokens)):
+    for chunk in (*chunks, len(tokens)):
         end = min(at + chunk, len(tokens))
         if end <= at:
             break
@@ -188,15 +198,19 @@ def _schedule_b(node: _Node, rid: str, tokens: list[int]) -> tuple[int, list[int
 # ── the claim ───────────────────────────────────────────────────────────
 
 
-def test_a_run_that_hit_the_cache_attends_what_a_fresh_run_computed():
-    warm = _Node()
+@pytest.mark.parametrize("window", [None, 40], ids=["full", "window"])
+def test_a_run_that_hit_the_cache_attends_what_a_fresh_run_computed(window):
+    warm = _Node(window=window)
     _schedule_a(warm, "seed", PROMPT)
     warm.kv.remove_request("seed")
 
     matched, cached = _schedule_b(warm, "b", PROMPT + SUFFIX)
-    fresh_node = _Node(cached=False)
-    skipped, fresh = _schedule_b(fresh_node, "b", PROMPT + SUFFIX)
+    fresh_node = _Node(cached=False, window=window)
+    # its second step, like the cached run's first, writes tokens 192-229 while the window still holds the hit's
+    # pages, and both end with a step to the prompt's end
+    skipped, fresh = _schedule_b(fresh_node, "b", PROMPT + SUFFIX, chunks=(192, 37, 61))
 
+    assert matched == 192, "the run found nothing in the cache"
     assert skipped == 0, "the fresh run found a cache it was supposed to be without"
     assert cached == fresh[matched:], (
         "the run that skipped a prefix carried on at the wrong positions"
@@ -205,6 +219,10 @@ def test_a_run_that_hit_the_cache_attends_what_a_fresh_run_computed():
         warm.attended("b"), fresh_node.attended("b"), atol=0.0, rtol=0.0,
         msg="a request served from the cache attends different bytes than the "
             "same request computed from nothing",
+    )
+    torch.testing.assert_close(
+        warm.reads[-2], fresh_node.reads[-2], atol=0.0, rtol=0.0,
+        msg="the first step past the hit reads different bytes than the same step of a run with no cache",
     )
 
 

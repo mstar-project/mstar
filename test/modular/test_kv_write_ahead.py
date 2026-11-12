@@ -327,7 +327,7 @@ def test_a_heads_host_run_survives_a_drain_while_its_copy_is_in_flight():
     # `after_output_copy` needs host pages, and only a's cached prefix could give them
     _serve(kv, "c", B_PROMPT + [1, 2])
     kv._streams["c"]["main"].page_indices, pages = [], kv._streams["c"]["main"].page_indices
-    kv._release("c", kv._streams["c"]["main"], pages)
+    kv._release("c", kv._streams["c"]["main"], pages, windows=())
     _ingest(kv, "b", A_PROMPT + [7, 8])
     assert not _ready(kv, "b")
 

@@ -186,7 +186,7 @@ def test_a_refused_admit_answers_the_same_and_holds_one_lease():
     keys = _seed(kv, list(range(100)))
     kv.ingest_request("r1", KVReqConfig(prefix_keys={"main": keys}, kv_layout=_layout(100)))
     first = kv.resolve_cached_prefix("r1", NODE, WALK, ARNodeInputs(input_seq_len=100)).tokens
-    held = list(kv._streams["r1"]["main"].lease)
+    held = kv._streams["r1"]["main"].lease.pages()
     owners = [kv._arena.owners(page) for page in held]
 
     # nothing left for the unmatched tail
@@ -213,7 +213,7 @@ def test_remove_gives_back_a_lease_admit_never_took():
     keys = _seed(kv, list(range(100)))
     kv.ingest_request("r1", KVReqConfig(prefix_keys={"main": keys}, kv_layout=_layout(100)))
     kv.resolve_cached_prefix("r1", NODE, WALK, ARNodeInputs(input_seq_len=100))
-    leased = list(kv._streams["r1"]["main"].lease)
+    leased = kv._streams["r1"]["main"].lease.pages()
     owners = [kv._arena.owners(page) for page in leased]
 
     kv.remove_request("r1")
@@ -246,7 +246,7 @@ def test_admit_takes_the_lease_over_and_commit_clears_it():
     keys = _seed(kv, list(range(100)))
     kv.ingest_request("r1", KVReqConfig(prefix_keys={"main": keys}, kv_layout=_layout(100)))
     matched = kv.resolve_cached_prefix("r1", NODE, WALK, ARNodeInputs(input_seq_len=100)).tokens
-    leased = list(kv._streams["r1"]["main"].lease)
+    leased = kv._streams["r1"]["main"].lease.pages()
 
     _grow(kv, "r1", 100 - matched)
 
@@ -271,7 +271,7 @@ def _converted_by_a_refused_admit(kv: KVManager) -> list[int]:
     kv.remove_request("seed")
     kv.ingest_request("r1", KVReqConfig(prefix_keys={"main": keys}, kv_layout=_layout(100)))
     matched = kv.resolve_cached_prefix("r1", NODE, WALK, ARNodeInputs(input_seq_len=100)).tokens
-    leased = list(kv._streams["r1"]["main"].lease)
+    leased = kv._streams["r1"]["main"].lease.pages()
     kv.ingest_request("hog", KVReqConfig())
     _grow(kv, "hog", kv._arena.num_free * PAGE_SIZE)
 
@@ -357,7 +357,7 @@ def test_a_lease_taken_after_a_refused_batch_admit_is_still_converted():
     reserved = _refused_then_cached(kv, prompt)
 
     matched = kv.resolve_cached_prefix("r1", NODE, WALK, ARNodeInputs(input_seq_len=len(prompt))).tokens
-    leased = list(kv._streams["r1"]["main"].lease)
+    leased = kv._streams["r1"]["main"].lease.pages()
     _grow(kv, "r1", len(prompt) - matched)
 
     stream = kv._streams["r1"]["main"]
@@ -380,7 +380,7 @@ def test_a_leased_stream_an_offload_has_claimed_keeps_its_pages():
     prompt = list(range(100))
     reserved = _refused_then_cached(kv, prompt)
     matched = kv.resolve_cached_prefix("r1", NODE, WALK, ARNodeInputs(input_seq_len=len(prompt))).tokens
-    leased = list(kv._streams["r1"]["main"].lease)
+    leased = kv._streams["r1"]["main"].lease.pages()
     # what a claim leaves on a stream while its copy runs with the lock down
     kv._streams["r1"]["main"].offloaded = True
 
@@ -390,7 +390,7 @@ def test_a_leased_stream_an_offload_has_claimed_keeps_its_pages():
     assert stream.page_indices == reserved, (
         "the conversion let go of pages an offload was still copying"
     )
-    assert stream.lease == leased, "the lease was converted under the offload"
+    assert stream.lease.pages() == leased, "the lease was converted under the offload"
 
 
 def test_a_pre_fork_off_a_leased_stream_covers_the_whole_prefix():
@@ -441,16 +441,182 @@ def test_a_lease_is_cut_to_the_smallest_answer_and_the_rest_given_back():
     )
 
     matched = runner.resolve_cached_prefix("r1", NODE, WALK, ARNodeInputs(input_seq_len=100))
-    leased = list(kv._streams["r1"]["main"].lease)
+    leased = kv._streams["r1"]["main"].lease.pages()
     runner.apply_cached_prefix("r1", NODE, WALK, None, matched)
 
     assert matched.tokens == PAGE_SIZE, "the runner did not take the smallest answer"
-    assert kv._streams["r1"]["main"].lease == leased[:1], (
+    assert kv._streams["r1"]["main"].lease.pages() == leased[:1], (
         "the lease still covers pages the step will now recompute"
     )
     assert all(kv._arena.owners(page) == 1 for page in leased[1:]), (
         "the pages past the agreed length are held by a lease nobody will convert"
     )
+    kv.assert_pages_conserved()
+
+
+# ── a pool that keeps a window ──────────────────────────────────────────
+
+# Layer 0 keeps every token in pages of 16; layers 1 and 2 keep the last 24, three pages of 8.
+WINDOW = 24
+
+
+def _window_manager(max_num_pages: int = 64) -> KVManager:
+    cfg = PagedKVConfig(
+        num_layers=3, num_kv_heads=1, head_dim=8, max_seq_len=4096, max_num_pages=max_num_pages, page_size=PAGE_SIZE,
+    )
+    cfg.keep_window(WINDOW, (1, 2))
+    kv = KVManager(
+        cfg=cfg, name="kv", joint_comm_group=None, transfer_engine_info=None,
+        device=torch.device("cpu"), dtype=torch.float32,
+    )
+    kv.enable_prefix_cache(ROOT)
+    return kv
+
+
+def _write(kv: KVManager, rid: str, tokens: list[int]) -> None:
+    """Probe, then write what the cache didn't serve in one step, whose commit files what it filled."""
+    kv.ingest_request(rid, KVReqConfig(prefix_keys={"main": _keys(tokens)}, kv_layout=_layout(len(tokens))))
+    inputs = ARNodeInputs(input_seq_len=len(tokens))
+    prefix = kv.resolve_cached_prefix(rid, NODE, WALK, inputs)
+    kv.apply_cached_prefix(rid, NODE, WALK, inputs, prefix)
+    _grow(kv, rid, len(tokens) - (prefix.tokens if prefix is not None else 0))
+
+
+def test_repeats_of_one_cached_prompt_on_a_window_pool_fit_the_capture_bound():
+    """Repeats of one cached prompt each name its full-group pages, so together they name more pages than the
+    pool holds; a captured wrapper's index buffer holds them all (it was once sized by the pool)."""
+    from mstar.engine.resources.attn.base import captured_page_capacity
+
+    # room for the window pages they share too, which each repeat rolls out into pages of its own (`_shared`)
+    kv = _window_manager(max_num_pages=20)
+    shared = list(range(8 * PAGE_SIZE))
+    rids = [f"r{i}" for i in range(10)]
+    for i, rid in enumerate(rids):
+        _write(kv, rid, shared + [10_000 + i])
+    named = sum(len(kv._streams[rid]["main"].page_indices) for rid in rids)
+    # more than the pool, a step's pages and a page a row, which bounded them before repeats shared the cached prefix
+    first = kv.config.groups[0]
+    assert named > kv.config.num_units + -(-len(rids) // first.page_size) + len(rids)
+    assert named <= captured_page_capacity(len(rids), len(rids), kv.config, first)
+
+
+def test_a_repeat_on_a_window_pool_takes_the_window_pages_the_first_request_left_in_the_cache():
+    kv = _window_manager()
+    tokens = list(range(100))
+    _write(kv, "a", tokens)
+    a = kv._streams["a"]["main"]
+    # at 100 tokens the window holds pages 9-12 (tokens 72-100); 9-11 end on the last whole full page
+    full, window = a.page_indices[:6], a.later[0].page_indices[:3]
+    lengths = (a.later[0].stored_len, a.later[0].released)
+    kv.remove_request("a")
+
+    _write(kv, "b", tokens)
+    b = kv._streams["b"]["main"]
+
+    assert b.page_indices[:6] == full, "the repeat recomputed the full layers' pages"
+    assert b.later[0].page_indices[:3] == window, (
+        "the repeat's sliding layers attend pages other than the ones that hold tokens 72-96"
+    )
+    assert (b.later[0].stored_len, b.later[0].released) == lengths, (
+        "the repeat's window doesn't stand where writing the prompt would have left it"
+    )
+    kv.assert_pages_conserved()
+
+
+@pytest.mark.parametrize("removed", ["b", "a"])
+def test_a_removed_holder_gives_back_the_room_kept_for_the_window_pages_two_streams_hold(removed):
+    """b leases the window pages a still holds, so the pool keeps room for the second holder (`_shared`). Removing
+    either, b before admit converts its lease, gives that room back."""
+    kv = _window_manager()
+    tokens = list(range(100))
+    _write(kv, "a", tokens)
+    room = kv._room()
+    kv.ingest_request("b", KVReqConfig(prefix_keys={"main": _keys(tokens)}, kv_layout=_layout(100)))
+    assert kv.resolve_cached_prefix("b", NODE, WALK, ARNodeInputs(input_seq_len=100)).tokens == 96
+    assert kv._room() < room, "b leases none of the window pages a holds"
+
+    kv.remove_request(removed)
+
+    kv.assert_pages_conserved()
+    if removed == "b":
+        assert kv._room() == room, "the pool still keeps room for window pages only a holds"
+
+
+def test_a_window_page_missing_from_the_cache_moves_the_hit_back_below_it():
+    kv = _window_manager()
+    tokens = list(range(100))
+    _write(kv, "a", tokens)
+    kv.remove_request("a")
+    rooted = [fingerprint(ROOT, key) for key in _keys(tokens)]
+    kv._index._remove(kv._index.page_for(kv._window_key(rooted[kv._ends_on(1, 10)], 1, 10)))
+    kv.ingest_request("b", KVReqConfig(prefix_keys={"main": _keys(tokens)}, kv_layout=_layout(100)))
+
+    # tokens 80-88 are gone from the window, so the hit ends at 80, whose window (56-80) is whole
+    assert kv.resolve_cached_prefix("b", NODE, WALK, ARNodeInputs(input_seq_len=100)).tokens == 80
+    kv.assert_pages_conserved()
+
+
+def test_eviction_takes_window_pages_before_the_full_page_they_end_on():
+    kv = _window_manager()
+    _write(kv, "a", list(range(100)))
+    full = kv._streams["a"]["main"].page_indices[:6]
+    kv.remove_request("a")
+    window = kv._index.num_pages() - len(full)
+
+    kv._evict(window)
+
+    assert all(kv._index.holds(page) for page in full), (
+        "eviction dropped a full layers' page while window pages that only it reaches stayed cached"
+    )
+
+
+class _Capping(StubResource):
+    """A resource that answers no prefix and caps the agreed one, as the recurrent pool does."""
+
+    def __init__(self, cap: int):
+        self._cap = cap
+
+    def cap_cached_prefix(self, rid, node_name, graph_walk, prefix):
+        tokens = min(prefix.tokens, self._cap)
+        return prefix._replace(tokens=tokens, position=prefix.position - prefix.tokens + tokens)
+
+
+@pytest.mark.parametrize(("other", "gone", "served", "holder", "shared"), [
+    (_Holding(0), None, 0, None, 0),
+    # the lease ends at 96 and holds the window of tokens 72-96, but the index still holds 56-80's
+    (_Holding(80), None, 80, None, 0),
+    # and a still holds 72-96's, so the cut gives back the room kept for b's holding them, but the page of 72-80,
+    # which it takes again, keeps room for b's second hold (`_shared`)
+    (_Holding(80), None, 80, "a", 1),
+    # c holds 56-80's, which the cut takes again, so the pool keeps room for each of b's holds on them
+    (_Holding(80), None, 80, "c", 3),
+    # the window page of tokens 64-72 is gone, so the cache serves 64, and the cap is asked again at 64
+    (_Capping(80), 8, 64, None, 0),
+], ids=["declined", "shorter", "shorter_while_held", "shorter_beside_a_holder", "capped"])
+def test_a_window_lease_cut_below_its_end_serves_what_the_index_holds_there(other, gone, served, holder, shared):
+    """``shared`` is `_shared` once the cut has taken the pages the index holds there."""
+    kv = _window_manager()
+    tokens = list(range(100))
+    _write(kv, "a", tokens)
+    if holder != "a":
+        kv.remove_request("a")
+    if holder == "c":
+        _write(kv, "c", tokens[:80] + [9999])
+    if gone is not None:
+        rooted = [fingerprint(ROOT, key) for key in _keys(tokens)]
+        kv._index._remove(kv._index.page_for(kv._window_key(rooted[kv._ends_on(1, gone)], 1, gone)))
+    kv.ingest_request("b", KVReqConfig(prefix_keys={"main": _keys(tokens)}, kv_layout=_layout(100)))
+    runner = StepRunner({"kv": kv, "other": other}, node_resources={NODE: ["kv", "other"]})
+    inputs = ARNodeInputs(input_seq_len=100)
+
+    matched = runner.resolve_cached_prefix("b", NODE, WALK, inputs)
+    runner.apply_cached_prefix("b", NODE, WALK, inputs, matched)
+    assert kv._shared == shared
+    _grow(kv, "b", 100 - matched.tokens)
+
+    assert matched.tokens == served
+    b = kv._streams["b"]["main"].later[0]
+    assert b.stored_len + b.released == 100, "the repeat's window doesn't stand where its prompt ends"
     kv.assert_pages_conserved()
 
 

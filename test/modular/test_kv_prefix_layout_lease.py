@@ -99,8 +99,8 @@ class _Node(_TextNode):
     """One request's cache and positions under a real runner, after an earlier
     request ran every walk of ``seeded`` and indexed what it filled."""
 
-    def __init__(self, seeded: list = PARTS, parts: list | None = None, decode: int = 0):
-        super().__init__()
+    def __init__(self, seeded: list = PARTS, parts: list | None = None, decode: int = 0, window: int | None = None):
+        super().__init__(window=window)
         self.kv.enable_prefix_cache(ROOT, {"main": KeyedWalks((TEXT_WALK, IMAGE_WALK), ("decode",))})
         self.runner.ingest_request("seed", {"kv": _config(seeded, decode=decode)})
         for walk, length in _walks(seeded):
@@ -377,11 +377,15 @@ _DISAGREEING = {
 }
 
 
+@pytest.mark.parametrize("window", [None, 32], ids=["full", "window"])
 @pytest.mark.parametrize("disagree", _DISAGREEING.values(), ids=_DISAGREEING.keys())
-def test_a_walk_the_layout_no_longer_describes_keeps_the_pages_the_cache_served(disagree):
-    node = _Node([list(range(1, 33)), IMAGE, TAIL])
+def test_a_walk_the_layout_no_longer_describes_keeps_the_pages_the_cache_served(disagree, window):
+    node = _Node([list(range(1, 33)), IMAGE, TAIL], window=window)
     node.walk(TEXT_WALK, 32)
-    lease = list(node.stream.lease)
+    assert node.stream.lease.end > 32
+    lease = node.stream.lease.pages()
+    # A window keeps other pages at the served text's end than at the lease's, so they must outlive eviction.
+    node.kv._index.evict(len(node.kv._index.evictable()))
 
     disagree(node)
 
@@ -389,6 +393,37 @@ def test_a_walk_the_layout_no_longer_describes_keeps_the_pages_the_cache_served(
         "the chain dropped at the image let go of the text the cache served, so "
         "the image would be written from slot 0 with that text missing"
     )
+
+
+def test_a_walk_is_served_whole_only_up_to_where_the_lease_holds_the_window():
+    """A cut of the lease falls where it holds the window, so a walk ending elsewhere isn't served whole. Here the
+    cache lost the window page ending at the text's end, so the text is served the 16 slots before it, and a layout
+    dropped at the image keeps the text it wrote rather than failing the request."""
+    node = _Node([list(range(1, 33)), IMAGE, TAIL], window=32)
+    kv, chain = node.kv, node.stream.chain
+    kv._root_chain(chain)
+    g, group = kv._windows[0]
+    last = 32 // group.page_size - 1
+    kv._index._remove(kv._index.page_for(kv._window_key(chain.rooted[kv._ends_on(g, last)], g, last)))
+
+    assert node.walk(TEXT_WALK, 32) == PAGE_SIZE
+    node.probe(IMAGE_WALK, IMAGE + 1)
+
+    assert (node.stream.chain, node.stream.stored_len) == (None, 32)
+
+
+def test_a_walk_after_walks_served_inside_a_page_is_served_whole_though_the_lease_holds_no_window_at_its_end():
+    """No cut keeps walks the cache served up to inside a page (`_drop_layout`), so cutting the next walk short of
+    them gains nothing: the 12-slot image after 20 slots of text is served whole though the window page ending at
+    its end is lost."""
+    node = _Node([TEXT, 12, list(range(100, 150))], window=32)
+    kv, chain = node.kv, node.stream.chain
+    kv._root_chain(chain)
+    g, group = kv._windows[0]
+    last = 32 // group.page_size - 1
+    kv._index._remove(kv._index.page_for(kv._window_key(chain.rooted[kv._ends_on(g, last)], g, last)))
+
+    assert [node.walk(TEXT_WALK, len(TEXT)), node.walk(IMAGE_WALK, 12)] == [len(TEXT), 12]
 
 
 def test_a_mismatch_the_served_walks_cannot_survive_fails_the_request():
@@ -428,6 +463,16 @@ def test_a_repeat_with_another_question_is_served_the_whole_image_and_the_slots_
         "the repeat's page for the image's end does not hold the slots the first "
         "request wrote there, so its question attends to other KV"
     )
+
+
+def test_a_window_pool_serves_a_repeat_up_to_the_page_before_the_image_end():
+    """A hit inside a page would need that page of the window too, so a window pool caches no image end and
+    serves the whole pages before it: 48 slots, whose window (16-48) is cached."""
+    node = _Node([TEXT, IMAGE, ASK], [TEXT, IMAGE, OTHER_ASK], window=32)
+
+    answers = [node.walk(walk, length) for walk, length in _walks([TEXT, IMAGE, OTHER_ASK])]
+
+    assert answers == [len(TEXT), 3 * PAGE_SIZE - len(TEXT), 0]
 
 
 def test_a_missed_probe_asked_again_hashes_nothing_and_is_served_what_was_cached_since(monkeypatch):

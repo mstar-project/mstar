@@ -356,9 +356,9 @@ class SlidingWindowTests(unittest.TestCase):
         # a window over a pool its specs never resolved would plan as if it kept every page
         with self.assertRaisesRegex(ValueError, "resolve"):
             build_manager(WINDOW, kv_config=geometry(), layers=(0,))
-        # a window turns the prefix cache off, unless the serving config asked for it
+        # a window beside a host tier turns the prefix cache off, unless the serving config asked for it
         cfg = PagedKVConfig(num_layers=2, num_qo_heads=4, num_kv_heads=2, head_dim=128,
-                            max_seq_len=64, page_size=16, max_num_pages=6)
+                            max_seq_len=64, page_size=16, max_num_pages=6, cpu_offload_pages=2)
         cfg.apply_yaml_overrides(prefix_cache=True)
         with self.assertRaisesRegex(ValueError, "prefix_cache"):
             resolve_spec_dependencies([

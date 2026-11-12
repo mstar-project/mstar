@@ -20,7 +20,7 @@ import mstar.communication.wire_types  # noqa: F401  (registers the tags)
 from mstar.api_server.request_types import APIServerMessage, RequestComplete, ResultTensors
 from mstar.communication.wire import _TYPE_TO_TAG, WireError, decode, encode
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.resources.base import CachedLease
+from mstar.engine.resources.kv.manager import Lease
 from mstar.graph.base import GraphEdge, TensorPointerInfo
 from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.profile.format import GraphTiming, RxInfo, TxInfo
@@ -187,7 +187,7 @@ def test_rank_0s_moves_round_trip_typed():
 
 def test_rank_0s_leases_and_page_trails_round_trip_typed():
     body = ScheduleTPNode(
-        "llm", "decode", ["r"], prefix_hits={"r": {"kv": CachedLease([4, 5, 6], [4])}},
+        "llm", "decode", ["r"], prefix_hits={"r": {"kv": Lease(48, [[4, 5, 6], [7]], starts=[8], lent=[4, 7])}},
         page_trails={"kv": (3, 17, 2, 0, 1)},
     )
 
@@ -195,6 +195,7 @@ def test_rank_0s_leases_and_page_trails_round_trip_typed():
 
     assert got.prefix_hits == body.prefix_hits, "a follower would take another lease than rank 0's"
     assert got.page_trails == body.page_trails, "a follower would check another trail than rank 0's"
+    assert type(got.prefix_hits["r"]["kv"]) is Lease, "the lease came back as the base type"
 
 
 def test_unregistered_payloads_still_round_trip():

@@ -118,12 +118,11 @@ class CachedPrefix(NamedTuple):
     position: int
 
 
-@dataclass
+@dataclass(slots=True)
 class CachedLease:
-    """Rank 0's lease of a stream's cached prefix, which a TP follower takes as given: its ``pages``, and the
-    ones it ``lent``, which another request holds and so take no room."""
-    pages: list[int]
-    lent: list[int]
+    """Rank 0's lease of a resource's cached prefix, which a TP follower takes as given. Each resource that
+    leases subclasses it with what its followers need, as an ``@dataclass(slots=True)`` with a tag in
+    ``wire_types._TYPES``, so the wire carries it by that tag."""
 
 
 class Residency(IntEnum):
@@ -314,14 +313,14 @@ class Resource(ResidentHooks, ABC):
 
     def lease_cached_prefix(self, rid: str, node_name: str, graph_walk: str) -> CachedLease | None:
         """On rank 0 of a TP node, lease the request's cached prefix as its step is sent and
-        return the lease, or None."""
+        return the lease, or None. The followers' `adopt_cached_prefix` takes it back as it is."""
         return None
 
     def adopt_cached_prefix(
         self, rid: str, node_name: str, graph_walk: str, lease: CachedLease, caught_up: bool,
     ) -> bool:
-        """On a TP follower, take rank 0's ``lease``. False until this rank holds its pages too, and
-        raises if it still lacks them once ``caught_up``."""
+        """On a TP follower, take rank 0's ``lease``, the pages it counts lent included. False until this rank
+        holds its pages too, and raises if it still lacks them once ``caught_up``."""
         return True
 
     def release_cached_prefix(self, rid: str, node_name: str, graph_walk: str) -> None:
