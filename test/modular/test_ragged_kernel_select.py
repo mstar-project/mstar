@@ -117,6 +117,14 @@ def test_sm_103_picks_cudnn_for_the_dit_sizes(gpu, heads, head_dim, seq_len):
     assert kernels_module.RAGGED_ATTENTION.row_for(manager._kernel_rows, seq_len) == Choice("cudnn")
 
 
+@pytest.mark.parametrize(("seq_len", "impl"), [(4608, "cudnn"), (16384, "cudnn"), (32760, "fa4"), (75600, "fa4")])
+def test_sm_103_runs_fa4_for_wan_a14b_sizes(gpu, seq_len, impl):
+    """Wan2.2-T2V-A14B's 40 heads: FA4 at its 480p and 720p self-attention, cuDNN at the sizes below."""
+    gpu(B300)
+    manager = build(spec(40, 128))
+    assert kernels_module.RAGGED_ATTENTION.row_for(manager._kernel_rows, seq_len) == Choice(impl)
+
+
 @pytest.mark.parametrize("key", [H100, DeviceKey("NVIDIA B200", "sm_100")], ids=["sm_90", "sm_100"])
 def test_a_gpu_without_a_table_keeps_flashinfer(gpu, key):
     gpu(key)

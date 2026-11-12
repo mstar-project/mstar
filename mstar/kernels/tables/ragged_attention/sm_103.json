@@ -55,6 +55,27 @@
         "32768": {"us": 32777.54, "default_us": 118882.18, "cudnn_us": 32777.54, "flashinfer_fa2_us": 118877.59, "flashinfer_cudnn_us": 34001.85},
         "65536": {"us": 133867.56, "default_us": 469622.69, "cudnn_us": 133867.56, "flashinfer_fa2_us": 469633.99, "flashinfer_cudnn_us": 139011.64}
       }
+    },
+    {
+      "dtype": "bfloat16",
+      "shape": {"head_dim": 128, "num_kv_heads": 40, "num_qo_heads": 40},
+      "provenance": {"device": "NVIDIA B300 SXM6 AC", "arch": "sm_103", "date": "2026-11-12", "harness": "python -m benchmark.kernels.sweep ragged_attention --dtype bfloat16 --shape num_qo_heads=40,num_kv_heads=40,head_dim=128 --buckets 128,1024,4096,4608,8192,16384,18480,32768,65536,75600", "torch": "2.11.0+cu130", "triton": "3.6.0", "note": "Wan2.2-T2V-A14B self-attention at 832x480x81 (32760 tokens) and 1280x720x81 (75600), CFG-batched (2 segments). Rows hand-set from the sweep's: FA4 past 16384 tokens (-6% at 32768-75600); cuDNN below, where the sweep's FA4 wins at <= 4608 are within FA4's ~0.3 ms of host time per eager call"},
+      "rows": {
+        "16384": {"impl": "cudnn"},
+        "*": {"impl": "fa4"}
+      },
+      "measured": {
+        "128": {"us": 10.51, "default_us": 26.02, "cudnn_us": 15.71, "fa4_us": 10.51, "flashinfer_fa2_us": 32.2, "flashinfer_cudnn_us": 27.57},
+        "1024": {"us": 55.97, "default_us": 246.13, "cudnn_us": 58.5, "fa4_us": 55.97, "flashinfer_fa2_us": 246.05, "flashinfer_cudnn_us": 93.67},
+        "4096": {"us": 571.47, "default_us": 2716.11, "cudnn_us": 576.86, "fa4_us": 571.47, "flashinfer_fa2_us": 2768.4, "flashinfer_cudnn_us": 650.96},
+        "4608": {"us": 657.25, "default_us": 3439.33, "cudnn_us": 693.9, "fa4_us": 657.25, "flashinfer_fa2_us": 3781.63, "flashinfer_cudnn_us": 775.68},
+        "8192": {"us": 2239.4, "default_us": 10431.92, "cudnn_us": 2239.4, "fa4_us": 2405.91, "flashinfer_fa2_us": 10288.23, "flashinfer_cudnn_us": 2410.7},
+        "16384": {"us": 9359.79, "default_us": 37912.03, "cudnn_us": 9359.79, "fa4_us": 9535.7, "flashinfer_fa2_us": 37957.76, "flashinfer_cudnn_us": 10166.77},
+        "18480": {"us": 11548.5, "default_us": 48525.79, "cudnn_us": 12337.15, "fa4_us": 11548.5, "flashinfer_fa2_us": 48534.21, "flashinfer_cudnn_us": 12961.7},
+        "32768": {"us": 38187.19, "default_us": 149264.66, "cudnn_us": 40633.65, "fa4_us": 38187.19, "flashinfer_fa2_us": 149258.48, "flashinfer_cudnn_us": 43598.45},
+        "65536": {"us": 158959.85, "default_us": 590306.71, "cudnn_us": 167755.96, "fa4_us": 158959.85, "flashinfer_fa2_us": 590297.56},
+        "75600": {"us": 210810.29, "default_us": 784867.31, "cudnn_us": 224988.0, "fa4_us": 210810.29, "flashinfer_fa2_us": 784898.67}
+      }
     }
   ]
 }
