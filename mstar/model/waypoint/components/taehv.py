@@ -23,7 +23,10 @@ _CHECKPOINT_NAME = "taehv1_5.pth"
 _PATCH_SIZE = 2
 _LATENT_CHANNELS = 32
 
-DECODER_HISTORY_PREFIX = "decoder_history_"
+# The pinned decoder's MemBlocks come in three stages of three, at these channels, and each stage runs at twice the
+# height and width of the one before (``n_f`` and ``decoder_space_upscale`` in TAEHV_UPSTREAM_ARCHIVE's taehv.py).
+_DECODER_STAGE_CHANNELS = (256, 128, 64)
+_MEMBLOCKS_PER_STAGE = 3
 
 
 def encoded_size_for_latent(latent_height: int, latent_width: int) -> tuple[int, int]:
@@ -191,18 +194,34 @@ def _conv_output_size(size: int, block: nn.Conv2d, dim: int) -> int:
     return math.floor((size + 2 * padding - dilation * (kernel - 1) - 1) / stride + 1)
 
 
-def decoder_history_shapes(
-    ae_model: nn.Module,
-    *,
-    batch_size: int,
-    latent_height: int,
-    latent_width: int,
-) -> tuple[tuple[int, int, int, int], ...]:
-    """The nine fixed MemBlock input shapes for one decoder request."""
-    validate_taehv_architecture(ae_model)
+def decoder_history_shapes(latent_height: int, latent_width: int) -> tuple[tuple[int, int, int], ...]:
+    """The nine MemBlock input shapes of one decoder row, for a latent of ``latent_height`` by ``latent_width``,
+    with no module built."""
+    return tuple(
+        (channels, latent_height << stage, latent_width << stage)
+        for stage, channels in enumerate(_DECODER_STAGE_CHANNELS) for _ in range(_MEMBLOCKS_PER_STAGE)
+    )
+
+
+def validate_decoder_histories(ae_model: nn.Module, latent_height: int, latent_width: int) -> None:
+    """Refuse a decoder whose MemBlock inputs aren't `decoder_history_shapes`, the ones a request's state holds."""
+    walked = _walked_history_shapes(ae_model, latent_height, latent_width)
+    declared = decoder_history_shapes(latent_height, latent_width)
+    if walked != declared:
+        raise ValueError(
+            f"The TAEHV decoder's MemBlocks take {list(walked)} at a {latent_height}x{latent_width} latent, and "
+            f"Waypoint's state holds {list(declared)}; install the pinned TAEHV source from "
+            f"{TAEHV_UPSTREAM_ARCHIVE}."
+        )
+
+
+def _walked_history_shapes(
+    ae_model: nn.Module, latent_height: int, latent_width: int,
+) -> tuple[tuple[int, int, int], ...]:
+    """The nine MemBlock input shapes of one decoder row, from the modules of a validated architecture."""
     height, width = int(latent_height), int(latent_width)
     channels = int(ae_model.latent_channels)
-    shapes: list[tuple[int, int, int, int]] = []
+    shapes: list[tuple[int, int, int]] = []
     for block in ae_model.decoder:
         kind = _block_kind(block)
         if kind == "MemBlock":
@@ -212,7 +231,7 @@ def decoder_history_shapes(
                     f"decoder MemBlock expects {block_channels} channels after "
                     f"a {channels}-channel block"
                 )
-            shapes.append((batch_size, channels, height, width))
+            shapes.append((channels, height, width))
         elif kind == "TGrow":
             continue
         elif isinstance(block, nn.Conv2d):
@@ -229,18 +248,6 @@ def decoder_history_shapes(
     if len(shapes) != 9:
         raise ValueError(f"Waypoint decoder needs nine histories; derived {len(shapes)}")
     return tuple(shapes)
-
-
-def initial_decoder_histories(
-    ae_model: nn.Module, latent: Tensor,
-) -> tuple[Tensor, ...]:
-    shapes = decoder_history_shapes(
-        ae_model,
-        batch_size=int(latent.shape[0]),
-        latent_height=int(latent.shape[-2]),
-        latent_width=int(latent.shape[-1]),
-    )
-    return tuple(latent.new_zeros(shape) for shape in shapes)
 
 
 def _apply_decoder_sequence(

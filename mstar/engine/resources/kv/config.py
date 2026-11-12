@@ -945,6 +945,4 @@ class KVStep(ResourceStep):
 
 @dataclass(frozen=True, kw_only=True)
 class RingKVStep(ResourceStep):
-    """One ring clock per request in the step's batch."""
-
-    frames: tuple[tuple[str, int], ...]
+    """A step of a ring: one frame per row, which its commit counts."""

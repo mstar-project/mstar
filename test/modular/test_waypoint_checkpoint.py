@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 import torch
 import yaml
+from test_waypoint_shell import _FakeTaehv
 
 sys.path.insert(0, ".")
 
@@ -319,21 +320,9 @@ def test_model_resolves_variant_artifacts_before_first_module_allocation(
         calls.append(("allocate", checkpoint_dir, device))
         return torch.nn.Linear(1, 1)
 
-    class MemBlock(torch.nn.Module):
-        """The class name, not the weights, is what
-        ``validate_taehv_architecture`` reads off ``encoder``/``decoder``."""
-
     def load_taehv(ae_uri, cache_dir=None):
         calls.append(("load_taehv", ae_uri, {"cache_dir": cache_dir}))
-        stub = torch.nn.Module()
-        stub.patch_size = 2
-        stub.latent_channels = 32
-        stub.t_downscale = 4
-        stub.t_upscale = 4
-        stub.frames_to_trim = 3
-        stub.encoder = torch.nn.ModuleList([MemBlock() for _ in range(9)])
-        stub.decoder = torch.nn.ModuleList([MemBlock() for _ in range(9)])
-        return stub
+        return _FakeTaehv()
 
     monkeypatch.setattr(
         "mstar.model.waypoint.checkpoint.require_taehv_runtime",

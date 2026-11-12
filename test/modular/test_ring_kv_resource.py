@@ -2,16 +2,17 @@
 fail quietly.
 
 Every test here pins a failure that produces no exception on its own. The ring
-IS the world state, so a lost claim, a rebound buffer, a stale visibility row or
-a world reading its neighbour's history does not raise — it produces plausible,
-smoothly drifting video, or a request that hangs forever waiting on an evictor
-with nothing to evict.
+IS the world state, so a lost claim, a rebound buffer, a miscounted frame or a
+world writing into its neighbour's history does not raise — it produces
+plausible, smoothly drifting video, or a request that hangs forever waiting on
+an evictor with nothing to evict.
 
 ``num_sessions`` worlds share one buffer per layer, folded into its token
-dimension (``kv/ring/cache.py``). Nothing physical separates them: ``upsert``
-hands back K and V spanning every resident world and one bool row that is False
-outside the caller's own span. That row is the whole isolation mechanism, so the
-tests that check it (``test_the_flat_ring_matches_one_ring_per_world``,
+dimension (``kv/ring/cache.py``). Nothing physical separates them: a read
+attends K and V spanning every resident world, and the flex mask that keeps each
+row to its own span is checked in ``test_flex_attention_resource.py``. The ring's
+half is that each world's writes stay in its own span, so the tests that check it
+(``test_the_flat_ring_matches_one_ring_per_world``,
 ``test_worlds_interleave_without_reaching_each_other``) are load-bearing in a
 way the ownership tests are not: ownership failures lose capacity, isolation
 failures corrupt video.
@@ -49,7 +50,6 @@ from mstar.engine.resources.spec import apply_yaml_overrides
 from mstar.engine.resources.step import (
     AdmitRuntimeError,
     AllocationFailed,
-    RequestOffloading,
     StepContext,
 )
 
@@ -102,26 +102,14 @@ def _ctx(*rids: str) -> StepContext:
     )
 
 
-def _step(*rids: str, frame: int = 0) -> RingKVStep:
-    """A step declaring ``frame`` as the ring clock for every rid in ``rids``.
-
-    One clock per request, and never absent: ``RingKVStep`` has no shape that
-    declines to answer, so there is no step a test can build that switches the
-    continuity check off. Frame 0 by default, so the ownership tests below can
-    say what they are about — they exercise who holds a world, not what frame it
-    is on, and a clock they did not think about should not refuse them.
-    """
-    return RingKVStep(frames=tuple((rid, frame) for rid in rids))
-
-
-def _open(kv: RingKVManager, *rids: str, frame: int = 0) -> None:
+def _open(kv: RingKVManager, *rids: str) -> None:
     """Register and admit each rid in its own step, one world claimed per
     call — the ownership tests are about who holds a world, not step
     batching, so they build it up one rid at a time regardless of
     ``step_batch_size``."""
     for rid in rids:
         kv.ingest_request(rid)
-        outcome = kv.admit(_step(rid, frame=frame), _ctx(rid))
+        outcome = kv.admit(RingKVStep(), _ctx(rid))
         assert outcome.ok, f"{rid} was refused a world: {outcome.reason}"
 
 
@@ -135,22 +123,29 @@ def _frame(kv: RingKVManager, gen: torch.Generator) -> tuple[torch.Tensor, torch
     )
 
 
-def _rollout(
-    kv: RingKVManager, frames: int = 6, seed: int = 0, start: int = 0
-) -> None:
-    """The 4+1 schedule, for as many frames as asked, into whichever world
-    ``plan`` last staged. Past ``ring_frames`` it wraps, which is the only way
-    the ring's contents stop being trivially position-ordered.
+def _rollout(kv: RingKVManager, gen: torch.Generator) -> None:
+    """One frame of the 4+1 schedule through `write`, into whichever world and
+    frame ``plan`` last staged."""
+    for keep in (False, False, False, False, True):
+        for layer_idx in range(len(kv.layers)):
+            k, v = _frame(kv, gen)
+            kv.write(k, v, layer_idx, keep=keep)
 
-    ``start`` is the clock the first frame runs at, for the tests that drive
-    the resource lifecycle alongside it and need the two to agree."""
+
+def _drive(kv: RingKVManager, rid: str, frames: int = 1, seed: int = 0) -> None:
+    """``frames`` engine steps of ``rid``, each admit, plan, forward, commit.
+    Past ``ring_frames`` it wraps, which is the only way the ring's contents
+    stop being trivially position-ordered. Asserts each admit, since a test that
+    meant to reach `commit` and was refused on the way should say so there
+    rather than fail three lines later."""
     gen = torch.Generator().manual_seed(seed)
-    for f in range(start, start + frames):
-        frame_pos = torch.tensor([f], dtype=torch.int64)
-        for commit in (False, False, False, False, True):
-            for layer_idx in range(len(kv.layers)):
-                k, v = _frame(kv, gen)
-                kv.upsert(k, v, layer_idx, frame_pos, commit=commit)
+    for _ in range(frames):
+        step, ctx = RingKVStep(), _ctx(rid)
+        outcome = kv.admit(step, ctx)
+        assert outcome.ok, f"{rid} was refused: {outcome.reason}"
+        kv.plan(step, ctx)
+        _rollout(kv, gen)
+        kv.commit(step, ctx)
 
 
 def _ptrs(kv: RingKVManager) -> list[tuple[int, int, int, int]]:
@@ -317,12 +312,8 @@ def test_two_capture_configs_can_each_open_and_claim():
     room for two the bug this pins would sail through capture and reappear as a
     node that can serve one fewer request than it was sized for.
 
-    It is also what pins the clock check against capture. Every admit below
-    declares frame 0 — the capture template's `frame_pos` is `torch.zeros(1)`
-    and replay re-stages it, so capture never advances — and `_capture_one`
-    drives admit and plan but never `commit`. If the check were keyed on
-    anything the manager could learn without a commit, the second warmup admit
-    would refuse and capture would die here rather than in production.
+    `_capture_one` drives admit and plan but never `commit`, so capture leaves
+    no frame count for `post_warmup_validate` to refuse.
     """
     kv = _manager(_ring_config(num_sessions=1))
     pool = DummyRowPool(
@@ -334,23 +325,24 @@ def test_two_capture_configs_can_each_open_and_claim():
     # `_capture_one`, in order: ensure, prepare (admit -> plan), NUM_WARMUP
     # forwards each followed by a free=False reset and a re-prepare, the capture
     # forward, and the `finally` reset. No commit anywhere in it.
+    gen = torch.Generator().manual_seed(0)
     for config_idx in (0, 1):
         rids = pool.ensure(f"{config_idx}_slot0", 1)
         ctx = StepContext(
             request_ids=tuple(rids), graph_walk="rollout", slot=0, capture=True,
         )
-        step = _step(*rids, frame=0)
+        step = RingKVStep()
         outcome = kv.admit(step, ctx)
         assert outcome.ok, (
             f"capture config {config_idx} was refused the ring: {outcome.reason}"
         )
         kv.plan(step, ctx)
         for _ in range(2):  # CudaGraphRunner.NUM_WARMUP
-            _rollout(kv, frames=1)
+            _rollout(kv, gen)
             pool.reset(rids)
             assert kv.admit(step, ctx).ok
             kv.plan(step, ctx)
-        _rollout(kv, frames=1)  # the capture forward itself
+        _rollout(kv, gen)  # the capture forward itself
         pool.reset(rids)
 
     pool.release_all()
@@ -366,7 +358,7 @@ def test_ingest_request_registers_without_claiming():
 
     assert kv.session_of("a") is None and kv.session_of("b") is None
     # neither registration took a world, so either may still be admitted
-    assert kv.admit(_step("b"), _ctx("b")).ok
+    assert kv.admit(RingKVStep(), _ctx("b")).ok
 
 
 def test_admit_refuses_a_request_that_was_never_ingested():
@@ -383,7 +375,7 @@ def test_admit_refuses_a_request_that_was_never_ingested():
     """
     kv = _manager(_ring_config(num_sessions=4))
 
-    outcome = kv.admit(_step("stranger"), _ctx("stranger"))
+    outcome = kv.admit(RingKVStep(), _ctx("stranger"))
 
     assert not outcome.ok
     assert type(outcome.reason) is AdmitRuntimeError
@@ -405,7 +397,7 @@ def test_the_n_plus_first_request_waits_for_a_session(num_sessions):
     _open(kv, *[f"r{i}" for i in range(num_sessions)])
     kv.ingest_request("extra")
 
-    outcome = kv.admit(_step("extra"), _ctx("extra"))
+    outcome = kv.admit(RingKVStep(), _ctx("extra"))
 
     assert not outcome.ok
     assert type(outcome.reason) is AllocationFailed
@@ -415,7 +407,7 @@ def test_the_n_plus_first_request_waits_for_a_session(num_sessions):
     assert not kv._free_sessions
 
     kv.remove_request("r0")
-    assert kv.admit(_step("extra"), _ctx("extra")).ok
+    assert kv.admit(RingKVStep(), _ctx("extra")).ok
 
 
 def test_the_latest_arrival_is_the_one_that_waits():
@@ -424,7 +416,7 @@ def test_the_latest_arrival_is_the_one_that_waits():
     kv.ingest_request("a")
     kv.ingest_request("b")
 
-    outcome = kv.admit(_step("a", "b"), _ctx("a", "b"))
+    outcome = kv.admit(RingKVStep(), _ctx("a", "b"))
 
     assert not outcome.ok
     assert type(outcome.reason) is AllocationFailed
@@ -461,7 +453,7 @@ def test_admit_is_idempotent_for_the_holder():
     kv = _manager()
     kv.ingest_request("a")
 
-    assert all(kv.admit(_step("a"), _ctx("a")).ok for _ in range(4))
+    assert all(kv.admit(RingKVStep(), _ctx("a")).ok for _ in range(4))
     assert kv.session_of("a") == 0
 
 
@@ -477,11 +469,11 @@ def test_a_refused_admit_leaves_every_previous_holder_in_place():
     before = {rid: kv.session_of(rid) for rid in ("a", "b")}
     kv.ingest_request("c")
 
-    assert not kv.admit(_step("c"), _ctx("c")).ok
+    assert not kv.admit(RingKVStep(), _ctx("c")).ok
 
     assert {rid: kv.session_of(rid) for rid in ("a", "b")} == before
-    assert kv.admit(_step("a"), _ctx("a")).ok
-    assert kv.admit(_step("b"), _ctx("b")).ok
+    assert kv.admit(RingKVStep(), _ctx("a")).ok
+    assert kv.admit(RingKVStep(), _ctx("b")).ok
     assert kv.session_of("c") is None
 
 
@@ -505,7 +497,7 @@ def test_reset_request_releases_one_world_and_only_one(free):
     assert kv.session_of("a") is None
     assert kv.session_of("b") == b_world, "resetting `a` released `b`'s world"
     kv.ingest_request("c")
-    assert kv.admit(_step("c"), _ctx("c")).ok
+    assert kv.admit(RingKVStep(), _ctx("c")).ok
     assert kv.session_of("c") == 0, "the freed world was not the one handed on"
 
 
@@ -522,9 +514,9 @@ def test_remove_request_releases_the_world_and_the_registration():
     assert kv.session_of("a") is None
     assert kv.session_of("b") == b_world, "removing `a` released `b`'s world"
     # the registration went with it: `a` is a stranger again
-    assert not kv.admit(_step("a"), _ctx("a")).ok
+    assert not kv.admit(RingKVStep(), _ctx("a")).ok
     kv.ingest_request("a")
-    assert kv.admit(_step("a"), _ctx("a")).ok
+    assert kv.admit(RingKVStep(), _ctx("a")).ok
 
 
 def test_supports_preplan_stays_false():
@@ -556,13 +548,13 @@ def test_plan_stages_the_world_index_in_place_as_a_device_tensor():
     staged = kv._static_session_idx
     assert staged.shape == (4,) and staged.dtype == torch.int64
 
-    kv.plan(_step("b"), _ctx("b"))
+    kv.plan(RingKVStep(), _ctx("b"))
 
     assert kv._static_session_idx is staged, "plan rebound the buffer capture baked"
     assert staged.data_ptr() == kv._static_session_idx.data_ptr()
     assert int(staged[0]) == kv.session_of("b")
 
-    kv.plan(_step("a"), _ctx("a"))
+    kv.plan(RingKVStep(), _ctx("a"))
     assert int(staged[0]) == kv.session_of("a")
 
 
@@ -573,7 +565,7 @@ def test_plan_stages_a_batch_of_distinct_rids():
     kv = _manager(_ring_config(num_sessions=2))
     _open(kv, "a", "b")
 
-    result = kv.plan(_step("a", "b"), _ctx("a", "b"))
+    result = kv.plan(RingKVStep(), _ctx("a", "b"))
 
     assert result.request_ids == ("a", "b")
     assert result.session_idx == (kv.session_of("a"), kv.session_of("b"))
@@ -592,7 +584,7 @@ def test_plan_parks_padding_rows_on_the_shared_padding_world():
 
     ctx = _ctx("a", "b")
     ctx.set_padded_rids(("a", "b", "__pad0__", "__pad1__"))
-    result = kv.plan(_step("a", "b"), ctx)
+    result = kv.plan(RingKVStep(), ctx)
 
     pad = kv._padding_session
     assert pad == 4, "the padding world is the one index past the resident pool"
@@ -609,7 +601,7 @@ def test_plan_refuses_a_request_holding_no_world():
     kv = _manager()
 
     with pytest.raises(KeyError, match="no session for request"):
-        kv.plan(_step("a"), _ctx("a"))
+        kv.plan(RingKVStep(), _ctx("a"))
 
 
 def test_admit_refuses_a_batch_naming_the_same_request_twice():
@@ -618,7 +610,7 @@ def test_admit_refuses_a_batch_naming_the_same_request_twice():
     kv = _manager(_ring_config(num_sessions=4))
     kv.ingest_request("a")
 
-    outcome = kv.admit(_step("a", "a"), _ctx("a", "a"))
+    outcome = kv.admit(RingKVStep(), _ctx("a", "a"))
 
     assert not outcome.ok
     assert type(outcome.reason) is AdmitRuntimeError
@@ -629,181 +621,72 @@ def test_admit_refuses_a_batch_naming_the_same_request_twice():
 #
 # The clock has to advance by exactly one per committed frame, per world. Every
 # failure below is silent on its own: a skipped or repeated frame picks a
-# different ring slot to write and a different one to hide, so the video keeps
-# coming out — from a history that is no longer the one that was generated.
-# `admit` is the only point per frame where the engine holds both the clock the
-# forward is about to run at and the frame the last one committed.
-
-
-def _drive(kv: RingKVManager, rid: str, frame: int, seed: int | None = None) -> None:
-    """One engine step at ``frame``: admit, plan, forward, commit. Asserts the
-    admit, since a test that meant to reach `commit` and was refused on the way
-    should say so there rather than fail three lines later."""
-    step, ctx = _step(rid, frame=frame), _ctx(rid)
-    outcome = kv.admit(step, ctx)
-    assert outcome.ok, f"{rid} frame {frame} was refused: {outcome.reason}"
-    kv.plan(step, ctx)
-    _rollout(kv, frames=1, seed=frame if seed is None else seed, start=frame)
-    kv.commit(step, ctx)
-
-
-def test_the_clock_check_is_silent_until_the_first_commit():
-    """A fresh claim may start its clock anywhere. Nothing has been committed,
-    so there is no history for a frame number to be inconsistent *with* — and a
-    world restored by `load_state` legitimately resumes at frame 37, not 0."""
-    kv = _manager()
-    kv.ingest_request("a")
-
-    assert kv.admit(_step("a", frame=37), _ctx("a")).ok
-    # still nothing committed: re-driving the same frame is not yet a repeat
-    assert kv.admit(_step("a", frame=37), _ctx("a")).ok
-    assert kv.admit(_step("a", frame=0), _ctx("a")).ok
-
-
-def test_a_skipped_frame_is_refused_with_a_terminal_reason():
-    """The reason class matters as much as the refusal: `AllocationFailed` sends
-    the scheduler off to evict against `supports_eviction=False`, so the request
-    would hang instead of failing. Nothing about a desynced clock is fixable by
-    eviction or reload."""
-    kv = _manager()
-    kv.ingest_request("a")
-    _drive(kv, "a", 0)
-
-    outcome = kv.admit(_step("a", frame=2), _ctx("a"))
-
-    assert not outcome.ok
-    assert not outcome.ready
-    assert type(outcome.reason) is AdmitRuntimeError
-    assert not isinstance(outcome.reason, (AllocationFailed, RequestOffloading))
-    # the worker fails the request this names, and only that one
-    assert outcome.reason.request_ids == {"a"}
-    # names both numbers, and whose clock they belong to
-    assert "frame 0" in outcome.reason.message
-    assert "declares frame 2" in outcome.reason.message
-    assert "'a'" in outcome.reason.message
-
-
-def test_a_repeated_frame_is_refused():
-    """The other half of the invariant, and the one a stalled `postprocess`
-    produces: the ring already holds frame 0, so re-running it would overwrite
-    that slot with a different frame's K/V while the visibility row hides it."""
-    kv = _manager()
-    kv.ingest_request("a")
-    _drive(kv, "a", 0)
-    _drive(kv, "a", 1)
-
-    assert not kv.admit(_step("a", frame=1), _ctx("a")).ok
+# different ring slot to write, so the video keeps coming out — from a history
+# that is no longer the one that was generated.
 
 
 def test_each_world_runs_its_own_clock():
-    """Per rid, not per resource. A shared clock would refuse the second
-    request's very first frame the moment the first request had committed one —
-    and, worse under a hypothetical "just take the max", would let a lagging
-    world skip forward into a slot it never wrote.
-    """
+    """Per rid, not per resource. A shared count would move a lagging world
+    forward into a slot it never wrote."""
     kv = _manager(_ring_config(num_sessions=3))
     _open(kv, "a", "b", "c")
 
-    _drive(kv, "a", 0)
-    _drive(kv, "a", 1)
-    _drive(kv, "a", 2)
-    # `b` has committed nothing, so it may still start wherever it likes
-    assert kv.admit(_step("b", frame=0), _ctx("b")).ok
-    _drive(kv, "b", 41)
-    # and `c`'s clock is not `a`'s or `b`'s either
-    _drive(kv, "c", 7)
+    _drive(kv, "a")
+    _drive(kv, "b")
+    _drive(kv, "a", frames=2)
 
-    assert kv.admit(_step("a", frame=3), _ctx("a")).ok
-    assert kv.admit(_step("b", frame=42), _ctx("b")).ok
-    assert kv.admit(_step("c", frame=8), _ctx("c")).ok
-    # each is still refused its neighbour's next frame
-    assert not kv.admit(_step("a", frame=42), _ctx("a")).ok
-    assert not kv.admit(_step("b", frame=3), _ctx("b")).ok
+    plan = kv.plan(RingKVStep(), _ctx("a", "b", "c"))
 
-
-def test_the_clock_check_fires_per_rid_inside_a_batched_admit():
-    """Two rids in one `admit` call, not two: the continuity check must still
-    catch a bad clock on either row of a batch, and a good row ahead of it in
-    `ctx.request_ids` order must not paper over it."""
-    kv = _manager(_ring_config(num_sessions=2))
-    _open(kv, "a", "b")
-    _drive(kv, "a", 0)
-    _drive(kv, "b", 0)
-
-    step = RingKVStep(frames=(("a", 1), ("b", 5)))  # b skips ahead
-    outcome = kv.admit(step, _ctx("a", "b"))
-
-    assert not outcome.ok
-    assert "'b'" in outcome.reason.message
-    assert "declares frame 5" in outcome.reason.message
-
-    # the same two rids with both clocks valid still admits as a batch.
-    assert kv.admit(RingKVStep(frames=(("a", 1), ("b", 1))), _ctx("a", "b")).ok
-
-
-def test_a_step_that_declares_no_clock_for_an_admitted_request_is_refused():
-    """`RingKVStep` has no shape that declines to answer, so this is only
-    reachable by hand — which is the point. The continuity check is the only
-    thing standing between a stalled clock and a world that rewrites its own
-    history, and the singular `frame_pos: int | None` this replaced switched it
-    off for any batch a submodule could not describe with one number.
-    """
-    kv = _manager()
-    kv.ingest_request("a")
-
-    outcome = kv.admit(RingKVStep(frames=()), _ctx("a"))
-
-    assert not outcome.ok
-    assert type(outcome.reason) is AdmitRuntimeError
-    assert "no ring clock" in outcome.reason.message
+    assert plan.frame_pos == (3, 1, 0)
+    assert kv._static_frame_pos[:3].tolist() == [3, 1, 0], "a world writes at another world's count"
 
 
 def test_a_frame_that_never_committed_can_be_re_driven():
     """`commit` is called straight-line after the forward, not in a `finally`,
-    so a forward that raised commits nothing. Re-driving that frame at the same
-    clock has to be allowed — the ring write is idempotent per (frame, layer),
-    since the slot a frame overwrites is the slot its own visibility row hides,
-    so a frame torn halfway through the layer stack heals on the re-run."""
+    so a forward that raised commits nothing. Re-driving it has to land on the
+    same frame — the ring write is idempotent per (frame, layer), so a frame
+    torn halfway through the layer stack heals on the re-run."""
     kv = _manager()
     kv.ingest_request("a")
-    _drive(kv, "a", 0)
+    _drive(kv, "a")
 
-    # frame 1 admitted, forward raised: no commit
-    assert kv.admit(_step("a", frame=1), _ctx("a")).ok
+    # frame 1 admitted and planned, forward raised: no commit
+    step, ctx = RingKVStep(), _ctx("a")
+    assert kv.admit(step, ctx).ok
+    kv.plan(step, ctx)
 
-    assert kv.admit(_step("a", frame=1), _ctx("a")).ok
-    _drive(kv, "a", 1)
-    assert kv.admit(_step("a", frame=2), _ctx("a")).ok
+    assert kv.admit(step, ctx).ok
+    assert kv.plan(step, ctx).frame_pos == (1,), "a frame that never committed moved the count"
 
 
 def test_commit_records_the_frame_and_moves_no_kv():
     """The division the whole design rests on, and the same one the paged
     manager keeps: `KVManager.write_kv` scatters the bytes from the layer body
     and `KVManager.commit` only advances `stored_len`. Here the bytes land in
-    `upsert`. `commit` runs on the host after the forward's launch *returns*,
+    `write`. `commit` runs on the host after the forward's launch *returns*,
     outside any captured graph, so a hook that moved KV would add 24 layers of
     launches per frame to the path capture exists to shorten."""
     kv = _manager()
     kv.ingest_request("a")
-    _drive(kv, "a", 0)
+    _drive(kv, "a")
     before = [layer.kv.clone() for layer in kv.layers]
     written = [layer.written.clone() for layer in kv.layers]
 
-    step, ctx = _step("a", frame=1), _ctx("a")
+    step, ctx = RingKVStep(), _ctx("a")
     assert kv.admit(step, ctx).ok
     kv.commit(step, ctx)  # no forward between them
 
     for layer, kv_t, w_t in zip(kv.layers, before, written, strict=True):
         assert torch.equal(layer.kv, kv_t), "commit moved KV"
-        assert torch.equal(layer.written, w_t), "commit changed visibility"
-    # but it did record, so frame 1 is now spent
-    assert not kv.admit(_step("a", frame=1), _ctx("a")).ok
+        assert torch.equal(layer.written, w_t), "commit marked a slot written"
+    assert kv.position("a", "main") == 2 * TPF, "commit did not count the frame"
 
 
-def test_a_paged_step_is_refused_rather_than_skipping_the_check():
-    """A `KVStep` carries no `frames`, so it would admit and commit exactly
-    as before while switching the check off — the wrong thing that raises
-    nothing. Same guard, same reason, as `build` refusing a PagedKVConfig."""
+def test_a_paged_step_is_refused_rather_than_counted():
+    """A `KVStep` belongs to the paged manager, so a ring handed one was wired
+    to the wrong storage. Without the guard the ring would admit it and count a
+    frame for every row — the wrong thing that raises nothing. Same guard, same
+    reason, as `build` refusing a PagedKVConfig."""
     kv = _manager()
 
     with pytest.raises(TypeError, match="RingKVStep"):
@@ -822,47 +705,45 @@ def test_a_paged_step_is_refused_rather_than_skipping_the_check():
 )
 def test_dropping_the_world_drops_the_clock(drop):
     """An empty world has committed no frames. Keeping the count across a reset
-    would hold the next claim to a continuity it cannot satisfy — capture, which
+    would write the next claim's first frame that many slots on — capture, which
     resets between every warmup, is the caller that would hit it first."""
     kv = _manager()
     kv.ingest_request("a")
-    _drive(kv, "a", 0)
-    _drive(kv, "a", 1)
+    _drive(kv, "a", frames=2)
 
     drop(kv)
 
-    # frame 0 again, which frame 1 would otherwise have made a repeat. Every one
-    # of these hands the world back, so re-register first — whether the *claim*
-    # survives each of them is the ownership tests' question, not this one's.
-    kv.ingest_request("a")
-    assert kv.admit(_step("a", frame=0), _ctx("a")).ok
+    # Every one of these hands the world back, so re-register first — whether
+    # the *claim* survives each of them is the ownership tests' question, not
+    # this one's.
+    _open(kv, "a")
+    assert kv.plan(RingKVStep(), _ctx("a")).frame_pos == (0,), "the count outlived its world"
 
 
-def test_load_state_clears_the_clock():
-    """`load_state` restores the frame count `get_state` took, and the
-    continuity check's last frame stays unset until the first frame after a
-    load sets it."""
+def test_load_state_restores_the_frame_count():
+    """`load_state` restores the frame count `get_state` took. A cleared count
+    would stage frame 0 over the restored ring."""
     kv = _manager()
     kv.ingest_request("a")
-    _drive(kv, "a", 0)
-    _drive(kv, "a", 1)
+    _drive(kv, "a", frames=2)
     state = kv.get_state("a")
+    _drive(kv, "a")
 
     kv.load_state("a", state)
 
-    assert kv.admit(_step("a", frame=9), _ctx("a")).ok
+    assert kv.plan(RingKVStep(), _ctx("a")).frame_pos == (2,), "load_state did not restore the count"
 
 
 def test_post_warmup_validate_catches_a_committed_frame():
     """Capture drives admit and plan but never commit, so this should be
-    unreachable — which is why it is pinned rather than assumed. A clock left
-    set by capture refuses the first real admit."""
+    unreachable — which is why it is pinned rather than assumed. A count left
+    by capture writes the first real request's first frame that many slots on."""
     kv = _manager()
     kv.post_warmup_validate()
 
-    kv.commit(_step("a", frame=4), _ctx("a"))  # a commit capture should never have made
+    kv.commit(RingKVStep(), _ctx("a"))  # a commit capture should never have made
 
-    with pytest.raises(RuntimeError, match="during accelerator graph capture"):
+    with pytest.raises(RuntimeError, match="counted committed frames"):
         kv.post_warmup_validate()
 
 
@@ -885,13 +766,11 @@ def test_reset_request_zeroes_one_span_without_reallocating():
     _open(kv, "a", "b")
     assert (kv.session_of("a"), kv.session_of("b")) == (0, 1)
 
-    kv.plan(_step("b"), _ctx("b"))
-    _rollout(kv, frames=6, seed=2)
+    _drive(kv, "b", frames=6, seed=2)
     kept_kv = [layer.kv.clone() for layer in kv.layers]
     kept_written = [layer.written.clone() for layer in kv.layers]
 
-    kv.plan(_step("a"), _ctx("a"))
-    _rollout(kv, frames=6, seed=3)
+    _drive(kv, "a", frames=6, seed=3)
     assert any(
         not torch.equal(layer.kv, snap)
         for layer, snap in zip(kv.layers, kept_kv, strict=True)
@@ -919,12 +798,10 @@ def test_remove_request_zeroes_one_span_without_reallocating():
     before = _ptrs(kv)
     _open(kv, "a", "b")
 
-    kv.plan(_step("b"), _ctx("b"))
-    _rollout(kv, frames=4, seed=4)
+    _drive(kv, "b", frames=4, seed=4)
     kept_kv = [layer.kv.clone() for layer in kv.layers]
     kept_written = [layer.written.clone() for layer in kv.layers]
-    kv.plan(_step("a"), _ctx("a"))
-    _rollout(kv, frames=4, seed=5)
+    _drive(kv, "a", frames=4, seed=5)
 
     kv.remove_request("a")
 
@@ -941,8 +818,7 @@ def test_a_reused_world_starts_empty():
     is no release path that does not zero first."""
     kv = _manager(_ring_config(num_sessions=1))
     _open(kv, "a")
-    kv.plan(_step("a"), _ctx("a"))
-    _rollout(kv, frames=5, seed=6)
+    _drive(kv, "a", frames=5, seed=6)
     assert any(bool(layer.kv.any()) for layer in kv.layers)
 
     kv.remove_request("a")
@@ -970,7 +846,7 @@ def test_post_warmup_validate_catches_capture_residue():
     kv = _manager(_ring_config(num_sessions=2))
     kv.post_warmup_validate()
 
-    _rollout(kv, frames=1)
+    _rollout(kv, torch.Generator().manual_seed(0))
     with pytest.raises(RuntimeError, match="capture-time frames"):
         kv.post_warmup_validate()
 
@@ -998,8 +874,7 @@ def test_get_state_covers_the_ring_and_its_frame_count():
     temporal receptive field. This covers the first."""
     kv = _manager()
     _open(kv, "a")
-    kv.plan(_step("a"), _ctx("a"))
-    _rollout(kv, frames=3)
+    _drive(kv, "a", frames=3)
 
     state = kv.get_state("a")
 
@@ -1033,8 +908,7 @@ def test_get_state_covers_one_world_and_is_cloned_not_aliased():
     would carry `b`'s history into `a`'s save file."""
     kv = _manager(_ring_config(num_sessions=2))
     _open(kv, "a", "b")
-    kv.plan(_step("a"), _ctx("a"))
-    _rollout(kv, frames=2)
+    _drive(kv, "a", frames=2)
     state = kv.get_state("a")
     saved = [(a.clone(), b.clone()) for a, b in state["layers"]]
 
@@ -1042,10 +916,8 @@ def test_get_state_covers_one_world_and_is_cloned_not_aliased():
         assert kv_t.shape[-2] == layer.capacity, "the snapshot is not one world"
         assert w_t.shape == (layer.capacity,)
 
-    kv.plan(_step("b"), _ctx("b"))
-    _rollout(kv, frames=3, seed=7)
-    kv.plan(_step("a"), _ctx("a"))
-    _rollout(kv, frames=3, seed=8, start=2)
+    _drive(kv, "b", frames=3, seed=7)
+    _drive(kv, "a", frames=3, seed=8)
 
     for (kv_t, w_t), (kv_s, w_s) in zip(state["layers"], saved, strict=True):
         assert torch.equal(kv_t, kv_s)
@@ -1060,18 +932,15 @@ def test_load_state_copies_into_one_span_of_the_fixed_allocation():
     session resets its neighbours."""
     kv = _manager(_ring_config(num_sessions=2))
     _open(kv, "a", "b")
-    kv.plan(_step("a"), _ctx("a"))
-    _rollout(kv, frames=5)
+    _drive(kv, "a", frames=5)
     state = kv.get_state("a")
     before = _ptrs(kv)
 
-    kv.plan(_step("b"), _ctx("b"))
-    _rollout(kv, frames=4, seed=9)
+    _drive(kv, "b", frames=4, seed=9)
     b_kv = [layer.kv.clone() for layer in kv.layers]
     b_written = [layer.written.clone() for layer in kv.layers]
 
-    kv.plan(_step("a"), _ctx("a"))
-    _rollout(kv, frames=3, seed=11, start=5)
+    _drive(kv, "a", frames=3, seed=11)
     assert not torch.equal(kv.layers[0].kv, b_kv[0]), (
         "the second rollout has to actually move the ring, or the round trip "
         "below proves nothing"
@@ -1099,8 +968,7 @@ def test_a_state_is_portable_between_rings_of_different_widths():
     small = _manager(_ring_config(num_sessions=2))
     big = _manager(_ring_config(num_sessions=4))
     _open(small, "a")
-    small.plan(_step("a"), _ctx("a"))
-    _rollout(small, frames=3, seed=13)
+    _drive(small, "a", frames=3, seed=13)
     _open(big, "x", "y")  # so `y` lands on a nonzero world index
 
     big.load_state("y", small.get_state("a"))
@@ -1118,14 +986,12 @@ def test_a_state_is_portable_between_rings_of_different_widths():
 def test_load_state_refuses_a_geometry_that_would_broadcast():
     """The shape guard, not `copy_`, is what has to catch this. The failure it
     exists for is a state saved under one horizon loaded into another — a 360P
-    state into a 720P ring, or a compacted state into a `full_global_ring` one.
-    Where the dims happen to line up, `copy_` broadcasts a frame across the ring
+    state into a 720P ring. Where the dims happen to line up, `copy_` broadcasts a frame across the ring
     and produces a world made of one repeated moment, with no error anywhere."""
     small = _manager(_ring_config(ring_frames=2))
     big = _manager(_ring_config(ring_frames=RING_FRAMES))
     _open(small, "a")
-    small.plan(_step("a"), _ctx("a"))
-    _rollout(small, frames=2)
+    _drive(small, "a", frames=2)
     _open(big, "a")
 
     with pytest.raises(ValueError, match="state shape"):
@@ -1142,107 +1008,11 @@ def test_load_state_refuses_a_different_layer_count():
         kv.load_state("a", state)
 
 
-# ── the visible row ─────────────────────────────────────────────────────
-
-
-def test_visible_is_the_layers_scratch_buffer_and_must_be_read_immediately():
-    """`upsert` hands back `_mask_written` itself, not a copy: a fresh
-    `[total_slots]` buffer on each of the 120 upserts per frame is allocation
-    the compiled region does not need.
-
-    The cost is an aliasing obligation the consumer has to honour — read it
-    before the next `upsert` on the same layer. The 4+1 schedule does (each
-    pass consumes the row inside the same attention call). A consumer that
-    stashed it would attend under a *later* frame's visibility: the wrong ring
-    slots, no exception, drifting video — and, with worlds resident, possibly
-    another world's mask entirely.
-
-    The clone below is what makes this test bite: it shows the two frames'
-    visibility genuinely differ, so `visible0 is visible1` is a statement about
-    aliasing and not a vacuous equality between identical rows.
-    """
-    kv = _manager()
-    gen = torch.Generator().manual_seed(3)
-    k, v = _frame(kv, gen)
-
-    _, _, visible0 = kv.upsert(k, v, 0, torch.tensor([0], dtype=torch.int64), commit=True)
-    snapshot = visible0.clone()
-    _, _, visible1 = kv.upsert(k, v, 0, torch.tensor([1], dtype=torch.int64), commit=True)
-
-    assert visible1 is visible0
-    assert not torch.equal(snapshot, visible1), (
-        "frames 0 and 1 must differ in visibility, or this test proves nothing"
-    )
-    # the buffer the caller was handed at frame 0 now reads as frame 1
-    assert not torch.equal(snapshot, visible0)
-
-
-def test_visible_hides_the_slot_this_frame_is_about_to_overwrite():
-    """At the resource seam: without it the current frame attends to the
-    stale frame still occupying its ring slot."""
-    kv = _manager()
-    gen = torch.Generator().manual_seed(4)
-    for f in range(RING_FRAMES + 1):
-        k, v = _frame(kv, gen)
-        _, _, visible = kv.upsert(k, v, 0, torch.tensor([f], dtype=torch.int64), commit=True)
-        slot = (f % RING_FRAMES) * TPF
-        assert not bool(visible[slot : slot + TPF].any()), f"frame {f} sees its own slot"
-        # World 0's scratch only: the buffer now holds a padding world past it,
-        # whose slots are (correctly) not visible to this row.
-        cap = kv.layers[0].capacity
-        assert bool(visible[kv.layers[0].ring_len : cap].all()), "scratch must stay visible"
-
-
-def test_upsert_returns_the_whole_buffer_and_delegates_by_layer():
-    """K and V span every resident world — there is one buffer and no view is
-    taken — and the visibility row is the same length, because it is what cuts
-    the caller's world back out of it. `capacity` and `total_slots` are both
-    named for this reason: using either where the other belongs is an off-by-N
-    that produces a valid shape."""
-    kv = _manager(_ring_config(num_sessions=3))
-    gen = torch.Generator().manual_seed(5)
-    k, v = _frame(kv, gen)
-
-    for layer_idx in range(N_LAYERS):
-        k_all, v_all, visible = kv.upsert(
-            k, v, layer_idx, torch.tensor([0], dtype=torch.int64), commit=True
-        )
-        total = kv.total_slots(layer_idx)
-        # 3 resident worlds + 1 shared padding world.
-        assert total == (3 + 1) * kv.capacity(layer_idx)
-        assert k_all.shape[-2] == total and v_all.shape[-2] == total
-        assert visible.shape == (total,)
-        assert k_all.shape[0] == 1, "the world dim is folded into tokens, not dim 0"
-        assert k_all.data_ptr() == kv.layers[layer_idx].kv.data_ptr()
-
-
-def test_planned_attention_skips_per_upsert_visibility_reconstruction():
-    """A planned block mask makes the token-level scratch row dead output."""
-    kv = _manager()
-    _open(kv, "r")
-    kv.plan(_step("r"), _ctx("r"))
-    layer = kv.layers[0]
-    layer._mask_written.copy_(
-        torch.arange(layer.total_slots).remainder(2).to(torch.bool)
-    )
-    sentinel = layer._mask_written.clone()
-    k, v = _frame(kv, torch.Generator().manual_seed(91))
-
-    _, _, returned = kv.upsert(
-        k,
-        v,
-        0,
-        torch.tensor([0], dtype=torch.int64),
-        commit=False,
-        build_visibility=False,
-    )
-
-    assert returned.data_ptr() == layer._mask_written.data_ptr()
-    assert torch.equal(returned, sentinel)
+# ── frozen passes ───────────────────────────────────────────────────────
 
 
 def test_frozen_passes_leave_the_ring_byte_identical():
-    """At the resource seam: `commit` is per call and the manager keeps no
+    """At the resource seam: `keep` is per call and the manager keeps no
     frozen state between calls, because all five passes of a frame sit inside
     one engine step and the step lifecycle never sees the boundary. If the
     manager ever started latching it, this is what would break."""
@@ -1253,7 +1023,7 @@ def test_frozen_passes_leave_the_ring_byte_identical():
     for _ in range(4):
         for layer_idx in range(N_LAYERS):
             k, v = _frame(kv, gen)
-            kv.upsert(k, v, layer_idx, torch.tensor([0], dtype=torch.int64), commit=False)
+            kv.write(k, v, layer_idx, keep=False)
 
     for layer, snapshot in zip(kv.layers, before, strict=True):
         assert torch.equal(layer.kv[:, :, :, : layer.ring_len], snapshot[:, :, :, : layer.ring_len])
@@ -1263,11 +1033,10 @@ def test_frozen_passes_leave_the_ring_byte_identical():
 # ── worlds are isolated ─────────────────────────────────────────────────
 #
 # The two tests below are the ones that matter most in this file. Nothing
-# physical separates two resident worlds: they share one `kv` tensor, one
-# `written` row and one `_mask_written` scratch, and `upsert` returns K and V
-# spanning all of it. The only thing that stops world 1 attending to world 0's
-# frames is a single `&=` in `cache.py`. Delete it and every shape is still
-# valid, every test above still passes, and the video drifts between sessions.
+# physical separates two resident worlds: they share one `kv` tensor and one
+# `written` row. Only the session offset in `write`'s slot arithmetic keeps one
+# world's frames out of another's span. Get it wrong and every shape is still
+# valid, and the video drifts between sessions.
 
 
 def _w(idx: int) -> torch.Tensor:
@@ -1284,16 +1053,10 @@ def test_the_flat_ring_matches_one_ring_per_world(num_sessions, pinned_dilation)
 
     This is the equivalence the whole layout rests on and the reason
     `num_sessions` can be a deployment knob at all: a world's arithmetic must not
-    depend on how many neighbours it has. Three things are compared and all
-    three are necessary — the K/V bytes (the write landed in the right slots),
-    `written` (the bookkeeping did too), and the visibility row restricted to
-    the span (the mask agrees). The fourth assertion is the one with no
-    single-world counterpart: everything OUTSIDE the span is False, which is
-    isolation itself.
-
-    The own-world term is checked as `_session_of_slot == session_idx` computed from
-    the span arithmetic, not read back off the implementation, so a mask built
-    from the wrong comparison cannot agree with it by construction.
+    depend on how many neighbours it has. Two things are compared and both are
+    necessary — the K/V bytes (the write landed in the right slots) and
+    `written` (the bookkeeping did too). Every world's span is compared, so a
+    write that left its own span shows up in a neighbour's.
     """
     kwargs = dict(
         n_kv_heads=N_KV_HEADS, ring_frames=RING_FRAMES, ring_buckets=RING_FRAMES,
@@ -1306,8 +1069,8 @@ def test_the_flat_ring_matches_one_ring_per_world(num_sessions, pinned_dilation)
     assert all(s.capacity == flat.capacity for s in solo)
 
     # Independent clocks and a deliberately uneven interleave: with every world
-    # on the same frame, a mask that ignored `session_idx` entirely would still
-    # hide the same slots and this test would pass against it.
+    # on the same frame, a stray write into a neighbour's span would hit the
+    # slot that neighbour writes next, and be covered before the comparison.
     gens = [torch.Generator().manual_seed(100 + w) for w in range(num_sessions)]
     clocks = [3 * w for w in range(num_sessions)]
     order = torch.Generator().manual_seed(41)
@@ -1315,26 +1078,10 @@ def test_the_flat_ring_matches_one_ring_per_world(num_sessions, pinned_dilation)
     for _ in range(20 * num_sessions):
         w = int(torch.randint(0, num_sessions, (1,), generator=order).item())
         frame_pos = torch.tensor([clocks[w]], dtype=torch.int64)
-        for commit in (False, False, False, False, True):
+        for keep in (False, False, False, False, True):
             kv = torch.randn(2, 1, N_KV_HEADS, TPF, D_HEAD, generator=gens[w])
-            _, _, flat_vis = flat.upsert(kv, frame_pos, commit, _w(w))
-            _, _, solo_vis = solo[w].upsert(kv, frame_pos, commit, _w(0))
-
-            lo, hi = flat.session_span(w)
-            assert torch.equal(flat_vis[lo:hi], solo_vis), (
-                f"world {w} frame {clocks[w]}: visibility diverged from a solo ring"
-            )
-            outside = torch.ones_like(flat_vis)
-            outside[lo:hi] = False
-            assert not bool((flat_vis & outside).any()), (
-                f"world {w} can see {int((flat_vis & outside).sum())} slots outside "
-                "its own span"
-            )
-            # the own-world term, derived here rather than read from the cache
-            own = (
-                torch.arange(flat.total_slots) // flat.capacity
-            ) == w
-            assert torch.equal(flat_vis, flat_vis & own)
+            flat.write(kv, frame_pos, keep, _w(w))
+            solo[w].write(kv, frame_pos, keep, _w(0))
         clocks[w] += 1
 
     for w in range(num_sessions):
@@ -1345,21 +1092,19 @@ def test_the_flat_ring_matches_one_ring_per_world(num_sessions, pinned_dilation)
 
 def test_worlds_interleave_without_reaching_each_other():
     """The same claim one level up, driven through the resource lifecycle
-    rather than the cache: three requests, three independent clocks starting at
-    different frames, forty frames each at five passes, interleaved in an order
-    none of them controls — against three managers each holding one world and
-    driven in isolation.
+    rather than the cache: three requests, three independent clocks, forty
+    frames each at five passes, interleaved in an order none of them controls —
+    against three managers each holding one world and driven in isolation.
 
     This is what a node actually does, and it is where a bug in the *lifecycle*
-    would show up rather than a bug in the mask: a `plan` that staged the wrong
-    index, a `commit` that recorded against the wrong rid, a claim that two
-    requests shared. Every one of those is invisible at N=1.
+    would show up rather than a bug in the slot arithmetic: a `plan` that
+    staged the wrong index, a `commit` that recorded against the wrong rid, a
+    claim that two requests shared. Every one of those is invisible at N=1.
 
     Each request's K/V comes from its own generator, so the interleave order
     cannot change what any request writes — only where it lands.
     """
     rids = ["a", "b", "c"]
-    starts = {"a": 0, "b": 5, "c": 11}
     frames = 40
 
     flat = _manager(_ring_config(num_sessions=3))
@@ -1374,13 +1119,12 @@ def test_worlds_interleave_without_reaching_each_other():
     schedule = [schedule[i] for i in perm]
     assert schedule[:3] != rids, "the schedule is round-robin; interleave nothing"
 
-    clocks = dict(starts)
+    clocks = dict.fromkeys(rids, 0)
     seeds = {rid: 200 + i for i, rid in enumerate(rids)}
     for rid in schedule:
-        frame = clocks[rid]
-        seed = seeds[rid] * 1000 + frame
-        _drive(flat, rid, frame, seed=seed)
-        _drive(solo[rid], rid, frame, seed=seed)
+        seed = seeds[rid] * 1000 + clocks[rid]
+        _drive(flat, rid, seed=seed)
+        _drive(solo[rid], rid, seed=seed)
         clocks[rid] += 1
 
     for rid in rids:
@@ -1394,29 +1138,7 @@ def test_worlds_interleave_without_reaching_each_other():
                 f"{rid} layer {i}: interleaving changed what the world holds"
             )
             assert torch.equal(layer.written[lo:hi], ref.written[ref_lo:ref_hi]), (
-                f"{rid} layer {i}: interleaving changed what the world can see"
-            )
-
-    # and the mask hid every other world completely, on the last step of each
-    gen = torch.Generator().manual_seed(59)
-    for rid in rids:
-        world = flat.session_of(rid)
-        flat.plan(_step(rid), _ctx(rid))
-        for layer_idx in range(N_LAYERS):
-            k, v = _frame(flat, gen)
-            _, _, visible = flat.upsert(
-                k, v, layer_idx, torch.tensor([clocks[rid]], dtype=torch.int64), commit=False
-            )
-            lo, hi = flat.layers[layer_idx].session_span(world)
-            seen = visible.clone()
-            seen[lo:hi] = False
-            assert not bool(seen.any()), (
-                f"{rid} layer {layer_idx} can see {int(seen.sum())} slots belonging "
-                "to another world"
-            )
-            assert bool(visible[lo:hi].any()), (
-                "the mask hid everything, including this world's own history; "
-                "an all-False row would pass the check above vacuously"
+                f"{rid} layer {i}: interleaving changed which slots the world marked written"
             )
 
 
@@ -1441,25 +1163,22 @@ def test_the_captured_world_index_is_read_at_replay_not_baked_at_capture():
     layer = kv.layers[0]
 
     _open(kv, "cap")
-    kv.plan(_step("cap"), _ctx("cap"))
+    kv.plan(RingKVStep(), _ctx("cap"))
     assert kv.session_of("cap") == 0, "this test needs capture to hold world 0"
 
     static_k = torch.zeros(1, N_KV_HEADS, TPF, D_HEAD, dtype=torch.float32, device="cuda")
     static_v = torch.zeros_like(static_k)
-    static_frame = torch.zeros(1, dtype=torch.int64, device="cuda")
 
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
         for _ in range(3):
-            kv.upsert(static_k, static_v, 0, static_frame, commit=True)
+            kv.write(static_k, static_v, 0, keep=True)
     torch.cuda.current_stream().wait_stream(stream)
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        _, _, captured_visible = kv.upsert(
-            static_k, static_v, 0, static_frame, commit=True
-        )
+        kv.write(static_k, static_v, 0, keep=True)
     torch.cuda.synchronize()
 
     kv.reset_request("cap", free=True)
@@ -1470,7 +1189,7 @@ def test_the_captured_world_index_is_read_at_replay_not_baked_at_capture():
     _open(kv, "pad0", "pad1", "pad2", "real")
     world = kv.session_of("real")
     assert world == 3
-    kv.plan(_step("real"), _ctx("real"))
+    kv.plan(RingKVStep(), _ctx("real"))
 
     static_k.fill_(1.5)
     static_v.fill_(-2.5)
@@ -1493,22 +1212,15 @@ def test_the_captured_world_index_is_read_at_replay_not_baked_at_capture():
             f"{world}"
         )
         assert not bool(layer.written[o_lo : o_lo + layer.ring_len].any())
-    # the visibility row the graph returns is the layer's scratch, restaged too
-    assert bool(captured_visible[lo:hi].any())
-    other_lo, other_hi = layer.session_span(0)
-    assert not bool(captured_visible[other_lo:other_hi].any()), (
-        "the captured mask still shows the capture-time world"
-    )
 
 
 # ── the two branches that do nothing under this schedule ────────────────
 
 
 def test_the_bucket_rounding_is_unobservable_off_write_steps():
-    """`bucket` rounds up, verbatim from the reference, and the rounding is
-    dead arithmetic: `ring_idx` is discarded at both of its use sites off a
-    write step, and on a write step `frame_pos` is a multiple of the dilation,
-    where ceil and floor agree.
+    """`slot` rounds down where the reference rounds up, and the rounding is
+    dead arithmetic: `ring_idx` is discarded off a write step, and on a write
+    step `frame_pos` is a multiple of the dilation, where ceil and floor agree.
 
     What is pinned here is the *unobservability*, which is the load-bearing
     half — it holds for any rounding, not just floor, so it survives someone
@@ -1529,19 +1241,15 @@ def test_the_bucket_rounding_is_unobservable_off_write_steps():
         before_written = layer.written.clone()
         kv = torch.randn(2, 1, N_KV_HEADS, TPF, D_HEAD, generator=gen)
 
-        # commit=True is the harder case: if `ring_idx` were live off a write
+        # keep=True is the harder case: if `ring_idx` were live off a write
         # step, this is the call that would write through it. World 1, not 0, so
         # a placeholder address that forgot the world offset lands somewhere
         # this test can see.
-        _, _, visible = layer.upsert(kv, torch.tensor([f], dtype=torch.int64), True, _w(1))
+        layer.write(kv, torch.tensor([f], dtype=torch.int64), True, _w(1))
 
         lo, hi = layer.session_span(1)
         if f % d:
             off_steps += 1
-            expected = before_written.clone()
-            expected[: lo] = False
-            expected[hi :] = False
-            assert torch.equal(visible, expected), f"frame {f} hid a ring slot"
             assert torch.equal(
                 layer.kv[:, :, :, lo : lo + layer.ring_len],
                 before_kv[:, :, :, lo : lo + layer.ring_len],
@@ -1555,64 +1263,46 @@ def test_the_bucket_rounding_is_unobservable_off_write_steps():
 
 
 def test_committing_on_every_pass_matches_the_4_plus_1_schedule():
-    """`commit` is dead under the shipped schedule and live in general.
+    """`keep` is dead under the shipped schedule and live in general.
 
-    Dead: on a write step the visibility row hides `ring_idx` from all five
-    passes and the fifth writes it last, so committing on all five leaves the
-    same visible K/V and a byte-identical ring. Off a write step `dst` is
+    Dead: on a write step the fifth pass writes `ring_idx` last, so keeping on
+    all five leaves a byte-identical ring. Off a write step `dst` is
     `current_idx`, which the unconditional write already filled with the same
-    data, so the commit changes nothing anywhere.
+    data, so keeping changes nothing anywhere.
 
-    `raw_differs` is what stops the first half being vacuous: mid-frame the two
-    rings genuinely diverge, and it is the mask — block-aligned, so the
-    BlockMask drops the region whole — that makes the divergence unobservable.
-
-    Live: committing on no pass diverges. Deleting the branch on the strength
+    Live: keeping on no pass diverges. Deleting the branch on the strength
     of the first half would pass everything above and produce a world that
     never remembers a frame.
     """
-    def drive(kv, schedule):
-        """One `(masked_k, masked_v, raw_k, visible)` per upsert, lazily, so
-        the three schedules can be compared in lockstep without three full
-        traces resident at once."""
+    def drive(schedule):
+        """A ring driven ``3 * RING_FRAMES`` frames, each pass keeping as
+        ``schedule`` says."""
+        kv = _manager()
+        kv.ingest_request("a")
         gen = torch.Generator().manual_seed(37)
-        for f in range(3 * RING_FRAMES):
-            frame_pos = torch.tensor([f], dtype=torch.int64)
-            for commit in schedule:
+        for _ in range(3 * RING_FRAMES):
+            step, ctx = RingKVStep(), _ctx("a")
+            assert kv.admit(step, ctx).ok
+            kv.plan(step, ctx)
+            for keep in schedule:
                 for layer_idx in range(N_LAYERS):
                     k, v = _frame(kv, gen)
-                    k_all, v_all, visible = kv.upsert(
-                        k, v, layer_idx, frame_pos, commit=commit
-                    )
-                    m = visible[None, None, :, None]
-                    yield k_all * m, v_all * m, k_all, visible
+                    kv.write(k, v, layer_idx, keep=keep)
+            kv.commit(step, ctx)
+        return kv
 
-    shipped, always, never = _manager(), _manager(), _manager()
+    shipped = drive((False, False, False, False, True))
+    always = drive((True,) * 5)
+    never = drive((False,) * 5)
 
-    raw_differs = False
-    for (sk, sv, s_raw, s_vis), (ak, av, a_raw, a_vis) in zip(
-        drive(shipped, (False, False, False, False, True)),
-        drive(always, (True,) * 5),
-        strict=True,
-    ):
-        assert torch.equal(s_vis, a_vis), "visibility diverged"
-        assert torch.equal(sk, ak) and torch.equal(sv, av), "visible K/V diverged"
-        raw_differs |= not torch.equal(s_raw, a_raw)
-
-    assert raw_differs, (
-        "the rings never differed mid-frame, so the mask was never what made "
-        "them agree and this test proves nothing"
-    )
     for s_layer, a_layer in zip(shipped.layers, always.layers, strict=True):
         assert torch.equal(s_layer.kv, a_layer.kv), "end-of-frame ring diverged"
         assert torch.equal(s_layer.written, a_layer.written)
 
-    for _ in drive(never, (False,) * 5):
-        pass
     assert any(
         not torch.equal(s_layer.kv, n_layer.kv)
         for s_layer, n_layer in zip(shipped.layers, never.layers, strict=True)
-    ), "suppressing every commit changed nothing; the branch is not live"
+    ), "suppressing every keep changed nothing; the branch is not live"
 
 
 # ── the shapes the forward path insists on ──────────────────────────────
@@ -1626,7 +1316,7 @@ def test_committing_on_every_pass_matches_the_4_plus_1_schedule():
         pytest.param(torch.tensor([0], dtype=torch.int32), id="int32"),
     ],
 )
-def test_upsert_refuses_a_world_index_that_is_not_the_staged_shape(bad):
+def test_write_refuses_a_world_index_that_is_not_the_staged_shape(bad):
     """`[1]` int64, and nothing else — including `[]`, which would broadcast
     just as well here. This is not a shape necessity, it is the shape the
     resource stages into its static buffer and the shape a replay re-stages, and
@@ -1636,12 +1326,12 @@ def test_upsert_refuses_a_world_index_that_is_not_the_staged_shape(bad):
     kv = torch.zeros(2, 1, N_KV_HEADS, TPF, D_HEAD)
 
     with pytest.raises(RuntimeError, match="session_idx must be a"):
-        layer.upsert(kv, torch.tensor([0], dtype=torch.int64), True, bad)
+        layer.write(kv, torch.tensor([0], dtype=torch.int64), True, bad)
 
 
 def test_a_world_index_out_of_range_is_caught_on_the_host_paths():
     """Only on the host paths. The forward cannot check it — `session_idx` is a
-    device tensor there and comparing it would cost a sync per upsert — so an
+    device tensor there and comparing it would cost a sync per write — so an
     out-of-range index in the graph silently writes past the buffer's last
     world or wraps into another's. What keeps it in range is that `admit` is the
     only thing that ever produces one."""
@@ -1664,7 +1354,7 @@ def _write_frames(kv: RingKVManager, rid: str, frames: int) -> None:
     """``frames`` steps of the 4+1 schedule through `write`, each frame's kept
     pass holding the value ``frame + 1`` and its scratch passes -1."""
     for frame in range(frames):
-        step, ctx = _step(rid, frame=frame), _ctx(rid)
+        step, ctx = RingKVStep(), _ctx(rid)
         assert kv.admit(step, ctx).ok
         kv.plan(step, ctx)
         for keep in (False, False, False, False, True):
@@ -1675,35 +1365,13 @@ def _write_frames(kv: RingKVManager, rid: str, frames: int) -> None:
         kv.commit(step, ctx)
 
 
-def test_the_frame_count_follows_its_session_and_never_fills_at_capture():
-    """The count is where the next frame writes, so one left behind by a released
-    session or by capture would write a request's first frame that many slots on."""
-    kv = _manager()
-    kv.ingest_request("a")
-    _drive(kv, "a", 0)
-    _drive(kv, "a", 1)
-    assert kv.position("a", "main") == 2 * TPF
-    state = kv.get_state("a")
-    kv.reset_request("a")
-    assert kv.position("a", "main") == 0, "a released session's count should go with it"
-    _open(kv, "a")
-    kv.load_state("a", state)
-    assert kv.position("a", "main") == 2 * TPF, "load_state should restore the count get_state took"
-
-    fresh = _manager()
-    fresh.commit(RingKVStep(frames=()), _ctx("a"))  # a commit capture should never have made
-    with pytest.raises(RuntimeError, match="counted committed frames"):
-        fresh.post_warmup_validate()
-
-
 def test_the_ring_refuses_a_frame_past_max_len():
     """A frame past the array's length has no position, so the request fails at admit rather than reusing slots."""
     kv = _manager(dataclasses.replace(_ring_config(), max_frames=2))
     kv.ingest_request("a")
-    _drive(kv, "a", 0)
-    _drive(kv, "a", 1)
+    _drive(kv, "a", frames=2)
 
-    outcome = kv.admit(_step("a", frame=2), _ctx("a"))
+    outcome = kv.admit(RingKVStep(), _ctx("a"))
 
     assert not outcome.ok and not outcome.ready
     assert type(outcome.reason) is AdmitRuntimeError and outcome.reason.request_ids == {"a"}
@@ -1723,28 +1391,3 @@ def test_the_ring_stores_only_what_a_frame_window_reaches():
     assert local.kv[0, 0, 0, : local.ring_len, 0].view(RING_FRAMES, TPF)[:, 0].tolist() == [9.0, 10.0, 7.0, 8.0], (
         "a layer of stride 1 should keep the last four frames, frame 9 among them"
     )
-
-
-def test_write_leaves_the_bytes_upsert_leaves_over_two_wraps():
-    """`write` is `upsert`'s write without the visibility row, at the frame `plan` staged from the count."""
-    old, new = _manager(), _manager()
-    gen = torch.Generator().manual_seed(0)
-    for kv in (old, new):
-        kv.ingest_request("a")
-    # two wraps of the dilated layer's ring, so of every layer's
-    for frame in range(2 * 8 * RING_FRAMES + 1):
-        step, ctx = _step("a", frame=frame), _ctx("a")
-        for kv in (old, new):
-            assert kv.admit(step, ctx).ok
-            kv.plan(step, ctx)
-        for keep in (False, False, False, False, True):
-            for layer_idx in range(N_LAYERS):
-                k, v = _frame(old, gen)
-                old.upsert(k, v, layer_idx, torch.tensor([frame]), commit=keep)
-                new.write(k, v, layer_idx, keep=keep)
-        for kv in (old, new):
-            kv.commit(step, ctx)
-        for i, (a, b) in enumerate(zip(old.layers, new.layers, strict=True)):
-            assert torch.equal(a.kv, b.kv) and torch.equal(a.written, b.written), (
-                f"layer {i} differs after frame {frame}"
-            )

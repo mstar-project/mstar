@@ -1179,7 +1179,7 @@ class RingHandle(ArrayHandle):
             self._record_read(layer)
         k, v = self._views[layer]
         q = q.transpose(1, 2)
-        out = self._flex.attend(q, k, v, None, enable_gqa=q.size(1) != k.size(1), layer_idx=self._pool_layer[layer])
+        out = self._flex.attend(q, k, v, enable_gqa=q.size(1) != k.size(1), layer_idx=self._pool_layer[layer])
         return out.transpose(1, 2)
 
 
@@ -1948,13 +1948,7 @@ class RingStorage(Storage):
         return resolved
 
     def steps(self, handle: RingHandle, declared: ArrayStep, step: SubmoduleStep, steps: dict[str, Any]) -> None:
-        ring = handle._ring
-        # the ring's admit checks each row's frame against the one it last committed, while a model still declares one
-        frames = tuple(
-            (segment.request_id, ring.position(segment.request_id, segment.label) // ring.tokens_per_frame)
-            for segment in segments_of(declared, step)
-        )
-        steps[handle.name] = RingKVStep(segments=declared.segments, frames=frames)
+        steps[handle.name] = RingKVStep(segments=declared.segments)
         steps[handle.flex_key] = AttentionStep(segments=declared.segments)
 
 

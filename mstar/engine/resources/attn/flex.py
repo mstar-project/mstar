@@ -243,13 +243,8 @@ class FlexAttentionManager(AttentionManager):
 
     @property
     def requires_kv_write(self) -> bool:
-        """False: the layer has already written this step's K/V.
-
-        A ring ``upsert`` is not the paged backends' ``write_kv``. It writes
-        the frame *and* returns the whole ring view to attend against, in one
-        call, because which slots the write makes visible is part of its
-        result — so there is no separate write step for a layer to perform and
-        calling one would commit the frame twice.
+        """False: the ring's own write has put this step's K/V in the frame's
+        slots.
 
         A ``@property``, not a class attribute, to keep the base's read-only
         contract: ``AttentionManager.requires_kv_write`` is a property and
@@ -258,16 +253,6 @@ class FlexAttentionManager(AttentionManager):
         writable on this subclass alone.
         """
         return False
-
-    @property
-    def needs_token_visibility(self) -> bool:
-        """Whether the ring must construct its legacy token-level mask.
-
-        Engine execution stages a block mask in ``plan`` and does not need the
-        per-layer row. The fallback remains useful for standalone numerical
-        calls that invoke ``attend`` without a resource plan.
-        """
-        return self._active_slot is None
 
     @staticmethod
     def _geometry(layer) -> tuple[int, int, int]:
@@ -399,11 +384,6 @@ class FlexAttentionManager(AttentionManager):
         del step
         self.reset_default_cursors()
         ring_plan = ctx.plan_results.get(self._kv_cache_name)
-        if ring_plan is None:
-            # Keeps standalone manager tests and non-ring diagnostic calls able
-            # to use the visibility tensor supplied directly to attend().
-            self._active_slot = None
-            return
         if not isinstance(ring_plan, RingPlan):
             raise TypeError(
                 f"FlexAttention expected RingPlan from {self._kv_cache_name!r}; "
@@ -420,31 +400,17 @@ class FlexAttentionManager(AttentionManager):
             mask = self._mask_for(ctx.slot, geometry, B, create=not ctx.capture)
             self._stage(mask, geometry, ring_plan)
 
-    def attend(
-        self,
-        q: Tensor,
-        k: Tensor,
-        v: Tensor,
-        visible: Tensor,
-        *,
-        enable_gqa: bool,
-        layer_idx: int | None = None,
-    ) -> Tensor:
-        """One layer's attention over the ring.
+    def attend(self, q: Tensor, k: Tensor, v: Tensor, *, enable_gqa: bool, layer_idx: int) -> Tensor:
+        """One layer's attention over the ring, through the mask `plan` staged
+        for this step's frames.
 
         ``q`` is ``[B, H_q, T, D]``; ``k``/``v`` are ``[B, H_kv, kv_len, D]``,
-        the whole ring view (history slots plus the scratch frame) as the KV
-        resource returned it. ``visible`` is ``[kv_len]`` bool, True where that
-        view holds KV this step may read — it is not derivable from a length,
-        which is the entire reason this backend exists. Returns
-        ``[B, H_q, T, D]``.
+        the whole ring view (history slots plus the scratch frame). Which slots
+        a query reads is not derivable from a length, which is the entire reason
+        this backend exists. Returns ``[B, H_q, T, D]``.
         """
-        if self._active_slot is None or layer_idx is None:
-            assert q.size(0) == 1, "the make_block_mask fallback only supports B == 1"
-            block_mask = make_block_mask(q.size(-2), k.size(-2), visible)
-        else:
-            geometry = self._geometry(self._kv_config.layers[layer_idx])
-            block_mask = self._mask_for(self._active_slot, geometry, q.size(0))
+        geometry = self._geometry(self._kv_config.layers[layer_idx])
+        block_mask = self._mask_for(self._active_slot, geometry, q.size(0))
         # `flex_attention_masked`, never bare `flex_attention`: with a no-op
         # `mask_mod` the eager path ignores the block mask entirely and attends
         # to unwritten ring slots. See the note at its definition.

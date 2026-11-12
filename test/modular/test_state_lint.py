@@ -22,6 +22,7 @@ PORTED = (
     "mstar/model/vjepa2", "mstar/model/canary", "mstar/model/components/encoder_decoder.py",
     "mstar/model/canary_qwen", "mstar/model/qwen3_asr", "mstar/model/parakeet", "mstar/model/fish_s2_pro",
     "mstar/model/qwen3_tts", "mstar/model/bagel", "mstar/model/chatterbox", "mstar/model/whisper",
+    "mstar/model/waypoint",
 )
 FORBIDDEN_ATTRIBUTES = {
     "node_resources", "resources", "request_state", "request_states", "per_request_states",
@@ -40,6 +41,7 @@ ALLOWED = {
         "geometric_batch_sizes",
     )
 } | {
+    ("mstar.engine.accelerator_graph_runner", "compile_kwargs"): _CAPTURE,
     ("mstar.engine.engine", "ExecutingBatch"): "the annotation of `NodeSubmodule.can_batch`, a base class's hook",
     ("mstar.engine.resources.lora.checkpoint", "LoraFile"): "a model's static LoRA merge at load, which holds no state",
     ("mstar.engine.resources.lora", "LoraSpec"): "the opt-in LoRA spec, written by hand: the contract declares no LoRA",

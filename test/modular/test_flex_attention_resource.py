@@ -68,13 +68,13 @@ from mstar.engine.resources.kv.config import (
     PagedKVConfig,
     RingKVConfig,
     RingKVLayerConfig,
+    RingKVStep,
 )
-from mstar.engine.resources.kv.ring.cache import LayerRingCache
-from mstar.engine.resources.kv.ring.manager import RingPlan
+from mstar.engine.resources.kv.ring.manager import RingKVManager, RingPlan
 
 BLOCK = _DEFAULT_SPARSE_BLOCK_SIZE  # 128
 TPF = BLOCK  # one frame per sparse block keeps the geometry readable
-KV_LEN = 4 * BLOCK  # 3 ring frames + 1 scratch
+KV_LEN = 8 * BLOCK  # session 0's 3 ring frames + 1 scratch, then the padding session's 4
 N_KV_HEADS = 2
 N_QO_HEADS = 4
 D_HEAD = 32
@@ -125,12 +125,12 @@ def build_attention(backend: AttnBackend, kv_config) -> AttentionManager:
 
 def visible_row(committed_blocks: tuple[int, ...]) -> torch.Tensor:
     """A ring visibility row: whole blocks, plus the permanently visible
-    scratch frame at the tail (it holds the frame being denoised, so masking it
-    would remove self-attention)."""
+    scratch frame at block 3, the end of session 0 (it holds the frame being
+    denoised, so masking it would remove self-attention)."""
     visible = torch.zeros(KV_LEN, dtype=torch.bool)
     for b in committed_blocks:
         visible[b * BLOCK : (b + 1) * BLOCK] = True
-    visible[KV_LEN - BLOCK :] = True
+    visible[3 * BLOCK : 4 * BLOCK] = True
     return visible
 
 
@@ -196,8 +196,8 @@ def test_paged_backend_rejects_a_ring_kv_config():
 
 def test_requires_kv_write_is_false_for_flex_and_true_for_the_paged_backend():
     """The layer reads this to decide whether to call ``kv.write_kv``. For the
-    ring the answer is no — ``upsert`` already wrote the frame and returned the
-    view to attend against — and calling one would commit the frame twice."""
+    ring the answer is no — the ring's ``write`` already put the frame in its
+    slots — and calling one would commit the frame twice."""
     flex_manager = build_attention(AttnBackend.FLEX, ring_config())
     assert flex_manager.requires_kv_write is False
 
@@ -266,7 +266,10 @@ def test_plan_clears_the_inherited_cursors():
     manager.set_default_layer_idx(7)
     manager.plan(
         AttentionStep(),
-        StepContext(request_ids=("r0",), graph_walk="gen", slot=0, capture=False),
+        StepContext(
+            request_ids=("r0",), graph_walk="gen", slot=0, capture=False,
+            plan_results={"kv": RingPlan(("r0",), (0,), (0,))},
+        ),
     )
     assert manager.default_label == "main"
     assert manager._default_layer_idx is None
@@ -295,7 +298,6 @@ def test_plan_stages_one_reused_mask_per_geometry_and_slot(monkeypatch):
 
     manager.plan(AttentionStep(), ctx)
 
-    assert manager.needs_token_visibility is False
     assert len(manager._planned_masks) == 2
     local = manager._mask_for(1, manager._geometry(config.layers[0]), 1)
     assert local is manager._mask_for(1, manager._geometry(config.layers[1]), 1)
@@ -340,9 +342,9 @@ def test_planned_masks_match_ring_visibility_across_wraps_and_worlds():
     """The host plan must reproduce the ring's pre-commit visibility exactly.
 
     This crosses two wraps of both geometries while alternating worlds. It
-    compares against ``LayerRingCache.upsert``'s independently maintained
-    ``written`` state, so a clock, dilation, overwrite, scratch, or world-offset
-    error in the planner cannot satisfy the test by sharing its formula.
+    compares against the ring's own ``written`` state after each frame's write,
+    so a clock, dilation, overwrite, scratch, or world-offset error in the
+    planner cannot satisfy the test by sharing its formula.
     """
     layers = (
         RingKVLayerConfig(ring_frames=4, ring_buckets=4, pinned_dilation=1),
@@ -358,49 +360,39 @@ def test_planned_masks_match_ring_visibility_across_wraps_and_worlds():
         layers=layers,
     )
     manager = build_attention(AttnBackend.FLEX, config)
-    caches = [
-        LayerRingCache(
-            num_sessions=config.num_sessions,
-            n_kv_heads=config.num_kv_heads,
-            ring_frames=layer.ring_frames,
-            ring_buckets=layer.ring_buckets,
-            d_head=config.head_dim,
-            tokens_per_frame=config.tokens_per_frame,
-            pinned_dilation=layer.pinned_dilation,
-            dtype=torch.float32,
-            device="cpu",
-        )
-        for layer in layers
-    ]
-    kv = torch.zeros(2, 1, N_KV_HEADS, TPF, D_HEAD)
+    ring = RingKVManager(config, "kv", torch.device("cpu"), torch.float32)
+    step = RingKVStep()
+    for world in (0, 1):
+        ring.ingest_request(f"r{world}")
 
     for frame in range(10):
         for world in (0, 1):
-            expected = []
-            for cache in caches:
-                *_, visible = cache.upsert(
-                    kv,
-                    torch.tensor([frame], dtype=torch.int64),
-                    True,
-                    torch.tensor([world], dtype=torch.int64),
-                )
-                expected.append(
-                    visible.view(-1, BLOCK).all(-1).nonzero().flatten().tolist()
-                )
-
-            ctx = StepContext(
-                request_ids=(f"r{world}",),
-                graph_walk="rollout",
-                slot=0,
-                capture=False,
-                plan_results={"kv": RingPlan((f"r{world}",), (world,), (frame,))},
-            )
+            rid = f"r{world}"
+            ctx = StepContext(request_ids=(rid,), graph_walk="rollout", slot=0, capture=False)
+            assert ring.admit(step, ctx).ok
+            ctx.plan_results["kv"] = ring.plan(step, ctx)
             manager.plan(AttentionStep(), ctx)
 
-            for layer, expected_blocks in zip(layers, expected, strict=True):
-                mask = manager._mask_for(0, manager._geometry(layer), 1)
+            # a value no other frame writes, to find the ring slot that keeps this frame
+            value = float(1 + 2 * frame + world)
+            frame_kv = torch.full((1, N_KV_HEADS, TPF, D_HEAD), value)
+            for layer_idx, cache in enumerate(ring.layers):
+                ring.write(frame_kv, frame_kv, layer_idx, keep=True)
+                lo, hi = cache.session_span(ring.session_of(rid))
+                history = slice(lo, lo + cache.ring_len)
+                visible = torch.zeros_like(cache.written)
+                visible[lo:hi] = cache.written[lo:hi]
+                # The query reads this frame through the scratch, not through its ring slot.
+                visible[history] &= cache.kv[0, 0, 0, history, 0] != value
+                expected = visible.view(-1, BLOCK).all(-1).nonzero().flatten().tolist()
+
+                mask = manager._mask_for(0, manager._geometry(cache), 1)
                 count = int(mask.full_kv_num_blocks[0, 0, 0])
-                assert mask.full_kv_indices[0, 0, 0, :count].tolist() == expected_blocks
+                assert mask.full_kv_indices[0, 0, 0, :count].tolist() == expected, (
+                    f"layer {layer_idx} at frame {frame} of world {world}: the planned mask "
+                    "differs from the blocks the ring has written"
+                )
+            ring.commit(step, ctx)
 
 
 def test_stage_writes_each_rows_own_visibility_at_its_own_world_and_frame():
@@ -482,19 +474,31 @@ def test_make_block_mask_rejects_unaligned_and_non_multiple_lengths():
 # ---------------------------------------------------------------------------
 
 
+def plan_frame(manager: AttentionManager, frame: int) -> None:
+    """Stage session 0's masks for ``frame``."""
+    manager.plan(
+        AttentionStep(),
+        StepContext(
+            request_ids=("r",), graph_walk="rollout", slot=0, capture=False,
+            plan_results={"kv": RingPlan(("r",), (0,), (frame,))},
+        ),
+    )
+
+
 @pytest.mark.parametrize(
-    ("label", "committed_blocks"),
+    ("label", "frame", "committed_blocks"),
     [
-        ("one_frame", (0,)),
-        ("gappy_ring", (0, 2)),
+        ("one_frame", 1, (0,)),
+        ("gappy_ring", 4, (0, 2)),
     ],
 )
-def test_attend_matches_a_masked_dense_reference(label, committed_blocks):
+def test_attend_matches_a_masked_dense_reference(label, frame, committed_blocks):
     visible = visible_row(committed_blocks)
     q, k, v = qkv(visible)
     manager = build_attention(AttnBackend.FLEX, ring_config())
+    plan_frame(manager, frame)
 
-    got = manager.attend(q, k, v, visible, enable_gqa=True)
+    got = manager.attend(q, k, v, enable_gqa=True, layer_idx=0)
     want = masked_dense_reference(q, k, v, visible)
 
     err = (got - want).abs().max().item()
@@ -548,8 +552,9 @@ def test_attend_takes_the_compiled_path():
     q, k, v = qkv(visible, seed=11)
     bm = make_block_mask(TPF, KV_LEN, visible)
     manager = build_attention(AttnBackend.FLEX, ring_config())
+    plan_frame(manager, 4)
 
-    got = manager.attend(q, k, v, visible, enable_gqa=True)
+    got = manager.attend(q, k, v, enable_gqa=True, layer_idx=0)
     want = flex_attention_masked(q, k, v, block_mask=bm, enable_gqa=True)
     trap = flex_attention(q, k, v, block_mask=bm, enable_gqa=True)
 
@@ -582,13 +587,13 @@ def test_masked_dense_reference_is_not_trivially_satisfied():
 
 
 # ---------------------------------------------------------------------------
-# 4. The batched step this backend is not asked for yet
+# 4. The batched step
 # ---------------------------------------------------------------------------
 #
 # The world pool folds N worlds into the token axis of ONE ring, so the ring is
 # `[2, 1, H_kv, N*capacity, D]` and world `w` owns `[w*capacity, (w+1)*capacity)`.
-# Today the step batch is 1 and `attend` gets a single row, so isolation is a
-# `[kv_len]` visibility row and this section is a derisk, not a contract.
+# A step's rows attend that one ring through the mask `plan` stages, one
+# visibility row per world in its leading dim, so this section backs that path.
 #
 # What it derisks is the *only* way batching a step can be made free. When B
 # rows of one step attend against that ring, the K/V they share is byte-identical
@@ -630,11 +635,8 @@ def folded_block_mask(rows: list[torch.Tensor], q_len: int) -> "object":
     """``make_block_mask`` with a batch dim: the same query-uniform,
     full-blocks-only construction, stacked over rows.
 
-    Deliberately written here and not in ``flex.py``. The shipped backend takes
-    a single ``[kv_len]`` row because the node takes a single row; adding an
-    unreachable batched path to the module would be an untested branch on the
-    serving path. This is the shape the future change would take, asserted
-    against today's kernel.
+    ``plan`` stages this shape from a ring's sessions and frames. These rows
+    come from no plan, so the kernel's batching is tested apart from the planner.
     """
     b = len(rows)
     q_blocks = q_len // BLOCK
@@ -731,9 +733,10 @@ def test_a_batched_step_can_share_one_ring_by_stride_0_expand(device):
     )
     assert batched.shape == q.shape
 
-    manager = build_attention(AttnBackend.FLEX, ring_config())
     for w in range(WORLDS):
-        serial = manager.attend(q[w : w + 1], k, v, rows[w], enable_gqa=True)
+        serial = flex_attention_masked(
+            q[w : w + 1], k, v, block_mask=make_block_mask(TPF, FOLDED_KV, rows[w]), enable_gqa=True
+        )
         assert torch.equal(batched[w : w + 1], serial), (
             f"world {w} in a batch of {WORLDS} differs from the same world served "
             f"alone by {(batched[w:w+1] - serial).abs().max().item():.3e}; a batched "
@@ -848,9 +851,8 @@ def test_flash_batched_step_does_not_copy_the_unexpanded_ring():
         f"would add ~{copy_bytes} bytes, so this looks like a hidden copy"
     )
 
-    manager = build_attention(AttnBackend.FLEX, ring_config())
     for w in range(B):
-        serial = manager.attend(q[w : w + 1], k, v, written, enable_gqa=True)
+        serial = flex_attention_masked(q[w : w + 1], k, v, block_mask=block_mask, enable_gqa=True)
         assert torch.equal(batched[w : w + 1], serial), (
             f"row {w} in a batch of {B} differs from the same row served alone"
         )

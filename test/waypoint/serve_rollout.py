@@ -157,6 +157,9 @@ def _run_config(
     resources = config["resources"] = config.get("resources") or {}
     kv = resources["kv"] = resources.get("kv") or {}
     kv["num_sessions"] = worlds
+    # a slot of the decoder's histories per world, and the pool's sink slot
+    decoder = resources["decoder"] = resources.get("decoder") or {}
+    decoder["max_slots"] = worlds + 1
     out.write_text(yaml.safe_dump(config, sort_keys=False))
     return out
 

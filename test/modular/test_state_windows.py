@@ -185,7 +185,7 @@ class _StubFlex:
     def __init__(self):
         self.layers = []
 
-    def attend(self, q, k, v, visible, *, enable_gqa, layer_idx=None):
+    def attend(self, q, k, v, *, enable_gqa, layer_idx):
         if not torch.compiler.is_compiling():
             self.layers.append(layer_idx)
         k, v = k.expand(q.size(0), -1, -1, -1), v.expand(q.size(0), -1, -1, -1)
@@ -251,19 +251,16 @@ def test_the_ring_handle_builds_through_node_handles():
 
 def test_prime_then_rollout_drives_the_ring_in_order():
     """A prime is one kept pass per layer, and a rollout four scratch passes and one kept pass. The ring counts a frame
-    per step, plans each row's next frame from the count, and its admit checks the frame the step declares, which is
-    the count Waypoint declares on each walk."""
+    per step and plans each row's next frame from the count."""
     handle, ring, flex = _ring()
     prime = _ring_step(handle, ring, walk="prime")
-    assert prime.steps["kv"].frames == (("a", 0),)
     assert (ring._static_session_idx[0].item(), ring._static_frame_pos[0].item()) == (0, 0)
     _pass(handle, keep=True)
     _end(prime, ring)
     assert position(handle, "a", "main") == TPF
 
     rollout = _ring_step(handle, ring)
-    assert rollout.steps["kv"].frames == (("a", 1),)
-    assert ring._static_frame_pos[0].item() == 1
+    assert ring._static_frame_pos[0].item() == 1, "the rollout's frame should follow the prime's"
     for keep in (False, False, False, False, True):
         _pass(handle, keep=keep)
     assert (handle._kept, handle._scratch, handle._read) == ({0, 1}, {0, 1}, {0, 1})
@@ -395,9 +392,9 @@ def test_a_ring_step_sets_no_advance_or_position_ids():
 
 
 def test_a_ring_of_waypoint_s_geometry_builds_waypoint_s_specs_and_steps():
-    """The reference is Waypoint's hand-written spec and step, copied. Two differences are the declaration's own: the
-    flex resource takes its first read's key, and the ring holds a request to the array's ``max_len``. A step lists its
-    rows' segments, which Waypoint's didn't."""
+    """The reference is Waypoint's hand-written spec and step, copied. The differences are the declaration's own: the
+    flex resource takes its first read's key, the ring holds a request to the array's ``max_len``, and a step lists its
+    rows' segments in place of each row's frame, which the ring counts itself."""
     global_layers = frozenset(range(3, 24, 4))
     array = Array("kv", nodes={"dit"}, layers=frozenset(range(24)), entry=KVEntry(heads=16, head_dim=64),
                   max_len=(1 + 512) * 512, positions=Positions(), reads={
@@ -422,7 +419,7 @@ def test_a_ring_of_waypoint_s_geometry_builds_waypoint_s_specs_and_steps():
     handle, _, _ = _ring()
     rows = [Segment(rid, "main", TPF) for rid in ("a", "b")]
     step = state_steps(SubmoduleStep(segments=rows, state={"kv": ArrayStep()}), {"kv": handle}, graph_walk="prime")
-    assert replace(step.steps["kv"], segments=None) == RingKVStep(frames=(("a", 0), ("b", 0)))
+    assert replace(step.steps["kv"], segments=None) == RingKVStep()
     assert replace(step.steps["local"], segments=None) == AttentionStep()
 
 

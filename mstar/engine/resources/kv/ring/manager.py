@@ -3,6 +3,7 @@ this one reserves nothing. Every layer's ring is allocated once at
 ``build`` and reused for the life of the process,.
 """
 
+import logging
 from typing import NamedTuple
 
 import torch
@@ -26,6 +27,8 @@ from mstar.engine.resources.step import (
 )
 
 __all__ = ["RingKVManager", "RingPlan"]
+
+logger = logging.getLogger(__name__)
 
 
 class RingPlan(NamedTuple):
@@ -76,7 +79,6 @@ class RingKVManager(AttentionResource):
         # never claimed, so a padding write never reaches a real session's history.
         self._padding_session: int = config.num_sessions
         self._known_rids: set[str] = set()
-        self._last_frames: dict[str, int] = {}
         # Each request's clock: the frames it has committed, so the next frame it writes is this count.
         self._committed_frames: dict[str, int] = {}
         # Sized to num_sessions, the largest B any step can carry (B_max <=
@@ -97,12 +99,16 @@ class RingKVManager(AttentionResource):
                 "built by hand with the wrong one."
             )
         config.shard(info.head_shards)
-        return cls(
+        manager = cls(
             config=config,
             name=spec.resource_key,
             device=info.device,
             dtype=info.kv_dtype,
         )
+        # allocated once, for every session, so a deployment sees the cost of its num_sessions here
+        logger.info("ring KV %r holds %.1f MiB for %d sessions and the padding session", manager.name,
+                    manager.memory_bytes() / 2**20, config.num_sessions)
+        return manager
 
     # ---- Model-facing API -------------------------------------------------
 
@@ -121,8 +127,8 @@ class RingKVManager(AttentionResource):
         return self.layers[layer_idx].capacity
 
     def total_slots(self, layer_idx: int) -> int:
-        """Token slots in ``layer_idx``'s buffer across every session -- the
-        length of the KV view ``upsert`` returns and of its visibility row."""
+        """Token slots in ``layer_idx``'s buffer across every session, the
+        length of the KV view a read attends."""
         return self.layers[layer_idx].total_slots
 
     def position(self, rid: str, label: str) -> int:
@@ -135,49 +141,11 @@ class RingKVManager(AttentionResource):
         introspection; the forward reads the staged tensor, never this."""
         return self._sessions.get(rid)
 
-    def upsert(
-        self,
-        k: Tensor,
-        v: Tensor,
-        layer_idx: int,
-        frame_pos: Tensor,
-        *,
-        commit: bool,
-        build_visibility: bool = True,
-    ) -> tuple[Tensor, Tensor, Tensor]:
-        """Write one step's K/V for ``layer_idx`` and return what to attend to.
-
-        ``k``/``v`` are ``[B, H_kv, tokens_per_frame, D]``, one frame per
-        resident session in the step batch. ``k`` is already RoPE'd and
-        RMS-normed and ``v`` is post value-residual lerp: the cache stores
-        post-RoPE keys, so replayed history is never re-rotated.
-        Returns ``(k_all, v_all, visible)``, the first two spanning
-        the whole buffer, every resident session and the third a
-        ``[total_slots]`` bool row that is False everywhere outside the calling
-        request's own session.
-
-        ``frame_pos`` and ``commit`` are both arguments rather than resource
-        state, for the same reason. ``frame_pos`` is the ``[B]`` int64 ring
-        clock -- not a slot id -- and alone determines the slot written and the
-        visibility row;
-        """
-        # `layer_idx` is Python-level (it indexes a list of differently-shaped
-        # rings), so indexing on it is graph-safe.
-        B = k.size(0)
-        # [2, H_kv, B, T, D] contiguous, then folded into the ring's [2, 1,
-        # H_kv, B*T, D] layout -- the one copy this already needed.
-        kv = torch.stack([k.transpose(0, 1), v.transpose(0, 1)], dim=0)
-        kv = kv.view(2, 1, k.size(1), B * k.size(2), k.size(3))
-        return self.layers[layer_idx].upsert(
-            kv, frame_pos, commit, self._static_session_idx[:B],
-            build_visibility=build_visibility,
-        )
-
     def write(self, k: Tensor, v: Tensor, layer_idx: int, *, keep: bool) -> None:
         """Write one step's K/V for ``layer_idx`` at the frames and sessions
-        ``plan`` staged, ``k``/``v`` as ``upsert`` takes them. ``keep`` also
-        writes each frame into its ring slot, or its scratch slot where a
-        layer's stride skips the frame."""
+        ``plan`` staged. ``k``/``v`` are ``[B, H_kv, tokens_per_frame, D]``,
+        one frame per row, ``k`` already rotated. ``keep`` also writes each
+        frame into its ring slot, where the layer's stride keeps the frame."""
         B = k.size(0)
         kv = torch.stack([k.transpose(0, 1), v.transpose(0, 1)], dim=0)
         kv = kv.view(2, 1, k.size(1), B * k.size(2), k.size(3))
@@ -187,13 +155,12 @@ class RingKVManager(AttentionResource):
 
     def _reset_session(self, rid: str) -> None:
         """Zero ``rid``'s session and drop its clock, leaving its claim in place."""
+        self._committed_frames.pop(rid, None)
         session_idx = self._sessions.get(rid)
         if session_idx is None:
             return
         for layer in self.layers:
             layer.reset(session_idx)
-        self._last_frames.pop(rid, None)
-        self._committed_frames.pop(rid, None)
 
     def _release_session(self, rid: str) -> None:
         """Hand ``rid``'s session back to the pool. Zero it first."""
@@ -237,7 +204,6 @@ class RingKVManager(AttentionResource):
                 )
             span.copy_(kv)
             layer.written[lo:hi].copy_(written)
-        self._last_frames.pop(rid, None)
         self._committed_frames[rid] = state["committed_frames"]
 
     def _require_session(self, rid: str, what: str) -> int:
@@ -258,16 +224,12 @@ class RingKVManager(AttentionResource):
 
     # ---- Resource lifecycle -----------------------------------------------
 
-    def _step_frames(self, step: ResourceStep) -> dict[str, int]:
-        """This step's declared ring clock per request id."""
-
+    def _check_step(self, step: ResourceStep) -> None:
         if not isinstance(step, RingKVStep):
             raise TypeError(
                 f"ring KV {self.name!r} was declared a {type(step).__name__}; it "
-                "needs a RingKVStep, the step that carries `frames`. A KVStep "
-                "admits and commits without ever checking the ring clock."
+                "needs a RingKVStep, whose commit counts a frame for every row."
             )
-        return dict(step.frames)
 
     def ingest_request(self, rid: str, overrides: ResourceReqConfig | None = None) -> None:
         """Register ``rid``. Deliberately does not claim a session."""
@@ -294,7 +256,7 @@ class RingKVManager(AttentionResource):
                 ),
             )
 
-        frames = self._step_frames(step)
+        self._check_step(step)
 
         # Check every rid before claiming any session: a refused admit must not
         # leave a session half-claimed by the first rid of a batch it rejected.
@@ -345,34 +307,6 @@ class RingKVManager(AttentionResource):
                         request_ids=frozenset({rid}),
                     ),
                 )
-            frame = frames.get(rid)
-            if frame is None:
-                return AdmitOutcome(
-                    ok=False, ready=False,
-                    reason=AdmitRuntimeError(
-                        f"ring KV {self.name!r} was handed a step declaring no ring "
-                        f"clock for request {rid!r} (it names {sorted(frames)}). "
-                        "Every admitted request needs one: the continuity check is "
-                        "the only thing standing between a stalled clock and a "
-                        "session that rewrites its own history.",
-                        request_ids=frozenset({rid}),
-                    ),
-                )
-            last = self._last_frames.get(rid)
-            if last is not None and frame != last + 1:
-                return AdmitOutcome(
-                    ok=False, ready=False,
-                    reason=AdmitRuntimeError(
-                        f"ring KV {self.name!r} last committed frame "
-                        f"{last} for request {rid!r}, so the next one must be "
-                        f"{last + 1}; this step declares frame {frame}. "
-                        "The ring clock advances by exactly one per committed frame "
-                        "-- a skipped or repeated frame selects the wrong ring slot "
-                        "and hides the wrong one, which rewrites history rather than "
-                        "raising.",
-                        request_ids=frozenset({rid}),
-                    ),
-                )
 
         for rid in rids:
             if rid not in self._sessions:
@@ -382,8 +316,8 @@ class RingKVManager(AttentionResource):
         return ADMIT_OK
 
     def plan(self, step: ResourceStep, ctx: StepContext) -> RingPlan:
-        """Stage the padded batch's session indices, one per row. Ring addresses
-        stay in the graph.
+        """Stage the padded batch's session indices and next frames, one per
+        row. Ring addresses stay in the graph.
 
         A replay pads the batch to its capture bucket with dummy rids that hold
         no session. Those rows still write and attend (their output is dropped
@@ -393,7 +327,7 @@ class RingKVManager(AttentionResource):
         session and never reach a real request's history; no request is ever
         admitted to it, so the tail it leaves behind is never read.
         """
-        frames = self._step_frames(step)
+        self._check_step(step)
         real_rids = tuple(ctx.request_ids)
         padded_rids = tuple(ctx.padded_request_ids)
         session_idx = []
@@ -403,10 +337,11 @@ class RingKVManager(AttentionResource):
             # `fill_`, not a `copy_` from a fresh host tensor: same in-place
             # write through the address the graph baked, without allocating a
             # staging tensor 24 times a second.
+            frame = self._committed_frames.get(rid, 0)
             self._static_session_idx[b].fill_(session)
-            self._static_frame_pos[b].fill_(self._committed_frames.get(rid, 0))
+            self._static_frame_pos[b].fill_(frame)
             session_idx.append(session)
-            frame_pos.append(frames[rid])
+            frame_pos.append(frame)
         for b in range(len(real_rids), len(padded_rids)):
             self._static_session_idx[b].fill_(self._padding_session)
             self._static_frame_pos[b].fill_(0)
@@ -417,13 +352,10 @@ class RingKVManager(AttentionResource):
         return RingPlan(padded_rids, tuple(session_idx), tuple(frame_pos))
 
     def commit(self, step: ResourceStep, ctx: StepContext) -> None:
-        """Record the frame each request just committed. Metadata only."""
-        frames = self._step_frames(step)
+        """Count the frame each request just committed. Metadata only."""
+        self._check_step(step)
         for rid in ctx.request_ids:
             self._committed_frames[rid] = self._committed_frames.get(rid, 0) + 1
-            frame = frames.get(rid)
-            if frame is not None:
-                self._last_frames[rid] = frame
 
     def reset_request(self, rid: str, free: bool = False) -> None:
         """Zero ``rid``'s session and release its claim.
@@ -468,14 +400,6 @@ class RingKVManager(AttentionResource):
                 f"ring KV {self.name!r} counted committed frames "
                 f"({sorted(self._committed_frames.items())}) during accelerator graph capture; "
                 "the first real request would write its first frame that many slots on."
-            )
-        if self._last_frames:
-            raise RuntimeError(
-                f"ring KV {self.name!r} recorded committed frames "
-                f"({sorted(self._last_frames.items())}) during accelerator graph capture; "
-                "capture drives admit and plan but must never commit, and the "
-                "first real request will be refused at admit unless it happens to "
-                "declare the very next frame."
             )
         for i, layer in enumerate(self.layers):
             history = layer.written.view(layer.num_sessions, layer.capacity)[:, : layer.ring_len]

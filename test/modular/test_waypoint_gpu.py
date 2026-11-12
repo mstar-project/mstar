@@ -1,5 +1,5 @@
 """GPU gates for the Waypoint port: fullgraph capture, compiled/eager parity,
-CUDA-graph replay, rollout isolation, and the BlockMask rebuild cost.
+CUDA-graph replay and rollout isolation.
 
 Checkpoint-free -- weights are random and every claim is a self-consistency
 one. The geometry is reduced (4 layers, 128 tokens per frame) but structurally
@@ -17,7 +17,6 @@ Set ``WAYPOINT_GPU_TESTS=0`` to skip; a full run is a few minutes, most of it
 
 import os
 import sys
-import time
 import zlib
 
 import pytest
@@ -26,26 +25,17 @@ import torch
 sys.path.insert(0, ".")
 
 from mstar.engine.resources.attn.base import AttentionManager
-from mstar.engine.resources.attn.config import (
-    AttentionConfig,
-    AttentionSpec,
-    AttentionStep,
-    AttnBackend,
-)
 from mstar.engine.resources.attn.flex import flex_attention_masked, make_block_mask
-from mstar.engine.resources.base import EngineResourceInfo
-from mstar.engine.resources.kv.config import (
-    KVSpec,
-    RingKVConfig,
-    RingKVLayerConfig,
-    RingKVStep,
-)
+from mstar.engine.resources.base import EngineResourceInfo, build_resource
 from mstar.engine.resources.kv.ring import RingKVManager
-from mstar.engine.resources.step import StepContext
+from mstar.engine.resources.step import Segment, StepContext, SubmoduleStep
+from mstar.engine.state import ArrayStep
+from mstar.engine.state.adapters import RingHandle, node_handles, node_resources, state_steps
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.waypoint.components.dit import WaypointDiT
 from mstar.model.waypoint.components.layers import NoiseConditioner
 from mstar.model.waypoint.config import WaypointConfig, waypoint_1_5_1b_720p
+from mstar.model.waypoint.waypoint_model import WaypointModel
 
 pytestmark = [
     pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA"),
@@ -93,29 +83,6 @@ def gpu_config(**overrides) -> WaypointConfig:
     return WaypointConfig(**{**base, **overrides})
 
 
-def _kv_spec(config: WaypointConfig, num_sessions: int) -> KVSpec:
-    return KVSpec(
-        resource_key="kv",
-        nodes={"dit"},
-        config=RingKVConfig(
-            num_layers=config.n_layers,
-            num_kv_heads=config.n_kv_heads,
-            head_dim=config.d_head,
-            num_qo_heads=config.n_heads,
-            tokens_per_frame=config.tokens_per_frame,
-            num_sessions=num_sessions,
-            layers=tuple(
-                RingKVLayerConfig(
-                    ring_frames=config.ring_frames(i),
-                    ring_buckets=config.ring_buckets(i),
-                    pinned_dilation=config.pinned_dilation(i),
-                )
-                for i in range(config.n_layers)
-            ),
-        ),
-    )
-
-
 class _DitNode(NodeSubmodule):
     """Binds through the engine's own walk: one call on the node has to reach
     all of the attention layers."""
@@ -152,19 +119,15 @@ def build(config: WaypointConfig, *, seed: int = 0, num_sessions: int = 1):
             block.attn.v_lamb.fill_(0.25)
     dit.eval()
 
-    spec = _kv_spec(config, num_sessions)
-    info = EngineResourceInfo(device=DEVICE, kv_dtype=DTYPE)
-    kv = RingKVManager.build(spec, info)
-    attn = AttentionManager.build(
-        AttentionSpec(
-            resource_key="attn",
-            nodes={"dit"},
-            config=AttentionConfig(kv_cache="kv", backend=AttnBackend.FLEX),
-        ),
-        EngineResourceInfo(device=DEVICE, kv_dtype=DTYPE, dependencies={"kv": spec}),
-    )
-    _DitNode(dit).bind_node_resources({"kv": kv, "attn": attn})
-    return dit, kv, attn
+    model = WaypointModel(skip_weight_loading=True)
+    model.config = config
+    ring, flex, decoder = node_resources(model)
+    ring.apply_yaml_overrides(num_sessions=num_sessions)
+    info = EngineResourceInfo(device=DEVICE, kv_dtype=DTYPE, dependencies={"kv": ring})
+    resources = {spec.resource_key: build_resource(spec, info) for spec in (ring, flex, decoder)}
+    handles = node_handles(model, "dit", resources)
+    _DitNode(dit).bind_node_state(handles)
+    return dit, resources["kv"], resources[flex.resource_key], handles["kv"]
 
 
 def controls(config: WaypointConfig):
@@ -192,57 +155,32 @@ def noise_for(config: WaypointConfig, stream: str, frame: int) -> torch.Tensor:
 # ---- resource lifecycle, driven by hand ------------------------------------
 
 
-def _ctx(rid: str) -> StepContext:
-    return StepContext(request_ids=(rid,), graph_walk="rollout", slot=0, capture=False)
-
-
-def _step(rid: str, frame: int) -> RingKVStep:
-    return RingKVStep(frames=((rid, frame),))
-
-
-def admit_frame(
-    kv: RingKVManager,
-    rid: str,
-    frame: int,
-    attn: AttentionManager | None = None,
-) -> None:
-    """Admit and stage one frame exactly as the engine's resource runner does.
+def admit_frame(kv: RingKVManager, attn: AttentionManager, state: RingHandle, *rids: str) -> SubmoduleStep:
+    """Admit and stage one frame for each of ``rids``, in the row order the
+    batched forward's inputs use, exactly as the engine's resource runner does,
+    and open the step's calls.
 
     KV planning writes the world index read by replay and returns the host ring
     facts the dependent attention plan uses to stage its fixed-address mask.
-    ``attn=None`` is reserved for the standalone fallback diagnostic.
     """
-    ctx = _ctx(rid)
-    outcome = kv.admit(_step(rid, frame), ctx)
-    assert outcome.ok, f"{rid} refused at frame {frame}: {outcome.reason}"
-    ring_plan = kv.plan(_step(rid, frame), ctx)
-    if attn is not None:
-        ctx.plan_results["kv"] = ring_plan
-        attn.plan(AttentionStep(), ctx)
+    step = state_steps(
+        SubmoduleStep(segments=[Segment(rid, "main", kv.tokens_per_frame) for rid in rids], state={"kv": ArrayStep()}),
+        {"kv": state}, graph_walk="rollout",
+    )
+    step.set_ctx(StepContext(request_ids=rids, graph_walk="rollout", slot=0, capture=False))
+    outcome = kv.admit(step.steps["kv"], step.ctx)
+    assert outcome.ok, f"{rids} refused: {outcome.reason}"
+    step.ctx.plan_results["kv"] = kv.plan(step.steps["kv"], step.ctx)
+    attn.plan(step.steps[state.flex_key], step.ctx)
+    step.begin_calls()
+    return step
 
 
-def _batch_ctx(*rids: str) -> StepContext:
-    return StepContext(request_ids=rids, graph_walk="rollout", slot=0, capture=False)
-
-
-def _batch_step(frames: list[tuple[str, int]]) -> RingKVStep:
-    return RingKVStep(frames=tuple(frames))
-
-
-def admit_batch(
-    kv: RingKVManager,
-    frames: list[tuple[str, int]],
-    attn: AttentionManager,
-) -> None:
-    """`admit_frame`'s multi-row form: one step naming every ``(rid, frame)``
-    pair in ``frames``, in the row order the batched forward's inputs use."""
-    ctx = _batch_ctx(*(rid for rid, _ in frames))
-    step = _batch_step(frames)
-    outcome = kv.admit(step, ctx)
-    assert outcome.ok, f"batch {frames} refused: {outcome.reason}"
-    ring_plan = kv.plan(step, ctx)
-    ctx.plan_results["kv"] = ring_plan
-    attn.plan(AttentionStep(), ctx)
+def commit_frame(kv: RingKVManager, step: SubmoduleStep) -> None:
+    """Check the step's calls, count its frames and close it, as the engine ends a step."""
+    step.check_calls()
+    kv.commit(step.steps["kv"], step.ctx)
+    step.end_calls()
 
 
 def scrub(kv: RingKVManager, *rids: str) -> None:
@@ -286,10 +224,10 @@ def test_compile_regions_holds_under_fullgraph():
     future break behind an unbacked symint.
     """
     config = gpu_config()
-    dit, kv, attn = build(config)
+    dit, kv, attn, state = build(config)
     mouse, button, scroll = controls(config)
     kv.ingest_request("r")
-    admit_frame(kv, "r", 0, attn)
+    admit_frame(kv, attn, state, "r")
 
     assert dit.materialize_runtime_tables(DEVICE) is dit
     assert dit.compile_regions() is dit
@@ -387,7 +325,7 @@ def test_compiled_matches_eager_to_four_bf16_ulp_of_peak():
     mouse, button, scroll = controls(config)
 
     def rollout(compiled: bool):
-        dit, kv, attn = build(config, seed=0)
+        dit, kv, attn, state = build(config, seed=0)
         dit.materialize_runtime_tables(DEVICE)
         if compiled:
             dit.compile_regions()
@@ -395,7 +333,7 @@ def test_compiled_matches_eager_to_four_bf16_ulp_of_peak():
         latents = []
         with torch.no_grad():
             for frame in range(frames):
-                admit_frame(kv, "r", frame, attn)
+                step = admit_frame(kv, attn, state, "r")
                 latents.append(
                     dit.generate_frame(
                         noise_for(config, "a2", frame),
@@ -403,7 +341,7 @@ def test_compiled_matches_eager_to_four_bf16_ulp_of_peak():
                         mouse=mouse, button=button, scroll=scroll,
                     ).clone()
                 )
-                kv.commit(_step("r", frame), _ctx("r"))
+                commit_frame(kv, step)
         torch.cuda.synchronize()
         return latents, world_snapshot(kv, kv.session_of("r"))
 
@@ -443,13 +381,13 @@ def captured():
     every test scrubs on entry.
     """
     config = gpu_config()
-    dit, kv, attn = build(config, seed=0, num_sessions=2)
+    dit, kv, attn, state = build(config, seed=0, num_sessions=2)
     dit.materialize_runtime_tables(DEVICE)
     dit.compile_regions()
     mouse, button, scroll = controls(config)
 
     kv.ingest_request("capture")
-    admit_frame(kv, "capture", 0, attn)
+    step = admit_frame(kv, attn, state, "capture")
     static_noise = torch.zeros(1, 1, *config.latent_shape, dtype=DTYPE, device=DEVICE)
     static_frame = torch.zeros(1, dtype=torch.int64, device=DEVICE)
 
@@ -486,6 +424,7 @@ def captured():
             static_latent, static_frame, mouse=mouse, button=button, scroll=scroll
         )
     torch.cuda.synchronize()
+    step.end_calls()
 
     # Warmup and capture wrote real frames into the ring and left the dummy rid
     # holding a world. Asserted here rather than in a test because this is the
@@ -495,7 +434,7 @@ def captured():
         kv.post_warmup_validate()
 
     return {
-        "config": config, "dit": dit, "kv": kv, "attn": attn, "graph": graph,
+        "config": config, "dit": dit, "kv": kv, "attn": attn, "state": state, "graph": graph,
         "noise": static_noise, "frame": static_frame, "out": static_out,
         "prime_graph": prime_graph, "latent": static_latent, "prime_out": prime_out,
         "controls": (mouse, button, scroll),
@@ -505,13 +444,13 @@ def captured():
 def replay_frame(captured, rid: str, frame: int, stream: str) -> torch.Tensor:
     """One frame through the captured graph: stage the world, refill the
     inputs, replay, read the output back before the next replay overwrites it."""
-    admit_frame(captured["kv"], rid, frame, captured["attn"])
+    step = admit_frame(captured["kv"], captured["attn"], captured["state"], rid)
     captured["noise"].copy_(noise_for(captured["config"], stream, frame))
     captured["frame"].fill_(frame)
     captured["graph"].replay()
     torch.cuda.synchronize()
     latent = captured["out"].clone()
-    captured["kv"].commit(_step(rid, frame), _ctx(rid))
+    commit_frame(captured["kv"], step)
     return latent
 
 
@@ -519,7 +458,7 @@ def eager_frame(captured, rid: str, frame: int, stream: str) -> torch.Tensor:
     """The same frame through the same compiled regions, uncaptured: the
     control A.3 needs, since replaying must be compared against the code the
     graph was captured from, not a differently-fused build of it."""
-    admit_frame(captured["kv"], rid, frame, captured["attn"])
+    step = admit_frame(captured["kv"], captured["attn"], captured["state"], rid)
     mouse, button, scroll = captured["controls"]
     with torch.no_grad():
         latent = captured["dit"].generate_frame(
@@ -528,7 +467,7 @@ def eager_frame(captured, rid: str, frame: int, stream: str) -> torch.Tensor:
             mouse=mouse, button=button, scroll=scroll,
         ).clone()
     torch.cuda.synchronize()
-    captured["kv"].commit(_step(rid, frame), _ctx(rid))
+    commit_frame(captured["kv"], step)
     return latent
 
 
@@ -538,13 +477,13 @@ def replay_prime(captured, rid: str, stream: str) -> torch.Tensor:
     The latent stands in for the VAE encoder's output; ``noise_for`` only has to
     be a deterministic function of ``stream`` here, not real pixels.
     """
-    admit_frame(captured["kv"], rid, 0, captured["attn"])
+    step = admit_frame(captured["kv"], captured["attn"], captured["state"], rid)
     captured["latent"].copy_(noise_for(captured["config"], stream, 0))
     captured["frame"].fill_(0)
     captured["prime_graph"].replay()
     torch.cuda.synchronize()
     latent = captured["prime_out"].clone()
-    captured["kv"].commit(_step(rid, 0), _ctx(rid))
+    commit_frame(captured["kv"], step)
     return latent
 
 
@@ -552,7 +491,7 @@ def eager_prime(captured, rid: str, stream: str) -> torch.Tensor:
     """The same prime through the same compiled ``_cache_pass``, uncaptured --
     the control replay must be compared against, for the reason ``eager_frame``
     gives."""
-    admit_frame(captured["kv"], rid, 0, captured["attn"])
+    step = admit_frame(captured["kv"], captured["attn"], captured["state"], rid)
     mouse, button, scroll = captured["controls"]
     with torch.no_grad():
         latent = captured["dit"].append_frame(
@@ -561,14 +500,13 @@ def eager_prime(captured, rid: str, stream: str) -> torch.Tensor:
             mouse=mouse, button=button, scroll=scroll,
         ).clone()
     torch.cuda.synchronize()
-    captured["kv"].commit(_step(rid, 0), _ctx(rid))
+    commit_frame(captured["kv"], step)
     return latent
 
 
 def test_capture_replays_fixed_address_planned_masks(captured):
     """The manual CUDA gate uses the served preplanned-mask path."""
     attn = captured["attn"]
-    assert attn.needs_token_visibility is False
     assert len(attn._planned_masks) == 2
     addresses = {
         key: (
@@ -601,9 +539,10 @@ def test_replay_matches_the_uncaptured_regions_over_two_ring_wraps(captured):
     """
     config = captured["config"]
     kv = captured["kv"]
+    rings = kv.config.layers
     assert ROLLOUT_FRAMES >= 2 * config.local_window
-    assert ROLLOUT_FRAMES >= 2 * config.ring_buckets(3) * config.pinned_dilation(3)
-    assert config.ring_frames(0) != config.ring_frames(3), "the two rings are the same size"
+    assert ROLLOUT_FRAMES >= 2 * rings[3].ring_buckets * rings[3].pinned_dilation
+    assert rings[0].ring_frames != rings[3].ring_frames, "the two rings are the same size"
 
     scrub(kv, "capture")
     kv.post_warmup_validate()
@@ -677,7 +616,7 @@ def test_two_worlds_interleaved_match_the_same_rollouts_run_alone(captured):
 
     Nothing physical separates the worlds -- they share one buffer per layer,
     folded into the token dimension -- so the whole isolation mechanism is the
-    visibility row, and a leak is silent. Both go through the *same* captured
+    planned mask, and a leak is silent. Both go through the *same* captured
     graph, which is also the claim that ``session_idx`` is read at replay
     rather than baked at capture.
     """
@@ -696,8 +635,8 @@ def test_two_worlds_interleaved_match_the_same_rollouts_run_alone(captured):
 
     kv.ingest_request("both_a")
     kv.ingest_request("both_b")
-    admit_frame(kv, "both_a", 0, captured["attn"])
-    admit_frame(kv, "both_b", 0, captured["attn"])
+    admit_frame(kv, captured["attn"], captured["state"], "both_a").end_calls()
+    admit_frame(kv, captured["attn"], captured["state"], "both_b").end_calls()
     assert {kv.session_of("both_a"), kv.session_of("both_b")} == {0, 1}
 
     interleaved = {"A": [], "B": []}
@@ -734,7 +673,7 @@ def test_batched_step_matches_the_same_rollouts_run_one_row_at_a_time():
     config = gpu_config()
     frames = 8
     mouse, button, scroll = controls(config)
-    dit, kv, attn = build(config, seed=0, num_sessions=2)
+    dit, kv, attn, state = build(config, seed=0, num_sessions=2)
     dit.materialize_runtime_tables(DEVICE)
 
     # ---- B=1, alternating: each world through its own single-row forward.
@@ -744,14 +683,14 @@ def test_batched_step_matches_the_same_rollouts_run_one_row_at_a_time():
     with torch.no_grad():
         for frame in range(frames):
             for stream, rid in (("s0", "w0"), ("s1", "w1")):
-                admit_frame(kv, rid, frame, attn)
+                step = admit_frame(kv, attn, state, rid)
                 out = dit.generate_frame(
                     noise_for(config, stream, frame),
                     torch.tensor([frame], dtype=torch.int64, device=DEVICE),
                     mouse=mouse, button=button, scroll=scroll,
                 ).clone()
                 solo_latents[rid].append(out)
-                kv.commit(_step(rid, frame), _ctx(rid))
+                commit_frame(kv, step)
     torch.cuda.synchronize()
     solo_ring = {rid: world_snapshot(kv, kv.session_of(rid)) for rid in ("w0", "w1")}
     scrub(kv, "w0", "w1")
@@ -765,8 +704,7 @@ def test_batched_step_matches_the_same_rollouts_run_one_row_at_a_time():
     batched_latents = {"w0": [], "w1": []}
     with torch.no_grad():
         for frame in range(frames):
-            batch_frames = [("w0", frame), ("w1", frame)]
-            admit_batch(kv, batch_frames, attn)
+            step = admit_frame(kv, attn, state, "w0", "w1")
             noise = torch.cat(
                 [noise_for(config, "s0", frame), noise_for(config, "s1", frame)], dim=0,
             )
@@ -776,7 +714,7 @@ def test_batched_step_matches_the_same_rollouts_run_one_row_at_a_time():
             ).clone()
             batched_latents["w0"].append(out[0:1])
             batched_latents["w1"].append(out[1:2])
-            kv.commit(_batch_step(batch_frames), _batch_ctx("w0", "w1"))
+            commit_frame(kv, step)
     torch.cuda.synchronize()
     batch_ring = {rid: world_snapshot(kv, kv.session_of(rid)) for rid in ("w0", "w1")}
     scrub(kv, "w0", "w1")
@@ -797,8 +735,7 @@ def test_batched_step_matches_the_same_rollouts_run_one_row_at_a_time():
     # bit-exact, or a row is reading another row's data or batch position.
     for rid in ("id0", "id1"):
         kv.ingest_request(rid)
-    identical_frames = [("id0", 0), ("id1", 0)]
-    admit_batch(kv, identical_frames, attn)
+    step = admit_frame(kv, attn, state, "id0", "id1")
     same_noise = noise_for(config, "dup", 0).expand(2, -1, -1, -1, -1).contiguous()
     same_frame_pos = torch.tensor([0, 0], dtype=torch.int64, device=DEVICE)
     with torch.no_grad():
@@ -810,7 +747,7 @@ def test_batched_step_matches_the_same_rollouts_run_one_row_at_a_time():
         "identical inputs on two rows of the same batched call produced different "
         "output; a row is reading something batch-position-dependent"
     )
-    kv.commit(_batch_step(identical_frames), _batch_ctx("id0", "id1"))
+    commit_frame(kv, step)
     scrub(kv, "id0", "id1")
 
 
@@ -913,68 +850,6 @@ def test_prime_then_rollout_through_both_graphs_matches_eager(captured):
         "prime graph wrote nothing the rollout could read"
     )
     scrub(kv, "unprimed")
-
-
-# ---------------------------------------------------------------------------
-# B -- what the BlockMask rebuild costs
-# ---------------------------------------------------------------------------
-
-
-def test_block_mask_rebuild_cost_at_720p(record_property):
-    """A measurement, not a bound: ``FlexAttentionManager.attend`` rebuilds
-    the mask on every call (24 layers x 5 passes = 120 times per frame).
-
-    Reported for the eager path, where the rebuild is host work; under the
-    compiled regions it is traced into the graph instead, so a captured
-    replay pays device time and no host time at all. The block-alignment
-    ``torch.equal`` is timed separately since it's a full sync and also what
-    blocks capture; ``torch.compiler.is_compiling()`` switches it off.
-    """
-    config = waypoint_1_5_1b_720p()
-    kv_len = config.kv_capacity(0)
-    rebuilds = config.n_layers * len(config.scheduler_sigmas)
-    assert (rebuilds, kv_len) == (120, 8704)
-
-    written = torch.zeros(kv_len, dtype=torch.bool, device=DEVICE)
-    frames = written.view(-1, config.tokens_per_frame)
-    frames[:9] = True   # nine committed frames of history
-    frames[-1] = True   # the scratch tail is always visible
-
-    def measure(fn, repeats: int) -> float:
-        for _ in range(3):
-            fn()
-        torch.cuda.synchronize()
-        start = time.perf_counter()
-        for _ in range(repeats):
-            fn()
-        torch.cuda.synchronize()
-        return (time.perf_counter() - start) / repeats * 1e3
-
-    blocks = written.view(-1, 128)
-    per_frame = measure(
-        lambda: [make_block_mask(config.tokens_per_frame, kv_len, written)
-                 for _ in range(rebuilds)],
-        repeats=20,
-    )
-    # The block-alignment assert, alone. It is a device-to-host sync, so it is
-    # both the largest single line in the rebuild and the reason a capture of
-    # the eager path is impossible.
-    sync = measure(lambda: torch.equal(blocks.any(-1), blocks.all(-1)), repeats=200)
-    cached = per_frame / rebuilds * config.n_layers
-
-    record_property("block_mask_ms_per_frame", per_frame)
-    print(f"\n[Gate B] {rebuilds} eager BlockMask rebuilds per frame: {per_frame:.2f} ms "
-          f"({per_frame / rebuilds * 1e3:.0f} us each), q={config.tokens_per_frame} kv={kv_len}"
-          f"\n[Gate B] of which the block-alignment sync: {sync * rebuilds:.2f} ms"
-          f"\n[Gate B] a (layer, frame) cache would leave {config.n_layers} rebuilds: "
-          f"{cached:.2f} ms, saving {per_frame - cached:.2f} ms/frame")
-
-    # The mask itself is what the timing is about, so assert it is the right one:
-    # exactly the written blocks, and nothing partial.
-    mask = make_block_mask(config.tokens_per_frame, kv_len, written)
-    visible = int(written.view(-1, 128).any(-1).sum())
-    assert int(mask.full_kv_num_blocks[0, 0, 0]) == visible == 10 * 4
-    assert int(mask.kv_num_blocks.sum()) == 0
 
 
 # ---------------------------------------------------------------------------

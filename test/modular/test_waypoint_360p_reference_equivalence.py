@@ -48,8 +48,8 @@ from test_waypoint_reference_equivalence import (
 
 from mstar.model.waypoint.components.taehv import (
     decode_latent,
+    decoder_history_shapes,
     encode_seed_clip,
-    initial_decoder_histories,
     load_taehv,
 )
 from mstar.model.waypoint.config import waypoint_1_5_1b_360p
@@ -191,10 +191,11 @@ def test_360p_reference_compat_is_bit_exact_end_to_end():
         with _stage_capture(_stage_modules(reference["model"], is_port=False), reference_stages):
             expected = _reference_forward(reference, reference_seed.unsqueeze(1), sigma_value, idle, commit=commit)
         port_stages: dict[str, torch.Tensor] = {}
-        _admit(port, 0)
+        _admit(port)
         with _stage_capture(_stage_modules(port["dit"], is_port=True), port_stages):
             actual = _port_forward(port, functional_seed.unsqueeze(1), sigma_value, idle, 0, commit=commit)
-        _commit(port, 0)
+        if commit:
+            _commit(port)
         divergent = _divergent_stages(reference_stages, port_stages, stage_names)
         gap, relative = _deviation(expected, actual)
         print(f"stages sigma={sigma_value}: divergent={len(divergent)}/30 output maxabs={gap:.4e} rel={relative:.4e}")
@@ -204,7 +205,9 @@ def test_360p_reference_compat_is_bit_exact_end_to_end():
 
     _new_request(port)
     _reset(port, reference)
-    histories = initial_decoder_histories(ae, functional_seed)
+    histories = tuple(
+        functional_seed.new_zeros(1, *shape) for shape in decoder_history_shapes(*functional_seed.shape[-2:])
+    )
     sigmas = torch.tensor(list(reference["cfg"].scheduler_sigmas), dtype=DTYPE, device=DEVICE)
     noise_generator = torch.Generator(device="cpu").manual_seed(NOISE_SEED)
     frame_shape = (
@@ -232,9 +235,9 @@ def test_360p_reference_compat_is_bit_exact_end_to_end():
             expected = reference_seed.unsqueeze(1)
             actual = functional_seed.unsqueeze(1)
             expected_velocity = _reference_forward(reference, expected, 0.0, ctx, commit=True)
-            _admit(port, 0)
+            _admit(port)
             actual_velocity = _port_forward(port, actual, 0.0, ctx, 0, commit=True)
-            _commit(port, 0)
+            _commit(port)
             pass_outputs = [(expected_velocity, actual_velocity)]
         else:
             buttons, mouse, scroll = CONTROL_SEQUENCE[frame - 1]

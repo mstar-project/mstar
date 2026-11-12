@@ -23,31 +23,23 @@ spends ``frames_to_trim`` of temporal memory priming itself, so an
 encode-only prime would leave every rollout frame quietly drifting from the
 reference. The reconstructed seed frames are never sent to the client.
 
-The world state is the ring KV cache, an engine resource
-(``get_node_resources`` below) rather than a model-owned buffer, since a
-per-request ring cannot survive CUDA-graph capture.
-
-``num_sessions`` (resident worlds) and ``max_batch_size`` (rows sharing one
-forward step, set by ``step_batch_size <= num_sessions``) are separate knobs.
+The world state is declared (``declare_state`` below): the K/V of each
+frame, which the engine keeps in a ring of frames per layer, and the
+decoder's histories. ``num_sessions`` (resident worlds) and
+``max_batch_size`` (rows sharing one forward step, set by
+``step_batch_size <= max_concurrent_requests``) are separate knobs.
 """
 
 import logging
 import math
 from dataclasses import replace
+from typing import Any
 
 import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import DEFAULT_PARTITION
-from mstar.engine.resources import (
-    AttentionConfig,
-    AttentionSpec,
-    AttnBackend,
-    KVSpec,
-    NodeResourceSpec,
-    RingKVConfig,
-    RingKVLayerConfig,
-)
+from mstar.engine.state import Array, Attend, Entry, FrameWindow, KVEntry, Positions, Read, TensorType, Value
 from mstar.graph.base import (
     GraphEdge,
     GraphNode,
@@ -60,6 +52,8 @@ from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import ClientChunk, Model, TensorAndMetadata, WalkStep
 from mstar.model.media_limits import read_image
 from mstar.model.submodule_base import NodeSubmodule
+from mstar.model.utils import check_kv_pools_fit
+from mstar.model.waypoint.components.taehv import decoder_history_shapes
 from mstar.model.waypoint.config import (
     WAYPOINT_VARIANT_360P,
     WAYPOINT_VARIANT_720P,
@@ -68,11 +62,10 @@ from mstar.model.waypoint.config import (
     waypoint_1_5_1b_360p,
     waypoint_1_5_1b_720p,
 )
-from mstar.model.waypoint.ring_geometry import describe_ring_memory
 from mstar.model.waypoint.submodules import (
     ACTIONS_STREAM,
-    ATTN_RESOURCE,
-    KV_RESOURCE,
+    DECODER,
+    KV,
     PRIME_WALK,
     ROLLOUT_LOOP_NAME,
     ROLLOUT_WALK,
@@ -86,6 +79,8 @@ logger = logging.getLogger(__name__)
 
 DIT_NODE = "dit"
 VAE_ENCODER_NODE = "vae_encoder"
+# what the TAEHV weights, and so the decoder's histories, are held in
+AE_DTYPE = torch.bfloat16
 
 _VARIANT_FACTORIES = {
     WAYPOINT_VARIANT_720P: waypoint_1_5_1b_720p,
@@ -114,7 +109,6 @@ class WaypointModel(Model):
         compile_dit: bool | None = None,
         accelerator_graph: bool | None = None,
         capture_dit_prime: bool | None = None,
-        full_global_ring: bool | None = None,
         step_batch_size: int | None = None,
         checkpoint_revision: str | None = None,
         ae_revision: str | None = None,
@@ -141,7 +135,6 @@ class WaypointModel(Model):
                 "compile_dit": compile_dit,
                 "accelerator_graph": accelerator_graph,
                 "capture_dit_prime": capture_dit_prime,
-                "full_global_ring": full_global_ring,
                 "step_batch_size": step_batch_size,
                 "seed_capture_sizes": seed_capture_sizes,
             }.items() if value is not None
@@ -167,57 +160,35 @@ class WaypointModel(Model):
     # Model ABC: structure
     # ------------------------------------------------------------------
 
-    def get_node_resources(self) -> list[NodeResourceSpec]:
-        """The ring KV cache holding the world, and the FlexAttention over it.
-
-        Ring geometry is copied out of ``WaypointConfig`` layer by layer since
-        Waypoint's layers are not alike (six global layers hold 16 frames
-        spaced 8 apart, the other eighteen hold 16 consecutive frames), so
-        ``ring_frames`` and ``ring_buckets`` cannot be derived from one another.
-
-        FlexAttention rather than the paged FlashInfer default: a paged kernel
-        changes the KV accumulation order, and a mask/position bug here would
-        not raise, it would just drift the video. Bit-exactness against the
-        reference is the only check there is.
-        """
-        ring_config = RingKVConfig(
-            num_layers=self.config.n_layers,
-            num_kv_heads=self.config.n_kv_heads,
-            num_qo_heads=self.config.n_heads,
-            head_dim=self.config.d_head,
-            tokens_per_frame=self.config.tokens_per_frame,
-            layers=tuple(
-                RingKVLayerConfig(
-                    ring_frames=self.config.ring_frames(i),
-                    ring_buckets=self.config.ring_buckets(i),
-                    pinned_dilation=self.config.pinned_dilation(i),
-                )
-                for i in range(self.config.n_layers)
-            ),
-            # Resident session count, not the step batch (that's
-            # ``max_batch_size``/``step_batch_size``). Default 1; a deployment
-            # raises it via ``resources: {kv: {num_sessions: N}}`` along with
-            # ``max_concurrent_requests`` (see ``validate_config_yaml``).
-            num_sessions=1,
-        )
-        # Logged since nothing downstream prints this ~816 MiB/world cost.
-        # Uses the DECLARED num_sessions: `apply_yaml_overrides` may still
-        # raise it after this hook returns.
-        logger.info(
-            "%s", describe_ring_memory(self.config, num_sessions=ring_config.num_sessions)
-        )
+    def declare_state(self) -> list[Array]:
+        """The world: each frame's K/V, which local layers read over the last ``local_window`` frames and global layers
+        over every ``global_pinned_dilation``-th frame of the last ``global_window``. And the decoder's nine histories,
+        whose shapes follow the latent grid."""
+        cfg = self.config
+        attend = Attend(q_heads=cfg.n_heads)
+        local = frozenset(range(cfg.n_layers)) - cfg.global_layers
+        reads = {"local_attn": Read(
+            mask=FrameWindow(cfg.tokens_per_frame, frames=cfg.local_window), op=attend, layers=local, packed=False,
+        )}
+        if cfg.global_layers:
+            reads["global_attn"] = Read(
+                mask=FrameWindow(cfg.tokens_per_frame, frames=cfg.global_window, stride=cfg.global_pinned_dilation),
+                op=attend, layers=cfg.global_layers, packed=False,
+            )
+        histories = decoder_history_shapes(cfg.latent_height, cfg.latent_width)
         return [
-            KVSpec(
-                resource_key=KV_RESOURCE, nodes={DIT_NODE}, config=ring_config,
-            ),
-            AttentionSpec(
-                resource_key=ATTN_RESOURCE,
-                nodes={DIT_NODE},
-                config=AttentionConfig(
-                    kv_cache=KV_RESOURCE, backend=AttnBackend.FLEX,
-                ),
-            ),
+            # the seed frame, then at most max_frames rollout frames
+            Array(KV, nodes={DIT_NODE}, layers=frozenset(range(cfg.n_layers)),
+                  entry=KVEntry(heads=cfg.n_kv_heads, head_dim=cfg.d_head),
+                  max_len=(1 + cfg.max_frames) * cfg.tokens_per_frame, reads=reads, positions=Positions()),
+            Value(DECODER, nodes={DIT_NODE}, layers=frozenset({0}), entry=Entry({
+                f"history_{idx}": TensorType(shape, dtype=AE_DTYPE) for idx, shape in enumerate(histories)
+            })),
         ]
+
+    def kernel_settings(self) -> dict[str, dict[str, Any]]:
+        # the ring's default single session, and the pool's sink slot
+        return {DECODER: {"max_slots": 2}}
 
     def _emit_frames(self) -> GraphEdge:
         return GraphEdge(
@@ -244,8 +215,8 @@ class WaypointModel(Model):
         ])
 
         # rollout: one frame decoded and emitted per action row, from a single
-        # node. The "clock" self loop-back carries no data (frame_pos lives in
-        # host state); it only makes the dit a same-node speculation target
+        # node. The "clock" self loop-back carries no data (the ring counts the
+        # frames); it only makes the dit a same-node speculation target
         # (GraphNode.is_ready_for_speculation). The loop ends with the actions
         # stream: on its last row, or on the empty chunk the dit declines when
         # the stream's end arrives after its last row. A speculative step past
@@ -282,61 +253,30 @@ class WaypointModel(Model):
         ])
 
     def validate_config_yaml(self, config: dict, config_path: str) -> None:
-        """Refuse to serve unless the deployment caps concurrency at the number
-        of worlds the ring was sized for.
+        """Refuse to serve unless the deployment caps concurrency at what the
+        world's pools hold.
 
-        The primary gate on the world pool: a world is claimed at ``admit``,
-        and the conductor's FIFO admit queue (only active when
-        ``max_concurrent_requests`` is set) is what keeps arrivals inside the
-        pool. ``max_batch_size``/``step_batch_size`` caps a step's row count,
-        not how many worlds may exist, so it does not substitute for this
-        check.
+        A world is claimed at ``admit``, and the conductor's FIFO admit queue
+        (only active when ``max_concurrent_requests`` is set) is what keeps
+        arrivals inside the pools. ``step_batch_size`` caps a step's rows, and
+        a step's rows are requests, so a cap that fits the pools bounds it too.
         """
-        # Same block ``EngineManager.build`` feeds to
-        # ``apply_yaml_overrides``, so the gate and the allocation agree.
-        overrides = (config.get("resources") or {}).get(KV_RESOURCE) or {}
-        num_sessions = overrides.get("num_sessions", 1)
-        if (
-            not isinstance(num_sessions, int)
-            or isinstance(num_sessions, bool)
-            or num_sessions < 1
-        ):
-            raise ValueError(
-                f"Waypoint requires `resources.{KV_RESOURCE}.num_sessions` in "
-                f"{config_path} to be a positive int; got {num_sessions!r}."
-            )
         limit = config.get("max_concurrent_requests")
         if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
             raise ValueError(
                 f"Waypoint requires `max_concurrent_requests` in {config_path} to be "
-                f"a positive int; got {limit!r}. The DiT node holds "
-                f"{num_sessions} live world(s) in a fixed ring buffer, and the "
-                "conductor's FIFO admit queue — which exists only when this key "
-                "is set — is what keeps arrivals inside that pool. max_batch_size "
-                "alone does not: it caps a step, not the number of requests on "
-                "the node."
+                f"a positive int; got {limit!r}. The DiT node holds each live "
+                "world in a fixed ring, and the conductor's FIFO admit queue — which "
+                "exists only when this key is set — is what keeps arrivals inside "
+                "it. max_batch_size alone does not: it caps a step, not the number "
+                "of requests on the node."
             )
-        if limit > num_sessions:
-            raise ValueError(
-                f"`max_concurrent_requests: {limit}` in {config_path} exceeds the "
-                f"{num_sessions} world(s) the ring is sized for. Every request past "
-                "the pool fails terminally at admit — there is nothing to evict. "
-                f"Set `resources.{KV_RESOURCE}.num_sessions` to {limit} to match, at "
-                "the cost of ~816 MiB of ring per world at 720P."
-            )
-        if limit < num_sessions:
-            logger.warning(
-                "Waypoint ring is sized for %d worlds but max_concurrent_requests "
-                "is %d: %d world(s) of ring (~816 MiB each at 720P) are allocated "
-                "and can never be filled.",
-                num_sessions, limit, num_sessions - limit,
-            )
-        if self.config.step_batch_size > num_sessions:
+        check_kv_pools_fit(self, config, config_path, logger)
+        if self.config.step_batch_size > limit:
             raise ValueError(
                 f"`step_batch_size: {self.config.step_batch_size}` exceeds "
-                f"`resources.{KV_RESOURCE}.num_sessions: {num_sessions}` in "
-                f"{config_path}. A step cannot batch more rows than there are "
-                "resident worlds to supply them."
+                f"`max_concurrent_requests: {limit}` in {config_path}. A step "
+                "cannot batch more rows than there are requests to supply them."
             )
 
     # ------------------------------------------------------------------
