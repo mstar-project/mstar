@@ -612,7 +612,9 @@ class WithinStepAttend(OpBinding, ABC):
     """`Attend` within a step, over the step's own adds."""
 
     # the model's settings are for the ragged kernel, whichever binding the deployment picks
-    kernel_settings = frozenset({"max_segments_per_request", "max_segments_per_step", "compile_op", "workspace_mb"})
+    kernel_settings = frozenset({
+        "max_segments_per_request", "max_segments_per_step", "compile_op", "workspace_mb", "ulysses_head_groups",
+    })
     # whether the read runs a plan its step builds, so its resource has a spec and its calls need the step open
     plans: ClassVar[bool]
 

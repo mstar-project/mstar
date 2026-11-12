@@ -140,6 +140,7 @@ def _wan_reference() -> list:
             config=RaggedAttentionConfig(
                 num_qo_heads=c.num_attention_heads, num_kv_heads=c.num_attention_heads,
                 head_dim=c.attention_head_dim, max_segments_per_request=2, compile_op=True, dtype=torch.bfloat16,
+                ulysses_head_groups=2,
             ),
         ),
         SeqShardSpec(resource_key=WAN_SHARD, nodes={"dit"}, labels=("main",), axis=1),
