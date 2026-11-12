@@ -60,3 +60,18 @@ def test_a_per_request_ceiling_on_a_per_step_resource_is_refused(declared, overr
     spec.config.max_segments_per_step = declared
     with pytest.raises(ValueError, match="max_segments_per_step"):
         spec.apply_yaml_overrides(**override)
+
+
+def test_a_deployment_sets_the_ulysses_head_groups():
+    spec = _spec()
+    assert spec.config.ulysses_head_groups == 1
+    spec.apply_yaml_overrides(ulysses_head_groups=3)
+    assert spec.config.ulysses_head_groups == 3
+
+
+@pytest.mark.parametrize("bad", [0, -2, True, 1.5, "2"])
+def test_ulysses_head_groups_must_be_a_positive_int(bad):
+    with pytest.raises(ValueError, match="ulysses_head_groups"):
+        _spec().apply_yaml_overrides(ulysses_head_groups=bad)
+    with pytest.raises(ValueError, match="ulysses_head_groups"):
+        RaggedAttentionConfig(num_qo_heads=2, num_kv_heads=2, head_dim=128, ulysses_head_groups=bad)
