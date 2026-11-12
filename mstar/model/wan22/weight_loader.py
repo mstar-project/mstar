@@ -9,7 +9,7 @@ The checkpoint is fp32 throughout. The copy applies the same round-to-nearest bf
 downcast that a ``torch_dtype=bfloat16`` load would, and copies the fp32 islands
 exactly, so the loaded bits match the diffusers module parameter for parameter.
 
-Key remap (checkpoint -> native), 825 keys, bijective:
+Key remap (checkpoint -> native), bijective (825 keys on TI2V-5B, 1095 on each A14B expert):
 
     condition_embedder.{time,text}_embedder.linear_{1,2}  -> .linear_{in,out}
     blocks.N.ffn.net.0.proj / .net.2                      -> .ffn.linear_{in,out}
@@ -19,7 +19,11 @@ Key remap (checkpoint -> native), 825 keys, bijective:
 
 Completeness is a hard contract: a checkpoint key that reaches no parameter, or a
 parameter no key reached, raises. A silently skipped weight is a wrong-output bug,
-not a warning.
+not a warning. So is a transformer whose config.json is not the variant's: a
+TI2V-5B config pointed at the A14B checkpoint (or the reverse) raises before any
+weight loads.
+
+T2V-A14B's two experts load the same way, from ``transformer`` and ``transformer_2``.
 """
 
 import json
@@ -53,20 +57,57 @@ def remap_checkpoint_key(name: str) -> str:
     return name
 
 
-def resolve_transformer_dir(model_path_hf: str, cache_dir: str | None = None) -> Path:
+# transformer/config.json key -> the Wan22Config field it must equal
+_CONFIG_FIELDS = {
+    "num_attention_heads": "num_attention_heads",
+    "attention_head_dim": "attention_head_dim",
+    "num_layers": "num_layers",
+    "ffn_dim": "ffn_dim",
+    "in_channels": "in_channels",
+    "out_channels": "out_channels",
+    "text_dim": "text_dim",
+    "freq_dim": "freq_dim",
+}
+
+
+def resolve_transformer_dir(
+    model_path_hf: str, cache_dir: str | None = None, subfolder: str = "transformer",
+) -> Path:
     """Local directory holding the transformer's safetensors shards. A local
     checkpoint path is used as-is; a hub id resolves through the HF cache
     (the Wan2.2 snapshot already lives there — same resolution the wrapped
     components' ``from_pretrained`` used)."""
     local = Path(model_path_hf)
     if local.is_dir():
-        return local / "transformer"
+        return local / subfolder
     from huggingface_hub import snapshot_download
 
     snapshot = snapshot_download(
-        model_path_hf, allow_patterns=["transformer/*"], cache_dir=cache_dir
+        model_path_hf, allow_patterns=[f"{subfolder}/*"], cache_dir=cache_dir
     )
-    return Path(snapshot) / "transformer"
+    return Path(snapshot) / subfolder
+
+
+def check_transformer_config(config: Wan22Config, transformer_dir: Path) -> None:
+    """Raise if the checkpoint's transformer config.json disagrees with ``config``
+    on a dimension the native DiT is built from (a variant pointed at another
+    variant's checkpoint). A checkpoint without a config.json is not checked."""
+    path = transformer_dir / "config.json"
+    if not path.exists():
+        return
+    with open(path) as f:
+        checkpoint = json.load(f)
+    drift = {
+        key: (checkpoint[key], getattr(config, field))
+        for key, field in _CONFIG_FIELDS.items()
+        if key in checkpoint and checkpoint[key] != getattr(config, field)
+    }
+    if drift:
+        raise ValueError(
+            f"Wan2.2 variant {config.variant!r} does not match the checkpoint at {transformer_dir}: "
+            + ", ".join(f"{key}={ckpt} (variant has {ours})" for key, (ckpt, ours) in drift.items())
+            + ". Set model_kwargs variant to the checkpoint's, or model_path_hf to the variant's checkpoint."
+        )
 
 
 def _iter_transformer_shards(transformer_dir: Path, device: torch.device | str):
@@ -99,10 +140,13 @@ def build_wan22_dit(
     model_path_hf: str,
     device: torch.device | str = "cpu",
     cache_dir: str | None = None,
+    subfolder: str = "transformer",
 ) -> Wan22DiT:
-    """Meta-build, materialize on ``device``, and load the checkpoint into a
+    """Meta-build, materialize on ``device``, and load the checkpoint's
+    ``subfolder`` (A14B's low-noise expert is ``transformer_2``) into a
     ready-to-serve (eval-mode) native DiT."""
-    transformer_dir = resolve_transformer_dir(model_path_hf, cache_dir)
+    transformer_dir = resolve_transformer_dir(model_path_hf, cache_dir, subfolder)
+    check_transformer_config(config, transformer_dir)
 
     with torch.device("meta"):
         dit = Wan22DiT(config)
