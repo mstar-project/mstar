@@ -8,9 +8,16 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-from mstar.engine.resources import AttentionStep, RaggedAttentionConfig, Segment, StepContext
+from mstar.engine.resources import (
+    AttentionStep,
+    RaggedAttentionConfig,
+    RaggedCrossAttentionStep,
+    Segment,
+    StepContext,
+)
 from mstar.engine.resources.attn.ragged.dense import DenseRaggedManager
 from mstar.engine.resources.attn.ragged.dense_wrappers import DenseRaggedPrefillWrapper
+from mstar.engine.resources.attn.ragged.flashinfer import FlashInferRaggedCrossManager
 from mstar.engine.resources.attn.ragged.wrappers import (
     SUPPORTED_HEAD_DIMS,
     FlashInferRaggedPrefillWrapper,
@@ -204,3 +211,17 @@ def test_a_ragged_wrapper_does_not_replan_an_unchanged_layout(monkeypatch):
     plan(64, 32, causal=True)
     plan(64, 33)
     assert len(planned) == 4
+
+
+def test_cross_pair_with_both_sides_split_is_refused_at_its_first_split_step():
+    # a hand-written spec: only the split step knows both labels split (load checks state-contract reads)
+    from mstar.engine.resources.sequence_shard import SeqRange, SeqShardPlan
+
+    manager = object.__new__(FlashInferRaggedCrossManager)
+    manager._kv_labels = {}
+    group = SimpleNamespace(rank=0)
+    plan = SeqShardPlan(True, {"video": SeqRange(group, (8, 8), 2), "text": SeqRange(group, (2, 2), 2)})
+    segments = (Segment("r0", "video", 16), Segment("r0", "text", 4))
+    step = RaggedCrossAttentionStep(segments=segments, pairs=(("video", "text"),))
+    with pytest.raises(ValueError, match="splits both sides"):
+        manager._plan_layouts(step, StepContext(request_ids=["r0"], graph_walk="w", slot=0, capture=False), {}, plan)

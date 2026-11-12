@@ -683,11 +683,13 @@ class _RaggedCrossManagerBase(_RaggedManagerBase, RaggedCrossAttnManager):
             label = cross_label(q_label, kv_label)
             self._kv_labels[label] = kv_label
             if split:
-                # a pair with both sides split is refused at load (`split_read_problems`)
+                # load refuses this pair for a read declared through the state contract
+                # (`split_read_problems`); a hand-written spec reaches here at its first split step
                 q_range, kv_range = shard_plan.ranges.get(q_label), shard_plan.ranges.get(kv_label)
-                assert q_range is None or kv_range is None, (
-                    f"cross-attention {q_label!r} <- {kv_label!r} splits both sides, which no exchange serves"
-                )
+                if q_range is not None and kv_range is not None:
+                    raise ValueError(
+                        f"cross-attention {q_label!r} <- {kv_label!r} splits both sides, which no exchange serves"
+                    )
                 if q_range is not None:
                     # each rank's queries over every key, each replicated; load refuses a packed
                     # (axis 0) split, so each row keeps ``count`` of its queries

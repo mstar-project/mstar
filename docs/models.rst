@@ -2351,7 +2351,8 @@ On SDPA the nodes' modules, driven by ``test/minimax_h3/parity.py`` (fp32 matmul
 "highest"), were bit-identical to diffusers' MiniMax-H3 pipeline end to end (latents, frames,
 waveform), measured at ``f6260f2677``; with ``--exact`` the script exits nonzero when one isn't.
 FA3 and the compiled DiT are not bit-exact. Served at 768p (50 steps, SP2 on H200, three
-seeds), clips are 23.7-32.8 dB (video) and 17.8-22.3 dB (audio) from diffusers', where the
+seeds), measured on main's earlier SP path, before the DiT and the decoder moved onto the sequence
+shard, clips are 23.7-32.8 dB (video) and 17.8-22.3 dB (audio) from diffusers', where the
 reference on another SDPA kernel is 23.5-33.1 and 21.6-22.3 dB from itself; per seed, the
 served clip is below that spread on one seed's video and another's audio.
 
