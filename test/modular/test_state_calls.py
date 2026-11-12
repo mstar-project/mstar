@@ -1,7 +1,7 @@
 """A layer reaches declared state through a handle.
 
-The order of a step's calls is the contract: a read sees this layer's add, and an add after a read would change what an
-earlier layer read. Nothing in a kernel would notice a broken order, so each rule raises here, naming the array and the
+The order of a step's calls is the contract: a read sees this layer's latest add, and nothing adds to a layer after
+its kept add. Nothing in a kernel would notice a broken order, so each rule raises here, naming the array and the
 cause, in eager steps and at capture. A replay runs no Python, so it skips all of them.
 """
 
@@ -545,13 +545,17 @@ def test_an_add_after_a_kept_add_raises():
     _refused(r"Array 'kv': an add on layer 0 after its kept add", lambda: h.add(0, k=k, v=v))
 
 
-def test_a_kept_add_after_a_read_in_the_same_layer_raises():
+def test_the_kept_add_may_follow_a_read():
+    """A world model's chunk step runs scratch passes, each an add and a read, then one kept pass in the same layers."""
     h = _kv_handle()
-    _begin(h)
+    step = _begin(h)
     q, k, v = _tensors()
-    h.add(0, keep=False, k=k, v=v)
-    h.read(0, q)
-    _refused(r"Array 'kv': a kept add on layer 0 after a read in the same layer", lambda: h.add(0, k=k, v=v))
+    for layer in range(LAYERS):
+        h.add(layer, keep=False, k=k, v=v)
+        h.read(layer, q)
+        h.add(layer, k=k, v=v)
+        h.read(layer, q)
+    h.check_step(step)
 
 
 def test_a_scratch_add_after_a_read_starts_another_pass():
@@ -800,17 +804,11 @@ def _added(h, q, k, v):
     h.add(0, k=k, v=v)
 
 
-def _added_and_read(h, q, k, v):
-    h.add(0, keep=False, k=k, v=v)
-    h.read(0, q)
-
-
 @pytest.mark.parametrize(("setup", "layer", "keep", "with_q", "mask_args", "cause"), [
     (None, LAYERS + 1, None, True, {}, f"add on layer {LAYERS + 1}, which the array doesn't declare"),
     (_added, 0, None, True, {}, "an add on layer 0 after its kept add"),
     # both calls would refuse, and the add's check runs first
     (_added, 0, None, False, {}, "an add on layer 0 after its kept add"),
-    (_added_and_read, 0, None, True, {}, "a kept add on layer 0 after a read in the same layer"),
     (None, 0, None, False, {}, "no layout yet: a read with no op"),
     (None, 0, None, True, {"top_k": 3}, r"no layout yet: mask arguments \['top_k'\]"),
 ])
