@@ -142,7 +142,8 @@ def test_a_rebuild_refuses_a_kept_window_on_its_decode_walks():
     kept = _array(reads={"attn": _read(Bidirectional(kept_window=True), walks={"decode"})})
     assert state_declaration_problems(_Model(kept, rebuilt=True)) == [
         "Array 'kv'.reads['attn']: Bidirectional on walk 'decode', which dit's rebuild policy replaces with its "
-        "prefill rows. A Block or Bidirectional read sees each step's adds as a whole, so drop the rebuild policy"
+        "prefill rows. A kept window cuts other entries from a prefill row than from the steps it replaces, so drop "
+        "the rebuild policy"
     ]
     plain = _array(reads={"attn": _read(Bidirectional(), walks={"decode"})})
     assert state_declaration_problems(_Model(plain, rebuilt=True)) == [], (
