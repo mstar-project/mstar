@@ -33,7 +33,7 @@ import torch
 sys.path.insert(0, ".")
 
 from mstar.conductor.request_info import CurrentForwardPassInfo  # noqa: E402
-from mstar.model.components.diffusion.qwen3.submodule import TEXT_INPUTS, Qwen3TextEncoderSubmodule  # noqa: E402
+from mstar.model.components.diffusion.qwen.submodule import TEXT_INPUTS, QwenTextEncoderSubmodule  # noqa: E402
 from mstar.model.flux2_klein.config import DENOISE_LOOP, Flux2KleinConfig  # noqa: E402
 from mstar.model.flux2_klein.flux2_klein_model import IMAGE_EDIT_WALK, IMAGE_GEN_WALK, Flux2KleinModel  # noqa: E402
 from mstar.model.flux2_klein.submodules import (  # noqa: E402
@@ -122,7 +122,7 @@ def _engine_inputs() -> ModelInputsFromEngine:
     return ModelInputsFromEngine(request_ids=["oracle"], per_request_info={})
 
 
-def _encode_rows(text: Qwen3TextEncoderSubmodule, walk: str, rows: list[NodeInputs]) -> list[torch.Tensor]:
+def _encode_rows(text: QwenTextEncoderSubmodule, walk: str, rows: list[NodeInputs]) -> list[torch.Tensor]:
     """Each prepared row's ``text_embeds`` from one batched call, the node's only output
     path (Z-Image's encoder tests share it)."""
     rids = [f"r{i}" for i in range(len(rows))]
@@ -132,7 +132,7 @@ def _encode_rows(text: Qwen3TextEncoderSubmodule, walk: str, rows: list[NodeInpu
     return [unpacked[rid][TEXT_EMBEDS][0] for rid in rids]
 
 
-def _text_embeds(text: Qwen3TextEncoderSubmodule, walk: str, ids: torch.Tensor) -> torch.Tensor:
+def _text_embeds(text: QwenTextEncoderSubmodule, walk: str, ids: torch.Tensor) -> torch.Tensor:
     """One prompt's ``text_embeds`` through the node's own padding and forward."""
     return _encode_rows(text, walk, [text.prepare_inputs(walk, None, {TEXT_INPUTS: [ids]})])[0]
 
@@ -150,7 +150,7 @@ def _load_png(path: Path) -> torch.Tensor:
 
 
 def test_text_encoder_matches_oracle(model, meta):
-    sub: Qwen3TextEncoderSubmodule = model.get_submodule("text_encoder", device=DEVICE)
+    sub: QwenTextEncoderSubmodule = model.get_submodule("text_encoder", device=DEVICE)
     with torch.no_grad():
         embeds = _text_embeds(sub, IMAGE_GEN_WALK, model.tokenize(meta["prompt"])).cpu()
     expected = torch.load(ORACLE_DIR / "t2i" / "prompt_embeds.pt")
@@ -172,7 +172,7 @@ def test_initial_noise_matches_oracle(model, meta):
 
 
 def test_denoise_trajectory_and_image_match_oracle(model, meta):
-    text: Qwen3TextEncoderSubmodule = model.get_submodule("text_encoder", device=DEVICE)
+    text: QwenTextEncoderSubmodule = model.get_submodule("text_encoder", device=DEVICE)
     dit: KleinDenoiseSubmodule = model.get_submodule("dit", device=DEVICE)
     decoder: KleinVaeDecoderSubmodule = model.get_submodule("vae_decoder", device=DEVICE)
     with torch.no_grad():
@@ -206,7 +206,7 @@ def test_edit_trajectory_and_image_match_oracle(model, meta):
     oracle; reference latents, text embeddings, every Euler step and the final image must match."""
     if "edit_prompt" not in meta:
         pytest.skip("oracle recorded with --skip-edit")
-    text: Qwen3TextEncoderSubmodule = model.get_submodule("text_encoder", device=DEVICE)
+    text: QwenTextEncoderSubmodule = model.get_submodule("text_encoder", device=DEVICE)
     encoder: KleinVaeEncoderSubmodule = model.get_submodule("vae_encoder", device=DEVICE)
     dit: KleinDenoiseSubmodule = model.get_submodule("dit", device=DEVICE)
     decoder: KleinVaeDecoderSubmodule = model.get_submodule("vae_decoder", device=DEVICE)
@@ -249,7 +249,7 @@ def test_multi_reference_edit_matches_oracle(model, meta):
     every reference's latents in request order, the ids ``(10(i+1), h, w, 0)`` per grid, every step and the image."""
     if "edit_multi_prompt" not in meta:
         pytest.skip("oracle recorded without --refs N")
-    text: Qwen3TextEncoderSubmodule = model.get_submodule("text_encoder", device=DEVICE)
+    text: QwenTextEncoderSubmodule = model.get_submodule("text_encoder", device=DEVICE)
     encoder: KleinVaeEncoderSubmodule = model.get_submodule("vae_encoder", device=DEVICE)
     dit: KleinDenoiseSubmodule = model.get_submodule("dit", device=DEVICE)
     decoder: KleinVaeDecoderSubmodule = model.get_submodule("vae_decoder", device=DEVICE)

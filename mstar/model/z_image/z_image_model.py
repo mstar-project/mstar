@@ -31,7 +31,7 @@ from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import Model, WalkStep
 from mstar.model.components.diffusion.attention import dit_entry, refuse_attention_backend_kwarg
 from mstar.model.components.diffusion.image_io import OUTPUT_FORMAT_KWARGS, encode_image, image_output_format
-from mstar.model.components.diffusion.qwen3.submodule import TEXT_INPUTS
+from mstar.model.components.diffusion.qwen.submodule import TEXT_INPUTS
 from mstar.model.components.quant_linear import (
     check_linear_dtype,
     check_linear_dtype_steps,

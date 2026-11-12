@@ -74,6 +74,7 @@ DEFAULT_CONFIGS: dict[str, str] = {
     # Full-duplex speech-to-speech (NemotronLabs VoiceChat-11B).
     "nemotron_duplex": "nemotron_duplex.yaml",
     "flux2_klein": "flux2_klein.yaml",
+    "qwen_image_edit": "qwen_image_edit.yaml",
     "ltx2_5": "ltx2_5.yaml",
     "minimax_h3": "minimax_h3.yaml",
     # bf16 fits one 141 GB GPU; muse_glimmer_tp2.yaml for two 80 GB ones
@@ -166,6 +167,8 @@ def _next_steps(model: str, host: str, port: int, api_key_set: bool = False) -> 
         lines.append("    open(\"out.png\",\"wb\").write(client.generate_image(\"a cat holding a sign\"))")
     if model in ("flux2_klein", "flux2_klein_9b"):  # Z-Image is text-to-image only
         lines.append("    open(\"edit.png\",\"wb\").write(client.edit_image(\"make it a watercolor\", \"out.png\"))")
+    if model == "qwen_image_edit":
+        lines.append("    open(\"edit.png\",\"wb\").write(client.edit_image(\"make it a watercolor\", \"in.png\"))")
     if model == "ltx2_5":
         lines.append("    res = client.generate(text=\"a dog barking on a beach at sunset\",")
         lines.append("                          output_modalities=(\"video\", \"audio\"),")

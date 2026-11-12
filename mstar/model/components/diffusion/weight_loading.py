@@ -3,8 +3,8 @@
 Model-agnostic machinery: walking a diffusers or transformers component
 directory, streaming it into a module under the completeness contract, and
 materialising a meta-device module. Shared by every model on the scaffold, so a
-model never imports a sibling model's loader. The Qwen3 prompt encoder's own
-rules live in ``qwen3.weight_loading``.
+model never imports a sibling model's loader. The Qwen prompt encoder's own
+rules live in ``qwen.weight_loading``.
 """
 
 from __future__ import annotations

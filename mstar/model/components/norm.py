@@ -13,6 +13,9 @@ add.
 
 ``BiasFreeLayerNorm`` is Cohere's LayerNorm (Command A+), with a fused
 residual add + norm kernel for CUDA.
+
+``QwenRMSNorm`` is Hugging Face's Qwen2/Qwen3 RMSNorm in its rounding order, for the
+reference-exact Qwen prompt encoders and vision towers.
 """
 from __future__ import annotations
 
@@ -230,3 +233,21 @@ class BiasFreeLayerNorm(nn.Module):
         from mstar.utils.add_layernorm import add_layernorm
 
         return add_layernorm(residual, delta, self.weight, self.eps)
+
+
+class QwenRMSNorm(nn.Module):
+    """RMSNorm in HF's ``Qwen2RMSNorm`` / ``Qwen3RMSNorm`` rounding order: normalize in fp32, round
+    to the input dtype, then multiply by the weight. In bf16 this is bit-exact with the
+    reference Qwen encoders and vision towers; :class:`RMSNorm` rounds ``rsqrt`` first (portable
+    path) or the whole product once (FlashInfer kernel), and either differs in the last bit,
+    which the layers below a tap then amplify."""
+
+    def __init__(self, dim: int, eps: float):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = x.to(torch.float32)
+        h = h * torch.rsqrt(h.pow(2).mean(-1, keepdim=True) + self.eps)
+        return self.weight * h.to(x.dtype)

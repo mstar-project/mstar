@@ -21,6 +21,7 @@ from mstar.engine.resources.spec import resolve_spec_dependencies
 from mstar.engine.state.adapters import node_resources, state_setup
 from mstar.graph.base import GraphNode, Loop, Parallel, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
+from mstar.model.components.diffusion.denoise_loop import StepKey
 from mstar.model.ltx2_5.components.transformer import (
     LTX2DiT,
     audio_positions,
@@ -60,7 +61,6 @@ from mstar.model.ltx2_5.ltx2_5_model import (
 from mstar.model.ltx2_5.submodules import (
     LTXDenoiseSubmodule,
     LTXShape,
-    distilled_schedule,
     ltx_step,
     pack_audio,
     pack_video,
@@ -355,7 +355,7 @@ def test_pack_unpack_round_trip():
 def test_declare_step_lists_all_six_arrays_with_whole_segments():
     cfg = LTX25Config()
     shape = LTXShape(frames=1, height=5, width=5, audio_frames=5, fps=24.0, text_len=16)
-    step = _dit(cfg).declare_step("generate_av", [11, 12], [NodeInputs(resource_step_info=shape)] * 2)
+    step = _dit(cfg).declare_step("generate_av", [11, 12], [NodeInputs(resource_step_info=StepKey(shape))] * 2)
     spans = {
         name: {(s.request_id, s.label, s.span) for s in declared.segments} for name, declared in step.state.items()
     }
@@ -366,14 +366,7 @@ def test_declare_step_lists_all_six_arrays_with_whole_segments():
         VIDEO: video, AUDIO: audio, TEXT_FOR_VIDEO: text, TEXT_FOR_AUDIO: text, AUDIO_FOR_VIDEO: audio,
         VIDEO_FOR_AUDIO: video,
     }, "a step is the same on every rank, since the engine cuts each read's share"
-    assert step.cg_key_info == shape
-
-
-def test_distilled_schedule_matches_the_scheduler_recipe():
-    sched = distilled_schedule()
-    assert sched.num_steps == 8
-    assert sched.sigmas[-1] == 0 and sched.sigmas[:-1].tolist() == pytest.approx(list(DISTILLED_SIGMA_VALUES))
-    assert torch.equal(sched.timesteps, sched.sigmas[:-1] * 1000)
+    assert step.cg_key_info == StepKey(shape)
 
 
 def test_step_is_the_reference_round_trip_then_euler():

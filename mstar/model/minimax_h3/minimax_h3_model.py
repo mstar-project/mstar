@@ -633,7 +633,7 @@ class H3Model(Model):
             return H3TextEncoderSubmodule(
                 weight_loader.build_text_encoder(config, snapshot, device),
                 weight_loader.build_text_conditioner(config, snapshot, device),
-                vision=weight_loader.build_vision_tower(snapshot, device), config=config,
+                vision=weight_loader.build_vision_tower(snapshot, device),
             )
         if node_name == VAE_ENCODER_NODE:
             return H3VaeEncoderSubmodule(weight_loader.build_keyframe_encoder(config, snapshot, device))

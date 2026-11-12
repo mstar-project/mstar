@@ -20,7 +20,8 @@ from mstar.model.components.diffusion.image_io import (  # noqa: E402
     pixels_to_uint8,
     uint8_to_png,
 )
-from mstar.model.components.diffusion.qwen3.encoder import Qwen3RMSNorm, qwen3_rotary_tables  # noqa: E402
+from mstar.model.components.diffusion.qwen.encoder import qwen_rotary_tables  # noqa: E402
+from mstar.model.components.norm import QwenRMSNorm  # noqa: E402
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
@@ -29,7 +30,7 @@ def test_qwen3_rmsnorm_matches_hf_rounding_order(dtype):
     torch.manual_seed(0)
     dim, eps = 64, 1e-6
     reference = hf.Qwen3RMSNorm(dim, eps=eps)
-    native = Qwen3RMSNorm(dim, eps=eps)
+    native = QwenRMSNorm(dim, eps=eps)
     with torch.no_grad():
         reference.weight.copy_(torch.randn(dim) * 0.5 + 1.0)
         native.weight.copy_(reference.weight)
@@ -75,7 +76,7 @@ def test_qwen3_rotary_tables_match_hf(seq, head_dim, theta):
     rotary = hf.Qwen3RotaryEmbedding(config)
     positions = torch.arange(seq)
     cos_ref, sin_ref = rotary(torch.zeros(1, seq, head_dim), positions[None])
-    cos, sin = qwen3_rotary_tables(positions, head_dim, theta)
+    cos, sin = qwen_rotary_tables(positions, head_dim, theta)
     assert cos.dtype == sin.dtype == torch.float32 and cos.shape == (seq, head_dim)
     torch.testing.assert_close(cos, cos_ref[0], rtol=0, atol=0)
     torch.testing.assert_close(sin, sin_ref[0], rtol=0, atol=0)
@@ -85,25 +86,30 @@ def test_qwen3_encoder_builds_one_rotary_table_across_prompt_lengths(monkeypatch
     """The encoder builds its rotary table once per device, at its longest length, and
     slices it: a table per prompt length was a device allocation per new length, never
     freed. A slice computes what a table built at that length does."""
-    from mstar.model.components.diffusion.qwen3 import encoder as qwen3_encoder
+    from mstar.model.components.diffusion.qwen import encoder as qwen3_encoder
 
     torch.manual_seed(0)
     dims = dict(
-        vocab_size=32, hidden_size=16, intermediate_size=32, num_heads=2, num_kv_heads=1,
-        head_dim=8, rms_norm_eps=1e-6, rope_theta=10_000.0, tap_layers=(1,),
+        vocab_size=32, hidden_size=16, intermediate_size=32, num_hidden_layers=2, num_attention_heads=2,
+        num_key_value_heads=1, head_dim=8, rms_norm_eps=1e-6, rope_theta=10_000.0, hidden_state_layers=(1,),
     )
-    encoder = qwen3_encoder.Qwen3HiddenStateEncoder(**dims, max_positions=16).eval()
+
+    def build(max_positions):
+        config = qwen3_encoder.QwenEncoderConfig(**dims, max_sequence_length=max_positions)
+        return qwen3_encoder.QwenHiddenStateEncoder(config).eval()
+
+    encoder = build(16)
     with torch.no_grad():
         for p in encoder.parameters():  # some layers allocate with torch.empty
             p.normal_(std=0.1)
     builds = []
-    build = qwen3_encoder.qwen3_rotary_tables
-    monkeypatch.setattr(qwen3_encoder, "qwen3_rotary_tables", lambda *a: builds.append(a) or build(*a))
+    tables = qwen3_encoder.qwen_rotary_tables
+    monkeypatch.setattr(qwen3_encoder, "qwen_rotary_tables", lambda *a: builds.append(a) or tables(*a))
     prompts = [torch.randint(0, 32, (1, seq)) for seq in (3, 7, 16)]
     outputs = [encoder(ids, torch.ones_like(ids, dtype=torch.bool), padded=False) for ids in prompts]
     assert len(builds) == 1
     for ids, out in zip(prompts, outputs, strict=True):
-        exact = qwen3_encoder.Qwen3HiddenStateEncoder(**dims, max_positions=ids.shape[1]).eval()
+        exact = build(ids.shape[1])
         exact.load_state_dict(encoder.state_dict())
         want = exact(ids, torch.ones_like(ids, dtype=torch.bool), padded=False)
         torch.testing.assert_close(out, want, rtol=0, atol=0)

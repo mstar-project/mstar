@@ -19,7 +19,6 @@ import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-import numpy as np
 import torch
 from torch import nn
 
@@ -28,7 +27,7 @@ from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.state import gather, scatter
 from mstar.model.components.batched_rows import BatchedRows
 from mstar.model.components.diffusion.compile_utils import compile_transformer_forward, with_inductor_rounding
-from mstar.model.components.diffusion.denoise_loop import DenoiseLoopSubmodule
+from mstar.model.components.diffusion.denoise_loop import DenoiseLoopSubmodule, StepKey
 from mstar.model.components.diffusion.flow_match import FlowMatchSchedule, euler_step
 from mstar.model.ltx2_5.components.layers import RotaryTable
 from mstar.model.ltx2_5.components.transformer import build_rope
@@ -91,14 +90,6 @@ def shape_from_metadata(config: LTX25Config, step_metadata: dict) -> LTXShape:
         fps=fps,
         text_len=config.text_max_seq_len,
     )
-
-
-def distilled_schedule(sigma_values=DISTILLED_SIGMA_VALUES) -> FlowMatchSchedule:
-    """An explicit sigma list as ``FlowMatchEulerDiscreteScheduler.set_timesteps(sigmas=...)``
-    builds it for this checkpoint (shift 1.0, no dynamic shifting): float32 sigmas used
-    as given, ``timesteps = 1000 * sigmas``, a terminal 0 appended."""
-    sigmas = torch.from_numpy(np.array(sigma_values).astype(np.float32))
-    return FlowMatchSchedule(sigmas=torch.cat([sigmas, torch.zeros(1)]), timesteps=sigmas * 1000, mu=None)
 
 
 def ltx_step(sample: torch.Tensor, velocity: torch.Tensor, sigma: torch.Tensor, sigma_next: torch.Tensor):
@@ -247,7 +238,9 @@ class LTXDenoiseSubmodule(DenoiseLoopSubmodule):
         return shape_from_metadata(self.config, fwd_info.step_metadata)
 
     def schedule_for(self, walk: str, num_steps: None, bucket_key: LTXShape) -> FlowMatchSchedule:
-        return distilled_schedule(STAGE_2_DISTILLED_SIGMA_VALUES) if walk in self.refine_walks else distilled_schedule()
+        return FlowMatchSchedule.from_sigmas(
+            STAGE_2_DISTILLED_SIGMA_VALUES if walk in self.refine_walks else DISTILLED_SIGMA_VALUES,
+        )
 
     def initial_loop_back(self, fwd_info, inputs, bucket_key: LTXShape, generator: torch.Generator):
         """Stage 2 of the two-stage recipe starts from the upsampled stage-1 latents,
@@ -285,13 +278,14 @@ class LTXDenoiseSubmodule(DenoiseLoopSubmodule):
         )
         return {LATENTS: pack_video(video)[0], AUDIO_LATENTS: pack_audio(audio)[0]}
 
-    def request_inputs(self, fwd_info, inputs: NameToTensorList, bucket_key: LTXShape) -> dict[str, torch.Tensor]:
+    def request_inputs(self, fwd_info, inputs: NameToTensorList, key: StepKey) -> dict[str, torch.Tensor]:
         return {TEXT_VIDEO: inputs[TEXT_VIDEO][0], TEXT_AUDIO: inputs[TEXT_AUDIO][0]}
 
-    def num_tokens(self, bucket_key: LTXShape) -> int:
-        return bucket_key.total_tokens
+    def num_tokens(self, key: StepKey) -> int:
+        return key.bucket.total_tokens
 
-    def capture_request_inputs(self, bucket_key: LTXShape, device) -> dict[str, torch.Tensor]:
+    def capture_request_inputs(self, key: StepKey, device) -> dict[str, torch.Tensor]:
+        bucket_key: LTXShape = key.bucket
         cfg = self.config.transformer
         dtype = self.transformer.dtype
         return {
@@ -302,7 +296,8 @@ class LTXDenoiseSubmodule(DenoiseLoopSubmodule):
             TEXT_AUDIO: torch.zeros(bucket_key.text_len, cfg.audio_cross_attention_dim, dtype=dtype, device=device),
         }
 
-    def build_layout(self, bucket_key: LTXShape, device):
+    def build_layout(self, key: StepKey, device):
+        bucket_key: LTXShape = key.bucket
         # TODO: per-row tables (a positions resource) would let mixed fps/resolutions share a batch.
         return build_rope(
             self.config.transformer, bucket_key.frames, bucket_key.height, bucket_key.width, bucket_key.fps,
@@ -310,11 +305,11 @@ class LTXDenoiseSubmodule(DenoiseLoopSubmodule):
         )
 
     def denoise(
-        self, engine_inputs, bucket_key: LTXShape, latents, timestep, sigma, sigma_next,
+        self, engine_inputs, key: StepKey, latents, timestep, sigma, sigma_next,
         audio_latents, text_video, text_audio, **cond,
     ):
         dtype = self.transformer.dtype
-        rope = self.layout(bucket_key, latents.device)
+        rope = self.layout(key, latents.device)
         # on a step the sequence shard splits, the DiT runs on this rank's share of each
         # row's video tokens (the scatter is the identity otherwise)
         shard = self.shard
@@ -332,7 +327,8 @@ class LTXDenoiseSubmodule(DenoiseLoopSubmodule):
             AUDIO_LATENTS: ltx_step(audio_latents, audio_velocity, sigma, sigma_next),
         }
 
-    def attention_segments(self, bucket_key: LTXShape):
+    def attention_segments(self, key: StepKey):
+        bucket_key: LTXShape = key.bucket
         video = (VIDEO_SPAN, bucket_key.video_tokens)
         audio = (AUDIO_SPAN, bucket_key.audio_frames)
         text = (TEXT_SPAN, bucket_key.text_len)

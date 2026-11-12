@@ -26,7 +26,7 @@ def test_config_reads_the_checkpoint_json(tmp_path):
     config = H3Config.from_snapshot(tmp_path)
     assert config.transformer == CFG  # the unknown "_class_name" ignored, lists as tuples
     assert (config.video_shift, config.audio_shift) == (11.0, 2.5)
-    assert config.image_token_id == 151655 and config.mrope_section == (24, 20, 20)
+    assert config.text.image_token_id == 151655 and config.text.mrope_section == (24, 20, 20)
     assert config.text.hidden_size == 5120 and not config.text.fused_qkv
     assert config.text.max_sequence_length == config.text_max_positions == 262_144
     assert config.video_vae.latents_std == (2.0,) * 24 and config.video_vae.decoder_layers == 36

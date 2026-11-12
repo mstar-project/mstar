@@ -30,6 +30,7 @@ from mstar.model.flux2_klein.flux2_klein_model import (  # noqa: E402
     Flux2KleinModel,
 )
 from mstar.model.flux2_klein.submodules import KleinShape, shape_from_metadata  # noqa: E402
+from mstar.model.media_limits import check_file_counts  # noqa: E402
 
 CONFIG_PATH = str(Path(__file__).resolve().parents[2] / "configs" / "flux2_klein.yaml")
 
@@ -156,9 +157,10 @@ def test_process_prompt_rejects_missing_prompt_or_wrong_modality():
         model.process_prompt("x", ["text"], ["text"])
     with pytest.raises(ValueError, match="reference image"):
         model.process_prompt("x", ["image", "text"], ["image"], tensors={"image_inputs": []})
-    too_many = {"image_inputs": [torch.zeros(3, 64, 64)] * (model.config.max_ref_images + 1)}
+    # more reference images than klein takes are refused before any is decoded
+    check_file_counts({"image": model.config.max_ref_images}, model.max_input_files())
     with pytest.raises(ValueError, match="at most"):
-        model.process_prompt("x", ["image", "text"], ["image"], tensors=too_many)
+        check_file_counts({"image": model.config.max_ref_images + 1}, model.max_input_files())
 
 
 def test_steps_past_the_loop_ceiling_are_refused_not_clamped():
@@ -268,8 +270,8 @@ def test_diffusion_image_adapter_maps_size_seed_and_edits(tmp_path):
     with pytest.raises(ValueError, match="WxH"):
         adapter.image_to_request(ImageGenerationRequest(prompt="x", size="big"), tmp_path)
 
-    edit = adapter.image_edit_to_request("make it neon", "/tmp/in.png", {"seed": 5, "size": "1024x1024"})
-    assert edit.file_paths == {"image": ["/tmp/in.png"]}
+    edit = adapter.image_edit_to_request("make it neon", ["/tmp/a.png", "/tmp/b.png"], {"seed": 5, "size": "1024x1024"})
+    assert edit.file_paths == {"image": ["/tmp/a.png", "/tmp/b.png"]}  # every reference, in upload order
     assert edit.input_modalities == ["image", "text"] and edit.output_modalities == ["image"]
     assert edit.model_kwargs == {"seed": 5, "width": 1024, "height": 1024}
 
@@ -339,14 +341,16 @@ def test_load_image_resamples_before_rgb_conversion(tmp_path):
     assert not np.array_equal(np.array(other), np.array(expected))
 
 
-def test_qwen3_encoder_config_rejects_taps_at_or_past_the_final_norm():
-    from mstar.model.components.diffusion.qwen3.encoder import Qwen3EncoderConfig
+def test_qwen_encoder_config_taps_lie_within_the_layers():
+    from mstar.model.components.diffusion.qwen.encoder import QwenEncoderConfig
 
-    with pytest.raises(ValueError, match="below layer"):
-        Qwen3EncoderConfig(num_hidden_layers=36, hidden_state_layers=(9, 36))
+    with pytest.raises(ValueError, match="within the 36 layers"):
+        QwenEncoderConfig(num_hidden_layers=36, hidden_state_layers=(9, 37))
+    # the last layer's tap is HF's normed last hidden state
+    assert QwenEncoderConfig(num_hidden_layers=36, hidden_state_layers=(9, 36)).taps_final_norm
     with pytest.raises(ValueError, match="1-indexed"):
-        Qwen3EncoderConfig(num_hidden_layers=36, hidden_state_layers=(0,))
-    assert Qwen3EncoderConfig(num_hidden_layers=36, hidden_state_layers=(35,)).num_layers_needed == 35
+        QwenEncoderConfig(num_hidden_layers=36, hidden_state_layers=(0,))
+    assert QwenEncoderConfig(num_hidden_layers=36, hidden_state_layers=(35,)).num_layers_needed == 35
 
 
 def test_component_iterator_filters_skipped_keys_before_reading(tmp_path):
@@ -484,13 +488,13 @@ def test_encoder_graphs_and_vae_compiles_cover_the_max_batch(monkeypatch, max_ba
     """Powers of two plus the max batch itself, so a full batch never falls off the
     largest graph; the VAE stops at its compile cap and splits larger batches."""
     import mstar.model.components.diffusion.decode_utils as subs
-    from mstar.model.components.diffusion.qwen3.submodule import Qwen3TextEncoderSubmodule
+    from mstar.model.components.diffusion.qwen.submodule import QwenTextEncoderSubmodule
     from mstar.model.flux2_klein.submodules import KleinVaeDecoderSubmodule
 
     monkeypatch.setattr(subs, "compile_vae_decode", lambda vae: None)  # no inductor on CPU tests
 
     config = Flux2KleinConfig()
-    text = Qwen3TextEncoderSubmodule(torch.nn.Identity(), config.text_encoder, max_batch_size=max_batch_size,
+    text = QwenTextEncoderSubmodule(torch.nn.Identity(), config.text_encoder, max_batch_size=max_batch_size,
                                      capture_walk=ENCODE_TEXT_WALK)
     [graph] = text.get_accelerator_graph_configs(torch.device("cpu"))
     assert graph.capture_batch_sizes == encoder
@@ -504,9 +508,9 @@ def test_the_text_encoder_refuses_a_row_without_its_prompt_length():
     """Whether a batch replays the captured encoder is read from each row's ``text_len``
     step metadata; a model that never sets it must fail, not run eager on every batch."""
     from mstar.conductor.request_info import CurrentForwardPassInfo
-    from mstar.model.components.diffusion.qwen3.submodule import TEXT_LEN, Qwen3TextEncoderSubmodule
+    from mstar.model.components.diffusion.qwen.submodule import TEXT_LEN, QwenTextEncoderSubmodule
 
-    text = Qwen3TextEncoderSubmodule(torch.nn.Identity(), Flux2KleinConfig().text_encoder,
+    text = QwenTextEncoderSubmodule(torch.nn.Identity(), Flux2KleinConfig().text_encoder,
                                      capture_walk=ENCODE_TEXT_WALK)
 
     def row(**step_metadata):
@@ -747,3 +751,27 @@ def test_a_dropped_guidance_scale_is_always_reported(caplog):
     with caplog.at_level(logging.WARNING):
         model.process_prompt("a cat", ["text"], ["image"])
     assert not [r for r in caplog.records if "guidance_scale" in r.message]
+
+
+def test_the_compiled_dit_runs_a_step(monkeypatch):
+    """Compile is on by default; the per-shape log once rebound the step key to a shape tuple, so every
+    compiled step failed on ``key.dtype``."""
+    from mstar.model.components.diffusion.denoise_loop import StepKey
+    from mstar.model.flux2_klein import submodules
+
+    monkeypatch.setattr(submodules, "compile_transformer_forward", lambda module, **kw: None)  # no inductor on CPU
+    config = Flux2KleinConfig()
+
+    class Transformer(torch.nn.Module):
+        dtype = torch.float32
+
+        def forward(self, model_input, text_embeds, timestep, rope, ragged=None):
+            return model_input * 2
+
+    dit = submodules.KleinDenoiseSubmodule(Transformer(), config, loop_name=DENOISE_LOOP)
+    assert dit._compile
+    key = StepKey(KleinShape(grid=(2, 2), text_len=3))
+    latents = torch.ones(1, 4, config.transformer.in_channels)
+    text = torch.zeros(1, 3, config.transformer.joint_attention_dim)
+    out = dit.model_output(None, key, latents, torch.full((1,), 500.0), text_embeds=text)
+    assert torch.equal(out, latents * 2)

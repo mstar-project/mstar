@@ -18,7 +18,7 @@ from pathlib import Path
 
 from mstar.model.components.diffusion.autoencoder_kl import AutoencoderKLConfig
 from mstar.model.components.diffusion.flow_match import FlowMatchConfig
-from mstar.model.components.diffusion.qwen3.encoder import Qwen3EncoderConfig
+from mstar.model.components.diffusion.qwen.encoder import QwenEncoderConfig
 
 # Resource key the dit node declares its ragged joint attention under.
 DIT_ATTN = "dit_attn"
@@ -119,7 +119,7 @@ class Flux2KleinConfig:
 
     transformer: Flux2TransformerConfig = field(default_factory=Flux2TransformerConfig)
     vae: Flux2VaeConfig = field(default_factory=Flux2VaeConfig)
-    text_encoder: Qwen3EncoderConfig = field(default_factory=Qwen3EncoderConfig)
+    text_encoder: QwenEncoderConfig = field(default_factory=QwenEncoderConfig)
     scheduler: FlowMatchConfig = field(default_factory=FlowMatchConfig)
 
     # Generation defaults; every one is overridable per request through model_kwargs.
@@ -127,10 +127,10 @@ class Flux2KleinConfig:
     default_width: int = 1024
     default_num_inference_steps: int = 4
     # Distilled: no classifier-free guidance (the pipeline ignores guidance_scale).
-    # Kept as a knob for a -base checkpoint, but CFG is NOT implemented yet --
-    # ``denoise`` runs a single conditional pass and ``guidance_scale`` is only
-    # logged -- so ``from_snapshot`` refuses a non-distilled snapshot rather than
-    # serving it silently unguided. Flip this back to a real knob when CFG lands.
+    # Kept as a knob for a -base checkpoint, but the klein dit declares no GUIDANCE --
+    # it runs a single conditional pass and ``guidance_scale`` is only logged -- so
+    # ``from_snapshot`` refuses a non-distilled snapshot rather than serving it
+    # silently unguided. A -base checkpoint needs the dit's GUIDANCE declared first.
     is_distilled: bool = True
     default_guidance_scale: float = 1.0
     # The denoise loop's max_iters; the conductor refuses a num_inference_steps past it.
@@ -155,10 +155,10 @@ class Flux2KleinConfig:
         snapshot = Path(snapshot)
         with open(snapshot / "model_index.json") as f:
             index = json.load(f)
-        # klein only: the non-distilled Flux2Pipeline needs CFG, which `denoise` does not do.
+        # klein only: the non-distilled Flux2Pipeline needs CFG, which the klein dit does not declare.
         if index.get("_class_name") != "Flux2KleinPipeline":
             raise ValueError(f"{snapshot} is not a FLUX.2 [klein] pipeline snapshot ({index.get('_class_name')!r})")
-        # Before parsing the rest: nothing downstream runs CFG. `denoise` does one
+        # Before parsing the rest: nothing downstream runs CFG. The dit does one
         # conditional pass and `guidance_scale` is only logged, so a non-distilled
         # checkpoint would load and serve silently unguided images at 50 steps.
         # `is_distilled` is absent from some snapshots, so the DEFAULT decides --
@@ -182,7 +182,7 @@ class Flux2KleinConfig:
         with open(snapshot / "vae" / "config.json") as f:
             vae = Flux2VaeConfig.from_dict(json.load(f))
         with open(snapshot / "text_encoder" / "config.json") as f:
-            text_encoder = Qwen3EncoderConfig.from_dict(json.load(f))
+            text_encoder = QwenEncoderConfig.from_dict(json.load(f))
         with open(snapshot / "scheduler" / "scheduler_config.json") as f:
             scheduler = FlowMatchConfig.from_scheduler_config(json.load(f), empirical_mu=True)
         if transformer.joint_attention_dim != text_encoder.output_dim:
@@ -196,7 +196,7 @@ class Flux2KleinConfig:
                 f"{vae.patched_latent_channels}"
             )
         # Past the guard every loadable snapshot is distilled, so the defaults are
-        # the distilled ones; the non-distilled branch comes back with CFG.
+        # the distilled ones; the non-distilled branch comes back with the dit's GUIDANCE.
         return cls(
             transformer=transformer, vae=vae, text_encoder=text_encoder, scheduler=scheduler,
             is_distilled=True, default_num_inference_steps=4, default_guidance_scale=1.0,

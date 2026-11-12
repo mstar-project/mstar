@@ -1502,7 +1502,8 @@ class Qwen3OmniModel(Model):
         from mstar.model.qwen3_omni.submodules import VisionEncoderSubmodule
         from mstar.model.utils import check_loaded
 
-        # built on the device, not on meta: the rotary table is a computed buffer
+        # the weights are built on the device; the rotary inv_freq is built on the host, as transformers builds
+        # it, and reaches the device with the engine's move (submodule.to)
         with torch.device(device):
             tower = Qwen3OmniVisionTower(self.config.vision, attn_key=VISION_ATTN, array=VISION_TOKENS)
         if autocast_dtype is not None:

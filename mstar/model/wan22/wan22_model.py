@@ -162,7 +162,7 @@ class Wan22Model(Model):
     def kernel_settings(self) -> dict[str, dict[str, Any]]:
         # one segment per guidance branch; the DiT is compiled, not captured, so attention stays in its graph (under
         # SP the op runs the exchange inside it)
-        return {SELF_ATTN: {"max_segments_per_request": Wan22DitSubmodule.CFG_BRANCHES, "compile_op": True}}
+        return {SELF_ATTN: {"max_segments_per_request": len(Wan22DitSubmodule.GUIDANCE.branches), "compile_op": True}}
 
     def get_default_sharding_config(self) -> ShardingConfig:
         # The dit's two guidance branches split over cfg_size ranks, which
@@ -171,7 +171,7 @@ class Wan22Model(Model):
         # Signals stay replicated: no shard_dim entries.
         return ShardingConfig(
             groups=[], tp_enabled_nodes=set(), shard_dim={},
-            cfg_enabled_nodes={"dit": Wan22DitSubmodule.CFG_BRANCHES},
+            cfg_enabled_nodes={"dit": len(Wan22DitSubmodule.GUIDANCE.branches)},
         )
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:

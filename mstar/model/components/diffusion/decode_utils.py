@@ -127,6 +127,13 @@ def latent_affine(vae, dtype: torch.dtype, device) -> tuple[torch.Tensor, torch.
     tensors in ``dtype`` (fp32 or bf16): raw latents ``z = latents / inv_std +
     mean``, DiT latents ``(z - mean) * inv_std``."""
     mean = torch.tensor(vae.config.latents_mean, dtype=dtype, device=device).view(1, -1, 1, 1, 1)
-    inv_std = (1.0 / torch.tensor(vae.config.latents_std, dtype=dtype, device=device)).view(1, -1, 1, 1, 1)
+    inv_std = 1.0 / latent_std(vae, dtype, device)
     return mean, inv_std
+
+
+def latent_std(vae, dtype: torch.dtype, device) -> torch.Tensor:
+    """``vae``'s latent std as a ``[1, C, 1, 1, 1]`` tensor in ``dtype``, for a pipeline that
+    normalizes by dividing by it (QwenImage's ``(z - mean) / std``), which rounds differently
+    from multiplying by :func:`latent_affine`'s ``inv_std``."""
+    return torch.tensor(vae.config.latents_std, dtype=dtype, device=device).view(1, -1, 1, 1, 1)
 

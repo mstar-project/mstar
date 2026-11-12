@@ -1,0 +1,17 @@
+model: "qwen_image_edit"
+
+max_seq_len: 8192
+
+# See qwen_image_edit.yaml. The DiT tensor-parallel over two GPUs (its attention and MLP
+# linears split; the AdaLN modulation stays whole on each); the text encoder and the VAE on rank 0.
+model_kwargs:
+  compile: false
+
+node_groups:
+  - node_names: [text_encoder]
+    ranks: [0]
+  - node_names: [vae_encoder, vae_decoder]
+    ranks: [0]
+  - node_names: [dit]
+    ranks: [0, 1]
+    tp_size: 2

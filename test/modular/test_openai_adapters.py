@@ -295,7 +295,7 @@ def test_qwen3_chat_audio_url_input(tmp_path):
 
 def test_bagel_image_edit(tmp_path):
     image_path = str(tmp_path / "in.png")
-    sa = adapters.BagelAdapter().image_edit_to_request("make it neon", image_path, {"cfg_img_scale": 2.0})
+    sa = adapters.BagelAdapter().image_edit_to_request("make it neon", [image_path], {"cfg_img_scale": 2.0})
     assert sa.text == "make it neon"
     assert sa.file_paths == {"image": [image_path]}
     assert sa.input_modalities == ["image", "text"]

@@ -852,6 +852,53 @@ def test_images_edits_takes_the_openai_image_list_name(client_and_stub):
     assert resp.status_code == 200 and "image" in stub.last_submit["file_paths"]
 
 
+def test_images_edits_takes_every_reference_image_in_order(client_and_stub):
+    """A multi-reference model gets every upload; how many it takes is its own to refuse."""
+    client, stub = client_and_stub
+    stub.model_name = "flux2_klein"
+    stub.next_chunks = [_Chunk("image", b"\x89PNGedited")]
+    uploads = [b"\x89PNGone", b"\x89PNGtwo", b"\x89PNGthree"]
+    resp = client.post("/v1/images/edits", files=[("image[]", u) for u in uploads], data={"prompt": "x"})
+    assert resp.status_code == 200, resp.text
+    assert [Path(p).read_bytes() for p in stub.last_submit["file_paths"]["image"]] == uploads
+
+
+@pytest.mark.parametrize("uploads,fields,message", [
+    ([b"\x89PNGone", b""], {}, "images/edits: image 2 is empty"),
+    ([b""], {"image": "x"}, "images/edits: image 1 is empty"),  # a text field named image is no image
+    ([b"\x89PNGone"] * 17, {}, "images/edits takes at most 16 images (MSTAR_MAX_MEDIA_FILES)"),
+], ids=["empty", "text-image-field", "past-the-file-cap"])
+def test_images_edits_refuses_an_empty_image_or_too_many_as_the_rust_frontend_does(
+    client_and_stub, uploads, fields, message,
+):
+    """The same 400 text as ``an_edit_refuses_what_it_would_drop`` in rust/server/src/main.rs."""
+    client, stub = client_and_stub
+    stub.model_name = "flux2_klein"
+    resp = client.post("/v1/images/edits", files=[("image[]", ("in.png", u)) for u in uploads],
+                       data={"prompt": "x", **fields})
+    assert (resp.status_code, resp.json()["error"]["message"]) == (400, message)
+    assert stub.last_submit is None and not any(stub.upload_dir.iterdir())
+
+
+def test_a_failed_upload_write_leaves_no_upload(client_and_stub, monkeypatch):
+    """The images are written one by one; a write failing past the first must take the earlier ones with it."""
+    client, stub = client_and_stub
+    stub.model_name = "flux2_klein"
+    real_write, writes = Path.write_bytes, []
+
+    def write_bytes(self, data):
+        writes.append(self)
+        if len(writes) == 2:
+            raise OSError("disk full")
+        return real_write(self, data)
+
+    monkeypatch.setattr(Path, "write_bytes", write_bytes)
+    resp = client.post("/v1/images/edits", files=[("image[]", b"\x89PNGone"), ("image[]", b"\x89PNGtwo")],
+                       data={"prompt": "x"})
+    assert resp.status_code == 500 and len(writes) == 2
+    assert stub.last_submit is None and not any(stub.upload_dir.iterdir())
+
+
 @pytest.mark.parametrize("model", ["cosmos3", "cosmos3_edge"])
 def test_an_edit_the_model_cannot_do_is_a_400_and_leaves_no_upload(client_and_stub, model):
     """A model with image generation but no editing refuses the edit as the

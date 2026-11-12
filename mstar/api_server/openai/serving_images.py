@@ -80,24 +80,24 @@ async def create_image_edit(
     adapter,
     *,
     prompt,
-    image_bytes,
-    image_filename,
+    images,
     model_kwargs,
     requested_model=None,
     raw_request=None,
 ):  # noqa: ARG001
-    # Persist the uploaded image so the model's loader can read it by path
-    # (same contract as multipart uploads), then run the image-to-image edit.
+    # Persist the uploaded images, as ``(bytes, filename)`` in upload order, so the model's
+    # loader can read them by path (same contract as multipart uploads), then run the edit.
     upload_dir = Path(api.upload_dir)
     upload_dir.mkdir(parents=True, exist_ok=True)
-    ext = os.path.splitext(image_filename or "")[1] or ".png"
-    image_path = upload_dir / f"{uuid4().hex}{ext}"
-    image_path.write_bytes(image_bytes)
-
+    image_paths = []
     try:
-        args = adapter.image_edit_to_request(prompt, str(image_path), model_kwargs)
+        for data, filename in images:
+            image_paths.append(upload_dir / f"{uuid4().hex}{os.path.splitext(filename or '')[1] or '.png'}")
+            image_paths[-1].write_bytes(data)  # listed first: a partial write is removed too
+        args = adapter.image_edit_to_request(prompt, [str(p) for p in image_paths], model_kwargs)
     except Exception as exc:
-        image_path.unlink(missing_ok=True)
+        for path in image_paths:
+            path.unlink(missing_ok=True)
         if isinstance(exc, NotImplementedError):
             # a model with images but no editing: the client's error, a 400
             raise ValueError(str(exc)) from exc
@@ -117,7 +117,7 @@ async def create_image_edit(
         )
         chunks = await api.collect_results(request_id, raw_request)
     finally:
-        media_io.schedule_upload_cleanup({"image": [str(image_path)]}, upload_dir)
+        media_io.schedule_upload_cleanup({"image": [str(p) for p in image_paths]}, upload_dir)
     data = [
         {"b64_json": base64.b64encode(c.data), "url": None}
         for c in chunks

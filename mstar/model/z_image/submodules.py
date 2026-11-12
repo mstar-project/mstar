@@ -32,10 +32,10 @@ from mstar.model.components.diffusion.decode_utils import (
     VAE_MAX_DECODE_BATCH,
     WarmedDecode,
 )
-from mstar.model.components.diffusion.denoise_loop import LATENTS, DenoiseLoopSubmodule
-from mstar.model.components.diffusion.flow_match import FlowMatchSchedule, euler_step
+from mstar.model.components.diffusion.denoise_loop import LATENTS, DenoiseLoopSubmodule, StepKey
+from mstar.model.components.diffusion.flow_match import FlowMatchSchedule
 from mstar.model.components.diffusion.image_io import pixels_to_uint8
-from mstar.model.components.diffusion.qwen3.submodule import TEXT_EMBEDS, Qwen3TextEncoderSubmodule
+from mstar.model.components.diffusion.qwen.submodule import TEXT_EMBEDS, QwenTextEncoderSubmodule
 from mstar.model.components.quant_linear import BF16, StepDtypes
 from mstar.model.submodule_base import NodeInputs, NodeSubmodule
 from mstar.model.z_image.components.transformer import (
@@ -89,7 +89,7 @@ def shape_from_metadata(config: ZImageConfig, step_metadata: dict) -> ZShape:
 # text_encoder
 # ---------------------------------------------------------------------------
 
-class ZImageTextEncoderSubmodule(Qwen3TextEncoderSubmodule):
+class ZImageTextEncoderSubmodule(QwenTextEncoderSubmodule):
     """Caption features ``[1, cap_len, 2560]`` for one request: Qwen3 hidden states after
     layer 35 at the real token positions, zero elsewhere (the DiT swaps those rows for its
     learned pad token), cut to the padded caption length. The batching, padding and capture
@@ -160,24 +160,26 @@ class ZImageDenoiseSubmodule(DenoiseLoopSubmodule):
             (self.config.transformer.in_channels, h * patch, w * patch), generator=generator, dtype=torch.float32,
         )
 
-    def request_inputs(self, fwd_info, inputs: NameToTensorList, bucket_key: ZShape) -> dict[str, torch.Tensor]:
+    def request_inputs(self, fwd_info, inputs: NameToTensorList, key: StepKey) -> dict[str, torch.Tensor]:
         embeds = inputs[TEXT_EMBEDS][0][0]
         text_len = int(fwd_info.step_metadata["text_len"])
-        pad_mask = torch.arange(bucket_key.cap_len, device=embeds.device) >= text_len
+        pad_mask = torch.arange(key.bucket.cap_len, device=embeds.device) >= text_len
         return {TEXT_EMBEDS: embeds, CAP_PAD_MASK: pad_mask}
 
-    def num_tokens(self, bucket_key: ZShape) -> int:
-        return bucket_key.total_tokens
+    def num_tokens(self, key: StepKey) -> int:
+        return key.bucket.total_tokens
 
-    def attention_segments(self, bucket_key: ZShape):
+    def attention_segments(self, key: StepKey):
         # the refiners attend over the padded image tokens / the caption alone, the main layers over both
+        bucket_key: ZShape = key.bucket
         return {
             IMAGE_TOKENS: ((IMAGE_SPAN, bucket_key.image_tokens_padded),),
             CAPTION_TOKENS: ((CAPTION_SPAN, bucket_key.cap_len),),
             JOINT_TOKENS: ((MAIN_SPAN, bucket_key.total_tokens),),
         }
 
-    def capture_request_inputs(self, bucket_key: ZShape, device) -> dict[str, torch.Tensor]:
+    def capture_request_inputs(self, key: StepKey, device) -> dict[str, torch.Tensor]:
+        bucket_key: ZShape = key.bucket
         tcfg = self.config.transformer
         h, w = bucket_key.grid
         return {
@@ -188,7 +190,8 @@ class ZImageDenoiseSubmodule(DenoiseLoopSubmodule):
             CAP_PAD_MASK: torch.zeros(bucket_key.cap_len, dtype=torch.bool, device=device),
         }
 
-    def build_layout(self, bucket_key: ZShape, device):
+    def build_layout(self, key: StepKey, device):
+        bucket_key: ZShape = key.bucket
         h, w = bucket_key.grid
         n_img, n_pad = bucket_key.image_tokens, bucket_key.image_tokens_padded - bucket_key.image_tokens
         cap_ids = torch.zeros(bucket_key.cap_len, 3, dtype=torch.long)
@@ -203,8 +206,9 @@ class ZImageDenoiseSubmodule(DenoiseLoopSubmodule):
             "image_pad_mask": image_pad_mask.to(device),
         }
 
-    def denoise(self, engine_inputs, bucket_key: ZShape, latents, timestep, sigma, sigma_next, **cond):
-        layout = self.layout(bucket_key, latents.device)
+    def model_output(self, engine_inputs, key: StepKey, latents, timestep, **cond):
+        bucket_key: ZShape = key.bucket
+        layout = self.layout(key, latents.device)
         patch = self.config.transformer.patch_size
         tokens = torch.stack([patchify_image(row, patch) for row in latents.to(self.transformer.dtype)])
         n_pad = bucket_key.image_tokens_padded - bucket_key.image_tokens
@@ -212,14 +216,13 @@ class ZImageDenoiseSubmodule(DenoiseLoopSubmodule):
             tokens = torch.cat([tokens, tokens[:, -1:].expand(-1, n_pad, -1)], dim=1)
         # the reference conditions on (1000 - t) / 1000 with the scheduler's fp32 timestep
         t_cond = (1000.0 - timestep) / 1000.0
-        transformer = self.bf16_transformer if self.step_dtype == BF16 else self.transformer
+        transformer = self.bf16_transformer if key.dtype == BF16 else self.transformer
         out = transformer(
             tokens, cond[TEXT_EMBEDS], cond[CAP_PAD_MASK], layout["image_pad_mask"].expand(tokens.shape[0], -1),
             t_cond, layout["image_freqs"], layout["caption_freqs"],
         )
         channels = self.config.transformer.in_channels
-        velocity = -torch.stack([unpatchify_image(row, bucket_key.grid, patch, channels) for row in out.float()])
-        return euler_step(latents, velocity, sigma, sigma_next)
+        return -torch.stack([unpatchify_image(row, bucket_key.grid, patch, channels) for row in out.float()])
 
 
 # ---------------------------------------------------------------------------

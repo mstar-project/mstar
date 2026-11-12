@@ -45,12 +45,17 @@ from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequentia
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import Model, TensorAndMetadata, WalkStep
 from mstar.model.components.diffusion.attention import dit_entry, refuse_attention_backend_kwarg
-from mstar.model.components.diffusion.image_io import OUTPUT_FORMAT_KWARGS, encode_image, image_output_format
-from mstar.model.components.diffusion.qwen3.submodule import (
+from mstar.model.components.diffusion.image_io import (
+    OUTPUT_FORMAT_KWARGS,
+    encode_image,
+    image_output_format,
+    unit_pixels,
+)
+from mstar.model.components.diffusion.qwen.submodule import (
     TEXT_EMBEDS,
     TEXT_INPUTS,
     TEXT_LEN,
-    Qwen3TextEncoderSubmodule,
+    QwenTextEncoderSubmodule,
 )
 from mstar.model.components.quant_linear import (
     check_linear_dtype,
@@ -257,7 +262,8 @@ class Flux2KleinModel(Model):
     def load_image(self, filepath: str, device: str) -> TensorAndMetadata:
         """Reference image with the pipeline's preprocessing: validity checks, LANCZOS
         shrink to at most ``ref_image_max_area`` pixels, floor of both sides to the 16-px
-        token grid, center crop, RGB; returned as float ``[3, H, W]`` in ``[0, 1]``, upright by its EXIF
+        token grid, center crop, RGB; returned as float ``[3, H, W]`` in ``[0, 1]`` (divided here, on the host:
+        :func:`unit_pixels`), upright by its EXIF
         orientation as diffusers' ``load_image`` reads it."""
         from PIL import Image
 
@@ -283,7 +289,7 @@ class Flux2KleinModel(Model):
             # image and then dropping the alpha differs from resampling its RGB conversion
             image = image.convert("RGB")
         tensor = torch.from_numpy(np.array(image)).permute(2, 0, 1).contiguous()
-        return TensorAndMetadata(tensor.to(torch.float32).div_(255.0).to(device))
+        return TensorAndMetadata(unit_pixels(tensor).to(device))
 
     def _resolve_size(self, model_kwargs: dict, ref_dims: list[tuple[int, int]]) -> tuple[int, int]:
         """(height, width) of the output: request kwargs, else the first reference image's
@@ -319,6 +325,10 @@ class Flux2KleinModel(Model):
         # past the loop's max_iters the conductor refuses the request
         return {DENOISE_LOOP: self._resolve_steps(model_kwargs)}
 
+    def max_input_files(self) -> dict[str, int]:
+        # the data worker refuses more reference images than this before decoding any
+        return {"image": self.config.max_ref_images}
+
     def process_prompt(
         self, prompt: str | None, input_modalities: list[str], output_modalities: list[str],
         tensors: NameToTensorList | None = None, **kwargs,
@@ -331,8 +341,6 @@ class Flux2KleinModel(Model):
         images = (tensors or {}).get(IMAGE_INPUTS) or []
         if "image" in input_modalities and not images:
             raise ValueError("request declared an image input but no image arrived; editing needs the reference image")
-        if len(images) > self.config.max_ref_images:
-            raise ValueError(f"at most {self.config.max_ref_images} reference images are supported, got {len(images)}")
         ref_dims = [(int(img.shape[-2]), int(img.shape[-1])) for img in images]
         self._resolve_size(kwargs, ref_dims)
         self._resolve_steps(kwargs)
@@ -420,7 +428,7 @@ class Flux2KleinModel(Model):
 
         if node_name == "text_encoder":
             encoder = build_text_encoder(self.config.text_encoder, self.snapshot, device)
-            return Qwen3TextEncoderSubmodule(
+            return QwenTextEncoderSubmodule(
                 encoder, self.config.text_encoder, max_batch_size=self.max_batch_size,
                 capture_walk=ENCODE_TEXT_WALK if self.accelerator_graph else None,
             )

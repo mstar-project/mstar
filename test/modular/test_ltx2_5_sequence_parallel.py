@@ -24,6 +24,7 @@ from mstar.engine.resources import RaggedAttentionConfig, StepContext, StepRunne
 from mstar.engine.resources.base import EngineResourceInfo, build_resource  # noqa: E402
 from mstar.engine.resources.spec import resolve_spec_dependencies  # noqa: E402
 from mstar.engine.state.adapters import node_handles, node_resources  # noqa: E402
+from mstar.model.components.diffusion.denoise_loop import StepKey  # noqa: E402
 from mstar.model.ltx2_5.components.transformer import LTX2DiT  # noqa: E402
 from mstar.model.ltx2_5.config import DENOISE_LOOP, VIDEO_SHARD, LTX25Config  # noqa: E402
 from mstar.model.ltx2_5.ltx2_5_model import LTX25Model  # noqa: E402
@@ -95,7 +96,7 @@ def _denoise(rank, frames, height, width):
     dit = LTX2DiT(cfg.transformer)
     for p in dit.parameters():
         torch.nn.init.normal_(p, std=0.05)
-    shape = LTXShape(frames=frames, height=height, width=width, audio_frames=5, fps=24.0, text_len=7)
+    shape = StepKey(LTXShape(frames=frames, height=height, width=width, audio_frames=5, fps=24.0, text_len=7))
     t = cfg.transformer
     tokens = frames * height * width
     g = torch.Generator().manual_seed(1)

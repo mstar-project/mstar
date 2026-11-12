@@ -34,6 +34,7 @@ from mstar.model.components.diffusion.flow_match import (  # noqa: E402
     FlowMatchConfig,
     FlowMatchSchedule,
     ShiftMode,
+    calculate_shift,
     compute_empirical_mu,
     euler_step,
 )
@@ -45,10 +46,9 @@ from mstar.model.components.diffusion.image_io import (  # noqa: E402
     unpack_latents,
     unpatchify_latents,
 )
-from mstar.model.components.diffusion.qwen3.encoder import Qwen3EncoderConfig  # noqa: E402
-from mstar.model.components.diffusion.qwen3.weight_loading import (  # noqa: E402
+from mstar.model.components.diffusion.qwen.encoder import QwenEncoderConfig, QwenHiddenStateEncoder  # noqa: E402
+from mstar.model.components.diffusion.qwen.weight_loading import (  # noqa: E402
     QKV_RULES_LM,
-    make_text_encoder,
     remap_text_encoder_key,
     text_encoder_skip,
 )
@@ -70,6 +70,11 @@ KLEIN_SCHEDULER = dict(
     use_exponential_sigmas=False, use_karras_sigmas=False,
 )
 ZIMAGE_SCHEDULER = dict(num_train_timesteps=1000, use_dynamic_shifting=False, shift=3.0)
+# Qwen-Image-2.1: FLUX.1-style dynamic shift, then stretched to end at shift_terminal.
+QWEN_IMAGE21_SCHEDULER = dict(
+    base_image_seq_len=256, base_shift=0.5, max_image_seq_len=8192, max_shift=0.9, num_train_timesteps=1000,
+    shift=1.0, shift_terminal=0.02, time_shift_type="exponential", use_dynamic_shifting=True,
+)
 
 TINY_TRANSFORMER = dict(
     patch_size=1, in_channels=16, num_layers=2, num_single_layers=3, attention_head_dim=8, num_attention_heads=4,
@@ -91,6 +96,7 @@ TINY_VAE = dict(
 @pytest.mark.parametrize("scheduler_cfg,empirical,mode", [
     (KLEIN_SCHEDULER, True, ShiftMode.EMPIRICAL_MU),
     (ZIMAGE_SCHEDULER, False, ShiftMode.LINEAR),
+    (QWEN_IMAGE21_SCHEDULER, False, ShiftMode.DYNAMIC),
 ])
 @pytest.mark.parametrize("num_steps", [1, 4, 8, 50])
 @pytest.mark.parametrize("image_seq_len", [256, 1024, 4096, 6144])
@@ -98,7 +104,16 @@ def test_flow_match_schedule_bit_exact(scheduler_cfg, empirical, mode, num_steps
     config = FlowMatchConfig.from_scheduler_config(scheduler_cfg, empirical_mu=empirical)
     assert config.shift_mode is mode
     ref = FlowMatchEulerDiscreteScheduler(**scheduler_cfg)
-    mu = compute_empirical_mu(image_seq_len, num_steps) if empirical else None
+    if empirical:
+        mu = compute_empirical_mu(image_seq_len, num_steps)
+    elif mode is ShiftMode.DYNAMIC:
+        mu = calculate_shift(image_seq_len, 256, 8192, 0.5, 0.9)
+    else:
+        mu = None
+    if config.shift_terminal is not None and num_steps == 1:
+        with pytest.raises(ValueError):  # the reference's stretch is NaN there
+            FlowMatchSchedule.build(config, num_steps, image_seq_len)
+        return
     ref.set_timesteps(sigmas=np.linspace(1.0, 1 / num_steps, num_steps), mu=mu)
     ours = FlowMatchSchedule.build(config, num_steps, image_seq_len)
     assert ours.num_steps == num_steps
@@ -106,11 +121,22 @@ def test_flow_match_schedule_bit_exact(scheduler_cfg, empirical, mode, num_steps
     assert torch.equal(ref.timesteps, ours.timesteps)
 
 
+@pytest.mark.parametrize("sigma_values", [
+    [1.0, 0.978453, 0.95418, 0.926626, 0.89508, 0.845148, 0.704534, 0.414568],  # Qwen-Image-2.1-Turbo
+    [0.909375, 0.725, 0.421875],  # LTX-2.5 stage 2
+])
+def test_fixed_sigma_schedule_bit_exact(sigma_values):
+    """A distilled checkpoint's fixed list, as ``set_timesteps(sigmas=...)`` runs it at shift 1."""
+    ref = FlowMatchEulerDiscreteScheduler(num_train_timesteps=1000, shift=1.0, use_dynamic_shifting=False)
+    ref.set_timesteps(sigmas=sigma_values)
+    ours = FlowMatchSchedule.from_sigmas(sigma_values)
+    assert torch.equal(ref.sigmas, ours.sigmas)
+    assert torch.equal(ref.timesteps, ours.timesteps)
+
+
 def test_flow_match_schedule_rejects_unsupported_scheduler_options():
     with pytest.raises(NotImplementedError):
         FlowMatchConfig.from_scheduler_config({**ZIMAGE_SCHEDULER, "use_karras_sigmas": True})
-    with pytest.raises(NotImplementedError):
-        FlowMatchConfig.from_scheduler_config({**ZIMAGE_SCHEDULER, "shift_terminal": 0.1})
     with pytest.raises(ValueError):
         FlowMatchSchedule.build(FlowMatchConfig.from_scheduler_config(ZIMAGE_SCHEDULER), 0, 4096)
 
@@ -288,9 +314,9 @@ def test_text_encoder_tapped_hidden_states_bit_exact_with_padding():
     )
     ref = transformers.Qwen3ForCausalLM(hf_cfg).eval()
     taps = (2, 4, 5)
-    text_cfg = Qwen3EncoderConfig.from_dict({**hf_cfg.to_dict(), "model_type": "qwen3"}, hidden_state_layers=taps,
+    text_cfg = QwenEncoderConfig.from_dict({**hf_cfg.to_dict(), "model_type": "qwen3"}, hidden_state_layers=taps,
                                             max_sequence_length=12)
-    native = make_text_encoder(text_cfg).eval()
+    native = QwenHiddenStateEncoder(text_cfg).eval()
     load_native(native, iter(ref.state_dict().items()), remap_text_encoder_key, "tiny qwen3",
                 stacked_params=QKV_RULES_LM, skip=text_encoder_skip(text_cfg))
     # only the layers up to the deepest tap exist (klein: 27 of 36)

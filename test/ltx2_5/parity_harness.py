@@ -101,18 +101,6 @@ def check_text(device="cuda:1"):
     report("text path audio (e2e)", audio2, load("text_audio"))
 
 
-def distilled_schedule():
-    import numpy as np
-
-    from mstar.model.components.diffusion.flow_match import FlowMatchSchedule
-    from mstar.model.ltx2_5.config import DISTILLED_SIGMA_VALUES
-
-    sigmas = torch.from_numpy(np.array(DISTILLED_SIGMA_VALUES).astype(np.float32))
-    return FlowMatchSchedule(
-        sigmas=torch.cat([sigmas, torch.zeros(1)]), timesteps=sigmas * 1000, mu=None,
-    )
-
-
 def ltx_step(x: torch.Tensor, velocity: torch.Tensor, sigma: torch.Tensor, sigma_next: torch.Tensor) -> torch.Tensor:
     """The reference's unguided step: velocity -> x0 -> velocity (fp32), then Euler."""
     from mstar.model.components.diffusion.flow_match import euler_step
@@ -129,7 +117,10 @@ def check_loop(device="cuda:0"):
     snapshot, config = snapshot_and_config()
     dit = build_transformer(config, snapshot, device)
     rope = build_rope(config.transformer, 16, 17, 30, 24.0, 126, device)
-    sched = distilled_schedule()
+    from mstar.model.components.diffusion.flow_match import FlowMatchSchedule
+    from mstar.model.ltx2_5.config import DISTILLED_SIGMA_VALUES
+
+    sched = FlowMatchSchedule.from_sigmas(DISTILLED_SIGMA_VALUES)
     x, a = load("latents_init").to(device), load("audio_init").to(device)
     text, audio_text = load("text_video").to(device), load("text_audio").to(device)
     for k in range(sched.num_steps):

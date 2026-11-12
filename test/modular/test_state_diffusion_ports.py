@@ -43,6 +43,7 @@ from mstar.engine.state.adapters import (
 from mstar.engine.state.analysis import state_declaration_problems
 from mstar.model.base import serving_resources
 from mstar.model.components.diffusion.attention import dit_entry
+from mstar.model.components.diffusion.denoise_loop import StepKey
 from mstar.model.flux2_klein.components.transformer import Flux2JointAttention
 from mstar.model.flux2_klein.config import DENOISE_LOOP, JOINT_TOKENS, Flux2KleinConfig
 from mstar.model.flux2_klein.config import DIT_ATTN as KLEIN_ATTN
@@ -234,8 +235,12 @@ class _StubRagged:
         return q
 
 
+def _step_key(key):
+    return key if isinstance(key, StepKey) else StepKey(key)
+
+
 def _inputs(key):
-    return NodeInputs(tensor_inputs={}, resource_step_info=key)
+    return NodeInputs(tensor_inputs={}, resource_step_info=_step_key(key))
 
 
 def _expanded(model, sub, keys, rids):
@@ -274,7 +279,8 @@ def test_klein_steps_equal_the_hand_written_one(rids):
     sub = KleinDenoiseSubmodule(None, model.config, loop_name=DENOISE_LOOP, compile_transformer=False)
     segments = [Segment(request_id=rid, label="main", span=key.total_tokens) for rid in rids]
     reference = SubmoduleStep(
-        segments=segments, steps={KLEIN_ATTN: AttentionStep(causal=False, fixed_layout=True)}, cg_key_info=key,
+        segments=segments, steps={KLEIN_ATTN: AttentionStep(causal=False, fixed_layout=True)},
+        cg_key_info=_step_key(key),
     )
     _assert_plans_equal(_expanded(model, sub, [key] * len(rids), rids), reference, KLEIN_ATTN)
 
@@ -289,7 +295,8 @@ def test_z_image_steps_equal_the_hand_written_one(rids):
         for label, span in (("image", key.image_tokens_padded), ("caption", 32), ("main", key.total_tokens))
     ]
     reference = SubmoduleStep(
-        segments=segments, steps={Z_ATTN: AttentionStep(causal=False, fixed_layout=True)}, cg_key_info=key,
+        segments=segments, steps={Z_ATTN: AttentionStep(causal=False, fixed_layout=True)},
+        cg_key_info=_step_key(key),
     )
     _assert_plans_equal(_expanded(model, sub, [key] * len(rids), rids), reference, Z_ATTN)
 
@@ -297,12 +304,13 @@ def test_z_image_steps_equal_the_hand_written_one(rids):
 @pytest.mark.parametrize("guidance, branches", [(5.0, 2), (1.0, 1)])
 def test_wan22_steps_equal_the_hand_written_one(guidance, branches):
     model = _wan()
-    key = WanStepKey(frames=3, height=8, width=8, guidance=guidance, i2v=False)
     sub = Wan22DitSubmodule(None, model.config)
+    key = sub._key(WanStepKey(frames=3, height=8, width=8, i2v=False), None, guidance > 1.0)
     tokens = sub.num_tokens(key)
     segments = [Segment(request_id=0, label="main", span=tokens)] * branches
     reference = SubmoduleStep(
-        segments=segments, steps={SELF_ATTN: AttentionStep(causal=False, fixed_layout=True)}, cg_key_info=key,
+        segments=segments, steps={SELF_ATTN: AttentionStep(causal=False, fixed_layout=True)},
+        cg_key_info=_step_key(key),
     )
     _assert_plans_equal(_expanded(model, sub, [key], [0]), reference, SELF_ATTN)
 
@@ -339,13 +347,14 @@ def test_wan22_parallel_configs_plan_each_ranks_step_as_main_did(path, guidance)
     exchanges."""
     _, axes = _serving(path)
     model = _wan()
-    key = WanStepKey(frames=3, height=8, width=8, guidance=guidance, i2v=False)
     branches = 2 // axes["cfg"] if guidance > 1.0 else 1
     for cfg_rank in range(axes["cfg"]):
         sub = Wan22DitSubmodule(None, model.config, cfg_group=SimpleNamespace(world_size=axes["cfg"], rank=cfg_rank))
+        key = sub._key(WanStepKey(frames=3, height=8, width=8, i2v=False), None, guidance > 1.0)
         segments = [Segment(request_id=0, label="main", span=sub.num_tokens(key))] * branches
         reference = SubmoduleStep(
-            segments=segments, steps={SELF_ATTN: AttentionStep(causal=False, fixed_layout=True)}, cg_key_info=key,
+            segments=segments, steps={SELF_ATTN: AttentionStep(causal=False, fixed_layout=True)},
+            cg_key_info=_step_key(key),
         )
         handles = node_handles(model, "dit", {**_one_rank_shards(model), SELF_ATTN: _StubRagged()})
         step = state_steps(sub.declare_step("gen", [0], [_inputs(key)]), handles)
@@ -355,8 +364,8 @@ def test_wan22_parallel_configs_plan_each_ranks_step_as_main_did(path, guidance)
 @pytest.mark.parametrize("rids", [[0], [0, 1]])
 def test_wan22_guided_rows_split_one_rows_tokens_over_sp2(rids):
     """Each guidance branch is a row of its own, so the shard splits one row's tokens however many rows there are."""
-    key = WanStepKey(frames=3, height=8, width=8, guidance=5.0, i2v=False)
     sub = Wan22DitSubmodule(None, _wan().config)
+    key = sub._key(WanStepKey(frames=3, height=8, width=8, i2v=False), None, True)
     plan = _shard_plan(SequenceShard(("main",), 1, None, 0, SimpleNamespace(world_size=2, rank=0)),
                        sub.declare_step("gen", rids, [_inputs(key)] * len(rids)), rids)
     split = plan.ranges["main"]
@@ -543,7 +552,7 @@ def test_ltx_steps_equal_the_hand_written_ones(rids):
     declared = sub.declare_step("generate_av", rids, [_inputs(shape)] * len(rids))
     step = state_steps(declared, handles)
     reference = _ltx_reference_step(rids, shape)
-    assert step.steps.keys() == reference.keys() and step.cg_key_info == shape
+    assert step.steps.keys() == reference.keys() and step.cg_key_info == StepKey(shape)
     for key, expected in reference.items():
         assert _by_label(step.steps[key]) == _by_label(expected), key
         if isinstance(expected, RaggedCrossAttentionStep):
@@ -645,11 +654,11 @@ def test_h3_steps_equal_the_hand_written_one_on_every_rank(world):
     """Every rank plans the whole row, padding a segment of its own, since the exchange gives each rank all of it.
     The rows pad to a multiple of the shard's SP ranks."""
     model, layout, sub = _h3(), _h3_layout(), _h3_dit(world)
-    rows, padded = layout.total_rows, sub.num_tokens(layout)
+    rows, padded = layout.total_rows, sub.num_tokens(StepKey(layout))
     assert (padded > rows) == (world > 1)
     segments = [Segment(request_id=0, label="main", span=span) for span in (rows, padded - rows) if span]
     reference = SubmoduleStep(
-        segments=segments, steps={H3_ATTN: AttentionStep(causal=False, fixed_layout=True)}, cg_key_info=layout,
+        segments=segments, steps={H3_ATTN: AttentionStep(causal=False, fixed_layout=True)}, cg_key_info=StepKey(layout),
     )
     handles = node_handles(model, "dit", {**_one_rank_shards(model), H3_ATTN: _StubRagged()})
     _assert_plans_equal(state_steps(sub.declare_step("gen", [0], [_inputs(layout)]), handles), reference, H3_ATTN)
@@ -669,7 +678,7 @@ def test_h3s_shard_splits_the_whole_padded_row_at_sp2():
     layout, sub = _h3_layout(), _h3_dit(2)
     plan = _shard_plan(SequenceShard(("main",), 0, None, 0, SimpleNamespace(world_size=2, rank=0)),
                        sub.declare_step("gen", [0], [_inputs(layout)]), [0])
-    padded = sub.num_tokens(layout)
+    padded = sub.num_tokens(StepKey(layout))
     assert padded > layout.total_rows and plan.ranges["main"].counts == tuple(sp_seq_split(padded, 2))
 
 

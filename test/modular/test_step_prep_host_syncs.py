@@ -145,7 +145,7 @@ def test_wan22_step_prep_reads_no_tensor():
         with _HostReads() as host:
             got = prepare(k)
         assert host.reads == [], f"step {k}: host reads {host.reads}"
-        assert got.tensor_inputs.keys() == {*_wan22_loop_inputs(shape, k), "timestep"}
+        assert got.tensor_inputs.keys() == {*_wan22_loop_inputs(shape, k), "timestep", "guidance_scale"}
         assert torch.equal(got.tensor_inputs["latents"], torch.full(shape, float(k)))
 
 

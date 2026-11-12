@@ -14,7 +14,9 @@ Images arrive packed: ``pixel_values`` is ``[total_patches, patch_numel]`` and
 """
 from __future__ import annotations
 
+import functools
 import math
+from collections.abc import Callable
 from typing import Protocol
 
 import torch
@@ -55,6 +57,24 @@ def vision_seq_lengths(grid: list[tuple[int, int, int]]) -> tuple[int, ...]:
     """One attending segment per frame, on the host: ``t`` segments of
     ``h * w`` per entry, planned by the ragged attention resource."""
     return tuple(h * w for t, h, w in grid for _ in range(t))
+
+
+def window_order(grid: list[tuple[int, int, int]], window: int) -> tuple[torch.Tensor, tuple[int, ...]]:
+    """Raster -> window order over a packed set of ``(t, h, w)`` grids of units, and each
+    window's length in units, on the host. Windows of ``window`` x ``window`` units tile each
+    frame from the top left, row-major, edge windows partial; frames never mix. A unit is a
+    patch (Muse Glimmer) or a merge block of patches (Qwen2.5-VL, over the merged grid)."""
+    index, lengths, offset = [], [], 0
+    for t, h, w in grid:
+        frame = torch.arange(h * w).view(h, w)
+        for f in range(t):
+            for r0 in range(0, h, window):
+                for c0 in range(0, w, window):
+                    block = frame[r0:r0 + window, c0:c0 + window].reshape(-1)
+                    index.append(block + offset + f * h * w)
+                    lengths.append(block.numel())
+        offset += t * h * w
+    return torch.cat(index), tuple(lengths)
 
 
 def _tile_frames(frames: list[tuple[torch.Tensor, int]]) -> torch.Tensor:
@@ -187,7 +207,9 @@ class VisionRotaryEmbedding(nn.Module):
     halves are concatenated to cover the whole head — no partial rotation.
 
     ``keep_fp32``: the frequencies stay fp32 through a cast of the module (the
-    engine's ``.to(bfloat16)`` would otherwise round them).
+    engine's ``.to(bfloat16)`` would otherwise round them). They are always computed
+    on the host and moved, as transformers builds them: CUDA's ``pow`` rounds 4 of
+    Qwen2.5-VL's 20 differently.
     """
 
     def __init__(self, config: ViTBlockConfig, keep_fp32: bool = False):
@@ -195,16 +217,16 @@ class VisionRotaryEmbedding(nn.Module):
         self._spatial_dim = config.head_dim // 2
         self._theta = config.rope_theta
         self._keep_fp32 = keep_fp32
-        self.register_buffer("inv_freq", self._inv_freq(None), persistent=False)
+        self.register_buffer("inv_freq", self._inv_freq(), persistent=False)
 
-    def _inv_freq(self, device) -> torch.Tensor:
+    def _inv_freq(self) -> torch.Tensor:
         d = self._spatial_dim
-        return 1.0 / (self._theta ** (torch.arange(0, d, 2, dtype=torch.float, device=device) / d))
+        return 1.0 / (self._theta ** (torch.arange(0, d, 2, dtype=torch.float, device="cpu") / d))
 
     def _apply(self, fn, recurse=True):
         result = super()._apply(fn, recurse=recurse)
         if self._keep_fp32:
-            self.inv_freq = self._inv_freq(self.inv_freq.device)
+            self.inv_freq = self._inv_freq().to(self.inv_freq.device)
         return result
 
     @torch.no_grad()
@@ -246,7 +268,7 @@ class PatchProjection(LoraCapable, nn.Conv3d):
 
 
 class VisionPatchEmbed(nn.Module):
-    def __init__(self, config: ViTConfig):
+    def __init__(self, config: ViTConfig, bias: bool = True):
         super().__init__()
         self.in_channels = config.in_channels
         self.temporal_patch_size = config.temporal_patch_size
@@ -255,7 +277,7 @@ class VisionPatchEmbed(nn.Module):
         kernel = (config.temporal_patch_size, config.patch_size, config.patch_size)
         self.proj = PatchProjection(
             config.in_channels, config.hidden_size,
-            kernel_size=kernel, stride=kernel, bias=True,
+            kernel_size=kernel, stride=kernel, bias=bias,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -366,17 +388,22 @@ class VisionAttention(nn.Module):
 
 
 class VisionBlock(nn.Module):
-    """Pre-norm attention and MLP. ``eps`` is the tower's LayerNorm epsilon."""
+    """Pre-norm attention and MLP. A tower passes its norm (built per width) and its MLP, as
+    ``DecoderLayer`` takes its parts; by default a LayerNorm of ``eps`` and the plain
+    :class:`VisionMLP` (Qwen3-VL's and Muse Glimmer's). ``label`` names the layout this block
+    attends within (windows or frames, for a windowed tower)."""
 
     def __init__(
         self, config: ViTBlockConfig, attn_key: str, label: str | None = None, eps: float = 1e-6,
-        array: str | None = None, layer: int | None = None,
+        array: str | None = None, layer: int | None = None, *,
+        norm: Callable[[int], nn.Module] | None = None, mlp: nn.Module | None = None,
     ):
         super().__init__()
-        self.norm1 = nn.LayerNorm(config.hidden_size, eps=eps)
-        self.norm2 = nn.LayerNorm(config.hidden_size, eps=eps)
+        norm = norm or functools.partial(nn.LayerNorm, eps=eps)
+        self.norm1 = norm(config.hidden_size)
+        self.norm2 = norm(config.hidden_size)
         self.attn = VisionAttention(config, attn_key, label, array, layer)
-        self.mlp = VisionMLP(config)
+        self.mlp = mlp if mlp is not None else VisionMLP(config)
 
     def forward(
         self,

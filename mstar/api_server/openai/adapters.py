@@ -364,7 +364,9 @@ class OpenAIAdapter:
     def video_to_request(self, req: VideoGenerationRequest, upload_dir: Path) -> SubmitArgs:  # noqa: ARG002
         raise NotImplementedError("video generation is not supported by this model")
 
-    def image_edit_to_request(self, prompt: str, image_path: str, extra_kwargs: dict) -> SubmitArgs:  # noqa: ARG002
+    def image_edit_to_request(self, prompt: str, image_paths: list[str], extra_kwargs: dict) -> SubmitArgs:  # noqa: ARG002
+        """An ``images/edits`` request's submission: the prompt and every uploaded image, in
+        upload order. How many images an edit takes is the adapter's or the model's to refuse."""
         raise NotImplementedError("image editing is not supported by this model")
 
     def transcription_to_request(self, req: TranscriptionRequest, audio_path: str) -> SubmitArgs:  # noqa: ARG002
@@ -447,14 +449,17 @@ class BagelAdapter(OpenAIAdapter):
             model_kwargs=mk,
         )
 
-    def image_edit_to_request(self, prompt: str, image_path: str, extra_kwargs: dict) -> SubmitArgs:
+    def image_edit_to_request(self, prompt: str, image_paths: list[str], extra_kwargs: dict) -> SubmitArgs:
         # Image editing: the input image + prompt produce an edited image
         # (BAGEL's I2I path). Extra kwargs (e.g. cfg_*_scale, seed) pass through.
+        if len(image_paths) != 1:
+            # BAGEL edits one image: a second would be dropped
+            raise ValueError(f"images/edits takes one image, got {len(image_paths)}")
         mk = dict(extra_kwargs or {})
         _size_kwargs(mk.pop("size", None), mk)
         return SubmitArgs(
             text=prompt,
-            file_paths={"image": [image_path]},
+            file_paths={"image": list(image_paths)},
             input_modalities=["image", "text"],
             output_modalities=["image"],
             model_kwargs=mk,
@@ -1288,12 +1293,13 @@ class DiffusionImageAdapter(OpenAIAdapter):
             model_kwargs=mk,
         )
 
-    def image_edit_to_request(self, prompt: str, image_path: str, extra_kwargs: dict) -> SubmitArgs:
+    def image_edit_to_request(self, prompt: str, image_paths: list[str], extra_kwargs: dict) -> SubmitArgs:
+        # every reference image: the model refuses more than it takes
         mk = dict(extra_kwargs or {})
         _size_kwargs(mk.pop("size", None), mk)
         return SubmitArgs(
             text=prompt,
-            file_paths={"image": [image_path]},
+            file_paths={"image": list(image_paths)},
             input_modalities=["image", "text"],
             output_modalities=["image"],
             model_kwargs=mk,
@@ -1778,6 +1784,7 @@ ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
     "flux2_klein": DiffusionImageAdapter(),
     "flux2_klein_9b": DiffusionImageAdapter(),
     "z_image_turbo": DiffusionImageAdapter(),
+    "qwen_image_edit": DiffusionImageAdapter(),
     "glm52": TextChatAdapter(),
     "glm5_next": TextChatAdapter(),
     # chat with images; reasoning_effort and the sampling defaults are the model's

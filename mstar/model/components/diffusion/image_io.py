@@ -235,8 +235,17 @@ def _png_chunk(tag: bytes, body: bytes) -> bytes:
     return struct.pack(">I", len(body)) + tag + body + struct.pack(">I", zlib.crc32(tag + body) & 0xFFFFFFFF)
 
 
-def normalize_pixels(image: torch.Tensor) -> torch.Tensor:
-    """``[0, 1]`` float (or uint8) pixels -> ``[-1, 1]`` float, the VAE's input range."""
-    if image.dtype == torch.uint8:
-        image = image.to(torch.float32) / 255.0
-    return image.to(torch.float32) * 2.0 - 1.0
+def unit_pixels(image: torch.Tensor) -> torch.Tensor:
+    """uint8 ``[C, H, W]`` on the host -> fp32 in ``[0, 1]``, divided as diffusers' ``VaeImageProcessor`` divides
+    (numpy's true division). On the host, where a loader or ``process_prompt`` runs: CUDA divides by a scalar
+    through its reciprocal, which rounds some entries differently and changes the latents' bits."""
+    return image.float().div_(255.0)
+
+
+def vae_pixels(image: torch.Tensor) -> torch.Tensor:
+    """fp32 ``[C, H, W]`` in ``[0, 1]`` (:func:`unit_pixels`) -> ``[1, C, 1, H, W]`` in ``[-1, 1]``, laid out NHWC as
+    diffusers' ``VaeImageProcessor.preprocess`` hands an image to a pipeline's VAE (the processor's numpy image;
+    cuDNN picks the VAE's convolution kernels by layout, which changes the latents' bits). On the image's own
+    device: ``2x - 1`` rounds the same there as on the host."""
+    pixels = image.permute(1, 2, 0).contiguous()
+    return (2.0 * pixels - 1.0)[None].permute(0, 3, 1, 2).unsqueeze(2)

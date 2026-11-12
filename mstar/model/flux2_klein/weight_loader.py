@@ -43,10 +43,9 @@ import torch
 
 from mstar.engine.resources.lora.checkpoint import LoraFile
 from mstar.model.components.diffusion.lora import apply_loras
-from mstar.model.components.diffusion.qwen3.encoder import Qwen3EncoderConfig, Qwen3HiddenStateEncoder
-from mstar.model.components.diffusion.qwen3.weight_loading import (
+from mstar.model.components.diffusion.qwen.encoder import QwenEncoderConfig, QwenHiddenStateEncoder
+from mstar.model.components.diffusion.qwen.weight_loading import (
     QKV_RULES_LM,
-    make_text_encoder,
     remap_text_encoder_key,
     text_encoder_skip,
 )
@@ -138,10 +137,10 @@ def build_vae(config: Flux2KleinConfig, snapshot: Path, device, dtype=torch.bflo
 
 
 def build_text_encoder(
-    text_config: Qwen3EncoderConfig, snapshot: Path, device, dtype=torch.bfloat16,
-) -> Qwen3HiddenStateEncoder:
+    text_config: QwenEncoderConfig, snapshot: Path, device, dtype=torch.bfloat16,
+) -> QwenHiddenStateEncoder:
     with torch.device("meta"):
-        encoder = make_text_encoder(text_config)
+        encoder = QwenHiddenStateEncoder(text_config)
     materialize(encoder, dtype, device)
     skip = text_encoder_skip(text_config)  # filtered before the read: unused LM layers never reach the device
     return load_native(

@@ -508,3 +508,51 @@ def test_an_image_request_is_submitted_or_refused_as_the_python_adapter_does(cls
     sub = stub.submitted[0]
     assert (sub["text"], sub["in"], sub["out"], sub["mk"] or {}) == (
         want.text, want.input_modalities, want.output_modalities, want.model_kwargs)
+
+
+# ── an edit with several images reaches the backend as the Python adapter builds it ──
+
+def _edit_form(images: list[bytes], fields: dict) -> tuple[bytes, str]:
+    boundary = "----mstaredit"
+    body = b"".join(
+        f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode()
+        for k, v in fields.items()
+    )
+    for i, image in enumerate(images):
+        body += (f'--{boundary}\r\nContent-Disposition: form-data; name="image[]"; filename="in{i}.png"\r\n'
+                 "Content-Type: image/png\r\n\r\n").encode() + image + b"\r\n"
+    return body + f"--{boundary}--\r\n".encode(), f"multipart/form-data; boundary={boundary}"
+
+
+@pytest.mark.parametrize("count", [1, 3])
+@pytest.mark.parametrize("cls", sorted(c for c, a in _classes().items() if a.supports_images))
+def test_an_edit_takes_every_image_or_refuses_as_the_python_adapter_does(cls, count, tmp_path):
+    """Every uploaded image, in upload order, or the adapter's own refusal; with no upload left behind."""
+    model = _model_of(cls)
+    images = [base64.b64decode(PNG) + bytes([i]) for i in range(count)]
+    paths = []
+    for i, image in enumerate(images):
+        paths.append(str(tmp_path / f"in{i}.png"))
+        Path(paths[-1]).write_bytes(image)
+    try:
+        want, refusal = ADAPTER_REGISTRY[model].image_edit_to_request("make it blue", paths, {}), None
+    except (ValueError, NotImplementedError) as e:
+        want, refusal = None, str(e)
+    body, ctype = _edit_form(images, {"prompt": "make it blue"})
+    stub = _StubAPIServer()
+    with _model_stack(model, stub) as (port, upload):
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/images/edits", data=body,
+                                     headers={"Content-Type": ctype})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                status, data = r.status, r.read()
+        except urllib.error.HTTPError as e:
+            status, data = e.code, e.read()
+        if refusal is not None:
+            assert (status, json.loads(data)["error"]["message"]) == (400, refusal)
+            assert stub.submitted == [] and not any(Path(upload).iterdir())
+            return
+        assert status == 200, data
+        (sub,) = stub.submitted
+        assert _files(sub["files"]) == _files(want.file_paths) == {"image": images}
+    assert (sub["text"], sub["in"], sub["out"]) == (want.text, want.input_modalities, want.output_modalities)

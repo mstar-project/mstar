@@ -22,7 +22,7 @@ import torch
 from torch import nn
 
 from mstar.engine.accelerator_graph_config import BatchedAcceleratorGraphConfig, geometric_batch_sizes
-from mstar.model.components.diffusion.qwen3.encoder import Qwen3EncoderConfig
+from mstar.model.components.diffusion.qwen.encoder import QwenEncoderConfig
 from mstar.model.submodule_base import NodeInputs, NodeSubmodule
 
 TEXT_INPUTS, TEXT_MASK, TEXT_EMBEDS = "text_inputs", "text_mask", "text_embeds"
@@ -30,7 +30,7 @@ TEXT_INPUTS, TEXT_MASK, TEXT_EMBEDS = "text_inputs", "text_mask", "text_embeds"
 TEXT_LEN = "text_len"
 
 
-class Qwen3TextEncoderSubmodule(NodeSubmodule):
+class QwenTextEncoderSubmodule(NodeSubmodule):
     """Qwen3 hidden-state taps over the right-padded prompt (see the module docstring)."""
 
     disable_torch_compile = True
@@ -38,7 +38,7 @@ class Qwen3TextEncoderSubmodule(NodeSubmodule):
     PACKED_EMBEDS = "__text_embeds__"
 
     def __init__(
-        self, encoder: nn.Module, text_config: Qwen3EncoderConfig, max_batch_size: int = 16,
+        self, encoder: nn.Module, text_config: QwenEncoderConfig, max_batch_size: int = 16,
         capture_walk: str | None = None,
     ):
         super().__init__()

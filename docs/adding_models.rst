@@ -3649,17 +3649,19 @@ and ``sp_size`` (see :doc:`serving`). Declare the node and the most branches it 
            cfg_enabled_nodes={"dit": 2},
        )
 
-The submodule receives ``cfg_group`` from ``get_submodule``, takes its rows of the branch
-batch with ``my_rows(cfg_group, branches)``
-(``mstar/distributed/communication.py``), and after the forward
-reassembles them with ``cfg_group.all_gather(out, dim=0)``. Every rank then runs the same
-guidance combine and solver step on replicated latents. CFG ranks keep every attention
+A node on the DiT scaffold writes no cfg code: it declares
+``GUIDANCE = Guidance(branches=..., combine=...)``
+(``mstar/model/components/diffusion/guidance.py``) on its ``DenoiseLoopSubmodule``, which
+receives ``cfg_group`` from ``get_submodule``. The base's ``guided_output``
+(``denoise_loop.py``) runs this rank's share of the branches as rows, gathers the
+predictions over the group and combines them. Every rank then runs the same guidance
+combine and solver step on replicated latents. CFG ranks keep every attention
 head; only TP and SP ranks split them. The ranks run in lockstep on the same requests, so
 any per-request resource the node declares must stay the same shape on every rank, and a
 node with ``cfg_size > 1`` can't hold a paged KV cache (placement refuses one before
 any worker starts): branches that hold different KV are separate nodes in a graph ``Parallel``
 instead, on a node group with ``cfg_size: 1``, as BAGEL's ``LLM_cfg_text`` and ``LLM_cfg_img`` are.
-``Wan22DitSubmodule`` is the reference.
+Wan2.2 and Qwen-Image are the references.
 
 .. _Expert parallelism (MoE):
 
@@ -4061,26 +4063,46 @@ iteration past the schedule. The hooks:
 .. code-block:: python
 
     class MyDenoise(DenoiseLoopSubmodule):
+        GUIDANCE = Guidance(branches=({"text_embeds": "text_embeds_pos"}, {"text_embeds": "text_embeds_neg"}),
+                            combine=cfg)    # a CFG checkpoint only; a distilled one declares none
         def bucket_key_for(self, fwd_info): ...       # hashable: latent grid, text length, ...
         def schedule_for(self, walk, settings, key): ...  # FlowMatchSchedule (flow_match.py), memoized
         # optional: what the request sets of its schedule; its step count by default
         def schedule_settings(self, fwd_info): ...
         def seed_latents(self, key, gen): ...         # [L, C] initial noise, seeded
         def request_inputs(self, fwd_info, inputs, key): ...  # per-row conditioning tensors
-        def num_tokens(self, key): ...                # image tokens for the attention step
+        def num_tokens(self, key): ...                # one branch's tokens for the attention step
         def capture_request_inputs(self, key, device): ...   # dummy rows for graph capture
-        def denoise(self, engine_inputs, key, latents, timestep, sigma, sigma_next, **cond): ...
+        def model_output(self, engine_inputs, key, latents, timestep, **cond): ...  # the prediction
         # optional: extra attention spans (a refiner over the image tokens alone, ...)
-        def attention_segments(self, key): return {TOKENS: (("main", self.num_tokens(key)),)}
+        def attention_segments(self, key): return {TOKENS: (("main", self.num_tokens(key)),) * len(key.branches)}
 
-``bucket_key`` is whatever has to match for two rows to share a forward, and it is also
-the CUDA-graph bucket key — shape, but equally a knob like whether CFG is on.
+``bucket_key_for`` returns whatever has to match for two rows to share a forward, the
+model's own key. The per-step hooks get the step's ``StepKey`` instead: that key, plus what
+the base adds per step (the linears' dtype under a step schedule, whether the step is
+guided, and the guidance branches this rank runs), so they read the model's fields as
+``key.bucket.<field>``. The step key is also the CUDA-graph bucket key.
+
+The default ``denoise`` is the Euler step of ``model_output``. A model that steps itself
+(two streams, a model-specific update) overrides ``denoise`` instead. Guidance is a
+declaration: ``GUIDANCE`` names, per branch, the request inputs that branch reads, and a
+``combine`` (``guidance.cfg`` or ``guidance.cfg_renorm``). A guided step runs each
+branch as a row of ``model_output``, splits the branches over the node's ``cfg_size``
+ranks, gathers their predictions and combines them with the request's scales, each a step
+scalar, so rows at different scales share a forward. ``combine`` receives them as
+``{name: tensor}`` and names the knobs it reads in its own ``scales`` (``cfg``:
+``guidance_scale``), so they are declared once: a combine is an object with its ``scales``
+and a ``__call__``, as ``guidance.Cfg`` is. A model whose one knob has another name
+subclasses ``Cfg`` with its own ``scales``; one with more knobs declares its ``scales``
+and ``__call__``. ``Guidance.active`` is the one rule for whether guidance is on, asked of the request's
+metadata (the text encoder also asks it before it encodes a negative prompt). It holds for
+the whole request.
 
 A multi-step scheduler that carries solver state between iterations names it in
 ``SOLVER_STATE``; those become loop-back edges alongside ``latents``, seeded by
 ``seed_loop_back`` and returned from ``denoise`` as a ``{name: tensor}`` mapping. UniPC
 comes with the scaffold: a subclass of ``UniPCDenoiseLoopSubmodule`` implements
-``model_output`` in place of ``denoise``, and the base carries
+``model_output`` as any model does, and the base carries
 ``unipc_model_outputs`` and ``unipc_last_sample`` and steps each row by the loop counter
 from its own tables, with no host read, so rows at different steps share a forward
 (wan22 is the example). A scheduler needing another per-step
@@ -4095,7 +4117,7 @@ it to the device. Otherwise the CPU draw runs on the GPU thread at iteration 0, 
 joining row.
 
 Every span a layer attends over is a segment of a declared array with ``max_len`` 0, listed
-in ``attention_segments`` per request. A layer calls ``attend(self.state, self.layer, q, k, v)``
+in ``attention_segments`` per request, for each guidance branch the rank runs in ``key.branches`` order. A layer calls ``attend(self.state, self.layer, q, k, v)``
 from ``attention.py``, which adds and reads through its array, and runs SDPA on a layer no
 engine bound a handle to. Arrays of one geometry share one resource, each under its own label.
 
@@ -4116,6 +4138,11 @@ LayerNorm row wider than 1024 twice. ``qk_norm_rope.rms_norm_rope`` is the q/k R
 across heads followed by the interleaved-pair RoPE, q and k in one launch. Both agree
 with eager to bf16 rounding rather than bitwise. Wan2.2 is the first user;
 ``test/modular/test_diffusion_dit_kernels.py`` holds them to the eager form.
+``qwen/dit_kernels.py`` is a third, bit-exact one for the Qwen-Image DiTs, exposed as the ops
+``mstar::dit_qk_norm_rope``, ``dit_qk_pair_norm_rope``, ``dit_joint_qk_pair_norm_rope``, ``dit_modulate``,
+``dit_gated_add``, ``dit_norm_modulate`` and ``dit_gated_norm_modulate``. Unlike the two above these run in the
+eager forward too (on CUDA, bf16, after a one-time self-check against the eager ops), and the same test file holds
+them to the eager ops bit for bit.
 
 On the API side ``DiffusionImageAdapter`` (``mstar/api_server/openai/adapters.py``) serves
 ``/v1/images/generations`` and ``/v1/images/edits`` for any such model (``size`` becomes

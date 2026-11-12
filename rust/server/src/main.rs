@@ -395,6 +395,16 @@ fn body_limit_mb() -> usize {
         .unwrap_or(128)
 }
 
+/// `MSTAR_MAX_MEDIA_FILES`, default 16: the media files one request may attach. The Python frontend reads it in
+/// `mstar/model/media_limits.py`, whose data worker refuses a value that isn't a positive integer at startup.
+fn max_media_files() -> usize {
+    std::env::var("MSTAR_MAX_MEDIA_FILES")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .filter(|&n: &usize| n > 0)
+        .unwrap_or(16)
+}
+
 /// Status and message for a failed multipart read: 413 naming the limit when
 /// the body passed `MSTAR_MAX_BODY_MB`, as the Python frontend answers, else
 /// 400 with `fallback`.
@@ -1461,10 +1471,12 @@ async fn images_edits(State(st): State<AppState>, mut mp: Multipart) -> Response
     // Multipart (image file + prompt + passthrough fields), parsed manually so
     // arbitrary model knobs (e.g. cfg_*_scale) flow through as model_kwargs.
     // `size` is kept: the adapter maps "WxH" onto the model's width / height
-    let known = ["model"];
-    let mut image_bytes: Option<Vec<u8>> = None;
-    let mut image_filename: Option<String> = None;
-    let mut images = 0;
+    // a text field named like the image list is dropped, as the Python frontend drops it
+    let known = ["model", "image", "image[]"];
+    // every image, in upload order, with its filename. The Python frontend refuses the same requests, in the same
+    // order and with the same text (`images_edits` in mstar/api_server/openai/router.py).
+    let mut images: Vec<(Vec<u8>, Option<String>)> = Vec::new();
+    let most = max_media_files();
     let mut requested_model: Option<String> = None;
     let mut prompt = String::new();
     let mut n: Option<String> = None;
@@ -1485,17 +1497,22 @@ async fn images_edits(State(st): State<AppState>, mut mp: Multipart) -> Response
         // A field read failure (body-limit overrun, mid-upload disconnect,
         // non-UTF-8 text) must surface as a 400, not be flattened to an empty
         // value — otherwise a truncated upload becomes a misleading error.
-        // One image, edited whole: a mask or a second image would be dropped.
-        // `image[]` is how OpenAI clients name the image list.
+        // Every image: the adapter and the model say how many they take. A mask
+        // would be dropped, as would any other upload. `image[]` is how OpenAI
+        // clients name the image list.
         if has_file && name != "image" && name != "image[]" {
             let msg = format!("images/edits does not take a '{name}' upload; the whole image is edited");
             return error(400, &msg, "invalid_request_error");
         }
-        if name == "image" || name == "image[]" {
-            images += 1;
-            image_filename = field.file_name().map(str::to_string);
+        if has_file && (name == "image" || name == "image[]") {
+            // refused before it is read, so no request writes more than this many files
+            if images.len() == most {
+                let msg = format!("images/edits takes at most {most} images (MSTAR_MAX_MEDIA_FILES)");
+                return error(400, &msg, "invalid_request_error");
+            }
+            let filename = field.file_name().map(str::to_string);
             match field.bytes().await {
-                Ok(b) => image_bytes = Some(b.to_vec()),
+                Ok(b) => images.push((b.to_vec(), filename)),
                 Err(e) => {
                     let (status, msg) = multipart_failure(&e, e.to_string());
                     return error(status, &msg, "invalid_request_error");
@@ -1540,13 +1557,12 @@ async fn images_edits(State(st): State<AppState>, mut mp: Multipart) -> Response
         }
     }
 
-    if images > 1 {
-        return error(400, &format!("images/edits takes one image, got {images}"), "invalid_request_error");
+    if images.is_empty() {
+        return error(400, "images/edits requires an 'image' file upload", "invalid_request_error");
     }
-    let image_bytes = match image_bytes {
-        Some(b) if !b.is_empty() => b,
-        _ => return error(400, "images/edits requires an 'image' file upload", "invalid_request_error"),
-    };
+    if let Some(i) = images.iter().position(|(b, _)| b.is_empty()) {
+        return error(400, &format!("images/edits: image {} is empty", i + 1), "invalid_request_error");
+    }
     let n = match n.filter(|v| !v.is_empty()).map(|v| v.trim().parse::<i64>()) {
         None => None,
         Some(Ok(n)) => Some(n),
@@ -1555,24 +1571,36 @@ async fn images_edits(State(st): State<AppState>, mut mp: Multipart) -> Response
     if let Err(e) = check_inline_result(response_format.as_deref(), n) {
         return error(400, &e, "invalid_request_error");
     }
-    // Persist the uploaded image so the data-worker's loader can read it by path.
+    // Persist the uploaded images so the data-worker's loader can read them by path.
     if let Err(e) = std::fs::create_dir_all(&st.upload_dir) {
         return error(500, &e.to_string(), "server_error");
     }
-    let ext = image_filename
-        .as_deref()
-        .and_then(|f| PathBuf::from(f).extension().map(|e| format!(".{}", e.to_string_lossy())))
-        .unwrap_or_else(|| ".png".to_string());
-    let image_path = st.upload_dir.join(format!("{}{}", Uuid::new_v4().simple(), ext));
-    let path = image_path.clone();
-    if let Err(e) = blocking(move || std::fs::write(&path, &image_bytes)).await {
+    let image_paths: Vec<PathBuf> = images
+        .iter()
+        .map(|(_, filename)| {
+            let ext = filename
+                .as_deref()
+                .and_then(|f| PathBuf::from(f).extension().map(|e| format!(".{}", e.to_string_lossy())))
+                .unwrap_or_else(|| ".png".to_string());
+            st.upload_dir.join(format!("{}{}", Uuid::new_v4().simple(), ext))
+        })
+        .collect();
+    let remove_all = |paths: &[PathBuf]| {
+        for path in paths {
+            let _ = std::fs::remove_file(path);
+        }
+    };
+    let writes: Vec<(PathBuf, Vec<u8>)> = image_paths.iter().cloned().zip(images.into_iter().map(|(b, _)| b)).collect();
+    if let Err(e) = blocking(move || writes.iter().try_for_each(|(path, bytes)| std::fs::write(path, bytes))).await {
+        remove_all(&image_paths);
         return error(500, &e.to_string(), "server_error");
     }
 
-    let mut args = match adapter.image_edit_to_request(&prompt, &image_path.to_string_lossy(), extra) {
+    let paths: Vec<String> = image_paths.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+    let mut args = match adapter.image_edit_to_request(&prompt, &paths, extra) {
         Ok(a) => a,
         Err(e) => {
-            let _ = std::fs::remove_file(&image_path);
+            remove_all(&image_paths);
             return error(400, &e, "invalid_request_error");
         }
     };
@@ -2449,13 +2477,19 @@ mod tests {
             (vec![("image", Some("a.png")), ("image", Some("b.png"))], "images/edits takes one image, got 2"),
             (vec![("image[]", Some("a.png")), ("n", None)], "n=2: this route returns one result per request"),
             (vec![("image", Some("a.png")), ("response_format", None)], "response_format 'url' is not served; results are returned as b64_json"),
+            // the Python frontend's answers to the same two (test_openai_router.py)
+            (vec![("image", Some("a.png")), ("image[]", Some("empty.png"))], "images/edits: image 2 is empty"),
+            // a text field named `image` is no image
+            (vec![("image", None), ("image[]", Some("empty.png"))], "images/edits: image 1 is empty"),
+            (vec![("image", Some("a.png")); 17], "images/edits takes at most 16 images (MSTAR_MAX_MEDIA_FILES)"),
         ] {
             let parts: Vec<(&str, Option<&str>, &[u8])> = fields
                 .iter()
                 .map(|&(name, file)| {
-                    let value: &[u8] = match name {
-                        "n" => b"2",
-                        "response_format" => b"url",
+                    let value: &[u8] = match (name, file) {
+                        ("n", _) => b"2",
+                        ("response_format", _) => b"url",
+                        (_, Some("empty.png")) => b"",
                         _ => b"\x89PNG",
                     };
                     (name, file, value)

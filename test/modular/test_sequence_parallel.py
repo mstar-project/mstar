@@ -1117,11 +1117,12 @@ def _wan_step(rank, world, grid):
         res[key].bind_dependencies({dep: res[dep] for dep in spec.depends_on()})
 
     frames, height, width = grid
-    key = WanStepKey(frames, height, width, guidance=5.0, i2v=False)
+    # a guided step: its two guidance branches are two rows
+    key = Wan22DitSubmodule(dit, config)._key(WanStepKey(frames, height, width, i2v=False), None, True)
     gen = torch.Generator().manual_seed(1)
     args = (
-        torch.randn(1, 4, frames, height, width, generator=gen), torch.rand(1, frames, generator=gen) * 1000,
-        torch.randn(1, 5, 8, generator=gen), torch.randn(1, 5, 8, generator=gen), key.guidance,
+        torch.randn(2, 4, frames, height, width, generator=gen), torch.rand(2, frames, generator=gen) * 1000,
+        torch.randn(2, 5, 8, generator=gen),
     )
     with torch.no_grad():
         # one rank: no resources and no handles bound, so the self-attention runs SDPA

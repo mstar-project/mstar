@@ -12,10 +12,16 @@ leaves the model-specific parts to a handful of hooks:
   equal-key request batching (can_batch)          seed_latents(key, generator)  -> [L, C]
   stacked preprocess / per-row outputs            request_inputs(fwd_info, inputs, key) -> {name: [..]}
   per-key CUDA-graph buckets (Euler inside)       num_tokens(key)               -> int
-                                                  denoise(engine_inputs, key, latents, timestep,
-                                                          sigma, sigma_next, **cond) -> [B, L, C]
+  guidance branches, their split over the         model_output(engine_inputs, key, latents, timestep,
+    cfg ranks and their combine (GUIDANCE)                     **cond) -> [B, ...] prediction
+                                                  (or denoise(...), a model that steps itself)
   the step's arrays and their segments            capture_request_inputs(key, device) -> {name: [..]}
                                                   attention_segments(key) -> {array: ((label, span), ...)}
+
+``bucket`` is the model's own key (``bucket_key_for``). ``key`` is the step's
+:class:`StepKey`: the bucket, plus what the base adds per step (the linears'
+dtype under a step schedule, and the guidance branches this rank runs), so the
+per-step hooks read their own fields as ``key.bucket.<field>``.
 
 Conventions the base fixes:
 
@@ -31,25 +37,32 @@ Conventions the base fixes:
   worker before each batch — no host sync per step.
 * A schedule and its device-resident ``sigmas`` / ``timesteps`` are a memo of the hook's
   inputs, so requests with the same settings share one on the device, and losing an
-  entry costs a rebuild and changes no output. So are the seeds drawn at ingest.
+  entry costs a rebuild and changes no output. So are the seeds drawn at ingest and a
+  guidance scale's per-step values (keyed by ``(num_steps, knobs)``).
 * Per-step per-request scalars (``STEP_SCALARS``: ``sigma``, ``sigma_next``,
   ``timestep``) are sliced out of the schedule ``schedule_for`` returns and
   travel as ``[1]`` device tensors, so a batch of requests at different steps
   (or step counts) shares one forward, and a captured graph reads them from
   staged buffers. Declaring one is enough: the base stages every source the
   table names on the device and slices it per step.
-* Rows are batched only at an identical ``bucket_key``, which is also the
-  CUDA-graph bucket key. It need not be shape alone: anything that has to match
-  for two rows to share a forward belongs in it (the latent grid, text length
-  and conditioning layout, but equally whether CFG is on).
+* Rows are batched only at an identical step key, which is also the
+  CUDA-graph bucket key. The bucket need not be shape alone: anything that has
+  to match for two rows to share a forward belongs in it (the latent grid, text
+  length and conditioning layout). Whether guidance is on is the step key's.
 * Every span a forward attends over is a segment of a declared array: a model
   whose layers also attend over a sub-span (a refiner over the image tokens
   alone, say) declares an array for it and lists it in :meth:`attention_segments`.
 * A step schedule (``step_dtypes``, a model's ``linear_dtype_steps``) is the
-  base's alone: a step's key is then a :class:`StepBucket` (:meth:`step_key`),
-  so rows batch and capture per dtype, the scheduler batches each dtype apart,
-  and ``denoise`` reads the step's dtype off :attr:`step_dtype` while the hooks
-  keep seeing the model's own key.
+  base's alone: the step key carries the step's dtype (:meth:`step_key`), so rows
+  batch and capture per dtype, the scheduler batches each dtype apart, and the
+  forward reads it as ``key.dtype``.
+* Guidance is a declaration (``GUIDANCE``, see ``guidance.py``). A guided step runs
+  each branch this rank owns as a row (``key.branches``: ``my_rows`` of the
+  ``cfg_group``), gathers the branches' predictions over the group and combines
+  them, with the request's scales as step scalars. An unguided step runs branch 0
+  alone. A request's rows are its local branches in order. Whether a request is
+  guided is decided at intake (``Guidance.active`` of its scales) and is the step
+  key's.
 """
 
 from __future__ import annotations
@@ -66,8 +79,10 @@ import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.distributed.communication import CommGroup, my_rows
 from mstar.engine.state import ArrayStep, Segment, SlotLease, SubmoduleStep
-from mstar.model.components.diffusion.flow_match import FlowMatchSchedule
+from mstar.model.components.diffusion.flow_match import FlowMatchSchedule, euler_step
+from mstar.model.components.diffusion.guidance import Guidance
 from mstar.model.components.diffusion.unipc import (
     LAST_SAMPLE,
     MODEL_OUTPUTS,
@@ -106,12 +121,17 @@ class StepScalar(NamedTuple):
 
 
 @dataclass(frozen=True)
-class StepBucket:
-    """A step's key under a step schedule: the request's bucket and the dtype the step's linears run in. Two dtypes
-    share neither a forward nor a graph."""
+class StepKey:
+    """What a step batches and captures on: the model's bucket, plus what the base decides per step. Two keys that
+    differ in any field share neither a forward nor a graph.
+
+    ``branches`` is a function of ``guided`` and the rank, so on one rank two keys are equal exactly when the
+    rank-invariant fields are, and every rank of a cfg group batches the same rows."""
 
     bucket: Hashable
-    dtype: str
+    dtype: str | None = None             # the linears' dtype under a step schedule
+    guided: bool = False                 # whether the step runs its guidance branches
+    branches: tuple[int, ...] = (0,)     # the branches this rank runs, in row order
 
 
 class DenoiseLoopSubmodule(NodeSubmodule):
@@ -136,13 +156,17 @@ class DenoiseLoopSubmodule(NodeSubmodule):
     SOLVER_STATE: tuple[str, ...] = ()
 
     # name -> where in the request's schedule this step's value comes from. A
-    # scheduler needing another scalar (a per-step guidance scale, say) adds an
-    # entry here instead of overriding prepare_inputs / preprocess / _run.
+    # scheduler needing another scalar adds an entry here instead of overriding
+    # prepare_inputs / preprocess / _run (a guided model's scales come from GUIDANCE).
     STEP_SCALARS: Mapping[str, StepScalar] = {
         "sigma": StepScalar("sigmas"),
         "sigma_next": StepScalar("sigmas", offset=1, capture_fill=0.0),
         "timestep": StepScalar("timesteps", broadcast=False, capture_fill=1000.0),
     }
+
+    # The model's guidance branches and their combine, or None for an unguided model
+    # (a distilled checkpoint). See ``guidance.py``.
+    GUIDANCE: Guidance | None = None
 
     # True when :meth:`seed_loop_back` depends on nothing but the bucket key and the
     # request's seed. The base then draws the seeds when the request reaches the
@@ -161,6 +185,7 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         replay_walks: Mapping[str, Sequence[str]] | None = None,
         max_uncaptured_layouts: int = 4,
         step_dtypes: StepDtypes | None = None,
+        cfg_group: CommGroup | None = None,
     ):
         super().__init__()
         self.loop_name = loop_name
@@ -188,9 +213,44 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         # device.
         self._schedules = functools.lru_cache(_MEMO_ENTRIES)(self.schedule_for)
         self._staged_schedules = functools.lru_cache(_MEMO_ENTRIES)(self._stage_schedule)
-        # The dtype each step runs (``step_key``), and the one the step in ``denoise`` runs: None without a schedule.
+        # The dtype each step runs (``step_key``): None without a schedule.
         self.step_dtypes = step_dtypes
-        self.step_dtype: str | None = None
+        # The node's classifier-free-guidance group (cfg_size), across which the guidance branches split; trivial
+        # on one GPU. Each rank's share of the branches, guided or not, is fixed for the life of the node.
+        self.cfg_group = cfg_group or CommGroup.trivial()
+        guidance = self.GUIDANCE
+        if guidance is not None:
+            arguments = {frozenset(branch) for branch in guidance.branches}
+            if len(guidance.branches) < 2 or len(arguments) != 1 or not next(iter(arguments)):
+                raise ValueError(
+                    f"{type(self).__name__}: GUIDANCE needs at least two branches, each mapping the same "
+                    f"model_output arguments (got {[sorted(branch) for branch in guidance.branches]})"
+                )
+        self._branch_shares = {
+            False: (0,),
+            True: tuple(range(len(guidance.branches)))[my_rows(self.cfg_group, len(guidance.branches))]
+            if guidance is not None else (0,),
+        }
+        # The request's guidance scales, one value per step and on the device, memoized by the step count and the
+        # knobs' values, as the schedule is.
+        self._staged_scales = functools.lru_cache(_MEMO_ENTRIES)(self._stage_scales)
+        # The step scalars the base slices per step: the scheduler's, and a guided model's scales. A scale is an
+        # input under its own name, beside the step scalars, the loop-back edges and the branches' request inputs;
+        # its values are staged under ``guidance:<name>`` (``_stage_scales``), apart from the schedule's sources. Shared
+        # request inputs no branch names are the model's own: prepare_inputs checks those per row.
+        scales = guidance.scales if guidance is not None else ()
+        branch_inputs = {edge for branch in guidance.branches for edge in branch.values()} if guidance else set()
+        shadowed = set(scales) & {*self.STEP_SCALARS, *self.loop_back_names, *branch_inputs}
+        if shadowed:
+            raise ValueError(
+                f"{type(self).__name__}: guidance scale(s) {sorted(shadowed)} share a name with a step scalar, "
+                f"loop-back input or guidance branch input"
+            )
+        self.step_scalars: Mapping[str, StepScalar] = {
+            **self.STEP_SCALARS, **{name: StepScalar(f"guidance:{name}", broadcast=False) for name in scales},
+        }
+        # What the scaffold stages itself, which a model's request_inputs must not name
+        self._staged_names = frozenset({*self.step_scalars, *self.loop_back_names})
 
     @property
     def loop_back_names(self) -> tuple[str, ...]:
@@ -275,60 +335,105 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         return draw.result()
 
     def request_inputs(
-        self, fwd_info: CurrentForwardPassInfo, inputs: NameToTensorList, bucket_key: Hashable,
+        self, fwd_info: CurrentForwardPassInfo, inputs: NameToTensorList, key: StepKey,
     ) -> dict[str, torch.Tensor]:
-        """The request's conditioning tensors for this step, without a batch dim."""
+        """The request's conditioning tensors for this step, without a batch dim. A guided model returns every
+        branch input its ``key.branches`` read (the contract is on ``Guidance.branches``); the base maps them onto
+        each branch's row. No name may be a step scalar's or a loop-back edge's (``prepare_inputs`` refuses it)."""
         raise NotImplementedError
 
-    def num_tokens(self, bucket_key: Hashable) -> int:
-        """Tokens one request contributes to the step (sizes the attention segment / buckets)."""
+    def num_tokens(self, key: StepKey) -> int:
+        """Tokens one guidance branch of one request contributes to the step (sizes the attention segment / buckets)."""
         raise NotImplementedError
 
-    def capture_request_inputs(self, bucket_key: Hashable, device: torch.device) -> dict[str, torch.Tensor]:
+    def capture_request_inputs(self, key: StepKey, device: torch.device) -> dict[str, torch.Tensor]:
         """Placeholder loop-back tensors + conditioning for one row of this bucket (capture time)."""
+        raise NotImplementedError
+
+    def model_output(
+        self, engine_inputs: ModelInputsFromEngine, key: StepKey, latents: torch.Tensor,
+        timestep: torch.Tensor, **cond: torch.Tensor,
+    ) -> torch.Tensor:
+        """The model's prediction for a stacked batch of rows, ``[R, ...]`` over the rows' samples (a velocity for
+        the Euler step, what the solver takes for UniPC). Under guidance the rows are each request's local branches
+        (``key.branches``), with ``latents``, ``timestep`` and the shared inputs repeated per branch and each branch's
+        inputs mapped onto its row."""
         raise NotImplementedError
 
     def denoise(
         self,
         engine_inputs: ModelInputsFromEngine,
-        bucket_key: Hashable,
+        key: StepKey,
         latents: torch.Tensor,
         timestep: torch.Tensor,
         sigma: torch.Tensor,
         sigma_next: torch.Tensor,
         **cond: torch.Tensor,
     ) -> torch.Tensor | Mapping[str, torch.Tensor]:
-        """One scheduler step for a stacked batch: ``[B, L, C] -> [B, L, C]``.
+        """One scheduler step for a stacked batch: ``[B, L, C] -> [B, L, C]``. Default: the Euler step of the
+        (guided) :meth:`model_output`.
 
-        A model with ``SOLVER_STATE`` returns ``{name: stacked tensor}`` covering
-        every loop-back edge instead of the new sample alone."""
-        raise NotImplementedError
+        A model that steps itself (several streams, a model-specific update) overrides this; one with
+        ``SOLVER_STATE`` returns ``{name: stacked tensor}`` covering every loop-back edge instead of the new sample
+        alone."""
+        return euler_step(latents, self.guided_output(engine_inputs, key, latents, timestep, **cond), sigma, sigma_next)
 
-    def build_layout(self, bucket_key: Hashable, device: torch.device) -> Any:
-        """Derived per-key state (e.g. rotary tables); cached by :meth:`layout`."""
+    def build_layout(self, key: StepKey, device: torch.device) -> Any:
+        """Derived per-key state (e.g. rotary tables); cached by :meth:`layout` per bucket and branch share."""
         return None
 
-    def attention_segments(self, bucket_key: Hashable) -> Mapping[str, Sequence[tuple[str, int]]]:
-        """``(label, span)`` for each segment one request brings to each array its layers attend through. Whole on every
-        rank, since the engine cuts each read's share. Default: none, for a loop with no declared arrays."""
+    def attention_segments(self, key: StepKey) -> Mapping[str, Sequence[tuple[str, int]]]:
+        """``(label, span)`` for each segment one request brings to each array its layers attend through, in row order
+        (each local branch's segments, ``key.branches`` in order). Whole on every rank, since the engine cuts each
+        read's share. Default: none, for a loop with no declared arrays."""
         return {}
 
+    def guided_output(
+        self, engine_inputs: ModelInputsFromEngine, key: StepKey, latents: torch.Tensor, timestep: torch.Tensor,
+        **inputs: torch.Tensor,
+    ) -> torch.Tensor:
+        """:meth:`model_output` under the model's ``GUIDANCE``: this rank's branches as rows, request-major, then
+        the predictions gathered over the cfg group and combined. Unguided, branch 0 alone."""
+        guidance = self.GUIDANCE
+        if guidance is None:
+            return self.model_output(engine_inputs, key, latents, timestep, **inputs)
+        values = {name: inputs.pop(name) for name in guidance.scales}
+        named = {edge for branch in guidance.branches for edge in branch.values()}
+        shared = {name: tensor for name, tensor in inputs.items() if name not in named}
+        rows = [
+            {**shared, **{arg: inputs[edge] for arg, edge in guidance.branches[b].items()}} for b in key.branches
+        ]
+        local = len(rows)
+        pred = self.model_output(
+            engine_inputs, key, _branch_rows([latents] * local), _branch_rows([timestep] * local),
+            **{name: _branch_rows([row[name] for row in rows]) for name in rows[0]},
+        )
+        if not key.guided:
+            return pred
+        # [B * local, ...] -> [B, local, ...] -> every branch, gathered over the group in branch order
+        pred = self.cfg_group.all_gather(pred.reshape(-1, local, *pred.shape[1:]).contiguous(), dim=1)
+        rank = [1] * (pred.ndim - 2)
+        return guidance.combine(pred.unbind(1), {name: s.reshape(-1, *rank) for name, s in values.items()})
+
     # --------------------------------------------------------------- helpers
-    def layout(self, bucket_key: Hashable, device: torch.device) -> Any:
-        entry = self._layouts.get(bucket_key)
+    def layout(self, key: StepKey, device: torch.device) -> Any:
+        """:meth:`build_layout` for ``key``, cached by its bucket and branch share (the step's dtype changes no
+        layout)."""
+        cache_key = (key.bucket, key.branches)
+        entry = self._layouts.get(cache_key)
         if entry is not None:
             return entry
-        if bucket_key in self._captured_keys:
-            entry = self._layouts[bucket_key] = self.build_layout(bucket_key, device)
+        if key.bucket in self._captured_keys:
+            entry = self._layouts[cache_key] = self.build_layout(key, device)
             return entry
         cache = self._uncaptured_layouts
-        entry = cache.get(bucket_key)
+        entry = cache.get(cache_key)
         if entry is None:
-            entry = cache[bucket_key] = self.build_layout(bucket_key, device)
+            entry = cache[cache_key] = self.build_layout(key, device)
             while len(cache) > self.max_uncaptured_layouts:
                 cache.popitem(last=False)
         else:
-            cache.move_to_end(bucket_key)
+            cache.move_to_end(cache_key)
         return entry
 
     def step_index(self, fwd_info: CurrentForwardPassInfo) -> int:
@@ -341,16 +446,23 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         """
         return int(fwd_info.dynamic_loop_iter_counts[self.loop_name])
 
-    def step_key(self, fwd_info: CurrentForwardPassInfo, bucket_key: Hashable, step: int | None = None) -> Hashable:
+    def step_key(self, fwd_info: CurrentForwardPassInfo, bucket_key: Hashable, step: int | None = None) -> StepKey:
         """What step ``step`` (default: ``fwd_info``'s) batches and captures on: ``bucket_key``, with the step's dtype
-        under a step schedule. ``prepare_inputs`` and ``cg_key_info`` both take it from here, so a step's rows and its
-        graph agree."""
+        under a step schedule and whether the request is guided. ``prepare_inputs`` and ``cg_key_info`` both take it
+        from here, so a step's rows and its graph agree."""
+        guidance = self.GUIDANCE
+        guided = guidance is not None and guidance.active(fwd_info.step_metadata)
         if self.step_dtypes is None:
-            return bucket_key
-        return StepBucket(bucket_key, self.step_dtypes.at(self.step_index(fwd_info) if step is None else step))
+            return self._key(bucket_key, None, guided)
+        k = self.step_index(fwd_info) if step is None else step
+        return self._key(bucket_key, self.step_dtypes.at(k), guided)
 
-    def _bucket_of(self, step_key: Hashable) -> Hashable:
-        return step_key.bucket if isinstance(step_key, StepBucket) else step_key
+    def _key(self, bucket_key: Hashable, dtype: str | None, guided: bool) -> StepKey:
+        return StepKey(bucket_key, dtype, guided, self._branch_shares[guided])
+
+    def _knobs(self, fwd_info: CurrentForwardPassInfo) -> dict[str, float]:
+        """The request's guidance scales as it set them."""
+        return {name: float(fwd_info.step_metadata[name]) for name in self.GUIDANCE.scales}
 
     # --------------------------------------------------------- engine contract
     def prepare_inputs(
@@ -369,18 +481,25 @@ class DenoiseLoopSubmodule(NodeSubmodule):
                 f"{num_steps} steps; declare the step count as the loop's cap (Model.get_loop_caps)"
             )
         staged = self._staged_schedules(*schedule_key)
+        if self.GUIDANCE is not None:
+            staged = {**staged, **self._staged_scales(num_steps, tuple(self._knobs(fwd_info).items()))}
+        key = self.step_key(fwd_info, bucket_key)
+        conditioning = self.request_inputs(fwd_info, inputs, key)
+        shadowed = conditioning.keys() & self._staged_names
+        if shadowed:
+            raise ValueError(
+                f"{type(self).__name__}.request_inputs returned {sorted(shadowed)}, the name of a step scalar or "
+                f"loop-back input"
+            )
         tensors = {
             **self._carried_inputs(fwd_info, inputs, bucket_key, k, device),
             **{
                 name: staged[scalar.source][k + scalar.offset:k + scalar.offset + 1]
-                for name, scalar in self.STEP_SCALARS.items()
+                for name, scalar in self.step_scalars.items()
             },
-            **self.request_inputs(fwd_info, inputs, bucket_key),
+            **conditioning,
         }
-        return NodeInputs(
-            tensor_inputs=tensors, input_seq_len=self.num_tokens(bucket_key),
-            resource_step_info=self.step_key(fwd_info, bucket_key),
-        )
+        return NodeInputs(tensor_inputs=tensors, input_seq_len=self.num_tokens(key), resource_step_info=key)
 
     def _schedule_key(self, fwd_info: CurrentForwardPassInfo, bucket_key: Hashable) -> tuple[str, Hashable, Hashable]:
         return fwd_info.graph_walk, self.schedule_settings(fwd_info), bucket_key
@@ -391,6 +510,15 @@ class DenoiseLoopSubmodule(NodeSubmodule):
 
     def _stage_schedule(self, walk: str, settings: Hashable, bucket_key: Hashable) -> dict[str, torch.Tensor]:
         return self._step_scalar_sources(self._schedules(walk, settings, bucket_key), self.get_device())
+
+    def _stage_scales(self, num_steps: int, knobs: tuple[tuple[str, float], ...]) -> dict[str, torch.Tensor]:
+        """Each of the request's guidance scales, one value per step, on the device under its step scalar's source
+        name."""
+        return {
+            self.step_scalars[name].source:
+                to_device_nonblocking(torch.full((num_steps,), value, dtype=torch.float32), self.get_device())
+            for name, value in knobs
+        }
 
     def _step_scalar_sources(
         self, schedule: FlowMatchSchedule, device: torch.device,
@@ -455,22 +583,20 @@ class DenoiseLoopSubmodule(NodeSubmodule):
     def preprocess(self, graph_walk: str, engine_inputs: ModelInputsFromEngine, inputs: list[NodeInputs]) -> dict:
         keys = inputs[0].tensor_inputs.keys()
         stacked = {key: torch.stack([inp.tensor_inputs[key] for inp in inputs]) for key in keys}
-        for name, scalar in self.STEP_SCALARS.items():
+        for name, scalar in self.step_scalars.items():
             # [B, 1] -> [B, 1, 1] to broadcast over [B, L, C], or a plain [B]
             stacked[name] = stacked[name].view(-1, 1, 1) if scalar.broadcast else stacked[name].view(-1)
-        stacked["bucket_key"] = inputs[0].resource_step_info
+        stacked["step_key"] = inputs[0].resource_step_info
         return stacked
 
     def _run(
         self, engine_inputs: ModelInputsFromEngine, kwargs: dict,
     ) -> dict[str, torch.Tensor]:
         """One stacked step, as ``{loop-back edge: [B, ...]}``."""
-        bucket_key = kwargs.pop("bucket_key")
-        if isinstance(bucket_key, StepBucket):
-            self.step_dtype, bucket_key = bucket_key.dtype, bucket_key.bucket
+        key = kwargs.pop("step_key")
         carried = {name: kwargs.pop(name) for name in self.loop_back_names}
-        scalars = {name: kwargs.pop(name) for name in self.STEP_SCALARS}
-        out = self.denoise(engine_inputs, bucket_key, **carried, **scalars, **kwargs)
+        scalars = {name: kwargs.pop(name) for name in self.step_scalars}
+        out = self.denoise(engine_inputs, key, **carried, **scalars, **kwargs)
         return {self.LATENTS: out} if isinstance(out, torch.Tensor) else dict(out)
 
     def forward(self, graph_walk: str, engine_inputs: ModelInputsFromEngine, **kwargs) -> NameToTensorList:
@@ -515,9 +641,9 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         return int(loops[self.loop_name]) if self.loop_name in loops else None
 
     def split_batches_by_capture_key(self, graph_walk: str) -> bool:
-        # a step mixing dtypes matches no capture and would run a row at a time
+        # a step mixing dtypes, or guided and unguided requests, matches no capture and would run a row at a time
         del graph_walk
-        return self.step_dtypes is not None
+        return self.step_dtypes is not None or self.GUIDANCE is not None
 
     def declare_step(
         self, graph_walk: str, request_ids: list[str], inputs: list[NodeInputs],
@@ -526,7 +652,7 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         # every row (padding rows included) carries its bucket key, so the spans are
         # identical between a bucket's capture and its replays
         rows = [
-            (rid, self.attention_segments(self._bucket_of(inp.resource_step_info)))
+            (rid, self.attention_segments(inp.resource_step_info))
             for rid, inp in zip(request_ids, inputs, strict=True)
         ]
         if not rows[0][1]:
@@ -550,19 +676,17 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         from mstar.engine.accelerator_graph_config import BatchedAcceleratorGraphConfig
 
         configs = []
+        dtypes = [None] if self.step_dtypes is None else list(self.step_dtypes.dtypes)
+        guided = [False] if self.GUIDANCE is None else [False, True]
         for walk, bucket_key in self.capture_buckets:
-            step_keys = (
-                [bucket_key] if self.step_dtypes is None
-                else [StepBucket(bucket_key, dtype) for dtype in self.step_dtypes.dtypes]
-            )
-            for step_key in step_keys:
-                tensors = dict(self.capture_request_inputs(bucket_key, device))
-                for name, scalar in self.STEP_SCALARS.items():
+            for step_key in (self._key(bucket_key, dtype, on) for dtype in dtypes for on in guided):
+                tensors = dict(self.capture_request_inputs(step_key, device))
+                for name, scalar in self.step_scalars.items():
                     tensors[name] = torch.full(
                         (1,), scalar.capture_fill, dtype=torch.float32, device=device,
                     )
                 single = NodeInputs(
-                    tensor_inputs=tensors, input_seq_len=self.num_tokens(bucket_key), resource_step_info=step_key,
+                    tensor_inputs=tensors, input_seq_len=self.num_tokens(step_key), resource_step_info=step_key,
                 )
                 configs.append(BatchedAcceleratorGraphConfig(
                     capture_graph_walk=walk,
@@ -572,6 +696,8 @@ class DenoiseLoopSubmodule(NodeSubmodule):
                     # the model compiles its own transformer region; the graph records those kernels
                     compile=False,
                     capture_batch_sizes=list(self.capture_batch_sizes),
+                    # a row's input_seq_len is one branch's tokens; the step plans every local branch's
+                    total_tokens_multiplier=len(step_key.branches),
                     # uncaptured sizes / shapes run the eager batched path, so don't cap the batch
                     caps_eager_batch_size=False,
                     # every static input is row-leading ([tokens, features] or a per-batch scalar); a text
@@ -594,14 +720,6 @@ class UniPCDenoiseLoopSubmodule(DenoiseLoopSubmodule):
     SOLVER_STATE = SOLVER_STATE
     STEP_SCALARS = {"timestep": StepScalar("timesteps", broadcast=False, capture_fill=1000.0)}
 
-    def model_output(
-        self, engine_inputs: ModelInputsFromEngine, bucket_key: Hashable, latents: torch.Tensor,
-        timestep: torch.Tensor, **cond: torch.Tensor,
-    ) -> torch.Tensor:
-        """What the solver takes for a stacked batch, ``[B, ...]`` over the rows'
-        samples; ``latents`` and ``cond`` are stacked over the rows' tensors."""
-        raise NotImplementedError
-
     def seed_loop_back(self, bucket_key: Hashable, generator: torch.Generator) -> dict[str, torch.Tensor]:
         latents = self.seed_latents(bucket_key, generator)
         return {self.LATENTS: latents, **initial_state(latents)}
@@ -618,18 +736,18 @@ class UniPCDenoiseLoopSubmodule(DenoiseLoopSubmodule):
     def denoise(
         self,
         engine_inputs: ModelInputsFromEngine,
-        bucket_key: Hashable,
+        key: StepKey,
         latents: torch.Tensor,
         timestep: torch.Tensor,
         unipc_model_outputs: torch.Tensor,
         unipc_last_sample: torch.Tensor,
         **cond: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        output = self.model_output(engine_inputs, bucket_key, latents, timestep, **cond)
+        output = self.guided_output(engine_inputs, key, latents, timestep, **cond)
         steps = []
         for i, rid in enumerate(engine_inputs.request_ids):
             info = engine_inputs.per_request_info[rid]
-            schedule_key = self._schedule_key(info, bucket_key)
+            schedule_key = self._schedule_key(info, key.bucket)
             schedule = self._schedules(*schedule_key)
             steps.append(unipc_step(
                 output[i], latents[i],
@@ -642,6 +760,12 @@ class UniPCDenoiseLoopSubmodule(DenoiseLoopSubmodule):
             MODEL_OUTPUTS: torch.stack([step.model_outputs for step in steps]),
             LAST_SAMPLE: torch.stack([step.last_sample for step in steps]),
         }
+
+
+def _branch_rows(tensors: list[torch.Tensor]) -> torch.Tensor:
+    """Each branch's ``[B, ...]`` stacked request-major, ``[B * branches, ...]``: a request's rows are adjacent, in
+    branch order, which is the order its attention segments are declared in."""
+    return tensors[0] if len(tensors) == 1 else torch.stack(tensors, dim=1).flatten(0, 1)
 
 
 # The default names, for callers that only need those (the module's own graph

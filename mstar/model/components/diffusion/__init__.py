@@ -8,12 +8,14 @@ component ports, a weight loader and a thin graph file:
 * ``rope``         multi-axis rotary tables and the interleaved application FLUX-family DiTs use
 * ``attention``    joint attention over packed text+image tokens: SDPA eagerly, the ragged
                    FlashInfer resource under CUDA graphs
-* ``qwen3``        the native Qwen3-family prompt encoder the DiTs condition on, and the
+* ``qwen``         the native Qwen-family prompt encoder the DiTs condition on, and the
                    checkpoint rules that fill it (model-specific, hence its own package)
+* ``guidance``     the declared CFG branches and combine a DiT's rows run through
 * ``denoise_loop`` the Loop-body submodule: seeded noise, equal-shape request batching, per-step
                    CUDA graphs, stop at the request's step count
 * ``image_io``     pixel/latent packing helpers, PNG encoding and the shared mp4 encoder
-* ``ffn``          a DiT feed-forward with its GELU in the GEMM's epilogue when compiled
+* ``ffn``          a DiT up-projection with its bias and GELU in the GEMM's epilogue (a whole
+                   feed-forward swaps it in when compiled)
 * ``lora``         static LoRA merging at load time
 * ``compile_utils``/``decode_utils``  the transformer/VAE ``torch.compile`` wrappers, the exact-op
                    exclusions, and the batch splitting that keeps a compiled decode on warm shapes

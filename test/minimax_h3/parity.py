@@ -140,6 +140,7 @@ def run(args, report: dict, failures: list[str]) -> None:
     from mstar.engine.resources.sequence_shard import SequenceShard
     from mstar.engine.resources.step import StepContext
     from mstar.engine.state.adapters import node_handles, state_setup
+    from mstar.model.components.diffusion.denoise_loop import StepKey
     from mstar.model.minimax_h3 import weight_loader
     from mstar.model.minimax_h3.components.layout import (
         modality_tags,
@@ -285,7 +286,7 @@ def run(args, report: dict, failures: list[str]) -> None:
         with torch.no_grad():
             if images:
                 text_node = H3TextEncoderSubmodule(
-                    encoder, conditioner, vision=weight_loader.build_vision_tower(args.snapshot, dev), config=config,
+                    encoder, conditioner, vision=weight_loader.build_vision_tower(args.snapshot, dev),
                 ).to(dev)
                 hidden = text_node._encode_with_images(ids.to(dev), vision_pixels.to(dev), grids)
             else:
@@ -307,7 +308,7 @@ def run(args, report: dict, failures: list[str]) -> None:
         sub = H3DenoiseSubmodule(dit, config, loop_name="denoise_loop")
         one_rank = SequenceShard(("main",), 0, None, 0, types.SimpleNamespace(world_size=1))
         sub.bind_node_state(node_handles(model, DIT_NODE, {DIT_SHARD: one_rank}, setup=on_sdpa))
-        step_layout = sub.build_layout(layout, dev)
+        step_layout = sub.build_layout(StepKey(layout), dev)
         sched = h3_schedule(request["num_inference_steps"], request["video_shift"], request["audio_shift"])
         text = text_rows.to(dev)
         plans = {entry["k"]: (entry["timestep"], entry["timestep_indices"]) for entry in oracle["steps"]}
@@ -326,7 +327,7 @@ def run(args, report: dict, failures: list[str]) -> None:
             else:
                 t = torch.stack([sched.timesteps[k], sched.audio_timesteps[k], sched.cond_timesteps[k]])[None].to(dev)
                 row_class = None
-            step = engine_step(sub, "gen", [0], [NodeInputs(resource_step_info=layout)])
+            step = engine_step(sub, "gen", [0], [NodeInputs(resource_step_info=StepKey(layout))])
             step.set_ctx(StepContext(request_ids=[0], graph_walk="gen", slot=0, capture=False))
             step.begin_calls()
             with torch.no_grad():

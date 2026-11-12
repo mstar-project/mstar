@@ -18,6 +18,7 @@ import time
 import torch
 import torch.distributed as dist
 
+from mstar.model.components.diffusion.denoise_loop import StepKey
 from mstar.model.ltx2_5.config import LTX25_REPO, SNAPSHOT_PATTERNS, LTX25Config
 from mstar.model.ltx2_5.weight_loader import build_transformer
 from mstar.utils.hf_snapshot import resolve_snapshot_dir
@@ -53,7 +54,7 @@ def denoise_step(config, dit, shape, batch, device, joint, attention):
     sub.bind_node_resources(res)
     sub.bind_node_state(node_handles(model, "dit", res, setup=setup))
     rids = list(range(batch))
-    step = engine_step(sub, "g", rids, [NodeInputs(resource_step_info=shape)] * batch)
+    step = engine_step(sub, "g", rids, [NodeInputs(resource_step_info=StepKey(shape))] * batch)
     step.set_ctx(StepContext(request_ids=rids, graph_walk="g", slot=0, capture=False))
     StepRunner(res).plan(step)
     return sub, step
@@ -116,7 +117,7 @@ def main():
     def step():
         opened.begin_calls()
         try:
-            sub.denoise(None, shape, video, timestep, sigma, sigma * 0.5, audio, text, audio_text)
+            sub.denoise(None, StepKey(shape), video, timestep, sigma, sigma * 0.5, audio, text, audio_text)
         finally:
             opened.end_calls()
 
