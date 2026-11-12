@@ -911,7 +911,8 @@ def _step(node, layout, first, latents=None, cond=None):
     return node.denoise(
         None, layout, latents, scalar(0.9), scalar(0.8), scalar(0.8),
         torch.zeros(1, layout.num_audio_rows, cfg.audio_latents_dim), scalar(0.9), scalar(0.8), scalar(0.8),
-        scalar(KEYFRAME_NOISE_AUG), torch.zeros(1, 3, cfg.hidden_size), torch.tensor(first), cond_latents=cond,
+        scalar(KEYFRAME_NOISE_AUG), torch.zeros(1, 3, cfg.hidden_size), torch.tensor(first),
+        torch.tensor(first and not layout.num_condition_rows), cond_latents=cond,
     )
 
 
@@ -973,7 +974,7 @@ def test_denoise_noises_keyframe_rows_at_step_0_and_carries_them():
         return node.denoise(
             None, layout, latents, scalar(0.9), scalar(0.8), scalar(0.8), audio, scalar(0.9), scalar(0.8),
             scalar(0.8), scalar(KEYFRAME_NOISE_AUG), torch.zeros(1, 3, H3Config().transformer.hidden_size),
-            torch.tensor(first), cond_latents=cond,
+            torch.tensor(first), torch.tensor(False), cond_latents=cond,
         )
 
     t = torch.tensor(KEYFRAME_NOISE_AUG, dtype=torch.float32)
