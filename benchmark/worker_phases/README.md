@@ -59,7 +59,9 @@ The names say neither which thread a phase runs on nor whether it is work.
 
 | phase | thread | what it is |
 | --- | --- | --- |
-| `worker.postprocess.event_sync` | main | **The only real GPU wait.** Blocks on the step's completion event |
+| `worker.postprocess.event_sync` | main | **The real GPU wait**, with `stream_run.wait` below. Blocks on the step's completion event |
+| `worker.postprocess.stream_run.wait` | main | GPU wait: a repeated step's (`step_repeats`) replays landing while the host streams their tokens. It takes most of such a step's wait, so `event_sync` reads only what is left |
+| `worker.postprocess.stream_run` | main | Work: sending a repeated step's landed tokens to the client (`emit_prefix`), its waits taken out |
 | `await_gpu` | main | Waits for the GPU *thread's* host work (`prepare_inputs` plus kernel launch). Not GPU execution |
 | `worker.gpu_thread.exec` | GPU | CPU time spent enqueuing kernels, not GPU time |
 | `worker.gpu_thread.prepare_inputs` | GPU | Host work, but it absorbs any host sync inside a submodule's `prepare_inputs` |

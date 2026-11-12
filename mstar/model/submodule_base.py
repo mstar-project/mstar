@@ -141,7 +141,7 @@ class BatchedStopCheck(NamedTuple):
 
 if TYPE_CHECKING:
     from mstar.engine.accelerator_graph_config import AcceleratorGraphConfig, PiecewiseAcceleratorGraphConfig
-    from mstar.engine.accelerator_graph_runner import PiecewiseAcceleratorGraphRunner
+    from mstar.engine.accelerator_graph_runner import PiecewiseAcceleratorGraphRunner, ReplayEvents
     from mstar.engine.engine import ExecutingBatch
     from mstar.streaming.stream_buffer import StreamChunkInfo
 
@@ -299,6 +299,9 @@ class BatchedModelOutput:
     # along its last dim. The worker cuts the rows to it once the step has
     # run (see ``NodeSubmodule.spanned_outputs``).
     output_spans: dict[str, torch.Tensor] | None = None
+    # A repeated step's replays as they land on the host; None on any other
+    # step.
+    landing: "ReplayEvents | None" = None
     # The request each row of ``output_spans`` belongs to, stamped by the
     # engine like ``row_request_ids``.
     span_request_ids: tuple | None = None
@@ -348,6 +351,10 @@ class BatchedModelOutput:
         """
         if self.check_stop_buffers is None:
             return None
+        if self.landing is not None:
+            # a repeated step's columns, on the host as they land: no replay
+            # overwrites them, and a copy now would miss what lands later
+            return dict(self.check_stop_buffers)
         rows = self.row_outputs or {}
         clones = {
             id(rows[name]): clone for name, clone in (reuse or {}).items()

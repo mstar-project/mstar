@@ -429,8 +429,7 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        about one at a few dozen rows; measure with ``prefix_slots: 0`` too. A run delays the next admission
        even without ``ready_waits``: a request that arrives mid-run waits for the run to end, so time to
        first token can rise where the throughput gain doesn't pay for it (Canary's closed-loop c16 TTFT went
-       from 51 to 103 ms at ``max: 8``; Whisper large-v3 and Qwen3-ASR lost TTFT with no throughput gain), and a
-       streaming client receives up to ``max`` tokens at once, with gaps of up to ``max`` steps between them.
+       from 51 to 103 ms at ``max: 8``; Whisper large-v3 and Qwen3-ASR lost TTFT with no throughput gain).
        ``ready_waits: true`` makes ready rows wait for a full-length run after a step that ran once, trading
        more admission latency for longer runs; measure it, it is not a free improvement. Needs a ``TokenStop``, every output on the device,
        resources that can all run on resident tables, and a decode kernel that reads its lengths per replay (any node on
@@ -440,6 +439,7 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        runs the walks asked on resident tables, with the runtime's stop and its token looped back on
        the device; another AR node must declare those itself (see :doc:`adding_models`), and a node
        not named keeps its own token path. A step isn't rewound for a row that stopped inside it.
+       A step's client tokens go out as each of its iterations lands, not all when the step ends.
    * - ``batch_builder``
      - *(optional, default* ``fifo`` *)* How the worker composes a step under a token
        budget (``max_batch_tokens``). ``fifo`` serves prompts in the order they started:

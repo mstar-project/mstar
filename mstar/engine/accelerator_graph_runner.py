@@ -669,6 +669,74 @@ class DummyRowPool:
             self.reset(rids, free=True)
 
 
+class ReplayEvents(NamedTuple):
+    """A repeated step's replays as they land on the host while it runs:
+    replay i's event records once its stop buffers' column i is there."""
+    events: Sequence[Any]
+
+    def landed(self, after: int) -> int:
+        """Waits for replay ``after``, which the host launched, then counts
+        the replays that have landed. This thread's reads of their columns
+        come after it."""
+        if not self.events[after].query():
+            self.events[after].synchronize()
+        end = after + 1
+        while end < len(self.events) and self.events[end].query():
+            end += 1
+        return end
+
+
+class HostRun:
+    """A step that repeats from the host: each replay's stop buffers land in
+    pinned memory, ``[turns, limit, bs]`` each, then the replay's event
+    records (``[turns][limit]``). A turn a step, so the next step's replays
+    leave this one's alone: step N's are read on the host while N+1's land
+    theirs (the pipeline is one step deep; as ``HostCopies``' ring, four leave
+    slack). On a CPU device the columns are plain memory and there are no
+    events, so the step has no landing."""
+
+    TURNS = 4
+
+    def __init__(self, buffers: Mapping[str, torch.Tensor], limit: int, device: torch.device):
+        pinned = device.type != "cpu"
+        self.turn = 0
+        self.events = tuple(
+            tuple(torch.Event(device=device) for _ in range(limit)) for _ in range(self.TURNS)
+        ) if pinned else ()
+        # two names can share a buffer, and then share its columns
+        columns: dict[int, torch.Tensor] = {}
+        self.columns: dict[str, torch.Tensor] = {}
+        self._copies: list[tuple[torch.Tensor, torch.Tensor]] = []
+        for name, tensor in buffers.items():
+            if id(tensor) not in columns:
+                columns[id(tensor)] = torch.empty(
+                    self.TURNS, limit, tensor.shape[0], dtype=tensor.dtype, pin_memory=pinned,
+                )
+                self._copies.append((tensor, columns[id(tensor)]))
+            self.columns[name] = columns[id(tensor)]
+
+    def next_turn(self) -> None:
+        """Before a step's first replay lands."""
+        self.turn = (self.turn + 1) % self.TURNS
+
+    def land(self, i: int) -> None:
+        """After replay ``i``: its stop buffers' column ``i`` of this turn,
+        copied to the host before the next replay overwrites them, then the
+        replay's event."""
+        for source, column in self._copies:
+            column[self.turn, i].copy_(source.reshape(-1), non_blocking=True)
+        if self.events:
+            self.events[self.turn][i].record()
+
+    def results(self, repeats: int) -> tuple[dict[str, torch.Tensor], ReplayEvents | None]:
+        """After the last replay: the stop buffers as ``[bs, repeats]`` views
+        of this turn's columns, and how far they have landed."""
+        wide = {id(column): column[self.turn, :repeats].t() for column in self.columns.values()}
+        events = self.events[self.turn][:repeats] if self.events else ()
+        columns = {name: wide[id(column)] for name, column in self.columns.items()}
+        return columns, ReplayEvents(events) if events else None
+
+
 def _carried(outputs: BatchedModelOutput, name: str) -> torch.Tensor | None:
     """The buffer a replay leaves ``name`` in: a stop buffer, else a row output."""
     for buffers in (outputs.check_stop_buffers, outputs.row_outputs):
@@ -696,6 +764,8 @@ class AcceleratorGraphSlot:
     dummy_rids: list[int]
     dummy_metadata: dict[int, CurrentForwardPassInfo]
     config_idx: int
+    # a step that repeats: its replays' pinned columns (``HostRun``)
+    run: HostRun | None = None
 
 
 @dataclass
@@ -1729,17 +1799,26 @@ class AcceleratorGraphRunner:
             profiler.range_pop()
         return slot.static_outputs
 
-    def accept_repeats(self, walk: str, carries: Mapping[str, str]) -> None:
-        """A step of ``walk`` may repeat, carrying its signals as ``carries``."""
+    def accept_repeats(self, walk: str, carries: Mapping[str, str], limit: int) -> None:
+        """A step of ``walk`` may repeat up to ``limit`` times, carrying its
+        signals as ``carries``. Each slot's replays land their stop buffers in
+        the slot's pinned columns."""
         self._repeat_carries[walk] = carries
+        for bucket in self._buckets.values():
+            if bucket.config.capture_graph_walk != walk:
+                continue
+            for slot in bucket.slots:
+                if slot.run is None:
+                    slot.run = HostRun(slot.static_outputs.check_stop_buffers or {}, limit, self._device)
 
     def repeat(self, lease: SlotLease, out: BatchedModelOutput, repeats: int) -> BatchedModelOutput:
         """``out``, the step's first launch, with the rest of its iterations:
-        its stop buffers gain a column per iteration. The graph replays,
-        copying every loop-back signal's output into the static input it feeds
-        before each replay, and each column out on the stream before the next
-        replay overwrites it. A walk that can't repeat returns ``out`` as it is
-        for one iteration, and refuses more: every resource would commit them."""
+        its stop buffers gain a column per iteration, on the host, landing as
+        each iteration ends. The graph replays (``HostRun``), copying every
+        loop-back signal's output into the static input it feeds before each
+        replay, and landing each replay's columns. A walk that can't repeat
+        returns ``out`` as it is for one iteration, and refuses more: every
+        resource would commit them."""
         slot = self.slot_for(lease)
         walk = lease.bucket.graph_walk
         carries = self._repeat_carries.get(walk)
@@ -1752,20 +1831,19 @@ class AcceleratorGraphRunner:
         profiler.phase_record(f"repeats.{walk}#", repeats)
         if repeats == 1:
             return out
-        buffers = slot.static_outputs.check_stop_buffers
+        run = slot.run
         copies = [
             (_carried(slot.static_outputs, output), slot.static_inputs[target]) for output, target in carries.items()
         ]
-        unique = {id(t): t for t in buffers.values()}
-        columns = {key: t.new_empty(t.shape[0], repeats) for key, t in unique.items()}
+        run.next_turn()
         for i in range(repeats):
             if i:
                 for source, target in copies:
                     target.copy_(source.reshape(target.shape))
                 slot.graph.replay()
-            for key, tensor in unique.items():
-                columns[key][:, i].copy_(tensor.reshape(-1))
-        return replace(out, check_stop_buffers={name: columns[id(tensor)] for name, tensor in buffers.items()})
+            run.land(i)
+        buffers, landing = run.results(repeats)
+        return replace(out, check_stop_buffers=buffers, landing=landing)
 
     def carry_refusal(self, walk: str, carries: Mapping[str, str]) -> str | None:
         """Why a capture of ``walk`` can't carry each loop-back output into the

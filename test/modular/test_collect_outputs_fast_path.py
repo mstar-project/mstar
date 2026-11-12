@@ -3,8 +3,12 @@ filtering) hands out the same per-rid row views as the generic walk, and the
 stop buffer shares the row clone instead of taking a second copy."""
 from __future__ import annotations
 
+from types import SimpleNamespace
+
+import pytest
 import torch
 
+from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner
 from mstar.model.submodule_base import BatchedModelOutput, NodeSubmodule
 from mstar.testing_utils.engine import make_engine, make_mgmt
 
@@ -154,3 +158,22 @@ def test_rows_only_collect_takes_no_clone():
     assert out.rows_only and out.per_rid_outputs == {} and out.row_views is None
     assert out.check_stop_buffers["new_token"] is raw.check_stop_buffers["new_token"]
     assert out.row_request_ids == (1, 2, 3, 4)
+
+
+@pytest.mark.parametrize("rows_only", [True, False], ids=["rows_only", "per_rid"])
+def test_a_repeated_steps_landing_reaches_the_collected_output(rows_only):
+    """The landing is a field every construction of the output has to carry; lost,
+    the host would stream nothing while the step runs."""
+    columns = {"new_token": torch.ones(2, 3).long()}
+    landing = object()
+    run = SimpleNamespace(next_turn=lambda: None, land=lambda i: None, results=lambda repeats: (columns, landing))
+    runner = AcceleratorGraphRunner.__new__(AcceleratorGraphRunner)
+    runner.slot_for = lambda lease: SimpleNamespace(
+        run=run, graph=SimpleNamespace(replay=lambda: None), static_outputs=BatchedModelOutput(), static_inputs={},
+    )
+    runner._repeat_carries = {"w": {}}
+    raw = runner.repeat(SimpleNamespace(bucket=SimpleNamespace(graph_walk="w")), BatchedModelOutput(), 3)
+
+    out = make_engine()._collect_outputs(make_mgmt(_Sub()), None, raw, [], {}, [1, 2], (1, 2), "w", rows_only=rows_only)
+
+    assert out.landing is landing

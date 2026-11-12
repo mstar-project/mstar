@@ -20,7 +20,7 @@ Build: ``maturin develop --release -m rust/Cargo.toml`` (see
 from __future__ import annotations
 
 import time as _time
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from copy import deepcopy
 from typing import TYPE_CHECKING, get_args
 
@@ -39,6 +39,7 @@ from mstar.graph.runtime.base import (
     ColumnarEdgeSpecs,
     FreedTensors,
     GraphRuntime,
+    InlineColumn,
     ParallelList,
     PopRidsOutput,
     PostprocessNeed,
@@ -216,12 +217,13 @@ def _columns(out) -> ColumnarEdgeSpecs:
     )
 
 
-def _column(t: torch.Tensor | None) -> tuple[int, int, int, str]:
-    """A 1-D host view as Rust reads it in place: pointer, rows, stride and
-    dtype; a null pointer for none."""
+def _column(t: torch.Tensor | None) -> tuple[int, int, int, int, str]:
+    """A host view as Rust reads it in place: pointer, rows, the stride
+    between rows, between a row's iterations (a 2-D view: one column per
+    iteration of a repeated step), and dtype; a null pointer for none."""
     if t is None:
-        return 0, 0, 0, ""
-    return t.data_ptr(), t.shape[0], t.stride(0), _dtype_name(t.dtype)
+        return 0, 0, 0, 1, ""
+    return t.data_ptr(), t.shape[0], t.stride(0), t.stride(1) if t.dim() == 2 else 1, _dtype_name(t.dtype)
 
 
 class RustGraphRuntime(GraphRuntime):
@@ -735,7 +737,7 @@ class RustGraphRuntime(GraphRuntime):
         policies = self._stop_policies[(node_name, graph_walk)]
         if not policies:
             return {}
-        ptr, rows, stride, dtype = _column(tokens)
+        ptr, rows, stride, _, dtype = _column(tokens)
         stop_rids, stop_rules, missing = self._rust.check_stops_inline(
             partition, node_name, graph_walk, rids, ptr, rows, stride, dtype, row_rids,
         )
@@ -753,8 +755,8 @@ class RustGraphRuntime(GraphRuntime):
         self._postprocess_nogil_ns = 0
         stops = request.stops or {}
         inline = request.inline
-        ptr, rows, stride, dtype = _column(request.tokens)
-        iptr, irows, istride, idtype = _column(None if inline is None else inline.column)
+        ptr, rows, stride, step, dtype = _column(request.tokens)
+        iptr, irows, istride, istep, idtype = _column(None if inline is None else inline.column)
         out = self._rust.begin_postprocess(
             partition=request.partition, node_name=request.node_name,
             graph_walk=request.graph_walk, output_signals=list(request.output_signals),
@@ -767,8 +769,22 @@ class RustGraphRuntime(GraphRuntime):
             inline_ptr=iptr, inline_rows=irows, inline_stride=istride, inline_dtype=idtype,
             partition_done=list(request.partition_done), python_send=request.python_send,
             loop_strides=request.loop_strides, token_width=request.token_width,
+            token_iter_stride=step, inline_iter_stride=istep, inline_start=0 if inline is None else inline.start,
         )
         return self._postprocess_step(out)
+
+    def emit_prefix(
+        self, partition: str, node_name: str, graph_walk: str, rids: list[int], row_rids: Sequence[int],
+        tokens: torch.Tensor, inline: InlineColumn, end: int,
+    ) -> tuple[int, bool]:
+        ptr, rows, stride, step, dtype = _column(tokens)
+        iptr, irows, istride, istep, idtype = _column(inline.column)
+        return self._rust.emit_prefix(
+            partition, node_name, graph_walk, rids, list(row_rids),
+            ptr, rows, stride, step, dtype,
+            inline.signal, iptr, irows, istride, istep, idtype,
+            inline.start, end,
+        )
 
     def resume_postprocess(
         self, stops: Mapping[int, set[str]] | None = None, dropped: Iterable[int] = (),
