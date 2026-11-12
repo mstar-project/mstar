@@ -111,8 +111,8 @@ class _Talker:
             if rid not in self.opened:
                 self.opened.add(rid)
                 self.pool.ingest_request(rid)
-        step = SubmoduleStep(steps={CODEC_STATE: self.node.declare_step("talker_decode", rows, inputs).get(
-            CODEC_STATE)})
+        declared = self.node.declare_step("talker_decode", rows, inputs)
+        step = SubmoduleStep(steps={CODEC_STATE: declared.get(CODEC_STATE)}, combined_labels=declared.combined_labels)
         step.set_ctx(ctx)
         assert self.runner.admit(step).ok
         self.runner.plan(step)

@@ -1251,15 +1251,25 @@ pub struct RouteArg {
     rids: Vec<u32>,
     tensors: Vec<u64>,
     num_tensors: Vec<usize>,
-    /// One output signal whose per-request value is a scalar the worker
-    /// already holds on the host (a sampled token). Its EMIT_TO_CLIENT edge
-    /// then rides inline in one frame per step instead of as a tensor per
-    /// request; `inline_values` are in `rids` order, or empty for none. A
-    /// row whose value is None (it ran no forward) takes the tensor path.
-    /// Both keys may be absent or None: a caller with no inline signal sends
-    /// the plain route input.
-    inline_signal: Option<String>,
+    /// Output signals whose per-request value is one scalar the worker
+    /// already holds on the host (a sampled token), the same for each. Their
+    /// EMIT_TO_CLIENT edges, and their streams registered by value, then ride
+    /// inline in one frame per step instead of as a tensor per request;
+    /// `inline_values` are in `rids` order, or empty for none. A row whose
+    /// value is None (it ran no forward) takes the tensor path. Both keys may
+    /// be absent or None: a caller with no inline signal sends the plain
+    /// route input.
+    inline_signals: Vec<String>,
     inline_values: Vec<Option<i64>>,
+    /// A repeated step's values after each row's first, in `rids` order, or
+    /// empty for a step that ran once.
+    inline_tails: Vec<Vec<i64>>,
+    /// `withheld_rids[i]`: the rows whose stop check withheld
+    /// `withheld_signals[i]`. An inline signal's edges that ride inline route
+    /// nothing for them: no value, no frame, no stream item. Other signals'
+    /// withheld tensors the caller has already left out.
+    withheld_signals: Vec<String>,
+    withheld_rids: Vec<Vec<u32>>,
     /// The log-prob of the token row i sampled (None without one): it rides
     /// with the row's client emits, inline or in a tensor emit's metadata.
     /// Empty (or absent) when no row has one.
@@ -1295,8 +1305,11 @@ impl<'py> FromPyObject<'py> for RouteArg {
             rids: r.rids,
             tensors: r.tensors,
             num_tensors: r.num_tensors,
-            inline_signal: optional_item(ob, "inline_signal")?,
+            inline_signals: optional_item(ob, "inline_signals")?.unwrap_or_default(),
             inline_values: optional_item(ob, "inline_values")?.unwrap_or_default(),
+            inline_tails: Vec::new(),
+            withheld_signals: optional_item(ob, "withheld_signals")?.unwrap_or_default(),
+            withheld_rids: optional_item(ob, "withheld_rids")?.unwrap_or_default(),
             logprobs: optional_item(ob, "logprobs")?.unwrap_or_default(),
             walks: r.walks,
             rid_walk_idx: r.rid_walk_idx,
@@ -1392,9 +1405,11 @@ pub struct Completion {
     /// have to ask for it per rid, convert it to strings on the way out, and
     /// hand it back to be re-interned.
     pub nested: FxHashMap<u32, (Vec<Sym>, Vec<(Sym, u32)>, u32)>,
-    /// Per rid: (signal, modality, value) of the emit edge that rides inline
+    /// (rid, signal) -> (modality, value) of an emit edge that rides inline
     /// instead of as a tensor. Empty unless the route carried inline values.
-    pub emit_inline: FxHashMap<u32, (Sym, Sym, i64)>,
+    pub emit_inline: FxHashMap<(u32, Sym), (Sym, i64)>,
+    /// (rid, signal): the values after `emit_inline`'s of a repeated step.
+    pub emit_inline_tails: FxHashMap<(u32, Sym), Vec<i64>>,
     /// (rid, signal) -> the value of a streamed edge to another worker that
     /// rides inline instead of as a tensor (`EdgeItems` values).
     pub stream_inline: FxHashMap<(u32, Sym), i64>,
@@ -1512,7 +1527,6 @@ pub struct ShardingArg {
     /// signal -> shard dim; None means replicated, same as absent.
     #[pyo3(item)] shard_dim: Vec<(String, Option<u32>)>,
     #[pyo3(item)] tp_enabled_nodes: Vec<String>,
-    #[pyo3(item)] sp_enabled_nodes: Vec<String>,
 }
 
 /// A worker graph owned by another worker: enough to route to it, no spec.
@@ -1615,8 +1629,6 @@ impl GraphRuntime {
                 .filter_map(|(sig, dim)| dim.map(|d| (it.intern(sig), d)))
                 .collect(),
             tp_enabled_nodes: sharding.tp_enabled_nodes.iter()
-                .map(|n| it.intern(n)).collect(),
-            sp_enabled_nodes: sharding.sp_enabled_nodes.iter()
                 .map(|n| it.intern(n)).collect(),
             me: me_sym,
         };
@@ -2052,6 +2064,20 @@ impl GraphRuntime {
             }
         }
         Ok(())
+    }
+
+    /// How many more iterations of `loop_name` the rows can all take, after
+    /// the `stride` each has in flight: a repeated step never passes a cap.
+    fn loop_room(
+        &self, node_name: &str, graph_walk: &str, loop_name: &str, rids: Vec<u32>, stride: u32,
+    ) -> u32 {
+        let Some((wg, lid)) = self.loop_of(node_name, graph_walk, loop_name) else { return 0 };
+        rids.iter()
+            .map(|&rid| self.state(wg, rid).map_or(0, |state| {
+                state.loop_max_iters(lid).saturating_sub(state.loop_iter(lid).saturating_add(stride))
+            }))
+            .min()
+            .unwrap_or(0)
     }
 
     /// `GraphRuntime.loop_progress`: (counts, caps), -1 for a row not here.
@@ -2725,27 +2751,52 @@ impl GraphRuntime {
         let mut nested_snapshot: FxHashMap<u32, (Vec<Sym>, Vec<(Sym, u32)>, u32)> =
             FxHashMap::default();
         let mut cursor = 0usize;
-        // The emit edge of this signal carries its value inline: no staging,
+        // The emit edges of these signals carry their value inline: no staging,
         // no per-request frame, no reference for the api server to release.
         // A persisted signal keeps the tensor: the conductor reads it.
-        let inline_sym: Option<Sym> = input
-            .inline_signal
-            .as_deref()
-            .and_then(|s| self.interner.get(s));
-        let inline_on = inline_sym.is_some()
+        let inline_syms: Vec<Sym> = input
+            .inline_signals
+            .iter()
+            .filter_map(|s| self.interner.get(s))
+            .collect();
+        let inline_on = !inline_syms.is_empty()
             && input.inline_values.len() == input.rids.len();
-        let mut emit_inline: FxHashMap<u32, (Sym, Sym, i64)> = FxHashMap::default();
-        // A streamed edge of the inline signal carries its value too, when the
-        // node streams that signal inline, unless its consumer's walk follows
+        let mut emit_inline: FxHashMap<(u32, Sym), (Sym, i64)> = FxHashMap::default();
+        let mut emit_inline_tails: FxHashMap<(u32, Sym), Vec<i64>> = FxHashMap::default();
+        // A streamed edge of an inline signal carries its value too, when the
+        // node streams that signal by value, unless its consumer's walk follows
         // the producer's (a walk-driven stream tags every item with it), which
         // only a tensor's descriptor carries.
-        let inline_streams = inline_on
-            && inline_sym.is_some_and(|s| {
-                let signal = self.interner.name(s);
-                !self.walk_driven_signals.contains(signal)
-                    && self.inline_streams.contains(&(input.node_name.clone(), signal.to_string()))
-            });
+        let stream_syms: Vec<Sym> = if inline_on {
+            inline_syms
+                .iter()
+                .copied()
+                .filter(|&s| {
+                    let signal = self.interner.name(s);
+                    !self.walk_driven_signals.contains(signal)
+                        && self.inline_streams.contains(&(input.node_name.clone(), signal.to_string()))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let mut stream_inline: FxHashMap<(u32, Sym), i64> = FxHashMap::default();
+        // (rid, signal) pairs of the inline signals the stop check withheld:
+        // their inline edges are dropped, so they send nothing and count no item.
+        let withheld: FxHashSet<(u32, Sym)> = if inline_on {
+            input
+                .withheld_signals
+                .iter()
+                .zip(&input.withheld_rids)
+                .filter_map(|(s, rids)| {
+                    let sym = self.interner.get(s)?;
+                    inline_syms.contains(&sym).then_some((sym, rids))
+                })
+                .flat_map(|(sym, rids)| rids.iter().map(move |&rid| (rid, sym)))
+                .collect()
+        } else {
+            FxHashSet::default()
+        };
         let logprobs: FxHashMap<u32, f64> = input
             .rids
             .iter()
@@ -2906,6 +2957,19 @@ impl GraphRuntime {
                 pre_shard_edges
             };
             
+            if !withheld.is_empty() {
+                // what would ride inline for a withheld (rid, signal) goes nowhere
+                edges.retain(|e| {
+                    !(withheld.contains(&(rid, e.name))
+                        && !e.persist
+                        && match e.dest {
+                            Dest::EmitToClient => true,
+                            Dest::External(_) => e.streaming && stream_syms.contains(&e.name),
+                            _ => false,
+                        })
+                });
+            }
+
             speculative.insert(rid, was_speculative);
 
             first_tp_rank.insert(rid, is_first_tp_rank);
@@ -3092,11 +3156,10 @@ impl GraphRuntime {
                 // when it lives in a SIBLING worker graph on this worker, which
                 // compiles to External (Orpheus streams new_token from the LLM
                 // graph into the snac_decoder graph).
-                let inline_stream = inline_streams
-                    && inline_value.is_some()
+                let inline_stream = inline_value.is_some()
                     && e.streaming
                     && matches!(e.dest, Dest::External(_))
-                    && Some(e.name) == inline_sym
+                    && stream_syms.contains(&e.name)
                     && !e.persist;
                 if let (true, Some(value)) = (inline_stream, inline_value) {
                     stream_inline.insert((rid, e.name), value);
@@ -3146,10 +3209,13 @@ impl GraphRuntime {
                 // out of the register set for the same reason.
                 let inline_edge = inline_value.is_some()
                     && matches!(e.dest, Dest::EmitToClient)
-                    && Some(e.name) == inline_sym
+                    && inline_syms.contains(&e.name)
                     && !e.persist;
                 if let (true, Some(value)) = (inline_edge, inline_value) {
-                    emit_inline.insert(rid, (e.name, e.modality, value));
+                    emit_inline.insert((rid, e.name), (e.modality, value));
+                    if let Some(tail) = input.inline_tails.get(i).filter(|t| !t.is_empty()) {
+                        emit_inline_tails.insert((rid, e.name), tail.clone());
+                    }
                 }
                 let remote = (e.persist && has_remote)
                     || e.declined_local
@@ -3214,7 +3280,7 @@ impl GraphRuntime {
                         // An inline emit holds no reference: nothing reads
                         // the tensor on the api server's behalf.
                         Dest::EmitToClient => i64::from(
-                            !(inline_value.is_some() && Some(e.name) == inline_sym && !e.persist),
+                            !(inline_value.is_some() && inline_syms.contains(&e.name) && !e.persist),
                         ),
                         // Nor does a streamed item sent as its value: no
                         // consumer reads the tensor.
@@ -3370,6 +3436,7 @@ impl GraphRuntime {
                 speculative,
                 nested: nested_snapshot,
                 emit_inline,
+                emit_inline_tails,
                 stream_inline,
                 logprobs,
             },
@@ -3448,7 +3515,8 @@ impl GraphRuntime {
         row_rids: Vec<u32>,
     ) -> PyResult<(Vec<u32>, Vec<u32>, Vec<u32>)> {
         let tokens = postprocess::TokenColumn::new(token_ptr, token_rows, token_stride, token_dtype);
-        self.stops_over(partition, node_name, graph_walk, &rids, tokens.as_ref(), &row_rids)
+        let found = self.stops_over(partition, node_name, graph_walk, &rids, tokens.as_ref(), &row_rids)?;
+        Ok((found.rids, found.rules, found.missing))
     }
 
 
@@ -3458,13 +3526,16 @@ impl GraphRuntime {
     /// `stop_loops[i]` before any check (stream-terminated loops). The token
     /// and inline columns are host views the caller keeps alive until the
     /// step is done: `rows` integers of `dtype`, `stride` elements apart, row
-    /// i belonging to `row_rids[i]`; a null pointer is no column.
+    /// i belonging to `row_rids[i]`; a null pointer is no column, as are no
+    /// `inline_signals`. `withheld_rids[i]` are the rows whose stop check
+    /// withheld `withheld_signals[i]` (`RouteArg`).
     #[pyo3(signature = (
         partition, node_name, graph_walk, output_signals, rids, walks, rid_walk_idx,
         stop_rids, stop_loops, runtime_stops,
         token_ptr, token_rows, token_stride, token_dtype, row_rids,
-        inline_signal, inline_ptr, inline_rows, inline_stride, inline_dtype,
-        partition_done, python_send, loop_strides = None,
+        inline_signals, inline_ptr, inline_rows, inline_stride, inline_dtype,
+        partition_done, python_send, loop_strides = None, token_width = 1,
+        withheld_signals = Vec::new(), withheld_rids = Vec::new(),
     ))]
     #[allow(clippy::too_many_arguments)]
     fn begin_postprocess(
@@ -3474,40 +3545,50 @@ impl GraphRuntime {
         stop_rids: Vec<u32>, stop_loops: Vec<Vec<String>>, runtime_stops: bool,
         token_ptr: usize, token_rows: usize, token_stride: usize, token_dtype: &str,
         row_rids: Vec<u32>,
-        inline_signal: Option<String>, inline_ptr: usize, inline_rows: usize,
+        inline_signals: Vec<String>, inline_ptr: usize, inline_rows: usize,
         inline_stride: usize, inline_dtype: &str,
         partition_done: Vec<u32>, python_send: bool, loop_strides: Option<Vec<u32>>,
+        token_width: usize,
+        withheld_signals: Vec<String>, withheld_rids: Vec<Vec<u32>>,
     ) -> PyResult<postprocess::PostprocessOut> {
-        let tokens = postprocess::TokenColumn::new(token_ptr, token_rows, token_stride, token_dtype);
-        let inline = inline_signal.and_then(|signal| {
+        let tokens = postprocess::TokenColumn::new(token_ptr, token_rows, token_stride, token_dtype)
+            .map(|col| col.wide(token_width));
+        let inline = if inline_signals.is_empty() {
+            None
+        } else {
             postprocess::TokenColumn::new(inline_ptr, inline_rows, inline_stride, inline_dtype)
-                .map(|col| (signal, col))
-        });
-        let pp = postprocess::Postprocess::new(
+                .map(|col| (inline_signals, col.wide(token_width)))
+        };
+        let mut pp = postprocess::Postprocess::new(
             partition, node_name, graph_walk, output_signals, rids, walks, rid_walk_idx,
             stop_rids.into_iter().zip(stop_loops).collect(), runtime_stops,
             tokens, row_rids, inline, partition_done, python_send, loop_strides,
         );
+        pp.withheld = postprocess::Withheld { signals: withheld_signals, rids: withheld_rids };
         self.postprocess = None;
         self.pp_run(py, pp)
     }
 
     /// Resume a step parked for its stops (STOPS): the loops each rid stops,
-    /// and the rows to drop (their stop check failed).
+    /// the rows to drop (their stop check failed), and what the check
+    /// withheld, as `begin_postprocess` takes it.
+    #[pyo3(signature = (rids, loops, dropped, withheld_signals = Vec::new(), withheld_rids = Vec::new()))]
     fn resume_postprocess_stops(
         &mut self, py: Python<'_>, rids: Vec<u32>, loops: Vec<Vec<String>>, dropped: Vec<u32>,
+        withheld_signals: Vec<String>, withheld_rids: Vec<Vec<u32>>,
     ) -> PyResult<postprocess::PostprocessOut> {
-        self.pp_resume_stops(py, rids, loops, dropped)
+        let withheld = postprocess::Withheld { signals: withheld_signals, rids: withheld_rids };
+        self.pp_resume_stops(py, rids, loops, dropped, withheld)
     }
 
     /// Resume a step parked for its stored outputs (STORE): `RouteTensors`.
-    #[pyo3(signature = (tensors, num_tensors, inline_signal, inline_values, logprobs = Vec::new()))]
+    #[pyo3(signature = (tensors, num_tensors, inline_signals, inline_values, logprobs = Vec::new()))]
     fn resume_postprocess_store(
         &mut self, py: Python<'_>, tensors: Vec<u64>, num_tensors: Vec<usize>,
-        inline_signal: Option<String>, inline_values: Vec<Option<i64>>, logprobs: Vec<Option<f64>>,
+        inline_signals: Vec<String>, inline_values: Vec<Option<i64>>, logprobs: Vec<Option<f64>>,
     ) -> PyResult<postprocess::PostprocessOut> {
         let stored = postprocess::Stored {
-            tensors, num_tensors, inline_signal, inline_values, logprobs,
+            tensors, num_tensors, inline_signals, inline_values, inline_tails: Vec::new(), logprobs,
         };
         self.pp_resume_store(py, stored)
     }
@@ -3710,6 +3791,7 @@ impl GraphRuntime {
         // The graph is resolved per walk in the loop below: a completion that
         // spans a combined walk has no single `c.wg`.
         let emit_inline = std::mem::take(&mut c.emit_inline);
+        let mut emit_inline_tails = std::mem::take(&mut c.emit_inline_tails);
         let stream_inline = std::mem::take(&mut c.stream_inline);
         let mut plan = SendPlan {
             partition: c.partition.clone(),
@@ -3758,14 +3840,28 @@ impl GraphRuntime {
             for e in edges {
                 let name = self.interner.name(e.name).to_string();
                 match e.dest {
-                    Dest::EmitToClient => match emit_inline.get(&rid) {
-                        Some(&(sig, modality, value)) if sig == e.name => {
+                    Dest::EmitToClient => match emit_inline.get(&(rid, e.name)) {
+                        Some(&(modality, value)) => {
                             plan.emit_inline.push((
                                 rid,
                                 name.clone(),
                                 self.interner.name(modality).to_string(),
                                 value,
                             ));
+                            // one row of the frame per iteration, in order: a step that repeated
+                            let tails = if emit_inline_tails.is_empty() {
+                                Vec::new()
+                            } else {
+                                emit_inline_tails.remove(&(rid, e.name)).unwrap_or_default()
+                            };
+                            for tail in tails {
+                                plan.emit_inline.push((
+                                    rid,
+                                    name.clone(),
+                                    self.interner.name(modality).to_string(),
+                                    tail,
+                                ));
+                            }
                         }
                         _ => plan.emit.push((
                             rid,
