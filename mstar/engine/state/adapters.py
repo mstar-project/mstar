@@ -572,14 +572,23 @@ class OpBinding:
     kernel_settings: ClassVar[frozenset[str]] = frozenset()
     # those of them whose value in effect the bound runner reports, which `kernel_setting` reads back
     read_back: ClassVar[frozenset[str]] = frozenset()
+    # whether a read bound here takes queries; one that doesn't returns the entries it reaches
+    takes_queries: ClassVar[bool] = True
+
+    @property
+    def kept_window_binding(self) -> "OpBinding | None":
+        """The binding that runs the op through a kept window, None where none does."""
+        return None
 
     def check(self, array: Array, key: str, declared: Read | Op | Positions) -> None:
         """Raise ``ValueError`` on what today's resources can't run, naming ``array``."""
         return
 
     def for_mask(self, mask: Mask) -> "OpBinding":
-        """The binding that runs the op through ``mask``: this one, unless a field of the mask needs another."""
-        return self
+        """The binding that runs the op through ``mask``: `kept_window_binding` through a kept window, and this one
+        through any other mask. The one place a field of the mask picks a binding."""
+        kept = self.kept_window_binding if isinstance(mask, Bidirectional) and mask.kept_window else None
+        return self if kept is None else kept
 
     def retention(self, key: str, layout: Layout) -> RetentionPolicy | None:
         """What the pages under the read ``key`` keep of a request laid out as ``layout``, None for every entry."""
@@ -634,8 +643,9 @@ class PagedAttend(OpBinding):
             raise _no_layout(array, f"reads[{key!r}].mask must be Causal, Window or Bidirectional, the masks "
                                     "AttentionConfig has")
 
-    def for_mask(self, mask: Mask) -> OpBinding:
-        return KEPT_WINDOW_ATTEND if isinstance(mask, Bidirectional) and mask.kept_window else self
+    @property
+    def kept_window_binding(self) -> OpBinding:
+        return KEPT_WINDOW_ATTEND
 
     def specs(self, array: Array, key: str, read: Read) -> list[NodeResourceSpec]:
         windowed = isinstance(read.mask, Window)
@@ -769,16 +779,27 @@ class PagedReach(KeptWindowBinding):
     """A read with no op through a kept window: the entries it reaches, gathered from the pages. It runs on the pool
     itself, whose plan holds the views, so it builds no spec and no step."""
 
-    def check(self, array: Array, key: str, read: Read) -> None:
-        if not (isinstance(read.mask, Bidirectional) and read.mask.kept_window):
-            raise _no_binding(PAGED, array, f"reads[{key!r}].op", update=False)
-        super().check(array, key, read)
+    takes_queries = False
 
     def resource(self, array: Array, key: str) -> str:
         return array.name
 
     def bind(self, array: Array, key: str, resources: Mapping[str, Any]) -> "ReachRead":
         return ReachRead(array, resources[key])
+
+
+class PagedNoOp(OpBinding):
+    """A read with no op on a paged array, which only a kept window binds (`PagedReach`)."""
+
+    @property
+    def kept_window_binding(self) -> OpBinding:
+        return PAGED_REACH
+
+    def check(self, array: Array, key: str, read: Read) -> None:
+        raise _no_binding(PAGED, array, f"reads[{key!r}].op", update=False)
+
+
+PAGED_REACH = PagedReach()
 
 
 class ReachRead:
@@ -1015,9 +1036,10 @@ class PagedArrayHandle(ArrayHandle):
         }
         self._kv = resources[array.name]
         self._views = {layer: self._kv.layer_view(i) for layer, i in self._pool_layer.items()}
-        # the layers whose read has no op, which takes no q and returns `Reached`
+        # the layers whose read takes no q and returns `Reached`
         self._reached = frozenset(
-            layer for read in array.reads.values() if read.op is None for layer in read_layers(array, read)
+            layer for bound in bindings if not bound.binding.takes_queries
+            for layer in read_layers(array, bound.declared)
         )
         # each op with its resource, built once since `state_steps` runs on every step, replays too
         self._ops = [(resolved.resource_of[bound.key], bound) for bound in bindings]
@@ -2227,7 +2249,7 @@ def storage_of(array: Array) -> Storage:
 # the binding, through `OpBinding.for_mask`, as a kept window does, and the `SDPA` table below is the deployment's swap.
 BINDINGS: dict[tuple[Storage, type[Op | Positions | None]], OpBinding] = {
     (PAGED, Attend): PagedAttend(),
-    (PAGED, type(None)): PagedReach(),
+    (PAGED, type(None)): PagedNoOp(),
     (PAGED, Positions): PositionsBinding(),
     (PAGED_BY_WALK, Attend): PagedAttend(),
     (PAGED_BY_WALK, Positions): PositionsBinding(),

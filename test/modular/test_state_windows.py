@@ -883,3 +883,17 @@ def test_the_views_are_the_live_step_s_through_a_pre_plan():
         planned = pool.plan(readonly, ctx)
         assert pool.views("main") is planned["main"].views, "a reused read-only plan's views should be live"
         pool.commit(readonly, ctx)
+
+
+def test_a_kept_window_picks_its_binding_only_through_for_mask():
+    """The mask's field picks the binding once, in `OpBinding.for_mask`, for a read with an op and for one without; a
+    read with no op through any other mask has no binding."""
+    from mstar.engine.state.adapters import BINDINGS, PAGED, PAGED_CROSS, KeptWindowAttend, PagedNoOp, PagedReach
+
+    kept, plain = Bidirectional(kept_window=True), Bidirectional()
+    assert isinstance(BINDINGS[PAGED, Attend].for_mask(kept), KeptWindowAttend)
+    assert isinstance(BINDINGS[PAGED_CROSS, Attend].for_mask(kept), KeptWindowAttend)
+    assert type(BINDINGS[PAGED, Attend].for_mask(plain)) is type(BINDINGS[PAGED, Attend])
+    assert isinstance(BINDINGS[PAGED, type(None)].for_mask(kept), PagedReach)
+    assert isinstance(BINDINGS[PAGED, type(None)].for_mask(plain), PagedNoOp)
+
