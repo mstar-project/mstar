@@ -1,6 +1,7 @@
 """The cacheless self-attention kernels against an fp32 reference at the image
 DiTs' sizes (klein 4B / 9B, Z-Image Turbo at 1024x1024), eager and replayed
-from a CUDA graph, and the resource running the kernel its table picks.
+from a CUDA graph, and the resource running the kernel its table picks. The FA4
+cases run on Blackwell with flash-attn-4 installed.
 """
 
 from __future__ import annotations
@@ -20,7 +21,8 @@ from mstar.engine.resources import (
     SlotLease,
     StepContext,
 )
-from mstar.engine.resources.attn.ragged.cudnn_wrappers import CudnnRaggedPrefillWrapper
+from mstar.engine.resources.attn.ragged.cudnn_wrappers import CudnnRaggedPrefillWrapper, Fa4UniformPrefillWrapper
+from mstar.engine.resources.attn.ragged.dense import fa4_unavailable_reason
 from mstar.engine.resources.attn.ragged.wrappers import FlashInferRaggedPrefillWrapper
 from mstar.engine.resources.attn.workspace import Workspace
 from mstar.engine.resources.base import EngineResourceInfo, build_resource
@@ -77,6 +79,8 @@ def make(kernel: str, heads: int, n: int, seq: int, graph: bool, rows: int | Non
         kw.update(accelerator_graph=True, max_num_segments=n, max_total_tokens=rows or n * seq)
     if kernel == "cudnn":
         return CudnnRaggedPrefillWrapper(**kw)
+    if kernel == "fa4":
+        return Fa4UniformPrefillWrapper(**kw)
     ws = Workspace(torch.empty(256 << 20, dtype=torch.uint8, device=DEVICE), "test")
     return FlashInferRaggedPrefillWrapper(ws, backend=kernel.removeprefix("flashinfer_"), **kw)
 
@@ -96,7 +100,11 @@ def replay(fn):
     return out
 
 
-KERNELS = ["cudnn", "flashinfer_fa2", "flashinfer_cudnn"]
+_FA4_REASON = fa4_unavailable_reason(DEVICE) if torch.cuda.is_available() else "no CUDA"
+needs_fa4 = pytest.mark.skipif(_FA4_REASON is not None, reason=f"FA4 unavailable: {_FA4_REASON}")
+KERNELS = ["cudnn", pytest.param("fa4", marks=needs_fa4), "flashinfer_fa2", "flashinfer_cudnn"]
+# the kernels that take equal-length segments only
+UNIFORM = ["cudnn", pytest.param("fa4", marks=needs_fa4)]
 
 
 @pytest.mark.parametrize("kernel", KERNELS)
@@ -113,10 +121,11 @@ def test_kernel_matches_fp32_at_the_dit_sizes(kernel, heads, seq, n):
     assert rel_l2(replay(lambda: captured.run(q, k, v)), want) < REL_L2
 
 
-def test_cudnn_lse_matches_the_reference():
+@pytest.mark.parametrize("kernel", UNIFORM)
+def test_uniform_lse_matches_the_reference(kernel):
     q, k, v = qkv(2 * 4608, 24)
     want, want_lse = reference(q, k, v, cu(2, 4608), lse=True)
-    w = make("cudnn", 24, 2, 4608, graph=True)
+    w = make(kernel, 24, 2, 4608, graph=True)
     w.plan(cu(2, 4608))
     out, lse = replay(lambda: w.run(q, k, v, return_lse=True))
     assert rel_l2(out, want) < REL_L2
@@ -124,14 +133,15 @@ def test_cudnn_lse_matches_the_reference():
     torch.testing.assert_close(lse, want_lse, atol=2e-2, rtol=0)
 
 
-def test_cudnn_rows_past_the_layout_read_zero():
+@pytest.mark.parametrize("kernel", UNIFORM)
+def test_uniform_rows_past_the_layout_read_zero(kernel):
     """A graph wrapper sized for more rows than its layout fills: the tail reads back zero
     whatever the inputs hold there."""
     heads, seq = 24, 512
     q, k, v = qkv(3 * seq, heads)
     for t in (q, k, v):
         t[2 * seq:] = float("nan")
-    w = make("cudnn", heads, 2, seq, graph=True, rows=3 * seq)
+    w = make(kernel, heads, 2, seq, graph=True, rows=3 * seq)
     w.plan(cu(2, seq))
     out = replay(lambda: w.run(q, k, v))
     assert out.shape == q.shape
@@ -139,12 +149,13 @@ def test_cudnn_rows_past_the_layout_read_zero():
     assert bool((out[2 * seq:] == 0).all())
 
 
-def test_cudnn_takes_strided_views():
+@pytest.mark.parametrize("kernel", UNIFORM)
+def test_uniform_takes_strided_views(kernel):
     """q / k / v sliced out of a fused projection."""
     heads, seq = 30, 4192
     qkv_fused = torch.randn(seq, 3, heads, D, device=DEVICE, dtype=DTYPE)
     q, k, v = qkv_fused.unbind(1)
-    w = make("cudnn", heads, 1, seq, graph=False)
+    w = make(kernel, heads, 1, seq, graph=False)
     w.plan(cu(1, seq))
     assert rel_l2(w.run(q, k, v), reference(q, k, v, cu(1, seq))) < REL_L2
 

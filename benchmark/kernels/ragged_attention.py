@@ -5,7 +5,8 @@ A bucket is a segment length. Each candidate runs through the resource's own gra
 wrapper, planned with 1 and 8 equal segments of that length and timed from a CUDA graph; its
 score is the geometric mean of the two. Its output is checked against an fp32 reference (math
 SDPA per segment, TF32 off) first. The candidates are what a captured resource can replay:
-torch's cuDNN SDPA (``cudnn``), and FlashInfer's FA2 and cuDNN backends. FlashInfer's
+torch's cuDNN SDPA (``cudnn``), FlashAttention 4's dense forward (``fa4``, Blackwell), and
+FlashInfer's FA2 and cuDNN backends. FlashInfer's
 ``cutlass`` backend is not one: its plan allocates fresh buffers, so a graph-mode wrapper can't
 be planned twice.
 
@@ -28,7 +29,7 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from benchmark.kernels.sweep import BucketResult
 from benchmark.kernels.timing import time_graph
-from mstar.engine.resources.attn.ragged.cudnn_wrappers import CudnnRaggedPrefillWrapper
+from mstar.engine.resources.attn.ragged.cudnn_wrappers import CudnnRaggedPrefillWrapper, Fa4UniformPrefillWrapper
 from mstar.engine.resources.attn.ragged.kernels import RAGGED_ATTENTION
 from mstar.engine.resources.attn.ragged.wrappers import FlashInferRaggedPrefillWrapper
 from mstar.engine.resources.attn.workspace import Workspace
@@ -38,6 +39,7 @@ DEFAULT_BUCKETS = (4608,)
 SEGMENTS = (1, 8)
 CANDIDATES = (
     Choice("cudnn"),
+    Choice("fa4"),
     Choice("flashinfer", {"backend": "fa2"}),
     Choice("flashinfer", {"backend": "cudnn"}),
 )
@@ -93,6 +95,8 @@ def wrapper_for(choice: Choice, p: Problem, graph: bool = True):
         kw.update(accelerator_graph=True, max_num_segments=p.n, max_total_tokens=p.n * p.seq)
     if choice.impl == "cudnn":
         w = CudnnRaggedPrefillWrapper(**kw)
+    elif choice.impl == "fa4":
+        w = Fa4UniformPrefillWrapper(**kw)
     else:
         ws = Workspace(torch.empty(512 << 20, dtype=torch.uint8, device=p.q.device), "sweep")
         w = FlashInferRaggedPrefillWrapper(ws, backend=(choice.config or {}).get("backend", "auto"), **kw)
@@ -206,6 +210,7 @@ def _kernels(p: Problem) -> dict[str, Callable[[], Callable[[], torch.Tensor]]]:
         "flashinfer cudnn (graph wrapper)": via(Choice("flashinfer", {"backend": "cudnn"})),
         "flashinfer cutlass (eager wrapper)": via(Choice("flashinfer", {"backend": "cutlass"}), graph=False),
         "torch cudnn sdpa (cudnn wrapper)": via(Choice("cudnn")),
+        "fa4 dense (fa4 wrapper)": via(Choice("fa4")),
         "torch flash varlen (FA2, sm_100 build)": torch_flash,
     }
 
