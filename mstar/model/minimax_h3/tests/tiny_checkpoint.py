@@ -1,5 +1,5 @@
-"""A tiny random MiniMax-H3 transformer checkpoint (original FL2VA format) and the
-config files of a snapshot around it, for tests that need no diffusers."""
+"""A tiny random MiniMax-H3 transformer checkpoint (original FL2VA format, or diffusers' layout)
+and the config files of a snapshot around it, for tests that need no diffusers."""
 
 from __future__ import annotations
 
@@ -60,6 +60,47 @@ def random_checkpoint(cfg: H3TransformerConfig) -> dict[str, torch.Tensor]:
     for i in range(cfg.token_refiner_num_layers):
         state.update(block(f"token_refiner.blocks.{i}", adaln=False))
     return state
+
+
+# diffusers' convert_minimax_h3_transformer_checkpoint_to_diffusers, restated
+_TO_DIFFUSERS = {
+    "token_refiner.blocks.": "token_refiner.refiner_blocks.", "time_embedder.proj_in.": "time_embedder.linear_1.",
+    "time_embedder.proj_out.": "time_embedder.linear_2.", "video_patch_proj.": "proj_in.",
+    "audio_patch_proj.": "audio_proj_in.", "condition_proj.": "context_embedder.",
+    "final_layer.norm.": "norm_out.norm.", "final_layer.adaln_proj.linear.": "norm_out.linear.",
+    "final_layer.video_out.": "proj_out.",
+    "final_layer.audio_out.": "audio_proj_out.", ".attn.q_norm.": ".attn.norm_q.", ".attn.k_norm.": ".attn.norm_k.",
+    ".attn.out_proj.": ".attn.to_out.0.", ".mlp.fc1.": ".ff.net.0.proj.", ".mlp.fc2.": ".ff.net.2.",
+}
+
+
+def to_diffusers(state: dict[str, torch.Tensor], cfg: H3TransformerConfig, vsa_gates: bool = True
+                 ) -> dict[str, torch.Tensor]:
+    """``state`` (FL2VA's layout) as a diffusers ``MiniMaxH3Transformer3DModel`` checkpoint: renamed,
+    q/k/v unfused from their per-head interleave, the SwiGLU input reordered to ``[value; gate]``,
+    no ``rope.inv_freq``; with ``vsa_gates``, a VSA compression gate per block, as FastH3 ships."""
+    out = {}
+    for name, tensor in state.items():
+        if name == "rope.inv_freq":
+            continue
+        if name.startswith("blocks."):
+            name = "transformer_blocks." + name[len("blocks."):]
+        for native, diffusers in _TO_DIFFUSERS.items():
+            name = name.replace(native, diffusers)
+        if name.endswith(".attn.qkv_proj.weight"):
+            q, k, v = tensor.unflatten(0, (cfg.num_attention_heads, 3, cfg.attention_head_dim)).unbind(1)
+            for part, rows in (("to_q", q), ("to_k", k), ("to_v", v)):
+                out[name.replace("qkv_proj", part)] = rows.flatten(0, 1).contiguous()
+        elif name.endswith(".ff.net.0.proj.weight"):
+            gate, value = tensor.chunk(2, dim=0)
+            out[name] = torch.cat([value, gate])
+        else:
+            out[name] = tensor
+    if vsa_gates:
+        for i in range(cfg.num_layers):
+            out[f"transformer_blocks.{i}.attn.to_gate_compress.weight"] = torch.full((cfg.inner_dim, cfg.hidden_size),
+                                                                                     float("nan"))
+    return out
 
 
 def write_snapshot_configs(root: Path, cfg: H3TransformerConfig) -> None:
