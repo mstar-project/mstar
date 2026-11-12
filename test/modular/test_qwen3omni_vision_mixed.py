@@ -9,7 +9,7 @@ import torch
 
 from mstar.model.qwen3_omni.config import THINKER_KV, THINKER_MIXED, THINKER_SHARD
 from mstar.model.qwen3_omni.submodules import ThinkerSubmodule
-from mstar.model.submodule_base import ARNodeInputs, engine_step
+from mstar.model.submodule_base import ARNodeInputs, with_segment_steps
 
 HIDDEN = 4
 
@@ -135,11 +135,10 @@ def test_every_step_plans_the_sequence_shard_over_its_tokens(thinker, step_walk,
     """The Thinker's attention and positions depend on its sequence shard, whose step the engine
     adds from the node's segments (the Thinker declares none), at any SP size."""
     rows = [_row(1 if w == "thinker_decode" else 3, w) for w in walks]
-    thinker.segment_keys = (THINKER_SHARD,)
 
-    step = engine_step(thinker, step_walk, list(range(len(rows))), rows)
+    step = with_segment_steps(thinker.declare_step(step_walk, list(range(len(rows))), rows), (THINKER_SHARD,))
 
-    assert list(step.steps[THINKER_SHARD].segments) == step.steps[THINKER_KV].segments
+    assert step.steps[THINKER_SHARD].segments == tuple(step.segments) and len(step.segments) == len(rows)
 
 
 class _DecodeModel:
