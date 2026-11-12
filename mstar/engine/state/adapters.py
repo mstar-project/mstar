@@ -1364,7 +1364,7 @@ class HostValueHandle(_HostCalls, ArrayHandle):
         super()._check_storage(declared, segments, ctx)
 
     def _calls_cover(self, declared: ArrayStep, ctx) -> bool:
-        """Always: a Value of host fields only has no entry for a call to give."""
+        """True: a Value of host fields only takes its rows' values from the step's host writes, not from calls."""
         return True
 
 
