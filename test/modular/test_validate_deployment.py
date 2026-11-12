@@ -28,11 +28,19 @@ from test_startup_graph_validation import (
 
 from mstar.conductor.conductor import Conductor
 from mstar.distributed.base import ShardingConfig, ShardingGroup
+from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec
+from mstar.engine.resources.attn.ragged.config import (
+    RaggedAttentionConfig,
+    RaggedAttentionSpec,
+    RaggedCrossAttentionSpec,
+)
 from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
+from mstar.engine.resources.sequence_shard import SeqShardSpec, sequence_parallel_refusals
 from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.graph.base import GraphEdge, GraphNode, Sequential
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import KVLabel, PrefixKeys, WorkerGraph
+from mstar.model.components.moe_parallel import MoeParallelConfig
 from mstar.testing_utils.resource import StubResource
 from mstar.validation import DeploymentError
 from mstar.validation.placement import MAX_NODE_INPUTS, _sharding_groups
@@ -281,7 +289,7 @@ def test_ranks_not_divisible_by_the_instance_size_are_refused(tmp_path):
 
 @pytest.mark.parametrize("axis, pattern", [
     ("tp", r"node_groups\[0\] has tp_size 2 and contains nodes not in tp_enabled_nodes"),
-    ("sp", r"node_groups\[0\]: node 'llm' on 2 SP ranks is not in sp_enabled_nodes"),
+    ("sp", r"node_groups\[0\]: node 'llm' runs on 2 SP ranks but neither splits tokens"),
     ("cfg", r"node_groups\[0\] has cfg_size 2 and contains nodes not in cfg_enabled_nodes"),
 ], ids=["tp", "sp", "cfg"])
 def test_parallel_node_group_over_a_node_without_support_is_refused(axis, pattern, tmp_path):
@@ -301,25 +309,40 @@ def test_the_sp_checks_run_when_the_lora_specs_fail_to_build(tmp_path):
     cfg = _cfg(tmp_path, [{"node_names": ["llm"], "ranks": [0, 1], "sp_size": 2}], resources={"lora": {}})
     problems = _problems(_Model(specs=[lora]), cfg)
     assert any("building the node resources failed: OSError" in p for p in problems), problems
-    assert any("node 'llm' on 2 SP ranks is not in sp_enabled_nodes" in p for p in problems), problems
+    assert any("node 'llm' runs on 2 SP ranks but neither splits tokens" in p for p in problems), problems
 
 
-def _paged_llm(sp_enabled_nodes=(), **kw) -> _Model:
-    kv = KVSpec(resource_key="kv", nodes={"llm"}, config=PagedKVConfig(
-        num_layers=1, num_kv_heads=2, head_dim=8, max_seq_len=64, num_qo_heads=4, page_size=16,
+def _paged_llm(*extra, node="llm", kv_heads=2, **kw) -> _Model:
+    """A model whose ``node`` holds a paged KV pool, and ``extra`` specs."""
+    kv = KVSpec(resource_key="kv", nodes={node}, config=PagedKVConfig(
+        num_layers=1, num_kv_heads=kv_heads, head_dim=8, max_seq_len=64, num_qo_heads=4, page_size=16,
     ))
-    return _Model(specs=[kv], kv_labels={"kv": {"main": KVLabel()}}, sp_enabled_nodes=sp_enabled_nodes, **kw)
+    return _Model(specs=[kv, *extra], kv_labels={"kv": {"main": KVLabel()}}, **kw)
+
+
+def _shard(node="llm", **kw) -> SeqShardSpec:
+    return SeqShardSpec("shard", {node}, ("main",), 0, **kw)
+
+
+def _attention(nodes=("llm",)) -> AttentionSpec:
+    return AttentionSpec("attn", set(nodes), AttentionConfig(kv_cache="kv"))
+
+
+def _ulysses(heads: int) -> RaggedAttentionSpec:
+    # over the label the shard splits, so it attends it by Ulysses
+    return RaggedAttentionSpec("ragged", {"llm"}, RaggedAttentionConfig(heads, heads, 8), labels={"main"})
+
+
+def _cross() -> RaggedCrossAttentionSpec:
+    return RaggedCrossAttentionSpec("xattn", {"llm"}, RaggedAttentionConfig(4, 4, 8))
 
 
 @pytest.mark.parametrize("model,group,kv,pattern", [
-    # the placement would load the node without the SP group its own sequence parallelism needs
-    (dict(sp_enabled_nodes=["llm"]), dict(sp_size=2), {},
-     r"node_groups\[0\]: node 'llm' runs its own sequence parallelism .* sets context_parallel"),
     ({}, dict(sp_size=4), dict(page_size=6),
      r"node_groups\[0\]: KV 'kv': context_parallel stripes each page over 4 ranks, which doesn't divide page_size 6"),
     (dict(tp_enabled_nodes=["llm"]), dict(tp_size=2), {},
      r"node_groups\[0\]: KV 'kv': .* 2 KV head\(s\) over 2 TP rank\(s\) leave none sharing one"),
-], ids=["own_sp", "page_size", "kv_heads"])
+], ids=["page_size", "kv_heads"])
 def test_a_kv_placement_the_node_cannot_take_is_refused(model, group, kv, pattern, tmp_path):
     """The engine refused these on every worker, after loading the weights."""
     size = group.get("tp_size", 1) * group.get("sp_size", 1)
@@ -328,18 +351,80 @@ def test_a_kv_placement_the_node_cannot_take_is_refused(model, group, kv, patter
     _refused(_paged_llm(**model), cfg, pattern)
 
 
+@pytest.mark.parametrize("specs, group, resources, pattern", [
+    ([_shard()], dict(sp_size=2), {},
+     r"node_groups\[0\]: node 'llm' splits tokens \(SeqShardSpec 'shard'\) but declares no attention"),
+    ([_shard(), _attention()], dict(sp_size=4), {},
+     r"node_groups\[0\]: node 'llm' splits tokens over 4 SP ranks, and KV 'kv' stores 4 query and 2 KV heads by "
+     r"head, which don't split 4 ways per TP rank"),
+    # split tokens over KV stored by position: not yet
+    ([_shard(), _attention()], dict(sp_size=2), {"kv": {"context_parallel": True}},
+     r"node_groups\[0\]: node 'llm' splits tokens over 2 SP ranks, and KV 'kv' stores them by position "
+     r"\(context_parallel\), which split steps don't support yet"),
+    ([_shard(), _ulysses(heads=3)], dict(sp_size=2), {},
+     r"node_groups\[0\]: ragged attention 'ragged' attends labels its sequence shard splits \(Ulysses\), and its 3 "
+     r"query and 3 KV heads "
+     r"don't split over 1 TP x 2 SP ranks"),
+    # a packed split can leave a rank none of a row's queries or keys
+    ([_shard(), _attention(), _cross()], dict(sp_size=2), {},
+     r"node_groups\[0\]: ragged cross-attention 'xattn' on node 'llm', whose sequence shard 'shard' splits "
+     r"packed tokens \(axis 0\)"),
+    # the attention spans a node the shard doesn't, so it would split on one and not the other: at any SP size
+    ([_shard(), _attention(nodes=("llm", "post"))], dict(sp_size=1), {},
+     r"resources.attn: spans nodes \['post'\] without the sequence shard 'shard'"),
+], ids=["no_attention", "heads_by_head", "split_over_positions", "ulysses_heads", "axis0_cross",
+        "shard_misses_a_node"])
+def test_a_node_whose_sp_ranks_cant_split_its_steps_is_refused(specs, group, resources, pattern, tmp_path):
+    size = group.get("sp_size", 1)
+    cfg = _cfg(tmp_path, [{"node_names": ["llm"], "ranks": list(range(size)), **group}], resources=resources)
+    _refused(_paged_llm(*specs), cfg, pattern)
+
+
+@pytest.mark.parametrize("specs, resources", [
+    ([_shard(), _attention()], {}),
+    ([_attention()], {"kv": {"context_parallel": True}}),
+    # a strategy for split steps is a no-op on a node that never splits
+    ([_ulysses(heads=3), _attention()], {"kv": {"context_parallel": True}}),
+], ids=["heads", "positions_copied", "ulysses_without_a_shard"])
+def test_a_node_that_splits_its_steps_or_stores_positions_on_sp_ranks_validates(specs, resources, tmp_path):
+    cfg = _cfg(tmp_path, [{"node_names": ["llm"], "ranks": [0, 1], "sp_size": 2}], resources=resources)
+    assert _validate(_paged_llm(*specs), cfg).worker_graphs
+
+
+@pytest.mark.parametrize("attention, pattern", [
+    (_attention, r"exchanges=False, which can hand a rank no tokens, beside an attention that exchanges"),
+    (_cross, r"ragged cross-attention 'xattn' .* declares exchanges=False, which can leave a rank no tokens"),
+], ids=["attention", "cross_attention"])
+def test_a_split_without_exchanges_beside_an_attention_is_refused(attention, pattern):
+    """A split nothing exchanges can give a rank no tokens, which no attention over them can take."""
+    shard = SeqShardSpec("shard", {"llm"}, ("main",), 1, exchanges=False)
+    refusals = sequence_parallel_refusals([shard, attention()], "llm", 1, 4)
+    assert any(re.search(pattern, refusal) for refusal in refusals), refusals
+
+
+def test_expert_parallelism_on_a_node_that_splits_its_steps_is_refused():
+    specs = _paged_llm(_shard(), _attention()).get_node_resources()
+    assert sequence_parallel_refusals(specs, "llm", 1, 2, MoeParallelConfig(parallel="ep")) == [
+        "node 'llm' splits tokens over SP ranks, which expert parallelism (ep_config) can't",
+    ]
+    assert sequence_parallel_refusals(specs, "llm", 1, 2, MoeParallelConfig()) == []
+
+
 def test_a_resource_over_nodes_that_split_heads_differently_is_refused(tmp_path):
     """Engine.load_model raised this on the worker, after loading the weights: 'a' places its
-    positions over the SP ranks (heads over TP), 'b' runs its own SP (heads over TP x SP)."""
-    kv = KVSpec(resource_key="kv", nodes={"a"}, config=PagedKVConfig(
-        num_layers=1, num_kv_heads=2, head_dim=8, max_seq_len=64, num_qo_heads=4, page_size=16,
-    ))
-    model = _Model(_a_then_b, specs=[kv, _Spec("shared", {"a", "b"})], kv_labels={"kv": {"main": KVLabel()}},
-                   sp_enabled_nodes=["b"])
+    positions over the SP ranks (heads over TP), 'b' splits its steps (heads over TP x SP)."""
+    def pool(key, node):
+        return KVSpec(resource_key=key, nodes={node}, config=PagedKVConfig(
+            num_layers=1, num_kv_heads=2, head_dim=8, max_seq_len=64, num_qo_heads=4, page_size=16,
+        ))
+
+    specs = [pool("kv", "a"), pool("kv_b", "b"), _shard("b"),
+             AttentionSpec("attn", {"b"}, AttentionConfig(kv_cache="kv_b")), _Spec("shared", {"a", "b"})]
+    model = _Model(_a_then_b, specs=specs, kv_labels={"kv": {"main": KVLabel()}, "kv_b": {"main": KVLabel()}})
     cfg = _cfg(tmp_path, [{"node_names": ["a", "b"], "ranks": [0, 1], "sp_size": 2}],
                resources={"kv": {"context_parallel": True}})
     _refused(model, cfg, r"node_groups\[0\]: \['a'\] place their KV positions over the SP ranks and "
-                         r"\['b'\] run their own sequence parallelism, .* share resources \['shared'\]")
+                         r"\['b'\] split their steps over them, .* share resources \['shared'\]")
 
 
 def test_qwen3_5_on_sp_ranks_runs_with_its_kv_positions_placed_over_them(tmp_path, monkeypatch):
@@ -388,10 +473,7 @@ class _WideModel(_Model):
     """A model whose ``llm`` takes TP beside SP or CFG."""
 
     def get_default_sharding_config(self):
-        return ShardingConfig(
-            groups=[], tp_enabled_nodes={"llm"}, shard_dim={},
-            sp_enabled_nodes={"llm"}, cfg_enabled_nodes={"llm": 2},
-        )
+        return ShardingConfig(groups=[], tp_enabled_nodes={"llm"}, shard_dim={}, cfg_enabled_nodes={"llm": 2})
 
 
 @pytest.mark.parametrize("axis", ["sp", "cfg"])
@@ -400,7 +482,9 @@ def test_a_sharded_signal_into_an_instance_wider_than_tp_is_refused(axis, tmp_pa
     only the TP ranks split the weights."""
     cfg = _cfg(tmp_path, [{"node_names": ["llm"], "ranks": [0, 1, 2, 3], "tp_size": 2, f"{axis}_size": 2}],
                sharding_config={"shard_dim": {"x": 1}})
-    _refused(_WideModel(), cfg, r"node 'llm' takes or emits \['x'\], which have a shard_dim")
+    # a node SP ranks can run: a sequence shard and an attention that takes it
+    model = _WideModel(specs=[SeqShardSpec("shard", {"llm"}, ("main",), 0), _ulysses(4)])
+    _refused(model, cfg, r"node 'llm' takes or emits \['x'\], which have a shard_dim")
 
 
 def test_model_yaml_hook_refusal_is_reported(tmp_path):
@@ -546,7 +630,8 @@ def test_lockstep_nodes_in_different_instances_on_one_worker_are_refused(b, plac
     """Two instances on a worker are two leaders' step streams with no order
     between them."""
     cfg = _cfg(tmp_path, [{"node_names": ["a"], **_TP2}, {"node_names": ["b"], **b}])
-    model = _Model(_a_then_b, tp_enabled_nodes=["a", "b"], sp_enabled_nodes=["b"] if "sp_size" in b else ())
+    model = _paged_llm(_shard(node="b"), _attention(nodes=("b",)), node="b", walks=_a_then_b,
+                       tp_enabled_nodes=["a", "b"])
     problems = _problems(model, cfg)
     assert len(problems) == 2
     for rank, problem in enumerate(problems):

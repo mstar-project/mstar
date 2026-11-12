@@ -887,7 +887,7 @@ class NodeSubmodule(torch.nn.Module, ABC):
     capture_cudnn_benchmark: bool = False
 
     # The keys of this node's resources whose step is its segments
-    # (``Resource.steps_from_segments``: the LoRA pools); set by `bind_node_resources`. The
+    # (``Resource.steps_from_segments``: the LoRA pools, the sequence shard); set by `bind_node_resources`. The
     # engine adds a step of the segments under each to the node's step (``engine_step``),
     # and to each piecewise region's from the region's own: in order, the rows the node's
     # computation sees, each a request's span of tokens (a request may have several, as
@@ -907,6 +907,9 @@ class NodeSubmodule(torch.nn.Module, ABC):
         # embedder, scratch caches), bound once at load. Empty until then
         # and on engines that build none.
         self.node_resources: dict[str, Any] = {}
+        # This node's sequence shard (`SeqShardSpec`; a node takes one), whose `scatter` / `gather` bracket the layer
+        # stack under sequence parallelism; None on a node that declares none. Set by `bind_node_resources`.
+        self.sequence_shard: Any = None
         # This node's handles on its declared state (`mstar.engine.state`), bound once at load.
         self.state_handles: Mapping[str, Any] = {}
 
@@ -921,10 +924,13 @@ class NodeSubmodule(torch.nn.Module, ABC):
         ``get_node_resources``; a layer that names a label this node doesn't
         have fails at bind rather than in the middle of a forward.
         """
+        from mstar.engine.resources.sequence_shard import SequenceShard
+
         self.segment_keys = tuple(
             key for key, resource in resources.items() if getattr(resource, "steps_from_segments", False)
         )
         self.node_resources = resources
+        self.sequence_shard = next((r for r in resources.values() if isinstance(r, SequenceShard)), None)
         for module in self.modules():
             bind = getattr(module, "bind_resources", None)
             if bind is not None and module is not self:
@@ -1564,12 +1570,15 @@ class NodeSubmodule(torch.nn.Module, ABC):
 def with_segment_steps(step: SubmoduleStep | None, keys: Sequence[str]) -> SubmoduleStep | None:
     """``step`` with a ``ResourceStep`` of its segments under each of ``keys`` (the
     resources whose step is the segments, ``Resource.steps_from_segments``) that it does
-    not declare itself, as a new step (a declaration reused across calls keeps its own). A
-    step without segments gets none: a resource that needs one refuses for want of a plan
-    (``LoraLayerDelta``)."""
+    not declare itself, as a new step carrying its ``combined_labels`` (a declaration reused
+    across calls keeps its own). A step without segments gets none: a resource that needs one
+    refuses for want of a plan (``LoraLayerDelta``, the sequence shard's dependents)."""
     if keys and step is not None and step.segments is not None:
         segments = tuple(step.segments)
-        added = {key: ResourceStep(segments=segments) for key in keys if key not in step.steps}
+        added = {
+            key: ResourceStep(segments=segments, combined_labels=step.combined_labels)
+            for key in keys if key not in step.steps
+        }
         if added:
             step = replace(step, steps={**step.steps, **added})
     return step

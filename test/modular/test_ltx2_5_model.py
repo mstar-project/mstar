@@ -16,6 +16,8 @@ import pytest
 import torch
 
 from mstar.engine.resources import RaggedCrossAttentionSpec
+from mstar.engine.resources.sequence_shard import sequence_parallel_refusals
+from mstar.engine.resources.spec import resolve_spec_dependencies
 from mstar.engine.state.adapters import node_resources, state_setup
 from mstar.graph.base import GraphNode, Loop, Parallel, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
@@ -40,6 +42,7 @@ from mstar.model.ltx2_5.config import (
     VIDEO,
     VIDEO_FOR_AUDIO,
     VIDEO_SELF,
+    VIDEO_SHARD,
     VIDEO_TEXT,
     LTX2TransformerConfig,
     LTX25Config,
@@ -177,7 +180,7 @@ def test_generate_walk_structure(walk, decoders):
 
 
 def test_resources_follow_the_attention_backend():
-    specs = {s.resource_key: s for s in node_resources(_make_model())}
+    specs = {s.resource_key: s for s in node_resources(_make_model()) if not s.splits_steps}
     assert set(specs) == {VIDEO_SELF, AUDIO_SELF, VIDEO_TEXT, AUDIO_TEXT}
     assert {k for k, s in specs.items() if isinstance(s, RaggedCrossAttentionSpec)} == {VIDEO_TEXT, AUDIO_TEXT}
     assert (specs[VIDEO_TEXT].config.head_dim, specs[AUDIO_TEXT].config.head_dim) == (128, 64)
@@ -186,7 +189,11 @@ def test_resources_follow_the_attention_backend():
     assert (specs[AUDIO_SELF].config.num_qo_heads, specs[AUDIO_SELF].config.head_dim) == (32, 64)
     model = _make_model()
     setup, _ = state_setup({"resources": {key: {"backend": "sdpa"} for key in specs}}, model.declare_state())
-    assert node_resources(model, setup=setup) == []
+    on_sdpa = node_resources(model, setup=setup)
+    assert [spec.resource_key for spec in on_sdpa] == [VIDEO_SHARD]
+    # SDPA attends outside the engine's resources, so the shard can't split its steps on SP ranks
+    (refusal,) = sequence_parallel_refusals(resolve_spec_dependencies(on_sdpa).values(), "dit", 1, 2)
+    assert "declares no attention that can take them" in refusal
     with pytest.raises(ValueError, match="attention_backend is a resource's setting"):
         _make_model(attention_backend="sdpa")
 

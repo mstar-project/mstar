@@ -44,7 +44,7 @@ Every attention in the DiT should go through the read of an array with `max_len=
 - `attention_segments(key)` declares, per array, every span a request's layers attend over, as `(label, length)`. A layer that attends over a sub-span (a refiner over the image tokens alone, a joint model's per-modality self-attention) binds its own array with its own label.
 - Reads of one kernel configuration on one node fold into one resource, so a model with more than one head geometry (LTX-2.5's video 32×128 and audio 32×64 heads) gets one resource per geometry.
 - Cross-attention between spans of the same request (video queries over text keys) is a read with `queries=` naming the array that lays out its queries, which builds `RaggedCrossAttentionSpec` and its `(q_label, kv_label)` pairs; see "Cross-attention between spans" in `docs/adding_models.rst`. Don't fall back to SDPA for it because the shapes are fixed inside a bucket.
-- Under sequence parallelism the two arrays' `seq_sharded` flags pick the exchange in the read, so a layer's calls stay the same at SP1 and above.
+- Under sequence parallelism the node's sequence shard (`SeqShardSpec` in `get_node_resources`) lists the labels that split, and the forward brackets its layer stack with `shard.scatter` / `shard.gather`; each read's resource exchanges by itself, so a layer's calls stay the same at SP1 and above.
 - A DiT's read declares `packed=False`, since its layers pass rows of one length rather than packed tokens.
 
 ## Compile and capture

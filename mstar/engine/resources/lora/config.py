@@ -23,6 +23,7 @@ from mstar.utils.client_errors import scrub_paths
 
 if TYPE_CHECKING:
     from mstar.engine.resources.base import Resource
+    from mstar.engine.resources.sequence_shard import SeqShardSpec
 
 # The resource key a model's ``LoraSpec`` is declared under, and so the serving YAML's
 # ``resources:`` block that turns LoRA on (see ``mstar.engine.resources.lora.serving``).
@@ -438,6 +439,14 @@ class LoraSpec(NodeResourceSpec):
         from mstar.engine.resources.lora.pool import LoraAdapterPool
 
         return LoraAdapterPool
+
+    def split_step_refusals(self, node: str, shard: SeqShardSpec, tp: int, sp: int) -> list[str]:
+        # a node placing its KV positions over its SP ranks instead runs every row on every rank
+        return [
+            f"LoRA resource {self.resource_key!r} serves node {node!r}, which splits tokens over {sp} SP "
+            f"ranks (SeqShardSpec {shard.resource_key!r}): LoRA lays its rows out per request, while each "
+            "SP rank holds a shard of the tokens. Serve this node without SP, or drop the 'lora:' block"
+        ]
 
     def for_node(self, node: str) -> "LoraSpec | None":
         """``node``'s pool: the targets on it, keyed ``lora@<node>``; None when the

@@ -127,14 +127,14 @@ def test_mixed_wrapper_builds_both_halves_in_graph_mode(monkeypatch, tensor_core
         assert prefill.call_args_list[0].kwargs["backend"] == "fa2"
 
 
-@pytest.mark.parametrize(("tp", "sp", "shard_over_sp", "heads"), [
+@pytest.mark.parametrize(("tp", "sp", "ulysses", "heads"), [
     (1, 1, True, 8), (2, 1, True, 4), (1, 2, True, 4), (2, 2, True, 2), (2, 2, False, 4),
 ])
-def test_cfg_ranks_keep_every_head(tp, sp, shard_over_sp, heads):
-    """On a lockstep instance with a two-rank CFG axis, a ragged attention's
-    heads split over the TP x SP ranks only (TP only with ``shard_over_sp=False``):
-    each CFG rank runs whole guidance branches, so the instance's world size
-    over-counts the head shards."""
+def test_cfg_ranks_keep_every_head(tp, sp, ulysses, heads):
+    """On a lockstep instance with a two-rank CFG axis, a Ulysses ragged attention's
+    heads split over the TP x SP ranks only (any other over TP only): each CFG rank
+    runs whole guidance branches, so the instance's world size over-counts the head
+    shards."""
     from mstar.distributed.communication import CommGroup, JointGroups
     from mstar.engine.resources import RaggedAttentionConfig, RaggedAttentionSpec
     from mstar.engine.resources.base import EngineResourceInfo, build_resource
@@ -145,8 +145,10 @@ def test_cfg_ranks_keep_every_head(tp, sp, shard_over_sp, heads):
     joint = JointGroups(tp_group=group(tp), sp_group=group(sp), cfg_group=group(2), instance=group(tp * sp * 2))
     spec = RaggedAttentionSpec(
         resource_key="by_hand", nodes={"dit"},
-        config=RaggedAttentionConfig(num_qo_heads=8, num_kv_heads=8, head_dim=64, shard_over_sp=shard_over_sp),
+        config=RaggedAttentionConfig(num_qo_heads=8, num_kv_heads=8, head_dim=64),
     )
+    # what `RaggedAttentionSpec.derive` sets over a node whose sequence shard splits a label the spec lists
+    spec.shard_key, spec.sp_exchange = ("shard", "ulysses") if ulysses else (None, None)
     mgr = build_resource(spec, EngineResourceInfo(
         device=torch.device("cpu"), kv_dtype=torch.bfloat16, joint_comm_group=joint,
     ))

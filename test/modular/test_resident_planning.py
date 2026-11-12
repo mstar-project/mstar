@@ -1995,6 +1995,18 @@ def test_a_resource_without_a_table_refuses():
     assert planner is None and "_Spare keeps no resident table" in why
 
 
+def test_a_sequence_shard_holds_no_node_back():
+    """Cosmos3-Edge's reasoner shares the dit's shard and decodes on resident tables (#1295)."""
+    from mstar.engine.resources.base import EngineResourceInfo
+    from mstar.engine.resources.sequence_shard import SeqShardSpec
+
+    res = _resources()
+    spec = SeqShardSpec("shard", {"n"}, ("main",), 0)
+    shard = spec.resource_class.build(spec, EngineResourceInfo(device=CPU))
+    planner, why = _build({"kv": res["kv"], "shard": shard})
+    assert planner is not None and why == ""
+
+
 def test_a_pool_shared_with_a_host_planned_node_builds():
     res = _resources()
     planner, why = _build({"kv": res["kv"]}, nodes={"kv": ("n", "m")})

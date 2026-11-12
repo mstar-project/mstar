@@ -339,7 +339,7 @@ class QwenImageModel(Model):
         return None
 
     def get_submodule(
-        self, node_name: str, device="cpu", tp_group=None, autocast_dtype=None, sp_group=None, moe_parallel=None,
+        self, node_name: str, device="cpu", tp_group=None, autocast_dtype=None, moe_parallel=None,
         cfg_group=None,
     ) -> NodeSubmodule | None:
         if self.skip_weight_loading:

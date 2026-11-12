@@ -629,7 +629,7 @@ def gather_merge(group: CommGroup, out: torch.Tensor, lse: torch.Tensor) -> torc
     return merge(*gathered).to(out.dtype)
 
 
-def _position_pools(specs: Iterable[NodeResourceSpec], node: str) -> dict[str, bool]:
+def position_pools(specs: Iterable[NodeResourceSpec], node: str) -> dict[str, bool]:
     """``node``'s resources that hold token positions, each to whether it places them
     (``NodeResourceSpec.places_positions``). Raises when one is placed and another isn't."""
     pools = {
@@ -642,28 +642,3 @@ def _position_pools(specs: Iterable[NodeResourceSpec], node: str) -> dict[str, b
             f"set context_parallel on {sorted(key for key, placed in pools.items() if not placed)} too"
         )
     return pools
-
-
-def positions_over_sp(specs: Iterable[NodeResourceSpec], node: str, sp_size: int, sp_enabled_nodes) -> bool:
-    """Whether ``node``, on ``sp_size`` SP ranks, places its pools' positions over them, sharding
-    heads over TP alone and running replicated across SP, so the model loads without its SP group;
-    otherwise it runs the model's own sequence parallelism (it is in ``sp_enabled_nodes``). False on
-    one SP rank. Raises when it does neither, or both, or places one pool and not another."""
-    if sp_size == 1:
-        return False
-    pools = _position_pools(specs, node)
-    placed = any(pools.values())
-    if placed and node in sp_enabled_nodes:
-        raise ValueError(
-            f"node {node!r} runs its own sequence parallelism (sp_enabled_nodes), and a paged KV pool over "
-            "it sets context_parallel, which would replace it: turn context_parallel off, or use sp_size 1 "
-            "to place positions over TP ranks"
-        )
-    if not placed and node not in sp_enabled_nodes:
-        raise ValueError(
-            f"node {node!r} on {sp_size} SP ranks is not in sp_enabled_nodes {sorted(sp_enabled_nodes)}"
-            + (": set context_parallel on its paged KV pools to place positions over the SP ranks instead"
-               if pools else ", and holds no paged KV pool to place over them: put it in a node group of "
-               "its own with sp_size 1")
-        )
-    return placed
