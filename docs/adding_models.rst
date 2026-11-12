@@ -418,7 +418,7 @@ doesn't name, it opens the labels ``kv_labels()`` lists for it, or ``main`` wher
 none, and a paged array needs a layout for each label it opens, so leaving one out fails the
 request: lay out every paged array. A layout may be empty where an opened label is never
 written. A Value's layout is ``Layout()``, because a Value takes one slot per label. A layout
-has three fields:
+has four fields:
 
 - ``spans``: the committed writes known at intake, in walk order. A ``Span`` has a
   ``kind``: ``"ids"`` for token ids from the tensor ``source`` names, ``"digest"`` for KV
@@ -440,6 +440,10 @@ has three fields:
   slots, as a window's denoise steps do.
 - ``growth``: ``(loop, entries)`` pairs, ``entries`` per iteration of ``loop``.
 - ``scratch``: the most entries one non-committing step writes past the kept length.
+- ``kept_windows``: by read key, the ``KeptWindow(sink, window=)`` of each kept-window read,
+  in entries (``Bidirectional(kept_window=True)``, below). The pool keeps the label's first
+  ``sink`` entries and its last ``window``, and gives back the whole pages between them, so
+  the footprint is the window's.
 
 ``process_prompt`` may also return ``keyed_spans``, keyed by array and then label: how many
 leading spans the label's keys cover, by default every span before the first ``rows`` span.
@@ -705,7 +709,19 @@ deployment YAML tunes them under ``resources:`` (see :ref:`Step 6 <config-yaml>`
   the one read declared for its layer and walk, and loading refuses two reads over one
   layer and walk. ``Causal()`` sees every entry up to the query's own, ``Window(size)`` the
   last ``size`` of them, its own included, and ``Bidirectional()`` every entry the row keeps and
-  every entry this step adds for it. On an array that keeps entries, reads of one attention
+  every entry this step adds for it. ``Bidirectional(kept_window=True)`` sees, of what the row
+  kept before the step, the first ``sink`` entries and the last ``window`` that the request's
+  layout gives (``kept_windows``), and every entry this step adds, as LingBot-World's chunks
+  read their sink and latest window. It is its array's only read, with no ``walks`` and no
+  ``queries``, it takes packed queries, and a step that reads it is never captured.
+  ``FrameWindow(tokens, frames=, stride=1)`` sees frames of ``tokens`` entries: every
+  ``stride``-th of the latest ``frames``, and the step's own frame. An array whose reads are
+  all frame windows is held in a ring of frames per session, which a compiled region adds to
+  and reads through FlexAttention, as Waypoint's is. Each step adds one frame a row, and
+  ``position()`` counts the frames a request has committed. A read with ``op=None`` takes no
+  queries and returns the entries it reaches as ``Reached``, which the model attends itself.
+  It needs a kept window, as LingBot-World's ``reference_numerics`` reads one for its FA2.
+  On an array that keeps entries, reads of one attention
   config share one resource, unless a walk reads through two of them with different masks, and
   each step plans ``causal`` from the read its walk resolves to:
   BAGEL reads ``kv`` through ``attn`` (``Causal()``) on ``prefill_text`` and ``decode``, and
@@ -1453,8 +1469,10 @@ Rolling (compacted) caches
 ^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 A causal video DiT that denoises chunk after chunk against a sink and a sliding window of
-earlier chunks (Self-Forcing's rolling cache; LingBot-World's ``DIT_KV``) declares a
-``RollingKVSpec``. Its chunks are thousands of queries over tens of thousands of keys, so
+earlier chunks (Self-Forcing's rolling cache) can declare a ``RollingKVSpec``. A model on
+the contract declares a kept-window read instead (``Bidirectional(kept_window=True)``),
+whose pool keeps the sink and the window in pages and gathers them for each read. Its
+chunks are thousands of queries over tens of thousands of keys, so
 the attention kernel dominates the step, and bounded KV's Triton kernel (built for short
 streaming steps) is several times slower there than the ragged FlashInfer one. The rolling
 store therefore runs no attention: it keeps the stream's first ``sink`` tokens and its last
@@ -1477,11 +1495,11 @@ back when the request ends, so requests of different sizes share the pool instea
 holding the largest. When no free gap holds a new request but the free tokens do, the
 resident regions slide left to join the gaps, a copy of what they hold, between steps; one
 that slides across a short gap is copied through a staging block of 512 tokens a layer,
-reserved with the pool (90 MiB at LingBot-World's geometry), rather than in many small
+reserved with the pool (90 MiB at 30 layers of 12 heads of 128), rather than in many small
 copies. How many requests run at once is the deployment's ``max_concurrent_requests``, not
 the store's: the pool counts tokens, so it admits many small requests, and any state a
-model keeps per request outside the store is bounded only by that limit (LingBot-World
-requires it to be 1 for this reason). A step that declares this store runs eager (no
+model keeps per request outside the store is bounded only by that limit. A step that
+declares this store runs eager (no
 capture yet), and it does not shard across ranks yet.
 
 Per-request LoRA adapters
