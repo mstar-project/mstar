@@ -4,7 +4,8 @@ Mostly a rename: the text stack sits under ``language_model`` and the delta
 net mixer is ``linear_attn`` (ours: ``self_attn``); vision tensors lose their
 ``model.visual.`` prefix. ``_STACKED_PARAMS`` routes the separate q/k/v, gate/up
 and delta net input projections by shard id into their fused parameters. The two
-towers load separately, as separate nodes. The MTP head (``mtp.*``) is skipped.
+towers load separately, as separate nodes. The MTP head (``mtp.*``, the same
+names in ours) loads only into a model built with it, for speculative decoding.
 """
 from __future__ import annotations
 
@@ -34,6 +35,7 @@ _TEXT_PREFIX = "model.language_model."
 _VISION_PREFIX = "model.visual."
 # at the checkpoint's root, and only when untied (9B and 27B)
 _LM_HEAD = "lm_head.weight"
+_MTP_PREFIX = "mtp."
 
 
 def qwen3_5_name_remapper(name: str) -> str | None:
@@ -45,6 +47,13 @@ def qwen3_5_name_remapper(name: str) -> str | None:
     return name.replace(_TEXT_PREFIX, "model.").replace(
         ".linear_attn.", ".self_attn."
     )
+
+
+def qwen3_5_mtp_name_remapper(name: str) -> str | None:
+    """The text tower's names, and the MTP head's, which pass through."""
+    if name.startswith(_MTP_PREFIX):
+        return name
+    return qwen3_5_name_remapper(name)
 
 
 def qwen3_5_vision_name_remapper(name: str) -> str | None:
@@ -94,6 +103,8 @@ def load_qwen3_5_weights(
     if not tied:
         # an untied head sits at the root, outside the text prefix
         selectors.append({"keys": {_LM_HEAD}})
+    if getattr(model, "mtp", None) is not None:
+        selectors.append({"prefix": _MTP_PREFIX})
     return _load(
         model, path, device, selectors,
         expected={

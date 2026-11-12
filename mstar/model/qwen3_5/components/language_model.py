@@ -281,12 +281,22 @@ class Qwen3_5LanguageModel(nn.Module):
 
 
 class Qwen3_5ForCausalLM(nn.Module):
+    """The text stack and LM head; with ``with_mtp`` the checkpoint's MTP head
+    too (``mtp``, speculative decoding's drafter), whose KV is one layer past
+    the stack's full-attention layers."""
+
     def __init__(
-        self, config: Qwen3_5Config, comm_group: CommGroup | None = None,
+        self, config: Qwen3_5Config, comm_group: CommGroup | None = None, with_mtp: bool = False,
     ):
         super().__init__()
         self.config = config
         self.model = Qwen3_5LanguageModel(config, comm_group)
+        self.mtp = None
+        if with_mtp:
+            from mstar.model.qwen3_5.components.mtp import Qwen3_5MTPHead
+
+            # its KV layer is bound from the pool's layer set when the engine binds the node
+            self.mtp = Qwen3_5MTPHead(config, comm_group=self.model.comm_group)
         # Gathers the vocab so the sampler is TP-oblivious. Its `[vocab/tp,
         # hidden]` shard matches the embedding's, so the tie works per rank.
         self.lm_head = ColumnParallelLinear(
@@ -301,12 +311,18 @@ class Qwen3_5ForCausalLM(nn.Module):
             self.lm_head.weight = self.model.embed_tokens.weight
 
     def checkpoint_rules(self):
-        """How the checkpoint's text tower lands here (the MTP head and the vision tower
-        dropped), for its weight loader and for LoRA adapters."""
+        """How the checkpoint's text tower lands here (the vision tower dropped, and the
+        MTP head unless this model was built with it), for its weight loader and for
+        LoRA adapters."""
         from mstar.model.loader import CheckpointRules
-        from mstar.model.qwen3_5.weight_loader import _STACKED_PARAMS, qwen3_5_name_remapper
+        from mstar.model.qwen3_5.weight_loader import (
+            _STACKED_PARAMS,
+            qwen3_5_mtp_name_remapper,
+            qwen3_5_name_remapper,
+        )
 
-        return CheckpointRules(stacked_params=tuple(_STACKED_PARAMS), remap=qwen3_5_name_remapper)
+        remap = qwen3_5_name_remapper if self.mtp is None else qwen3_5_mtp_name_remapper
+        return CheckpointRules(stacked_params=tuple(_STACKED_PARAMS), remap=remap)
 
     # The decoder contract `SampledTokenDecoder` drives (as `Qwen3DenseLM`).
 

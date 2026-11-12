@@ -72,6 +72,8 @@ class Qwen3_5Config:
     mrope_interleaved: bool = False
     partial_rotary_factor: float = 1.0
     mtp_num_hidden_layers: int = 0
+    # an MTP head with its own embedding table, which the drafter doesn't build (refused)
+    mtp_use_dedicated_embeddings: bool = False
     mamba_ssm_dtype: str = "float32"
     # Filled from the tokenizer at model construction; see `stop_token_ids`.
     extra_stop_token_ids: tuple[int, ...] = ()

@@ -174,11 +174,15 @@ def test_qwen3_5_hands_over_a_batch_tensor():
     per-request copies."""
     import inspect
 
+    from mstar.model.components.sampled_token_decoder import SampledTokenDecoder
     from mstar.model.qwen3_5 import submodules
 
-    src = inspect.getsource(submodules.LLMSubmodule.forward_batched)
+    src = inspect.getsource(SampledTokenDecoder.forward_batched)
     assert "check_stop_buffers" in src
     assert "BatchedModelOutput" in src
+    # Qwen3.5's own (a verifying node's verify step) hands every other step to the scaffold's
+    own = submodules.LLMSubmodule.forward_batched
+    assert own is SampledTokenDecoder.forward_batched or "super().forward_batched" in inspect.getsource(own)
 
 
 def test_rows_map_through_the_forward_order_not_the_batch_list():

@@ -1,4 +1,7 @@
+import dataclasses
+import json
 import logging
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -10,6 +13,8 @@ from mstar.engine.resources.attn.ragged.config import (
     RaggedAttentionConfig,
     RaggedAttentionSpec,
 )
+from mstar.engine.resources.draft.config import DraftConfig
+from mstar.engine.resources.draft.drafter import ModelGeometry, VerifyNode, drafter_resources
 from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
 from mstar.engine.resources.linear_attn.config import (
     LinearAttnConfig,
@@ -37,6 +42,7 @@ from mstar.model.multimodal_decoder import (
     PreparedMedia,
 )
 from mstar.model.qwen3_5.components.language_model import Qwen3_5ForCausalLM
+from mstar.model.qwen3_5.components.mtp import MTP
 from mstar.model.qwen3_5.components.rope import vision_position_advance
 from mstar.model.qwen3_5.config import (
     ATTN,
@@ -54,6 +60,7 @@ from mstar.model.qwen3_5.video import (
     group_timestamps,
     sample_video,
 )
+from mstar.model.rebuild import RebuildPolicy
 from mstar.model.submodule_base import ChunkingPolicy, NodeSubmodule
 from mstar.utils.fast_tokenize import encode_ids
 
@@ -74,16 +81,34 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
         # some fine-tunes (LightOnOCR-3, Surya) keep their template nowhere else
         "chat_template.jinja",
     )
+    # speculative decoding off unless `__init__` gets a ``draft`` block
+    draft: DraftConfig | None = None
+    drafter_decl: MTP | None = None
 
     def __init__(
         self,
         model_path_hf: str,
         cache_dir: str | None = None,
         prefill_token_buckets: list[int] | None = None,
+        draft: dict | None = None,
+        accelerator_graph: bool = True,
         **kwargs: Any,
     ):
+        """``draft``: the speculative-decoding block (``method: mtp``), which
+        makes every decode step verify ``num_draft_tokens`` drafts of the
+        checkpoint's MTP head. ``accelerator_graph: false`` runs the LLM node
+        uncaptured (no resident planning, so a draft block runs synchronous)."""
         super().__init__(model_path_hf, cache_dir, prefill_token_buckets)
+        self.accelerator_graph = bool(accelerator_graph)
         self.config = Qwen3_5Config.from_hf(self.local_dir)
+        self.draft = DraftConfig.from_model_kwargs({"draft": draft})
+        self.drafter_decl: MTP | None = None
+        if self.draft is not None:
+            if self.draft.method != "mtp":
+                raise ValueError(f"Qwen3.5 drafts with its MTP head (method mtp), not {self.draft.method!r}")
+            raw = json.loads((Path(self.local_dir) / "config.json").read_text())
+            dtype = raw.get("text_config", raw).get("dtype") or raw.get("torch_dtype") or raw.get("dtype")
+            self.drafter_decl = MTP(self.config, self.draft.num_draft_tokens, dtype=str(dtype or "bfloat16"))
         # None on a text-only checkpoint (`_create_submodule` then refuses a
         # vision_encoder node)
         self.vision_config = Qwen3_5VisionConfig.from_hf_or_none(self.local_dir)
@@ -132,16 +157,26 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
         return torch.float32
 
     def get_node_resources(self) -> list[NodeResourceSpec]:
+        drafting = self.draft is not None
+        # the MTP head's KV layer joins after the stack's full-attention layers (`drafter_resources`)
         num_kv_layers = len(self.config.full_layer_indices)
         num_gdn_layers = len(self.config.linear_layer_indices)
-        return [
+        # two committed verify steps' worth past the serving limit
+        slack = self.draft.kv_slack if drafting else 0
+        # a verifying node runs no mixed prompt-plus-decode steps: they aren't supported yet
+        splits = () if drafting else (MIXED_SPLIT,)
+        sampler = self._sampler_spec(self.config.vocab_size)
+        if drafting:
+            # a verify step can't penalize per draft position
+            sampler = dataclasses.replace(sampler, enable_repetion_penalty=False, verifies=True)
+        specs = [
             KVSpec(
-                resource_key=KV_CACHE, nodes={"LLM"},
+                resource_key=KV_CACHE, nodes={"LLM"}, draft_slack=slack,
                 config=PagedKVConfig(
                     num_layers=num_kv_layers,
                     num_kv_heads=self.config.num_key_value_heads,
                     head_dim=self.config.head_dim,
-                    max_seq_len=self.config.max_position_embeddings,
+                    max_seq_len=self.config.max_position_embeddings + slack,
                     num_qo_heads=self.config.num_attention_heads
                 )
             ),
@@ -149,7 +184,7 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
                 resource_key=ATTN, nodes={"LLM"},
                 config=AttentionConfig(
                     kv_cache=KV_CACHE,
-                    splits=(MIXED_SPLIT,),
+                    splits=splits,
                     decode_fmha=True,
                 ),
             ),
@@ -176,12 +211,16 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
                 config=LinearAttnConfig(
                     recurrent_state=GDN_STATE,
                     variant=LinearAttnVariant.GDN,
-                    splits=(MIXED_SPLIT,),
+                    splits=splits,
                 ),
             ),
-            self._sampler_spec(self.config.vocab_size),
+            sampler,
             *self._vision_resources(),
         ]
+        if drafting:
+            # the head's KV layer, and its hidden vector from one verify step to the next
+            specs = drafter_resources(specs, self.drafter_decl, {"LLM"})
+        return specs
 
     def get_lora_specs(self) -> list[LoraSpec]:
         """The LLM's, then the vision encoder's when the checkpoint has a vision tower."""
@@ -224,11 +263,54 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
         from mstar.model.qwen3_5.submodules import LLMSubmodule
 
         budget = LLMSubmodule.MAX_BATCH_TOKENS
+        text = ChunkingPolicy(walks=("prefill_text",), chunkable=True, max_batch_tokens=budget)
+        if self.draft is not None:
+            return {"LLM": (text,)}
         return {"LLM": (
-            ChunkingPolicy(walks=("prefill_text",), chunkable=True, max_batch_tokens=budget),
+            text,
             # carries the budget for the steps that mix a chunk with decode rows
             ChunkingPolicy(walks=(MIXED,), max_batch_tokens=budget),
         )}
+
+    # -----------------------------------------------------------------------
+    # Speculative decoding
+    # -----------------------------------------------------------------------
+
+    def get_combined_graph_walks(self) -> dict[str, dict[str, set[str]]]:
+        if getattr(self, "draft", None) is not None:
+            # mixed prompt-plus-verify steps are not supported yet
+            return {}
+        return MultimodalDecoderModel.get_combined_graph_walks(self)
+
+    def rebuild_policies(self) -> dict[str, RebuildPolicy]:
+        if self.draft is not None:
+            # A dropped request isn't rebuilt on a verifying node: what a rebuild replays (the
+            # prompt and the kept samples, then decode) hasn't been checked against the verify
+            # state a request holds (its pending take-backs and the drafter's carry). KV pressure
+            # there is resolved by offload and eviction, as without preemption.
+            return {}
+        return super().rebuild_policies()
+
+    def verify_nodes(self) -> list[VerifyNode]:
+        if self.draft is None:
+            return []
+        from mstar.model.qwen3_5.submodules import LLMSubmodule
+
+        config = self.config
+        # video prompts are refused on a drafting node (`intake`)
+        kinds = {"text"} | ({"image"} if self.vision_config is not None else set())
+        return [VerifyNode(
+            "LLM", "decode", self.draft, self.drafter_decl.needs,
+            token_stop=LLMSubmodule.node_token_stop(config.stop_token_ids, self.encoders),
+            device_loopback=LLMSubmodule.node_device_loopback(),
+            input_kinds=frozenset(kinds),
+            # the KV pool's layers are the full-attention ones
+            target=ModelGeometry(
+                num_layers=len(config.full_layer_indices), num_kv_heads=config.num_key_value_heads,
+                head_dim=config.head_dim, hidden_size=config.hidden_size, vocab_size=config.vocab_size,
+                dtype=self.drafter_decl.dtype,
+            ),
+        )]
 
     # ------------------------------------------------------------------
     # Model ABC: I/O
@@ -347,6 +429,15 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
             )
         return ProcessedVideo(out["pixel_values_videos"], grid, timestamps)
 
+    def intake(self, prompt, input_modalities, tensors=None, prompt_parts=None, **kwargs):
+        if self.draft is not None and VIDEO in input_modalities:
+            # before the base's attachment checks, which would refuse first in their own words
+            raise ValueError(
+                "Qwen3.5 with speculative decoding (a draft block) serves text and image prompts; "
+                "video is not supported on it yet"
+            )
+        return super().intake(prompt, input_modalities, tensors, prompt_parts, **kwargs)
+
     def _prompt_ids(
         self, parts: list[PromptPart], raw: dict[str, list[torch.Tensor]], **kwargs,
     ) -> torch.Tensor:
@@ -420,7 +511,12 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
             vision_position_advance(torch.tensor(grid), self._merge()) - tokens
             for tokens, grid in zip(layout.get("tokens", ()), layout.get("grid", ()), strict=True)
         )
-        return super().kv_layout(layout, length, advance)
+        out = super().kv_layout(layout, length, advance)
+        if self.draft is not None:
+            # a verifying node's rows reserve two committed verify steps past the verified length
+            main = out[KV_CACHE]["main"]
+            out[KV_CACHE]["main"] = main._replace(scratch=self.draft.kv_slack)
+        return out
 
     # ------------------------------------------------------------------
     # Model ABC: submodule loading
@@ -430,7 +526,6 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
         self, node_name: str, device: str, dtype: torch.dtype, tp_group,
     ) -> NodeSubmodule | None:
         from mstar.model.qwen3_5.submodules import (
-            LLMSubmodule,
             VisionEncoderSubmodule,
         )
 
@@ -464,12 +559,22 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
         from mstar.model.qwen3_5.weight_loader import load_qwen3_5_weights
 
         model = self._build(
-            lambda: Qwen3_5ForCausalLM(self.config, tp_group), dtype, device,
+            lambda: Qwen3_5ForCausalLM(self.config, tp_group, with_mtp=self.draft is not None), dtype, device,
         )
         load_qwen3_5_weights(model, weights_dir, device=device)
         model.requires_grad_(False).eval()
         logger.info("Loaded Qwen3.5 LLM submodule onto %s", device)
+        return self.make_llm_submodule(model)
+
+    def make_llm_submodule(self, model: Qwen3_5ForCausalLM):
+        """The LLM node around a loaded text stack, drafting with its MTP head
+        when the deployment names a ``draft`` block."""
+        from mstar.model.qwen3_5.components.mtp import Qwen3_5MTPDrafter
+        from mstar.model.qwen3_5.submodules import LLMSubmodule
+
+        drafter = None if self.drafter_decl is None else Qwen3_5MTPDrafter(self.drafter_decl, model)
         return LLMSubmodule(
             model, self.config, self.vision_config, self.encoders,
-            prefill_token_buckets=self.prefill_token_buckets,
+            prefill_token_buckets=self.prefill_token_buckets, drafter=drafter,
+            accelerator_graph=getattr(self, "accelerator_graph", True),
         )

@@ -732,11 +732,15 @@ def _minimax_h3(name, model_kwargs, tmp_path, monkeypatch):
 
 def _qwen3_5(name, model_kwargs, tmp_path, monkeypatch):
     """Small text-only shapes: the resource rules read the layer and head
-    counts, not their sizes."""
+    counts, not their sizes. A config's ``draft`` block is the model's, as
+    ``Qwen3_5DenseModel.__init__`` reads it (with the checkpoint's MTP layer)."""
+    from mstar.engine.resources.draft.config import DraftConfig
     from mstar.model.multimodal import vision_encoder
     from mstar.model.multimodal_decoder import MediaIntake
+    from mstar.model.qwen3_5.components.mtp import MTP
     from mstar.model.qwen3_5.config import FULL_ATTENTION, LINEAR_ATTENTION, Qwen3_5Config
     from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
+    draft = DraftConfig.from_model_kwargs({"draft": model_kwargs.get("draft")})
     config = Qwen3_5Config(
         num_hidden_layers=4, hidden_size=256, intermediate_size=512,
         layer_types=[LINEAR_ATTENTION] * 3 + [FULL_ATTENTION],
@@ -744,10 +748,13 @@ def _qwen3_5(name, model_kwargs, tmp_path, monkeypatch):
         linear_num_key_heads=4, linear_num_value_heads=8, linear_key_head_dim=128,
         linear_value_head_dim=128, linear_conv_kernel_dim=4,
         vocab_size=1024, rms_norm_eps=1e-6, max_position_embeddings=262144,
+        mtp_num_hidden_layers=1 if draft is not None else 0,
     )
+    drafter = None if draft is None else MTP(config, draft.num_draft_tokens, dtype="bfloat16")
     return _bare(
         Qwen3_5DenseModel, config=config, vision_config=None,
         media=(MediaIntake("image", vision_encoder((0,)), 0, None),),
+        draft=draft, drafter_decl=drafter,
     )
 
 

@@ -9,19 +9,25 @@ counter here; the 3D ids are built in this module and passed in as cos/sin.
 
 import logging
 import os
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from typing import Any
 
 import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.accelerator_graph_config import DETERMINISTIC_COMPILE_MODE
+from mstar.engine.accelerator_graph_config import (
+    DETERMINISTIC_COMPILE_MODE,
+    AcceleratorGraphConfig,
+)
 from mstar.engine.resources.attn.config import AttentionStep
 from mstar.engine.resources.kv.config import KVStep
 from mstar.engine.resources.linear_attn.config import LinearAttnStep
+from mstar.engine.resources.position.config import PositionStep
 from mstar.engine.resources.recurrent.config import RecurrentStep
-from mstar.engine.resources.step import ResourceStep
+from mstar.engine.resources.sampler.config import SamplerStep
+from mstar.engine.resources.step import ResourceStep, Segment, SubmoduleStep
 from mstar.model.components.block_loop_encoder import PackedBlockLoopEncoder
 from mstar.model.components.mrope import mrope_position_ids
 from mstar.model.components.qwen3_vit import (
@@ -36,6 +42,7 @@ from mstar.model.components.sampled_token_decoder import SampledTokenDecoder
 from mstar.model.keys import MIXED
 from mstar.model.multimodal import MediaEncoder
 from mstar.model.qwen3_5.components.language_model import Qwen3_5ForCausalLM
+from mstar.model.qwen3_5.components.mtp import MTP_NEXT_IDS, Qwen3_5MTPDrafter
 from mstar.model.qwen3_5.components.rope import (
     text_position_ids,
     vision_position_advance,
@@ -50,7 +57,13 @@ from mstar.model.qwen3_5.config import (
     Qwen3_5Config,
     Qwen3_5VisionConfig,
 )
-from mstar.model.submodule_base import ARNodeInputs, ModelInputsFromEngine, NodeInputs
+from mstar.model.submodule_base import (
+    ARNodeInputs,
+    BatchedModelOutput,
+    InputSeqLenInfo,
+    ModelInputsFromEngine,
+    NodeInputs,
+)
 from mstar.utils.h2d import to_device_nonblocking
 from mstar.utils.knobs import compile_deterministic, ingraph_decode_rope
 from mstar.utils.profiler import PhaseLaps
@@ -119,6 +132,11 @@ class LLMSubmodule(SampledTokenDecoder):
     MIXED_SLACK_TOKENS = MAX_BATCH_TOKENS + SampledTokenDecoder.MIXED_CAPTURE_BATCH_SIZES[-1]
     MIXED_TOKEN_BUCKETS = _mixed_token_buckets(PREFILL_TOKEN_BUCKETS, MIXED_SLACK_TOKENS)
 
+    # speculative decoding off unless `__init__` gets a drafter
+    drafter: Qwen3_5MTPDrafter | None = None
+    _block = 1
+    accelerator_graph = True
+
     def __init__(
         self,
         model: Qwen3_5ForCausalLM,
@@ -126,8 +144,19 @@ class LLMSubmodule(SampledTokenDecoder):
         vision_config: Qwen3_5VisionConfig | None = None,
         encoders: tuple[MediaEncoder, ...] = (),
         prefill_token_buckets: list[int] | None = None,
+        drafter: Qwen3_5MTPDrafter | None = None,
+        accelerator_graph: bool = True,
     ):
+        """``drafter``: the target's MTP head as a drafter (speculative
+        decoding): every decode step verifies its ``k`` drafts, ``k + 1``
+        tokens a row, through the engine's `draft_verify_step`."""
         super().__init__(model, config, encoders, prefill_token_buckets)
+        self.drafter = drafter
+        self.accelerator_graph = accelerator_graph
+        # rows a decode step runs a request: the last token, then the drafts
+        self._block = 1 if drafter is None else drafter.k + 1
+        # a text prompt's rows carry the MTP head's following ids, cut with them
+        self.cuts_tensor_inputs = drafter is not None
         if "MSTAR_QWEN35_PREFILL_TOKEN_BUCKETS" in os.environ:
             logger.warning(
                 "MSTAR_QWEN35_PREFILL_TOKEN_BUCKETS is no longer read; set the ladder "
@@ -160,6 +189,163 @@ class LLMSubmodule(SampledTokenDecoder):
             GDN_STATE: RecurrentStep(),
             LINEAR_ATTN: LinearAttnStep(),
         }
+
+    # ------------------------------------------------------------------
+    # Speculative decoding (a drafter)
+    # ------------------------------------------------------------------
+
+    def get_accelerator_graph_configs(
+        self, device: torch.device, tp_world_size: int = 1,
+    ) -> list[AcceleratorGraphConfig]:
+        """The base's captures, unless the deployment turns the node's graphs
+        off (``accelerator_graph``)."""
+        if not self.accelerator_graph:
+            return []
+        configs = super().get_accelerator_graph_configs(device, tp_world_size)
+        if self.drafter is None:
+            return configs
+        out = []
+        for config in configs:
+            if config.capture_graph_walk == MIXED:
+                # no mixed steps on a verifying node: they aren't supported yet
+                continue
+            # the base builds these configs afresh on every call, so they are ours to change
+            if config.capture_graph_walk == self.DECODE_WALK:
+                # a verify step's draft passes, target, verify, rerun and observe replay as one graph
+                config.single_request_inputs = ARNodeInputs(
+                    input_ids=torch.zeros(1, dtype=torch.long, device=device), input_seq_len=self._block,
+                )
+            elif config.capture_graph_walk == "prefill_text":
+                ids_row = config.make_node_input
+
+                def with_next_ids(n: int, ids_row=ids_row) -> ARNodeInputs:
+                    row = ids_row(n)
+                    row.tensor_inputs = {MTP_NEXT_IDS: torch.zeros_like(row.input_ids)}
+                    return row
+
+                config.make_node_input = with_next_ids
+            out.append(config)
+        return out
+
+    def get_input_sequence_len(
+        self, graph_walk: str, fwd_info: CurrentForwardPassInfo, inputs, **kwargs,
+    ) -> InputSeqLenInfo | None:
+        if graph_walk == self.DECODE_WALK:
+            # a verify row runs its block, k + 1
+            return InputSeqLenInfo(self._block)
+        return super().get_input_sequence_len(graph_walk, fwd_info, inputs, **kwargs)
+
+    def speculative_input_seq_len(self, graph_walk, fwd_info, prev_seq_len):
+        if graph_walk == self.DECODE_WALK:
+            return self._block
+        return super().speculative_input_seq_len(graph_walk, fwd_info, prev_seq_len)
+
+    def prepare_inputs(
+        self, graph_walk: str, fwd_info: CurrentForwardPassInfo, inputs, has_loopback: bool = False,
+        **kwargs: Any,
+    ) -> ARNodeInputs:
+        row = super().prepare_inputs(graph_walk, fwd_info, inputs, has_loopback, **kwargs)
+        if self.drafter is None or graph_walk in self._media_walks or row.input_ids is None:
+            return row
+        if graph_walk == self.DECODE_WALK:
+            # a row's first verify step brings its prompt's token routed
+            return ARNodeInputs(input_seq_len=self._block, input_ids=row.input_ids.reshape(-1)[-1:])
+        if graph_walk == "prefill_text":
+            # each row's following token for the MTP head; the last one is the token the
+            # prompt's step samples. Device ops on the ids, no host copy.
+            ids = row.input_ids
+            row.tensor_inputs = {MTP_NEXT_IDS: torch.cat([ids[1:], torch.full_like(ids[:1], -1)])}
+        return row
+
+    def split_inputs(
+        self, graph_walk: str, fwd_info: CurrentForwardPassInfo, inputs: ARNodeInputs, start: int, end: int,
+    ) -> ARNodeInputs:
+        """A prompt chunk; a drafting node's ``mtp_next_ids`` are cut with the
+        ids, so a chunk's last row reads the next chunk's first token
+        (`ChunkBoundary.READS_NEXT_TOKEN`) and only the final chunk's reads
+        the sampled one."""
+        following = inputs.tensor_inputs.get(MTP_NEXT_IDS)
+        if following is None:
+            return super().split_inputs(graph_walk, fwd_info, inputs, start, end)
+        cut = super().split_inputs(
+            graph_walk, fwd_info, replace(inputs, tensor_inputs={}), start, end,
+        )
+        cut.tensor_inputs = {MTP_NEXT_IDS: following[start:end]}
+        return cut
+
+    def declare_step(
+        self, graph_walk: str, request_ids: list[str], inputs: list[ARNodeInputs],
+        per_request_info: Mapping[int, CurrentForwardPassInfo] | None = None, **kwargs,
+    ) -> SubmoduleStep:
+        if self.drafter is not None and graph_walk == self.DECODE_WALK:
+            # before the base step, which a verify step would discard
+            return self._declare_verify(request_ids, inputs)
+        step = super().declare_step(graph_walk, request_ids, inputs, per_request_info, **kwargs)
+        if self.drafter is None:
+            return step
+        # a verifying node applies no repetition penalty, so tracks no prompt; the engine adds the
+        # MTP head's carry, which a prompt's last prefill stores first (`drafter_step`)
+        step.steps[self.SAMPLER] = SamplerStep(apply_penalty=False)
+        return step
+
+    def _declare_verify(self, request_ids: list[str], inputs: list[ARNodeInputs]) -> SubmoduleStep:
+        """A verify step: every row runs its block, ``k + 1`` tokens, on the
+        verify attention kernel; the sampler verifies one row a request, which
+        the engine stores the drafter's carry through (`drafter_step`)."""
+        segments = [
+            Segment(request_id=rid, label="main", span=inp.input_seq_len)
+            for rid, inp in zip(request_ids, inputs, strict=True)
+        ]
+        one = [Segment(request_id=rid, label="main", span=1) for rid in request_ids]
+        return SubmoduleStep(
+            segments=segments,
+            steps={
+                KV_CACHE: KVStep(),
+                ATTN: AttentionStep(causal=True, verify=True),
+                GDN_STATE: RecurrentStep(),
+                LINEAR_ATTN: LinearAttnStep(),
+                self.SAMPLER: SamplerStep(segments=one, apply_penalty=False),
+                ROPE: PositionStep(),
+            },
+        )
+
+    def after_prompt_rows(self, engine_inputs, hidden, embeds, tokens, decoder_kwargs, tensors) -> None:
+        if self.drafter is None:
+            return
+        # the MTP head over the prompt rows: its K/V, and each prompt's first carry
+        next_ids = tensors.get(MTP_NEXT_IDS)
+        carry = self.drafter.prefill(
+            engine_inputs.resources, hidden, decoder_kwargs["cos_sin"], next_ids=next_ids,
+            next_embeds=embeds if next_ids is None else None, sampled=tokens,
+        )
+        engine_inputs.store_draft_carry(carry)
+
+    def _verify(self, engine_inputs: ModelInputsFromEngine, input_ids: torch.Tensor | None) -> BatchedModelOutput:
+        """A verify step: the MTP head drafts, the target runs the block at the
+        planned positions, and the engine verifies, settles and keeps the carry."""
+        if input_ids is None:
+            input_ids = engine_inputs.resources[self.SAMPLER].loopback_tokens(engine_inputs.request_ids)
+        n = input_ids.shape[0]
+        cos_sin = self._decode_cos_sin(engine_inputs, n * self._block)
+        self.drafter.bind_block(cos_sin)
+        lm = self.model
+
+        def target(block: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            hidden = lm(lm.embed(block), label="main", cos_sin=cos_sin)
+            return lm.logits(hidden), hidden
+
+        result = engine_inputs.draft_verify_step(input_ids.view(n), target, self.drafter)
+        return engine_inputs.verify_output(result)
+
+    def forward(self, graph_walk, engine_inputs, input_ids=None, **tensors):
+        if self.drafter is not None and graph_walk == self.DECODE_WALK:
+            return self._verify(engine_inputs, input_ids)
+        return super().forward(graph_walk, engine_inputs, input_ids, **tensors)
+
+    def forward_batched(self, graph_walk, engine_inputs, input_ids=None, **tensors):
+        if self.drafter is not None and graph_walk == self.DECODE_WALK:
+            return self._verify(engine_inputs, input_ids)
+        return super().forward_batched(graph_walk, engine_inputs, input_ids, **tensors)
 
     # ------------------------------------------------------------------
     # MRoPE
@@ -199,8 +385,9 @@ class LLMSubmodule(SampledTokenDecoder):
 
     def resident_walks(self) -> frozenset[str]:
         # a captured decode step builds its rope inside the graph on every config
-        # (`_rope_in_graph`), so its `preprocess` reads nothing the tables fill
-        return frozenset({"decode"})
+        # (`_rope_in_graph`), so its `preprocess` reads nothing the tables fill; an
+        # uncaptured node has no resident step, so `mode: auto` verifies synchronously
+        return frozenset({"decode"}) if getattr(self, "accelerator_graph", True) else frozenset()
 
     @staticmethod
     def _rope_in_graph(engine_inputs: ModelInputsFromEngine, graph_walk: str) -> bool:
@@ -237,6 +424,9 @@ class LLMSubmodule(SampledTokenDecoder):
         inputs: list[ARNodeInputs],
     ) -> dict[str, torch.Tensor | Any]:
         out = super().preprocess(graph_walk, engine_inputs, inputs)
+        if graph_walk == "prefill_text" and self.drafter is not None:
+            # the MTP head's following ids, in row order
+            out[MTP_NEXT_IDS] = torch.cat([inp.tensor_inputs[MTP_NEXT_IDS] for inp in inputs], dim=0)
         if self._rope_in_graph(engine_inputs, graph_walk):
             assert self._has_loopback_rows(inputs) or all(inp.custom_pos_ids is None for inp in inputs), (
                 "a text walk's rows take the planned 1D positions"
