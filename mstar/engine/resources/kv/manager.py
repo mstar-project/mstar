@@ -3337,9 +3337,9 @@ class KVManager(AttentionResource):
         filled tail page are never freed, so the realized release can fall
         short of ``num_tokens`` by up to a page — callers re-offer the
         shortfall next time (see ``WindowedKVSession``). ``stored_len`` drops
-        by exactly the freed count and ``generation`` moves, so a prefix a
-        backend gathered out of these pages is re-read (the dense backend keys
-        its gathered prefix on it). Positions are not touched: the tokens that
+        by exactly the freed count and ``generation`` moves (each dense layer
+        gathers its prefix from the pages every step, so none holds a stale one).
+        Positions are not touched: the tokens that
         remain keep the absolute positions their K/V was written with.
 
         Refused under an admitted step (its plan addresses these pages) and

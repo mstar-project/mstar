@@ -862,7 +862,7 @@ The spec types are:
        Leave it at ``AUTO`` unless the model needs a specific kernel. FlashInfer, dense
        and MLA attention require a ``PagedKVConfig``; FlexAttention requires a
        ``RingKVConfig``. ``DENSE`` runs one varlen pass over each stream's frozen
-       prefix (gathered from the pages once) and the step's fresh K/V, eager only:
+       prefix (gathered from the pages by each layer, every step) and the step's fresh K/V, eager only:
        FA3 (AITER on ROCm), or FlashInfer's ragged prefill where FA3 has no kernel for
        the GPU, the same choice the ragged resources make (``dense_or_flashinfer``), with
        ``flashinfer_backend`` picking its kernel. The engine plans and runs a tiny layout on
