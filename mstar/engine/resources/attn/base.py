@@ -274,6 +274,22 @@ class AttentionManager(AttentionResource):
         last = (self.qo_indptr_buf(label)[1:] - 1).long()
         return hidden.index_select(0, last)
 
+    @torch.compiler.disable
+    def prompt_last_rows(
+        self, tokens: int, device: torch.device, label: str = "main",
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Each row's last token index in a packed prompt step of ``tokens``, and where the row writes a
+        per-row value into a ``tokens + 1`` buffer: its last index, or for a padding row (no tokens of its
+        own) the sink at ``tokens``, so no padding row lands on a real row's. A plan of one-token rows keeps
+        no query offsets: then every row is its own last. For a drafter's prompt step."""
+        qo = self.qo_indptr_buf(label)
+        if qo is None:
+            last = torch.arange(tokens, device=device)
+            return last, last
+        qo = qo.long()
+        last = qo[1:] - 1
+        return last, torch.where(qo[1:] > qo[:-1], last, torch.full_like(last, tokens))
+
 
 class PlanCacheKey(NamedTuple):
     """Fingerprint of a wrapper ``plan`` call's inputs. When it is unchanged

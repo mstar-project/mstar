@@ -1,4 +1,4 @@
-"""What a target that hosts a drafter (Qwen3's DSpark) calls on it: the declaration,
+"""What a target that hosts a drafter (Qwen3's DSpark, EAGLE-3 and draft model) calls on it: the declaration,
 built from config alone, and the module it builds on a worker."""
 from __future__ import annotations
 
@@ -17,10 +17,10 @@ if TYPE_CHECKING:
 class HostedDrafter(Drafter, Protocol):
     @abstractmethod
     def prefill(self, inputs: PrefillInputs) -> torch.Tensor | None:
-        """Its state over a prompt step's rows, after the target's forward wrote what it reads.
-        A hosted drafter runs its own stack over the prompt, so it has to say what it keeps: for
-        one that declares a carry (`DrafterNeeds.carry`), the rows' first carry, which the
-        scaffold stores; None otherwise."""
+        """Its state over a prompt step's rows, after the target's forward wrote what it reads. Returns
+        each prompt's first carry, ``[rows, width]``, for a drafter that declares one, which the node stores
+        (`ARNodeSubmodule.store_draft_carry`); None otherwise. A hosted drafter runs its own stack over the
+        prompt, so it has to say what it keeps."""
         ...
 
 

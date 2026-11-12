@@ -942,6 +942,22 @@ _QWEN3_REPOS = {
         "vocab_size": 151936, "rms_norm_eps": 1e-6, "rope_parameters": {"rope_theta": 1000000, "rope_type": "default"},
         "max_position_embeddings": 40960, "tie_word_embeddings": False, "dtype": "bfloat16",
     },
+    "RedHatAI/Qwen3-8B-speculator.eagle3": {
+        "draft_vocab_size": 32000, "norm_before_residual": True, "speculators_model_type": "eagle3",
+        "speculators_config": {"proposal_methods": [{"proposal_type": "greedy", "speculative_tokens": 3}]},
+        "torch_dtype": "bfloat16",
+        "transformer_layer_config": {
+            "head_dim": 128, "hidden_size": 4096, "intermediate_size": 12288, "num_attention_heads": 32,
+            "num_hidden_layers": 1, "num_key_value_heads": 8, "rms_norm_eps": 1e-6, "rope_theta": 1000000,
+            "vocab_size": 151936,
+        },
+    },
+    "Qwen/Qwen3-0.6B": {
+        "model_type": "qwen3", "hidden_size": 1024, "num_hidden_layers": 28, "num_attention_heads": 16,
+        "num_key_value_heads": 8, "head_dim": 128, "intermediate_size": 3072, "vocab_size": 151936,
+        "rms_norm_eps": 1e-6, "rope_theta": 1000000, "max_position_embeddings": 32768,
+        "tie_word_embeddings": True, "eos_token_id": 151645, "torch_dtype": "bfloat16",
+    },
 }
 
 

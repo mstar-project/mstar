@@ -1901,7 +1901,11 @@ samples it calls the drafter's ``prefill(PrefillInputs)``. What stays the node's
 
 **Drafter resources.** A drafter is declared from config alone (``DrafterDecl``): its
 ``needs`` and ``node_resources(nodes)``, the resources it adds to the node (DSpark's attention
-with the block's mask and its ``TapSpec``). A drafter whose layers write the
+with the block's mask and its ``TapSpec``). A target that builds and runs a
+drafter module (Qwen3) types it as ``HostedDrafterDecl`` (``mstar/model/components/hosted_drafter.py``):
+``num_draft_tokens``, ``prefill_steps()``, ``verify_steps()``, ``build(...)``, and the module's
+``prefill``, which returns each prompt's first carry for a drafter that declares one (the
+node stores it with ``store_draft_carry``), None otherwise. A drafter whose layers write the
 target's KV declares them as a ``KVLayerSet(kv_cache, name, num_layers, num_kv_heads,
 head_dim)`` in ``DrafterNeeds.kv``, the checkpoint's unsharded counts, derived from its
 ``ModelGeometry`` (``geometry.layer_set(kv_cache, name)``) rather than repeated.
@@ -1919,10 +1923,6 @@ engine refuses, at load, a verifying node whose drafter's layer set is not bound
 layers, one attention layer each: a stack that forgot ``kv_layer_set`` would write the target's.
 Declare the pool's tunables (``page_size``, ``max_num_pages``) as for any pool: ``max_num_pages``
 counts pages of every layer, the drafter's included, as it always did.
-
-A target that builds and runs a drafter module (Qwen3) types it as ``HostedDrafterDecl``
-(``mstar/model/components/hosted_drafter.py``): ``num_draft_tokens``, ``prefill_steps()``,
-``verify_steps()``, ``build(...)``, and the module's ``prefill``.
 
 ``mstar/model/qwen3`` is the worked example: a plain Qwen3 node that, under a draft block,
 adds a DSpark drafter (``mstar/model/components/dspark``) whose layers join the target's KV
@@ -1949,6 +1949,9 @@ the graph unless it is set. FA3 plans every pass's extent on the device; FlashIn
 the host, so a lagged drafter on FlashInfer runs synchronously. A lagged drafter
 can't rotate through LongRoPE positions, whose table ids keep no lagged copy;
 startup refuses it.
+``mstar/model/components/draft_model.py`` (Qwen3-0.6B for Qwen3-8B) is the example, and
+``mstar/model/components/eagle3.py`` is a carrying drafter with no lag that drafts over a reduced
+vocabulary through a ``TokenMap`` (``mstar.engine.resources.draft.token_map``).
 
 **Recurrent state (GDN).** A verify step runs a row's ``k + 1`` tokens through FlashInfer's
 recurrent multi-token kernel (``gated_delta_rule_mtp``) for their outputs, and through the
