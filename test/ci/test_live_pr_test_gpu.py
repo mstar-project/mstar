@@ -533,6 +533,8 @@ class TestStorageFreeProviders(unittest.TestCase):
             lam.cfg.update(cfg)
             body, _ = lam.plan({"id": "lambda:gpu_1x_h100:us-west-1", "region": "us-west-1"}, "live-pr-7-t",
                                "ssh-ed25519 AAAA", 1, args)
+        self.assertEqual([t["key"] for t in body["tags"]], [lam.CREATED_TAG],
+                         "the hourly reap could not date a Lambda box that never became healthy")
         files = {f["path"]: gzip.decompress(base64.b64decode(f["content"]))
                  for f in json.loads(body["user_data"].split("\n", 1)[1])["write_files"]}
         self.assertEqual(files, {"/run/live-pr/box.sh": b"echo hello\n", "/run/live-pr-key/value": b"sk-ant-box"},
@@ -597,8 +599,10 @@ class TestStorageFreeProviders(unittest.TestCase):
 
     def test_a_deleted_box_has_ended_and_creation_times_are_read(self):
         created = "2026-11-12T10:00:00Z"
+        epoch = datetime.datetime(2026, 11, 12, 10, tzinfo=datetime.timezone.utc).timestamp()
         replies = {"runpod": {"pods": [{"id": "p1", "name": "live-pr-1-t", "status": "RUNNING", "createdAt": created}]},
-                   "lambda": [{"id": "i-1", "name": "live-pr-1-t", "status": "active", "first_healthy": created},
+                   "lambda": [{"id": "i-1", "name": "live-pr-1-t", "status": "booting",
+                               "tags": [{"key": GPU["Lambda"].CREATED_TAG, "value": str(int(epoch))}]},
                               {"id": "i-2", "name": "live-pr-2-t", "status": "booting"}]}
         for name, cls in (("runpod", "RunPod"), ("lambda", "Lambda")):
             with self.subTest(name):
@@ -614,7 +618,6 @@ class TestStorageFreeProviders(unittest.TestCase):
                 p = GPU[cls]({})
                 self.assertEqual(p.status({"instance_id": "x"})[0], "ended",
                                  "the bot would wait on a deleted box until its timeout")
-                epoch = datetime.datetime(2026, 11, 12, 10, tzinfo=datetime.timezone.utc).timestamp()
                 self.assertEqual([i.created for i in p.instances()][0], epoch,
                                  "the hourly reap could never tell a runaway box from a new one")
 

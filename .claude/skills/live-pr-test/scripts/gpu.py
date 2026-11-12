@@ -47,7 +47,8 @@ its deadline (budget.max_hours by default), even if the session that launched it
 `reap`, which every launch under budget.max_running runs first, is the backstop for a box whose
 watchdog's machine is gone too: on a provider whose instances have no deadline of their own, it
 releases this tool's instances past their ledger deadline, or past budget.max_hours plus an hour
-from their creation when this machine's ledger doesn't have them.
+from their creation when this machine's ledger doesn't have them. Lambda lists no creation time, so a launch
+tags its instance with one (`live-pr-created`); a Lambda instance made another way is never reaped.
 
 `launch` exits 4 when budget.max_running refuses it, 1 on any other error.
 
@@ -515,6 +516,7 @@ class RunPod(Provider):
 
 class Lambda(Provider):
     name, key_env, user = "lambda", "LAMBDA_API_KEY", "ubuntu"
+    CREATED_TAG = "live-pr-created"  # Lambda lists no creation time: a launch tags its instance with its own
 
     @classmethod
     def pool(cls, cfg, offer_id):
@@ -559,6 +561,7 @@ class Lambda(Provider):
             "name": name, "region_name": o["region"], "instance_type_name": o["id"].split(":")[1],
             "ssh_key_names": [key], **({"file_system_names": [fs["name"]]} if fs else {}),
             "image": {"family": lm.get("image_family", "lambda-stack-24-04")},
+            "tags": [{"key": self.CREATED_TAG, "value": str(int(time.time()))}],
         }
         if args.run:
             body["user_data"] = run_user_data(self.cfg, args)
@@ -581,8 +584,10 @@ class Lambda(Provider):
         return i.get("status", "?"), i.get("ip"), 22
 
     def instances(self):
-        # created: when it first answered healthily (Lambda lists no creation time); None while it boots
-        return [Instance(i["id"], i.get("name"), i.get("status"), iso_epoch(i.get("first_healthy")))
+        def created(i):  # the epoch the launch tagged it with; None for an instance launched some other way
+            value = next((t.get("value") for t in i.get("tags") or [] if t.get("key") == self.CREATED_TAG), None)
+            return float(value) if str(value).isdigit() else None
+        return [Instance(i["id"], i.get("name"), i.get("status"), created(i))
                 for i in lambda_("GET", "/instances") or [] if i.get("status") not in ("terminating", "terminated")]
 
     def release(self, iid, e):
