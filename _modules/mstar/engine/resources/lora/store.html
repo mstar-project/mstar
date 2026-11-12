@@ -1036,7 +1036,8 @@ window.runMermaid = runMermaid;</script>
 <span></span><span class="sd">"""The host tier of the adapter pool: adapters read, sharded for this rank, and pinned.</span>
 
 <span class="sd">An adapter's tensors are laid out exactly like one device slot (rank padded to the pool's</span>
-<span class="sd">``max_rank`` with zeros), so moving it onto the device is one copy per target.</span>
+<span class="sd">``max_rank`` with zeros), so moving it onto the device is one copy per target. The kernels</span>
+<span class="sd">need that padding finite (``ops.py``).</span>
 <span class="sd">"""</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">__future__</span><span class="w"> </span><span class="kn">import</span> <span class="n">annotations</span>

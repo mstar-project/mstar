@@ -783,7 +783,8 @@
 <span id="mstar-engine-resources-lora-store"></span><h1>mstar.engine.resources.lora.store<a class="headerlink" href="#module-mstar.engine.resources.lora.store" title="Link to this heading">#</a></h1>
 <p>The host tier of the adapter pool: adapters read, sharded for this rank, and pinned.</p>
 <p>An adapter’s tensors are laid out exactly like one device slot (rank padded to the pool’s
-<code class="docutils literal notranslate"><span class="pre">max_rank</span></code> with zeros), so moving it onto the device is one copy per target.</p>
+<code class="docutils literal notranslate"><span class="pre">max_rank</span></code> with zeros), so moving it onto the device is one copy per target. The kernels
+need that padding finite (<code class="docutils literal notranslate"><span class="pre">ops.py</span></code>).</p>
 <p class="rubric">Functions</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>

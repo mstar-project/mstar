@@ -1049,6 +1049,11 @@ window.runMermaid = runMermaid;</script>
 
 <span class="sd">Rows of ``h`` the expand does not read (tokens on the zero adapter, columns past a</span>
 <span class="sd">slot's rank) are unspecified; the reference writes zeros there.</span>
+
+<span class="sd">``b`` must be finite everywhere, including ``b[slot, :, rank:]`` past each slot's rank: the</span>
+<span class="sd">CUDA expand reads it up to the max rank against zeros in ``h``, so a NaN or inf there reaches</span>
+<span class="sd">the output (the reference's one GEMM over every slot reads all of ``b``). The pool keeps those</span>
+<span class="sd">columns zero.</span>
 <span class="sd">"""</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">__future__</span><span class="w"> </span><span class="kn">import</span> <span class="n">annotations</span>
@@ -1089,7 +1094,8 @@ window.runMermaid = runMermaid;</script>
     <span class="n">slot_indptr</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">token_slot</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">ranks</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">scalings</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
     <span class="n">out_slices</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span>
 <span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">"""``y[:, slice] += scaling * h[:, slice ranks] @ b[slot, slice]^T`` in place."""</span>
+<span class="w">    </span><span class="sd">"""``y[:, slice] += scaling * h[:, slice ranks] @ b[slot, slice]^T`` in place. ``b`` must be</span>
+<span class="sd">    finite past each slot's rank (see above)."""</span>
     <span class="n">expand_reference_</span><span class="p">(</span><span class="n">y</span><span class="p">,</span> <span class="n">h</span><span class="p">,</span> <span class="n">b</span><span class="p">,</span> <span class="n">token_slot</span><span class="p">,</span> <span class="n">ranks</span><span class="p">,</span> <span class="n">scalings</span><span class="p">,</span> <span class="n">out_slices</span><span class="p">)</span>
 
 
@@ -1105,7 +1111,8 @@ window.runMermaid = runMermaid;</script>
     <span class="n">scalings</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">out_slices</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span>
 <span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">"""``lora_expand_(y, lora_shrink(x, ...), ...)`` as one op, so a kernel may keep the</span>
-<span class="sd">    shrink's output in whatever form suits its expand (split partials on CUDA)."""</span>
+<span class="sd">    shrink's output in whatever form suits its expand (split partials on CUDA). ``b`` must be</span>
+<span class="sd">    finite past each slot's rank, as for ``lora_expand_``."""</span>
     <span class="n">h</span> <span class="o">=</span> <span class="n">shrink_reference</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">a</span><span class="p">,</span> <span class="n">token_slot</span><span class="p">,</span> <span class="n">ranks</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">out_slices</span><span class="p">))</span>
     <span class="n">expand_reference_</span><span class="p">(</span><span class="n">y</span><span class="p">,</span> <span class="n">h</span><span class="p">,</span> <span class="n">b</span><span class="p">,</span> <span class="n">token_slot</span><span class="p">,</span> <span class="n">ranks</span><span class="p">,</span> <span class="n">scalings</span><span class="p">,</span> <span class="n">out_slices</span><span class="p">)</span>
 

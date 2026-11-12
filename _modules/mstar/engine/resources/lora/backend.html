@@ -1087,7 +1087,9 @@ window.runMermaid = runMermaid;</script>
         <span class="n">ranks</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">scalings</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">y</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
         <span class="n">out_slices</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="o">...</span><span class="p">],</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">"""``y[t, slice i] += scalings[slot(t)] * h[t, slice i] @ b[slot(t), slice i]^T``."""</span></div>
+<span class="w">        </span><span class="sd">"""``y[t, slice i] += scalings[slot(t)] * h[t, slice i] @ b[slot(t), slice i]^T``.</span>
+<span class="sd">        ``b`` must be finite everywhere, past a slot's rank included: a backend may read it up</span>
+<span class="sd">        to the max rank against zeros in ``h`` (the pool keeps it zero there)."""</span></div>
 
 
 <div class="viewcode-block" id="LoraBackend.gather_shrink">
@@ -1136,7 +1138,8 @@ window.runMermaid = runMermaid;</script>
         <span class="n">addressing</span><span class="p">:</span> <span class="s2">"LoraAddressing"</span><span class="p">,</span> <span class="n">ranks</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">scalings</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
         <span class="n">out_slices</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="o">...</span><span class="p">],</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">"""Shrink then expand into ``y``, for a linear target; a backend may fuse them."""</span>
+<span class="w">        </span><span class="sd">"""Shrink then expand into ``y``, for a linear target; a backend may fuse them. ``b`` as</span>
+<span class="sd">        for ``expand_fused``."""</span>
         <span class="n">h</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">shrink</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">a</span><span class="p">,</span> <span class="n">addressing</span><span class="p">,</span> <span class="n">ranks</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">out_slices</span><span class="p">))</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">expand_fused</span><span class="p">(</span><span class="n">h</span><span class="p">,</span> <span class="n">b</span><span class="p">,</span> <span class="n">addressing</span><span class="p">,</span> <span class="n">ranks</span><span class="p">,</span> <span class="n">scalings</span><span class="p">,</span> <span class="n">y</span><span class="p">,</span> <span class="n">out_slices</span><span class="p">)</span></div>
 

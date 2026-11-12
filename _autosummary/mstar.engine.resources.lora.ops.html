@@ -779,6 +779,10 @@ the same meaning, so the fake (shape) implementations and <code class="docutils 
 be checked on a CPU.</p>
 <p>Rows of <code class="docutils literal notranslate"><span class="pre">h</span></code> the expand does not read (tokens on the zero adapter, columns past a
 slot’s rank) are unspecified; the reference writes zeros there.</p>
+<p><code class="docutils literal notranslate"><span class="pre">b</span></code> must be finite everywhere, including <code class="docutils literal notranslate"><span class="pre">b[slot,</span> <span class="pre">:,</span> <span class="pre">rank:]</span></code> past each slot’s rank: the
+CUDA expand reads it up to the max rank against zeros in <code class="docutils literal notranslate"><span class="pre">h</span></code>, so a NaN or inf there reaches
+the output (the reference’s one GEMM over every slot reads all of <code class="docutils literal notranslate"><span class="pre">b</span></code>). The pool keeps those
+columns zero.</p>
 <p class="rubric">Functions</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
@@ -826,7 +830,8 @@ is past <code class="docutils literal notranslate"><span class="pre">a</span></c
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.lora.ops.LoraOpsBackend.apply_linear_">
 <span class="sig-name descname"><span class="pre">apply_linear_</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">x</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">y</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">a</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">b</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">addressing</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">ranks</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">scalings</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">out_slices</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/lora/ops.html#LoraOpsBackend.apply_linear_"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.lora.ops.LoraOpsBackend.apply_linear_" title="Link to this definition">#</a></dt>
-<dd><p>Shrink then expand into <code class="docutils literal notranslate"><span class="pre">y</span></code>, for a linear target; a backend may fuse them.</p>
+<dd><p>Shrink then expand into <code class="docutils literal notranslate"><span class="pre">y</span></code>, for a linear target; a backend may fuse them. <code class="docutils literal notranslate"><span class="pre">b</span></code> as
+for <code class="docutils literal notranslate"><span class="pre">expand_fused</span></code>.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><p><strong>addressing</strong> (<a class="reference internal" href="mstar.engine.resources.lora.pool.html#mstar.engine.resources.lora.pool.LoraAddressing" title="mstar.engine.resources.lora.pool.LoraAddressing"><em>LoraAddressing</em></a>)</p>
@@ -837,7 +842,9 @@ is past <code class="docutils literal notranslate"><span class="pre">a</span></c
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.lora.ops.LoraOpsBackend.expand_fused">
 <span class="sig-name descname"><span class="pre">expand_fused</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">h</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">b</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">addressing</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">ranks</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">scalings</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">y</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">out_slices</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/lora/ops.html#LoraOpsBackend.expand_fused"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.lora.ops.LoraOpsBackend.expand_fused" title="Link to this definition">#</a></dt>
-<dd><p><code class="docutils literal notranslate"><span class="pre">y[t,</span> <span class="pre">slice</span> <span class="pre">i]</span> <span class="pre">+=</span> <span class="pre">scalings[slot(t)]</span> <span class="pre">*</span> <span class="pre">h[t,</span> <span class="pre">slice</span> <span class="pre">i]</span> <span class="pre">&#64;</span> <span class="pre">b[slot(t),</span> <span class="pre">slice</span> <span class="pre">i]^T</span></code>.</p>
+<dd><p><code class="docutils literal notranslate"><span class="pre">y[t,</span> <span class="pre">slice</span> <span class="pre">i]</span> <span class="pre">+=</span> <span class="pre">scalings[slot(t)]</span> <span class="pre">*</span> <span class="pre">h[t,</span> <span class="pre">slice</span> <span class="pre">i]</span> <span class="pre">&#64;</span> <span class="pre">b[slot(t),</span> <span class="pre">slice</span> <span class="pre">i]^T</span></code>.
+<code class="docutils literal notranslate"><span class="pre">b</span></code> must be finite everywhere, past a slot’s rank included: a backend may read it up
+to the max rank against zeros in <code class="docutils literal notranslate"><span class="pre">h</span></code> (the pool keeps it zero there).</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><p><strong>addressing</strong> (<a class="reference internal" href="mstar.engine.resources.lora.pool.html#mstar.engine.resources.lora.pool.LoraAddressing" title="mstar.engine.resources.lora.pool.LoraAddressing"><em>LoraAddressing</em></a>)</p>
