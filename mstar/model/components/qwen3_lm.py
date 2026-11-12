@@ -98,8 +98,18 @@ class Qwen3Attention(ParallelAttention):
         self._fuse = self._theta is not None
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # The state op is a graph break. Called from a helper method, the op makes Dynamo compile that helper as one
+        # more frame, once per shape at boot.
         if self.state is not None:
-            return self._forward_state(hidden_states)
+            if not self._fuse:
+                return super().forward(hidden_states)
+            num_tokens = hidden_states.shape[0]
+            q, k, v = self._project_qkv(hidden_states)
+            out = qk_norm_rope_attend(
+                self.state, self.layer, q, k, v, self.q_norm.weight, self.k_norm.weight, positions(self.state),
+                self._theta, float(self.q_norm.variance_epsilon), float(self.k_norm.variance_epsilon),
+            )
+            return self.o_proj(out.reshape(num_tokens, self.num_heads * self.head_dim))
         pos_ids = self.pos.pos_ids(self.attend.label) if self._fuse_qk else None
         if pos_ids is None or not hidden_states.is_cuda:
             return super().forward(hidden_states)
@@ -108,17 +118,6 @@ class Qwen3Attention(ParallelAttention):
         attn_output = self.attend.norm_rope_attend(q, k, v, self.q_norm, self.k_norm, pos_ids, self._rope_theta)
         attn_output = attn_output.reshape(num_tokens, self.num_heads * self.head_dim)
         return self.o_proj(attn_output)
-
-    def _forward_state(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if not self._fuse:
-            return super().forward(hidden_states)
-        num_tokens = hidden_states.shape[0]
-        q, k, v = self._project_qkv(hidden_states)
-        out = qk_norm_rope_attend(
-            self.state, self.layer, q, k, v, self.q_norm.weight, self.k_norm.weight, positions(self.state),
-            self._theta, float(self.q_norm.variance_epsilon), float(self.k_norm.variance_epsilon),
-        )
-        return self.o_proj(out.reshape(num_tokens, self.num_heads * self.head_dim))
 
 
 @dataclass

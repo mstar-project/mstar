@@ -20,9 +20,10 @@ import pytest
 PORTED = (
     "mstar/model/qwen3_5", "mstar/model/command_a_plus", "mstar/model/wan22", "mstar/model/flux2_klein",
     "mstar/model/z_image", "mstar/model/ltx2_5", "mstar/model/qwen3_omni", "mstar/model/minimax_h3",
+    "mstar/model/kokoro", "mstar/model/omnilingual_asr", "mstar/model/omnivoice", "mstar/model/orpheus",
+    "mstar/model/higgs_audio", "mstar/model/voxcpm2",
     "mstar/model/canary_qwen", "mstar/model/qwen3_asr", "mstar/model/parakeet", "mstar/model/fish_s2_pro",
-    "mstar/model/qwen3_tts", "mstar/model/kokoro", "mstar/model/omnilingual_asr", "mstar/model/omnivoice",
-    "mstar/model/orpheus", "mstar/model/higgs_audio", "mstar/model/voxcpm2",
+    "mstar/model/qwen3_tts",
 )
 FORBIDDEN_ATTRIBUTES = {
     "node_resources", "resources", "request_state", "request_states", "per_request_states", "sequence_shard",

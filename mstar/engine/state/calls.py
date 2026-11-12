@@ -240,9 +240,9 @@ class ArrayHandle(StepHandle):
                                 f"{sorted(binding.read_back) or 'none'}")
         return getattr(self.reads[read], field)
 
-    def _update(self, kind: type[Op], field: str, layer: int) -> tuple[Any, torch.Tensor]:
-        """Record the update of type ``kind`` on ``layer``'s ``field``, and return the resource that runs it and the
-        field's view."""
+    def _update(self, kind: type[Op], layer: int) -> tuple[Any, torch.Tensor]:
+        """Record the update of type ``kind`` on ``layer``'s field that ``kind`` writes, and return the resource that
+        runs it and the field's view."""
         raise self._unsupported(f"an update of type {kind.__name__}")
 
     def _host(self, request: int, label: str, layer: int) -> Mapping[str, object]:
@@ -335,7 +335,7 @@ def causal_conv(
     bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """The declared `CausalConv` over ``x``, which reads and writes ``layer``'s ``conv`` field in place."""
-    run, conv = h._update(CausalConv, "conv", h._layer_id(layer))
+    run, conv = h._update(CausalConv, h._layer_id(layer))
     return run.run_conv(x, conv_layer=conv, weight=weight, bias=bias, label=h.label)
 
 
@@ -345,7 +345,7 @@ def gated_delta_net(
     b: torch.Tensor, a_log: torch.Tensor, dt_bias: torch.Tensor,
 ) -> torch.Tensor:
     """The declared `GatedDeltaNet`, which reads and writes ``layer``'s ``state`` field in place."""
-    run, state = h._update(GatedDeltaNet, "state", h._layer_id(layer))
+    run, state = h._update(GatedDeltaNet, h._layer_id(layer))
     return run.run(q, k, v, a, b, state_layer=state, a_log=a_log, dt_bias=dt_bias, label=h.label)
 
 

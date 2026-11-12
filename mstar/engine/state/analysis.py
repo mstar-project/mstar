@@ -53,17 +53,17 @@ def position_key(array: Array) -> str:
     return f"{array.name.removesuffix('_kv')}_pos" if array.name.endswith("_kv") else "rope"
 
 
+def host_field_holders(arrays: Iterable[Array]) -> list[Array]:
+    """The arrays of ``arrays`` that hold host fields."""
+    return [array for array in arrays if array.entry.host]
+
+
 def written_by_step(array: Array) -> frozenset[str]:
     """The fields of a Value's entry that its step writes itself, the ones no update op writes in place, and none for
     any other array."""
     if not is_value(array):
         return frozenset()
     return frozenset(array.entry.tensors.keys() - {field for op in array.updates.values() for field in op.writes})
-
-
-def host_field_holders(arrays: Iterable[Array]) -> list[Array]:
-    """The arrays of ``arrays`` that hold host fields."""
-    return [array for array in arrays if array.entry.host]
 
 
 def query_array(array: Array, read: Read, arrays: Mapping[str, Array]) -> Array:

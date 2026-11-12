@@ -1126,7 +1126,7 @@ def test_a_streamed_value_goes_as_the_value_frame_python_builds(tmp_path, with_t
     rid = mesh.admit(wgs=(WG_ID, 1), workers=(ME, PEER))
     if with_tensor:
         _put(mesh, 1, _source_node_name="only", _source_graph_walk=WALK)
-    got = mesh.run(rid, uuids=[1] if with_tensor else [], route={"inline_signal": "out", "inline_values": [7]})
+    got = mesh.run(rid, uuids=[1] if with_tensor else [], route={"inline_signals": ["out"], "inline_values": [7]})
     (frame,) = got[PEER]
     builder = EdgeItemsBuilder("default")
     assert builder.add_values("r1", "out", "remote", None, [7], ("", ME, "only", 1, 0))
@@ -1141,7 +1141,7 @@ def test_a_signal_inline_to_the_client_keeps_its_streams_tensors(tmp_path):
     mesh = _stream_mesh(tmp_path)
     rid = mesh.admit(wgs=(WG_ID, 1), workers=(ME, PEER))
     _put(mesh, 1, _source_node_name="only", _source_graph_walk=WALK)
-    (frame,) = mesh.run(rid, uuids=[1], route={"inline_signal": "out", "inline_values": [7]})[PEER]
+    (frame,) = mesh.run(rid, uuids=[1], route={"inline_signals": ["out"], "inline_values": [7]})[PEER]
     assert frame.message_type == WorkerMessageType.EDGE_ITEMS
     assert frame.body.values == [] and frame.body.uuids == [1]
 
@@ -1209,3 +1209,87 @@ def test_only_a_non_streamed_edge_to_a_peer_asks_for_request_info(tmp_path, edge
     assert frame.message_type == (
         WorkerMessageType.EDGE_ITEMS if edge == "streamed" else WorkerMessageType.INPUT_SIGNALS
     )
+
+
+def _spoken_mesh(tmp_path):
+    """A talker whose sampled token goes to the client as ``text`` and down a
+    by-value stream to a peer's vocoder as ``speech``; ``rids`` are two
+    requests on it."""
+    book = RustTensorBookkeeping()
+    comm = ZmqCommunicator(ME, str(tmp_path))
+    inboxes = {peer: ZmqCommunicator(peer, str(tmp_path)) for peer in ("conductor", "api_server", PEER)}
+    node = _node("talker", ["prompt"], [("text", "emit_to_client", False)])
+    node["outputs"].append({"name": "speech", "dest": "vocoder", "persist": False,
+                            "new_token": False, "streaming": True, "modality": ""})
+    rt = GraphRuntime(
+        worker_graphs=[{"wg_id": WG_ID, "graph_walks": [WALK], "nodes": [node], "loops": []}],
+        remote_worker_graphs=[{"wg_id": 1, "graph_walks": [WALK], "nodes": ["vocoder"], "dyn_loops": []}],
+        sharding={"groups": [], "shard_dim": [], "tp_enabled_nodes": [], "sp_enabled_nodes": []},
+        bookkeeping=book._rust, me=ME, communicator=comm,
+    )
+    rt.set_inline_streams([("talker", "speech")])
+    rids = [
+        rt.add_request(f"r{i}", "default", WALK, [WG_ID, 1], [WG_ID, 1], [ME, PEER], [1, 1], [], [])
+        for i in (1, 2)
+    ]
+
+    def run(**route):
+        for rid in rids:
+            rt.ingest_inputs_batch(_one_signal(rid, "prompt", "talker"))
+        rt.pop_rids("talker", WALK, rids)
+        signals = rt.get_output_signals("talker", WALK)
+        out = rt.complete_and_route_batch({
+            "partition": "default", "graph_walk": WALK, "walks": None, "rid_walk_idx": None,
+            "node_name": "talker", "output_signals": signals, "rids": rids, "wg_ids": [WG_ID, WG_ID],
+            "tensors": [], "num_tensors": [0] * (len(rids) * len(signals)), "inline_values": [7, 8],
+            **route,
+        })
+        _send(rt, out.completion_id, request_infos=[(rid, None) for rid in rids])
+        return {peer: _collect(box) for peer, box in inboxes.items()}
+
+    return run
+
+
+def _speech_frame(values, request_ids):
+    builder = EdgeItemsBuilder("default")
+    for rid, value in zip(request_ids, values, strict=True):
+        assert builder.add_values(rid, "speech", "vocoder", None, [value], ("", ME, "talker", 1, 0))
+    return _sent(WorkerMessage(message_type=WorkerMessageType.EDGE_ITEMS, body=builder.build()))
+
+
+def test_signals_on_one_column_ride_to_the_client_and_down_the_stream(tmp_path):
+    """Two inline signals off the same values: the client gets its tokens in
+    one RESULT_TOKENS frame and the peer the same values in one value frame,
+    each counted as one item sent."""
+    got = _spoken_mesh(tmp_path)(inline_signals=["text", "speech"])
+    [tokens] = got["api_server"]
+    assert tokens.body.request_ids == ["r1", "r2"] and tokens.body.values == [7, 8]
+    assert got[PEER] == [_speech_frame([7, 8], ["r1", "r2"])]
+    assert {m.body.request_id: m.body.stream_items_sent for m in got["conductor"]} == {
+        "r1": {"speech": {PEER: 1}}, "r2": {"speech": {PEER: 1}},
+    }
+
+
+def test_a_withheld_inline_item_goes_nowhere_and_counts_no_item(tmp_path):
+    """A row whose stop check withheld its stream item sends the peer nothing
+    for it and counts no item, while its client token and the other row's item
+    go as usual."""
+    got = _spoken_mesh(tmp_path)(
+        inline_signals=["text", "speech"], withheld_signals=["speech"], withheld_rids=[[1]],
+    )
+    [tokens] = got["api_server"]
+    assert tokens.body.request_ids == ["r1", "r2"] and tokens.body.values == [7, 8]
+    assert got[PEER] == [_speech_frame([7], ["r1"])]
+    assert {m.body.request_id: m.body.stream_items_sent for m in got["conductor"]} == {
+        "r1": {"speech": {PEER: 1}}, "r2": {},
+    }
+
+
+def test_a_withheld_signal_that_does_not_ride_inline_changes_nothing(tmp_path):
+    """Withholding a tensor-path signal is the worker's: it leaves the tensor
+    out, and the route sends what it would have without the list."""
+    plain = _spoken_mesh(tmp_path / "plain")(inline_signals=["speech"])
+    named = _spoken_mesh(tmp_path / "named")(
+        inline_signals=["speech"], withheld_signals=["text"], withheld_rids=[[0, 1]],
+    )
+    assert plain == named and plain[PEER] == [_speech_frame([7, 8], ["r1", "r2"])]

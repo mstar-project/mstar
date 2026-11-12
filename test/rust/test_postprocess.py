@@ -107,7 +107,7 @@ def _start(rt, n, limits=True):
     return rids
 
 
-def _drive(rt, request, values, model_stops, dropped=()):
+def _drive(rt, request, values, model_stops, dropped=(), withheld=None):
     """One step's postprocess as the worker runs it; each break, summarized."""
     trace = []
     step = rt.begin_postprocess(request)
@@ -119,11 +119,11 @@ def _drive(rt, request, values, model_stops, dropped=()):
         if step.need is PostprocessNeed.DONE:
             return trace
         if step.need is PostprocessNeed.STOPS:
-            step = rt.resume_postprocess(stops=model_stops, dropped=dropped)
+            step = rt.resume_postprocess(stops=model_stops, dropped=dropped, withheld=withheld)
         elif step.need is PostprocessNeed.STORE:
             keys = step.wg_ids.keys
             step = rt.resume_postprocess(stored=RouteTensors(
-                [], [0] * len(keys), SIG, [values[r] for r in keys],
+                [], [0] * len(keys), (SIG,), [values[r] for r in keys],
             ))
         else:
             info = sorted(step.route_output.rids_needing_request_info)
@@ -168,7 +168,7 @@ def test_native_matches_reference(tmp_path, mode, dtype, reverse_rows):
             wg_ids=ParallelList(list(active), [0] * len(active)),
             stops=model_stops if mode == "model_stops" else None,
             runtime_stops=mode != "model_stops", tokens=column, row_rids=row_rids,
-            inline=None if mode == "stored" else InlineColumn(SIG, column),
+            inline=None if mode == "stored" else InlineColumn((SIG,), column),
         )
         traces = {k: _drive(rt, request, values, model_stops) for k, rt in rts.items()}
         assert traces["native"] == traces["reference"], step
@@ -205,7 +205,7 @@ def test_dropped_rows_are_not_routed(tmp_path):
         request = PostprocessRequest(
             partition=PART, node_name=NODE, graph_walk=WALK, output_signals=[SIG],
             wg_ids=ParallelList(list(rids), [0] * 3), runtime_stops=True, tokens=column,
-            row_rids=rids, inline=InlineColumn(SIG, column),
+            row_rids=rids, inline=InlineColumn((SIG,), column),
         )
         traces[k] = _drive(
             rt, request, dict(zip(rids, [1, 2, 3], strict=True)),
@@ -234,7 +234,7 @@ def test_a_row_with_no_host_value_routes_through_the_store(tmp_path):
         traces[k] = _drive(rt, PostprocessRequest(
             partition=PART, node_name=NODE, graph_walk=WALK, output_signals=[SIG],
             wg_ids=ParallelList(list(rids), [0] * 3), stops={}, tokens=column, row_rids=ran,
-            inline=InlineColumn(SIG, column),
+            inline=InlineColumn((SIG,), column),
         ), {ran[0]: 100, ran[1]: 101, rids[2]: None}, model_stops={})
         frames[k] = _collect(box)
     assert traces["native"] == traces["reference"]
@@ -278,7 +278,7 @@ def test_each_rows_loop_stride_advances_its_loop(tmp_path, drop):
             _drive(rt, PostprocessRequest(
                 partition=PART, node_name=NODE, graph_walk=WALK, output_signals=[SIG],
                 wg_ids=ParallelList(list(live), [0] * len(live)), runtime_stops=True,
-                tokens=column, row_rids=live, inline=InlineColumn(SIG, column),
+                tokens=column, row_rids=live, inline=InlineColumn((SIG,), column),
                 loop_strides=[s for r, s in zip(rids, strides, strict=True) if r in live],
             ), values, model_stops={}, dropped=dropped if step == 0 else ())
             got.append([it[LOOP] for it in rt.get_dynamic_loop_iters(live, PART).values])
@@ -300,7 +300,7 @@ def test_a_repeated_step_stops_a_row_at_its_iteration_and_emits_up_to_it(tmp_pat
     trace = _drive(rt, PostprocessRequest(
         partition=PART, node_name=NODE, graph_walk=WALK, output_signals=[SIG],
         wg_ids=ParallelList(list(rids), [0, 0]), runtime_stops=True,
-        tokens=wide[:, 0], row_rids=rids, inline=InlineColumn(SIG, wide[:, 0]),
+        tokens=wide[:, 0], row_rids=rids, inline=InlineColumn((SIG,), wide[:, 0]),
         loop_strides=[3, 3], token_width=3,
     ), {}, model_stops={})
     assert trace[-1][2] == [rids[1]]
@@ -309,3 +309,36 @@ def test_a_repeated_step_stops_a_row_at_its_iteration_and_emits_up_to_it(tmp_pat
         for rid, value in zip(frame.body.request_ids, frame.body.values, strict=True):
             sent.setdefault(rid, []).append(value)
     assert sent == {"r0": [1, 2, 3], "r1": [4, EOS]}
+
+
+@pytest.mark.parametrize("known", [True, False], ids=["withheld_on_begin", "withheld_on_stops"])
+def test_a_withheld_rows_inline_emit_goes_nowhere(tmp_path, known):
+    """What the stop check withheld rides nothing inline, in either
+    implementation, whether the request names it (the model's stops checked
+    first) or the STOPS resume does (the runtime's check could not decide); the
+    row's loop-back still feeds its next step."""
+    frames, iters = {}, {}
+    for k, cls in (("native", rust_runtime.RustGraphRuntime), ("reference", _Reference)):
+        d = tmp_path / k
+        d.mkdir()
+        box = ZmqCommunicator("api_server", str(d))
+        rt = _runtime(cls, str(d))
+        rids = _start(rt, 3, limits=False)
+        assert rt.pop_rids(NODE, WALK, rids) is not None
+        column = torch.tensor([100, 101, 102], dtype=torch.int64)
+        withheld = {SIG: [rids[1]]}
+        trace = _drive(rt, PostprocessRequest(
+            partition=PART, node_name=NODE, graph_walk=WALK, output_signals=[SIG],
+            wg_ids=ParallelList(list(rids), [0] * 3), stops={} if known else None,
+            runtime_stops=not known, tokens=column, row_rids=rids, inline=InlineColumn((SIG,), column),
+            withheld=withheld if known else None,
+        ), {}, model_stops={}, withheld=None if known else withheld)
+        assert trace[-1][0] is PostprocessNeed.DONE
+        assert (trace[0][0] is PostprocessNeed.STOPS) is not known
+        frames[k] = _collect(box)
+        assert rt.pop_rids(NODE, WALK, rids) is not None, "every row's loop-back fed its next step"
+        iters[k] = [it[LOOP] for it in rt.get_dynamic_loop_iters(rids, PART).values]
+    assert frames["native"] == frames["reference"]
+    [tokens] = frames["native"]
+    assert tokens.body.request_ids == ["r0", "r2"] and tokens.body.values == [100, 102]
+    assert iters["native"] == iters["reference"] == [1, 1, 1]
