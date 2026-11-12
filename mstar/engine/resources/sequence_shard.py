@@ -587,7 +587,8 @@ class SequenceShard(Resource):
             return
         raise ValueError(
             f"{what} reached label {label!r}, {why}, outside an exchange: call the attention through "
-            "AttentionCallable (or the resource's exchange)"
+            "AttentionCallable (or the resource's exchange); a state-contract model reaches it through the "
+            "array handle's `add` and `read`"
         )
 
 

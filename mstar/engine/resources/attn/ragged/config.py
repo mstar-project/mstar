@@ -146,8 +146,8 @@ class _RaggedSpecBase(NodeResourceSpec):
     config: RaggedAttentionConfig
     # the sequence shard over its nodes, if any (`derive`, on the kinds that take split steps)
     shard_key: str | None = field(default=None, init=False, repr=False)
-    # how a split label's tokens reach the heads: declared on self-attention (`RaggedAttentionSpec`),
-    # derived per pair on cross-attention
+    # how a split label's tokens reach the heads: derived from the spec's `labels` and the node's
+    # shard (`derive`)
     sp_exchange = "none"
 
     def depends_on(self) -> set[str]:
