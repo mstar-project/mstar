@@ -251,10 +251,9 @@ class WhisperDecoderSubmodule(TokenStepNode, ARNodeSubmodule):
     count, ``context`` grows by the encoder output at the walk that writes it
     and is declared zero-span (read-only) thereafter.
 
-    Not an ``EncoderDecoderNode`` like Canary's decoder: that node writes the
-    context inside the prefill forward and captures only decode, while this
-    one writes it eagerly in ``preprocess`` so the prefill walk can replay a
-    graph sized by the prompt alone. The token feedback and batch caps are
+    Not an ``EncoderDecoderNode`` like Canary's decoder, though both write the
+    context eagerly in ``preprocess`` so the prefill walk replays a graph sized
+    by the prompt alone. The token feedback and batch caps are
     ``TokenStepNode``'s; the base stop condition is its ``token_stop``.
     """
 

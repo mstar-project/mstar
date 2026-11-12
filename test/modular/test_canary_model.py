@@ -304,7 +304,7 @@ def test_decoder_matches_hf():
             module.bind_resources({ATTN: self_attn, KV_CACHE: self_attn, CROSS_ATTN: _FakeCross(context),
                                    CROSS_KV_CACHE: context})
 
-    node, last_rows = CanaryDecoderSubmodule(ours, config), _LastRows()
+    node, last_rows = CanaryDecoderSubmodule(ours, config, max_context=13), _LastRows()
 
     def run(walk, inputs, positions):
         """One step as the engine runs it, with a sampler that hands back its logits."""
@@ -343,7 +343,7 @@ def _tiny_node():
         encoder=FastConformerConfig(), hidden_size=32, num_layers=1, num_heads=4, intermediate_size=64,
         vocab_size=50, max_position_embeddings=64, eos_token_id=3,
     )
-    return CanaryDecoderSubmodule(CanaryDecoderModel(config), config)
+    return CanaryDecoderSubmodule(CanaryDecoderModel(config), config, max_context=13)
 
 
 def test_prefill_reserves_each_clips_context_once():
@@ -361,11 +361,46 @@ def test_prefill_reserves_each_clips_context_once():
     for key in (CROSS_KV_CACHE, CROSS_ATTN):
         assert [(s.request_id, s.span) for s in step.steps[key].segments] == [("a", 13), ("b", 7)]
     assert [s.span for s in step.segments] == [9, 9]
-    assert torch.equal(node.preprocess("prefill", None, prefill)["encoder_states"], torch.cat(clips))
+    # written in `preprocess`, outside the prefill's graph, which is sized by the prompt alone
+    assert step.steps[CROSS_KV_CACHE].eager_write
+    written = []
+    node.model.write_cross_kv = written.append
+    assert "encoder_states" not in node.preprocess("prefill", None, prefill)
+    assert len(written) == 1 and torch.equal(written[0], torch.cat(clips))
     decode = [ARNodeInputs(input_ids=torch.tensor([5]), input_seq_len=1) for _ in clips]
     step = node.declare_step("decode", ["a", "b"], decode)
     assert [s.span for s in step.steps[CROSS_KV_CACHE].segments] == [0, 0]
-    assert "encoder_states" not in node.preprocess("decode", None, decode)
+    assert not step.steps[CROSS_KV_CACHE].eager_write
+    assert "encoder_states" not in node.preprocess("decode", None, decode) and len(written) == 1
+
+
+def test_a_padded_prefill_replay_projects_only_the_real_rows_context():
+    """A replay pads its rows to the bucket's batch size with rows of no
+    tokens; they carry no context, so the eager context write projects the
+    real clips' frames and nothing for the padding."""
+    from collections import namedtuple
+    from types import SimpleNamespace
+
+    from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner
+    from mstar.model.canary.config import CROSS_KV_CACHE
+    from mstar.model.submodule_base import ARNodeInputs
+
+    node = _tiny_node()
+    _, prefill = node.get_accelerator_graph_configs(torch.device("cpu"))
+    clips = [torch.randn(13, 32), torch.randn(7, 32)]
+    real = [ARNodeInputs(input_ids=torch.arange(PROMPT_LENGTH), input_seq_len=PROMPT_LENGTH,
+                         tensor_inputs={"encoder_states": c}) for c in clips]
+    # the runner's own padding of a 2-row step to a 5-row bucket
+    bucket = namedtuple("Bucket", "bs")(5)
+    runner = SimpleNamespace(_buckets={bucket: SimpleNamespace(config=prefill)})
+    rows = AcceleratorGraphRunner.pad_inputs(runner, SimpleNamespace(bucket=bucket), real)
+    assert len(rows) == 5 and rows[:2] == real
+    step = node.declare_step("prefill", ["a", "b", "p0", "p1", "p2"], rows)
+    assert [s.span for s in step.steps[CROSS_KV_CACHE].segments] == [13, 7, 0, 0, 0]
+    written = []
+    node.model.write_cross_kv = written.append
+    node.preprocess("prefill", None, rows)
+    assert len(written) == 1 and torch.equal(written[0], torch.cat(clips))
 
 
 @pytest.mark.parametrize("width", [1, 3])
@@ -402,17 +437,23 @@ def test_batched_stop_check_agrees_with_the_per_request_one(width):
 
 
 def test_decoder_node_caps_captures_and_names(snapshot):
-    """What the shared decoder gives Canary's node, as before the scaffold:
-    prefill batches capped, only decode captured on its ladder, the sampled
-    token fed back, the walk, loop and sampler names of Canary's graph, and
-    positions advanced on the resource the model declares, under its key."""
+    """What the shared decoder gives Canary's node: prefill batches capped,
+    decode captured on its ladder and prefill packed at the prompt's length per
+    row, the sampled token fed back, the walk, loop and sampler names of
+    Canary's graph, and positions advanced on the resource the model declares,
+    under its key."""
     from mstar.model.canary.config import POS, SAMPLER
     from mstar.model.submodule_base import ARNodeInputs
 
     node = _tiny_node()
     assert node.max_batch_size("prefill") == 32 and node.max_batch_size("decode") is None
-    (capture,) = node.get_accelerator_graph_configs(torch.device("cpu"))
+    capture, prefill = node.get_accelerator_graph_configs(torch.device("cpu"))
     assert capture.capture_graph_walk == "decode" and capture.capture_batch_sizes == [1, 2, 4, 8, 16, 32, 64]
+    assert prefill.capture_graph_walk == "prefill" and prefill.capture_batch_sizes == [1, 2, 4, 8, 16, 32]
+    assert [prefill.get_total_tokens(bs) for bs in (1, 4, 32)] == [[PROMPT_LENGTH], [4 * PROMPT_LENGTH], [320]]
+    # template rows reserve the longest clip's context
+    rows = prefill.get_node_inputs(4, 4 * PROMPT_LENGTH)
+    assert [(r.input_seq_len, r.tensor_inputs["encoder_states"].shape[0]) for r in rows] == [(PROMPT_LENGTH, 13)] * 4
     outputs = {"new_token": [torch.tensor([5])]}
     node.postprocess("a", None, outputs)
     assert outputs["text_inputs"] is outputs["new_token"]
