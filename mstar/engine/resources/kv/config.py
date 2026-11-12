@@ -4,6 +4,7 @@ Kept free of the manager and its kernels so a submodule can declare a step
 without pulling FlashInfer in behind it.
 """
 
+import logging
 import math
 from abc import ABC, abstractmethod
 from collections.abc import Collection, Iterable, Mapping, Sequence
@@ -16,6 +17,8 @@ from mstar.engine.resources.step import ResourceStep
 
 if TYPE_CHECKING:
     from mstar.engine.resources.base import Resource
+
+logger = logging.getLogger(__name__)
 
 
 class KVLayout(Enum):
@@ -341,6 +344,22 @@ class RingKVConfig(KVConfig):
             )
         if self.max_frames is not None and not (type(self.max_frames) is int and self.max_frames >= 1):
             raise ValueError(f"max_frames must be None or a positive int; got {self.max_frames!r}")
+
+    def capacity_problem(self, spec: "KVSpec", requests: int, request: "KVReqConfig | None") -> str | None:
+        """A request holds a session from its first step until it is torn down. Sessions past the cap are allocated
+        and never filled, which is only a warning."""
+        if requests > self.num_sessions:
+            return (
+                f"{requests} concurrent requests (max_concurrent_requests) need {requests} sessions of "
+                f"resources.{spec.resource_key}, which has {self.num_sessions}; raise num_sessions or lower "
+                "max_concurrent_requests"
+            )
+        if requests < self.num_sessions:
+            logger.warning(
+                "resources.%s holds %d sessions and max_concurrent_requests is %d, so %d of them are allocated and "
+                "never filled", spec.resource_key, self.num_sessions, requests, self.num_sessions - requests,
+            )
+        return None
 
     def apply_yaml_overrides(self, num_sessions: int | None = None, **kwargs) -> None:
         """``num_sessions`` only. Nothing else here is a deployment knob."""

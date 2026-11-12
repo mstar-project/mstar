@@ -724,7 +724,8 @@ def check_kv_pools_fit(
     (``cpu_offload_pages``), the worker offloads decoding requests to admit it,
     which costs far more than queueing would. So the cap's requests
     at full length must fit each cache next to its sink page; the conductor
-    queues the rest. Warnings go to the model's ``log``. ``request_layouts``
+    queues the rest. The helper's warnings go to the model's ``log``, and a
+    pool's own to its module's logger. ``request_layouts``
     gives the `Layout` per array and label of the request the deployment is
     sized for, with its loops at ``loop_caps``, and a pool it doesn't name
     holds one stream of its ``max_seq_len``.
