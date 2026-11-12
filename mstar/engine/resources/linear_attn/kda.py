@@ -196,10 +196,6 @@ class KDAManager(LinearAttnManager):
         """Whether a captured prefill replays with each step's spans on these kernels."""
         return self.kernels.prefill_capturable
 
-    def depends_on(self) -> set[str]:
-        # the pool plans first; its addressing arrives via `ctx.plan_results`
-        return {self._pool_key}
-
     # Step lifecycle
 
     @property

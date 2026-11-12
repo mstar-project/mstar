@@ -243,9 +243,8 @@ class KokoroModel(Model):
         device: str = "cpu",
         tp_group=None,
         autocast_dtype: torch.dtype | None = None,
-        sp_group=None,
     ) -> NodeSubmodule | None:
-        del tp_group, autocast_dtype, sp_group
+        del tp_group, autocast_dtype
         if node_name != SYNTH_NODE:
             raise ValueError(f"Unknown Kokoro node: {node_name!r}")
         if node_name not in self._submodule_cache:

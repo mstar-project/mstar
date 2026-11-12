@@ -161,13 +161,9 @@ class CommandAPlusModel(Model):
     def get_default_sharding_config(self):
         return ShardingConfig(groups=[], tp_enabled_nodes={"LLM"}, shard_dim={})
 
-    def get_submodule(
-        self, node_name, device="cpu", tp_group=None, autocast_dtype=None, sp_group=None,
-    ):
+    def get_submodule(self, node_name, device="cpu", tp_group=None, autocast_dtype=None):
         if node_name not in ("LLM", "vision_encoder"):
             raise ValueError(f"Unknown Command A+ node: {node_name!r}")
-        if sp_group is not None and sp_group.world_size != 1:
-            raise ValueError("Command A+ sequence parallelism is not implemented")
         from mstar.model.command_a_plus.components.language_model import CommandAPlusForCausalLM
         from mstar.model.command_a_plus.components.vision import CommandAPlusVisionEncoder
         from mstar.model.command_a_plus.submodules import CommandAPlusLLMSubmodule, CommandAPlusVisionSubmodule

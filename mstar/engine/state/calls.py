@@ -1,7 +1,9 @@
-"""What layers and submodules hold for declared state: a handle per array or sampler, over today's resources.
+"""What layers and submodules hold for declared state: a handle per array, sampler or sequence shard, over today's
+resources.
 
-A call that touches state runs behind a graph break, so it is plain Python in eager steps and at capture, it never runs
-on a replay, and its checks live in it.
+A call that touches an array or a sampler runs behind a graph break, so it is plain Python in eager steps and at
+capture, it never runs on a replay, and its checks live in it. A shard's `scatter` and `gather` deliberately don't break
+the graph: a compiled frame of a walk the shard never splits traces them straight through.
 """
 
 from abc import abstractmethod
@@ -12,7 +14,7 @@ import torch
 
 from mstar.engine.resources.sampler.utils import FUSED_DRAW_MAX_VOCAB, FusedDrawArgs
 from mstar.engine.resources.step import Segment, StepHandle
-from mstar.engine.state.contract import EMPTY, Array, ArrayStep, CausalConv, GatedDeltaNet, Op, Sampler
+from mstar.engine.state.contract import EMPTY, Array, ArrayStep, CausalConv, GatedDeltaNet, Op, Sampler, SeqShard
 
 if TYPE_CHECKING:
     from mstar.engine.state.state_op import StateOp
@@ -187,7 +189,7 @@ class ArrayHandle(StepHandle):
         held = self._held
         if held is None:
             raise self._refusal(f"a read on layer {layer} with no add before it")
-        self._held = None
+        self._held = self._held_layer = None
         return held
 
     def add(self, layer: int | torch.Tensor, *, keep: bool | None = None, **fields: torch.Tensor) -> None:
@@ -287,6 +289,46 @@ class SamplerHandle(StepHandle):
         self._fused = False
 
 
+class ShardHandle(StepHandle):
+    """A node's calls on its declared `SeqShard`. Its step is the node's segments, so the engine opens it on every
+    step of the node, with no entry in ``state``. It takes the label it brackets from the step's segments, as the
+    array handles do, and the walk from the step, so a compiled frame of a walk the shard never splits traces the
+    bracket straight through. Closed, it holds neither, and the bracket is the resource's outside a step: the
+    identity."""
+
+    def __init__(self, shard: SeqShard, resource: Any):
+        self.shard = shard
+        self.name = shard.name
+        self.resource = resource
+        self.label: str | None = None
+        self.walk: str | None = None
+
+    @property
+    def ranks(self) -> int:
+        """The sequence-parallel ranks the node's tokens split over: what a layout that must tile evenly rounds to."""
+        return self.resource.group.world_size
+
+    @property
+    def needs_step(self) -> bool:
+        """Whether a step must plan the shard: where it can split. Elsewhere its plan is copied, and a step nothing
+        else needs skips it, the bracket then the identity."""
+        return self.resource.can_split
+
+    def begin_step(self, step) -> None:
+        (label,) = self.shard.labels  # analysis refuses a shard of several
+        self.label = label if any(segment.label == label for segment in step.segments or ()) else None
+        self.walk = step.ctx.graph_walk
+
+    def check_step(self, step) -> None:
+        return
+
+    def commit_step(self, step) -> None:
+        """Nothing: a shard holds no state across steps."""
+
+    def end_step(self, step) -> None:
+        self.label = self.walk = None
+
+
 @torch.compiler.disable
 def causal_conv(
     h: ArrayHandle, layer: int | torch.Tensor, x: torch.Tensor, *, weight: torch.Tensor,
@@ -305,6 +347,24 @@ def gated_delta_net(
     """The declared `GatedDeltaNet`, which reads and writes ``layer``'s ``state`` field in place."""
     run, state = h._update(GatedDeltaNet, "state", h._layer_id(layer))
     return run.run(q, k, v, a, b, state_layer=state, a_log=a_log, dt_bias=dt_bias, label=h.label)
+
+
+def scatter(h: ShardHandle, *xs: torch.Tensor | None, dim: int | None = None):
+    """This rank's share of each of ``xs``, whole on every rank, along ``dim`` (the shard's axis by default), where
+    this step splits the label; ``xs`` as they are otherwise. One tensor in, one out; several in, a tuple out. None
+    passes through."""
+    return h.resource.scatter(h.label, *xs, dim=dim, walk=h.walk)
+
+
+def gather(h: ShardHandle, *xs: torch.Tensor | None, dim: int | None = None):
+    """`scatter`'s inverse: every rank's share of each of ``xs``, back whole."""
+    return h.resource.gather(h.label, *xs, dim=dim, walk=h.walk)
+
+
+def split_range(h: ShardHandle):
+    """This rank's range of the label (``start``, ``count``, and every rank's ``counts``) where this step splits it;
+    None where it is copied or the step doesn't open the label."""
+    return h.resource.split_range(h.label)
 
 
 def host(h: ArrayHandle, request: int, label: str, layer: int | torch.Tensor) -> Mapping[str, object]:

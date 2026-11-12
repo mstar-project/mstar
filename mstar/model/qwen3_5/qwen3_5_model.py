@@ -18,17 +18,19 @@ from mstar.engine.state import (
     Positions,
     Read,
     Sampler,
+    SeqShard,
     TensorType,
     Value,
 )
 from mstar.model.base import ProcessPromptOutput, TensorAndMetadata
 from mstar.model.components.mrope import image_position_advance
-from mstar.model.keys import MIXED
+from mstar.model.keys import MIXED, PREFILL_TEXT
 from mstar.model.media_limits import read_image
 from mstar.model.multimodal import (
     VIDEO,
     PromptPart,
     as_uint8_chw,
+    media_walk_names,
     messages_from_parts,
     vision_encoder,
 )
@@ -45,6 +47,7 @@ from mstar.model.qwen3_5.config import (
     GDN_STATE,
     KV_CACHE,
     LINEAR_ATTN,
+    LLM_SHARD,
     SAMPLER,
     VISION_ATTN,
     VISION_TOKENS,
@@ -116,7 +119,7 @@ class Qwen3_5DenseModel(DeclaredDecoderModel):
     # Model ABC: resources
     # -----------------------------------------------------------------------
 
-    def declare_state(self) -> list[Array | Sampler]:
+    def declare_state(self) -> list[Array | Sampler | SeqShard]:
         c, v = self.config, self.vision_config
         conv_dim = (
             2 * c.linear_num_key_heads * c.linear_key_head_dim
@@ -145,6 +148,13 @@ class Qwen3_5DenseModel(DeclaredDecoderModel):
             Sampler(
                 SAMPLER, nodes={"LLM"}, vocab_size=c.vocab_size, penalty=True,
                 min_p=self._sampler_spec(c.vocab_size).enable_min_p,
+            ),
+            # Prefill steps may split over the LLM's SP ranks, and decode never does, so decode's compiled frame
+            # traces the bracket straight through. "none" until a deployment opts in: the LLM on SP ranks over KV
+            # stored by head is refused until it sets ulysses, which has run on CPU only, and over KV stored by
+            # position it runs copied unless it sets all_gather or ring.
+            SeqShard(
+                LLM_SHARD, nodes={"LLM"}, walks={PREFILL_TEXT, *media_walk_names(self.encoders)}, exchange="none",
             ),
         ]
         if v is not None:

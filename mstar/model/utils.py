@@ -713,8 +713,9 @@ def check_kv_pools_fit(model, config: dict, config_path: str, log: logging.Logge
     """Refuse a ``max_concurrent_requests`` the model's KV caches cannot hold.
 
     A request keeps its pages from prefill to its last token. Past a pool, a
-    prefill batch is refused and the worker offloads decoding requests to
-    admit it, which costs far more than queueing would. So the cap's requests
+    prefill batch is refused. With host pages (``cpu_offload_pages``) the worker
+    offloads decoding requests to admit it, which costs far more than queueing
+    would. Without them it retries until requests time out. So the cap's requests
     at full length must fit each cache next to its sink page; the conductor
     queues the rest. Warnings go to the model's ``log``.
     """
@@ -725,8 +726,9 @@ def check_kv_pools_fit(model, config: dict, config_path: str, log: logging.Logge
     if cap is None:
         log.warning(
             "%s sets no max_concurrent_requests: past the requests the KV caches "
-            "hold, the worker offloads decoding requests to admit new ones instead "
-            "of queueing them", config_path,
+            "hold, new ones aren't queued. A cache with cpu_offload_pages offloads "
+            "decoding requests to admit them, and one without stalls until requests "
+            "time out", config_path,
         )
         return
     if not isinstance(cap, int) or isinstance(cap, bool) or cap < 1:
@@ -742,8 +744,12 @@ def check_kv_pools_fit(model, config: dict, config_path: str, log: logging.Logge
             continue
         kv = spec.config
         # in arena pages: a request at full length holds every token of every group, a window's
-        # too, since a one-step prefill keeps its whole prompt until it commits
-        per_request = sum(-(-kv.max_seq_len // group.page_size) for group in kv.groups)
+        # too, since a one-step prefill keeps its whole prompt until it commits. A pool placed by
+        # position over a node group's ranks pages its window groups as `placed_groups` does
+        per_request = max(
+            sum(-(-kv.max_seq_len // group.page_size) for group in groups)
+            for groups in (kv.groups, *_placed_groups(spec, config.get("node_groups") or ()))
+        )
         need = 1 + cap * per_request
         if need > kv.num_units:
             raise ValueError(
@@ -753,3 +759,18 @@ def check_kv_pools_fit(model, config: dict, config_path: str, log: logging.Logge
                 f"which has {kv.max_num_pages}; raise max_num_pages or lower "
                 "max_concurrent_requests"
             )
+
+
+def _placed_groups(spec, node_groups) -> list:
+    """The groups of ``spec``'s pool placed over each node group of ``node_groups`` it runs on,
+    where it sets ``context_parallel``; a group it can't place on is validation's to report."""
+    kv, placed = spec.config, []
+    for group in node_groups if kv.context_parallel else ():
+        if not spec.nodes & set(group.get("node_names", ())):
+            continue
+        try:
+            placed.append(kv.paged_for(spec.resource_key, group.get("tp_size", 1), group.get("sp_size", 1)).groups)
+        except ValueError:
+            pass
+    return placed
+

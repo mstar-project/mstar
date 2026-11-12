@@ -336,6 +336,12 @@ class TalkerSubmodule(ARNodeSubmodule):
         # What the last committed step left: a step whose admit was refused
         # committed nothing, so it prepares the same index and noise again.
         progress = host(self.progress, fwd_info.rid_handle, "main", 0)
+        if not progress["rng"]:
+            # seeding here would draw the prefill's noise again
+            raise KeyError(
+                f"VoxCPM2 talker {fwd_info.request_id}: a decode step ran with no prefill committed, "
+                f"so {TALKER_STEP!r} holds no generator state to draw its noise from"
+            )
         step = progress["generated"]
         if step >= int(meta[PATCH_BUDGET_KEY]):
             logger.debug("VoxCPM2 talker %s: skipping overshoot step %d", fwd_info.request_id, step)

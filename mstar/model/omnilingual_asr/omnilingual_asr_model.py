@@ -138,7 +138,7 @@ class OmnilingualASRModel(Model):
         )]
 
     def kernel_settings(self) -> dict[str, dict[str, Any]]:
-        if self.dtype not in (torch.bfloat16, torch.float16):
+        if not self.declare_state():
             return {}
         # one segment per request, and a captured step packs a whole batch into one row
         return {ENCODER_ATTN: {"max_segments_per_step": self.max_batch_size}}
@@ -219,9 +219,8 @@ class OmnilingualASRModel(Model):
         device: str = "cpu",
         tp_group=None,
         autocast_dtype: torch.dtype | None = None,
-        sp_group=None,
     ) -> NodeSubmodule:
-        del tp_group, autocast_dtype, sp_group
+        del tp_group, autocast_dtype
         if node_name != ENCODER_NODE:
             raise ValueError(f"Unknown Omnilingual ASR node: {node_name!r}")
         if node_name not in self._submodule_cache:

@@ -110,6 +110,7 @@ class _Node:
             self.cg = AcceleratorGraphRunner(
                 submodule_name=NODE, submodule=self.sub, resources=self.resources, step_runner=self.runner,
                 device=DEVICE, autocast_dtype=DTYPE, joint_comm_group=groups, num_slots=1,
+                head_shards=groups.world_size,
             )
             with torch.no_grad():
                 self.cg.warmup_and_capture(None)

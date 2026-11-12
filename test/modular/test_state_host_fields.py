@@ -16,6 +16,7 @@ sys.path.insert(0, ".")
 import pytest
 import torch
 
+from mstar.engine import engine as engine_module
 from mstar.engine.engine import Engine
 from mstar.engine.resources.step import Segment, StepContext, SubmoduleStep
 from mstar.engine.state import Array, ArrayStep, Attend, Causal, Entry, Fork, KVEntry, Read, Value, host
@@ -33,6 +34,7 @@ from mstar.engine.state.adapters import (
 from mstar.engine.state.analysis import host_field_holders
 from mstar.engine.state.calls import ArrayHandle
 from mstar.engine.state.host_fields import HostFields, is_host_value
+from mstar.model.submodule_base import NodeSubmodule
 from mstar.testing_utils.engine import make_engine, make_mgmt
 from mstar.testing_utils.model import make_model
 
@@ -177,6 +179,37 @@ def test_a_node_holding_host_fields_that_reports_step_is_input_free_is_refused_a
         f"'talker' holds the host fields of ['flags'] and reports step_is_input_free for [{walk!r}]",
     )):
         engine._check_host_fields(model)
+
+
+class _InputFreeNode(NodeSubmodule):
+    def prepare_inputs(self, graph_walk, fwd_info, inputs, **kwargs):
+        raise NotImplementedError
+
+    def forward(self, graph_walk, engine_inputs, **kwargs):
+        raise NotImplementedError
+
+    def step_is_input_free(self, graph_walk):
+        return True
+
+
+def test_loading_a_model_runs_the_host_field_check(monkeypatch):
+    monkeypatch.setattr(engine_module, "node_handles", lambda *args, **kwargs: {})
+    graph = SimpleNamespace(get_nodes=lambda: {"talker": None})
+    model = make_model(declare_state=lambda: [_flags()], get_graph_walk_graphs=lambda: {"decode": graph},
+                       checkpoint_path=lambda: None)
+    joint = SimpleNamespace(
+        world_size=1, tp_group=SimpleNamespace(barrier=lambda: None, world_size=1),
+        sp_group=SimpleNamespace(world_size=1),
+    )
+    groups = SimpleNamespace(
+        get_joint_group_for_node=lambda name: joint, get_instance_world_size_for_node=lambda name: 1,
+        get_instance_rank_for_node=lambda name: 0,
+    )
+    with pytest.raises(ValueError, match=r"'talker' holds the host fields of \['flags'\]"):
+        Engine(None, autocast_dtype=None).load_model(
+            submodules={"talker": _InputFreeNode()}, specs=[], parallel_groups=groups, device=torch.device("cpu"),
+            transfer_engine_info=None, model=model,
+        )
 
 
 def test_the_holders_of_host_fields_are_the_arrays_whose_entry_declares_them():

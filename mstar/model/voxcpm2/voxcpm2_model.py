@@ -559,9 +559,7 @@ class VoxCPM2Model(Model):
         device: str = "cpu",
         tp_group=None,
         autocast_dtype: torch.dtype | None = None,
-        sp_group=None,
     ) -> NodeSubmodule | None:
-        del sp_group
         if node_name not in ("Talker", "RefEncoder", "VAEDecoder"):
             raise ValueError(f"Unknown VoxCPM2 node: {node_name!r}")
         if node_name not in self._submodule_cache:

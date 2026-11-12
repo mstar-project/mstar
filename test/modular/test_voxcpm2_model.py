@@ -579,9 +579,13 @@ def test_max_concurrent_requests_must_be_a_positive_int(model, cap):
 
 
 def test_no_request_cap_is_a_warning(model, caplog):
+    """Neither LM cache has host pages, so nothing is offloaded to admit a request past them."""
     with caplog.at_level("WARNING"):
         model.validate_config_yaml({}, "voxcpm2.yaml")
     assert "sets no max_concurrent_requests" in caplog.text
+    assert "one without stalls until requests time out" in caplog.text, "the warning would promise an offload"
+    caches = [spec.config for spec in node_resources(model) if hasattr(spec.config, "cpu_offload_pages")]
+    assert [cache.cpu_offload_pages for cache in caches] == [0, 0]
 
 
 def test_build_prompt_matches_the_reference_layout():
@@ -939,6 +943,16 @@ def test_talker_reprepares_a_refused_step_with_the_same_index_and_noise(model):
     retry = talker.prepare_inputs("talker_decode", _decode_info("r", 0, meta), {"latent_patch": [patch]})
     assert retry is not None and retry.kwargs["step"] == 1
     assert torch.equal(retry.tensor_inputs["noise"], refused.tensor_inputs["noise"])
+
+
+def test_talker_refuses_a_decode_step_with_no_prefill_committed(model):
+    """A request's fields open at their zero values, so the first decode step of a request whose prefill never
+    committed would seed the generator again and draw the prefill's noise."""
+    talker, _, _ = _talker(model)
+    _, meta = _request(model, "hello")
+    talker.progress.host_fields.open("r")
+    with pytest.raises(KeyError, match="no prefill committed"):
+        talker.prepare_inputs("talker_decode", _decode_info("r", 0, meta), {"latent_patch": [torch.zeros(4, 8)]})
 
 
 def _committed(talker, rid) -> dict:

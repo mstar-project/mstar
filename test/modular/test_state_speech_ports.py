@@ -157,7 +157,7 @@ def _higgs_reference(model) -> list:
 def _omnivoice_reference(model) -> list:
     body = model.config.backbone
     return [RaggedAttentionSpec(
-        resource_key=BACKBONE_ATTN, nodes={"backbone"},
+        resource_key=BACKBONE_ATTN, nodes={"backbone"}, labels={"main"},
         config=RaggedAttentionConfig(
             num_qo_heads=body.num_attention_heads, num_kv_heads=body.num_key_value_heads, head_dim=body.head_dim,
             max_segments_per_request=2, dtype=getattr(torch, model.config.load_dtype),
@@ -170,7 +170,7 @@ def _omnilingual_reference(model) -> list:
         return []
     c = model.config
     return [RaggedAttentionSpec(
-        resource_key=ENCODER_ATTN, nodes={"encoder"},
+        resource_key=ENCODER_ATTN, nodes={"encoder"}, labels={"main"},
         config=RaggedAttentionConfig(
             num_qo_heads=c.num_heads, num_kv_heads=c.num_heads, head_dim=c.model_dim // c.num_heads, dtype=model.dtype,
             max_segments_per_step=model.max_batch_size,

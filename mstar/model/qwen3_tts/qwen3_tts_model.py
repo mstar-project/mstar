@@ -1163,10 +1163,8 @@ class Qwen3TTSModel(Model):
         device: str = "cpu",
         tp_group=None,
         autocast_dtype: torch.dtype | None = None,
-        sp_group=None,
     ) -> NodeSubmodule | None:
         """Build only the node assigned to this worker and cache the wrapper."""
-        del sp_group
         if node_name not in ("Talker", "Codec", "RefEncoder"):
             raise ValueError(f"Unknown Qwen3-TTS node: {node_name!r}")
         if node_name in self._submodule_cache:
