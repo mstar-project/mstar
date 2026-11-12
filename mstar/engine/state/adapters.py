@@ -670,7 +670,6 @@ class PagedCrossAttend(PagedAttend):
             raise _no_layout(array, f"reads[{key!r}].walks must be None, since CrossAttentionConfig has no walk")
 
     def specs(self, array: Array, key: str, read: Read) -> list[NodeResourceSpec]:
-        label = _plan_label(array, "a cross read's array declares one label, CrossAttentionConfig's one context_label")
         return [CrossAttentionSpec(
             resource_key=key, nodes=array.nodes,
             config=CrossAttentionConfig(
