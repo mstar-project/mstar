@@ -291,16 +291,14 @@ def _apply_kernel_settings(
 def node_handles(
     model: "Model", node: str, resources: Mapping[str, Any], *, setup: "StateSetup | None" = None,
 ) -> dict[str, ArrayHandle | SamplerHandle | ShardHandle]:
-    """``node``'s handles, by declared name, over its built ``resources``, each read bound as ``setup`` binds it. A
-    sequence shard ``resources`` doesn't hold (a node bound with no resources, as one rank) has no handle, so the
-    layer stack brackets nothing."""
+    """``node``'s handles, by declared name, over its built ``resources``, each read bound as ``setup`` binds it."""
     setup = setup or StateSetup()
     declarations = model.declare_state()
     resolved = _resolve([declared for declared in declarations if isinstance(declared, Array)], setup)
     return {
         declared.name: build_handle(declared, resources, resolved, setup)
         for declared in declarations
-        if node in declared.nodes and not (isinstance(declared, SeqShard) and declared.name not in resources)
+        if node in declared.nodes
     }
 
 

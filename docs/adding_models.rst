@@ -755,8 +755,8 @@ deployment YAML tunes them under ``resources:`` (see :ref:`Step 6 <config-yaml>`
   author's default for how a split step reaches the node's paged attentions (``auto``,
   ``none``, ``ulysses``, ``all_gather`` or ``ring``), which a deployment's ``resources:`` block
   overrides under ``name``. The layer stack calls ``scatter`` before it and ``gather`` after it
-  on the shard's handle (`Reaching your state`_), or, where it needs the rank's range or another
-  axis (Wan2.2, MiniMax-H3), on the submodule's ``sequence_shard``; the reads and updates of the
+  on the shard's handle (`Reaching your state`_), which also gives the rank's range (``split_range``,
+  Wan2.2 and MiniMax-H3) and an axis other than the shard's (``dim=``); the reads and updates of the
   node's arrays exchange what a split step needs by themselves. Loading checks ``walks`` against the model's
   walks and the shard's nodes, and refuses a label no array on those nodes opens, and a shard
   of more than one label, since its handle brackets one. A node with no arrays can't declare a
@@ -2369,6 +2369,8 @@ The rest are free functions in ``mstar.engine.state``:
    ids  = last_sampled(self.sampler)          # each row's last sampled token, for a DeviceLoopback
    x, cos, sin = scatter(self.shard, x, cos, sin)  # this rank's share where the step splits, else as they are
    hidden = gather(self.shard, hidden)        # every rank's share, back whole
+   mine = split_range(self.shard)                 # this rank's range (start, count, counts), None where copied
+   ranks = self.shard.ranks                   # the SP ranks a layout must tile over
 
 The shard's handle is opened on every step of its node and takes the label it brackets from the
 step's segments and the walk from the step, so the calls name neither. Both are the identity on a
@@ -3207,11 +3209,13 @@ Splitting is declared in four places:
   on one GPU. The diffusion scaffold's step holds each label's segments once, however many
   arrays attend them (LTX-2.5's video tokens are the keys of two).
 - The forward **brackets** its layer stack (on the state contract, with ``scatter(shard, *xs)``
-  and ``gather(shard, x)`` on the shard's handle, as Qwen3.5, Qwen3-Omni's Thinker and LTX-2.5 do;
-  otherwise on the submodule's
-  ``sequence_shard``, bound with its resources): ``shard.scatter(label, *xs, dim=None)``
-  before it (this rank's share of each tensor, ``dim`` the spec's axis by default; ``None`` passes
-  through), ``shard.gather(label, x)`` after it. Both are the identity on a copied step, at one SP rank, and
+  and ``gather(shard, x)`` on the shard's handle, as every ported model does; a model off the
+  contract calls the submodule's ``sequence_shard``, bound with its resources, as
+  ``shard.scatter(label, *xs, dim=None)`` and ``shard.gather(label, x)``): ``scatter`` before it
+  (this rank's share of each tensor, ``dim`` the spec's axis by default; ``None`` passes
+  through), ``gather`` after it. ``split_range(shard)`` is this rank's range of the label
+  (``start``, ``count``, every rank's ``counts``) where the step splits it, else ``None``, for what
+  must follow the cut (Wan2.2's timestep runs, MiniMax-H3's rope rows). Both are the identity on a copied step, at one SP rank, and
   outside a step (a warmup compile); at one rank they trace straight through a compiled frame,
   and on SP ranks each breaks the graph once. Everything between them runs on this rank's tokens.
   LTX-2.5 brackets the DiT in its denoise step (``mstar/model/ltx2_5/submodules.py``), Wan2.2 and

@@ -763,6 +763,7 @@ def _omni():
     ``targets:``), layer 1 a dense MLP. A row is ``per_token`` tokens per unit of the
     ``n`` it is asked for, so at ``test_lora_models.ROWS``' sizes one expert gathers
     more rows than the torch reference's 64-row chunk."""
+    from mstar.engine.resources.sequence_shard import SequenceShard
     from mstar.engine.state.adapters import node_handles
     from mstar.model.qwen3_omni.components.thinker import Qwen3OmniThinkerModel
     from mstar.model.qwen3_omni.config import (
@@ -770,6 +771,7 @@ def _omni():
         THINKER_KV,
         THINKER_POS,
         THINKER_SAMPLER,
+        THINKER_SHARD,
         Qwen3OmniModelConfig,
         ThinkerTextConfig,
     )
@@ -786,6 +788,7 @@ def _omni():
         declaring = model_object(Qwen3OmniModel, sub.config, local_dir=None)
         resources = {
             THINKER_KV: _Unread(), THINKER_ATTN: _AttendCore(rows), THINKER_POS: _NoRotation(), THINKER_SAMPLER: None,
+            THINKER_SHARD: SequenceShard(("main",), 0, None, 0, CommGroup.trivial()),
         }
         sub.bind_node_state(node_handles(declaring, "Thinker", resources))
         return sub

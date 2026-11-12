@@ -19,6 +19,7 @@ from mstar.engine.state.calls import (
     rope,
     sample,
     scatter,
+    split_range,
 )
 from mstar.engine.state.contract import (
     Array,
@@ -90,5 +91,6 @@ __all__ = [
     "rope",
     "sample",
     "scatter",
+    "split_range",
     "state_op",
 ]

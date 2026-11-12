@@ -292,6 +292,11 @@ class ShardHandle(StepHandle):
         self.walk: str | None = None
 
     @property
+    def ranks(self) -> int:
+        """The sequence-parallel ranks the node's tokens split over: what a layout that must tile evenly rounds to."""
+        return self.resource.group.world_size
+
+    @property
     def needs_step(self) -> bool:
         """Whether a step must plan the shard: where it can split. Elsewhere its plan is copied, and a step nothing
         else needs skips it, the bracket then the identity."""
@@ -332,15 +337,22 @@ def gated_delta_net(
     return run.run(q, k, v, a, b, state_layer=state, a_log=a_log, dt_bias=dt_bias, label=h.label)
 
 
-def scatter(h: ShardHandle, *xs: torch.Tensor | None):
-    """This rank's share of each of ``xs``, whole on every rank, where this step splits the label; ``xs`` as they are
-    otherwise. One tensor in, one out; several in, a tuple out. None passes through."""
-    return h.resource.scatter(h.label, *xs, walk=h.walk)
+def scatter(h: ShardHandle, *xs: torch.Tensor | None, dim: int | None = None):
+    """This rank's share of each of ``xs``, whole on every rank, along ``dim`` (the shard's axis by default), where
+    this step splits the label; ``xs`` as they are otherwise. One tensor in, one out; several in, a tuple out. None
+    passes through."""
+    return h.resource.scatter(h.label, *xs, dim=dim, walk=h.walk)
 
 
-def gather(h: ShardHandle, *xs: torch.Tensor | None):
+def gather(h: ShardHandle, *xs: torch.Tensor | None, dim: int | None = None):
     """`scatter`'s inverse: every rank's share of each of ``xs``, back whole."""
-    return h.resource.gather(h.label, *xs, walk=h.walk)
+    return h.resource.gather(h.label, *xs, dim=dim, walk=h.walk)
+
+
+def split_range(h: ShardHandle):
+    """This rank's range of the label (``start``, ``count``, and every rank's ``counts``) where this step splits it;
+    None where it is copied or the step doesn't open the label."""
+    return h.resource.split_range(h.label)
 
 
 def host(h: ArrayHandle, request: int, label: str, layer: int | torch.Tensor) -> Mapping[str, object]:

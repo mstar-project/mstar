@@ -25,7 +25,7 @@ _POSITIONAL = {"PagedNHDTarget", "Reached", "Segment", "SlotLease", "Span"}
 # The calls take the handle first, then what every call names, and only then keywords.
 _CALLS = {
     "at_last_token", "causal_conv", "gated_delta_net", "gather", "host", "last_sampled", "position", "positions",
-    "rope", "sample", "scatter",
+    "rope", "sample", "scatter", "split_range",
 }
 # Each public name's parameters as ``[name, kind, default]``. A dataclass's parameters are its fields.
 SNAPSHOT = {
@@ -216,6 +216,7 @@ SNAPSHOT = {
     "gather": [
         ["h", "POSITIONAL_OR_KEYWORD", None],
         ["xs", "VAR_POSITIONAL", None],
+        ["dim", "KEYWORD_ONLY", "None"],
     ],
     "host": [
         ["h", "POSITIONAL_OR_KEYWORD", None],
@@ -254,6 +255,10 @@ SNAPSHOT = {
     "scatter": [
         ["h", "POSITIONAL_OR_KEYWORD", None],
         ["xs", "VAR_POSITIONAL", None],
+        ["dim", "KEYWORD_ONLY", "None"],
+    ],
+    "split_range": [
+        ["h", "POSITIONAL_OR_KEYWORD", None],
     ],
 }
 
