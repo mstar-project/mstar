@@ -36,6 +36,7 @@ from mstar.model.components import (
     TopKRouter,
     instantiate_moe_block,
 )
+from mstar.model.components.decoder_layer import no_cursor
 from mstar.model.components.distributed import ParallelGatedMLP
 from mstar.model.loader.base import CheckpointRules, StackedParamRule
 from mstar.model.qwen3_omni.components.attention import Qwen3OmniAttention
@@ -121,6 +122,7 @@ class Qwen3OmniThinkerLayer(nn.Module):
             comm_group=comm_group,
             attn_key=THINKER_ATTN,
             kv_key=THINKER_KV,
+            layer=layer_idx,
             pos_key=THINKER_POS
         )
 
@@ -265,7 +267,6 @@ class Qwen3OmniThinkerModel(MoeParallelMixin, nn.Module):
         cos_sin_3d: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         mrope_section: Optional[list[int]] = None,
         deepstack_visual_embeds: list[torch.Tensor] | None = None,
-        label: str = "main",
         num_valid_tokens: torch.Tensor | None = None,
         keep_states: bool = True,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
@@ -278,10 +279,6 @@ class Qwen3OmniThinkerModel(MoeParallelMixin, nn.Module):
                 e.g. [24, 20, 20].
             num_valid_tokens: ``(1,)`` real token count; rows past it are
                 CUDA-graph padding. Used only under ``mask_padding``.
-            label: the plan key every layer runs against. The stream's
-                stored length and position counter advance when the runner
-                commits the declared step (vision prefill declares its
-                MRoPE 3D-grid span there).
             keep_states: False skips the two states below, which only the
                 Talker reads.
 
@@ -299,13 +296,9 @@ class Qwen3OmniThinkerModel(MoeParallelMixin, nn.Module):
         layer_n_hidden = None
         token_valid = self.moe_token_valid(hidden_states, num_valid_tokens)
 
-        # The label and layer index are cursors on the shared resources: bind
-        # the label once, advance the index per layer. Passing them as
-        # arguments instead would make inductor specialize on the int.
-        self.model.layers[0].self_attn.attend.bind_step(label)
         residual = None
         for layer_idx, decoder_layer in enumerate(self.model.layers):
-            decoder_layer.self_attn.attend.set_layer_idx(layer_idx)
+            no_cursor(layer_idx, decoder_layer.self_attn)
             # a layer's output is ``residual + hidden_states``
             hidden_states, residual = decoder_layer(
                 hidden_states,

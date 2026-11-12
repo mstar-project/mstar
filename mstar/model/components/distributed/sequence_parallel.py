@@ -122,6 +122,28 @@ def ulysses_attention(
     return sp_group.all_to_all(out, scatter_dim=seq_dim, gather_dim=head_dim, scatter_sizes=seq_sizes)
 
 
+@torch.compiler.disable
+def attention_over_sharded_keys(
+    sp_group: CommGroup,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    run_attention: Callable[..., tuple[torch.Tensor, torch.Tensor]],
+) -> torch.Tensor:
+    """A query replicated on every rank attending keys sharded along the sequence:
+    ``q`` ``[B, Lq, H, D]``, ``k``/``v`` ``[B, Lk/P, H, D]`` (this rank's tokens), returns
+    ``[B, Lq, H, D]``. Each rank attends its own shard and the partial attentions merge
+    exactly by their log-sum-exps (``gather_merge``, the merge a context-parallel pool's
+    partials take), which moves query-sized results rather than the keys.
+
+    ``run_attention(q, k, v, return_lse=True)`` returns ``(out, lse)`` with ``lse``
+    ``[B, Lq, H]`` in natural log (``joint_attention`` over a ragged resource, or
+    ``sdpa_attention``)."""
+    if sp_group.world_size == 1:
+        return run_attention(q, k, v)
+    return gather_merge(sp_group, *run_attention(q, k, v, return_lse=True))
+
+
 def sp_head_slice(sp_group: CommGroup, x: torch.Tensor) -> torch.Tensor:
     """Keep this SP rank's contiguous head-group: ``[T, H, D] -> [T, H/P, D]``.
 
@@ -148,13 +170,8 @@ def sp_head_gather(sp_group: CommGroup, x: torch.Tensor) -> torch.Tensor:
 class SeqParallel(NamedTuple):
     """Ulysses sequence parallelism over a ``[B, L, H, D]`` token stream: ``sizes`` is
     each rank's share of its ``L``. ``scatter`` cuts a replicated per-token tensor to
-    this rank's tokens and ``gather`` reassembles them, both a no-op on one rank.
-
-    Only an attention whose queries and keys are both the sharded stream needs the
-    exchange: it attends every token over this rank's head-group (``attend``). A
-    query shard attending a replicated stream needs nothing, and a replicated query
-    attending the sharded keys merges the ranks' partial attentions by their
-    log-sum-exps (``attend_shards``; ``run`` must take ``return_lse``)."""
+    this rank's tokens and ``gather`` reassembles them, both a no-op on one rank. An
+    attention's exchange is its array's read."""
 
     group: CommGroup
     sizes: list[int]
@@ -164,15 +181,3 @@ class SeqParallel(NamedTuple):
 
     def gather(self, x: torch.Tensor, dim: int = 1) -> torch.Tensor:
         return gather_sequence(self.group, x, self.sizes, dim=dim)
-
-    def attend(
-        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, run: Callable[..., torch.Tensor],
-    ) -> torch.Tensor:
-        return ulysses_attention(self.group, q, k, v, run, self.sizes, seq_dim=1, head_dim=2)
-
-    @torch.compiler.disable
-    def attend_shards(
-        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, run: Callable[..., torch.Tensor],
-    ) -> torch.Tensor:
-        # eager like the gather, so a compiled block doesn't trace the SDPA fallback's fp32 lse
-        return gather_merge(self.group, *run(q, k, v, return_lse=True))

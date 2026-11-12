@@ -17,7 +17,13 @@ from mstar.engine.resources.context_parallel import positions_over_sp
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.graph.base import GraphNode
 from mstar.graph.runtime.base import GraphRuntime
-from mstar.model.base import Model, node_moe_parallel_configs, parse_autocast_dtype, serving_resources
+from mstar.model.base import (
+    Model,
+    deployment_setup,
+    node_moe_parallel_configs,
+    parse_autocast_dtype,
+    serving_resources,
+)
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.utils.device import DeviceCapability
 from mstar.utils.streams import reset_device_scheduling
@@ -386,7 +392,8 @@ class EngineManager:
             if unknown:
                 raise ValueError(f"{key} names nodes {unknown} that no node group serves")
         walk_ladders, region_ladders = _split_token_ladders(ladders, model)
-        specs = serving_resources(model, model_config)
+        setup = deployment_setup(model, model_config)
+        specs = serving_resources(model, model_config, setup)
 
         # YAML autocast_dtype over the model's own, but never re-enabling
         # autocast for a model that pinned its numerics (see node_dtype)
@@ -445,6 +452,7 @@ class EngineManager:
             gpu_memory_fraction=model_config.get("gpu_memory_fraction"),
             device_capability=device_capability,
             side_stream_nodes={name for name, _ in side_keys},
+            state_setup=setup,
         )
         engine.load_model(
             submodules,
