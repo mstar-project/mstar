@@ -215,15 +215,18 @@ def test_the_compiled_vae_decoder_serves_other_sizes_without_recompiling():
         temperal_downsample=[False], num_res_blocks=1, latents_mean=[0.0] * 64, latents_std=[1.0] * 64,
     ).eval()
     decoder = QwenImage21VaeDecoderSubmodule(vae, True)
-    for path, examples in decoder.compile_regions().items():
-        module = decoder.get_submodule(path)
-        module.forward = torch.compile(module.forward, dynamic=True, backend="eager")
-        with torch.no_grad():
-            module.forward(*examples[0])
-    with torch._dynamo.config.patch(error_on_recompile=True):
-        for h, w in ((52, 78), (64, 64)):
-            decoder.forward(None, None, latents=torch.randn(h * w, 64), target=(h, w))
-    torch._dynamo.reset()
+    try:
+        for path, examples in decoder.compile_regions().items():
+            module = decoder.get_submodule(path)
+            module.forward = torch.compile(module.forward, dynamic=True, backend="eager")
+            with torch.no_grad():
+                module.forward(*examples[0])
+        with torch._dynamo.config.patch(error_on_recompile=True):
+            for h, w in ((52, 78), (64, 64)):
+                decoder.forward(None, None, latents=torch.randn(h * w, 64), target=(h, w))
+    finally:
+        # a failure here must not leave the compiled frames to the next test
+        torch._dynamo.reset()
 
 
 @pytest.mark.parametrize("layout", ["preprocessor_config", "processor_config"])
