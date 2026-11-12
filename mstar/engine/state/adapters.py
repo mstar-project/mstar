@@ -1131,11 +1131,12 @@ class PagedCrossHandle(PagedArrayHandle):
         super().begin_step(step)
         if step.ctx.replays:
             return
-        queries = self.queries.check(self, self._segments, step)
+        queries = self.queries.segments(self, step)
         labels = step_labels(queries)
         if len(labels) > 1:
             raise self._no_layout(f"a step over labels {sorted(labels)} on {self.queries.array.name!r}, whose segments "
                                   "lay out this read's queries")
+        self.queries.check(self, self._segments, step)
         if queries:
             self._query_label = queries[0].label
 
