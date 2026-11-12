@@ -433,12 +433,13 @@ def latent(bug):
     return f"**[{bug['priority']}]** `{bug['location']}`: {bug['detail']} {issue}"
 
 
-def checklist(review, pages, stacked, extra=()):
+def checklist(review, pages, stacked, extra=(), approving=False):
     """The "What's left for you" list: what the review leaves to a person (the bot approves over its questions and
     a medium design risk), most important first, one line each with its place: open P0/P1, findings a PR above
     fixes (merge together), then `extra` (what the live-test job's rule found), the design decisions, questions,
     open P2s and skipped files. P3s and latent bugs aren't decisions. Past ten lines the rest fold away, so a
-    question or decision, whose only home this is, is never lost."""
+    question or decision, whose only home this is, is never lost. `approving`: the bot may approve over them, which
+    the closing line says."""
     found = open_findings(review, pages, stacked)
     review = inert(judged(review, stacked))
 
@@ -466,8 +467,8 @@ def checklist(review, pages, stacked, extra=()):
     if lines[10:]:
         rest = "\n".join(lines[10:])
         text += f"\n\n<details><summary>and {len(lines) - 10} more</summary>\n\n{rest}\n\n</details>"
-    return (f"{text}\n\nApprove if you're OK with these. The bot approves over open questions and a medium design "
-            "risk, so object on the PR if you aren't.")
+    return text + ("\n\nApprove if you're OK with these. The bot approves over open questions and a medium design "
+                   "risk, so object on the PR if you aren't." if approving else "")
 
 
 def render(review, pages, head, mode, stacked, salvaged=False, team=False):
@@ -516,7 +517,7 @@ def render(review, pages, head, mode, stacked, salvaged=False, team=False):
         after = (" No live test runs: the review went past its turn limit." if salvaged
                  else " The live-test job posts its outcome in a separate comment.")
         parts.append(f"Live test: **{live['run']}**{checks}. {live['reason']}{after}")
-    left = checklist(raw, pages, stacked)
+    left = checklist(raw, pages, stacked, approving=mode == "full")
     parts.append(f"{left} The live-test comment adds its own items." if mode == "full" and not salvaged else left)
     # Only full mode can lead to an approval, by gpu_review.py's rule.
     role = ("Any approval is posted by the live-test job, by the rule in `gpu_review.py`." if mode == "full"

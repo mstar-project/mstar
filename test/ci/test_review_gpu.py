@@ -1142,6 +1142,8 @@ class TestApprove(unittest.TestCase):
                      look_at=[{"location": "a.py:1", "why": "w"}])
         self.assertIn("1 open question and 1 design decision", posted[-1]["body"],
                       "the approval would read as if nothing were left for a person")
+        self.approve({"value": "on"}, extra=capture, questions=[{"location": "", "text": "q"}])
+        self.assertIn("1 open question remains on", posted[-1]["body"], "one question would 'remain' in the plural")
         for variable, what in (({"value": "off"}, "off"), (Fail("HTTP 404"), "unset"),
                                (Fail("HTTP 403"), "unreadable")):
             text, out, writes = self.approve(variable)
@@ -1201,6 +1203,7 @@ class TestApprove(unittest.TestCase):
         text, out, writes = self.approve({"value": "on"}, verdict="fail")
         self.assertEqual(writes, [])
         self.assertIn("- [ ] the live test's verdict is fail", text, "the rule's condition would not reach the human")
+        self.assertNotIn("Approve if you're OK", text, "a not-approved PR would be asked for an approval")
         stdout = io.StringIO()
         with contextlib.redirect_stdout(stdout):
             self.approve({"value": "on"}, verdict="fail", untestable="x\n::add-mask::y")
