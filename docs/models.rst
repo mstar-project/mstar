@@ -204,6 +204,8 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
    * - ``wan22``
      - ``Wan-AI/Wan2.2-TI2V-5B-Diffusers``
      - Wan2.2-TI2V-5B video diffusion: text-to-video and image-to-video, 5B dense DiT.
+       ``variant: t2v_a14b`` serves Wan2.2-T2V-A14B (``Wan-AI/Wan2.2-T2V-A14B-Diffusers``),
+       text-to-video with two 14B experts.
    * - ``waypoint``
      - ``Overworld/Waypoint-1.5-1B``
      - Waypoint-1.5 interactive video world model: 1.28B DiT generating one latent
@@ -2147,8 +2149,9 @@ Wan2.2 (``wan22``)
 
 Text-to-video and image-to-video on **Wan2.2-TI2V-5B** — the dense 5B variant
 (``Wan-AI/Wan2.2-TI2V-5B-Diffusers``): a native video DiT, a UMT5-XXL prompt
-encoder and the Wan2.2-VAE, all four nodes stateless. The A14B (MoE dual-DiT)
-variants are **not** supported; ``wan22`` rejects any other variant explicitly.
+encoder and the Wan2.2-VAE, all four nodes stateless. The same model serves
+**Wan2.2-T2V-A14B** (``variant: t2v_a14b``, see `T2V-A14B`_ below); the I2V-A14B
+variant is not supported, and ``wan22`` rejects any other variant.
 
 Install and serve on one GPU:
 
@@ -2361,6 +2364,57 @@ parallelism stays the throughput layout: at 1280x704x81 and 4 concurrent, four
 replicas (``wan22_dp2.yaml``'s layout over four ranks) serve 8.6 videos/min
 against 7.2 for this layout on H200s, and 11.0 against 7.4 in a separate run on
 H100s.
+
+T2V-A14B
+~~~~~~~~
+
+``configs/wan22_a14b.yaml`` serves **Wan2.2-T2V-A14B**
+(``Wan-AI/Wan2.2-T2V-A14B-Diffusers``) on one GPU: ``model_kwargs`` sets
+``variant: t2v_a14b`` and ``model_path_hf`` to its checkpoint (the DiT refuses to
+load a checkpoint whose transformer config is not the variant's). It is
+text-to-video only (no ``vae_encoder`` node; an image is a 400). The dit node holds
+two DiTs of the same 40-layer, 5120-wide architecture, both resident (2 x 28.6 GB
+bf16): the high-noise ``transformer`` runs the steps whose timestep is at least
+``boundary_ratio`` x 1000 (875, from the checkpoint's ``model_index.json``) and
+``transformer_2`` the rest, as diffusers' ``WanPipeline`` splits them. Each sample
+has one timestep, which every token takes. The VAE is the Wan2.1 one (8x spatial),
+so **height and width must be multiples of 16** (1280x720 is valid here). The
+shared Wan VAE decoder takes it as it takes Wan2.2's.
+
+.. list-table::
+   :header-rows: 1
+
+   * - Knob
+     - A14B default
+     - Notes
+   * - ``height`` / ``width`` / ``num_frames``
+     - 720 / 1280 / 81
+     - ``/v1/videos/generations`` defaults ``size`` to ``832x480``.
+   * - ``num_inference_steps``
+     - 40
+     -
+   * - ``guidance_scale``
+     - 4.0
+     - The high-noise expert's guidance. It alone decides whether the negative branch
+       runs, as in diffusers.
+   * - ``guidance_scale_2``
+     - 3.0
+     - The low-noise expert's guidance. A request that sets only ``guidance_scale``
+       gets it for both experts, as in diffusers.
+   * - ``flow_shift``
+     - checkpoint (3.0)
+     - The UniPC flow shift, per request (on TI2V-5B too). The official Wan2.2 recipe
+       uses 12.0. The expert boundary follows the request's own timesteps.
+   * - ``fps``
+     - 16
+     - Playback rate only.
+
+``configs/wan22_a14b_cfg_parallel_2gpu.yaml`` splits the guidance branches over two
+GPUs (``cfg_size: 2``), each rank holding both experts, and
+``configs/wan22_a14b_sp2.yaml`` splits the tokens instead (``sp_size: 2``, 20 of the
+40 heads per rank). Both compile the DiT for ``1280x720x81`` and ``832x480x81``, each
+expert once per CFG setting. ``step_cache`` is TI2V-5B's only: its calibrated table is
+that model's, so A14B refuses one at startup.
 
 LTX-2.5 (``ltx2_5``)
 --------------------

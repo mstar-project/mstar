@@ -1,9 +1,9 @@
-"""Wan2.2-TI2V-5B node submodules (nothing is cached; the dit declares the array its self-attention reads).
+"""Wan2.2 node submodules (nothing is cached; the dit declares the array its self-attention reads).
 
     text_encoder -> Wan22TextEncoderSubmodule (UMT5-XXL, thin HF wrapper)
-    vae_encoder  -> Wan22VaeEncoderSubmodule  (Wan2.2-VAE encode, I2V only)
-    dit          -> Wan22DitSubmodule         (native 5B DiT + the scaffold's UniPC)
-    vae_decoder  -> Wan22VaeDecoderSubmodule  (Wan2.2-VAE decode)
+    vae_encoder  -> Wan22VaeEncoderSubmodule  (Wan2.2-VAE encode, TI2V-5B I2V only)
+    dit          -> Wan22DitSubmodule         (native DiT, or A14B's two experts, + the scaffold's UniPC)
+    vae_decoder  -> Wan22VaeDecoderSubmodule  (Wan2.2-VAE decode; the Wan2.1 VAE on A14B)
 
 All four set ``disable_torch_compile``, so the engine never wraps their forwards: the
 three wrapped nodes run once per request with no graph to amortize, and the dit's whole
@@ -34,7 +34,7 @@ from mstar.model.components.diffusion.denoise_loop import UniPCDenoiseLoopSubmod
 from mstar.model.components.diffusion.flow_match import FlowMatchSchedule
 from mstar.model.components.diffusion.image_io import truncate_to_uint8
 from mstar.model.components.diffusion.step_cache import BlockCache, step_cache_policy
-from mstar.model.components.diffusion.unipc import make_unipc_tables
+from mstar.model.components.diffusion.unipc import NUM_TRAIN_TIMESTEPS, make_unipc_tables
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
 from mstar.model.wan22.config import DIT_SHARD, DIT_TOKENS, MAG_RATIOS, Wan22Config
 
@@ -118,7 +118,7 @@ def _set_buffer(module: nn.Module, dotted_name: str, value: torch.Tensor):
 
 def _latent_grid(config: Wan22Config, step_metadata: dict) -> tuple[int, int, int]:
     """(T_lat, H_lat, W_lat) for the request's pixel-space dims (diffusers
-    ``prepare_latents``: T=(F-1)//4+1, spatial /16)."""
+    ``prepare_latents``: T=(F-1)//4+1, spatial /16, /8 on A14B)."""
     t_lat = (int(step_metadata["num_frames"]) - 1) // config.vae_scale_factor_temporal + 1
     h_lat = int(step_metadata["height"]) // config.vae_scale_factor_spatial
     w_lat = int(step_metadata["width"]) // config.vae_scale_factor_spatial
@@ -283,14 +283,24 @@ class WanStepKey(NamedTuple):
     guidance: float
     # I2V rows carry ``image_latent`` and keep frame 0 clean
     i2v: bool
+    # A14B: the low-noise expert's combine (its steps run the negative branch when
+    # ``guidance`` turns it on, as diffusers does); None with one DiT
+    guidance_2: float | None = None
 
 
 class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
-    """Dense 5B video DiT on the scaffold's denoise loop, stepped by its UniPC.
+    """The Wan2.2 video DiT on the scaffold's denoise loop, stepped by its UniPC.
 
     One loop iteration is one transformer forward over every row's positive and
     negative embeddings (with cfg_size 2, one branch per cfg rank), plus a UniPC
     predictor/corrector update per row.
+
+    A14B (``config.is_moe``) holds both experts: a row whose step's timestep is at
+    least ``boundary_ratio * 1000`` runs ``transformer`` with ``guidance_scale``, a
+    later one ``transformer_2`` with ``guidance_scale_2``, the comparison diffusers'
+    ``WanPipeline`` makes. The expert follows from the row's step index and its host
+    timestep table, so choosing it reads nothing off the device; a batch whose rows
+    straddle the boundary runs one forward per expert.
 
     Loop-carried edges, all float32 over ``[1, C, T, H, W]``:
 
@@ -317,13 +327,22 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
     # the [cond, uncond] stack a guided step forwards (the CFG axis splits it)
     CFG_BRANCHES = 2
 
-    def __init__(self, transformer: nn.Module, config: Wan22Config, cfg_group=None):
+    def __init__(
+        self, transformer: nn.Module, config: Wan22Config, cfg_group=None, transformer_2: nn.Module | None = None,
+    ):
         super().__init__(
             loop_name=DENOISE_LOOP_NAME, max_batch_size=config.dit_max_batch_size,
             step_cache=step_cache_policy(config.step_cache, MAG_RATIOS),
         )
+        if config.is_moe and transformer is not None and transformer_2 is None:
+            raise ValueError("Wan2.2 A14B needs both experts: transformer_2 is missing.")
         self.transformer = transformer
+        self.transformer_2 = transformer_2
         self.config = config
+        # the high-noise expert runs the steps whose timestep is at least this
+        self._boundary_timestep = (
+            config.boundary_ratio * NUM_TRAIN_TIMESTEPS if config.is_moe else None
+        )
         # CFG parallelism (cfg_size: 2; not passed on one GPU, so trivial here):
         # the ranks split the CFG stack (my_rows, then an all-gather), each
         # running one branch over the batch's rows, so the step costs one
@@ -345,17 +364,18 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
         # request at a new resolution pauses; logged in ``_noise_prediction``);
         # fullgraph=False allows the SDPA graph break, matching cosmos3. Only the
         # latent grids of ``config.compile_dit_sizes`` reach the compiled forward;
-        # every other grid runs ``_eager_forward``, the transformer's own forward.
+        # every other grid runs the expert's own forward, kept in ``_eager_forwards``.
         self._compile_dit = bool(config.compile_dit)
         self._compile_grids = config.compile_dit_grids()
         self._compiled_shapes: set[tuple[int, ...]] = set()
-        self._eager_forward = None
-        if self._compile_dit and transformer is not None:
-            # with the transformer it belongs to: one swapped in later runs its own forward
-            self._eager_forward = (transformer, transformer.forward)
-            transformer.forward = torch.compile(
-                transformer.forward, fullgraph=False, dynamic=False,
-            )
+        # (transformer, its eager forward) per compiled expert, kept with the module it
+        # belongs to: one swapped in later runs its own forward
+        self._eager_forwards: list[tuple[nn.Module, object]] = []
+        experts = [t for t in (transformer, transformer_2) if t is not None]
+        if self._compile_dit and experts:
+            for expert in experts:
+                self._eager_forwards.append((expert, expert.forward))
+                expert.forward = torch.compile(expert.forward, fullgraph=False, dynamic=False)
             logger.info(
                 "Wan2.2 DiT: torch.compile enabled on the transformer region "
                 "(fullgraph=False, dynamic=False) for latent (frames, height, width) %s; other "
@@ -369,13 +389,23 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
 
     def bucket_key_for(self, fwd_info: CurrentForwardPassInfo) -> WanStepKey:
         meta = fwd_info.step_metadata
+        guidance_2 = meta.get("guidance_scale_2")
         return WanStepKey(
             *_latent_grid(self.config, meta), guidance=float(meta["guidance_scale"]),
             i2v=fwd_info.graph_walk == self._I2V_WALK,
+            guidance_2=None if guidance_2 is None else float(guidance_2),
         )
 
-    def schedule_for(self, walk: str, num_steps: int, bucket_key: WanStepKey) -> FlowMatchSchedule:
-        sigmas, timesteps = make_unipc_tables(int(num_steps), self.config.flow_shift)
+    def schedule_settings(self, fwd_info: CurrentForwardPassInfo) -> tuple[int, float]:
+        # the step count, and the flow shift: the request's, or the checkpoint's
+        # (``config.flow_shift``, refreshed on this worker at load)
+        meta = fwd_info.step_metadata
+        shift = meta.get("flow_shift")
+        return int(meta["num_inference_steps"]), float(self.config.flow_shift if shift is None else shift)
+
+    def schedule_for(self, walk: str, settings: tuple[int, float], bucket_key: WanStepKey) -> FlowMatchSchedule:
+        num_steps, flow_shift = settings
+        sigmas, timesteps = make_unipc_tables(num_steps, flow_shift)
         return FlowMatchSchedule(sigmas=sigmas, timesteps=timesteps, mu=None)
 
     def _branch_rows(self, guidance_scale: float) -> slice:
@@ -406,6 +436,25 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
 
     def num_tokens(self, bucket_key: WanStepKey) -> int:
         return bucket_key.frames * bucket_key.height * bucket_key.width // 4  # patch_size (1, 2, 2)
+
+    def _is_high_noise(self, fwd_info: CurrentForwardPassInfo, bucket_key: WanStepKey) -> bool:
+        """Whether the row's step runs A14B's high-noise expert: its timestep, read
+        off the host table, is at least the boundary (diffusers ``t >= boundary_timestep``)."""
+        timesteps = self.schedule_of(fwd_info, bucket_key).timesteps
+        return bool(timesteps[self.step_index(fwd_info)] >= self._boundary_timestep)
+
+    def _expert_groups(
+        self, engine_inputs: ModelInputsFromEngine, bucket_key: WanStepKey,
+    ) -> list[tuple[nn.Module, float, list[int]]]:
+        """(transformer, its guidance combine scale, row indices) for each expert this batch's rows run."""
+        if not self.config.is_moe:
+            return [(self.transformer, bucket_key.guidance, list(range(len(engine_inputs.request_ids))))]
+        high, low = [], []
+        for i, rid in enumerate(engine_inputs.request_ids):
+            (high if self._is_high_noise(engine_inputs.per_request_info[rid], bucket_key) else low).append(i)
+        guidance_2 = bucket_key.guidance if bucket_key.guidance_2 is None else bucket_key.guidance_2
+        groups = [(self.transformer, bucket_key.guidance, high), (self.transformer_2, guidance_2, low)]
+        return [group for group in groups if group[2]]
 
     @staticmethod
     def _first_frame_mask(sample: torch.Tensor) -> torch.Tensor:
@@ -452,13 +501,33 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
             mask = torch.ones(1, 1, *batch.shape[2:], dtype=torch.float32, device=batch.device)
             model_input = batch
 
-        # expand_timesteps: every token of a latent frame takes its frame's
-        # timestep (patch_size (1, 2, 2) keeps the frame axis); I2V frame 0 gets 0.
-        temp_ts = (mask[0, 0, :, 0, 0] * timestep[:, None]).squeeze(0)
-        output = self._noise_prediction(
-            model_input.to(self.transformer.dtype), temp_ts, text_embeds_pos.flatten(0, 1),
-            text_embeds_neg.flatten(0, 1), bucket_key.guidance, self.block_cache(engine_inputs),
-        )
+        if self.config.expand_timesteps:
+            # every token of a latent frame takes its frame's timestep (patch_size
+            # (1, 2, 2) keeps the frame axis); I2V frame 0 gets 0.
+            temp_ts = mask[0, 0, :, 0, 0] * timestep[:, None]
+        else:
+            # one timestep per sample, which every token takes (A14B)
+            temp_ts = timestep[:, None]
+        pos, neg = text_embeds_pos.flatten(0, 1), text_embeds_neg.flatten(0, 1)
+        groups = self._expert_groups(engine_inputs, bucket_key)
+        if len(groups) == 1:
+            transformer, guidance, _ = groups[0]
+            output = self._noise_prediction(
+                model_input.to(transformer.dtype), temp_ts.squeeze(0), pos, neg, bucket_key.guidance,
+                transformer=transformer, combine_scale=guidance, block_cache=self.block_cache(engine_inputs),
+            )
+            return output[:, None]
+        # rows on both sides of A14B's boundary: one forward per expert (no step cache: the config refuses one on A14B)
+        output = None
+        for transformer, guidance, rows in groups:
+            index = torch.tensor(rows, device=batch.device)
+            part = self._noise_prediction(
+                model_input[index].to(transformer.dtype), temp_ts[index], pos[index], neg[index],
+                bucket_key.guidance, transformer=transformer, combine_scale=guidance,
+            )
+            if output is None:
+                output = part.new_empty((batch.shape[0], *part.shape[1:]))
+            output[index] = part
         return output[:, None]
 
     def _noise_prediction(
@@ -469,12 +538,22 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
         text_embeds_neg: torch.Tensor,
         guidance_scale: float,
         block_cache: BlockCache | None = None,
+        transformer: nn.Module | None = None,
+        combine_scale: float | None = None,
     ) -> torch.Tensor:
         """CFG noise prediction; one forward over every row's two branches instead
         of the reference's two sequential forwards. The combine runs in the
         transformer's output dtype (bf16), like the reference. ``temp_ts`` is per
-        row, ``[B, frames]``, or one row's ``[frames]``. Under a step cache a row
-        keeps its residual as ``[branches, tokens, dim]`` over this rank's branches."""
+        row, ``[B, groups]``, or one row's ``[groups]``, a group being a latent
+        frame or (A14B) the whole sample. ``transformer`` is the expert to run, by
+        default ``self.transformer``. Under a step cache a row keeps its residual
+        as ``[branches, tokens, dim]`` over this rank's branches.
+
+        ``guidance_scale`` above 1.0 runs the negative branch and is the combine's
+        scale unless ``combine_scale`` is given: A14B's low-noise steps combine with
+        ``guidance_scale_2`` while ``guidance_scale`` still decides the branches, as
+        diffusers' ``do_classifier_free_guidance`` reads ``guidance_scale`` alone (and
+        the attention segments, keyed on it, stay the same for every step)."""
         do_cfg = guidance_scale > 1.0
         rows = model_input.shape[0]
         branch_rows = self._branch_rows(guidance_scale)
@@ -501,9 +580,10 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
             encoder_hidden_states = stack[branch_rows.start * rows : branch_rows.stop * rows]
         else:
             encoder_hidden_states = text_embeds_pos
-        transformer = self.transformer
-        if not compiled and self._eager_forward is not None and self._eager_forward[0] is transformer:
-            transformer = self._eager_forward[1]
+        module = self.transformer if transformer is None else transformer
+        forward = module
+        if not compiled:
+            forward = next((eager for owner, eager in self._eager_forwards if owner is module), module)
         cache = {}
         if block_cache is not None:
             # the forward's batch is branch-major, [branches * rows]; the cache is row-leading
@@ -511,10 +591,10 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
                 cache["cached_residual"] = block_cache.residual.transpose(0, 1).flatten(0, 1)
             else:
                 cache["return_residual"] = True
-        out = transformer(
+        out = forward(
             hidden_states=hidden_states,
             timestep=timestep,
-            encoder_hidden_states=encoder_hidden_states.to(self.transformer.dtype),
+            encoder_hidden_states=encoder_hidden_states.to(module.dtype),
             shard=self.shard,
             **cache,
         )
@@ -525,7 +605,8 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
             return out
         out = self.cfg_group.all_gather(out.contiguous(), dim=0)
         noise_cond, noise_uncond = out[:rows], out[rows:]
-        return noise_uncond + guidance_scale * (noise_cond - noise_uncond)
+        scale = guidance_scale if combine_scale is None else combine_scale
+        return noise_uncond + scale * (noise_cond - noise_uncond)
 
 
 # ---------------------------------------------------------------------------
@@ -533,7 +614,8 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
 # ---------------------------------------------------------------------------
 
 class Wan22VaeDecoderSubmodule(_Fp32IslandMixin, NodeSubmodule):
-    """Wan2.2-VAE latent -> pixel decoder (tiled).
+    """Wan2.2-VAE latent -> pixel decoder (tiled); on A14B the Wan2.1 VAE, the same
+    ``AutoencoderKLWan`` class at z 16 and 8x spatial, which every path below takes as is.
 
     Consumes the loop's final ``latents`` and emits ``video_output`` as uint8
     ``[num_frames, H, W, 3]`` frames. Quantizing here, at the worker boundary,
@@ -622,7 +704,7 @@ class Wan22VaeDecoderSubmodule(_Fp32IslandMixin, NodeSubmodule):
 
     def _output_size(self, latents: torch.Tensor) -> tuple[int, int, int]:
         """(height, width, num_frames) the latent grid decodes to — the inverse of
-        the VAE's spatial (/16) and temporal (4k+1) compression."""
+        the VAE's spatial (/16, /8 on A14B) and temporal (4k+1) compression."""
         _, _, t_lat, h_lat, w_lat = latents.shape
         height = h_lat * self.config.vae_scale_factor_spatial
         width = w_lat * self.config.vae_scale_factor_spatial
