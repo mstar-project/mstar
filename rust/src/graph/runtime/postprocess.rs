@@ -105,7 +105,7 @@ enum Phase {
 pub(super) struct Stored {
     pub tensors: Vec<u64>,
     pub num_tensors: Vec<usize>,
-    pub inline_signal: Option<String>,
+    pub inline_signals: Vec<String>,
     pub inline_values: Vec<Option<i64>>,
     /// A repeated step's values after each row's first, in `rids` order
     pub inline_tails: Vec<Vec<i64>>,
@@ -119,6 +119,14 @@ pub(super) struct Stops {
     pub rules: Vec<u32>,
     pub kept: Vec<u32>,
     pub missing: Vec<u32>,
+}
+
+/// What a step's stop check withheld (`RouteArg::withheld_signals`):
+/// `rids[i]` withheld `signals[i]`.
+#[derive(Default)]
+pub(super) struct Withheld {
+    pub signals: Vec<String>,
+    pub rids: Vec<Vec<u32>>,
 }
 
 /// A step's postprocess (`PostprocessRequest`), and how far it got.
@@ -136,7 +144,8 @@ pub(super) struct Postprocess {
     pub runtime_stops: bool,
     pub tokens: Option<TokenColumn>,
     pub row_rids: Vec<u32>,
-    pub inline: Option<(String, TokenColumn)>,
+    /// the signals riding the step's inline column, and the column
+    pub inline: Option<(Vec<String>, TokenColumn)>,
     pub partition_done: Vec<u32>,
     pub python_send: bool,
     /// `RouteInput.loop_strides`, in `rids` order; None is 1 each
@@ -144,6 +153,7 @@ pub(super) struct Postprocess {
     /// rid -> the iterations of a repeated step that count, for a row that
     /// stopped inside it: what the device ran past that is dropped
     kept: FxHashMap<u32, u32>,
+    pub withheld: Withheld,
     phase: Phase,
     stops: Option<Vec<(u32, Vec<String>)>>,
     stopped: Vec<u32>,
@@ -157,13 +167,13 @@ impl Postprocess {
         partition: String, node_name: String, graph_walk: String, output_signals: Vec<String>,
         rids: Vec<u32>, walks: Option<Vec<String>>, rid_walk_idx: Option<Vec<u32>>,
         known_stops: Vec<(u32, Vec<String>)>, runtime_stops: bool,
-        tokens: Option<TokenColumn>, row_rids: Vec<u32>, inline: Option<(String, TokenColumn)>,
+        tokens: Option<TokenColumn>, row_rids: Vec<u32>, inline: Option<(Vec<String>, TokenColumn)>,
         partition_done: Vec<u32>, python_send: bool, loop_strides: Option<Vec<u32>>,
     ) -> Self {
         Postprocess {
             partition, node_name, graph_walk, output_signals, rids, walks, rid_walk_idx,
             known_stops, runtime_stops, tokens, row_rids, inline, partition_done, python_send,
-            loop_strides, kept: FxHashMap::default(),
+            loop_strides, kept: FxHashMap::default(), withheld: Withheld::default(),
             phase: Phase::Stops, stops: None, stopped: Vec::new(), stored: None, completion_id: 0,
         }
     }
@@ -221,9 +231,11 @@ impl Postprocess {
             rids: self.rids.clone(),
             tensors: s.tensors,
             num_tensors: s.num_tensors,
-            inline_signal: s.inline_signal,
+            inline_signals: s.inline_signals,
             inline_values: s.inline_values,
             inline_tails: s.inline_tails,
+            withheld_signals: self.withheld.signals.clone(),
+            withheld_rids: self.withheld.rids.clone(),
             logprobs: s.logprobs,
             walks: if self.rid_walk_idx.is_some() { self.walks.clone() } else { None },
             rid_walk_idx: self.rid_walk_idx.clone(),
@@ -530,11 +542,11 @@ impl GraphRuntime {
             .unwrap_or_default();
         // Inline: nothing stored, so nothing here touches Python.
         let n = pp.rids.len() * pp.output_signals.len();
-        let signal = pp.inline.as_ref().map(|(s, _)| s.clone());
+        let signals = pp.inline.as_ref().map(|(s, _)| s.clone()).unwrap_or_default();
         let t = std::time::Instant::now();
         let sent = py.detach(|| -> PyResult<Result<Vec<u32>, RouteOut>> {
             let route = self.complete_and_route_batch(pp.route_arg(Stored {
-                tensors: Vec::new(), num_tensors: vec![0; n], inline_signal: signal,
+                tensors: Vec::new(), num_tensors: vec![0; n], inline_signals: signals,
                 inline_values: values.into_iter().map(Some).collect(), inline_tails: tails, logprobs: Vec::new(),
             }))?;
             pp.completion_id = route.completion_id;
@@ -596,10 +608,14 @@ impl GraphRuntime {
 
     pub(super) fn pp_resume_stops(
         &mut self, py: Python<'_>, rids: Vec<u32>, loops: Vec<Vec<String>>, dropped: Vec<u32>,
+        withheld: Withheld,
     ) -> PyResult<PostprocessOut> {
         let mut pp = self.pp_take()?;
         let given: Vec<(u32, Vec<String>)> = rids.into_iter().zip(loops).collect();
         pp.stops = Some(merged_stops([&pp.known_stops, &given]));
+        if !withheld.signals.is_empty() {
+            pp.withheld = withheld;
+        }
         pp.keep_rows(&dropped.into_iter().collect());
         self.pp_run(py, pp)
     }

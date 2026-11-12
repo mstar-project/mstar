@@ -108,13 +108,20 @@ class DeviceLoopback(NamedTuple):
     tokens on the host would pay for nothing.
     """
 
-    walk: str
+    # the walk, or walks, whose token loops back (a combined walk's rows
+    # follow their own walk's)
+    walk: str | frozenset[str]
     # the input signal the walk's token loops back to
     signal: str
     # resource key of the sampler keeping the slot masters
     sampler: str
     # the row-addressed output (``check_stop_buffers`` entry) holding the token
     buffer: str
+
+    def covers(self, graph_walk: str) -> bool:
+        """Whether ``graph_walk``'s token loops back on the device."""
+        walk = self.walk
+        return graph_walk == walk or (isinstance(walk, frozenset) and graph_walk in walk)
 
 
 class StopCheck(NamedTuple):
@@ -1263,11 +1270,14 @@ class NodeSubmodule(torch.nn.Module, ABC):
         row-addressed stop buffer holding it. The worker then sends those values
         inline, one frame per step, instead of one tensor per request: to the
         client on an emit edge that is not persisted, and down a stream whose
-        ``Connection`` goes ``by_value``. A step carries one inline signal, the
-        first of these it outputs. Its rows stay on the device only if every
-        output is a ``device_loopback_signals`` one, so a stream's signal sent
-        inline lets the step run rows-only when it is also the loop-back
-        signal."""
+        ``Connection`` goes ``by_value``. A step carries one column of these:
+        the first it outputs, and every other it outputs that reads the same
+        buffer. A row whose stop check withheld one of them sends nothing for
+        it. The step keeps its rows on the device (rows-only) when every
+        output is a ``device_loopback_signals`` one or rides the column on
+        every edge: a client emit, or a ``by_value`` stream. A rows-only step
+        builds no per-request outputs and skips ``postprocess``, so anything
+        ``postprocess`` does must be about outputs the step stores."""
         del graph_walk
         return {}
 
@@ -1629,7 +1639,7 @@ class ARNodeSubmodule(NodeSubmodule):
     def _loops_back(self, graph_walk: str) -> bool:
         """Whether this walk's token loops back on the device."""
         loopback = self.device_loopback
-        return loopback is not None and graph_walk == loopback.walk
+        return loopback is not None and loopback.covers(graph_walk)
 
     def _reads_loopback(self, graph_walk: str) -> bool:
         """Whether this walk's rows read their token off the slot masters: a
