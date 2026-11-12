@@ -176,6 +176,13 @@ def _env_number(name: str, default, parse, minimum):
     return value
 
 
+
+def set_worker_threads(plan: cpus.CpuPlan, workers: int) -> None:
+    """Size this worker's torch intra-op pool from ``plan`` (``CpuPlan.worker_threads``),
+    unless ``OMP_NUM_THREADS`` names the deployment's own count."""
+    if not os.environ.get("OMP_NUM_THREADS"):
+        torch.set_num_threads(plan.worker_threads(workers))
+
 class Worker:
     """One per GPU: builds the worker's components, and runs ``StepPipeline``
     once warmup is done. What each component owns is in its own module."""
@@ -504,6 +511,7 @@ class Worker:
         slot = worker_ids.index(self.worker_id) if local_worker_devices else 0
         plan = cpus.devices_plan(knobs.step_thread_core(), devices, knobs.idle_hold())
         cpus.install(plan)
+        set_worker_threads(plan, len(devices))
         step = plan.workers[slot] if plan.workers else None
         if step is None:
             # a host that doesn't call for pinning is the API server's one line
