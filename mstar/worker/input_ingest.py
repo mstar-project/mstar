@@ -19,8 +19,11 @@ from mstar.graph.runtime.base import ColumnarEdgeSpecs
 from mstar.utils.client_errors import client_error_text
 from mstar.utils.containers import ParallelList
 from mstar.utils.ipc_format import (
+    ConductorMessage,
+    ConductorMessageType,
     DrainRequest,
     EdgeItems,
+    FailRequests,
     InputSignals,
     MessageSource,
     NewRequest,
@@ -182,31 +185,31 @@ class InputIngest:
         logger.debug("Worker %s received request %s", self._worker_id, wire_rid)
         laps = PhaseLaps("worker.msg.new_request.")
         runtime = self._runtime
-        # The one place a handle is minted; a request with several partitions
-        # on this worker gets the same one for each. Everything below keys on it.
-        rid = runtime.add_request(
-            request_id=wire_rid,
-            partition=body.request_info.partition_name,
-            graph_walk=body.request_info.graph_walk,
-            partition_worker_graph_ids=body.partition_worker_graph_ids,
-            worker_graph_to_workers=ParallelList.from_dict(body.worker_graph_to_workers),
-            loop_caps=body.loop_caps,
-        )
-        body.request_info.rid_handle = rid
-        lifecycle.add(rid, wire_rid)
-        laps.lap("runtime_add")
-
-        # One NewRequest comes per partition this worker serves, and a later one
-        # can land after a step already ran. The tensor manager and the engine
-        # hold request-wide state, so only the first opens it. Opening it again
-        # would reset that state under the partition that is running.
-        first = rid not in self._request_state.per_request_info
-        self._request_state.add_request(rid, body.request_info)
-        runtime.register_stop_limits(rid, body.request_info)
-        if first:
-            self._tensors.register_request(rid, runtime.get_sharding_config(rid))
-        laps.lap("worker_state")
         try:
+            # The one place a handle is minted; a request with several partitions
+            # on this worker gets the same one for each. Everything below keys on it.
+            rid = runtime.add_request(
+                request_id=wire_rid,
+                partition=body.request_info.partition_name,
+                graph_walk=body.request_info.graph_walk,
+                partition_worker_graph_ids=body.partition_worker_graph_ids,
+                worker_graph_to_workers=ParallelList.from_dict(body.worker_graph_to_workers),
+                loop_caps=body.loop_caps,
+            )
+            body.request_info.rid_handle = rid
+            lifecycle.add(rid, wire_rid)
+            laps.lap("runtime_add")
+
+            # One NewRequest comes per partition this worker serves, and a later one
+            # can land after a step already ran. The tensor manager and the engine
+            # hold request-wide state, so only the first opens it. Opening it again
+            # would reset that state under the partition that is running.
+            first = rid not in self._request_state.per_request_info
+            self._request_state.add_request(rid, body.request_info)
+            runtime.register_stop_limits(rid, body.request_info)
+            if first:
+                self._tensors.register_request(rid, runtime.get_sharding_config(rid))
+            laps.lap("worker_state")
             if first:
                 unheld = () if self._set_rebuildable is None else self._set_rebuildable(
                     rid, body.request_info.resource_configs,
@@ -239,9 +242,20 @@ class InputIngest:
                     runtime.ingest_inputs_batch(_one_rids_edges(rid, signal_only), can_buffer=True)
                 laps.lap("ingest_signals")
         except Exception as err:
-            # a failed engine ingest rolled itself back; the conductor's REMOVE
-            # tears down what else the request has here
-            self._fail_intake([rid], err, f"ingest of request {wire_rid} failed")
+            what = f"ingest of request {wire_rid} failed"
+            rid = runtime.get_rid_handle(wire_rid)
+            if rid is not None and rid in lifecycle.arrivals:
+                # a failed engine ingest rolled itself back; the conductor's REMOVE
+                # tears down what else the request has here
+                self._fail_intake([rid], err, what)
+            else:
+                # Raised before the lifecycle took the request in, so it can't
+                # report it: tell the conductor by its wire id.
+                text, _ = client_error_text(err, f"Worker {self._worker_id}: {what}", log=logger)
+                self._communicator.send("conductor", ConductorMessage(
+                    message_type=ConductorMessageType.FAIL_REQUESTS,
+                    body=FailRequests(errors={wire_rid: f"Error in worker: {text}"}),
+                ))
         parked = lifecycle.take_parked(wire_rid)
         if unread:
             # its parked inputs are never read, so they are ACKed unread as for a removed request

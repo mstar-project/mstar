@@ -102,7 +102,8 @@ def _speculator(scheduler, runtime, lockstep=None):
     layout = WorkerLayout()
     return Speculator(
         services=services, layout=layout, scheduler=scheduler,
-        lifecycle=RequestLifecycle(layout=layout, graph_runtime=runtime), lockstep=lockstep, admission=None, timer=None,
+        lifecycle=RequestLifecycle(layout=layout, graph_runtime=runtime, worker_id="w0"),
+        lockstep=lockstep, admission=None, timer=None,
     )
 
 
@@ -193,3 +194,29 @@ def test_fresh_rid_without_a_final_chunk_keeps_its_stream_open():
         assert FRESH in spec.scheduled_batch.request_to_worker_graph
         assert not spec.node_batch.final_stream_rids
         assert not spec.node_batch.partition_done_rids
+
+
+def test_a_step_the_budget_leaves_with_no_row_of_its_parent_runs_on_its_own():
+    """A token budget at or under the minimum chunk can leave out the chain's
+    only row, one mid-prefill, after the pick. The step then holds only fresh
+    rows of another walk and must not run as the parent's speculative head: a
+    TP follower finds no row of the parent to build it from, and one GPU labels
+    the step with the parent walk's output signals, losing a reply token."""
+    fresh = ScheduledBatch(node_name=NODE, graph_walk=WALK, request_to_worker_graph={FRESH: 0},
+                           input_edges=_fresh_edges(False))
+    scheduler = SimpleNamespace(
+        backlog_splits_from=lambda *a: False,
+        pick_chain_step=lambda *a: ChainPick((NODE, WALK), StepPick(
+            taken=[FRESH], continuing=[], room=0, held_back=set(), ordered=False,
+        ), specs=[], mid_prefill=[SimpleNamespace(request_id=CONTINUING)]),
+        take_chain_step=lambda *a: fresh,
+        rebuilds=Rebuilds({}, {}),
+    )
+    runtime, target = _runtime()
+    runtime.prep_spec_rids = lambda inp: SpeculationPrepOutput(
+        consumed_streaming_edge_idxs=[], ready_rids=[], wg_ids=[], input_edges=_edges([]),
+    )
+    speculator = _speculator(scheduler, runtime)
+    speculator.request_state.get_partition_for_node = lambda node: PART
+    spec = speculator._try_speculate_next(_pending(), SpeculationTarget(target, [CONTINUING]))
+    assert spec.is_yield_away and spec.scheduled_batch is fresh

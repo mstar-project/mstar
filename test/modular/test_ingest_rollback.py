@@ -46,17 +46,29 @@ def _raise(err):
     raise err
 
 
-@pytest.mark.parametrize("raises_in", ["rebuild_room", "engine_add", "input_read"])
+@pytest.mark.parametrize("raises_in", ["runtime_add", "stop_limits", "rebuild_room", "engine_add", "input_read"])
 def test_the_worker_fails_only_the_request_whose_ingest_raised(raises_in):
-    """A pinned allocation for the request's rebuild log, an engine that
-    refuses the request, or a read that raises as it starts (a CUDA OOM in
-    the H2D copy, say): the request fails, alone."""
-    registered, processed, reads = [], [], []
+    """Registration that raises (before or after the request has a handle), a
+    pinned allocation for the request's rebuild log, an engine that refuses the
+    request, or a read that raises as it starts (a CUDA OOM in the H2D copy,
+    say): the request fails, alone."""
+    registered, processed, reads, sent = [], [], [], []
     parked = SimpleNamespace(body=SimpleNamespace(request_id="wire"))
+    handles = {}
+
+    def add_request(**kw):
+        if raises_in == "runtime_add":
+            raise RuntimeError("registration failed")
+        handles[kw["request_id"]] = 5
+        return 5
+
     w = make_worker(
+        communicator=SimpleNamespace(send=lambda to, msg: sent.append(msg)),
         graph_runtime=SimpleNamespace(
-            add_request=lambda **kw: 5, get_sharding_config=lambda rid: None,
-            register_stop_limits=lambda rid, info: None,
+            add_request=add_request, get_rid_handle=handles.get, get_sharding_config=lambda rid: None,
+            register_stop_limits=lambda rid, info: (
+                _raise(RuntimeError("registration failed")) if raises_in == "stop_limits" else None
+            ),
         ),
         engine_manager=SimpleNamespace(
             engine=SimpleNamespace(publisher_nodes={}, skip_publish=lambda rid, keys: None),
@@ -89,8 +101,14 @@ def test_the_worker_fails_only_the_request_whose_ingest_raised(raises_in):
     )
     w.ingest._add_new_request(body)
     failed = w.lifecycle.take_failures()
-    assert registered == [5] and list(failed) == [5]
+    if raises_in == "runtime_add":
+        assert not failed and [msg.body.errors.keys() for msg in sent] == [{"wire"}]
+        error = sent[0].body.errors["wire"]
+    else:
+        assert not sent and list(failed) == [5]
+        error = failed[5]
+    assert registered == ([5] if raises_in in ("rebuild_room", "engine_add", "input_read") else [])
     assert reads == ([5] if raises_in == "input_read" else [])  # the read itself raised
-    assert failed[5].startswith("Error in worker: internal error (error id ")
+    assert error.startswith("Error in worker: internal error (error id ")
     # messages parked before the NEW still go through (a parked REMOVE among them)
     assert processed == [parked] and "wire" not in w.lifecycle._parked

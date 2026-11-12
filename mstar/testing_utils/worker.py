@@ -11,6 +11,7 @@ from types import SimpleNamespace
 
 import torch
 
+from mstar.distributed.base import ShardingConfig, ShardingGroup
 from mstar.profile.worker import WorkerProfileInfo
 from mstar.worker.admission import Admission
 from mstar.worker.chunk_loops import ChunkLoops
@@ -36,6 +37,19 @@ _COMPONENTS = (
 # an engine with no paged KV cache, so the default `Preemption` moves nothing
 _NO_PAGED_KV = SimpleNamespace(engine=SimpleNamespace(paged_kv_caches=list))
 _LAYOUT = frozenset(WorkerLayout.__dataclass_fields__)
+
+
+def tp_sharding(*workers: str, tp_rank: int | None = None, nodes=frozenset({"node"})) -> ShardingConfig:
+    """A request's sharding config whose one TP group, of ``workers`` in rank
+    order, serves every node and walk; with no worker named, no group, and no
+    node mapped, as the runtime answers for a node it has no mapping for."""
+    if not workers:
+        return ShardingConfig(groups=[], tp_enabled_nodes=set(), shard_dim={})
+    group = ShardingGroup(nodes=set(nodes), tp_size=len(workers), _tp_rank=tp_rank)
+    group.register_workers(list(workers))
+    config = ShardingConfig(groups=[group], tp_enabled_nodes=set(), shard_dim={})
+    config.get_sharding_group = lambda node, walk: group
+    return config
 
 
 def make_services(**overrides) -> WorkerServices:
@@ -79,7 +93,7 @@ def make_scheduler(
         side_keys=frozenset(side_keys), walk_priorities=walk_priorities or {},
         **(layout_fields or {}),
     )
-    lifecycle = RequestLifecycle(layout=layout, graph_runtime=graph_runtime)
+    lifecycle = RequestLifecycle(layout=layout, graph_runtime=graph_runtime, worker_id=services.worker_id)
     admission = Admission(services=services, layout=layout, lifecycle=lifecycle)
     lockstep = Lockstep(services=services, layout=layout, admission=admission, async_sched=async_sched)
     return MicroScheduler(
@@ -163,7 +177,9 @@ def make_worker(
         given = named.get(name, getattr(under_scheduler, name, None))
         setattr(worker, name, given if given is not None else build())
 
-    component("lifecycle", lambda: RequestLifecycle(layout=layout, graph_runtime=services.graph_runtime))
+    component("lifecycle", lambda: RequestLifecycle(
+        layout=layout, graph_runtime=services.graph_runtime, worker_id=worker_id,
+    ))
     component("admission", lambda: Admission(services=services, layout=layout, lifecycle=worker.lifecycle))
     component("lockstep", lambda: Lockstep(
         services=services, layout=layout, admission=worker.admission, async_sched=async_sched,

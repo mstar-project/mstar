@@ -630,10 +630,22 @@ class _UploadReaper:
                 while not self._due or (wait := self._due[0][0] - time.monotonic()) > 0:
                     self._cv.wait(wait if self._due else None)
                 _, _, file_paths, upload_dir = heapq.heappop(self._due)
-            try:
-                remove_uploads(file_paths, upload_dir)
-            except Exception:  # noqa: BLE001 — the other requests' cleanups still run
-                logger.exception("Deleting a request's uploads failed")
+            self._remove(file_paths, upload_dir)
+
+    def flush(self) -> None:
+        """Run every pending cleanup now: the thread is a daemon, so at exit
+        what it still waits on would never run."""
+        with self._cv:
+            due, self._due = self._due, []
+        for _, _, file_paths, upload_dir in due:
+            self._remove(file_paths, upload_dir)
+
+    @staticmethod
+    def _remove(file_paths: dict[str, list[str]], upload_dir: Path) -> None:
+        try:
+            remove_uploads(file_paths, upload_dir)
+        except Exception:  # noqa: BLE001 — the other requests' cleanups still run
+            logger.exception("Deleting a request's uploads failed")
 
 
 _REAPER = _UploadReaper()
@@ -645,6 +657,12 @@ def schedule_upload_cleanup(file_paths: dict[str, list[str]] | None, upload_dir:
     if not file_paths:
         return
     _REAPER.schedule(file_paths, upload_dir, UPLOAD_CLEANUP_DELAY_S)
+
+
+def flush_upload_cleanups() -> None:
+    """At shutdown: delete now the uploads :func:`schedule_upload_cleanup` would
+    have deleted later."""
+    _REAPER.flush()
 
 
 # ---------------------------------------------------------------------------

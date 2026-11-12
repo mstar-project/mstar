@@ -255,10 +255,18 @@ def _walk_partitions(model: Model, walk_graphs: Mapping[str, GraphSection]) -> I
 
 def _node_placement(walk_graphs: Mapping[str, GraphSection], node_groups: list[dict]) -> Iterator[str]:
     """A node of a walk in no node_group or in two (the later group silently
-    wins), a node_group naming a walk the model does not define, and a rank no
-    walk runs on: the deployment starts a worker per rank ``node_groups`` names
-    (``deployment_workers``), and this one would have nothing to do."""
+    wins), a node_group naming a node or a walk the model does not define, and
+    a rank no walk runs on: the deployment starts a worker per rank
+    ``node_groups`` names (``deployment_workers``), and this one would have
+    nothing to do."""
+    nodes = {node for graph in walk_graphs.values() for node in graph.get_nodes()}
     for i, group in enumerate(node_groups):
+        unknown_nodes = sorted(set(group["node_names"]) - nodes)
+        if unknown_nodes:
+            yield (
+                f"node_groups[{i}] lists nodes {unknown_nodes}, which no graph walk of this "
+                f"model uses with this config (nodes: {sorted(nodes)})."
+            )
         unknown = sorted(set(group.get("graph_walks", [])) - walk_graphs.keys())
         if unknown:
             yield (
@@ -551,6 +559,14 @@ def _worker_parallelism(
                 f"Resource spec {spec.resource_key} nodes {sorted(spec.nodes)} "
                 "must use the same parallel shape across replicas"
             )
+        head_problems = set()
+        for wid, nodes in deployed.items():
+            for node in spec.nodes & nodes:
+                try:
+                    spec.check_head_shards(per_worker[wid].get_joint_group_for_node(node))
+                except ValueError as exc:
+                    head_problems.add(f"Resource {spec.resource_key}: {exc}")
+        yield from sorted(head_problems)
         shared: dict[tuple[str, ...], list[str]] = {}
         for wid, nodes in deployed.items():
             local = spec.nodes & nodes

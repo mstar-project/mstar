@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, Protocol
 
 if TYPE_CHECKING:
+    from mstar.distributed.communication import JointGroups
     from mstar.engine.resources.base import Resource
 
 logger = logging.getLogger(__name__)
@@ -96,6 +97,25 @@ class RoutingMirror(Protocol):
         walk that uses the resource), so the resource may hold what it left."""
 
 
+def head_shards(group: "JointGroups | None") -> int:
+    """How many ways a node's ranks split its attention heads: its TP × SP ranks
+    (CFG ranks run whole branches, every head)."""
+    return 1 if group is None else group.tp_group.world_size * group.sp_group.world_size
+
+
+def split_heads(qo_heads: int, kv_heads: int, shards: int) -> tuple[int, int]:
+    """One rank's ``(query, KV)`` head counts with the heads split ``shards``
+    ways. Query heads divide evenly; KV heads divide evenly or, when fewer than
+    the shards, are replicated equally, so each rank's query heads share one."""
+    if shards < 1 or qo_heads % shards or max(kv_heads, shards) % min(kv_heads, shards):
+        raise ValueError(
+            f"attention heads (query={qo_heads}, key/value={kv_heads}) cannot be split "
+            f"over {shards} head shards; query heads must divide evenly and KV heads "
+            "must divide evenly or be replicated equally across ranks"
+        )
+    return qo_heads // shards, max(1, kv_heads // shards)
+
+
 @dataclass
 class NodeResourceSpec(ABC):
     resource_key: str
@@ -116,6 +136,13 @@ class NodeResourceSpec(ABC):
     def __post_init__(self):
         if not isinstance(self.nodes, set):
             self.nodes = set(self.nodes)
+
+    def check_head_shards(self, group: "JointGroups") -> None:
+        """Raise ``ValueError`` if a node of this resource on ``group`` can't
+        split its heads the way the resource's builder will, so the deployment
+        is refused at startup rather than in a worker's load. Nothing to check
+        for a resource without heads."""
+        return
 
     def depends_on(self) -> set[str]:
         """Keys whose specs this one builds against; the engine resolves them

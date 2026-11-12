@@ -359,9 +359,9 @@ class Admission:
             if too_big and could_refill():
                 self.cap_batch(batch.node_name, batch.graph_walk, alone, failed)
             logger.warning(
-                "OOM on node=%s walk=%s: offloaded victim=%s, "
+                "OOM on node=%s walk=%s: offloaded one request, "
                 "retrying %d remaining requests",
-                batch.node_name, batch.graph_walk, victim_id,
+                batch.node_name, batch.graph_walk,
                 len(batch_ids) - (1 if victim_id in batch_ids else 0),
             )
             return
@@ -387,11 +387,9 @@ class Admission:
             )
         self.log_throttled(
             self._hold_logged, (batch.node_name, batch.graph_walk),
-            "OOM on node=%s walk=%s: no offload possible, holding %s of %d "
+            "OOM on node=%s walk=%s: no offload possible, holding %d of %d "
             "requests so the retry is smaller (%d earlier holds not logged)",
-            batch.node_name, batch.graph_walk,
-            blamed if len(shed) == 1 else f"all {len(shed)}",
-            len(batch_ids),
+            batch.node_name, batch.graph_walk, len(shed), len(batch_ids),
         )
 
     def log_throttled(self, logged: dict, key, message: str, *args) -> None:

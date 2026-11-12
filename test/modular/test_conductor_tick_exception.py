@@ -299,3 +299,14 @@ def test_a_base_exception_is_not_swallowed():
     )
     with pytest.raises(KeyboardInterrupt):
         c.run()
+
+
+def test_new_request_error_before_registration_reaches_client():
+    message = ConductorMessage(message_type=ConductorMessageType.NEW_REQUEST,
+                               body=SimpleNamespace(request_id="new"))
+    c = _conductor([message], requests={})
+    def fail_before_registration(body):
+        raise RuntimeError("admission failed")
+    c._ingest_request = fail_before_registration
+    _run(c)
+    assert _to_client(c, "request_failed")["new"].status == 500

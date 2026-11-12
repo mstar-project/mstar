@@ -50,7 +50,8 @@ new ones are refused, the HTTP server stops and the process exits non-zero. Each
 also watches its parent and exits if the conductor is gone, so a conductor that is killed
 outright cannot leave workers behind holding GPU memory. The conductor watches the API
 server the same way, so an API server that is killed outright takes the whole deployment
-down with it. SIGINT and SIGTERM shutdowns are unaffected.
+down with it. SIGINT and SIGTERM shutdowns are unaffected. On either, the HTTP server gives
+requests in flight 30 seconds to finish, then cuts them.
 
 Core design principles
 ----------------------

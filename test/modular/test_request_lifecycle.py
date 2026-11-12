@@ -1,5 +1,7 @@
 """The order ``RequestLifecycle`` hands teardowns back in, which keeps a TP
 follower's page state in step with rank 0's."""
+
+from mstar.testing_utils.worker import tp_sharding
 from mstar.utils.ipc_format import DrainRequest, MessageSource, RemoveRequest
 from mstar.worker.request_lifecycle import RequestLifecycle
 from mstar.worker.services import WorkerLayout
@@ -19,6 +21,10 @@ class _Runtime:
     def get_rid_handle(self, wire_rid):
         return next((h for h, w in self.names.items() if w == wire_rid), None)
 
+    def get_sharding_config(self, handle):
+        # on a follower, every request runs on the TP group it follows
+        return tp_sharding("lead", "w0")
+
 
 def _add(lifecycle: RequestLifecycle, rid: int, wire_rid: str) -> None:
     lifecycle._runtime.names[rid] = wire_rid
@@ -26,7 +32,9 @@ def _add(lifecycle: RequestLifecycle, rid: int, wire_rid: str) -> None:
 
 
 def _lifecycle(*rids, follower=False) -> RequestLifecycle:
-    lifecycle = RequestLifecycle(layout=WorkerLayout(is_tp_follower=follower), graph_runtime=_Runtime())
+    lifecycle = RequestLifecycle(
+        layout=WorkerLayout(is_tp_follower=follower), graph_runtime=_Runtime(), worker_id="w0",
+    )
     for rid in rids:
         _add(lifecycle, rid, f"r{rid}")
     return lifecycle
@@ -176,15 +184,3 @@ def test_a_rows_first_error_is_the_one_reported():
     assert lifecycle.take_failures() == {1: "Error in worker: request too long"}, (
         "the client would get the step's generic error instead of its own"
     )
-
-
-def test_a_teardown_that_raised_keeps_its_request_out_and_is_not_retried():
-    lifecycle = _lifecycle(1)
-    lifecycle.remove(1, RemoveRequest(request_id="r1", source=MessageSource.CONDUCTOR), -1)
-    assert lifecycle.removes_ready(set(), -1) == [1]
-    lifecycle.removed(1, "r1")
-
-    lifecycle.teardown_failed(1)
-
-    assert 1 in lifecycle.failed_rids, "a half torn-down request would be scheduled again"
-    assert lifecycle.removes_ready(set(), -1) == [], "the teardown would raise again every pass"

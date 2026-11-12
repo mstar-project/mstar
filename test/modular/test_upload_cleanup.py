@@ -36,3 +36,21 @@ def test_a_short_delay_after_a_long_one_is_not_held_behind_it(tmp_path, monkeypa
     monkeypatch.setattr(media_io, "UPLOAD_CLEANUP_DELAY_S", 0.0)
     media_io.schedule_upload_cleanup({"image": [str(soon)]}, tmp_path)
     assert _gone([soon]) and late.exists()
+
+
+def test_shutdown_deletes_the_uploads_still_waiting_for_their_delay(tmp_path, monkeypatch):
+    """The cleanup thread is a daemon: at exit, deletes it still waits on never run."""
+    from types import SimpleNamespace
+
+    from api_server_helpers import make_test_api_server
+
+    upload = tmp_path / "clip.wav"
+    upload.write_bytes(b"x")
+    monkeypatch.setattr(media_io, "UPLOAD_CLEANUP_DELAY_S", 300.0)
+    media_io.schedule_upload_cleanup({"audio": [str(upload)]}, tmp_path)
+    server = make_test_api_server(
+        upload_dir=tmp_path, _msg_thread=SimpleNamespace(is_alive=lambda: False),
+        preprocess_worker=SimpleNamespace(shutdown=lambda: None, results_wakeup=SimpleNamespace(signal=lambda: None)),
+    )
+    server.cleanup()
+    assert not upload.exists()

@@ -38,9 +38,10 @@ _NONE: frozenset[int] = frozenset()
 
 
 class RequestLifecycle:
-    def __init__(self, layout: WorkerLayout, graph_runtime):
+    def __init__(self, layout: WorkerLayout, graph_runtime, worker_id: str):
         self._is_tp_follower = layout.is_tp_follower
         self._runtime = graph_runtime
+        self._worker_id = worker_id
 
         # rid -> the order requests arrived at this worker in. Also which rids
         # are admitted here and not yet torn down: the runtime keeps a handle
@@ -109,6 +110,15 @@ class RequestLifecycle:
         After READS_DONE the producer may free what it sent."""
         return wire_rid not in self._reads_done_sent
 
+    def _follows(self, rid: int) -> bool:
+        """Whether a leader forwards ``rid``'s teardown here. A follower worker
+        can also run a request whose TP replica is another one, on a node it
+        follows no leader for; that request takes the conductor's teardown."""
+        if not self._is_tp_follower:
+            return False
+        sharding = self._runtime.get_sharding_config(rid)
+        return sharding is not None and sharding.follows_leader(self._worker_id)
+
     # -- failure -------------------------------------------------------------
 
     def fail(self, errors: dict[int, str]) -> None:
@@ -134,7 +144,7 @@ class RequestLifecycle:
         """A REMOVE for a request this worker holds. A follower takes only rank
         0's, to tear down in rank 0's order; it can't release pages rank 0
         released between two steps until it has consumed the earlier one."""
-        if not self._is_tp_follower:
+        if not self._follows(rid):
             self.pending_removes.setdefault(rid, -1)
         elif body.source == MessageSource.TP_RANK_0:
             self._removes_awaiting_step.setdefault(body.after_tp_seq, []).append(rid)
@@ -147,21 +157,23 @@ class RequestLifecycle:
 
     def removes_ready(self, in_flight: Collection[int], last_consumed_seq: int) -> list[int]:
         """The requests to tear down now, in order; each stays pending until
-        ``removed``, so a teardown that raises doesn't lose the ones after it. A
-        step holding a rid defers its remove; on a follower it also defers the
-        ones after it, which rank 0 tore down later. The free list hands pages
-        back out in the order they were freed."""
+        ``removed`` (a teardown that raises stops the worker). A step holding
+        a rid defers its remove; on a follower it also defers the followed ones
+        after it, which rank 0 tore down later. The free list hands pages back
+        out in the order they were freed."""
         self._land_removes(last_consumed_seq)
         if not self.pending_removes:
             return []
         ready = []
         # A remove replayed from the parking lot can arrive after a later stamp.
         pending = self.pending_removes
+        held_back = False
         for rid in sorted(pending, key=pending.__getitem__) if self._is_tp_follower else pending:
-            if rid not in in_flight:
+            follows = self._follows(rid)
+            if rid in in_flight:
+                held_back |= follows
+            elif not (follows and held_back):
                 ready.append(rid)
-            elif self._is_tp_follower:
-                break
         return ready
 
     def removed(self, rid: int | None, wire_rid: str) -> Iterable[WorkerMessage]:
@@ -183,13 +195,6 @@ class RequestLifecycle:
         self._removed.add(wire_rid)
         return self._parked.pop(wire_rid, ())
 
-    def teardown_failed(self, rid: int) -> None:
-        """A teardown that raised after ``removed``: the request's state is
-        partly gone, so it takes no more work. It is not retried, since it would
-        likely raise again every pass, and its handle is never freed (that is
-        the teardown's last step), so no later request inherits the mark."""
-        self.failed_rids.add(rid)
-
     # -- drains --------------------------------------------------------------
 
     def drain(self, body: DrainRequest) -> None:
@@ -197,10 +202,8 @@ class RequestLifecycle:
         but for a request never admitted here: the conductor sends a NEW_REQUEST
         ahead of its drain on one FIFO socket, so the leader has no handle either
         and forwards nothing."""
-        if (
-            not self._is_tp_follower or body.source == MessageSource.TP_RANK_0
-            or self._handle(body.request_id) is None
-        ):
+        handle = self._handle(body.request_id)
+        if handle is None or not self._follows(handle) or body.source == MessageSource.TP_RANK_0:
             self.pending_drains.add(body.request_id)
 
     def drains_ready(self, in_flight: Collection[int]) -> list[str]:

@@ -399,6 +399,7 @@ def test_intake_journals_each_log_rank_0s_pool_couldnt_hold_once_the_engine_hold
     w.engine_manager.add_request = add_request
     w._graph_runtime.add_request, w._graph_runtime.get_sharding_config = lambda request_id, **kw: int(request_id), id
     w._graph_runtime.register_stop_limits = lambda rid, info: None
+    w._graph_runtime.get_rid_handle = int
     w.request_state.add_request, w.request_state.per_request_info = lambda rid, info: None, defaultdict(dict)
     w.tensor_manager.register_request, w.tensor_manager.start_read_tensors = lambda *a: None, lambda *a, **k: []
 

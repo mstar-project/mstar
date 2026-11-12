@@ -446,12 +446,7 @@ class Lockstep:
         sharding = self._runtime.get_sharding_config(rid)
         if sharding is None:
             return
-        followers: set[str] = set()
-        for group in sharding.groups:
-            # rank-ordered; index 0 is this worker when it is rank 0
-            if group.tp_size > 1 and group._tp_rank == 0:
-                followers.update(group._workers[1:])
-        for worker in followers:
+        for worker in sharding.followers_of(self._worker_id):
             self._communicator.send(worker, msg=message)
 
     def enqueue_follow(self, message: ScheduleTPNode) -> None:

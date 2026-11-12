@@ -50,7 +50,7 @@ from mstar.engine.resources.runner import StepRunner
 from mstar.engine.resources.step import FULL_ADMIT_OK, AllocationFailed, Segment, StepContext, SubmoduleStep
 from mstar.testing_utils.engine import make_engine, make_mgmt
 from mstar.testing_utils.resource import StubResource
-from mstar.testing_utils.worker import deliver, make_scheduler, make_worker
+from mstar.testing_utils.worker import deliver, make_scheduler, make_worker, tp_sharding
 from mstar.utils.ipc_format import (
     MessageSource,
     Move,
@@ -965,7 +965,9 @@ def _consume(rank, seq: int) -> None:
 
 def _remove_rank(consumed: int, *, follower: bool = True) -> Worker:
     """A rank whose lifecycle orders a forwarded removal against the step stream."""
-    rank = make_worker(engine_manager=SimpleNamespace(), is_tp_follower=follower)
+    # each request runs on the TP group a follower follows
+    runtime = SimpleNamespace(get_sharding_config=lambda rid: tp_sharding("rank0", "w0"))
+    rank = make_worker(engine_manager=SimpleNamespace(), is_tp_follower=follower, graph_runtime=runtime)
     if consumed >= 0:
         _consume(rank, consumed)
     return rank
@@ -1033,16 +1035,16 @@ def test_held_removals_land_in_step_order():
 
 def _forwarding_leader(broadcast_seq: int) -> Worker:
     """Rank 0's real removal, over stubs, to pin what it forwards."""
-    group = SimpleNamespace(tp_size=2, _tp_rank=0, _workers=["rank0", "rank1"])
     sent: list = []
     request_state = SimpleNamespace(remove_request=lambda rid: None)
     tensor_manager = SimpleNamespace(force_cleanup_request=lambda rid: None)
     leader = make_worker(
+        worker_id="rank0",
         # ``remove_request`` here is what frees the handle
         graph_runtime=SimpleNamespace(
             get_rid_handle=lambda rid: 0 if rid == "gone" else None,
             get_rid_string=lambda handle: "gone" if handle == 0 else None,
-            get_sharding_config=lambda rid: SimpleNamespace(groups=[group]),
+            get_sharding_config=lambda rid: tp_sharding("rank0", "rank1", tp_rank=0),
             remove_request=lambda rid: None,
         ),
         request_state=request_state,

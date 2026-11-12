@@ -174,7 +174,8 @@ def test_enable_reasoner_false_serves_generator_only(tmp_path) -> None:
 
 
 def test_edge_yaml_splits_worker_graphs(tmp_path) -> None:
-    model = _model(tmp_path)
+    # the yaml serves windowed video, so it places vae_decoder_ar
+    model = _model(tmp_path, enable_windowed_video=True)
     graphs = model.get_worker_graphs(str(CONFIGS / "cosmos3_edge.yaml"))
     by_walk = {}
     for wg in graphs:

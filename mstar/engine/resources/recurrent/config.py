@@ -6,15 +6,17 @@ layer, so capacity is a slot count and a fork is a fixed-size copy.
 """
 
 from abc import ABC, abstractmethod
+from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING
 
 import torch
 
-from mstar.engine.resources.spec import NodeResourceSpec, check_sizes
+from mstar.engine.resources.spec import NodeResourceSpec, check_sizes, head_shards
 from mstar.engine.resources.step import ResourceStep
 
 if TYPE_CHECKING:
+    from mstar.distributed.communication import JointGroups
     from mstar.engine.resources.base import Resource
 
 
@@ -45,11 +47,14 @@ class RecurrentBlockConfig:
         return self.dtype or kv_dtype or torch.get_default_dtype()
 
     def shard(self, num_shards: int) -> None:
-        from mstar.distributed.utils import divide
-
         shape = list(self._unsharded_shape)
         for dim in self.shard_dims:
-            shape[dim] = divide(self._unsharded_shape[dim], num_shards)
+            if shape[dim] % num_shards:
+                raise ValueError(
+                    f"recurrent state shape {self._unsharded_shape} cannot be split over "
+                    f"{num_shards} head shards on axis {dim}"
+                )
+            shape[dim] //= num_shards
         self.shape = tuple(shape)
 
 
@@ -342,6 +347,9 @@ class RecurrentStateConfig:
 @dataclass
 class RecurrentStateSpec(NodeResourceSpec):
     config: RecurrentStateConfig
+
+    def check_head_shards(self, group: "JointGroups") -> None:
+        deepcopy(self.config).shard(head_shards(group))  # the builder shards the model's own blocks
 
     @property
     def resource_class(self) -> "type[Resource]":

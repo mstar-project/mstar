@@ -4,16 +4,18 @@ Kept free of the manager and its kernels, like the other resources' configs, so
 a submodule can declare a step without pulling FlashInfer in behind it.
 """
 
+from copy import copy
 from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING
 
 import torch
 
-from mstar.engine.resources.spec import NodeResourceSpec
+from mstar.engine.resources.spec import NodeResourceSpec, head_shards, split_heads
 from mstar.engine.resources.step import ResourceStep
 
 if TYPE_CHECKING:
+    from mstar.distributed.communication import JointGroups
     from mstar.engine.resources.base import Resource
 
 
@@ -122,14 +124,16 @@ class RaggedAttentionConfig:
 
         Idempotent, so a rebuild (or a second manager over one config) is free.
         """
-        from mstar.distributed.utils import divide
+        self.num_qo_heads, self.num_kv_heads = split_heads(
+            self._unsharded_qo_heads, self._unsharded_kv_heads, num_shards,
+        )
 
-        if num_shards >= self._unsharded_kv_heads:
-            # fewer KV heads than ranks — every rank replicates one
-            self.num_kv_heads = 1
-        else:
-            self.num_kv_heads = divide(self._unsharded_kv_heads, num_shards)
-        self.num_qo_heads = divide(self._unsharded_qo_heads, num_shards)
+    def head_shards(self, group: "JointGroups | None") -> int:
+        """The ways ``group`` splits these heads: TP alone when they stay whole
+        on each SP rank (``shard_over_sp``)."""
+        if self.shard_over_sp or group is None:
+            return head_shards(group)
+        return group.tp_group.world_size
 
     def max_segments_for(self, bs: int) -> int:
         if self.max_segments_per_step is not None:
@@ -147,6 +151,9 @@ class _RaggedSpecBase(NodeResourceSpec):
     """The config and deployment overrides both ragged specs share."""
 
     config: RaggedAttentionConfig
+
+    def check_head_shards(self, group: "JointGroups") -> None:
+        copy(self.config).shard(self.config.head_shards(group))  # the builder shards the model's own
 
     def apply_yaml_overrides(
         self,

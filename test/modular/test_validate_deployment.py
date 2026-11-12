@@ -421,7 +421,7 @@ _TP2 = {"ranks": [0, 1], "tp_size": 2}
 
 def _kv(key, nodes):
     return KVSpec(resource_key=key, nodes=set(nodes), config=PagedKVConfig(
-        num_layers=1, num_kv_heads=2, head_dim=8, max_seq_len=64,
+        num_layers=1, num_qo_heads=12, num_kv_heads=2, head_dim=8, max_seq_len=64,
     ))
 
 
@@ -725,3 +725,60 @@ def test_worker_graph_problems_are_reported_together(tmp_path):
     assert problems[2] == (
         "Resource spec kv nodes ['llm', 'post'] must use the same parallel shape across replicas"
     )
+
+
+@pytest.mark.parametrize("value", [0, -1, "64", True])
+def test_concurrency_limit_must_be_a_positive_integer(tmp_path, value):
+    problems = _problems(_Model(), _cfg(tmp_path, max_concurrent_requests=value))
+    assert any("max_concurrent_requests" in p for p in problems)
+
+
+def _head_spec(kind, qo_heads, kv_heads):
+    """A resource whose heads (a recurrent state's shard axis) a node's TP splits."""
+    from mstar.engine.resources.attn.ragged.config import RaggedAttentionConfig, RaggedAttentionSpec
+    from mstar.engine.resources.recurrent.config import RecurrentBlockConfig, RecurrentStateConfig, RecurrentStateSpec
+
+    if kind == "kv":
+        return KVSpec(resource_key="kv", nodes={"llm"}, config=PagedKVConfig(
+            num_layers=1, num_qo_heads=qo_heads, num_kv_heads=kv_heads, head_dim=8, max_seq_len=64,
+        ))
+    if kind == "bounded":
+        from mstar.engine.resources.kv.bounded.config import BoundedKVConfig, BoundedKVSpec, SinkWindow
+
+        return BoundedKVSpec(resource_key="enc", nodes={"llm"}, config=BoundedKVConfig(
+            num_layers=1, num_heads=qo_heads, head_dim=8, rows_per_request=1, max_source_len=0,
+            retention=SinkWindow(0, 4),
+        ))
+    if kind == "ragged":
+        return RaggedAttentionSpec(resource_key="vit", nodes={"llm"}, config=RaggedAttentionConfig(
+            num_qo_heads=qo_heads, num_kv_heads=kv_heads, head_dim=8,
+        ))
+    block = RecurrentBlockConfig(shape=(qo_heads, 4), dtype=None, shard_dims=(0,))
+    return RecurrentStateSpec(resource_key="state", nodes={"llm"}, config=RecurrentStateConfig(
+        num_layers=1, blocks={"state": block},
+    ))
+
+
+@pytest.mark.parametrize("kind,qo_heads,kv_heads,degree,valid", [
+    ("kv", 8, 2, 3, False), ("kv", 6, 3, 3, True), ("kv", 12, 3, 4, False), ("kv", 8, 2, 4, True),
+    # 6 query heads over 3 ranks: each rank's 2 would read 2 different KV heads
+    ("ragged", 6, 2, 3, False), ("ragged", 6, 3, 3, True),
+    ("recurrent", 8, None, 3, False), ("recurrent", 6, None, 3, True),
+    ("bounded", 4, None, 2, False), ("bounded", 4, None, 1, True),
+])
+def test_head_geometry_is_checked_before_workers_start(tmp_path, kind, qo_heads, kv_heads, degree, valid):
+    spec = _head_spec(kind, qo_heads, kv_heads)
+    model = _Model(specs=[spec], kv_labels={"kv": {"main": KVLabel()}} if kind == "kv" else None,
+                   tp_enabled_nodes=["llm"])
+    cfg = _cfg(tmp_path, [{"node_names": ["llm"], "ranks": list(range(degree)), "tp_size": degree}])
+    if valid:
+        _validate(model, cfg)
+    else:
+        problems = _problems(model, cfg)
+        assert any(spec.resource_key in problem for problem in problems), problems
+    assert spec.config == _head_spec(kind, qo_heads, kv_heads).config, "the check sharded the model's own config"
+
+
+def test_node_group_typo_is_not_silently_ignored(tmp_path):
+    config = _cfg(tmp_path, node_groups=[{"node_names": ["llm", "typo"], "ranks": [0]}])
+    assert any("typo" in p for p in _problems(_Model(), config))

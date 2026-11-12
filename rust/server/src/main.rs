@@ -47,10 +47,10 @@ mod ws;
 
 use client_errors::scrub_paths;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::convert::Infallible;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use axum::{
     body::{Body, Bytes},
@@ -267,6 +267,7 @@ async fn main() {
         .with_graceful_shutdown(shutdown_signal())
         .await
         .unwrap();
+    remove_pending_uploads();
 }
 
 /// SIGTERM/SIGINT: stop accepting, drain in-flight requests, exit — with a
@@ -289,6 +290,7 @@ async fn shutdown_signal() {
     tokio::spawn(async {
         tokio::time::sleep(std::time::Duration::from_secs(30)).await;
         eprintln!("mstar-server: drain deadline reached, exiting");
+        remove_pending_uploads();
         std::process::exit(0);
     });
 }
@@ -550,6 +552,17 @@ impl Drop for DeferredCleanup {
     }
 }
 
+/// Uploads waiting out their 60 s; shutdown deletes what is left, since the
+/// sleeping tasks die with the runtime.
+static PENDING_UPLOADS: Mutex<Option<HashSet<PathBuf>>> = Mutex::new(None);
+
+fn remove_pending_uploads() {
+    let files = PENDING_UPLOADS.lock().unwrap().take();
+    for f in files.into_iter().flatten() {
+        let _ = std::fs::remove_file(f);
+    }
+}
+
 /// Delete a request's persisted media 60 s after translation, matching
 /// mstar's deferred upload cleanup. Only files under `upload_dir` are deleted.
 fn schedule_upload_cleanup(upload_dir: &std::path::Path, args: &SubmitArgs) {
@@ -563,10 +576,14 @@ fn schedule_upload_cleanup(upload_dir: &std::path::Path, args: &SubmitArgs) {
     if files.is_empty() {
         return;
     }
+    PENDING_UPLOADS.lock().unwrap().get_or_insert_default().extend(files.iter().cloned());
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
         for f in files {
-            let _ = std::fs::remove_file(f);
+            let _ = std::fs::remove_file(&f);
+            if let Some(pending) = PENDING_UPLOADS.lock().unwrap().as_mut() {
+                pending.remove(&f);
+            }
         }
     });
 }
@@ -2046,8 +2063,12 @@ fn ndjson_line(c: &ResultChunk) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    // PENDING_UPLOADS is process-wide: tests that schedule uploads take turns.
+    static UPLOADS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[tokio::test(start_paused = true)]
     async fn a_speech_clip_is_removed_once_the_last_piece_is_done_with_it() {
+        let _turn = UPLOADS.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("mstar_cleanup_{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&dir).unwrap();
         let clip = dir.join("ref.wav");
@@ -2066,6 +2087,22 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         tokio::task::yield_now().await;
         assert!(!clip.exists(), "never removed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_removes_the_uploads_still_waiting_for_their_grace() {
+        let _turn = UPLOADS.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("mstar_cleanup_{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let clip = dir.join("shutdown.wav");
+        std::fs::write(&clip, b"RIFF").unwrap();
+        let mut args = super::SubmitArgs::default();
+        args.file_paths.insert("audio".into(), vec![clip.to_string_lossy().into_owned()]);
+        super::schedule_upload_cleanup(&dir, &args);
+        assert!(clip.exists());
+        super::remove_pending_uploads();
+        assert!(!clip.exists(), "left behind at shutdown");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

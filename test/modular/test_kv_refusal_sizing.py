@@ -33,7 +33,7 @@ from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.spec import resolve_spec_dependencies
 from mstar.engine.resources.step import AdmitRuntimeError, AllocationFailed, Segment, StepContext
 from mstar.testing_utils.engine import make_engine
-from mstar.testing_utils.worker import bound, deliver, make_worker
+from mstar.testing_utils.worker import bound, deliver, make_worker, tp_sharding
 from mstar.utils.ipc_format import RemoveRequest, WorkerMessage, WorkerMessageType
 from mstar.worker.micro_scheduler import ScheduledBatch
 from mstar.worker.stream_buffers import StreamBufferManager
@@ -367,7 +367,7 @@ def _teardown_over(sched, known_rids, engine_manager):
     runtime = SimpleNamespace(
         get_rid_handle=lambda rid: rid if rid in known_rids else None,
         get_rid_string=lambda rid: rid,
-        get_sharding_config=lambda rid: SimpleNamespace(groups=[]),
+        get_sharding_config=lambda rid: tp_sharding(),
         remove_request=lambda rid: None,
     )
     bound(sched, runtime=runtime)

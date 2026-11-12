@@ -7,14 +7,23 @@ without pulling FlashInfer in behind it.
 import math
 from abc import ABC, abstractmethod
 from collections.abc import Collection, Iterable, Mapping, Sequence
+from copy import copy
 from dataclasses import dataclass, field, replace
 from enum import Enum, StrEnum
 from typing import TYPE_CHECKING, NamedTuple
 
-from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig, RoutingContext, check_sizes
+from mstar.engine.resources.spec import (
+    NodeResourceSpec,
+    ResourceReqConfig,
+    RoutingContext,
+    check_sizes,
+    head_shards,
+    split_heads,
+)
 from mstar.engine.resources.step import ResourceStep
 
 if TYPE_CHECKING:
+    from mstar.distributed.communication import JointGroups
     from mstar.engine.resources.base import Resource
 
 
@@ -64,14 +73,9 @@ class KVConfig(ABC):
         ``num_shards`` is the instance session size (tp * sp): Ulysses SP
         all-to-alls heads, so attention runs at head-degree tp*sp.
         """
-        from mstar.distributed.utils import divide
-
-        if num_shards >= self._unsharded_kv_heads:
-            # fewer KV heads than ranks — every rank holds a replicated head
-            self.num_kv_heads = 1
-        else:
-            self.num_kv_heads = divide(self._unsharded_kv_heads, num_shards)
-        self.num_qo_heads = divide(self._unsharded_qo_heads, num_shards)
+        self.num_qo_heads, self.num_kv_heads = split_heads(
+            self._unsharded_qo_heads, self._unsharded_kv_heads, num_shards,
+        )
 
     @abstractmethod
     def apply_yaml_overrides(self, **kwargs) -> None:
@@ -719,6 +723,9 @@ class KVSpec(NodeResourceSpec):
     # Under CFG parallel, the node whose pool admits each request. The other nodes' pools hold no
     # more pages per request than the leader's, as long as the leader offloads nothing.
     leader: str | None = None
+
+    def check_head_shards(self, group: "JointGroups") -> None:
+        copy(self.config).shard(head_shards(group))  # the builder shards the model's own
 
     @property
     def resource_class(self) -> "type[Resource]":

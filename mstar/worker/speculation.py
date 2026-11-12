@@ -319,6 +319,14 @@ class SpeculationBuilder:
             ctx.scheduler.label_for(spec_node, request_walks) if request_walks
             else (spec_target.graph_walk, {})
         )
+        if not request_walks and label != spec_target.graph_walk:
+            # Every row of the target's walk ended at N, so this is a step of
+            # its rows' own walk: it routes that walk's outputs and continues
+            # no row of the target's loop, like a step built for those rows.
+            spec_target = SpeculationOutput(
+                node_name=spec_node, graph_walk=label,
+                output_signals=tuple(self._walk_output_signals(spec_node, label, spec_target)),
+            )
         spec_batch = ScheduledBatch(
             node_name=spec_node,
             graph_walk=label,
@@ -334,7 +342,8 @@ class SpeculationBuilder:
                 for walk in set(request_walks.values())
             },
             # Reported by whichever step chose the target -- speculate_node on
-            # the leader, get_spec_target on a follower -- so the hot path does
+            # the leader, get_spec_target on a follower, or the rebuild above
+            # for a step that collapsed to another walk -- so the hot path does
             # not cross back into the runtime once per forward pass.
             output_signals=spec_target.output_signals,
             tp_seq=tp_seq,
@@ -741,6 +750,18 @@ class Speculator:
             ),
         )
         laps.lap("fresh_schedule")
+
+        if not continuing and (
+            fresh_batch is None
+            or fresh_batch.request_to_worker_graph.keys().isdisjoint(batch_N.request_to_worker_graph)
+        ):
+            # The token budget left out every row of N mid-prefill, so the step
+            # holds no row of N. It does not follow N: run it as a step of its
+            # own, under its own walk. Sent as N's head, a TP follower finds no
+            # row of N to follow it by.
+            # With no continuing row the prep staged nothing to undo, as for
+            # the return above.
+            return None if fresh_batch is None else self._yield_away_speculation(fresh_batch, gave_way=True)
 
         if fresh_batch is not None:
             # The merge below relabels these node objects with the spec

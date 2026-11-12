@@ -29,7 +29,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from mstar.engine.resources.kv.cache import PageAllocator  # noqa: E402
-from mstar.testing_utils.worker import make_worker
+from mstar.testing_utils.worker import make_worker, tp_sharding
 from mstar.utils.ipc_format import (  # noqa: E402
     MessageSource,
     RemoveRequest,
@@ -114,7 +114,7 @@ def _rank(
     ))
     log: list[tuple] = []
     torn_down = threading.Event()
-    group = SimpleNamespace(tp_size=2, _tp_rank=tp_rank, _workers=["rank0", "rank1"])
+    sharding = tp_sharding("rank0", "rank1", tp_rank=tp_rank)
     wire = {handle: rid for rid, handle in HANDLES.items()}
 
     def _tear_down(handle):
@@ -135,7 +135,7 @@ def _rank(
         profile_info=SimpleNamespace(pop_request=lambda rid: None),
         graph_runtime=SimpleNamespace(
             get_rid_handle=HANDLES.get, get_rid_string=wire.get,
-            get_sharding_config=lambda rid: SimpleNamespace(groups=[group]),
+            get_sharding_config=lambda rid: sharding,
             remove_request=lambda rid: None,
         ),
         engine_manager=SimpleNamespace(warmup_all=lambda: None, remove_request=_tear_down),
@@ -269,7 +269,10 @@ def test_a_follower_tears_down_what_a_head_with_no_rows_released_before_it_build
     freed. A follower whose first try at a step away from its own chain takes the step with no rows tears "gone"
     down before its second try builds N+1, as rank 0 did before it sent N+1."""
     log = []
-    w = make_worker(is_tp_follower=True)
+    w = make_worker(
+        is_tp_follower=True,
+        graph_runtime=SimpleNamespace(get_sharding_config=lambda rid: tp_sharding("rank0", "w0")),
+    )
     w.lifecycle.add(HANDLES["gone"], "gone")
     removal = RemoveRequest(request_id="gone", source=MessageSource.TP_RANK_0, after_tp_seq=0)
     w.lifecycle.remove(HANDLES["gone"], removal, w.lockstep.last_consumed_seq)

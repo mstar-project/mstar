@@ -252,9 +252,9 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
      - *(optional)* Per-resource overrides, keyed by the model's resource names (see
        below).
    * - ``max_concurrent_requests``
-     - *(optional)* How many requests run at once. Requests past the cap wait in the
-       conductor's queue, except a live call (open client input), which is refused with
-       a 503.
+     - *(optional)* How many requests run at once, a positive integer. Requests past
+       the cap wait in the conductor's queue, except a live call (open client input),
+       which is refused with a 503.
    * - ``unpausable_outputs``
      - *(optional)* The output modalities a pause would break, such as ``[audio]``. A request
        that streams one of them reserves its whole KV footprint and is never preempted once it

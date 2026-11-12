@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from mstar.testing_utils.worker import deliver, make_scheduler, make_worker
+from mstar.testing_utils.worker import deliver, make_scheduler, make_worker, tp_sharding
 from mstar.utils.ipc_format import (
     ConductorMessageType,
     MessageSource,
@@ -151,7 +151,7 @@ def _worker(
     runtime.add_request = lambda request_id, **kw: t.intern(request_id)
     runtime.register_stop_limits = lambda rid, info: None
     runtime.get_rid_handle, runtime.get_rid_string = t.handle, t.name
-    runtime.get_sharding_config = lambda h: SimpleNamespace(groups=[])
+    runtime.get_sharding_config = lambda h: tp_sharding()
     runtime.remove_request = _runtime_remove
     request_state.per_request_info = {t.intern(r): SimpleNamespace() for r in rids}
     for r in rids:
@@ -208,24 +208,22 @@ def test_remove_purges_handle_keyed_state_then_frees_the_handle():
     assert t.intern("req-c") == a
 
 
-def test_a_request_whose_engine_teardown_raises_stays_out_of_the_schedule():
+def test_a_teardown_that_raises_stops_the_worker_instead_of_failing_other_requests():
     def remove_request(h):
         raise RuntimeError("engine teardown failed")
 
-    w, t = _worker(
+    w, _ = _worker(
         "req-a", "req-b", engine_manager=SimpleNamespace(remove_request=remove_request),
         tensor_manager=SimpleNamespace(force_cleanup_request=lambda h: None),
     )
-    a = t.handle("req-a")
 
-    with pytest.raises(RuntimeError, match="engine teardown failed"):
+    # SystemExit passes the main loop's ``except Exception``, which would fail
+    # the step in flight (req-b's) for a release that may have leaked pages.
+    with pytest.raises(SystemExit, match="teardown of request req-a"):
         deliver(w, WorkerMessage(
             WorkerMessageType.REMOVE_REQUEST, RemoveRequest(request_id="req-a", source=MessageSource.SELF),
         ))
-
-    assert a in w.lifecycle.failed_rids, "next_batch could hand out a request whose state is half gone"
-    assert not w.lifecycle.removes_ready(set(), -1), "the teardown would be retried every pass"
-    assert t.handle("req-a") == a, "the handle was freed, so a later request would inherit the exclusion"
+    assert not w.sent, "the worker stops; the conductor's dead-worker check fails what is left"
 
 
 def test_remove_for_an_unknown_request_is_a_no_op():
