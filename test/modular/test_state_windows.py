@@ -45,7 +45,6 @@ from mstar.engine.state import (
     FrameWindow,
     KeptWindow,
     KVEntry,
-    Layout,
     Positions,
     Read,
     Rope,
@@ -58,7 +57,7 @@ from mstar.engine.state import (
     positions,
     rope,
 )
-from mstar.engine.state.adapters import RingHandle, build_specs, kv_layouts, node_handles, state_steps
+from mstar.engine.state.adapters import RingHandle, build_specs, node_handles, state_steps
 from mstar.engine.state.analysis import state_declaration_problems
 from mstar.engine.state.calls import kernel_setting
 from mstar.graph.base import GraphNode, Loop
@@ -97,20 +96,6 @@ def _read(mask, **fields) -> Read:
 def test_a_window_refuses_its_own_bad_fields(make, message):
     with pytest.raises(ValueError, match=f"^{message}$"):
         make()
-
-
-def test_a_kept_window_has_no_layout_until_it_is_bound():
-    kept = Bidirectional(kept_window=True)
-    for arrays in (
-        [_array(reads={"attn": _read(kept)})],
-        [_array(reads={"attn": _read(kept, walks={"a"}), "other": _read(Causal(), walks={"b"})})],
-        [_array("q", reads={"own": _read(Causal())}), _array(reads={"attn": _read(kept, queries="q")})],
-    ):
-        with pytest.raises(ValueError, match=r"Array 'kv': no layout yet: reads\['attn'\].mask keeps a window"):
-            build_specs(arrays)
-    plain = _array(reads={"attn": _read(Causal())})
-    with pytest.raises(ValueError, match="no layout yet: label 'main' gives kept_windows"):
-        kv_layouts([plain], {"kv": {"main": Layout(kept_windows={"attn": KeptWindow(4, window=8)})}}, {})
 
 
 class _Model:

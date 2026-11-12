@@ -23,6 +23,7 @@ from mstar.engine.resources.attn.config import (
     CrossAttentionSpec,
 )
 from mstar.engine.resources.attn.ragged.config import (
+    KeptWindowAttentionSpec,
     RaggedAttentionConfig,
     RaggedAttentionSpec,
     RaggedCrossAttentionSpec,
@@ -34,6 +35,7 @@ from mstar.engine.resources.kv.config import (
     KVSpec,
     KVStep,
     PagedKVConfig,
+    RetentionPolicy,
     RingKVConfig,
     RingKVLayerConfig,
     RingKVStep,
@@ -80,6 +82,7 @@ from mstar.engine.state.contract import (
     GatedDeltaNet,
     KVEntry,
     Layout,
+    Mask,
     Op,
     PagedNHDTarget,
     Positions,
@@ -519,7 +522,7 @@ def kv_layouts(
                 raise RuntimeError(f"{where}[{name!r}]: labels {sorted(undeclared)} aren't in Array {name!r}.labels")
     converted = {}
     for name, by_label in state_layout.items():
-        layouts = storage_of(arrays[name]).layouts(by_label, keyed_spans.get(name, EMPTY))
+        layouts = storage_of(arrays[name]).layouts(arrays[name], by_label, keyed_spans.get(name, EMPTY))
         if layouts is not None:
             converted[name] = layouts
     for name, by_label in keyed_spans.items():
@@ -572,6 +575,14 @@ class OpBinding:
         """Raise ``ValueError`` on what today's resources can't run, naming ``array``."""
         return
 
+    def for_mask(self, mask: Mask) -> "OpBinding":
+        """The binding that runs the op through ``mask``: this one, unless a field of the mask needs another."""
+        return self
+
+    def retention(self, key: str, layout: Layout) -> RetentionPolicy | None:
+        """What the pages under the read ``key`` keep of a request laid out as ``layout``, None for every entry."""
+        return None
+
     def specs(self, array: Array, key: str, declared: Read | Op | Positions) -> list[NodeResourceSpec]:
         return []
 
@@ -620,11 +631,9 @@ class PagedAttend(OpBinding):
         if not isinstance(read.mask, Causal | Window | Bidirectional):
             raise _no_layout(array, f"reads[{key!r}].mask must be Causal, Window or Bidirectional, the masks "
                                     "AttentionConfig has")
-        self._refuse_kept_window(array, key, read)
 
-    def _refuse_kept_window(self, array: Array, key: str, read: Read) -> None:
-        if isinstance(read.mask, Bidirectional) and read.mask.kept_window:
-            raise _no_layout(array, f"reads[{key!r}].mask keeps a window, which no binding runs yet")
+    def for_mask(self, mask: Mask) -> OpBinding:
+        return KEPT_WINDOW_ATTEND if isinstance(mask, Bidirectional) and mask.kept_window else self
 
     def specs(self, array: Array, key: str, read: Read) -> list[NodeResourceSpec]:
         windowed = isinstance(read.mask, Window)
@@ -664,7 +673,6 @@ class PagedCrossAttend(PagedAttend):
     def check(self, array: Array, key: str, read: Read) -> None:
         if not isinstance(read.mask, Bidirectional):
             raise _no_layout(array, f"reads[{key!r}].mask must be Bidirectional, the mask CrossAttentionConfig has")
-        self._refuse_kept_window(array, key, read)
         if read.walks is not None:
             raise _no_layout(array, f"reads[{key!r}].walks must be None, since CrossAttentionConfig has no walk")
         if len(array.labels) != 1:
@@ -701,6 +709,58 @@ class FlexAttend(OpBinding):
 
     def attach(self, handle: ArrayHandle, key: str, run: Any) -> None:
         handle.reads[key] = run
+
+
+class KeptWindowBinding(OpBinding):
+    """A read through a kept window on a paged array. The pool releases what the window no longer reaches, so the read
+    is its array's only one, and each request's layout sizes it."""
+
+    def check(self, array: Array, key: str, read: Read) -> None:
+        others = sorted(set(array.reads) - {key})
+        if others:
+            raise _no_layout(array, f"reads[{key!r}] keeps a window beside reads {others}, which would reach entries "
+                                    "the window releases")
+        if read.walks is not None:
+            raise _no_layout(array, f"reads[{key!r}].walks must be None, since the pool keeps one window a label")
+        if read.queries is not None:
+            raise _no_layout(array, f"reads[{key!r}].queries must be None, since the window is cut per row of its "
+                                    "own array")
+
+    def retention(self, key: str, layout: Layout) -> RetentionPolicy:
+        kept = layout.kept_windows.get(key)
+        if kept is None:
+            raise RuntimeError(f"state_layout: kept_windows gives no sizes for the kept-window read {key!r}")
+        return RetentionPolicy(context_budget=kept.window, protected_prefix=kept.sink, exact=True)
+
+    def attach(self, handle: ArrayHandle, key: str, run: Any) -> None:
+        handle.reads[key] = run
+
+
+class KeptWindowAttend(KeptWindowBinding):
+    """`Attend` through a kept window: a ragged kernel over each row's reach, gathered from the pages."""
+
+    def check(self, array: Array, key: str, read: Read) -> None:
+        super().check(array, key, read)
+        if not read.packed:
+            raise _no_layout(array, f"reads[{key!r}] declares packed=False, and the kept-window kernel takes packed "
+                                    "queries")
+
+    def specs(self, array: Array, key: str, read: Read) -> list[NodeResourceSpec]:
+        heads, head_dim = _kv_shape(array)
+        return [KeptWindowAttentionSpec(
+            resource_key=key, nodes=array.nodes, kv_cache=array.name, config=RaggedAttentionConfig(
+                num_qo_heads=read.op.q_heads, num_kv_heads=heads, head_dim=head_dim,
+                dtype=array.entry.tensors["k"].dtype,
+            ),
+        )]
+
+    def steps(
+        self, array: Array, key: str, read: Read, declared: ArrayStep, segments, steps: dict[str, Any],
+    ) -> None:
+        steps[key] = AttentionStep(segments=segments)
+
+
+KEPT_WINDOW_ATTEND = KeptWindowAttend()
 
 
 class PositionsBinding(OpBinding):
@@ -1721,9 +1781,9 @@ class Storage(ABC):
         return ArraySteps(self)
 
     def layouts(
-        self, by_label: Mapping[str, Layout], keyed_spans: Mapping[str, int],
+        self, array: Array, by_label: Mapping[str, Layout], keyed_spans: Mapping[str, int],
     ) -> "dict[str, LabelLayout] | None":
-        """Today's `LabelLayout` per label, or None where the array's pool takes no layout."""
+        """Today's `LabelLayout` per label of ``array``, or None where the array's pool takes no layout."""
         return None
 
     def apply(self, spec: NodeResourceSpec, settings: Mapping[str, Any]) -> None:
@@ -1809,19 +1869,25 @@ class PagedStorage(Storage):
             combined_labels={labels: "+".join(labels)} if labels else {},
         )
 
-    def layouts(self, by_label: Mapping[str, Layout], keyed_spans: Mapping[str, int]) -> "dict[str, LabelLayout]":
+    def layouts(
+        self, array: Array, by_label: Mapping[str, Layout], keyed_spans: Mapping[str, int],
+    ) -> "dict[str, LabelLayout]":
+        """Each read's binding gives the retention its pages keep."""
         from mstar.model.base import LabelLayout
 
+        reads = [each for each in _checked_bindings(self, array) if each.key in array.reads]
+        layouts = {}
         for label, layout in by_label.items():
-            if layout.kept_windows:
-                raise ValueError(f"no layout yet: label {label!r} gives kept_windows, and no binding sizes a kept "
-                                 "window yet")
-        return {
-            label: LabelLayout(
+            policies = {key: binding.retention(key, layout) for key, _, binding in reads}
+            unread = sorted(layout.kept_windows.keys() - {key for key, policy in policies.items() if policy})
+            if unread:
+                raise RuntimeError(f"state_layout[{array.name!r}][{label!r}].kept_windows: {unread} name no "
+                                   "kept-window read of the array")
+            layouts[label] = LabelLayout(
                 spans=layout.spans, growth=layout.growth, scratch=layout.scratch, keyed_spans=keyed_spans.get(label),
+                retention=next((policy for policy in policies.values() if policy is not None), None),
             )
-            for label, layout in by_label.items()
-        }
+        return layouts
 
 
 def _leader(array: Array, walks: "Walks") -> str | None:
@@ -2095,7 +2161,8 @@ def storage_of(array: Array) -> Storage:
 
 
 # `Attend` is an `AttentionSpec` on a paged array, a `CrossAttentionSpec` on one read with another array's queries and a
-# `RaggedAttentionSpec` within a step, so a binding is per storage and op type.
+# `RaggedAttentionSpec` within a step, so a binding is per storage and op type. A field of a read's mask can still swap
+# the binding, through `OpBinding.for_mask`, as a kept window does, and the `SDPA` table below is the deployment's swap.
 BINDINGS: dict[tuple[Storage, type[Op | Positions]], OpBinding] = {
     (PAGED, Attend): PagedAttend(),
     (PAGED, Positions): PositionsBinding(),
@@ -2142,7 +2209,7 @@ def _bindings(
         binding = BINDINGS.get((storage, type(read.op)))
         if binding is None:
             raise _no_binding(storage, array, f"reads[{key!r}].op", update=False)
-        bound.append(BoundOp(key, read, chosen.get(key, binding)))
+        bound.append(BoundOp(key, read, chosen.get(key, binding.for_mask(read.mask))))
     unbound = sorted(key for key, op in array.updates.items() if (storage, type(op)) not in BINDINGS)
     if unbound:
         raise _no_binding(storage, array, f"updates {unbound}", update=True)
@@ -2161,6 +2228,13 @@ def _bindings(
     for each in bound:
         each.binding.check(array, each.key, each.declared)
     return tuple(bound)
+
+
+@functools.cache
+def _checked_bindings(storage: Storage, array: Array) -> tuple[BoundOp, ...]:
+    """`_bindings` with the default bindings, once per array, for what a request asks of them: a declaration is
+    frozen, and each request would otherwise run every binding's check again."""
+    return _bindings(storage, array)
 
 
 def _no_binding(storage: Storage, array: Array, where: str, *, update: bool) -> ValueError:

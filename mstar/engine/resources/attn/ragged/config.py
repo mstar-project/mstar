@@ -211,6 +211,23 @@ class RaggedCrossAttentionSpec(_RaggedSpecBase):
 
 
 @dataclass
+class KeptWindowAttentionSpec(_RaggedSpecBase):
+    """Attention over the kept window of each row of the paged array ``kv_cache``: the entries its view reaches
+    (`kv.plan.kept_reach`), gathered from the pages and attended through a ragged cross plan of the step's queries."""
+
+    kv_cache: str
+
+    def depends_on(self) -> set[str]:
+        return {self.kv_cache}
+
+    @property
+    def resource_class(self) -> "type[Resource]":
+        from mstar.engine.resources.attn.kept_window import KeptWindowAttention
+
+        return KeptWindowAttention
+
+
+@dataclass
 class RaggedBlockCausalAttentionSpec(_RaggedSpecBase):
     """Cacheless block-causal self-attention within each declared span: a token in
     block ``b`` of its span (``block_size`` tokens a block, from the span's start)
