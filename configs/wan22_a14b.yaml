@@ -1,0 +1,37 @@
+model: "wan22"
+
+# Wan2.2-T2V-A14B on one GPU: text to video with two DiT experts of 14B each, the
+# high-noise one for the steps at timestep >= 875 and the low-noise one after,
+# both resident on the dit's rank (2 x 28.6 GB bf16). The VAE is the Wan2.1 one
+# (8x spatial), so height and width are multiples of 16. Defaults: 1280x720,
+# 81 frames at 16 fps, 40 steps, guidance 4.0 (high noise) / 3.0 (low noise),
+# overridable per request with guidance_scale / guidance_scale_2.
+#
+# As in wan22.yaml, the DiT compiles only for the listed "WxHxF" shapes (each
+# expert once with CFG and once without; any other shape runs eager), and the
+# untiled VAE decode runs the compiled shared Wan VAE decoder at the listed
+# sizes only.
+max_seq_len: 512
+
+model_kwargs:
+  variant: "t2v_a14b"
+  model_path_hf: "Wan-AI/Wan2.2-T2V-A14B-Diffusers"
+  compile_dit_sizes: ["1280x720x81", "832x480x81"]
+  vae_decode_fast_sizes: ["1280x720", "832x480"]
+
+# Text to video only, so no vae_encoder node.
+node_groups:
+  - node_names:
+      - text_encoder
+    ranks:
+      - 0
+
+  - node_names:
+      - vae_decoder
+    ranks:
+      - 0
+
+  - node_names:
+      - dit
+    ranks:
+      - 0

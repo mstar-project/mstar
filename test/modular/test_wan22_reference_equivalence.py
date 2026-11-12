@@ -439,18 +439,23 @@ def test_unipc_port_matches_reference_scheduler_bitwise(t2v_trajectory):
 # ---------------------------------------------------------------------------
 
 
-def _sequential_noise_prediction(self, model_input, temp_ts, text_embeds_pos, text_embeds_neg, guidance_scale):
+def _sequential_noise_prediction(
+    self, model_input, temp_ts, text_embeds_pos, text_embeds_neg, guidance_scale, block_cache=None, transformer=None,
+    combine_scale=None,
+):
     """Reference CFG semantics: two batch-1 forwards + the same combine."""
+    transformer = self.transformer if transformer is None else transformer
     timestep = temp_ts.unsqueeze(0).expand(1, -1)
-    cond = self.transformer(
+    cond = transformer(
         hidden_states=model_input, timestep=timestep,
-        encoder_hidden_states=text_embeds_pos.to(self.transformer.dtype),
+        encoder_hidden_states=text_embeds_pos.to(transformer.dtype),
     )
-    uncond = self.transformer(
+    uncond = transformer(
         hidden_states=model_input, timestep=timestep,
-        encoder_hidden_states=text_embeds_neg.to(self.transformer.dtype),
+        encoder_hidden_states=text_embeds_neg.to(transformer.dtype),
     )
-    return uncond + guidance_scale * (cond - uncond)
+    scale = guidance_scale if combine_scale is None else combine_scale
+    return uncond + scale * (cond - uncond)
 
 
 def _sequential_trajectory_diffs(oracle_meta, text_embeds, dit_submodule) -> list[float]:

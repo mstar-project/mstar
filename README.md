@@ -137,6 +137,7 @@ _Note_: The **first request(s) on a fresh environment can be slow** — often te
 | [Waypoint-1.5](https://huggingface.co/Overworld/Waypoint-1.5-1B) | Interactive world model | controller input (mouse, buttons, scroll) → live video frames | `/generate` |
 | [LingBot-World-V2 1.3B](https://huggingface.co/robbyant/lingbot-world-v2-1.3b-causal-fast) | Interactive world model | text, image, camera trajectory → video (streamed chunks; weights CC-BY-NC-SA-4.0) | `/generate` |
 | [Wan2.2-TI2V-5B](https://huggingface.co/Wan-AI/Wan2.2-TI2V-5B-Diffusers) | Video diffusion | text, image → video | `/v1/videos/generations`, `/generate` |
+| [Wan2.2-T2V-A14B](https://huggingface.co/Wan-AI/Wan2.2-T2V-A14B-Diffusers) | Video diffusion | text → video | `/v1/videos/generations`, `/generate` |
 | [LTX-2.5](https://huggingface.co/Lightricks/LTX-2.5-Diffusers) *(Beta)* | Audio-video diffusion | text → video + stereo audio (8-step distilled; gated, LTX-2.x Community License) | `/v1/videos/generations`, `/generate` |
 | [FLUX.2 klein 4B / 9B](https://huggingface.co/black-forest-labs/FLUX.2-klein-4B) | Image diffusion | text, image → image (4-step distilled, editing; 4B Apache-2.0, 9B under the FLUX Non-Commercial License) | `/v1/images/generations`, `/v1/images/edits` |
 | [Z-Image-Turbo](https://huggingface.co/Tongyi-MAI/Z-Image-Turbo) | Image diffusion | text → image (8-step distilled) | `/v1/images/generations` |
