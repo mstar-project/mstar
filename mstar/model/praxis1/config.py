@@ -63,6 +63,7 @@ _SHARED_DEFAULTS = {
     "window_frames": 93, "n_chunks": 4, "grid_hz": 15.0,
     "latent_channels": 48, "vae_stride": (4, 16, 16), "patch_size": (1, 2, 2),
     "text_model": "Qwen3.5-2B", "text_hidden_dim": 2048, "text_hidden_layer": -3,
+    "antialias": True,
 }
 
 
@@ -129,6 +130,10 @@ class Praxis1Config:
     canvas_width: int
     tile_height: int
     tile_width: int
+    # Which canvas rule the checkpoint was trained with. The two crop to
+    # different aspects and round in different places, so this is not a
+    # quality knob: it selects the observation the weights expect.
+    antialias: bool
     latent_channels: int
     vae_stride: tuple[int, int, int]
     patch_size: tuple[int, int, int]
@@ -296,6 +301,7 @@ class Praxis1Config:
             window_frames=int(chunking.get("window_frames", 93)),
             n_chunks=int(chunking.get("n_chunks", 4)),
             grid_hz=float(chunking.get("grid_hz", 15.0)),
+            antialias=bool(video.get("antialias", True)),
             canvas_height=int(video["height"]),
             canvas_width=int(video["width"]),
             tile_height=int(video.get("tile_height", video["height"])),
