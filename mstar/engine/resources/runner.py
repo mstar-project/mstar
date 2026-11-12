@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable, Collection, Mapping
 from dataclasses import replace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from mstar.engine.resources.admission import Admission, Refusal
 from mstar.engine.resources.base import CachedLease, CachedPrefix, CGSlotSpec, PublishedInfo, Resource
@@ -22,6 +22,9 @@ from mstar.engine.resources.step import (
     SubmoduleStep,
 )
 from mstar.utils.profiler import phase_end, phase_start, range_pop, range_push
+
+if TYPE_CHECKING:
+    from mstar.engine.resources.draft.ledger import VerifyLedger
 
 logger = logging.getLogger(__name__)
 
@@ -116,6 +119,10 @@ class StepRunner:
         ]
         self._node_cap_order = self._per_node(node_resources, self._cap_order)
         self._node_trail_order = self._per_node(node_resources, self._trail_order)
+        # the resources a verify result corrects, in dependency order
+        self._take_back_order = [
+            key for key in self._order if type(self._resources[key]).take_back is not Resource.take_back
+        ]
         self._after_output_copy_keys = frozenset(
             key for key in self._order
             if type(self._resources[key]).after_output_copy is not Resource.after_output_copy
@@ -533,12 +540,48 @@ class StepRunner:
         for key in self._order:
             self._resources[key].clear_preplan()
 
-    def admit(self, step: SubmoduleStep) -> FullAdmitOutcome:
+    def take_back_keys(self, keys: Collection[str]) -> list[str]:
+        """Of ``keys``, the resources a verify result corrects, in dependency order."""
+        return [key for key in self._take_back_order if key in keys]
+
+    def _take_back(self, ledger: "VerifyLedger | None", step: SubmoduleStep) -> None:
+        """Apply every verify result due at this step's admit, before any
+        resource admits it: the same pass on every path that reaches the
+        step's admit first, and on every rank. Exactly once, since the
+        ledger hands a result out once."""
+        if ledger is None:
+            return
+        # nested in engine.admit and engine.pre_admit: the second of the two finds nothing due
+        t0 = phase_start()
+        try:
+            takes = ledger.take_due(ledger.next_step, frozenset(step.ctx.request_ids))
+            if not takes:
+                return
+            if self._staged is not None:
+                # a staged pre-plan was promoted by step key, from lengths this would change
+                raise RuntimeError(
+                    f"verify results came due with a pre-plan staged for walk {self._staged[0]}: "
+                    "the pre-plan's admit should have applied them"
+                )
+            self.apply_take_backs(takes)
+        finally:
+            phase_end("res.verify.take_back", t0)
+
+    def apply_take_backs(self, takes) -> None:
+        """Each resource's share of verify results, in dependency order (the
+        admit-time pass's fan-out, `_take_back`)."""
+        for key in self._take_back_order:
+            take = takes.get(key)
+            if take is not None and take.rids:
+                self._resources[key].take_back(take.rids, take.counts, take.label)
+
+    def admit(self, step: SubmoduleStep, ledger: "VerifyLedger | None" = None) -> FullAdmitOutcome:
         """Reserve capacity for step. A refused admit gives back everything
         the step reserved, and drops its stage, whose plan addresses what it
-        gave back.
+        gave back. ``ledger``: the node's verify results, applied first.
         """
         staged_key = self._drop_stale_preplan(step)
+        self._take_back(ledger, step)
         # A step whose ``pre_admit`` ran a step ahead, and whose stage is still
         # up for it, skips the resources that sweep covered: each would only
         # find its own reservation and no-op (0.1 ms of Python per step at
@@ -617,14 +660,16 @@ class StepRunner:
                     range_pop()
         return results
 
-    def pre_admit(self, step: SubmoduleStep) -> FullAdmitOutcome:
+    def pre_admit(self, step: SubmoduleStep, ledger: "VerifyLedger | None" = None) -> FullAdmitOutcome:
         """admit over the pre-planning subset, a step ahead
 
         the later full `admit` covers the rest; these resources see their own
         state as already reserved and no-op
 
-        Unwound on refusal exactly as ``admit`` is.
+        Unwound on refusal exactly as ``admit`` is. ``ledger``: the node's
+        verify results, applied first, before anything is staged.
         """
+        self._take_back(ledger, step)
         ready = True
         admitted: list[str] = []
         for key in self._preplan_keys_for(step):

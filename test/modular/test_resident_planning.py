@@ -715,6 +715,43 @@ def test_the_graph_built_page_arrays_match_the_host_lengths_and_the_block_table(
     end = int(want.paged_kv_indptr[-1])
     assert attn._paged_kv_indices_buf[:end].tolist() == [p for row in pages for p in row]
 
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the kernels run on CUDA")
+@pytest.mark.parametrize("span", [4, 8])
+def test_the_verify_span_kernels_match_the_torch_ops(span):
+    """A verify step's resident kernels: SPAN > 1 in the write-slot and column
+    gathers (rows whose block crosses pages), and BY in the advance (each row
+    keeps accepted + 1, the trash row nothing)."""
+    from mstar.engine.resources.kv.resident import KVResidentTables
+    from mstar.engine.resources.resident import TRASH_SLOT, advance_column, gather_column
+
+    def run(device):
+        stride = 9
+        store = torch.arange(1000, 1000 + 6 * stride, device=device, dtype=torch.long)
+        slots = torch.tensor([3, 1, 4, TRASH_SLOT], device=device)
+        # stored lengths straddling page boundaries (page 4): 3, 6, 11, and the trash row's
+        store[slots * stride + 1] = torch.tensor([3, 6, 11, 0], device=device)
+        positions = torch.zeros(4 * span, dtype=torch.long, device=device)
+        gather_column(store, slots, stride, 1, positions, plus=torch.tensor([10, 20, 30, 0], device=device),
+                      span=span)
+        tables = SimpleNamespace(
+            planner=SimpleNamespace(store=store), page_size=4, key="kv",
+            block_table=SimpleNamespace(stride=stride, col=3), kv_len=SimpleNamespace(stride=stride, col=1),
+        )
+        kv_len = torch.zeros(4, dtype=torch.long, device=device)
+        pages = torch.zeros(4 * span, dtype=torch.long, device=device)
+        offsets = torch.zeros(4 * span, dtype=torch.long, device=device)
+        step = SimpleNamespace(
+            slots=slots, bucket=SimpleNamespace(bs=4), buffers=SimpleNamespace(kv_len={"kv": kv_len}),
+            streams={"kv": resident_mod.ResidentStream("main", reads=False, span=span)}, block_tables={},
+        )
+        KVResidentTables.gather(tables, step, pages, offsets)
+        advance_column(store, slots, stride, 1, by=torch.tensor([2, span, 1, 5], device=device))
+        return [t.tolist() for t in (store, positions, kv_len, pages, offsets)]
+
+    assert run(torch.device("cuda")) == run(CPU)
+
+
 # ---- slots ----
 
 def test_a_freed_slot_waits_for_the_last_step_that_read_it():
@@ -1835,6 +1872,29 @@ def test_a_bucket_is_host_plan_free_only_when_every_attention_reads_the_tables(a
     step = SubmoduleStep(steps={}, segments=[Segment(1, "main", 1)])
     planner.gather(planner.capture_step(BucketKey(WALK, 1, 1), 0, step))
     assert (BucketKey(WALK, 1, 1) in planner.host_plan_free) is free
+    planned = {key for key, reads in zip(resources, attentions, strict=True) if not reads}
+    assert planner.host_planned_by.get(BucketKey(WALK, 1, 1), frozenset()) == planned
+
+
+def test_a_bucket_is_host_planned_by_any_resource_that_planned_any_capture_of_it():
+    """Over every gather of a bucket (sizing, warmups, each slot), not the last
+    one, so a slot that host-planned is not hidden by one that didn't."""
+    reader, planner_attn = _Attention(True), _Attention(True)
+    planner = ResidentPlanner("n", {WALK}, {"a": reader, "b": planner_attn}, CPU, max_bs=2)
+    step = SubmoduleStep(steps={}, segments=[Segment(1, "main", 1)])
+    bucket = BucketKey(WALK, 1, 1)
+    planner.gather(planner.capture_step(bucket, 0, step))
+    assert bucket not in planner.host_planned_by and bucket in planner.host_plan_free
+    planner_attn._reads = False
+    planner.gather(planner.capture_step(bucket, 1, step))
+    reader._reads, planner_attn._reads = False, True
+    planner.gather(planner.capture_step(bucket, 0, step))
+    assert planner.host_planned_by[bucket] == {"a", "b"}
+    # and no replay of it skips the host plan, though its first capture read the tables alone
+    assert bucket not in planner.host_plan_free
+    reader._reads = True
+    planner.gather(planner.capture_step(bucket, 1, step))
+    assert bucket not in planner.host_plan_free
 
 
 def test_cross_attention_over_its_own_context_pool_runs_on_the_planner():
@@ -2004,10 +2064,10 @@ def test_a_resident_walk_can_not_declare_forks_or_a_sink(field, value):
 def test_a_resident_walk_is_one_token_a_row_in_one_stream():
     _, _, planner = _setup({})
     two = [Segment(1, "main", 2)]
-    with pytest.raises(ValueError, match="one token per row"):
+    with pytest.raises(ValueError, match="one span"):
         planner.capture_step(BucketKey(WALK, 1, 2), 0, SubmoduleStep(steps={}, segments=two))
     labels = [Segment(1, "a", 1), Segment(1, "b", 1)]
-    with pytest.raises(ValueError, match="one token per row"):
+    with pytest.raises(ValueError, match="one span"):
         planner.capture_step(BucketKey(WALK, 2, 2), 0, SubmoduleStep(steps={}, segments=labels))
 
 

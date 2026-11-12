@@ -715,7 +715,7 @@ def test_preemptions_after_metrics_start_are_reported():
     """The worker hands the metrics its counts before anything is preempted."""
     w = _worker(_pool())
     w.layout, w.scheduler.pending_rows = replace(w.layout, parallel_leader_nodes=frozenset({NODE})), dict
-    w.engine_manager.engine = SimpleNamespace(paged_kv_caches=list)
+    w.engine_manager.engine = SimpleNamespace(paged_kv_caches=list, node_drafts=dict)
     w.communicator = SimpleNamespace(send=lambda peer, message: None)
     w.tensor_manager = SimpleNamespace(enable_transfer_metrics=lambda: EdgeTransfers("SHM"))
     metrics = w._start_metrics(3600.0)

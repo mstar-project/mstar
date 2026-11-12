@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
+from mstar.engine.resources.spec import NodeResourceSpec, ResourceCapabilities, ResourceReqConfig
 from mstar.engine.resources.step import ResourceStep
 
 if TYPE_CHECKING:
@@ -152,6 +152,14 @@ class PositionConfig:
 @dataclass
 class PositionSpec(NodeResourceSpec):
     config: PositionConfig
+
+    def resource_capabilities(self, ctx) -> ResourceCapabilities:
+        return ResourceCapabilities(
+            verify_refusal=None if self.config.scheme == PosScheme.SEQUENTIAL
+            else f"position scheme {self.config.scheme} doesn't follow the KV length",
+            # a resident row's position is its device KV length plus a fixed offset
+            async_verify_refusal=None,
+        )
 
     def depends_on(self) -> set[str]:
         return {self.config.kv_cache}

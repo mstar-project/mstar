@@ -709,6 +709,17 @@ class Conductor:
             ]
         return specs
 
+    def _spec_by_key(self) -> dict:
+        """Each resource's spec by key, from the first worker that builds it: what
+        a request's `ResourceReqConfig.apply_spec` reads, the same on every worker."""
+        by_key = getattr(self, "_spec_by_key_cache", None)
+        if by_key is None:
+            by_key = self._spec_by_key_cache = {}
+            for specs in self._resource_specs():
+                for key, spec in specs.items():
+                    by_key.setdefault(key, spec)
+        return by_key
+
     def _node_resources(self) -> list:
         """The deployment's resource specs (``serving_resources``), each with all of its nodes."""
         built = getattr(self, "_node_resources_cache", None)
@@ -1440,6 +1451,11 @@ class Conductor:
                 kv_layout=kv_layout.get(key),
                 loop_caps=loop_caps,
             )
+        # what the deployment's specs decide for the request (a verifying pool's scratch
+        # floor), before its loops are fitted and it is checked against them
+        spec_of = self._spec_by_key()
+        for key, cfg in resource_configs.items():
+            cfg.apply_spec(spec_of.get(key))
         if not any(model_kwargs.get(key) is not None for key in self.model.LENGTH_KWARGS):
             max_output_tokens, loop_caps = self._fit_loop_caps(
                 model_kwargs, resource_configs, max_output_tokens,

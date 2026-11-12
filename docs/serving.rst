@@ -239,9 +239,11 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
    * - ``model``
      - Registry key of the model (see :doc:`models`).
    * - ``max_seq_len``
-     - Required, but nothing reads it: it neither sizes the KV cache nor caps context.
-       A KV cache's length limit is its own ``max_seq_len``, set by the model or under
-       ``resources: <kv>:`` (see the resource overrides below).
+     - Required. It neither sizes the KV cache nor caps context: a KV cache's length limit
+       is its own ``max_seq_len``, set by the model or under ``resources: <kv>:`` (see the
+       resource overrides below). On a node that verifies drafts that override is still the
+       client's limit (the pool holds the verify slack past it), and startup reads the
+       top-level value only to refuse a verifying pool whose limit is below it.
    * - ``node_groups``
      - List of placements. Each entry assigns ``node_names`` to ``ranks``, optionally
        scoped to specific ``graph_walks`` and/or parallelized with ``tp_size``,
@@ -442,7 +444,8 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        this, since it also holds the ids of requests the first rank has torn down until it tears them down too.
        A non-negative int, and 0 sets no pool aside, so no request is dropped there and the node preempts as
        one with no rebuild policy does. The pool is rounded up to a power of two, as the pinned allocator would
-       round it anyway.
+       round it anyway. A node that verifies drafts never drops a request, so it keeps no
+       ids there.
    * - ``warmup_requests``
      - *(optional)* Requests the server runs after the workers are ready and before it
        binds, so no client pays a shape's first-request cost (torch.compile of a step,
@@ -909,6 +912,26 @@ actions in robot units, as openpi's policy server does. ``norm_stats`` can also 
 of an openpi ``norm_stats.json``. Without it, ``robot_state`` must already be normalized to
 [-1, 1]. Either way it is a list of 1 to ``state_dim`` finite numbers (the checkpoint's
 ``max_state_dim``, 32 when it sets none); anything else is a 400.
+
+A model that supports speculative decoding (drafting several tokens and verifying them in
+one target pass) turns it on with a ``draft`` block; without one it decodes as usual. No shipped
+model declares a drafter yet; a block looks like this:
+
+.. code-block:: yaml
+
+   model_kwargs:
+     draft:
+       method: <method>                            # the drafter
+       model: <checkpoint>                         # its checkpoint, for a method that loads one
+       num_draft_tokens: 7
+       mode: auto                                  # auto | synchronous | asynchronous
+
+``mode: auto`` runs asynchronously (the next step planned while one runs) where every rank
+can, which needs FlashAttention-3 on Hopper (see :doc:`installation`), and synchronously
+otherwise, logging why; ``asynchronous`` refuses to start where it can't run. The engine
+refuses unknown keys, and a block on a model that serves none. Requests on such a
+deployment can't ask for ``repetition_penalty`` other than 1, ``repetition_window``,
+``min_tokens``, ``return_logprobs`` or ``penalize_prompt: false`` (see :doc:`clients`).
 
 Per-request knobs (``temperature``, ``voice``, ``max_output_tokens``, …) are sent by the
 client instead — see :doc:`clients`, and :ref:`generation-parameters` for what each

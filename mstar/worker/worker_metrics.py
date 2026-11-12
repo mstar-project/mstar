@@ -115,6 +115,15 @@ class WorkerMetrics:
         self._rebuild_pages = Counter(catalog.KV_REBUILD_CACHED_PAGES)
         self._host_used = Gauge(catalog.REBUILD_HOST_BYTES_USED)
         self._host_total = Gauge(catalog.REBUILD_HOST_BYTES_TOTAL)
+        # speculative decoding: the verifying nodes this rank leads, their
+        # cumulative counters at start_counting(), and the histogram reported so far
+        self._drafts = {node: draft for node, draft in engine.node_drafts().items() if node in components}
+        self._draft_base: dict[str, tuple[int, int, int]] | None = None
+        self._draft_hist: dict[str, list[int]] = {}
+        self._draft_tokens = Counter(catalog.SPEC_DRAFT_TOKENS)
+        self._accepted_tokens = Counter(catalog.SPEC_ACCEPTED_TOKENS)
+        self._verify_rows = Counter(catalog.SPEC_VERIFY_ROWS)
+        self._accepted_per_row = Histogram(catalog.SPEC_ACCEPTED_PER_ROW)
 
     def start_counting(self) -> None:
         """Count the steps whose time starts from now on (see ``step_done``),
@@ -124,6 +133,10 @@ class WorkerMetrics:
         self._prefix_base = [dict(cache.prefix_tokens) for _, _, cache in self._kv]
         self._preemption_base = {node: astuple(counts) for node, counts in self._preemptions.items()}
         self._rebuild_base = [dict(cache.rebuild_pages) for _, _, cache in self._kv]
+        self._draft_base = {
+            node: (draft.drafted, draft.accepted, draft.verify_rows) for node, draft in self._drafts.items()
+        }
+        self._draft_hist = {node: draft.accepted_hist.tolist() for node, draft in self._drafts.items()}
         self._transfers = self._enable_transfers()
 
     def step_done(
@@ -192,6 +205,18 @@ class WorkerMetrics:
                 for node, pages in list(cache.rebuild_pages.items()):
                     if node in self.components:
                         self._rebuild_pages.set((node,), pages - base.get(node, 0))
+        if self._draft_base is not None:
+            for node, draft in self._drafts.items():
+                labels = (node,)
+                d0, a0, r0 = self._draft_base[node]
+                # cumulative on the node, so set, not added
+                self._draft_tokens.set(labels, draft.drafted - d0)
+                self._accepted_tokens.set(labels, draft.accepted - a0)
+                self._verify_rows.set(labels, draft.verify_rows - r0)
+                hist, seen = draft.accepted_hist.tolist(), self._draft_hist[node]
+                for accepted, (now, before) in enumerate(zip(hist, seen, strict=True)):
+                    self._accepted_per_row.observe_n(labels, accepted, now - before)
+                self._draft_hist[node] = hist
         # a rank leading no node reports only its transfers
         pending = self._scheduler.pending_rows() if self.components else {}
         for node in self.components:
@@ -208,4 +233,6 @@ class WorkerMetrics:
             *(counter.snapshot() for counter in self._preemption_counters), self._rebuild_pages.snapshot(),
             self._pending.snapshot(), self._host_used.snapshot(), self._host_total.snapshot(),
             *self._transfers.snapshot(),
+            self._draft_tokens.snapshot(), self._accepted_tokens.snapshot(), self._verify_rows.snapshot(),
+            self._accepted_per_row.snapshot(),
         ]

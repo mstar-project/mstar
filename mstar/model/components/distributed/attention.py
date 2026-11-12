@@ -59,12 +59,16 @@ class ParallelAttention(nn.Module):
         kv_key: str = "kv",
         pos_key: str | None = "rope",
         layer: int | None = None,
+        kv_layer_set: str | None = None,
     ):
         super().__init__()
         # resource labels this layer calls; see components/attention.py
         self._attn_key = attn_key
         self._kv_key = kv_key
         self._pos_key = pos_key
+        # the KV pool layer set this layer's stack joined, if any (a drafter's): its layer
+        # indices are the set's own, which the pool places (`AttentionCallable`)
+        self._kv_layer_set = kv_layer_set
         self.attn = None
         self.kv = None
         self.pos = None
@@ -143,7 +147,7 @@ class ParallelAttention(nn.Module):
         self.kv = resources.get(self._kv_key)
         self.pos = None if self._pos_key is None else resources.get(self._pos_key)
         # see Attention.bind_resources
-        self.attend = AttentionCallable(kv=self.kv, attn=self.attn)
+        self.attend = AttentionCallable(kv=self.kv, attn=self.attn, layer_set=self._kv_layer_set)
 
     def bind_state(self, handles: dict) -> None:
         """See ``Attention.bind_state``."""

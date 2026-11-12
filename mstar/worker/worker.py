@@ -4,6 +4,7 @@ import math
 import os
 import sys
 import threading
+from collections.abc import Collection
 from dataclasses import replace
 from functools import cached_property, partial
 
@@ -18,7 +19,7 @@ from mstar.communication.tensors import (
 )
 from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import WorkerParallelGroups
-from mstar.engine.engine import Engine
+from mstar.engine.engine import Engine, rebuild_policies_of
 from mstar.engine.resources import ResourceReqConfig
 from mstar.engine.resources.kv.config import KVReqConfig
 from mstar.engine.resources.kv.transfer import (
@@ -117,14 +118,27 @@ def _make_graph_runtime(
 def _make_rebuilds(
     model: Model | None, model_config: dict | None, my_walks: set[tuple[str, str]], lockstep_nodes: set[str],
     device: torch.device, engine: Engine, followed: frozenset[str] = frozenset(),
+    verifying_nodes: Collection[str] = (),
 ) -> Rebuilds:
     """What a dropped request is rebuilt from, on each node whose model declares how and whose rebuild this worker
-    runs: a disaggregated decode node can't run the prefill walk a rebuild needs.
+    runs: a disaggregated decode node can't run the prefill walk a rebuild needs. The policies leave out every
+    verifying node the model declares (`rebuild_policies_of`), and a policy left for a node the engine verifies on is
+    refused.
 
     A worker that follows one of those nodes sets aside twice ``rebuild_host_mb``. Beside the ids of every request
     rank 0 keeps ids for, it holds those of requests rank 0 has torn down until it tears them down too."""
     graphs = model.get_graph_walk_graphs() if model is not None else {}
-    policies = {} if model is None else policies_run_here(model.rebuild_policies(), graphs, my_walks, lockstep_nodes)
+    declared = {} if model is None else rebuild_policies_of(model)
+    verifying = sorted(declared.keys() & set(verifying_nodes))
+    if verifying:
+        raise RuntimeError(f"rebuild policies for verifying nodes {verifying}, which never drop a request")
+    policies = policies_run_here(declared, graphs, my_walks, lockstep_nodes)
+    if "rebuild_host_mb" in (model_config or {}) and verifying_nodes and not policies:
+        # set for nothing here: the worker's other nodes keep no policy either
+        logger.warning(
+            "rebuild_host_mb is set, but %s verify drafts, so they never drop a request and keep no ids",
+            sorted(verifying_nodes),
+        )
     copies = any(names for node, policy in policies.items() for names in policy.check(node, graphs).values())
     host_mb = _serving_mb(
         model_config, "rebuild_host_mb", DEFAULT_REBUILD_MEDIA_HOST_MB if copies else DEFAULT_REBUILD_HOST_MB,
@@ -346,11 +360,13 @@ class Worker:
         layout = replace(
             layout, side_keys=frozenset(self.engine_manager.side_keys),
             tensor_streams=self.engine_manager.inline_streams.tensor_streams,
+            verifying_nodes=self.engine_manager.engine.verifying_nodes(),
+            synchronous_verify_nodes=self.engine_manager.engine.synchronous_verify_nodes(),
         )
         self.layout = layout
         self._rebuilds = _make_rebuilds(
             model, model_config, layout.my_walks, layout.parallel_nodes, self.device, self.engine_manager.engine,
-            layout.followed_nodes,
+            layout.followed_nodes, layout.verifying_nodes,
         )
         services = WorkerServices(
             worker_id=worker_id,

@@ -1,5 +1,6 @@
 
 
+import dataclasses
 import functools
 import logging
 import math
@@ -12,6 +13,7 @@ from dataclasses import dataclass, field
 from functools import partial
 from itertools import repeat
 from pathlib import Path
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Callable, Collection, Iterator, Mapping, NamedTuple, Protocol, Sequence
 
 import torch
@@ -50,6 +52,8 @@ from mstar.engine.resources import (
     SubmoduleStep,
 )
 from mstar.engine.resources.base import CachedLease, EngineResourceInfo, KeyedWalks, StepAllowance, build_resource
+from mstar.engine.resources.draft.startup import model_combined_walks, node_chunks_prompts
+from mstar.engine.resources.kv import manager as kv_manager
 from mstar.engine.resources.kv.config import instance_size, opening_prefix_caches, unrestorable
 from mstar.engine.resources.kv.keys import fingerprint
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
@@ -103,8 +107,12 @@ from mstar.utils.profiler import (
 
 if TYPE_CHECKING:
     from mstar.engine.resources.admission import Refusal
+    from mstar.engine.resources.draft.config import DraftMode
+    from mstar.engine.resources.draft.drafter import VerifyNode
+    from mstar.engine.resources.draft.node import NodeDraft
     from mstar.engine.resources.kv.manager import KVManager
     from mstar.model.base import Model
+    from mstar.model.rebuild import RebuildPolicy
 
 logger = logging.getLogger(__name__)
 
@@ -216,6 +224,63 @@ class SlotRotation:
             self.next_slot = (self.next_slot + 1) % self.num_slots
             return slot
 
+
+def _layer_set_problem(submodule, resources: Mapping[str, Resource], joined) -> str | None:
+    """Why the drafter's KV layer set (``joined``, a `KVLayerSet`) is not bound
+    by exactly its layers once `bind_node_resources` has run: as many attention
+    layers declaring the set (``kv_layer_set``) as it holds. A stack that forgot
+    it would write the target's first layers instead of its own. Layers are counted
+    by their `AttentionCallable`, so a layer-set stack gives each layer its own
+    ``attend``. Which index each layer sets is not checked."""
+    if joined is None:
+        return None
+    from mstar.engine.resources.convenience import AttentionCallable
+
+    pool = resources.get(joined.kv_cache)
+    slot = pool.layer_set(joined.name)
+    callables = {
+        id(attend): attend for module in submodule.modules()
+        if isinstance(attend := getattr(module, "attend", None), AttentionCallable)
+    }
+    bound = sum(1 for attend in callables.values() if attend.kv is pool and attend.layer_set == joined.name)
+    if bound != slot.num_layers:
+        return (
+            f"layer set {joined.name!r} of KV {joined.kv_cache!r} holds {slot.num_layers} layers, and {bound} "
+            "attention layers declare it (kv_layer_set; each layer of the set needs its own attend)"
+        )
+    return None
+
+
+def _warn_hostless(node: str, resources: Mapping[str, Resource]) -> None:
+    """A verifying node never drops a request, so on a KV pool with no host pool every request it serves is
+    guaranteed: it reserves its whole footprint at admission, and one with no max_tokens is fitted to nearly the
+    whole pool, so such requests run about one at a time."""
+    for key, resource in resources.items():
+        if isinstance(resource, kv_manager.KVManager) and not resource.config.cpu_offload_pages:
+            logger.warning(
+                "speculative decoding on %s: KV %r has no host pool (cpu_offload_pages 0), and a verifying node "
+                "never drops a request, so every request is guaranteed: it reserves its whole footprint at "
+                "admission, and requests without max_tokens run about one at a time. Set "
+                "resources.%s.cpu_offload_pages to let it preempt by moving requests to the host",
+                node, key, key,
+            )
+
+
+def _verify_nodes(model) -> list:
+    """The model's verifying nodes; none for a model, or a test's stand-in, that declares none."""
+    verify_nodes = getattr(model, "verify_nodes", None)
+    return list(verify_nodes()) if verify_nodes is not None else []
+
+
+def rebuild_policies_of(model) -> "dict[str, RebuildPolicy]":
+    """The model's rebuild policies less its verifying nodes', which the engine's
+    check and the worker's rebuilds read. A rebuild replays the prompt and the
+    kept samples, which nothing checks against a request's verify state (its
+    pending take-backs, the drafter's carry), so a verifying node never drops a
+    request. From the model's declarations alone, so every rank and worker
+    agrees."""
+    verifying = {decl.node for decl in _verify_nodes(model)}
+    return {node: policy for node, policy in model.rebuild_policies().items() if node not in verifying}
 
 @dataclass
 class SubmoduleManagement:
@@ -442,6 +507,8 @@ class ExecutingBatch:
     step: SubmoduleStep | None = None
     # the step the batch committed last: a batch run row by row commits once per row
     committed: SubmoduleStep | None = None
+    # the node's number for this step (`VerifyLedger`), on a node that verifies drafts
+    verify_seq: int | None = None
 
     # {request_id: {input_name: [tensor]}}, what prepare_inputs reads
     per_request_input_tensors: Mapping[str, NameToTensorList] = field(
@@ -646,6 +713,14 @@ class ExecutingBatch:
 
 
 class Engine:
+    # node -> its speculative decoding state, for the nodes that verify drafts;
+    # empty unless `load_model` set one up (and on an engine a test builds by hand)
+    _drafts: "Mapping[str, NodeDraft]" = MappingProxyType({})
+    # (node, rid) -> its resources' fingerprints at offload, checked at reload (MSTAR_KV_DEBUG_ASSERTS)
+    _offload_prints: "dict[tuple[str, int], dict[str, bytes | torch.Tensor]] | None" = None
+    # reload checks compared on the device and not yet read: (request, node, parts, flags on the host, event)
+    _pending_print_checks: "list[tuple] | None" = None
+
     @property
     def device_capability(self) -> DeviceCapability:
         capability = getattr(self, "_device_capability", None)
@@ -703,6 +778,8 @@ class Engine:
         # node without a planner -> the planners of the resources it shares,
         # fixed once every planner is built (`_bind_foreign_planners`)
         self._foreign_planners: dict[str, tuple[ResidentPlanner, ...]] = {}
+        # verifying nodes whose rebuild policy `rebuild_policies` has logged as off
+        self._rebuild_off_logged: set[str] = set()
         # Nodes this rank leads (journals its moves for the others) and nodes it
         # follows (may not move pages at all — see ``offload_request``). A node
         # that is not sharded is in neither: it owns its own eviction.
@@ -724,6 +801,7 @@ class Engine:
         model: "Model | None" = None,
         token_ladders: Mapping[str, Any] | None = None,
         region_ladders: Mapping[str, Any] | None = None,
+        async_scheduling: "Mapping[str, tuple[bool, str]] | None" = None,
     ):
         """``token_ladders`` and ``region_ladders``: the serving config's
         ``prefill_token_buckets``, node -> capture walk -> ladder and node ->
@@ -837,13 +915,38 @@ class Engine:
                 # reads them back on the device (see DeviceLoopback)
                 resources[loopback.sampler].enable_device_loopback_reader()
         share_slot_rotations(self._submodules.values())
+        self._drafts = {
+            decl.node: self._set_up_draft(
+                decl, specs_by_key, (async_scheduling or {}).get(decl.node, (True, "")),
+                chunks=node_chunks_prompts(model, decl.node),
+                combined=model_combined_walks(model) if model is not None else {},
+            )
+            for decl in _verify_nodes(model) if decl.node in self._submodules
+        }
+        undeclared = sorted(
+            node for node, mgmt in self._submodules.items()
+            if node not in self._drafts and getattr(mgmt.submodule, "drafter", None) is not None
+        )
+        if undeclared:
+            # it would never be bound, and its node would decode as if it had none
+            raise RuntimeError(f"nodes {undeclared} hold a drafter, and the model declares no VerifyNode for them")
         if model is not None:
             self._check_rebuild_policies(model)
+
+    def rebuild_policies(self, model: "Model") -> "dict[str, RebuildPolicy]":
+        """`rebuild_policies_of` the model, logging once for each verifying node
+        here that declared a policy."""
+        verifying = {decl.node for decl in _verify_nodes(model)}
+        for node in sorted((verifying & model.rebuild_policies().keys() & self._submodules.keys())
+                           - self._rebuild_off_logged):
+            self._rebuild_off_logged.add(node)
+            logger.info("speculative decoding on %s: rebuild is off, so the node never drops a request", node)
+        return rebuild_policies_of(model)
 
     def _check_rebuild_policies(self, model: "Model") -> None:
         """Raise for a node here whose rebuild policy a rebuild row couldn't run under."""
         combined = model.combined_walk_of()
-        for node, policy in model.rebuild_policies().items():
+        for node, policy in self.rebuild_policies(model).items():
             mgmt = self._submodules.get(node)
             if mgmt is None:
                 continue
@@ -865,6 +968,163 @@ class Engine:
     def node_dtype(self, node_name: str) -> torch.dtype | None:
         """The dtype ``node_name`` was cast to and runs in, or None if it keeps its own (``disable_autocast``)."""
         return resolve_node_dtype(self._submodules[node_name].submodule, self._autocast_dtype)
+    def _set_up_draft(
+        self, decl: "VerifyNode", specs_by_key: Mapping[str, NodeResourceSpec], async_scheduling: tuple[bool, str],
+        chunks: bool = False, combined: Mapping[tuple[str, str], str] | None = None,
+    ) -> "NodeDraft":
+        """Check a verifying node again against what was built, pick its mode,
+        and bind what its verify steps read: the sampler's ``k``, the ledger, and
+        the node's share (`NodeSubmodule.bind_draft`). Every rank of an instance
+        picks the same."""
+        from mstar.engine.resources.draft.node import DrafterShare, NodeDraft
+        from mstar.engine.resources.draft.startup import log_mode, node_problems, submodule_problems
+
+        mgmt = self._submodules[decl.node]
+        submodule = mgmt.submodule
+        problems = submodule_problems(decl, submodule)
+        if problems:
+            raise RuntimeError("speculative decoding: " + "; ".join(problems))
+        layer_set_problem = _layer_set_problem(submodule, mgmt.resources, decl.needs.kv)
+        if layer_set_problem is not None:
+            raise RuntimeError(f"speculative decoding on {decl.node}: {layer_set_problem}")
+        stop = getattr(submodule, "token_stop", None)
+        # the submodule's own, which is what runs
+        decl = decl._replace(device_loopback=getattr(submodule, "device_loopback", None))
+        # from config and the built submodule: the same on every rank, so a raise here is every rank's
+        problems = node_problems(decl, stop, specs_by_key, chunks, combined)
+        if problems:
+            raise RuntimeError("speculative decoding: " + "; ".join(problems))
+        mode, reason = self._agreed_mode(decl, mgmt, specs_by_key, async_scheduling)
+        if stop.runtime_check:
+            logger.info("speculative decoding on %s: the runtime stop check is off for walk %s", decl.node, decl.walk)
+        sampler = mgmt.resources[stop.sampler]
+        sampler.bind_verify(decl.config.num_draft_tokens)
+        for resource in mgmt.resources.values():
+            # never refuses: what a resource can't do, its capabilities said before the agreement
+            resource.bind_verify_walk(decl.walk, decl.config.block, decl.config.kv_slack)
+        draft = NodeDraft(decl, mode, reason, stop.sampler, stop, self._runner.take_back_keys(mgmt.resources))
+        if mgmt.joint_comm_group is None or mgmt.joint_comm_group.rank == 0:
+            # the instance's leader logs the agreed mode once
+            log_mode(decl, mode, reason)
+            _warn_hostless(decl.node, mgmt.resources)
+        # every check above derives from config and built shapes, so a raise was every rank's; from here
+        # every step the engine declares for the node, capture's and each replay's, carries its drafter's share
+        submodule.bind_draft(DrafterShare(
+            decl.walk, stop.sampler, decl.config.num_draft_tokens, stop.prefill_walks,
+            decl.prefill_steps, decl.verify_steps,
+        ))
+        return draft
+
+    def _refuse_uncaptured_verify(self, ag_runners: Mapping[str, AcceleratorGraphRunner]) -> None:
+        """An asynchronous verify node whose verify walk capture left no bucket
+        would get a batch cap of 0 and hang every request, and one whose capture
+        planned a verify bucket on the host would attend over the reserved
+        lengths: fail startup. Each input is agreed across ranks, so every rank
+        refuses alike: the declarations, the agreed mode, the captured buckets,
+        and the planner's ``host_planned_by``, which each rank fills from its own
+        gathers but which follows from the declarations and ``_verify_fa3`` under
+        the agreed mode (so a ``resident_gather`` must not branch on per-rank state).
+        A verifying node that captures nothing still needs the sampler's slot
+        masters, the loop-back slots its verify writes each row's token to:
+        built here, as a capture would have."""
+        for node_name, draft in self._drafts.items():
+            sampler = self._submodules[node_name].resources[draft.sampler_key]
+            if not sampler.has_slot_masters:
+                # eager verify steps read the masters by slot; no captured rows to size
+                sampler.build_accelerator_graph_buffers([], 1, 0)
+                if not sampler.has_slot_masters:
+                    raise RuntimeError(
+                        f"speculative decoding on {node_name}: its sampler keeps no loop-back slots, which a "
+                        "verify walk reads its tokens from (MSTAR_DEVICE_LOOPBACK, or no DeviceLoopback)"
+                    )
+            runner = ag_runners.get(node_name)
+            if draft.asynchronous and (runner is None or runner.max_captured_bs(draft.walk) == 0):
+                dropped = [] if runner is None else [str(key) for key in runner.dropped_buckets]
+                raise RuntimeError(
+                    f"speculative decoding on {node_name}: asynchronous mode runs every verify step on a "
+                    f"resident capture of walk {draft.walk!r}, and capture left none (dropped: {dropped}); "
+                    "set model_kwargs.draft.mode: synchronous, or free memory for the verify buckets"
+                )
+            if not draft.asynchronous:
+                continue
+            planner = self._submodules[node_name].resident
+            if planner is None:
+                raise RuntimeError(f"speculative decoding on {node_name}: asynchronous verify with no resident planner")
+            planned = {
+                str(bucket): sorted(planner.host_planned_by[bucket])
+                for bucket in runner.captured_buckets(draft.walk) if bucket in planner.host_planned_by
+            }
+            if planned:
+                raise RuntimeError(
+                    f"speculative decoding on {node_name}: capture planned {planned} on the host, which an "
+                    "asynchronous verify step can't prove exact. Declare the walk's attention with "
+                    "AttentionStep(verify=True), or set model_kwargs.draft.mode: synchronous"
+                )
+
+    def _agreed_mode(
+        self, decl: "VerifyNode", mgmt: SubmoduleManagement, specs_by_key: Mapping[str, NodeResourceSpec],
+        async_scheduling: tuple[bool, str],
+    ) -> tuple["DraftMode", str]:
+        """The node's mode, fixed here and never changed at warmup: asynchronous
+        only when everything this worker can know before capture allows it, and
+        every rank of the lockstep instance agrees (one MIN reduction). Under
+        ``auto`` any rank that can't makes every rank synchronous; an explicit
+        ``asynchronous`` then refuses on every rank."""
+        from mstar.engine.resources.draft.config import DraftMode
+        from mstar.engine.resources.draft.startup import node_capabilities, resolve_mode
+
+        blockers = []
+        # this rank's environment or hardware, which the others may not share: agreed before raising
+        fatal = []
+        if not knobs.device_loopback_enabled():
+            fatal.append(
+                "a verify walk reads its tokens off the loop-back slots, which MSTAR_DEVICE_LOOPBACK turns off"
+            )
+        resident = knobs.resident_planning() != "off"
+        if resident and decl.walk not in mgmt.submodule.resident_walks():
+            # an asynchronous verify step replays a resident capture, which this walk never has
+            blockers.append(f"walk {decl.walk!r} is not one of the submodule's resident_walks")
+        declared = node_capabilities(decl, specs_by_key)
+        if declared.keys() != mgmt.resources.keys():
+            raise RuntimeError(
+                f"speculative decoding on {decl.node}: specs {sorted(declared)} and resources "
+                f"{sorted(mgmt.resources)} differ"
+            )
+        for key, resource in mgmt.resources.items():
+            refusal = resource.resident_refusal()
+            if refusal is not None:
+                blockers.append(f"resource {key!r} keeps the node off resident planning ({refusal})")
+            if len(self._resource_nodes.get(key, ())) > 1:
+                blockers.append(f"resource {key!r} is shared by nodes {sorted(self._resource_nodes[key])}")
+            # what this worker refuses beyond config, which startup and resolve_mode already read:
+            # a verify refusal (`verify_backend: fa3` off Hopper) is fatal, an asynchronous one a blocker
+            local = declared[key].narrowed(resource.capabilities())
+            if local.verify_refusal is not None and declared[key].verify_refusal is None:
+                fatal.append(f"resource {key!r}: {local.verify_refusal}")
+            if local.async_verify_refusal is not None and declared[key].async_verify_refusal is None:
+                blockers.append(f"resource {key!r}: {local.async_verify_refusal}")
+        wanted = decl.config.mode
+        local = decl._replace(config=dataclasses.replace(decl.config, mode=DraftMode.AUTO))
+        mode, reason = resolve_mode(
+            local, specs_by_key, *async_scheduling, resident_planning=resident, blockers=blockers,
+        )
+        if wanted == DraftMode.SYNCHRONOUS:
+            mode, reason = DraftMode.SYNCHRONOUS, "configured"
+        joint = mgmt.joint_comm_group
+        can_run = not fatal
+        if joint is not None and joint.world_size > 1:
+            # every rank's due rule must be the same, or their lengths part; and a rank that can't
+            # verify at all fails every rank's startup, not just its own while the others wait
+            agreed, can_run = joint.agree([int(mode == DraftMode.ASYNCHRONOUS), int(not fatal)])
+            if mode == DraftMode.ASYNCHRONOUS and not agreed:
+                mode = DraftMode.SYNCHRONOUS
+                reason = "another rank of the lockstep instance can't run asynchronous mode"
+        if not can_run:
+            why = "; ".join(fatal) or "another rank of the lockstep instance can't verify drafts (see its log)"
+            raise RuntimeError(f"speculative decoding on {decl.node}: {why}")
+        if wanted == DraftMode.ASYNCHRONOUS and mode != DraftMode.ASYNCHRONOUS:
+            raise RuntimeError(f"node {decl.node!r}: asynchronous verify mode was asked for, but {reason}")
+        return mode, reason
 
     def _build_resident_planner(self, node_name: str, runner: AcceleratorGraphRunner) -> None:
         """Put ``node_name`` on resident tables if it can and the deployment
@@ -884,17 +1144,29 @@ class Engine:
             node for node, mgmt in self._submodules.items()
             if node != node_name and mgmt.submodule is not None and mgmt.submodule.resident_walks()
         }
+        draft = self._drafts.get(node_name)
         submodule_mgmt.resident, refused = build_planner(
             node_name, walks,
             {key: resources[key] for key in self._runner.order if key in resources},
             self._resource_nodes, self._device, runner.max_capture_bs(walks),
             resident_nodes=resident_nodes,
             sharded_nodes=self._tp_leader_nodes | self._tp_follower_nodes,
+            max_span=1 if draft is None else draft.decl.config.block,
         )
         if submodule_mgmt.resident is None:
+            if draft is not None and draft.asynchronous:
+                raise RuntimeError(
+                    f"speculative decoding on {node_name}: asynchronous mode needs resident planning, "
+                    f"which stays off: {refused}"
+                )
             logger.warning("resident planning stays off on %s: %s", node_name, refused)
         else:
             self._resource_planners.update(dict.fromkeys(resources, submodule_mgmt.resident))
+            if draft is not None:
+                # a request with unapplied results keeps its device length through a rewrite,
+                # and one with unrecorded results keeps its slot
+                submodule_mgmt.resident.pending = draft.ledger.pending
+                submodule_mgmt.resident.unrecorded = draft.ledger.unrecorded
         runner.bind_resident(submodule_mgmt.resident)
 
     def _bind_foreign_planners(self) -> None:
@@ -1094,6 +1366,8 @@ class Engine:
             for label, runner in runners.items() if runner.required
             for bs, tokens in runner.dropped_shapes
         ])
+        self._refuse_uncaptured_verify(ag_runners)
+
         fail_if_graphs_required([
             f"{node_name} {key}"
             for node_name, runner in ag_runners.items()
@@ -1277,8 +1551,28 @@ class Engine:
         shared = [
             checkpoint_identity(checkpoint) if checkpoint is not None else b"",
             model.preprocess_fingerprint() if model is not None else "",
+            # a drafter whose KV layers share the target's pages: its weights name them too
+            *(checkpoint_identity(decl.checkpoint) for decl in _verify_nodes(model) if decl.checkpoint),
         ]
         declared = keyed_labels(model) if model is not None else {}
+        # A verify step commits its whole block before its result is known, so a page it
+        # filled could be sealed holding rejected drafts: only prompt pages are keyed there.
+        verifying = frozenset((decl.node, decl.walk) for decl in _verify_nodes(model))
+
+        def verifies(key: str, walk: str) -> bool:
+            """A node of KV ``key`` verifies drafts on ``walk``."""
+            return bool(verifying) and any((node, walk) in verifying for node in self._resource_nodes.get(key, ()))
+
+        for key, labels in declared.items():
+            for label, kv_label in labels.items():
+                dropped = {w for w in kv_label.keys.walks if verifies(key, w)} | {
+                    w for w, _ in kv_label.growth if verifies(key, w) and kv_label.keys.growth
+                }
+                if dropped:
+                    logger.info(
+                        "prefix keys on %s/%s: walks %s verify drafts, so their tokens are not keyed",
+                        key, label, sorted(dropped),
+                    )
         self._prefix_model = type(model).__name__
         opened_keys = opened & declared.keys()
         self._log_shut_caches(specs_by_key, declared.keys() - opened, opened, instance, checkpoint is not None)
@@ -1288,6 +1582,7 @@ class Engine:
             for node in specs_by_key[key].nodes:
                 self._keyed_walks.setdefault(node, set()).update(
                     walk for label in declared[key].values() for walk in label.keys.walks
+                    if (node, walk) not in verifying
                 )
         for key, spec in specs_by_key.items():
             if key in self._resources and spec.depends_on() <= self._resources.keys():
@@ -1307,7 +1602,10 @@ class Engine:
                         parts.append(mark)
             resource.enable_prefix_cache(fingerprint(*shared, *parts), {
                 label: KeyedWalks(
-                    kv_label.keys.walks, tuple(walk for walk, _ in kv_label.growth if kv_label.keys.growth),
+                    tuple(walk for walk in kv_label.keys.walks if not verifies(key, walk)),
+                    tuple(
+                        walk for walk, _ in kv_label.growth if kv_label.keys.growth and not verifies(key, walk)
+                    ),
                 )
                 for label, kv_label in declared.get(key, {}).items()
             })
@@ -1426,6 +1724,10 @@ class Engine:
                 return
         # a step of one walk probes (or not) for every row alike
         step_probes = not mixed and walk in keyed_walks
+        # a verify row runs its last token and k drafts: a row whose own prepare (its first verify
+        # step, before it loops back) declares another span would reserve and commit too few slots
+        draft = self._drafts.get(batch.node_name) if self._drafts else None
+        block = draft.decl.config.block if draft is not None and walk == draft.walk and not mixed else None
         for i, rid in enumerate(batch.request_ids):
             row_walk = walk_of(rid) if mixed else walk
             probe_prefix = (row_walk in keyed_walks) if mixed else step_probes
@@ -1460,6 +1762,11 @@ class Engine:
                 continue
             if req_inputs is None:
                 batch.skipped_rids.add(rid)
+            elif block is not None and req_inputs.input_seq_len != block:
+                batch.register_failure(rid, RuntimeError(
+                    f"{batch.node_name}: a verify step's row runs k + 1 = {block} tokens (its last token and the "
+                    f"drafts); prepare_inputs declared {req_inputs.input_seq_len}"
+                ), walk=row_walk)
             else:
                 node_inputs.append(req_inputs)
 
@@ -1492,7 +1799,11 @@ class Engine:
         # a rebuild row leaves its request's entry for the decode step it resumes
         rebuild = batch.step_context.rebuild_rids
         rids = [rid for rid in batch.request_ids if rid not in rebuild] if rebuild else batch.request_ids
-        if batch.rows_only:
+        draft = self._drafts.get(batch.node_name) if self._drafts else None
+        if draft is not None and batch.step_context.graph_walk == draft.walk:
+            # the verify wrote each row's bonus token to its loop-back slot in the graph
+            steps.update(dict.fromkeys(rids, (batch.node_name, draft.walk)))
+        elif batch.rows_only:
             steps.update(dict.fromkeys(
                 rids, (batch.node_name, batch.step_context.graph_walk),
             ))
@@ -1827,6 +2138,8 @@ class Engine:
             if batch.admit_error is None:
                 self._record_loopback(batch)
                 batch.outputs.loopback_rids = batch.loopback_rids
+                if self._drafts and self._verify_step(batch) is not None:
+                    batch.outputs.verify_step = True
             batch.outputs_ready.set()
             laps.lap("record_loopback")
             return batch.outputs
@@ -2142,7 +2455,11 @@ class Engine:
             range_push("engine.admit")
         t0 = phase_start()
         try:
-            admit_outcome = self._runner.admit(step)
+            draft = self._drafts.get(batch.node_name)
+            admit_outcome = self._runner.admit(step) if draft is None else self._runner.admit(step, draft.ledger)
+            if draft is not None and kv_manager._DEBUG_ASSERTS and ctx.graph_walk == draft.walk:
+                # the step's own rows: another row may be offloaded mid-flight
+                draft.check_offsets(self._submodules[batch.node_name].resources, batch.request_ids, step)
         finally:
             phase_end("engine.admit", t0)
             if nvtx:
@@ -2246,6 +2563,20 @@ class Engine:
                     "cg_key_info() and declare_step disagree"
                 )
             step.set_ctx(ctx)
+            draft = self._drafts.get(batch.node_name)
+            if draft is not None and ctx.request_walks and ctx.graph_walk != draft.walk and any(
+                walk == draft.walk for walk in ctx.request_walks.values()
+            ):
+                # its rows would commit k + 1 tokens no ledger entry ever takes back
+                raise RuntimeError(f"{batch.node_name}: verify walk {draft.walk!r} rows inside a combined step")
+            if draft is not None and ctx.graph_walk == draft.walk:
+                if draft.asynchronous and ctx.resident is None:
+                    # a host plan reads the reserved length as the attention length and write slot
+                    raise RuntimeError(
+                        f"{batch.node_name}: an asynchronous verify step of {len(request_ids)} rows "
+                        "found no resident capture"
+                    )
+                draft.refuse_step(step)
             # before any copy this plan issues, the resident stage's included
             self._order_after_pre_plans()
             # promoted and inline plans per resource, apart
@@ -2370,6 +2701,19 @@ class Engine:
                     # a node sharing a resident node's resources moves its rows on the host
                     for planner in self._foreign_planners.get(batch.node_name, ()):
                         planner.note_foreign_step(step, ctx)
+                draft = self._drafts.get(batch.node_name)
+                if draft is not None:
+                    if batch.verify_seq is not None and ctx.graph_walk == draft.walk:
+                        # one result a step: a batch run row by row would commit several
+                        raise RuntimeError(f"{batch.node_name}: a verify step runs batched, not row by row")
+                    # numbered before the commit event the next pre-plan waits on; nested in engine.commit
+                    t1 = phase_start()
+                    batch.verify_seq = draft.committed(
+                        ctx.graph_walk, request_ids, step, submodule_mgmt.resources,
+                    )
+                    phase_end("engine.verify.commit", t1)
+                    if kv_manager._DEBUG_ASSERTS and ctx.graph_walk == draft.walk:
+                        draft.check_offsets(submodule_mgmt.resources, request_ids, step)
             finally:
                 phase_end("engine.commit", t0)
                 if nvtx:
@@ -3004,6 +3348,12 @@ class Engine:
             caps.append(
                 submodule_mgmt.capture_runner.max_batch_size_for(graph_walk)
             )
+        draft = self._drafts.get(node_name)
+        if draft is not None and draft.asynchronous and graph_walk == draft.walk:
+            # every asynchronous verify step replays a resident capture: the
+            # largest bucket captured, which the ranks agreed on, caps the step
+            runner = submodule_mgmt.accelerator_graph_runner
+            caps.append(runner.max_captured_bs(graph_walk) if runner is not None else 0)
         capped = [cap for cap in caps if cap is not None]
         return min(capped) if capped else None
 
@@ -3325,7 +3675,10 @@ class Engine:
         step.set_ctx(batch.step_context)
         try:
             t0 = phase_start()
-            admit_outcome = self._runner.pre_admit(step)
+            draft = self._drafts.get(batch.node_name)
+            admit_outcome = (
+                self._runner.pre_admit(step) if draft is None else self._runner.pre_admit(step, draft.ledger)
+            )
             phase_end("engine.pre_admit", t0)
             if not admit_outcome.ok:
                 # exec re-drives the step and reports the failure from there
@@ -3511,6 +3864,9 @@ class Engine:
             # given a single source of truth for eviction.
             return 0
         at = len(self._resident_delta) if node_name in self._tp_leader_nodes else None
+        if kv_manager._DEBUG_ASSERTS:
+            self._poll_print_checks()
+        prints = self._fingerprints(node_name, request_id) if kv_manager._DEBUG_ASSERTS else None
         freed = sum(
             resource.offload(request_id)
             for resource in self._submodules[node_name].resources.values()
@@ -3519,11 +3875,93 @@ class Engine:
         # a victim can be offloaded without freeing a page
         moved = freed > 0 or self.residency(node_name, request_id) is Residency.ON_HOST
         if moved:
+            if prints is not None:
+                if self._offload_prints is None:
+                    self._offload_prints = {}
+                self._offload_prints[(node_name, request_id)] = prints
             self._release_resident_slot(node_name, request_id)
+            self._mark_offloaded(node_name, request_id)
             if node_name in self._tp_leader_nodes:
                 self._journal(MoveKind.OFFLOAD, request_id, node=node_name, at=at)
         self._runner.readmit(request_id, node_name)
         return freed
+
+    def _mark_offloaded(self, node_name: str, request_id: int) -> None:
+        """A verifying node's row gave up its slot to an offload: what it holds is due
+        at its first admit back (`VerifyLedger.mark_offloaded`). Every rank marks it
+        from the same journaled OFFLOAD, so they apply its results at the same step.
+        Only this node's ledger: `_release_resident_slot` can also release a slot on
+        another node's planner that shares a resource, but a verifying node that shares
+        one never runs asynchronous (`_agreed_mode`), and the synchronous rule makes all
+        its held results due anyway."""
+        draft = self._drafts.get(node_name)
+        if draft is not None:
+            draft.ledger.mark_offloaded(request_id)
+
+    def _rid_name(self, request_id: int) -> str:
+        """The request's id string for a log line; the handle on an engine with no
+        graph runtime (one a test builds)."""
+        if self._graph_runtime is None:
+            return str(request_id)
+        return self._graph_runtime.get_rid_string(request_id)
+
+    def _fingerprints(self, node_name: str, request_id: int) -> "dict[str, bytes | torch.Tensor]":
+        """Every resource's digests of ``request_id`` on ``node_name``. A device
+        digest is queued on the current stream, which every write to the request's
+        state precedes (the host pool's offload and reload copies order on it too),
+        and nothing is read on the host: no sync."""
+        out: dict[str, bytes | torch.Tensor] = {}
+        for key, resource in self._submodules[node_name].resources.items():
+            out.update({f"{key}:{part}": digest for part, digest in resource.debug_fingerprint(request_id).items()})
+        return out
+
+    def _check_reload_prints(self, node_name: str, request_id: int) -> None:
+        """A reload brings back what the offload moved, and the state that stayed
+        on device is as it was. Host parts are compared here; device parts on the
+        device, into flags read once they have landed (`_poll_print_checks`), so the
+        check never waits on the GPU. Raises on a difference."""
+        before = self._offload_prints.pop((node_name, request_id), None)
+        if before is None:
+            return
+        after = self._fingerprints(node_name, request_id)
+        name = self._rid_name(request_id)
+        changed = sorted(part for part, digest in before.items()
+                         if part not in after or (not torch.is_tensor(digest) and after[part] != digest))
+        if changed:
+            raise AssertionError(f"reload of {name} on {node_name}: device state differs from the offload's: {changed}")
+        parts = [part for part, digest in before.items() if torch.is_tensor(digest)]
+        if parts:
+            flags = torch.stack([(before[part] != after[part]).any() for part in parts])
+            event = None
+            if flags.is_cuda:
+                host = torch.empty(len(parts), dtype=torch.bool, pin_memory=True)
+                host.copy_(flags, non_blocking=True)
+                event = torch.cuda.Event()
+                event.record()
+            else:
+                host = flags
+            if self._pending_print_checks is None:
+                self._pending_print_checks = []
+            self._pending_print_checks.append((name, node_name, parts, host, event))
+        self._poll_print_checks()
+
+    def _poll_print_checks(self, wait: bool = False) -> None:
+        """Read the reload checks whose flags have landed (all of them, waiting, at shutdown), and raise on
+        the first that found a difference."""
+        if not self._pending_print_checks:
+            return
+        pending, self._pending_print_checks = self._pending_print_checks, []
+        for i, (name, node_name, parts, host, event) in enumerate(pending):
+            if event is not None and not wait and not event.query():
+                self._pending_print_checks.append(pending[i])
+                continue
+            if event is not None:
+                event.synchronize()
+            changed = [part for part, flag in zip(parts, host.tolist(), strict=True) if flag]
+            if changed:
+                raise AssertionError(
+                    f"reload of {name} on {node_name}: device state differs from the offload's: {changed}"
+                )
 
     def _release_resident_slot(self, node_name: str, request_id: int) -> None:
         """An offloaded request needs no slot: a reload is written whole anyway.
@@ -3560,14 +3998,13 @@ class Engine:
                     done.offload(request_id)
                 return False
             reloaded.append(resource)
+        if kv_manager._DEBUG_ASSERTS and self._offload_prints:
+            self._check_reload_prints(node_name, request_id)
         # Logged at the same level as the eviction in
         # ``Admission._evict`` and as a follower's replay, so
         # the two ranks' resident-set moves can be lined up side by side.
         # A reload only happens after an eviction, so this is not chatty.
-        logger.info(
-            "Reloaded request %s on %s",
-            self._graph_runtime.get_rid_string(request_id), node_name,
-        )
+        logger.info("Reloaded request %s on %s", self._rid_name(request_id), node_name)
         if node_name in self._tp_leader_nodes:
             self._journal(MoveKind.RELOAD, request_id, node=node_name)
         return True
@@ -3718,6 +4155,9 @@ class Engine:
                         "Replayed rank 0's offload of request %s from %s "
                         "(%d reclaimed)", wire_rid, node_name, freed,
                     )
+                # in every branch: rank 0 marked it, and its results must be due at the
+                # same admit here, whichever state this rank's copy was in
+                self._mark_offloaded(node_name, rid)
             elif self.residency(node_name, rid) is not Residency.ON_HOST:
                 logger.debug(
                     "Replay: %s already resident on %s", wire_rid, node_name,
@@ -3811,12 +4251,123 @@ class Engine:
         """Never publish ``keys`` for any request (see ``StepRunner.never_publish``)."""
         self._runner.never_publish(keys)
 
+    # Speculative decoding
+
+    def synchronous_verify_nodes(self) -> frozenset[str]:
+        """Nodes that verify drafts in synchronous mode: the worker never plans
+        their next step ahead of the last one's postprocess."""
+        return frozenset(name for name, draft in self._drafts.items() if not draft.asynchronous)
+
+    def verifying_nodes(self) -> frozenset[str]:
+        """Nodes that verify drafts, in either mode."""
+        return frozenset(self._drafts)
+
+    def node_drafts(self) -> "Mapping[str, NodeDraft]":
+        """Each verifying node's speculative decoding state (its counters, for the worker's metrics)."""
+        return MappingProxyType(self._drafts)
+
+    def verify_unrecorded(self, node_name: str, rid: int) -> bool:
+        """``rid`` has a committed verify step on ``node_name`` whose result is
+        not recorded yet, so nothing on the host knows its length. A diagnostic
+        for preemption's checks (`Preemption._move`); what fails closed is
+        `VerifyLedger.take_due`, which raises on such a result at the row's first
+        admit back, on every rank."""
+        draft = self._drafts.get(node_name)
+        return draft is not None and draft.ledger.unrecorded(rid)
+
+    def verify_pending(self, node_name: str, rid: int) -> bool:
+        """``rid`` holds a verify result on ``node_name`` not yet applied (`VerifyLedger.pending`)."""
+        draft = self._drafts.get(node_name)
+        return draft is not None and draft.ledger.pending(rid)
+
+    def verify_returning(self, node_name: str, rid: int) -> bool:
+        """``rid`` moved to the host on ``node_name`` since its last admit, and holds
+        its verify results until the next (`VerifyLedger.returning`)."""
+        draft = self._drafts.get(node_name)
+        return draft is not None and draft.ledger.returning(rid)
+
+    def unrecorded_verify_rows(self, node_name: str) -> list[int]:
+        """The rows of ``node_name`` with a committed verify step not recorded yet; none off a verifying node."""
+        draft = self._drafts.get(node_name)
+        return [] if draft is None else draft.ledger.unrecorded_rows()
+
+    def void_verify(self, batch: ExecutingBatch) -> None:
+        """A step that committed and failed before its postprocess recorded it:
+        its rows are failed and torn down, so nothing will take it back, and no
+        later admit may wait on its result."""
+        draft = self._drafts.get(batch.node_name)
+        if draft is not None and batch.verify_seq is not None:
+            draft.ledger.void(batch.verify_seq)
+
+    def _verify_step(self, batch: ExecutingBatch) -> "NodeDraft | None":
+        draft = self._drafts.get(batch.node_name)
+        if draft is None or batch.verify_seq is None or batch.step_context.graph_walk != draft.walk:
+            return None
+        return draft
+
+    def record_verify(self, batch: ExecutingBatch, outputs: BatchedModelOutput) -> None:
+        """A verify step's result, for a postprocess that leaves before its
+        token cut (every row stopped or failed): the take-back still needs it.
+        After the step's completion event."""
+        from mstar.engine.resources.draft.drafter import VERIFY_ACCEPTED
+
+        draft = self._verify_step(batch)
+        if draft is None:
+            return
+        host = outputs.host_rows
+        if host is None and outputs.check_stop_buffers is None:
+            # it raised after its commit (`StepPipeline._step_result`): no result, and its rows are torn down
+            draft.ledger.void(batch.verify_seq)
+            return
+        if host is not None and VERIFY_ACCEPTED in host.buffers:
+            rids, accepted = host.request_ids, host.buffers[VERIFY_ACCEPTED]
+        else:
+            rids, accepted = outputs.row_request_ids, outputs.check_stop_buffers[VERIFY_ACCEPTED].cpu()
+        draft.ledger.record(batch.verify_seq, rids, accepted.reshape(-1).numpy())
+
+    def cut_verify_step(self, batch: ExecutingBatch, outputs: BatchedModelOutput, host_rows) -> None:
+        """The token cut of a verify step, in postprocess right after the stop
+        check's host copy and before anything reads the outputs: each row's
+        emitted output (the stop's buffer) is cut to its run, and the stop
+        check reads the cut's stopped column. Records the step's result."""
+        from mstar.engine.resources.draft.drafter import VERIFY_TOKENS
+
+        draft = self._verify_step(batch)
+        if draft is None:
+            return
+        if host_rows is None or VERIFY_TOKENS not in host_rows.buffers:
+            raise RuntimeError(f"{batch.node_name}: a verify step's tokens never reached the host")
+        if draft.token_stop.buffer in host_rows.buffers:
+            # its host copy would carry every block's k + 1 tokens, past stops and the budget
+            raise RuntimeError(
+                f"{batch.node_name}: a verify step stages {draft.token_stop.buffer!r} for the stop check; "
+                "stage VERIFY_TOKENS and VERIFY_ACCEPTED only"
+            )
+        # nested in the worker's prematerialize stage, whose stopwatch it doesn't move
+        t0 = phase_start()
+        cut = draft.cut(batch.verify_seq, host_rows, batch.per_request_info)
+        name = draft.token_stop.buffer
+        per_rid = outputs.per_rid_outputs
+        for rid, count in zip(cut.request_ids, cut.counts.tolist(), strict=True):
+            tensors = per_rid.get(rid, {}).get(name)
+            for i, tensor in enumerate(tensors or ()):
+                tensors[i] = tensor[..., :count]
+        # the views no longer describe the stored rows
+        outputs.row_views = None
+        phase_end("engine.verify.cut", t0)
+
     def remove_request(self, request_id: str) -> set[str]:
         """Tear the request down on every resource. Returns the resources it
         held pages of that the teardown hands back, which `reclaimable` counts:
         a KV cache whose pages reach the free list or are left to the prefix
         index alone. An offloaded request, or one that never ran, frees none."""
         self._loopback_steps.pop(request_id, None)
+        if self._offload_prints:
+            for node in self._submodules:
+                self._offload_prints.pop((node, request_id), None)
+        # first: no take-back may find the ledger holding a row whose streams are gone
+        for draft in self._drafts.values():
+            draft.remove_request(request_id)
         freed = {
             key for key, resource in self._resources.items()
             if resource.reclaimable(request_id)
@@ -3830,5 +4381,7 @@ class Engine:
         return freed
 
     def shutdown(self):
+        # the reload checks still in flight: a difference is reported, not lost with the process
+        self._poll_print_checks(wait=True)
         for resource in self._resources.values():
             resource.cleanup()

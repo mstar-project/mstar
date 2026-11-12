@@ -103,6 +103,20 @@ def context_only_views(
     return out
 
 
+def hide_tail_views(views: list[SequenceView], hide: int, page_size: int) -> list[SequenceView]:
+    """The views with each one's last ``hide`` rows out of its keys (the pages
+    past the shorter length dropped), its queries (``to_compute``) unchanged:
+    a step whose trailing rows no query attends to (``AttentionStep.hide_last``)."""
+    out = []
+    for view in views:
+        length = view.length - hide
+        if length < 1 or view.to_compute < hide:
+            raise ValueError(f"hide_last={hide} on a row of {view.to_compute} new tokens and {view.length} in all")
+        pages = -(-(view.start + length) // page_size)
+        out.append(view._replace(page_idxs=view.page_idxs[:pages], length=length))
+    return out
+
+
 def build_paged_indptrs(
     segments: list[SequenceView],
     page_size: int,

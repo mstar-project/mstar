@@ -397,7 +397,10 @@ The core method is ``generate``:
    ``(filename, bytes)`` tuple, or a list of those. Extra keyword args are forwarded as the
    model's ``model_kwargs`` (e.g. ``voice="tara"``, ``temperature=0.7``,
    ``max_output_tokens=256``); ``None`` values are dropped. Returns a ``GenerateResult``
-   when ``stream=False``, or an iterator of stream events when ``stream=True``.
+   when ``stream=False``, or an iterator of stream events when ``stream=True``. On a
+   deployment with speculative decoding on, ``repetition_penalty`` other than 1,
+   ``repetition_window``, ``min_tokens``, ``return_logprobs`` and ``penalize_prompt=False``
+   are refused with a 400, and a streamed chunk may carry several tokens.
 
 Convenience wrappers:
 

@@ -712,7 +712,7 @@ def test_a_follower_worker_takes_room_past_twice_the_rebuild_pool(monkeypatch):
         set_node_metadata=lambda *a, **kw: None, set_inline_streams=lambda keys: None))
     engine = SimpleNamespace(
         get_stop_policies=lambda node, walk: None, paged_kv_caches=list, host_allowance=StepAllowance(),
-        node_dtype=lambda node: torch.float32,
+        node_dtype=lambda node: torch.float32, verifying_nodes=frozenset, synchronous_verify_nodes=frozenset,
     )
     monkeypatch.setattr(worker_mod, "EngineManager", SimpleNamespace(
         build=lambda *a, **kw: SimpleNamespace(

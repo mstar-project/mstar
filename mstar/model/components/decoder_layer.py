@@ -13,10 +13,13 @@ into the next norm (``RMSNorm.forward_residual``).
 """
 from __future__ import annotations
 
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 import torch
 from torch import nn
+
+if TYPE_CHECKING:
+    from mstar.engine.resources.taps.resource import TapResource
 
 
 def _gated_residual(
@@ -100,6 +103,7 @@ def run_layers(
     layers: nn.ModuleList, hidden_states: torch.Tensor, norm: nn.Module,
     set_cursor: Callable[[int, nn.Module], None] | None = None,
     comm_group=None,
+    taps: TapResource | None = None,
 ) -> torch.Tensor:
     """``layers`` then the final ``norm``, each residual add fused into the next
     norm (one add+norm kernel instead of two launches; under TP, with
@@ -113,9 +117,20 @@ def run_layers(
     on ``i``; ``set_cursor`` must be ``torch.compiler.disable``'d whole and do
     no tensor work. Not ``recursive=False``: Dynamo calls back into such a frame
     on every call, and the capture stance (``fail_on_recompile``) raises there.
+
+    ``taps`` (the node's `TapResource`, e.g. for a drafter) gets the residual
+    stream entering each of its layers, and with layer ``len(layers)`` the
+    stream after the last one: copied as soon as it exists, since the next
+    fused add+norm updates it in place.
     """
+    columns = () if taps is None else taps.columns
+    if columns and max(columns) > len(layers):
+        # never written, a captured step would read zeros and an eager one garbage
+        raise ValueError(f"taps name layer {max(columns)} of a stack of {len(layers)}")
     first_norm = layers[0].input_layernorm if len(layers) else norm
     h, residual = first_norm.forward_residual(hidden_states.clone(), None, comm_group)
+    if 0 in columns:
+        taps.write(0, residual)
     for i, layer in enumerate(layers):
         if set_cursor is None:
             layer.self_attn.attend.set_layer_idx(i)
@@ -124,6 +139,8 @@ def run_layers(
         h = layer.self_attn(h)
         next_norm = layers[i + 1].input_layernorm if i + 1 < len(layers) else norm
         h, residual = layer.forward_mlp_residual(h, residual, next_norm, comm_group)
+        if i + 1 in columns:
+            taps.write(i + 1, residual)
     return h
 
 
