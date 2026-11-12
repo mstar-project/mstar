@@ -24,6 +24,7 @@ replay, not baked at capture) only exists inside a CUDA graph.
 
 from __future__ import annotations
 
+import dataclasses
 import sys
 from types import SimpleNamespace
 
@@ -1654,3 +1655,96 @@ def test_a_world_index_out_of_range_is_caught_on_the_host_paths():
             layer.session_span(bad)
         with pytest.raises(IndexError, match="out of range"):
             layer.reset(bad)
+
+
+# ── the frame count and the write ────────────────────────────────────────
+
+
+def _write_frames(kv: RingKVManager, rid: str, frames: int) -> None:
+    """``frames`` steps of the 4+1 schedule through `write`, each frame's kept
+    pass holding the value ``frame + 1`` and its scratch passes -1."""
+    for frame in range(frames):
+        step, ctx = _step(rid, frame=frame), _ctx(rid)
+        assert kv.admit(step, ctx).ok
+        kv.plan(step, ctx)
+        for keep in (False, False, False, False, True):
+            value = frame + 1.0 if keep else -1.0
+            for layer_idx in range(len(kv.layers)):
+                k = torch.full((1, N_KV_HEADS, TPF, D_HEAD), value)
+                kv.write(k, k, layer_idx, keep=keep)
+        kv.commit(step, ctx)
+
+
+def test_the_frame_count_follows_its_session_and_never_fills_at_capture():
+    """The count is where the next frame writes, so one left behind by a released
+    session or by capture would write a request's first frame that many slots on."""
+    kv = _manager()
+    kv.ingest_request("a")
+    _drive(kv, "a", 0)
+    _drive(kv, "a", 1)
+    assert kv.position("a", "main") == 2 * TPF
+    state = kv.get_state("a")
+    kv.reset_request("a")
+    assert kv.position("a", "main") == 0, "a released session's count should go with it"
+    _open(kv, "a")
+    kv.load_state("a", state)
+    assert kv.position("a", "main") == 2 * TPF, "load_state should restore the count get_state took"
+
+    fresh = _manager()
+    fresh.commit(RingKVStep(frames=()), _ctx("a"))  # a commit capture should never have made
+    with pytest.raises(RuntimeError, match="counted committed frames"):
+        fresh.post_warmup_validate()
+
+
+def test_the_ring_refuses_a_frame_past_max_len():
+    """A frame past the array's length has no position, so the request fails at admit rather than reusing slots."""
+    kv = _manager(dataclasses.replace(_ring_config(), max_frames=2))
+    kv.ingest_request("a")
+    _drive(kv, "a", 0)
+    _drive(kv, "a", 1)
+
+    outcome = kv.admit(_step("a", frame=2), _ctx("a"))
+
+    assert not outcome.ok and not outcome.ready
+    assert type(outcome.reason) is AdmitRuntimeError and outcome.reason.request_ids == {"a"}
+    assert "holds 2 frames per request" in outcome.reason.message
+
+
+def test_the_ring_stores_only_what_a_frame_window_reaches():
+    """The dilated layer keeps frames on its stride: frame 8 and not frame 9, which only its own step's reads see."""
+    kv = _manager()
+    kv.ingest_request("a")
+    _write_frames(kv, "a", 10)
+
+    dilated = kv.layers[-1]
+    kept = dilated.kv[0, 0, 0, : dilated.ring_len, 0].view(RING_FRAMES, TPF)[:, 0].tolist()
+    assert kept == [1.0, 9.0, 0.0, 0.0], "slot 0 should hold frame 0, slot 1 frame 8, and nothing else"
+    local = kv.layers[0]
+    assert local.kv[0, 0, 0, : local.ring_len, 0].view(RING_FRAMES, TPF)[:, 0].tolist() == [9.0, 10.0, 7.0, 8.0], (
+        "a layer of stride 1 should keep the last four frames, frame 9 among them"
+    )
+
+
+def test_write_leaves_the_bytes_upsert_leaves_over_two_wraps():
+    """`write` is `upsert`'s write without the visibility row, at the frame `plan` staged from the count."""
+    old, new = _manager(), _manager()
+    gen = torch.Generator().manual_seed(0)
+    for kv in (old, new):
+        kv.ingest_request("a")
+    # two wraps of the dilated layer's ring, so of every layer's
+    for frame in range(2 * 8 * RING_FRAMES + 1):
+        step, ctx = _step("a", frame=frame), _ctx("a")
+        for kv in (old, new):
+            assert kv.admit(step, ctx).ok
+            kv.plan(step, ctx)
+        for keep in (False, False, False, False, True):
+            for layer_idx in range(N_LAYERS):
+                k, v = _frame(old, gen)
+                old.upsert(k, v, layer_idx, torch.tensor([frame]), commit=keep)
+                new.write(k, v, layer_idx, keep=keep)
+        for kv in (old, new):
+            kv.commit(step, ctx)
+        for i, (a, b) in enumerate(zip(old.layers, new.layers, strict=True)):
+            assert torch.equal(a.kv, b.kv) and torch.equal(a.written, b.written), (
+                f"layer {i} differs after frame {frame}"
+            )
