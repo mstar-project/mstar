@@ -2550,7 +2550,7 @@ class Engine:
                 )
             except Exception as error:
                 batch.register_failure(rid, error)
-        if type(submodule).batch_postprocess is not NodeSubmodule.batch_postprocess:
+        if submodule.runs_batch_postprocess:
             live = [
                 (rid, node_inputs)
                 for rid, node_inputs in zip(batch.request_ids, batch.inputs, strict=True)
@@ -2594,7 +2594,7 @@ class Engine:
             else:
                 submodule_mgmt = self._submodules[batch.node_name]
                 submodule = submodule_mgmt.submodule
-                if type(submodule).batch_postprocess is not NodeSubmodule.batch_postprocess:
+                if submodule.runs_batch_postprocess:
                     submodule.batch_postprocess(
                         outputs, batch.per_request_info_wrapped, batch.inputs,
                         piecewise_runners=submodule_mgmt.piecewise_runners,
@@ -3434,9 +3434,8 @@ class Engine:
             return False
         if batch.inputs is not None or (
             not submodule_mgmt.piecewise_runners
-            and submodule_mgmt.submodule.step_is_input_free(
-                batch.step_context.graph_walk,
-            )
+            # the walk the leased capture ran, whose template rows the step was declared over
+            and submodule_mgmt.submodule.step_is_input_free(lease.bucket.graph_walk)
         ):
             # exec drives this step as declared here, and its admit skips
             # the resources pre_admit covered

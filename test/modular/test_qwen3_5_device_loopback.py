@@ -205,7 +205,7 @@ def test_forward_in_graph_rope_reads_planned_positions_at_capture():
         out = LLMSubmodule._forward(
             sub, "decode", engine_inputs, cos_3d=static_cos, sin_3d=static_cos, input_ids=static_ids,
         )
-        assert out == ("sampled", ["r1", "r2"])
+        assert out == {"new_token": ("sampled", ["r1", "r2"])}
         return dict(calls)
 
     c = run(True)

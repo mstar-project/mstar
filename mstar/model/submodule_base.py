@@ -448,7 +448,9 @@ class NodeInputs:
     # it. 0 for a submodule whose inputs aren't sequence-shaped.
     input_seq_len: int = 0
 
-    # The request's real walk, stamped by the engine; None on capture templates
+    # The request's real walk, stamped by the engine. A capture template may
+    # name the walk its rows stand for (a decode row under a mixed step's
+    # label), else None.
     graph_walk: str | None = None
 
     # Set by the engine on a chunk of a split input: where it starts, and the
@@ -1204,7 +1206,9 @@ class NodeSubmodule(torch.nn.Module, ABC):
         but their spans, and every real row has the span of the template row.
         Then the step a pre-plan declared over the bucket's template rows is
         the step the forward would declare, and the engine runs it instead of
-        declaring and admitting a second time."""
+        declaring and admitting a second time. ``graph_walk`` is the walk the
+        leased capture ran; a replay walk must declare as that walk does over
+        its template rows."""
         del graph_walk
         return False
 
@@ -1466,6 +1470,12 @@ class NodeSubmodule(torch.nn.Module, ABC):
         """
         return
 
+    @property
+    def runs_batch_postprocess(self) -> bool:
+        """Whether the engine calls `batch_postprocess` for this node: when the
+        class overrides it, unless the node says its override has nothing to do."""
+        return type(self).batch_postprocess is not NodeSubmodule.batch_postprocess
+
     def batch_postprocess(
         self, outputs: BatchedModelOutput,
         request_infos: dict[int, CurrentForwardPassInfo],
@@ -1479,7 +1489,7 @@ class NodeSubmodule(torch.nn.Module, ABC):
         every request's ``postprocess``, for the requests whose
         ``postprocess`` succeeded (``request_infos``' keys, in the order of
         ``inputs``); a raise then fails every one of them. Optional; only
-        called when overridden.
+        called when `runs_batch_postprocess` says so.
 
         ``piecewise_runners`` are this node's captured regions
         (``get_piecewise_accelerator_graph_configs``), as ``engine_inputs`` hands

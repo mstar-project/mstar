@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import math
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -35,6 +36,7 @@ from mstar.model.phi4mm.components.audio import (
     audio_batch,
     plan_windows,
 )
+from mstar.model.phi4mm.phi4mm_model import Phi4MMModel
 from mstar.model.phi4mm.tests._paths import ORACLE as _ORACLE
 from mstar.model.phi4mm.tests._paths import snapshot
 from mstar.model.submodule_base import ModelInputsFromEngine
@@ -60,6 +62,10 @@ def _tone(samples: int, rate: int) -> torch.Tensor:
 )
 def test_frame_and_token_counts(samples: int, rate: int, frames: int):
     prepared = audio_intake(_tone(samples, rate), {"sample_rate": rate})
+    # the model's intake, called as the scaffold calls it (with the request's kwargs)
+    clip, metadata = _tone(samples, rate), {"sample_rate": rate}
+    via_model = Phi4MMModel._audio_intake(SimpleNamespace(audio_config=None), clip, metadata, {})
+    assert via_model.tokens == prepared.tokens
     mel = prepared.inputs[AUDIO_FEATURES]
     assert mel.shape == (frames, 80) and mel.dtype == torch.float32
     assert prepared.tokens == [-(-frames // 8)]

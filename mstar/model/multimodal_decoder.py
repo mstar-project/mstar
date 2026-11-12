@@ -32,6 +32,7 @@ from mstar.engine.resources.sampler.config import SamplerSpec, SamplingReqConfig
 from mstar.engine.resources.spec import CombinedSplit, ResourceReqConfig
 from mstar.graph.base import GraphSection, TensorPointerInfo
 from mstar.model.base import KVLabel, LabelLayout, Model, PrefixKeys, ProcessPromptOutput, Span, WalkStep
+from mstar.model.components.sampled_token_decoder import DecoderWalks, SampledTokenDecoder, decoder_walks
 from mstar.model.keys import KV_CACHE, MIXED, PREFILL_TEXT, SAMPLER
 from mstar.model.multimodal import (
     MEDIA_LAYOUT,
@@ -50,7 +51,7 @@ from mstar.model.multimodal import (
     media_walk_names,
     media_walks,
     parts_from_modalities,
-    text_combined_walks,
+    placeholders,
 )
 from mstar.model.rebuild import RebuildPolicy
 from mstar.model.submodule_base import NodeSubmodule
@@ -86,23 +87,30 @@ class PreparedMedia(NamedTuple):
 class MediaIntake:
     """How a prompt's attachments of one ``modality`` reach their encoder.
 
-    Each attachment fills ``runs(attachment, metadata)`` placeholders
+    Each attachment fills ``runs(attachment, metadata, request)`` placeholders
     ``pad`` in the rendered prompt (one when ``runs`` is None);
-    ``prepare(attachment, metadata)`` gives its `PreparedMedia`, and each
-    placeholder is expanded to its run's tokens, between ``sentinels`` when
-    given. ``metadata`` is the attachment's loader metadata, ``{}`` when it
-    came with none. Intakes may share a ``pad`` (and then its sentinels):
+    ``prepare(attachment, metadata, request)`` gives its `PreparedMedia`, and
+    each placeholder is expanded to its run's tokens, between ``sentinels``
+    when given. ``metadata`` is the attachment's loader metadata, ``{}`` when
+    it came with none, and ``request`` the request's kwargs, as
+    ``process_prompt`` got them (a knob such as MiniCPM-o's
+    ``max_slice_nums``). Intakes may share a ``pad`` (and then its sentinels):
     the nth placeholder of a pad goes to the nth attachment of that pad in
     the order of the prompt's parts, which is where `_prompt_ids` renders
-    each attachment.
+    each attachment. ``opens`` are the ids a placeholder follows in the
+    rendered prompt, for a template that writes its own sentinels around a
+    pad users may also type (MiniCPM-o's ``<unk>``): a pad right after none
+    of them stays a token. Intakes sharing a pad declare them all or none,
+    and the same sentinels, which setting a model's ``media`` checks.
     """
 
     modality: str
     encoder: MediaEncoder
     pad: int
-    prepare: Callable[[torch.Tensor, dict], PreparedMedia]
+    prepare: Callable[[torch.Tensor, dict, Mapping], PreparedMedia]
     sentinels: tuple[int, int] | None = None
-    runs: Callable[[torch.Tensor, dict], int] | None = None
+    runs: Callable[[torch.Tensor, dict, Mapping], int] | None = None
+    opens: frozenset[int] = frozenset()
 
 
 class MediaPrompt(NamedTuple):
@@ -131,8 +139,10 @@ class MultimodalDecoderModel(Model):
     # comes too); workers fetch the full snapshot (`_resolve_weights`)
     METADATA_FILES: tuple[str, ...]
 
-    # one per attachment modality the model takes, set by its `__init__`
-    media: tuple[MediaIntake, ...] = ()
+    # set through `media`
+    _media: tuple[MediaIntake, ...] = ()
+    _sentinels: Mapping[int, tuple[int, int]] = MappingProxyType({})
+    _opens: Mapping[int, frozenset[int]] = MappingProxyType({})
     # False for a model every prompt of which carries media (an audio-only
     # STT checkpoint): no text-only prefill walk, no mixed step, no prefix keys
     # (only a text span is keyed), and its LLM node, given this as its
@@ -174,6 +184,28 @@ class MultimodalDecoderModel(Model):
         return snapshot_download(repo_id=self.model_path_hf, cache_dir=self.cache_dir)
 
     @property
+    def media(self) -> tuple[MediaIntake, ...]:
+        """One `MediaIntake` per attachment modality the model takes, set by
+        its `__init__`."""
+        return self._media
+
+    @media.setter
+    def media(self, media: Sequence[MediaIntake]) -> None:
+        # intakes sharing a pad must agree on how it is wrapped and found, checked
+        # here once rather than per prompt
+        sentinels: dict[int, tuple[int, int]] = {}
+        opens: dict[int, frozenset[int]] = {}
+        for m in media:
+            if m.sentinels is not None and sentinels.setdefault(m.pad, m.sentinels) != m.sentinels:
+                raise ValueError(f"{self.NAME}: intakes sharing placeholder {m.pad} wrap it in different sentinels")
+            if any(bool(o.opens) != bool(m.opens) for o in media if o.pad == m.pad):
+                raise ValueError(f"{self.NAME}: intakes sharing placeholder {m.pad} declare opens all or none")
+            if m.opens:
+                opens[m.pad] = opens.get(m.pad, frozenset()) | m.opens
+        self._media = tuple(media)
+        self._sentinels, self._opens = sentinels, opens
+
+    @property
     def encoders(self) -> tuple[MediaEncoder, ...]:
         """The media's encoders, each once (modalities may share one)."""
         return tuple(dict.fromkeys(m.encoder for m in self.media))
@@ -186,8 +218,15 @@ class MultimodalDecoderModel(Model):
     # Graph
     # -----------------------------------------------------------------------
 
+    def decoder_walks(self) -> DecoderWalks:
+        """The LLM node's decode and hidden walks, read off this model's graph:
+        what the mixed step and the KV growth name, and what `get_submodule`
+        binds to that node."""
+        return decoder_walks(self.get_graph_walk_graphs(), "LLM", self.DECODE_LOOP)
+
     def get_combined_graph_walks(self) -> dict[str, dict[str, set[str]]]:
-        return text_combined_walks() if self.TEXT_PROMPTS else {}
+        # text prefill and every decode walk's rows share a step
+        return {"LLM": {MIXED: {PREFILL_TEXT, *self.decoder_walks().decode}}} if self.TEXT_PROMPTS else {}
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         # a safety bound on decode, not the per-request budget
@@ -211,11 +250,11 @@ class MultimodalDecoderModel(Model):
         # A text prompt's one `ids` span is keyed for the prefix cache, and its replies extend the
         # keys. Nothing of a media prompt is, since its one step carries tensor inputs, which the
         # prefix cache never cuts.
+        growth = tuple((walk, self.DECODE_LOOP) for walk in sorted(self.decoder_walks().decode))
         if not self.TEXT_PROMPTS:
-            return {KV_CACHE: {"main": KVLabel(growth=(("decode", "decode_loop"),))}}
+            return {KV_CACHE: {"main": KVLabel(growth=growth)}}
         return {KV_CACHE: {"main": KVLabel(
-            growth=(("decode", "decode_loop"),),
-            keys=PrefixKeys("text_inputs", (PREFILL_TEXT,), growth=True),
+            growth=growth, keys=PrefixKeys("text_inputs", (PREFILL_TEXT,), growth=True),
         )}}
 
     def checkpoint_path(self) -> str:
@@ -337,20 +376,17 @@ class MultimodalDecoderModel(Model):
         want: dict[int, int] = {}
         for m, intake in media.items():
             want[intake.pad] = want.get(intake.pad, 0) + sum(
-                1 if intake.runs is None else intake.runs(raw[m][i], metadata(m, i)) for i in range(len(raw[m]))
+                1 if intake.runs is None else intake.runs(raw[m][i], metadata(m, i), kwargs) for i in range(len(raw[m]))
             )
+        hits = ids[placeholders(ids, want, self._opens)].tolist()
         for pad, n in want.items():
-            found = int((ids == pad).sum())
+            found = hits.count(pad)
             if found != n:
                 names = " / ".join(m.modality for m in self.media if m.pad == pad)
                 raise ValueError(
                     f"multimodal placement mismatch: the prompt holds {found} {names} "
                     f"placeholders for {n} {names} inputs"
                 )
-        sentinels: dict[int, tuple[int, int]] = {}
-        for m in self.media:
-            if m.sentinels is not None and sentinels.setdefault(m.pad, m.sentinels) != m.sentinels:
-                raise ValueError(f"{self.NAME}: intakes sharing placeholder {m.pad} wrap it in different sentinels")
         inputs: NameToTensorList = {}
         # per pad id, its runs in prompt order: the nth placeholder of a pad is its nth run
         pad_runs: dict[int, list[MediaRun]] = {m.pad: [] for m in self.media}
@@ -358,14 +394,14 @@ class MultimodalDecoderModel(Model):
             intake = media.get(part.modality)
             if intake is None:
                 continue
-            prepared = intake.prepare(raw[part.modality][part.index], metadata(part.modality, part.index))
+            prepared = intake.prepare(raw[part.modality][part.index], metadata(part.modality, part.index), kwargs)
             grids = [()] * len(prepared.tokens) if prepared.grids is None else prepared.grids
             pad_runs[intake.pad] += [
                 MediaRun(n, intake.encoder.output, grid) for n, grid in zip(prepared.tokens, grids, strict=True)
             ]
             for name, tensor in prepared.inputs.items():
                 inputs.setdefault(name, []).append(tensor)
-        return MediaPrompt(expand_media_pads(ids, pad_runs, sentinels), inputs)
+        return MediaPrompt(expand_media_pads(ids, pad_runs, self._sentinels, self._opens), inputs)
 
     def max_input_files(self) -> dict[str, int]:
         # an attachment no intake takes, refused before any file is decoded
@@ -383,13 +419,6 @@ class MultimodalDecoderModel(Model):
 
     def text_output(self) -> TextOutput:
         return TextOutput(self._chunk_detokenizer(), self.config.stop_token_ids)
-
-    def postprocess(
-        self, output: torch.Tensor, modality: str, request_kwargs: dict | None = None,
-    ) -> bytes:
-        if modality == "text":
-            return super().postprocess(output, modality, request_kwargs)
-        raise ValueError(f"Unsupported modality for {self.NAME}: {modality!r}")
 
     # -----------------------------------------------------------------------
     # Sampling
@@ -457,9 +486,12 @@ class MultimodalDecoderModel(Model):
         if node_name not in self._submodule_cache:
             # the weights' dtype, and the fused kernel's: they must agree
             dtype = autocast_dtype or torch.bfloat16
-            self._submodule_cache[node_name] = self._create_submodule(
-                node_name, device, dtype, tp_group,
-            )
+            submodule = self._create_submodule(node_name, device, dtype, tp_group)
+            if isinstance(submodule, SampledTokenDecoder):
+                # the walks this node decodes in are the graph's, whatever the model built;
+                # a decoder node in no decode loop is refused
+                submodule.bind_walks(decoder_walks(self.get_graph_walk_graphs(), node_name, self.DECODE_LOOP))
+            self._submodule_cache[node_name] = submodule
             if tp_group is not None and tp_group.world_size > 1:
                 # the LLM's norms reduce its row-parallel partial sums in one
                 # fused kernel; collective, and every rank builds the node here

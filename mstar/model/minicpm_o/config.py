@@ -12,13 +12,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from mstar.model.components.qwen3_lm import Qwen3LMConfig
+from mstar.model.multimodal import MediaEncoder
 
-# resource keys
-LLM_KV = "llm_kv"
-LLM_ATTN = "llm_attn"
-LLM_POS = "llm_pos"
-LLM_SAMPLER = "llm_sampler"
-VISION_ATTN = "vision_attn"
+# resource keys beyond the scaffold's (``mstar.model.keys``): the LLM's attention,
+# then the other nodes'
+ATTN = "attn"
 RESAMPLER_ATTN = "resampler_attn"
 AUDIO_ATTN = "audio_attn"
 TTS_KV = "tts_kv"
@@ -29,30 +27,26 @@ T2W_STATE = "t2w_state"
 # token2wav attention caches, one resource per ``token2wav.CACHE_FAMILIES`` entry
 T2W_KV = {"enc1": "t2w_enc1_kv", "enc2": "t2w_enc2_kv", "dit": "t2w_dit_kv"}
 
-# the LLM's decode loop, which the KV layout and loop caps name
-DECODE_LOOP = "decode_loop"
-# Its walks: a text reply's, whose token loops back on the device, and a spoken
-# reply's, which also hands the TTS each step's input token and hidden. Their rows
-# share a step as DECODE_MIXED.
-DECODE = "decode"
+# The media encoders, which name the scaffold's prefill walks (``prefill_image``,
+# ``prefill_audio``, ``prefill_image_audio``). Both fill upstream's ``<unk>``
+# placeholder; the media layout says whose row each token takes.
+IMAGE_ENCODER = MediaEncoder("image", "vision_encoder", ("pixel_values",), "vision_embeds")
+AUDIO_ENCODER = MediaEncoder("audio", "audio_encoder", ("audio_features",), "audio_embeds")
+
+# A spoken reply's decode walk: the scaffold's ``decode`` loop, also handing the
+# TTS each row's input id and hidden state
 DECODE_SPOKEN = "decode_spoken"
-DECODE_MIXED = "decode_mixed"
-DECODE_WALKS = frozenset({DECODE, DECODE_SPOKEN, DECODE_MIXED})
 # a spoken reply's TTS walks and its decode loop
 TTS_PREFILL = "tts_prefill"
 TTS_DECODE = "tts_decode"
 TTS_DECODE_LOOP = "tts_decode_loop"
-# the walks that prefill the prompt and sample the reply's first token
-PREFILL_WALKS = frozenset({"prefill_text", "prefill_image", "prefill_audio", "prefill_omni"})
 
-# step_metadata keys: each image slice's patch grid and each audio piece's mel
-# frames, which the encoders lay their segments out by (read off a routed
-# tensor, they would wait on the device)
-IMAGE_TGT_SIZES = "image_tgt_sizes"
-AUDIO_FEATURE_LENS = "audio_feature_lens"
 # a spoken reply's text cap (``get_max_output_tokens``), a default rather than a
 # length kwarg, so admission still fits it to the prompt
 SPEECH_TEXT_TOKENS = "speech_text_tokens"
+# the request kwarg capping an image's slices, which the image intake reads off
+# the request's kwargs (``MediaIntake`` hands them to its callables)
+MAX_SLICE_NUMS_KEY = "max_slice_nums"
 
 # ragged span labels
 PATCHES = "patches"
@@ -139,6 +133,11 @@ class MiniCPMOConfig:
     # tokens that end a reply; filled from the tokenizer by the model
     stop_token_ids: tuple[int, ...] = ()
     tts_config: dict = field(default_factory=dict)
+
+    @property
+    def hidden_size(self) -> int:
+        """The LLM's width, which the encoders' outputs share."""
+        return self.llm.hidden_size
 
     @classmethod
     def from_hf(cls, local_dir: str) -> "MiniCPMOConfig":

@@ -17,6 +17,7 @@ sys.path.insert(0, ".")
 import pytest
 import torch
 
+from mstar.engine.resources.step import BucketKey, SlotLease
 from mstar.testing_utils.engine import make_engine, make_mgmt
 from mstar.testing_utils.worker import make_worker
 from mstar.worker.micro_scheduler import CHAIN_LANE, ScheduledBatch
@@ -267,10 +268,40 @@ def test_a_pre_plan_records_its_event_even_when_it_raises(monkeypatch) -> None:
     submodule.step_is_input_free = lambda walk: False
     mgmt = make_mgmt(submodule)
     with pytest.raises(RuntimeError):
-        fake._pre_plan_for_batch(batch, mgmt, cg_runner, object())
+        fake._pre_plan_for_batch(batch, mgmt, cg_runner, SlotLease(slot=0, bucket=BucketKey("decode", 1, 1)))
     event = fake._pre_plan_done["dit"]
     assert isinstance(event, _FakeEvent) and event.recorded_on is None
     assert batch.preplan_event is None
+
+
+@pytest.mark.parametrize("input_free", [True, False])
+def test_a_pre_plan_keeps_its_step_when_its_capture_walk_is_input_free(monkeypatch, input_free) -> None:
+    # a step under a walk that replays another walk's batched capture (a decode-only
+    # mixed step on the decode capture) was declared over that capture's template
+    # rows, so exec runs it as declared when that walk's step reads no inputs
+    monkeypatch.setattr(torch, "Event", _FakeEvent)
+    fake = make_engine(
+        _order_after_pre_plans=lambda: None,
+        _runner=SimpleNamespace(pre_admit=lambda step: SimpleNamespace(ok=True), pre_plan=lambda step: None),
+    )
+    step = SimpleNamespace(set_ctx=lambda ctx: None, state={})
+    submodule = SimpleNamespace(declare_step=lambda **kw: step)
+    submodule.step_is_input_free = lambda walk: input_free and walk == "decode"
+    cg_runner = SimpleNamespace(
+        declare_inputs_for=lambda lease: [], step_ids=lambda lease, rids: rids,
+        plan_stream=lambda: None,
+    )
+    batch = SimpleNamespace(
+        node_name="dit", inputs=None, request_ids=["a"], per_request_info={},
+        step=None, preplan_event=None, preplanned_rids=None,
+        step_context=SimpleNamespace(
+            graph_walk="mixed", padded_request_ids=["a"], is_preplan=False,
+            set_padded_rids=lambda rids: None, resident=None,
+        ),
+    )
+    lease = SlotLease(slot=0, bucket=BucketKey("decode", 1, 1))
+    assert fake._pre_plan_for_batch(batch, make_mgmt(submodule), cg_runner, lease)
+    assert (batch.step is step) == input_free
 
 
 def test_a_step_is_ordered_after_every_plan_streams_pre_plans(monkeypatch) -> None:

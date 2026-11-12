@@ -7,6 +7,7 @@ loop over the LLM.
 """
 import json
 import logging
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -231,7 +232,7 @@ class MuseGlimmerModel(MultimodalDecoderModel):
         processor does."""
         return self._encode(self.render_prompt(parts, **kwargs))
 
-    def _image_intake(self, image: torch.Tensor, metadata: dict) -> PreparedMedia:
+    def _image_intake(self, image: torch.Tensor, metadata: dict, request: Mapping = {}) -> PreparedMedia:
         pixels, grid = preprocess_image(image, **self._processor)
         grid = torch.tensor(grid, dtype=torch.long)
         return PreparedMedia(

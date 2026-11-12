@@ -80,7 +80,7 @@ from mstar.model.components.block_loop_encoder import VISION_BLOCK_LOOP
 from mstar.model.components.request_kwargs import sampler_capabilities
 from mstar.model.keys import MIXED, PREFILL_TEXT, ROPE
 from mstar.model.multimodal import media_walk_names, vision_encoder
-from mstar.model.multimodal_decoder import MultimodalDecoderModel
+from mstar.model.multimodal_decoder import MediaIntake, MultimodalDecoderModel
 from mstar.model.qwen3_5.components.language_model import Qwen3_5ForCausalLM, Qwen3_5LanguageModel
 from mstar.model.qwen3_5.config import (
     ATTN,
@@ -361,7 +361,7 @@ _VISION = dict(
 def _qwen3_5_vision(monkeypatch) -> Qwen3_5DenseModel:
     model = _qwen3_5(**QWEN3_5["9B"])
     model.vision_config = Qwen3_5VisionConfig(**_VISION)
-    model.media = (SimpleNamespace(encoder=vision_encoder()),)
+    model.media = (MediaIntake("image", vision_encoder(), 0, None),)
     # the image processor's numbers, which `Qwen3_5DenseModel.image_processor` reads off the checkpoint
     processor = SimpleNamespace(size={"shortest_edge": 65536}, patch_size=16)
     monkeypatch.setattr(Qwen3_5DenseModel, "image_processor", processor)
@@ -794,7 +794,7 @@ def test_qwen3_5_takes_each_rows_last_token_on_a_prefill_only(monkeypatch, walk,
     taken = []
     monkeypatch.setattr("mstar.model.qwen3_5.submodules.at_last_token", lambda h, x: taken.append(h) or x[-1:])
     monkeypatch.setattr("mstar.model.qwen3_5.submodules.sample", lambda s, logits: logits)
-    logits = llm._forward(walk, None, torch.tensor([1, 2, 3]), cos_3d=torch.ones(1), sin_3d=torch.ones(1))
+    logits = llm._forward(walk, None, torch.tensor([1, 2, 3]), cos_3d=torch.ones(1), sin_3d=torch.ones(1))["new_token"]
     assert (taken == [llm.kv]) is last_token
     assert logits.shape[0] == (1 if last_token else 3)
 

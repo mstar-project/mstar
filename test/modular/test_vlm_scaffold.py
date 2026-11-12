@@ -268,32 +268,44 @@ def test_encoders_sharing_a_placeholder_take_their_rows_from_the_layout(tile):
     assert spliced[:, 0].tolist() == [1, 10, 11, 2, 20, 3, 12]
 
 
-def test_two_intakes_may_share_a_placeholder():
-    """Each placeholder goes to the attachment the prompt renders there, and
-    the layout names that attachment's encoder."""
-    from mstar.model.multimodal_decoder import MediaIntake, MultimodalDecoderModel, PreparedMedia
+U = 0  # a placeholder two intakes share (MiniCPM-o's <unk>)
 
-    unk = 0
+
+@pytest.mark.parametrize("rendered, opens, expanded, offsets", [
+    ([1, U, 2, U, 3], (), [1, U, U, U, 2, U, U, 3], [1, 5]),
+    # each intake's placeholders follow its own openers (1 audio's, 2 the
+    # image's); the pads the user typed follow neither and stay tokens
+    ([U, 1, U, 2, U, 3, U], ({1}, {2}), [U, 1, U, U, U, 2, U, U, 3, U], [2, 6]),
+], ids=["every-pad", "after-openers"])
+def test_two_intakes_may_share_a_placeholder(rendered, opens, expanded, offsets):
+    """Each placeholder goes to the attachment the prompt renders there, and
+    the layout names that attachment's encoder. An intake declaring the ids
+    its placeholders follow leaves its pad elsewhere as text."""
+    from mstar.model.multimodal_decoder import MediaIntake, MultimodalDecoderModel, PreparedMedia
 
     class Model(MultimodalDecoderModel):
         NAME = "shared"
 
         def _prompt_ids(self, parts, raw, **kwargs):
-            return torch.tensor([1, unk, 2, unk, 3])
+            return torch.tensor(rendered)
 
         def get_node_resources(self):
             return []
 
     model = object.__new__(Model)
     model.media = tuple(
-        MediaIntake(m, encoder, unk, lambda attachment, metadata, n=n: PreparedMedia({}, [n]))
-        for m, encoder, n in (("image", VISION, 2), ("audio", AUDIO, 3))
+        MediaIntake(
+            m, encoder, U, lambda attachment, metadata, request, n=n: PreparedMedia({}, [n]),
+            opens=frozenset(after),
+        )
+        for m, encoder, n, after in zip(("audio", "image"), (AUDIO, VISION), (3, 2), opens or ((), ()), strict=True)
     )
     attachments = {"image_inputs": [torch.zeros(1)], "audio_inputs": [torch.zeros(1)]}
     prompt = model.intake(None, ["audio", "image"], attachments)
     layout = model.prompt_layout(prompt)
-    assert prompt.pads.ids.tolist() == [1, unk, unk, unk, 2, unk, unk, 3]
-    assert (layout["offset"], layout["tokens"], layout["output"]) == ([1, 5], [3, 2], ["audio_embeds", "vision_embeds"])
+    assert prompt.pads.ids.tolist() == expanded
+    assert (layout["offset"], layout["tokens"]) == (offsets, [3, 2])
+    assert layout["output"] == ["audio_embeds", "vision_embeds"]
 
 
 def test_every_media_walk_replays_one_capture_that_caps_it():
@@ -349,6 +361,59 @@ def test_a_media_only_model_has_no_text_walk_mixed_step_or_prefix_keys():
     )
     captured = {w for c in llm.get_accelerator_graph_configs(torch.device("cpu")) for w in c.replay_graph_walks}
     assert captured == {"prefill_audio", "decode"}
+
+
+def test_a_second_decode_walk_in_the_graph_is_a_decode_walk_everywhere():
+    """A walk whose graph runs the LLM in the decode loop, which nothing else
+    lists, stops on the stop ids, replays the decode capture, joins the mixed
+    step and grows the KV label, as ``decode`` does: the node the model builds
+    takes its graph's walks however the model constructs it."""
+    from mstar.model.components.sampled_token_decoder import SampledTokenDecoder
+    from mstar.model.keys import KV_CACHE
+    from mstar.model.multimodal_decoder import MultimodalDecoderModel
+    from mstar.model.qwen3_5.submodules import LLMSubmodule
+
+    class Model(MultimodalDecoderModel):
+        NAME = "two decodes"
+
+        def get_graph_walk_graphs(self):
+            walks = media_walks(8, self.encoders)
+            walks["decode_other"] = walks["decode"]
+            return walks
+
+        def get_node_resources(self):
+            return []
+
+        def _create_submodule(self, node_name, device, dtype, tp_group):
+            llm = object.__new__(LLMSubmodule)
+            SampledTokenDecoder.__init__(
+                llm, SimpleNamespace(embed_dtype=torch.bfloat16), SimpleNamespace(hidden_size=8, stop_token_ids=(7,)),
+            )
+            return llm
+
+    model = object.__new__(Model)
+    model._submodule_cache = {}
+    assert model.get_combined_graph_walks() == {"LLM": {MIXED: {"prefill_text", "decode", "decode_other"}}}
+    (label,) = model.kv_labels()[KV_CACHE].values()
+    assert label.growth == (("decode", "decode_loop"), ("decode_other", "decode_loop"))
+
+    llm = model.get_submodule("LLM")
+    assert llm.get_stop_policies("decode_other")["decode_loop"].eos_tokens == frozenset({7})
+    (decode,) = [c for c in llm.get_accelerator_graph_configs(torch.device("cpu")) if c.capture_graph_walk == "decode"]
+    # and a mixed step of its rows and decode's alone
+    assert decode.replay_graph_walks == ["decode", "decode_other", MIXED]
+    # a mixed step of decode rows alone runs as decode; with a prompt row, as mixed
+    rows = [SimpleNamespace(graph_walk="decode"), SimpleNamespace(graph_walk="decode_other")]
+    assert llm._step_walk(MIXED, rows) == "decode"
+    assert llm._step_walk(MIXED, [*rows, SimpleNamespace(graph_walk="prefill_text")]) == MIXED
+    # under one decode walk such a step replays the packed mixed capture, and runs as mixed
+    one = object.__new__(LLMSubmodule)
+    SampledTokenDecoder.__init__(one, None, SimpleNamespace(stop_token_ids=()))
+    assert one.cg_key_info(MIXED, {0: SimpleNamespace(graph_walk="decode")}) is None
+    assert one._step_walk(MIXED, [SimpleNamespace(graph_walk="decode")] * 2) == MIXED
+    # each decoder node takes its own graph's walks: one in no decode loop is refused
+    with pytest.raises(ValueError, match="no walk runs Drafter"):
+        model.get_submodule("Drafter")
 
 
 def test_qwen_media_capture_stages_every_media_buffer():
@@ -439,7 +504,7 @@ def test_glimmer_samples_and_loops_back_off_its_resources():
         ),
         ATTN_FULL: SimpleNamespace(select_last_hidden=lambda x: x[-1:]),
     })
-    rows, logits = llm._forward("prefill_text", engine_inputs)
+    rows, logits = llm._forward("prefill_text", engine_inputs)["new_token"]
     assert rows == ["r"] and torch.equal(logits, hidden[-1:]), "a prefill feeds the head each row's last token"
     assert llm.loopback_tokens(engine_inputs).tolist() == [9]
 

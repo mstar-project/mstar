@@ -1,11 +1,11 @@
 """MiniCPM-o's node submodules: the Qwen3 LLM, the two encoders, and a spoken
 reply's TTS and vocoder (token2wav).
 
-The LLM's prompt is the whole rendered chat, placeholders included; a
-multimodal prefill embeds it and overwrites each placeholder row with the
-encoder output that belongs there, at positions ``process_prompt`` read off
-the prompt. RoPE is plain 1D over that sequence, so the position resource
-advances by the token count with no special casing.
+The LLM is the scaffold's decoder node (`SampledTokenDecoder`): its prompt is
+the whole rendered chat, placeholders included, with each encoder's rows
+spliced in where the media layout puts them. RoPE is plain 1D over that
+sequence, so the position resource advances by the token count with no
+special casing. The encoders lay their segments out by the layout's grids.
 """
 from __future__ import annotations
 
@@ -42,8 +42,10 @@ from mstar.engine.resources.attn.base import AttentionManager
 from mstar.engine.resources.kv.bounded import BoundedKVStep, StreamPosition
 from mstar.engine.resources.recurrent.config import RecurrentStep
 from mstar.engine.resources.sampler.resource import SamplerResource
+from mstar.engine.resources.step import ResourceStep
 from mstar.model.chatterbox.components.s3gen_hift import HiFTNoise
-from mstar.model.components.qwen3_lm import Qwen3DenseLM
+from mstar.model.components.sampled_token_decoder import ROW_HIDDEN, ROW_IDS, SampledTokenDecoder
+from mstar.model.keys import KV_CACHE, VISION_ATTN
 from mstar.model.minicpm_o.components.audio import MiniCPMOAudio
 from mstar.model.minicpm_o.components.token2wav import (
     CACHE_FAMILIES,
@@ -60,20 +62,11 @@ from mstar.model.minicpm_o.components.token2wav import (
 from mstar.model.minicpm_o.components.token2wav_flow import MEL_BINS as MEL_BINS_T2W
 from mstar.model.minicpm_o.components.vision import MiniCPMOVision, slice_layout
 from mstar.model.minicpm_o.config import (
+    ATTN,
     AUDIO_ATTN,
-    AUDIO_FEATURE_LENS,
-    DECODE,
-    DECODE_LOOP,
-    DECODE_MIXED,
-    DECODE_SPOKEN,
-    DECODE_WALKS,
-    IMAGE_TGT_SIZES,
-    LLM_ATTN,
-    LLM_KV,
-    LLM_POS,
-    LLM_SAMPLER,
+    AUDIO_ENCODER,
+    IMAGE_ENCODER,
     PATCHES,
-    PREFILL_WALKS,
     QUERIES,
     RESAMPLER_ATTN,
     T2W_KV,
@@ -85,9 +78,9 @@ from mstar.model.minicpm_o.config import (
     TTS_POS,
     TTS_PREFILL,
     TTS_SAMPLER,
-    VISION_ATTN,
     MiniCPMOConfig,
 )
+from mstar.model.multimodal import MEDIA_LAYOUT, media_grids
 from mstar.model.submodule_base import (
     EMPTY_INPUT_METADATA,
     ARNodeInputs,
@@ -104,223 +97,28 @@ from mstar.utils.h2d import to_device_nonblocking
 
 logger = logging.getLogger(__name__)
 
-# encoder output name -> the prompt positions it fills
-_MM_FILLS = {"vision_embeds": "image_positions", "audio_embeds": "audio_positions"}
+class MiniCPMOLLM(SampledTokenDecoder):
+    """The Qwen3 LLM on the scaffold's decoder node. A spoken reply decodes on
+    ``decode_spoken`` beside a text reply's ``decode``: one capture, one stop,
+    and its graph takes each row's input id and hidden for the TTS."""
 
-
-class LLMSubmodule(ARNodeSubmodule):
+    ATTN_KEY = ATTN
+    # the ladders it captured before moving onto the scaffold
     PREFILL_TOKEN_BUCKETS = [32, 64, 128, 256, 512, 1024, 2048]
     PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4, 8]
     DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]
+    # a mixed step's rows run to the decode batch, whose ladder tops out at 64
+    MIXED_CAPTURE_BATCH_SIZES = [4, 16, 64]
     # Off for the eager path only (a shape no capture holds), as on the other
     # Qwen3DenseLM nodes: compiled, Canary-Qwen's throughput was 7-15% lower
-    # (its H100 A/B). The captures below keep `compile=True`: uncompiled, text
+    # (its H100 A/B). The captures keep `compile=True`: uncompiled, text
     # was 8% slower at c=1 and 3% at c=32 (H200). Inductor picks its kernels
     # per process, so greedy text can differ between boots with an empty
     # compile cache.
     disable_torch_compile = True
 
-    def __init__(self, model: Qwen3DenseLM, config: MiniCPMOConfig):
-        super().__init__()
-        self.model = model
-        self.config = config
-        # A prefill samples the reply's first token, so a stop id there (or a
-        # one-token budget) ends the partition; decode's stop ids are checked
-        # by the graph runtime, and its budget is the loop's cap.
-        self.token_stop = TokenStop(
-            loop=DECODE_LOOP, buffer="new_token", stop_ids=frozenset(config.stop_token_ids),
-            sampler=LLM_SAMPLER, walk=DECODE_WALKS, prefill_walks=PREFILL_WALKS, runtime_check=True,
-        )
-        # a text reply's decode reads its last token off the sampler's slot
-        # masters, and its client token rides inline
-        self.device_loopback = DeviceLoopback(
-            walk=DECODE, signal="text_inputs", sampler=LLM_SAMPLER, buffer="new_token",
-        )
-
-    def inline_signals(self, graph_walk: str) -> dict[str, str]:
-        # a spoken reply's client token rides inline too; its other outputs go through the host
-        if graph_walk == DECODE_SPOKEN:
-            return {self.device_loopback.signal: self.device_loopback.buffer}
-        return super().inline_signals(graph_walk)
-
-    def get_accelerator_graph_configs(
-        self, device: torch.device, tp_world_size: int = 1,
-    ) -> list[AcceleratorGraphConfig]:
-        """Decode, and one prefill capture every prefill walk replays: ids are
-        embedded in `preprocess`, so the forward always takes embeddings."""
-        def dummy(n: int) -> ARNodeInputs:
-            return ARNodeInputs(input_ids=torch.zeros(n, dtype=torch.long, device=device), input_seq_len=n)
-
-        return [
-            BatchedAcceleratorGraphConfig(
-                capture_graph_walk=DECODE,
-                # the capture emits the TTS's pair too, which a text row's walk leaves unrouted
-                replay_graph_walks=[DECODE, DECODE_SPOKEN, DECODE_MIXED],
-                single_request_inputs=dummy(1),
-                capture_batch_sizes=self.DECODE_CAPTURE_BATCH_SIZES,
-            ),
-            PackedAcceleratorGraphConfig(
-                capture_graph_walk="prefill_text",
-                replay_graph_walks=["prefill_image", "prefill_audio", "prefill_omni"],
-                capture_token_lengths=self.PREFILL_TOKEN_BUCKETS,
-                make_node_input=dummy,
-                capture_batch_sizes=self.PREFILL_CAPTURE_BATCH_SIZES,
-            ),
-        ]
-
-    # ------------------------------------------------------------------
-    # Inputs
-    # ------------------------------------------------------------------
-
-    def _prompt_embeds(self, inputs: NameToTensorList) -> torch.Tensor:
-        """The prompt's embeddings with each placeholder row overwritten by the
-        encoder output for it, in prompt order."""
-        device = self.get_device()
-        embeds = self.model.embed(inputs["text_inputs"][0].to(device))
-        for name, positions in _MM_FILLS.items():
-            if name not in inputs:
-                continue
-            index = inputs[positions][0].to(device)
-            values = inputs[name][0].to(device=device, dtype=embeds.dtype)
-            if values.shape[0] != index.shape[0]:
-                raise ValueError(
-                    f"{name} has {values.shape[0]} rows for {index.shape[0]} placeholder "
-                    "tokens; the prompt and the encoder disagree on the attachment's length"
-                )
-            embeds = embeds.index_copy(0, index, values)
-        return embeds
-
-    def prepare_inputs(
-        self,
-        graph_walk: str,
-        fwd_info: CurrentForwardPassInfo,
-        inputs: NameToTensorList,
-        has_loopback: bool = False,
-        **kwargs: Any,
-    ) -> ARNodeInputs:
-        if (row := self.uniform_row_inputs(graph_walk, has_loopback)) is not None:
-            # one token per row, read off the sampler's slot master in
-            # `preprocess`; the routed signal is empty here
-            return row
-        ids = inputs["text_inputs"][0]
-        if graph_walk in DECODE_WALKS or not any(name in inputs for name in _MM_FILLS):
-            return ARNodeInputs(input_seq_len=ids.shape[0], input_ids=ids)
-        embeds = self._prompt_embeds(inputs)
-        return ARNodeInputs(input_seq_len=embeds.shape[0], input_embeds=embeds)
-
-    def preprocess(
-        self,
-        graph_walk: str,
-        engine_inputs: ModelInputsFromEngine,
-        inputs: list[ARNodeInputs],
-    ) -> dict[str, Any]:
-        device = self.get_device()
-        if graph_walk in DECODE_WALKS:
-            # A spoken reply's TTS reads each row's input token, so the ids
-            # ride to the forward. A text row that looped back brings none:
-            # its token is read by slot, beside the rows that bring theirs.
-            if any(inp.input_ids is None for inp in inputs):
-                ids = self.loopback_inputs(engine_inputs, inputs)["input_ids"]
-            else:
-                ids = torch.cat([inp.input_ids for inp in inputs]).to(device)
-            return {"input_embeds": self.model.embed(ids), "input_ids": ids}
-        if all(inp.input_ids is not None for inp in inputs):
-            ids = torch.cat([inp.input_ids for inp in inputs]).to(device)
-            return {"input_embeds": self.model.embed(ids)}
-        # the prefill walks share one capture, so a batch can mix text rows
-        # (ids) with multimodal ones (embeddings)
-        return {"input_embeds": torch.cat([
-            inp.input_embeds if inp.input_embeds is not None else self.model.embed(inp.input_ids.to(device))
-            for inp in inputs
-        ])}
-
-    def declare_step(
-        self,
-        graph_walk: str,
-        request_ids: list[str],
-        inputs: list[ARNodeInputs],
-        **kwargs,
-    ) -> SubmoduleStep:
-        return SubmoduleStep(
-            segments=[
-                Segment(request_id=rid, label="main", span=inp.input_seq_len)
-                for rid, inp in zip(request_ids, inputs, strict=True)
-            ],
-            steps={
-                LLM_KV: KVStep(),
-                LLM_ATTN: AttentionStep(causal=True),
-                LLM_POS: PositionStep(),
-                LLM_SAMPLER: SamplerStep(apply_penalty=True),
-            },
-        )
-
-    # ------------------------------------------------------------------
-    # Forward
-    # ------------------------------------------------------------------
-
-    def _forward(
-        self, graph_walk: str, engine_inputs: ModelInputsFromEngine, input_embeds: torch.Tensor,
-        input_ids: torch.Tensor | None = None,
-    ) -> dict[str, torch.Tensor]:
-        """``new_token``, and on decode the (``tts_ids``, ``tts_hidden``) pair:
-        each row's input token and its post-norm hidden, which a spoken
-        reply's TTS reads (a text reply's walk has no edge for them)."""
-        attn: AttentionManager = engine_inputs.resources[LLM_ATTN]
-        sampler: SamplerResource = engine_inputs.resources[LLM_SAMPLER]
-        hidden = self.model(input_embeds, label="main")
-        out = {}
-        if graph_walk in DECODE_WALKS:
-            out["tts_ids"] = input_ids
-            out["tts_hidden"] = hidden
-        else:
-            hidden = attn.select_last_hidden(hidden)
-        out["new_token"] = sampler.sample(engine_inputs.request_ids, logits=self.model.logits(hidden))
-        return out
-
-    def forward(
-        self, graph_walk: str, engine_inputs: ModelInputsFromEngine, input_embeds: torch.Tensor,
-        input_ids: torch.Tensor | None = None, **kwargs,
-    ) -> NameToTensorList:
-        return {k: [v] for k, v in self._forward(graph_walk, engine_inputs, input_embeds, input_ids).items()}
-
-    def can_batch(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
-        return True
-
-    def forward_batched(
-        self, graph_walk: str, engine_inputs: ModelInputsFromEngine, input_embeds: torch.Tensor,
-        input_ids: torch.Tensor | None = None, **kwargs,
-    ) -> BatchedModelOutput:
-        out = self._forward(graph_walk, engine_inputs, input_embeds, input_ids)
-        return BatchedModelOutput(
-            row_outputs=out,
-            check_stop_buffers={"new_token": out["new_token"]},
-        )
-
-    # ------------------------------------------------------------------
-    # Post-step
-    # ------------------------------------------------------------------
-
-    def postprocess(
-        self,
-        request_id: str,
-        request_info: CurrentForwardPassInfo,
-        outputs: dict[str, list[torch.Tensor]],
-        **kwargs,
-    ):
-        # Rebind, not copy: the decode loop routes on `text_inputs`.
-        if "new_token" in outputs:
-            outputs["text_inputs"] = outputs["new_token"]
-        if "tts_hidden" not in outputs:
-            return
-        if request_info.graph_walk != DECODE_SPOKEN:  # the row's own walk, in a mixed step too
-            outputs.pop("tts_ids")
-            outputs.pop("tts_hidden")
-            return
-        # The decode loop accumulates the spoken reply's rows until it ends. A row
-        # is a view of the batch's outputs, which would keep every row of every
-        # step alive with it.
-        for name in ("tts_ids", "tts_hidden"):
-            outputs[name] = [t.clone() for t in outputs[name]]
+    def layer_steps(self) -> dict[str, ResourceStep]:
+        return {KV_CACHE: KVStep(), ATTN: AttentionStep(causal=True)}
 
 
 class VisionEncoderSubmodule(NodeSubmodule):
@@ -344,7 +142,9 @@ class VisionEncoderSubmodule(NodeSubmodule):
         inputs: NameToTensorList,
         **kwargs: Any,
     ) -> NodeInputs:
-        layout = slice_layout([tuple(hw) for hw in fwd_info.step_metadata[IMAGE_TGT_SIZES]], self.config.vision)
+        # each slice's (h, w) in patches: its run's grid
+        grids = media_grids(fwd_info.step_metadata[MEDIA_LAYOUT], IMAGE_ENCODER.output)
+        layout = slice_layout(grids, self.config.vision)
         patches = torch.cat(inputs["pixel_values"])
         return NodeInputs(
             input_seq_len=patches.shape[0],
@@ -413,7 +213,7 @@ class VisionEncoderSubmodule(NodeSubmodule):
         q = self.config.resampler.num_queries
         per_request = embeds.split([n * q for n in slices_per_request])
         return {
-            rid: {"vision_embeds": [out]}
+            rid: {IMAGE_ENCODER.output: [out]}
             for rid, out in zip(engine_inputs.request_ids, per_request, strict=True)
         }
 
@@ -451,7 +251,8 @@ class AudioEncoderSubmodule(NodeSubmodule):
         inputs: NameToTensorList,
         **kwargs: Any,
     ) -> NodeInputs:
-        mel_lens = list(fwd_info.step_metadata[AUDIO_FEATURE_LENS])
+        # each clip's run's grid: its pieces' mel lengths
+        mel_lens = [n for grid in media_grids(fwd_info.step_metadata[MEDIA_LAYOUT], AUDIO_ENCODER.output) for n in grid]
         features = torch.cat(inputs["audio_features"], dim=-1)
         frames = [self.config.audio.conv_frames(n) for n in mel_lens]
         return NodeInputs(
@@ -567,7 +368,7 @@ class AudioEncoderSubmodule(NodeSubmodule):
             encoded = self.model.encode(hidden)
         embeds = self.model.pool(encoded, frames)
         return {
-            rid: {"audio_embeds": [out]}
+            rid: {AUDIO_ENCODER.output: [out]}
             for rid, out in zip(engine_inputs.request_ids, embeds.split(tokens_per_request), strict=True)
         }
 
@@ -660,8 +461,8 @@ class TTSSubmodule(ARNodeSubmodule):
             return row
         device = self.get_device()
         if graph_walk == TTS_PREFILL:
-            ids = torch.cat([t.reshape(-1) for t in inputs["tts_ids"]]).to(device)
-            hidden = torch.cat([t.reshape(-1, t.shape[-1]) for t in inputs["tts_hidden"]]).to(device)
+            ids = torch.cat([t.reshape(-1) for t in inputs[ROW_IDS]]).to(device)
+            hidden = torch.cat([t.reshape(-1, t.shape[-1]) for t in inputs[ROW_HIDDEN]]).to(device)
             embeds = self.model.condition(ids, hidden)
             return ARNodeInputs(input_seq_len=embeds.shape[0], input_embeds=embeds)
         return ARNodeInputs(input_seq_len=1, input_ids=inputs["tts_code"][0].reshape(1).to(device))

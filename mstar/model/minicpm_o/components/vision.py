@@ -25,11 +25,11 @@ from torch import nn
 
 from mstar.engine.resources.attn.ragged.config import cross_label
 from mstar.model.components.linear import FusedColumnLinear
+from mstar.model.keys import VISION_ATTN
 from mstar.model.minicpm_o.config import (
     PATCHES,
     QUERIES,
     RESAMPLER_ATTN,
-    VISION_ATTN,
     ResamplerConfig,
     VisionConfig,
 )

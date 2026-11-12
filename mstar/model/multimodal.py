@@ -26,8 +26,8 @@ import torch
 
 from mstar.conductor.request_info import FINAL_PREFILL, WalkStep
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Parallel, Sequential
-from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.keys import MIXED, PREFILL_TEXT
+from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
+from mstar.model.keys import PREFILL_TEXT
 
 if TYPE_CHECKING:
     from mstar.communication.tensors import NameToTensorList
@@ -368,15 +368,35 @@ class MediaPads(NamedTuple):
     grid: list[Sequence[int]]
 
 
+def placeholders(
+    ids: torch.Tensor, pads: Iterable[int], opens: Mapping[int, frozenset[int]] | None = None,
+) -> torch.Tensor:
+    """The positions in host ``ids`` of each placeholder: a pad id, and for a
+    pad in ``opens``, one right after one of its openers. Any other pad id
+    there is text the user typed (MiniCPM-o's ``<unk>``)."""
+    pads = list(pads)
+    # a loop over the pad ids, not the tokens: a text-only prompt has none
+    hits = torch.isin(ids, ids.new_tensor(pads)).nonzero().flatten() if pads else ids.new_empty(0)
+    if not opens or not hits.numel():
+        return hits
+    before = ids[(hits - 1).clamp(min=0)].tolist()
+    return hits.new_tensor([
+        i for i, token, prev in zip(hits.tolist(), ids[hits].tolist(), before, strict=True)
+        if token not in opens or (i > 0 and prev in opens[token])
+    ], dtype=hits.dtype)
+
+
 def expand_media_pads(
     ids: torch.Tensor,
     pad_runs: Mapping[int, Sequence[MediaRun]],
     sentinels: Mapping[int, tuple[int, int]] | None = None,
+    opens: Mapping[int, frozenset[int]] | None = None,
 ) -> MediaPads:
-    """Expand the nth occurrence of each pad id in ``ids`` to its run
+    """Expand the nth placeholder of each pad id in ``ids`` to its run
     ``pad_runs[pad][n]``, wrapped in ``sentinels[pad]`` when given (a
     template that writes a bare pad, as the processor's ``replace_*_token``
-    then wraps it).
+    then wraps it). With ``opens[pad]``, a pad is a placeholder only right
+    after one of those ids (`placeholders`), and stays a token elsewhere.
 
     Raises ``ValueError`` when a pad occurs other than once per run: user
     text that spells a placeholder token, or a layout naming an attachment
@@ -384,8 +404,7 @@ def expand_media_pads(
     tokenizer.
     """
     sentinels = sentinels or {}
-    # a loop over the placeholders, not the tokens: a text-only prompt has none
-    hits = torch.isin(ids, ids.new_tensor(list(pad_runs))).nonzero().flatten() if pad_runs else ids.new_empty(0)
+    hits = placeholders(ids, pad_runs, opens)
     seen = dict.fromkeys(pad_runs, 0)
     pieces: list[torch.Tensor] = []
     layout = MediaPads(ids, [], [], [], [])
@@ -563,7 +582,16 @@ def media_walks(
                 outputs=[emit_first_token()],
             ),
         ])
-    walks["decode"] = Loop(
+    walks["decode"] = decode_walk(max_iters, node)
+    return walks
+
+
+def decode_walk(max_iters: int, node: str = "LLM", accumulated: Sequence[str] = ()) -> Loop:
+    """The decode loop over the decoder ``node``: a token a step, fed back
+    and sent to the client. ``accumulated`` names outputs the loop gathers
+    over the reply and hands over whole when it ends (a spoken reply's
+    TTS condition)."""
+    return Loop(
         name="decode_loop",
         section=GraphNode(
             name=node,
@@ -571,17 +599,13 @@ def media_walks(
             outputs=[
                 GraphEdge(next_node=node, name="text_inputs"),
                 GraphEdge(next_node=EMIT_TO_CLIENT, name="text_inputs", output_modality="text"),
+                *(GraphEdge(next_node=EMPTY_DESTINATION, name=name) for name in accumulated),
             ],
         ),
         max_iters=max_iters,
         outputs=[],
+        accumulated_outputs=[GraphEdge(next_node=EMPTY_DESTINATION, name=name, persist=True) for name in accumulated],
     )
-    return walks
-
-
-def text_combined_walks(node: str = "LLM") -> dict[str, dict[str, set[str]]]:
-    """Text prefill and decode rows of the decoder ``node`` share a step."""
-    return {node: {MIXED: {PREFILL_TEXT, "decode"}}}
 
 
 def media_prefill_step(

@@ -11,6 +11,16 @@ stop, or a one-token budget, on the step the walk plan marks `FINAL_PREFILL`
 ends the partition, and the model's loop cap is the decode budget). A model subclasses it with its resource steps
 and its attention key, and an MRoPE model adds its own positions.
 
+The decode loop may run under more than one walk: MiniCPM-o's spoken reply
+decodes on ``decode_spoken``, whose graph also hands each row's input id and
+post-norm hidden state to its TTS. A node takes the walks its model's graph
+runs it in the decode loop and the walks that route those two
+(`DecoderWalks`, read off the graph by `decoder_walks`) through `bind_walks`,
+which the scaffold's `get_submodule` calls. With any of the
+latter it returns them as `ROW_IDS` and `ROW_HIDDEN` from every step, one row
+per request, so every capture holds them; a row whose walk has no edge for
+them leaves them unrouted.
+
 A media walk's row is the whole prompt's ids, each attachment expanded to
 one pad per token at intake (`expand_media_pads`). Its encoders' outputs
 ride as tensors named by `MediaEncoder.output`. `prepare_inputs` reads the
@@ -49,11 +59,12 @@ its positions under ``POS_KEY`` (``ROPE`` by default).
 """
 
 import functools
+import logging
 import os
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import replace
 from time import perf_counter
-from typing import Any
+from typing import Any, NamedTuple
 
 import torch
 
@@ -68,9 +79,11 @@ from mstar.engine.accelerator_graph_config import (
 from mstar.engine.resources.position.config import PositionStep
 from mstar.engine.resources.sampler.config import SamplerStep
 from mstar.engine.resources.step import ResourceStep, Segment, SubmoduleStep
+from mstar.graph.base import GraphSection
 from mstar.model.components.token_step import TokenStepNode
 from mstar.model.keys import MIXED, PREFILL_TEXT, ROPE, SAMPLER
 from mstar.model.multimodal import MEDIA_LAYOUT, MediaEncoder, media_rows, media_walk_names, splice_media
+from mstar.model.rebuild import loop_walks
 from mstar.model.submodule_base import (
     ARNodeInputs,
     ARNodeSubmodule,
@@ -83,10 +96,52 @@ from mstar.model.submodule_base import (
 from mstar.utils.h2d import to_device_nonblocking
 from mstar.utils.profiler import PHASE_PERIOD, PhaseLaps, phase_record
 
+logger = logging.getLogger(__name__)
+
 # A media row's encoder rows in prompt order, and its tokens' mask of where
 # they go (`SampledTokenDecoder._media_inputs`)
 MEDIA_EMBEDS = "media_embeds"
 MEDIA_MASK = "media_mask"
+# A row's last input id and its post-norm hidden state, for a walk whose graph
+# routes them (`DecoderWalks.hidden`)
+ROW_IDS = "row_ids"
+ROW_HIDDEN = "row_hidden"
+# The packed mixed capture's key, which a mixed step holding a prompt row
+# replays; one of decode rows alone replays the batched decode capture
+# (`SampledTokenDecoder.cg_key_info`)
+PROMPT_ROWS = "prompt_rows"
+
+
+class DecoderWalks(NamedTuple):
+    """The walks a decoder node treats apart, as its model's graph runs it
+    (`decoder_walks`). ``decode``: those running it in the decode loop, one
+    token a row, which share the decode capture (captured on ``DECODE_WALK``),
+    the stop, the client token inline and the mixed step; ``DECODE_WALK``
+    alone keeps its token on the device (`DeviceLoopback`). ``hidden``: those
+    whose graph routes its `ROW_IDS` and `ROW_HIDDEN`."""
+
+    decode: frozenset[str]
+    hidden: frozenset[str] = frozenset()
+
+
+def decoder_walks(
+    graphs: Mapping[str, GraphSection], node: str = "LLM", loop: str = "decode_loop",
+) -> DecoderWalks:
+    """``node``'s `DecoderWalks`, read off a model's walk graphs: the walks
+    that run it inside Loop ``loop``, and those in which it sends `ROW_IDS`
+    and `ROW_HIDDEN`, which go together."""
+    hidden = set()
+    for walk, section in graphs.items():
+        found = section.get_nodes().get(node)
+        sent = {ROW_IDS, ROW_HIDDEN} & {e.name for e in found.outputs} if found is not None else set()
+        if len(sent) == 1:
+            raise ValueError(f"{node} sends {sorted(sent)} alone in {walk!r}: a row's ids and hidden go together")
+        if sent:
+            hidden.add(walk)
+    decode = loop_walks(graphs, loop, node)
+    if not decode:
+        raise ValueError(f"no walk runs {node} inside Loop {loop!r}: a decoder needs a decode walk")
+    return DecoderWalks(decode, frozenset(hidden))
 
 
 class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
@@ -102,6 +157,8 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
     PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16]
     # A mixed step carries the decode batch beside its prompt rows, so its
     # captures run to the decode batch: one capped below it splits the batch.
+    # Under more than one decode walk its largest is the decode ladder's
+    # (`_decode_rows_mix`).
     MIXED_CAPTURE_BATCH_SIZES = [4, 16, 64, 128]
     # The largest is also the scheduler's cap on rows per decode step, and a
     # step pads to the next bucket. MSTAR_DECODE_BUCKETS narrows the ladder.
@@ -144,6 +201,8 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
     _encoders: tuple[MediaEncoder, ...] = ()
     _media_walks: frozenset[str] = frozenset()
     _text_prompts = True
+    _decode_walks: frozenset[str] = frozenset({TokenStepNode.DECODE_WALK})
+    _hidden_walks: frozenset[str] = frozenset()
 
     def __init__(
         self,
@@ -155,19 +214,31 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
         """``encoders`` are the model's media encoders, as its walks declare
         them; a text-only node passes none. ``text_prompts`` is the model's
         `MultimodalDecoderModel.TEXT_PROMPTS`: without it there is no text-only
-        prefill walk, so nothing captures one or a mixed step."""
+        prefill walk, so nothing captures one or a mixed step. Its walks are
+        ``DECODE_WALK`` alone until `bind_walks` gives it its graph's, as
+        `MultimodalDecoderModel.get_submodule` does for every model on the
+        scaffold."""
         super().__init__()
         self._text_prompts = text_prompts
         self.model = model
         self.config = config
         self._encoders = tuple(encoders)
         self._media_walks = frozenset(media_walk_names(self._encoders))
+        self.bind_walks(DecoderWalks(frozenset({self.DECODE_WALK})))
+
+    def bind_walks(self, walks: DecoderWalks) -> None:
+        """Run under the `DecoderWalks` of its model's graph
+        (`decoder_walks`): the stop, the decode capture, the mixed step and
+        the hidden outputs all read them."""
+        if self.DECODE_WALK not in walks.decode:
+            raise ValueError(f"{type(self).__name__}'s decode walks {sorted(walks.decode)} miss {self.DECODE_WALK!r}")
+        self._decode_walks, self._hidden_walks = walks
         # a prefill walk's token is the reply's first only on the step before
         # decode, which the walk plan marks
         prefills = self._media_walks | ({self.PREFILL_WALK} if self._text_prompts else set())
         self.token_stop = TokenStop(
-            loop=self.DECODE_LOOP, buffer="new_token", stop_ids=frozenset(config.stop_token_ids),
-            sampler=self.SAMPLER, walk=self.DECODE_WALK, prefill_walks=frozenset(prefills),
+            loop=self.DECODE_LOOP, buffer="new_token", stop_ids=frozenset(self.config.stop_token_ids),
+            sampler=self.SAMPLER, walk=self._decode_walks, prefill_walks=frozenset(prefills),
             last_prefill_flag=FINAL_PREFILL,
             # the graph runtime checks a decode row's stop ids itself, without
             # calling check_stop (measured on Qwen3.5; see TokenStop.runtime_check)
@@ -246,7 +317,8 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
         return engine_inputs.resources[SAMPLER].loopback_tokens(engine_inputs.request_ids)
 
     def last_token_hidden(self, engine_inputs: ModelInputsFromEngine, hidden: torch.Tensor) -> torch.Tensor:
-        """``hidden`` at each row's last token, picked by the plan of the attention resource under ``ATTN_KEY``."""
+        """``hidden`` (hidden states or token ids) at each row's last token, picked by the plan of the
+        attention resource under ``ATTN_KEY``."""
         return engine_inputs.resources[self.ATTN_KEY].select_last_hidden(hidden)
 
     def sample_tokens(self, engine_inputs: ModelInputsFromEngine, logits: torch.Tensor) -> torch.Tensor:
@@ -292,10 +364,23 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
                 },
             )
 
+        # a mixed step of decode rows alone replays the decode capture, keyed apart
+        # from the packed one its prompt rows need (`cg_key_info`)
+        mix = self._decode_rows_mix
+        top = max(self.DECODE_CAPTURE_BATCH_SIZES)
+        if mix and (dropped := [b for b in self.MIXED_CAPTURE_BATCH_SIZES if b > top]):
+            logger.warning(
+                f"{type(self).__name__}: mixed capture sizes {dropped} are above the decode ladder's top "
+                f"{top} and are dropped",
+            )
         configs: list[AcceleratorGraphConfig] = [
             BatchedAcceleratorGraphConfig(
                 capture_graph_walk=self.DECODE_WALK,
-                single_request_inputs=ids(1),
+                replay_graph_walks=[
+                    self.DECODE_WALK, *sorted(self._decode_walks - {self.DECODE_WALK}), *([MIXED] if mix else []),
+                ],
+                # a decode row, as a pre-plan under another walk declares the template
+                single_request_inputs=replace(ids(1), graph_walk=self.DECODE_WALK),
                 capture_batch_sizes=self.DECODE_CAPTURE_BATCH_SIZES,
                 compile_mode=self.capture_compile_mode(self.DECODE_WALK),
             ),
@@ -314,7 +399,14 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
                     self.PREFILL_TOKEN_BUCKETS if self.MIXED_TOKEN_BUCKETS is None else self.MIXED_TOKEN_BUCKETS
                 ),
                 make_node_input=media if self._mixes_media else ids,
-                capture_batch_sizes=self.MIXED_CAPTURE_BATCH_SIZES,
+                # Both captures replay a mixed step, so the scheduler caps one at the
+                # larger top (`max_batch_size_for`): topped at the decode ladder's,
+                # neither kind of step runs past its own ladder, eager.
+                capture_batch_sizes=(
+                    [b for b in self.MIXED_CAPTURE_BATCH_SIZES if b < top] + [top] if mix
+                    else self.MIXED_CAPTURE_BATCH_SIZES
+                ),
+                additional_key_info=PROMPT_ROWS if mix else None,
                 compile_mode=self.capture_compile_mode(MIXED),
                 # the layout the resources split; a replay's padding rows stay empty
                 token_layout=decode_rows_then_prompt,
@@ -343,6 +435,43 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
 
     def max_batch_size(self, graph_walk: str) -> int | None:
         return max(self.PREFILL_MEDIA_CAPTURE_BATCH_SIZES) if graph_walk in self._media_walks else None
+
+    @property
+    def _decode_rows_mix(self) -> bool:
+        """Whether a mixed step can hold decode rows of more than one walk and no
+        prompt row, and replay the decode capture. One decode walk's rows alone
+        are relabelled to it by the scheduler; those left alone in a mixed step
+        once its prompt row drops replay the packed capture (`_step_walk`)."""
+        return len(self._decode_walks) > 1 and self._text_prompts and self.CAPTURE_PREFILL
+
+    def _step_walk(self, graph_walk: str, rows: Collection[ARNodeInputs | CurrentForwardPassInfo]) -> str:
+        """The walk a mixed step of ``rows`` runs as. Under more than one decode
+        walk, one of decode rows alone replays the decode capture
+        (`cg_key_info`), so it is a decode step: ``DECODE_WALK``, for what is
+        keyed on the walk (`preprocess`, `_pack_media`, `decoder_kwargs`).
+        Under one, such a step (its prompt row dropped after scheduling)
+        replays the packed mixed capture, so it stays ``MIXED`` and no row is
+        read."""
+        if len(self._decode_walks) == 1 or not rows:
+            return graph_walk
+        if all((row.graph_walk or graph_walk) in self._decode_walks for row in rows):
+            return self.DECODE_WALK
+        return graph_walk
+
+    def cg_key_info(
+        self, graph_walk: str,
+        per_request_info: Mapping[int, CurrentForwardPassInfo],
+        per_request_input_metadata=None,
+        **kwargs: Any,
+    ) -> str | None:
+        """A mixed step holding a row of a walk outside the decode loop replays
+        the packed mixed capture; one of decode rows alone, the batched decode
+        capture, which a pre-plan can lease before the step's inputs exist."""
+        del per_request_input_metadata, kwargs
+        if graph_walk != MIXED or not self._decode_rows_mix:
+            return None
+        decode = self._decode_walks
+        return PROMPT_ROWS if any(info.graph_walk not in decode for info in per_request_info.values()) else None
 
     @property
     def _mixes_media(self) -> bool:
@@ -438,7 +567,7 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
         self, graph_walk: str, fwd_info: CurrentForwardPassInfo,
         inputs: NameToTensorList, **kwargs,
     ) -> InputSeqLenInfo | None:
-        if graph_walk == self.DECODE_WALK:
+        if graph_walk in self._decode_walks:
             return InputSeqLenInfo(1)
         # a media row's ids hold a pad per media token, so they measure it; it
         # is left unmeasured, and admitted whole, unless the model chunks it
@@ -489,7 +618,7 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
     def speculative_input_seq_len(
         self, graph_walk: str, fwd_info: CurrentForwardPassInfo, prev_seq_len: int,
     ) -> int | None:
-        if graph_walk == self.DECODE_WALK:
+        if graph_walk in self._decode_walks:
             return 1
         return super().speculative_input_seq_len(graph_walk, fwd_info, prev_seq_len)
 
@@ -533,6 +662,8 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
         engine_inputs: ModelInputsFromEngine,
         inputs: list[ARNodeInputs],
     ) -> dict[str, torch.Tensor | Any]:
+        if graph_walk == MIXED:
+            graph_walk = self._step_walk(graph_walk, inputs)
         if self._has_loopback_rows(inputs):
             # every row's last sampled token, read by slot (padding rows read
             # slot 0); a row whose last step ran elsewhere brought its own
@@ -540,7 +671,7 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
             laps = PhaseLaps("engine.preprocess.loopback.")
             ids = self.loopback_tokens(engine_inputs)
             laps.lap("tokens")
-            decode = graph_walk == self.DECODE_WALK
+            decode = graph_walk in self._decode_walks
             if not decode or any(inp.input_ids is not None and inp.input_seq_len for inp in inputs):
                 ids = self._splice_row_ids(ids, inputs, decode)
             laps.lap("splice")
@@ -598,8 +729,8 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
         # decode rows track their token through the sampler as usual.
         prefill_tokens = {
             rid: inp.input_ids for rid, inp in zip(request_ids, inputs, strict=True)
-            if (inp.graph_walk or graph_walk) != self.DECODE_WALK
-        } if graph_walk != self.DECODE_WALK else {}
+            if (inp.graph_walk or graph_walk) not in self._decode_walks
+        } if graph_walk not in self._decode_walks else {}
 
         # None advances by the span; a media prompt placing its own
         # positions advances by what it says (see `_media_inputs`), and so does
@@ -613,7 +744,7 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
                 int(inp.resource_step_info) if places_own(inp) else int(inp.input_seq_len) for inp in inputs
             )
 
-        return self.node_step(
+        step = self.node_step(
             [
                 Segment(request_id=rid, label="main", span=inp.input_seq_len)
                 for rid, inp in zip(request_ids, inputs, strict=True)
@@ -621,6 +752,10 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
             prefill_tokens,
             advance,
         )
+        if not self._decode_rows_mix:
+            return step
+        # the capture the lease took, from the same rows' walks
+        return replace(step, cg_key_info=self.cg_key_info(graph_walk, per_request_info or {}))
 
     # ------------------------------------------------------------------
     # Forward
@@ -632,11 +767,15 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
         engine_inputs: ModelInputsFromEngine,
         input_ids: torch.Tensor | None = None,
         **tensors: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> dict[str, torch.Tensor]:
+        """``new_token``, one a row; and with hidden walks, each row's
+        `ROW_IDS` and `ROW_HIDDEN` (its last token's)."""
         # a captured graph stages only tensors; anything else would be baked in at capture
         assert all(isinstance(t, torch.Tensor) for t in tensors.values()), (
             f"preprocess outputs the forward reads must be tensors: {sorted(tensors)}"
         )
+        if graph_walk == MIXED:
+            graph_walk = self._step_walk(graph_walk, engine_inputs.per_request_info.values())
         if input_ids is None:
             input_ids = self.loopback_tokens(engine_inputs)
         media, mask = tensors.pop(MEDIA_EMBEDS, None), tensors.pop(MEDIA_MASK, None)
@@ -646,10 +785,18 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
         if media is not None and media.shape[0]:
             embeds = splice_media(embeds, mask, media)
         hidden = self.model(embeds, label="main", **decoder_kwargs)
-        if graph_walk != self.DECODE_WALK:
+        out = {}
+        if graph_walk not in self._decode_walks:
             # only the last token of each prefill row feeds the head
+            if self._hidden_walks:
+                out[ROW_IDS] = self.last_token_hidden(engine_inputs, input_ids)
             hidden = self.last_token_hidden(engine_inputs, hidden)
-        return self.sample_tokens(engine_inputs, self.model.logits(hidden))
+        elif self._hidden_walks:
+            out[ROW_IDS] = input_ids
+        if self._hidden_walks:
+            out[ROW_HIDDEN] = hidden
+        out["new_token"] = self.sample_tokens(engine_inputs, self.model.logits(hidden))
+        return out
 
     def forward(
         self,
@@ -658,7 +805,7 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
         input_ids: torch.Tensor | None = None,
         **tensors: torch.Tensor,
     ) -> NameToTensorList:
-        return {"new_token": self._forward(graph_walk, engine_inputs, input_ids, **tensors)}
+        return self._forward(graph_walk, engine_inputs, input_ids, **tensors)
 
     def forward_batched(
         self,
@@ -667,11 +814,12 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
         input_ids: torch.Tensor | None = None,
         **tensors: torch.Tensor,
     ) -> BatchedModelOutput:
-        new_tokens = self._forward(graph_walk, engine_inputs, input_ids, **tensors)
+        out = self._forward(graph_walk, engine_inputs, input_ids, **tensors)
+        new_tokens = out["new_token"]
         # Row i is request i: one clone and one D2H copy per step instead of
         # one per request.
         return BatchedModelOutput(
-            row_outputs={"new_token": new_tokens},
+            row_outputs=out,
             # A keyed label's `PrefixKeys` names the prompt's `text_inputs`; its replies extend the
             # keys from this host copy. One tensor under two names is copied once.
             check_stop_buffers={"new_token": new_tokens, "text_inputs": new_tokens},
@@ -684,5 +832,42 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
     def step_is_input_free(self, graph_walk: str) -> bool:
         # decode rows are one token each; the prefill walks feed
         # `prefill_tokens` from the inputs
-        return graph_walk == self.DECODE_WALK
+        return graph_walk in self._decode_walks
 
+    def inline_signals(self, graph_walk: str) -> dict[str, str]:
+        # every decode walk's client token rides inline, off the stop check's host copy
+        loopback = self.device_loopback
+        if loopback is not None and graph_walk in self._decode_walks:
+            return {loopback.signal: loopback.buffer}
+        return super().inline_signals(graph_walk)
+
+    @property
+    def runs_batch_postprocess(self) -> bool:
+        # this class's tail has rows only where the graph routes hidden rows;
+        # a subclass's own tail always runs
+        return bool(self._hidden_walks) or type(self).batch_postprocess is not SampledTokenDecoder.batch_postprocess
+
+    def batch_postprocess(
+        self,
+        outputs: BatchedModelOutput,
+        request_infos: Mapping[str, CurrentForwardPassInfo],
+        inputs: list[ARNodeInputs],
+        piecewise_runners: Mapping[str, Any] | None = None,
+    ) -> None:
+        """A row whose own walk (in a mixed step too) routes `ROW_IDS` and
+        `ROW_HIDDEN` keeps them, each in its own copy: its loop may accumulate
+        them for the reply's life, and a view of the step's batch clone, or of
+        any copy shared with its step-mates, would keep all their rows alive
+        that long. Any other row drops them. A rows-only step routes nothing
+        off the device."""
+        if not self._hidden_walks or not outputs.per_rid_outputs:
+            return
+        for rid, info in request_infos.items():
+            out = outputs.get(rid)
+            if out is None or ROW_HIDDEN not in out:
+                continue
+            if info.graph_walk in self._hidden_walks:
+                for name in (ROW_IDS, ROW_HIDDEN):
+                    out[name] = [row.clone() for row in out[name]]
+            else:
+                del out[ROW_IDS], out[ROW_HIDDEN]

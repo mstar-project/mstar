@@ -305,7 +305,7 @@ def _stops_on_a_token(submodule: NodeSubmodule, walk: str) -> bool:
     stop = getattr(submodule, "token_stop", None)
     loopback = getattr(submodule, "device_loopback", None)
     return (
-        stop is not None and (stop.walk in (None, walk) or walk in stop.prefill_walks)
+        stop is not None and (stop.stops_on(walk) or walk in stop.prefill_walks)
     ) or (loopback is not None and loopback.walk == walk)
 
 

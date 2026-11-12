@@ -3,8 +3,8 @@ placeholder layout, ported from the checkpoint's ``processing_minicpmo.py`` so
 no Python from the checkpoint repo runs (#509).
 
 The rendered chat marks each attachment with a tag; ``expand_tags`` swaps each
-for its run of ``<unk>`` placeholder tokens, and ``prompt_ids`` finds the runs
-in the tokenized prompt, as upstream's ``_convert`` does.
+for its placeholder text: upstream's, with one ``<unk>`` for each run of them
+(an image slice, an audio clip), which intake expands to the run's tokens.
 """
 from __future__ import annotations
 
@@ -87,14 +87,19 @@ def slice_image(image: Image.Image, max_slice_nums: int, patch_size: int) -> tup
     return [source, *crops], grid
 
 
-def image_placeholder(index: int, grid: tuple | None, num_queries: int) -> str:
+def image_runs(grid: tuple | None) -> int:
+    """The ``<unk>`` runs of an image cut into ``grid``: the source's, then a
+    slice's each."""
+    return 1 if grid is None else 1 + grid[0] * grid[1]
+
+
+def image_placeholder(index: int, grid: tuple | None) -> str:
     """An image's placeholder text: its id, the source's run, then a line of
-    slice runs per grid row."""
-    unk = "<unk>" * num_queries
-    text = f"<image_id>{index}</image_id><image>{unk}</image>"
+    slice runs per grid row, each run one ``<unk>``."""
+    text = f"<image_id>{index}</image_id><image><unk></image>"
     if grid is not None:
         cols, rows = grid
-        text += "\n".join([f"<slice>{unk}</slice>" * cols] * rows)
+        text += "\n".join(["<slice><unk></slice>" * cols] * rows)
     return text
 
 
@@ -123,10 +128,16 @@ def audio_pieces(audio: torch.Tensor) -> list[torch.Tensor]:
     return [audio[i:i + step] for i in range(0, len(audio), step)] or [audio]
 
 
-def audio_placeholder(num_samples: int, audio: AudioConfig) -> str:
-    """A clip's placeholder text, sized off the whole clip (not its pieces)."""
-    tokens = audio.pooled_tokens(math.ceil(num_samples / HOP_LENGTH))
-    return "<|audio_start|>" + "<unk>" * tokens + "<|audio_end|>"
+def audio_tokens(num_samples: int, audio: AudioConfig) -> int:
+    """The tokens upstream sizes a clip's placeholder at: off the whole clip,
+    not its pieces."""
+    return audio.pooled_tokens(math.ceil(num_samples / HOP_LENGTH))
+
+
+def audio_placeholder(runs: int) -> str:
+    """A clip's placeholder text: its run's one ``<unk>``, or none for a clip
+    too short to encode."""
+    return "<|audio_start|>" + "<unk>" * runs + "<|audio_end|>"
 
 
 # ----------------------------------------------------------------------------
@@ -146,25 +157,3 @@ def expand_tags(text: str, image_placeholders: list[str], audio_placeholders: li
         next(images) if chunk == IMAGE_TAG else next(audios) if chunk == AUDIO_TAG else chunk
         for chunk in chunks
     )
-
-
-def _runs(ids: torch.Tensor, starts: list[int], ends: list[int]) -> torch.Tensor:
-    """The positions strictly inside each ``start ... end`` token pair."""
-    first = torch.where(torch.isin(ids, torch.tensor(starts)))[0] + 1
-    last = torch.where(torch.isin(ids, torch.tensor(ends)))[0]
-    if first.numel() != last.numel():
-        raise ValueError("the prompt's placeholder markers are unbalanced")
-    if first.numel() == 0:
-        return torch.zeros(0, dtype=torch.long)
-    return torch.cat([torch.arange(int(a), int(b)) for a, b in zip(first.tolist(), last.tolist(), strict=True)])
-
-
-def prompt_ids(tokenizer, text: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """The prompt's ids (upstream drops ``<|listen|>``), and the positions of
-    its image and audio placeholders."""
-    listen = tokenizer.convert_tokens_to_ids("<|listen|>")
-    ids = torch.tensor([t for t in tokenizer.encode(text) if t != listen], dtype=torch.long)
-    tok = tokenizer.convert_tokens_to_ids
-    image = _runs(ids, [tok("<image>"), tok("<slice>")], [tok("</image>"), tok("</slice>")])
-    audio = _runs(ids, [tok("<|audio_start|>")], [tok("<|audio_end|>")])
-    return ids, image, audio

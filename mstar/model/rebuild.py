@@ -7,6 +7,14 @@ from mstar.graph.base import GraphSection
 from mstar.model.submodule_base import chunk_tick_name
 
 
+def loop_walks(graphs: Mapping[str, GraphSection], loop: str, node: str) -> frozenset[str]:
+    """The walks whose graph runs ``node`` inside the Loop named ``loop``."""
+    return frozenset(
+        walk for walk, graph in graphs.items()
+        if (found := graph.get_loops().get(loop)) is not None and node in found.get_nodes()
+    )
+
+
 @dataclass(frozen=True)
 class RebuildPolicy:
     """A request that prefilled in ``walks`` is rebuilt by one row per prefill step, each run in its step's walk.
@@ -33,13 +41,6 @@ class RebuildPolicy:
     loop: str
     copy_width: Mapping[str, int] = field(default_factory=dict)
     pad_ids: frozenset[int] = frozenset()
-
-    def loop_walks(self, node: str, graphs: Mapping[str, GraphSection]) -> frozenset[str]:
-        """The walks in which ``loop`` runs ``node``: those a request can be dropped in."""
-        return frozenset(
-            walk for walk, graph in graphs.items()
-            if (loop := graph.get_loops().get(self.loop)) is not None and node in loop.get_nodes()
-        )
 
     def ids_walks(self, node: str, graphs: Mapping[str, GraphSection]) -> frozenset[str]:
         """The walks of ``walks`` in which ``node`` reads ``ids_input``: those an ids span can be written in."""
@@ -70,7 +71,7 @@ class RebuildPolicy:
                     f"{node} reads {sorted(copied[walk])} besides its ids in {walk!r}, and its rebuild policy doesn't "
                     "say how many values their host copies hold per slot"
                 )
-        if not self.loop_walks(node, graphs):
+        if not loop_walks(graphs, self.loop, node):
             raise ValueError(f"{node}'s rebuild policy names loop {self.loop!r}, which runs {node} in no walk")
         return copied
 

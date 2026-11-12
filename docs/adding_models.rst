@@ -4146,8 +4146,8 @@ Graph and walks (``mstar/model/multimodal.py``), from the model's ``MediaEncoder
     mixed          : prefill_text and decode rows in one step (a combined walk)
 
 The ``Model`` subclasses ``MultimodalDecoderModel`` (``mstar/model/multimodal_decoder.py``),
-which declares the walks (``media_walks(max_iters, encoders)`` and
-``text_combined_walks()``), plans the one prefill walk ``media_prefill_step`` picks
+which declares the walks (``media_walks(max_iters, encoders)``, and the mixed step over
+``prefill_text`` and every decode walk), plans the one prefill walk ``media_prefill_step`` picks
 and then decode (``walk_plan``), decodes text output, and owns
 media intake (``process_prompt``), the decode loop's cap (``get_loop_caps``, the
 request's output budget less the prefill's token), the KV label and its layout (``kv_labels``,
@@ -4170,10 +4170,13 @@ and Qwen3-ASR until one has run through its captured prefill. A model without te
 ``MediaIntake`` per attachment modality: its ``MediaEncoder`` (modalities may share one),
 its placeholder ``pad`` id (intakes may share one: the nth placeholder of a pad goes to the
 nth attachment of that pad in the order of the prompt's parts, which is where ``_prompt_ids``
-renders each), the sentinels a template leaves to its processor, how many
-placeholders an attachment fills (``runs(attachment, metadata)``, one by default; a Qwen3.5 video fills one
+renders each), the sentinels a template leaves to its processor, the ids its placeholders
+follow when the template writes the sentinels itself (``opens``: MiniCPM-o's ``<image>``,
+``<slice>`` and ``<|audio_start|>``, so a ``<unk>`` the user typed stays a token), how many
+placeholders an attachment fills (``runs(attachment, metadata, request)``, one by default; a Qwen3.5 video fills one
 per temporal group), and ``prepare``, which turns an attachment into the encoder's input
-tensors and each placeholder's tokens (a ``PreparedMedia``). ``_prompt_ids`` renders and
+tensors and each placeholder's tokens (a ``PreparedMedia``). Both see the attachment, its loader
+metadata and the request's kwargs, as ``process_prompt`` got them (MiniCPM-o's ``max_slice_nums``). ``_prompt_ids`` renders and
 tokenizes the whole prompt once. ``intake`` then refuses a prompt whose placeholders don't
 match its attachments, prepares each attachment in prompt order, expands each placeholder
 to its run (a ``MediaRun``) with ``expand_media_pads`` (one pad per token, read from the run's encoder output,
@@ -4233,6 +4236,21 @@ only. A lone encoder's ``MediaEncoder.walk`` names its media walk when the model
 calls it something other than ``prefill_<name>`` (Qwen3-ASR's and Canary-Qwen's
 ``prefill``). A graph that names its other walks otherwise sets
 ``PREFILL_WALK``, ``DECODE_WALK`` and ``DECODE_LOOP``.
+The decode loop may run under more than one walk: every walk whose graph runs the node in
+``DECODE_LOOP`` is a decode walk, and a second one is built with ``decode_walk(max_iters, node,
+accumulated)``. Their rows share the decode capture, the client token inline, the stop, the
+mixed step and the KV label's growth, and only ``DECODE_WALK`` keeps its token on the device.
+A mixed step of decode rows alone replays the decode capture, keyed apart from a step with prompt rows
+(``PROMPT_ROWS``), and the mixed ladder tops out at the decode ladder's top.
+MiniCPM-o's spoken reply decodes on ``decode_spoken``, whose graph also sends each row's input
+id and post-norm hidden state to its TTS (``ROW_IDS``, ``ROW_HIDDEN``, which a walk routes
+together). The scaffold reads both sets off the model's graph as one value
+(``decoder_walks``, a ``DecoderWalks``, refused when no walk decodes) and binds each decoder
+node it builds its own (``get_submodule`` calls the node's ``bind_walks``), so a model
+declares nothing for them. A node with hidden walks returns both outputs from every
+step, so every capture holds them; a row whose walk has no edge for them leaves them
+unrouted, and a row whose walk has one takes its own copy of them (in
+``batch_postprocess``), which a loop may accumulate.
 It reports a text prompt's length and a decode row's one token
 (``get_input_sequence_len``, ``speculative_input_seq_len``), so a model chunks its text
 prefill by declaring ``get_chunking_policies`` alone, as Qwen3.5 does.

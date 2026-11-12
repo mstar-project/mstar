@@ -609,6 +609,12 @@ class _Stops(_Codec):
     token_stop = TokenStop(loop="decode", buffer="tok", stop_ids=frozenset({0}), sampler="s")
 
 
+class _StopsAmong(_Codec):
+    # the stop's loop runs under several walks, the side walk among them
+    token_stop = TokenStop(loop="decode", buffer="tok", stop_ids=frozenset({0}), sampler="s",
+                           walk=frozenset({"codec_chunk", "codec_other"}))
+
+
 class _Loops(_Codec):
     device_loopback = DeviceLoopback(walk="codec_chunk", signal="tok", sampler="s", buffer="tok")
 
@@ -632,6 +638,7 @@ _LOOP = Loop(name="decode_loop", section=_codec_node(), max_iters=4, outputs=[])
     (dict(model=_Model(combined={SIDE: "codec_mixed"})), "combined walk"),
     (dict(submodules={"Codec": _Spans(), "Talker": object()}), "output spans or a stop check"),
     (dict(submodules={"Codec": _Stops(), "Talker": object()}), "output spans or a stop check"),
+    (dict(submodules={"Codec": _StopsAmong(), "Talker": object()}), "output spans or a stop check"),
     (dict(submodules={"Codec": _Loops(), "Talker": object()}), "output spans or a stop check"),
     (dict(submodules={"Codec": _Codec(), "Vocoder": _Vocoder(), "Talker": object()},
           nodes=("Codec", "Vocoder", "Talker"), asked=("Codec", "Vocoder"),
