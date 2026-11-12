@@ -13,10 +13,21 @@ sys.path.insert(0, ".")
 
 import pytest
 
-from mstar.engine.state import Array, Attend, Bidirectional, Causal, KeptWindow, KVEntry, Layout, Read
+from mstar.engine.state import (
+    Array,
+    Attend,
+    Bidirectional,
+    Causal,
+    FrameWindow,
+    KeptWindow,
+    KVEntry,
+    Layout,
+    Read,
+)
 from mstar.engine.state.adapters import build_specs, kv_layouts
 from mstar.engine.state.analysis import state_declaration_problems
 from mstar.graph.base import GraphNode, Loop
+from mstar.model.base import KVLabel, PrefixKeys
 from mstar.model.rebuild import RebuildPolicy
 from mstar.model.submodule_base import ChunkingPolicy
 
@@ -40,7 +51,14 @@ def _read(mask, **fields) -> Read:
     (lambda: KeptWindow(2, window=-1), "KeptWindow.window must be an int >= 0, got -1"),
     (lambda: KeptWindow(2.0, window=4), "KeptWindow.sink must be an int >= 0, got 2.0"),
     (lambda: KeptWindow(True, window=4), "KeptWindow.sink must be an int >= 0, got True"),
-], ids=["kept_window_int", "sink_negative", "window_negative", "sink_float", "sink_bool"])
+    (lambda: FrameWindow(0, frames=16), "FrameWindow.tokens must be a positive int, got 0"),
+    (lambda: FrameWindow(512, frames=0), "FrameWindow.frames must be a positive int, got 0"),
+    (lambda: FrameWindow(512, frames=16, stride=0), "FrameWindow.stride must be a positive int, got 0"),
+    (lambda: FrameWindow(512, frames=12, stride=8), "FrameWindow.frames must be a multiple of stride 8, got 12"),
+], ids=[
+    "kept_window_int", "sink_negative", "window_negative", "sink_float", "sink_bool", "tokens_zero", "frames_zero",
+    "stride_zero", "frames_off_stride",
+])
 def test_a_window_refuses_its_own_bad_fields(make, message):
     with pytest.raises(ValueError, match=f"^{message}$"):
         make()
@@ -106,3 +124,28 @@ def test_a_rebuild_refuses_a_kept_window_on_its_decode_walks():
     assert state_declaration_problems(_Model(plain, rebuilt=True)) == [], (
         "a plain Bidirectional read on decode walks was refused"
     )
+
+
+@pytest.mark.parametrize(("kwargs", "cause"), [
+    ({"chunked": ("prefill",)}, "which a chunking policy splits across steps"),
+    ({"kv_labels": {"kv": {"main": KVLabel(keys=PrefixKeys("ids", ("prefill",)))}}}, "keys for prefix reuse"),
+    ({"rebuilt": True}, "which dit's rebuild policy runs it again"),
+], ids=["chunked", "keyed", "rebuilt"])
+def test_a_frame_window_refuses_a_step_that_splits_a_frame(kwargs, cause):
+    """A frame's queries see the whole frame, so a step that ends inside a frame would cut what they see."""
+    frames = _array(reads={"local": _read(FrameWindow(4, frames=2), packed=False)})
+    (problem,) = state_declaration_problems(_Model(frames, **kwargs))
+    assert problem.startswith("Array 'kv'.reads['local']: FrameWindow on walk 'prefill'") and cause in problem
+    assert "A step boundary inside a frame cuts what the frame's queries see, so " in problem, (
+        "the refusal should give a frame window's own cause"
+    )
+
+
+def test_a_frame_window_beside_other_masks_has_no_layout():
+    """No paged kernel runs a frame window, and a read within a step takes only Block."""
+    mixed = _array(reads={"local": _read(FrameWindow(4, frames=2), layers={0}), "attn": _read(Causal(), layers={1})})
+    with pytest.raises(ValueError, match=r"Array 'kv': no layout yet: reads\['local'\].mask must be Causal, Window"):
+        build_specs([mixed])
+    within = _array(max_len=0, reads={"local": _read(FrameWindow(4, frames=2))})
+    with pytest.raises(ValueError, match=r"Array 'kv': no layout yet: reads\['local'\].mask must be Block"):
+        build_specs([within])
