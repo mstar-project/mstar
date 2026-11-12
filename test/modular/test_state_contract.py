@@ -36,7 +36,7 @@ from mstar.engine.state import (
     Value,
     Window,
 )
-from mstar.engine.state.contract import Op
+from mstar.engine.state.contract import Mask, Op
 
 _ENTRY = KVEntry(heads=4, head_dim=8)
 _GDN = Entry({
@@ -190,8 +190,14 @@ def test_a_bad_declaration_is_refused_naming_the_array_and_field(name):
     assert str(refused.value).startswith(where), f"the refusal should open with {where}: {refused.value}"
 
 
+@dataclass(frozen=True)
+class _UndeclaredMask(Mask):
+    """Sets neither property a mask declares."""
+
+
 @pytest.mark.parametrize("build, where", [
     (lambda: Read(mask="nope"), "Read.mask"),
+    (lambda: Read(mask=_UndeclaredMask()), "Read.mask: _UndeclaredMask leaves ['uses_query_position'"),
     (lambda: Read(mask=Causal(), op="garbage"), "Read.op"),
     (lambda: Read(mask=Causal(), op=CausalConv()), "Read.op: a read changes no field"),
 ])
@@ -199,6 +205,16 @@ def test_a_bad_mask_or_op_is_refused_when_the_read_is_built(build, where):
     with pytest.raises(ValueError) as refused:
         build()
     assert str(refused.value).startswith(where), f"the refusal should open with {where}: {refused.value}"
+
+
+@pytest.mark.parametrize("mask, uses_query_position, sees_step_whole", [
+    (Causal(), True, False), (Window(4), True, False), (Block(), False, True), (Bidirectional(), False, True),
+])
+def test_each_mask_says_whether_it_uses_the_query_position_and_sees_a_step_whole(
+    mask, uses_query_position, sees_step_whole,
+):
+    """`queries` takes a mask that uses no query position, and a regrouped walk refuses one that sees a step whole."""
+    assert (mask.uses_query_position, mask.sees_step_whole) == (uses_query_position, sees_step_whole)
 
 
 @dataclass(frozen=True)
