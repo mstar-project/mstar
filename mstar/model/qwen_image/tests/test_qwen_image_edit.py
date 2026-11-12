@@ -157,8 +157,8 @@ def _request(g, ref_grids, lengths):
 def test_a_step_matches_diffusers(zero_cond_t, ref_grids):
     """One request unguided is diffusers' forward bit for bit (SDPA within each segment). A guided request's
     two branches as rows of one forward, the negative prompt left-padded, match diffusers' per-branch forwards and
-    the pipeline's norm-rescaled CFG to the GEMM noise of batching rows (the GEMMs' shapes change). SDPA takes one
-    request a step; the FlashInfer read batches requests."""
+    the pipeline's norm-rescaled CFG to the GEMM noise of batching rows (the GEMMs' shapes change). The dit runs one
+    request a step (its read is segmented)."""
     reference, ours = _transformers(zero_cond_t)
     config = QwenImageConfig(transformer=ours.config)
     lengths = (9, 5)

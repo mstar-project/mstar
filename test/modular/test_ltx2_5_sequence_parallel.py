@@ -18,6 +18,7 @@ sys.path.insert(0, ".")
 from mstar.distributed.communication import CommGroup  # noqa: E402
 from mstar.engine.resources.step import StepContext  # noqa: E402
 from mstar.engine.state.adapters import node_handles, node_resources, state_setup, state_steps  # noqa: E402
+from mstar.model.components.diffusion.denoise_loop import StepKey  # noqa: E402
 from mstar.model.ltx2_5.components.transformer import LTX2DiT, build_rope  # noqa: E402
 from mstar.model.ltx2_5.config import LTX25Config  # noqa: E402
 from mstar.model.ltx2_5.ltx2_5_model import LTX25Model  # noqa: E402
@@ -68,7 +69,8 @@ def _opened_on_sdpa(dit, cfg, group, shape, rows):
         if hasattr(module, "bind_state"):
             module.bind_state(handles)
     sub = LTXDenoiseSubmodule(None, config, loop_name="denoise_loop")
-    step = state_steps(sub.declare_step("gen", rows, [NodeInputs(resource_step_info=shape)] * len(rows)), handles)
+    inputs = [NodeInputs(resource_step_info=StepKey(shape))] * len(rows)
+    step = state_steps(sub.declare_step("gen", rows, inputs), handles)
     step.set_ctx(StepContext(request_ids=rows, graph_walk="gen", slot=0, capture=False))
     step.begin_calls()
 

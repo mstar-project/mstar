@@ -42,6 +42,7 @@ from mstar.engine.state.adapters import (
 from mstar.engine.state.analysis import deployment_problems, state_declaration_problems
 from mstar.model.base import serving_resources
 from mstar.model.components.diffusion.attention import dit_entry
+from mstar.model.components.diffusion.denoise_loop import StepKey
 from mstar.model.components.distributed.sequence_parallel import sp_seq_split
 from mstar.model.flux2_klein.components.transformer import Flux2JointAttention
 from mstar.model.flux2_klein.config import DENOISE_LOOP, JOINT_TOKENS, Flux2KleinConfig
@@ -217,7 +218,7 @@ class _StubRagged:
 
 
 def _inputs(key):
-    return NodeInputs(tensor_inputs={}, resource_step_info=key)
+    return NodeInputs(tensor_inputs={}, resource_step_info=key if isinstance(key, StepKey) else StepKey(key))
 
 
 def _expanded(model, sub, keys, rids):
@@ -279,8 +280,8 @@ def test_z_image_steps_equal_the_hand_written_one(rids):
 @pytest.mark.parametrize("guidance, branches", [(5.0, 2), (1.0, 1)])
 def test_wan22_steps_equal_the_hand_written_one(guidance, branches):
     model = _wan()
-    key = WanStepKey(frames=3, height=8, width=8, guidance=guidance, i2v=False)
     sub = Wan22DitSubmodule(None, model.config)
+    key = sub._key(WanStepKey(frames=3, height=8, width=8, i2v=False), None, guidance > 1.0)
     tokens = sub.num_tokens(key)
     segments = [Segment(request_id=0, label="main", span=tokens)] * branches
     reference = SubmoduleStep(
@@ -320,10 +321,10 @@ def test_wan22_parallel_configs_plan_each_ranks_step_as_main_did(path, guidance)
     exchanges."""
     _, axes = _serving(path)
     model = _wan()
-    key = WanStepKey(frames=3, height=8, width=8, guidance=guidance, i2v=False)
     branches = 2 // axes["cfg"] if guidance > 1.0 else 1
     for cfg_rank in range(axes["cfg"]):
         sub = Wan22DitSubmodule(None, model.config, cfg_group=SimpleNamespace(world_size=axes["cfg"], rank=cfg_rank))
+        key = sub._key(WanStepKey(frames=3, height=8, width=8, i2v=False), None, guidance > 1.0)
         segments = [Segment(request_id=0, label="main", span=sub.num_tokens(key))] * branches
         reference = SubmoduleStep(
             segments=segments, steps={SELF_ATTN: AttentionStep(causal=False, fixed_layout=True)}, cg_key_info=key,
@@ -341,8 +342,8 @@ def test_wan22_parallel_configs_plan_each_ranks_step_as_main_did(path, guidance)
 def test_wan22_guided_rows_split_one_rows_tokens_over_sp2(rids):
     """Each guidance branch is a row of its own, so the exchange splits one row's tokens however many rows there are."""
     model = _wan()
-    key = WanStepKey(frames=3, height=8, width=8, guidance=5.0, i2v=False)
     sub = Wan22DitSubmodule(None, model.config)
+    key = sub._key(WanStepKey(frames=3, height=8, width=8, i2v=False), None, True)
     handles = node_handles(model, "dit", {SELF_ATTN: _StubRagged()}, sp_group=SimpleNamespace(world_size=2, rank=0))
     step = state_steps(sub.declare_step("gen", rids, [_inputs(key)] * len(rids)), handles)
     step.set_ctx(StepContext(request_ids=rids, graph_walk="gen", slot=0, capture=False))
@@ -625,7 +626,7 @@ def _h3_dit(world: int) -> H3DenoiseSubmodule:
 def test_h3_steps_equal_the_hand_written_one_on_every_rank(world):
     """Every rank plans the whole row, padding a segment of its own, since the exchange gives each rank all of it."""
     model, layout, sub = _h3(), _h3_layout(), _h3_dit(world)
-    rows, padded = layout.total_rows, sub.num_tokens(layout)
+    rows, padded = layout.total_rows, sub.num_tokens(StepKey(layout))
     assert (padded > rows) == (world > 1)
     segments = [Segment(request_id=0, label="main", span=span) for span in (rows, padded - rows) if span]
     reference = SubmoduleStep(
@@ -658,7 +659,7 @@ def test_h3_exchanges_a_ranks_share_of_the_whole_padded_row_at_sp2(monkeypatch):
     step = state_steps(sub.declare_step("gen", [0], [_inputs(layout)]), handles)
     step.set_ctx(StepContext(request_ids=[0], graph_walk="gen", slot=0, capture=False))
     step.begin_calls()
-    padded, t = sub.num_tokens(layout), H3Config().transformer
+    padded, t = sub.num_tokens(StepKey(layout)), H3Config().transformer
     x = torch.ones(1, padded // 2, t.num_attention_heads, t.attention_head_dim)
     handles[DIT_ROWS].add(0, k=x, v=x)
     handles[DIT_ROWS].read(0, x)

@@ -233,7 +233,9 @@ class QwenImageDenoiseSubmodule(DenoiseLoopSubmodule):
         self, transformer: nn.Module, config: QwenImageConfig, *, loop_name: str, compile_transformer: bool = False,
         cfg_group=None,
     ):
-        super().__init__(loop_name=loop_name, cfg_group=cfg_group)
+        # a row holds a branch's pad and prompt segments end to end (a segmented read), which the engine lays out
+        # for one request a step
+        super().__init__(loop_name=loop_name, max_batch_size=1, cfg_group=cfg_group)
         self.transformer = transformer
         self.config = config
         self._compiled = bool(compile_transformer) and transformer is not None
