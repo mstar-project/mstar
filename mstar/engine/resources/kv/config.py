@@ -308,6 +308,8 @@ class RingKVConfig(KVConfig):
     layers: tuple[RingKVLayerConfig, ...]
     # How many sessions are resident at once. NOT a batch.
     num_sessions: int = 1
+    # the most frames a request commits, which admit holds it to; None for no cap
+    max_frames: int | None = None
 
     @property
     def total_sessions(self) -> int:
@@ -337,6 +339,8 @@ class RingKVConfig(KVConfig):
                 f"num_sessions must be a positive int; got {self.num_sessions!r}. A node serving "
                 "zero sessions refuses every request at admit."
             )
+        if self.max_frames is not None and not (type(self.max_frames) is int and self.max_frames >= 1):
+            raise ValueError(f"max_frames must be None or a positive int; got {self.max_frames!r}")
 
     def apply_yaml_overrides(self, num_sessions: int | None = None, **kwargs) -> None:
         """``num_sessions`` only. Nothing else here is a deployment knob."""

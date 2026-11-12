@@ -135,6 +135,40 @@ class LayerRingCache:
         self.written[lo:hi].zero_()
         self.written[lo + self.ring_len : hi].fill_(True)
 
+    def write(self, kv: Tensor, frame_pos: Tensor, keep: bool, session_idx: Tensor) -> None:
+        """Write ``kv``, ``[2, 1, H_kv, B*tokens_per_frame, D]`` with one frame
+        for each of ``B`` sessions, into each session's scratch frame. With
+        ``keep``, a frame whose ``frame_pos`` is a multiple of the layer's
+        stride also goes into its ring slot."""
+        tokens = self.tokens_per_frame
+        if not torch.compiler.is_compiling():
+            torch._check(
+                frame_pos.ndim == 1 and frame_pos.dtype == torch.int64,
+                lambda: f"frame_pos must be a [B] int64 tensor; got {tuple(frame_pos.shape)} "
+                f"{frame_pos.dtype}",
+            )
+        B = frame_pos.shape[0]
+        if not torch.compiler.is_compiling():
+            torch._check(
+                kv.size(3) == B * tokens,
+                lambda: f"ring cache expects exactly one frame per session; got "
+                f"{kv.size(3)} tokens for B={B}",
+            )
+            torch._check(
+                session_idx.shape == frame_pos.shape and session_idx.dtype == torch.int64,
+                lambda: f"session_idx must be a {list(frame_pos.shape)} int64 tensor matching "
+                f"frame_pos; got {tuple(session_idx.shape)} {session_idx.dtype}",
+            )
+        session_base = session_idx * self.capacity  # [B]
+        slot = (frame_pos // self.pinned_dilation) % self.ring_buckets  # [B]
+        ring_idx = self.frame_offsets[None] + (slot * tokens + session_base)[:, None]  # [B, T]
+        current_idx = self._current_base[None] + session_base[:, None]  # [B, T]
+        ring_scatter(self.kv, self.written, current_idx.flatten(), kv, False)
+        if keep:
+            on_grid = frame_pos.remainder(self.pinned_dilation) == 0  # [B]
+            dst = torch.where(on_grid[:, None], ring_idx, current_idx).flatten()
+            ring_scatter(self.kv, self.written, dst, kv, True)
+
     def upsert(
         self,
         kv: Tensor,

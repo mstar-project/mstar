@@ -838,9 +838,9 @@ def test_dropping_the_world_drops_the_clock(drop):
 
 
 def test_load_state_clears_the_clock():
-    """The snapshot does not carry the clock — `get_state` covers the ring and
-    only the ring, and the clock lives in `PerRequestState`. Inventing one
-    would be worse than having none, so the first frame after a load sets it."""
+    """`load_state` restores the frame count `get_state` took, and the
+    continuity check's last frame stays unset until the first frame after a
+    load sets it."""
     kv = _manager()
     kv.ingest_request("a")
     _drive(kv, "a", 0)
@@ -991,11 +991,10 @@ def test_post_warmup_validate_catches_a_lingering_claim():
 # ── state ───────────────────────────────────────────────────────────────
 
 
-def test_get_state_covers_the_ring_and_nothing_else():
+def test_get_state_covers_the_ring_and_its_frame_count():
     """Pinned so a later field cannot quietly make the name a lie. A Waypoint
-    world is at least three things: the ring, the streaming VAE's temporal
-    receptive field, and `frame_pos`/seed/iteration in `PerRequestState`. This
-    covers one; what a complete world state should contain is still open."""
+    world is at least the ring with its frame count and the streaming VAE's
+    temporal receptive field. This covers the first."""
     kv = _manager()
     _open(kv, "a")
     kv.plan(_step("a"), _ctx("a"))
@@ -1003,7 +1002,7 @@ def test_get_state_covers_the_ring_and_nothing_else():
 
     state = kv.get_state("a")
 
-    assert set(state) == {"layers"}
+    assert set(state) == {"layers", "committed_frames"}
     assert len(state["layers"]) == N_LAYERS
     assert all(len(entry) == 2 for entry in state["layers"])
 

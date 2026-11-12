@@ -77,11 +77,15 @@ class RingKVManager(AttentionResource):
         self._padding_session: int = config.num_sessions
         self._known_rids: set[str] = set()
         self._last_frames: dict[str, int] = {}
+        # Each request's clock: the frames it has committed, so the next frame it writes is this count.
+        self._committed_frames: dict[str, int] = {}
         # Sized to num_sessions, the largest B any step can carry (B_max <=
-        # num_sessions is enforced at config load).
+        # num_sessions is enforced at config load). `plan` stages each row's
+        # session and its next frame.
         self._static_session_idx = torch.zeros(
             config.num_sessions, dtype=torch.int64, device=self.device
         )
+        self._static_frame_pos = torch.zeros_like(self._static_session_idx)
 
     @classmethod
     def build(cls, spec: KVSpec, info: EngineResourceInfo) -> "RingKVManager":
@@ -120,6 +124,11 @@ class RingKVManager(AttentionResource):
         """Token slots in ``layer_idx``'s buffer across every session -- the
         length of the KV view ``upsert`` returns and of its visibility row."""
         return self.layers[layer_idx].total_slots
+
+    def position(self, rid: str, label: str) -> int:
+        """The entries of the frames ``rid`` has committed, where its next frame starts."""
+        del label
+        return self._committed_frames.get(rid, 0) * self.tokens_per_frame
 
     def session_of(self, rid: str) -> int | None:
         """``rid``'s session index, or None if it holds none. Host-side
@@ -164,6 +173,18 @@ class RingKVManager(AttentionResource):
             build_visibility=build_visibility,
         )
 
+    def write(self, k: Tensor, v: Tensor, layer_idx: int, *, keep: bool) -> None:
+        """Write one step's K/V for ``layer_idx`` at the frames and sessions
+        ``plan`` staged, ``k``/``v`` as ``upsert`` takes them. ``keep`` also
+        writes each frame into its ring slot, or its scratch slot where a
+        layer's stride skips the frame."""
+        B = k.size(0)
+        kv = torch.stack([k.transpose(0, 1), v.transpose(0, 1)], dim=0)
+        kv = kv.view(2, 1, k.size(1), B * k.size(2), k.size(3))
+        self.layers[layer_idx].write(
+            kv, self._static_frame_pos[:B], keep, self._static_session_idx[:B],
+        )
+
     def _reset_session(self, rid: str) -> None:
         """Zero ``rid``'s session and drop its clock, leaving its claim in place."""
         session_idx = self._sessions.get(rid)
@@ -172,6 +193,7 @@ class RingKVManager(AttentionResource):
         for layer in self.layers:
             layer.reset(session_idx)
         self._last_frames.pop(rid, None)
+        self._committed_frames.pop(rid, None)
 
     def _release_session(self, rid: str) -> None:
         """Hand ``rid``'s session back to the pool. Zero it first."""
@@ -193,7 +215,7 @@ class RingKVManager(AttentionResource):
                 layer.kv[:, :, :, lo:hi].detach().clone(),
                 layer.written[lo:hi].detach().clone(),
             ))
-        return {"layers": layers}
+        return {"layers": layers, "committed_frames": self._committed_frames.get(rid, 0)}
 
     @torch.no_grad()
     def load_state(self, rid: str, state: dict) -> None:
@@ -216,6 +238,7 @@ class RingKVManager(AttentionResource):
             span.copy_(kv)
             layer.written[lo:hi].copy_(written)
         self._last_frames.pop(rid, None)
+        self._committed_frames[rid] = state["committed_frames"]
 
     def _require_session(self, rid: str, what: str) -> int:
         session_idx = self._sessions.get(rid)
@@ -312,6 +335,16 @@ class RingKVManager(AttentionResource):
             )
 
         for rid in rids:
+            committed = self._committed_frames.get(rid, 0)
+            if self.config.max_frames is not None and committed >= self.config.max_frames:
+                return AdmitOutcome(
+                    ok=False, ready=False,
+                    reason=AdmitRuntimeError(
+                        f"ring KV {self.name!r} holds {self.config.max_frames} frames per "
+                        f"request, and request {rid!r} has committed all of them",
+                        request_ids=frozenset({rid}),
+                    ),
+                )
             frame = frames.get(rid)
             if frame is None:
                 return AdmitOutcome(
@@ -371,10 +404,12 @@ class RingKVManager(AttentionResource):
             # write through the address the graph baked, without allocating a
             # staging tensor 24 times a second.
             self._static_session_idx[b].fill_(session)
+            self._static_frame_pos[b].fill_(self._committed_frames.get(rid, 0))
             session_idx.append(session)
             frame_pos.append(frames[rid])
         for b in range(len(real_rids), len(padded_rids)):
             self._static_session_idx[b].fill_(self._padding_session)
+            self._static_frame_pos[b].fill_(0)
             session_idx.append(self._padding_session)
             # Frame 0's visibility is scratch-only, so the padding row attends
             # exactly one (garbage, dropped) block and never an unwritten slot.
@@ -385,6 +420,7 @@ class RingKVManager(AttentionResource):
         """Record the frame each request just committed. Metadata only."""
         frames = self._step_frames(step)
         for rid in ctx.request_ids:
+            self._committed_frames[rid] = self._committed_frames.get(rid, 0) + 1
             frame = frames.get(rid)
             if frame is not None:
                 self._last_frames[rid] = frame
@@ -426,6 +462,12 @@ class RingKVManager(AttentionResource):
                 f"{self.num_sessions} sessions free after accelerator graph capture; a session "
                 "was zeroed and never returned to the pool, so the node has "
                 "silently lost concurrency."
+            )
+        if self._committed_frames:
+            raise RuntimeError(
+                f"ring KV {self.name!r} counted committed frames "
+                f"({sorted(self._committed_frames.items())}) during accelerator graph capture; "
+                "the first real request would write its first frame that many slots on."
             )
         if self._last_frames:
             raise RuntimeError(
