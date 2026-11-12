@@ -11,7 +11,8 @@ from __future__ import annotations
 
 import math
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 import torch
@@ -20,11 +21,13 @@ from safetensors.torch import save_file
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
-from mstar.engine.resources.lora import LoraReqConfig, LoraSpec
-from mstar.engine.resources.lora.checkpoint import read_lora_file
+from mstar.engine.resources.lora import AdapterInfo, LoraReqConfig, LoraSpec
+from mstar.engine.resources.lora.checkpoint import normalize_lora_key, parse_lora_key, read_lora_file
 from mstar.engine.resources.lora.identity import adapter_digest
 from mstar.engine.resources.lora.pool import LoraAdapterPool
-from mstar.engine.resources.step import ResourceStep, Segment, StepContext
+from mstar.engine.resources.lora.store import classify_adapter
+from mstar.engine.resources.step import ResourceStep, Segment, StepContext, SubmoduleStep
+from mstar.engine.state import ArrayStep
 from mstar.model.qwen3_5.config import FULL_ATTENTION, LINEAR_ATTENTION, Qwen3_5Config
 from mstar.model.submodule_base import ARNodeInputs, engine_step, with_segment_steps
 
@@ -122,6 +125,22 @@ def pin_digests(spec: LoraSpec) -> LoraSpec:
         for name, path in spec.adapters.items()
     }
     return spec
+
+
+def header_info(spec: LoraSpec, items) -> AdapterInfo:
+    """``classify_adapter`` on the ``(checkpoint key, shape)`` pairs a safetensors header
+    lists: what ``check_adapter_file`` refuses, for adapters too large to write out (a
+    released model size) or a refusal checked without writing a file."""
+    shapes: dict[str, dict[str, tuple[int, ...]]] = {}
+    for key, shape in items:
+        # a key no plain LoRA has (DoRA, modules_to_save, ...) raises a refusal, named
+        module, kind = parse_lora_key(normalize_lora_key(key))
+        if kind != "alpha":
+            shapes.setdefault(module, {})[kind] = tuple(shape)
+    for module, ab in shapes.items():
+        if set(ab) != {"A", "B"}:  # as read_lora_file refuses it
+            raise ValueError(f"LoRA module {module!r} is missing lora_{'B' if 'A' in ab else 'A'}")
+    return classify_adapter(spec, shapes)
 
 
 def serve(spec: LoraSpec, adapters: dict[str, str], max_rank: int = 4, **kw) -> LoraSpec:
@@ -270,6 +289,44 @@ class _DeltaRuleStub(CausalAttend):
         return torch.stack(out)
 
 
+class _AttendCore:
+    """``CausalAttend`` as the KV array's read runs it, on the k and v its add held."""
+
+    requires_kv_write = False
+
+    def __init__(self, rows: _Rows):
+        self.attend = CausalAttend(rows)
+
+    def run(self, q, *, label, kv_cache_layer, k, v, layer_idx):
+        return self.attend(q, k, v)
+
+
+class _DeltaCore:
+    """``_DeltaRuleStub`` as the delta-net's ``causal_conv`` and ``gated_delta_net`` run it."""
+
+    def __init__(self, rows: _Rows):
+        self.rule = _DeltaRuleStub(rows)
+
+    def run_conv(self, x, *, conv_layer, weight, bias, label):
+        return self.rule.conv(x, weight, bias)
+
+    def run(self, q, k, v, a, b, *, state_layer, a_log, dt_bias, label):
+        return self.rule(q, k, v, a, b, a_log, dt_bias)
+
+
+class _Unread:
+    """The KV pages and the recurrent blocks, which no stubbed core reads."""
+
+    def layer_view(self, i):
+        return torch.empty(0)
+
+    def block(self, field, i):
+        return torch.empty(0)
+
+    def opens_label(self, rid, label):
+        return True
+
+
 # -- Llama-shaped checkpoints -------------------------------------------------------------------
 
 def llama_layers(c, prefix: str) -> dict[str, tuple[int, int]]:
@@ -321,7 +378,7 @@ def bind_under(module: nn.Module, prefix: str, lora_pool: LoraAdapterPool, check
             continue
         target = make_lora_capable(module.get_submodule(path[len(prefix):]))
         if check:
-            _check(target, spec.targets[ref.target], lora_pool.targets[ref.target], path, spec.resource_key)
+            _check(target, None, spec.targets[ref.target], lora_pool.targets[ref.target], path, spec.resource_key)
         target.lora_delta = lora_pool.layer_delta(ref.target, ref.layer)
         bound += 1
     return bound
@@ -462,30 +519,63 @@ def build_stack(weights: dict[str, torch.Tensor], comm_group: CommGroup | None =
     return _loaded(model, weights)
 
 
-def _stub_cores(model, rows: _Rows) -> None:
-    from mstar.model.qwen3_5.components.language_model import Qwen3_5Attention
+def _stub_cores(llm, rows: _Rows, doubles: dict | None = None):
+    """``llm`` with its handles on Qwen3.5's declared state bound over stubs of the kernels, which read ``rows``.
+    ``doubles`` replaces a resource under its key, such as the position resource or the sampler."""
+    from mstar.engine.state.adapters import node_handles
+    from mstar.model.keys import ROPE
+    from mstar.model.qwen3_5.config import ATTN, GDN_STATE, KV_CACHE, LINEAR_ATTN, SAMPLER
+    from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
 
-    for layer in model.model.layers:
-        if isinstance(layer.self_attn, Qwen3_5Attention):
-            layer.self_attn.attend = CausalAttend(rows)
-        else:
-            layer.self_attn.mix = _DeltaRuleStub(rows)
+    declaring = model_object(Qwen3_5DenseModel, llm.config, vision_config=None, sampling_defaults={})
+    unread = _Unread()
+    resources = {
+        KV_CACHE: unread, GDN_STATE: unread, ATTN: _AttendCore(rows), LINEAR_ATTN: _DeltaCore(rows), ROPE: None,
+        SAMPLER: None, **(doubles or {}),
+    }
+    llm.bind_node_state(node_handles(declaring, "LLM", resources))
+    return llm
 
 
-def bind(model, rows: _Rows, resources: dict):
-    """The LLM node over ``model``, ``resources`` bound and the kernels stubbed."""
+def bind(model, rows: _Rows, resources: dict, doubles: dict | None = None):
+    """The LLM node over ``model``, ``resources`` bound and the kernels stubbed (``_stub_cores``)."""
     from mstar.model.qwen3_5.submodules import LLMSubmodule
 
     llm = LLMSubmodule(model, model.config)
     llm.bind_node_resources(resources)
-    _stub_cores(model, rows)
-    return llm
+    return _stub_cores(llm, rows, doubles)
 
 
-def run(model, rows: _Rows, embeds_per_row: list[torch.Tensor]) -> torch.Tensor:
+@contextmanager
+def step_over(llm, rows: _Rows, arrays: Sequence[str] | None = None):
+    """A step of one row per ``rows.lengths``, with ``llm``'s handles on ``arrays`` (Qwen3.5's by default) open, as
+    the engine opens them around a forward."""
+    from mstar.model.qwen3_5.config import GDN_STATE, KV_CACHE
+
+    arrays = arrays or (KV_CACHE, GDN_STATE)
+    step = SubmoduleStep(
+        segments=[Segment(rid, "main", n) for rid, n in enumerate(rows.lengths)],
+        state={name: ArrayStep() for name in arrays},
+    )
+    step.set_state_handles(tuple(llm.state_handles[name] for name in arrays))
+    step.set_ctx(StepContext(tuple(range(len(rows.lengths))), "prefill_text", 0, False))
+    step.begin_calls()
+    try:
+        yield
+    finally:
+        step.end_calls()
+
+
+def no_rope(stack, tokens: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """The rotary tables at position 0, which rotate nothing, as the stack ran with no position resource."""
+    return stack.build_text_cos_sin(torch.zeros(tokens, dtype=torch.long), dtype=DTYPE)
+
+
+def run(llm, rows: _Rows, embeds_per_row: list[torch.Tensor]) -> torch.Tensor:
     rows.lengths = [e.shape[0] for e in embeds_per_row]
-    with torch.no_grad():
-        return model.model(torch.cat(embeds_per_row), label="main")
+    x = torch.cat(embeds_per_row)
+    with torch.no_grad(), step_over(llm, rows):
+        return llm.model.model(x, cos_sin=no_rope(llm.model.model, x.shape[0]))
 
 
 # -- every enabled model's LLM node, as the parity tests drive it -----------------------------
@@ -501,7 +591,7 @@ class Stack:
     # the node's forward, per request: (its hidden rows, its head rows)
     run: Callable[[nn.Module, list[torch.Tensor]], list[tuple[torch.Tensor, torch.Tensor]]]
     declare: Callable[[nn.Module, list[str], list[torch.Tensor]], object]
-    inputs: Callable[[object, int, int], torch.Tensor]         # (config, tokens, seed) -> a row
+    inputs: Callable[[object, int, int], torch.Tensor]         # (config, n, seed) -> a row whose length scales with n
     # (the model at its released config, (config, TP group) -> the root its LoRA binds in)
     released: Callable[[], tuple[object, Callable]] | None = None
     worlds: tuple[int, ...] = (1, 2, 4)
@@ -509,6 +599,8 @@ class Stack:
     # the layouts the adapters' files name their modules in
     a1_rename: Callable[[str], str] = lambda m: m
     a2_rename: Callable[[str], str] = lambda m: m
+    # the YAML's `targets:` (every target the spec declares), for opt-in ones (experts)
+    opt_in: bool = False
 
 
 def model_object(cls, config, **attrs):
@@ -612,7 +704,7 @@ def _higgs():
         model = model_object(HiggsAudioModel, c)
         llm = model.build_llm(group).to(DTYPE)
         llm.load_weights((name, w) for k, w in weights.items() if (name := model._llm_remap(k)) is not None)
-        encoders = (audio_encoder(c.audio_in_token_idx),)
+        encoders = (audio_encoder(),)
         return HiggsAudioLLMSubmodule(llm.requires_grad_(False).eval(), c, encoders, text_prompts=False)
 
     def inputs(c, n, seed):
@@ -655,27 +747,76 @@ def _higgs():
     )
 
 
+class _NoRotation:
+    """The positions of a step at position 0, which rotate nothing, as the stack ran with no position resource."""
+
+    def apply_qk(self, q, k, *, label, rope_dtype):
+        return q, k
+
+
 def _omni():
-    """Layer 0 is MoE (its routed experts take no delta), layer 1 a dense MLP."""
+    """Layers 0 and 2 are MoE, their routed experts adapted (opted in by the YAML's
+    ``targets:``), layer 1 a dense MLP. A row is ``per_token`` tokens per unit of the
+    ``n`` it is asked for, so at ``test_lora_models.ROWS``' sizes one expert gathers
+    more rows than the torch reference's 64-row chunk."""
+    from mstar.engine.state.adapters import node_handles
     from mstar.model.qwen3_omni.components.thinker import Qwen3OmniThinkerModel
-    from mstar.model.qwen3_omni.config import Qwen3OmniModelConfig, ThinkerTextConfig
+    from mstar.model.qwen3_omni.config import (
+        THINKER_ATTN,
+        THINKER_KV,
+        THINKER_POS,
+        THINKER_SAMPLER,
+        Qwen3OmniModelConfig,
+        ThinkerTextConfig,
+    )
     from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
     from mstar.model.qwen3_omni.submodules import ThinkerSubmodule
+
+    moe = (0, 2)
+    per_token = 16
+    projs = (("gate_proj", (8, 16)), ("up_proj", (8, 16)), ("down_proj", (16, 8)))
+
+    def stub_cores(sub, rows: _Rows):
+        """``sub`` with its handles on the Thinker's declared state bound over stubs of the kernels, which read
+        ``rows``."""
+        declaring = model_object(Qwen3OmniModel, sub.config, local_dir=None)
+        resources = {
+            THINKER_KV: _Unread(), THINKER_ATTN: _AttendCore(rows), THINKER_POS: _NoRotation(), THINKER_SAMPLER: None,
+        }
+        sub.bind_node_state(node_handles(declaring, "Thinker", resources))
+        return sub
+
+    def run_(sub, rows):
+        lengths = _Rows([len(r) for r in rows])
+        stub_cores(sub, lengths)
+        x = sub.model.model.embed_tokens(torch.cat(rows))
+        with step_over(sub, lengths, (THINKER_KV,)):
+            hidden = sub.model(input_embeds=x)[0]
+        return _per_row(hidden, sub.model.lm_head(_last(hidden, lengths.lengths)), lengths.lengths)
 
     def weights(c):
         tc = c.thinker_text
         out = llama_weights(tc, "model.", "lm_head", qk_norm=True)
-        for proj in ("gate_proj", "up_proj", "down_proj"):
-            del out[f"model.layers.0.mlp.{proj}.weight"]
-        out["model.layers.0.mlp.gate.weight"] = rand(tc.num_experts, tc.hidden_size, seed=900)
-        for e in range(tc.num_experts):
-            for proj, shape in (("gate_proj", (8, 16)), ("up_proj", (8, 16)), ("down_proj", (16, 8))):
-                out[f"model.layers.0.mlp.experts.{e}.{proj}.weight"] = rand(*shape, seed=901 + e, scale=0.2)
+        for layer in moe:
+            for proj, _ in projs:
+                del out[f"model.layers.{layer}.mlp.{proj}.weight"]
+            seed = 900 + 100 * layer
+            out[f"model.layers.{layer}.mlp.gate.weight"] = rand(tc.num_experts, tc.hidden_size, seed=seed)
+            for e in range(tc.num_experts):
+                for i, (proj, shape) in enumerate(projs):
+                    out[f"model.layers.{layer}.mlp.experts.{e}.{proj}.weight"] = rand(
+                        *shape, seed=seed + 1 + 3 * e + i, scale=0.2)
         return out
 
     def adapted(c):
-        return {m: s for m, s in llama_layers(c.thinker_text, "model.").items()
-                if "self_attn" in m or not m.startswith("model.layers.0.")}
+        tc = c.thinker_text
+        experts = {
+            f"model.layers.{layer}.mlp.experts.{e}.{proj}": shape
+            for layer in moe for e in range(tc.num_experts) for proj, shape in projs
+        }
+        return {**{m: s for m, s in llama_layers(tc, "model.").items()
+                   if "self_attn" in m or not m.startswith(tuple(f"model.layers.{n}." for n in moe))},
+                **experts}
 
     # the released Qwen3-Omni-30B-A3B Thinker's text config
     full = Qwen3OmniModelConfig(thinker_text=ThinkerTextConfig(
@@ -685,22 +826,25 @@ def _omni():
     ))
     return Stack(
         config=lambda: Qwen3OmniModelConfig(thinker_text=ThinkerTextConfig(
-            vocab_size=64, hidden_size=16, intermediate_size=32, num_hidden_layers=2,
+            vocab_size=64, hidden_size=16, intermediate_size=32, num_hidden_layers=3,
             num_attention_heads=4, num_key_value_heads=2, head_dim=4, num_experts=4,
             num_experts_per_tok=2, moe_intermediate_size=8,
             mlp_only_layers=[1],
         )),
         lora_spec=lambda c: _declared(model_object(Qwen3OmniModel, c)),
-        build=lambda c, group, w: ThinkerSubmodule(_loaded(Qwen3OmniThinkerModel(c, comm_group=group).to(DTYPE), w), c),
+        build=lambda c, group, w: stub_cores(
+            ThinkerSubmodule(_loaded(Qwen3OmniThinkerModel(c, comm_group=group).to(DTYPE), w), c), _Rows(),
+        ),
         weights=weights,
         a1=lambda c: {**adapted(c), "lm_head": (c.thinker_text.vocab_size, c.thinker_text.hidden_size)},
-        a2=lambda c: _subset(adapted(c), "v_proj", "o_proj", "up_proj"),
-        run=_ids_run(lambda s: s.model, lambda s, ids: s.model.model.embed_tokens(ids),
-                     lambda s, x: s.model(input_embeds=x, label="main")[0], lambda s, x: s.model.lm_head(x)),
-        declare=_declare("prefill_text"), inputs=_tokens(lambda c: c.thinker_text.vocab_size),
+        a2=lambda c: _subset(adapted(c), "v_proj", "o_proj", "1.mlp.up_proj", "experts.1.up_proj",
+                             "experts.3.down_proj"),
+        run=run_, declare=_declare("prefill_text"),
+        inputs=lambda c, n, seed: _tokens(lambda c: c.thinker_text.vocab_size)(c, per_token * n, seed),
         released=lambda: (model_object(Qwen3OmniModel, full),
                           lambda c, g: Qwen3OmniThinkerModel(c, comm_group=g)),
         a1_rename=lambda m: f"thinker.{m}",  # the full model's checkpoint naming
+        opt_in=True,
     )
 
 
@@ -832,14 +976,16 @@ def _qwen3_5():
         return {**every, "lm_head": (c.vocab_size, HIDDEN), f"{TEXT}embed_tokens": (HIDDEN, c.vocab_size)}
 
     def run_(sub, rows):
-        lengths, lm = [len(r) for r in rows], sub.model
-        _stub_cores(lm, _Rows(lengths))
-        hidden = lm.model(lm.model.embed_tokens(torch.cat(rows)), label="main")
-        return _per_row(hidden, lm.lm_head(_last(hidden, lengths)), lengths)
+        lengths, lm = _Rows([len(r) for r in rows]), sub.model
+        _stub_cores(sub, lengths)
+        x = lm.model.embed_tokens(torch.cat(rows))
+        with step_over(sub, lengths):
+            hidden = lm.model(x, cos_sin=no_rope(lm.model, x.shape[0]))
+        return _per_row(hidden, lm.lm_head(_last(hidden, lengths.lengths)), lengths.lengths)
 
     return Stack(
         config=tiny_config, lora_spec=qwen3_5_lora_spec,
-        build=lambda c, group, w: LLMSubmodule(build_stack(w, group, c), c),
+        build=lambda c, group, w: _stub_cores(LLMSubmodule(build_stack(w, group, c), c), _Rows()),
         weights=lambda c: hf_text_weights(), a1=a1,
         # leaves `in_proj_qkv` and `in_proj_a` out: slices of one fused target on and off it
         a2=lambda c: _subset(a1(c), "q_proj", "v_proj", "down_proj", "in_proj_z", "in_proj_b",

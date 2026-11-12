@@ -25,6 +25,7 @@ from mstar.engine.resources.base import CGSlotKey
 from mstar.engine.resources.kv.config import PagedKVConfig
 from mstar.engine.resources.kv.keys import fingerprint
 from mstar.engine.resources.kv.plan import KVPlanOutputs
+from mstar.engine.resources.resident_hooks import ANY_REPEATS
 from mstar.engine.resources.spec import CombinedSplit
 from mstar.engine.resources.step import SlotLease, StepContext
 from mstar.utils.profiler import PhaseLaps
@@ -100,9 +101,21 @@ class FlashInferManager(AttentionManager):
         self._sm_scale = sm_scale
 
         self._workspaces = WorkspacePool(device, owner=kv_cache)
+        # walk -> whether its captured decode kernels see a row's length per replay
+        self._repeat_walks: dict[str, bool] = {}
 
     def depends_on(self):
         return {self._kv_cache_name}
+
+    def max_repeats(self, step, ctx) -> int:
+        """Whether every wrapper of the walk's captures sees each replay's lengths
+        (`supports_repeats`)."""
+        walk = ctx.graph_walk
+        allowed = self._repeat_walks.get(walk)
+        if allowed is None:
+            wrappers = [w for key, w in self._cg_plan_states.items() if key.bucket.graph_walk == walk]
+            allowed = self._repeat_walks[walk] = bool(wrappers) and all(w.supports_repeats for w in wrappers)
+        return ANY_REPEATS if allowed else 1
 
     def resident_refusal(self) -> str | None:
         if self._window_left >= 0:

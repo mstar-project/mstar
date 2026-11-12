@@ -27,6 +27,16 @@ class ResultChunk:
     # ``postprocess_inline`` call for a value sent inline)
     read_time: float | None = None
     postprocess_s: float = 0.0
+    # The text tokens it carries, as ``token_ids`` lists them (a stop token
+    # included); summed into the request's ``completion_tokens``.
+    num_tokens: int = 0
+    # Its last token is one of the model's stop ids, so it ended the reply.
+    stopped: bool = False
+
+
+# The modality of the chunk that ends a request submitted with
+# ``report_usage``: no data, its token counts and finish reason in metadata.
+USAGE = "usage"
 
 
 @dataclass
@@ -71,6 +81,11 @@ class RequestComplete:
     # When the conductor took the request in (queued or admitted), in the same
     # clock as conductor_ingest_time. Only stamped while metrics are on.
     conductor_arrival_time: float | None = None
+    # For the response's usage: the prompt's token count as the data worker
+    # sent it, and the output cap the conductor resolved for the request
+    # (the model's default, or what fits its resources, when the client set none).
+    prompt_tokens: int | None = None
+    max_output_tokens: int | None = None
 
 
 @dataclass

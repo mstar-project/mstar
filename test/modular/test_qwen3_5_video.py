@@ -25,6 +25,7 @@ import pytest
 import torch
 from torch import nn
 
+from mstar.model.components.sampled_token_decoder import MEDIA_EMBEDS, MEDIA_MASK
 from mstar.model.multimodal import (
     MEDIA_LAYOUT,
     TEXT,
@@ -369,15 +370,18 @@ def test_only_a_text_prompt_is_keyed_for_the_prefix_cache(model, processor):
     """A text prompt's one span is keyed, so the prefix cache serves it. An attachment prompt's one
     step carries tensor inputs, which the prefix cache never cuts, and a keyed span in that walk
     makes the preprocess worker refuse the request."""
+    from mstar.engine.state.adapters import kv_layouts
     from mstar.model.base import keyed_labels
     from mstar.model.qwen3_5.config import KV_CACHE
 
     assert keyed_labels(model) == {KV_CACHE: {"main": model.kv_labels()[KV_CACHE]["main"]}}
     question = "Question 0: what happens?"
     text = model.process_prompt(question, [TEXT], ["text"], prompt_parts=parts_from_modalities([TEXT], [question]))
-    assert text.metadata["kv_layout"][KV_CACHE]["main"].keyed_count() == 1
+    layouts = kv_layouts(model.declare_state(), text.metadata["state_layout"], text.metadata.get("keyed_spans", {}))
+    assert layouts[KV_CACHE]["main"].keyed_count() == 1
     _, out, _ = run_both(model, processor, "mixed")
-    assert out.metadata["kv_layout"][KV_CACHE]["main"].keyed_count() == 0
+    layouts = kv_layouts(model.declare_state(), out.metadata["state_layout"], out.metadata.get("keyed_spans", {}))
+    assert layouts[KV_CACHE]["main"].keyed_count() == 0
 
 
 @pytest.mark.parametrize("layout", list(LAYOUTS))
@@ -404,7 +408,7 @@ def test_vision_walk_matches_get_rope_index(model, processor, rope_model, layout
     spliced row's token order and its 3D positions, plus where decode
     resumes."""
     from mstar.model.multimodal import splice_media
-    from mstar.model.qwen3_5.config import KV_CACHE, ROPE
+    from mstar.model.qwen3_5.config import KV_CACHE
     from mstar.model.qwen3_5.submodules import LLMSubmodule
 
     _, out, ref = run_both(model, processor, layout)
@@ -418,18 +422,19 @@ def test_vision_walk_matches_get_rope_index(model, processor, rope_model, layout
         torch.full((n, 1), VIDEO_MARK if int(prompt[offset]) == model.config.video_token_id else IMAGE_MARK)
         for offset, n in zip(media["offset"], media["tokens"], strict=True)
     ])
-    (encoder,) = model.encoders
     llm = LLMSubmodule(nn.Linear(1, 1), model.config, model.vision_config, model.encoders)
     # the stream's counter is keyed by the worker's handle, not the wire id (AGENTS.md invariant 14)
     start = 5
-    llm.node_resources = {ROPE: SimpleNamespace(position=lambda rid, label: {7: start}.get(rid, 0))}
+    llm.kv = SimpleNamespace(positions=SimpleNamespace(position=lambda rid, label: {7: start}.get(rid, 0)))
     fwd_info = SimpleNamespace(request_id="r", rid_handle=7, step_metadata=step.step_metadata)
     row = llm._media_inputs(fwd_info, {"text_inputs": [prompt], "vision_embeds": [marks]})
 
     expected_row = ref["input_ids"][0].float()
     expected_row[ref["input_ids"][0] == model.config.image_token_id] = IMAGE_MARK
     expected_row[ref["input_ids"][0] == model.config.video_token_id] = VIDEO_MARK
-    spliced = splice_media(row.input_ids.float()[:, None], encoder.pads(row.input_ids), marks)
+    spliced = splice_media(
+        row.input_ids.float()[:, None], row.tensor_inputs[MEDIA_MASK], row.tensor_inputs[MEDIA_EMBEDS],
+    )
     assert torch.equal(spliced[:, 0], expected_row)
 
     positions, _ = rope_model.get_rope_index(
@@ -439,7 +444,7 @@ def test_vision_walk_matches_get_rope_index(model, processor, rope_model, layout
     assert torch.equal(row.custom_pos_ids.long(), positions[:, 0] + start)
     # decode resumes where transformers' rope delta puts it
     assert row.resource_step_info == int(positions.max()) + 1
-    spans = out.metadata["kv_layout"][KV_CACHE]["main"].spans
+    spans = out.metadata["state_layout"][KV_CACHE]["main"].spans
     assert sum(span.length for span in spans) == row.input_seq_len
     assert sum(span.advance for span in spans) == row.resource_step_info
 
@@ -481,10 +486,10 @@ def test_mp4_matches_processor(model, processor, tmp_path):
 def test_more_frame_groups_than_a_replay_holds_is_accepted(model):
     """Many tiny frame groups fit the top patch bucket but overflow a replay's
     segment ceiling; the encoder runs them eagerly, so intake takes them."""
+    from mstar.model.qwen3_5.config import VISION_ATTN
     from mstar.model.qwen3_5.submodules import VisionEncoderSubmodule
 
-    (spec,) = model._vision_resources()
-    limit = spec.config.max_segments_per_step
+    limit = model.kernel_settings()[VISION_ATTN]["max_segments_per_step"]
     n = 2 * (limit + 1)
     video = torch.randint(0, 256, (n, 3, 32, 32), dtype=torch.uint8)
     frames, metadata = sampled(video, 2.0, model.video_processor)
@@ -500,7 +505,9 @@ def test_more_frame_groups_than_a_replay_holds_is_accepted(model):
 
 def _encoder(max_segments: int):
     """A vision encoder bound to a ragged attention resource with this ceiling."""
-    from mstar.model.qwen3_5.config import VISION_ATTN, Qwen3_5VisionConfig
+    from mstar.engine.state import Array, Attend, Block, KVEntry, Read
+    from mstar.engine.state.adapters import StateSetup, _resolve, build_handle
+    from mstar.model.qwen3_5.config import VISION_ATTN, VISION_TOKENS, Qwen3_5VisionConfig
     from mstar.model.qwen3_5.submodules import VisionEncoderSubmodule
 
     config = Qwen3_5VisionConfig(
@@ -509,7 +516,10 @@ def _encoder(max_segments: int):
         num_position_embeddings=16, out_hidden_size=64,
     )
     encoder = VisionEncoderSubmodule(nn.Linear(1, 1), config, "vision_embeds", (torch.zeros(1), torch.ones(1)))
-    encoder.node_resources = {VISION_ATTN: SimpleNamespace(max_segments_per_step=max_segments)}
+    array = Array(VISION_TOKENS, nodes={"vision_encoder"}, layers={0}, entry=KVEntry(heads=2, head_dim=16), max_len=0,
+                  reads={VISION_ATTN: Read(mask=Block(), op=Attend(q_heads=2))})
+    ragged = SimpleNamespace(max_segments_per_step=max_segments, run=lambda *args, **kwargs: None)
+    encoder.vision = build_handle(array, {VISION_ATTN: ragged}, _resolve([array], StateSetup()))
     return encoder
 
 
@@ -589,7 +599,7 @@ def test_the_replayed_region_declares_what_the_eager_step_would():
     """One declaration serves the eager step and the region: at capture
     (no labels) each label plans the bucket's span, at replay the frames."""
     from mstar.model.components.block_loop_encoder import VISION_BLOCK_LOOP
-    from mstar.model.qwen3_5.config import VISION_ATTN
+    from mstar.model.qwen3_5.config import VISION_TOKENS
     from mstar.model.submodule_base import NodeInputs
 
     encoder = _encoder(max_segments=4)
@@ -605,7 +615,7 @@ def test_the_replayed_region_declares_what_the_eager_step_would():
     )
     replayed = region.declare_step(["r"], [8], label_seq_lens={"main": [4, 4]})
     assert spans(eager) == spans(replayed) == [("r", "main", 4), ("r", "main", 4)]
-    assert set(eager.steps) == set(replayed.steps) == {VISION_ATTN}
+    assert set(eager.state) == set(replayed.state) == {VISION_TOKENS}
     assert spans(region.declare_step(["r"], [256])) == [("r", "main", 256)]
     # leased, the region declares the node's whole step
     leased = encoder.declare_step(
@@ -790,14 +800,16 @@ def test_the_model_pickles_for_its_workers(model):
 def test_the_checkpoint_sampling_defaults_reach_the_sampler(tmp_path):
     """The checkpoint's generation_config applies under the request, and its
     min_p turns the sampler's min-p filter on."""
+    from mstar.engine.state.adapters import node_resources, sampling_configs
     from mstar.model.qwen3_5.config import SAMPLER
     from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
 
     ckpt = write_synthetic_checkpoint(tmp_path)
     (ckpt / "generation_config.json").write_text(json.dumps({"temperature": 0.6, "top_k": 20, "min_p": 0.05}))
     model = Qwen3_5DenseModel(str(ckpt))
-    (spec,) = [s for s in model.get_node_resources() if s.resource_key == SAMPLER]
-    cfg = model.get_request_resource_configs([], [], {"min_p": 0.2})[SAMPLER]
+    (spec,) = [s for s in node_resources(model) if s.resource_key == SAMPLER]
+    settings = model.get_request_resource_configs([], [], {"min_p": 0.2})
+    cfg = sampling_configs(settings, model.declare_state())[SAMPLER]
     cfg.validate(spec)
     assert (spec.enable_min_p, cfg.temperature, cfg.top_k, cfg.min_p) == (True, 0.6, 20, 0.2)
 
@@ -822,7 +834,7 @@ def test_the_layout_places_every_pad(model, processor):
     _, out, _ = run_both(model, processor, "two_videos_around_image")
     (ids,) = out.new_input_tensors["text_inputs"]
     layout = out.metadata[MEDIA_LAYOUT]
-    pads = set(model.encoders[0].pad_ids)
+    pads = set(model._pad_ids().values())
     covered = torch.zeros_like(ids, dtype=torch.bool)
     for offset, n in zip(layout["offset"], layout["tokens"], strict=True):
         assert all(int(t) in pads for t in ids[offset:offset + n])
@@ -876,7 +888,8 @@ def test_a_rebuilt_media_prompt_holds_the_slots_and_positions_of_an_uninterrupte
     from mstar.engine.resources.position.config import PositionConfig, PositionStep
     from mstar.engine.resources.position.manager import RopeManager
     from mstar.engine.resources.step import Segment
-    from mstar.model.qwen3_5.config import KV_CACHE, ROPE
+    from mstar.engine.state.adapters import kv_layouts
+    from mstar.model.qwen3_5.config import KV_CACHE
     from mstar.model.qwen3_5.submodules import LLMSubmodule
     from mstar.worker.executing_batch import build_executing_batch
     from mstar.worker.host_pool import HostPool
@@ -893,13 +906,14 @@ def test_a_rebuilt_media_prompt_holds_the_slots_and_positions_of_an_uninterrupte
         prompt_parts=parts_from_modalities(modalities, texts),
         input_metadata={"video_inputs": [metadata for _, metadata in videos]},
     )
-    tensors, kv_layout = out.new_input_tensors, out.metadata["kv_layout"][KV_CACHE]["main"]
+    layouts = kv_layouts(model.declare_state(), out.metadata["state_layout"], out.metadata.get("keyed_spans", {}))
+    tensors, kv_layout = out.new_input_tensors, layouts[KV_CACHE]["main"]
     step = model._prefill_step(tensors, out.metadata[MEDIA_LAYOUT])
     rows = sum(out.metadata[MEDIA_LAYOUT]["tokens"])
     copied = {"vision_embeds": [torch.full((rows, model.config.hidden_size), IMAGE_MARK)]}
     llm = LLMSubmodule(nn.Linear(1, 1), model.config, model.vision_config, model.encoders)
     rope = RopeManager(PositionConfig(kv_cache="kv"), torch.device("cpu"))
-    llm.node_resources = {ROPE: rope}
+    llm.kv = SimpleNamespace(positions=rope)
     metadata = {"is_prefill": True, **step.step_metadata}
     kv = KVManager(
         cfg=PagedKVConfig(num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=4096, max_num_pages=64, page_size=16),
@@ -910,7 +924,7 @@ def test_a_rebuilt_media_prompt_holds_the_slots_and_positions_of_an_uninterrupte
     def write(walk, row=None):
         """A decode step when ``row`` is None, else a ``step.walk`` row."""
         span = 1 if row is None else row.input_seq_len
-        advance = None if row is None else llm.declare_step(walk, [R], [row]).steps[ROPE].advance
+        advance = None if row is None else llm.declare_step(walk, [R], [row]).state[KV_CACHE].advance
         segments = (Segment(R, "main", span),)
         kv_step, ctx = KVStep(segments=segments), StepContext((R,), walk, 0, False)
         assert kv.admit(kv_step, ctx).ok
@@ -949,8 +963,9 @@ def test_a_rebuilt_media_prompt_holds_the_slots_and_positions_of_an_uninterrupte
     )
     w._rebuilds.record(prefilled)
     w._rebuilds.flush()
-    # the samples before 9 are in the KV, and 9 is the next decode step's input
-    w._rebuilds.kept(R, NODE).sampled.extend([*[7, 8][:samples], 9])
+    # the samples before 9 are in the KV, and 9 is the next decode step's input; one is an image pad
+    tail = [model._pad_ids()["image"], 8][:samples]
+    w._rebuilds.kept(R, NODE).sampled.extend([*tail, 9])
     eng.dropped.append(R)
     assert w._rebuilds.tokens(R, NODE, None) == held[0], "the drop would refuse the request"
     kv.prepare_rebuild(R, w._rebuilds.start(R, NODE, None))
@@ -964,11 +979,16 @@ def test_a_rebuilt_media_prompt_holds_the_slots_and_positions_of_an_uninterrupte
 
     advance = prefill.resource_step_info
     after = torch.arange(advance, advance + samples).expand(3, -1)
-    assert torch.equal(rebuilt.input_ids, torch.cat([ids, torch.tensor([7, 8][:samples])])), (
+    assert torch.equal(rebuilt.input_ids, torch.cat([ids, torch.tensor(tail, dtype=ids.dtype)])), (
         "the rebuild row would read other ids"
     )
-    assert torch.equal(rebuilt.tensor_inputs["vision_embeds"], copied["vision_embeds"][0]), (
+    assert torch.equal(rebuilt.tensor_inputs[MEDIA_EMBEDS], copied["vision_embeds"][0]), (
         "the rebuild row would splice in other encoder output"
+    )
+    # the ids sampled since take no encoder row, the pad among them included
+    unmasked = torch.zeros(samples, dtype=torch.bool)
+    assert torch.equal(rebuilt.tensor_inputs[MEDIA_MASK], torch.cat([prefill.tensor_inputs[MEDIA_MASK], unmasked])), (
+        "a sampled id would take an encoder row"
     )
     assert torch.equal(rebuilt.custom_pos_ids.long(), torch.cat([prefill.custom_pos_ids.long(), after], dim=1)), (
         "decode would resume at another position"

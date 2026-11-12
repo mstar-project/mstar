@@ -302,6 +302,9 @@ class RustGraphRuntime(GraphRuntime):
 
     supports_inline_emit = True
 
+    def set_inline_streams(self, keys: frozenset[tuple[str, str]]) -> None:
+        self._rust.set_inline_streams(sorted(keys))
+
     # --------- Bookkeeping ----------
 
     def set_node_metadata(
@@ -683,6 +686,15 @@ class RustGraphRuntime(GraphRuntime):
                     strict=True,
                 )
             },
+            local_stream_values_by_signal={
+                name: ParallelList(rids, values)
+                for name, rids, values in zip(
+                    out.local_stream_value_signals,
+                    out.local_stream_value_rids,
+                    out.local_stream_values,
+                    strict=True,
+                )
+            },
             rids_needing_request_info=frozenset(out.rids_needing_request_info),
             freed_inputs=FreedTensors(
                 out.freed_input_uuids, out.freed_input_registered,
@@ -698,6 +710,9 @@ class RustGraphRuntime(GraphRuntime):
             [p.reads_token for p in policies.values()],
             [sorted(p.eos_tokens) for p in policies.values()],
         )
+
+    def loop_room(self, node_name: str, graph_walk: str, loop_name: str, rids: list[int], stride: int) -> int:
+        return self._rust.loop_room(node_name, graph_walk, loop_name, rids, stride)
 
     def register_stop_limits(self, rid: int, info: CurrentForwardPassInfo) -> None:
         cap = (1 << 32) - 1  # also "no limit": a loop count never reaches it
@@ -751,7 +766,7 @@ class RustGraphRuntime(GraphRuntime):
             inline_signal=None if inline is None else inline.signal,
             inline_ptr=iptr, inline_rows=irows, inline_stride=istride, inline_dtype=idtype,
             partition_done=list(request.partition_done), python_send=request.python_send,
-            loop_strides=request.loop_strides,
+            loop_strides=request.loop_strides, token_width=request.token_width,
         )
         return self._postprocess_step(out)
 

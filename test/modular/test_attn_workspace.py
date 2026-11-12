@@ -444,7 +444,7 @@ def test_the_engine_seals_between_sizing_and_capture(monkeypatch):
             events.append("seal")
 
     mgmt = make_mgmt(SimpleNamespace(warmup_compiles=lambda: None, resident_walks=frozenset))
-    mgmt._num_slots = 2
+    mgmt._slots.num_slots = 2
     engine = make_engine(_resources={"attn": _Resource()}, _submodules={"dit": mgmt})
     monkeypatch.setattr(engine_mod, "AcceleratorGraphRunner", _Runner)
     monkeypatch.setattr(engine, "_compile_regions", lambda: None, raising=False)

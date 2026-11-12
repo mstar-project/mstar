@@ -38,6 +38,7 @@ from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PrefixSpan, St
 from mstar.engine.resources.kv.manager import KVManager, Victims
 from mstar.engine.resources.runner import StepRunner
 from mstar.engine.resources.step import AdmitOutcome, Segment
+from mstar.engine.state.adapters import StateSetup
 from mstar.model.submodule_base import ARNodeInputs
 
 
@@ -211,7 +212,7 @@ def test_small_prompts_pass_a_dropped_request_with_pages_free_while_an_older_req
 def test_the_engine_orders_requests_by_the_arrival_their_request_info_carries():
     kv = _pool()
     engine = Engine.__new__(Engine)
-    engine._runner, engine._submodules = _runner(kv), {}
+    engine._runner, engine._submodules, engine._state_setup = _runner(kv), {}, StateSetup()
     # a's second partition sends it again
     for rid, arrival in (("v", 2), ("r", 0), ("a", 1), ("x", None), ("a", 1)):
         info = CurrentForwardPassInfo(rid, WALK, 0, 0, 1, arrival=arrival)

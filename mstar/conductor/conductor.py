@@ -39,6 +39,8 @@ from mstar.distributed.communication import GlobalParallelConfig, WorkerParallel
 from mstar.engine.resources import KVReqConfig, ResourceReqConfig
 from mstar.engine.resources.kv.config import mark_unpausable, refuse_undeclared_labels, without_layouts
 from mstar.engine.resources.lora.config import LoraSpec
+from mstar.engine.state import SampleSettings
+from mstar.engine.state.adapters import sampling_configs
 from mstar.graph.base import GraphEdge, NodeAndGraphWalk, TensorPointerInfo
 from mstar.model.base import Model, WorkerGraph, serving_resources, streamed_inputs
 from mstar.model.submodule_base import chunk_loop_name
@@ -409,6 +411,8 @@ class RequestData:
     # double-count: rx by (source, dest, edge), tx by (source, edge).
     rx_info: dict[tuple[str, str, str], RxInfo] = field(default_factory=dict)
     tx_info: dict[tuple[str, str], TxInfo] = field(default_factory=dict)
+    # the data worker's count, returned on request_complete
+    prompt_tokens: int | None = None
 
     def remove_persist_signal_uuids(self, uuids: list[int]):
         uuids = set(uuids)
@@ -714,6 +718,12 @@ class Conductor:
             )
         return built
 
+    def _declarations(self) -> list:
+        built = getattr(self, "_declarations_cache", None)
+        if built is None:
+            built = self._declarations_cache = self.model.declare_state()
+        return built
+
     def _streamed_partitions(self) -> frozenset[str]:
         streamed = getattr(self, "_streamed_partitions_cache", None)
         if streamed is None:
@@ -762,6 +772,8 @@ class Conductor:
         (``LoraAdapterOps.refuse_request``).
         """
         configs = self.model.get_request_resource_configs(input_modalities, output_modalities, model_kwargs)
+        if any(isinstance(config, SampleSettings) for config in configs.values()):
+            configs = sampling_configs(configs, self._declarations())
         # a model that builds its sampler config from its own keys would drop it unseen
         if model_kwargs.get("return_logprobs") and not any(
             getattr(cfg, "return_logprobs", False) for cfg in configs.values()
@@ -1484,6 +1496,7 @@ class Conductor:
             sharding_config=self._build_request_sharding_config(worker_graph_to_workers),
             conductor_ingest_time=ingest_time,
             conductor_arrival_time=arrival_time,
+            prompt_tokens=body.prompt_tokens,
         )
         self._register_request(body.request_id, request_data)
 
@@ -1846,6 +1859,8 @@ class Conductor:
                     rx_info=list(request_data.rx_info.values()),
                     tx_info=list(request_data.tx_info.values()),
                     conductor_arrival_time=request_data.conductor_arrival_time,
+                    prompt_tokens=request_data.prompt_tokens,
+                    max_output_tokens=request_data.max_output_tokens,
                 )
             )
         )

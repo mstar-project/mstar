@@ -218,7 +218,7 @@ model, so they are named for it.
        the token buckets (see :doc:`serving`).
    * - ``MSTAR_VIT_ACCELERATOR_GRAPH_BATCH_SIZES``
      - ``1,2,4``
-     - Comma-separated batch sizes to capture. Read only when
+     - Comma-separated batch sizes to capture; empty captures none. Read only when
        ``MSTAR_VIT_BATCHING=1``; otherwise only batch size 1 is captured.
    * - ``COSMOS3_DISABLE_ACCELERATOR_GRAPH``
      - unset
@@ -314,7 +314,7 @@ Read by ``mstar-serve`` / ``mstar.api_server.entrypoint``.
      - Silero VAD ONNX file (``silero_vad.onnx``) for ``/v1/realtime``
        ``server_vad`` turn detection, read by
        ``realtime_vad.silero_weights``. Unset, the copy bundled with the
-       ``silero-vad`` package (``mstar[vad]``) is used; with neither, or
+       ``silero-vad`` package (``mstar-ai[vad]``) is used; with neither, or
        with a file whose inputs or outputs differ (the package's other
        exports), ``server_vad`` sessions are refused. Never downloaded.
    * - ``MSTAR_SMART_TURN_PATH``
@@ -379,10 +379,43 @@ Read by the ``mstar-server`` binary and its bridge
    * - ``MSTAR_SERVED_MODELS``
      - unset
      - The names a Rust-frontend request's ``model`` may carry, as JSON: the
-       base model's names and the served LoRA adapters
-       (``api_server/served_models.py``, ``rust/server/src/served_models.rs``).
-       Unset serves the base model alone. Not for deployments to set:
+       base model's names and the LoRA adapters served at launch
+       (``api_server/served_models.py``, ``rust/server/src/served_models.rs``);
+       the API server pushes each later change over the bridge. Unset serves
+       the base model alone. Not for deployments to set:
        ``launch_rust_server`` sets it from the API server's ``ServedModels``.
+   * - ``MSTAR_TRANSCRIPTION``
+     - unset
+     - What the Rust frontend's ``/v1/audio/transcriptions`` needs from the
+       served model, as JSON: the kwargs it declares, the deployment's
+       ``max_concurrent_requests``, the adapter's language tables, and the
+       pydantic version its error text cites. Not for deployments to set:
+       ``launch_rust_server`` sets it from ``transcription_facts`` for a model
+       with a transcription surface, and drops an inherited value.
+   * - ``MSTAR_OPENPI``
+     - unset
+     - The deployment's openpi policy (its ``openpi:`` block as the API server
+       checked it, the metadata frame packed), as JSON; unset serves no socket
+       at ``/``. Not for deployments to set: ``launch_rust_server`` sets it from
+       ``openpi_facts``.
+   * - ``MSTAR_WS_MAX_BYTES``
+     - the body limit
+     - The largest WebSocket message the Rust frontend reads, in bytes: the
+       config's ``ws_max_message_mb``. Not for deployments to set:
+       ``launch_rust_server`` sets it.
+   * - ``MSTAR_CLIENT_STREAMS``
+     - ``[]``
+     - The model's client streams, as JSON: on ``/generate/ws`` a request to a
+       model with any is a live call. Not for deployments to set:
+       ``launch_rust_server`` sets it from ``APIServer.client_streams``.
+   * - ``MSTAR_REALTIME``
+     - unset
+     - What the Rust frontend's ``/v1/realtime`` runs with, as JSON: for a
+       model with an audio client stream, what a conversation needs from it
+       (``conversation_facts``); for realtime transcription, the ONNX Runtime
+       library ``onnxruntime`` loads, Silero's weights, why Smart Turn did not
+       load (if it didn't), and the model's tokenizer. Not for deployments to
+       set: ``launch_rust_server`` sets it from ``realtime_facts``.
    * - ``MSTAR_ALLOW_REMOTE``
      - ``0``
      - Allow ``http(s)`` media URLs in requests, fetched server-side by both
@@ -443,13 +476,6 @@ Read by the ``mstar-server`` binary and its bridge
        tokenization. Leave unset with the Python backend — its preprocess
        worker owns tokenization, and the bridge rejects pre-tokenized
        ingest.
-
-Rust frontend limitations
-~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-The Rust frontend serves no ``/generate/ws``, so a model's live client input
-(appends to a running request, see :doc:`clients`) needs the Python frontend;
-over ``/generate`` such a model's input ends when the request is submitted.
 
 Request media
 -------------
@@ -796,7 +822,9 @@ Worker scheduling
        pages, and each commit against its request's layout. A recurrent snapshot's key is
        checked against the KV chain's key at its boundary. Logs a label left under its
        footprint at removal. Above one rank, each follower stops if the reservations it
-       admits a step from differ from rank 0's. Tests and debugging only.
+       admits a step from differ from rank 0's. Around each state op that runs its fused
+       kernel in an eager step, checks that the array changed only at the step's slots,
+       through a host copy of the array. Tests and debugging only.
 
 Compilation
 -----------

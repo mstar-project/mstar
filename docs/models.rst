@@ -102,6 +102,8 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
        openpi's DROID normalization: raw joint state in, joint velocities out. It also
        serves openpi's policy WebSocket, so openpi's DROID client connects unchanged
        (see :doc:`clients`).
+       ``LLM`` and ``action_expert`` share a KV cache, so ``node_groups`` must list them in
+       one entry; the server refuses to start otherwise.
    * - ``qwen3_5_{0.8,2,4,9,27}b``
      - ``Qwen/Qwen3.5-4B``
      - Hybrid-attention VLM (text + image in, text out): gated DeltaNet linear
@@ -111,8 +113,9 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
      - Qwen3.8-27B on the Qwen3.5 code above (same architecture); ships a TP4 config.
    * - ``minicpm_o`` *(Beta)*
      - ``openbmb/MiniCPM-o-4_5``
-     - Omni-modal chat (text/image/audio in, text out): Qwen3-8B over a navit SigLIP +
-       resampler and a Whisper-medium encoder. Half-duplex only.
+     - Omni-modal chat (text/image/audio in, text and speech out): Qwen3-8B over a navit
+       SigLIP + resampler and a Whisper-medium encoder; a Llama TTS and a streaming
+       flow-matching vocoder for speech. Half-duplex only.
    * - ``omnivoice``
      - ``k2-fsa/OmniVoice``
      - Massively multilingual zero-shot TTS: masked-diffusion canvas over a Qwen3-0.6B
@@ -167,6 +170,11 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
    * - ``higgs_audio`` *(Beta)*
      - ``bosonai/higgs-audio-v3-stt``
      - Audio-tower + Qwen3 LLM speech-to-text. Beta / un-optimized.
+   * - ``phi4mm`` *(Beta)*
+     - ``microsoft/Phi-4-multimodal-instruct``
+     - Phi-4-mini with a SigLIP vision tower and a conformer audio tower: text, images
+       and audio in, text out. Each request runs under the checkpoint's vision or speech
+       LoRA as its media call for, from the engine's LoRA pool.
    * - ``omnilingual_asr_ctc_{300m,1b,3b,7b}``
      - ``facebook/omniASR-CTC-300M`` (v1); v2 from Meta's CDN (default)
      - Meta Omnilingual ASR, CTC variants: wav2vec 2.0 encoder + CTC head, speech-to-text
@@ -211,7 +219,10 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
        chunk by chunk (Wan2.1-layout causal DiT, rolling KV cache, 4 distilled steps).
        A request carries the whole camera trajectory as JSON in ``model_kwargs``, which the API
        server caps at 1 MiB: about 3,900 frames of ``[4, 4]`` float32 poses; send ``[F, 3, 4]``
-       rows for up to the 4,077-frame maximum. One rollout per GPU. The DiT's attention runs
+       rows for up to the 4,077-frame maximum. One rollout at a time: the model refuses any
+       other ``max_concurrent_requests`` until each rollout's text K/V and VAE caches, which
+       are outside the rolling K/V pool (``resources: dit_kv: pool_tokens``), are engine
+       resources. The DiT's attention runs
        through the engine's ragged attention resource, its blocks are compiled (Inductor's
        deterministic mode), the condition encode runs channels-last, and the VAE decode is
        channels-last, compiled and bf16 where cuDNN >= 9.16 (frames 51 dB from the fp32 decode).
@@ -315,12 +326,18 @@ merge's.
        checkpoint's ``audio_decoder_proj.text_lm_head``)
      - No embedding target.
    * - Qwen3-Omni (``Thinker``), *not validated*
-     - ``qkv_proj``, ``o_proj``, dense-layer ``gate_up_proj`` / ``down_proj``, ``lm_head``
-     - Attention only on MoE layers: an adapter on the routed experts or the router is
-       refused. Talker, code predictor and encoders take none. Not validated: this MoE
-       model's bf16 noise is about 10x a dense model's (its router flips experts on
-       near-ties), so even base rows, run in a larger batch than the reference's, miss
-       the check against merged weights.
+     - ``qkv_proj``, ``o_proj``, dense-layer ``gate_up_proj`` / ``down_proj``, ``lm_head``;
+       the routed experts' ``experts_gate_up_proj`` / ``experts_down_proj`` when the YAML's
+       ``targets:`` names them
+     - Expert targets are opt-in: each slot holds every expert's A and B (about 1.7 GB per
+       slot at rank 16, and as much pinned on the host per adapter held there), and with
+       128 experts a pool serves at most 7 slots. Under TP only: an ``ep_config`` with
+       ``parallel: ep`` over several ranks refuses them at startup. Per-expert adapters
+       only (``experts.<N>.<proj>``), not PEFT's fused 3-D form. The router takes none.
+       Talker, code predictor and encoders take none. Not validated: this MoE model's
+       bf16 noise is about 10x a dense model's (its router flips experts on near-ties),
+       so even base rows, run in a larger batch than the reference's, miss the check
+       against merged weights.
    * - Qwen3-TTS (``Talker``), *not validated*
      - ``qkv_proj``, ``o_proj``, ``gate_up_proj``, ``down_proj``, ``codec_head``
      - Not the text projection (runs before the step) or the CodePredictor. Not
@@ -841,9 +858,9 @@ on one GPU in every shipped config.
 
 Both frontends serve LoRA: a request's ``model`` names the adapter it runs under
 (``ServedModels``), and ``/v1/models`` lists the adapters beside the base model.
-Runtime updates (below) are the Python frontend's only for now: ``mstar-server``
-reads the served adapters once at launch and has neither route, so ``mstar serve``
-refuses ``--rust-frontend`` with ``runtime_updates: true``.
+Both serve runtime updates (below) too: ``mstar-server`` selects the adapter itself,
+and the API server pushes it the served set after every change, so a request pays no
+extra round trip for it.
 
 Adapters can also be loaded and unloaded while the server runs, with vLLM's
 endpoints and bodies. They make the server read paths a client names, so they are off
@@ -890,6 +907,37 @@ refused and the MTP head is skipped. The chat template's new
 ``reasoning_effort`` and ``preserve_thinking`` are not forwarded: every
 request gets the template's defaults (``xhigh`` and preserved), whatever the
 client sends, and a request that sends one is logged as ignoring it.
+
+MiniCPM-o 4.5 (``minicpm_o``)
+------------------------------
+
+Text, image and audio in; text, or text and 24 kHz speech, out, as upstream's half-duplex
+``chat()``: the LLM (Qwen3-8B) writes the reply, a TTS reads it into speech codes, and a
+streaming flow-matching vocoder (Step-Audio2's token2wav) turns them into audio. Ask for
+speech with ``output_modalities`` including ``"audio"``; the bundled ``default`` voice is the
+only one. A spoken reply's system message is upstream's voice-clip prompt, so a spoken
+request with a system prompt of its own is refused (400) unless it sets ``voice_prompt:
+false``, which uses the request's ``system_prompt`` instead, as vllm-omni does.
+``streaming_generate``, video input and full duplex are not supported.
+
+``configs/minicpm_o.yaml`` runs three workers on one GPU (LLM and encoders, TTS, vocoder);
+it sets ``mps: true``, so their kernels overlap (see *Several workers on one GPU* in :doc:`serving`). Each spoken
+reply holds a slot of each ``t2w_*`` resource (~0.4 GiB in all) while it speaks, so their
+``max_slots`` cap the replies being voiced at once. ``t2w_state`` has one more than each of the
+three ``t2w_*_kv`` (its sink); startup refuses counts that disagree. The slots don't hold
+back the TTS, which keeps a spoken reply's ``tts_kv`` pages (up to 32) until its last code,
+so ``max_concurrent_requests`` caps the requests in flight and startup refuses a ``tts_kv``
+that can't hold that many full replies: overfilled, the TTS would stall. A reply's LLM
+pages have no such bound, so ``llm_kv`` has host pages (``cpu_offload_pages``): a full
+pool moves a request to the host until those fill. At the cap of 32, with 2048 tokens
+out on an H200 (one run per size), a burst of prompts around 3.7k tokens or longer still
+waits, 2.5k does not (follow-up: reserve a request's whole layout).
+
+The vocoder's DiT runs its GEMMs, convolutions and attention, and keeps its caches, in
+float16; its residual stream, its norms' arithmetic, the Euler solver, the token encoder
+and HiFT stay float32. Its mel is within about 0.1% of a float32 DiT's, and the served
+speech's Whisper WER is unchanged. HiFT up to its spectrum is compiled (``compile_regions``),
+and the TTS's decode capture runs cuBLAS GEMMs (``compile_mode="default"``).
 
 Command A+ (``command_a_plus``)
 -------------------------------
@@ -2125,12 +2173,12 @@ each row count compiling its own graph.
 **What is accelerated by default.** The DiT runs under ``torch.compile``
 (``compile_dit``); its self-attention runs on the engine's ragged attention
 resource (FlashInfer, FA3 on Hopper; on a B300 the ``ragged_attention`` kernel table
-picks torch's cuDNN SDPA, the kernel ``attention_backend: sdpa`` runs, and the two
+picks torch's cuDNN SDPA, the kernel ``backend: sdpa`` runs, and the two
 configs give the same videos at the same step time) as an opaque op inside the compiled graph,
 6% off a 1280x704x81 denoise step on an H200 against cuDNN SDPA, measured on
 an earlier version of the DiT block, before the adaLN was computed in one pass
 and the q/k norm and RoPE were fused
-(``model_kwargs: attention_backend: sdpa`` restores the reference kernel; the
+(``backend: sdpa`` on the ``dit_self_attn`` resource restores the reference kernel; the
 cross-attention over the 512 text tokens stays on SDPA, which is faster at that
 shape). The untiled VAE decode runs the shared Wan VAE decoder,
 channels-last and compiled (``vae_decode_fast``; set it to ``false`` under the
@@ -2281,7 +2329,9 @@ Deployment knobs (``model_kwargs``; the SP configs set ``compile``, ``vae_tile_b
 - ``vae_compile``: the decoder's blocks, static per tile batch; a canvas or clip share with
   another tile count compiles again. A 768p clip's share decodes in 2.1 s instead of 3.2 s
   on one H200, within 62.9 dB of eager.
-- ``attention_backend``: ``flashinfer``, or ``sdpa`` (the reference's kernel).
+
+The attention kernel is a resource's setting: ``backend: sdpa`` on the ``dit_attn`` and
+``refiner_attn`` resources runs the reference's kernel, and FlashInfer runs without it.
 
 Async scheduling is on for the DiT and the decoder, the default for parallel nodes
 (``tp_async_sched: false`` turns it off); on and off measured within noise. Runtime needs:
@@ -2290,9 +2340,9 @@ torchaudio built for another torch, refuses to start), FlashInfer, and ``ffmpeg`
 rank holds the whole DiT, and the SP configs put the conditioner beside it on rank 0 (117 GiB
 in use once loaded), so they need 141 GB GPUs (H200); no config has been run on 80 GB cards.
 
-At ``attention_backend: sdpa`` the nodes' modules, driven by ``test/minimax_h3/parity.py``
-(fp32 matmuls at "highest"), are bit-identical to diffusers' MiniMax-H3 pipeline end to end
-(latents, frames, waveform); with ``--exact`` the script exits nonzero when one isn't.
+On SDPA the nodes' modules, driven by ``test/minimax_h3/parity.py`` (fp32 matmuls at
+"highest"), were bit-identical to diffusers' MiniMax-H3 pipeline end to end (latents, frames,
+waveform), measured at ``f6260f2677``; with ``--exact`` the script exits nonzero when one isn't.
 FA3 and the compiled DiT are not bit-exact. Served at 768p (50 steps, SP2 on H200, three
 seeds), clips are 23.7-32.8 dB (video) and 17.8-22.3 dB (audio) from diffusers', where the
 reference on another SDPA kernel is 23.5-33.1 and 21.6-22.3 dB from itself; per seed, the
@@ -2353,16 +2403,14 @@ The OpenAI routes are ``POST /v1/images/generations`` (``size`` as ``WxH``, ``se
 (multipart ``image`` + ``prompt``; up to four reference images are concatenated as
 conditioning tokens, in order).
 
-Deployment knobs live under ``model_kwargs`` in ``configs/flux2_klein.yaml``:
+``backend: sdpa`` on the ``dit_attn`` resource, as the shipped configs set it, runs the
+reference kernel: torch's SDPA called by the model, cuDNN on an H100 and a B300. Without it the
+DiT's joint attention runs on the engine's ragged attention resource, whose kernel the GPU's
+``ragged_attention`` table picks: torch's cuDNN SDPA on ``sm_103`` (B300), FlashInfer's ragged
+prefill (FA3 on Hopper) where no table covers the GPU. ``backend: flashinfer`` keeps
+FlashInfer. Both are CUDA-graph replayable. Z-Image takes the same block.
 
-``attention_backend``
-   ``sdpa`` (the shipped configs) is the reference kernel: torch's SDPA called by the model,
-   cuDNN on an H100 and a B300. ``flashinfer`` (the model's default when a config names none)
-   runs the DiT's joint attention on the engine's ragged attention resource, whose kernel the
-   GPU's ``ragged_attention`` table picks: torch's cuDNN SDPA on ``sm_103`` (B300), FlashInfer's
-   ragged prefill (FA3 on Hopper) where no table covers the GPU. ``resources: dit_attn:
-   backend: flashinfer`` keeps FlashInfer. Both are CUDA-graph replayable. Z-Image takes the
-   same knob.
+Deployment knobs live under ``model_kwargs`` in ``configs/flux2_klein.yaml``:
 
 ``compile``
    ``torch.compile`` of the transformer, one trace per shape.
@@ -2459,7 +2507,7 @@ Deployment knobs live under ``model_kwargs`` in ``configs/flux2_klein.yaml``:
    the same GPU the 4B's denoise step goes from 31.4 ms to 24.4 ms (MXFP8) or 22.9 ms (NVFP4),
    and images per second at 8 concurrent requests rise 25% or 39%. Device memory after 8
    concurrent requests falls by 2.3 GiB on klein 4B with MXFP8 (5.1 GiB with NVFP4), 7.6 GiB on
-   9B and 6.9 GiB on Z-Image (MXFP8, each model's shipped config with ``attention_backend: sdpa``).
+   9B and 6.9 GiB on Z-Image (MXFP8, each model's shipped config with ``backend: sdpa``).
 
 ``linear_keep_bf16``
    A list of module-name patterns over the transformer's linears to keep in bf16 for one

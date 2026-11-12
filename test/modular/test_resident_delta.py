@@ -48,6 +48,7 @@ from mstar.engine.resources.kv.config import (
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.runner import StepRunner
 from mstar.engine.resources.step import FULL_ADMIT_OK, AllocationFailed, Segment, StepContext, SubmoduleStep
+from mstar.engine.state.adapters import StateSetup
 from mstar.testing_utils.engine import make_engine, make_mgmt
 from mstar.testing_utils.resource import StubResource
 from mstar.testing_utils.worker import deliver, make_scheduler, make_worker
@@ -1368,7 +1369,7 @@ def _pool_rank(monkeypatch, rank: int, cfg: PagedKVConfig | None = None) -> tupl
     engine._submodules = {NODE: SimpleNamespace(resources={"kv": kv}, resident=None, submodule=SimpleNamespace(
         cleanup_request=lambda rid: None))}
     engine._runner, engine._loopback_steps = StepRunner({"kv": kv}), {}
-    engine._resource_planners = {}
+    engine._resource_planners, engine._state_setup = {}, StateSetup()
     engine._chunking = ChunkingManagement({})
     engine._graph_runtime = SimpleNamespace(
         get_rid_string=str, get_rid_handle=lambda rid: rid if rid in kv._streams else None,

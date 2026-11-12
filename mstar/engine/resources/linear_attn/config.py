@@ -16,6 +16,11 @@ if TYPE_CHECKING:
     from mstar.engine.resources.base import Resource
 
 
+def bf16_gdn_state_fits(head_k_dim: int, head_v_dim: int) -> bool:
+    """Whether FlashInfer's bf16 GDN decode kernel takes a state of these head dims: K = V = 128 only."""
+    return head_k_dim == head_v_dim == 128
+
+
 class LinearAttnVariant(Enum):
     # gated delta rule: scalar decay per head. Qwen3.5, Qwen3-Next.
     GDN = "gdn"
@@ -41,7 +46,7 @@ class LinearAttnConfig:
     sm_scale: float | None = None
 
     # L2-normalise q and k for the delta rule: in the kernel where it can, by
-    # `GDNManager.run` where it cannot (the SM90 chunked prefill). Qwen3.5 needs
+    # `GDNManager.run` where it cannot (any unstaged chunked prefill). Qwen3.5 needs
     # it (the HF reference passes it) and skipping it diverges silently.
     qk_l2norm: bool = True
 

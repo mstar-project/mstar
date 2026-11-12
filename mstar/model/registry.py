@@ -25,6 +25,7 @@ MODEL_REGISTRY: dict[str, tuple[str, str]] = {
     "glm5_next": ("mstar.model.glm5_next.glm5_next_model", "Glm5NextModel"),
     "higgs_audio": ("mstar.model.higgs_audio.higgs_audio_model", "HiggsAudioModel"),
     "minicpm_o": ("mstar.model.minicpm_o.minicpm_o_model", "MiniCPMOModel"),
+    "phi4mm": ("mstar.model.phi4mm.phi4mm_model", "Phi4MMModel"),
     "nemotron_duplex": ("mstar.model.nemotron_duplex.nemotron_duplex_model", "NemotronDuplexModel"),
     "omnilingual_asr_ctc_300m": ("mstar.model.omnilingual_asr.omnilingual_asr_model", "OmnilingualASRModel"),
     "omnilingual_asr_ctc_1b": ("mstar.model.omnilingual_asr.omnilingual_asr_model", "OmnilingualASRModel"),
@@ -131,6 +132,7 @@ HF_MODELS: dict[str, dict] = {
     # Higgs-Audio v3 STT: Whisper-style audio tower + Qwen3-1.7B LLM.
     # (The v2 checkpoints are TTS/generation models, not ASR.)
     "higgs_audio": {"model_path_hf": "bosonai/higgs-audio-v3-stt"},
+    "phi4mm": {"model_path_hf": "microsoft/Phi-4-multimodal-instruct"},
     # NVIDIA NemotronLabs VoiceChat-11B: full-duplex S2S -- Fast-Conformer STT
     # encoder + Nemotron-H hybrid Mamba-2/attn/MLP backbone (9B) + EarTTS
     # (Gemma3 talker + RVQ codec). Single composite ``model.safetensors``.

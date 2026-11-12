@@ -536,6 +536,26 @@ class StepRunner:
         for key in self._order:
             self._resources[key].clear_preplan()
 
+    def _settle_repeats(self, step: SubmoduleStep) -> None:
+        """Narrow the step's replays to what its resources allow, before any
+        of them reserves for it. Every resource the step declares answers.
+        Called only for a step that asks for more than one."""
+        ctx = step.ctx
+        if ctx.resident is None:
+            ctx.repeats = 1
+            return
+        ctx.repeats = max(1, min(
+            ctx.repeats, *(self._resources[key].max_repeats(step.get(key), ctx) for key in self._keys_for(step)),
+        ))
+
+    def repeat_refusal(self, step: SubmoduleStep) -> str | None:
+        """Why no step like ``step`` can ever repeat, or None: its resources
+        answer on the template step, with the walk's captures done."""
+        for key in self._keys_for(step):
+            if self._resources[key].max_repeats(step.get(key), step.ctx) <= 1:
+                return f"resource {key!r} ({type(self._resources[key]).__name__}) allows one iteration a step"
+        return None
+
     def admit(self, step: SubmoduleStep) -> FullAdmitOutcome:
         """Reserve capacity for step. A refused admit gives back everything
         the step reserved, and drops its stage, whose plan addresses what it
@@ -554,6 +574,8 @@ class StepRunner:
             ready = pre[1]
             # this admit owns the stage's reservations now, so a refusal below unwinds them once
             self._pre_admitted = None
+        elif step.ctx.repeats != 1:
+            self._settle_repeats(step)
         admitted: list[str] = []
         for key in self._keys_for(step):
             if key in covered:
@@ -628,6 +650,8 @@ class StepRunner:
 
         Unwound on refusal exactly as ``admit`` is.
         """
+        if step.ctx.repeats != 1:
+            self._settle_repeats(step)
         ready = True
         admitted: list[str] = []
         for key in self._preplan_keys_for(step):

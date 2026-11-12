@@ -46,6 +46,7 @@ from mstar.api_server.data_worker import PreprocessWorker, unlink_files
 from mstar.api_server.lora_admin import LoraAdmin
 from mstar.api_server.openpi import OpenpiPolicy, serve_connection
 from mstar.api_server.request_types import (
+    USAGE,
     APIServerMessage,
     ClientAppend,
     PreprocessInput,
@@ -334,6 +335,14 @@ class PendingRequest:
     # APIServer.relay_chunks_to), and the tag it knows the request by.
     sink: "ChunkSink | None" = None
     sink_tag: Any = None
+    # submit_request's report_usage, and what usage_chunk reports: the text
+    # tokens of the chunks so far, whether one was a stop token, and
+    # request_complete's counts
+    report_usage: bool = False
+    completion_tokens: int = 0
+    stopped: bool = False
+    prompt_tokens: int | None = None
+    max_output_tokens: int | None = None
 
     def notify(self) -> None:
         """Wake the streaming handler, from any thread."""
@@ -366,6 +375,22 @@ class _SinkBatch(NamedTuple):
 def _set_events(wakes: list) -> None:
     for wake in wakes:
         wake.set()
+
+
+def usage_chunk(request_id: str, req: PendingRequest) -> ResultChunk:
+    """The chunk that ends a successful request submitted with ``report_usage``.
+    Its ``finish_reason`` is ``length`` when the reply used all of the
+    ``max_output_tokens`` the conductor resolved for it without sampling a stop
+    token, and ``stop`` otherwise. A stop token in the last allowed slot is
+    ``stop``, as OpenAI and vLLM report it. Only a model that declares
+    ``text_output`` has its stop tokens seen; any other is ``length`` at the cap."""
+    cap = req.max_output_tokens
+    at_cap = cap is not None and req.completion_tokens >= cap
+    return ResultChunk(request_id=request_id, modality=USAGE, data=b"", metadata={
+        "prompt_tokens": req.prompt_tokens or 0,
+        "completion_tokens": req.completion_tokens,
+        "finish_reason": "length" if at_cap and not req.stopped else "stop",
+    })
 
 
 def notify_many(reqs) -> None:
@@ -538,6 +563,7 @@ class APIServer:
         self.served_models = ServedModels.of(
             model_name, model_config, lora.adapter_digests if lora is not None else None,
         )
+        self.served_models.refuse_unserved(model)
         # Requests to a model with client streams keep their input open until
         # the client ends it (see ``stream_input``).
         connections = model.get_partition_topology().client_connections() if model is not None else []
@@ -569,6 +595,7 @@ class APIServer:
             enable_nvtx=self.enable_nvtx,
             is_pending=self.is_pending,
             upload_dir=self.upload_dir,
+            served_models=self.served_models,
         )
 
         # /v1/load_lora_adapter and /v1/unload_lora_adapter; sent from the data worker
@@ -784,6 +811,7 @@ class APIServer:
         end_input: bool | Collection[str] = True,
         file_streams: dict[str, list[str | None]] | None = None,
         raw_inputs: dict[str, list[torch.Tensor]] | None = None,
+        report_usage: bool = False,
     ) -> str:
         """Build a :class:`NewRequestConductor` and send it to the conductor.
 
@@ -818,6 +846,9 @@ class APIServer:
         in place of that modality's files (images, as RGB uint8 ``[3, H, W]``):
         the model loads them with ``Model.load_decoded_<modality>``, so nothing
         is written or decoded.
+
+        ``report_usage`` ends a successful request's chunks with a ``usage``
+        chunk (:func:`usage_chunk`).
         """
         if raw_inputs is not None:
             _check_raw_inputs(raw_inputs, file_paths)
@@ -879,6 +910,7 @@ class APIServer:
                 request_id=request_id,
                 open_streams=open_streams,
                 input_bytes=input_bytes,
+                report_usage=report_usage,
             )
         if self.metrics is not None:
             mark_submitted()
@@ -1277,6 +1309,8 @@ class APIServer:
                                 # late, not rejected
                                 req.open_streams = frozenset()
                                 req.output_chunk_counts = message.body.output_chunk_counts
+                                req.prompt_tokens = message.body.prompt_tokens
+                                req.max_output_tokens = message.body.max_output_tokens
                                 req.profile.timing.conductor_ingest_time = \
                                     message.body.conductor_ingest_time
                                 req.profile.timing.conductor_finish_time = \
@@ -1353,6 +1387,8 @@ class APIServer:
                         if result_chunk.read_time is not None:
                             req.profile.timing.last_output_read_time = result_chunk.read_time
                         req.profile.timing.output_postprocess_s += result_chunk.postprocess_s
+                        req.completion_tokens += result_chunk.num_tokens
+                        req.stopped |= result_chunk.stopped
                         if metrics is not None and result_chunk.modality != "error":
                             req.first_chunk_times.setdefault(result_chunk.modality, now)
                         if req.request_id is not None:
@@ -1618,17 +1654,16 @@ class APIServer:
                     # (preprocess error, result-delivery timeout); the HTTP
                     # status is committed by then, so the error must travel
                     # in-band as the final chunk, once.
-                    if (
-                        not errored
-                        and finished_req is not None
-                        and finished_req.error is not None
-                    ):
-                        tail.append(ResultChunk(
-                            request_id=request_id,
-                            modality="error",
-                            data=str(finished_req.error).encode("utf-8"),
-                            metadata={"status": finished_req.error_status},
-                        ))
+                    if not errored and finished_req is not None:
+                        if finished_req.error is not None:
+                            tail.append(ResultChunk(
+                                request_id=request_id,
+                                modality="error",
+                                data=str(finished_req.error).encode("utf-8"),
+                                metadata={"status": finished_req.error_status},
+                            ))
+                        elif finished_req.report_usage:
+                            tail.append(usage_chunk(request_id, finished_req))
                     if tail:
                         yield tail
                     finished = True
@@ -1772,7 +1807,8 @@ class APIServer:
         self, request_id: str, raw_request: Request | None = None
     ) -> list[ResultChunk]:
         """Wait for the request to finish (or the client to disconnect), then
-        return its chunks. Disconnecting or timing out releases engine state."""
+        return its chunks. Disconnecting, timing out, or cancelling the wait
+        releases the submission."""
         start = time.monotonic()
         key = self.submission_key(request_id)
         # Woken by the message thread (PendingRequest.notify) when the request
@@ -1788,28 +1824,34 @@ class APIServer:
                 req.wake = wake
                 req.wake_on_finish = True
         checked = start
-        while True:
-            # Cleared before the read: a notification that lands after this
-            # point stays set and the wait below returns at once.
-            wake.clear()
-            with self.request_lock:
-                req = self.pending_requests.get(key)
-                done = req.event.is_set() if req else True
-            if done:
-                break
-            now = time.monotonic()
-            if now - start > self.timeout_seconds:
-                self.abort_submission(key, outcome="timeout")
-                raise HTTPException(status_code=500, detail="Request timed out")
-            if raw_request is not None and now - checked >= DISCONNECT_CHECK_S:
-                checked = now
-                if await raw_request.is_disconnected():
-                    self.abort_submission(key)
-                    return []
-            try:
-                await asyncio.wait_for(wake.wait(), timeout=DISCONNECT_CHECK_S)
-            except asyncio.TimeoutError:
-                pass
+        try:
+            while True:
+                # Cleared before the read: a notification that lands after this
+                # point stays set and the wait below returns at once.
+                wake.clear()
+                with self.request_lock:
+                    req = self.pending_requests.get(key)
+                    done = req.event.is_set() if req else True
+                if done:
+                    break
+                now = time.monotonic()
+                if now - start > self.timeout_seconds:
+                    self.abort_submission(key, outcome="timeout")
+                    raise HTTPException(status_code=500, detail="Request timed out")
+                if raw_request is not None and now - checked >= DISCONNECT_CHECK_S:
+                    checked = now
+                    if await raw_request.is_disconnected():
+                        self.abort_submission(key)
+                        return []
+                try:
+                    await asyncio.wait_for(wake.wait(), timeout=DISCONNECT_CHECK_S)
+                except asyncio.TimeoutError:
+                    pass
+        except asyncio.CancelledError:
+            # Release this submission even if it finished during cancellation;
+            # a newer submission under the same public id must stay untouched.
+            self.release_submission(key)
+            raise
 
         with self.request_lock:
             req = self.pending_requests.pop(key, None)
@@ -1824,6 +1866,8 @@ class APIServer:
         # Profiling (incl. the optional file write) runs outside the lock; the
         # popped request is no longer shared with other threads.
         self._finalize_profile(req)
+        if req.report_usage:
+            return [*req.chunks, usage_chunk(request_id, req)]
         return list(req.chunks)
 
     def _record_end(self, req: PendingRequest, outcome: str) -> None:
@@ -3087,7 +3131,7 @@ def main(argv: list[str] | None = None):
     )
     parser.add_argument(
         "--enable-metrics", action="store_true",
-        help="Serve Prometheus metrics at /metrics (needs mstar[metrics])",
+        help="Serve Prometheus metrics at /metrics (needs mstar-ai[metrics])",
     )
     parser.add_argument(
         "--rust-frontend", action="store_true",
@@ -3121,14 +3165,6 @@ def main(argv: list[str] | None = None):
     with open(args.config) as f:
         config = yaml.safe_load(f)
 
-    lora_block = (config.get("resources") or {}).get("lora") if lora_enabled(config) else None
-    if args.rust_frontend and isinstance(lora_block, dict) and lora_block.get("runtime_updates"):
-        # mstar-server reads the served adapters once at launch and has no
-        # /v1/load_lora_adapter or /v1/unload_lora_adapter
-        raise SystemExit(
-            "LoRA runtime updates (`runtime_updates: true` in the serving config's `lora:` block) "
-            "are served by the Python frontend only; drop --rust-frontend or the setting"
-        )
     try:
         _ws_max_size(config)  # here, not at the bind after the workers' compile
     except ValueError as e:
@@ -3138,9 +3174,6 @@ def main(argv: list[str] | None = None):
 
         # Before anything loads, so a missing or stale binary fails fast.
         rust_frontend_bin = find_server_binary(args.rust_frontend_bin)
-        if config.get("openpi") is not None:
-            logger.warning("The openpi WebSocket (`openpi:` in the config) is served by the Python frontend only; "
-                           "--rust-frontend serves without it")
 
     model_name = config.get("model", "dummy")
     # Forward yaml-level model_kwargs to the API-server-side lightweight
@@ -3232,9 +3265,13 @@ def main(argv: list[str] | None = None):
         if args.rust_frontend:
             import tempfile
 
+            from mstar.api_server.openai.adapters import get_adapter
             from mstar.api_server.rust_frontend import (
                 RustFrontendBridge,
                 launch_rust_server,
+                openpi_facts,
+                realtime_facts,
+                transcription_facts,
             )
 
             bridge_dir = tempfile.mkdtemp(prefix="mstar_rust_frontend_")
@@ -3247,7 +3284,12 @@ def main(argv: list[str] | None = None):
                 args.port, bridge_dir, args.upload_dir, api_key=api_key,
                 timeout_s=args.timeout,
                 sample_rate=model.get_output_sample_rate("audio") if model is not None else None,
-                served_models=api_server.served_models)
+                served_models=api_server.served_models,
+                transcription=transcription_facts(api_server, get_adapter(model_name)),
+                openpi=openpi_facts(api_server.openpi_policy),
+                ws_max_bytes=_ws_max_size(config),
+                client_streams=api_server.client_streams,
+                realtime=realtime_facts(api_server, get_adapter(model_name), bridge_dir))
             logger.info("Starting mstar API server (Rust frontend) on port %s",
                         args.port)
             bridge = RustFrontendBridge(api_server, bridge_dir)
