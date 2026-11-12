@@ -600,8 +600,9 @@ GLM-5.2 / GLM-5.3-Flash (``glm52``, ``glm5_next``)
   (function tools) and ``tool_choice``: ``auto`` (the default), ``none``, which leaves
   the tools out of the prompt, or ``required`` or a named function, which the prompt forces
   by opening the call, so that reply does not reason; ``parallel_tool_calls: false`` ends the
-  reply at its first call. A call to a function the request did not offer stays text.
-  ``stop`` takes up to 4 strings, matched on the answer. ``enable_thinking``,
+  reply at its first call. A call to a function the request did not offer stays text, and
+  the deprecated ``functions`` and ``function_call`` are a 400. ``stop`` takes up to 4
+  strings of up to 256 characters, matched on the answer. ``enable_thinking``,
   ``reasoning_effort`` and ``clear_thinking`` reach the template, flat in the body or under
   ``chat_template_kwargs``, which drops any other key. GLM-5.3-Flash always reasons, so
   ``enable_thinking: false`` is a 400 there.
@@ -869,9 +870,9 @@ on one GPU in every shipped config.
 
 Both frontends serve LoRA: a request's ``model`` names the adapter it runs under
 (``ServedModels``), and ``/v1/models`` lists the adapters beside the base model.
-Runtime updates (below) are the Python frontend's only for now: ``mstar-server``
-reads the served adapters once at launch and has neither route, so ``mstar serve``
-refuses ``--rust-frontend`` with ``runtime_updates: true``.
+Both serve runtime updates (below) too: ``mstar-server`` selects the adapter itself,
+and the API server pushes it the served set after every change, so a request pays no
+extra round trip for it.
 
 Adapters can also be loaded and unloaded while the server runs, with vLLM's
 endpoints and bodies. They make the server read paths a client names, so they are off

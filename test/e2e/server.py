@@ -15,7 +15,6 @@ from pathlib import Path
 import requests
 
 HOST = "127.0.0.1"  # where every server binds
-BIND_FAILED = 3  # the entrypoint's exit code when uvicorn never came up
 HELD_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 
 # Runs in the server's process before exec. SIGINT, the entrypoint's graceful
@@ -263,7 +262,7 @@ class Server:
             code = self.poll()
             if code is not None:
                 log = self.log_path.read_text(errors="replace").lower()
-                if code == BIND_FAILED or "address already in use" in log:
+                if "address already in use" in log:  # mstar-server and uvicorn both log it on a failed bind
                     raise PortTakenError(f"port {self.port} was taken by another process while the server loaded")
                 raise ServerError(f"server exited with code {code} during startup; see {self.log_path}")
             if self._listening() is not False:  # ours, or no /proc to tell

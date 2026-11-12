@@ -43,8 +43,8 @@ def measure(
     uncapped = spec.mode == "open" and spec.concurrency <= 0
 
     def new_session() -> aiohttp.ClientSession:
-        # A fresh pool per pass: scoring between repeats outlasts the server's keep-alive
-        # (uvicorn closes idle connections after 5 s), and a reused dead connection fails
+        # A fresh pool per pass: scoring between repeats can outlast the server's keep-alive,
+        # and a reused dead connection fails
         # the first wave of the next repeat. The client also drops idle ones first.
         connector = aiohttp.TCPConnector(limit=0 if uncapped else max(100, spec.concurrency + 10),
                                          keepalive_timeout=CLIENT_KEEPALIVE_S)

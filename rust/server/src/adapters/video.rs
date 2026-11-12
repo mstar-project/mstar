@@ -212,19 +212,6 @@ impl OpenAIAdapter for MiniMaxH3 {
     }
 }
 
-/// `type(value).__name__` of a JSON value as `json.loads` gives it.
-fn py_type_name(v: &Value) -> &'static str {
-    match v {
-        Value::Null => "NoneType",
-        Value::Bool(_) => "bool",
-        Value::Number(n) if n.is_f64() => "float",
-        Value::Number(_) => "int",
-        Value::String(_) => "str",
-        Value::Array(_) => "list",
-        Value::Object(_) => "dict",
-    }
-}
-
 /// `media_io.remove_uploads`: the files under `upload_dir` among `paths`.
 fn remove_under(upload_dir: &Path, paths: &[String]) {
     let Ok(root) = upload_dir.canonicalize() else { return };

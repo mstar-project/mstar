@@ -34,7 +34,9 @@ mod media;
 mod protocol;
 mod realtime;
 mod refusals;
+mod reply;
 mod served_models;
+mod lora_admin;
 mod serving;
 mod sndfile;
 mod speech_chunking;
@@ -96,6 +98,8 @@ async fn main() {
         eprintln!("{USAGE}\nbuilt from sources {sources}");
         std::process::exit(2);
     };
+    // first, so a launcher that dies while the facts load is still noticed
+    exit_with_launcher();
     if model_name == "-h" || model_name == "--help" {
         println!("{USAGE}\nbuilt from sources {sources}");
         return;
@@ -155,6 +159,9 @@ async fn main() {
         realtime::report_availability();
     }
     let served = Arc::new(served_models::ServedModels::from_env(&model_name));
+    if let Some(bridge) = &bridge {
+        bridge.serve_models(served.clone());
+    }
 
     let refusals = Arc::new(refusals::Refusals::default());
     let state = AppState {
@@ -171,11 +178,14 @@ async fn main() {
         served,
     };
 
-    // Allow-all CORS, matching mstar's CORSMiddleware configuration.
+    // Allow-all CORS, matching mstar's CORSMiddleware configuration. A
+    // preflight's requested headers are echoed, as Starlette echoes them for
+    // `allow_headers=["*"]`: browsers don't let a literal `*` cover
+    // `Authorization`, so a page sending the API key would fail the preflight.
     let cors = tower_http::cors::CorsLayer::new()
         .allow_origin(tower_http::cors::Any)
         .allow_methods(tower_http::cors::Any)
-        .allow_headers(tower_http::cors::Any);
+        .allow_headers(tower_http::cors::AllowHeaders::mirror_request());
 
     // Admission control: bound concurrent generation requests; past the cap
     // clients get an immediate 503 instead of queueing into the timeout.
@@ -216,6 +226,9 @@ async fn main() {
         .route("/health", get(health))
         .route("/metrics", get(metrics))
         .route("/v1/models", get(list_models))
+        // LoRA's runtime updates: no generation, outside the admission cap
+        .route("/v1/load_lora_adapter", post(lora_admin::load_lora_adapter))
+        .route("/v1/unload_lora_adapter", post(lora_admin::unload_lora_adapter))
         .route("/v1/audio/voices", get(audio_voices))
         // long-lived sockets: outside the admission cap, as on the Python frontend
         .route("/", any(ws::openpi::openpi_ws))
@@ -251,7 +264,15 @@ async fn main() {
     let app = tower::Layer::layer(&tower::util::MapRequestLayer::new(move |req: Request<Body>| {
         strip_root_path(&root_path, req)
     }), app);
-    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
+    let listener = match tokio::net::TcpListener::bind(&addr).await {
+        Ok(listener) => listener,
+        Err(e) => {
+            // a port another server took while the model loaded, most often;
+            // mstar serve exits nonzero when this process does
+            eprintln!("mstar-server: could not listen on http://{addr}: {e}");
+            std::process::exit(3);
+        }
+    };
     eprintln!("mstar-server (Rust frontend) for model {model_name:?} on http://{addr}");
     axum::serve(listener, axum::ServiceExt::<Request<Body>>::into_make_service(app))
         // Disable Nagle: SSE/NDJSON streams write many small chunks, and
@@ -260,6 +281,26 @@ async fn main() {
         .with_graceful_shutdown(shutdown_signal())
         .await
         .unwrap();
+}
+
+/// Exits once the process that launched this one is gone (`mstar serve`
+/// killed with SIGKILL, which runs no cleanup), so the port and the bridge's
+/// socket are not held for a deployment that no longer exists.
+fn exit_with_launcher() {
+    #[cfg(unix)]
+    {
+        let launcher = std::os::unix::process::parent_id();
+        tokio::spawn(async move {
+            let mut every = tokio::time::interval(std::time::Duration::from_secs(1));
+            loop {
+                every.tick().await;
+                if std::os::unix::process::parent_id() != launcher {
+                    eprintln!("mstar-server: its launcher (pid {launcher}) exited; stopping");
+                    std::process::exit(1);
+                }
+            }
+        });
+    }
 }
 
 /// SIGTERM/SIGINT: stop accepting, drain in-flight requests, exit — with a
@@ -509,7 +550,7 @@ fn resolve_message(st: &AppState, surface: Surface) -> Result<&'static dyn OpenA
     } else {
         format!(
             "Model '{}' has an OpenAI adapter ({}) the Rust frontend does not serve; \
-             use POST /generate, or serve without --rust-frontend",
+             use POST /generate, or serve with --python-frontend",
             st.model_name, st.python_adapter
         )
     };
@@ -646,6 +687,47 @@ async fn audio_voices(State(st): State<AppState>) -> Response {
 
 // ---- POST /v1/chat/completions -------------------------------------------
 
+/// A chat its adapter translated for submission, with the LoRA adapter its
+/// `model` names selected, and what its reply is read with.
+struct ChatSubmission {
+    req: ChatCompletionRequest,
+    args: SubmitArgs,
+    /// The model the reply names: the LoRA adapter that serves it, as vLLM's does.
+    model: String,
+    parser: Option<Box<dyn reply::OutputParser>>,
+    stops: Vec<String>,
+}
+
+/// `req` translated by `adapter`; a refusal is the 400's text, with any
+/// upload it saved removed.
+async fn chat_submission(
+    st: &AppState,
+    adapter: &'static dyn OpenAIAdapter,
+    req: ChatCompletionRequest,
+) -> Result<ChatSubmission, String> {
+    let (dir, remote) = (st.upload_dir.clone(), st.allow_remote);
+    let (req, translated) = blocking(move || {
+        let args = adapter.chat_to_request(&req, &dir, remote);
+        (req, args)
+    })
+    .await;
+    let mut args = translated?;
+    // resolved before it is submitted: the response names the adapter that serves it
+    let read = st.served.select(req.model.as_deref(), &mut args.model_kwargs).and_then(|served| {
+        Ok((served, adapter.output_parser(&req)?, adapter.stop_strings(&req)?))
+    });
+    match read {
+        Ok((served, parser, stops)) => {
+            let model = served.unwrap_or_else(|| st.model_name.clone());
+            Ok(ChatSubmission { req, args, model, parser, stops })
+        }
+        Err(e) => {
+            remove_uploads(&st.upload_dir, &args.file_paths);
+            Err(e)
+        }
+    }
+}
+
 async fn chat_completions(
     State(st): State<AppState>,
     payload: Result<Json<ChatCompletionRequest>, JsonRejection>,
@@ -662,24 +744,29 @@ async fn chat_completions(
         Ok(fmt) => fmt,
         Err(e) => return error(400, &e, "invalid_request_error"),
     };
-    let (dir, remote) = (st.upload_dir.clone(), st.allow_remote);
-    let (req, translated) = blocking(move || {
-        let args = adapter.chat_to_request(&req, &dir, remote);
-        (req, args)
-    })
-    .await;
-    let mut args = match translated {
-        Ok(a) => a,
+    let ChatSubmission {
+        req,
+        mut args,
+        model: model_name,
+        parser,
+        stops,
+    } = match chat_submission(&st, adapter, req).await {
+        Ok(sub) => sub,
         Err(e) => return error(400, &e, "invalid_request_error"),
     };
-    // Resolved before it is submitted: the response names the adapter that served it.
-    let model_name = match select_lora(&st, req.model.as_deref(), &mut args) {
-        Ok(served) => served.unwrap_or_else(|| st.model_name.clone()),
-        Err(r) => {
-            remove_uploads(&st.upload_dir, &args.file_paths);
-            return r;
-        }
-    };
+    let include_usage = req
+        .stream_options
+        .as_ref()
+        .and_then(|o| o.include_usage)
+        .unwrap_or(false);
+    // A reply with structure in its text (reasoning, tool calls), or one that
+    // ends at a stop string, is read as reply events.
+    if parser.is_some() || !stops.is_empty() {
+        let request_id = rid("chatcmpl");
+        let format = reply::chat::ChatReply::new(request_id.clone(), model_name, include_usage);
+        let stream = req.stream.unwrap_or(false);
+        return reply::serve(&st, args, &request_id, stream, parser, stops, format).await;
+    }
     // Frontend-tokenizes fast path: flagged adapters with a loaded tokenizer
     // submit token ids and detokenize the reply in Rust, off the GIL.
     if adapter.frontend_tokenizes() {
@@ -696,7 +783,6 @@ async fn chat_completions(
             Ok(base) => base,
             Err((status, msg)) => return error(status, &msg, error_type(status)),
         };
-        let include_usage = req.stream_options.as_ref().and_then(|o| o.include_usage).unwrap_or(false);
         return chat_sse(base, request_id, model_name, include_usage).into_response();
     }
     match collect(result_stream(&st, &args, &request_id, false)).await {
@@ -1301,14 +1387,12 @@ async fn images_generations(
             collect(result_stream(&st, &args, &request_id, false)).await
         }
     });
-    let mut all: Vec<ResultChunk> = Vec::new();
-    for r in futures::future::join_all(futs).await {
-        match r {
-            Ok(chunks) => all.extend(chunks),
-            Err((status, msg)) => return error(status, &msg, error_type(status)),
-        }
+    // The first failure ends the request; dropping the other images' streams
+    // aborts the ones still running. Results stay in submit order.
+    match futures::future::try_join_all(futs).await {
+        Ok(images) => Json(images_response(images.into_iter().flatten().collect())).into_response(),
+        Err((status, msg)) => error(status, &msg, error_type(status)),
     }
-    Json(images_response(all)).into_response()
 }
 
 /// The request's `n`, 1 when omitted; outside `1..=limit` the 400 message,
@@ -1429,6 +1513,7 @@ fn video_ndjson(base: OutStream) -> impl futures::Stream<Item = Result<Bytes, In
                         modality: "error".to_string(),
                         data: message.into_bytes(),
                         metadata: json!({"status": status}),
+                        ..Default::default()
                     })
                 }
             };
@@ -1949,6 +2034,7 @@ async fn generate_finish(
                     modality: "error".to_string(),
                     data: message.into_bytes(),
                     metadata: json!({"status": status}),
+                    ..Default::default()
                 },
             };
             let pieces = if binary {
@@ -2564,7 +2650,7 @@ mod tests {
         };
         assert_eq!((compressed("MP3"), compressed("opus")), (Ok("mp3"), Ok("opus")));
         let pcm = vec![1u8, 0, 2, 0];
-        let chunks = vec![ResultChunk { modality: "audio".into(), data: pcm.clone(), metadata: Value::Null }];
+        let chunks = vec![ResultChunk { modality: "audio".into(), data: pcm.clone(), metadata: Value::Null, ..Default::default() }];
         let resp = build_chat_response("m", "r", chunks, 24000, "pcm").unwrap();
         assert_eq!(resp["choices"][0]["message"]["audio"]["data"], media::b64(&pcm));
     }
@@ -2613,7 +2699,7 @@ mod tests {
         let data = "中文 😀".as_bytes();
         [&data[..1], &data[1..4], &data[4..8], &data[8..]]
             .iter()
-            .map(|p| ResultChunk { modality: "text".to_string(), data: p.to_vec(), metadata: Value::Null })
+            .map(|p| ResultChunk { modality: "text".to_string(), data: p.to_vec(), metadata: Value::Null, ..Default::default() })
             .collect()
     }
 
@@ -2657,7 +2743,7 @@ mod tests {
     fn chat_stream_sends_no_empty_deltas() {
         // the first piece completes no character, and an end token decodes to nothing
         let mut chunks = split_text_chunks();
-        chunks.push(ResultChunk { modality: "text".to_string(), data: Vec::new(), metadata: Value::Null });
+        chunks.push(ResultChunk { modality: "text".to_string(), data: Vec::new(), metadata: Value::Null, ..Default::default() });
         let (content, events) = streamed_content(chunks.into_iter().map(Out::Chunk).collect());
         assert_eq!(content, "中文 😀");
         let deltas: Vec<&Value> = events.iter().map(|e| &e["choices"][0]["delta"]).collect();
@@ -2836,6 +2922,7 @@ mod tests {
             modality: "usage".to_string(),
             data: Vec::new(),
             metadata: json!({"prompt_tokens": 7, "completion_tokens": 4, "finish_reason": finish}),
+            ..Default::default()
         }
     }
 

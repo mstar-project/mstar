@@ -111,11 +111,13 @@ struct LaxError {
     loc: String,
     kind: &'static str,
     msg: &'static str,
-    input: FieldValue,
+    // boxed, as a JSON object (an IndexMap under serde_json's preserve_order)
+    // would make every Result carrying this error large
+    input: Box<FieldValue>,
 }
 
 fn fail(loc: &str, kind: &'static str, msg: &'static str, input: &FieldValue) -> LaxError {
-    LaxError { loc: loc.to_string(), kind, msg, input: input.clone() }
+    LaxError { loc: loc.to_string(), kind, msg, input: Box::new(input.clone()) }
 }
 
 const STRING_TYPE: (&str, &str) = ("string_type", "Input should be a valid string");
