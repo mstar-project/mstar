@@ -28,6 +28,35 @@ except Exception as _fa3_exc:  # noqa: BLE001
 else:
     _VARLEN_IMPORT_ERROR = None
 
+
+def _fa3_fixed_into():
+    """FA3's fixed-length forward writing into a given output, or None. The
+    interface's own entry point allocates its output and refuses one passed in
+    (a custom op may not return an input), so this calls the extension behind
+    it, whose positional signature is fa3-fwd 0.0.2's: another version gets
+    None, and its callers keep to the varlen kernel."""
+    try:
+        from importlib.metadata import version
+
+        from fa3_fwd_interface import fa3_fwd_cuda
+    except Exception:  # noqa: BLE001
+        return None
+    if version("fa3-fwd") != "0.0.2":
+        return None
+
+    def run(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, out: torch.Tensor, softmax_scale: float) -> None:
+        # q [1, Sq, H, D], k / v [1, Sk, Hkv, D], out [1, Sq, H, Dv]: non-causal, with no window,
+        # softcap, paging, rotary or splits
+        fa3_fwd_cuda.fwd(
+            q, k, v, None, None, None, out, *(None,) * 16,
+            softmax_scale, False, -1, -1, 0, 0.0, True, None, 1, None, 0,
+        )
+
+    return run
+
+
+fa3_fixed_into = _fa3_fixed_into() if flash_attn_func is not None else None
+
 # ROCm has no FA3; AITER's varlen FMHA takes the same call, so dense runs on it
 # there instead of degrading to the paged backend
 if flash_attn_varlen_func is None and current_platform.is_rocm():

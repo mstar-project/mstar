@@ -178,6 +178,57 @@ def test_causal_and_captured_single_segments_stay_on_varlen(monkeypatch):
     assert not calls
 
 
+def _count_fixed_segment_calls(monkeypatch):
+    import mstar.engine.resources.attn.ragged.dense_wrappers as dw
+
+    if dw.fa3_fixed_into is None:
+        pytest.skip("no FA3 fixed-length entry point that writes into an output (fa3-fwd 0.0.2)")
+    calls, into = [], dw.fa3_fixed_into
+    monkeypatch.setattr(dw, "fa3_fixed_into", lambda *a: calls.append(a[0].shape[1]) or into(*a))
+    return dw, calls
+
+
+def _varlen_segments(dw, q, k, v, q_lens, kv_lens, scale):
+    out = dw.flash_attn_varlen_func(
+        q, k, v, cu(q_lens).to(DEVICE), cu(kv_lens).to(DEVICE), max(q_lens), max(kv_lens),
+        causal=False, softmax_scale=scale,
+    )
+    return out[0] if isinstance(out, tuple) else out
+
+
+# Cosmos3's guidance pair (one context longer than the other) and a three-request pack
+@pytest.mark.parametrize("q_lens,kv_lens", [
+    ([1536, 1536], [2436, 1596]),
+    ([1600, 2000, 1536], [1700, 2900, 1536]),
+])
+def test_long_segments_each_run_the_fixed_length_kernel_bit_exactly(monkeypatch, q_lens, kv_lens):
+    """Every segment of an eager non-causal plan at least the threshold long runs
+    on its own fixed-length call into one output, with the varlen kernel's output
+    bit for bit."""
+    dw, calls = _count_fixed_segment_calls(monkeypatch)
+    gen = torch.Generator(device=DEVICE).manual_seed(5)
+    q = torch.randn(sum(q_lens), 32, 128, dtype=DTYPE, device=DEVICE, generator=gen)
+    k, v = (torch.randn(sum(kv_lens), 8, 128, dtype=DTYPE, device=DEVICE, generator=gen) for _ in range(2))
+    w = cross_wrapper(num_qo_heads=32, num_kv_heads=8, head_dim=128)
+    w.plan(cu(q_lens), cu(kv_lens))
+    got = w.run(q, k, v)
+    assert calls == q_lens
+    assert torch.equal(got, _varlen_segments(dw, q, k, v, q_lens, kv_lens, w.sm_scale))
+
+
+def test_short_or_causal_segments_stay_on_varlen(monkeypatch):
+    """One segment under the threshold keeps the whole plan on varlen, where the
+    launches would cost more than they save; so does a causal plan."""
+    dw, calls = _count_fixed_segment_calls(monkeypatch)
+    short = dw._FIXED_SEGMENT_MIN_ROWS - 1
+    for q_lens, causal in (([2048, short], False), ([2048, 2048], True)):
+        q, k, v = (t.repeat(1, 8, 1) for t in qkv(sum(q_lens)))
+        w = wrapper(num_qo_heads=HEADS * 8, num_kv_heads=HEADS * 8)
+        w.plan(cu(q_lens), causal=causal)
+        w.run(q, k, v)
+    assert not calls
+
+
 def capture_wrapper(w):
     static = tuple(
         torch.zeros(MAX_TOKENS, HEADS, HEAD_DIM, dtype=DTYPE, device=DEVICE) for _ in range(3)
