@@ -610,3 +610,59 @@ class TestStreamGeneration:
         kv.reset_request("r0")
         out, _, _ = self._plan_views(kv, [Segment("r0", "main", 4)])
         assert out["main"].views[0].generation > before
+
+
+@pytest.mark.parametrize("batched", [True, False], ids=["batched-cfg", "plan-per-branch"])
+def test_cosmos3s_eager_denoise_attends_each_branch_prefix_from_the_pages(kv_manager, monkeypatch, batched):
+    """Cosmos3's eager denoise on the dense backend (``attention_backend="dense_gen"``): its own step declaration
+    (cond and uncond in one combined plan, or a plan each), planned by the KV manager over committed text
+    prefixes, attends every branch's [prefix | fresh] as the prefix commit wrote it, at every step."""
+    from mstar.model.cosmos3.submodules import COND_LABEL, KV_CACHE, UNCOND_LABEL, Cosmos3DiTSubmodule
+
+    kv, rids, fresh = kv_manager, ("r0", "r1"), 2
+    prefix = {COND_LABEL: 5, UNCOND_LABEL: 2}
+    for rid in rids:
+        kv.ingest_request(rid)
+    out, _, _ = TestStreamGeneration()._plan_views(
+        kv, [Segment(rid, label, n) for label, n in prefix.items() for rid in rids],
+    )
+    # the prefix's K/V as its layers would have written it: a distinct value per (request, label, token)
+    tensor, written = kv.kv_cache.tensor, {}
+    for label, plan in out.items():
+        for view in plan.views:
+            for t in range(prefix[label]):
+                value = 100 * rids.index(view.request_id) + 10 * (label == UNCOND_LABEL) + t + 1
+                page, slot = view.page_idxs[t // PAGE_SIZE], t % PAGE_SIZE
+                tensor[0, page, 0, slot], tensor[0, page, 1, slot] = value, -value
+                written[view.request_id, label, t] = value
+
+    manager = DenseAttentionManager(
+        kv_cache="kv", device=torch.device("cpu"), dtype=torch.float32, kv_config=_kv_config(),
+        wrapper_class=DensePrefixedPrefillWrapper,
+    )
+    seen = []
+    monkeypatch.setattr(
+        DensePrefixedPrefillWrapper, "run", lambda self, q, k, v, return_lse=False: seen.append((k, v)) or q,
+    )
+    step = Cosmos3DiTSubmodule._gen_step(
+        Cosmos3DiTSubmodule, list(rids), (fresh,) * len(rids), (COND_LABEL, UNCOND_LABEL), combined=batched,
+        attn_key="attn",
+    )
+    kv_step = step.steps[KV_CACHE]
+    for _ in range(2):
+        ctx = StepContext(request_ids=rids, graph_walk="gen", slot=0, capture=False)
+        assert kv.admit(kv_step, ctx).ok
+        ctx.plan_results["kv"] = kv.plan(kv_step, ctx)
+        kv.commit(kv_step, ctx)
+        manager.plan(step.steps["attn"], ctx)
+        assert len(manager._current_plans) == (1 if batched else 2)
+        for label, plan in manager._current_plans.items():
+            n = sum(s.q_len for s in plan.segments)
+            k = torch.full((n, NUM_KV_HEADS, HEAD_DIM), 0.5)
+            manager.run(torch.zeros(n, 2, HEAD_DIM), label, tensor[0], k=k, v=-k, layer_idx=0)
+            key, val = seen.pop()
+            want = []
+            for segment in plan.segments:
+                want += [written[segment.request_id, segment.label, t] for t in range(prefix[segment.label])]
+                want += [0.5] * fresh
+            assert key[:, 0, 0].tolist() == want and val[:, 0, 0].tolist() == [-w for w in want]
