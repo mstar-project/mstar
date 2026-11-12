@@ -95,10 +95,16 @@ class _StubKV:
 class _StubAttn:
     """Reads from the pages it is handed, or takes K/V at its read when told to."""
 
-    def __init__(self, requires_kv_write=True):
+    def __init__(self, requires_kv_write=True, step_kv=False):
         self.requires_kv_write = requires_kv_write
+        self.step_kv = step_kv
+        self.read_kv = []
+
+    def reads_step_kv(self, label=None):
+        return self.step_kv or not self.requires_kv_write
 
     def run(self, q, label=None, kv_cache_layer=None, k=None, v=None, layer_idx=None):
+        self.read_kv.append(k is not None)
         return q
 
 
@@ -239,6 +245,23 @@ def test_a_listed_format_runs_the_fused_kernel_and_counts_as_the_layers_add():
     with pytest.raises(ValueError, match="an add on layer 0 after its kept add"):
         call(h, 0, q, k, v)
     h.read(0, q)
+
+
+def test_a_step_whose_read_attends_its_own_k_and_v_runs_the_reference():
+    """A context-parallel pool's multi-token step attends the k and v its add holds (`reads_step_kv`). A fused kernel
+    writes the pages and holds nothing, so on that step the op runs its reference, and the read gets k and v."""
+    call = _fused_op()
+    attn = _StubAttn(step_kv=True)
+    h = _handle(attn=attn)
+    state_op_module.bind_state_ops({"kv": h})
+    _open(h)
+    q, k, v = _tensors()
+    call(h, 0, q, k, v)
+    h.read(0, q)
+    assert h._kv.writes == [0], "the reference adds"
+    assert attn.read_kv == [True]
+    attn.step_kv = False
+    assert "write_q" in h.fused_ops, "a step that attends the pages alone runs the kernel"
 
 
 def test_fused_and_reference_write_the_same_and_the_layer_goes_through_the_normalizer():

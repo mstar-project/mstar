@@ -107,7 +107,8 @@ def _state_op(fused, adds, writes, reads, mutates, formats, reference) -> StateO
 
 
 def bind_state_ops(handles: Mapping[str, Any]) -> None:
-    """Cache on each array handle which ops run their fused kernel on it, so a call reads a constant."""
+    """Cache on each array handle which ops may run their fused kernel on it. A paged handle still runs the reference
+    on a step whose reads attend the step's own k and v (``PagedArrayHandle.fused_ops``)."""
     for handle in handles.values():
         if isinstance(handle, ArrayHandle):
             handle.fused_ops = frozenset(name for name, op in STATE_OPS.items() if handle.takes_fused(op))

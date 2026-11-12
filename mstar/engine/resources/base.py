@@ -24,6 +24,7 @@ if TYPE_CHECKING:
         PiecewiseConfigType,
     )
     from mstar.engine.resources.attn.workspace import WorkspacePool
+    from mstar.engine.resources.context_parallel import ContextParallel
     from mstar.engine.resources.kv.transfer import TransferEngineInfo
 
 
@@ -52,6 +53,16 @@ class CGSlotKey:
     bucket: BucketKey
     slot: int
     label: str
+
+
+def head_shards(group: JointGroups | None, places_positions: bool = False) -> int:
+    """How many ways a node's ranks split its attention heads: its TP and SP ranks (CFG ranks run
+    whole branches, every head), or TP alone when its pools place positions over the SP ranks
+    (``PagedKVConfig.context_parallel``)."""
+    if group is None:
+        return 1
+    tp = group.tp_group.world_size
+    return tp if places_positions else tp * group.sp_group.world_size
 
 
 @dataclass(frozen=True)
@@ -85,17 +96,20 @@ class EngineResourceInfo:
     # the prefix caches this engine opens (`opening_prefix_caches`), decided
     # before any resource is built, for one that sizes itself by its own
     prefix_caches: frozenset[str] = frozenset()
+    # whether the resource's nodes run replicated over their SP ranks, because their pools place
+    # positions over them (``PagedKVConfig.context_parallel``), rather than splitting their steps
+    # over them (``SeqShardSpec``)
+    replicated_over_sp: bool = False
     # what each step may still copy to the host once its outputs are sent, or on a pass that runs no step
     host_allowance: StepAllowance | None = None
 
     @property
     def head_shards(self) -> int:
-        """How many ways the node's ranks split its attention heads, which each
-        builder sizes head counts by: its TP × SP ranks (CFG ranks run whole
-        branches, every head). A ragged resource declaring
-        ``RaggedAttentionConfig.shard_over_sp=False`` splits over TP only."""
-        group = self.joint_comm_group
-        return 1 if group is None else group.tp_group.world_size * group.sp_group.world_size
+        """How many ways the node's ranks split its attention heads, which each builder sizes head
+        counts by (`head_shards`). A ragged resource splits over TP only, unless it attends a label
+        its node's sequence shard splits (``RaggedAttentionSpec.sp_exchange``, derived): over TP x SP
+        then, even where the node's pools place positions."""
+        return head_shards(self.joint_comm_group, self.replicated_over_sp)
 
     def dependency(self, key: str) -> NodeResourceSpec:
         spec = self.dependencies.get(key)
@@ -235,12 +249,23 @@ class Resource(ResidentHooks, ABC):
     # Whether this resource's step on a node is the node's own segments
     # (``SubmoduleStep.segments``: a request's span of tokens each, in the order the node
     # packs its rows), so the node declares nothing for it: ``engine_step`` adds a
-    # ``ResourceStep`` of them under the resource's key (the LoRA pool, whose rows are the
-    # node's tokens).
+    # ``ResourceStep`` of them (and of its ``combined_labels``) under the resource's key (the
+    # LoRA pool, whose rows are the node's tokens; the sequence shard).
     steps_from_segments: bool = False
 
     # stays correct when a hit skips the front of a request; required of every resource on a keyed node
     prefix_skip_safe: bool = False
+    # stays correct when a pool it depends on has a `placement`; the engine refuses to load it otherwise
+    supports_context_parallel: bool = False
+    # stays correct on a node whose steps split over its SP ranks (`SeqShardSpec`); the engine
+    # refuses to load it on one otherwise
+    supports_split_steps: bool = False
+
+    @property
+    def placement(self) -> "ContextParallel | None":
+        """How this resource places token positions over ranks (`PagedKVConfig.context_parallel`);
+        None for one that doesn't."""
+        return None
 
     def enable_prefix_cache(self, root: bytes, walks: dict[str, KeyedWalks] | None = None) -> None:
         """Open whatever this resource keeps across requests, under ``root``. The
@@ -526,7 +551,8 @@ class Resource(ResidentHooks, ABC):
         return snapshot
 
     def reset_request(self, rid: str, free: bool=False):
-        """For clearing dummy RIDs during cuda graph capture"""
+        """Clear a dummy rid's state: during accelerator graph capture, after each replayed step
+        and when a pre-plan is discarded."""
         return
 
     # Pre-planning
@@ -631,6 +657,12 @@ class Resource(ResidentHooks, ABC):
         return 0.0
 
     # Engine lifecycle
+
+    def check_captures(self, node: str, configs: list[AcceleratorGraphConfig], piecewise: Mapping) -> None:
+        """Raise ``ValueError`` for a capture of ``node`` this resource can't replay, before any
+        is taken: ``configs`` its whole-forward capture configs, ``piecewise`` its piecewise
+        runners by region."""
+        return
 
     def build_accelerator_graph_buffers(
         self, slots: list[CGSlotSpec],

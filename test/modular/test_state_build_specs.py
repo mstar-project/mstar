@@ -390,7 +390,6 @@ def test_resolve_records_the_resource_every_op_runs_on():
 
 
 @pytest.mark.parametrize("field, refusal", [
-    ({"seq_sharded": True}, "seq_sharded takes max_len 0"),
     ({"positions": Positions()}, "positions, which only an append-only array that keeps entries holds"),
 ])
 def test_a_host_value_is_refused_what_only_another_storage_holds(field, refusal):
@@ -521,6 +520,17 @@ def test_a_size_its_built_spec_doesnt_take_is_refused_naming_the_array_the_key_a
         build_specs(arrays(), kernel_settings={key: settings})
     message = str(refused.value)
     assert f"Array {key!r}: kernel_settings[{key!r}] sets" in message and allowed in message, message
+
+
+def test_a_hook_slot_count_meets_the_pools_own_check_as_the_same_key_under_resources_does():
+    # one slot is a positive count, and the pool refuses it because the sink takes it
+    with pytest.raises(ValueError) as written:
+        apply_yaml_overrides(build_specs([_kv(), _gdn()]), {"resources": {"gdn": {"max_slots": 1}}})
+    with pytest.raises(ValueError) as hooked:
+        build_specs([_kv(), _gdn()], kernel_settings={"gdn": {"max_slots": 1}})
+    assert str(hooked.value) == f"Array 'gdn': kernel_settings['gdn']: {written.value}", (
+        "the hook would size the pool by a rule of its own"
+    )
 
 
 @pytest.mark.parametrize("value", [0, -1, 1.5, "8", True])

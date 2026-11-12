@@ -16,7 +16,8 @@ Worker integration:
     world size (tp * sp).
 
 For non-standard RoPE (qwen3's 3D MRoPE), subclass and override
-``_apply_rope`` — same shape as the non-parallel ``Attention``.
+``_rotate_state`` on state handles, or ``_apply_rope`` on resources — the
+latter the same shape as the non-parallel ``Attention``.
 """
 from __future__ import annotations
 
@@ -24,7 +25,7 @@ import torch
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
-from mstar.distributed.utils import divide
+from mstar.distributed.utils import divide, kv_head_replicas
 from mstar.engine.resources.convenience import AttentionCallable
 from mstar.engine.state import add_read, rope
 from mstar.model.components.distributed.linear import (
@@ -149,10 +150,15 @@ class ParallelAttention(nn.Module):
         """See ``Attention.bind_state``."""
         self.state = handles.get(self._kv_key)
 
-    def _attend_state(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    def _rotate_state(self, q: torch.Tensor, k: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         # see Attention._attend_state
-        if self._pos_key is not None:
-            q, k = rope(self.state, q, k)
+        return (q, k) if self._pos_key is None else rope(self.state, q, k)
+
+    def _attend_state(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        # This still rotates in a frame of its own, which `forward` avoids. Its one caller is Command A+'s fused path,
+        # which passes q and k as views of one projection with no QK norm, and is safe only because the model sets
+        # `disable_torch_compile`.
+        q, k = self._rotate_state(q, k)
         return add_read(self.state, self.layer, q, k=k, v=v)
 
     def _apply_rope(
@@ -182,7 +188,12 @@ class ParallelAttention(nn.Module):
         q, k, v = self._project_qkv(hidden_states)
         q, k = self._apply_qk_norm(q, k)
         if self.state is not None:
-            attn_output = self._attend_state(q, k, v)
+            # Rotate here rather than in `_attend_state`: the break in the handle's `add` compiles that method as a
+            # frame of its own, whose inputs q and k are views of one projection, and rotating those aliased inputs in
+            # place fails Inductor's `assert_size_stride` at boot.
+            q, k = self._rotate_state(q, k)
+            self.state.add(self.layer, k=k, v=v)
+            attn_output = self.state.read(self.layer, q)
         else:
             q, k = self._apply_rope(q, k, self.attend.label)
             attn_output = self.attend(q, k, v)
@@ -244,12 +255,7 @@ class ParallelCrossAttention(nn.Module):
         # It is then required to have TP_size <= num_heads; otherwise divide(tp_size, self.total_num_heads)
         # will raise.
         if num_kv_heads is not None:
-            if tp_size > num_kv_heads:
-                self.num_kv_heads = 1
-                self.num_kv_head_replicas = divide(tp_size, num_kv_heads)
-            else:
-                self.num_kv_heads = divide(num_kv_heads, tp_size)
-                self.num_kv_head_replicas = 1
+            self.num_kv_heads, self.num_kv_head_replicas = kv_head_replicas(num_kv_heads, tp_size)
         else :
             self.num_kv_heads = self.num_heads
 
