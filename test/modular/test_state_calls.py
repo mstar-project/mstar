@@ -1311,6 +1311,13 @@ def test_a_read_on_a_value_with_only_host_fields_is_refused():
     _refused(r"Array 'host': no layout yet: read on a HostValueHandle", lambda: h.read(0))
 
 
+def test_a_write_on_a_value_with_only_host_fields_is_refused():
+    array = Value("host", nodes={"LLM"}, layers={0}, entry=Entry({}, host={"n": int}))
+    setup = StateSetup(host_fields=HostFields())
+    h = build_handle(array, {}, _resolve([array], setup), setup)
+    _refused(r"Array 'host': no layout yet: write on a HostValueHandle", lambda: h.write(0, n=torch.ones(1)))
+
+
 def test_set_start_on_an_array_that_isnt_a_value_is_refused():
     _refused(r"Array 'kv': no layout yet: set_start on a PagedArrayHandle",
              lambda: _kv_handle().set_start({"k": torch.ones(1)}))

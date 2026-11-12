@@ -1240,6 +1240,9 @@ class HostValueHandle(_HostCalls, ArrayHandle):
     def _check_storage(self, declared: ArrayStep, segments, ctx) -> None:
         super()._check_storage(declared, segments, ctx)
 
+    def write(self, layer: int | torch.Tensor, *, at: torch.Tensor | None = None, **fields: torch.Tensor) -> None:
+        raise self._unsupported("write")
+
 
 class ValueWithHostHandle(_HostCalls, ValueHandle):
     """The calls on a Value with host fields beside its tensor fields."""

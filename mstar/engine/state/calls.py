@@ -224,9 +224,7 @@ class ArrayHandle(StepHandle):
     def write(self, layer: int | torch.Tensor, *, at: torch.Tensor | None = None, **fields: torch.Tensor) -> None:
         """Overwrite entries in place, on a rewritable array. ``at`` gives each token's log position, and is omitted
         for a Value."""
-        if not self.array.rewritable:
-            raise self._refusal("write on an append-only array")
-        raise self._unsupported("write")
+        raise self._refusal("write on an append-only array")
 
     def set_start(self, start: Mapping[str, torch.Tensor]) -> None:
         """What a row of this Value reads while it has nothing written, has span 0 or pads a step: ``start``'s tensor
