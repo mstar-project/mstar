@@ -136,7 +136,7 @@ def check_worker_graphs(
         *_worker_parallelism(worker_graphs, specs or ()),
         *_sequence_parallel(worker_graphs, specs, moe_parallel or {}),
         *_paged_kv_on_cfg_ranks(worker_graphs, specs or ()),
-        *_grammar_samplers(worker_graphs, specs or ()),
+        *_grammar_samplers(model, worker_graphs, specs or ()),
     ]
 
 
@@ -490,12 +490,18 @@ def _paged_kv_on_cfg_ranks(
 
 
 def _grammar_samplers(
-    worker_graphs: Sequence[WorkerGraph], specs: Sequence[NodeResourceSpec],
+    model: Model, worker_graphs: Sequence[WorkerGraph], specs: Sequence[NodeResourceSpec],
 ) -> Iterator[str]:
-    """``enable_grammar`` on more than one sampler, or on one whose node runs its
-    walks on different ranks (a prefill/decode split): the grammar lives with
-    one worker's sampler, and a draw on another would never reach it."""
+    """``enable_grammar`` on a model that doesn't declare ``STRUCTURED_OUTPUTS``, on
+    more than one sampler, or on one whose node runs its walks on different ranks (a
+    prefill/decode split): the grammar lives with one worker's sampler, and a draw on
+    another would never reach it."""
     grammar = [spec for spec in specs if isinstance(spec, SamplerSpec) and spec.enable_grammar]
+    if grammar and not model.STRUCTURED_OUTPUTS:
+        yield (
+            f"enable_grammar is on, but {type(model).__name__} does not declare STRUCTURED_OUTPUTS: "
+            "structured outputs are served on Qwen3.5 for now"
+        )
     if len(grammar) > 1:
         yield (
             f"enable_grammar is on samplers {sorted(spec.resource_key for spec in grammar)}; "

@@ -479,8 +479,6 @@ def test_llm_check_stop():
     assert sub.check_stop("r", info(DECODE_WALK, 0), im_end) == {"decode_loop"}
     assert sub.check_stop("r", info(DECODE_WALK, 0), eot) == {"decode_loop"}
     assert sub.check_stop("r", info(DECODE_WALK, 0), word) == set()
-    # the model declares the ids the loop stops on
-    assert _make_model(cfg).text_output().stop_token_ids == sub.token_stop.stop_ids == {IM_END, EOT}
     # the budget is the loop cap's to end
     assert sub.check_stop("r", info(DECODE_WALK, 9, max_tokens=10), word) == set()
 

@@ -269,7 +269,7 @@ class CanaryModel(Model):
         return {"audio": 1}
 
     def text_output(self) -> TextOutput:
-        return TextOutput(self._detokenizer, self.config.stop_token_ids)
+        return TextOutput(self._detokenizer)
 
     # -------------------------------------------------------------------
     # submodules

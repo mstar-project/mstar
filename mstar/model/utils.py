@@ -354,10 +354,9 @@ class ByteLevelDetokenizer:
 
     def __init__(self, tokenizer, keep_special: bool = False):
         self.tokenizer = tokenizer
-        special = frozenset(tokenizer.all_special_ids)
-        # the ids ``to_bytes`` drops, and the ones it writes out as text (``keep_special``)
-        self.dropped_ids = frozenset() if keep_special else special
-        self.kept_special_ids = special if keep_special else frozenset()
+        self.special_ids = frozenset() if keep_special else set(tokenizer.all_special_ids)
+        # the special-token ids ``to_bytes`` writes out as text (``keep_special``)
+        self.kept_special_ids = frozenset(tokenizer.all_special_ids) if keep_special else frozenset()
         # GPT-2's bytes_to_unicode: printable unicode char <-> raw byte.
         printable = (
             list(range(ord("!"), ord("~") + 1))
@@ -378,7 +377,7 @@ class ByteLevelDetokenizer:
         self.verbatim = {}
         for i, added in getattr(tokenizer, "added_tokens_decoder", {}).items():
             text = str(added)
-            if i in self.dropped_ids or self._byte_map(text) == text.encode("utf-8"):
+            if i in self.special_ids or self._byte_map(text) == text.encode("utf-8"):
                 continue
             try:
                 decoded = tokenizer.decode([i])
@@ -405,7 +404,7 @@ class ByteLevelDetokenizer:
 
     def to_bytes(self, token_ids: list[int]) -> bytes:
         raw = bytearray()
-        ids = [i for i in token_ids if i not in self.dropped_ids]
+        ids = [i for i in token_ids if i not in self.special_ids]
         for i, token in zip(ids, self.tokenizer.convert_ids_to_tokens(ids), strict=True):
             if token is None:  # an id past the vocabulary, which decode skips too
                 continue

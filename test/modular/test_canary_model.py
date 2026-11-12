@@ -144,8 +144,6 @@ def test_detokenizes_pieces_and_byte_fallback(snapshot):
     per_token = b"".join(model.postprocess(torch.tensor([i]), "text") for i in ids)
     assert per_token.decode("utf-8") == " hello café!"
     assert b"".join(model.postprocess_inline(ids, "text", [None] * len(ids))) == per_token
-    # the end-of-text id ends the reply, and the loop stops on it (`_tiny_node`'s config)
-    assert model.text_output().stop_token_ids == {vocab["<|endoftext|>"]} == _tiny_node().token_stop.stop_ids
 
 
 def test_decoder_weight_names():

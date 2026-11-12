@@ -284,7 +284,7 @@ class Qwen3ASRModel(DeclaredDecoderModel):
         return PreparedMedia({"audio": clip.contiguous()}, [tokens])
 
     def text_output(self) -> TextOutput:
-        return TextOutput(self._detokenizer, self.config.stop_token_ids)
+        return TextOutput(self._detokenizer)
 
     # -------------------------------------------------------------------
     # Submodules
