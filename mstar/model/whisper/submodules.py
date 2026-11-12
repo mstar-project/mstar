@@ -11,7 +11,7 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from typing import Any
 
 import torch
@@ -43,7 +43,6 @@ from mstar.model.submodule_base import (
     ARNodeSubmodule,
     BatchedModelOutput,
     DeviceLoopback,
-    HostRows,
     ModelInputsFromEngine,
     NodeInputs,
     NodeSubmodule,
