@@ -39,7 +39,7 @@ from mstar.engine.resources.sampler.config import SamplerSpec, SamplerStep, Samp
 from mstar.engine.resources.sequence_shard import SeqShardSpec
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
 from mstar.engine.resources.step import Segment, SubmoduleStep
-from mstar.engine.state.analysis import position_key, query_array
+from mstar.engine.state.analysis import position_key, query_array, shard_axis
 from mstar.engine.state.calls import ArrayHandle, SamplerHandle, ShardHandle, pool_layers, segments_of
 from mstar.engine.state.contract import (
     EMPTY,
@@ -101,7 +101,9 @@ def build_specs(
     for array in arrays:
         specs += resolved.specs[array.name]
     specs += [_sampler_spec(declared) for declared in declarations if isinstance(declared, Sampler)]
-    specs += [_shard_spec(declared, combined_walks) for declared in declarations if isinstance(declared, SeqShard)]
+    specs += [
+        _shard_spec(declared, combined_walks, arrays) for declared in declarations if isinstance(declared, SeqShard)
+    ]
     _apply_kernel_settings(specs, arrays, resolved, kernel_settings)
     return specs
 
@@ -240,7 +242,9 @@ def _sampler_spec(sampler: Sampler) -> SamplerSpec:
     )
 
 
-def _shard_spec(shard: SeqShard, combined_walks: Mapping[str, Mapping[str, Collection[str]]]) -> SeqShardSpec:
+def _shard_spec(
+    shard: SeqShard, combined_walks: Mapping[str, Mapping[str, Collection[str]]], arrays: Sequence[Array],
+) -> SeqShardSpec:
     walks = shard.walks
     if walks is not None:
         walks = walks | {
@@ -248,7 +252,8 @@ def _shard_spec(shard: SeqShard, combined_walks: Mapping[str, Mapping[str, Colle
             if walks & set(rows)
         }
     return SeqShardSpec(
-        shard.name, shard.nodes, labels=tuple(sorted(shard.labels)), axis=0, walks=walks, exchange=shard.exchange,
+        shard.name, shard.nodes, labels=tuple(sorted(shard.labels)), axis=shard_axis(shard, arrays), walks=walks,
+        exchange=shard.exchange,
     )
 
 

@@ -347,11 +347,13 @@ class SeqShard:
     and updates of the node's arrays exchange what a split step needs by themselves.
 
     ``labels`` lists one label, which an array on ``nodes`` opens, since the shard's handle brackets one; a node with
-    no arrays declares a `SeqShardSpec` itself. ``walks`` are the walks whose steps may split, as a row's walk (a
-    combined walk splits where a walk it combines is listed); None: every walk. ``exchange`` is the author's default
-    for how a split step reaches the node's paged attentions, which the deployment's ``resources:`` block overrides
-    under the shard's name: ``auto`` (Ulysses over KV stored by head, copied over KV stored by position), ``none``
-    (never split), ``ulysses``, ``all_gather`` or ``ring``.
+    no arrays declares a `SeqShardSpec` itself. The shard cuts the label's tensors as the node's reads take queries on
+    it: rows of one span (``Read.packed`` False, not ``segmented``) each row alike, packed tokens or a request's
+    segments in one row contiguously; the reads take one of the two. ``walks`` are the walks whose steps may split,
+    as a row's walk (a combined walk splits where a walk it combines is listed); None: every walk. ``exchange`` is the
+    author's default for how a split step reaches the node's paged attentions, which the deployment's ``resources:``
+    block overrides under the shard's name: ``auto`` (Ulysses over KV stored by head, copied over KV stored by
+    position), ``none`` (never split), ``ulysses``, ``all_gather`` or ``ring``.
     """
 
     name: str

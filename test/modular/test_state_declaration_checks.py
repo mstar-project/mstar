@@ -217,6 +217,14 @@ def test_a_sequence_shard_lists_one_label_since_its_handle_brackets_one():
     assert problem.startswith("SeqShard 'shard'.labels: ['cfg', 'main'] are several")
 
 
+def test_a_sequence_shard_cuts_its_label_on_one_axis():
+    # rows of one span split each row alike (axis 1), packed tokens contiguously (axis 0): one tensor can't take both
+    rows = _array("rows", max_len=0, reads={"rows_attn": _read(mask=Block(), packed=False)})
+    packed = _array("packed", max_len=0, reads={"packed_attn": _read(mask=Block())})
+    problem = _one_problem(rows, packed, SeqShard("shard", nodes={"LLM"}))
+    assert problem.startswith("SeqShard 'shard'.labels: reads on nodes ['LLM'] take queries on ['main'] both as rows")
+
+
 def test_a_block_read_needs_max_len_zero():
     problem = _one_problem(_array(reads={"r": _read(mask=Block())}))
     assert problem.startswith("Array 'kv'.reads['r'].mask") and "Block needs max_len 0" in problem

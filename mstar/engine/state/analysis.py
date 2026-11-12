@@ -184,7 +184,28 @@ def _shard_problems(
     if shard.labels - opened:
         problems.append(f"{where}.labels: {sorted(shard.labels - opened)} are opened by no array on nodes "
                         f"{sorted(shard.nodes)}, which open {sorted(opened)}")
+    if len(_query_rows(shard, arrays)) > 1:
+        problems.append(f"{where}.labels: reads on nodes {sorted(shard.nodes)} take queries on {sorted(shard.labels)} "
+                        "both as rows of one span (packed=False) and as packed tokens or a segmented row, and the "
+                        "shard cuts its label's tensors on one axis")
     return problems
+
+
+def shard_axis(shard: SeqShard, arrays: Sequence[Array]) -> int:
+    """The axis ``shard`` cuts its label's tensors on, from how the reads on its nodes take queries on the label: 1
+    where they take rows of one span (`Read.packed` False, not `segmented`), every row cut alike; 0 where they take
+    packed tokens or a request's segments in one row, cut contiguously. `_shard_problems` refuses a mix."""
+    return 1 if _query_rows(shard, arrays) == {True} else 0
+
+
+def _query_rows(shard: SeqShard, arrays: Sequence[Array]) -> set[bool]:
+    """Whether each read on ``shard``'s nodes whose queries open its labels takes them as rows of one span."""
+    by_name = {array.name: array for array in arrays}
+    return {
+        not read.packed and not read.segmented
+        for array in arrays if array.nodes & shard.nodes
+        for read in array.reads.values() if query_array(array, read, by_name).labels & shard.labels
+    }
 
 
 def _read_problems(array: Array, walks: Mapping[str, set[str]], combined: set[str]) -> list[str]:
