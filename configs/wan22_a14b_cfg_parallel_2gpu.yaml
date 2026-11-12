@@ -1,0 +1,30 @@
+model: "wan22"
+
+# See wan22_a14b.yaml and wan22_cfg_parallel_2gpu.yaml. Wan2.2-T2V-A14B with
+# CFG-parallel on two GPUs: each rank holds both experts and computes one
+# classifier-free-guidance branch, and the two noise predictions are
+# all-gathered every step. The text encoder and the VAE decode run on rank 0.
+max_seq_len: 512
+
+model_kwargs:
+  variant: "t2v_a14b"
+  model_path_hf: "Wan-AI/Wan2.2-T2V-A14B-Diffusers"
+  compile_dit_sizes: ["1280x720x81", "832x480x81"]
+  vae_decode_fast_sizes: ["1280x720", "832x480"]
+
+node_groups:
+  - node_names:
+      - text_encoder
+    ranks:
+      - 0
+
+  - node_names:
+      - vae_decoder
+    ranks:
+      - 0
+
+  - node_names:
+      - dit
+    ranks: [0, 1]
+    # one classifier-free-guidance branch per rank
+    cfg_size: 2

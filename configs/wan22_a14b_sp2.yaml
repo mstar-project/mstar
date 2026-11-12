@@ -1,0 +1,29 @@
+model: "wan22"
+
+# See wan22_a14b.yaml. Wan2.2-T2V-A14B with Ulysses sequence parallelism on two
+# GPUs: each rank holds both experts and a contiguous half of the tokens (20 of
+# the 40 heads in the self-attention's all-to-all). The text encoder and the VAE
+# decode run on rank 0.
+max_seq_len: 512
+
+model_kwargs:
+  variant: "t2v_a14b"
+  model_path_hf: "Wan-AI/Wan2.2-T2V-A14B-Diffusers"
+  compile_dit_sizes: ["1280x720x81", "832x480x81"]
+  vae_decode_fast_sizes: ["1280x720", "832x480"]
+
+node_groups:
+  - node_names:
+      - text_encoder
+    ranks:
+      - 0
+
+  - node_names:
+      - vae_decoder
+    ranks:
+      - 0
+
+  - node_names:
+      - dit
+    ranks: [0, 1]
+    sp_size: 2

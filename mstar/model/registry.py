@@ -191,8 +191,9 @@ HF_MODELS: dict[str, dict] = {
     # TTS, 30 languages, voice design and cloning. MiniCPM-4 base + residual
     # LMs drive a local DiT over AudioVAE V2 latents, decoded to 48 kHz.
     "voxcpm2": {"model_path_hf": "openbmb/VoxCPM2"},
-    # Wan2.2-TI2V-5B (dense video DiT + UMT5-XXL + Wan2.2-VAE).  TI2V-5B
-    # only; the A14B MoE variants are a separate follow-up.
+    # Wan2.2-TI2V-5B (dense video DiT + UMT5-XXL + Wan2.2-VAE). The same class
+    # serves T2V-A14B with model_kwargs variant: t2v_a14b and model_path_hf
+    # Wan-AI/Wan2.2-T2V-A14B-Diffusers (configs/wan22_a14b.yaml).
     "wan22": {"model_path_hf": "Wan-AI/Wan2.2-TI2V-5B-Diffusers"},
     # LingBot-World-V2 1.3B causal-fast (weights CC-BY-NC-SA-4.0): the DiT repo only;
     # UMT5 and the Wan2.1 VAE load from the diffusers repos mstar already uses.
