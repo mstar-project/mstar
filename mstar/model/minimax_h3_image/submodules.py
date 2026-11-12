@@ -20,6 +20,7 @@ from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.distributed.communication import CommGroup
 from mstar.model.components.batched_rows import BatchedRows
 from mstar.model.components.diffusion.attention import sdpa_attention
 from mstar.model.components.diffusion.compile_utils import compile_blocks as compile_blocks_
@@ -27,8 +28,16 @@ from mstar.model.components.diffusion.denoise_loop import StepScalar
 from mstar.model.components.diffusion.flow_match import FlowMatchSchedule
 from mstar.model.minimax_h3.components.layout import patchify_video
 from mstar.model.minimax_h3.components.transformer import H3Inputs, H3StepLayout
+from mstar.model.minimax_h3.components.video_vae import stitch_tiles
 from mstar.model.minimax_h3.config import PIXEL_MEAN, PIXEL_STD
-from mstar.model.minimax_h3.submodules import COND_LATENTS, FIRST_STEP, LATENTS, TEXT_EMBEDS, H3PackedDenoise
+from mstar.model.minimax_h3.submodules import (
+    COND_LATENTS,
+    FIRST_STEP,
+    LATENTS,
+    TEXT_EMBEDS,
+    H3PackedDenoise,
+    clip_share,
+)
 from mstar.model.minimax_h3_image.config import REFERENCE_NOISE_AUG, H3ImageConfig
 from mstar.model.minimax_h3_image.layout import H3ImageLayout, modality_tags, position_ids, timestep_classes
 from mstar.model.submodule_base import NodeInputs, NodeSubmodule
@@ -215,15 +224,20 @@ class H3ImageDecoderSubmodule(BatchedRows, NodeSubmodule):
     """Image rows ``[N, 96]`` fp32 -> uint8 ``[3, H, W]`` on the canvas: reference rows dropped,
     unpatchified, denormalized with the VAE's latent statistics, decoded in tiles, the
     ImageNet normalization undone, clamped, and quantized to 8 bits by truncation, as the
-    released pipeline does (the resize to the requested size is the model's postprocess)."""
+    released pipeline does (the resize to the requested size is the model's postprocess).
+
+    As a sequence-parallel node (``sp_group``), each rank decodes its contiguous share of the
+    tiles (``clip_share``) and the shares are gathered on every rank, which then stitch the
+    same image: the DiT's ranks decode in lockstep, as MiniMax-H3's video decoder does."""
 
     disable_torch_compile = True
     output_keys = (IMAGE_OUTPUT,)
 
     def __init__(self, vae: nn.Module, config: H3ImageConfig, *, max_batch_size: int = 1, tile_batch: int = 1,
-                 compile_blocks: bool = False):
+                 compile_blocks: bool = False, sp_group: CommGroup | None = None):
         super().__init__()
         self.vae = vae
+        self.sp_group = sp_group if sp_group is not None and sp_group.world_size > 1 else None
         self._max_batch_size = max_batch_size
         # spatial tiles decoded per decoder call: 1 is the reference's order of work
         self.tile_batch = int(tile_batch)
@@ -257,9 +271,31 @@ class H3ImageDecoderSubmodule(BatchedRows, NodeSubmodule):
         z = rows.reshape(b, h // ph, w // pw, self.channels, ph, pw).permute(0, 3, 1, 4, 2, 5)
         z = z.reshape(b, self.channels, h, w) * self.latents_std + self.latents_mean
         # SDPA within each fixed-size tile, as the reference: dense, one segment
-        image = self.vae.decode(z, sdpa_attention, tile_batch=self.tile_batch)
+        if self.sp_group is None:
+            image = self.vae.decode(z, sdpa_attention, tile_batch=self.tile_batch)
+        else:
+            image = self._decode_shared(z)
         image = (image.float() * self.pixel_std + self.pixel_mean).clamp(0, 1)
         return {IMAGE_OUTPUT: (image * 255).clamp(0, 255).to(torch.uint8)}
+
+    def _decode_shared(self, z: torch.Tensor) -> torch.Tensor:
+        """This rank's ``clip_share`` of the tiles, all-gathered in tile order and stitched on
+        every rank. A rank short of a full share pads it with zeros, which only the last ranks
+        are and the trim to the tile count drops, so a rank without a share decodes nothing."""
+        group, vae = self.sp_group, self.vae
+        z = z.to(vae.post_quant_conv.weight.dtype)
+        grid, y_overlaps, x_overlaps = vae.tile_slices(z.shape[-2], z.shape[-1])
+        tiles = [z[..., ys, xs] for row in grid for ys, xs in row]
+        share = clip_share(len(tiles), group.rank, group.world_size)
+        decoded = vae.decode_tiles([tiles[i] for i in share], sdpa_attention, max(1, self.tile_batch))
+        per = -(-len(tiles) // group.world_size)
+        if len(decoded) < per:
+            first = tiles[0]
+            empty = first.new_zeros(first.shape[0], vae.decoder.out_channels, first.shape[-2] * vae.ratio,
+                                    first.shape[-1] * vae.ratio, dtype=vae.decoder.proj_out.weight.dtype)
+            decoded += [empty] * (per - len(decoded))
+        gathered = iter(group.all_gather(torch.stack(decoded), dim=0)[:len(tiles)].unbind(0))
+        return stitch_tiles([[next(gathered) for _ in row] for row in grid], y_overlaps, x_overlaps)
 
 
 __all__ = [

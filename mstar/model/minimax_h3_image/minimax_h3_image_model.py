@@ -97,7 +97,7 @@ class H3ImageModel(Model):
         cache_dir: str | None = None,
         skip_weight_loading: bool = False,
         attention_backend: str = "flashinfer",
-        max_packed_rows: int = 65_536,
+        max_packed_rows: int = 131_072,
         async_scheduling: bool = True,
         compile: bool = False,
         row_bucket: int | None = None,
@@ -112,7 +112,9 @@ class H3ImageModel(Model):
         self.skip_weight_loading = skip_weight_loading
         self.attention_backend = attention_backend
         # Prompt, reference and generated rows; a step's attention grows with their square. The
-        # default covers a 16 MP image (16,384 rows) with three 4 MP references and a long prompt.
+        # default covers the reference's largest request: a 16 MP image (16,384 rows) with 16
+        # references at a 2048-px short edge (4,096 rows each, ~1k vision tokens each) and a
+        # 4096-token prompt, ~102k rows.
         self.max_packed_rows = int(max_packed_rows)
         self.async_scheduling = bool(async_scheduling)
         self.compile = bool(compile)  # the DiT's blocks
@@ -410,8 +412,9 @@ class H3ImageModel(Model):
         return None
 
     def get_default_sharding_config(self) -> ShardingConfig:
-        # The dit shards its rows by rank (Ulysses). No tensor parallelism.
-        return ShardingConfig(groups=[], tp_enabled_nodes=set(), shard_dim={}, sp_enabled_nodes={DIT_NODE})
+        # The dit shards its rows by rank (Ulysses), the decoder its tiles. No tensor parallelism.
+        return ShardingConfig(groups=[], tp_enabled_nodes=set(), shard_dim={},
+                              sp_enabled_nodes={DIT_NODE, VAE_DECODER_NODE})
 
     def get_submodule(self, node_name: str, device="cpu", tp_group=None, autocast_dtype=None, sp_group=None):
         if node_name in self._submodule_cache:
@@ -446,7 +449,8 @@ class H3ImageModel(Model):
             )
         if node_name == VAE_DECODER_NODE:
             return H3ImageDecoderSubmodule(weight_loader.build_image_decoder(config, snapshot, device), config,
-                                           tile_batch=self.vae_tile_batch, compile_blocks=self.vae_compile)
+                                           tile_batch=self.vae_tile_batch, compile_blocks=self.vae_compile,
+                                           sp_group=sp_group)
         logger.warning("MiniMax-H3-Image has no submodule for node %r; running it dummy", node_name)
         return None
 

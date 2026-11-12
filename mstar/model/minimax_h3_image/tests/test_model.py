@@ -238,3 +238,63 @@ def test_transformer_loads_the_step_heads(tmp_path):
     save_file({"video_out.weight": heads["video_out.weight"]}, str(tmp_path / "pdd_fused_heads.safetensors"))
     with pytest.raises(RuntimeError, match="unloaded"):
         weight_loader.build_transformer(TINY, tmp_path, "cpu", dtype=torch.float32)
+
+
+def _tiny_decode_case():
+    """A tiny image VAE with 64-px tiles and a batch of two requests' rows: a 10x6 latent grid
+    makes 3 x 2 tiles."""
+    from mstar.model.minimax_h3.config import H3VideoVAEConfig
+    from mstar.model.minimax_h3_image.components.image_vae import H3ImageDecoder
+
+    torch.manual_seed(0)
+    vcfg = H3VideoVAEConfig(latent_channels=4, decoder_layers=1, decoder_heads=2, decoder_head_dim=32,
+                            decoder_rope_dim_ratio=0.5, decoder_2d=True, tile_size=64, tile_overlap_min=16,
+                            latents_mean=(0.1,) * 4, latents_std=(0.9,) * 4)
+    vae = H3ImageDecoder(vcfg).eval()
+    with torch.no_grad():
+        for param in vae.parameters():
+            param.normal_(0, 0.2)
+    layout = H3ImageLayout(text_len=3, latent_height=10, latent_width=6, references=((2, 2),))
+    rows = torch.randn(2, layout.num_condition_rows + layout.num_video_rows, 4 * 2 * 2)
+    return vae, H3ImageConfig(vae=vcfg), layout, rows
+
+
+def _sp_decode(rank: int, world: int, store: str, out: str) -> None:
+    import torch.distributed as dist
+
+    from mstar.distributed.communication import CommGroup
+    from mstar.model.minimax_h3_image.submodules import IMAGE_OUTPUT, H3ImageDecoderSubmodule
+
+    dist.init_process_group("gloo", init_method=f"file://{store}", rank=rank, world_size=world)
+    try:
+        torch.set_num_threads(1)
+        group = CommGroup(rank, rank, list(range(world)))
+        group.device_group, group.initialized = dist.group.WORLD, True
+        vae, config, layout, rows = _tiny_decode_case()
+        calls = []
+        decode = vae.decoder.forward
+        vae.decoder.forward = lambda *args, **kwargs: calls.append(1) or decode(*args, **kwargs)
+        with torch.no_grad():
+            image = H3ImageDecoderSubmodule(vae, config, sp_group=group).run_batch(rows, layout)[IMAGE_OUTPUT]
+            torch.save(len(calls), f"{out}.{rank}.calls")
+            if rank == 0:  # at the same thread count: CPU reductions round by it
+                torch.save(H3ImageDecoderSubmodule(vae, config).run_batch(rows, layout)[IMAGE_OUTPUT], f"{out}.one")
+        torch.save(image, f"{out}.{rank}")
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("world", [2, 4])
+def test_sequence_parallel_decode_gives_every_rank_the_one_nodes_image(tmp_path, world):
+    """``vae_decoder`` as an SP node: each rank's share of the tiles, gathered, against one
+    decode; 4 ranks over 6 tiles leaves the last rank without a share, which decodes nothing."""
+    import torch.multiprocessing as mp
+
+    out = str(tmp_path / "image")
+    mp.spawn(_sp_decode, args=(world, str(tmp_path / "store"), out), nprocs=world)
+    want = torch.load(f"{out}.one")
+    assert want.shape == (2, 3, 160, 96)
+    for rank in range(world):
+        assert torch.equal(torch.load(f"{out}.{rank}"), want)
+    calls = [torch.load(f"{out}.{rank}.calls") for rank in range(world)]
+    assert calls == ([3, 3] if world == 2 else [2, 2, 2, 0]), calls  # one decoder call per tile

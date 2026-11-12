@@ -4,16 +4,17 @@ model: "minimax_h3_image"
 max_seq_len: 8192
 
 # MiniMax-H3-Image on 2 GPUs for latency: the DiT (66 GB) Ulysses sequence-parallel over both,
-# each rank holding the whole DiT and half of the packed rows; the conditioner and the VAE on
-# rank 1 (~115 GiB in use there once loaded, so 141 GB GPUs).
+# each rank holding the whole DiT and half of the packed rows, and the decoder in the same SP
+# group, each rank decoding half of the tiles between denoise steps; the conditioner and the VAE
+# encoder on rank 1 (~120 GiB in use there once loaded, so 141 GB GPUs).
 model_kwargs:
   attention_backend: flashinfer
   compile: true
   vae_tile_batch: 64
 
 node_groups:
-  - node_names: [dit]
+  - node_names: [dit, vae_decoder]
     ranks: [0, 1]
     sp_size: 2
-  - node_names: [text_encoder, vae_encoder, vae_decoder]
+  - node_names: [text_encoder, vae_encoder]
     ranks: [1]

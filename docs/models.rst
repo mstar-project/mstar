@@ -2408,7 +2408,7 @@ and the OpenAI image output knobs. With images (``POST /generate`` with up to 16
 ``/v1/images/edits`` with one), each reference keeps its own size: resized for the VAE to a
 short edge in [1024, 2048] and for the text encoder to 1024, as the reference does, and the
 prompt refers to them as ``<Picture 1>``, ``<Picture 2>``, ... The prompt is cut to 4096 tokens,
-as the reference cuts it. A packed sequence over ``max_packed_rows`` (default 65536) is a 400.
+as the reference cuts it. A packed sequence over ``max_packed_rows`` (default 131072, the reference's largest request: 16 MP with 16 references) is a 400.
 One request runs per denoise step.
 
 Deployment knobs (``model_kwargs``; the configs set ``compile`` and ``vae_tile_batch: 64``):
@@ -2417,7 +2417,8 @@ Deployment knobs (``model_kwargs``; the configs set ``compile`` and ``vae_tile_b
 launch-bound at 9.2 s for 16 MP on a B300 against 0.45 s at 64, and the batched decode is
 bit-identical), ``vae_compile``, ``attention_backend`` (``flashinfer``, or ``sdpa``). The
 configs: ``minimax_h3_image.yaml`` (2 GPUs, the DiT alone on one), ``minimax_h3_image_sp2.yaml``
-(the DiT Ulysses over 2 GPUs, the conditioner and the VAE beside it on rank 1) and
+(the DiT Ulysses over 2 GPUs, the decoder in its SP group decoding half of the tiles per rank,
+the conditioner and the VAE encoder on rank 1) and
 ``minimax_h3_image_1gpu.yaml`` (~119 GiB in use on one H200 at 16 MP).
 
 At ``attention_backend: sdpa`` the nodes' modules, driven by ``test/minimax_h3_image/parity.py``
@@ -2451,9 +2452,9 @@ canvas, 2.14 s on M*):
      - 2.08
      - 10.71
    * - M*, SP2 (``minimax_h3_image_sp2.yaml``)
-     - 0.59
-     - 1.53
-     - 7.12
+     - 0.51
+     - 1.44
+     - 6.87
    * - SGLang, Ulysses 2
      - 0.37
      - 1.26
@@ -2467,9 +2468,8 @@ The 2-GPU default config takes 0.65 / 2.18 / 11.13 s, as one GPU at one request 
 requests, not steps); diffusers' pipeline on two H200s (encoder | rest, no HTTP) takes 1.05 /
 4.20 / 18.65 s. SGLang ran ``--performance-mode speed``; vllm-omni its H200 recipe's SP2 profile,
 whose ``extra_args.min_generation_area`` was not honoured at 1024². At SP2 and 4096², a step is
-0.94 s and the decode, on one rank, 0.51 s. Not done: CUDA-graph capture, more than one request
-per step, the decode split over the SP ranks, tensor parallelism, multi-reference edits through
-``/v1/images/edits``.
+0.94 s; the decode is split over the SP ranks' tiles. Not done: CUDA-graph capture, more than
+one request per step, tensor parallelism, multi-reference edits through ``/v1/images/edits``.
 
 
 FLUX.2 [klein] (``flux2_klein`` / ``flux2_klein_9b``)
