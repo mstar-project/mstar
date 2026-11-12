@@ -777,9 +777,9 @@ It takes a mask that uses no query position: ``Block()`` on an array with ``max_
 ``Bidirectional()`` on one that keeps entries, whose context is added on the walk that carries it
 and listed at span 0 afterwards. A cross read on an array that keeps entries is that array's one
 read, over one label, and its queries come from an append-only array that keeps entries. It is
-refused at load on a node that splits its steps over SP ranks, and over a pool stored by position
-(``context_parallel``). A
-``max_len=0`` cross read's queries come from an array of one label, and ``queries`` never names the
+refused at load on a node that splits its steps over SP ranks, and where its pool or the queried
+array's pool is stored by position (``context_parallel``). A ``max_len=0`` cross read's queries
+come from an array of one label, and ``queries`` never names the
 read's own array. Separate token sets are separate arrays, and arrays of one kind and geometry on one node share one resource,
 each under its own label.
 
