@@ -1787,3 +1787,72 @@ def test_distance_bias_has_no_layout_on_paged_or_within_step_reads(handle, where
     q, k, v = _tensors()
     h.add(0, k=k, v=v)
     _refused(rf"no layout yet: distance_bias {where}", lambda: h.read(0, q, distance_bias=q))
+
+
+# A region: a piecewise graph replayed inside the open step, whose own step commits the rows it lists.
+
+
+def _region(h, rows) -> SubmoduleStep:
+    """A region's step over ``rows`` at span 1, replayed and committed inside ``h``'s open step."""
+    region = _step(h, segments=[Segment(rid, "main", 1) for rid in rows], ctx=_ctx(leased=True, rows=tuple(rows)))
+    h.commit_step(region)
+    return region
+
+
+def test_a_row_only_a_region_wrote_passes_and_a_row_nobody_wrote_is_refused():
+    h, pool = _plain_value()
+    step, _, _ = _value_step(h, pool, [Segment(1, "main", 1), Segment(2, "main", 1)])
+    _region(h, [1])
+    _refused(r"Array 'state': layer 0's fields \['n', 'x'\] are unwritten in a kept step for rows \[2\], and no "
+             "update op writes them", lambda: h.check_step(step))
+    _region(h, [2])
+    h.check_step(step)
+    h.end_step(step)
+
+
+def test_a_bounded_row_only_a_region_added_passes_and_a_row_nobody_added_is_refused():
+    h, kv = _bounded()
+    step = _bounded_step(h, kv, spans=(1, 1))
+    _region(h, [2])
+    _refused(r"Array 'enc_kv': a step that keeps lists rows \[1\] at span above 0, which neither its adds nor a "
+             r"region's step added to; list those rows at span 0", lambda: h.check_step(step))
+    _region(h, [1])
+    h.check_step(step)
+
+
+def test_a_region_s_rows_cover_only_the_step_it_ran_in():
+    h, pool = _plain_value()
+    first, _, _ = _value_step(h, pool, [Segment(1, "main", 1)])
+    _region(h, [1])
+    h.check_step(first)
+    h.end_step(first)
+    second, _, _ = _value_step(h, pool, [Segment(1, "main", 1)])
+    _refused(r"Array 'state': layer 0's fields \['n', 'x'\] are unwritten in a kept step for rows \[1\]",
+             lambda: h.check_step(second))
+
+
+def test_a_step_s_own_replay_records_no_region_rows():
+    """A whole-forward replay replays too, and its rows got their entries at capture, not from a region."""
+    h = _kv_handle()
+    step = _begin(h, ctx=_ctx(leased=True))
+    h.commit_step(step)
+    assert not h._region_rows, "the open step's own commit is no region's"
+    h.end_step(step)
+    eager = _begin(h)
+    _refused(r"Array 'kv': a step that keeps lists rows at span above 0 and adds nothing, so the pages would keep "
+             r"entries no add wrote; list those rows at span 0", lambda: h.check_step(eager))
+
+
+def test_a_region_s_rows_reach_a_value_with_host_fields():
+    """Its host calls commit the step's host writes, and a region's step still records its rows."""
+    entry = Entry({"x": TensorType((2, 3), dtype=torch.float32)}, host={"n": int})
+    array = Value("state", nodes={"LLM"}, layers={0}, entry=entry)
+    (spec,) = build_specs([array], kernel_settings={"state": {"max_slots": 4}})
+    pool = RecurrentStatePool(torch.device("cpu"), spec.config)
+    pool.ingest_request(1)
+    setup = StateSetup(host_fields=HostFields())
+    h = build_handle(array, {"state": pool}, _resolve([array], setup), setup)
+    step, _, _ = _value_step(h, pool, [Segment(1, "main", 1)])
+    _region(h, [1])
+    h.check_step(step)
+    h.end_step(step)
