@@ -386,3 +386,5 @@ def test_a_step_cache_with_a_distilled_sampler_is_refused():
     assert step_cache_policy({"method": "magcache"}, table).reuse_plan(3) == (False, True, False)
     with pytest.raises(ValueError, match="unipc sampler only"):
         Wan22Config(sampler="dmd", step_cache=_FLAT)
+    with pytest.raises(ValueError, match="unipc sampler only"):
+        Wan22Config.for_variant(WAN22_VARIANT_T2V_A14B, sampler="step_distill", step_cache=_FLAT)

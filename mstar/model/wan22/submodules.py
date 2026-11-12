@@ -4,6 +4,7 @@
     vae_encoder  -> Wan22VaeEncoderSubmodule  (Wan2.2-VAE encode, TI2V-5B I2V only)
     dit          -> Wan22DitSubmodule         (native DiT, or A14B's two experts, + the scaffold's UniPC)
                     Wan22DmdDitSubmodule      (the 5B DiT on a DMD-distilled checkpoint's few steps)
+                    Wan22StepDistillDitSubmodule (on LightX2V's step-distill recipe)
     vae_decoder  -> Wan22VaeDecoderSubmodule  (Wan2.2-VAE decode; the Wan2.1 VAE on A14B)
 
 All four set ``disable_torch_compile``, so the engine never wraps their forwards: the
@@ -32,7 +33,7 @@ from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.communication import CommGroup, my_rows
 from mstar.model.components.diffusion.decode_utils import latent_affine, wan_vae_decode_dtype
 from mstar.model.components.diffusion.denoise_loop import DenoiseLoopSubmodule, UniPCDenoiseLoopSubmodule
-from mstar.model.components.diffusion.dmd import dmd_schedule, dmd_step
+from mstar.model.components.diffusion.dmd import dmd_schedule, dmd_step, step_distill_schedule, step_distill_step
 from mstar.model.components.diffusion.flow_match import FlowMatchSchedule
 from mstar.model.components.diffusion.image_io import truncate_to_uint8
 from mstar.model.components.diffusion.step_cache import BlockCache, step_cache_policy
@@ -679,6 +680,46 @@ class Wan22DmdDitSubmodule(Wan22DitSubmodule):
                 # float32 so rows at different steps stack; the bf16 values carry exactly
                 samples.append(dmd_step(latents[i], flow[i], sigma[i], sigma_next[i], noise).float())
         return {self.LATENTS: torch.stack(samples), DMD_NOISE: dmd_noise}
+
+
+class Wan22StepDistillDitSubmodule(Wan22DitSubmodule):
+    """The DiT on LightX2V's step-distill recipe (``config.sampler == "step_distill"``, A14B
+    with its 4-step distill LoRAs): one unguided forward per timestep of
+    ``config.dmd_timesteps``, conditioned on the shifted sigma, each a flow Euler step to the
+    next sigma (``components/diffusion/dmd.py``). The latents are the only loop-back edge,
+    seeded as the UniPC path seeds them. T2V only.
+    """
+
+    SOLVER_STATE = ()
+    PREFETCH_SEEDS = True
+
+    def schedule_settings(self, fwd_info: CurrentForwardPassInfo) -> None:
+        return None
+
+    def schedule_for(self, walk: str, settings: None, bucket_key: WanStepKey) -> FlowMatchSchedule:
+        return step_distill_schedule(self.config.dmd_timesteps, self.config.dmd_shift)
+
+    def seed_loop_back(self, bucket_key: WanStepKey, generator: torch.Generator) -> dict[str, torch.Tensor]:
+        if bucket_key.i2v:
+            raise ValueError("Wan2.2's step-distill sampler is text-to-video only.")
+        return {self.LATENTS: self.seed_latents(bucket_key, generator)}
+
+    def denoise(
+        self, engine_inputs: ModelInputsFromEngine, bucket_key: WanStepKey, latents: torch.Tensor,
+        timestep: torch.Tensor, **cond: torch.Tensor,
+    ) -> torch.Tensor:
+        with _inference_ctx():
+            flow = self.model_output(engine_inputs, bucket_key, latents, timestep, **cond)
+            samples = []
+            for i, rid in enumerate(engine_inputs.request_ids):
+                info = engine_inputs.per_request_info[rid]
+                k, sigmas = self.step_index(info), self.schedule_of(info, bucket_key).sigmas
+                # host floats, as the reference reads them (``.item()``)
+                last = k + 1 >= len(self.config.dmd_timesteps)
+                samples.append(step_distill_step(
+                    latents[i], flow[i], float(sigmas[k]), None if last else float(sigmas[k + 1]),
+                ))
+        return torch.stack(samples)
 
 
 # ---------------------------------------------------------------------------
