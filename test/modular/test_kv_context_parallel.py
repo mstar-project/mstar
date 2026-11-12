@@ -1962,12 +1962,9 @@ def _thinker_over_ranks(rank, world, store, placed, exchange):
                 make_model(rebuild_policies=omni.rebuild_policies, combined_walk_of=dict)
             )
             handles = node_handles(omni, "Thinker", {**res, THINKER_SAMPLER: None})
-            for module in thinker.modules():
-                if hasattr(module, "bind_state"):
-                    module.bind_state(handles)
-            # the submodule hands the model its node's shard
-            ThinkerSubmodule(thinker, cfg).bind_node_resources(res)
-            assert thinker.sequence_shard is res[THINKER_SHARD]
+            # the submodule hands its layers and the model their handles, the declared shard's among them
+            ThinkerSubmodule(thinker, cfg).bind_node_state(handles)
+            assert thinker.shard is handles[THINKER_SHARD] and thinker.shard.resource is res[THINKER_SHARD]
             res[THINKER_SHARD].min_tokens = 0 if split else 1 << 20
             runner = StepRunner(res)
             for rid in ("r0", "r1", "r2"):

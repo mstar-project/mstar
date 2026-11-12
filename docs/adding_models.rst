@@ -746,14 +746,18 @@ deployment YAML tunes them under ``resources:`` (see :ref:`Step 6 <config-yaml>`
   builds a ``SeqShardSpec`` from it under ``name`` (see **Sequence and context parallelism**
   under `Tuning resources per deployment`_). Per step the engine decides whether the tokens of
   ``labels`` (``{"main"}`` by default) split, from the step alone, so it has no step of its own.
-  ``walks`` are rows' walks, as a read's are, and a combined walk splits where a walk it
+  It cuts the label's tensors as the node's reads take queries on it: rows of one span
+  (``packed=False``, Wan2.2 and LTX-2.5's DiTs) each row alike, packed tokens or a segmented row
+  (Qwen3.5, Qwen3-Omni's Thinker, MiniMax-H3's DiT) contiguously; loading refuses reads that
+  take both. ``walks`` are rows' walks, as a read's are, and a combined walk splits where a walk it
   combines is listed; ``None`` is every walk. List only walks with steps of many tokens a row,
   so that decode's compiled frame traces the bracket straight through. ``exchange`` is the
   author's default for how a split step reaches the node's paged attentions (``auto``,
   ``none``, ``ulysses``, ``all_gather`` or ``ring``), which a deployment's ``resources:`` block
   overrides under ``name``. The layer stack calls ``scatter`` before it and ``gather`` after it
-  on the shard's handle (`Reaching your state`_); the reads and updates of the node's arrays
-  exchange what a split step needs by themselves. Loading checks ``walks`` against the model's
+  on the shard's handle (`Reaching your state`_), or, where it needs the rank's range or another
+  axis (Wan2.2, MiniMax-H3), on the submodule's ``sequence_shard``; the reads and updates of the
+  node's arrays exchange what a split step needs by themselves. Loading checks ``walks`` against the model's
   walks and the shard's nodes, and refuses a label no array on those nodes opens, and a shard
   of more than one label, since its handle brackets one. A node with no arrays can't declare a
   ``SeqShard``, since its label has none to match: it declares a ``SeqShardSpec`` directly, as
@@ -794,7 +798,7 @@ separate arrays, and arrays of one kind and geometry on one node share one resou
 its own label.
 
 Under sequence parallelism an array declares nothing: the node's sequence shard
-(``SeqShardSpec``, in ``get_node_resources``) lists the labels whose tokens split, and an array
+(the ``SeqShard`` in ``declare_state``) lists the labels whose tokens split, and an array
 is split on a step when the shard lists its label and splits that step. Segments always cover
 the whole sequence, so ``declare_step`` is the same on every rank, and the read's resource picks
 the exchange per step: Ulysses for a self read over split tokens; for a cross read, none with
@@ -3176,7 +3180,7 @@ the model writes no exchange (a ragged attention's Ulysses follows from the labe
 Splitting is declared in four places:
 
 - ``SeqShardSpec(resource_key, nodes, labels, axis, walks=None)`` names the labels whose tokens
-  split (on the state contract, the ``SeqShard`` the model declares, on axis 0). ``axis=0`` cuts a
+  split (on the state contract, the ``SeqShard`` the model declares, on its reads' axis). ``axis=0`` cuts a
   label's packed tokens into contiguous ranges; ``axis=1`` cuts each row of a ``[B, S, ...]``
   layout alike (every row of the label one length). ``walks`` limits splitting
   to those walks; the others plan copied. A step splits only when it isn't one token a row, its
@@ -3203,8 +3207,8 @@ Splitting is declared in four places:
   on one GPU. The diffusion scaffold's step holds each label's segments once, however many
   arrays attend them (LTX-2.5's video tokens are the keys of two).
 - The forward **brackets** its layer stack (on the state contract, with ``scatter(shard, *xs)``
-  and ``gather(shard, x)`` on the shard's handle, as Qwen3.5 does in
-  ``mstar/model/qwen3_5/components/language_model.py``; otherwise on the submodule's
+  and ``gather(shard, x)`` on the shard's handle, as Qwen3.5, Qwen3-Omni's Thinker and LTX-2.5 do;
+  otherwise on the submodule's
   ``sequence_shard``, bound with its resources): ``shard.scatter(label, *xs, dim=None)``
   before it (this rank's share of each tensor, ``dim`` the spec's axis by default; ``None`` passes
   through), ``shard.gather(label, x)`` after it. Both are the identity on a copied step, at one SP rank, and

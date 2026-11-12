@@ -150,8 +150,8 @@ def test_specs_equal_the_hand_written_ones_after_yaml_overrides():
     _assert_specs_equal(specs, reference)
 
 
-def test_the_port_writes_only_lora_and_the_thinkers_shard_by_hand():
-    assert {spec.resource_key for spec in _model().get_node_resources()} == {LORA_RESOURCE_KEY, THINKER_SHARD}
+def test_the_port_writes_only_lora_by_hand():
+    assert {spec.resource_key for spec in _model().get_node_resources()} == {LORA_RESOURCE_KEY}
 
 
 def test_the_value_of_host_fields_is_on_a_node_with_no_prefix_keys():

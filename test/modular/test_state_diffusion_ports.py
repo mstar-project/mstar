@@ -187,15 +187,15 @@ def test_sdpa_builds_no_spec_as_the_hand_written_model_did(name):
 
 
 @pytest.mark.parametrize("name", MODELS)
-def test_a_port_writes_no_spec_by_hand_but_its_shard_and_has_no_layout_to_convert(name):
+def test_a_port_writes_no_spec_by_hand_and_has_no_layout_to_convert(name):
     model = MODELS[name][0]()
-    assert all(isinstance(spec, SeqShardSpec) for spec in model.get_node_resources()) and model.kv_labels() == {}, (
+    assert model.get_node_resources() == [] and model.kv_labels() == {}, (
         "a DiT keeps nothing between steps"
     )
 
 
-def test_ltx_writes_no_spec_by_hand_but_its_shard_and_has_no_layout_to_convert():
-    assert all(isinstance(spec, SeqShardSpec) for spec in _ltx().get_node_resources()) and _ltx().kv_labels() == {}
+def test_ltx_writes_no_spec_by_hand_and_has_no_layout_to_convert():
+    assert _ltx().get_node_resources() == [] and _ltx().kv_labels() == {}
 
 
 @pytest.mark.parametrize("name", ["klein", "z_image"])
