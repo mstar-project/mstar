@@ -57,6 +57,7 @@ from mstar.engine.resources.step import ResourceStep, StepContext
 from mstar.utils.h2d import to_device_nonblocking
 
 if TYPE_CHECKING:
+    from mstar.distributed.ulysses_pipeline import UlyssesPipeline
     from mstar.engine.resources.attn.config import SpExchange
     from mstar.model.components.moe_parallel import MoeParallelConfig
 
@@ -693,6 +694,17 @@ def ulysses(run: Callable, *xs: torch.Tensor | None, r: SeqRange):
     if out is None:
         return None
     return r.group.heads_to_tokens(out, counts, r.rows)
+
+
+def pipelined_ulysses(run: Callable, q, k, v, r: SeqRange, pipeline: UlyssesPipeline):
+    """``ulysses`` of an attention's q, k and v, the exchange pipelined over head groups
+    (``UlyssesPipeline``) where it serves the call: ``run`` then attends one group's heads at a time.
+    The NCCL exchange (``ulysses``) where it doesn't, and for a K/V write alone."""
+    _check_entry(r, q, k, v)
+    out = None
+    if q is not None:
+        out = pipeline(q, k, v, list(r.counts), r.rows, run, lambda: ulysses(run, q, k, v, r=r))
+    return ulysses(run, q, k, v, r=r) if out is None else out
 
 
 def _whole(r: SeqRange, xs: Sequence[torch.Tensor | None]) -> list[torch.Tensor | None]:

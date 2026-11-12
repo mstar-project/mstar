@@ -61,6 +61,13 @@ class KeyPrefixAttentionStep(ResourceStep):
     key_lens: tuple[int, ...] = ()
 
 
+def _head_groups(n) -> int:
+    # a YAML `true` is an int to Python; refuse it rather than run one group
+    if isinstance(n, bool) or not isinstance(n, int) or n < 1:
+        raise ValueError(f"ulysses_head_groups must be a positive int, got {n!r}")
+    return n
+
+
 @dataclass
 class RaggedAttentionConfig:
     """Varlen attention over segments packed into one forward, with no KV
@@ -119,7 +126,15 @@ class RaggedAttentionConfig:
     # ceiling, so a resource with many labels can declare less.
     workspace_mb: int | None = None
 
+    # Under a Ulysses exchange, attend this rank's heads in this many groups, each group's q/k/v and output
+    # moved by the copy engines while the group before it attends (``mstar.distributed.ulysses_pipeline``), in
+    # place of NCCL all-to-alls on either side of one call. 1 keeps the NCCL exchange. Where the pipeline can't
+    # serve a call (unequal shares, a captured graph, a kernel planned for a head count, a shape whose result
+    # isn't the NCCL exchange's bit for bit) that call takes the NCCL exchange.
+    ulysses_head_groups: int = 1
+
     def __post_init__(self):
+        _head_groups(self.ulysses_head_groups)
         if self.sm_scale is None:
             self.sm_scale = self.head_dim ** -0.5
         self._unsharded_qo_heads = self.num_qo_heads
@@ -171,6 +186,7 @@ class _RaggedSpecBase(NodeResourceSpec):
         max_segments_per_request: int | None = None,
         max_segments_per_step: int | None = None,
         max_tokens_per_request: int | None = None,
+        ulysses_head_groups: int | None = None,
     ):
         """Which kernel to run is the deployment's call as much as the model's —
         an image that cannot build FA3 pins FA2 here.
@@ -196,6 +212,8 @@ class _RaggedSpecBase(NodeResourceSpec):
             self.config.max_segments_per_step = max_segments_per_step
         if max_tokens_per_request is not None:
             self.config.max_tokens_per_request = max_tokens_per_request
+        if ulysses_head_groups is not None:
+            self.config.ulysses_head_groups = _head_groups(ulysses_head_groups)
 
 
 @dataclass
